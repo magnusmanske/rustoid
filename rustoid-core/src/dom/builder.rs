@@ -96,7 +96,10 @@ impl TreeBuilder {
                     i = new_i;
                 }
                 WikitextToken::BoldOpen => {
-                    self.handle_bold_open(&mut inline_buf, &mut fmt_stack);
+                    // QuoteTransformer already resolved open/close context.
+                    // Just push to format stack.
+                    wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                    fmt_stack.push(ElementKind::Bold);
                     at_line_start = false;
                     i += 1;
                 }
@@ -106,7 +109,8 @@ impl TreeBuilder {
                     i += 1;
                 }
                 WikitextToken::ItalicOpen => {
-                    self.handle_italic_open(&mut inline_buf, &mut fmt_stack);
+                    wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                    fmt_stack.push(ElementKind::Italic);
                     at_line_start = false;
                     i += 1;
                 }
