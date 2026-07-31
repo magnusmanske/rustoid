@@ -47,7 +47,7 @@ impl HtmlSerializer {
 
         match &node.kind {
             NodeKind::Document => {
-                for (i, child) in node.children.iter().enumerate() {
+                for child in node.children.iter() {
                     self.serialize_node(child, buf, depth)?;
                 }
             }
@@ -260,7 +260,7 @@ impl HtmlSerializer {
     }
 
     /// Map an ElementKind to its HTML tag name.
-    fn element_tag(&self, kind: &ElementKind) -> &'static str {
+    fn element_tag<'a>(&self, kind: &'a ElementKind) -> &'a str {
         match kind {
             ElementKind::Document => "html",
             ElementKind::Paragraph => "p",
@@ -304,7 +304,7 @@ impl HtmlSerializer {
             ElementKind::Figure => "figure",
             ElementKind::FigCaption => "figcaption",
             ElementKind::Heading(_) => "h2",
-            ElementKind::Other(_) => "div",
+            ElementKind::Other(name) => name.as_str(),
         }
     }
 }

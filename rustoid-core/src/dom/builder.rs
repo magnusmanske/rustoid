@@ -13,6 +13,9 @@ pub struct TreeBuilder {
     /// Stack of currently-open block HTML elements (div, pre, blockquote).
     /// When non-empty, content is added as children of the top element.
     open_blocks: Vec<Node>,
+    /// Stack of currently-open inline HTML elements (code, b, i, span, etc.).
+    /// When non-empty, inline content is added as children of the top element.
+    open_inlines: Vec<Node>,
 }
 
 impl TreeBuilder {
@@ -20,6 +23,7 @@ impl TreeBuilder {
     pub fn new() -> Self {
         Self {
             open_blocks: Vec::new(),
+            open_inlines: Vec::new(),
         }
     }
 
@@ -30,6 +34,7 @@ impl TreeBuilder {
         let mut fmt_stack: Vec<ElementKind> = Vec::new();
         let mut at_line_start = true;
         self.open_blocks.clear();
+        self.open_inlines.clear();
 
         let mut i = 0;
         while i < tokens.len() {
@@ -92,14 +97,17 @@ impl TreeBuilder {
                 }
                 WikitextToken::BoldOpen => {
                     self.handle_bold_open(&mut inline_buf, &mut fmt_stack);
+                    at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::ItalicOpen => {
                     self.handle_italic_open(&mut inline_buf, &mut fmt_stack);
+                    at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::Text(text) => {
-                    inline_buf.push(Node::text(text.clone()));
+                    let node = Node::text(text.clone());
+                    self.push_inline(&mut inline_buf, node);
                     at_line_start = false;
                     i += 1;
                 }
@@ -142,7 +150,6 @@ impl TreeBuilder {
                         "div" => ElementKind::Div,
                         "span" => ElementKind::Span,
                         "pre" => ElementKind::Preformatted,
-                        "code" | "tt" => ElementKind::Span,
                         _ => ElementKind::Other(name.clone()),
                     };
                     if is_block {
@@ -157,22 +164,33 @@ impl TreeBuilder {
                         self.open_blocks.push(elem);
                         at_line_start = true;
                     } else {
-                        inline_buf.push(Node::element(tag_kind));
+                        let mut elem = Node::element(tag_kind);
+                        for (k, v) in attrs {
+                            elem.set_attr(k, v);
+                        }
+                        self.open_inlines.push(elem);
                         at_line_start = false;
                     }
                     i += 1;
                 }
                 WikitextToken::HtmlTagClose(name) => {
-                    // Close matching open block tag
+                    // Close matching open block or inline tag
                     if self.open_blocks.last().map_or(false, |b| {
                         let tag = element_kind_to_tag(&b.kind);
                         tag == Some(name.as_str())
                     }) {
-                        // Flush inline before closing
+                        // Flush inline before closing block
                         doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                         inline_buf = Vec::new();
                         if let Some(block) = self.open_blocks.pop() {
                             Self::push_to_target(&mut doc, &mut self.open_blocks, block);
+                        }
+                    } else if let Some(top) = self.open_inlines.last() {
+                        let tag = element_kind_to_tag(&top.kind);
+                        if tag == Some(name.as_str()) {
+                            if let Some(inline) = self.open_inlines.pop() {
+                                inline_buf.push(inline);
+                            }
                         }
                     }
                     i += 1;
@@ -211,6 +229,15 @@ impl TreeBuilder {
         }
     }
 
+    /// Push a text node to either the current open inline or the inline buffer.
+    fn push_inline(&mut self, inline_buf: &mut Vec<Node>, node: Node) {
+        if let Some(top) = self.open_inlines.last_mut() {
+            top.push_child(node);
+        } else {
+            inline_buf.push(node);
+        }
+    }
+
     /// Flush inline buffer into a paragraph (or not, if inside pre), appending to the right target.
     fn flush_inline_to_target(
         &mut self,
@@ -218,6 +245,11 @@ impl TreeBuilder {
         inline_buf: &mut Vec<Node>,
         fmt_stack: &[ElementKind],
     ) -> Node {
+        // Close any open inline elements
+        while let Some(inline) = self.open_inlines.pop() {
+            inline_buf.push(inline);
+        }
+
         let mut buf = std::mem::take(inline_buf);
         wrap_buf_in_fmt(&mut buf, fmt_stack);
         if buf.is_empty() {
