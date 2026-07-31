@@ -62,14 +62,15 @@ impl QuoteTransformer {
 
     /// Resolve Quote tokens within a single line to open/close tags.
     fn resolve_line_quotes(tokens: &[WikitextToken]) -> Vec<WikitextToken> {
-        // Collect quote tokens with their positions
         let mut quote_positions: Vec<usize> = Vec::new();
         let mut quote_values: Vec<String> = Vec::new();
+        let mut original_lengths: Vec<usize> = Vec::new();
 
         for (i, token) in tokens.iter().enumerate() {
             if let WikitextToken::Quote(val) = token {
                 quote_positions.push(i);
                 quote_values.push(val.clone());
+                original_lengths.push(val.len());
             }
         }
 
@@ -96,7 +97,7 @@ impl QuoteTransformer {
         }
 
         // Convert quotes to tags using the state machine
-        Self::convert_quotes_to_tokens(tokens, &quote_positions, &quote_values)
+        Self::convert_quotes_to_tokens(tokens, &quote_positions, &quote_values, &original_lengths)
     }
 
     /// Balance odd counts of both bold and italic by converting a bold
@@ -116,26 +117,9 @@ impl QuoteTransformer {
             }
             let pos = quote_positions[qi];
 
-            // Check characters before and after the quote for context
-            let has_text_before = pos > 0 && matches!(&tokens[pos - 1], WikitextToken::Text(_));
-            let text_before = if has_text_before {
-                if let WikitextToken::Text(t) = &tokens[pos - 1] {
-                    Some(t.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let last_char_is_space = text_before
-                .as_ref()
-                .map(|t| t.ends_with(' '))
-                .unwrap_or(true); // at line start, treat as space
-
-            let second_last_char_is_space = text_before.as_ref().map_or(true, |t| {
-                t.chars().rev().nth(1).map(|c| c == ' ').unwrap_or(true)
-            });
+            // Look backwards through tokens to find the last text content
+            let last_char_is_space = Self::last_char_before_is_space(tokens, pos);
+            let second_last_char_is_space = Self::second_last_char_before_is_space(tokens, pos);
 
             if last_char_is_space && first_space.is_none() {
                 first_space = Some(qi);
@@ -151,9 +135,55 @@ impl QuoteTransformer {
         let convert_idx = first_single_letter.or(first_multi_letter).or(first_space);
 
         if let Some(idx) = convert_idx {
-            // Convert this bold (3 quotes) to italic (2 quotes) + apostrophe
             quote_values[idx] = "''".to_string();
         }
+    }
+
+    /// Look backwards to determine if the last non-whitespace character before
+    /// a quote token is a space.
+    fn last_char_before_is_space(tokens: &[WikitextToken], pos: usize) -> bool {
+        for i in (0..pos).rev() {
+            match &tokens[i] {
+                WikitextToken::Text(t) => {
+                    return t.chars().last().map_or(true, |c| c == ' ');
+                }
+                WikitextToken::WikilinkClose | WikitextToken::ExtLinkClose => {
+                    // Links end with ]] or ] — look inside the link text
+                    // For now, treat as non-space (it's typically a word)
+                    return false;
+                }
+                WikitextToken::ItalicClose | WikitextToken::BoldClose => {
+                    // These are formatting closes — continue looking
+                    continue;
+                }
+                _ => {
+                    // Other tokens (like tags, etc.) — continue looking
+                    continue;
+                }
+            }
+        }
+        true // at start of line, treat as space
+    }
+
+    fn second_last_char_before_is_space(tokens: &[WikitextToken], pos: usize) -> bool {
+        for i in (0..pos).rev() {
+            match &tokens[i] {
+                WikitextToken::Text(t) => {
+                    let chars: Vec<char> = t.chars().rev().collect();
+                    return chars.len() < 2 || chars[1] == ' ';
+                }
+                WikitextToken::WikilinkClose | WikitextToken::ExtLinkClose => {
+                    return false;
+                }
+                WikitextToken::ItalicClose | WikitextToken::BoldClose => {
+                    continue;
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+        true
     }
 
     /// Convert quote tokens to BoldOpen/BoldClose/ItalicOpen/ItalicClose using
@@ -162,6 +192,7 @@ impl QuoteTransformer {
         tokens: &[WikitextToken],
         quote_positions: &[usize],
         quote_values: &[String],
+        original_lengths: &[usize],
     ) -> Vec<WikitextToken> {
         let mut result: Vec<WikitextToken> = Vec::new();
         let mut token_idx: usize = 0;
@@ -183,6 +214,11 @@ impl QuoteTransformer {
         while token_idx < tokens.len() {
             if qi < quote_positions.len() && token_idx == quote_positions[qi] {
                 let qlen = quote_values[qi].len();
+                // If this was a 3-quote converted to 2-quote, prepend apostrophe
+                let was_converted = qlen == 2 && original_lengths[qi] == 3;
+                if was_converted {
+                    result.push(WikitextToken::Text("'".to_string()));
+                }
                 match (qlen, state) {
                     (2, State::Empty | State::B) => {
                         result.push(WikitextToken::ItalicOpen);

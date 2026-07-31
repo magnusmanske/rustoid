@@ -16,6 +16,8 @@ pub struct TreeBuilder {
     /// Stack of currently-open inline HTML elements (code, b, i, span, etc.).
     /// When non-empty, inline content is added as children of the top element.
     open_inlines: Vec<Node>,
+    /// Stack of format start positions (index into inline_buf when format opened).
+    fmt_starts: Vec<usize>,
 }
 
 impl TreeBuilder {
@@ -24,6 +26,7 @@ impl TreeBuilder {
         Self {
             open_blocks: Vec::new(),
             open_inlines: Vec::new(),
+            fmt_starts: Vec::new(),
         }
     }
 
@@ -97,11 +100,13 @@ impl TreeBuilder {
                 }
                 WikitextToken::ItalicOpen => {
                     fmt_stack.push(ElementKind::Italic);
+                    self.fmt_starts.push(inline_buf.len());
                     at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::BoldOpen => {
                     fmt_stack.push(ElementKind::Bold);
+                    self.fmt_starts.push(inline_buf.len());
                     at_line_start = false;
                     i += 1;
                 }
@@ -315,45 +320,39 @@ impl TreeBuilder {
         }
     }
 
-    fn handle_bold_close(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+    fn handle_bold_close(&mut self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
         if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Bold) {
-            // Pop everything above Bold and wrap
-            while fmt_stack.len() > pos + 1 {
-                let kind = fmt_stack.pop().unwrap();
-                let mut wrapper = Node::element(kind);
-                for node in inline_buf.drain(..) {
-                    wrapper.push_child(node);
-                }
-                inline_buf.push(wrapper);
+            let start_idx = self.fmt_starts.get(pos).copied().unwrap_or(0);
+            // Remove starts for this and everything above
+            self.fmt_starts.truncate(pos);
+            // Pop everything above Bold, wrapping from their start positions
+            // But first, wrap content from start_idx to end in Bold
+            let tail: Vec<Node> = inline_buf.drain(start_idx..).collect();
+            let mut bold = Node::element(ElementKind::Bold);
+            for node in tail {
+                bold.push_child(node);
             }
-            // Now wrap in Bold
-            let mut wrapper = Node::element(ElementKind::Bold);
-            for node in inline_buf.drain(..) {
-                wrapper.push_child(node);
-            }
-            inline_buf.push(wrapper);
-            fmt_stack.pop(); // remove Bold
+            inline_buf.push(bold);
+            // Remove Bold from stack (and everything above)
+            fmt_stack.truncate(pos);
         }
     }
 
-    fn handle_italic_close(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+    fn handle_italic_close(
+        &mut self,
+        inline_buf: &mut Vec<Node>,
+        fmt_stack: &mut Vec<ElementKind>,
+    ) {
         if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Italic) {
-            // Pop everything above Italic and wrap
-            while fmt_stack.len() > pos + 1 {
-                let kind = fmt_stack.pop().unwrap();
-                let mut wrapper = Node::element(kind);
-                for node in inline_buf.drain(..) {
-                    wrapper.push_child(node);
-                }
-                inline_buf.push(wrapper);
+            let start_idx = self.fmt_starts.get(pos).copied().unwrap_or(0);
+            self.fmt_starts.truncate(pos);
+            let tail: Vec<Node> = inline_buf.drain(start_idx..).collect();
+            let mut italic = Node::element(ElementKind::Italic);
+            for node in tail {
+                italic.push_child(node);
             }
-            // Now wrap in Italic
-            let mut wrapper = Node::element(ElementKind::Italic);
-            for node in inline_buf.drain(..) {
-                wrapper.push_child(node);
-            }
-            inline_buf.push(wrapper);
-            fmt_stack.pop(); // remove Italic
+            inline_buf.push(italic);
+            fmt_stack.truncate(pos);
         }
     }
 
