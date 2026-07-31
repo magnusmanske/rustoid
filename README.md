@@ -4,13 +4,13 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 
 ## Status
 
-🚧 **Phase 0 complete** — project skeleton, workspace structure, CI, core types.
+🚧 **Phase 1 complete** — core types, mock backends, namespace-aware TitleParser.
 
 | Phase | Status |
 |-------|--------|
 | 0 — Project setup | ✅ Done |
-| 1 — Core types & traits | 🔄 In progress |
-| 2 — Wikitext tokenizer | ⬜ Pending |
+| 1 — Core types & traits | ✅ Done |
+| 2 — Wikitext tokenizer | 🔄 In progress |
 | 3 — Template expander | ⬜ Pending |
 | 4 — Lua/Scribunto engine | ⬜ Pending |
 | 5 — AST / Tree builder | ⬜ Pending |

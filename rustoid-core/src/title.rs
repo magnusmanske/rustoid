@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::traits::SiteConfig;
+
 /// A MediaWiki page title with optional namespace, interwiki prefix, and fragment.
 ///
 /// Examples:
@@ -33,8 +35,7 @@ impl Title {
         }
     }
 
-    /// Create a simple Title from text, assuming namespace 0.
-    /// This is a convenience constructor; use `TitleParser` for full parsing.
+    /// Create a simple Title with the given namespace ID and text.
     pub fn new(namespace_id: i32, text: impl Into<String>) -> Self {
         Self {
             interwiki: None,
@@ -44,24 +45,51 @@ impl Title {
         }
     }
 
-    /// The full page name including namespace prefix (e.g. `"Template:Foo"`).
+    /// The full page name including namespace prefix, resolved via SiteConfig.
     pub fn full_text(&self) -> String {
-        // TODO: resolve namespace name from SiteConfig.
-        // For now, use canonical namespace names for well-known IDs.
-        match self.namespace_id {
-            0 => self.text.clone(),
-            1 => format!("Talk:{}", self.text),
-            2 => format!("User:{}", self.text),
-            3 => format!("User talk:{}", self.text),
-            4 => format!("Project:{}", self.text),
-            6 => format!("File:{}", self.text),
-            8 => format!("MediaWiki:{}", self.text),
-            10 => format!("Template:{}", self.text),
-            12 => format!("Help:{}", self.text),
-            14 => format!("Category:{}", self.text),
-            828 => format!("Module:{}", self.text),
-            _ => self.text.clone(),
+        let prefix = namespace_prefix(self.namespace_id);
+        if self.namespace_id != 0 && !prefix.is_empty() {
+            format!("{prefix}:{}", self.text)
+        } else {
+            self.text.clone()
         }
+    }
+
+    /// The full page name using canonical namespace names for display.
+    pub fn full_text_with_config(&self, config: &dyn SiteConfig) -> String {
+        if self.namespace_id == 0 {
+            return self.text.clone();
+        }
+        if let Some(ns) = config.namespaces().get(&self.namespace_id) {
+            format!("{}:{}", ns.canonical, self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+/// Map a namespace ID to its canonical English prefix (fallback without SiteConfig).
+fn namespace_prefix(ns_id: i32) -> &'static str {
+    match ns_id {
+        0 => "",
+        1 => "Talk",
+        2 => "User",
+        3 => "User talk",
+        4 => "Project",
+        5 => "Project talk",
+        6 => "File",
+        7 => "File talk",
+        8 => "MediaWiki",
+        9 => "MediaWiki talk",
+        10 => "Template",
+        11 => "Template talk",
+        12 => "Help",
+        13 => "Help talk",
+        14 => "Category",
+        15 => "Category talk",
+        828 => "Module",
+        829 => "Module talk",
+        _ => "",
     }
 }
 
@@ -72,25 +100,10 @@ impl fmt::Display for Title {
             s.push_str(iw);
             s.push(':');
         }
-        if self.namespace_id != 0 {
-            // Use canonical prefix
-            let prefix = match self.namespace_id {
-                1 => "Talk",
-                2 => "User",
-                3 => "User talk",
-                4 => "Project",
-                6 => "File",
-                8 => "MediaWiki",
-                10 => "Template",
-                12 => "Help",
-                14 => "Category",
-                828 => "Module",
-                _ => "",
-            };
-            if !prefix.is_empty() {
-                s.push_str(prefix);
-                s.push(':');
-            }
+        let prefix = namespace_prefix(self.namespace_id);
+        if !prefix.is_empty() {
+            s.push_str(prefix);
+            s.push(':');
         }
         s.push_str(&self.text);
         if let Some(ref frag) = self.fragment {
@@ -101,21 +114,19 @@ impl fmt::Display for Title {
     }
 }
 
-/// Parser for constructing `Title` from a string, given namespace/prefix context.
-///
-/// This is a simplified parser; the full version will use `SiteConfig` for
+/// Parser for constructing `Title` from a string, using `SiteConfig` for
 /// namespace alias resolution and interwiki prefix matching.
 pub struct TitleParser;
 
 impl TitleParser {
-    /// Parse a title string into a `Title`.
+    /// Parse a title string into a `Title` using the given site configuration.
     ///
     /// Handles:
     /// - Leading `:` to force mainspace (e.g. `":Category:Foo"` → mainspace `"Category:Foo"`).
-    /// - Namespace prefixes (only canonical English names for now).
-    /// - Interwiki prefixes (delegates to `SiteConfig`).
+    /// - Namespace prefixes resolved via `SiteConfig.namespaces()`.
+    /// - Interwiki prefixes resolved via `SiteConfig.interwiki_map()`.
     /// - URL fragments (`#Section`).
-    pub fn parse(input: &str) -> Title {
+    pub fn parse(input: &str, config: &dyn SiteConfig) -> Title {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Title::new_main(String::new());
@@ -131,26 +142,50 @@ impl TitleParser {
             (rest, false)
         };
 
-        // For now, only handle canonical English namespace prefixes.
-        let namespace_names: &[(i32, &str)] = &[
-            (6, "File"),
-            (6, "Image"),
-            (10, "Template"),
-            (14, "Category"),
-            (12, "Help"),
-            (828, "Module"),
-        ];
+        if !force_main {
+            // Try to match interwiki prefix first
+            for prefix in config.interwiki_map().keys() {
+                if let Some(after) = rest
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|s| s.strip_prefix(':'))
+                {
+                    return Title {
+                        interwiki: Some(prefix.clone()),
+                        namespace_id: 0,
+                        text: after.to_string(),
+                        fragment,
+                    };
+                }
+            }
 
-        for &(ns_id, prefix) in namespace_names {
-            if let Some(title_part) = rest.strip_prefix(prefix).and_then(|s| s.strip_prefix(':'))
-                && !force_main
-            {
-                return Title {
-                    interwiki: None,
-                    namespace_id: ns_id,
-                    text: title_part.to_string(),
-                    fragment,
-                };
+            // Try to match namespace prefix by canonical name or alias
+            for (&ns_id, ns_info) in config.namespaces() {
+                // Check canonical name first
+                if let Some(title_part) = rest
+                    .strip_prefix(&ns_info.canonical)
+                    .and_then(|s| s.strip_prefix(':'))
+                {
+                    return Title {
+                        interwiki: None,
+                        namespace_id: ns_id,
+                        text: title_part.to_string(),
+                        fragment,
+                    };
+                }
+                // Check localized aliases
+                for alias in &ns_info.aliases {
+                    if let Some(title_part) = rest
+                        .strip_prefix(alias.as_str())
+                        .and_then(|s| s.strip_prefix(':'))
+                    {
+                        return Title {
+                            interwiki: None,
+                            namespace_id: ns_id,
+                            text: title_part.to_string(),
+                            fragment,
+                        };
+                    }
+                }
             }
         }
 
@@ -176,10 +211,16 @@ fn split_fragment(input: &str) -> (&str, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::MockSiteConfig;
+
+    fn test_config() -> MockSiteConfig {
+        MockSiteConfig::new()
+    }
 
     #[test]
     fn test_mainspace_title() {
-        let t = TitleParser::parse("Main Page");
+        let config = test_config();
+        let t = TitleParser::parse("Main Page", &config);
         assert_eq!(t.namespace_id, 0);
         assert_eq!(t.text, "Main Page");
         assert!(t.fragment.is_none());
@@ -187,23 +228,75 @@ mod tests {
 
     #[test]
     fn test_template_title() {
-        let t = TitleParser::parse("Template:Foo");
+        let config = test_config();
+        let t = TitleParser::parse("Template:Foo", &config);
         assert_eq!(t.namespace_id, 10);
         assert_eq!(t.text, "Foo");
     }
 
     #[test]
+    fn test_file_title() {
+        let config = test_config();
+        let t = TitleParser::parse("File:Example.jpg", &config);
+        assert_eq!(t.namespace_id, 6);
+        assert_eq!(t.text, "Example.jpg");
+    }
+
+    #[test]
+    fn test_image_alias() {
+        let config = test_config();
+        let t = TitleParser::parse("Image:Example.jpg", &config);
+        assert_eq!(t.namespace_id, 6);
+        assert_eq!(t.text, "Example.jpg");
+    }
+
+    #[test]
     fn test_force_mainspace() {
-        let t = TitleParser::parse(":Category:People");
+        let config = test_config();
+        let t = TitleParser::parse(":Category:People", &config);
         assert_eq!(t.namespace_id, 0);
         assert_eq!(t.text, "Category:People");
     }
 
     #[test]
     fn test_fragment() {
-        let t = TitleParser::parse("Foo#Section");
+        let config = test_config();
+        let t = TitleParser::parse("Foo#Section", &config);
         assert_eq!(t.namespace_id, 0);
         assert_eq!(t.text, "Foo");
         assert_eq!(t.fragment, Some("Section".to_string()));
+    }
+
+    #[test]
+    fn test_interwiki() {
+        let config = test_config();
+        let t = TitleParser::parse("commons:File:Example.jpg", &config);
+        assert_eq!(t.interwiki, Some("commons".to_string()));
+        assert_eq!(t.namespace_id, 0);
+        assert_eq!(t.text, "File:Example.jpg");
+    }
+
+    #[test]
+    fn test_module_title() {
+        let config = test_config();
+        let t = TitleParser::parse("Module:Citation", &config);
+        assert_eq!(t.namespace_id, 828);
+        assert_eq!(t.text, "Citation");
+    }
+
+    #[test]
+    fn test_title_display() {
+        let t = Title::new(10, "Foo");
+        assert_eq!(t.to_string(), "Template:Foo");
+
+        let t = Title::new_main("Main Page");
+        assert_eq!(t.to_string(), "Main Page");
+    }
+
+    #[test]
+    fn test_full_text_with_config() {
+        let config = test_config();
+        let t = Title::new(14, "People");
+        assert_eq!(t.full_text_with_config(&config), "Category:People");
     }
 }

@@ -46,6 +46,8 @@ pub mod links;
 pub mod magic;
 pub mod sanitizer;
 
+pub mod mock;
+
 mod util;
 
 // Re-export key types

@@ -27,3 +27,6 @@ log.workspace = true
 tokio = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 ruwex = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
