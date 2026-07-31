@@ -167,7 +167,12 @@ impl<'a> Tokenizer<'a> {
             if self.text_start == self.pos && !remaining.is_empty() {
                 self.text_start = self.pos;
             }
-            self.pos += 1;
+            // Advance by one char (not byte) to handle multi-byte UTF-8
+            if let Some(ch) = remaining.chars().next() {
+                self.pos += ch.len_utf8();
+            } else {
+                break;
+            }
         }
 
         // Flush remaining text
@@ -229,6 +234,7 @@ impl<'a> Tokenizer<'a> {
     fn try_comment(&mut self, remaining: &str) -> Option<WikitextToken> {
         if remaining.starts_with("<!--")
             && let Some(end) = remaining.find("-->")
+            && end >= 4
         {
             let comment = remaining[4..end].to_string();
             self.advance(end + 3);

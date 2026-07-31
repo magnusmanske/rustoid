@@ -173,15 +173,36 @@ pub fn parse_test_file(path: &Path) -> Result<ParserTestFile> {
             if lines.get(i).map(|l| l.trim()) == Some("!! text") {
                 i += 1;
                 let mut text = String::new();
-                while i < lines.len() && lines[i].trim() != "!! endarticle" {
+                while i < lines.len()
+                    && lines[i].trim() != "!! endarticle"
+                    && lines[i].trim() != "!! end"
+                {
                     text.push_str(lines[i]);
                     text.push('\n');
                     i += 1;
                 }
                 articles.insert(name.to_string(), text.trim_end().to_string());
                 if i < lines.len() {
-                    i += 1; // skip !! endarticle
+                    i += 1;
                 }
+            }
+        } else if (line == "!! options" || line.starts_with("!! options"))
+            && !line.starts_with("!! options ")
+        {
+            // File-level !! options block (no extra text after "!! options")
+            // Skip until !! end at the same level
+            while i < lines.len() && lines[i].trim() != "!! end" {
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1;
+            }
+        } else if line == "!! hooks" {
+            while i < lines.len() && lines[i].trim() != "!! endhooks" {
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1;
             }
         } else if let Some(stripped) = line.strip_prefix("!! test") {
             let description = stripped.trim().to_string();
