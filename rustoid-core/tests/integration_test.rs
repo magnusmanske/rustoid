@@ -7,11 +7,7 @@ fn run_all_fixtures() {
     let entries = std::fs::read_dir(fixture_dir).expect("fixtures dir exists");
     let mut total = 0;
     let mut passed = 0;
-    let mut failed = 0;
-    let mut skipped = 0;
-    let mut errors = 0;
     let mut file_results = Vec::new();
-    let mut failure_details = Vec::new();
 
     for entry in entries {
         let entry = entry.unwrap();
@@ -22,19 +18,8 @@ fn run_all_fixtures() {
         let summary = test_harness::run_test_file(&path).unwrap();
         total += summary.total;
         passed += summary.passed;
-        failed += summary.failed;
-        skipped += summary.skipped;
-        errors += summary.errors;
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
-        let pct = if summary.total > 0 {
-            (summary.passed as f64 / summary.total as f64) * 100.0
-        } else {
-            0.0
-        };
         file_results.push(format!("  {fname}: {}/{}", summary.passed, summary.total));
-        for (name, result) in &summary.failures {
-            failure_details.push(format!("    [{fname}] {name}: {result}"));
-        }
     }
 
     let overall_pct = if total > 0 {
@@ -47,13 +32,19 @@ fn run_all_fixtures() {
     for fr in &file_results {
         eprintln!("{fr}");
     }
-
-    // We expect at least some tests to pass
-    assert!(passed > 0, "No tests passed");
+    assert!(
+        passed >= 5,
+        "Only {passed}/{total} tests passed (below minimum of 5)"
+    );
 }
 
 #[test]
 fn test_all_parsoid_fixtures() {
+    run_all_fixtures();
+}
+
+#[test]
+fn test_fixture_summary() {
     run_all_fixtures();
 }
 

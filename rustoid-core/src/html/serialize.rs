@@ -214,7 +214,9 @@ impl HtmlSerializer {
                 buf.push_str(&html_escape(text));
             }
             NodeKind::Comment(content) => {
-                buf.push_str(&format!("<!--{content}-->"));
+                // Escape -- inside comments per HTML spec
+                let escaped = content.replace("--", "&#x2D;&#x2D;");
+                buf.push_str(&format!("<!--{escaped}-->\n"));
             }
         }
 

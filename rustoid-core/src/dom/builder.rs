@@ -21,8 +21,8 @@ impl TreeBuilder {
     pub fn build(&mut self, tokens: &[WikitextToken]) -> Result<Node> {
         let mut doc = Node::document();
         let mut inline_buf: Vec<Node> = Vec::new();
-        // Stack of open inline formatting elements (Bold, Italic).
         let mut fmt_stack: Vec<ElementKind> = Vec::new();
+        let mut at_line_start = true;
 
         let mut i = 0;
         while i < tokens.len() {
@@ -40,6 +40,7 @@ impl TreeBuilder {
                     let (heading, new_i) = self.build_heading(tokens, i, *level);
                     doc.push_child(heading);
                     i = new_i;
+                    at_line_start = true;
                 }
                 WikitextToken::ListItem(ch, depth) => {
                     doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
@@ -49,6 +50,7 @@ impl TreeBuilder {
                     let (list_item, new_i) = self.build_list_item(tokens, i, *ch, *depth, prefix);
                     doc.push_child(list_item);
                     i = new_i;
+                    at_line_start = true;
                 }
                 WikitextToken::Hr => {
                     doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
@@ -56,25 +58,20 @@ impl TreeBuilder {
                     fmt_stack.clear();
                     doc.push_child(Node::element(ElementKind::HorizontalRule));
                     i += 1;
+                    at_line_start = true;
                 }
                 WikitextToken::ParagraphBreak => {
                     doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
                     i += 1;
+                    at_line_start = true;
                 }
                 WikitextToken::TableOpen(_) => {
                     let prefix = std::mem::take(&mut inline_buf);
                     let (table, new_i) = self.build_table(tokens, i, prefix);
                     doc.push_child(table);
                     i = new_i;
-                }
-                WikitextToken::Newline => {
-                    // In inline context, newlines become spaces or line breaks
-                    if !inline_buf.is_empty() {
-                        inline_buf.push(Node::text(" "));
-                    }
-                    i += 1;
                 }
                 WikitextToken::WikilinkOpen => {
                     let (link_node, new_i) = self.build_wikilink(tokens, i);
@@ -140,13 +137,22 @@ impl TreeBuilder {
                     i += 1;
                 }
                 WikitextToken::Comment(comment) => {
-                    inline_buf.push(Node::comment(comment.clone()));
+                    if at_line_start || inline_buf.is_empty() {
+                        doc.push_child(Node::comment(comment.clone()));
+                    } else {
+                        inline_buf.push(Node::comment(comment.clone()));
+                    }
                     i += 1;
                 }
                 WikitextToken::NowikiContent(content) => {
+                    // Nowiki content is a block-level preformatted element
+                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    inline_buf = Vec::new();
+                    fmt_stack.clear();
                     let mut pre = Node::element(ElementKind::Preformatted);
                     pre.push_child(Node::text(content.clone()));
-                    inline_buf.push(pre);
+                    doc.push_child(pre);
+                    at_line_start = true;
                     i += 1;
                 }
                 WikitextToken::SelfClosingTag(name, _) => {
@@ -158,6 +164,7 @@ impl TreeBuilder {
                     i += 1;
                 }
                 WikitextToken::HtmlTagOpen(name, _) => {
+                    let is_block = matches!(name.as_str(), "div" | "pre" | "blockquote");
                     let tag_kind = match name.as_str() {
                         "b" | "strong" => ElementKind::Bold,
                         "i" | "em" => ElementKind::Italic,
@@ -167,7 +174,17 @@ impl TreeBuilder {
                         "code" | "tt" => ElementKind::Span,
                         _ => ElementKind::Other(name.clone()),
                     };
-                    inline_buf.push(Node::element(tag_kind));
+                    if is_block {
+                        // Block-level HTML tag: flush pending paragraph first
+                        doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                        inline_buf = Vec::new();
+                        fmt_stack.clear();
+                        doc.push_child(Node::element(tag_kind));
+                        at_line_start = true;
+                    } else {
+                        inline_buf.push(Node::element(tag_kind));
+                        at_line_start = false;
+                    }
                     i += 1;
                 }
                 WikitextToken::HtmlTagClose(_name) => {
