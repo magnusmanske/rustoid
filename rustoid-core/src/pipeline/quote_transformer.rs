@@ -1,46 +1,23 @@
 //! Quote transformer — resolves raw quote tokens to Bold/Italic open/close tags.
 //!
-//! This implements the same state machine as Parsoid's QuoteTransformer
-//! and the MediaWiki PHP parser for balancing and converting quote markers.
+//! Implements the same chunk-based state machine as Parsoid's QuoteTransformer.
+//! Tokens are split into alternating non-quote and quote chunks, then quote chunks
+//! are resolved to open/close tags.
 
 use crate::error::Result;
 use crate::wikitext::tokens::WikitextToken;
 
-/// Transforms a token stream by replacing Quote tokens with appropriate
-/// Bold/Italic element tokens.
 pub struct QuoteTransformer;
-
-/// Resolved inline formatting element types.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResolvedToken {
-    /// Plain text.
-    Text(String),
-    /// Start of a bold span.
-    BoldOpen,
-    /// End of a bold span.
-    BoldClose,
-    /// Start of an italic span.
-    ItalicOpen,
-    /// End of an italic span.
-    ItalicClose,
-    /// Any other token (pass-through).
-    Other(WikitextToken),
-}
 
 impl QuoteTransformer {
     /// Process a token stream, resolving quote tokens per line.
-    ///
-    /// Quote tokens within a line are buffered and resolved when a newline or
-    /// block-level token is encountered.
     pub fn transform(tokens: Vec<WikitextToken>) -> Result<Vec<WikitextToken>> {
-        // Pre-pass: collect tokens per line, resolve quotes per line
         let mut result: Vec<WikitextToken> = Vec::new();
         let mut line_tokens: Vec<WikitextToken> = Vec::new();
 
         for token in tokens {
             match &token {
                 WikitextToken::Newline | WikitextToken::ParagraphBreak => {
-                    // Resolve quotes in the current line
                     let resolved = Self::resolve_line_quotes(&line_tokens);
                     result.extend(resolved);
                     result.push(token);
@@ -60,29 +37,67 @@ impl QuoteTransformer {
         Ok(result)
     }
 
-    /// Resolve Quote tokens within a single line to open/close tags.
-    fn resolve_line_quotes(tokens: &[WikitextToken]) -> Vec<WikitextToken> {
-        let mut quote_positions: Vec<usize> = Vec::new();
-        let mut quote_values: Vec<String> = Vec::new();
-        let mut original_lengths: Vec<usize> = Vec::new();
+    /// Split tokens into alternating chunks: non-quote, quote, non-quote, quote, ...
+    /// Returns (chunks, quote_chunk_indices) where quote_chunk_indices are odd-numbered.
+    fn chunkify(tokens: &[WikitextToken]) -> (Vec<Vec<WikitextToken>>, Vec<usize>) {
+        let mut chunks: Vec<Vec<WikitextToken>> = Vec::new();
+        let mut quote_indices: Vec<usize> = Vec::new();
+        let mut current: Vec<WikitextToken> = Vec::new();
+        let mut is_quote_chunk = false;
 
-        for (i, token) in tokens.iter().enumerate() {
-            if let WikitextToken::Quote(val) = token {
-                quote_positions.push(i);
-                quote_values.push(val.clone());
-                original_lengths.push(val.len());
+        for token in tokens {
+            match token {
+                WikitextToken::Quote(_) => {
+                    if !is_quote_chunk {
+                        // Flush non-quote chunk
+                        chunks.push(std::mem::take(&mut current));
+                        is_quote_chunk = true;
+                    }
+                    current.push(token.clone());
+                }
+                _ => {
+                    if is_quote_chunk {
+                        // Flush quote chunk
+                        chunks.push(std::mem::take(&mut current));
+                        quote_indices.push(chunks.len() - 1);
+                        is_quote_chunk = false;
+                    }
+                    current.push(token.clone());
+                }
             }
         }
+        // Flush final chunk
+        if !current.is_empty() {
+            if is_quote_chunk {
+                quote_indices.push(chunks.len());
+            }
+            chunks.push(current);
+        }
 
-        if quote_positions.is_empty() {
+        (chunks, quote_indices)
+    }
+
+    /// Resolve Quote tokens within a single line to open/close tags.
+    fn resolve_line_quotes(tokens: &[WikitextToken]) -> Vec<WikitextToken> {
+        let (chunks, quote_indices) = Self::chunkify(tokens);
+
+        if quote_indices.is_empty() {
             return tokens.to_vec();
         }
 
-        // Count bold and italic quotes
-        let mut num_bold: usize = 0;
-        let mut num_italic: usize = 0;
-        for val in &quote_values {
-            let len = val.len();
+        // Extract quote lengths from quote chunks
+        let mut quote_lengths: Vec<usize> = Vec::new();
+        for &qi in &quote_indices {
+            // Each quote chunk should contain exactly one Quote token
+            if let Some(WikitextToken::Quote(q)) = chunks[qi].first() {
+                quote_lengths.push(q.len());
+            }
+        }
+
+        // Count bold and italic
+        let mut num_bold = 0;
+        let mut num_italic = 0;
+        for &len in &quote_lengths {
             if len == 2 || len == 5 {
                 num_italic += 1;
             }
@@ -91,40 +106,57 @@ impl QuoteTransformer {
             }
         }
 
-        // Balance: if both are odd, convert a bold to italic+apostrophe
+        // Balance: if both counts are odd, convert a bold to italic+apostrophe
+        let mut quote_lengths = quote_lengths;
         if num_italic % 2 == 1 && num_bold % 2 == 1 {
-            Self::balance_quotes(&mut quote_values, &tokens, &quote_positions);
+            Self::balance_quote_lengths(&mut quote_lengths, &chunks, &quote_indices);
         }
 
-        // Convert quotes to tags using the state machine
-        Self::convert_quotes_to_tokens(tokens, &quote_positions, &quote_values, &original_lengths)
+        // Convert quote chunks to tags using Parsoid state machine
+        Self::convert_chunks(&chunks, &quote_indices, &quote_lengths)
     }
 
-    /// Balance odd counts of both bold and italic by converting a bold
-    /// to an italic plus an apostrophe.
-    fn balance_quotes(
-        quote_values: &mut [String],
-        tokens: &[WikitextToken],
-        quote_positions: &[usize],
+    fn balance_quote_lengths(
+        quote_lengths: &mut [usize],
+        chunks: &[Vec<WikitextToken>],
+        quote_indices: &[usize],
     ) {
         let mut first_single_letter = None;
         let mut first_multi_letter = None;
         let mut first_space = None;
 
-        for (qi, val) in quote_values.iter().enumerate() {
-            if val.len() != 3 {
-                continue; // only look at bold (3-quote) tokens
+        for (qi, &len) in quote_lengths.iter().enumerate() {
+            if len != 3 {
+                continue;
             }
-            let pos = quote_positions[qi];
+            // Check the non-quote chunk BEFORE this quote chunk
+            let prev_chunk_idx = if quote_indices[qi] > 0 {
+                quote_indices[qi] - 1
+            } else {
+                0
+            };
+            let has_text = prev_chunk_idx < chunks.len();
+            let last_text = if has_text {
+                chunks[prev_chunk_idx].last().and_then(|t| {
+                    if let WikitextToken::Text(s) = t {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
 
-            // Look backwards through tokens to find the last text content
-            let last_char_is_space = Self::last_char_before_is_space(tokens, pos);
-            let second_last_char_is_space = Self::second_last_char_before_is_space(tokens, pos);
+            let last_char_space = last_text.as_ref().map_or(true, |t| t.ends_with(' '));
+            let second_last_space = last_text.as_ref().map_or(true, |t| {
+                t.chars().rev().nth(1).map(|c| c == ' ').unwrap_or(true)
+            });
 
-            if last_char_is_space && first_space.is_none() {
+            if last_char_space && first_space.is_none() {
                 first_space = Some(qi);
-            } else if !last_char_is_space {
-                if second_last_char_is_space && first_single_letter.is_none() {
+            } else if !last_char_space {
+                if second_last_space && first_single_letter.is_none() {
                     first_single_letter = Some(qi);
                 } else if first_multi_letter.is_none() {
                     first_multi_letter = Some(qi);
@@ -133,72 +165,20 @@ impl QuoteTransformer {
         }
 
         let convert_idx = first_single_letter.or(first_multi_letter).or(first_space);
-
         if let Some(idx) = convert_idx {
-            quote_values[idx] = "''".to_string();
+            quote_lengths[idx] = 2;
         }
     }
 
-    /// Look backwards to determine if the last non-whitespace character before
-    /// a quote token is a space.
-    fn last_char_before_is_space(tokens: &[WikitextToken], pos: usize) -> bool {
-        for i in (0..pos).rev() {
-            match &tokens[i] {
-                WikitextToken::Text(t) => {
-                    return t.chars().last().map_or(true, |c| c == ' ');
-                }
-                WikitextToken::WikilinkClose | WikitextToken::ExtLinkClose => {
-                    // Links end with ]] or ] — look inside the link text
-                    // For now, treat as non-space (it's typically a word)
-                    return false;
-                }
-                WikitextToken::ItalicClose | WikitextToken::BoldClose => {
-                    // These are formatting closes — continue looking
-                    continue;
-                }
-                _ => {
-                    // Other tokens (like tags, etc.) — continue looking
-                    continue;
-                }
-            }
-        }
-        true // at start of line, treat as space
-    }
-
-    fn second_last_char_before_is_space(tokens: &[WikitextToken], pos: usize) -> bool {
-        for i in (0..pos).rev() {
-            match &tokens[i] {
-                WikitextToken::Text(t) => {
-                    let chars: Vec<char> = t.chars().rev().collect();
-                    return chars.len() < 2 || chars[1] == ' ';
-                }
-                WikitextToken::WikilinkClose | WikitextToken::ExtLinkClose => {
-                    return false;
-                }
-                WikitextToken::ItalicClose | WikitextToken::BoldClose => {
-                    continue;
-                }
-                _ => {
-                    continue;
-                }
-            }
-        }
-        true
-    }
-
-    /// Convert quote tokens to BoldOpen/BoldClose/ItalicOpen/ItalicClose using
-    /// the MediaWiki state machine.
-    fn convert_quotes_to_tokens(
-        tokens: &[WikitextToken],
-        quote_positions: &[usize],
-        quote_values: &[String],
-        original_lengths: &[usize],
+    /// Convert quote chunks to BoldOpen/BoldClose/ItalicOpen/ItalicClose.
+    /// Non-quote chunks pass through unchanged.
+    fn convert_chunks(
+        chunks: &[Vec<WikitextToken>],
+        quote_indices: &[usize],
+        quote_lengths: &[usize],
     ) -> Vec<WikitextToken> {
         let mut result: Vec<WikitextToken> = Vec::new();
-        let mut token_idx: usize = 0;
-        let mut qi: usize = 0;
 
-        // State: "" | "i" | "b" | "bi" | "ib" | "both"
         #[derive(Clone, Copy)]
         enum State {
             Empty,
@@ -206,41 +186,30 @@ impl QuoteTransformer {
             B,
             BI,
             IB,
-            Both(usize), // Both stores the index of the lastboth
+            Both(usize),
         }
 
         let mut state = State::Empty;
+        let mut qi: usize = 0;
 
-        while token_idx < tokens.len() {
-            if qi < quote_positions.len() && token_idx == quote_positions[qi] {
-                let qlen = quote_values[qi].len();
-                // If this was a 3-quote converted to 2-quote, prepend apostrophe
-                let was_converted = qlen == 2 && original_lengths[qi] == 3;
-                if was_converted {
-                    result.push(WikitextToken::Text("'".to_string()));
-                }
+        for (ci, chunk) in chunks.iter().enumerate() {
+            if qi < quote_indices.len() && ci == quote_indices[qi] {
+                // Quote chunk
+                let qlen = quote_lengths[qi];
                 match (qlen, state) {
                     (2, State::Empty | State::B) => {
                         result.push(WikitextToken::ItalicOpen);
-                        state = match &state {
-                            State::B => State::IB,
-                            _ => State::I,
+                        state = if matches!(state, State::B) {
+                            State::IB
+                        } else {
+                            State::I
                         };
                     }
                     (2, State::I) => {
                         result.push(WikitextToken::ItalicClose);
                         state = State::Empty;
                     }
-                    (2, State::BI) => {
-                        // Close inner bold, then italic, then re-open bold
-                        result.extend(vec![
-                            WikitextToken::BoldClose,
-                            WikitextToken::ItalicClose,
-                            WikitextToken::BoldOpen,
-                        ]);
-                        state = State::B;
-                    }
-                    (2, State::IB) => {
+                    (2, State::BI | State::IB) => {
                         result.extend(vec![
                             WikitextToken::BoldClose,
                             WikitextToken::ItalicClose,
@@ -254,12 +223,12 @@ impl QuoteTransformer {
                         result.push(WikitextToken::ItalicClose);
                         state = State::B;
                     }
-
                     (3, State::Empty | State::I) => {
                         result.push(WikitextToken::BoldOpen);
-                        state = match &state {
-                            State::I => State::BI,
-                            _ => State::B,
+                        state = if matches!(state, State::I) {
+                            State::BI
+                        } else {
+                            State::B
                         };
                     }
                     (3, State::B) => {
@@ -284,7 +253,6 @@ impl QuoteTransformer {
                         result.push(WikitextToken::BoldClose);
                         state = State::I;
                     }
-
                     (5, State::Empty) => {
                         let last = result.len();
                         result.push(WikitextToken::BoldOpen);
@@ -307,28 +275,21 @@ impl QuoteTransformer {
                         state = State::Empty;
                     }
                     (5, State::Both(last)) => {
-                        // First 5-quote opens Italic + Bold
                         result[last] = WikitextToken::ItalicOpen;
                         result.insert(last + 1, WikitextToken::BoldOpen);
-                        // Second 5-quote closes Bold + Italic
                         result.extend(vec![WikitextToken::BoldClose, WikitextToken::ItalicClose]);
                         state = State::Empty;
                     }
-
-                    _ => {
-                        // Unknown quote length — pass through as text
-                        result.push(WikitextToken::Text(quote_values[qi].clone()));
-                    }
+                    _ => {}
                 }
                 qi += 1;
-                token_idx += 1;
             } else {
-                result.push(tokens[token_idx].clone());
-                token_idx += 1;
+                // Non-quote chunk — pass through
+                result.extend(chunk.clone());
             }
         }
 
-        // Close any remaining open tags (auto-inserted ends)
+        // Close remaining open tags
         match state {
             State::Both(last) => {
                 result[last] = WikitextToken::ItalicOpen;
@@ -390,8 +351,6 @@ mod tests {
             WikitextToken::Quote("'''''".to_string()),
         ];
         let result = QuoteTransformer::resolve_line_quotes(&tokens);
-        eprintln!("result: {:?}", result);
-        // Should produce ItalicOpen, BoldOpen, text, BoldClose, ItalicClose
         assert!(matches!(result[0], WikitextToken::ItalicOpen));
         assert!(matches!(result[1], WikitextToken::BoldOpen));
         assert!(matches!(result[2], WikitextToken::Text(_)));

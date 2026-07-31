@@ -285,13 +285,13 @@ impl TreeBuilder {
             return doc;
         }
 
-        // If we're inside a pre block, don't wrap in <p>
-        let inside_pre = self.open_blocks.last().map_or(false, |b| {
+        // If we're inside a block HTML element that doesn't require p-wrapping,
+        // push content directly.
+        let inside_no_wrap = self.open_blocks.last().map_or(false, |b| {
             matches!(&b.kind, NodeKind::Element(ElementKind::Preformatted))
         });
 
-        if inside_pre {
-            // Push children directly to the pre block
+        if inside_no_wrap {
             for child in buf {
                 Self::push_to_target(&mut doc, &mut self.open_blocks, child);
             }
