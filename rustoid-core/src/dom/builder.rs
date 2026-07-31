@@ -100,6 +100,7 @@ impl TreeBuilder {
                 }
                 WikitextToken::Text(text) => {
                     inline_buf.push(Node::text(text.clone()));
+                    at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::Comment(comment) => {
@@ -130,6 +131,7 @@ impl TreeBuilder {
                     } else {
                         inline_buf.push(Node::text(format!("<{name}/>")));
                     }
+                    at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::HtmlTagOpen(name, attrs) => {
@@ -177,6 +179,7 @@ impl TreeBuilder {
                 }
                 WikitextToken::MagicWord(word) => {
                     inline_buf.push(Node::text(format!("[{word}]")));
+                    at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::EOF => {
@@ -630,12 +633,23 @@ impl TreeBuilder {
                     }
                 }
                 _ => {
-                    // Non-list element — flush all pending lists
-                    for list in pending_lists.drain(..) {
-                        result.push_child(list);
+                    // Non-list element — flush all pending lists unless
+                    // it's a comment (SOL-transparent) that should stay in the list
+                    let is_comment = matches!(&child.kind, crate::dom::node::NodeKind::Comment(_));
+                    if last_list_kind.is_some() && is_comment {
+                        // Comment is SOL-transparent: add it to the current pending list
+                        if let Some(last_list) = pending_lists.last_mut() {
+                            last_list.push_child(child.clone());
+                        } else {
+                            result.push_child(child.clone());
+                        }
+                    } else {
+                        for list in pending_lists.drain(..) {
+                            result.push_child(list);
+                        }
+                        last_list_kind = None;
+                        result.push_child(child.clone());
                     }
-                    last_list_kind = None;
-                    result.push_child(child.clone());
                 }
             }
         }
