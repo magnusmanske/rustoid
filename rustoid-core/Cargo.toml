@@ -18,6 +18,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 mlua.workspace = true
 html5ever.workspace = true
+markup5ever_rcdom = "0.3"
 regex.workspace = true
 once_cell.workspace = true
 url.workspace = true

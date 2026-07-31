@@ -14,9 +14,9 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 | 3 — Template expander | ✅ Done |
 | 4 — Lua/Scribunto engine | ✅ Done |
 | 5 — AST / Tree builder | ✅ Done |
-| 6 — HTML serialization | 🔄 In progress |
-| 7 — HTML→wikitext round-trip | ⬜ Pending |
-| 8 — Selective serialization | ⬜ Pending |
+| 6 — HTML serialization | ✅ Done |
+| 7 — HTML→wikitext round-trip | ✅ Done |
+| 8 — Selective serialization | 🔄 In progress |
 | 9 — Data source impls | ⬜ Pending |
 | 10 — Test harness | ⬜ Pending |
 | 11 — Test pass | ⬜ Pending |
