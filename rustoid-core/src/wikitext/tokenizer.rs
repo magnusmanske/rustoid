@@ -497,7 +497,9 @@ impl<'a> Tokenizer<'a> {
             }
             return None;
         }
-        if let Some(end) = remaining.find('>') {
+        // Find tag end, skipping > inside quoted attribute values
+        let tag_end = Self::find_tag_end(remaining);
+        if let Some(end) = tag_end {
             let tag_content = &remaining[1..end];
             if tag_content.is_empty() || tag_content.starts_with('{') {
                 return None;
@@ -513,10 +515,17 @@ impl<'a> Tokenizer<'a> {
                 return None;
             }
             self.advance(end + 1);
+            // Parse attributes from the tag content
+            let attrs_str = tag_content[name.len()..].trim();
+            let attrs = if attrs_str.is_empty() {
+                Vec::new()
+            } else {
+                self.parse_attributes_from_str(attrs_str)
+            };
             if self_closing {
-                return Some(WikitextToken::SelfClosingTag(name, Vec::new()));
+                return Some(WikitextToken::SelfClosingTag(name, attrs));
             }
-            return Some(WikitextToken::HtmlTagOpen(name, Vec::new()));
+            return Some(WikitextToken::HtmlTagOpen(name, attrs));
         }
         None
     }
@@ -528,6 +537,29 @@ impl<'a> Tokenizer<'a> {
             let word = remaining[..end + 4].to_string();
             self.advance(end + 4);
             return Some(WikitextToken::MagicWord(word));
+        }
+        None
+    }
+
+    /// Find the closing `>` of an HTML tag, skipping `>` inside quoted attribute values.
+    fn find_tag_end(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' | b'\'' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b'>' => return Some(i),
+                _ => i += 1,
+            }
         }
         None
     }
