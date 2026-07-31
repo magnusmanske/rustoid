@@ -243,11 +243,14 @@ impl HtmlSerializer {
     }
 
     fn serialize_attrs(&self, node: &Node, buf: &mut String) {
-        // Skip internal attributes (href for links is handled specially)
-        for attr in &node.attrs {
-            if attr.key == "href" || attr.key == "src" {
-                continue; // handled inline
-            }
+        // Sort attributes for deterministic output
+        let mut sorted: Vec<_> = node
+            .attrs
+            .iter()
+            .filter(|a| a.key != "href" && a.key != "src")
+            .collect();
+        sorted.sort_by(|a, b| a.key.cmp(&b.key));
+        for attr in &sorted {
             buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
         }
         // Add data-parsoid and data-mw if present
