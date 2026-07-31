@@ -1,0 +1,38 @@
+# Rustoid
+
+A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wiki/Parsoid) parser — bidirectional wikitext ↔ HTML5 conversion with byte-perfect output compatibility.
+
+## Status
+
+🚧 **Phase 0 complete** — project skeleton, workspace structure, CI, core types.
+
+| Phase | Status |
+|-------|--------|
+| 0 — Project setup | ✅ Done |
+| 1 — Core types & traits | 🔄 In progress |
+| 2 — Wikitext tokenizer | ⬜ Pending |
+| 3 — Template expander | ⬜ Pending |
+| 4 — Lua/Scribunto engine | ⬜ Pending |
+| 5 — AST / Tree builder | ⬜ Pending |
+| 6 — HTML serialization | ⬜ Pending |
+| 7 — HTML→wikitext round-trip | ⬜ Pending |
+| 8 — Selective serialization | ⬜ Pending |
+| 9 — Data source impls | ⬜ Pending |
+| 10 — Test harness | ⬜ Pending |
+| 11 — Test pass | ⬜ Pending |
+| 12 — CLI binary | ⬜ Pending |
+| 13 — Polish | ⬜ Pending |
+
+See [PLAN.md](PLAN.md) for the full roadmap.
+
+## Quick start
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo run -- render --page "Main Page"
+```
+
+## License
+
+GPL-2.0-or-later. See [LICENSE](LICENSE).
