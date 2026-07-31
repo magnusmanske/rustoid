@@ -2,8 +2,10 @@
 //!
 //! Scans raw wikitext and produces a stream of [`WikitextToken`]s.
 //!
-//! This is a state-machine based tokenizer that handles the full wikitext
-//! syntax. It is designed to be single-pass and allocation-friendly.
+//! This is a single-pass tokenizer driven by pattern matching at the current
+//! position. Each `try_*` method looks at the remaining input and, if it
+//! matches, returns the token AND a byte-length to advance. Text between tokens
+//! is accumulated and emitted as `Text`.
 
 use crate::error::Result;
 use crate::wikitext::tokens::WikitextToken;
@@ -27,18 +29,16 @@ impl Default for TokenizerOptions {
 }
 
 /// The wikitext tokenizer.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// let mut tok = Tokenizer::new("'''bold''' text", TokenizerOptions::default());
-/// let tokens: Vec<WikitextToken> = tok.tokenize()?;
-/// ```
-#[allow(dead_code)]
 pub struct Tokenizer<'a> {
     input: &'a str,
     pos: usize,
-    options: TokenizerOptions,
+    _options: TokenizerOptions,
+    /// Byte position of the start of the current plain text run (or None).
+    text_start: usize,
+    /// Accumulated tokens.
+    tokens: Vec<WikitextToken>,
+    /// Whether we're at the start of a line.
+    at_line_start: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -47,146 +47,283 @@ impl<'a> Tokenizer<'a> {
         Self {
             input,
             pos: 0,
-            options,
+            _options: options,
+            tokens: Vec::new(),
+            text_start: 0,
+            at_line_start: true,
         }
     }
 
     /// Tokenize the entire input and return the token stream.
-    ///
-    /// Currently a placeholder; Phase 1 implementation will fill this in.
     pub fn tokenize(&mut self) -> Result<Vec<WikitextToken>> {
-        let mut tokens = Vec::new();
-
         while self.pos < self.input.len() {
             let remaining = &self.input[self.pos..];
 
-            // Try each token pattern in order of specificity.
-            if let Some(token) = self.try_comment(remaining) {
-                tokens.push(token);
-                continue;
+            if self.at_line_start {
+                // Block-level constructs
+                let p = self.pos;
+                if let Some(token) = self.try_heading(remaining) {
+                    self.emit_at(token, p);
+                    continue;
+                }
+                let p = self.pos;
+                if let Some(token) = self.try_hr(remaining) {
+                    self.emit_at(token, p);
+                    continue;
+                }
+                let p = self.pos;
+                if let Some(token) = self.try_redirect(remaining) {
+                    self.emit_at(token, p);
+                    continue;
+                }
+                let p = self.pos;
+                if let Some(token) = self.try_list(remaining) {
+                    self.emit_at(token, p);
+                    continue;
+                }
+                let p = self.pos;
+                if let Some(token) = self.try_table(remaining) {
+                    self.emit_at(token, p);
+                    continue;
+                }
             }
+
+            // Inline constructs
+            let p = self.pos;
             if let Some(token) = self.try_nowiki(remaining) {
-                tokens.push(token);
+                self.emit_at(token, p);
                 continue;
             }
-            if let Some(token) = self.try_template(remaining) {
-                tokens.push(token);
+            let p = self.pos;
+            if let Some(token) = self.try_comment(remaining) {
+                self.emit_at(token, p);
                 continue;
             }
-            if let Some(token) = self.try_heading(remaining) {
-                tokens.push(token);
+            let p = self.pos;
+            if let Some(token) = self.try_template_or_arg(remaining) {
+                self.emit_at(token, p);
                 continue;
             }
-            if let Some(token) = self.try_list(remaining) {
-                tokens.push(token);
+            let p = self.pos;
+            if let Some(token) = self.try_wikilink_open(remaining) {
+                self.emit_at(token, p);
                 continue;
             }
-            if let Some(token) = self.try_table(remaining) {
-                tokens.push(token);
+            if remaining.starts_with("]]") {
+                let p = self.pos;
+                self.emit_at(WikitextToken::WikilinkClose, p);
+                self.advance(2);
                 continue;
             }
-            if let Some(token) = self.try_hr(remaining) {
-                tokens.push(token);
+            if remaining.starts_with('|') {
+                let p = self.pos;
+                self.emit_at(WikitextToken::WikilinkPipe, p);
+                self.advance(1);
                 continue;
             }
-            if let Some(token) = self.try_wikilink(remaining) {
-                tokens.push(token);
+            if remaining.starts_with(']') && !remaining.starts_with("]]") {
+                let p = self.pos;
+                self.emit_at(WikitextToken::ExtLinkClose, p);
+                self.advance(1);
                 continue;
             }
+            let p = self.pos;
             if let Some(token) = self.try_extlink(remaining) {
-                tokens.push(token);
+                self.emit_at(token, p);
                 continue;
             }
+            let p = self.pos;
             if let Some(token) = self.try_bold_italic(remaining) {
-                tokens.push(token);
+                self.emit_at(token, p);
                 continue;
             }
+            let p = self.pos;
             if let Some(token) = self.try_html_tag(remaining) {
-                tokens.push(token);
+                self.emit_at(token, p);
                 continue;
             }
-            if let Some(token) = self.try_paragraph_break(remaining) {
-                tokens.push(token);
+            let p = self.pos;
+            if let Some(token) = self.try_magic_word(remaining) {
+                self.emit_at(token, p);
+                continue;
+            }
+            if let Some(stripped) = remaining.strip_prefix("\n\n") {
+                let p = self.pos;
+                self.emit_at(WikitextToken::ParagraphBreak, p);
+                let extra = stripped.chars().take_while(|&c| c == '\n').count();
+                self.advance(2 + extra);
+                self.at_line_start = true;
+                continue;
+            }
+            if remaining.starts_with('\n') {
+                let p = self.pos;
+                self.emit_at(WikitextToken::Newline, p);
+                self.advance(1);
+                self.at_line_start = true;
                 continue;
             }
 
-            // Fall through: accumulate plain text
-            let start = self.pos;
-            self.pos += 1;
-            if self.pos >= self.input.len() {
-                tokens.push(WikitextToken::Text(self.input[start..].to_string()));
-            } else {
-                // Continue accumulating text until we can match something.
-                // This is simplified — the real tokenizer will be more efficient.
-                continue;
+            // Not a token — accumulate as plain text if we haven't started
+            if self.text_start == self.pos && !remaining.is_empty() {
+                self.text_start = self.pos;
             }
+            self.pos += 1;
         }
 
-        // Collapse consecutive Text tokens and add EOF
-        tokens = collapse_text_tokens(tokens);
-        tokens.push(WikitextToken::EOF);
+        // Flush remaining text
+        self.flush_text();
+        self.tokens.push(WikitextToken::EOF);
 
-        Ok(tokens)
+        Ok(std::mem::take(&mut self.tokens))
     }
 
-    // ---- Token recognizers (placeholder implementations) ----
+    // ---- Internal helpers ----
+
+    fn emit_at(&mut self, token: WikitextToken, token_start: usize) {
+        // Flush text up to token_start
+        if self.text_start < token_start {
+            let text = self.input[self.text_start..token_start].to_string();
+            self.tokens.push(WikitextToken::Text(text));
+        }
+        self.tokens.push(token);
+        self.text_start = self.pos;
+    }
+
+    fn flush_text(&mut self) {
+        if self.text_start < self.pos {
+            let text = self.input[self.text_start..self.pos].to_string();
+            self.tokens.push(WikitextToken::Text(text));
+        }
+        self.text_start = self.pos;
+    }
+
+    fn advance(&mut self, n: usize) {
+        self.pos += n;
+    }
+
+    // ---- Token recognizers ----
+
+    fn try_nowiki(&mut self, remaining: &str) -> Option<WikitextToken> {
+        if !remaining.starts_with("<nowiki") {
+            return None;
+        }
+        if let Some(stripped) = remaining.strip_prefix("<nowiki") {
+            if let Some(rest) = stripped
+                .strip_prefix("/>")
+                .or_else(|| stripped.strip_prefix(" />"))
+            {
+                self.advance("<nowiki".len() + stripped.len() - rest.len());
+                return Some(WikitextToken::NowikiContent(String::new()));
+            }
+            if let Some(stripped2) = stripped.strip_prefix(">")
+                && let Some(end) = stripped2.find("</nowiki>")
+            {
+                let content = stripped2[..end].to_string();
+                self.advance("<nowiki>".len() + end + "</nowiki>".len());
+                return Some(WikitextToken::NowikiContent(content));
+            }
+        }
+        None
+    }
 
     fn try_comment(&mut self, remaining: &str) -> Option<WikitextToken> {
         if remaining.starts_with("<!--")
             && let Some(end) = remaining.find("-->")
         {
             let comment = remaining[4..end].to_string();
-            self.pos += end + 3;
+            self.advance(end + 3);
             return Some(WikitextToken::Comment(comment));
         }
         None
     }
 
-    fn try_nowiki(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if let Some(stripped) = remaining.strip_prefix("<nowiki>")
-            && let Some(end) = stripped.find("</nowiki>")
-        {
-            let content = stripped[..end].to_string();
-            self.pos += 8 + end + 9; // <nowiki> + content + </nowiki>
-            return Some(WikitextToken::NowikiContent(content));
-        }
-        None
-    }
-
-    fn try_template(&mut self, remaining: &str) -> Option<WikitextToken> {
+    fn try_template_or_arg(&mut self, remaining: &str) -> Option<WikitextToken> {
         if let Some(stripped) = remaining.strip_prefix("{{{") {
-            // Template argument
             let start = self.pos;
-            if let Some(end) = stripped.find("}}}") {
-                let inner = &stripped[..end];
+            let open_len = 3;
+            let mut depth: usize = open_len;
+            let mut end_pos = 0usize;
+            for (i, ch) in stripped.char_indices() {
+                match ch {
+                    '{' => depth = depth.saturating_add(1),
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end_pos = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth == 0 {
+                let content_end = end_pos.saturating_sub(open_len);
+                let inner = &stripped[..=content_end];
                 let name = inner.split('|').next().unwrap_or("").trim().to_string();
-                self.pos += 3 + end + 3;
+                self.advance(open_len + content_end + 1 + open_len);
                 return Some(WikitextToken::TplArgOpen(name));
             }
             self.pos = start;
+            self.text_start = start;
         } else if let Some(stripped) = remaining.strip_prefix("{{") {
             let start = self.pos;
-            if let Some(end) = stripped.find("}}") {
-                let inner = &stripped[..end];
-                let name = inner.split('|').next().unwrap_or("").trim().to_string();
-                self.pos += 2 + end + 2;
-                if name.starts_with('#') {
-                    return Some(WikitextToken::ParserFnOpen(name));
+            let open_len = 2;
+            let mut depth: usize = open_len;
+            let mut end_pos = 0usize;
+            for (i, ch) in stripped.char_indices() {
+                match ch {
+                    '{' => depth = depth.saturating_add(1),
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end_pos = i;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
-                return Some(WikitextToken::TemplateOpen(name));
+            }
+            if depth == 0 {
+                let content_end = end_pos.saturating_sub(open_len);
+                let inner = &stripped[..=content_end];
+                let full_name = inner.split('|').next().unwrap_or("").trim().to_string();
+                self.advance(open_len + content_end + 1 + open_len);
+                if let Some(rest) = full_name.strip_prefix('#') {
+                    // Parser function: name is up to the first colon
+                    let func_name = rest.split(':').next().unwrap_or(rest);
+                    return Some(WikitextToken::ParserFnOpen(format!("#{func_name}")));
+                }
+                return Some(WikitextToken::TemplateOpen(full_name));
             }
             self.pos = start;
+            self.text_start = start;
         }
         None
     }
 
     fn try_heading(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with('=') {
-            let level = remaining.chars().take_while(|&c| c == '=').count();
-            if (2..=6).contains(&level) {
-                self.pos += level;
+        if !remaining.starts_with('=') {
+            return None;
+        }
+        let level = remaining.chars().take_while(|&c| c == '=').count();
+        if (2..=6).contains(&level) {
+            let after_eq = &remaining[level..];
+            if after_eq.starts_with(' ') || after_eq.starts_with('\n') || after_eq.starts_with("==")
+            {
+                self.advance(level);
                 return Some(WikitextToken::HeadingOpen(level as u8));
             }
+        }
+        None
+    }
+
+    fn try_hr(&mut self, remaining: &str) -> Option<WikitextToken> {
+        if remaining.starts_with("----") {
+            self.advance(4);
+            let rem = &self.input[self.pos..];
+            let extra = rem.chars().take_while(|&c| c == '-').count();
+            self.advance(extra);
+            return Some(WikitextToken::Hr);
         }
         None
     }
@@ -195,7 +332,7 @@ impl<'a> Tokenizer<'a> {
         let first = remaining.chars().next()?;
         if matches!(first, '*' | '#' | ';' | ':') {
             let depth = remaining.chars().take_while(|&c| c == first).count();
-            self.pos += depth;
+            self.advance(depth);
             return Some(WikitextToken::ListItem(first, depth as u8));
         }
         None
@@ -203,82 +340,119 @@ impl<'a> Tokenizer<'a> {
 
     fn try_table(&mut self, remaining: &str) -> Option<WikitextToken> {
         if remaining.starts_with("{|") {
-            self.pos += 2;
-            let attrs = Vec::new();
+            self.advance(2);
+            let attrs = self.parse_html_attributes_until_newline();
             return Some(WikitextToken::TableOpen(attrs));
         }
         if remaining.starts_with("|}") {
-            self.pos += 2;
+            self.advance(2);
             return Some(WikitextToken::TableClose);
         }
         if remaining.starts_with("|-") {
-            self.pos += 2;
+            self.advance(2);
             return Some(WikitextToken::TableRow);
         }
         if remaining.starts_with("|+") {
-            self.pos += 2;
+            self.advance(2);
             return Some(WikitextToken::TableCaption);
         }
-        None
-    }
-
-    fn try_hr(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with("----") {
-            self.pos += 4;
-            return Some(WikitextToken::Hr);
+        if remaining.starts_with("!!") || remaining.starts_with("||") {
+            self.advance(2);
+            return Some(WikitextToken::TableCell);
+        }
+        if remaining.starts_with('|') || remaining.starts_with('!') {
+            self.advance(1);
+            return Some(WikitextToken::TableCell);
         }
         None
     }
 
-    fn try_wikilink(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with("[[") {
-            self.pos += 2;
+    fn try_redirect(&mut self, remaining: &str) -> Option<WikitextToken> {
+        let lower = remaining.to_lowercase();
+        if (lower.starts_with("#redirect") || lower.starts_with("#redireccion"))
+            && let Some(link_start) = remaining.find("[[")
+            && let Some(link_end) = remaining[link_start..].find("]]")
+        {
+            let target = remaining[link_start + 2..link_start + link_end].to_string();
+            self.advance(link_start + link_end + 2);
+            return Some(WikitextToken::Redirect(target));
+        }
+        None
+    }
+
+    fn try_wikilink_open(&mut self, remaining: &str) -> Option<WikitextToken> {
+        if remaining.starts_with("[[") && !remaining.starts_with("[[[") {
+            self.advance(2);
             return Some(WikitextToken::WikilinkOpen);
         }
         None
     }
 
     fn try_extlink(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with("[http") || remaining.starts_with("[https") {
-            self.pos += 1;
-            // Find the URL portion
-            let rest = &remaining[1..];
-            if let Some(space) = rest.find(' ') {
-                let url = rest[..space].to_string();
-                self.pos += space + 1;
+        if !remaining.starts_with('[') || remaining.starts_with("[[") {
+            return None;
+        }
+        let rest = &remaining[1..];
+        let has_protocol = rest.starts_with("http://")
+            || rest.starts_with("https://")
+            || rest.starts_with("ftp://")
+            || rest.starts_with("mailto:")
+            || rest.starts_with("//");
+        if !has_protocol {
+            return None;
+        }
+        self.advance(1); // skip [
+        let rem = &self.input[self.pos..];
+        if let Some(space_or_close) = rem.find([' ', ']']) {
+            let url = rem[..space_or_close].to_string();
+            let ch = rem.as_bytes()[space_or_close];
+            self.advance(space_or_close);
+            if ch == b']' {
+                // No display text: `[url]` — just advance and let the ] handler close it
+                // Don't advance past ] here — the main loop's ] handler will consume it
                 return Some(WikitextToken::ExtLinkOpen(url));
             }
-            // Revert the [ advance
-            self.pos -= 1;
+            // Has display text: skip space, return open
+            self.advance(1); // skip space
+            return Some(WikitextToken::ExtLinkOpen(url));
         }
-        None
+        self.advance(rem.len());
+        Some(WikitextToken::ExtLinkOpen(rem.to_string()))
     }
 
     fn try_bold_italic(&mut self, remaining: &str) -> Option<WikitextToken> {
         if remaining.starts_with("'''''") {
-            self.pos += 5;
+            self.advance(5);
             return Some(WikitextToken::BoldOpen);
-        } else if remaining.starts_with("'''") {
-            self.pos += 3;
+        }
+        if remaining.starts_with("'''") {
+            self.advance(3);
             return Some(WikitextToken::BoldOpen);
-        } else if remaining.starts_with("''") {
-            self.pos += 2;
+        }
+        if remaining.starts_with("''") {
+            self.advance(2);
             return Some(WikitextToken::ItalicOpen);
         }
         None
     }
 
     fn try_html_tag(&mut self, remaining: &str) -> Option<WikitextToken> {
+        if !remaining.starts_with('<') {
+            return None;
+        }
         if remaining.starts_with("</") {
             if let Some(end) = remaining.find('>') {
                 let name = remaining[2..end].trim().to_lowercase();
-                self.pos += end + 1;
+                self.advance(end + 1);
                 return Some(WikitextToken::HtmlTagClose(name));
             }
-        } else if remaining.starts_with('<')
-            && let Some(end) = remaining.find('>')
-        {
+            return None;
+        }
+        if let Some(end) = remaining.find('>') {
             let tag_content = &remaining[1..end];
+            if tag_content.is_empty() || tag_content.starts_with('{') {
+                return None;
+            }
             let self_closing = tag_content.ends_with('/');
             let name = tag_content
                 .trim_end_matches('/')
@@ -286,7 +460,10 @@ impl<'a> Tokenizer<'a> {
                 .next()
                 .unwrap_or("")
                 .to_lowercase();
-            self.pos += end + 1;
+            if name.is_empty() || !name.chars().next().unwrap().is_ascii_alphabetic() {
+                return None;
+            }
+            self.advance(end + 1);
             if self_closing {
                 return Some(WikitextToken::SelfClosingTag(name, Vec::new()));
             }
@@ -295,72 +472,142 @@ impl<'a> Tokenizer<'a> {
         None
     }
 
-    fn try_paragraph_break(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with("\n\n") {
-            self.pos += 2;
-            return Some(WikitextToken::ParagraphBreak);
-        }
-        if remaining.starts_with('\n') {
-            self.pos += 1;
-            return Some(WikitextToken::Newline);
+    fn try_magic_word(&mut self, remaining: &str) -> Option<WikitextToken> {
+        if remaining.starts_with("__")
+            && let Some(end) = remaining[2..].find("__")
+        {
+            let word = remaining[..end + 4].to_string();
+            self.advance(end + 4);
+            return Some(WikitextToken::MagicWord(word));
         }
         None
     }
-}
 
-/// Collapse consecutive Text tokens into a single Text token.
-fn collapse_text_tokens(tokens: Vec<WikitextToken>) -> Vec<WikitextToken> {
-    let mut result: Vec<WikitextToken> = Vec::new();
-    for token in tokens {
-        if let WikitextToken::Text(ref new_text) = token
-            && let Some(WikitextToken::Text(last_text)) = result.last_mut()
-        {
-            last_text.push_str(new_text);
-            continue;
-        }
-        result.push(token);
+    fn parse_html_attributes_until_newline(&mut self) -> Vec<(String, String)> {
+        let rem = &self.input[self.pos..];
+        let end = rem.find('\n').unwrap_or(rem.len());
+        self.parse_attributes_from_str(&rem[..end])
     }
-    result
+
+    fn parse_attributes_from_str(&self, s: &str) -> Vec<(String, String)> {
+        let mut attrs = Vec::new();
+        let s = s.trim();
+        let mut i = 0;
+        let bytes = s.as_bytes();
+        while i < s.len() {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let key_start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+                i += 1;
+            }
+            let key = s[key_start..i].to_string();
+            if i < bytes.len() && bytes[i] == b'=' {
+                i += 1;
+                if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                    let quote = bytes[i];
+                    i += 1;
+                    let val_start = i;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += 1;
+                    }
+                    let val = s[val_start..i].to_string();
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    attrs.push((key, val));
+                } else {
+                    let val_start = i;
+                    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    let val = s[val_start..i].to_string();
+                    attrs.push((key, val));
+                }
+            } else {
+                attrs.push((key, String::new()));
+            }
+        }
+        attrs
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn tokenize(s: &str) -> Vec<WikitextToken> {
+        let mut tok = Tokenizer::new(s, TokenizerOptions::default());
+        tok.tokenize().unwrap()
+    }
+
+    // -- Basic text --
+
     #[test]
     fn test_empty_input() {
-        let mut tok = Tokenizer::new("", TokenizerOptions::default());
-        let tokens = tok.tokenize().unwrap();
-        assert_eq!(tokens, vec![WikitextToken::EOF]);
+        assert_eq!(tokenize(""), vec![WikitextToken::EOF]);
     }
 
     #[test]
-    fn test_bold_text() {
-        let mut tok = Tokenizer::new("'''bold'''", TokenizerOptions::default());
-        let tokens = tok.tokenize().unwrap();
-        assert_eq!(tokens.len(), 3); // BoldOpen, collapsed Text+"'''", EOF
+    fn test_plain_text() {
+        let tokens = tokenize("hello world");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], WikitextToken::Text("hello world".into()));
+    }
+
+    #[test]
+    fn test_text_accumulation() {
+        let tokens = tokenize("abcdef");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], WikitextToken::Text("abcdef".into()));
+    }
+
+    #[test]
+    fn test_leading_text_before_token() {
+        let tokens = tokenize("text {{template}}");
+        assert_eq!(tokens[0], WikitextToken::Text("text ".into()));
+        assert!(matches!(tokens[1], WikitextToken::TemplateOpen(_)));
+    }
+
+    // -- Bold / italic --
+
+    #[test]
+    fn test_bold() {
+        let tokens = tokenize("'''bold'''");
         assert!(tokens.iter().any(|t| matches!(t, WikitextToken::BoldOpen)));
     }
 
     #[test]
-    fn test_wikilink() {
-        let mut tok = Tokenizer::new("[[Main Page]]", TokenizerOptions::default());
-        let tokens = tok.tokenize().unwrap();
-        assert_eq!(tokens.len(), 3); // WikilinkOpen, WikilinkClose, EOF
+    fn test_italic() {
+        let tokens = tokenize("''italic''");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::ItalicOpen))
+        );
     }
 
     #[test]
-    fn test_template() {
-        let mut tok = Tokenizer::new("{{Foo}}", TokenizerOptions::default());
-        let tokens = tok.tokenize().unwrap();
-        assert_eq!(tokens.len(), 2); // TemplateOpen, EOF
+    fn test_bold_italic() {
+        let tokens = tokenize("'''''bold italic'''''");
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|t| matches!(t, WikitextToken::BoldOpen))
+                .count(),
+            2
+        );
     }
 
+    // -- Headings --
+
     #[test]
-    fn test_heading() {
-        let mut tok = Tokenizer::new("== Heading ==", TokenizerOptions::default());
-        let tokens = tok.tokenize().unwrap();
-        // Opening heading, then the rest is text for now
+    fn test_heading_level_2() {
+        let tokens = tokenize("== Heading ==");
         assert!(
             tokens
                 .iter()
@@ -368,14 +615,233 @@ mod tests {
         );
     }
 
+    // -- Lists --
+
     #[test]
-    fn test_comment() {
-        let mut tok = Tokenizer::new("<!-- hidden -->text", TokenizerOptions::default());
-        let tokens = tok.tokenize().unwrap();
+    fn test_unordered_list() {
+        let tokens = tokenize("* item");
+        assert_eq!(tokens[0], WikitextToken::ListItem('*', 1));
+    }
+
+    #[test]
+    fn test_nested_list() {
+        let tokens = tokenize("** item");
+        assert_eq!(tokens[0], WikitextToken::ListItem('*', 2));
+    }
+
+    // -- HR --
+
+    #[test]
+    fn test_hr() {
+        let tokens = tokenize("----");
+        assert!(tokens.iter().any(|t| matches!(t, WikitextToken::Hr)));
+    }
+
+    // -- Wikilinks --
+
+    #[test]
+    fn test_wikilink_simple() {
+        let tokens = tokenize("[[Main Page]]");
+        assert_eq!(tokens[0], WikitextToken::WikilinkOpen);
+        assert_eq!(tokens[1], WikitextToken::Text("Main Page".into()));
+        assert_eq!(tokens[2], WikitextToken::WikilinkClose);
+    }
+
+    // -- External links --
+
+    #[test]
+    fn test_extlink_with_text() {
+        let tokens = tokenize("[https://example.com some text]");
+        let has_extlink = tokens
+            .iter()
+            .any(|t| matches!(t, WikitextToken::ExtLinkOpen(u) if u == "https://example.com"));
+        assert!(has_extlink);
+    }
+
+    #[test]
+    fn test_extlink_no_text() {
+        let tokens = tokenize("[https://example.com]");
+        let has_extlink = tokens
+            .iter()
+            .any(|t| matches!(t, WikitextToken::ExtLinkOpen(u) if u == "https://example.com"));
+        assert!(has_extlink);
         assert!(
             tokens
                 .iter()
-                .any(|t| matches!(t, WikitextToken::Comment(_)))
+                .any(|t| matches!(t, WikitextToken::ExtLinkClose))
         );
+    }
+
+    // -- Templates --
+
+    #[test]
+    fn test_template_simple() {
+        let tokens = tokenize("{{Foo}}");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::TemplateOpen(n) if n == "Foo"))
+        );
+    }
+
+    #[test]
+    fn test_parser_function() {
+        let tokens = tokenize("{{#if:true|yes|no}}");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::ParserFnOpen(n) if n == "#if"))
+        );
+    }
+
+    #[test]
+    fn test_template_arg() {
+        let tokens = tokenize("{{{1}}}");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::TplArgOpen(n) if n == "1"))
+        );
+    }
+
+    #[test]
+    fn test_nested_templates() {
+        let tokens = tokenize("{{A|{{B}}}}");
+        let tpl_count = tokens
+            .iter()
+            .filter(|t| matches!(t, WikitextToken::TemplateOpen(_)))
+            .count();
+        assert_eq!(tpl_count, 1);
+    }
+
+    #[test]
+    fn test_triple_brace_nested() {
+        let tokens = tokenize("{{{a|{{{b}}}}}}");
+        let arg_count = tokens
+            .iter()
+            .filter(|t| matches!(t, WikitextToken::TplArgOpen(_)))
+            .count();
+        assert_eq!(arg_count, 1);
+    }
+
+    // -- Comments --
+
+    #[test]
+    fn test_comment() {
+        let tokens = tokenize("<!-- hidden -->text");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::Comment(c) if c == " hidden "))
+        );
+    }
+
+    // -- Nowiki --
+
+    #[test]
+    fn test_nowiki() {
+        let tokens = tokenize("<nowiki>'''not bold'''</nowiki>");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::NowikiContent(c) if c == "'''not bold'''"))
+        );
+    }
+
+    // -- HTML tags --
+
+    #[test]
+    fn test_html_open_close() {
+        let tokens = tokenize("<div>content</div>");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::HtmlTagOpen(n, _) if n == "div"))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::HtmlTagClose(n) if n == "div"))
+        );
+    }
+
+    #[test]
+    fn test_self_closing_tag() {
+        let tokens = tokenize("<br/>");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::SelfClosingTag(n, _) if n == "br"))
+        );
+    }
+
+    // -- Magic words --
+
+    #[test]
+    fn test_magic_word_toc() {
+        let tokens = tokenize("__TOC__");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::MagicWord(w) if w == "__TOC__"))
+        );
+    }
+
+    // -- Tables --
+
+    #[test]
+    fn test_table_open() {
+        let tokens = tokenize("{| class=\"wikitable\"");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::TableOpen(_)))
+        );
+    }
+
+    #[test]
+    fn test_table_close() {
+        let tokens = tokenize("|}");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::TableClose))
+        );
+    }
+
+    // -- Redirects --
+
+    #[test]
+    fn test_redirect() {
+        let tokens = tokenize("#REDIRECT [[Target Page]]");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::Redirect(target) if target == "Target Page"))
+        );
+    }
+
+    // -- Newlines --
+
+    #[test]
+    fn test_paragraph_break() {
+        let tokens = tokenize("para1\n\npara2");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::ParagraphBreak))
+        );
+    }
+
+    #[test]
+    fn test_single_newline() {
+        let tokens = tokenize("line1\nline2");
+        assert!(tokens.iter().any(|t| matches!(t, WikitextToken::Newline)));
+    }
+
+    #[test]
+    fn test_mixed_content() {
+        let tokens = tokenize("'''bold''' and ''italic'' text [[link]].");
+        assert!(tokens.len() > 3);
     }
 }
