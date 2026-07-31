@@ -12,8 +12,8 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 | 1 — Core types & traits | ✅ Done |
 | 2 — Wikitext tokenizer | ✅ Done |
 | 3 — Template expander | ✅ Done |
-| 4 — Lua/Scribunto engine | 🔄 In progress |
-| 5 — AST / Tree builder | ⬜ Pending |
+| 4 — Lua/Scribunto engine | ✅ Done |
+| 5 — AST / Tree builder | 🔄 In progress |
 | 6 — HTML serialization | ⬜ Pending |
 | 7 — HTML→wikitext round-trip | ⬜ Pending |
 | 8 — Selective serialization | ⬜ Pending |

@@ -54,3 +54,9 @@ impl RustoidError {
         )
     }
 }
+
+impl From<mlua::Error> for RustoidError {
+    fn from(e: mlua::Error) -> Self {
+        RustoidError::Lua(e.to_string())
+    }
+}
