@@ -9,12 +9,18 @@ use crate::error::Result;
 use crate::wikitext::tokens::WikitextToken;
 
 /// Builds an AST from a stream of wikitext tokens.
-pub struct TreeBuilder;
+pub struct TreeBuilder {
+    /// Stack of currently-open block HTML elements (div, pre, blockquote).
+    /// When non-empty, content is added as children of the top element.
+    open_blocks: Vec<Node>,
+}
 
 impl TreeBuilder {
     /// Create a new tree builder.
     pub fn new() -> Self {
-        Self
+        Self {
+            open_blocks: Vec::new(),
+        }
     }
 
     /// Build an AST from a token stream.
@@ -23,45 +29,46 @@ impl TreeBuilder {
         let mut inline_buf: Vec<Node> = Vec::new();
         let mut fmt_stack: Vec<ElementKind> = Vec::new();
         let mut at_line_start = true;
+        self.open_blocks.clear();
 
         let mut i = 0;
         while i < tokens.len() {
             let token = &tokens[i];
 
-            // Helper: take inline_buf and wrap in paragraph if non-empty
-            // (defined as a repeated pattern, not a closure)
-
-            // Handle block-level token types
             match token {
                 WikitextToken::HeadingOpen(level) => {
-                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
                     let (heading, new_i) = self.build_heading(tokens, i, *level);
-                    doc.push_child(heading);
+                    Self::push_to_target(&mut doc, &mut self.open_blocks, heading);
                     i = new_i;
                     at_line_start = true;
                 }
                 WikitextToken::ListItem(ch, depth) => {
-                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
                     let prefix = std::mem::take(&mut inline_buf);
                     let (list_item, new_i) = self.build_list_item(tokens, i, *ch, *depth, prefix);
-                    doc.push_child(list_item);
+                    Self::push_to_target(&mut doc, &mut self.open_blocks, list_item);
                     i = new_i;
                     at_line_start = true;
                 }
                 WikitextToken::Hr => {
-                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
-                    doc.push_child(Node::element(ElementKind::HorizontalRule));
+                    Self::push_to_target(
+                        &mut doc,
+                        &mut self.open_blocks,
+                        Node::element(ElementKind::HorizontalRule),
+                    );
                     i += 1;
                     at_line_start = true;
                 }
                 WikitextToken::ParagraphBreak => {
-                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
                     i += 1;
@@ -70,7 +77,7 @@ impl TreeBuilder {
                 WikitextToken::TableOpen(_) => {
                     let prefix = std::mem::take(&mut inline_buf);
                     let (table, new_i) = self.build_table(tokens, i, prefix);
-                    doc.push_child(table);
+                    Self::push_to_target(&mut doc, &mut self.open_blocks, table);
                     i = new_i;
                 }
                 WikitextToken::WikilinkOpen => {
@@ -84,52 +91,11 @@ impl TreeBuilder {
                     i = new_i;
                 }
                 WikitextToken::BoldOpen => {
-                    // If inside Italic (''''' = bold+italic), this BoldOpen also opens Italic
-                    let in_italic = fmt_stack.contains(&ElementKind::Italic);
-                    if fmt_stack.contains(&ElementKind::Bold) {
-                        // Close: unwind until Bold
-                        while let Some(top) = fmt_stack.last() {
-                            wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
-                            let kind = top.clone();
-                            fmt_stack.pop();
-                            if kind == ElementKind::Bold {
-                                break;
-                            }
-                        }
-                        // If we were in italic too and just unwound past it, close italic
-                        if in_italic && fmt_stack.contains(&ElementKind::Italic) {
-                            while let Some(top) = fmt_stack.last() {
-                                wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
-                                let kind = top.clone();
-                                fmt_stack.pop();
-                                if kind == ElementKind::Italic {
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
-                        fmt_stack.push(ElementKind::Bold);
-                        if in_italic {
-                            fmt_stack.push(ElementKind::Italic);
-                        }
-                    }
+                    self.handle_bold_open(&mut inline_buf, &mut fmt_stack);
                     i += 1;
                 }
                 WikitextToken::ItalicOpen => {
-                    if fmt_stack.contains(&ElementKind::Italic) {
-                        while let Some(top) = fmt_stack.last() {
-                            wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
-                            let kind = top.clone();
-                            fmt_stack.pop();
-                            if kind == ElementKind::Italic {
-                                break;
-                            }
-                        }
-                    } else {
-                        wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
-                        fmt_stack.push(ElementKind::Italic);
-                    }
+                    self.handle_italic_open(&mut inline_buf, &mut fmt_stack);
                     i += 1;
                 }
                 WikitextToken::Text(text) => {
@@ -138,20 +104,23 @@ impl TreeBuilder {
                 }
                 WikitextToken::Comment(comment) => {
                     if at_line_start || inline_buf.is_empty() {
-                        doc.push_child(Node::comment(comment.clone()));
+                        Self::push_to_target(
+                            &mut doc,
+                            &mut self.open_blocks,
+                            Node::comment(comment.clone()),
+                        );
                     } else {
                         inline_buf.push(Node::comment(comment.clone()));
                     }
                     i += 1;
                 }
                 WikitextToken::NowikiContent(content) => {
-                    // Nowiki content is a block-level preformatted element
-                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
                     let mut pre = Node::element(ElementKind::Preformatted);
                     pre.push_child(Node::text(content.clone()));
-                    doc.push_child(pre);
+                    Self::push_to_target(&mut doc, &mut self.open_blocks, pre);
                     at_line_start = true;
                     i += 1;
                 }
@@ -163,7 +132,7 @@ impl TreeBuilder {
                     }
                     i += 1;
                 }
-                WikitextToken::HtmlTagOpen(name, _) => {
+                WikitextToken::HtmlTagOpen(name, attrs) => {
                     let is_block = matches!(name.as_str(), "div" | "pre" | "blockquote");
                     let tag_kind = match name.as_str() {
                         "b" | "strong" => ElementKind::Bold,
@@ -175,11 +144,15 @@ impl TreeBuilder {
                         _ => ElementKind::Other(name.clone()),
                     };
                     if is_block {
-                        // Block-level HTML tag: flush pending paragraph first
-                        doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                        // Flush pending inline content before opening block tag
+                        doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                         inline_buf = Vec::new();
                         fmt_stack.clear();
-                        doc.push_child(Node::element(tag_kind));
+                        let mut elem = Node::element(tag_kind);
+                        for (k, v) in attrs {
+                            elem.set_attr(k, v);
+                        }
+                        self.open_blocks.push(elem);
                         at_line_start = true;
                     } else {
                         inline_buf.push(Node::element(tag_kind));
@@ -187,10 +160,19 @@ impl TreeBuilder {
                     }
                     i += 1;
                 }
-                WikitextToken::HtmlTagClose(_name) => {
-                    // Close tags just mark end of element; we push a close marker
-                    // that is handled in post-processing (Phase 6).
-                    // For now, ignore closing HTML tags in tree building.
+                WikitextToken::HtmlTagClose(name) => {
+                    // Close matching open block tag
+                    if self.open_blocks.last().map_or(false, |b| {
+                        let tag = element_kind_to_tag(&b.kind);
+                        tag == Some(name.as_str())
+                    }) {
+                        // Flush inline before closing
+                        doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
+                        inline_buf = Vec::new();
+                        if let Some(block) = self.open_blocks.pop() {
+                            Self::push_to_target(&mut doc, &mut self.open_blocks, block);
+                        }
+                    }
                     i += 1;
                 }
                 WikitextToken::MagicWord(word) => {
@@ -198,8 +180,11 @@ impl TreeBuilder {
                     i += 1;
                 }
                 WikitextToken::EOF => {
-                    // Flush remaining inline content
-                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
+                    // Close any remaining open blocks
+                    while let Some(block) = self.open_blocks.pop() {
+                        doc.push_child(block);
+                    }
                     break;
                 }
                 _ => {
@@ -214,17 +199,91 @@ impl TreeBuilder {
         Ok(doc)
     }
 
-    /// Flush inline buffer into a paragraph, appending to doc.
-    fn flush_inline_into_para(
-        &self,
-        doc: Node,
-        inline_buf: Vec<Node>,
+    /// Push a node to either the current open block or the document.
+    fn push_to_target(doc: &mut Node, open_blocks: &mut Vec<Node>, child: Node) {
+        if let Some(block) = open_blocks.last_mut() {
+            block.push_child(child);
+        } else {
+            doc.push_child(child);
+        }
+    }
+
+    /// Flush inline buffer into a paragraph (or not, if inside pre), appending to the right target.
+    fn flush_inline_to_target(
+        &mut self,
+        mut doc: Node,
+        inline_buf: &mut Vec<Node>,
         fmt_stack: &[ElementKind],
     ) -> Node {
-        // Wrap any remaining content in open formatting elements
-        let mut buf = inline_buf;
+        let mut buf = std::mem::take(inline_buf);
         wrap_buf_in_fmt(&mut buf, fmt_stack);
-        flush_into_para(doc, buf)
+        if buf.is_empty() {
+            return doc;
+        }
+
+        // If we're inside a pre block, don't wrap in <p>
+        let inside_pre = self.open_blocks.last().map_or(false, |b| {
+            matches!(&b.kind, NodeKind::Element(ElementKind::Preformatted))
+        });
+
+        if inside_pre {
+            // Push children directly to the pre block
+            for child in buf {
+                Self::push_to_target(&mut doc, &mut self.open_blocks, child);
+            }
+        } else {
+            let para = flush_into_para(Node::document(), buf);
+            for child in para.children {
+                Self::push_to_target(&mut doc, &mut self.open_blocks, child);
+            }
+        }
+        doc
+    }
+
+    fn handle_bold_open(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+        let in_italic = fmt_stack.contains(&ElementKind::Italic);
+        if fmt_stack.contains(&ElementKind::Bold) {
+            while let Some(top) = fmt_stack.last() {
+                wrap_buf_in_fmt(inline_buf, fmt_stack);
+                let kind = top.clone();
+                fmt_stack.pop();
+                if kind == ElementKind::Bold {
+                    break;
+                }
+            }
+            if in_italic && fmt_stack.contains(&ElementKind::Italic) {
+                while let Some(top) = fmt_stack.last() {
+                    wrap_buf_in_fmt(inline_buf, fmt_stack);
+                    let kind = top.clone();
+                    fmt_stack.pop();
+                    if kind == ElementKind::Italic {
+                        break;
+                    }
+                }
+            }
+        } else {
+            wrap_buf_in_fmt(inline_buf, fmt_stack);
+            fmt_stack.push(ElementKind::Bold);
+            if in_italic {
+                fmt_stack.push(ElementKind::Italic);
+            }
+        }
+    }
+
+    fn handle_italic_open(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+        if fmt_stack.contains(&ElementKind::Italic) {
+            while let Some(top) = fmt_stack.last() {
+                wrap_buf_in_fmt(inline_buf, fmt_stack);
+                let kind = top.clone();
+                fmt_stack.pop();
+                if kind == ElementKind::Italic {
+                    break;
+                }
+            }
+        } else {
+            wrap_buf_in_fmt(inline_buf, fmt_stack);
+            fmt_stack.push(ElementKind::Italic);
+        }
     }
 
     /// Build a heading element: consume tokens until the end of the heading line.
@@ -619,6 +678,22 @@ fn flush_into_para(mut doc: Node, buf: Vec<Node>) -> Node {
         }
     }
     doc
+}
+
+/// Get the HTML tag name for an ElementKind (for matching open/close tags).
+fn element_kind_to_tag(kind: &crate::dom::node::NodeKind) -> Option<&'static str> {
+    if let crate::dom::node::NodeKind::Element(ek) = kind {
+        match ek {
+            ElementKind::Div => Some("div"),
+            ElementKind::Preformatted => Some("pre"),
+            ElementKind::Bold => Some("b"),
+            ElementKind::Italic => Some("i"),
+            ElementKind::Span => Some("span"),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 impl Default for TreeBuilder {

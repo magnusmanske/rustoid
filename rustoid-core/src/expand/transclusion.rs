@@ -195,7 +195,7 @@ fn build_template_title(name: &str, config: &dyn SiteConfig) -> Title {
 
 /// Strip `<noinclude>...</noinclude>` sections and their content.
 /// Content outside `<noinclude>` is kept; content inside is removed.
-fn strip_noinclude_sections(text: &str) -> String {
+pub(crate) fn strip_noinclude_sections(text: &str) -> String {
     let mut result = String::new();
     let mut pos = 0;
     while pos < text.len() {
@@ -218,14 +218,14 @@ fn strip_noinclude_sections(text: &str) -> String {
 /// Handle `<includeonly>...</includeonly>` sections.
 /// When transcluding, we keep this content; when viewing the template page,
 /// it would be hidden. For our purposes, we simply remove the tags.
-fn extract_includeonly_sections(text: &str) -> String {
+pub(crate) fn extract_includeonly_sections(text: &str) -> String {
     text.replace("<includeonly>", "")
         .replace("</includeonly>", "")
 }
 
 /// Handle `<onlyinclude>...</onlyinclude>` sections.
 /// When transcluding, ONLY content inside these tags is kept.
-fn extract_onlyinclude_sections(text: &str) -> String {
+pub(crate) fn extract_onlyinclude_sections(text: &str) -> String {
     if !text.contains("<onlyinclude>") {
         return text.to_string();
     }

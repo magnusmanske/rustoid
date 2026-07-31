@@ -4,22 +4,24 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 
 ## Status
 
-🚧 **Phase 1 complete** — core types, mock backends, namespace-aware TitleParser.
+🚧 **All phases have initial implementations** — 130 unit tests pass, 7/144 Parsoid fixture tests pass (5%).
+
+Active work: deeper architectural changes for block HTML tags, pre-mode tokenization, bold/italic nesting, and comment handling.
 
 | Phase | Status |
 |-------|--------|
 | 0 — Project setup | ✅ Done |
 | 1 — Core types & traits | ✅ Done |
-| 2 — Wikitext tokenizer | ✅ Done |
-| 3 — Template expander | ✅ Done |
+| 2 — Wikitext tokenizer | ✅ Done (pre-mode support added) |
+| 3 — Template expander | ✅ Done (iterative work-stack preprocessor) |
 | 4 — Lua/Scribunto engine | ✅ Done |
-| 5 — AST / Tree builder | ✅ Done |
+| 5 — AST / Tree builder | ✅ Done (block HTML content collection) |
 | 6 — HTML serialization | ✅ Done |
 | 7 — HTML→wikitext round-trip | ✅ Done |
 | 8 — Selective serialization | ✅ Done |
 | 9 — Data source impls | ✅ Done |
-| 10 — Test harness | ✅ Done |
-| 11 — Test pass | ✅ 5/7 mini-tests pass |
+| 10 — Test harness | ✅ Done (11 Parsoid fixture files) |
+| 11 — Test pass | 🔄 7/144 Parsoid fixtures (5%) |
 | 12 — CLI binary | 🔄 In progress |
 | 13 — Polish | ⬜ Pending |
 
