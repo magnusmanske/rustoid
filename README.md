@@ -18,8 +18,8 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 | 7 — HTML→wikitext round-trip | ✅ Done |
 | 8 — Selective serialization | ✅ Done |
 | 9 — Data source impls | ✅ Done |
-| 10 — Test harness | 🔄 In progress |
-| 11 — Test pass | ⬜ Pending |
+| 10 — Test harness | ✅ Done |
+| 11 — Test pass | 🔄 In progress |
 | 12 — CLI binary | ⬜ Pending |
 | 13 — Polish | ⬜ Pending |
 

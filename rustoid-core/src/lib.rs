@@ -48,6 +48,8 @@ pub mod sanitizer;
 
 pub mod mock;
 
+pub mod test_harness;
+
 #[cfg(feature = "mwapi")]
 pub mod mw_api;
 

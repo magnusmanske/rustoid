@@ -1,0 +1,68 @@
+!! Version 2
+
+!! article
+Template:1x
+!! text
+{{{1}}}
+!! endarticle
+
+!! test
+Simple bold text
+!! wikitext
+'''bold''' text
+!! html/parsoid
+<p><b>bold</b> text</p>
+!! end
+
+!! test
+Simple wikilink
+!! wikitext
+[[Main Page]]
+!! html/parsoid
+<p><a href="Main Page">Main Page</a></p>
+!! end
+
+!! test
+Heading level 2
+!! wikitext
+== Section Title ==
+!! html/parsoid
+<h2>Section Title</h2>
+!! end
+
+!! test
+Paragraph break
+!! wikitext
+First paragraph.
+
+Second paragraph.
+!! html/parsoid
+<p>First paragraph.</p>
+<p>Second paragraph.</p>
+!! end
+
+!! test
+Mixed inline formatting
+!! wikitext
+''italic'' and '''bold''' and '''''both'''''
+!! html/parsoid
+<p><i>italic</i> and <b>bold</b> and <b><i>both</i></b></p>
+!! end
+
+!! test
+Unordered list
+!! wikitext
+* Item one
+* Item two
+!! html/parsoid
+<ul><li>Item one</li>
+<li>Item two</li></ul>
+!! end
+
+!! test
+Template expansion
+!! wikitext
+{{1x|hello}}
+!! html/parsoid
+<p>hello</p>
+!! end
