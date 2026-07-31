@@ -176,6 +176,7 @@ impl TreeBuilder {
                         for (k, v) in attrs {
                             elem.set_attr(k, v);
                         }
+                        elem.data_parsoid = Some("{\"stx\":\"html\"}".to_string());
                         self.open_blocks.push(elem);
                         at_line_start = true;
                     } else {

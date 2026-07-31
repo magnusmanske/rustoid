@@ -252,10 +252,13 @@ impl HtmlSerializer {
         }
         // Add data-parsoid and data-mw if present
         if let Some(ref dp) = node.data_parsoid {
-            buf.push_str(&format!(" data-parsoid='{}'", attr_escape(dp)));
+            // Single-quoted attribute: only escape & and '
+            let escaped = dp.replace('&', "&amp;").replace('\'', "&#39;");
+            buf.push_str(&format!(" data-parsoid='{escaped}'"));
         }
         if let Some(ref dm) = node.data_mw {
-            buf.push_str(&format!(" data-mw='{}'", attr_escape(dm)));
+            let escaped = dm.replace('&', "&amp;").replace('\'', "&#39;");
+            buf.push_str(&format!(" data-mw='{escaped}'"));
         }
     }
 
