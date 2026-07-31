@@ -12,13 +12,16 @@ pub enum WikitextToken {
     Text(String),
 
     // ---- Inline formatting ----
-    /// Opening bold marker (`'''`).
+    /// A raw quote marker from the tokenizer: `''` (italic), `'''` (bold), or `'''''` (both).
+    /// Resolution to open/close tags is done by the QuoteTransformer.
+    Quote(String),
+    /// Opening bold tag (resolved from quotes).
     BoldOpen,
-    /// Closing bold marker (`'''`).
+    /// Closing bold tag (resolved from quotes).
     BoldClose,
-    /// Opening italic marker (`''`).
+    /// Opening italic tag (resolved from quotes).
     ItalicOpen,
-    /// Closing italic marker (`''`).
+    /// Closing italic tag (resolved from quotes).
     ItalicClose,
 
     // ---- Links ----
@@ -170,6 +173,7 @@ impl fmt::Display for WikitextToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WikitextToken::Text(s) => write!(f, "Text({s:?})"),
+            WikitextToken::Quote(q) => write!(f, "Quote({q:?})"),
             WikitextToken::BoldOpen => write!(f, "BoldOpen"),
             WikitextToken::BoldClose => write!(f, "BoldClose"),
             WikitextToken::ItalicOpen => write!(f, "ItalicOpen"),

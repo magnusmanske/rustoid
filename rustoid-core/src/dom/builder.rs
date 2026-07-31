@@ -100,8 +100,18 @@ impl TreeBuilder {
                     at_line_start = false;
                     i += 1;
                 }
+                WikitextToken::BoldClose => {
+                    self.handle_bold_close(&mut inline_buf, &mut fmt_stack);
+                    at_line_start = false;
+                    i += 1;
+                }
                 WikitextToken::ItalicOpen => {
                     self.handle_italic_open(&mut inline_buf, &mut fmt_stack);
+                    at_line_start = false;
+                    i += 1;
+                }
+                WikitextToken::ItalicClose => {
+                    self.handle_italic_close(&mut inline_buf, &mut fmt_stack);
                     at_line_start = false;
                     i += 1;
                 }
@@ -301,6 +311,32 @@ impl TreeBuilder {
             fmt_stack.push(ElementKind::Bold);
             if in_italic {
                 fmt_stack.push(ElementKind::Italic);
+            }
+        }
+    }
+
+    fn handle_bold_close(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+        if fmt_stack.contains(&ElementKind::Bold) {
+            while let Some(top) = fmt_stack.last() {
+                wrap_buf_in_fmt(inline_buf, fmt_stack);
+                let kind = top.clone();
+                fmt_stack.pop();
+                if kind == ElementKind::Bold {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_italic_close(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+        if fmt_stack.contains(&ElementKind::Italic) {
+            while let Some(top) = fmt_stack.last() {
+                wrap_buf_in_fmt(inline_buf, fmt_stack);
+                let kind = top.clone();
+                fmt_stack.pop();
+                if kind == ElementKind::Italic {
+                    break;
+                }
             }
         }
     }

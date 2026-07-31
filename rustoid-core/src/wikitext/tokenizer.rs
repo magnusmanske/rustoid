@@ -470,20 +470,17 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn try_bold_italic(&mut self, remaining: &str) -> Option<WikitextToken> {
-        // 5 quotes: open both bold and italic. Emit ItalicOpen, then BoldOpen
-        // will follow on the next call via a flag.
         if remaining.starts_with("'''''") {
             self.advance(5);
-            self.tokens.push(WikitextToken::ItalicOpen);
-            return Some(WikitextToken::BoldOpen);
+            return Some(WikitextToken::Quote("'''''".to_string()));
         }
         if remaining.starts_with("'''") {
             self.advance(3);
-            return Some(WikitextToken::BoldOpen);
+            return Some(WikitextToken::Quote("'''".to_string()));
         }
         if remaining.starts_with("''") {
             self.advance(2);
-            return Some(WikitextToken::ItalicOpen);
+            return Some(WikitextToken::Quote("''".to_string()));
         }
         None
     }
@@ -630,7 +627,11 @@ mod tests {
     #[test]
     fn test_bold() {
         let tokens = tokenize("'''bold'''");
-        assert!(tokens.iter().any(|t| matches!(t, WikitextToken::BoldOpen)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, WikitextToken::Quote(q) if q == "'''"))
+        );
     }
 
     #[test]
@@ -639,7 +640,7 @@ mod tests {
         assert!(
             tokens
                 .iter()
-                .any(|t| matches!(t, WikitextToken::ItalicOpen))
+                .any(|t| matches!(t, WikitextToken::Quote(q) if q == "''"))
         );
     }
 
@@ -649,7 +650,7 @@ mod tests {
         assert_eq!(
             tokens
                 .iter()
-                .filter(|t| matches!(t, WikitextToken::BoldOpen))
+                .filter(|t| matches!(t, WikitextToken::Quote(q) if q == "'''''"))
                 .count(),
             2
         );
