@@ -111,20 +111,20 @@ impl<'a> Tokenizer<'a> {
             }
             if remaining.starts_with("]]") {
                 let p = self.pos;
-                self.emit_at(WikitextToken::WikilinkClose, p);
                 self.advance(2);
+                self.emit_at(WikitextToken::WikilinkClose, p);
                 continue;
             }
             if remaining.starts_with('|') {
                 let p = self.pos;
-                self.emit_at(WikitextToken::WikilinkPipe, p);
                 self.advance(1);
+                self.emit_at(WikitextToken::WikilinkPipe, p);
                 continue;
             }
             if remaining.starts_with(']') && !remaining.starts_with("]]") {
                 let p = self.pos;
-                self.emit_at(WikitextToken::ExtLinkClose, p);
                 self.advance(1);
+                self.emit_at(WikitextToken::ExtLinkClose, p);
                 continue;
             }
             let p = self.pos;
@@ -149,16 +149,16 @@ impl<'a> Tokenizer<'a> {
             }
             if let Some(stripped) = remaining.strip_prefix("\n\n") {
                 let p = self.pos;
-                self.emit_at(WikitextToken::ParagraphBreak, p);
                 let extra = stripped.chars().take_while(|&c| c == '\n').count();
                 self.advance(2 + extra);
+                self.emit_at(WikitextToken::ParagraphBreak, p);
                 self.at_line_start = true;
                 continue;
             }
             if remaining.starts_with('\n') {
                 let p = self.pos;
-                self.emit_at(WikitextToken::Newline, p);
                 self.advance(1);
+                self.emit_at(WikitextToken::Newline, p);
                 self.at_line_start = true;
                 continue;
             }
@@ -190,7 +190,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn flush_text(&mut self) {
-        if self.text_start < self.pos {
+        if self.text_start < self.pos && self.pos <= self.input.len() {
             let text = self.input[self.text_start..self.pos].to_string();
             self.tokens.push(WikitextToken::Text(text));
         }

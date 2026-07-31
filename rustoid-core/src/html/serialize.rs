@@ -58,13 +58,8 @@ impl HtmlSerializer {
                         buf.push_str(&format!("{indent}<p"));
                         self.serialize_attrs(node, buf);
                         buf.push('>');
-                        if !node.children.is_empty() {
-                            buf.push('\n');
-                            self.serialize_children(node, buf, depth + 1)?;
-                            buf.push_str(&format!("{indent}</p>\n"));
-                        } else {
-                            buf.push_str("</p>\n");
-                        }
+                        self.serialize_children(node, buf, depth + 1)?;
+                        buf.push_str("</p>\n");
                     }
                     ElementKind::Heading(level) => {
                         let h = format!("h{level}");
@@ -120,23 +115,40 @@ impl HtmlSerializer {
                     ElementKind::UnorderedList => {
                         buf.push_str(&format!("{indent}<ul"));
                         self.serialize_attrs(node, buf);
-                        buf.push_str(">\n");
-                        self.serialize_children(node, buf, depth + 1)?;
-                        buf.push_str(&format!("{indent}</ul>\n"));
+                        buf.push('>');
+                        let count = node.children.len();
+                        for (i, child) in node.children.iter().enumerate() {
+                            self.serialize_node(child, buf, 0)?;
+                            // Add newline between items but not after the last
+                            if i + 1 < count
+                                && matches!(child.kind, NodeKind::Element(ElementKind::ListItem))
+                            {
+                                buf.push('\n');
+                            }
+                        }
+                        buf.push_str("</ul>\n");
                     }
                     ElementKind::OrderedList => {
                         buf.push_str(&format!("{indent}<ol"));
                         self.serialize_attrs(node, buf);
-                        buf.push_str(">\n");
-                        self.serialize_children(node, buf, depth + 1)?;
-                        buf.push_str(&format!("{indent}</ol>\n"));
+                        buf.push('>');
+                        let count = node.children.len();
+                        for (i, child) in node.children.iter().enumerate() {
+                            self.serialize_node(child, buf, 0)?;
+                            if i + 1 < count
+                                && matches!(child.kind, NodeKind::Element(ElementKind::ListItem))
+                            {
+                                buf.push('\n');
+                            }
+                        }
+                        buf.push_str("</ol>\n");
                     }
                     ElementKind::ListItem => {
-                        buf.push_str(&format!("{indent}<li"));
+                        buf.push_str("<li");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
-                        self.serialize_children(node, buf, depth)?;
-                        buf.push_str("</li>\n");
+                        self.serialize_children(node, buf, 0)?;
+                        buf.push_str("</li>");
                     }
                     ElementKind::Div => {
                         buf.push_str(&format!("{indent}<div"));

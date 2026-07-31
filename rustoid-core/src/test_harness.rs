@@ -403,6 +403,11 @@ pub fn run_parsed_tests(test_file: &ParserTestFile) -> Result<TestSummary> {
     Ok(summary)
 }
 
+/// Run a single test case (public for diagnostic use).
+pub fn run_single_test_public(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
+    run_single_test(test, test_file)
+}
+
 /// Run a single test case.
 fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
     // Determine mode from options

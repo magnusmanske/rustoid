@@ -4,7 +4,7 @@
 //! AST with proper block/inline structure. This implements the wikitext-to-DOM
 //! tree construction algorithm adapted from Parsoid's TreeBuilder.
 
-use crate::dom::node::{ElementKind, Node};
+use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::error::Result;
 use crate::wikitext::tokens::WikitextToken;
 
@@ -21,6 +21,8 @@ impl TreeBuilder {
     pub fn build(&mut self, tokens: &[WikitextToken]) -> Result<Node> {
         let mut doc = Node::document();
         let mut inline_buf: Vec<Node> = Vec::new();
+        // Stack of open inline formatting elements (Bold, Italic).
+        let mut fmt_stack: Vec<ElementKind> = Vec::new();
 
         let mut i = 0;
         while i < tokens.len() {
@@ -32,27 +34,33 @@ impl TreeBuilder {
             // Handle block-level token types
             match token {
                 WikitextToken::HeadingOpen(level) => {
-                    doc = self.flush_inline_into_para(doc, inline_buf);
+                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
+                    fmt_stack.clear();
                     let (heading, new_i) = self.build_heading(tokens, i, *level);
                     doc.push_child(heading);
                     i = new_i;
                 }
                 WikitextToken::ListItem(ch, depth) => {
+                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
+                    inline_buf = Vec::new();
+                    fmt_stack.clear();
                     let prefix = std::mem::take(&mut inline_buf);
                     let (list_item, new_i) = self.build_list_item(tokens, i, *ch, *depth, prefix);
                     doc.push_child(list_item);
                     i = new_i;
                 }
                 WikitextToken::Hr => {
-                    doc = self.flush_inline_into_para(doc, inline_buf);
+                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
+                    fmt_stack.clear();
                     doc.push_child(Node::element(ElementKind::HorizontalRule));
                     i += 1;
                 }
                 WikitextToken::ParagraphBreak => {
-                    doc = self.flush_inline_into_para(doc, inline_buf);
+                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
+                    fmt_stack.clear();
                     i += 1;
                 }
                 WikitextToken::TableOpen(_) => {
@@ -79,11 +87,52 @@ impl TreeBuilder {
                     i = new_i;
                 }
                 WikitextToken::BoldOpen => {
-                    inline_buf.push(Node::element(ElementKind::Bold));
+                    // If inside Italic (''''' = bold+italic), this BoldOpen also opens Italic
+                    let in_italic = fmt_stack.contains(&ElementKind::Italic);
+                    if fmt_stack.contains(&ElementKind::Bold) {
+                        // Close: unwind until Bold
+                        while let Some(top) = fmt_stack.last() {
+                            wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                            let kind = top.clone();
+                            fmt_stack.pop();
+                            if kind == ElementKind::Bold {
+                                break;
+                            }
+                        }
+                        // If we were in italic too and just unwound past it, close italic
+                        if in_italic && fmt_stack.contains(&ElementKind::Italic) {
+                            while let Some(top) = fmt_stack.last() {
+                                wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                                let kind = top.clone();
+                                fmt_stack.pop();
+                                if kind == ElementKind::Italic {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                        fmt_stack.push(ElementKind::Bold);
+                        if in_italic {
+                            fmt_stack.push(ElementKind::Italic);
+                        }
+                    }
                     i += 1;
                 }
                 WikitextToken::ItalicOpen => {
-                    inline_buf.push(Node::element(ElementKind::Italic));
+                    if fmt_stack.contains(&ElementKind::Italic) {
+                        while let Some(top) = fmt_stack.last() {
+                            wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                            let kind = top.clone();
+                            fmt_stack.pop();
+                            if kind == ElementKind::Italic {
+                                break;
+                            }
+                        }
+                    } else {
+                        wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
+                        fmt_stack.push(ElementKind::Italic);
+                    }
                     i += 1;
                 }
                 WikitextToken::Text(text) => {
@@ -133,7 +182,7 @@ impl TreeBuilder {
                 }
                 WikitextToken::EOF => {
                     // Flush remaining inline content
-                    doc = self.flush_inline_into_para(doc, inline_buf);
+                    doc = self.flush_inline_into_para(doc, inline_buf, &fmt_stack);
                     break;
                 }
                 _ => {
@@ -149,21 +198,16 @@ impl TreeBuilder {
     }
 
     /// Flush inline buffer into a paragraph, appending to doc.
-    fn flush_inline_into_para(&self, mut doc: Node, inline_buf: Vec<Node>) -> Node {
-        if !inline_buf.is_empty() {
-            let has_content = inline_buf.iter().any(|n| {
-                matches!(&n.kind, crate::dom::node::NodeKind::Text(t) if !t.trim().is_empty())
-                    || matches!(&n.kind, crate::dom::node::NodeKind::Element(_))
-            });
-            if has_content {
-                let mut p = Node::element(ElementKind::Paragraph);
-                for child in inline_buf {
-                    p.push_child(child);
-                }
-                doc.push_child(p);
-            }
-        }
-        doc
+    fn flush_inline_into_para(
+        &self,
+        doc: Node,
+        inline_buf: Vec<Node>,
+        fmt_stack: &[ElementKind],
+    ) -> Node {
+        // Wrap any remaining content in open formatting elements
+        let mut buf = inline_buf;
+        wrap_buf_in_fmt(&mut buf, fmt_stack);
+        flush_into_para(doc, buf)
     }
 
     /// Build a heading element: consume tokens until the end of the heading line.
@@ -211,6 +255,25 @@ impl TreeBuilder {
                 _ => {
                     i += 1;
                 }
+            }
+        }
+
+        // Strip trailing equals from last text node, and leading/trailing whitespace
+        if let Some(last) = heading.children.last_mut()
+            && let NodeKind::Text(ref mut text) = last.kind
+        {
+            *text = text.trim_end_matches('=').trim().to_string();
+            if text.is_empty() {
+                heading.children.pop();
+            }
+        }
+        // Also strip leading space from first text node
+        if let Some(first) = heading.children.first_mut()
+            && let NodeKind::Text(ref mut text) = first.kind
+        {
+            *text = text.trim_start().to_string();
+            if text.is_empty() {
+                heading.children.remove(0);
             }
         }
 
@@ -279,6 +342,15 @@ impl TreeBuilder {
         }
 
         list.push_child(item);
+
+        // Trim leading space from first text node
+        if let Some(first) = list.children.first_mut()
+            && let Some(first_item) = first.children.first_mut()
+            && let NodeKind::Text(ref mut text) = first_item.kind
+        {
+            *text = text.trim_start().to_string();
+        }
+
         (list, i)
     }
 
@@ -499,6 +571,37 @@ impl TreeBuilder {
 
         result
     }
+}
+
+/// Wrap a flat node buffer into the innermost formatting element.
+fn wrap_buf_in_fmt(buf: &mut Vec<Node>, stack: &[ElementKind]) {
+    if buf.is_empty() || stack.is_empty() {
+        return;
+    }
+    let kind = stack.last().unwrap().clone();
+    let mut wrapper = Node::element(kind);
+    for node in buf.drain(..) {
+        wrapper.push_child(node);
+    }
+    buf.push(wrapper);
+}
+
+/// Flush a buffer of nodes into a paragraph, appending to a document.
+fn flush_into_para(mut doc: Node, buf: Vec<Node>) -> Node {
+    if !buf.is_empty() {
+        let has_content = buf.iter().any(|n| {
+            matches!(&n.kind, crate::dom::node::NodeKind::Text(t) if !t.trim().is_empty())
+                || matches!(&n.kind, crate::dom::node::NodeKind::Element(_))
+        });
+        if has_content {
+            let mut p = Node::element(ElementKind::Paragraph);
+            for child in buf {
+                p.push_child(child);
+            }
+            doc.push_child(p);
+        }
+    }
+    doc
 }
 
 impl Default for TreeBuilder {

@@ -19,8 +19,8 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 | 8 — Selective serialization | ✅ Done |
 | 9 — Data source impls | ✅ Done |
 | 10 — Test harness | ✅ Done |
-| 11 — Test pass | 🔄 In progress |
-| 12 — CLI binary | ⬜ Pending |
+| 11 — Test pass | ✅ 5/7 mini-tests pass |
+| 12 — CLI binary | 🔄 In progress |
 | 13 — Polish | ⬜ Pending |
 
 See [PLAN.md](PLAN.md) for the full roadmap.
