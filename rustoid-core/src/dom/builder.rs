@@ -95,22 +95,18 @@ impl TreeBuilder {
                     inline_buf.push(link_node);
                     i = new_i;
                 }
+                WikitextToken::ItalicOpen => {
+                    fmt_stack.push(ElementKind::Italic);
+                    at_line_start = false;
+                    i += 1;
+                }
                 WikitextToken::BoldOpen => {
-                    // QuoteTransformer already resolved open/close context.
-                    // Just push to format stack.
-                    wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
                     fmt_stack.push(ElementKind::Bold);
                     at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::BoldClose => {
                     self.handle_bold_close(&mut inline_buf, &mut fmt_stack);
-                    at_line_start = false;
-                    i += 1;
-                }
-                WikitextToken::ItalicOpen => {
-                    wrap_buf_in_fmt(&mut inline_buf, &fmt_stack);
-                    fmt_stack.push(ElementKind::Italic);
                     at_line_start = false;
                     i += 1;
                 }
@@ -320,28 +316,44 @@ impl TreeBuilder {
     }
 
     fn handle_bold_close(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
-        if fmt_stack.contains(&ElementKind::Bold) {
-            while let Some(top) = fmt_stack.last() {
-                wrap_buf_in_fmt(inline_buf, fmt_stack);
-                let kind = top.clone();
-                fmt_stack.pop();
-                if kind == ElementKind::Bold {
-                    break;
+        if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Bold) {
+            // Pop everything above Bold and wrap
+            while fmt_stack.len() > pos + 1 {
+                let kind = fmt_stack.pop().unwrap();
+                let mut wrapper = Node::element(kind);
+                for node in inline_buf.drain(..) {
+                    wrapper.push_child(node);
                 }
+                inline_buf.push(wrapper);
             }
+            // Now wrap in Bold
+            let mut wrapper = Node::element(ElementKind::Bold);
+            for node in inline_buf.drain(..) {
+                wrapper.push_child(node);
+            }
+            inline_buf.push(wrapper);
+            fmt_stack.pop(); // remove Bold
         }
     }
 
     fn handle_italic_close(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
-        if fmt_stack.contains(&ElementKind::Italic) {
-            while let Some(top) = fmt_stack.last() {
-                wrap_buf_in_fmt(inline_buf, fmt_stack);
-                let kind = top.clone();
-                fmt_stack.pop();
-                if kind == ElementKind::Italic {
-                    break;
+        if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Italic) {
+            // Pop everything above Italic and wrap
+            while fmt_stack.len() > pos + 1 {
+                let kind = fmt_stack.pop().unwrap();
+                let mut wrapper = Node::element(kind);
+                for node in inline_buf.drain(..) {
+                    wrapper.push_child(node);
                 }
+                inline_buf.push(wrapper);
             }
+            // Now wrap in Italic
+            let mut wrapper = Node::element(ElementKind::Italic);
+            for node in inline_buf.drain(..) {
+                wrapper.push_child(node);
+            }
+            inline_buf.push(wrapper);
+            fmt_stack.pop(); // remove Italic
         }
     }
 
@@ -740,12 +752,14 @@ fn wrap_buf_in_fmt(buf: &mut Vec<Node>, stack: &[ElementKind]) {
     if buf.is_empty() || stack.is_empty() {
         return;
     }
-    let kind = stack.last().unwrap().clone();
-    let mut wrapper = Node::element(kind);
-    for node in buf.drain(..) {
-        wrapper.push_child(node);
+    // Wrap from innermost to outermost
+    for kind in stack.iter().rev() {
+        let mut wrapper = Node::element(kind.clone());
+        for node in buf.drain(..) {
+            wrapper.push_child(node);
+        }
+        buf.push(wrapper);
     }
-    buf.push(wrapper);
 }
 
 /// Flush a buffer of nodes into a paragraph, appending to a document.
