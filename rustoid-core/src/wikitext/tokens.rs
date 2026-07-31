@@ -111,6 +111,10 @@ pub enum WikitextToken {
     Newline,
     /// A double newline (paragraph break).
     ParagraphBreak,
+    /// Inserted paragraph open tag.
+    ParagraphOpen,
+    /// Inserted paragraph close tag.
+    ParagraphClose,
 
     // ---- Redirect ----
     /// A redirect directive (`#REDIRECT [[Target]]`).
@@ -210,6 +214,8 @@ impl fmt::Display for WikitextToken {
             WikitextToken::TableClose => write!(f, "TableClose"),
             WikitextToken::Newline => write!(f, "Newline"),
             WikitextToken::ParagraphBreak => write!(f, "ParagraphBreak"),
+            WikitextToken::ParagraphOpen => write!(f, "ParagraphOpen"),
+            WikitextToken::ParagraphClose => write!(f, "ParagraphClose"),
             WikitextToken::Redirect(t) => write!(f, "Redirect({t})"),
             WikitextToken::ExtensionTag { name, .. } => write!(f, "ExtensionTag({name})"),
             WikitextToken::AnnotationOpen(n, _) => write!(f, "AnnotationOpen({n})"),

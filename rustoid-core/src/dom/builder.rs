@@ -75,7 +75,9 @@ impl TreeBuilder {
                     i += 1;
                     at_line_start = true;
                 }
-                WikitextToken::ParagraphBreak => {
+                WikitextToken::ParagraphBreak
+                | WikitextToken::ParagraphOpen
+                | WikitextToken::ParagraphClose => {
                     doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
                     inline_buf = Vec::new();
                     fmt_stack.clear();
