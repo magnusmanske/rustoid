@@ -8,6 +8,7 @@
 - Adhere to **SOLID and DRY principles**.
 - Use **best practices** and **language standards**.
 - **Take advantage of the Rust language**. "Parse, don't validate" etc.
+- **No unsafe code**. Only use safe Rust.
 - **Write tests** where it makes sense. Aim to keep test coverage high and tests simple.
 - **Warn me if you think what I ask of you is a bad idea.** Or just window dressing, with no improvement of functionality, UX, or code readability. Be honest.
 - **Fix clippy warnings**, even pre-existing ones.
