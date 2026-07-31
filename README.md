@@ -16,8 +16,8 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 | 5 — AST / Tree builder | ✅ Done |
 | 6 — HTML serialization | ✅ Done |
 | 7 — HTML→wikitext round-trip | ✅ Done |
-| 8 — Selective serialization | 🔄 In progress |
-| 9 — Data source impls | ⬜ Pending |
+| 8 — Selective serialization | ✅ Done |
+| 9 — Data source impls | 🔄 In progress |
 | 10 — Test harness | ⬜ Pending |
 | 11 — Test pass | ⬜ Pending |
 | 12 — CLI binary | ⬜ Pending |
