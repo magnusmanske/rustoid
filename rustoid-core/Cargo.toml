@@ -1,0 +1,29 @@
+[package]
+name = "rustoid-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+ruwex = ["dep:ruwex"]
+mwapi = ["dep:reqwest", "dep:tokio"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+mlua.workspace = true
+html5ever.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+url.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+log.workspace = true
+tokio = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+ruwex = { workspace = true, optional = true }

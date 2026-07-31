@@ -1,0 +1,19 @@
+[package]
+name = "rustoid-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustoid"
+path = "src/main.rs"
+
+[dependencies]
+rustoid-core = { path = "../rustoid-core" }
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+serde_json.workspace = true

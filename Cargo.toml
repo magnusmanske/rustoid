@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "rustoid-core",
+    "rustoid-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+repository = "https://codeberg.org/magnusmanske/rustoid"
+authors = ["Magnus Manske <magnusmanske@users.noreply.codeberg.org>"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+html5ever = "0.29"
+regex = "1"
+once_cell = "1"
+url = "2"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ruwex = "0.1"
+log = "0.4"
