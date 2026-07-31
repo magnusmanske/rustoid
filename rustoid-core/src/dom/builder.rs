@@ -320,39 +320,50 @@ impl TreeBuilder {
         }
     }
 
-    fn handle_bold_close(&mut self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
-        if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Bold) {
-            let start_idx = self.fmt_starts.get(pos).copied().unwrap_or(0);
-            // Remove starts for this and everything above
-            self.fmt_starts.truncate(pos);
-            // Pop everything above Bold, wrapping from their start positions
-            // But first, wrap content from start_idx to end in Bold
-            let tail: Vec<Node> = inline_buf.drain(start_idx..).collect();
-            let mut bold = Node::element(ElementKind::Bold);
-            for node in tail {
-                bold.push_child(node);
-            }
-            inline_buf.push(bold);
-            // Remove Bold from stack (and everything above)
-            fmt_stack.truncate(pos);
-        }
-    }
-
     fn handle_italic_close(
         &mut self,
         inline_buf: &mut Vec<Node>,
         fmt_stack: &mut Vec<ElementKind>,
     ) {
+        // If bold is nested inside italic, close bold first (innermost first)
+        while fmt_stack.last() == Some(&ElementKind::Bold) {
+            self.handle_bold_close(inline_buf, fmt_stack);
+        }
         if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Italic) {
             let start_idx = self.fmt_starts.get(pos).copied().unwrap_or(0);
-            self.fmt_starts.truncate(pos);
+            // Ensure start_idx is within bounds
+            let start_idx = start_idx.min(inline_buf.len());
             let tail: Vec<Node> = inline_buf.drain(start_idx..).collect();
             let mut italic = Node::element(ElementKind::Italic);
             for node in tail {
                 italic.push_child(node);
             }
             inline_buf.push(italic);
-            fmt_stack.truncate(pos);
+            if pos < fmt_stack.len() {
+                fmt_stack.remove(pos);
+            }
+            if pos < self.fmt_starts.len() {
+                self.fmt_starts.remove(pos);
+            }
+        }
+    }
+
+    fn handle_bold_close(&mut self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
+        if let Some(pos) = fmt_stack.iter().rposition(|k| *k == ElementKind::Bold) {
+            let start_idx = self.fmt_starts.get(pos).copied().unwrap_or(0);
+            let start_idx = start_idx.min(inline_buf.len());
+            let tail: Vec<Node> = inline_buf.drain(start_idx..).collect();
+            let mut bold = Node::element(ElementKind::Bold);
+            for node in tail {
+                bold.push_child(node);
+            }
+            inline_buf.push(bold);
+            if pos < fmt_stack.len() {
+                fmt_stack.remove(pos);
+            }
+            if pos < self.fmt_starts.len() {
+                self.fmt_starts.remove(pos);
+            }
         }
     }
 

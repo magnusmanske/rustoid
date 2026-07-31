@@ -445,8 +445,10 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
         mode.split(',').map(|s| s.trim()).collect()
     };
 
-    // If html/parsoid is provided, run wt2html
-    if test.html_parsoid.is_some() || modes.contains(&"wt2html") {
+    // Only run wt2html if the mode explicitly supports it
+    let supports_wt2html = modes.is_empty() || modes.contains(&"wt2html");
+
+    if supports_wt2html && test.html_parsoid.is_some() {
         return run_wt2html_test(test, test_file);
     }
 

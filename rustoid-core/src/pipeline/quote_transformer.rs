@@ -232,11 +232,15 @@ impl QuoteTransformer {
                         state = State::Empty;
                     }
                     (2, State::BI) => {
-                        result.push(WikitextToken::ItalicClose);
+                        // Close inner bold, then italic, then re-open bold
+                        result.extend(vec![
+                            WikitextToken::BoldClose,
+                            WikitextToken::ItalicClose,
+                            WikitextToken::BoldOpen,
+                        ]);
                         state = State::B;
                     }
                     (2, State::IB) => {
-                        // annoying case
                         result.extend(vec![
                             WikitextToken::BoldClose,
                             WikitextToken::ItalicClose,
