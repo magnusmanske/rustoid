@@ -9,6 +9,7 @@
 - Use **best practices** and **language standards**.
 - **Take advantage of the Rust language**. "Parse, don't validate" etc.
 - **No unsafe code**. Only use safe Rust.
+- **Write code that does not panic**. Avoid panics in production code. Return proper `Result` errors instead.
 - **Write tests** where it makes sense. Aim to keep test coverage high and tests simple.
 - **Warn me if you think what I ask of you is a bad idea.** Or just window dressing, with no improvement of functionality, UX, or code readability. Be honest.
 - **Fix clippy warnings**, even pre-existing ones.
