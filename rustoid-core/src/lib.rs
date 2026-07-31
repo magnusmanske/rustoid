@@ -48,6 +48,12 @@ pub mod sanitizer;
 
 pub mod mock;
 
+#[cfg(feature = "mwapi")]
+pub mod mw_api;
+
+#[cfg(feature = "ruwex")]
+pub mod ruwex_source;
+
 mod util;
 
 // Re-export key types
