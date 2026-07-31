@@ -268,12 +268,19 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn try_comment(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with("<!--")
-            && let Some(end) = remaining.find("-->")
-            && end >= 4
-        {
-            let comment = remaining[4..end].to_string();
-            self.advance(end + 3);
+        if remaining.starts_with("<!--") {
+            if let Some(end) = remaining.find("-->") {
+                if end >= 4 {
+                    let comment = remaining[4..end].to_string();
+                    self.advance(end + 3);
+                    return Some(WikitextToken::Comment(comment));
+                }
+                // "-->") found overlapping with "<!--" — unusual but handle
+                // Just consume the whole thing as unclosed
+            }
+            // Unclosed comment — consume until end of input
+            let comment = remaining[4..].to_string();
+            self.advance(remaining.len());
             return Some(WikitextToken::Comment(comment));
         }
         None
@@ -773,12 +780,33 @@ mod tests {
 
     #[test]
     fn test_comment() {
-        let tokens = tokenize("<!-- hidden -->text");
+        let tokens = tokenize("<!-- comment -->");
         assert!(
             tokens
                 .iter()
-                .any(|t| matches!(t, WikitextToken::Comment(c) if c == " hidden "))
+                .any(|t| matches!(t, WikitextToken::Comment(c) if c == " comment "))
         );
+    }
+
+    #[test]
+    fn test_multiple_comments() {
+        let tokens = tokenize("<!-- --><!----><!--&#x2D;--><!--&#x2D;&#x2D;-->");
+        let comments: Vec<&str> = tokens
+            .iter()
+            .filter_map(|t| {
+                if let WikitextToken::Comment(c) = t {
+                    Some(c.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        println!("comments: {:?}", comments);
+        assert_eq!(comments.len(), 4, "expected 4 comments");
+        assert_eq!(comments[0], " ");
+        assert_eq!(comments[1], "");
+        assert_eq!(comments[2], "&#x2D;");
+        assert_eq!(comments[3], "&#x2D;&#x2D;");
     }
 
     // -- Nowiki --

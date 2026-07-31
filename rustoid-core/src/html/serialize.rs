@@ -47,7 +47,7 @@ impl HtmlSerializer {
 
         match &node.kind {
             NodeKind::Document => {
-                for child in &node.children {
+                for (i, child) in node.children.iter().enumerate() {
                     self.serialize_node(child, buf, depth)?;
                 }
             }
@@ -214,8 +214,20 @@ impl HtmlSerializer {
                 buf.push_str(&html_escape(text));
             }
             NodeKind::Comment(content) => {
-                // Escape -- inside comments per HTML spec
-                let escaped = content.replace("--", "&#x2D;&#x2D;");
+                // Escape comment content per HTML/XML rules:
+                // 1. --  → &#x2D;&#x2D; (double hyphens close the comment)
+                // 2. >   → &#x3E;   (prevents premature close)
+                // 3. &   → &#x26;   (ampersand entity)
+                // 4. trailing - before --> → &#x2D; (prevents forming -->)
+                let mut escaped = content.replace("&", "&#x26;");
+                escaped = escaped.replace('>', "&#x3E;");
+                escaped = escaped.replace("--", "&#x2D;&#x2D;");
+                // Fix trailing dash: if the comment ends with -, escape it
+                // to prevent it from merging with the closing -->
+                if escaped.ends_with('-') {
+                    escaped.pop();
+                    escaped.push_str("&#x2D;");
+                }
                 buf.push_str(&format!("<!--{escaped}-->"));
             }
         }
@@ -236,14 +248,14 @@ impl HtmlSerializer {
             if attr.key == "href" || attr.key == "src" {
                 continue; // handled inline
             }
-            buf.push_str(&format!(" {}=\"{}\"", attr.key, html_escape(&attr.value)));
+            buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
         }
         // Add data-parsoid and data-mw if present
         if let Some(ref dp) = node.data_parsoid {
-            buf.push_str(&format!(" data-parsoid='{}'", html_escape(dp)));
+            buf.push_str(&format!(" data-parsoid='{}'", attr_escape(dp)));
         }
         if let Some(ref dm) = node.data_mw {
-            buf.push_str(&format!(" data-mw='{}'", html_escape(dm)));
+            buf.push_str(&format!(" data-mw='{}'", attr_escape(dm)));
         }
     }
 
@@ -297,11 +309,16 @@ impl HtmlSerializer {
     }
 }
 
-/// Basic HTML entity escaping.
+/// Basic HTML entity escaping for text content.
+/// Per HTML5, only `&` and `<` must be escaped in text content.
 fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;")
+}
+
+/// HTML entity escaping for attribute values (also escapes quotes).
+fn attr_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
@@ -369,6 +386,9 @@ mod tests {
 
     #[test]
     fn test_html_escape() {
-        assert_eq!(html_escape("<>&\"'"), "&lt;&gt;&amp;&quot;&#39;");
+        // html_escape: only & and < are escaped
+        assert_eq!(html_escape("<>&\"'"), "&lt;>&amp;\"'");
+        // attr_escape: also escapes " and '
+        assert_eq!(attr_escape("<>&\"'"), "&lt;>&amp;&quot;&#39;");
     }
 }

@@ -268,16 +268,16 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 section = Section::Html;
                 *i += 1;
             }
+            "!! html/php" => {
+                section = Section::HtmlPhp;
+                *i += 1;
+            }
             "!! html/parsoid+lang" => {
                 section = Section::HtmlLang;
                 *i += 1;
             }
             "!! html/parsoid+integrated" => {
                 section = Section::None; // Skip integrated tests for now
-                *i += 1;
-            }
-            "!! html/php" => {
-                section = Section::HtmlPhp;
                 *i += 1;
             }
             "!! wikitext/edited" => {
