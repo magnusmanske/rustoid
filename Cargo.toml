@@ -9,8 +9,8 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-or-later"
-repository = "https://codeberg.org/magnusmanske/rustoid"
-authors = ["Magnus Manske <magnusmanske@users.noreply.codeberg.org>"]
+repository = "https://github.com/magnusmanske/rustoid"
+authors = ["Magnus Manske <magnusmanskeproton.me>"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
