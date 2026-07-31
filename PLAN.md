@@ -289,24 +289,141 @@ pub enum WikitextToken {
 
 ### Phase 4 — Lua / Scribunto engine (est. 3-5 days)
 
-- [ ] Integrate `mlua` and create sandbox.
-- [ ] Implement `mw` global table:
-  - `mw.site` (site info)
-  - `mw.title` (title object)
-  - `mw.uri` (URL utilities)
-  - `mw.text` (text utilities: encode, decode, trim, etc.)
-  - `mw.language` (language/formatting)
-  - `mw.message` (i18n message lookup, via DataSource)
-  - `mw.html` (programmatic HTML builder — common in Lua modules)
-  - `mw.ustring` (Unicode-aware string operations)
-- [ ] Implement `frame:expandTemplate()` → calls back into template expander.
-- [ ] Implement `frame:preprocess()` → calls back into preprocessor.
-- [ ] Implement `frame:callParserFunction()`.
-- [ ] Implement `frame:extensionTag()`.
-- [ ] Implement `frame:newChild()` / parent frame management.
-- [ ] Implement `mw.log` (logs to a callback).
-- [ ] Implement timeout (Lua hook that errors after N instructions).
-- [ ] Implement memory limit check.
+**Status: Partially complete** — core mw table stubs exist but many APIs are missing.
+
+- [x] Integrate `mlua` and create sandbox.
+- [x] Implement `mw` global table:
+  - [x] `mw.site` — siteName, server, scriptPath, languageCode, namespaces
+  - [x] `mw.title` — new(), getCurrentTitle() with basic fields
+  - [x] `mw.uri` — encode, decode, anchorEncode
+  - [x] `mw.text` — encode, decode, trim, split, tag
+  - [x] `mw.language` — formatNum, getCode
+  - [x] `mw.message` — new() with plain() fallback (no actual i18n lookup)
+  - [x] `mw.html` — create() with wikitext(), done(), allDone() (simplified)
+  - [x] `mw.ustring` — len, sub, upper, lower
+- [x] Implement `frame:extensionTag()`.
+- [x] Implement memory limit check.
+- [x] Basic frame with args, getParent, preprocess (passthrough).
+
+**Remaining Scribunto work (post-Phase 4):**
+
+### mw.title object — missing methods/fields
+- [ ] `title:getContent()` — fetch page content via DataSource
+- [ ] `title:exists` — actual existence check
+- [ ] `title:isRedirect` — actual redirect detection
+- [ ] `title:redirectTarget` — resolve redirect target
+- [ ] `title:inNamespace(ns)` — namespace check
+- [ ] `title:subpageTitle(text)` — subpage construction
+- [ ] `title:partialUrl()` — URL-safe title
+- [ ] `title:localUrl()` — full local URL
+- [ ] `title:fullUrl()` — full URL with server
+- [ ] `title:canonicalUrl()` — canonical URL
+- [ ] `title:getSites()` (interwiki support)
+- [ ] `title:baseText`, `title:rootText`, `title:subpageText` — more text fields
+- [ ] `title:talkPageTitle` — talk page title object
+- [ ] `title:subjectPageTitle` — subject page title object
+- [ ] `title:makeTitle(ns, text)` — static constructor
+- [ ] `mw.title.equals(a, b)` — title comparison
+- [ ] `mw.title.compare(a, b)` — title ordering
+
+### mw.site — missing fields/tables
+- [ ] `mw.site.stats` — pages, articles, edits, users, etc.
+- [ ] `mw.site.interwikiMap(prefix)` — interwiki prefix lookup
+- [ ] `mw.site.contentNamespaces` — list of content namespace IDs
+- [ ] `mw.site.subjectNamespaces` / `talkNamespaces`
+- [ ] `mw.site.namespaces[id].talk` — associated talk namespace
+- [ ] `mw.site.namespaces[id].subject` — associated subject namespace
+- [ ] `mw.site.namespaces[id].isContent` / `.isTalk` / `.hasSubpages`
+- [ ] `mw.site.currentVersion` — MediaWiki version string
+- [ ] `mw.site.pagesInNamespace(ns)`
+
+### mw.language — missing methods
+- [ ] `mw.language.new(code)` — create language object
+- [ ] `lang:lc(s)`, `lang:lcfirst(s)`, `lang:uc(s)`, `lang:ucfirst(s)`
+- [ ] `lang:grammar(case, word)` — grammatical case transformation
+- [ ] `lang:formatNum(n, opts)` — more options
+- [ ] `lang:formatDate(format, timestamp)`
+- [ ] `lang:formatDuration(seconds)`
+- [ ] `lang:parseFormattedNumber(s)`
+- [ ] `lang:convertPlural(n, forms)` — plural rules
+- [ ] `lang:convertGrammar(word, case)` — grammar conversion
+- [ ] `lang:gender(username, forms)` — gender-specific text
+- [ ] `lang:getDir()` — text direction
+
+### mw.message — missing methods
+- [ ] `msg:plain()` — actually look up i18n messages
+- [ ] `msg:exists()` — does the message exist
+- [ ] `msg:isBlank()`
+- [ ] `msg:isDisabled()`
+- [ ] `msg:inLanguage(lang)`
+- [ ] `msg:params(...)` — parameter substitution
+- [ ] `msg:rawParams(...)` — raw (unescaped) params
+- [ ] `msg:numParams(...)` — numeric params
+- [ ] `msg:text()` — wikitext formatted message
+- [ ] `msg:parse(opts)` — parsed message
+- [ ] `msg:page()` — message page title
+
+### mw.ustring — missing methods
+- [ ] `mw.ustring.gsub(s, pattern, repl, n)` — global substitution (stub exists)
+- [ ] `mw.ustring.find(s, pattern, init, plain)`
+- [ ] `mw.ustring.match(s, pattern, init)`
+- [ ] `mw.ustring.gmatch(s, pattern)` — iterator
+- [ ] `mw.ustring.format(formatstring, ...)`
+- [ ] `mw.ustring.char(codepoint, ...)`
+- [ ] `mw.ustring.codepoint(s, i, j)`
+- [ ] `mw.ustring.toNFC(s)`, `toNFD(s)`, `toNFKC(s)`, `toNFKD(s)`
+- [ ] `mw.ustring.isutf8(s)`
+
+### mw.html — missing methods
+- [ ] `builder:tag(name)` — nested element
+- [ ] `builder:attr(name, value)` — set attribute
+- [ ] `builder:addClass(class)` — add CSS class
+- [ ] `builder:css(prop, val)` — inline CSS
+- [ ] `builder:cssText(css)` — raw CSS text
+- [ ] `builder:done()` — return to parent
+- [ ] `builder:allDone()` — return to root
+- [ ] `builder:node(builder)` — insert child node
+- [ ] `builder:wikitext(text)` — set wikitext content (basic stub exists)
+- [ ] Builder return value chaining (all methods return `self`)
+
+### mw.text — missing methods
+- [ ] `mw.text.jsonEncode(val, flags)`
+- [ ] `mw.text.jsonDecode(s, flags)`
+- [ ] `mw.text.killMarkers(s)` — strip strip markers
+- [ ] `mw.text.listToText(list, separator, conjunction)`
+- [ ] `mw.text.nowiki(s)` — escape for nowiki
+- [ ] `mw.text.unstrip(s)` — replace strip markers with original
+- [ ] `mw.text.unstripNoWiki(s)`
+
+### Frame object — missing methods
+- [ ] `frame:expandTemplate{title = "...", args = {...}}` — **critical for template use**
+- [ ] `frame:callParserFunction{name = "...", args = {...}}` — **critical**
+- [ ] `frame:preprocess(text)` — actually preprocess wikitext (currently passthrough)
+- [ ] `frame:newChild{title = "...", args = {...}}` — child frame for recursive expansion
+- [ ] `frame:getParent()` — return parent frame (nil for top-level)
+- [ ] `frame:getTitle()` — title of the page being parsed
+- [ ] `frame:argumentPairs()` — iterator over args
+
+### Other missing Scribunto features
+- [ ] **`#invoke` parser function** — entry point from wikitext to Lua
+- [ ] **`mw.log(...)` / `mw.dumpObject(obj)`** — debugging output
+- [ ] **Instruction timeout** via Lua hooks — prevent infinite loops
+- [ ] **`mw.loadData(page)`** — efficient data table loading from Module: namespace
+- [ ] **`mw.addWarning(text)` / `mw.getCurrentFrame()`** — frame context access
+- [ ] **`mw.clone(obj)`** — deep copy
+- [ ] **`mw.allToString(...)`** — debug string representation
+- [ ] **`mw.getLanguage(code)`** — language object factory
+- [ ] **`mw.getCurrentTitle()`** — alias for mw.title.getCurrentTitle()
+- [ ] **`package.loaders` compatibility** — module require() system
+- [ ] **Strip markers** (`\127'"`UNIQ"...`) — placeholder handling for extension tags
+
+**Priority for Phase 13 (Polish):**
+1. `frame:expandTemplate()` and `frame:callParserFunction()` — needed for real template use
+2. `#invoke` parser function — needed to call Lua from wikitext
+3. `mw.language:grammar()` — needed for i18n modules
+4. `mw.ustring.gsub/gmatch` — needed for string-heavy modules
+5. `mw.title:getContent()` — needed for data access
+6. Instruction timeout — needed for safety in production
 
 ### Phase 5 — AST / Tree builder (est. 4-6 days)
 
