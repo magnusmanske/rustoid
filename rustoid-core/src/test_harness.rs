@@ -268,6 +268,13 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 section = Section::Html;
                 *i += 1;
             }
+            "!! html" => {
+                // Generic HTML: use for PHP format. If there's no parsoid section,
+                // we can use this, but it won't match Parsoid output.
+                // Set as HtmlPhp for now.
+                section = Section::HtmlPhp;
+                *i += 1;
+            }
             "!! html/php" => {
                 section = Section::HtmlPhp;
                 *i += 1;
