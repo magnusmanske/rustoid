@@ -20,7 +20,6 @@ pub fn run_stage3_html(ast: &Node, options: &ParserOptions) -> Result<String> {
 
 /// Apply post-processing to the AST (fostering fixups, annotation cleanup, etc.).
 fn post_process(ast: &Node) -> Result<Node> {
-    // Placeholder: return a clone for now.
-    // Phase 6 will implement full DOM post-processing.
+    // Currently a pass-through; Phase 6 will implement full DOM post-processing.
     Ok(ast.clone())
 }

@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::wikitext::tokens::WikitextToken;
 
 /// Run Stage 2: build the AST from the token stream.
-pub fn run_stage2(tokens: Vec<WikitextToken>, wrap_sections: bool) -> Result<Node> {
-    let builder = TreeBuilder::new(wrap_sections);
-    builder.build(tokens)
+pub fn run_stage2(tokens: Vec<WikitextToken>) -> Result<Node> {
+    let mut builder = TreeBuilder::new();
+    builder.build(&tokens)
 }

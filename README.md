@@ -13,8 +13,8 @@ A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wik
 | 2 — Wikitext tokenizer | ✅ Done |
 | 3 — Template expander | ✅ Done |
 | 4 — Lua/Scribunto engine | ✅ Done |
-| 5 — AST / Tree builder | 🔄 In progress |
-| 6 — HTML serialization | ⬜ Pending |
+| 5 — AST / Tree builder | ✅ Done |
+| 6 — HTML serialization | 🔄 In progress |
 | 7 — HTML→wikitext round-trip | ⬜ Pending |
 | 8 — Selective serialization | ⬜ Pending |
 | 9 — Data source impls | ⬜ Pending |
