@@ -217,8 +217,21 @@ impl TreeBuilder {
                     i += 1;
                 }
                 WikitextToken::EOF => {
-                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
-                    // Close any remaining open blocks
+                    // Auto-close any remaining open format elements, innermost first.
+                    while !fmt_stack.is_empty() {
+                        let start_idx = self.fmt_starts.pop().unwrap_or(0);
+                        let start_idx = start_idx.min(inline_buf.len());
+                        let kind = fmt_stack.pop().unwrap();
+                        let tail: Vec<Node> = inline_buf.drain(start_idx..).collect();
+                        if !tail.is_empty() {
+                            let mut wrapper = Node::element(kind);
+                            for node in tail {
+                                wrapper.push_child(node);
+                            }
+                            inline_buf.push(wrapper);
+                        }
+                    }
+                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &[]);
                     while let Some(block) = self.open_blocks.pop() {
                         doc.push_child(block);
                     }
