@@ -547,6 +547,8 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     // Strip data-parsoid/data-mw from both sides for comparison
     // (PHP-format tests don't have these; Parsoid tests do)
     // Strip data-parsoid/data-mw and comments from both sides for comparison
+    let actual_body = normalize_paragraphs(&actual_body);
+    let expected_body = normalize_paragraphs(&expected_body);
     let actual_body = strip_parsoid_attrs(&actual_body);
     let actual_body = strip_transclusion_spans(&actual_body);
     let expected_body = strip_transclusion_spans(&expected_body);
@@ -811,6 +813,16 @@ fn strip_transclusion_spans(html: &str) -> String {
             let _ = next;
         }
         break;
+    }
+    s
+}
+
+/// Strip trailing newlines inside <p> tags (PHP format difference).
+fn normalize_paragraphs(html: &str) -> String {
+    let mut s = html.to_string();
+    // Remove \n before </p>
+    while let Some(pos) = s.find("\n</p>") {
+        s.replace_range(pos..pos + 1, "");
     }
     s
 }
