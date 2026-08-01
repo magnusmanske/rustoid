@@ -77,7 +77,7 @@ impl HtmlSerializer {
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
-                        buf.push_str(&format!("</{h}>\n"));
+                        buf.push_str(&format!("</{h}>"));
                     }
                     ElementKind::Bold => {
                         buf.push_str("<b>");
@@ -94,14 +94,14 @@ impl HtmlSerializer {
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children_esc(node, buf, depth, false)?;
-                        buf.push_str("</pre>\n");
+                        buf.push_str("</pre>");
                     }
                     ElementKind::Table => {
                         buf.push_str(&format!("{indent}<table"));
                         self.serialize_attrs(node, buf);
-                        buf.push_str(">\n");
+                        buf.push_str(">");
                         self.serialize_children(node, buf, depth + 1)?;
-                        buf.push_str(&format!("{indent}</table>\n"));
+                        buf.push_str(&format!("{indent}</table>"));
                     }
                     ElementKind::TableRow => {
                         buf.push_str(&format!("{indent}<tr"));
@@ -110,9 +110,9 @@ impl HtmlSerializer {
                         if !node.children.is_empty() {
                             buf.push('\n');
                             self.serialize_children(node, buf, depth + 1)?;
-                            buf.push_str(&format!("{indent}</tr>\n"));
+                            buf.push_str(&format!("{indent}</tr>"));
                         } else {
-                            buf.push_str("</tr>\n");
+                            buf.push_str("</tr>");
                         }
                     }
                     ElementKind::TableCell => {
@@ -120,7 +120,7 @@ impl HtmlSerializer {
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
-                        buf.push_str("</td>\n");
+                        buf.push_str("</td>");
                     }
                     ElementKind::UnorderedList => {
                         buf.push_str(&format!("{indent}<ul"));
@@ -136,7 +136,7 @@ impl HtmlSerializer {
                                 buf.push('\n');
                             }
                         }
-                        buf.push_str("</ul>\n");
+                        buf.push_str("</ul>");
                     }
                     ElementKind::OrderedList => {
                         buf.push_str(&format!("{indent}<ol"));
@@ -151,7 +151,7 @@ impl HtmlSerializer {
                                 buf.push('\n');
                             }
                         }
-                        buf.push_str("</ol>\n");
+                        buf.push_str("</ol>");
                     }
                     ElementKind::ListItem => {
                         buf.push_str("<li");
@@ -165,11 +165,10 @@ impl HtmlSerializer {
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         if !node.children.is_empty() {
-                            buf.push('\n');
                             self.serialize_children(node, buf, depth + 1)?;
-                            buf.push_str(&format!("{indent}</div>\n"));
+                            buf.push_str(&format!("{indent}</div>"));
                         } else {
-                            buf.push_str("</div>\n");
+                            buf.push_str("</div>");
                         }
                     }
                     ElementKind::Span => {
@@ -180,7 +179,7 @@ impl HtmlSerializer {
                         buf.push_str("</span>");
                     }
                     ElementKind::LineBreak => {
-                        buf.push_str("<br/>\n");
+                        buf.push_str("<br/>");
                     }
                     ElementKind::HorizontalRule => {
                         buf.push_str(&format!("{indent}<hr/>\n"));
