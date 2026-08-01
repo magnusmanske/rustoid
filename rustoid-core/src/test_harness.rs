@@ -268,10 +268,9 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 section = Section::Html;
                 *i += 1;
             }
-            "!! html" => {
+            "!! html" | "!! html/*" => {
                 // Generic HTML: use for PHP format. If there's no parsoid section,
                 // we can use this, but it won't match Parsoid output.
-                // Set as HtmlPhp for now.
                 section = Section::HtmlPhp;
                 *i += 1;
             }
@@ -455,7 +454,7 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
     // Only run wt2html if the mode explicitly supports it
     let supports_wt2html = modes.is_empty() || modes.contains(&"wt2html");
 
-    if supports_wt2html && test.html_parsoid.is_some() {
+    if supports_wt2html && (test.html_parsoid.is_some() || test.html_php.is_some()) {
         return run_wt2html_test(test, test_file);
     }
 
@@ -475,18 +474,19 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
 
     let expected_html = match test.html_parsoid.as_ref() {
         Some(h) => h.clone(),
-        None => return TestResult::Skip("no expected HTML".to_string()),
+        None => match test.html_php.as_ref() {
+            Some(h) => h.clone(),
+            None => return TestResult::Skip("no expected HTML".to_string()),
+        },
     };
 
     // Build mock data source with test file articles
     let source = MockDataSource::new();
     for (name, text) in &test_file.articles {
-        // Articles might be templates or pages
         if name.starts_with("Template:") {
             source.add_template(name, text);
         } else {
             source.add_page(name, text);
-            // Also add as template (some tests define templates via articles)
             if !name.contains(':') {
                 source.add_template(&format!("Template:{name}"), text);
             }
@@ -501,12 +501,14 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         .unwrap_or_else(|| "TestPage".to_string());
     source.add_page(&page_title, &test.wikitext);
 
-    // Build mock config
     let _config = MockSiteConfig::new();
 
-    // Run the pipeline: tokenize → preprocess → tree build → serialize
+    // Expand simple templates in wikitext (sync, for test harness use)
+    let expanded = expand_simple_templates(&test.wikitext, &test_file.articles);
+
+    // Tokenize expanded wikitext
     let tokenizer_opts = TokenizerOptions::default();
-    let mut tokenizer = Tokenizer::new(&test.wikitext, tokenizer_opts);
+    let mut tokenizer = Tokenizer::new(&expanded, tokenizer_opts);
     let tokens = match tokenizer.tokenize() {
         Ok(t) => t,
         Err(e) => return TestResult::Error(format!("tokenization error: {e}")),
@@ -553,7 +555,135 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     }
 }
 
-/// Run a selser (selective serialization) test.
+/// Simple synchronous template expansion for test harness.
+/// Replaces {{TemplateName|arg1=val1|arg2=val2}} with the template content.
+fn expand_simple_templates(wikitext: &str, articles: &HashMap<String, String>) -> String {
+    if !wikitext.contains("{{") {
+        return wikitext.to_string();
+    }
+
+    let mut result = String::with_capacity(wikitext.len());
+    let chars: Vec<char> = wikitext.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if i + 1 < chars.len() && chars[i] == '{' && chars[i + 1] == '{'
+            && !(i + 2 < chars.len() && chars[i + 2] == '{')
+        {
+            // Count brace depth to find matching }}
+            let mut depth: usize = 2;
+            let mut j = i + 2;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '{' => depth = depth.saturating_add(1),
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+
+            if depth == 0 {
+                let inner: String = chars[i + 2..j - 1].iter().collect();
+                let parts: Vec<&str> = inner.split('|').collect();
+                let name = parts.first().map(|s| s.trim()).unwrap_or("").to_string();
+
+                // Build the template key
+                let key = if name.contains(':') {
+                    name.clone()
+                } else {
+                    format!("Template:{name}")
+                };
+
+                // Also try without Template: prefix
+                if let Some(template_text) = articles.get(&key).or_else(|| articles.get(&name)) {
+                    // Substitute arguments
+                    let mut substituted = template_text.clone();
+
+                    // Handle positional args with index (1-based)
+                    let mut args_map: HashMap<String, String> = HashMap::new();
+                    for (idx, part) in parts.iter().skip(1).enumerate() {
+                        if let Some(eq_pos) = part.find('=') {
+                            let key = part[..eq_pos].trim().to_string();
+                            let value = part[eq_pos + 1..].to_string();
+                            args_map.insert(key, value);
+                        } else {
+                            let pos = (idx + 1).to_string();
+                            args_map.insert(pos, (*part).to_string());
+                        }
+                    }
+
+                    // Perform {{{1}}}, {{{name}}} substitution
+                    substituted = substitute_template_args(&substituted, &args_map);
+                    result.push_str(&substituted);
+                } else {
+                    // Unknown template — keep as-is
+                    result.push_str(&chars[i..=j].iter().collect::<String>());
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Replace {{{arg}}} in template text with values.
+fn substitute_template_args(text: &str, args: &HashMap<String, String>) -> String {
+    if !text.contains("{{{") {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i] == '{' && chars[i + 1] == '{' && chars[i + 2] == '{' {
+            let mut depth: usize = 3;
+            let mut j = i + 3;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '{' => depth = depth.saturating_add(1),
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner: String = chars[i + 3..j - 2].iter().collect();
+                let arg_ref = crate::expand::tpl_args::parse_arg_reference(&inner);
+                let val = args
+                    .get(&arg_ref.name)
+                    .cloned()
+                    .or(arg_ref.default)
+                    .unwrap_or_else(|| format!("{{{}}}", arg_ref.name));
+                result.push_str(&val);
+                i = j + 1;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Run a selser (selective serialization) test. (selective serialization) test.
 fn run_selser_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
     if test.wikitext.is_empty() {
         return TestResult::Skip("no wikitext input".to_string());
