@@ -1,9 +1,9 @@
 //! Paragraph wrapper — inserts <p> tags into the token stream.
 //!
-//! Mimics the MediaWiki PHP parser's paragraph wrapping behavior.
-//! Operates at the token level (before tree building), as Parsoid does.
-//! Handles newline-induced paragraph breaks, SOL-transparent tokens,
-//! and empty line handling (two newlines → close p, open new p).
+//! Ported from Parsoid's ParagraphWrapper.php / PWrap logic.
+//! Inserts ParagraphOpen/ParagraphClose tokens around inline content.
+//! Block-level tokens and SOL-transparent tokens are passed through
+//! outside paragraph context.
 
 use crate::wikitext::tokens::WikitextToken;
 
@@ -11,97 +11,88 @@ pub struct ParagraphWrapper;
 
 impl ParagraphWrapper {
     /// Process a token stream, inserting paragraph open/close tags.
+    /// Runs after quote transformation (Bold/Italic open/close tokens present).
     pub fn wrap(tokens: Vec<WikitextToken>) -> Vec<WikitextToken> {
         let mut result: Vec<WikitextToken> = Vec::new();
         let mut has_open_p: bool = false;
-        let mut in_block: bool = false;
         let mut pending_newlines: usize = 0;
-        let mut line_tokens: Vec<WikitextToken> = Vec::new();
-        let mut line_has_content: bool = false;
 
         for token in tokens {
             match &token {
-                // Block-level tokens close any open paragraph
+                // Skip these — they're handled in the pipeline stage
+                WikitextToken::ParagraphOpen | WikitextToken::ParagraphClose => {
+                    continue;
+                }
+
+                // Block-level tokens: flush paragraph if open, emit pending newlines, then emit token
                 WikitextToken::HeadingOpen(_)
                 | WikitextToken::Hr
                 | WikitextToken::TableOpen(_)
+                | WikitextToken::TableClose
+                | WikitextToken::TableRow
                 | WikitextToken::ListItem(_, _) => {
-                    // Flush current line
-                    if has_open_p || line_has_content {
-                        Self::close_p_if_open(&mut result, &mut has_open_p);
-                        if !line_tokens.is_empty() {
-                            // Don't wrap in p — block elements are their own blocks
-                            result.append(&mut line_tokens);
-                        }
+                    Self::close_p_if_open(&mut result, &mut has_open_p);
+                    for _ in 0..pending_newlines {
+                        result.push(WikitextToken::Newline);
                     }
+                    pending_newlines = 0;
                     result.push(token);
-                    in_block = true;
-                    continue;
                 }
 
-                // Newline handling
+                // Newline — accumulate pending newlines
                 WikitextToken::Newline => {
                     pending_newlines += 1;
-                    continue;
                 }
 
-                // Paragraph break (empty line): close current p, emit newline, open new p
+                // Paragraph break — close current p, emit separator newline
                 WikitextToken::ParagraphBreak => {
-                    pending_newlines += 2;
-                    continue;
+                    Self::close_p_if_open(&mut result, &mut has_open_p);
+                    pending_newlines = 0;
+                    result.push(WikitextToken::Newline);
                 }
 
-                // Comments and whitespace-only text are SOL-transparent
+                // SOL-transparent: comments go through without changing paragraph state
                 WikitextToken::Comment(_) => {
-                    if pending_newlines == 0 {
-                        result.push(token);
-                    } else {
-                        line_tokens.push(token);
+                    // Emit any pending newlines before the comment
+                    if pending_newlines > 0 && has_open_p {
+                        Self::close_p_if_open(&mut result, &mut has_open_p);
                     }
-                    continue;
+                    pending_newlines = 0;
+                    result.push(token);
                 }
 
-                WikitextToken::Text(s) if s.trim().is_empty() => {
-                    // Whitespace-only text
-                    if pending_newlines == 0 {
-                        result.push(token);
-                    }
-                    continue;
-                }
-
-                // End of file
+                // EOF — close any open paragraph
                 WikitextToken::EOF => {
                     Self::close_p_if_open(&mut result, &mut has_open_p);
                     result.push(WikitextToken::EOF);
-                    break;
+                    return result;
                 }
 
+                // All other tokens (Text, Bold/Italic open/close, Wikilink, etc.)
                 _ => {
-                    // Process any pending newlines first
-                    if pending_newlines > 0 {
-                        if pending_newlines >= 2 || in_block {
-                            // Two+ newlines or after block: close paragraph
-                            Self::close_p_if_open(&mut result, &mut has_open_p);
-                            if pending_newlines >= 2 {
-                                result.push(WikitextToken::Newline);
-                            }
-                            in_block = false;
-                        }
+                    // Flush pending newlines: 2+ newlines close and reopen paragraph
+                    if pending_newlines >= 2 {
+                        Self::close_p_if_open(&mut result, &mut has_open_p);
+                        result.push(WikitextToken::Newline);
+                        pending_newlines = 0;
+                    } else if pending_newlines == 1 {
+                        // Single newline — emit as plain newline within paragraph
+                        result.push(WikitextToken::Newline);
                         pending_newlines = 0;
                     }
 
                     // Open paragraph if needed
-                    if !has_open_p && !in_block {
+                    if !has_open_p {
                         result.push(WikitextToken::ParagraphOpen);
                         has_open_p = true;
                     }
 
-                    line_has_content = true;
                     result.push(token);
                 }
             }
         }
 
+        // Should not reach here (EOF handles cleanup)
         result
     }
 
@@ -118,17 +109,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_simple_wrapping() {
+    fn test_simple_paragraph() {
         let tokens = vec![
             WikitextToken::Text("hello".to_string()),
-            WikitextToken::Newline,
-            WikitextToken::Text("world".to_string()),
+            WikitextToken::Text(" world".to_string()),
             WikitextToken::EOF,
         ];
         let result = ParagraphWrapper::wrap(tokens);
-        // Should produce: <p>, hello, </p>, world, EOF
-        // Actually, newline doesn't close p by itself in our current impl
-        // Let's check the behavior
-        eprintln!("result: {:?}", result);
+        // Should be: ParagraphOpen, Text("hello"), Text(" world"), ParagraphClose, EOF
+        assert!(matches!(result[0], WikitextToken::ParagraphOpen));
+        assert!(matches!(result[1], WikitextToken::Text(_)));
+        assert!(matches!(result[2], WikitextToken::Text(_)));
+        assert!(matches!(result[3], WikitextToken::ParagraphClose));
+        assert!(matches!(result[4], WikitextToken::EOF));
+    }
+
+    #[test]
+    fn test_two_paragraphs() {
+        let tokens = vec![
+            WikitextToken::Text("first".to_string()),
+            WikitextToken::Newline,
+            WikitextToken::Newline,
+            WikitextToken::Text("second".to_string()),
+            WikitextToken::EOF,
+        ];
+        let result = ParagraphWrapper::wrap(tokens);
+        // Should be: POpen, "first", PClose, Newline, POpen, "second", PClose, EOF
+        let mut found_first = false;
+        let mut found_second = false;
+        let mut para_count = 0;
+        for t in &result {
+            match t {
+                WikitextToken::ParagraphOpen => para_count += 1,
+                WikitextToken::Text(s) if s == "first" => found_first = true,
+                WikitextToken::Text(s) if s == "second" => found_second = true,
+                _ => {}
+            }
+        }
+        assert!(found_first, "got {:?}", result);
+        assert!(found_second, "got {:?}", result);
+        assert_eq!(para_count, 2, "expected 2 paragraphs, got {:?}", result);
+    }
+
+    #[test]
+    fn test_list_passes_through() {
+        let tokens = vec![
+            WikitextToken::Text("text".to_string()),
+            WikitextToken::Newline,
+            WikitextToken::ListItem('*', 1),
+            WikitextToken::Text("item".to_string()),
+            WikitextToken::EOF,
+        ];
+        let result = ParagraphWrapper::wrap(tokens);
+        // Should not wrap list item in paragraph
+        let has_list = result
+            .iter()
+            .any(|t| matches!(t, WikitextToken::ListItem(_, _)));
+        assert!(has_list, "got {:?}", result);
     }
 }

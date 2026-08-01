@@ -6,6 +6,7 @@
 use crate::dom::builder::TreeBuilder;
 use crate::dom::node::Node;
 use crate::error::Result;
+use crate::pipeline::paragraph_wrapper::ParagraphWrapper;
 use crate::pipeline::quote_transformer::QuoteTransformer;
 use crate::wikitext::tokens::WikitextToken;
 
@@ -13,6 +14,8 @@ use crate::wikitext::tokens::WikitextToken;
 pub fn run_stage2(tokens: Vec<WikitextToken>) -> Result<Node> {
     // Apply quote transformer (converts Quote tokens to Bold/Italic open/close)
     let tokens = QuoteTransformer::transform(tokens)?;
+    // Apply paragraph wrapper (inserts ParagraphOpen/ParagraphClose tokens)
+    let tokens = ParagraphWrapper::wrap(tokens);
     let mut builder = TreeBuilder::new();
     builder.build(&tokens)
 }
