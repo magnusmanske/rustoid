@@ -46,7 +46,13 @@ impl HtmlSerializer {
         self.serialize_node_esc(node, buf, depth, true)
     }
 
-    fn serialize_node_esc(&self, node: &Node, buf: &mut String, depth: usize, escape: bool) -> Result<()> {
+    fn serialize_node_esc(
+        &self,
+        node: &Node,
+        buf: &mut String,
+        depth: usize,
+        escape: bool,
+    ) -> Result<()> {
         let indent = "  ".repeat(depth);
 
         match &node.kind {
@@ -238,7 +244,13 @@ impl HtmlSerializer {
         self.serialize_children_esc(node, buf, depth, true)
     }
 
-    fn serialize_children_esc(&self, node: &Node, buf: &mut String, depth: usize, escape: bool) -> Result<()> {
+    fn serialize_children_esc(
+        &self,
+        node: &Node,
+        buf: &mut String,
+        depth: usize,
+        escape: bool,
+    ) -> Result<()> {
         for child in &node.children {
             self.serialize_node_esc(child, buf, depth, escape)?;
         }

@@ -282,8 +282,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 section = Section::HtmlLang;
                 *i += 1;
             }
-            "!! html/parsoid+integrated"
-            | "!! html/parsoid+standalone" => {
+            "!! html/parsoid+integrated" | "!! html/parsoid+standalone" => {
                 // Treat as Parsoid HTML
                 section = Section::Html;
                 *i += 1;
@@ -622,7 +621,9 @@ fn expand_simple_templates(wikitext: &str, articles: &HashMap<String, String>) -
                     result.push_str("<span typeof=\"mw:Transclusion\">");
                     result.push_str(&expanded);
                     result.push_str("</span>");
-                } else if let Some(template_text) = articles.get(&key).or_else(|| articles.get(&name)) {
+                } else if let Some(template_text) =
+                    articles.get(&key).or_else(|| articles.get(&name))
+                {
                     // Template expansion with argument substitution
                     let mut args_map: HashMap<String, String> = HashMap::new();
                     for (idx, part) in parts.iter().skip(1).enumerate() {
@@ -665,8 +666,14 @@ fn evaluate_parser_fn(name: &str, parts: &[&str]) -> String {
         (&name[1..], None)
     };
     let mut args: Vec<String> = Vec::new();
-    if let Some(a) = colon_arg { if !a.is_empty() { args.push(a.to_string()); } }
-    for p in parts.iter().skip(1) { args.push(p.trim().to_string()); }
+    if let Some(a) = colon_arg {
+        if !a.is_empty() {
+            args.push(a.to_string());
+        }
+    }
+    for p in parts.iter().skip(1) {
+        args.push(p.trim().to_string());
+    }
     match fn_name {
         "if" => {
             if !args.first().map(|s| s.trim()).unwrap_or("").is_empty() {
@@ -678,14 +685,19 @@ fn evaluate_parser_fn(name: &str, parts: &[&str]) -> String {
         "ifeq" => {
             let a = args.first().map(|s| s.trim()).unwrap_or("");
             let b = args.get(1).map(|s| s.trim()).unwrap_or("");
-            if a == b { args.get(2).cloned().unwrap_or_default() }
-            else { args.get(3).cloned().unwrap_or_default() }
+            if a == b {
+                args.get(2).cloned().unwrap_or_default()
+            } else {
+                args.get(3).cloned().unwrap_or_default()
+            }
         }
         "switch" => {
             let val = args.first().map(|s| s.trim()).unwrap_or("");
             let mut idx = 1;
             while idx + 1 < args.len() {
-                if args[idx].trim() == val { return args[idx + 1].clone(); }
+                if args[idx].trim() == val {
+                    return args[idx + 1].clone();
+                }
                 idx += 2;
             }
             if args.len() % 2 == 0 && args.len() > 1 {
@@ -699,7 +711,7 @@ fn evaluate_parser_fn(name: &str, parts: &[&str]) -> String {
             let content = args.get(1).cloned().unwrap_or_default();
             format!("<{tag}>{content}</{tag}>")
         }
-        _ => format!("{{{{{name}|...}}}}")
+        _ => format!("{{{{{name}|...}}}}"),
     }
 }
 
