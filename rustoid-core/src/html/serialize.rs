@@ -43,6 +43,10 @@ impl HtmlSerializer {
     }
 
     fn serialize_node(&self, node: &Node, buf: &mut String, depth: usize) -> Result<()> {
+        self.serialize_node_esc(node, buf, depth, true)
+    }
+
+    fn serialize_node_esc(&self, node: &Node, buf: &mut String, depth: usize, escape: bool) -> Result<()> {
         let indent = "  ".repeat(depth);
 
         match &node.kind {
@@ -83,7 +87,7 @@ impl HtmlSerializer {
                         buf.push_str(&format!("{indent}<pre"));
                         self.serialize_attrs(node, buf);
                         buf.push('>');
-                        self.serialize_children(node, buf, depth)?;
+                        self.serialize_children_esc(node, buf, depth, false)?;
                         buf.push_str("</pre>\n");
                     }
                     ElementKind::Table => {
@@ -211,7 +215,11 @@ impl HtmlSerializer {
                 }
             }
             NodeKind::Text(text) => {
-                buf.push_str(&html_escape(text));
+                if escape {
+                    buf.push_str(&html_escape(text));
+                } else {
+                    buf.push_str(text);
+                }
             }
             NodeKind::Comment(content) => {
                 // Escape per Parsoid: & -> &#x26;, then - -> &#x2D;, then > -> &#x3E;
@@ -227,8 +235,12 @@ impl HtmlSerializer {
     }
 
     fn serialize_children(&self, node: &Node, buf: &mut String, depth: usize) -> Result<()> {
+        self.serialize_children_esc(node, buf, depth, true)
+    }
+
+    fn serialize_children_esc(&self, node: &Node, buf: &mut String, depth: usize, escape: bool) -> Result<()> {
         for child in &node.children {
-            self.serialize_node(child, buf, depth)?;
+            self.serialize_node_esc(child, buf, depth, escape)?;
         }
         Ok(())
     }
