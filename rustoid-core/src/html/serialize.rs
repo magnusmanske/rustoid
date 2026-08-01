@@ -69,7 +69,7 @@ impl HtmlSerializer {
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
-                        buf.push_str("</p>\n");
+                        buf.push_str("</p>");
                     }
                     ElementKind::Heading(level) => {
                         let h = format!("h{level}");
