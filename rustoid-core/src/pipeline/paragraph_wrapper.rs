@@ -51,11 +51,14 @@ impl ParagraphWrapper {
                     result.push(WikitextToken::Newline);
                 }
 
-                // SOL-transparent: comments go through without changing paragraph state
+                // SOL-transparent: comments go through without changing paragraph state.
+                // A comment at line start should NOT close the current paragraph.
                 WikitextToken::Comment(_) => {
-                    // Emit any pending newlines before the comment
-                    if pending_newlines > 0 && has_open_p {
-                        Self::close_p_if_open(&mut result, &mut has_open_p);
+                    // Emit accumulated newlines as Newline tokens (they belong in the current paragraph)
+                    for _ in 0..pending_newlines {
+                        if has_open_p {
+                            result.push(WikitextToken::Newline);
+                        }
                     }
                     pending_newlines = 0;
                     result.push(token);
