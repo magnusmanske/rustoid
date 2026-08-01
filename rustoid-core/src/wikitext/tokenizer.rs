@@ -474,6 +474,11 @@ impl<'a> Tokenizer<'a> {
             self.advance(5);
             return Some(WikitextToken::Quote("'''''".to_string()));
         }
+        // 4 quotes (''''): return None so first ' becomes text, then ''' matches
+        // This ensures the apostrophe goes BEFORE the bold/italic tag.
+        if remaining.starts_with("''''") {
+            return None;
+        }
         if remaining.starts_with("'''") {
             self.advance(3);
             return Some(WikitextToken::Quote("'''".to_string()));
