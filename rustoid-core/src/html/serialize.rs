@@ -214,20 +214,11 @@ impl HtmlSerializer {
                 buf.push_str(&html_escape(text));
             }
             NodeKind::Comment(content) => {
-                // Escape comment content per HTML/XML rules:
-                // 1. --  → &#x2D;&#x2D; (double hyphens close the comment)
-                // 2. >   → &#x3E;   (prevents premature close)
-                // 3. &   → &#x26;   (ampersand entity)
-                // 4. trailing - before --> → &#x2D; (prevents forming -->)
-                let mut escaped = content.replace("&", "&#x26;");
-                escaped = escaped.replace('>', "&#x3E;");
-                escaped = escaped.replace("--", "&#x2D;&#x2D;");
-                // Fix trailing dash: if the comment ends with -, escape it
-                // to prevent it from merging with the closing -->
-                if escaped.ends_with('-') {
-                    escaped.pop();
-                    escaped.push_str("&#x2D;");
-                }
+                // Escape per Parsoid: & -> &#x26;, then - -> &#x2D;, then > -> &#x3E;
+                let escaped = content
+                    .replace("&", "&#x26;")
+                    .replace("-", "&#x2D;")
+                    .replace(">", "&#x3E;");
                 buf.push_str(&format!("<!--{escaped}-->"));
             }
         }
