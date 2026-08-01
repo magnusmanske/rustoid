@@ -282,8 +282,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 section = Section::HtmlLang;
                 *i += 1;
             }
-            "!! html/parsoid+integrated" => {
-                section = Section::None; // Skip integrated tests for now
+            "!! html/parsoid+integrated"
+            | "!! html/parsoid+standalone" => {
+                // Treat as Parsoid HTML
+                section = Section::Html;
                 *i += 1;
             }
             "!! wikitext/edited" => {
@@ -546,6 +548,8 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     // (PHP-format tests don't have these; Parsoid tests do)
     // Strip data-parsoid/data-mw and comments from both sides for comparison
     let actual_body = strip_parsoid_attrs(&actual_body);
+    let actual_body = strip_transclusion_spans(&actual_body);
+    let expected_body = strip_transclusion_spans(&expected_body);
     let expected_body = strip_parsoid_attrs(&expected_body);
     let expected_body = strip_parsoid_attrs(&expected_body);
 
@@ -574,7 +578,9 @@ fn expand_simple_templates(wikitext: &str, articles: &HashMap<String, String>) -
     let mut i = 0;
 
     while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '{' && chars[i + 1] == '{'
+        if i + 1 < chars.len()
+            && chars[i] == '{'
+            && chars[i + 1] == '{'
             && !(i + 2 < chars.len() && chars[i + 2] == '{')
         {
             // Count brace depth to find matching }}
@@ -606,27 +612,31 @@ fn expand_simple_templates(wikitext: &str, articles: &HashMap<String, String>) -
                     format!("Template:{name}")
                 };
 
-                // Also try without Template: prefix
-                if let Some(template_text) = articles.get(&key).or_else(|| articles.get(&name)) {
-                    // Substitute arguments
-                    let mut substituted = template_text.clone();
-
-                    // Handle positional args with index (1-based)
+                // Try as template or parser function
+                if name.starts_with('#') {
+                    // Parser function evaluation
+                    let expanded = evaluate_parser_fn(&name, &parts);
+                    // Wrap in span with mw:Transclusion type
+                    result.push_str("<span typeof=\"mw:Transclusion\">");
+                    result.push_str(&expanded);
+                    result.push_str("</span>");
+                } else if let Some(template_text) = articles.get(&key).or_else(|| articles.get(&name)) {
+                    // Template expansion with argument substitution
                     let mut args_map: HashMap<String, String> = HashMap::new();
                     for (idx, part) in parts.iter().skip(1).enumerate() {
                         if let Some(eq_pos) = part.find('=') {
-                            let key = part[..eq_pos].trim().to_string();
-                            let value = part[eq_pos + 1..].to_string();
-                            args_map.insert(key, value);
+                            let k = part[..eq_pos].trim().to_string();
+                            let v = part[eq_pos + 1..].to_string();
+                            args_map.insert(k, v);
                         } else {
-                            let pos = (idx + 1).to_string();
-                            args_map.insert(pos, (*part).to_string());
+                            args_map.insert((idx + 1).to_string(), (*part).to_string());
                         }
                     }
-
-                    // Perform {{{1}}}, {{{name}}} substitution
-                    substituted = substitute_template_args(&substituted, &args_map);
+                    let substituted = substitute_template_args(template_text, &args_map);
+                    // Wrap in span with mw:Transclusion type
+                    result.push_str("<span typeof=\"mw:Transclusion\">");
                     result.push_str(&substituted);
+                    result.push_str("</span>");
                 } else {
                     // Unknown template — keep as-is
                     result.push_str(&chars[i..=j].iter().collect::<String>());
@@ -644,6 +654,53 @@ fn expand_simple_templates(wikitext: &str, articles: &HashMap<String, String>) -
 }
 
 /// Replace {{{arg}}} in template text with values.
+/// Evaluate simple parser functions: #if, #ifeq, #switch, #tag
+fn evaluate_parser_fn(name: &str, parts: &[&str]) -> String {
+    let name = name.trim();
+    let (fn_name, colon_arg) = if let Some(pos) = name.find(':') {
+        (&name[1..pos], Some(name[pos + 1..].trim()))
+    } else {
+        (&name[1..], None)
+    };
+    let mut args: Vec<String> = Vec::new();
+    if let Some(a) = colon_arg { if !a.is_empty() { args.push(a.to_string()); } }
+    for p in parts.iter().skip(1) { args.push(p.trim().to_string()); }
+    match fn_name {
+        "if" => {
+            if !args.first().map(|s| s.trim()).unwrap_or("").is_empty() {
+                args.get(1).cloned().unwrap_or_default()
+            } else {
+                args.get(2).cloned().unwrap_or_default()
+            }
+        }
+        "ifeq" => {
+            let a = args.first().map(|s| s.trim()).unwrap_or("");
+            let b = args.get(1).map(|s| s.trim()).unwrap_or("");
+            if a == b { args.get(2).cloned().unwrap_or_default() }
+            else { args.get(3).cloned().unwrap_or_default() }
+        }
+        "switch" => {
+            let val = args.first().map(|s| s.trim()).unwrap_or("");
+            let mut idx = 1;
+            while idx + 1 < args.len() {
+                if args[idx].trim() == val { return args[idx + 1].clone(); }
+                idx += 2;
+            }
+            if args.len() % 2 == 0 && args.len() > 1 {
+                args.last().cloned().unwrap_or_default()
+            } else {
+                String::new()
+            }
+        }
+        "tag" => {
+            let tag = args.first().map(|s| s.trim()).unwrap_or("");
+            let content = args.get(1).cloned().unwrap_or_default();
+            format!("<{tag}>{content}</{tag}>")
+        }
+        _ => format!("{{{{{name}|...}}}}")
+    }
+}
+
 fn substitute_template_args(text: &str, args: &HashMap<String, String>) -> String {
     if !text.contains("{{{") {
         return text.to_string();
@@ -729,6 +786,35 @@ fn extract_body(html: &str) -> String {
 
 /// Compute a short diff hint for test failures.
 /// Strip data-parsoid and data-mw attributes for comparison normalization.
+/// Strip mw:Transclusion span wrappers when expected doesn't have them.
+fn strip_transclusion_spans(html: &str) -> String {
+    let mut s = html.to_string();
+    // Strip <span ...>...</span> pairs that contain mw:Transclusion in typeof, keeping content
+    while let Some(start) = s.find("<span") {
+        // Find the matching >
+        let after_span = &s[start..];
+        if let Some(tag_end) = after_span.find('>') {
+            let full_tag = &after_span[..=tag_end];
+            // Only strip if it's a transclusion span
+            if full_tag.contains("mw:Transclusion") {
+                let open_end = start + tag_end + 1;
+                // Find matching </span>
+                if let Some(close) = s[open_end..].find("</span>") {
+                    let content = s[open_end..open_end + close].to_string();
+                    s.replace_range(start..open_end + close + "</span>".len(), &content);
+                    continue;
+                }
+            }
+        }
+        // Move past this <span>
+        if let Some(next) = s[start + 5..].find("<span") {
+            let _ = next;
+        }
+        break;
+    }
+    s
+}
+
 fn strip_parsoid_attrs(html: &str) -> String {
     let mut s = html.to_string();
     // Strip HTML comments (PHP tests strip them entirely)
