@@ -542,6 +542,11 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         expected_html.clone()
     };
 
+    // Strip data-parsoid/data-mw from both sides for comparison
+    // (PHP-format tests don't have these; Parsoid tests do)
+    let actual_body = strip_parsoid_attrs(&actual_body);
+    let expected_body = strip_parsoid_attrs(&expected_body);
+
     if actual_body.trim() == expected_body.trim() {
         TestResult::Pass
     } else {
@@ -721,6 +726,27 @@ fn extract_body(html: &str) -> String {
 }
 
 /// Compute a short diff hint for test failures.
+/// Strip data-parsoid and data-mw attributes for comparison normalization.
+fn strip_parsoid_attrs(html: &str) -> String {
+    let mut s = html.to_string();
+    // Simple manual stripping: remove data-parsoid='...' and data-mw='...'
+    while let Some(start) = s.find(" data-parsoid='") {
+        if let Some(end) = s[start + 15..].find("'") {
+            s.replace_range(start..start + 15 + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    while let Some(start) = s.find(" data-mw='") {
+        if let Some(end) = s[start + 11..].find("'") {
+            s.replace_range(start..start + 11 + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    s
+}
+
 fn compute_diff_hint(expected: &str, actual: &str) -> String {
     // Simple: find the first character position where they differ
     let expected_chars: Vec<char> = expected.chars().collect();
