@@ -290,7 +290,7 @@ impl TreeBuilder {
         // If we're inside a block HTML element that doesn't require p-wrapping,
         // push content directly.
         let inside_no_wrap = self.open_blocks.last().map_or(false, |b| {
-            matches!(&b.kind, NodeKind::Element(ElementKind::Preformatted))
+            matches!(&b.kind, NodeKind::Element(ElementKind::Preformatted | ElementKind::Div))
         });
 
         if inside_no_wrap {
