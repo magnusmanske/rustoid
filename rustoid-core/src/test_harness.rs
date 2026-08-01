@@ -544,7 +544,9 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
 
     // Strip data-parsoid/data-mw from both sides for comparison
     // (PHP-format tests don't have these; Parsoid tests do)
+    // Strip data-parsoid/data-mw and comments from both sides for comparison
     let actual_body = strip_parsoid_attrs(&actual_body);
+    let expected_body = strip_parsoid_attrs(&expected_body);
     let expected_body = strip_parsoid_attrs(&expected_body);
 
     if actual_body.trim() == expected_body.trim() {
@@ -729,7 +731,15 @@ fn extract_body(html: &str) -> String {
 /// Strip data-parsoid and data-mw attributes for comparison normalization.
 fn strip_parsoid_attrs(html: &str) -> String {
     let mut s = html.to_string();
-    // Simple manual stripping: remove data-parsoid='...' and data-mw='...'
+    // Strip HTML comments (PHP tests strip them entirely)
+    while let Some(start) = s.find("<!--") {
+        if let Some(end) = s[start..].find("-->") {
+            s.replace_range(start..start + end + 3, "");
+        } else {
+            break;
+        }
+    }
+    // Strip data-parsoid='...' and data-mw='...'
     while let Some(start) = s.find(" data-parsoid='") {
         if let Some(end) = s[start + 15..].find("'") {
             s.replace_range(start..start + 15 + end + 1, "");
