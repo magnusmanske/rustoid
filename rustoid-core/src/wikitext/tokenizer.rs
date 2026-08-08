@@ -62,34 +62,35 @@ impl<'a> Tokenizer<'a> {
         while self.pos < self.input.len() {
             let remaining = &self.input[self.pos..];
 
-            if self.at_line_start {
-                // Pre mode: everything is literal text until </pre>
-                if self.in_pre {
-                    if let Some(end) = remaining.find("</pre>") {
-                        // Emit text up to the closing tag
-                        if end > 0 {
-                            let text = &remaining[..end];
-                            let p = self.pos;
-                            self.pos += end;
-                            self.emit_at(WikitextToken::Text(text.to_string()), p);
-                        }
-                        // Emit the closing tag
+            // Pre mode: everything is literal text until </pre>
+            // This is checked FIRST, before at_line_start, since pre can start mid-line
+            if self.in_pre {
+                if let Some(end) = remaining.find("</pre>") {
+                    // Emit text up to the closing tag
+                    if end > 0 {
+                        let text = &remaining[..end];
                         let p = self.pos;
-                        self.pos += 6; // "</pre>"
-                        self.emit_at(WikitextToken::HtmlTagClose("pre".to_string()), p);
-                        self.in_pre = false;
-                        continue;
-                    } else {
-                        // No closing tag — emit rest as text and end
-                        if !remaining.is_empty() {
-                            let p = self.pos;
-                            self.pos = self.input.len();
-                            self.emit_at(WikitextToken::Text(remaining.to_string()), p);
-                        }
-                        continue;
+                        self.pos += end;
+                        self.emit_at(WikitextToken::Text(text.to_string()), p);
                     }
+                    // Emit the closing tag
+                    let p = self.pos;
+                    self.pos += 6; // "</pre>"
+                    self.emit_at(WikitextToken::HtmlTagClose("pre".to_string()), p);
+                    self.in_pre = false;
+                    continue;
+                } else {
+                    // No closing tag — emit rest as text and end
+                    if !remaining.is_empty() {
+                        let p = self.pos;
+                        self.pos = self.input.len();
+                        self.emit_at(WikitextToken::Text(remaining.to_string()), p);
+                    }
+                    continue;
                 }
+            }
 
+            if self.at_line_start {
                 // Block-level constructs
                 let p = self.pos;
                 if let Some(token) = self.try_heading(remaining) {
@@ -169,6 +170,10 @@ impl<'a> Tokenizer<'a> {
             }
             let p = self.pos;
             if let Some(token) = self.try_html_tag(remaining) {
+                // Enter pre mode when we see a <pre> tag (not self-closing)
+                if matches!(&token, WikitextToken::HtmlTagOpen(name, _) if name == "pre") {
+                    self.in_pre = true;
+                }
                 self.emit_at(token, p);
                 continue;
             }
@@ -245,6 +250,10 @@ impl<'a> Tokenizer<'a> {
     // ---- Token recognizers ----
 
     fn try_nowiki(&mut self, remaining: &str) -> Option<WikitextToken> {
+        // In pre-mode, everything is literal; <nowiki> is just text
+        if self.in_pre {
+            return None;
+        }
         if !remaining.starts_with("<nowiki") {
             return None;
         }
@@ -470,12 +479,16 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn try_bold_italic(&mut self, remaining: &str) -> Option<WikitextToken> {
-        if remaining.starts_with("'''''") {
+        if remaining.starts_with("'''''") && !remaining.starts_with("''''''") {
             self.advance(5);
             return Some(WikitextToken::Quote("'''''".to_string()));
         }
+        // 6 quotes (''''''): return None so first ' becomes text, then ''''' matches.
+        // This puts the apostrophe BEFORE the 5-quote tag, matching PHP parsoid behavior.
+        if remaining.starts_with("''''''") {
+            return None;
+        }
         // 4 quotes (''''): return None so first ' becomes text, then ''' matches
-        // This ensures the apostrophe goes BEFORE the bold/italic tag.
         if remaining.starts_with("''''") {
             return None;
         }

@@ -16,6 +16,7 @@ impl ParagraphWrapper {
         let mut result: Vec<WikitextToken> = Vec::new();
         let mut has_open_p: bool = false;
         let mut pending_newlines: usize = 0;
+        let mut pending_nl_tokens: Vec<WikitextToken> = Vec::new();
 
         for token in tokens {
             match &token {
@@ -32,35 +33,69 @@ impl ParagraphWrapper {
                 | WikitextToken::TableRow
                 | WikitextToken::ListItem(_, _) => {
                     Self::close_p_if_open(&mut result, &mut has_open_p);
-                    for _ in 0..pending_newlines {
+                    // Emit exactly one newline before block tokens, regardless of pending count
+                    for _ in 0..pending_newlines.min(1) {
                         result.push(WikitextToken::Newline);
                     }
                     pending_newlines = 0;
+                    pending_nl_tokens.clear();
+                    result.push(token);
+                }
+
+                // HTML block OPEN elements: <div>, <blockquote>, <pre> etc.
+                // These start a block context — close paragraph before them.
+                WikitextToken::HtmlTagOpen(name, _) if Self::is_block_tag(name) => {
+                    Self::close_p_if_open(&mut result, &mut has_open_p);
+                    pending_newlines = 0;
+                    pending_nl_tokens.clear();
+                    result.push(token);
+                }
+
+                // HTML block CLOSE elements: </div>, </blockquote> etc.
+                // These close the current paragraph (the content inside the block),
+                // then emit the close tag.
+                WikitextToken::HtmlTagClose(name) if Self::is_block_tag(name) => {
+                    Self::close_p_if_open(&mut result, &mut has_open_p);
+                    pending_newlines = 0;
+                    pending_nl_tokens.clear();
+                    result.push(token);
+                }
+
+                // HTML self-closing block elements: <br/>, <hr/> etc.
+                WikitextToken::SelfClosingTag(name, _) if Self::is_block_tag(name) => {
+                    Self::close_p_if_open(&mut result, &mut has_open_p);
+                    pending_newlines = 0;
+                    pending_nl_tokens.clear();
                     result.push(token);
                 }
 
                 // Newline — accumulate pending newlines
                 WikitextToken::Newline => {
                     pending_newlines += 1;
+                    pending_nl_tokens.push(token);
                 }
 
                 // Paragraph break — close current p, emit separator newline
                 WikitextToken::ParagraphBreak => {
                     Self::close_p_if_open(&mut result, &mut has_open_p);
-                    pending_newlines = 0;
                     result.push(WikitextToken::Newline);
+                    pending_newlines = 0;
+                    pending_nl_tokens.clear();
                 }
 
                 // SOL-transparent: comments go through without changing paragraph state.
-                // A comment at line start should NOT close the current paragraph.
+                // Comments consume one preceding newline (they're SOL-transparent).
+                // The newline AFTER a comment is preserved for the next content token.
                 WikitextToken::Comment(_) => {
-                    // Emit accumulated newlines as Newline tokens (they belong in the current paragraph)
-                    for _ in 0..pending_newlines {
-                        if has_open_p {
-                            result.push(WikitextToken::Newline);
-                        }
+                    // A comment following newlines consumes exactly one newline.
+                    if pending_newlines > 0 {
+                        pending_newlines -= 1;
                     }
-                    pending_newlines = 0;
+                    // Emit the comment into the current context
+                    if !has_open_p {
+                        result.push(WikitextToken::ParagraphOpen);
+                        has_open_p = true;
+                    }
                     result.push(token);
                 }
 
@@ -78,10 +113,12 @@ impl ParagraphWrapper {
                         Self::close_p_if_open(&mut result, &mut has_open_p);
                         result.push(WikitextToken::Newline);
                         pending_newlines = 0;
+                        pending_nl_tokens.clear();
                     } else if pending_newlines == 1 {
                         // Single newline — emit as plain newline within paragraph
                         result.push(WikitextToken::Newline);
                         pending_newlines = 0;
+                        pending_nl_tokens.clear();
                     }
 
                     // Open paragraph if needed
@@ -104,6 +141,40 @@ impl ParagraphWrapper {
             result.push(WikitextToken::ParagraphClose);
             *has_open_p = false;
         }
+    }
+
+    /// Check if the tag name is considered a block-level HTML element.
+    fn is_block_tag(name: &str) -> bool {
+        matches!(
+            name,
+            "div"
+                | "blockquote"
+                | "pre"
+                | "table"
+                | "tr"
+                | "td"
+                | "th"
+                | "center"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "ul"
+                | "ol"
+                | "li"
+                | "dl"
+                | "dt"
+                | "dd"
+                | "section"
+                | "article"
+                | "aside"
+                | "nav"
+                | "header"
+                | "footer"
+                | "hr"
+        )
     }
 }
 

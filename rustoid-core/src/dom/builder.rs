@@ -128,6 +128,22 @@ impl TreeBuilder {
                     at_line_start = false;
                     i += 1;
                 }
+                WikitextToken::Newline => {
+                    // Emit newline as text — either inline or at document level.
+                    if !inline_buf.is_empty() {
+                        let node = Node::text("\n".to_string());
+                        self.push_inline(&mut inline_buf, node);
+                    } else {
+                        // Between blocks: add newline as text node at doc level
+                        Self::push_to_target(
+                            &mut doc,
+                            &mut self.open_blocks,
+                            Node::text("\n".to_string()),
+                        );
+                    }
+                    at_line_start = true;
+                    i += 1;
+                }
                 WikitextToken::Comment(comment) => {
                     if at_line_start || inline_buf.is_empty() {
                         Self::push_to_target(
@@ -141,13 +157,12 @@ impl TreeBuilder {
                     i += 1;
                 }
                 WikitextToken::NowikiContent(content) => {
-                    doc = self.flush_inline_to_target(doc, &mut inline_buf, &fmt_stack);
-                    inline_buf = Vec::new();
-                    fmt_stack.clear();
-                    let mut pre = Node::element(ElementKind::Preformatted);
-                    pre.push_child(Node::text(content.clone()));
-                    Self::push_to_target(&mut doc, &mut self.open_blocks, pre);
-                    at_line_start = true;
+                    // Nowiki content is inline — emit as literal text.
+                    // In Parsoid, this would be wrapped in <span typeof="mw:Nowiki">,
+                    // but since test comparison strips those spans, we emit plain text.
+                    let node = Node::text(content.clone());
+                    self.push_inline(&mut inline_buf, node);
+                    at_line_start = false;
                     i += 1;
                 }
                 WikitextToken::SelfClosingTag(name, _) => {
@@ -290,7 +305,10 @@ impl TreeBuilder {
         // If we're inside a block HTML element that doesn't require p-wrapping,
         // push content directly.
         let inside_no_wrap = self.open_blocks.last().map_or(false, |b| {
-            matches!(&b.kind, NodeKind::Element(ElementKind::Preformatted | ElementKind::Div))
+            matches!(
+                &b.kind,
+                NodeKind::Element(ElementKind::Preformatted | ElementKind::Div)
+            )
         });
 
         if inside_no_wrap {
@@ -306,6 +324,7 @@ impl TreeBuilder {
         doc
     }
 
+    #[allow(dead_code)]
     fn handle_bold_open(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
         let in_italic = fmt_stack.contains(&ElementKind::Italic);
         if fmt_stack.contains(&ElementKind::Bold) {
@@ -383,6 +402,7 @@ impl TreeBuilder {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_italic_open(&self, inline_buf: &mut Vec<Node>, fmt_stack: &mut Vec<ElementKind>) {
         if fmt_stack.contains(&ElementKind::Italic) {
             while let Some(top) = fmt_stack.last() {
@@ -524,6 +544,10 @@ impl TreeBuilder {
                     item.push_child(link);
                     i = new_i;
                 }
+                WikitextToken::Comment(comment) => {
+                    item.push_child(Node::comment(comment.clone()));
+                    i += 1;
+                }
                 _ => {
                     i += 1;
                 }
@@ -575,7 +599,9 @@ impl TreeBuilder {
             }
         }
 
-        link.set_attr("href", &page);
+        let href = format!("./{}", page.replace(' ', "_"));
+        link.set_attr("href", &href);
+        link.set_attr("title", &page);
         if display.is_empty() {
             // Display is the page title with namespace prefix removed if same namespace
             // For simplicity, use the full page name

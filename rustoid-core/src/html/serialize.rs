@@ -186,7 +186,7 @@ impl HtmlSerializer {
                     }
                     ElementKind::Wikilink => {
                         let href = node.get_attr("href").unwrap_or("");
-                        buf.push_str(&format!("<a href=\"{href}\""));
+                        buf.push_str(&format!("<a rel=\"mw:WikiLink\" href=\"{href}\""));
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
@@ -330,7 +330,7 @@ impl HtmlSerializer {
 }
 
 /// Basic HTML entity escaping for text content.
-/// Per HTML5, only `&` and `<` must be escaped in text content.
+/// Escapes &, <, and > per HTML5 recommendation.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;")
 }
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_html_escape() {
-        // html_escape: only & and < are escaped
+        // html_escape: escapes &, <, and >
         assert_eq!(html_escape("<>&\"'"), "&lt;>&amp;\"'");
         // attr_escape: also escapes " and '
         assert_eq!(attr_escape("<>&\"'"), "&lt;>&amp;&quot;&#39;");

@@ -203,7 +203,7 @@ impl QuoteTransformer {
         }
 
         let mut state = State::Empty;
-        let mut last_both: isize = -1;
+        let _last_both: isize = -1;
 
         let quote_chunk_count = chunks
             .iter()
@@ -216,7 +216,7 @@ impl QuoteTransformer {
         }
 
         // We'll process in-place by replacing quote chunks with tag tokens
-        let mut qi = 0usize; // tracks which quote chunk we're on (0-based)
+        let _qi = 0usize; // tracks which quote chunk we're on (0-based)
         let total_chunks = chunks.len();
 
         for ci in 0..total_chunks {
@@ -321,7 +321,6 @@ impl QuoteTransformer {
                         state = State::Empty;
                     }
                     State::Empty => {
-                        last_both = ci as isize;
                         state = State::Both(ci);
                         // Don't replace the chunk yet — we'll do it when we know the order
                     }
@@ -329,33 +328,38 @@ impl QuoteTransformer {
                 _ => {}
             }
 
-            qi += 1;
+            // qi tracks which quote chunk we're on
         }
 
-        // Close remaining open tags
+        // Close remaining open tags. Order matters: bold before italic
+        // (because bold is OUTSIDE italic in IB state, and we close outermost first).
+        // These are sequential if-checks, not a match — multiple can fire.
         match state {
             State::Both(i) => {
                 replace_quote_chunk(chunks, i, vec![bold_open(), italic_open()]);
-                state = State::BI;
             }
-            State::B | State::IB => {
-                // Append close to the last non-quote chunk
-                let last = chunks.len() - 1;
-                if last % 2 == 1 {
-                    chunks.push(Vec::new());
-                }
-                chunks.last_mut().unwrap().push(bold_close());
-            }
-            State::I | State::BI => {
-                let last = chunks.len() - 1;
-                if last % 2 == 1 {
-                    chunks.push(Vec::new());
-                }
-                chunks.last_mut().unwrap().push(italic_close());
-            }
-            State::Empty => {}
+            _ => {}
         }
-        if matches!(state, State::BI) {
+        let state_after_both = if matches!(state, State::Both(_)) {
+            State::BI
+        } else {
+            state
+        };
+        if matches!(state_after_both, State::B | State::IB) {
+            let last = chunks.len() - 1;
+            if last % 2 == 1 {
+                chunks.push(Vec::new());
+            }
+            chunks.last_mut().unwrap().push(bold_close());
+        }
+        if matches!(state_after_both, State::I | State::BI | State::IB) {
+            let last = chunks.len() - 1;
+            if last % 2 == 1 {
+                chunks.push(Vec::new());
+            }
+            chunks.last_mut().unwrap().push(italic_close());
+        }
+        if matches!(state_after_both, State::BI) {
             chunks.last_mut().unwrap().push(bold_close());
         }
 
@@ -457,4 +461,3 @@ mod tests {
         assert!(result.len() >= 2, "got {:?}", result);
     }
 }
-
