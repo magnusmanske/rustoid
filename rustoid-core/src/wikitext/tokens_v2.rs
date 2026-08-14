@@ -206,6 +206,8 @@ pub enum ParsoidToken {
     EmptyLine(EmptyLineTk),
     /// Indent-pre compound token (nested tokens incl. `<pre>`/`</pre>`).
     IndentPre(IndentPreTk),
+    /// List compound token (nested tokens; `list_type` is ul/ol/dl).
+    List(ListTk),
 }
 
 impl ParsoidToken {
@@ -229,6 +231,7 @@ impl ParsoidToken {
             ParsoidToken::Nl(t) => Some(&t.data_parsoid),
             ParsoidToken::EmptyLine(t) => Some(&t.data_parsoid),
             ParsoidToken::IndentPre(t) => Some(&t.data_parsoid),
+            ParsoidToken::List(t) => Some(&t.data_parsoid),
             ParsoidToken::Eof(_) => None,
         }
     }
@@ -243,6 +246,7 @@ impl ParsoidToken {
             ParsoidToken::Nl(t) => Some(&mut t.data_parsoid),
             ParsoidToken::EmptyLine(t) => Some(&mut t.data_parsoid),
             ParsoidToken::IndentPre(t) => Some(&mut t.data_parsoid),
+            ParsoidToken::List(t) => Some(&mut t.data_parsoid),
             ParsoidToken::Eof(_) => None,
         }
     }
@@ -301,6 +305,7 @@ impl fmt::Display for ParsoidToken {
             ParsoidToken::Eof(_) => write!(f, "EOF"),
             ParsoidToken::EmptyLine(_) => write!(f, "[empty-line]"),
             ParsoidToken::IndentPre(_) => write!(f, "[indent-pre]"),
+            ParsoidToken::List(_) => write!(f, "[list]"),
         }
     }
 }
@@ -324,6 +329,17 @@ impl TagTk {
             data_parsoid: dp,
             data_mw: None,
         }
+    }
+
+    /// Add a string attribute.
+    pub fn add_attribute_str(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.attribs.push(KV {
+            key: KeyValue::Str(key.into()),
+            value: KeyValue::Str(value.into()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
     }
 }
 
@@ -466,6 +482,81 @@ impl IndentPreTk {
 }
 
 impl Default for IndentPreTk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// List compound token (nested tokens; `list_type` is ul/ol/dl).
+/// Analogous to PHP's `ListTk` (which extends `CompoundTk`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListTk {
+    pub nested_tokens: Vec<Item>,
+    pub data_parsoid: DataParsoid,
+    pub list_type: Option<String>,
+}
+
+impl ListTk {
+    pub fn new() -> Self {
+        Self {
+            nested_tokens: Vec::new(),
+            data_parsoid: DataParsoid::default(),
+            list_type: None,
+        }
+    }
+
+    pub fn add_token(&mut self, token: Item) {
+        self.nested_tokens.push(token);
+    }
+
+    pub fn add_tokens(&mut self, tokens: Vec<Item>) {
+        self.nested_tokens.extend(tokens);
+    }
+
+    pub fn get_nested_tokens(&self) -> &[Item] {
+        &self.nested_tokens
+    }
+
+    pub fn sets_eol_context(&self) -> bool {
+        true
+    }
+
+    /// Is this a dl list containing only dd items (per PHP `isDLDDList`).
+    pub fn is_dl_dd_list(&self) -> bool {
+        if self.list_type.as_deref() != Some("dl") {
+            return false;
+        }
+        let n = self.nested_tokens.len();
+        if n == 0 {
+            return false;
+        }
+        let mut i = 0;
+        loop {
+            // nested_tokens[i+1] must be a <dd>.
+            let is_dd = matches!(
+                self.nested_tokens.get(i + 1),
+                Some(Item::Tok(ParsoidToken::Tag(t))) if t.name == "dd"
+            );
+            if !is_dd {
+                return false;
+            }
+            i += 2;
+            if i >= n {
+                break;
+            }
+            let is_dl = matches!(
+                self.nested_tokens.get(i),
+                Some(Item::Tok(ParsoidToken::Tag(t))) if t.name == "dl"
+            );
+            if !is_dl {
+                break;
+            }
+        }
+        true
+    }
+}
+
+impl Default for ListTk {
     fn default() -> Self {
         Self::new()
     }
