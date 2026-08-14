@@ -9,6 +9,7 @@ pub mod paragraph_wrapper_v2;
 pub mod pre_handler;
 pub mod quote_transformer;
 pub mod quote_transformer_v2;
+pub mod sanitizer_handler;
 pub mod stage1;
 pub mod stage2;
 pub mod stage3;
