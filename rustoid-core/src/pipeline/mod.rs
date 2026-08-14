@@ -4,7 +4,9 @@
 //! and serialization. It is the primary entry point for library consumers.
 
 pub mod paragraph_wrapper;
+pub mod paragraph_wrapper_v2;
 pub mod quote_transformer;
+pub mod quote_transformer_v2;
 pub mod stage1;
 pub mod stage2;
 pub mod stage3;

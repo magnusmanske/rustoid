@@ -141,6 +141,24 @@ pub struct DataParsoid {
     pub link_tk: Option<Box<ParsoidToken>>,
 }
 
+impl DataParsoid {
+    /// Create a DataParsoid with the given source range.
+    pub fn with_tsr(start: usize, end: usize) -> Self {
+        Self {
+            tsr: Some(SourceRange::new(start, end)),
+            ..Default::default()
+        }
+    }
+
+    /// Create a DataParsoid with the given source range (already built).
+    pub fn with_tsr_range(tsr: SourceRange) -> Self {
+        Self {
+            tsr: Some(tsr),
+            ..Default::default()
+        }
+    }
+}
+
 /// DOM source range with additional metadata (analogous to PHP's DomSourceRange).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomSourceRange {
@@ -377,9 +395,9 @@ pub struct NlTk {
 
 impl NlTk {
     pub fn new(tsr: SourceRange) -> Self {
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(tsr);
-        Self { data_parsoid: dp }
+        Self {
+            data_parsoid: DataParsoid::with_tsr_range(tsr),
+        }
     }
 }
 

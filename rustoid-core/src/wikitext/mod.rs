@@ -10,3 +10,6 @@ pub mod tokens;
 // V2 token types and tokenizer (faithful PHP Parsoid port).
 pub mod tokenizer_v2;
 pub mod tokens_v2;
+
+// Wikitext constants (faithful PHP Parsoid Consts.php port).
+pub mod consts;

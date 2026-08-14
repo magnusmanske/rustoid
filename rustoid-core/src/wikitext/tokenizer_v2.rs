@@ -179,15 +179,11 @@ impl<'a> PegTokenizer<'a> {
 
     /// Emit a DataParsoid with a TSR.
     fn make_dp(&self, start: usize, end: usize) -> DataParsoid {
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(SourceRange::new(start, end));
-        dp
+        DataParsoid::with_tsr(start, end)
     }
 
     fn make_dp_tsr(&self, tsr: SourceRange) -> DataParsoid {
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(tsr);
-        dp
+        DataParsoid::with_tsr_range(tsr)
     }
 
     // ---- Top-level parsing ----
@@ -224,14 +220,15 @@ impl<'a> PegTokenizer<'a> {
         // Try block constructs at SOL.
         if self.at_sol {
             // 1. Redirect
-            if self.pos == 0 && !self.in_template {
-                if let Some(token) = self.try_redirect() {
-                    self.emit_token(token);
-                    self.consume_sol_transparent();
-                    self.try_block_line();
-                    self.has_sol_transparent_at_start = true;
-                    return true;
-                }
+            if self.pos == 0
+                && !self.in_template
+                && let Some(token) = self.try_redirect()
+            {
+                self.emit_token(token);
+                self.consume_sol_transparent();
+                self.try_block_line();
+                self.has_sol_transparent_at_start = true;
+                return true;
             }
 
             // 2. Block lines (headings, lists, hr, table lines).
@@ -415,39 +412,29 @@ impl<'a> PegTokenizer<'a> {
             // Try inline elements.
             let saved = self.pos;
 
-            if ch == '<' {
-                if self.try_angle_bracket_markup() {
-                    matched = true;
-                    continue;
-                }
+            if ch == '<' && self.try_angle_bracket_markup() {
+                matched = true;
+                continue;
             }
 
-            if ch == '{' {
-                if self.try_tplarg_or_template() {
-                    matched = true;
-                    continue;
-                }
+            if ch == '{' && self.try_tplarg_or_template() {
+                matched = true;
+                continue;
             }
 
-            if self.starts_with("-{") {
-                if self.try_lang_variant_or_tpl() {
-                    matched = true;
-                    continue;
-                }
+            if self.starts_with("-{") && self.try_lang_variant_or_tpl() {
+                matched = true;
+                continue;
             }
 
-            if ch == '[' {
-                if self.try_wikilink_or_extlink() {
-                    matched = true;
-                    continue;
-                }
+            if ch == '[' && self.try_wikilink_or_extlink() {
+                matched = true;
+                continue;
             }
 
-            if ch == '\'' {
-                if self.try_quote() {
-                    matched = true;
-                    continue;
-                }
+            if ch == '\'' && self.try_quote() {
+                matched = true;
+                continue;
             }
 
             if self.try_urltext() {
@@ -455,18 +442,14 @@ impl<'a> PegTokenizer<'a> {
                 continue;
             }
 
-            if self.starts_with("__") {
-                if self.try_behavior_switch() {
-                    matched = true;
-                    continue;
-                }
+            if self.starts_with("__") && self.try_behavior_switch() {
+                matched = true;
+                continue;
             }
 
-            if ch == '&' {
-                if self.try_html_entity() {
-                    matched = true;
-                    continue;
-                }
+            if ch == '&' && self.try_html_entity() {
+                matched = true;
+                continue;
             }
 
             // If no inline element matched, make sure we advance to avoid infinite loop.
@@ -558,8 +541,7 @@ impl<'a> PegTokenizer<'a> {
 
             // Emit opening tag.
             let tag_start = saved;
-            let mut dp = DataParsoid::default();
-            dp.tsr = Some(SourceRange::new(tag_start, tag_start + level));
+            let dp = DataParsoid::with_tsr(tag_start, tag_start + level);
             self.emit_token(ParsoidToken::Tag(TagTk::new(
                 format!("h{level}"),
                 vec![],
@@ -971,7 +953,7 @@ impl<'a> PegTokenizer<'a> {
     fn parse_ths(&mut self) {
         while self.starts_with("!!") || self.starts_with("||") {
             let pp_start = self.pos;
-            let pp_len = if self.starts_with("!!") { 2 } else { 2 };
+            let pp_len = 2;
             self.advance(pp_len);
 
             let attrs = self.parse_row_syntax_table_args();
@@ -1164,12 +1146,12 @@ impl<'a> PegTokenizer<'a> {
         let mut end = rem.len();
 
         // Quoted?
-        if rem.starts_with("\"") {
-            if let Some(quote_end) = rem[1..].find('"') {
+        if let Some(stripped) = rem.strip_prefix('"') {
+            if let Some(quote_end) = stripped.find('"') {
                 end = quote_end + 2;
             }
-        } else if rem.starts_with("'") {
-            if let Some(quote_end) = rem[1..].find('\'') {
+        } else if let Some(stripped) = rem.strip_prefix('\'') {
+            if let Some(quote_end) = stripped.find('\'') {
                 end = quote_end + 2;
             }
         } else {
@@ -1316,7 +1298,7 @@ impl<'a> PegTokenizer<'a> {
     fn parse_tag_name(&self) -> String {
         let rem = self.remaining();
         let end = rem
-            .find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/' || c == '>')
+            .find([' ', '\t', '\n', '\r', '/', '>'])
             .unwrap_or(rem.len());
         rem[..end].to_string()
     }
@@ -1389,23 +1371,23 @@ impl<'a> PegTokenizer<'a> {
 
     fn parse_attr_value(&mut self) -> String {
         let rem = self.remaining();
-        if rem.starts_with("\"") {
-            if let Some(end) = rem[1..].find('"') {
-                let val = rem[1..end + 1].to_string();
-                self.advance(end + 2);
-                return val;
-            }
-        } else if rem.starts_with("'") {
-            if let Some(end) = rem[1..].find('\'') {
-                let val = rem[1..end + 1].to_string();
-                self.advance(end + 2);
-                return val;
-            }
+        if let Some(stripped) = rem.strip_prefix('"')
+            && let Some(end) = stripped.find('"')
+        {
+            let val = stripped[..end].to_string();
+            self.advance(end + 2);
+            return val;
+        } else if let Some(stripped) = rem.strip_prefix('\'')
+            && let Some(end) = stripped.find('\'')
+        {
+            let val = stripped[..end].to_string();
+            self.advance(end + 2);
+            return val;
         }
 
         // Unquoted.
         let end = rem
-            .find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/' || c == '>')
+            .find([' ', '\t', '\n', '\r', '/', '>'])
             .unwrap_or(rem.len());
         let val = rem[..end].to_string();
         self.advance(end);
@@ -1587,7 +1569,7 @@ impl<'a> PegTokenizer<'a> {
         // Find the closing `]`.
         if let Some(end) = self.remaining().find(']') {
             let content = &self.remaining()[..end];
-            let (url, text) = if let Some(space) = content.find(|c: char| c == ' ' || c == '\t') {
+            let (url, text) = if let Some(space) = content.find([' ', '\t']) {
                 (
                     content[..space].to_string(),
                     Some(content[space + 1..].to_string()),
@@ -1618,7 +1600,7 @@ impl<'a> PegTokenizer<'a> {
         let start = self.pos;
 
         // Count the number of consecutive single quotes.
-        let mut count = 0;
+        let mut count = 0usize;
         let remaining = self.remaining();
         for ch in remaining.chars() {
             if ch == '\'' {
@@ -1638,10 +1620,8 @@ impl<'a> PegTokenizer<'a> {
         // - >5 quotes: first N-5 are plain text apostrophes, 5 are `'''''`
         let plain_ticks = if count == 4 {
             1
-        } else if count > 5 {
-            count - 5
         } else {
-            0
+            count.saturating_sub(5)
         };
 
         let quote_len = count - plain_ticks;
