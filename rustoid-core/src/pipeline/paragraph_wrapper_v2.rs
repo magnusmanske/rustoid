@@ -7,9 +7,10 @@
 //! This is a line-based handler that buffers tokens and flushes them when it
 //! becomes clear where `<p>` boundaries should lie.
 
-use crate::pipeline::quote_transformer_v2::Item;
 use crate::wikitext::consts;
-use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, ParsoidToken, SelfclosingTagTk, TagTk};
+use crate::wikitext::tokens_v2::{
+    DataParsoid, EndTagTk, Item, ParsoidToken, SelfclosingTagTk, TagTk,
+};
 
 /// The ParagraphWrapper. Stateful across a single `wrap` call.
 pub struct ParagraphWrapper {

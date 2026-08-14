@@ -5,6 +5,7 @@
 
 pub mod paragraph_wrapper;
 pub mod paragraph_wrapper_v2;
+pub mod pre_handler;
 pub mod quote_transformer;
 pub mod quote_transformer_v2;
 pub mod stage1;

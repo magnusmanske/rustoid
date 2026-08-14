@@ -11,21 +11,12 @@
 //! context-free and must balance across an entire line.
 
 use crate::wikitext::tokens_v2::{
-    DataParsoid, EndTagTk, ParsoidToken, SelfclosingTagTk, SourceRange, TagTk,
+    DataParsoid, EndTagTk, Item, ParsoidToken, SelfclosingTagTk, SourceRange, TagTk,
 };
 
 /// The QuoteTransformer. Stateless across calls; per-run state lives in the
 /// `transform` method's local buffers, mirroring the PHP instance state.
 pub struct QuoteTransformer;
-
-/// A token stream item: either a plain-text string or a structured token.
-/// Mirrors the PHP `list<string|Token>` type.
-#[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
-pub enum Item {
-    Str(String),
-    Tok(ParsoidToken),
-}
 
 /// Per-run state, mirroring the PHP instance fields.
 struct State {

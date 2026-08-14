@@ -204,6 +204,8 @@ pub enum ParsoidToken {
     Eof(EOFTk),
     /// Empty line token (may contain comments).
     EmptyLine(EmptyLineTk),
+    /// Indent-pre compound token (nested tokens incl. `<pre>`/`</pre>`).
+    IndentPre(IndentPreTk),
 }
 
 impl ParsoidToken {
@@ -226,6 +228,7 @@ impl ParsoidToken {
             ParsoidToken::Comment(t) => Some(&t.data_parsoid),
             ParsoidToken::Nl(t) => Some(&t.data_parsoid),
             ParsoidToken::EmptyLine(t) => Some(&t.data_parsoid),
+            ParsoidToken::IndentPre(t) => Some(&t.data_parsoid),
             ParsoidToken::Eof(_) => None,
         }
     }
@@ -239,6 +242,7 @@ impl ParsoidToken {
             ParsoidToken::Comment(t) => Some(&mut t.data_parsoid),
             ParsoidToken::Nl(t) => Some(&mut t.data_parsoid),
             ParsoidToken::EmptyLine(t) => Some(&mut t.data_parsoid),
+            ParsoidToken::IndentPre(t) => Some(&mut t.data_parsoid),
             ParsoidToken::Eof(_) => None,
         }
     }
@@ -296,6 +300,7 @@ impl fmt::Display for ParsoidToken {
             ParsoidToken::Nl(_) => write!(f, "\\n"),
             ParsoidToken::Eof(_) => write!(f, "EOF"),
             ParsoidToken::EmptyLine(_) => write!(f, "[empty-line]"),
+            ParsoidToken::IndentPre(_) => write!(f, "[indent-pre]"),
         }
     }
 }
@@ -419,6 +424,63 @@ impl EmptyLineTk {
             data_parsoid: dp,
         }
     }
+}
+
+/// Indent-pre compound token (nested tokens incl. `<pre>`/`</pre>`).
+/// Analogous to PHP's `IndentPreTk` (which extends `CompoundTk`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndentPreTk {
+    /// The nested tokens making up the indent-pre block.
+    pub nested_tokens: Vec<Item>,
+    pub data_parsoid: DataParsoid,
+}
+
+impl IndentPreTk {
+    pub fn new() -> Self {
+        Self {
+            nested_tokens: Vec::new(),
+            data_parsoid: DataParsoid::default(),
+        }
+    }
+
+    /// Add a nested token.
+    pub fn add_token(&mut self, token: Item) {
+        self.nested_tokens.push(token);
+    }
+
+    /// Get the nested tokens.
+    pub fn get_nested_tokens(&self) -> &[Item] {
+        &self.nested_tokens
+    }
+
+    /// Set the nested tokens.
+    pub fn set_nested_tokens(&mut self, tokens: Vec<Item>) {
+        self.nested_tokens = tokens;
+    }
+
+    /// Does this token implicitly induce an end-of-line context?
+    /// (True, per PHP `IndentPreTk::setsEOLContext()`.)
+    pub fn sets_eol_context(&self) -> bool {
+        true
+    }
+}
+
+impl Default for IndentPreTk {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A token stream item: either a plain text string or a ParsoidToken.
+/// Used by compound tokens (IndentPre, List) to store nested tokens.
+// `ParsoidToken` is large enough that boxing `Tok` would avoid bloat, but
+// `Item` is part of the public API and boxing would ripple through the
+// codebase, so we accept the size cost rather than breaking callers.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Str(String),
+    Tok(ParsoidToken),
 }
 
 /// Helper: flatten a list of `ParsoidToken | String` into a single Vec.
