@@ -66,6 +66,30 @@ impl Title {
             self.text.clone()
         }
     }
+
+    /// The prefixed title with spaces (for display). Mirrors PHP's
+    /// `Title::getPrefixedText()`.
+    pub fn get_prefixed_text(&self) -> String {
+        let text = self.text.replace('_', " ");
+        let prefix = namespace_prefix(self.namespace_id);
+        if self.namespace_id != 0 && !prefix.is_empty() {
+            format!("{prefix}:{text}")
+        } else {
+            text
+        }
+    }
+
+    /// The prefixed title with underscores (DB key). Mirrors PHP's
+    /// `Title::getPrefixedDBKey()` / `getFullDBKey()`.
+    pub fn get_full_db_key(&self) -> String {
+        let text = self.text.replace(' ', "_");
+        let prefix = namespace_prefix(self.namespace_id);
+        if self.namespace_id != 0 && !prefix.is_empty() {
+            format!("{prefix}:{text}")
+        } else {
+            text
+        }
+    }
 }
 
 /// Map a namespace ID to its canonical English prefix (fallback without SiteConfig).
@@ -199,6 +223,20 @@ impl TitleParser {
     }
 }
 
+/// Config-aware relative link prefix. Mirrors PHP's
+/// `SiteConfig::relativeLinkPrefix()` (defaults to `"./"` on enwiki).
+pub fn relative_link_prefix(_config: &dyn SiteConfig) -> &'static str {
+    // The standard MediaWiki relative link prefix is "./".
+    "./"
+}
+
+/// Make a link href for a local Title. Mirrors PHP's `Env::makeLink`:
+/// `relativeLinkPrefix() . Sanitizer::sanitizeTitleURI(title->getFullDBKey(), false)`.
+pub fn make_link(title: &Title, config: &dyn SiteConfig) -> String {
+    let sanitized = crate::sanitizer::sanitize_title_uri(&title.get_full_db_key(), false);
+    format!("{}{}", relative_link_prefix(config), sanitized)
+}
+
 /// Split off the URL fragment (after `#`).
 fn split_fragment(input: &str) -> (&str, Option<String>) {
     if let Some(pos) = input.find('#') {
@@ -298,5 +336,33 @@ mod tests {
         let config = test_config();
         let t = Title::new(14, "People");
         assert_eq!(t.full_text_with_config(&config), "Category:People");
+    }
+
+    #[test]
+    fn test_get_prefixed_text() {
+        assert_eq!(
+            Title::new_main("Main Page").get_prefixed_text(),
+            "Main Page"
+        );
+        assert_eq!(Title::new(10, "Foo").get_prefixed_text(), "Template:Foo");
+    }
+
+    #[test]
+    fn test_get_full_db_key() {
+        assert_eq!(Title::new_main("Main Page").get_full_db_key(), "Main_Page");
+        assert_eq!(
+            Title::new(10, "Foo bar").get_full_db_key(),
+            "Template:Foo_bar"
+        );
+    }
+
+    #[test]
+    fn test_make_link() {
+        let config = test_config();
+        assert_eq!(
+            make_link(&Title::new_main("Main Page"), &config),
+            "./Main_Page"
+        );
+        assert_eq!(make_link(&Title::new(10, "Foo"), &config), "./Template:Foo");
     }
 }

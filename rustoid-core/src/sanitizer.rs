@@ -266,6 +266,85 @@ pub fn escape_literal_html_tag(token: &ParsoidToken) -> bool {
     false
 }
 
+/// Sanitize a title for use in a URI. Mirrors PHP's `Sanitizer::sanitizeTitleURI`.
+///
+/// Percent-encodes characters in the set `[%? \[\]#|<>\\]`, and (if a fragment
+/// is present) escapes it as an HTML5 id fragment.
+pub fn sanitize_title_uri(title: &str, _is_interwiki: bool) -> String {
+    let idx = title.find('#');
+    let (main_part, anchor) = match idx {
+        Some(pos) => (&title[..pos], Some(&title[pos + 1..])),
+        None => (title, None),
+    };
+
+    // Replace the unsafe set with percent-encoding.
+    let encoded: String = main_part
+        .chars()
+        .map(|c| {
+            if matches!(
+                c,
+                '%' | '?' | ' ' | '[' | ']' | '#' | '|' | '<' | '>' | '\\'
+            ) {
+                percent_encode_char(c)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+
+    if let Some(anchor) = anchor {
+        format!("{encoded}#{}", escape_id_for_link(anchor))
+    } else {
+        encoded
+    }
+}
+
+/// Escape a fragment string as an HTML5 id (used by `sanitize_title_uri`).
+/// Mirrors PHP's `escapeIdForLink` with html5 mode.
+fn escape_id_for_link(id: &str) -> String {
+    let id: String = escape_id_internal(id, "html5");
+    // Do percent encoding of percent signs for href (but not id) attrs.
+    id.replace('%', "%25")
+}
+
+/// Escape a string into an HTML5/legacy id. Mirrors `escapeIdInternal`.
+fn escape_id_internal(id: &str, mode: &str) -> String {
+    // Truncate overly-long ids (griefer protection, T251506).
+    let mut id = id.chars().take(1024).collect::<String>();
+    match mode {
+        "html5" => {
+            id = id
+                .chars()
+                .map(|c| match c {
+                    '\t' | '\n' | '\u{0C}' | '\r' | ' ' => '_',
+                    other => other,
+                })
+                .collect();
+            id
+        }
+        "legacy" => {
+            id = id.replace(' ', "_");
+            let encoded = percent_encode_all(&id);
+            encoded.replace("%3A", ":").replace('%', ".")
+        }
+        _ => id,
+    }
+}
+
+/// Percent-encode a full string (used by legacy id escaping).
+fn percent_encode_all(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            // urlencode semantics: encode all except unreserved.
+            if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +377,12 @@ mod tests {
         let tk = TagTk::new("meta", vec![], DataParsoid::default());
         let token = ParsoidToken::Tag(tk);
         assert!(escape_literal_html_tag(&token));
+    }
+
+    #[test]
+    fn test_sanitize_title_uri() {
+        assert_eq!(sanitize_title_uri("Foo", false), "Foo");
+        assert_eq!(sanitize_title_uri("Foo bar", false), "Foo%20bar");
+        assert_eq!(sanitize_title_uri("Foo#Section", false), "Foo#Section");
     }
 }
