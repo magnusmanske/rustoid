@@ -14,3 +14,4 @@ pub mod sanitizer_handler;
 pub mod stage1;
 pub mod stage2;
 pub mod stage3;
+pub mod wiki_link_handler;

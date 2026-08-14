@@ -292,6 +292,74 @@ impl ParsoidToken {
     pub fn get_attribute_v(&self, name: &str) -> Option<&str> {
         self.get_attribute(name).and_then(|v| v.as_str())
     }
+
+    /// Get a named attribute KV (analogous to PHP's getAttributeKV).
+    pub fn get_attribute_kv(&self, name: &str) -> Option<&crate::wikitext::tokens_v2::KV> {
+        self.get_attribs()
+            .iter()
+            .find(|kv| kv.key.as_str() == Some(name))
+    }
+
+    /// Get a mutable named attribute KV.
+    pub fn get_attribute_kv_mut(
+        &mut self,
+        name: &str,
+    ) -> Option<&mut crate::wikitext::tokens_v2::KV> {
+        match self {
+            ParsoidToken::Tag(t) => t
+                .attribs
+                .iter_mut()
+                .find(|kv| kv.key.as_str() == Some(name)),
+            ParsoidToken::EndTag(t) => t
+                .attribs
+                .iter_mut()
+                .find(|kv| kv.key.as_str() == Some(name)),
+            ParsoidToken::SelfclosingTag(t) => t
+                .attribs
+                .iter_mut()
+                .find(|kv| kv.key.as_str() == Some(name)),
+            _ => None,
+        }
+    }
+
+    /// Set (replace or append) a string attribute.
+    pub fn set_attribute(&mut self, name: &str, value: &str) {
+        if let Some(kv) = self.get_attribute_kv_mut(name) {
+            kv.value = KeyValue::Str(value.to_string());
+        } else {
+            self.push_string_attr(name, value);
+        }
+    }
+
+    /// Add a space-separated string attribute value (append if present).
+    pub fn add_space_separated_attribute(&mut self, name: &str, value: &str) {
+        if let Some(existing) = self.get_attribute_v(name).map(|v| v.to_string()) {
+            let combined = format!("{existing} {value}");
+            self.set_attribute(name, &combined);
+        } else {
+            self.push_string_attr(name, value);
+        }
+    }
+
+    /// Remove a named attribute.
+    pub fn remove_attribute(&mut self, name: &str) {
+        match self {
+            ParsoidToken::Tag(t) => t.attribs.retain(|kv| kv.key.as_str() != Some(name)),
+            ParsoidToken::EndTag(t) => t.attribs.retain(|kv| kv.key.as_str() != Some(name)),
+            ParsoidToken::SelfclosingTag(t) => t.attribs.retain(|kv| kv.key.as_str() != Some(name)),
+            _ => {}
+        }
+    }
+
+    /// Push a string attribute (internal helper).
+    fn push_string_attr(&mut self, name: &str, value: &str) {
+        match self {
+            ParsoidToken::Tag(t) => t.add_attribute_str(name, value),
+            ParsoidToken::EndTag(t) => t.add_attribute_str(name, value),
+            ParsoidToken::SelfclosingTag(t) => t.add_attribute_str(name, value),
+            _ => {}
+        }
+    }
 }
 
 impl fmt::Display for ParsoidToken {
@@ -358,6 +426,17 @@ impl EndTagTk {
             attribs,
             data_parsoid: dp,
         }
+    }
+
+    /// Add a string attribute.
+    pub fn add_attribute_str(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.attribs.push(KV {
+            key: KeyValue::Str(key.into()),
+            value: KeyValue::Str(value.into()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
     }
 }
 
