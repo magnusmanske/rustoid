@@ -15,3 +15,4 @@ pub mod stage1;
 pub mod stage2;
 pub mod stage3;
 pub mod wiki_link_handler;
+pub mod wiki_link_render;
