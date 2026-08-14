@@ -6,7 +6,7 @@ Rustoid is a from-scratch Rust reimplementation of the Wikimedia [Parsoid](https
 
 ## Goals
 
-1. **Byte-perfect output compatibility** with the PHP Parsoid (the current canonical implementation). Where byte-perfect is impossible (e.g., attribute ordering differences in HTML), whitespace-equivalent output is acceptable. The standard is: given the same wikitext, produce HTML that is functionally identical to Parsoid's and matches the `!! html/parsoid` sections in the official test suite.
+1. **Byte-perfect output compatibility** with the PHP Parsoid (the current canonical implementation). Byte-perfect is the desired outcome. The standard is: given the same wikitext, produce HTML that is functionally identical to Parsoid's and matches the `!! html/parsoid` sections in the official test suite.
 2. **Full feature coverage**: wikitext→HTML, HTML→wikitext (round-tripping), selective serialization (selser), and the full VisualEditor editing pipeline (DOM diffing, minimal selser patches).
 3. **Template expansion** (transclusion) via a pluggable data backend.
 4. **Lua/Scribunto** module evaluation via the `mlua` crate.

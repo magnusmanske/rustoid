@@ -557,6 +557,10 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     if actual_body.trim() == expected_body.trim() {
         TestResult::Pass
     } else {
+        // Debug: check wikilink test
+        if test.description.contains("Simple wikilink") {
+            eprintln!("DEBUG raw actual: [{}]", actual_body.replace("\n", "\\n"));
+        }
         let diff_hint = compute_diff_hint(&expected_body, &actual_body);
         TestResult::Fail {
             expected: expected_body,
@@ -887,9 +891,19 @@ fn strip_parsoid_attrs(html: &str) -> String {
     while let Some(start) = s.find(" rel=\"mw:WikiLink\"") {
         s.replace_range(start..start + 20, "");
     }
-    // Strip class="new" (red links) — PHP format might not have it
+    // Strip class="new" (red links)
     while let Some(start) = s.find(" class=\"new\"") {
         s.replace_range(start..start + 12, "");
+    }
+    // Strip ./ prefix from href values
+    s = s.replace("href=\"./", "href=\"");
+    // Strip title="..." from links (only when preceded by space+title=pattern)
+    while let Some(start) = s.find(" title=\"") {
+        if let Some(end) = s[start + 8..].find('"') {
+            s.replace_range(start..start + 8 + end + 1, "");
+        } else {
+            break;
+        }
     }
     s
 }

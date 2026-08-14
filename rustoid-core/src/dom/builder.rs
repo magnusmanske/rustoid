@@ -599,8 +599,8 @@ impl TreeBuilder {
             }
         }
 
-        let href = format!("./{}", page.replace(' ', "_"));
-        link.set_attr("href", &href);
+        let href = page.replace(' ', "_");
+        link.set_attr("href", &format!("./{href}"));
         link.set_attr("title", &page);
         if display.is_empty() {
             // Display is the page title with namespace prefix removed if same namespace

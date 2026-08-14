@@ -6,3 +6,7 @@
 pub mod preprocessor;
 pub mod tokenizer;
 pub mod tokens;
+
+// V2 token types and tokenizer (faithful PHP Parsoid port).
+pub mod tokenizer_v2;
+pub mod tokens_v2;
