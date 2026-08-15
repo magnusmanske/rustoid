@@ -12,10 +12,236 @@
 
 use crate::title::{Title, TitleParser};
 use crate::traits::SiteConfig;
-use crate::wikitext::tokens_v2::Item;
+use crate::wikitext::token_utils::{is_entity_span_token, match_type_of};
+use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 
 use super::parser_functions::{Params, ParserFunctions};
 use super::template_encapsulator::{TemplateEncapsulator, template_info_from};
+
+/// Is this token an annotation meta tag? Mirrors PHP
+/// `WTUtils::ANNOTATION_META_TYPE_REGEXP`.
+fn is_annotation_meta(token: &ParsoidToken) -> bool {
+    matches!(token, ParsoidToken::SelfclosingTag(t) if t.name == "meta")
+        && match_type_of(token, "#^mw:Annotation/\\w+(/End)?$#").is_some()
+}
+
+/// Item-flavoured variant of `is_annotation_meta`.
+fn is_annotation_meta_item(item: &Item) -> bool {
+    match item {
+        Item::Tok(t) => is_annotation_meta(t),
+        Item::Str(_) => false,
+    }
+}
+
+/// Item-flavoured variant of `is_includes_meta`.
+fn is_includes_meta_item(item: &Item) -> bool {
+    match item {
+        Item::Tok(t) => is_includes_meta(t),
+        Item::Str(_) => false,
+    }
+}
+
+/// Is this token an include-directive meta (`mw:Includes/IncludeOnly` etc.)?
+/// Mirrors the `#^mw:Includes/#` check in `processToString`.
+fn is_includes_meta(token: &ParsoidToken) -> bool {
+    matches!(token, ParsoidToken::SelfclosingTag(t) if t.name == "meta")
+        && match_type_of(token, "#^mw:Includes/#").is_some()
+}
+
+/// Strip comments and process include/annotation preprocessor pieces.
+/// Mirrors PHP's `TemplateHandler::processPreprocToString`.
+///
+/// `in_template` controls whether `<noinclude>`/`<includeonly>` contents are
+/// dropped or kept.
+pub fn process_preproc_to_string(tokens: &[Item], in_template: bool) -> Vec<Item> {
+    let mut result = Vec::new();
+    for token in tokens {
+        let mut include_contents = false;
+        let mut skip = false;
+
+        let meta = match token {
+            Item::Tok(t) => match t {
+                ParsoidToken::SelfclosingTag(stt) if stt.name == "meta" => Some(stt),
+                _ => None,
+            },
+            Item::Str(_) => None,
+        };
+        if let Some(stt) = meta
+            && is_includes_meta_item(token)
+            && let Some(kv) = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+        {
+            let ty = kv.value.as_str().unwrap_or("");
+            match ty {
+                "mw:Includes/OnlyInclude" | "mw:Includes/OnlyInclude/End" => {
+                    include_contents = true;
+                }
+                "mw:Includes/NoInclude" | "mw:Includes/NoInclude/End" => {
+                    if in_template {
+                        skip = true;
+                    } else {
+                        include_contents = true;
+                    }
+                }
+                "mw:Includes/IncludeOnly" | "mw:Includes/IncludeOnly/End" => {
+                    if in_template {
+                        include_contents = true;
+                    } else {
+                        skip = true;
+                    }
+                }
+                _ => {
+                    // Annotation metas are ignored in template targets
+                    // (T295834).
+                    if is_annotation_meta_item(token) {
+                        include_contents = true;
+                    }
+                }
+            }
+        }
+
+        if include_contents {
+            // Annotate/meta pieces recurse into their contents; we don't have
+            // a nested contents field, so emit the token itself as a marker and
+            // let processToString drop it via the annotation-meta check.
+            result.push(token.clone());
+        } else if !skip {
+            result.push(token.clone());
+        }
+    }
+    result
+}
+
+/// The result of `process_to_string`: either a fully-stringified target
+/// (`rest` is `None`) or a partial string plus the unprocessed token tail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToStringResult {
+    pub target: String,
+    pub rest: Option<Vec<Item>>,
+}
+
+/// Take output of `tokens_to_string` and further postprocess it.
+/// Mirrors PHP's `TemplateHandler::processToString` (the string and
+/// token-tail loop).
+pub fn process_to_string(tokens: &[Item], in_template: bool) -> ToStringResult {
+    let tokens = process_preproc_to_string(tokens, in_template);
+
+    let mut buf = String::new();
+    let mut pre_nl_content: Option<String> = None;
+
+    // First pass: find the first token boundary (template/tag/etc.) where
+    // stringification must stop; accumulate the string form of leading
+    // strings and inline quotable/comment/nl tokens.
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        match token {
+            Item::Str(s) => {
+                buf.push_str(s);
+                if pre_nl_content.is_some()
+                    && !s.trim_matches(|c: char| c.is_whitespace()).is_empty()
+                {
+                    // Intervening non-ws after a newline means this is an
+                    // invalid template target.
+                    let tail = std::iter::once(Item::Str(buf.clone()))
+                        .chain(tokens[i..].to_vec())
+                        .collect();
+                    return ToStringResult {
+                        target: pre_nl_content.unwrap_or_default(),
+                        rest: Some(tail),
+                    };
+                }
+                i += 1;
+            }
+            Item::Tok(t) => match t {
+                ParsoidToken::SelfclosingTag(stt) => {
+                    if stt.name == "mw-quote" {
+                        if let Some(v) = stt
+                            .attribs
+                            .iter()
+                            .find(|kv| kv.key.as_str() == Some("value"))
+                        {
+                            buf.push_str(v.value.as_str().unwrap_or(""));
+                        }
+                        i += 1;
+                    } else if !matches!(t, ParsoidToken::EmptyLine(_))
+                        && stt.name != "template"
+                        && stt.name != "templatearg"
+                        && !is_annotation_meta(t)
+                        && !is_includes_meta(t)
+                    {
+                        // We are okay with empty (comment-only) lines,
+                        // {{..}} and {{{..}}} in template targets.
+                        return ToStringResult {
+                            target: pre_nl_content.unwrap_or(buf),
+                            rest: Some(tokens[i..].to_vec()),
+                        };
+                    } else {
+                        // EmptyLine, template, templatearg, annotation, or
+                        // includes meta: ignored in a template target.
+                        i += 1;
+                    }
+                }
+                ParsoidToken::Tag(_tag_tk) => {
+                    if is_entity_span_token(t) {
+                        // Entity span: append the following token (its text).
+                        if let Some(Item::Str(s)) = tokens.get(i + 1) {
+                            buf.push_str(s);
+                        }
+                        i += 2;
+                    } else {
+                        return ToStringResult {
+                            target: pre_nl_content.unwrap_or(buf),
+                            rest: Some(tokens[i..].to_vec()),
+                        };
+                    }
+                }
+                ParsoidToken::EndTag(_) => {
+                    return ToStringResult {
+                        target: pre_nl_content.unwrap_or(buf),
+                        rest: Some(tokens[i..].to_vec()),
+                    };
+                }
+                ParsoidToken::Comment(_) => {
+                    i += 1;
+                }
+                ParsoidToken::Nl(_) => {
+                    if buf.trim_matches(|c: char| c.is_whitespace()).is_empty() {
+                        buf.push('\n');
+                        i += 1;
+                    } else if pre_nl_content.is_none() {
+                        pre_nl_content = Some(buf.clone());
+                        buf = "\n".to_string();
+                        i += 1;
+                    } else {
+                        let tail = std::iter::once(Item::Str(buf.clone()))
+                            .chain(tokens[i..].to_vec())
+                            .collect();
+                        return ToStringResult {
+                            target: pre_nl_content.unwrap_or_default(),
+                            rest: Some(tail),
+                        };
+                    }
+                }
+                // All other token types cannot appear in a stringifiable target.
+                _ => {
+                    return ToStringResult {
+                        target: pre_nl_content.unwrap_or(buf),
+                        rest: Some(tokens[i..].to_vec()),
+                    };
+                }
+            },
+        }
+    }
+
+    // All good: no newline / only whitespace/comments post newline.
+    ToStringResult {
+        target: format!("{}{}", pre_nl_content.unwrap_or_default(), buf),
+        rest: None,
+    }
+}
 
 /// The result of classifying a template target. Mirrors PHP's return array
 /// from `resolveTemplateTarget`.
@@ -42,13 +268,9 @@ pub enum ResolvedTarget {
     Template { name: String, title: Title },
 }
 
-/// Resolve a template target string. Mirrors `TemplateHandler::resolveTemplateTarget`
-/// for the magic-variable, parser-function, and template-title classification
-/// (target string form, no additional token arrays).
-pub fn resolve_template_target(
-    config: &dyn SiteConfig,
-    target_toks: &str,
-) -> Option<ResolvedTarget> {
+/// Classify a resolved (string) template target. Mirrors the tail of PHP's
+/// `resolveTemplateTarget` once `$target` has been stringified.
+fn resolve_target_string(config: &dyn SiteConfig, target_toks: &str) -> Option<ResolvedTarget> {
     let mut target = target_toks.trim().to_string();
 
     // Split on ASCII ':' or fullwidth '：'.
@@ -137,6 +359,37 @@ pub fn resolve_template_target(
         name: title.get_full_db_key(),
         title,
     })
+}
+
+/// Resolve a template target from a plain string. Convenience wrapper around
+/// `resolve_target_string` (the common case where the target is already text).
+pub fn resolve_template_target(config: &dyn SiteConfig, target: &str) -> Option<ResolvedTarget> {
+    resolve_target_string(config, target)
+}
+
+/// Resolve a template target from a token chunk, mirroring PHP's
+/// `resolveTemplateTarget($state, $targetToks, $srcOffsets)`.
+///
+/// `in_template` mirrors `$this->options['inTemplate']`.
+pub fn resolve_template_target_tokens(
+    config: &dyn SiteConfig,
+    target_toks: &[Item],
+    in_template: bool,
+) -> Option<ResolvedTarget> {
+    let processed = process_to_string(target_toks, in_template);
+
+    // Additional tokens are only justifiable in parser-function scenarios.
+    // If we still have unprocessed tokens and the target has no colon, the
+    // target is not a valid parser function call.
+    if processed.rest.is_some() {
+        // The target has no colon: reject (mirrors PHP's `!$haveColon && $additionalToks`).
+        let target = processed.target.trim();
+        if !target.contains(':') && !target.contains('：') {
+            return None;
+        }
+    }
+
+    resolve_target_string(config, &processed.target)
 }
 
 /// Is `name` the `safesubst` magic word? Mirrors the essential safesubst check.
@@ -394,5 +647,114 @@ mod tests {
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "yes"))
         );
+    }
+
+    #[test]
+    fn test_process_to_string_plain() {
+        let tokens = vec![Item::Str("Foo".to_string())];
+        let result = process_to_string(&tokens, false);
+        assert_eq!(result.target, "Foo");
+        assert_eq!(result.rest, None);
+    }
+
+    #[test]
+    fn test_process_to_string_stops_at_tag() {
+        let config = MockSiteConfig::new();
+
+        // `uc:foo [[wikilink]] bar` stringifies up to the wikilink, leaving
+        // the wikilink + tail unprocessed. Because the string has a colon, it
+        // is still a valid parser-function target (PHP keeps going).
+        let tokens = vec![
+            Item::Str("uc:foo ".to_string()),
+            Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(
+                crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+                    "wikilink",
+                    vec![],
+                    crate::wikitext::tokens_v2::DataParsoid::default(),
+                ),
+            )),
+            Item::Str(" bar".to_string()),
+        ];
+        let result = process_to_string(&tokens, false);
+        assert_eq!(result.target, "uc:foo ");
+        assert!(result.rest.is_some());
+
+        // Colon present -> still resolvable as a parser function.
+        assert!(resolve_template_target_tokens(&config, &tokens, false).is_some());
+
+        // No colon -> additional tokens make this an invalid template target.
+        let tokens_no_colon = vec![
+            Item::Str("foo ".to_string()),
+            Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(
+                crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+                    "wikilink",
+                    vec![],
+                    crate::wikitext::tokens_v2::DataParsoid::default(),
+                ),
+            )),
+        ];
+        assert!(resolve_template_target_tokens(&config, &tokens_no_colon, false).is_none());
+    }
+
+    #[test]
+    fn test_process_to_string_ignores_comments() {
+        let tokens = vec![
+            Item::Str("Foo".to_string()),
+            Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Comment(
+                crate::wikitext::tokens_v2::CommentTk::new(
+                    "ignored",
+                    crate::wikitext::tokens_v2::DataParsoid::default(),
+                ),
+            )),
+        ];
+        let result = process_to_string(&tokens, false);
+        assert_eq!(result.target, "Foo");
+        assert_eq!(result.rest, None);
+    }
+
+    #[test]
+    fn test_process_to_string_quotes() {
+        let mut quote = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+            "mw-quote",
+            vec![],
+            crate::wikitext::tokens_v2::DataParsoid::default(),
+        );
+        quote.add_attribute_str("value", "'");
+
+        let tokens = vec![
+            Item::Str("a".to_string()),
+            Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(
+                quote,
+            )),
+            Item::Str("b".to_string()),
+        ];
+        let result = process_to_string(&tokens, false);
+        assert_eq!(result.target, "a'b");
+        assert_eq!(result.rest, None);
+    }
+
+    #[test]
+    fn test_process_to_string_includes() {
+        use crate::wikitext::tokens_v2::ParsoidToken;
+
+        let include =
+            ParsoidToken::SelfclosingTag(crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+                "meta",
+                vec![crate::wikitext::tokens_v2::KV {
+                    key: crate::wikitext::tokens_v2::KeyValue::Str("typeof".to_string()),
+                    value: crate::wikitext::tokens_v2::KeyValue::Str(
+                        "mw:Includes/OnlyInclude".to_string(),
+                    ),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                }],
+                crate::wikitext::tokens_v2::DataParsoid::default(),
+            ));
+
+        let tokens = vec![Item::Str("a".to_string()), Item::Tok(include)];
+        let result = process_to_string(&tokens, false);
+        assert_eq!(result.target, "a");
+        assert_eq!(result.rest, None);
     }
 }
