@@ -18,6 +18,33 @@ use super::wiki_link_handler::{build_link_attrs, string_kv};
 pub struct WikiLinkContext<'a> {
     pub config: &'a dyn SiteConfig,
     about_id_counter: usize,
+    metadata: MetadataCollector,
+}
+
+/// A lightweight `ContentMetadataCollector` analogue, tracking categories and
+/// language links emitted during link rendering.
+#[derive(Debug, Default, Clone)]
+pub struct MetadataCollector {
+    /// Categories as (title, sort-key) pairs.
+    pub categories: Vec<(crate::title::Title, String)>,
+    /// Language link titles.
+    pub language_links: Vec<crate::title::Title>,
+}
+
+impl MetadataCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a category membership (mirrors `addCategory`).
+    pub fn add_category(&mut self, title: &crate::title::Title, sort_key: &str) {
+        self.categories.push((title.clone(), sort_key.to_string()));
+    }
+
+    /// Record a language link (mirrors `addLanguageLink`).
+    pub fn add_language_link(&mut self, title: &crate::title::Title) {
+        self.language_links.push(title.clone());
+    }
 }
 
 impl<'a> WikiLinkContext<'a> {
@@ -25,6 +52,7 @@ impl<'a> WikiLinkContext<'a> {
         Self {
             config,
             about_id_counter: 0,
+            metadata: MetadataCollector::new(),
         }
     }
 
@@ -41,6 +69,11 @@ impl<'a> WikiLinkContext<'a> {
         // Use the existing TitleParser (handles namespace + interwiki).
         let title = TitleParser::parse(decoded, self.config);
         Some(title)
+    }
+
+    /// Mutable access to the metadata collector (mirrors `Env::getMetadata`).
+    pub fn metadata_mut(&mut self) -> &mut MetadataCollector {
+        &mut self.metadata
     }
 }
 
@@ -352,7 +385,63 @@ pub fn render_language_link(
         kv.value = crate::wikitext::tokens_v2::KeyValue::Str("mw:PageProp/Language".to_string());
     }
 
+    // Record the language link in metadata (PHP uses the decoded title).
+    let meta_title =
+        crate::title::TitleParser::parse(&decode_uri_component(&target.href), ctx.config);
+    ctx.metadata_mut().add_language_link(&meta_title);
+
     vec![Item::Tok(ParsoidToken::SelfclosingTag(new_tk))]
+}
+
+/// Render a category membership into `<link rel="mw:PageProp/Category">`.
+/// Mirrors `WikiLinkHandler::renderCategory` for the simple sort-key case.
+pub fn render_category(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+) -> Vec<Item> {
+    use crate::sanitizer::sanitize_title_uri;
+
+    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut new_tk =
+        crate::wikitext::tokens_v2::SelfclosingTagTk::new("link", attribs, DataParsoid::default());
+
+    // Change rel to mw:PageProp/Category.
+    if let Some(kv) = new_tk
+        .attribs
+        .iter_mut()
+        .find(|kv| kv.key.as_str() == Some("rel"))
+    {
+        kv.value = crate::wikitext::tokens_v2::KeyValue::Str("mw:PageProp/Category".to_string());
+    }
+
+    // href = makeLink(title).
+    if let Some(title) = &target.title {
+        let mut href = make_link(title, ctx.config);
+
+        // Compute sort key from content (strip newlines).
+        let category_sort = token_utils_tokens_to_string(&content);
+        let category_sort = category_sort.replace('\n', "");
+        if !category_sort.is_empty() && category_sort != target.href {
+            // Append '#sortkey' to href, encoding '#' as %23.
+            let encoded = sanitize_title_uri(&category_sort, false).replace('#', "%23");
+            href.push('#');
+            href.push_str(&encoded);
+        }
+
+        new_tk.add_attribute_str("href", &href);
+
+        // Record the category in metadata.
+        ctx.metadata_mut().add_category(title, &category_sort);
+    }
+
+    vec![Item::Tok(ParsoidToken::SelfclosingTag(new_tk))]
+}
+
+/// Convert content items to a single string for sort-key computation.
+fn token_utils_tokens_to_string(items: &[Item]) -> String {
+    use crate::wikitext::token_utils::tokens_to_string;
+    tokens_to_string(items)
 }
 
 #[cfg(test)]
@@ -479,6 +568,56 @@ mod tests {
                 .find(|kv| kv.key.as_str() == Some("href"))
                 .and_then(|kv| kv.value.as_str());
             assert_eq!(href, Some("https://de.wikipedia.org/wiki/Foo"));
+        }
+        // Language link should be recorded in metadata.
+        assert_eq!(ctx.metadata_mut().language_links.len(), 1);
+    }
+
+    #[test]
+    fn test_render_category_link() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("Category:People", None);
+        let target = get_wiki_link_target_info(&ctx, "Category:People", "Category:People").unwrap();
+
+        assert_eq!(target.title.as_ref().unwrap().namespace_id, 14);
+
+        let out = render_category(&mut ctx, &token, &target);
+
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "link"));
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] {
+            let rel = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("rel"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(rel, Some("mw:PageProp/Category"));
+
+            let href = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(href, Some("./Category:People"));
+        }
+        // Category should be recorded in metadata.
+        assert_eq!(ctx.metadata_mut().categories.len(), 1);
+    }
+
+    #[test]
+    fn test_render_category_with_sort_key() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("Category:People", Some("A sort key"));
+        let target = get_wiki_link_target_info(&ctx, "Category:People", "Category:People").unwrap();
+        let out = render_category(&mut ctx, &token, &target);
+
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] {
+            let href = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str());
+            // The sort key should be appended as '#A%20sort%20key'.
+            assert_eq!(href, Some("./Category:People#A%20sort%20key"));
         }
     }
 }
