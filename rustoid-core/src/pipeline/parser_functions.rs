@@ -36,10 +36,42 @@ impl Params {
         res
     }
 
+    /// Convert args to a named-argument view, mirroring `Params::named`.
+    ///
+    /// Positional args (empty key) get 1-based indexes; named args are keyed
+    /// by their trimmed key.
+    pub fn named(&self) -> NamedArgs {
+        let mut dict = std::collections::HashMap::new();
+        let mut named_args = std::collections::HashMap::new();
+        let mut index = 1usize;
+
+        for kv in &self.args {
+            let k = key_value_to_string(&kv.key);
+            let k = k.trim().to_string();
+            if k.is_empty() {
+                dict.insert(index.to_string(), kv.value.clone());
+                index += 1;
+            } else {
+                named_args.insert(k.clone(), true);
+                dict.insert(k, kv.value.clone());
+            }
+        }
+
+        NamedArgs { dict, named_args }
+    }
+
     /// Slice args and convert their values to strings (mirrors `Params::getSlice`).
     pub fn get_slice(&self, start: usize, end: usize) -> Vec<KV> {
         self.args[start..start.min(end.saturating_sub(start))].to_vec()
     }
+}
+
+/// The result of `Params::named`: a positional/named argument view plus a map
+/// indicating which keys are named (mirrors PHP's `namedArgs` + `dict`).
+#[derive(Debug, Clone, Default)]
+pub struct NamedArgs {
+    pub dict: std::collections::HashMap<String, KeyValue>,
+    pub named_args: std::collections::HashMap<String, bool>,
 }
 
 /// Extract a key value as a trimmed string.
