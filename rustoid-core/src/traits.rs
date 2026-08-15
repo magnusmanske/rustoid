@@ -122,6 +122,32 @@ pub struct InterwikiInfo {
     pub local: bool,
     /// Whether transclusions across this interwiki prefix are allowed.
     pub transclusion_allowed: bool,
+    /// Whether this is a local interwiki prefix (matched before namespace
+    /// lookup; empty title means main page). Mirrors PHP's `localinterwiki`.
+    pub localinterwiki: Option<bool>,
+    /// The language code if this prefix is a language link (e.g. `"de"`).
+    /// Mirrors PHP's `language`.
+    pub language: Option<String>,
+    /// Whether this is an extra-language link. Mirrors PHP's `extralanglink`.
+    pub extralanglink: Option<bool>,
+    /// If true, strip the `http:`/`https:` scheme from the absolute href.
+    /// Mirrors PHP's `protorel`.
+    pub protorel: Option<bool>,
+}
+
+impl InterwikiInfo {
+    /// Convenience constructor with the common fields set.
+    pub fn new(url: impl Into<String>, local: bool) -> Self {
+        Self {
+            url: url.into(),
+            local,
+            transclusion_allowed: false,
+            localinterwiki: None,
+            language: None,
+            extralanglink: None,
+            protorel: None,
+        }
+    }
 }
 
 /// Mapping of magic word names to their behavior.

@@ -214,6 +214,10 @@ impl MockSiteConfig {
         config.add_interwiki("meta", "https://meta.wikimedia.org/wiki/$1", true);
         config.add_interwiki("mw", "https://www.mediawiki.org/wiki/$1", true);
 
+        // Register language prefixes (language links, not plain interwikis).
+        config.add_language_interwiki("de", "https://de.wikipedia.org/wiki/$1");
+        config.add_language_interwiki("fr", "https://fr.wikipedia.org/wiki/$1");
+
         // Register common magic words (English)
         config.add_magic_word("toc", &["__TOC__", "__NOTOC__", "__FORCETOC__"]);
         config.add_magic_word(
@@ -276,14 +280,15 @@ impl MockSiteConfig {
     }
 
     fn add_interwiki(&mut self, prefix: &str, url: &str, local: bool) {
-        self.interwiki_map.insert(
-            prefix.to_string(),
-            InterwikiInfo {
-                url: url.to_string(),
-                local,
-                transclusion_allowed: false,
-            },
-        );
+        self.interwiki_map
+            .insert(prefix.to_string(), InterwikiInfo::new(url, local));
+    }
+
+    fn add_language_interwiki(&mut self, prefix: &str, url: &str) {
+        let mut info = InterwikiInfo::new(url, true);
+        info.language = Some(prefix.to_string());
+        info.extralanglink = Some(true);
+        self.interwiki_map.insert(prefix.to_string(), info);
     }
 
     fn add_magic_word(&mut self, canonical: &str, aliases: &[&str]) {

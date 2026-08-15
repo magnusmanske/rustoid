@@ -53,68 +53,109 @@ pub struct WikiLinkTargetInfo {
     /// A title object, if this is a local title link.
     pub title: Option<Title>,
     /// Reserved for interwiki/language info (not yet wired).
-    pub interwiki: Option<String>,
-    pub language: Option<String>,
+    pub interwiki: Option<crate::traits::InterwikiInfo>,
+    pub language: Option<crate::traits::InterwikiInfo>,
     pub local_prefix: Option<String>,
     pub from_colon_escaped_text: bool,
     pub prefix: Option<String>,
 }
 
 /// Normalize and analyze a wikilink target. Mirrors PHP's
-/// `getWikiLinkTargetInfo` for the title and colon-escape cases.
+/// `getWikiLinkTargetInfo` for the title, interwiki, and language cases.
 pub fn get_wiki_link_target_info(
     ctx: &WikiLinkContext,
     href: &str,
     href_src: &str,
 ) -> Result<WikiLinkTargetInfo, String> {
+    use crate::util::decode_uri_component;
+
     let mut href = href.to_string();
     let mut from_colon_escaped_text = false;
+    let mut local_prefix: Option<String> = None;
+    let mut prefix: Option<String> = None;
 
-    // Capture the title to resolve before handling colon escape.
+    // Capture the (decoded) title before handling colon escape.
+    let title_decoded = decode_uri_component(&href);
+
     if href.trim_start().starts_with(':') {
         from_colon_escaped_text = true;
         href = href.trim_start().strip_prefix(':').unwrap().to_string();
     }
     if href.starts_with(':') {
-        // Multiple colons — caught by the caller as an invalid title.
+        // Multiple colons — caught by caller as an invalid title.
         return Err("Multiple colons prefixing href.".to_string());
     }
 
-    // Try to classify prefix (namespace or interwiki) then title.
-    let title = if let Some((prefix, _)) = crate::pipeline::wiki_link_handler::href_parts(&href) {
-        let prefix = prefix.to_string();
-        let normalized = prefix.trim().to_string();
+    let href_bits = crate::pipeline::wiki_link_handler::href_parts(&href);
+
+    let mut title: Option<Title> = None;
+    let mut interwiki: Option<crate::traits::InterwikiInfo> = None;
+    let mut language: Option<crate::traits::InterwikiInfo> = None;
+
+    if let Some((ns_prefix, title_part)) = href_bits {
+        let ns_prefix = ns_prefix.to_string();
+        prefix = Some(ns_prefix.clone());
+
+        let normalized = crate::util::normalize_namespace_name(ns_prefix.trim());
         let ns_id = namespace_id(ctx.config, &normalized);
-        let interwiki = ctx.config.interwiki_map().get(&normalized);
+        let interwiki_info = ctx.config.interwiki_map().get(&normalized).cloned();
 
         if let Some(ns_id) = ns_id {
-            // Namespace prefix: build title with that namespace.
-            let after = href.strip_prefix(&prefix).and_then(|s| s.strip_prefix(':'));
-            let text = after.unwrap_or(&href).to_string();
-            Some(Title::new(ns_id, text))
-        } else if interwiki.is_some() {
-            // Interwiki/language link (not a local title). We don't fully
-            // render these yet; signal with a title from the remaining text.
-            let after = href.strip_prefix(&prefix).and_then(|s| s.strip_prefix(':'));
-            let text = after.unwrap_or(&href).to_string();
-            Some(Title::new_main(text))
+            // Namespace prefix → local title.
+            title = Some(Title::new(ns_id, title_part.to_string()));
+        } else if let Some(info) = &interwiki_info {
+            if info.localinterwiki == Some(true) {
+                // Local interwiki: empty title means main page (T66167).
+                if title_part.is_empty() {
+                    title = Some(Title::new_main(String::new()));
+                } else {
+                    href = if title_part.contains(':') {
+                        format!(":{title_part}")
+                    } else {
+                        title_part.to_string()
+                    };
+                    title = Some(TitleParser::parse(&href, ctx.config));
+                    local_prefix = Some(match local_prefix {
+                        Some(existing) => format!("{ns_prefix}:{existing}"),
+                        None => ns_prefix.clone(),
+                    });
+                }
+            } else if !info.url.is_empty() {
+                href = title_part.to_string();
+                if from_colon_escaped_text
+                    || (info.language.is_none() && info.extralanglink != Some(true))
+                {
+                    // Interwiki link.
+                    interwiki = Some(info.clone());
+                    if href.trim_start().starts_with(':') {
+                        href = href.trim_start().strip_prefix(':').unwrap().to_string();
+                    }
+                } else {
+                    // Language link.
+                    language = Some(info.clone());
+                }
+            } else {
+                // Unrecognized prefix → treat whole string as title.
+                title = Some(TitleParser::parse(&title_decoded, ctx.config));
+            }
         } else {
-            // No recognized namespace/interwiki prefix — plain mainspace title.
-            Some(Title::new_main(href.clone()))
+            // No namespace or interwiki prefix → plain title.
+            title = Some(TitleParser::parse(&title_decoded, ctx.config));
         }
     } else {
-        Some(Title::new_main(href.clone()))
-    };
+        // No colon → plain mainspace title.
+        title = Some(Title::new_main(title_decoded.clone()));
+    }
 
     Ok(WikiLinkTargetInfo {
         href,
         href_src: href_src.to_string(),
         title,
-        interwiki: None,
-        language: None,
-        local_prefix: None,
+        interwiki,
+        language,
+        local_prefix,
         from_colon_escaped_text,
-        prefix: None,
+        prefix,
     })
 }
 
@@ -219,6 +260,101 @@ pub fn render_wiki_link(
     out
 }
 
+/// Render an interwiki link into `<a rel="mw:WikiLink/Interwiki">...</a>`.
+/// Mirrors `WikiLinkHandler::renderInterwikiLink`.
+pub fn render_interwiki_link(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+) -> Vec<Item> {
+    use crate::sanitizer::sanitize_title_uri;
+    use crate::util::decode_uri_component;
+
+    let info = target.interwiki.as_ref().expect("interwiki info");
+
+    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut new_tk = TagTk::new("a", attribs, DataParsoid::default());
+
+    let is_local = info.local;
+    let trimmed_href = target.href.trim();
+    let title = sanitize_title_uri(&decode_uri_component(trimmed_href), !is_local);
+    let mut abs_href = info.url.replace("$1", &title);
+    if info.protorel == Some(true) {
+        abs_href = abs_href
+            .strip_prefix("http:")
+            .or_else(|| abs_href.strip_prefix("https:"))
+            .map(|s| s.to_string())
+            .unwrap_or(abs_href);
+    }
+    new_tk.add_attribute_str("href", &abs_href);
+
+    // Replace the rel attribute value with mw:WikiLink/Interwiki.
+    if let Some(kv) = new_tk
+        .attribs
+        .iter_mut()
+        .find(|kv| kv.key.as_str() == Some("rel"))
+    {
+        kv.value = crate::wikitext::tokens_v2::KeyValue::Str("mw:WikiLink/Interwiki".to_string());
+    }
+
+    // Add title unless it's just a fragment.
+    if target.href.is_empty() || !target.href.starts_with('#') {
+        let mut title_attr = format!("{}:", target.prefix.clone().unwrap_or_default());
+        let stripped_fragment = trimmed_href.split('#').next().unwrap_or(trimmed_href);
+        title_attr.push_str(&decode_uri_component(&stripped_fragment.replace('_', " ")));
+        new_tk.add_attribute_str("title", &title_attr);
+    }
+
+    let mut out = vec![Item::Tok(ParsoidToken::Tag(new_tk))];
+    out.extend(content);
+    out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+        "a",
+        vec![],
+        DataParsoid::default(),
+    ))));
+    out
+}
+
+/// Render a language link into `<link rel="mw:PageProp/Language">`.
+/// Mirrors `WikiLinkHandler::renderLanguageLink`.
+pub fn render_language_link(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+) -> Vec<Item> {
+    use crate::sanitizer::sanitize_title_uri;
+    use crate::util::decode_uri_component;
+
+    let info = target.language.as_ref().expect("language info");
+
+    let (attribs, _content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut new_tk =
+        crate::wikitext::tokens_v2::SelfclosingTagTk::new("link", attribs, DataParsoid::default());
+
+    // Set absolute link to the article in the other language.
+    let title = sanitize_title_uri(&decode_uri_component(&target.href), false);
+    let mut abs_href = info.url.replace("$1", &title);
+    if info.protorel == Some(true) {
+        abs_href = abs_href
+            .strip_prefix("http:")
+            .or_else(|| abs_href.strip_prefix("https:"))
+            .map(|s| s.to_string())
+            .unwrap_or(abs_href);
+    }
+    new_tk.add_attribute_str("href", &abs_href);
+
+    // Change rel to mw:PageProp/Language.
+    if let Some(kv) = new_tk
+        .attribs
+        .iter_mut()
+        .find(|kv| kv.key.as_str() == Some("rel"))
+    {
+        kv.value = crate::wikitext::tokens_v2::KeyValue::Str("mw:PageProp/Language".to_string());
+    }
+
+    vec![Item::Tok(ParsoidToken::SelfclosingTag(new_tk))]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +430,55 @@ mod tests {
         let title = target.title.unwrap();
         assert_eq!(title.namespace_id, 10);
         assert_eq!(title.text, "Foo");
+    }
+
+    #[test]
+    fn test_interwiki_classification() {
+        let ctx = WikiLinkContext::new(config_static());
+        // "wikipedia" is a non-language interwiki (no `language` field).
+        let target = get_wiki_link_target_info(&ctx, "wikipedia:Foo", "wikipedia:Foo").unwrap();
+        assert!(target.interwiki.is_some());
+        assert!(target.language.is_none());
+
+        // "de" is a language prefix (has `language` field).
+        let target = get_wiki_link_target_info(&ctx, "de:Foo", "de:Foo").unwrap();
+        assert!(target.language.is_some());
+        assert!(target.interwiki.is_none());
+    }
+
+    #[test]
+    fn test_render_interwiki_link() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("wikipedia:Foo", None);
+        let target = get_wiki_link_target_info(&ctx, "wikipedia:Foo", "wikipedia:Foo").unwrap();
+        let out = render_interwiki_link(&mut ctx, &token, &target);
+
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "a"));
+        if let Item::Tok(ParsoidToken::Tag(t)) = &out[0] {
+            let href = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(href, Some("https://en.wikipedia.org/wiki/Foo"));
+        }
+    }
+
+    #[test]
+    fn test_render_language_link() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("de:Foo", None);
+        let target = get_wiki_link_target_info(&ctx, "de:Foo", "de:Foo").unwrap();
+        let out = render_language_link(&mut ctx, &token, &target);
+
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "link"));
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] {
+            let href = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(href, Some("https://de.wikipedia.org/wiki/Foo"));
+        }
     }
 }
