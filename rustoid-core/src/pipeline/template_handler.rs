@@ -496,6 +496,57 @@ pub fn enforce_template_constraints(
     ])
 }
 
+/// Post-process a token chunk emitted after feeding a template. Mirrors
+/// PHP's `TemplateHandler::processTemplateTokens`.
+///
+/// - strips the EOF token;
+/// - clears `tsr` (template content has synthetic source ranges);
+/// - turns `mw:Placeholder` metas into empty strings (so they aren't
+///   foster-parented);
+/// - discards comments when template expansion is disabled.
+pub fn process_template_tokens(chunk: Vec<Item>, expand_templates: bool) -> Vec<Item> {
+    let mut out = Vec::new();
+    for mut item in chunk {
+        match &mut item {
+            Item::Tok(t) => match t {
+                ParsoidToken::Eof(_) => continue,
+                ParsoidToken::SelfclosingTag(stt)
+                    if stt.name == "meta"
+                        && crate::wikitext::token_utils::has_type_of(t, "mw:Placeholder") =>
+                {
+                    // Replace with an empty string (not an empty Item, which
+                    // would keep a phantom token in the chunk).
+                    out.push(Item::Str(String::new()));
+                    continue;
+                }
+                ParsoidToken::Comment(_) if !expand_templates => continue,
+                _ => {}
+            },
+            Item::Str(_) => {}
+        }
+
+        // Clear template-internal source ranges.
+        if let Item::Tok(t) = &mut item
+            && let Some(dp) = t.data_parsoid_mut()
+        {
+            dp.tsr = None;
+        }
+        out.push(item);
+    }
+    out
+}
+
+/// Wrap parser-function output tokens. Mirrors PHP's
+/// `TemplateHandler::parserFunctionsWrapper`: filter out empty strings,
+/// then run `processTemplateTokens`.
+pub fn parser_functions_wrapper(tokens: Vec<Item>) -> Vec<Item> {
+    let filtered: Vec<Item> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Item::Str(s) if s.is_empty()))
+        .collect();
+    process_template_tokens(filtered, /* expand_templates */ true)
+}
+
 /// Convert a template target to a wikilink (for the redlink path). Mirrors the
 /// fallback in `expandTemplateNatively` when the template isn't found.
 pub fn template_to_wikilink(name: &str) -> Item {
@@ -1057,6 +1108,25 @@ mod tests {
 
         // ignore_loop bypasses loop detection.
         assert!(enforce_template_constraints(&frame, "Template:Foo", &title, 40, true).is_none());
+    }
+
+    #[test]
+    fn test_process_template_tokens() {
+        use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
+
+        let mut tk = TagTk::new("span", vec![], DataParsoid::default());
+        tk.data_parsoid.tsr = Some(crate::wikitext::tokens_v2::SourceRange::new(0, 4));
+        let chunk = vec![
+            Item::Tok(ParsoidToken::Tag(tk)),
+            Item::Str("x".to_string()),
+            Item::Tok(ParsoidToken::Eof(crate::wikitext::tokens_v2::EOFTk)),
+        ];
+
+        let out = process_template_tokens(chunk, true);
+        assert_eq!(out.len(), 2);
+        if let Item::Tok(ParsoidToken::Tag(t)) = &out[0] {
+            assert!(t.data_parsoid.tsr.is_none());
+        }
     }
 
     #[test]
