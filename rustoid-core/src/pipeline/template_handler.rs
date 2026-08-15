@@ -415,6 +415,29 @@ fn magic_word_for_variable(config: &dyn SiteConfig, name: &str) -> Option<(Strin
     None
 }
 
+/// Process the special `!` magic word. Mirrors PHP's
+/// `TemplateHandler::processSpecialMagicWord`.
+///
+/// `magic_word_type === '!'` is `{{!}}`, which expands to a literal `|` at
+/// the top level, or to a table cell (`<td>`) inside a template (so the token
+/// can be recognized as a cell in the enclosing table).
+pub fn process_special_magic_word(magic_word_type: &str, in_template: bool) -> Vec<Item> {
+    use crate::wikitext::tokens_v2::{DataParsoid, ParsoidToken, TagTk};
+
+    if magic_word_type == "!" {
+        if in_template {
+            let td = TagTk::new("td", vec![], DataParsoid::default());
+            vec![Item::Tok(ParsoidToken::Tag(td))]
+        } else {
+            vec![Item::Str("|".to_string())]
+        }
+    } else {
+        // PHP throws an unreachable here for unsupported magic word types.
+        // We return an empty chunk rather than panicking.
+        Vec::new()
+    }
+}
+
 /// Convert a template target to a wikilink (for the redlink path). Mirrors the
 /// fallback in `expandTemplateNatively` when the template isn't found.
 pub fn template_to_wikilink(name: &str) -> Item {
@@ -595,6 +618,22 @@ mod tests {
             }
             other => panic!("expected template, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_process_special_magic_word() {
+        // Top level: {{!}} is a literal pipe.
+        let toks = process_special_magic_word("!", false);
+        assert_eq!(toks, vec![Item::Str("|".to_string())]);
+
+        // Inside a template: {{!}} becomes a <td>.
+        let toks = process_special_magic_word("!", true);
+        assert!(
+            matches!(&toks[0], Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Tag(t)) if t.name == "td")
+        );
+
+        // Unsupported magic-word types yield an empty chunk (no panic).
+        assert!(process_special_magic_word("something-else", false).is_empty());
     }
 
     #[test]
