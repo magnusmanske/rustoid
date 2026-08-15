@@ -15,25 +15,46 @@ use crate::wikitext::tokens_v2::{
 pub struct ParamInfo {
     /// Parameter key (string form, positional index for unnamed args).
     pub k: String,
+    /// The key source wikitext, if different from `k`.
+    pub key_wt: Option<String>,
     /// The parameter's wikitext value.
     pub value_wt: String,
     /// Whether this is a named parameter.
     pub named: bool,
+    /// Four-element whitespace array for non-standard spacing.
+    pub spc: Option<[String; 4]>,
+    /// Precomputed HTML representation (optional).
+    pub html: Option<String>,
 }
 
 impl ParamInfo {
     pub fn new(k: impl Into<String>) -> Self {
         Self {
             k: k.into(),
+            key_wt: None,
             value_wt: String::new(),
             named: false,
+            spc: None,
+            html: None,
         }
+    }
+
+    /// Returns true if this parameter uses a positive-integer key, like a
+    /// positional argument. Mirrors `ParamInfo::isNumericKey`.
+    pub fn is_numeric_key(&self) -> bool {
+        self.k
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_digit() && b != b'0')
+            && self.k.bytes().all(|b| b.is_ascii_digit())
     }
 }
 
 /// Template metadata (mirrors PHP's `TemplateInfo`).
 #[derive(Debug, Clone, Default)]
 pub struct TemplateInfo {
+    /// The target wikitext.
+    pub target_wt: Option<String>,
     /// Parser function / variable name (for `mw:Transclusion` of functions).
     pub func: Option<String>,
     /// Template target href (for template transclusions).
@@ -44,6 +65,8 @@ pub struct TemplateInfo {
     pub resolved_rev_id: Option<i64>,
     /// The parameter list.
     pub param_infos: Vec<ParamInfo>,
+    /// Template type descriptor.
+    pub ty: Option<String>,
 }
 
 /// Builds the transclusion encapsulation markers around a token chunk.
@@ -116,14 +139,19 @@ impl TemplateEncapsulator {
         out.extend(tokens);
         out.push(self.encapsulation_info_end());
 
-        // Store template info on the start marker's data-parsoid.
-        // (We store it structurally for now; the data-mw JSON blob is
-        // serialized later once DataMw is fully wired.)
         if let Item::Tok(ParsoidToken::SelfclosingTag(meta)) = &mut out[0] {
             meta.data_parsoid.src = self.token_src.clone();
+            meta.data_parsoid.colon = self.token_colon.clone();
+
+            // Serialize the template info as data-mw. This is the same JSON
+            // blob DOMDataUtils stores on the start marker's `data-mw`
+            // attribute (mirrors `TemplateInfo::toJsonArray`).
+            let data_mw = serialize_template_info(info);
+            if !data_mw.is_empty() {
+                meta.attribs.push(string_kv("data-mw", &data_mw));
+            }
         }
 
-        let _ = info;
         out
     }
 }
@@ -136,11 +164,17 @@ pub fn template_info_from(
     param_infos: Vec<ParamInfo>,
 ) -> TemplateInfo {
     TemplateInfo {
+        target_wt: None,
         func: func.map(|s| s.to_string()),
         href: href.map(|s| s.to_string()),
         resolved_title: None,
         resolved_rev_id: None,
         param_infos,
+        ty: if func.is_some() {
+            Some("old-parserfunction".to_string())
+        } else {
+            None
+        },
     }
 }
 
@@ -152,6 +186,215 @@ fn string_kv(key: &str, value: &str) -> KV {
         ksrc: None,
         vsrc: None,
     }
+}
+
+/// Serialize a `TemplateInfo` to the data-mw JSON object that PHP's
+/// `TemplateInfo::toJsonArray` emits (the `target`/`params`/`i` shape).
+///
+/// We serialize by hand to keep the crate free of an external JSON
+/// dependency for this small, stable shape. A couple of JSON escaping rules
+/// are enough because values are plain wikitext strings.
+pub fn serialize_template_info(info: &TemplateInfo) -> String {
+    let mut target = String::from("{");
+    if let Some(wt) = &info.target_wt {
+        target.push_str(&format!("\"wt\":{}", json_string(wt)));
+    } else {
+        // target must at least have "wt" for empty transclusions.
+        target.push_str("\"wt\":null");
+    }
+    if let Some(func) = &info.func {
+        target.push(',');
+        let func_field = if info.ty.as_deref() == Some("parserfunction") {
+            format!("\"key\":{}", json_string(func))
+        } else {
+            format!("\"function\":{}", json_string(func))
+        };
+        target.push_str(&func_field);
+    }
+    if let Some(href) = &info.href {
+        target.push(',');
+        target.push_str(&format!("\"href\":{}", json_string(href)));
+    }
+    target.push('}');
+
+    // Params object.
+    let mut params = String::from("{");
+    let mut first = true;
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut count = 0usize;
+    for param in &info.param_infos {
+        if !first {
+            params.push(',');
+        }
+        first = false;
+        count += 1;
+
+        let mut key = param.k.clone();
+        // For duplicate keys, disambiguate with a leading '=' like PHP does.
+        if let Some(&_n) = seen.get(&key) {
+            key = format!("={count}={key}");
+        }
+        seen.insert(param.k.clone(), count);
+
+        let value_wt = if param.value_wt.is_empty() {
+            "null".to_string()
+        } else {
+            json_string(&param.value_wt)
+        };
+        params.push_str(&format!("{}:{{\"wt\":{}}}", json_string(&key), value_wt));
+        if let Some(key_wt) = &param.key_wt {
+            params.push_str(&format!(",\"key\":{{\"wt\":{}}}", json_string(key_wt)));
+        }
+        params.push('}');
+    }
+    params.push('}');
+
+    let mut out = String::new();
+    out.push_str("{\"target\":");
+    out.push_str(&target);
+    out.push_str(",\"params\":");
+    out.push_str(&params);
+    out.push('}');
+    out
+}
+
+/// Escape a string for inclusion in a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\"');
+    for c in s.chars() {
+        match c {
+            '\"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('\"');
+    out
+}
+
+/// Split the first colon-delimited argument from `params[0]` (for old
+/// parser functions like `{{#if:x|...}}`). Mirrors
+/// `TemplateEncapsulator::adjustParserFunctionArg0` for the string-KV subset.
+///
+/// Returns the adjusted params and an optional colon string.
+pub fn adjust_parser_function_arg0(
+    params: &crate::pipeline::parser_functions::Params,
+) -> (crate::pipeline::parser_functions::Params, Option<String>) {
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    // The first arg's key is the full target, e.g. "#if:x". Split on the
+    // first ':' or fullwidth '：'.
+    let Some(first) = params.args.first() else {
+        return (params.clone(), None);
+    };
+    let key = key_value_to_string(&first.key);
+    let colon_pos = key.find([':', '：']);
+    let Some(pos) = colon_pos else {
+        return (params.clone(), None);
+    };
+    let colon = key[pos..pos + 1].to_string();
+    let name = key[..pos].to_string();
+    let arg0 = key[pos + 1..].to_string();
+    let src_offsets = first.src_offsets.clone();
+
+    let mut new_args = Vec::with_capacity(params.args.len() + 1);
+    // Replace args[0] with [name, arg0], then append args[1..].
+    new_args.push(crate::wikitext::tokens_v2::KV {
+        key: KeyValue::Str(name),
+        value: KeyValue::Str(String::new()),
+        src_offsets,
+        ksrc: None,
+        vsrc: None,
+    });
+    new_args.push(crate::wikitext::tokens_v2::KV {
+        key: KeyValue::Str(String::new()),
+        value: KeyValue::Str(arg0),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
+    new_args.extend(params.args.iter().skip(1).cloned());
+
+    (
+        crate::pipeline::parser_functions::Params::new(new_args),
+        Some(colon),
+    )
+}
+
+/// Prepare `ParamInfo` for a parser function transclusion. Mirrors
+/// `TemplateEncapsulator::preparePfParamInfos` for string-valued args (no
+/// source offsets are available yet).
+pub fn prepare_pf_param_infos(
+    target_wt: &str,
+    params: &crate::pipeline::parser_functions::Params,
+) -> Vec<ParamInfo> {
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    let mut out = Vec::new();
+    let mut arg_index = 1usize;
+
+    // Split the colon-separated first argument from target_wt.
+    if let Some(pos) = target_wt.find([':', '：']) {
+        let arg0 = &target_wt[pos + 1..];
+        let mut info = ParamInfo::new(arg_index.to_string());
+        info.value_wt = arg0.to_string();
+        out.push(info);
+        arg_index += 1;
+    }
+
+    // params[0] was the target; iterate params[1..].
+    for param in params.args.iter().skip(1) {
+        let k = key_value_to_string(&param.key);
+        let v = key_value_to_string(&param.value);
+        let mut info = ParamInfo::new(arg_index.to_string());
+        info.value_wt = if k.is_empty() { v } else { format!("{k}={v}") };
+        out.push(info);
+        arg_index += 1;
+    }
+
+    out
+}
+
+/// Prepare `ParamInfo` for a template transclusion. Mirrors
+/// `TemplateEncapsulator::prepareTplParamInfos` for string-valued args.
+pub fn prepare_tpl_param_infos(
+    params: &crate::pipeline::parser_functions::Params,
+) -> Vec<ParamInfo> {
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    let mut out = Vec::new();
+    let mut arg_index = 1usize;
+
+    // Ignore params[0] (the template name).
+    for param in params.args.iter().skip(1) {
+        let k = key_value_to_string(&param.key).trim().to_string();
+        let v = key_value_to_string(&param.value);
+
+        let mut info = if k.is_empty() {
+            let mut info = ParamInfo::new(arg_index.to_string());
+            arg_index += 1;
+            info.value_wt = v;
+            info
+        } else {
+            let mut info = ParamInfo::new(k.clone());
+            info.named = true;
+            info.value_wt = v.trim().to_string();
+            info
+        };
+
+        // Preserve original key wikitext when it differs.
+        if info.named && k != info.k {
+            info.key_wt = Some(k);
+        }
+        out.push(info);
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -203,5 +446,100 @@ mod tests {
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "content"))
         );
+    }
+
+    #[test]
+    fn test_adjust_parser_function_arg0() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let params = crate::pipeline::parser_functions::Params::new(vec![KV {
+            key: KeyValue::Str("#if:x".to_string()),
+            value: KeyValue::Str(String::new()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }]);
+
+        let (adjusted, colon) = adjust_parser_function_arg0(&params);
+        assert_eq!(colon.as_deref(), Some(":"));
+        assert_eq!(adjusted.args[0].key.as_str(), Some("#if"));
+        assert_eq!(adjusted.args[1].value.as_str(), Some("x"));
+    }
+
+    #[test]
+    fn test_prepare_pf_param_infos() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let params = crate::pipeline::parser_functions::Params::new(vec![
+            KV {
+                key: KeyValue::Str("#if:x".to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Str("yes".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+
+        let infos = prepare_pf_param_infos("#if:x", &params);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].k, "1");
+        assert_eq!(infos[0].value_wt, "x");
+        assert_eq!(infos[1].k, "2");
+        assert_eq!(infos[1].value_wt, "yes");
+    }
+
+    #[test]
+    fn test_prepare_tpl_param_infos() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let params = crate::pipeline::parser_functions::Params::new(vec![
+            KV {
+                key: KeyValue::Str("Foo".to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Str("pos".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str(" name ".to_string()),
+                value: KeyValue::Str(" value ".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+
+        let infos = prepare_tpl_param_infos(&params);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].k, "1");
+        assert_eq!(infos[0].value_wt, "pos");
+        assert!(!infos[0].named);
+        assert_eq!(infos[1].k, "name");
+        assert_eq!(infos[1].value_wt, "value");
+        assert!(infos[1].named);
+    }
+
+    #[test]
+    fn test_serialize_template_info() {
+        let mut info = template_info_from(Some("if"), None, vec![]);
+        info.target_wt = Some("#if:x".to_string());
+
+        let json = serialize_template_info(&info);
+        assert!(json.contains("\"function\":\"if\""));
+        assert!(json.contains("\"wt\":\"#if:x\""));
     }
 }

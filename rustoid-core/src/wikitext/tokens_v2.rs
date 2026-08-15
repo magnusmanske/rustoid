@@ -139,6 +139,8 @@ pub struct DataParsoid {
     pub ext_tag_offsets: Option<DomSourceRange>,
     /// Link token for redirects.
     pub link_tk: Option<Box<ParsoidToken>>,
+    /// Parser-function colon (':') separator source.
+    pub colon: Option<String>,
 }
 
 impl DataParsoid {
