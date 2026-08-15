@@ -284,7 +284,7 @@ impl<'a, S: DataSource, C: SiteConfig> Preprocessor<'a, S, C> {
 
 /// Very basic expression evaluator for `#expr` and `#ifexpr`.
 /// Supports +, -, *, / and parentheses. Returns result as string.
-fn evaluate_expression(expr: &str) -> String {
+pub(crate) fn evaluate_expression(expr: &str) -> String {
     let expr = expr.trim();
     if expr.is_empty() {
         return String::new();
