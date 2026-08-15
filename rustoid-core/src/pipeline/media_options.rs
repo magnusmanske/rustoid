@@ -263,7 +263,6 @@ mod tests {
 
     #[test]
     fn test_get_option_info_width() {
-        let config = MockSiteConfig::new();
         // Note: our mock doesn't define img_width aliases thoroughly, so test
         // with a plain numeric string that maps via `200px` -> 'width'.
         // This test documents the parse_media_dimension behavior.
