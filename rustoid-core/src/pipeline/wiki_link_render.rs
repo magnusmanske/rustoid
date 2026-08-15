@@ -516,28 +516,68 @@ pub fn link_to_media(
     out
 }
 
-/// Render a file link for the simple no-options case. Mirrors
-/// `WikiLinkHandler::renderFile` (the large image-option parsing path is
-/// layered on when the media option machinery is ported).
+/// Render a file link, parsing image options. Mirrors `WikiLinkHandler::renderFile`
+/// for the common simple-option and width cases (full media info fetching and
+/// complex option stringification are deferred).
 pub fn render_file(
     ctx: &mut WikiLinkContext,
-    _token: &ParsoidToken,
+    token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
 ) -> Vec<Item> {
+    use super::media_options::{MediaOpts, get_format, get_option_info, get_wrapper_info};
+
     let title = target.title.as_ref().expect("file title");
 
-    // No options: format is null, so inline, classes = [mw-default-size].
-    let rdfa_type = "mw:File";
-    let classes = ["mw-default-size".to_string()];
+    // Extract option strings from mw:maybeContent (pipe-separated).
+    let mut opts = MediaOpts::default();
+    if let Some(content) = token.get_attribute_v("mw:maybeContent") {
+        for part in content.split('|') {
+            if let Some(info) = get_option_info(ctx.config, part) {
+                match info.ck.as_str() {
+                    "format" => opts.format = Some(info.v),
+                    "manualthumb" => opts.manualthumb = Some(info.v),
+                    "halign" => opts.halign = Some(info.v),
+                    "valign" => opts.valign = Some(info.v),
+                    "border" => opts.border = Some(info.v),
+                    "upright" => opts.upright = Some(info.v),
+                    "width" => {
+                        // Parse WxH (separated by 'x').
+                        if let Some((w, h)) = info.v.split_once('x') {
+                            opts.width = Some(w.to_string());
+                            opts.height = Some(h.to_string());
+                        } else {
+                            opts.width = Some(info.v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let format = get_format(&opts);
+    let (classes, is_inline) = get_wrapper_info(&opts);
+
+    // rdfa type and container.
+    let rdfa_type = match format.as_deref() {
+        Some("manualthumb") | Some("thumbnail") => "mw:File/Thumb",
+        Some("framed") => "mw:File/Frame",
+        Some("frameless") => "mw:File/Frameless",
+        _ => "mw:File",
+    };
+
+    let container_name = if is_inline { "span" } else { "figure" };
 
     let mut container_attribs = vec![crate::pipeline::wiki_link_handler::string_kv(
         "typeof", rdfa_type,
     )];
-    container_attribs.insert(
-        0,
-        crate::pipeline::wiki_link_handler::string_kv("class", &classes.join(" ")),
-    );
-    let container = TagTk::new("span", container_attribs, DataParsoid::default());
+    if !classes.is_empty() {
+        container_attribs.insert(
+            0,
+            crate::pipeline::wiki_link_handler::string_kv("class", &classes.join(" ")),
+        );
+    }
+    let container = TagTk::new(container_name, container_attribs, DataParsoid::default());
 
     // Anchor wraps the file element.
     let mut anchor = TagTk::new("a", vec![], DataParsoid::default());
@@ -545,12 +585,18 @@ pub fn render_file(
     anchor.add_attribute_str("class", "new");
     anchor.add_attribute_str("title", title.get_prefixed_text());
 
-    // Inner span (broken media placeholder).
+    // Inner span (broken media placeholder) with resource/lang/data-* attrs.
     let mut span = TagTk::new("span", vec![], DataParsoid::default());
     span.add_attribute_str("class", "mw-file-element mw-broken-media");
     span.add_attribute_str("resource", make_link(title, ctx.config));
+    if let Some(width) = &opts.width {
+        span.add_attribute_str("data-width", width);
+    }
+    if let Some(height) = &opts.height {
+        span.add_attribute_str("data-height", height);
+    }
 
-    vec![
+    let mut out = vec![
         Item::Tok(ParsoidToken::Tag(container)),
         Item::Tok(ParsoidToken::Tag(anchor)),
         Item::Tok(ParsoidToken::Tag(span)),
@@ -565,12 +611,29 @@ pub fn render_file(
             vec![],
             DataParsoid::default(),
         ))),
-        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-            "span",
+    ];
+
+    // For block formats, add a figcaption (empty) then close the figure.
+    if !is_inline {
+        out.push(Item::Tok(ParsoidToken::Tag(TagTk::new(
+            "figcaption",
             vec![],
             DataParsoid::default(),
-        ))),
-    ]
+        ))));
+        out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "figcaption",
+            vec![],
+            DataParsoid::default(),
+        ))));
+    }
+
+    out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+        container_name,
+        vec![],
+        DataParsoid::default(),
+    ))));
+
+    out
 }
 
 /// Dispatch a wikilink token to the correct renderer based on the target's
@@ -812,6 +875,34 @@ mod tests {
                 .and_then(|kv| kv.value.as_str());
             assert_eq!(rel, Some("mw:MediaLink"));
         }
+    }
+
+    #[test]
+    fn test_render_file_link_with_thumb() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("File:Example.jpg", Some("thumb"));
+        let target =
+            get_wiki_link_target_info(&ctx, "File:Example.jpg", "File:Example.jpg").unwrap();
+        assert_eq!(target.title.as_ref().unwrap().namespace_id, 6);
+
+        let out = render_file(&mut ctx, &token, &target);
+
+        // With 'thumb' (thumbnail format), the container should be a <figure>
+        // with typeof='mw:File/Thumb'.
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "figure"));
+        if let Item::Tok(ParsoidToken::Tag(t)) = &out[0] {
+            let type_of = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(type_of, Some("mw:File/Thumb"));
+        }
+        // Block formats include a figcaption.
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "figcaption"))
+        );
     }
 
     #[test]

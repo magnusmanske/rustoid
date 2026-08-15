@@ -6,6 +6,7 @@
 pub mod behavior_switch_handler;
 pub mod external_link_handler;
 pub mod list_handler;
+pub mod media_options;
 pub mod paragraph_wrapper;
 pub mod paragraph_wrapper_v2;
 pub mod pre_handler;
