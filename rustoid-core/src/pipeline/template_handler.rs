@@ -456,6 +456,46 @@ pub fn process_special_magic_word(magic_word_type: &str, in_template: bool) -> V
     }
 }
 
+/// Enforce template loop / depth constraints. Mirrors PHP's
+/// `TemplateHandler::enforceTemplateConstraints`.
+///
+/// Returns `Some` error tokens (`<span class=error>` + message +
+/// `<a href>` + `</span>`) when a loop / depth violation is detected,
+/// else `None`.
+pub fn enforce_template_constraints(
+    frame: &super::frame::Frame,
+    target: &str,
+    title: &Title,
+    max_depth: usize,
+    ignore_loop: bool,
+) -> Option<Vec<Item>> {
+    use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, KV, KeyValue, TagTk};
+
+    let error = frame.loop_and_depth_check(title, max_depth, ignore_loop)?;
+
+    let mut span = TagTk::new("span", vec![], DataParsoid::default());
+    span.attribs.push(KV {
+        key: KeyValue::Str("class".to_string()),
+        value: KeyValue::Str("error".to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
+
+    let wikilink = template_to_wikilink(target);
+
+    Some(vec![
+        Item::Tok(ParsoidToken::Tag(span)),
+        Item::Str(error),
+        wikilink,
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
+    ])
+}
+
 /// Convert a template target to a wikilink (for the redlink path). Mirrors the
 /// fallback in `expandTemplateNatively` when the template isn't found.
 pub fn template_to_wikilink(name: &str) -> Item {
@@ -996,6 +1036,27 @@ mod tests {
         );
         assert_eq!(parse_template_arg_src("{{{}}}"), None);
         assert_eq!(parse_template_arg_src("not-an-arg"), None);
+    }
+
+    #[test]
+    fn test_enforce_template_constraints() {
+        let config = MockSiteConfig::new();
+        let title = TitleParser::parse("Template:Foo", &config);
+        let frame = crate::pipeline::frame::Frame::new(title.clone(), vec![]);
+
+        // Same title => loop => error tokens.
+        let err = enforce_template_constraints(&frame, "Template:Foo", &title, 40, false);
+        assert!(err.is_some());
+        let tokens = err.unwrap();
+        assert!(matches!(&tokens[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "span"));
+        assert!(
+            tokens
+                .iter()
+                .any(|it| matches!(it, Item::Str(s) if s.contains("Template loop")))
+        );
+
+        // ignore_loop bypasses loop detection.
+        assert!(enforce_template_constraints(&frame, "Template:Foo", &title, 40, true).is_none());
     }
 
     #[test]
