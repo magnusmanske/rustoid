@@ -18,7 +18,7 @@ use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
 use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 
 use super::parser_functions::{Params, ParserFunctions};
-use super::template_encapsulator::{TemplateEncapsulator, template_info_from};
+use super::template_encapsulator::{TemplateEncapsulator, TemplateInfo, template_info_from};
 
 /// Is this token an annotation meta tag? Mirrors PHP
 /// `WTUtils::ANNOTATION_META_TYPE_REGEXP`.
@@ -399,6 +399,22 @@ fn is_safe_subst(name: &str) -> bool {
     name == "safesubst"
 }
 
+/// Parse a `{{{...}}}` template-argument source string into its argument name
+/// and optional default. Mirrors the `k` / `v` attribution of PHP's
+/// `templatearg` token.
+pub fn parse_template_arg_src(src: &str) -> Option<(String, Option<String>)> {
+    let inner = src.strip_prefix("{{{")?.strip_suffix("}}}")?;
+    // Split on the first '|' for name | default.
+    let (name, default) = match inner.split_once('|') {
+        Some((n, d)) => (n.trim().to_string(), Some(d.to_string())),
+        None => (inner.trim().to_string(), None),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, default))
+}
+
 /// Find a magic variable whose alias matches `name`. Mirrors
 /// `SiteConfig::getMagicWordForVariable`.
 /// Returns (canonical name, whether it's a variable). Variables are magic
@@ -497,7 +513,8 @@ impl TemplateHandler {
             Some(ResolvedTarget::Variable { name, .. }) => {
                 let value = Self::variable_value(config, &name);
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-                let info = template_info_from(Some(&name), None, vec![]);
+                let mut info = template_info_from(Some(&name), None, vec![]);
+                info.target_wt = Some(target_str.clone());
                 encap.encap_tokens(vec![Item::Str(value)], &info)
             }
             Some(ResolvedTarget::ParserFunction {
@@ -521,13 +538,18 @@ impl TemplateHandler {
                 if !colon.is_empty() {
                     encap.set_colon(Some(colon));
                 }
-                let info = template_info_from(Some(&name), None, vec![]);
+                let mut info = template_info_from(Some(&name), None, vec![]);
+                info.target_wt = Some(target_str.clone());
+                info.param_infos =
+                    super::template_encapsulator::prepare_pf_param_infos(&target_str, params);
                 encap.encap_tokens(result, &info)
             }
             Some(ResolvedTarget::Template { name, .. }) => {
                 // Native template fetching is deferred; emit a redlink wikilink.
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-                let info = template_info_from(None, Some(&name), vec![]);
+                let mut info = template_info_from(None, Some(&name), vec![]);
+                info.target_wt = Some(target_str.clone());
+                info.param_infos = super::template_encapsulator::prepare_tpl_param_infos(params);
                 encap.encap_tokens(vec![template_to_wikilink(&name)], &info)
             }
             None => vec![Item::Str(target_str)],
@@ -573,6 +595,39 @@ impl TemplateHandler {
             "urlencode" => ParserFunctions::pf_urlencode(params),
             // Unknown parser function: return its name in braces.
             _ => vec![Item::Str(format!("{{{{{{#{name}|...}}}}}}"))],
+        }
+    }
+
+    /// Handle a bare `{{{...}}}` template-argument token at the top level.
+    /// Mirrors PHP's `TemplateHandler::onTemplateArg`: expand the argument
+    /// via the frame and wrap it with `mw:Param` markers when outside a
+    /// template context.
+    pub fn handle_template_arg(
+        &self,
+        frame: &super::frame::Frame,
+        src: &str,
+        about_id: String,
+        token: &ParsoidToken,
+        wrap: bool,
+    ) -> Vec<Item> {
+        let (name, default) = match parse_template_arg_src(src) {
+            Some(pair) => pair,
+            None => return vec![Item::Str(src.to_string())],
+        };
+
+        let mut toks = frame.expand_template_arg(&name);
+        if toks.is_empty()
+            && let Some(default) = default
+        {
+            toks = vec![Item::Str(default)];
+        }
+
+        if wrap {
+            let encap = TemplateEncapsulator::new("mw:Param", about_id, token);
+            let info = TemplateInfo::default();
+            encap.encap_tokens(toks, &info)
+        } else {
+            toks
         }
     }
 
@@ -926,6 +981,53 @@ mod tests {
         assert!(
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "Hello world"))
+        );
+    }
+
+    #[test]
+    fn test_parse_template_arg_src() {
+        assert_eq!(
+            parse_template_arg_src("{{{1}}}"),
+            Some(("1".to_string(), None))
+        );
+        assert_eq!(
+            parse_template_arg_src("{{{ name | default }}}"),
+            Some(("name".to_string(), Some(" default ".to_string())))
+        );
+        assert_eq!(parse_template_arg_src("{{{}}}"), None);
+        assert_eq!(parse_template_arg_src("not-an-arg"), None);
+    }
+
+    #[test]
+    fn test_handle_template_arg() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let config = MockSiteConfig::new();
+        let title = TitleParser::parse("Template:Foo", &config);
+        let args = vec![KV {
+            key: KeyValue::Str("".to_string()),
+            value: KeyValue::Str("world".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        let frame = crate::pipeline::frame::Frame::new(title, args);
+
+        let token =
+            ParsoidToken::SelfclosingTag(crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+                "templatearg",
+                vec![],
+                crate::wikitext::tokens_v2::DataParsoid::default(),
+            ));
+
+        let handler = TemplateHandler;
+        let out = handler.handle_template_arg(&frame, "{{{1}}}", "#mwt1".to_string(), &token, true);
+
+        // Wrapped in mw:Param markers, content resolves to "world".
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "meta"));
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Str(s) if s == "world"))
         );
     }
 }
