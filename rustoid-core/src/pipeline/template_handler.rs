@@ -10,9 +10,11 @@
 //! expansion, the preprocessor, and argument handling are layered in once the
 //! frame/preprocessor/data-access infrastructure is available.
 
+use crate::expand::transclusion;
 use crate::title::{Title, TitleParser};
-use crate::traits::SiteConfig;
+use crate::traits::{DataSource, SiteConfig};
 use crate::wikitext::token_utils::{is_entity_span_token, match_type_of};
+use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
 use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 
 use super::parser_functions::{Params, ParserFunctions};
@@ -573,6 +575,87 @@ impl TemplateHandler {
             _ => vec![Item::Str(format!("{{{{{{#{name}|...}}}}}}"))],
         }
     }
+
+    /// Fetch, expand, and tokenize a template natively. Mirrors the
+    /// `fetchTemplateAndTitle` + `processTemplateSource` path of PHP's
+    /// `TemplateHandler::expandTemplateNatively` for a resolved template
+    /// target.
+    ///
+    /// Template source is fetched via `DataSource::get_template`, then
+    /// re-parsed with the (approximate) tokenizer and encapsulated with
+    /// `mw:Transclusion` markers. Argument substitution uses the existing
+    /// string-level transclusion engine until the token-level
+    /// `AttributeTransformManager` is ported.
+    pub async fn expand_template_natively(
+        source: &dyn DataSource,
+        name: &str,
+        title: &Title,
+        params: &Params,
+        about_id: String,
+        token: &ParsoidToken,
+    ) -> Vec<Item> {
+        // Build the template invocation (target + arguments) for the legacy
+        // string-level substitution engine, from the token's attribute list
+        // (args[0] is the target; the rest are positional/named args).
+        use crate::expand::transclusion::TemplateInvocation;
+        use crate::wikitext::token_utils::key_value_to_string;
+
+        let mut positional_args = Vec::new();
+        let mut named_args = std::collections::HashMap::new();
+        for kv in params.args.iter().skip(1) {
+            let k = key_value_to_string(&kv.key);
+            let v = key_value_to_string(&kv.value);
+            if k.trim().is_empty() {
+                positional_args.push(v);
+            } else {
+                named_args.insert(k.trim().to_string(), v);
+            }
+        }
+        let invocation = TemplateInvocation {
+            name: name.to_string(),
+            positional_args,
+            named_args,
+        };
+
+        // Fetch the template source; missing templates become a redlink.
+        let fetched = source.get_template(title).await.ok().flatten();
+        let Some(src) = fetched else {
+            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+            let info = template_info_from(None, Some(name), vec![]);
+            return encap.encap_tokens(vec![template_to_wikilink(name)], &info);
+        };
+
+        // Substitute template arguments (string-level for now).
+        let expanded =
+            transclusion::substitute_args(&src, &invocation.to_template_args(), 40).unwrap_or(src);
+
+        // Re-tokenize the expanded source.
+        let items = tokenize_wikitext_to_items(&expanded, /* in_template */ true);
+
+        let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+        let info = template_info_from(None, Some(name), vec![]);
+        encap.encap_tokens(items, &info)
+    }
+}
+
+/// Tokenize a plain wikitext string into a flat `Vec<Item>`. Used to
+/// re-tokenize expanded template source.
+pub fn tokenize_wikitext_to_items(wikitext: &str, in_template: bool) -> Vec<Item> {
+    let options = TokenizerOptions {
+        in_template,
+        ..Default::default()
+    };
+    let mut tokenizer = PegTokenizer::new(wikitext, &options);
+    match tokenizer.tokenize() {
+        Ok(chunks) => chunks
+            .into_iter()
+            .map(|either| match either {
+                crate::wikitext::tokens_v2::Either::Left(s) => Item::Str(s),
+                crate::wikitext::tokens_v2::Either::Right(t) => Item::Tok(t),
+            })
+            .collect(),
+        Err(_) => vec![Item::Str(wikitext.to_string())],
+    }
 }
 
 #[cfg(test)]
@@ -795,5 +878,54 @@ mod tests {
         let result = process_to_string(&tokens, false);
         assert_eq!(result.target, "a");
         assert_eq!(result.rest, None);
+    }
+
+    #[tokio::test]
+    async fn test_expand_template_natively() {
+        use crate::mock::MockDataSource;
+        use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue, ParsoidToken, TagTk};
+
+        let source = MockDataSource::new();
+        source.add_template("Template:Foo", "Hello {{{1}}}!");
+
+        let title = Title::new(10, "Foo");
+
+        let args = vec![
+            KV {
+                key: KeyValue::Str("Foo".to_string()),
+                value: KeyValue::Str("".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str("".to_string()),
+                value: KeyValue::Str("world".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ];
+        let params = Params::new(args);
+
+        let token = ParsoidToken::Tag(TagTk::new("template", vec![], DataParsoid::default()));
+
+        let out = TemplateHandler::expand_template_natively(
+            &source,
+            "Template:Foo",
+            &title,
+            &params,
+            "#mwt1".to_string(),
+            &token,
+        )
+        .await;
+
+        // Wrapped in mw:Transclusion markers, and the source was expanded so
+        // that `{{{1}}}` resolves to `world`.
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "meta"));
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Str(s) if s == "Hello world"))
+        );
     }
 }
