@@ -444,6 +444,171 @@ fn token_utils_tokens_to_string(items: &[Item]) -> String {
     tokens_to_string(items)
 }
 
+/// Render a `[[Media:Foo]]` link (a direct media link). Mirrors
+/// `WikiLinkHandler::renderMedia` + `linkToMedia` for the no-file-info case.
+pub fn render_media(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+) -> Vec<Item> {
+    link_to_media(ctx, token, target, None)
+}
+
+/// Render a media link (shared by `renderMedia`). `info` is optional file info
+/// (not yet fetched; the no-info case uses the upload URL). Mirrors
+/// `WikiLinkHandler::linkToMedia`.
+pub fn link_to_media(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+    info: Option<&crate::traits::FileInfo>,
+) -> Vec<Item> {
+    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut link = TagTk::new("a", attribs, DataParsoid::default());
+
+    // imgHref = info.url or upload URL.
+    let img_href = info
+        .map(|i| i.file_url.clone())
+        .or_else(|| {
+            target
+                .title
+                .as_ref()
+                .map(|t| ctx.config.get_upload_url(&t.get_full_db_key()))
+        })
+        .unwrap_or_default();
+
+    // rel = mw:MediaLink.
+    if let Some(kv) = link
+        .attribs
+        .iter_mut()
+        .find(|kv| kv.key.as_str() == Some("rel"))
+    {
+        kv.value = crate::wikitext::tokens_v2::KeyValue::Str("mw:MediaLink".to_string());
+    }
+
+    link.add_attribute_str("href", &img_href);
+
+    // resource = makeLink(title).
+    if let Some(title) = &target.title {
+        let resource = make_link(title, ctx.config);
+        link.add_attribute_str("resource", &resource);
+
+        // Normalize file name (strip path). `getDBkey` is the raw title text.
+        let normalized = info
+            .map(|i| {
+                i.file_url
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&i.title)
+                    .to_string()
+            })
+            .unwrap_or_else(|| title.text.clone());
+        link.add_attribute_str("title", normalized.replace('_', " "));
+    }
+
+    let mut out = vec![Item::Tok(ParsoidToken::Tag(link))];
+    out.extend(content);
+    out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+        "a",
+        vec![],
+        DataParsoid::default(),
+    ))));
+    out
+}
+
+/// Render a file link for the simple no-options case. Mirrors
+/// `WikiLinkHandler::renderFile` (the large image-option parsing path is
+/// layered on when the media option machinery is ported).
+pub fn render_file(
+    ctx: &mut WikiLinkContext,
+    _token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+) -> Vec<Item> {
+    let title = target.title.as_ref().expect("file title");
+
+    // No options: format is null, so inline, classes = [mw-default-size].
+    let rdfa_type = "mw:File";
+    let classes = ["mw-default-size".to_string()];
+
+    let mut container_attribs = vec![crate::pipeline::wiki_link_handler::string_kv(
+        "typeof", rdfa_type,
+    )];
+    container_attribs.insert(
+        0,
+        crate::pipeline::wiki_link_handler::string_kv("class", &classes.join(" ")),
+    );
+    let container = TagTk::new("span", container_attribs, DataParsoid::default());
+
+    // Anchor wraps the file element.
+    let mut anchor = TagTk::new("a", vec![], DataParsoid::default());
+    anchor.add_attribute_str("href", ctx.config.get_upload_url(&title.get_full_db_key()));
+    anchor.add_attribute_str("class", "new");
+    anchor.add_attribute_str("title", title.get_prefixed_text());
+
+    // Inner span (broken media placeholder).
+    let mut span = TagTk::new("span", vec![], DataParsoid::default());
+    span.add_attribute_str("class", "mw-file-element mw-broken-media");
+    span.add_attribute_str("resource", make_link(title, ctx.config));
+
+    vec![
+        Item::Tok(ParsoidToken::Tag(container)),
+        Item::Tok(ParsoidToken::Tag(anchor)),
+        Item::Tok(ParsoidToken::Tag(span)),
+        Item::Str(title.get_prefixed_text()),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "a",
+            vec![],
+            DataParsoid::default(),
+        ))),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
+    ]
+}
+
+/// Dispatch a wikilink token to the correct renderer based on the target's
+/// namespace. Mirrors `WikiLinkHandler::wikiLinkHandler`.
+pub fn render_wiki_link_dispatched(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+) -> Vec<Item> {
+    if let Some(title) = &target.title {
+        let media_ns = ctx.config.canonical_namespace_id("Media");
+        let file_ns = ctx.config.canonical_namespace_id("File");
+        let category_ns = ctx.config.canonical_namespace_id("Category");
+
+        if Some(title.namespace_id) == media_ns {
+            return render_media(ctx, token, target);
+        }
+        if !target.from_colon_escaped_text && !target.href.starts_with('#') {
+            if Some(title.namespace_id) == file_ns {
+                return render_file(ctx, token, target);
+            }
+            if Some(title.namespace_id) == category_ns {
+                return render_category(ctx, token, target);
+            }
+        }
+        return render_wiki_link(ctx, token, target);
+    }
+
+    if target.interwiki.is_some() {
+        return render_interwiki_link(ctx, token, target);
+    }
+    if target.language.is_some() {
+        return render_language_link(ctx, token, target);
+    }
+
+    render_wiki_link(ctx, token, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +783,56 @@ mod tests {
                 .and_then(|kv| kv.value.as_str());
             // The sort key should be appended as '#A%20sort%20key'.
             assert_eq!(href, Some("./Category:People#A%20sort%20key"));
+        }
+    }
+
+    #[test]
+    fn test_media_namespace_classification() {
+        let ctx = WikiLinkContext::new(config_static());
+        assert_eq!(ctx.config.canonical_namespace_id("Media"), Some(-2));
+        assert_eq!(ctx.config.canonical_namespace_id("File"), Some(6));
+        assert_eq!(ctx.config.canonical_namespace_id("Category"), Some(14));
+    }
+
+    #[test]
+    fn test_render_media_link() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("Media:Foo.jpg", None);
+        let target = get_wiki_link_target_info(&ctx, "Media:Foo.jpg", "Media:Foo.jpg").unwrap();
+        assert_eq!(target.title.as_ref().unwrap().namespace_id, -2);
+
+        let out = render_media(&mut ctx, &token, &target);
+
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "a"));
+        if let Item::Tok(ParsoidToken::Tag(t)) = &out[0] {
+            let rel = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("rel"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(rel, Some("mw:MediaLink"));
+        }
+    }
+
+    #[test]
+    fn test_render_file_link() {
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("File:Example.jpg", None);
+        let target =
+            get_wiki_link_target_info(&ctx, "File:Example.jpg", "File:Example.jpg").unwrap();
+        assert_eq!(target.title.as_ref().unwrap().namespace_id, 6);
+
+        let out = render_file(&mut ctx, &token, &target);
+
+        // Container is <span typeof="mw:File" class="mw-default-size">.
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "span"));
+        if let Item::Tok(ParsoidToken::Tag(t)) = &out[0] {
+            let type_of = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+                .and_then(|kv| kv.value.as_str());
+            assert_eq!(type_of, Some("mw:File"));
         }
     }
 }

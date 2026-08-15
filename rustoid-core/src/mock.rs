@@ -186,6 +186,8 @@ impl MockSiteConfig {
         };
 
         // Register standard MediaWiki namespaces
+        config.add_namespace(-2, "Media", &[], true, "wikitext");
+        config.add_namespace(-1, "Special", &[], true, "wikitext");
         config.add_namespace(0, "Main", &[], true, "wikitext");
         config.add_namespace(1, "Talk", &[], true, "wikitext");
         config.add_namespace(2, "User", &[], true, "wikitext");

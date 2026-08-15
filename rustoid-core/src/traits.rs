@@ -98,6 +98,42 @@ pub trait SiteConfig: Send + Sync {
     fn script_path(&self) -> &str {
         "/w"
     }
+
+    /// Resolve a canonical namespace name (e.g. "Media", "File", "Category")
+    /// to its namespace ID. Mirrors PHP's `SiteConfig::canonicalNamespaceId`.
+    /// Returns `None` if the namespace is not configured.
+    fn canonical_namespace_id(&self, canonical: &str) -> Option<i32> {
+        self.namespaces()
+            .iter()
+            .find(|(_, info)| info.canonical == canonical)
+            .map(|(id, _)| *id)
+    }
+
+    /// Resolve a (canonical or localized) namespace name to its ID.
+    /// Mirrors PHP's `SiteConfig::namespaceId`.
+    fn namespace_id(&self, name: &str) -> Option<i32> {
+        let normalized = crate::util::normalize_namespace_name(name.trim());
+        for (&id, info) in self.namespaces() {
+            let canon_lower = crate::util::normalize_namespace_name(&info.canonical);
+            if canon_lower == normalized {
+                return Some(id);
+            }
+            if info
+                .aliases
+                .iter()
+                .any(|a| crate::util::normalize_namespace_name(a) == normalized)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// The URL for uploading a file (used by media/file links). Mirrors PHP's
+    /// `SiteConfig::getUploadUrl` (a sensible default, overridable).
+    fn get_upload_url(&self, _title: &str) -> String {
+        format!("{}/index.php?title=Special:Upload", self.server_url())
+    }
 }
 
 /// Information about a namespace.

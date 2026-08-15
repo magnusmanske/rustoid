@@ -95,6 +95,8 @@ impl Title {
 /// Map a namespace ID to its canonical English prefix (fallback without SiteConfig).
 fn namespace_prefix(ns_id: i32) -> &'static str {
     match ns_id {
+        -2 => "Media",
+        -1 => "Special",
         0 => "",
         1 => "Talk",
         2 => "User",
