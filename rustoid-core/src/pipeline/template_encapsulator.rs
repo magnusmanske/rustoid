@@ -225,14 +225,39 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
         seen.insert(param.k.clone(), count);
 
         let mut value = serde_json::Map::new();
+        // Empty wikitext serializes as null (mirrors PHP's `?string` default).
         value.insert(
             "wt".to_string(),
-            serde_json::Value::String(param.value_wt.clone()),
+            if param.value_wt.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(param.value_wt.clone())
+            },
         );
+        if let Some(html) = &param.html {
+            value.insert("html".to_string(), serde_json::Value::String(html.clone()));
+        }
         if let Some(key_wt) = &param.key_wt {
             let mut key_obj = serde_json::Map::new();
             key_obj.insert("wt".to_string(), serde_json::Value::String(key_wt.clone()));
             value.insert("key".to_string(), serde_json::Value::Object(key_obj));
+        }
+        // For parser-function params, emit `eq` (named-ness) and `order`
+        // deviations from defaults (mirrors TemplateInfo::toJsonArray).
+        if info.ty.as_deref() == Some("parserfunction") {
+            let is_numeric = param.is_numeric_key();
+            if is_numeric == param.named {
+                value.insert("eq".to_string(), serde_json::Value::Bool(param.named));
+            }
+            let order = count;
+            let default_order = if is_numeric {
+                param.k.parse::<usize>().ok()
+            } else {
+                None
+            };
+            if default_order != Some(order) {
+                value.insert("order".to_string(), serde_json::Value::from(order));
+            }
         }
         params.insert(key, serde_json::Value::Object(value));
     }
