@@ -357,6 +357,241 @@ fn split_key_value_str(s: &str) -> (Vec<PreprocPiece>, Vec<PreprocPiece>) {
     }
 }
 
+/// Tokenize raw wikitext into preprocessor pieces. Mirrors the
+/// `preproc_pieces` / `preproc_piece` rules of PHP's `Grammar.pegphp`.
+///
+/// The output is a flat `Vec<PreprocPiece>` (strings and nested `PreprocTk`
+/// for `{{...}}`, `{{{...}}}`, `[[...]]`, `-{...}-`, comments, headings, and
+/// angle tags).
+pub fn tokenize_preproc_pieces(input: &str) -> Vec<PreprocPiece> {
+    let mut scanner = PreprocScanner {
+        input,
+        pos: 0,
+        at_sol: true,
+    };
+    let mut out = Vec::new();
+    scanner.scan_until(input.len(), &mut out);
+    out
+}
+
+/// A small recursive-descent scanner for the preprocessor grammar. It tracks a
+/// byte position and a start-of-line flag (headings only match at start of
+/// line).
+struct PreprocScanner<'a> {
+    input: &'a str,
+    pos: usize,
+    at_sol: bool,
+}
+
+impl<'a> PreprocScanner<'a> {
+    fn remaining(&self) -> &'a str {
+        &self.input[self.pos..]
+    }
+
+    /// Scan until `end`, appending pieces to `out`.
+    fn scan_until(&mut self, end: usize, out: &mut Vec<PreprocPiece>) {
+        while self.pos < end {
+            if let Some(piece) = self.scan_one(end) {
+                out.push(piece);
+            } else {
+                // Advance one char to avoid an infinite loop.
+                let ch = self.input[self.pos..].chars().next().unwrap();
+                out.push(str_piece(&ch.to_string()));
+                self.pos += ch.len_utf8();
+                self.at_sol = false;
+            }
+        }
+    }
+
+    /// Try to match a single preprocessor piece at the current position.
+    fn scan_one(&mut self, end: usize) -> Option<PreprocPiece> {
+        // Headings at start of line: `== ... ==`.
+        if self.at_sol
+            && self.remaining().starts_with('=')
+            && let Some(tk) = self.scan_heading()
+        {
+            return Some(PreprocPiece::Tk(tk));
+        }
+
+        // `[[ ... ]]` — bracket (count 2).
+        if self.remaining().starts_with("[[") {
+            return self
+                .scan_balanced("[[", "]]", PreprocType::Bracket, 2)
+                .map(PreprocPiece::Tk);
+        }
+
+        // `{{{ ... }}}` — tplarg (brace count 3).
+        if self.remaining().starts_with("{{{") {
+            return self
+                .scan_balanced("{{", "}}}", PreprocType::Brace, 3)
+                .map(PreprocPiece::Tk);
+        }
+
+        // `{{ ... }}` — template (brace count 2).
+        if self.remaining().starts_with("{{") {
+            return self
+                .scan_balanced("{{", "}}", PreprocType::Brace, 2)
+                .map(PreprocPiece::Tk);
+        }
+
+        // `-{ ... }-` — dash-brace.
+        if self.remaining().starts_with("-{") {
+            return self
+                .scan_balanced("-{", "}-", PreprocType::DashBrace, 1)
+                .map(PreprocPiece::Tk);
+        }
+
+        // Comment `<!-- ... -->`.
+        if self.remaining().starts_with("<!--") {
+            return self.scan_comment().map(PreprocPiece::Tk);
+        }
+
+        // Angle tags for extension/includes: `<...>`.
+        if self.remaining().starts_with('<') {
+            return self.scan_angle().map(PreprocPiece::Tk);
+        }
+
+        // Ignored chars (a run of non-structural chars).
+        let ch = self.remaining().chars().next()?;
+        if !matches!(ch, '-' | '[' | ']' | '{' | '}' | '<' | '\n') {
+            let start = self.pos;
+            while self.pos < end {
+                let c = self.input[self.pos..].chars().next()?;
+                if matches!(c, '-' | '[' | ']' | '{' | '}' | '<' | '\n') {
+                    break;
+                }
+                self.pos += c.len_utf8();
+            }
+            let text = self.input[start..self.pos].to_string();
+            self.at_sol = false;
+            return Some(str_piece(&text));
+        }
+
+        // Fall back to a single broken structural char.
+        self.pos += ch.len_utf8();
+        self.at_sol = ch == '\n';
+        Some(str_piece(&ch.to_string()))
+    }
+
+    fn scan_balanced(
+        &mut self,
+        open: &str,
+        close: &str,
+        ty: PreprocType,
+        count: usize,
+    ) -> Option<PreprocTk> {
+        let start = self.pos;
+        self.pos += open.len();
+
+        let mut contents = Vec::new();
+        let mut depth = 1usize;
+        while self.pos < self.input.len() {
+            if self.remaining().starts_with(open) {
+                depth += 1;
+                let nested = self.scan_balanced(open, close, ty, count)?;
+                contents.push(PreprocPiece::Tk(nested));
+                continue;
+            }
+            if self.remaining().starts_with(close) {
+                depth -= 1;
+                self.pos += close.len();
+                if depth == 0 {
+                    let tsr = SourceRange::new(start, self.pos);
+                    self.at_sol = false;
+                    return Some(PreprocTk::simple(ty, tsr, contents, count));
+                }
+                contents.push(str_piece(close));
+                continue;
+            }
+            let ch = self.input[self.pos..].chars().next()?;
+            // Nested templates/links inside a non-matching construct.
+            if ch == '{' && self.remaining().starts_with("{{") && ty != PreprocType::Brace {
+                let nested = self.scan_balanced("{{", "}}", PreprocType::Brace, 2)?;
+                contents.push(PreprocPiece::Tk(nested));
+                continue;
+            }
+            if ch == '[' && self.remaining().starts_with("[[") && ty != PreprocType::Bracket {
+                let nested = self.scan_balanced("[[", "]]", PreprocType::Bracket, 2)?;
+                contents.push(PreprocPiece::Tk(nested));
+                continue;
+            }
+            contents.push(str_piece(&ch.to_string()));
+            self.pos += ch.len_utf8();
+        }
+        // Unbalanced: reset and treat the opener as plain text.
+        self.pos = start;
+        self.at_sol = false;
+        None
+    }
+
+    fn scan_comment(&mut self) -> Option<PreprocTk> {
+        let start = self.pos;
+        self.pos += 4; // "<!--"
+        let rem = self.remaining();
+        let end = rem.find("-->")?;
+        let contents = rem[..end].to_string();
+        self.pos += end + 3;
+        self.at_sol = false;
+        Some(PreprocTk::simple(
+            PreprocType::Comment,
+            SourceRange::new(start, self.pos),
+            vec![str_piece(&contents)],
+            1,
+        ))
+    }
+
+    fn scan_angle(&mut self) -> Option<PreprocTk> {
+        let start = self.pos;
+        self.pos += 1; // "<"
+        let rem = self.remaining();
+        let close = rem.find('>')?;
+        let inner = &rem[..close];
+        self.pos += close + 1;
+        self.at_sol = false;
+
+        let open = inner.trim_start_matches('/').to_string();
+        Some(PreprocTk::angle(
+            SourceRange::new(start, self.pos),
+            open,
+            String::new(),
+            vec![str_piece(inner)],
+            None,
+        ))
+    }
+
+    fn scan_heading(&mut self) -> Option<PreprocTk> {
+        let rem = self.remaining();
+        let eq = rem.chars().take_while(|&c| c == '=').count();
+        if eq < 2 {
+            return None;
+        }
+        let start = self.pos;
+        self.pos += eq;
+        let body_start = self.pos;
+        let Some(close_pos) = self.remaining().find('=') else {
+            self.pos = start;
+            return None;
+        };
+        let close_abs = body_start + close_pos;
+        let mut close_end = close_abs;
+        while close_end < self.input.len() && self.input[close_end..].starts_with('=') {
+            close_end += 1;
+        }
+        let close_count = close_end - close_abs;
+        let body = self.input[body_start..close_abs].to_string();
+        self.pos = close_end;
+        self.at_sol = false;
+
+        let level = eq.min(close_count).min(6);
+        Some(PreprocTk::simple(
+            PreprocType::Heading,
+            SourceRange::new(start, self.pos),
+            vec![str_piece(&body)],
+            level,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +633,62 @@ mod tests {
         assert_eq!(print_contents(&args[1].1, false), "bar");
         assert_eq!(print_contents(&args[2].0, false), "baz");
         assert_eq!(print_contents(&args[2].1, false), "qux");
+    }
+
+    #[test]
+    fn test_tokenize_preproc_pieces_plain() {
+        let pieces = tokenize_preproc_pieces("hello world");
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(print_contents(&pieces, false), "hello world");
+    }
+
+    #[test]
+    fn test_tokenize_preproc_pieces_template() {
+        let pieces = tokenize_preproc_pieces("{{foo|bar}}");
+        assert_eq!(pieces.len(), 1);
+        match &pieces[0] {
+            PreprocPiece::Tk(PreprocTk::Simple { ty, count, .. }) => {
+                assert_eq!(*ty, PreprocType::Brace);
+                assert_eq!(*count, 2);
+            }
+            other => panic!("expected brace template, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tokenize_preproc_pieces_tplarg() {
+        let pieces = tokenize_preproc_pieces("{{{1}}}");
+        match &pieces[0] {
+            PreprocPiece::Tk(PreprocTk::Simple { count, .. }) => {
+                assert_eq!(*count, 3);
+            }
+            other => panic!("expected tplarg, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tokenize_preproc_pieces_wikilink() {
+        let pieces = tokenize_preproc_pieces("[[Foo]]");
+        match &pieces[0] {
+            PreprocPiece::Tk(PreprocTk::Simple { ty, .. }) => {
+                assert_eq!(*ty, PreprocType::Bracket);
+            }
+            other => panic!("expected wikilink, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tokenize_preproc_pieces_comment() {
+        let pieces = tokenize_preproc_pieces("a<!-- c -->b");
+        let mut has_comment = false;
+        for p in &pieces {
+            if let PreprocPiece::Tk(PreprocTk::Simple { ty, .. }) = p {
+                if *ty == PreprocType::Comment {
+                    has_comment = true;
+                }
+            }
+        }
+        assert!(has_comment);
+        assert_eq!(print_contents(&pieces, false), "a<!-- c -->b");
     }
 }
