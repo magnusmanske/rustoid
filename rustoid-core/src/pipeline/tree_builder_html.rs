@@ -600,11 +600,45 @@ impl Html5TreeBuilder {
             &text[..],
         )));
         if self.in_transclusion && self.table_depth > 0 && !text.trim().is_empty() {
-            self.feed(html5ever::tokenizer::TagToken(make_tag("meta", true)));
+            // Mirrors `insertExplicitStartTag('meta', ['typeof' =>
+            // 'mw:TransclusionShadow'], true)` — a plain (un-stashed) shadow
+            // meta, not a data-carrier.
+            let mut tag = make_tag("meta", true);
+            tag.attrs.push(html_attr("typeof", "mw:TransclusionShadow"));
+            self.feed(html5ever::tokenizer::TagToken(tag));
         }
     }
 
     fn process_start_tag(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
+        // A stripped wikitext-syntax table tag outside a table re-emits its
+        // source (mirrors `handleDeletedStartTag`). We detect the "outside a
+        // table" condition via `table_depth` directly, and only for tags with
+        // non-HTML syntax (stx != "html").
+        if self.table_depth == 0
+            && dp.stx.as_deref() != Some("html")
+            && matches!(name, "td" | "tr" | "th")
+        {
+            let src = dp.src.clone().or_else(|| {
+                Some(
+                    match name {
+                        "td" => "|",
+                        "tr" => "|-",
+                        "th" => "!",
+                        _ => "",
+                    }
+                    .to_string(),
+                )
+            });
+            if let Some(orig) = src
+                && !orig.is_empty()
+            {
+                self.feed(html5ever::tokenizer::CharacterTokens(StrTendril::from(
+                    &orig[..],
+                )));
+                return;
+            }
+        }
+
         let data_mw = extract_data_mw(attribs);
         let mut attrs = kv_to_attrs(attribs);
         let data_id = self.stash(dp, data_mw);
@@ -856,6 +890,21 @@ mod tests {
             doc.children.iter().any(|n| n.data_parsoid.is_some()),
             "{doc:?}"
         );
+    }
+
+    #[test]
+    fn test_deleted_start_tag() {
+        // A wikitext-syntax `td`/`tr` outside a table re-emits its source
+        // literal (mirrors `handleDeletedStartTag`).
+        let mut td_dp = DataParsoid::default();
+        td_dp.stx = None;
+        let items = vec![Item::Tok(ParsoidToken::Tag(TagTk::new(
+            "td",
+            vec![],
+            td_dp,
+        )))];
+        let doc = token_stream_to_ast_html(&items);
+        assert!(contains_text(&doc, "|"), "expected literal pipe: {doc:?}");
     }
 
     fn contains_text(node: &Node, needle: &str) -> bool {
