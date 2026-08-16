@@ -4,25 +4,29 @@
 //! This is the Rust port of PHP Parsoid's top-level `Parser`/`Wikitext` entry
 //! points, using the V2 token pipeline (`PegTokenizer` → TT2 handlers →
 //! `TreeBuilderStage`).
-//!
-//! Template/parser-function expansion is layered in as a TT2 handler that
-//! consumes the `SiteConfig`/`DataSource`; see `TemplateHandler` and
-//! `TokenHandlerPipeline`.
 
 use crate::dom::node::Node;
 use crate::error::Result;
 use crate::options::ParserOptions;
+use crate::pipeline::frame::Frame;
+use crate::pipeline::template_encapsulator::{TemplateEncapsulator, template_info_from};
+use crate::pipeline::template_handler::{TemplateHandler, resolve_template_target};
 use crate::pipeline::tree_builder_stage::TreeBuilderStage;
+use crate::title::TitleParser;
+use crate::traits::{DataSource, SiteConfig};
 use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
-use crate::wikitext::tokens_v2::{Either, Item};
+use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
 
-/// The wikitext parser.
-#[derive(Default)]
-pub struct Parser;
+type ResolvedTarget = crate::pipeline::template_handler::ResolvedTarget;
 
-impl Parser {
-    pub fn new() -> Self {
-        Self
+/// The wikitext parser, bound to a site configuration.
+pub struct Parser<'a, C: SiteConfig> {
+    config: &'a C,
+}
+
+impl<'a, C: SiteConfig> Parser<'a, C> {
+    pub fn new(config: &'a C) -> Self {
+        Self { config }
     }
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
@@ -39,29 +43,150 @@ impl Parser {
             .collect())
     }
 
-    /// Convert wikitext to the format-agnostic AST.
+    fn new_about_id(&self, counter: &std::cell::Cell<usize>) -> String {
+        let id = counter.get();
+        counter.set(id + 1);
+        format!("#mwt{id}")
+    }
+
+    /// Convert wikitext to the format-agnostic AST (no template expansion).
     pub fn wikitext_to_ast(&self, wikitext: &str) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let stage = TreeBuilderStage::new(false);
         Ok(stage.to_ast(tokens))
     }
 
-    /// Convert wikitext to an HTML string (Parsoid-style output).
+    /// Convert wikitext to an HTML string (no native template expansion).
     pub fn wikitext_to_html(&self, wikitext: &str, options: &ParserOptions) -> Result<String> {
         let ast = self.wikitext_to_ast(wikitext)?;
         let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
         serializer.serialize(&ast)
+    }
+
+    /// Convert wikitext to an HTML string with native template expansion.
+    pub async fn wikitext_to_html_expanded(
+        &self,
+        wikitext: &str,
+        source: &dyn DataSource,
+        options: &ParserOptions,
+    ) -> Result<String> {
+        let tokens = self.tokenize(wikitext)?;
+        let about_counter = std::cell::Cell::new(0usize);
+        let ast = self
+            .build_ast(tokens, Some(source), &options.page_title, &about_counter)
+            .await;
+        let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
+        serializer.serialize(&ast)
+    }
+
+    /// Run the TT2 stage (template/parser-function/magic-variable expansion)
+    /// over a token stream, then the TT3 tree-building stage, producing an AST.
+    async fn build_ast(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        page_title: &str,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Node {
+        let title = TitleParser::parse(page_title, self.config);
+        let frame = Frame::new(title, vec![]);
+
+        let tokens = self
+            .expand_templates(&frame, tokens, source, about_counter)
+            .await;
+
+        let stage = TreeBuilderStage::new(false);
+        stage.to_ast(tokens)
+    }
+
+    /// Expand `template`/`templatearg` tokens in-place.
+    async fn expand_templates(
+        &self,
+        frame: &Frame,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let mut out = Vec::new();
+        for item in tokens {
+            let Item::Tok(tok) = &item else {
+                out.push(item);
+                continue;
+            };
+            let ParsoidToken::SelfclosingTag(stt) = tok else {
+                out.push(item);
+                continue;
+            };
+
+            if stt.name == "template" || stt.name == "template3" {
+                let about_id = self.new_about_id(about_counter);
+                let params = crate::pipeline::parser_functions::Params::new(stt.attribs.clone());
+
+                let target_str = stt
+                    .attribs
+                    .first()
+                    .and_then(|kv| kv.key.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                match resolve_template_target(self.config, &target_str) {
+                    Some(ResolvedTarget::Template { name, title }) => {
+                        if let Some(src) = source {
+                            let expanded = TemplateHandler::expand_template_natively(
+                                src, &name, &title, &params, about_id, tok,
+                            )
+                            .await;
+                            out.extend(expanded);
+                        } else {
+                            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, tok);
+                            let info = template_info_from(None, Some(&name), vec![]);
+                            out.extend(encap.encap_tokens(
+                                vec![crate::pipeline::template_handler::template_to_wikilink(
+                                    &name,
+                                )],
+                                &info,
+                            ));
+                        }
+                    }
+                    _ => {
+                        let expanded =
+                            TemplateHandler.process(self.config, frame, about_counter, vec![item]);
+                        out.extend(expanded);
+                    }
+                }
+                continue;
+            }
+
+            if stt.name == "templatearg" {
+                let about_id = self.new_about_id(about_counter);
+                let name = stt
+                    .attribs
+                    .first()
+                    .and_then(|kv| kv.key.as_str())
+                    .unwrap_or("");
+                let src = format!("{{{{{name}}}}}");
+                let expanded =
+                    TemplateHandler.handle_template_arg(frame, &src, about_id, tok, true);
+                out.extend(expanded);
+                continue;
+            }
+
+            out.push(item);
+        }
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::MockSiteConfig;
     use crate::options::ParserOptions;
 
     #[test]
     fn test_wikitext_to_html_heading() {
-        let parser = Parser::new();
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
         let html = parser
             .wikitext_to_html("== Heading ==\n", &ParserOptions::for_page("Test"))
             .unwrap();
@@ -71,11 +196,28 @@ mod tests {
 
     #[test]
     fn test_wikitext_to_html_bold() {
-        let parser = Parser::new();
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
         let html = parser
             .wikitext_to_html("'''bold'''", &ParserOptions::for_page("Test"))
             .unwrap();
         assert!(html.contains("<b>"), "got: {html}");
         assert!(html.contains("bold"), "got: {html}");
+    }
+
+    #[tokio::test]
+    async fn test_wikitext_to_html_template() {
+        use crate::mock::MockDataSource;
+
+        let source = MockDataSource::new();
+        source.add_template("Template:Foo", "Hello {{{1}}}!");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        let html = parser
+            .wikitext_to_html_expanded("{{Foo|world}}", &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        assert!(html.contains("Hello world"), "got: {html}");
     }
 }

@@ -21,12 +21,14 @@
 //! ## Quick example
 //!
 //! ```rust,ignore
-//! use rustoid_core::{Parser, MockDataSource, MockSiteConfig};
+//! use rustoid_core::{Parser, MockDataSource, MockSiteConfig, ParserOptions};
 //!
 //! let source = MockDataSource::new();
-//! let config = MockSiteConfig::enwiki();
-//! let parser = Parser::new(&source, &config);
-//! let html = parser.wikitext_to_html("'''Hello''' world!").unwrap();
+//! let config = MockSiteConfig::new();
+//! let parser = Parser::new(&config);
+//! let html = parser
+//!     .wikitext_to_html("'''Hello''' world!", &ParserOptions::for_page("Main Page"))
+//!     .unwrap();
 //! ```
 
 pub mod error;
