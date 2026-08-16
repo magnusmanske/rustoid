@@ -143,10 +143,9 @@ impl TemplateEncapsulator {
             meta.data_parsoid.src = self.token_src.clone();
             meta.data_parsoid.colon = self.token_colon.clone();
 
-            // Serialize the template info as data-mw. This is the same JSON
-            // blob DOMDataUtils stores on the start marker's `data-mw`
-            // attribute (mirrors `TemplateInfo::toJsonArray`).
-            let data_mw = serialize_template_info(info);
+            // Serialize the template info as the data-mw `parts` envelope
+            // (mirrors `DataMw::toJsonArray` + `TemplateInfo::toJsonArray`).
+            let data_mw = serialize_data_mw(info);
             if !data_mw.is_empty() {
                 meta.attribs.push(string_kv("data-mw", &data_mw));
             }
@@ -188,93 +187,81 @@ fn string_kv(key: &str, value: &str) -> KV {
     }
 }
 
-/// Serialize a `TemplateInfo` to the data-mw JSON object that PHP's
+/// Serialize a `TemplateInfo` to the JSON object that PHP's
 /// `TemplateInfo::toJsonArray` emits (the `target`/`params`/`i` shape).
-///
-/// We serialize by hand to keep the crate free of an external JSON
-/// dependency for this small, stable shape. A couple of JSON escaping rules
-/// are enough because values are plain wikitext strings.
 pub fn serialize_template_info(info: &TemplateInfo) -> String {
-    let mut target = String::from("{");
-    if let Some(wt) = &info.target_wt {
-        target.push_str(&format!("\"wt\":{}", json_string(wt)));
-    } else {
-        // target must at least have "wt" for empty transclusions.
-        target.push_str("\"wt\":null");
-    }
+    let mut target = serde_json::Map::new();
+    target.insert(
+        "wt".to_string(),
+        info.target_wt
+            .as_ref()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .unwrap_or(serde_json::Value::Null),
+    );
     if let Some(func) = &info.func {
-        target.push(',');
-        let func_field = if info.ty.as_deref() == Some("parserfunction") {
-            format!("\"key\":{}", json_string(func))
+        if info.ty.as_deref() == Some("parserfunction") {
+            target.insert("key".to_string(), serde_json::Value::String(func.clone()));
         } else {
-            format!("\"function\":{}", json_string(func))
-        };
-        target.push_str(&func_field);
+            target.insert(
+                "function".to_string(),
+                serde_json::Value::String(func.clone()),
+            );
+        }
     }
     if let Some(href) = &info.href {
-        target.push(',');
-        target.push_str(&format!("\"href\":{}", json_string(href)));
+        target.insert("href".to_string(), serde_json::Value::String(href.clone()));
     }
-    target.push('}');
 
-    // Params object.
-    let mut params = String::from("{");
-    let mut first = true;
+    // Params object (preserve PHP's disambiguating "=N=key" for duplicate keys).
+    let mut params = serde_json::Map::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut count = 0usize;
     for param in &info.param_infos {
-        if !first {
-            params.push(',');
-        }
-        first = false;
         count += 1;
-
         let mut key = param.k.clone();
-        // For duplicate keys, disambiguate with a leading '=' like PHP does.
-        if let Some(&_n) = seen.get(&key) {
+        if seen.contains_key(&key) {
             key = format!("={count}={key}");
         }
         seen.insert(param.k.clone(), count);
 
-        let value_wt = if param.value_wt.is_empty() {
-            "null".to_string()
-        } else {
-            json_string(&param.value_wt)
-        };
-        params.push_str(&format!("{}:{{\"wt\":{}}}", json_string(&key), value_wt));
+        let mut value = serde_json::Map::new();
+        value.insert(
+            "wt".to_string(),
+            serde_json::Value::String(param.value_wt.clone()),
+        );
         if let Some(key_wt) = &param.key_wt {
-            params.push_str(&format!(",\"key\":{{\"wt\":{}}}", json_string(key_wt)));
+            let mut key_obj = serde_json::Map::new();
+            key_obj.insert("wt".to_string(), serde_json::Value::String(key_wt.clone()));
+            value.insert("key".to_string(), serde_json::Value::Object(key_obj));
         }
-        params.push('}');
+        params.insert(key, serde_json::Value::Object(value));
     }
-    params.push('}');
 
-    let mut out = String::new();
-    out.push_str("{\"target\":");
-    out.push_str(&target);
-    out.push_str(",\"params\":");
-    out.push_str(&params);
-    out.push('}');
-    out
+    let mut out = serde_json::Map::new();
+    out.insert("target".to_string(), serde_json::Value::Object(target));
+    out.insert("params".to_string(), serde_json::Value::Object(params));
+    serde_json::Value::Object(out).to_string()
 }
 
-/// Escape a string for inclusion in a JSON string literal.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\"');
-    for c in s.chars() {
-        match c {
-            '\"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('\"');
-    out
+/// Serialize a `TemplateInfo` into the full `data-mw` envelope that
+/// Parsoid stores on a transclusion/param marker, mirroring PHP's
+/// `DataMw::toJsonArray` legacy `parts` encoding, i.e.
+/// `{"parts": [{"template": <TemplateInfo>}]}`.
+///
+/// (Old parser functions use `"template"` here too, with `func` set on the
+/// inner TemplateInfo — see `DataMw::toJsonArray`.)
+pub fn serialize_data_mw(info: &TemplateInfo) -> String {
+    let mut part = serde_json::Map::new();
+    let inner = serde_json::from_str::<serde_json::Value>(&serialize_template_info(info))
+        .unwrap_or(serde_json::Value::Null);
+    part.insert("template".to_string(), inner);
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "parts".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::Object(part)]),
+    );
+    serde_json::Value::Object(out).to_string()
 }
 
 /// Split the first colon-delimited argument from `params[0]` (for old
@@ -541,5 +528,18 @@ mod tests {
         let json = serialize_template_info(&info);
         assert!(json.contains("\"function\":\"if\""));
         assert!(json.contains("\"wt\":\"#if:x\""));
+    }
+
+    #[test]
+    fn test_serialize_data_mw() {
+        let mut info = template_info_from(None, Some("Template:Foo"), vec![]);
+        info.target_wt = Some("Foo".to_string());
+
+        let json = serialize_data_mw(&info);
+        // The data-mw envelope wraps the TemplateInfo in `parts` → `template`.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed.get("parts").and_then(|p| p.get(0)).is_some());
+        assert!(parsed["parts"][0].get("template").is_some());
+        assert_eq!(parsed["parts"][0]["template"]["target"]["wt"], "Foo");
     }
 }
