@@ -1403,20 +1403,72 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(3);
 
-        // Find the closing `}}}`.
-        if let Some(end) = self.remaining().find("}}}") {
-            let _inner = self.remaining()[..end].to_string();
-            self.advance(end + 3);
+        // Find the closing `}}}` (respecting brace nesting).
+        let Some(end) = self.find_closing('}', 3) else {
+            self.pos = saved;
+            return false;
+        };
 
-            let dp = self.make_dp(saved, self.pos);
-            let mut stt = SelfclosingTagTk::new("templatearg", vec![], dp);
-            stt.add_attribute_str("src", self.input[saved..self.pos].to_string());
-            self.emit_token(ParsoidToken::SelfclosingTag(stt));
-            return true;
+        // `end` is a byte offset relative to `self.pos` (after `{{{`).
+        let inner = self.remaining()[..end].to_string();
+        self.advance(end + 3);
+
+        let mut dp = self.make_dp(saved, self.pos);
+        dp.src = Some(self.input[saved..self.pos].to_string());
+        let mut stt = SelfclosingTagTk::new("templatearg", vec![], dp);
+
+        // Split content on the first '|' for name | default.
+        let (name, default) = match inner.split_once('|') {
+            Some((n, d)) => (n.trim().to_string(), Some(d.to_string())),
+            None => (inner.trim().to_string(), None),
+        };
+
+        // Mirrors `tplarg`: attribs[0] is KV(name, '') and attribs[1] (if any)
+        // is KV('', default).
+        if !name.is_empty() {
+            stt.attribs.push(kv_str(&name, ""));
+            if let Some(default) = default {
+                stt.attribs.push(kv_str("", &default));
+            }
         }
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
+    }
 
-        self.pos = saved;
-        false
+    /// Find the byte offset (within `remaining`, exclusive) of the closing
+    /// delimiter made of `close` repeated `count` times, respecting nested
+    /// open/close pairs (two-level brace counting).
+    fn find_closing(&self, close: char, count: usize) -> Option<usize> {
+        let rem = self.remaining();
+        let chars: Vec<char> = rem.chars().collect();
+        let mut depth: i32 = count as i32;
+        let mut byte_pos = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            let ch_len = chars[i].len_utf8();
+            // Detect '{{' opens (for template nesting) regardless of final close char.
+            if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+                depth += 2;
+                byte_pos += 2; // '{' and '{' are single-byte.
+                i += 2;
+                continue;
+            }
+            if chars[i] == close
+                && i + count - 1 < chars.len()
+                && chars[i..i + count].iter().all(|&c| c == close)
+            {
+                depth -= count as i32;
+                if depth <= 0 {
+                    return Some(byte_pos);
+                }
+                byte_pos += count; // 'close' is a single-byte ASCII char.
+                i += count;
+                continue;
+            }
+            byte_pos += ch_len;
+            i += 1;
+        }
+        None
     }
 
     /// Try template: `{{ ... }}`
@@ -1428,44 +1480,44 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(2);
 
-        // Handle brace-depth correctly using a simple counter.
-        let remaining = self.remaining();
-        let mut depth: i32 = 2;
-        let mut end = 0;
-        let chars: Vec<char> = remaining.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
-                depth += 2;
-                i += 2;
-                continue;
+        let Some(end) = self.find_closing('}', 2) else {
+            self.pos = saved;
+            return false;
+        };
+
+        // `end` is a byte offset relative to `self.pos` (after the `{{`);
+        // the closing `}}` is at `self.pos + end`, and the inner content is
+        // everything between `{{` and `}}`.
+        let inner = {
+            let rem = self.remaining();
+            rem[..end].to_string()
+        };
+        self.advance(end + 2);
+
+        // Split the inner content on top-level '|' into target + arguments.
+        let parts = split_template_args(&inner);
+
+        let mut dp = self.make_dp(saved, self.pos);
+        dp.src = Some(self.input[saved..self.pos].to_string());
+        let mut stt = SelfclosingTagTk::new("template", vec![], dp);
+
+        // attribs[0] = KV(target, '') — target is the part before the first '|'.
+        let target = parts.first().map(|s| s.as_str()).unwrap_or("").trim();
+        stt.attribs.push(kv_str(target, ""));
+
+        // attribs[1..] are the arguments: `name=value` is named, else positional.
+        for part in parts.iter().skip(1) {
+            if let Some(eq) = part.find('=') {
+                let k = part[..eq].trim().to_string();
+                let v = part[eq + 1..].to_string();
+                stt.attribs.push(kv_str(&k, &v));
+            } else {
+                stt.attribs.push(kv_str("", part));
             }
-            if chars[i] == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
-                depth -= 2;
-                if depth == 0 {
-                    end = i + 2;
-                    break;
-                }
-                i += 2;
-                continue;
-            }
-            i += 1;
         }
 
-        if depth == 0 {
-            // Convert char index to byte position.
-            let byte_pos: usize = chars[..end].iter().map(|c| c.len_utf8()).sum();
-            self.advance(byte_pos);
-
-            let dp = self.make_dp(saved, self.pos);
-            let mut stt = SelfclosingTagTk::new("template", vec![], dp);
-            stt.add_attribute_str("src", self.input[saved..self.pos].to_string());
-            self.emit_token(ParsoidToken::SelfclosingTag(stt));
-            return true;
-        }
-
-        self.pos = saved;
-        false
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
     }
 
     /// Try language variant or template: `-{ ... }-`
@@ -1833,6 +1885,77 @@ fn name_to_include_type(name: &str) -> &str {
     }
 }
 
+/// Build a string-valued KV (key/value as string tokens).
+fn kv_str(key: &str, value: &str) -> KV {
+    KV {
+        key: KeyValue::Str(key.to_string()),
+        value: KeyValue::Str(value.to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    }
+}
+
+/// Split a template invocation's inner content on top-level `|` characters,
+/// respecting nested `{{...}}`, `[[...]]`, and `{{{...}}}` constructs.
+fn split_template_args(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut double_brace: i32 = 0;
+    let mut triple_brace: i32 = 0;
+    let mut bracket: i32 = 0;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // Track nesting of `{{{`, `{{`, and `[[`.
+        if c == '{' && i + 2 < chars.len() && chars[i + 1] == '{' && chars[i + 2] == '{' {
+            triple_brace += 1;
+            current.push_str("{{{");
+            i += 3;
+            continue;
+        }
+        if c == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            double_brace += 1;
+            current.push_str("{{");
+            i += 2;
+            continue;
+        }
+        if c == '}' && i + 2 < chars.len() && chars[i + 1] == '}' && chars[i + 2] == '}' {
+            triple_brace = triple_brace.saturating_sub(1);
+            current.push_str("}}}");
+            i += 3;
+            continue;
+        }
+        if c == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
+            double_brace = double_brace.saturating_sub(1);
+            current.push_str("}}");
+            i += 2;
+            continue;
+        }
+        if c == '[' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            bracket += 1;
+            current.push_str("[[");
+            i += 2;
+            continue;
+        }
+        if c == ']' && i + 1 < chars.len() && chars[i + 1] == ']' {
+            bracket = bracket.saturating_sub(1);
+            current.push_str("]]");
+            i += 2;
+            continue;
+        }
+        if c == '|' && double_brace == 0 && triple_brace == 0 && bracket == 0 {
+            parts.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+        i += 1;
+    }
+    parts.push(current);
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,6 +2014,67 @@ mod tests {
         let tokens = tokenize("{{foo}}");
         let has_template = tokens.iter().any(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template"));
         assert!(has_template, "Expected template, got: {:?}", tokens);
+    }
+
+    #[test]
+    fn test_template_with_args() {
+        let tokens = tokenize("{{foo|bar|baz=qux}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected template token");
+
+        // attribs[0] is the target, then positional then named args.
+        assert_eq!(template.attribs.len(), 3);
+        assert_eq!(template.attribs[0].key.as_str(), Some("foo"));
+        assert_eq!(template.attribs[1].key.as_str(), Some(""));
+        assert_eq!(template.attribs[1].value.as_str(), Some("bar"));
+        assert_eq!(template.attribs[2].key.as_str(), Some("baz"));
+        assert_eq!(template.attribs[2].value.as_str(), Some("qux"));
+    }
+
+    #[test]
+    fn test_template_nested_pipe() {
+        // Pipes inside a nested template should not split the outer args.
+        let tokens = tokenize("{{foo|{{bar|x}}|baz}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected template token");
+
+        assert_eq!(template.attribs.len(), 3);
+        assert_eq!(template.attribs[0].key.as_str(), Some("foo"));
+        assert_eq!(template.attribs[1].key.as_str(), Some(""));
+        assert_eq!(template.attribs[1].value.as_str(), Some("{{bar|x}}"));
+    }
+
+    #[test]
+    fn test_template_arg_token() {
+        let tokens = tokenize("{{{1|default}}}");
+        let tplarg = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "templatearg" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected templatearg token");
+
+        assert_eq!(tplarg.attribs.len(), 2);
+        assert_eq!(tplarg.attribs[0].key.as_str(), Some("1"));
+        assert_eq!(tplarg.attribs[1].key.as_str(), Some(""));
+        assert_eq!(tplarg.attribs[1].value.as_str(), Some("default"));
     }
 
     #[test]
