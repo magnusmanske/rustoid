@@ -357,6 +357,34 @@ fn split_key_value_str(s: &str) -> (Vec<PreprocPiece>, Vec<PreprocPiece>) {
     }
 }
 
+/// Build the attribute list (`KV` array) for a `template` or `template3`
+/// token from a brace `PreprocTk`. Mirrors `PreprocTk::getBarredArgs` followed
+/// by the `template3` rule of `Grammar.pegphp`.
+///
+/// - `attribs[0]` is the target (`KV(target_tokens, '')`).
+/// - `attribs[1..]` are the pipe-separated arguments (`KV(name, value)` for
+///   named, `KV('', value)` for positional).
+pub fn brace_to_attribs(tk: &PreprocTk) -> Vec<crate::wikitext::tokens_v2::KV> {
+    use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+    let contents = tk.get_contents();
+    let args = get_barred_args(contents);
+
+    let mut attribs = Vec::with_capacity(args.len());
+    for (key, value) in args {
+        let key_str = print_contents(&key, false);
+        let value_str = print_contents(&value, false);
+        attribs.push(KV {
+            key: KeyValue::Str(key_str),
+            value: KeyValue::Str(value_str),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+    }
+    attribs
+}
+
 /// Tokenize raw wikitext into preprocessor pieces. Mirrors the
 /// `preproc_pieces` / `preproc_piece` rules of PHP's `Grammar.pegphp`.
 ///
@@ -690,5 +718,22 @@ mod tests {
         }
         assert!(has_comment);
         assert_eq!(print_contents(&pieces, false), "a<!-- c -->b");
+    }
+
+    #[test]
+    fn test_brace_to_attribs() {
+        let tk = PreprocTk::simple(
+            PreprocType::Brace,
+            SourceRange::new(0, 13),
+            vec![str_piece("foo|bar|baz=qux")],
+            2,
+        );
+        let attribs = brace_to_attribs(&tk);
+        assert_eq!(attribs.len(), 3);
+        assert_eq!(attribs[0].key.as_str(), Some("foo"));
+        assert_eq!(attribs[1].key.as_str(), Some(""));
+        assert_eq!(attribs[1].value.as_str(), Some("bar"));
+        assert_eq!(attribs[2].key.as_str(), Some("baz"));
+        assert_eq!(attribs[2].value.as_str(), Some("qux"));
     }
 }
