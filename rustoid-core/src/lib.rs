@@ -61,5 +61,6 @@ mod util;
 // Re-export key types
 pub use self::error::{Result, RustoidError};
 pub use self::options::ParserOptions;
+pub use self::pipeline::parser::Parser;
 pub use self::title::Title;
 pub use self::traits::{DataSource, ExtensionHandler, SiteConfig};

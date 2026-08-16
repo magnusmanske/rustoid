@@ -12,6 +12,7 @@ pub mod list_handler;
 pub mod media_options;
 pub mod paragraph_wrapper;
 pub mod paragraph_wrapper_v2;
+pub mod parser;
 pub mod parser_functions;
 pub mod pre_handler;
 pub mod quote_transformer;
