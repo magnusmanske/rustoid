@@ -14,7 +14,7 @@ use crate::title::Title;
 
 use super::parser_functions::Params;
 use crate::wikitext::token_utils::key_value_to_string;
-use crate::wikitext::tokens_v2::{Item, KV, KeyValue};
+use crate::wikitext::tokens_v2::{Item, KV, KeyValue, ParsoidToken};
 
 /// A template expansion scope.
 #[derive(Debug, Clone)]
@@ -109,6 +109,42 @@ impl Frame {
             Item::Str("}}}".to_string()),
         ]
     }
+
+    /// Expand / convert a thunk (a chunk of tokens not yet fully expanded).
+    /// Mirrors `Frame::expand` for the subset of the pipeline we've ported:
+    /// re-tokenize the chunk and expand any `templatearg` (`{{{...}}}`)
+    /// references against this frame's arguments.
+    ///
+    /// Full `template` (`{{...}}`) expansion via the TemplateHandler is wired
+    /// separately (see `TemplateHandler::handle_template`); here we only
+    /// substitute the parameter references that don't need data access.
+    pub fn expand(&self, chunk: &[Item]) -> Vec<Item> {
+        let mut out = Vec::new();
+        for item in chunk {
+            match item {
+                Item::Tok(t) => {
+                    if let ParsoidToken::SelfclosingTag(stt) = t
+                        && stt.name == "templatearg"
+                    {
+                        // attribs[0].key is the argument name.
+                        if let Some(kv) = stt.attribs.first() {
+                            let name = match &kv.key {
+                                KeyValue::Str(s) => s.clone(),
+                                KeyValue::Tokens(toks) => to_strings(toks),
+                            };
+                            out.extend(self.expand_template_arg(&name));
+                        } else {
+                            out.push(item.clone());
+                        }
+                    } else {
+                        out.push(item.clone());
+                    }
+                }
+                Item::Str(_) => out.push(item.clone()),
+            }
+        }
+        out
+    }
 }
 
 /// Convert a resolved `KeyValue` into a flat token chunk.
@@ -117,6 +153,20 @@ fn key_value_to_items(value: &KeyValue) -> Vec<Item> {
         KeyValue::Str(s) => vec![Item::Str(s.clone())],
         KeyValue::Tokens(tokens) => tokens.iter().cloned().map(Item::Tok).collect::<Vec<_>>(),
     }
+}
+
+/// Convert a token list (`Vec<ParsoidToken>`) to a single concatenated string.
+fn to_strings(tokens: &[ParsoidToken]) -> String {
+    tokens
+        .iter()
+        .map(|t| match t {
+            ParsoidToken::Comment(_) | ParsoidToken::Nl(_) => String::new(),
+            other => other
+                .data_parsoid()
+                .and_then(|d| d.src.clone())
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 /// Trim leading/trailing whitespace from a token chunk (mirrors

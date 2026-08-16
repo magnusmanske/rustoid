@@ -3,6 +3,7 @@
 //! The pipeline coordinates tokenization, preprocessing, tree building,
 //! and serialization. It is the primary entry point for library consumers.
 
+pub mod attribute_transform_manager;
 pub mod behavior_switch_handler;
 pub mod external_link_handler;
 pub mod frame;
