@@ -81,7 +81,7 @@ pub fn token_stream_to_ast(tokens: &[Item]) -> Node {
             }
             Item::Tok(tok) => match tok {
                 ParsoidToken::Tag(t) => {
-                    open_element(&mut stack, &t.name, &t.attribs);
+                    open_element(&mut stack, &t.name, &t.attribs, &t.data_parsoid);
                 }
                 ParsoidToken::EndTag(t) => {
                     close_element(&mut doc, &mut stack, &t.name);
@@ -139,9 +139,15 @@ fn element_kind(name: &str) -> ElementKind {
     }
 }
 
-fn open_element(stack: &mut Vec<Node>, name: &str, attrs: &[crate::wikitext::tokens_v2::KV]) {
+fn open_element(
+    stack: &mut Vec<Node>,
+    name: &str,
+    attrs: &[crate::wikitext::tokens_v2::KV],
+    dp: &crate::wikitext::tokens_v2::DataParsoid,
+) {
     let mut node = Node::element(element_kind(name));
     copy_attribs(&mut node, attrs);
+    node.data_parsoid = dp.to_data_parsoid_json();
     stack.push(node);
 }
 
@@ -199,7 +205,7 @@ fn selfclosing(
     stack: &mut [Node],
     name: &str,
     attrs: &[crate::wikitext::tokens_v2::KV],
-    _dp: &crate::wikitext::tokens_v2::DataParsoid,
+    dp: &crate::wikitext::tokens_v2::DataParsoid,
 ) {
     let kind = match name {
         "hr" => ElementKind::HorizontalRule,
@@ -212,16 +218,26 @@ fn selfclosing(
     };
     let mut node = Node::element(kind);
     copy_attribs(&mut node, attrs);
+    node.data_parsoid = dp.to_data_parsoid_json();
     push_node(doc, stack, node);
 }
 
 fn copy_attribs(node: &mut Node, attrs: &[crate::wikitext::tokens_v2::KV]) {
     for kv in attrs {
         if let Some(k) = kv.key.as_str() {
-            if let Some(v) = kv.value.as_str() {
-                node.set_attr(k, v);
-            } else {
-                node.set_attr(k, "");
+            // `data-mw` is a first-class field, not a regular attribute.
+            if k == "data-mw" {
+                if let Some(v) = kv.value.as_str() {
+                    node.data_mw = Some(v.to_string());
+                }
+                continue;
+            }
+            if k == "data-parsoid" {
+                continue;
+            }
+            match kv.value.as_str() {
+                Some(v) => node.set_attr(k, v),
+                None => node.set_attr(k, ""),
             }
         }
     }

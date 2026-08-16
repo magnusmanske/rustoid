@@ -287,7 +287,7 @@ mod tests {
         let html = parser
             .wikitext_to_html("== Heading ==\n", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("<h2>"), "got: {html}");
+        assert!(html.contains("<h2"), "got: {html}");
         assert!(html.contains("Heading"), "got: {html}");
     }
 
@@ -316,6 +316,8 @@ mod tests {
             .await
             .unwrap();
         assert!(html.contains("Hello world"), "got: {html}");
+        // The transclusion should carry a `data-mw` marker.
+        assert!(html.contains("data-mw"), "expected data-mw in: {html}");
     }
 
     #[tokio::test]

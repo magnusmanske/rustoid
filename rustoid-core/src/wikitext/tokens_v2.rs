@@ -161,6 +161,72 @@ impl DataParsoid {
             ..Default::default()
         }
     }
+
+    /// Serialize this `DataParsoid` to the `data-parsoid` JSON object that
+    /// Parsoid emits on DOM elements (mirrors PHP's `DataParsoid::toJsonArray`).
+    ///
+    /// Emits only the round-trip-critical fields that are populated.
+    pub fn to_data_parsoid_json(&self) -> Option<String> {
+        let mut obj = serde_json::Map::new();
+
+        if let Some(tsr) = &self.tsr {
+            obj.insert(
+                "tsr".to_string(),
+                serde_json::Value::Array(vec![tsr.start.into(), tsr.end.into()]),
+            );
+        }
+        if let Some(src) = &self.src {
+            obj.insert("src".to_string(), serde_json::Value::String(src.clone()));
+        }
+        if let Some(stx) = &self.stx {
+            obj.insert("stx".to_string(), serde_json::Value::String(stx.clone()));
+        }
+        if let Some(colon) = &self.colon {
+            obj.insert(
+                "colon".to_string(),
+                serde_json::Value::String(colon.clone()),
+            );
+        }
+        if self.auto_inserted_start {
+            obj.insert(
+                "autoInsertedStart".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if self.auto_inserted_end {
+            obj.insert("autoInsertedEnd".to_string(), serde_json::Value::Bool(true));
+        }
+        if let Some(start_tag_src) = &self.start_tag_src {
+            obj.insert(
+                "startTagSrc".to_string(),
+                serde_json::Value::String(start_tag_src.clone()),
+            );
+        }
+        if let Some(end_tag_src) = &self.end_tag_src {
+            obj.insert(
+                "endTagSrc".to_string(),
+                serde_json::Value::String(end_tag_src.clone()),
+            );
+        }
+        if let Some(first_pipe_src) = &self.first_pipe_src {
+            obj.insert(
+                "firstPipeSrc".to_string(),
+                serde_json::Value::String(first_pipe_src.clone()),
+            );
+        }
+        if let Some(extra_dashes) = &self.extra_dashes {
+            obj.insert(
+                "extra_dashes".to_string(),
+                serde_json::Value::from(*extra_dashes),
+            );
+        }
+
+        if obj.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(obj).to_string())
+        }
+    }
 }
 
 /// DOM source range with additional metadata (analogous to PHP's DomSourceRange).
