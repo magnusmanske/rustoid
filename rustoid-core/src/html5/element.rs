@@ -56,12 +56,12 @@ impl Attributes {
     }
 }
 
-/// An element node under construction, with the tree-builder link fields.
+/// An element node under construction.
 ///
-/// Ports `Wikimedia\RemexHtml\TreeBuilder\Element`. The `stackIndex`,
-/// `prevAFE`/`nextAFE`/`nextNoah` fields are used by `Stack` and
-/// `ActiveFormattingElements`; they live here (like the PHP `Element`), rather
-/// than in a separate side table, to mirror the PHP design exactly.
+/// Ports `Wikimedia\RemexHtml\TreeBuilder\Element`. The `stack_index` field
+/// (a slot identity) is used by `Stack`; the active-formatting-elements linkage
+/// lives separately in `ActiveFormattingElements` (keyed by slot index) rather
+/// than on the element, to keep `Element` a plain value type.
 #[derive(Clone)]
 pub struct Element {
     pub namespace: String,
@@ -69,28 +69,12 @@ pub struct Element {
     pub html_name: String,
     pub attrs: Attributes,
     pub is_virtual: bool,
-    /// Link in the CachingStack scope list.
-    pub next_elt_in_scope: Option<usize>,
-    /// Current stack index, or `None` if not in the stack.
+    /// Current stack slot index, or `None` if not in the stack.
     pub stack_index: Option<usize>,
-    /// Previous AFE entry (Element index or marker sentinel).
-    pub prev_afe: Option<AfeLink>,
-    /// Next AFE entry (Element index or marker sentinel).
-    pub next_afe: Option<AfeLink>,
-    /// Next element in the Noah's Ark bucket (element index).
-    pub next_noah: Option<usize>,
     /// User data attached by the handler (the DOM node id).
     pub user_data: usize,
     /// Unique id.
     pub uid: usize,
-}
-
-/// A link in the active-formatting-elements list: either an element (by index)
-/// or a scope marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AfeLink {
-    Element(usize),
-    Marker,
 }
 
 impl Element {
@@ -110,11 +94,7 @@ impl Element {
             html_name,
             attrs,
             is_virtual: false,
-            next_elt_in_scope: None,
             stack_index: None,
-            prev_afe: None,
-            next_afe: None,
-            next_noah: None,
             user_data: 0,
             uid,
         }

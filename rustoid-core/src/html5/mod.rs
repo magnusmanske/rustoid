@@ -6,6 +6,7 @@
 //! that html5ever's sealed `TreeBuilder` does not. We port RemexHtml directly
 //! rather than approximating with html5ever.
 
+pub mod active_formatting_elements;
 pub mod element;
 pub mod html_data;
 pub mod stack;

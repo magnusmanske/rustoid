@@ -1,20 +1,18 @@
 //! Faithful port of RemexHtml's `SimpleStack` — the "stack of open elements"
 //! with the HTML5 scope-checking predicates.
 //!
-//! Mirrors `Wikimedia\RemexHtml\TreeBuilder\SimpleStack` (including its
-//! "remove leaves a hole" semantics: `remove` clears `stackIndex` but does not
-//! shrink the element array). Indices used by `ActiveFormattingElements` are
-//! stable because the array only grows.
+//! Mirrors `Wikimedia\RemexHtml\TreeBuilder\SimpleStack`. Like that class,
+//! removal leaves a hole (the slot is marked removed rather than compacted),
+//! so slot indices are stable and can be used as element identities by
+//! `ActiveFormattingElements`.
 
 use super::element::Element;
 use super::html_data::{NS_HTML, NS_MATHML, NS_SVG};
 
-/// The stack of open elements.
+/// The stack of open elements. `None` entries are removed slots.
 #[derive(Default)]
 pub struct Stack {
-    /// Elements, in insertion order. Removal does not shrink this; `remove`
-    /// only clears the removed element's `stack_index` (see `SimpleStack`).
-    elements: Vec<Element>,
+    elements: Vec<Option<Element>>,
 }
 
 /// The default-scope boundary set (breaks a scope region).
@@ -48,71 +46,56 @@ impl Stack {
         Self::default()
     }
 
-    /// The current (most recently inserted) element, if any.
+    /// The current (most recently inserted, still-open) element.
     pub fn current(&self) -> Option<&Element> {
-        // The current element is the last element with a live `stack_index`.
-        let last_live = self
-            .elements
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, e)| e.stack_index.is_some());
-        last_live.map(|(_, e)| e)
+        self.elements.iter().rev().flatten().next()
     }
 
     /// A mutable reference to the current element.
     pub fn current_mut(&mut self) -> Option<&mut Element> {
-        let mut last: Option<&mut Element> = None;
-        for e in self.elements.iter_mut().rev() {
-            if e.stack_index.is_some() {
-                last = Some(e);
-                break;
-            }
-        }
-        last
+        self.elements.iter_mut().rev().flatten().next()
     }
 
-    /// Push an element and return its index.
-    pub fn push(&mut self, elt: Element) -> usize {
+    /// Push an element and return its stable slot index.
+    pub fn push(&mut self, mut elt: Element) -> usize {
         let idx = self.elements.len();
-        self.elements.push(elt);
-        self.elements[idx].stack_index = Some(idx);
+        elt.stack_index = Some(idx);
+        self.elements.push(Some(elt));
         idx
     }
 
-    /// Pop the current element from the stack, returning its index.
+    /// Pop the current element, returning its slot index (or `None` if empty).
     pub fn pop(&mut self) -> Option<usize> {
-        let idx = {
-            let top_live = self
-                .elements
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, e)| e.stack_index.is_some())
-                .map(|(i, _)| i);
-            top_live?
-        };
-        self.elements[idx].stack_index = None;
+        let top = self
+            .elements
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, e)| e.is_some())
+            .map(|(i, _)| i);
+        let idx = top?;
+        if let Some(elt) = &mut self.elements[idx] {
+            elt.stack_index = None;
+        }
+        self.elements[idx] = None;
         Some(idx)
     }
 
-    /// Replace `old_idx` with `new` (same position in the stack).
-    pub fn replace(&mut self, old_idx: usize, new: Element) -> usize {
-        self.elements[old_idx].stack_index = None;
-        self.elements[old_idx] = new;
-        self.elements[old_idx].stack_index = Some(old_idx);
-        old_idx
+    /// Replace the element at `old_idx` with `new` (same slot).
+    pub fn replace(&mut self, old_idx: usize, mut new: Element) {
+        if let Some(old) = &mut self.elements[old_idx] {
+            old.stack_index = None;
+        }
+        new.stack_index = Some(old_idx);
+        self.elements[old_idx] = Some(new);
     }
 
-    /// Remove an element from the middle of the stack (clears its index and
-    /// shifts subsequent indices down, without shrinking the array).
+    /// Remove an element from the stack, leaving a hole.
     pub fn remove(&mut self, idx: usize) {
-        self.elements[idx].stack_index = None;
-        for i in (idx + 1)..self.elements.len() {
-            if let Some(si) = self.elements[i].stack_index {
-                self.elements[i].stack_index = Some(si - 1);
-            }
+        if let Some(elt) = &mut self.elements[idx] {
+            elt.stack_index = None;
         }
+        self.elements[idx] = None;
     }
 
     /// Is there an HTML element `name` in default scope?
@@ -120,35 +103,31 @@ impl Stack {
         self.is_in_specific_scope(name, &default_scope_boundary)
     }
 
-    /// Is the given element (by index) in default scope?
+    /// Is the element at slot `idx` in default scope?
     pub fn is_element_in_scope(&self, idx: usize) -> bool {
         for i in (0..self.elements.len()).rev() {
-            let node = &self.elements[i];
-            if node.stack_index.is_none() {
-                continue;
-            }
-            if i == idx {
-                return true;
-            }
-            if default_scope_boundary(&node.namespace, &node.name) {
-                return false;
+            if let Some(node) = &self.elements[i] {
+                if i == idx {
+                    return true;
+                }
+                if default_scope_boundary(&node.namespace, &node.name) {
+                    return false;
+                }
             }
         }
         false
     }
 
-    /// Is any of `names` (an HTML tag set) in default scope?
+    /// Is any HTML tag in `names` in default scope?
     pub fn is_one_of_set_in_scope(&self, names: &[&str]) -> bool {
         for i in (0..self.elements.len()).rev() {
-            let node = &self.elements[i];
-            if node.stack_index.is_none() {
-                continue;
-            }
-            if node.namespace == NS_HTML && names.contains(&node.name.as_str()) {
-                return true;
-            }
-            if default_scope_boundary(&node.namespace, &node.name) {
-                return false;
+            if let Some(node) = &self.elements[i] {
+                if node.namespace == NS_HTML && names.contains(&node.name.as_str()) {
+                    return true;
+                }
+                if default_scope_boundary(&node.namespace, &node.name) {
+                    return false;
+                }
             }
         }
         false
@@ -172,18 +151,16 @@ impl Stack {
 
     pub fn is_in_select_scope(&self, name: &str) -> bool {
         for i in (0..self.elements.len()).rev() {
-            let node = &self.elements[i];
-            if node.stack_index.is_none() {
-                continue;
-            }
-            if node.namespace == NS_HTML && node.name == name {
-                return true;
-            }
-            if node.namespace != NS_HTML {
-                return false;
-            }
-            if node.name != "optgroup" && node.name != "option" {
-                return false;
+            if let Some(node) = &self.elements[i] {
+                if node.namespace == NS_HTML && node.name == name {
+                    return true;
+                }
+                if node.namespace != NS_HTML {
+                    return false;
+                }
+                if node.name != "optgroup" && node.name != "option" {
+                    return false;
+                }
             }
         }
         false
@@ -191,43 +168,39 @@ impl Stack {
 
     fn is_in_specific_scope(&self, name: &str, boundary: &dyn Fn(&str, &str) -> bool) -> bool {
         for i in (0..self.elements.len()).rev() {
-            let node = &self.elements[i];
-            if node.stack_index.is_none() {
-                continue;
-            }
-            if node.namespace == NS_HTML && node.name == name {
-                return true;
-            }
-            if boundary(&node.namespace, &node.name) {
-                return false;
+            if let Some(node) = &self.elements[i] {
+                if node.namespace == NS_HTML && node.name == name {
+                    return true;
+                }
+                if boundary(&node.namespace, &node.name) {
+                    return false;
+                }
             }
         }
         false
     }
 
-    /// Get an element by index.
+    /// Get an element by slot index.
     pub fn item(&self, idx: usize) -> &Element {
-        &self.elements[idx]
+        self.elements[idx].as_ref().expect("stack slot is empty")
     }
 
-    /// A mutable element by index.
+    /// A mutable element by slot index.
     pub fn item_mut(&mut self, idx: usize) -> &mut Element {
-        &mut self.elements[idx]
+        self.elements[idx].as_mut().expect("stack slot is empty")
     }
 
-    /// The number of *live* elements (excluding removal holes).
+    /// The count of live (non-removed) elements.
     pub fn length(&self) -> usize {
-        self.elements
-            .iter()
-            .filter(|e| e.stack_index.is_some())
-            .count()
+        self.elements.iter().flatten().count()
     }
 
     /// Is there an HTML `<template>` element in the stack?
     pub fn has_template(&self) -> bool {
         self.elements
             .iter()
-            .any(|e| e.stack_index.is_some() && e.namespace == NS_HTML && e.name == "template")
+            .flatten()
+            .any(|e| e.namespace == NS_HTML && e.name == "template")
     }
 }
 
@@ -260,8 +233,6 @@ mod tests {
         s.push(el("table", 3));
         s.push(el("tbody", 4));
         s.push(el("tr", 5));
-        // Inside a table, a `p` is not in scope (the table breaks the default
-        // scope before we reach the body level).
         assert!(!s.is_in_scope("p"));
         assert!(s.is_in_scope("table"));
         assert!(s.is_in_table_scope("table"));
@@ -270,11 +241,23 @@ mod tests {
     #[test]
     fn test_pop_and_current() {
         let mut s = Stack::new();
-        let _html = s.push(el("html", 1));
+        s.push(el("html", 1));
         let div = s.push(el("div", 2));
         assert_eq!(s.current().unwrap().uid, 2);
-        let popped = s.pop().unwrap();
-        assert_eq!(popped, div);
+        assert_eq!(s.pop().unwrap(), div);
         assert_eq!(s.current().unwrap().uid, 1);
+    }
+
+    #[test]
+    fn test_remove_leaves_hole() {
+        let mut s = Stack::new();
+        let html = s.push(el("html", 1));
+        let mid = s.push(el("div", 2));
+        s.push(el("span", 3));
+        s.remove(mid);
+        assert_eq!(s.length(), 2);
+        assert!(!s.is_element_in_scope(mid));
+        // The remaining elements keep their slot indices.
+        assert_eq!(s.item(html).uid, 1);
     }
 }
