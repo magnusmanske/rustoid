@@ -335,4 +335,26 @@ mod tests {
         // The nested `{{Inner|world}}` should expand to "Hello world!".
         assert!(html.contains("Hello world"), "got: {html}");
     }
+
+    #[tokio::test]
+    async fn test_wikitext_self_referential_template() {
+        use crate::mock::MockDataSource;
+
+        let source = MockDataSource::new();
+        // A self-referential template would infinitely recurse without a
+        // loop/depth guard.
+        source.add_template("Template:Loop", "{{Loop}}");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        let html = parser
+            .wikitext_to_html_expanded("{{Loop}}", &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        // The loop is detected and an error is emitted rather than hanging.
+        assert!(
+            html.contains("Template loop detected") || html.contains("limit exceeded"),
+            "got: {html}"
+        );
+    }
 }
