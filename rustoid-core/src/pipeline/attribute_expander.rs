@@ -189,6 +189,36 @@ pub fn tpl_toks_to_string(tokens: &[Item]) -> String {
     buf
 }
 
+/// Serialize a list of rich attributes into the `data-mw.attribs` JSON
+/// array. Mirrors PHP's `DataMwAttrib::toJsonArray` (an array of `[k, v]`
+/// pairs).
+pub fn serialize_data_mw_attribs(attribs: &[crate::wikitext::tokens_v2::DataMwAttrib]) -> String {
+    let array: Vec<serde_json::Value> = attribs
+        .iter()
+        .map(|attr| {
+            serde_json::Value::Array(vec![attr_to_json(&attr.key), attr_to_json(&attr.value)])
+        })
+        .collect();
+    serde_json::Value::Array(array).to_string()
+}
+
+fn attr_to_json(value: &crate::wikitext::tokens_v2::DataMwValue) -> serde_json::Value {
+    use crate::wikitext::tokens_v2::DataMwValue as V;
+    match value {
+        V::Str(s) => serde_json::Value::String(s.clone()),
+        V::Object { txt, html } => {
+            let mut obj = serde_json::Map::new();
+            if let Some(t) = txt {
+                obj.insert("txt".to_string(), serde_json::Value::String(t.clone()));
+            }
+            if let Some(h) = html {
+                obj.insert("html".to_string(), serde_json::Value::String(h.clone()));
+            }
+            serde_json::Value::Object(obj)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +269,18 @@ mod tests {
     fn test_tpl_toks_to_string() {
         let tokens = vec![Item::Str("foo".to_string()), Item::Str("bar".to_string())];
         assert_eq!(tpl_toks_to_string(&tokens), "foobar");
+    }
+
+    #[test]
+    fn test_serialize_data_mw_attribs() {
+        use crate::wikitext::tokens_v2::{DataMwAttrib, DataMwValue};
+
+        let attribs = vec![DataMwAttrib::new(
+            DataMwValue::Str("style".to_string()),
+            DataMwValue::Str("color:red".to_string()),
+        )];
+
+        let json = serialize_data_mw_attribs(&attribs);
+        assert_eq!(json, "[[\"style\",\"color:red\"]]");
     }
 }

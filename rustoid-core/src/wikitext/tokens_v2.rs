@@ -180,12 +180,48 @@ impl DomSourceRange {
     }
 }
 
+/// A rich attribute's key or value — either a plain string or a structured
+/// `{ txt, html }` object (mirrors PHP's `DataMwAttrib`'s key/value shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataMwValue {
+    Str(String),
+    Object {
+        txt: Option<String>,
+        html: Option<String>,
+    },
+}
+
+impl DataMwValue {
+    /// The plain-text form, if available (mirrors `DataMwAttrib::getKeyString`).
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            DataMwValue::Str(s) => Some(s),
+            DataMwValue::Object { txt, .. } => txt.as_deref(),
+        }
+    }
+}
+
+/// A rich attribute pair (mirrors PHP's `DataMwAttrib`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataMwAttrib {
+    pub key: DataMwValue,
+    pub value: DataMwValue,
+}
+
+impl DataMwAttrib {
+    pub fn new(key: DataMwValue, value: DataMwValue) -> Self {
+        Self { key, value }
+    }
+}
+
 /// DataMw — metadata about MediaWiki-specific attributes (analogous to PHP's DataMw).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DataMw {
-    /// Extension attributes map.
-    pub attrs: Vec<(String, String)>,
-    /// Source for include tags.
+    /// Template/ext parts for transclusion markers (`data-mw.parts`).
+    pub parts: Vec<String>,
+    /// Rich attributes for `mw:ExpandedAttrs` (`data-mw.attribs`).
+    pub attribs: Vec<DataMwAttrib>,
+    /// Source for include tags (`data-mw.src`).
     pub src: Option<String>,
 }
 
