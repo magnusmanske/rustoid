@@ -2094,6 +2094,24 @@ mod tests {
     }
 
     #[test]
+    fn test_html_tag_with_attrs() {
+        // Regression: parse_tag_name/parse_attr_name must advance position.
+        let tokens = tokenize("<div class=\"x\" style='y'>foo</div>");
+        let div_opts: Vec<_> = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "div"))
+            .collect();
+        assert_eq!(div_opts.len(), 1, "expected one <div>, got: {:?}", tokens);
+        if let Either::Right(ParsoidToken::Tag(tk)) = div_opts[0] {
+            assert_eq!(tk.attribs.len(), 2);
+            assert_eq!(tk.attribs[0].key.as_str(), Some("class"));
+            assert_eq!(tk.attribs[0].value.as_str(), Some("x"));
+            assert_eq!(tk.attribs[1].key.as_str(), Some("style"));
+            assert_eq!(tk.attribs[1].value.as_str(), Some("y"));
+        }
+    }
+
+    #[test]
     fn test_table_start() {
         let tokens = tokenize("{|");
         let has_table = tokens
