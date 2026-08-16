@@ -9,4 +9,6 @@
 pub mod active_formatting_elements;
 pub mod element;
 pub mod html_data;
+pub mod node_handler;
 pub mod stack;
+pub mod tree_handler;
