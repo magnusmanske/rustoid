@@ -131,22 +131,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
                 match resolve_template_target(self.config, &target_str) {
                     Some(ResolvedTarget::Template { name, title }) => {
-                        if let Some(src) = source {
-                            let expanded = TemplateHandler::expand_template_natively(
-                                src, &name, &title, &params, about_id, tok,
+                        let expanded = self
+                            .expand_one_template(
+                                source,
+                                frame,
+                                &name,
+                                &title,
+                                &params,
+                                about_id,
+                                tok,
+                                about_counter,
                             )
                             .await;
-                            out.extend(expanded);
-                        } else {
-                            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, tok);
-                            let info = template_info_from(None, Some(&name), vec![]);
-                            out.extend(encap.encap_tokens(
-                                vec![crate::pipeline::template_handler::template_to_wikilink(
-                                    &name,
-                                )],
-                                &info,
-                            ));
-                        }
+                        out.extend(expanded);
                     }
                     _ => {
                         let expanded =
@@ -174,6 +171,106 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             out.push(item);
         }
         out
+    }
+
+    /// Fetch, expand, and recursively re-process a single template. Mirrors the
+    /// native template expansion path (`fetchTemplateAndTitle` +
+    /// `processTemplateSource`), then recursively runs the fetched+substituted
+    /// source through template expansion with a child frame carrying the
+    /// template's arguments.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_one_template(
+        &self,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        name: &str,
+        title: &crate::title::Title,
+        params: &crate::pipeline::parser_functions::Params,
+        about_id: String,
+        token: &ParsoidToken,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        const MAX_TEMPLATE_DEPTH: usize = 40;
+
+        // Enforce loop / depth constraints.
+        if let Some(err) = crate::pipeline::template_handler::enforce_template_constraints(
+            frame,
+            name,
+            title,
+            MAX_TEMPLATE_DEPTH,
+            false,
+        ) {
+            return err;
+        }
+
+        // Without a data source, a template becomes a redlink.
+        let Some(src) = source else {
+            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+            let info = template_info_from(None, Some(name), vec![]);
+            return encap.encap_tokens(
+                vec![crate::pipeline::template_handler::template_to_wikilink(
+                    name,
+                )],
+                &info,
+            );
+        };
+
+        let fetched = src.get_template(title).await.ok().flatten();
+        let Some(template_src) = fetched else {
+            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+            let info = template_info_from(None, Some(name), vec![]);
+            return encap.encap_tokens(
+                vec![crate::pipeline::template_handler::template_to_wikilink(
+                    name,
+                )],
+                &info,
+            );
+        };
+
+        // Build a child frame carrying the template's arguments (params[1..]).
+        let child_args: Vec<crate::wikitext::tokens_v2::KV> =
+            params.args.iter().skip(1).cloned().collect();
+        let child_frame = frame.new_child(title.clone(), child_args);
+
+        // Substitute the template's arguments into its source.
+        use crate::expand::transclusion::TemplateInvocation;
+        use crate::wikitext::token_utils::key_value_to_string;
+        let mut positional_args = Vec::new();
+        let mut named_args = std::collections::HashMap::new();
+        for kv in params.args.iter().skip(1) {
+            let k = key_value_to_string(&kv.key);
+            let v = key_value_to_string(&kv.value);
+            if k.trim().is_empty() {
+                positional_args.push(v);
+            } else {
+                named_args.insert(k.trim().to_string(), v);
+            }
+        }
+        let invocation = TemplateInvocation {
+            name: name.to_string(),
+            positional_args,
+            named_args,
+        };
+        let substituted = crate::expand::transclusion::substitute_args(
+            &template_src,
+            &invocation.to_template_args(),
+            40,
+        )
+        .unwrap_or(template_src);
+
+        // Re-tokenize and recursively expand the substituted source with the
+        // child frame.
+        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+            &substituted,
+            /* in_template */ true,
+        );
+        let expanded =
+            Box::pin(self.expand_templates(&child_frame, items, Some(src), about_counter)).await;
+
+        let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+        let mut info = template_info_from(None, Some(name), vec![]);
+        info.param_infos = crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params);
+        encap.encap_tokens(expanded, &info)
     }
 }
 
@@ -218,6 +315,24 @@ mod tests {
             .wikitext_to_html_expanded("{{Foo|world}}", &source, &ParserOptions::for_page("Test"))
             .await
             .unwrap();
+        assert!(html.contains("Hello world"), "got: {html}");
+    }
+
+    #[tokio::test]
+    async fn test_wikitext_nested_template() {
+        use crate::mock::MockDataSource;
+
+        let source = MockDataSource::new();
+        source.add_template("Template:Outer", "{{Inner|world}}");
+        source.add_template("Template:Inner", "Hello {{{1}}}!");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        let html = parser
+            .wikitext_to_html_expanded("{{Outer}}", &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        // The nested `{{Inner|world}}` should expand to "Hello world!".
         assert!(html.contains("Hello world"), "got: {html}");
     }
 }
