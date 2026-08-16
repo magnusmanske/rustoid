@@ -99,7 +99,7 @@ impl HtmlSerializer {
                     ElementKind::Table => {
                         buf.push_str(&format!("{indent}<table"));
                         self.serialize_attrs(node, buf);
-                        buf.push_str(">");
+                        buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
                         buf.push_str(&format!("{indent}</table>"));
                     }
@@ -209,13 +209,21 @@ impl HtmlSerializer {
                         buf.push_str("</figure-inline>");
                     }
                     _ => {
-                        // Generic element serialization
+                        // Generic element serialization.
                         let tag = self.element_tag(kind);
-                        buf.push_str(&format!("{indent}<{tag}"));
-                        self.serialize_attrs(node, buf);
-                        buf.push('>');
-                        self.serialize_children(node, buf, depth)?;
-                        buf.push_str(&format!("</{tag}>\n"));
+                        // Void/self-closing elements (meta, link, img, etc.)
+                        // serialize without a closing tag.
+                        if is_void_element(tag) {
+                            buf.push_str(&format!("{indent}<{tag}"));
+                            self.serialize_attrs(node, buf);
+                            buf.push_str("/>\n");
+                        } else {
+                            buf.push_str(&format!("{indent}<{tag}"));
+                            self.serialize_attrs(node, buf);
+                            buf.push('>');
+                            self.serialize_children(node, buf, depth)?;
+                            buf.push_str(&format!("</{tag}>\n"));
+                        }
                     }
                 }
             }
@@ -327,6 +335,28 @@ impl HtmlSerializer {
             ElementKind::Other(name) => name.as_str(),
         }
     }
+}
+
+/// Whether a tag is void (self-closing) in HTML serialization. Mirrors the
+/// HTML void-element list that Parsoid emits without an explicit close tag.
+fn is_void_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 /// Basic HTML entity escaping for text content.
