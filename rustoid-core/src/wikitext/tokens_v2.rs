@@ -257,6 +257,9 @@ pub struct TempData {
     pub ref_: Option<String>,
     /// Untagged leading wikitext hoisted around a transclusion marker.
     pub unwrapped_wt: Option<String>,
+    /// The first wikitext node of a multi-template-content-block (html→wt
+    /// serialization).
+    pub first_wikitext_node: Option<String>,
 }
 
 /// A single Parsoid token — mirrors the PHP token hierarchy.

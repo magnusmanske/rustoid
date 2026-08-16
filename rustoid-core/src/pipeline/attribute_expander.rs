@@ -219,6 +219,106 @@ fn attr_to_json(value: &crate::wikitext::tokens_v2::DataMwValue) -> serde_json::
     }
 }
 
+/// The result of `split_tokens`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitTokensResult {
+    /// Hoisted transclusion start-meta tokens (empty if none).
+    pub meta_tokens: Vec<Item>,
+    /// Tokens before the first newline (after any start-meta hoisted out).
+    pub pre_nl_buf: Vec<Item>,
+    /// Tokens from the newline onward.
+    pub post_nl_buf: Vec<Item>,
+}
+
+/// Split a token array around the first newline token, hoisting any
+/// transclusion/param/language-variant/include/annotation start-meta from the
+/// first line to before the whole chunk. Mirrors
+/// `AttributeExpander::splitTokens`.
+///
+/// `token_tsr_start` is the enclosing token's source-range start (for
+/// computing `unwrappedWT` and `firstWikitextNode`).
+pub fn split_tokens(
+    tokens: &[Item],
+    nl_tk_pos: isize,
+    wrap_templates: bool,
+    token_tsr_start: usize,
+    token_name: &str,
+    token_stx: Option<&str>,
+) -> SplitTokensResult {
+    let mut pre_nl_buf = Vec::new();
+    let mut post_nl_buf = Vec::new();
+    let mut start_meta: Option<Item> = None;
+    let mut start_meta_index: Option<usize> = None;
+
+    for (i, t) in tokens.iter().enumerate() {
+        if i as isize == nl_tk_pos {
+            post_nl_buf = tokens[i..].to_vec();
+            break;
+        }
+
+        if wrap_templates
+            && let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = t
+            && let Some(ty) = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+                .and_then(|kv| kv.value.as_str())
+            && is_meta_type(ty)
+            && !ty.ends_with("/End")
+        {
+            start_meta = Some(t.clone());
+            start_meta_index = Some(i);
+        }
+
+        pre_nl_buf.push(t.clone());
+    }
+
+    if let Some(meta) = start_meta {
+        if pre_nl_buf.len() == 1 {
+            // Nothing to do (all content is after the newline).
+            return SplitTokensResult {
+                meta_tokens: Vec::new(),
+                pre_nl_buf: Vec::new(),
+                post_nl_buf: tokens.to_vec(),
+            };
+        }
+
+        // Clear the start-meta from pre_nl_buf and hoist it.
+        if let Some(idx) = start_meta_index {
+            pre_nl_buf[idx] = Item::Str(String::new());
+        }
+
+        // Build the hoisted meta token with updated data-parsoid.
+        let mut meta_tokens = Vec::new();
+        if let Item::Tok(ParsoidToken::SelfclosingTag(mut m)) = meta {
+            // `unwrappedWT` should be the wikitext between the enclosing token
+            // start and the start-meta; computing it needs the source text,
+            // which isn't threaded through this helper yet.
+            m.data_parsoid.tmp.unwrapped_wt = Some(String::new());
+            m.data_parsoid.tmp.first_wikitext_node = token_stx
+                .map(|stx| format!("{}_{}", token_name.to_uppercase(), stx))
+                .or_else(|| Some(token_name.to_uppercase()));
+            m.data_parsoid.tsr = m
+                .data_parsoid
+                .tsr
+                .map(|tsr| crate::wikitext::tokens_v2::SourceRange::new(token_tsr_start, tsr.end));
+            meta_tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(m)));
+        }
+
+        SplitTokensResult {
+            meta_tokens,
+            pre_nl_buf,
+            post_nl_buf,
+        }
+    } else {
+        SplitTokensResult {
+            meta_tokens: Vec::new(),
+            pre_nl_buf: tokens.to_vec(),
+            post_nl_buf: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +382,42 @@ mod tests {
 
         let json = serialize_data_mw_attribs(&attribs);
         assert_eq!(json, "[[\"style\",\"color:red\"]]");
+    }
+
+    #[test]
+    fn test_split_tokens_no_meta() {
+        let tokens = vec![
+            Item::Str("a".to_string()),
+            Item::Tok(ParsoidToken::Nl(NlTk::new(
+                crate::wikitext::tokens_v2::SourceRange::new(0, 1),
+            ))),
+            Item::Str("b".to_string()),
+        ];
+        // No start-meta: PHP returns the whole token array as `preNLBuf`.
+        let result = split_tokens(&tokens, 1, true, 0, "table", None);
+        assert!(result.meta_tokens.is_empty());
+        assert_eq!(result.pre_nl_buf, tokens);
+        assert!(result.post_nl_buf.is_empty());
+    }
+
+    #[test]
+    fn test_split_tokens_hoists_meta() {
+        // A transclusion meta followed by content then a newline.
+        let tokens = vec![
+            meta_token("mw:Transclusion"),
+            Item::Str("a".to_string()),
+            Item::Tok(ParsoidToken::Nl(NlTk::new(
+                crate::wikitext::tokens_v2::SourceRange::new(0, 1),
+            ))),
+            Item::Str("b".to_string()),
+        ];
+        let result = split_tokens(&tokens, 2, true, 0, "table", None);
+        assert_eq!(result.meta_tokens.len(), 1);
+        // The meta is hoisted; pre_nl_buf has "" (cleared meta) + "a".
+        assert_eq!(
+            result.pre_nl_buf,
+            vec![Item::Str(String::new()), Item::Str("a".to_string())]
+        );
+        assert_eq!(result.post_nl_buf.len(), 2);
     }
 }
