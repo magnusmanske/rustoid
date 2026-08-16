@@ -719,7 +719,7 @@ fn match_transclusion(attribs: &[KV]) -> Option<String> {
         .find(|kv| kv.key.as_str() == Some("typeof"))
         .and_then(|kv| kv.value.as_str())?;
     for ty in v.split_whitespace() {
-        if ty == "mw:Transclusion" || ty.starts_with("mw:Transclusion/") {
+        if ty.starts_with("mw:Transclusion") {
             return Some(ty.to_string());
         }
     }
