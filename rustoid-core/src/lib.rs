@@ -44,6 +44,7 @@ pub mod pipeline;
 pub mod wikitext;
 
 pub mod html;
+pub mod html5;
 pub mod links;
 pub mod magic;
 pub mod sanitizer;
