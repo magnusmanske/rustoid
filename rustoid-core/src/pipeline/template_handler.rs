@@ -722,6 +722,58 @@ impl TemplateHandler {
         }
     }
 
+    /// Process a chunk of tokens, dispatching `template`/`template3` and
+    /// `templatearg` self-closing tokens through `handle_template` and
+    /// `handle_template_arg` respectively. Mirrors PHP's
+    /// `TemplateHandler::onTag` + `XMLTagBasedHandler::process` (the
+    /// TokenTransform2 dispatch loop).
+    pub fn process(
+        &self,
+        config: &dyn SiteConfig,
+        frame: &super::frame::Frame,
+        about_counter: &std::cell::Cell<usize>,
+        tokens: Vec<Item>,
+    ) -> Vec<Item> {
+        let mut out = Vec::new();
+        for item in tokens {
+            let Item::Tok(tok) = &item else {
+                out.push(item);
+                continue;
+            };
+            let ParsoidToken::SelfclosingTag(stt) = tok else {
+                out.push(item);
+                continue;
+            };
+            if stt.name == "template" || stt.name == "template3" {
+                let about_id = {
+                    let id = about_counter.get();
+                    about_counter.set(id + 1);
+                    format!("#mwt{id}")
+                };
+                // Build a `Params` from the token's attribs.
+                let params = Params::new(stt.attribs.clone());
+                let expanded = self.handle_template(config, &params, about_id, tok);
+                out.extend(expanded);
+                continue;
+            }
+            if stt.name == "templatearg"
+                && let Some(name) = stt.attribs.first().and_then(|kv| kv.key.as_str())
+            {
+                let about_id = {
+                    let id = about_counter.get();
+                    about_counter.set(id + 1);
+                    format!("#mwt{id}")
+                };
+                let src = format!("{{{{{name}}}}}");
+                let expanded = self.handle_template_arg(frame, &src, about_id, tok, true);
+                out.extend(expanded);
+                continue;
+            }
+            out.push(item);
+        }
+        out
+    }
+
     /// Fetch, expand, and tokenize a template natively. Mirrors the
     /// `fetchTemplateAndTitle` + `processTemplateSource` path of PHP's
     /// `TemplateHandler::expandTemplateNatively` for a resolved template
@@ -1087,6 +1139,52 @@ mod tests {
         );
         assert_eq!(parse_template_arg_src("{{{}}}"), None);
         assert_eq!(parse_template_arg_src("not-an-arg"), None);
+    }
+
+    #[test]
+    fn test_process_pfifies_template() {
+        use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue, SelfclosingTagTk};
+
+        let config = MockSiteConfig::new();
+        let title = TitleParser::parse("Template:Foo", &config);
+        let frame = crate::pipeline::frame::Frame::new(title, vec![]);
+        let about = std::cell::Cell::new(0usize);
+
+        // A `template` token with `{{#if:x|yes|no}}`.
+        let mut stt = SelfclosingTagTk::new("template", vec![], DataParsoid::default());
+        stt.attribs = vec![
+            KV {
+                key: KeyValue::Str("#if:x".to_string()),
+                value: KeyValue::Str("".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str("".to_string()),
+                value: KeyValue::Str("yes".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str("".to_string()),
+                value: KeyValue::Str("no".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ];
+
+        let input = vec![Item::Tok(ParsoidToken::SelfclosingTag(stt))];
+        let out = TemplateHandler.process(&config, &frame, &about, input);
+
+        // Wrapped with mw:Transclusion and contains "yes".
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "meta"));
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Str(s) if s == "yes"))
+        );
     }
 
     #[test]

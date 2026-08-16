@@ -22,5 +22,6 @@ pub mod stage2;
 pub mod stage3;
 pub mod template_encapsulator;
 pub mod template_handler;
+pub mod token_handler_pipeline;
 pub mod wiki_link_handler;
 pub mod wiki_link_render;
