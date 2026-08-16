@@ -1242,7 +1242,8 @@ impl<'a> PegTokenizer<'a> {
                 let name = self.remaining()[..end].trim().to_lowercase();
                 self.advance(end + 1);
 
-                let dp = self.make_dp(saved, self.pos);
+                let mut dp = self.make_dp(saved, self.pos);
+                dp.stx = Some("html".to_string());
                 self.emit_token(ParsoidToken::EndTag(EndTagTk::new(name, vec![], dp)));
                 return true;
             }
@@ -1276,7 +1277,9 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
 
-        let dp = self.make_dp(saved, self.pos);
+        let mut dp = self.make_dp(saved, self.pos);
+        // Literal HTML tags carry `stx: "html"` (mirrors Parsoid's `StxInfo`).
+        dp.stx = Some("html".to_string());
 
         if self_closing {
             self.emit_token(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
@@ -1295,12 +1298,14 @@ impl<'a> PegTokenizer<'a> {
         true
     }
 
-    fn parse_tag_name(&self) -> String {
+    fn parse_tag_name(&mut self) -> String {
         let rem = self.remaining();
         let end = rem
             .find([' ', '\t', '\n', '\r', '/', '>'])
             .unwrap_or(rem.len());
-        rem[..end].to_string()
+        let name = rem[..end].to_string();
+        self.advance(end);
+        name
     }
 
     fn parse_html_attributes(&mut self) -> Vec<KV> {
@@ -1359,14 +1364,16 @@ impl<'a> PegTokenizer<'a> {
         attrs
     }
 
-    fn parse_attr_name(&self) -> String {
+    fn parse_attr_name(&mut self) -> String {
         let rem = self.remaining();
         let end = rem
             .find(|c: char| {
                 c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '=' || c == '/' || c == '>'
             })
             .unwrap_or(rem.len());
-        rem[..end].to_string()
+        let name = rem[..end].to_string();
+        self.advance(end);
+        name
     }
 
     fn parse_attr_value(&mut self) -> String {

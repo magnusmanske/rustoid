@@ -157,4 +157,18 @@ mod tests {
                     .any(|c| matches!(&c.kind, NodeKind::Element(ElementKind::Wikilink)))
         }));
     }
+
+    #[test]
+    fn test_process_div() {
+        let stage = TreeBuilderStage::new(false);
+        let out = stage.process(tokenize("<div>foo</div>"));
+        assert!(!out.is_empty(), "empty output");
+    }
+
+    #[test]
+    fn test_tokenize_div_only() {
+        // Isolate: tokenizer alone (no TT3) must not hang.
+        let toks = tokenize("<div>foo</div>");
+        assert!(!toks.is_empty());
+    }
 }

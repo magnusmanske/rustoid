@@ -907,6 +907,15 @@ mod tests {
         assert!(contains_text(&doc, "|"), "expected literal pipe: {doc:?}");
     }
 
+    #[test]
+    fn test_div_roundtrip() {
+        // A simple <div> must build and serialize without hanging.
+        let items = vec![tag("div"), txt("foo"), end("div")];
+        let doc = token_stream_to_ast_html(&items);
+        assert!(contains_kind(&doc, &ElementKind::Div), "{doc:?}");
+        assert!(contains_text(&doc, "foo"), "{doc:?}");
+    }
+
     fn contains_text(node: &Node, needle: &str) -> bool {
         if let NodeKind::Text(t) = &node.kind
             && t == needle

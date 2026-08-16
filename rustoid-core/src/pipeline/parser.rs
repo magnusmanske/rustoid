@@ -302,6 +302,21 @@ mod tests {
         assert!(html.contains("bold"), "got: {html}");
     }
 
+    #[test]
+    fn test_wikitext_literal_html_tag_stx() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("<div>foo</div>", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<div"), "got: {html}");
+        // Literal HTML tags carry stx:"html" in data-parsoid.
+        assert!(
+            html.contains("\"stx\":\"html\""),
+            "expected stx:html in: {html}"
+        );
+    }
+
     #[tokio::test]
     async fn test_wikitext_to_html_template() {
         use crate::mock::MockDataSource;
