@@ -141,6 +141,8 @@ pub struct DataParsoid {
     pub link_tk: Option<Box<ParsoidToken>>,
     /// Parser-function colon (':') separator source.
     pub colon: Option<String>,
+    /// Temporary node-related data (mirrors PHP's `TempData`).
+    pub tmp: TempData,
 }
 
 impl DataParsoid {
@@ -223,6 +225,38 @@ pub struct DataMw {
     pub attribs: Vec<DataMwAttrib>,
     /// Source for include tags (`data-mw.src`).
     pub src: Option<String>,
+}
+
+/// Temporary node-related data (mirrors PHP's `src/NodeData/TempData.php`).
+///
+/// This holds the transient properties that are set during token transforms and
+/// tree building but are not serialized to `data-parsoid`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TempData {
+    /// The original DSR for a quote element (pre-adjustment by ComputeDSR).
+    pub orig_dsr: Option<DomSourceRange>,
+    /// Offsets of external link content.
+    pub ext_link_content_offsets: Option<SourceRange>,
+    /// Heading section number (`h1`..`h6`).
+    pub heading_index: Option<usize>,
+    /// Information about a template invocation (serialized as a JSON string
+    /// to avoid a `wikitext`→`pipeline` dependency cycle).
+    pub tplarginfo: Option<String>,
+    /// The TSR of an end tag.
+    pub end_tsr: Option<SourceRange>,
+    /// Tokens shuttled to the end of a pipeline stage.
+    pub shuttle_tokens: Option<Vec<Item>>,
+    /// Wikitext source for table-cell attributes (for reparse).
+    pub attr_src: Option<String>,
+    /// Whether a template was detected inside an external link href.
+    pub link_contains_template: Option<bool>,
+    /// Whether a table cell encountered an attribute terminator in attribute
+    /// position (during AttributeExpander).
+    pub cell_attr_terminator_seen: Option<bool>,
+    /// Magic link type (`rfc`, `pmid`, `isbn`).
+    pub ref_: Option<String>,
+    /// Untagged leading wikitext hoisted around a transclusion marker.
+    pub unwrapped_wt: Option<String>,
 }
 
 /// A single Parsoid token — mirrors the PHP token hierarchy.
