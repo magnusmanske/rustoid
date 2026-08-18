@@ -38,15 +38,15 @@ pub struct TreeBuilder<H: TreeHandler> {
     pub ignore_errors: bool,
     pub ignore_nulls: bool,
     pub is_fragment: bool,
-    /// The fragment context element's `uid` (a virtual element not on the stack).
-    pub fragment_context: Option<usize>,
-    pub head_element: Option<usize>,
-    pub form_element: Option<usize>,
+    /// The fragment context element (a virtual element not on the stack).
+    pub fragment_context: Option<Element>,
+    pub head_element: Option<Element>,
+    pub form_element: Option<Element>,
     pub frameset_ok: bool,
     pub quirks: u8,
     pub foster_parenting: bool,
-    /// Pending table characters: `(is_whitespace, text)`.
-    pub pending_table_characters: Vec<(bool, String)>,
+    /// Pending table characters (raw substrings, whitespace determined at flush).
+    pub pending_table_characters: Vec<String>,
     next_uid: usize,
 }
 
@@ -84,27 +84,24 @@ impl<H: TreeHandler> TreeBuilder<H> {
         self.handler.start_document(namespace, name);
         if let (Some(ns), Some(nm)) = (namespace, name) {
             self.is_fragment = true;
-            self.fragment_context = Some(self.next_uid() + 1);
-            // The virtual fragment context element is not pushed; only its uid
-            // is recorded (the handler does not create a DOM node for it).
-            let ctx = Element::new(ns, nm, Attributes::new(), self.fragment_context.unwrap());
-            let _ = ctx;
+            // The virtual fragment context element is not pushed; we only keep
+            // a reference (the handler does not create a DOM node for it).
+            let ctx = Element::new(ns, nm, Attributes::new(), self.next_uid());
+            self.fragment_context = Some(ctx);
 
             // The synthetic <html> root.
             let mut html = Element::new(NS_HTML, "html", Attributes::new(), self.next_uid());
             html.is_virtual = true;
-            let uid = html.uid;
             self.handler
                 .insert_element(Preposition::Root, None, &mut html, false, 0, 0);
             self.stack.push(html);
-            let _ = uid;
         }
     }
 
     /// The adjusted current node's uid, if any.
     pub fn adjusted_current_node(&self) -> Option<usize> {
         if self.stack.length() == 1 && self.is_fragment {
-            self.fragment_context
+            self.fragment_context.as_ref().map(|e| e.uid)
         } else {
             self.stack.current().map(|e| e.uid)
         }

@@ -93,25 +93,20 @@ impl Dispatcher {
 
     /// Flush pending table text (mirror `Dispatcher::flushTableText` +
     /// `InTableText::flush`): move buffered table text to the appropriate
-    /// place (foster-parenting non-whitespace text is handled by the caller;
-    /// here we simply emit it via `insert_characters`).
+    /// place (foster-parenting non-whitespace text, else inserted normally).
     pub fn flush_table_text<H: TreeHandler>(&mut self, builder: &mut TreeBuilder<H>) {
         if self.mode != ModeId::InTableText {
             return;
         }
         let pending = std::mem::take(&mut builder.pending_table_characters);
-        let contains_nonspace = pending.iter().any(|(_, text)| !text.trim().is_empty());
-        for (_ws, text) in pending {
+        let contains_nonspace = pending.iter().any(|text| !is_html_whitespace(text));
+        for text in pending {
             if text.is_empty() {
                 continue;
             }
-            if contains_nonspace {
-                builder.foster_parenting = true;
-                builder.insert_characters(&text, 0, text.len(), 0, 0);
-                builder.foster_parenting = false;
-            } else {
-                builder.insert_characters(&text, 0, text.len(), 0, 0);
-            }
+            builder.foster_parenting = contains_nonspace;
+            builder.insert_characters(&text, 0, text.len(), 0, 0);
+            builder.foster_parenting = false;
         }
     }
 
@@ -212,4 +207,10 @@ pub fn is_table_mode(mode: ModeId) -> bool {
         mode,
         ModeId::InTable | ModeId::InCaption | ModeId::InTableBody | ModeId::InRow | ModeId::InCell
     )
+}
+
+/// HTML table-text whitespace (space, tab, LF, FF, CR).
+fn is_html_whitespace(s: &str) -> bool {
+    s.chars()
+        .all(|c| matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' '))
 }

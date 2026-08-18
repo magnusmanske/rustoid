@@ -11,6 +11,7 @@ pub mod dispatcher;
 pub mod element;
 pub mod html_data;
 pub mod insertion_mode;
+pub mod modes;
 pub mod node_handler;
 pub mod stack;
 pub mod tree_builder;
