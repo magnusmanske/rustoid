@@ -7,8 +7,10 @@
 //! rather than approximating with html5ever.
 
 pub mod active_formatting_elements;
+pub mod dispatcher;
 pub mod element;
 pub mod html_data;
+pub mod insertion_mode;
 pub mod node_handler;
 pub mod stack;
 pub mod tree_builder;
