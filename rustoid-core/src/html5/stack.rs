@@ -190,6 +190,16 @@ impl Stack {
         self.elements[idx].as_mut().expect("stack slot is empty")
     }
 
+    /// Get an element by its `uid`, if it is in the stack.
+    pub fn item_by_uid(&self, uid: usize) -> Option<&Element> {
+        self.elements.iter().flatten().find(|e| e.uid == uid)
+    }
+
+    /// The raw element slice (may contain `None` holes).
+    pub fn data(&self) -> &[Option<Element>] {
+        &self.elements
+    }
+
     /// The count of live (non-removed) elements.
     pub fn length(&self) -> usize {
         self.elements.iter().flatten().count()

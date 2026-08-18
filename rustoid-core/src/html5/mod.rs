@@ -11,4 +11,5 @@ pub mod element;
 pub mod html_data;
 pub mod node_handler;
 pub mod stack;
+pub mod tree_builder;
 pub mod tree_handler;
