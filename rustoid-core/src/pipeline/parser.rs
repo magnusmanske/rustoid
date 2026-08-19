@@ -115,20 +115,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             let clean = |href: &str| {
                 crate::sanitizer::clean_url(href, "external", |proto| {
+                    // `split_url` keeps the `//` when present, and no `//` for
+                    // scheme-only protocols like `mailto:`/`tel:`.
                     matches!(
                         proto,
-                        "http:"
-                            | "https:"
-                            | "ftp:"
-                            | "ftps:"
+                        "http://"
+                            | "https://"
+                            | "ftp://"
+                            | "ftps://"
                             | "mailto:"
                             | "news:"
                             | "irc:"
                             | "ircs:"
-                            | "gopher:"
-                            | "mms:"
+                            | "gopher://"
+                            | "mms://"
                             | "tel:"
-                            | "nntp:"
+                            | "nntp://"
                             | "//"
                     )
                 })
@@ -458,6 +460,20 @@ mod tests {
         assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
         assert!(html.contains("https://example.com"), "got: {html}");
         assert!(html.contains("Example"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_bare_url() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "See https://example.com now",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(html.contains("https://example.com"), "got: {html}");
     }
 
     #[test]

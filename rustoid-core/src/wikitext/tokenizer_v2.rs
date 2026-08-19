@@ -1765,7 +1765,8 @@ impl<'a> PegTokenizer<'a> {
         let rem = self.remaining();
         let prefixes = ["http://", "https://", "ftp://", "//"];
 
-        for prefix in &prefixes {
+        // If we are at the start of a URL, emit a `urllink` token.
+        for prefix in prefixes {
             if rem.starts_with(prefix) {
                 let start = self.pos;
                 let end = rem
@@ -1793,8 +1794,9 @@ impl<'a> PegTokenizer<'a> {
             }
         }
 
-        // Otherwise, match a run of plain text until we hit a special character.
-        let _start = self.pos;
+        // Otherwise, match a run of plain text until a special character or the
+        // start of a URL protocol (so the URL can be tokenized on the next
+        // iteration rather than being split at its `:`).
         let rem = self.remaining();
         let end = rem
             .find(|c: char| {
@@ -1819,6 +1821,10 @@ impl<'a> PegTokenizer<'a> {
                 ) || (c == '_' && rem.as_bytes().get(1).copied() == Some(b'_'))
             })
             .unwrap_or(rem.len());
+
+        // Stop before the earliest URL protocol, if it starts before `end`.
+        let url_start = prefixes.iter().filter_map(|p| rem.find(p)).min();
+        let end = url_start.map_or(end, |u| end.min(u));
 
         if end > 0 {
             let text = rem[..end].to_string();

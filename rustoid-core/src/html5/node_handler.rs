@@ -135,6 +135,23 @@ impl NodeTreeHandler {
             other => ElementKind::Other(other.to_string()),
         }
     }
+
+    /// Classify an `<a>` element by its `rel` attribute so the serializer can
+    /// emit `href`/`rel` correctly.
+    fn a_kind(element: &Element) -> ElementKind {
+        if let Some(rel) = element.attrs.get("rel") {
+            if rel == "mw:WikiLink" {
+                return ElementKind::Wikilink;
+            }
+            if rel == "mw:ExtLink" {
+                return ElementKind::ExtLink;
+            }
+            if rel == "mw:ExtLink/interwiki" || rel == "mw:WikiLink/Interwiki" {
+                return ElementKind::Wikilink;
+            }
+        }
+        ElementKind::Other("a".to_string())
+    }
 }
 
 impl Default for NodeTreeHandler {
@@ -186,6 +203,11 @@ impl TreeHandler for NodeTreeHandler {
         _source_length: usize,
     ) {
         let kind = Self::kind_for(&element.name);
+        let kind = if element.name == "a" {
+            Self::a_kind(element)
+        } else {
+            kind
+        };
         let mut node = Node::element(kind);
         for (k, v) in element.attrs.get_values() {
             node.set_attr(k.clone(), v.clone());
