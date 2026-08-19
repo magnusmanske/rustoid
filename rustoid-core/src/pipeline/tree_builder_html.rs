@@ -598,6 +598,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_adoption_agency_misnested_bold() {
+        // `<b>a<b>b</b>c</b>` exercises the adoption agency for the inner
+        // `</b>`; it must terminate and preserve all text.
+        let items = vec![
+            tag("b"),
+            txt("a"),
+            tag("b"),
+            txt("b"),
+            end("b"),
+            txt("c"),
+            end("b"),
+        ];
+        let doc = token_stream_to_ast_html(&items);
+        for needle in ["a", "b", "c"] {
+            assert!(contains_text(&doc, needle), "missing {needle}: {doc:?}");
+        }
+    }
+
     fn find_placeholder(node: &Node) -> Option<&Node> {
         if node
             .get_attr("typeof")

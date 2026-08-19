@@ -95,13 +95,25 @@ impl Stack {
 
     /// Remove an element by `uid` (used when the caller only has the identity).
     pub fn remove_by_uid(&mut self, uid: usize) -> Option<Element> {
-        let idx = self.elements.iter().position(|e| e.uid == uid)?;
+        let idx = self.index_of_uid(uid)?;
         let mut elt = self.elements.remove(idx);
         elt.stack_index = None;
         for (i, e) in self.elements.iter_mut().enumerate().skip(idx) {
             e.stack_index = Some(i);
         }
         Some(elt)
+    }
+
+    /// The dense index of the element with `uid`, if present.
+    pub fn index_of_uid(&self, uid: usize) -> Option<usize> {
+        self.elements.iter().position(|e| e.uid == uid)
+    }
+
+    /// Replace the element with `old_uid` with `new` (same slot).
+    pub fn replace_by_uid(&mut self, old_uid: usize, new: Element) {
+        if let Some(idx) = self.index_of_uid(old_uid) {
+            self.replace(idx, new);
+        }
     }
 
     /// Is there an HTML element `name` in default scope?

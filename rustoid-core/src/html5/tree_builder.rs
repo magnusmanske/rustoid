@@ -206,6 +206,49 @@ impl<H: TreeHandler> TreeBuilder<H> {
         uid
     }
 
+    /// Insert a pre-built element at an explicit position, assigning a uid,
+    /// and return that uid. Used by the adoption agency algorithm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_element_at(
+        &mut self,
+        ns: &str,
+        name: &str,
+        attrs: Attributes,
+        void: bool,
+        prep: Preposition,
+        reference: Option<usize>,
+        source_start: usize,
+        source_length: usize,
+    ) -> usize {
+        let uid = self.next_uid();
+        let mut element = Element::new(ns, name, attrs, uid);
+        self.handler.insert_element(
+            prep,
+            reference,
+            &mut element,
+            void,
+            source_start,
+            source_length,
+        );
+        if !void {
+            self.stack.push(element);
+        }
+        uid
+    }
+
+    /// Reparent the children of `from_uid` onto `to_uid` (mirrors
+    /// `TreeHandler::reparentChildren`).
+    pub fn reparent_children(&mut self, from_uid: usize, to_uid: usize, source_start: usize) {
+        let (Some(from), Some(to)) = (
+            self.stack.item_by_uid(from_uid),
+            self.stack.item_by_uid(to_uid),
+        ) else {
+            return;
+        };
+        let (from, to) = (from.clone(), to.clone());
+        self.handler.reparent_children(&from, &to, source_start);
+    }
+
     /// Pop the current node from the stack and notify the handler.
     pub fn pop(&mut self, source_start: usize, source_length: usize) -> Option<usize> {
         let element = self.stack.pop()?;
@@ -287,36 +330,66 @@ impl<H: TreeHandler> TreeBuilder<H> {
         }
     }
 
-    /// Reconstruct the active formatting elements.
-    //
-    // Note: this is a simplification. The full spec algorithm walks back from
-    // the tail until it finds a node that is either in the stack or a marker,
-    // then re-creates any dangling formatting element. We cover the common
-    // single-dangling-formatting-element case; the general reconstruction
-    // (multiple dangling entries) is layered in by the caller/adoption agency.
+    /// Reconstruct the active formatting elements (mirrors
+    /// `TreeBuilder::reconstructAFE`).
     pub fn reconstruct_afe(&mut self, source_start: usize) {
-        let tail = self.afe.get_tail();
-        match tail {
-            None | Some(super::active_formatting_elements::AfeEntry::Marker) => return,
-            Some(super::active_formatting_elements::AfeEntry::Element(elt)) => {
-                // If the tail element is still on the stack, nothing to do.
+        let Some(tail_node) = self.afe.tail_node() else {
+            return;
+        };
+        let mut node = tail_node;
+
+        // If the tail is a marker/bookmark, or an open element, do nothing.
+        match self.afe.entry(node).clone() {
+            super::active_formatting_elements::AfeEntry::Marker
+            | super::active_formatting_elements::AfeEntry::Bookmark => return,
+            super::active_formatting_elements::AfeEntry::Element(elt) => {
                 if self.stack.item_by_uid(elt.uid).is_some() {
                     return;
                 }
             }
         }
 
-        // Find the entry to reconstruct from. We re-insert the tail element's
-        // data and replace it in the AFE list. This is the common, correct
-        // observable behavior for a single dangling formatting element.
-        let Some(super::active_formatting_elements::AfeEntry::Element(tail)) = self.afe.get_tail()
-        else {
-            return;
+        // Walk backward to the last marker or an open element.
+        let mut found = false;
+        while let Some(prev) = self.afe.prev_node(node) {
+            node = prev;
+            match self.afe.entry(node).clone() {
+                super::active_formatting_elements::AfeEntry::Marker
+                | super::active_formatting_elements::AfeEntry::Bookmark => {
+                    found = true;
+                    break;
+                }
+                super::active_formatting_elements::AfeEntry::Element(elt) => {
+                    if self.stack.item_by_uid(elt.uid).is_some() {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If we stopped on a marker or open element, advance to the entry after
+        // it; otherwise start from the head.
+        let mut node = if found {
+            self.afe.next_node(node)
+        } else {
+            self.afe.head_node()
         };
-        let name = tail.name.clone();
-        let attrs = tail.attrs.clone();
-        let new_uid = self.insert_foreign(NS_HTML, &name, attrs, false, source_start, 0);
-        let _ = new_uid;
+
+        // Re-create dangling formatting elements and advance forward.
+        while let Some(idx) = node {
+            let entry = self.afe.entry(idx).clone();
+            let super::active_formatting_elements::AfeEntry::Element(elt) = entry else {
+                break;
+            };
+            let name = elt.name.clone();
+            let attrs = elt.attrs.clone();
+            let new_uid = self.insert_foreign(NS_HTML, &name, attrs, false, source_start, 0);
+            if let Some(new_elt) = self.stack.item_by_uid(new_uid).cloned() {
+                self.afe.replace(elt.uid, &new_elt);
+            }
+            node = self.afe.next_node(idx);
+        }
     }
 
     /// Generate implied end tags, excluding `name`.
@@ -501,7 +574,7 @@ impl<H: TreeHandler> TreeBuilder<H> {
         source_start: usize,
         source_length: usize,
     ) -> Option<usize> {
-        // Step 1.
+        // Step 1: current node is `subject` and not in the AFE → pop and abort.
         if let Some(cur) = self.stack.current()
             && cur.html_name == subject
             && !self.afe.is_in_list(cur.uid)
@@ -509,29 +582,187 @@ impl<H: TreeHandler> TreeBuilder<H> {
             return self.pop(source_start, source_length);
         }
 
-        // Step 5: last AFE element with name `subject`.
-        let fmt_uid = self.afe.find_element_by_name(subject).map(|e| e.uid);
-        let Some(fmt_uid) = fmt_uid else {
-            return self.any_other_end_tag(subject, source_start, source_length);
-        };
+        // Steps 2-4: outer loop bounded by 8 iterations.
+        for _outer in 0..8 {
+            // Step 5: last AFE element with the subject name.
+            let fmt_elt = self.afe.find_element_by_name(subject).cloned();
+            let Some(fmt_elt) = fmt_elt else {
+                return self.any_other_end_tag(subject, source_start, source_length);
+            };
+            let fmt_uid = fmt_elt.uid;
 
-        // Step 6: not in stack -> remove from AFE and abort.
-        if self.stack.item_by_uid(fmt_uid).is_none() {
+            // Step 6: not in the stack → remove from AFE and abort.
+            let fmt_idx = self.stack.index_of_uid(fmt_uid);
+            let Some(fmt_idx) = fmt_idx else {
+                self.afe.remove(fmt_uid);
+                return None;
+            };
+
+            // Step 7: not in scope → ignore and abort.
+            if !self.stack.is_uid_in_scope(fmt_uid) {
+                return None;
+            }
+
+            // Step 8: not the current node is a parse error (do not abort).
+            if self.stack.current().map(|e| e.uid) != Some(fmt_uid) {
+                self.handler.error(
+                    "end tag matched a formatting element which was not the current node",
+                    source_start,
+                );
+            }
+
+            // Step 9: furthest block above the formatting element.
+            let mut furthest_block: Option<Element> = None;
+            let mut furthest_block_index = 0usize;
+            let stack_length = self.stack.length();
+            for i in (fmt_idx + 1)..stack_length {
+                let item = self.stack.item(i);
+                if is_special(&item.namespace, &item.name) {
+                    furthest_block = Some(item.clone());
+                    furthest_block_index = i;
+                    break;
+                }
+            }
+
+            // Step 10: no furthest block → pop to fmt and remove from AFE.
+            let Some(furthest_block) = furthest_block else {
+                let result = self.pop_all_up_to_element(fmt_uid, source_start, source_length);
+                self.afe.remove(fmt_uid);
+                return result;
+            };
+            let furthest_block_uid = furthest_block.uid;
+
+            // Step 11: common ancestor is the element immediately above fmt.
+            if fmt_idx == 0 {
+                // Unreachable in practice (there is always an element below a
+                // formatting element), but avoid a subtraction underflow.
+                self.afe.remove(fmt_uid);
+                return None;
+            }
+            let ancestor = self.stack.item(fmt_idx - 1).clone();
+            let ancestor_uid = ancestor.uid;
+
+            // Step 12: bookmark after fmt.
+            let mut bookmark_node = self.afe.insert_bookmark_after(fmt_uid)?;
+
+            // Step 13: inner loop.
+            let mut last_node = furthest_block.clone();
+            let mut last_node_uid = furthest_block_uid;
+            let mut node_index = furthest_block_index;
+            let mut stack_removals: Vec<usize> = Vec::new();
+            // Queued (prep, reference, element) insertions.
+            let mut insertions: Vec<(Preposition, Option<usize>, Element)> = Vec::new();
+
+            let mut inner = 1usize;
+            loop {
+                // Step 13.3: node = element immediately above.
+                node_index -= 1;
+                let node_elt = self.stack.item(node_index).clone();
+                let node_uid = node_elt.uid;
+
+                // Step 13.4: reached the formatting element.
+                if node_uid == fmt_uid {
+                    break;
+                }
+
+                // Step 13.5: inner > 3 and node in AFE → remove from AFE.
+                let mut is_afe = self.afe.is_in_list(node_uid);
+                if inner > 3 && is_afe {
+                    self.afe.remove(node_uid);
+                    is_afe = false;
+                }
+
+                // Step 13.6: node not in AFE → mark for removal and continue.
+                if !is_afe {
+                    stack_removals.push(node_index);
+                    inner += 1;
+                    continue;
+                }
+
+                // Step 13.7: clone node, replace in AFE and stack, node = clone.
+                let new_elt = Element::new(
+                    &node_elt.namespace,
+                    &node_elt.name,
+                    node_elt.attrs.clone(),
+                    self.next_uid(),
+                );
+                let new_uid = new_elt.uid;
+                self.afe.replace(node_uid, &new_elt);
+                self.stack.replace_by_uid(node_uid, new_elt.clone());
+
+                // Step 13.8: if last node is furthest block, move bookmark after
+                // new node.
+                if last_node_uid == furthest_block_uid {
+                    self.afe.remove_index(bookmark_node);
+                    if let Some(n) = self.afe.insert_bookmark_after(new_uid) {
+                        bookmark_node = n;
+                    }
+                }
+
+                // Step 13.9: queue insertion of last node into node.
+                insertions.push((Preposition::Under, Some(new_uid), last_node.clone()));
+
+                // Step 13.10: last node = node.
+                last_node = new_elt;
+                last_node_uid = new_uid;
+                inner += 1;
+            }
+
+            // Step 14: insert last node at the appropriate place for `ancestor`.
+            let (prep, reference) = self.appropriate_place(Some(ancestor_uid));
+            insertions.push((prep, reference, last_node));
+
+            // Execute queued insertions in reverse order.
+            for (prep, reference, mut elt) in insertions.into_iter().rev() {
+                self.handler
+                    .insert_element(prep, reference, &mut elt, false, source_start, 0);
+            }
+
+            // Steps 15-17: new formatting element, move furthest block children.
+            let new_fmt = Element::new(
+                &fmt_elt.namespace,
+                &fmt_elt.name,
+                fmt_elt.attrs.clone(),
+                self.next_uid(),
+            );
+            let new_fmt_uid = new_fmt.uid;
+            self.reparent_children(furthest_block_uid, new_fmt_uid, source_start);
+
+            // Step 18: remove fmt from AFE, replace bookmark with new fmt.
             self.afe.remove(fmt_uid);
-            return None;
+            self.afe.replace_index(bookmark_node, &new_fmt);
+
+            // Step 19: rebuild the stack.
+            let mut temp_stack: Vec<Element> = Vec::new();
+            let mut index = self.stack.length();
+            while index > furthest_block_index {
+                index -= 1;
+                if let Some(elt) = self.stack.pop() {
+                    temp_stack.push(elt);
+                }
+            }
+            temp_stack.push(new_fmt.clone());
+            while index > fmt_idx {
+                index -= 1;
+                let elt = self.stack.pop();
+                let Some(elt) = elt else {
+                    break;
+                };
+                if stack_removals.contains(&index) {
+                    self.handler.end_tag(&elt, source_start, 0);
+                } else {
+                    temp_stack.push(elt);
+                }
+            }
+            let elt = self.stack.pop();
+            if let Some(elt) = elt {
+                self.handler.end_tag(&elt, source_start, 0);
+            }
+            for elt in temp_stack.into_iter().rev() {
+                self.stack.push(elt);
+            }
         }
 
-        // Step 7: not in scope -> ignore.
-        if !self.stack.is_uid_in_scope(fmt_uid) {
-            return None;
-        }
-
-        // Steps 9-19 (furthest block, bookmark, and reconstruction) are the
-        // adoption agency algorithm proper; they are layered in by the
-        // Dispatcher/InBody port. For the common mismatched-formatting case we
-        // close the formatting element and remove it from the AFE list.
-        let result = self.pop_all_up_to_element(fmt_uid, source_start, source_length);
-        self.afe.remove(fmt_uid);
-        result
+        None
     }
 }
