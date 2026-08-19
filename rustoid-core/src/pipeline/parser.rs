@@ -19,6 +19,28 @@ use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
 
 type ResolvedTarget = crate::pipeline::template_handler::ResolvedTarget;
 
+/// Locate the `<body>` element in the tree-builder output and wrap its children
+/// in `<section>` wrappers (see `pipeline::section_wrapper`).
+fn wrap_sections_in_ast(ast: &mut Node) {
+    use crate::dom::node::{ElementKind, NodeKind};
+
+    // The tree builder produces `<html><head>…</head><body>…</body></html>`.
+    for html in &mut ast.children {
+        if let NodeKind::Element(ElementKind::Other(tag)) = &html.kind
+            && tag == "html"
+        {
+            for section in &mut html.children {
+                if let NodeKind::Element(ElementKind::Other(tag)) = &section.kind
+                    && tag == "body"
+                {
+                    crate::pipeline::section_wrapper::wrap_sections(section);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// The wikitext parser, bound to a site configuration.
 pub struct Parser<'a, C: SiteConfig> {
     config: &'a C,
@@ -192,7 +214,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
         let stage = TreeBuilderStage::new(false);
-        Ok(stage.to_ast_with_source(tokens, Some(wikitext)))
+        let mut ast = stage.to_ast_with_source(tokens, Some(wikitext));
+        wrap_sections_in_ast(&mut ast);
+        Ok(ast)
     }
 
     /// Convert wikitext to an HTML string (no native template expansion).
@@ -245,7 +269,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_behavior_switches(tokens);
 
         let stage = TreeBuilderStage::new(false);
-        stage.to_ast_with_source(tokens, Some(page_source))
+        let mut ast = stage.to_ast_with_source(tokens, Some(page_source));
+        wrap_sections_in_ast(&mut ast);
+        ast
     }
 
     /// Expand `template`/`templatearg` tokens in-place.
@@ -916,5 +942,34 @@ mod tests {
             html.contains("Special:BookSources/9780123456472"),
             "got: {html}"
         );
+    }
+
+    #[test]
+    fn test_wikitext_to_html_section_wrapping() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "lead\n== Heading ==\nbody\n",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        // There is always a lead section, and each wikitext heading is wrapped.
+        assert!(html.contains("data-mw-section-id=\"0\""), "got: {html}");
+        assert!(html.contains("data-mw-section-id=\"1\""), "got: {html}");
+        assert!(html.contains("<section"), "got: {html}");
+        assert!(html.contains("<h2"), "got: {html}");
+        assert!(html.contains("Heading"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_nested_section() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("== A ==\n=== B ===\n", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("data-mw-section-id=\"1\""), "got: {html}");
+        assert!(html.contains("data-mw-section-id=\"2\""), "got: {html}");
     }
 }

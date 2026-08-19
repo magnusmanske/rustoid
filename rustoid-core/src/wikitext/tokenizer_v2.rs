@@ -78,8 +78,8 @@ pub struct PegTokenizer<'a> {
     annotation_tags: Vec<String>,
     /// Tokens output buffer (accumulated during toplevel block parsing).
     output: Vec<Either<String, ParsoidToken>>,
-    /// Heading counter.
-    #[allow(dead_code)]
+    /// Heading counter (start-of-line headings get an incrementing section
+    /// number, mirroring PHP's `headingIndex`).
     heading_index: usize,
     /// Accumulated has-sol-transparent-at-start flag.
     has_sol_transparent_at_start: bool,
@@ -561,7 +561,14 @@ impl<'a> PegTokenizer<'a> {
 
             // Emit opening tag.
             let tag_start = saved;
-            let dp = DataParsoid::with_tsr(tag_start, tag_start + level);
+            let mut dp = DataParsoid::with_tsr(tag_start, tag_start + level);
+            // Assign a heading index (used later for section wrapping). The
+            // PHP grammar increments the index only for top-level, non-
+            // SOL-transparent headings outside templates.
+            if !self.in_template {
+                self.heading_index += 1;
+                dp.tmp.heading_index = Some(self.heading_index);
+            }
             self.emit_token(ParsoidToken::Tag(TagTk::new(
                 format!("h{level}"),
                 vec![],
