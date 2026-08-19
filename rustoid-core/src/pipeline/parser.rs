@@ -170,11 +170,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
+    /// Expand `behavior-switch` tokens into `mw:PageProp` metas (mirrors the
+    /// TT2 `BehaviorSwitchHandler`).
+    fn render_behavior_switches(&self, tokens: Vec<Item>) -> Vec<Item> {
+        crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens)
+    }
+
     /// Convert wikitext to the format-agnostic AST (no template expansion).
     pub fn wikitext_to_ast(&self, wikitext: &str) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
+        let tokens = self.render_behavior_switches(tokens);
         let stage = TreeBuilderStage::new(false);
         Ok(stage.to_ast_with_source(tokens, Some(wikitext)))
     }
@@ -226,6 +233,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .await;
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
+        let tokens = self.render_behavior_switches(tokens);
 
         let stage = TreeBuilderStage::new(false);
         stage.to_ast_with_source(tokens, Some(page_source))
@@ -478,6 +486,16 @@ mod tests {
             .unwrap();
         assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
         assert!(html.contains("https://example.com"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_behavior_switch() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("__TOC__", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("mw:PageProp/toc"), "got: {html}");
     }
 
     #[test]

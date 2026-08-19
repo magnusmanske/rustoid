@@ -1714,7 +1714,8 @@ impl<'a> PegTokenizer<'a> {
         self.advance(2);
 
         if let Some(end) = self.remaining().find("__") {
-            let word = self.input[start..self.pos + end + 2].to_string();
+            // Canonical behavior-switch form is the lowercase inner text.
+            let word = self.input[start + 2..start + 2 + end].to_lowercase();
             self.advance(end + 2);
 
             let dp = self.make_dp(start, self.pos);
