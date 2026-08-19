@@ -49,9 +49,62 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         format!("#mwt{id}")
     }
 
+    /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
+    /// (mirrors the TT2 `WikiLinkHandler`, whose rendering path lives in
+    /// `pipeline::wiki_link_render`).
+    fn render_links(&self, tokens: Vec<Item>) -> Vec<Item> {
+        use crate::pipeline::wiki_link_render::{
+            WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+        };
+
+        let mut ctx = WikiLinkContext::new(self.config);
+        let mut out: Vec<Item> = Vec::new();
+
+        for item in tokens {
+            let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+                out.push(item);
+                continue;
+            };
+            if stt.name != "wikilink" {
+                out.push(item);
+                continue;
+            }
+
+            let href = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str())
+                .unwrap_or("")
+                .to_string();
+            let href_src = href.clone();
+            let target = get_wiki_link_target_info(&ctx, &href, &href_src).unwrap_or_else(|_| {
+                crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
+                    href: href.clone(),
+                    href_src: href_src.clone(),
+                    title: Some(crate::title::Title::new_main(href.clone())),
+                    interwiki: None,
+                    language: None,
+                    local_prefix: None,
+                    from_colon_escaped_text: false,
+                    prefix: None,
+                }
+            });
+            let rendered = render_wiki_link_dispatched(
+                &mut ctx,
+                &ParsoidToken::SelfclosingTag(stt.clone()),
+                &target,
+            );
+            out.extend(rendered);
+        }
+
+        out
+    }
+
     /// Convert wikitext to the format-agnostic AST (no template expansion).
     pub fn wikitext_to_ast(&self, wikitext: &str) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
+        let tokens = self.render_links(tokens);
         let stage = TreeBuilderStage::new(false);
         Ok(stage.to_ast_with_source(tokens, Some(wikitext)))
     }
@@ -101,6 +154,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self
             .expand_templates(&frame, tokens, source, about_counter)
             .await;
+        let tokens = self.render_links(tokens);
 
         let stage = TreeBuilderStage::new(false);
         stage.to_ast_with_source(tokens, Some(page_source))
@@ -307,6 +361,18 @@ mod tests {
             .unwrap();
         assert!(html.contains("<b>"), "got: {html}");
         assert!(html.contains("bold"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_wikilink() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("[[Main Page]]", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<a"), "got: {html}");
+        assert!(html.contains("rel=\"mw:WikiLink\""), "got: {html}");
+        assert!(html.contains("Main Page"), "got: {html}");
     }
 
     #[test]
