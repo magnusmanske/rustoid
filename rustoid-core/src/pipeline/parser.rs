@@ -615,6 +615,35 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_wikitext_table() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("{|\n|-\n| cell\n|}", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<table"), "got: {html}");
+        assert!(html.contains("<tr"), "got: {html}");
+        assert!(html.contains("<td"), "got: {html}");
+        assert!(html.contains("cell"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_html_table() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "<table><tr><td>cell</td></tr></table>",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("<table"), "got: {html}");
+        assert!(html.contains("<tr"), "got: {html}");
+        assert!(html.contains("<td"), "got: {html}");
+        assert!(html.contains("cell"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);

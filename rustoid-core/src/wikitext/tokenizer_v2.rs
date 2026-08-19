@@ -1115,23 +1115,23 @@ impl<'a> PegTokenizer<'a> {
                 break;
             }
 
-            // Try to parse a table attribute.
+            // Try to parse a table attribute. A bare word is not an attribute
+            // (it is content), so stop short and let the caller parse it.
             if let Some(attr) = self.parse_table_attribute() {
                 attrs.push(attr);
-            } else if ch == '!' {
-                break;
             } else {
-                // Skip one char.
-                self.pos += ch.len_utf8();
+                break;
             }
         }
         attrs
     }
 
-    /// Parse a single table attribute.
+    /// Parse a single table attribute (`name=value`). Bare words are not table
+    /// attributes; they are cell/table content and are left unconsumed.
     fn parse_table_attribute(&mut self) -> Option<KV> {
         let name_start = self.pos;
         let name = self.parse_table_attribute_name()?;
+        self.advance(name.len());
         let name_end = self.pos;
 
         self.consume_spaces();
@@ -1152,18 +1152,10 @@ impl<'a> PegTokenizer<'a> {
                 vsrc: None,
             })
         } else {
-            Some(KV {
-                key: KeyValue::Str(name),
-                value: KeyValue::Str(String::new()),
-                src_offsets: Some(KVSourceRange {
-                    key_start: name_start,
-                    key_end: name_end,
-                    value_start: name_end,
-                    value_end: name_end,
-                }),
-                ksrc: None,
-                vsrc: None,
-            })
+            // Not a `name=value` attribute — backtrack so the caller can treat
+            // the word as content.
+            self.pos = name_start;
+            None
         }
     }
 
