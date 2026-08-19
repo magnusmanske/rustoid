@@ -140,6 +140,11 @@ fn serialize_element(
             serialize_children(node, buf, ctx)?;
             buf.push('\n');
         }
+        ElementKind::TableHeader => {
+            buf.push('!');
+            serialize_children(node, buf, ctx)?;
+            buf.push('\n');
+        }
         ElementKind::TableCaption => {
             buf.push_str("|+ ");
             serialize_children(node, buf, ctx)?;

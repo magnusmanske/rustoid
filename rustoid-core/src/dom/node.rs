@@ -38,6 +38,8 @@ pub enum ElementKind {
     TableRow,
     /// A table cell (header or data).
     TableCell,
+    /// A table header cell.
+    TableHeader,
     /// A table caption.
     TableCaption,
     /// An unordered list.

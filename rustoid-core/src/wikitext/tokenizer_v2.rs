@@ -1056,6 +1056,9 @@ impl<'a> PegTokenizer<'a> {
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
 
+        // The cell content precedes any `||` separator on the same line.
+        self.parse_table_cell_text();
+
         // Parse additional `||` data cells.
         self.parse_tds();
 
@@ -1076,6 +1079,28 @@ impl<'a> PegTokenizer<'a> {
             dp.stx = Some("row".to_string());
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
+            self.parse_table_cell_text();
+        }
+    }
+
+    /// Consume a text run that is a table-cell's content, stopping before a
+    /// `||`, `|`, `!`, or end of line.
+    fn parse_table_cell_text(&mut self) {
+        if self.eof()
+            || self.starts_with("||")
+            || self.starts_with("|")
+            || self.starts_with("!")
+            || self.starts_with("\n")
+            || self.starts_with("\r\n")
+        {
+            return;
+        }
+        let rem = self.remaining();
+        let end = rem.find(['|', '!', '\n', '\r']).unwrap_or(rem.len());
+        if end > 0 {
+            let text = rem[..end].to_string();
+            self.advance(end);
+            self.emit_text(text);
         }
     }
 

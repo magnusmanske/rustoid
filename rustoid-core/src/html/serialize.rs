@@ -131,6 +131,13 @@ impl HtmlSerializer {
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</td>");
                     }
+                    ElementKind::TableHeader => {
+                        buf.push_str(&format!("{indent}<th"));
+                        self.serialize_attrs(node, buf);
+                        buf.push('>');
+                        self.serialize_children(node, buf, depth)?;
+                        buf.push_str("</th>");
+                    }
                     ElementKind::UnorderedList => {
                         buf.push_str(&format!("{indent}<ul"));
                         self.serialize_attrs(node, buf);
@@ -315,6 +322,7 @@ impl HtmlSerializer {
             ElementKind::Table => "table",
             ElementKind::TableRow => "tr",
             ElementKind::TableCell => "td",
+            ElementKind::TableHeader => "th",
             ElementKind::TableCaption => "caption",
             ElementKind::UnorderedList => "ul",
             ElementKind::OrderedList => "ol",

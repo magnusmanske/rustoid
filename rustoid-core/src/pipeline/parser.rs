@@ -644,6 +644,41 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_table_header() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("{|\n! header\n|}", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<table"), "got: {html}");
+        assert!(html.contains("<th"), "got: {html}");
+        assert!(html.contains("header"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_table_multi_cell() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("{|\n| a || b\n|}", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<table"), "got: {html}");
+        assert!(html.contains("a"), "got: {html}");
+        assert!(html.contains("b"), "got: {html}");
+        assert!(html.matches("<td").count() >= 2, "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_redirect() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("#redirect [[Target]]", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("Target"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
