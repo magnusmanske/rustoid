@@ -537,8 +537,10 @@ impl<'a> PegTokenizer<'a> {
         }
 
         if let Some(cp) = close_pos {
-            // Parse inline content between open and close.
-            let content_str = &self.input[content_start..cp];
+            // Parse inline content between open and close, trimming the
+            // surrounding whitespace so the heading text matches MediaWiki's
+            // output (e.g. `== Heading ==` → `Heading`, not ` Heading `).
+            let content_str = self.input[content_start..cp].trim();
             if !content_str.is_empty() {
                 // Reparse the content as inline.
                 let sub_input = content_str;
