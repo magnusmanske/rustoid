@@ -839,4 +839,26 @@ mod tests {
         assert!(!html.contains("mw:Entity"), "got: {html}");
         assert!(html.contains("&amp;foo;"), "got: {html}");
     }
+
+    #[test]
+    fn test_wikitext_to_html_entity_accented() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("&Aacute;", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("typeof=\"mw:Entity\""), "got: {html}");
+        assert!(html.contains("Á"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_entity_two_codepoints() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("&acE;", &ParserOptions::for_page("Test"))
+            .unwrap();
+        // acE decodes to two codepoints (U+223E U+0333), still wrapped.
+        assert!(html.contains("typeof=\"mw:Entity\""), "got: {html}");
+    }
 }

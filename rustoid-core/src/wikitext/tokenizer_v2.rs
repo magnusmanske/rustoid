@@ -2037,109 +2037,17 @@ fn decode_wt_entities(entity: &str) -> String {
         Some(name) => name,
         None => return entity.to_string(),
     };
-    let name = match name {
+    let canonical = match name {
         "רלמ" | "رلم" => "rlm",
         other => other,
     };
 
-    match named_entity(name) {
+    // The HTML5 table is keyed by the semicolon-terminated name.
+    let key = format!("{canonical};");
+    match crate::html5::html_data::named_entity_translation(&key) {
         Some(decoded) => decoded.to_string(),
         None => entity.to_string(),
     }
-}
-
-/// Look up a semicolon-terminated name in the HTML5 named-entity table.
-/// The PHP reference maps to `HTMLData::NAMED_ENTITY_TRANSLATION`, but keeps
-/// `lt;`, `gt;`, `amp;`, and `quot;` in word form during normalization before
-/// decoding — netting the same one-codepoint result as a direct lookup.
-fn named_entity(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "amp" => "&",
-        "lt" => "<",
-        "gt" => ">",
-        "quot" => "\"",
-        "apos" => "'",
-        "nbsp" => "\u{00a0}",
-        "ensp" => "\u{2002}",
-        "emsp" => "\u{2003}",
-        "thinsp" => "\u{2009}",
-        "ndash" => "\u{2013}",
-        "mdash" => "\u{2014}",
-        "lsquo" => "\u{2018}",
-        "rsquo" => "\u{2019}",
-        "sbquo" => "\u{201a}",
-        "ldquo" => "\u{201c}",
-        "rdquo" => "\u{201d}",
-        "bdquo" => "\u{201e}",
-        "dagger" => "\u{2020}",
-        "Dagger" => "\u{2021}",
-        "permil" => "\u{2030}",
-        "lsaquo" => "\u{2039}",
-        "rsaquo" => "\u{203a}",
-        "euro" => "\u{20ac}",
-        "lrm" => "\u{200e}",
-        "rlm" => "\u{200f}",
-        "horbar" => "\u{2015}",
-        "Vert" => "\u{2016}",
-        "lsqb" => "[",
-        "rsqb" => "]",
-        "lcub" => "{",
-        "rcub" => "}",
-        "lpar" => "(",
-        "rpar" => ")",
-        "commat" => "@",
-        "num" => "#",
-        "dollar" => "$",
-        "percnt" => "%",
-        "ast" => "*",
-        "midast" => "*",
-        "plus" => "+",
-        "comma" => ",",
-        "period" => ".",
-        "sol" => "/",
-        "colon" => ":",
-        "semi" => ";",
-        "equals" => "=",
-        "quest" => "?",
-        "bsol" => "\\",
-        "excl" => "!",
-        "vert" => "|",
-        "lowbar" => "_",
-        "middot" => "\u{00b7}",
-        "iexcl" => "\u{00a1}",
-        "cent" => "\u{00a2}",
-        "pound" => "\u{00a3}",
-        "curren" => "\u{00a4}",
-        "yen" => "\u{00a5}",
-        "brvbar" => "\u{00a6}",
-        "sect" => "\u{00a7}",
-        "uml" => "\u{00a8}",
-        "copy" => "\u{00a9}",
-        "ordf" => "\u{00aa}",
-        "laquo" => "\u{00ab}",
-        "not" => "\u{00ac}",
-        "shy" => "\u{00ad}",
-        "reg" => "\u{00ae}",
-        "macr" => "\u{00af}",
-        "deg" => "\u{00b0}",
-        "plusmn" => "\u{00b1}",
-        "sup2" => "\u{00b2}",
-        "sup3" => "\u{00b3}",
-        "acute" => "\u{00b4}",
-        "micro" => "\u{00b5}",
-        "para" => "\u{00b6}",
-        "cedil" => "\u{00b8}",
-        "sup1" => "\u{00b9}",
-        "ordm" => "\u{00ba}",
-        "raquo" => "\u{00bb}",
-        "frac14" => "\u{00bc}",
-        "frac12" => "\u{00bd}",
-        "frac34" => "\u{00be}",
-        "iquest" => "\u{00bf}",
-        "times" => "\u{00d7}",
-        "divide" => "\u{00f7}",
-        _ => return None,
-    })
 }
 
 fn name_to_include_type(name: &str) -> &str {
