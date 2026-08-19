@@ -502,6 +502,54 @@ mod tests {
     }
 
     #[test]
+    fn test_heading_roundtrip() {
+        let doc = token_stream_to_ast_html(&[tag("h2"), txt("H2"), end("h2")]);
+        assert!(contains_kind(&doc, &ElementKind::Heading(2)), "{doc:?}");
+        assert!(contains_text(&doc, "H2"), "{doc:?}");
+        // There should not be a spurious placeholder meta.
+        assert!(!contains_data_parsoid_name(&doc, "h2"), "{doc:?}");
+    }
+
+    #[test]
+    fn test_heading_via_stage() {
+        // Run the heading tokens through the full TT3 stage, which is what the
+        // Parser does, to see whether a stage handler introduces a placeholder.
+        let stage = crate::pipeline::tree_builder_stage::TreeBuilderStage::new(false);
+        let doc = stage.to_ast(vec![tag("h2"), txt("H2"), end("h2")]);
+        assert!(contains_kind(&doc, &ElementKind::Heading(2)), "{doc:?}");
+        assert!(!contains_data_parsoid_name(&doc, "h2"), "{doc:?}");
+    }
+
+    #[test]
+    fn test_heading_end_tag_with_tsr() {
+        // The real tokenizer gives the heading end tag a TSR; this must not
+        // cause the tree builder to treat it as a stripped tag.
+        let mut end_tag = EndTagTk::new("h2", vec![], DataParsoid::default());
+        end_tag.data_parsoid.tsr = Some(crate::wikitext::tokens_v2::SourceRange::new(7, 9));
+        let doc = token_stream_to_ast_html_with_source(
+            &[
+                tag("h2"),
+                txt("H2"),
+                Item::Tok(ParsoidToken::EndTag(end_tag)),
+            ],
+            Some("== H2 =="),
+        );
+        assert!(contains_kind(&doc, &ElementKind::Heading(2)), "{doc:?}");
+        assert!(!contains_data_parsoid_name(&doc, "h2"), "{doc:?}");
+    }
+
+    fn contains_data_parsoid_name(node: &Node, name: &str) -> bool {
+        if let Some(dp) = &node.data_parsoid
+            && dp.contains(&format!("\"name\":\"{name}\""))
+        {
+            return true;
+        }
+        node.children
+            .iter()
+            .any(|c| contains_data_parsoid_name(c, name))
+    }
+
+    #[test]
     fn test_table_basic() {
         let doc = token_stream_to_ast_html(&[
             tag("table"),

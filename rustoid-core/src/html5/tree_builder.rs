@@ -479,18 +479,18 @@ impl<H: TreeHandler> TreeBuilder<H> {
         source_start: usize,
         source_length: usize,
     ) -> Option<usize> {
-        let mut matched = None;
-        while let Some(uid) = self.pop(source_start, 0) {
-            let Some(e) = self.stack.item_by_uid(uid) else {
-                break;
-            };
-            if names.contains(&e.html_name.as_str()) {
-                matched = Some(uid);
-                break;
+        // Peek at the current element's name *before* popping, since `pop`
+        // removes the element from the dense stack and only returns its uid.
+        while let Some(cur) = self.stack.current() {
+            let name = cur.html_name.clone();
+            let uid = cur.uid;
+            self.pop(source_start, 0);
+            if names.contains(&name.as_str()) {
+                return Some(uid);
             }
         }
         let _ = source_length;
-        matched
+        None
     }
 
     /// Clear the stack back to an element in `names` (without popping it).
