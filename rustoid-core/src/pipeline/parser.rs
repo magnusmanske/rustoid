@@ -679,6 +679,36 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_table_caption() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "{|\n|+ A caption\n|-\n| cell\n|}",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("<caption"), "got: {html}");
+        assert!(html.contains("A caption"), "got: {html}");
+        assert!(html.contains("cell"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_table_cell_attrs() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "{|\n|-\n| style=\"color:red\" | cell\n|}",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("<td"), "got: {html}");
+        assert!(html.contains("color:red"), "got: {html}");
+        assert!(html.contains("cell"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
