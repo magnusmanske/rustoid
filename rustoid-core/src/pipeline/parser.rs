@@ -804,6 +804,10 @@ mod tests {
             html.contains("> &amp;</span>") || html.contains(">&amp;</span>"),
             "got: {html}"
         );
+        // The entity span carries both the raw and decoded source in
+        // data-parsoid (src and srcContent), mirroring PHP.
+        assert!(html.contains("\"src\":\"&amp;amp;\""), "got: {html}");
+        assert!(html.contains("\"srcContent\":\"&amp;\""), "got: {html}");
     }
 
     #[test]

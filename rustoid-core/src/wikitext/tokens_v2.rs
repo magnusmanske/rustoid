@@ -180,6 +180,12 @@ impl DataParsoid {
         if let Some(src) = &self.src {
             obj.insert("src".to_string(), serde_json::Value::String(src.clone()));
         }
+        if let Some(src_content) = &self.src_content {
+            obj.insert(
+                "srcContent".to_string(),
+                serde_json::Value::String(src_content.clone()),
+            );
+        }
         if let Some(stx) = &self.stx {
             obj.insert("stx".to_string(), serde_json::Value::String(stx.clone()));
         }
