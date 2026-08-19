@@ -17,6 +17,15 @@
 use crate::Result;
 use crate::wikitext::tokens_v2::*;
 
+/// Which magic links (RFC/PMID/ISBN) are enabled for tokenization.
+/// Mirrors the three `SiteConfig::magicLinkEnabled` lookups.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MagicLinkConfig {
+    pub rfc: bool,
+    pub pmid: bool,
+    pub isbn: bool,
+}
+
 /// Tokenizer configuration.
 pub struct TokenizerOptions {
     /// Whether we're inside a template context (affects include/noinclude handling).
@@ -31,6 +40,8 @@ pub struct TokenizerOptions {
     pub sol: bool,
     /// Pipeline offset for TSR shifting.
     pub pipeline_offset: usize,
+    /// Enabled magic-link types (RFC/PMID/ISBN).
+    pub magic_links: MagicLinkConfig,
 }
 
 impl Default for TokenizerOptions {
@@ -42,6 +53,7 @@ impl Default for TokenizerOptions {
             attr_expansion: false,
             sol: true,
             pipeline_offset: 0,
+            magic_links: MagicLinkConfig::default(),
         }
     }
 }
@@ -71,6 +83,8 @@ pub struct PegTokenizer<'a> {
     heading_index: usize,
     /// Accumulated has-sol-transparent-at-start flag.
     has_sol_transparent_at_start: bool,
+    /// Enabled magic-link types (RFC/PMID/ISBN).
+    magic_links: MagicLinkConfig,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -86,6 +100,7 @@ impl<'a> PegTokenizer<'a> {
             output: Vec::new(),
             heading_index: 0,
             has_sol_transparent_at_start: false,
+            magic_links: options.magic_links,
         }
     }
 
@@ -433,6 +448,11 @@ impl<'a> PegTokenizer<'a> {
             }
 
             if ch == '\'' && self.try_quote() {
+                matched = true;
+                continue;
+            }
+
+            if self.try_magic_link() {
                 matched = true;
                 continue;
             }
@@ -1886,6 +1906,31 @@ impl<'a> PegTokenizer<'a> {
         let url_start = prefixes.iter().filter_map(|p| rem.find(p)).min();
         let end = url_start.map_or(end, |u| end.min(u));
 
+        // Stop before an enabled magic-link prefix (RFC/PMID/ISBN) so the
+        // inline loop can attempt `try_magic_link` at that position.
+        let magic_prefixes: [Option<&str>; 3] = [
+            if self.magic_links.rfc {
+                Some("RFC")
+            } else {
+                None
+            },
+            if self.magic_links.pmid {
+                Some("PMID")
+            } else {
+                None
+            },
+            if self.magic_links.isbn {
+                Some("ISBN")
+            } else {
+                None
+            },
+        ];
+        let magic_start = magic_prefixes
+            .iter()
+            .filter_map(|p| p.and_then(|p| rem.find(p)))
+            .min();
+        let end = magic_start.map_or(end, |m| end.min(m));
+
         if end > 0 {
             let text = rem[..end].to_string();
             self.advance(end);
@@ -1894,6 +1939,219 @@ impl<'a> PegTokenizer<'a> {
         }
 
         false
+    }
+
+    /// Try a magic link (`RFC`, `PMID`, or `ISBN`) at the current position.
+    /// Faithful port of Parsoid's `autolink` / `autoref` / `isbn` grammar
+    /// productions. Returns an `extlink` self-closing token carrying a
+    /// `typeof` attribute that `ExternalLinkHandler::onExtLink` recognizes.
+    fn try_magic_link(&mut self) -> bool {
+        // The `!isUniWord(lastUniChar)` guard: don't autolink when the
+        // preceding character is a word character.
+        if self.pos > 0
+            && let Some(prev) = self.input[..self.pos].chars().next_back()
+            && is_word_char(prev)
+        {
+            return false;
+        }
+
+        if self.magic_links.rfc && self.try_autoref("RFC") {
+            return true;
+        }
+        if self.magic_links.pmid && self.try_autoref("PMID") {
+            return true;
+        }
+        if self.magic_links.isbn && self.try_isbn() {
+            return true;
+        }
+        false
+    }
+
+    /// Try `RFC 1234` / `PMID 5678` auto-ref magic links.
+    fn try_autoref(&mut self, ref_name: &str) -> bool {
+        let rem = self.remaining();
+        if !rem.starts_with(ref_name) {
+            return false;
+        }
+        let start = self.pos;
+        let after_ref = ref_name.len();
+
+        // space_or_nbsp+
+        let mut pos = after_ref;
+        while let Some(ch) = rem[pos..].chars().next() {
+            if !is_space_or_nbsp(ch) {
+                break;
+            }
+            pos += ch.len_utf8();
+        }
+        if pos == after_ref {
+            return false; // need at least one space
+        }
+        let sp = &rem[after_ref..pos];
+
+        // [0-9]+
+        let digits_start = pos;
+        while let Some(ch) = rem[pos..].chars().next() {
+            if !ch.is_ascii_digit() {
+                break;
+            }
+            pos += ch.len_utf8();
+        }
+        if pos == digits_start {
+            return false;
+        }
+        let identifier = &rem[digits_start..pos];
+
+        // end_of_word: eof or the next char is not [A-Za-z0-9_].
+        if let Some(ch) = rem[pos..].chars().next()
+            && (ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return false;
+        }
+
+        let base_url = if ref_name == "RFC" {
+            "https://datatracker.ietf.org/doc/html/rfc"
+        } else {
+            "//www.ncbi.nlm.nih.gov/pubmed/"
+        };
+        let suffix = if ref_name == "RFC" {
+            String::new()
+        } else {
+            "?dopt=Abstract".to_string()
+        };
+        let href = format!("{base_url}{identifier}{suffix}");
+        let content = format!("{ref_name}{sp}{identifier}");
+        let tsr_end = self.pos + pos;
+
+        let mut dp = self.make_dp(start, tsr_end);
+        dp.stx = Some("magiclink".to_string());
+
+        let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
+        stt.add_attribute_str("href", &href);
+        stt.add_attribute_str("mw:content", &content);
+        stt.add_attribute_str("typeof", format!("mw:ExtLink/{ref_name}"));
+
+        self.advance(pos);
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
+    }
+
+    /// Try an `ISBN 978-...` magic link. The ISBN is validated to be 10
+    /// digits (with an optional X check digit) or 13 digits beginning with
+    /// 978/979, per the PHP `isbn` production.
+    fn try_isbn(&mut self) -> bool {
+        let rem = self.remaining();
+        if !rem.starts_with("ISBN") {
+            return false;
+        }
+        let start = self.pos;
+        let after_prefix = "ISBN".len();
+
+        // space_or_nbsp+
+        let mut pos = after_prefix;
+        while let Some(ch) = rem[pos..].chars().next() {
+            if !is_space_or_nbsp(ch) {
+                break;
+            }
+            pos += ch.len_utf8();
+        }
+        if pos == after_prefix {
+            return false;
+        }
+        let sp = &rem[after_prefix..pos];
+
+        // The ISBN body: a leading digit...
+        let body_start = pos;
+        let mut code = String::new();
+        let mut cursor = pos;
+
+        // First digit.
+        let Some(first_ch) = rem[cursor..].chars().next() else {
+            return false;
+        };
+        if !first_ch.is_ascii_digit() {
+            return false;
+        }
+        code.push(first_ch);
+        cursor += first_ch.len_utf8();
+
+        // `(separator? [0-9])+`
+        loop {
+            // Consume optional separators (`-`, space, nbsp), but a digit is
+            // required to continue; roll back separators if no digit follows.
+            let sep_start = cursor;
+            while let Some(ch) = rem[cursor..].chars().next() {
+                if ch == '-' || is_space_or_nbsp(ch) {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            match rem[cursor..].chars().next() {
+                Some(ch) if ch.is_ascii_digit() => {
+                    code.push(ch);
+                    cursor += ch.len_utf8();
+                }
+                _ => {
+                    cursor = sep_start;
+                    break;
+                }
+            }
+        }
+
+        // Optional trailing `(separator? [xX])`.
+        {
+            let sep_start = cursor;
+            while let Some(ch) = rem[cursor..].chars().next() {
+                if ch == '-' || is_space_or_nbsp(ch) {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            match rem[cursor..].chars().next() {
+                Some(ch) if ch == 'x' || ch == 'X' => {
+                    code.push('X');
+                    cursor += ch.len_utf8();
+                }
+                _ => {
+                    cursor = sep_start;
+                }
+            }
+        }
+
+        // end_of_word guard.
+        if let Some(ch) = rem[cursor..].chars().next()
+            && (ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return false;
+        }
+
+        // The raw ISBN source (including separators and x/X).
+        let raw = &rem[body_start..cursor];
+
+        // Validate: 10 chars, or 13 chars beginning with 978/979.
+        let valid = code.len() == 10
+            || (code.len() == 13 && (code.starts_with("978") || code.starts_with("979")));
+        if !valid {
+            return false;
+        }
+
+        let end = self.pos + cursor;
+        let mut dp = self.make_dp(start, end);
+        dp.stx = Some("magiclink".to_string());
+
+        let content = format!("ISBN{sp}{raw}");
+        let href = format!("Special:BookSources/{code}");
+
+        let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
+        stt.add_attribute_str("href", &href);
+        stt.add_attribute_str("mw:content", &content);
+        stt.add_attribute_str("typeof", "mw:WikiLink/ISBN");
+
+        self.advance(cursor);
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
     }
 
     /// Try HTML entity: `&amp;`, `&#123;`, etc.
@@ -1991,6 +2249,22 @@ fn validate_codepoint(cp: u32) -> bool {
         || (0xa0..=0xd7ff).contains(&cp)
         || (0xe000..=0xfffd).contains(&cp)
         || (0x10000..=0x10ffff).contains(&cp)
+}
+
+/// Whether `c` is a word character for the auto-link boundary check (mirrors
+/// PHP `Utils::isUniWord`'s `\w` test).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `c` is a non-newline space or non-breaking space (mirrors Parsoid's
+/// `space_or_nbsp` grammar rule, minus entity-encoded `&nbsp;`).
+fn is_space_or_nbsp(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
 }
 
 /// Decode a single wikitext HTML entity reference (mirrors PHP's

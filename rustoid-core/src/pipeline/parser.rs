@@ -31,7 +31,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
     fn tokenize(&self, wikitext: &str) -> Result<Vec<Item>> {
-        let options = TokenizerOptions::default();
+        let options = TokenizerOptions {
+            magic_links: crate::wikitext::tokenizer_v2::MagicLinkConfig {
+                rfc: self.config.magic_link_enabled("RFC"),
+                pmid: self.config.magic_link_enabled("PMID"),
+                isbn: self.config.magic_link_enabled("ISBN"),
+            },
+            ..TokenizerOptions::default()
+        };
         let mut tokenizer = PegTokenizer::new(wikitext, &options);
         let chunks = tokenizer.tokenize()?;
         Ok(chunks
@@ -138,9 +145,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             match stt.name.as_str() {
                 "extlink" => {
-                    let Some(rendered) =
-                        on_ext_link(&ParsoidToken::SelfclosingTag(stt.clone()), clean)
-                    else {
+                    let Some(rendered) = on_ext_link(
+                        &ParsoidToken::SelfclosingTag(stt.clone()),
+                        clean,
+                        self.config.relative_link_prefix(),
+                    ) else {
                         out.push(item);
                         continue;
                     };
@@ -864,5 +873,48 @@ mod tests {
             .unwrap();
         // acE decodes to two codepoints (U+223E U+0333), still wrapped.
         assert!(html.contains("typeof=\"mw:Entity\""), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_magic_link_rfc() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("See RFC 1234 here", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(
+            html.contains("https://datatracker.ietf.org/doc/html/rfc1234"),
+            "got: {html}"
+        );
+        assert!(html.contains("RFC 1234"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_magic_link_pmid() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("PMID 1234", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(
+            html.contains("//www.ncbi.nlm.nih.gov/pubmed/1234?dopt=Abstract"),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn test_wikitext_to_html_magic_link_isbn() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("ISBN 978-0-123456-47-2", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("rel=\"mw:WikiLink\""), "got: {html}");
+        assert!(
+            html.contains("Special:BookSources/9780123456472"),
+            "got: {html}"
+        );
     }
 }

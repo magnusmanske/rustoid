@@ -103,6 +103,7 @@ fn has_image_link_generic(href: &str) -> bool {
 pub fn on_ext_link(
     token: &ParsoidToken,
     clean: impl Fn(&str) -> Option<String>,
+    relative_link_prefix: &str,
 ) -> Option<Vec<Item>> {
     let orig_href = token.get_attribute_v("href")?.to_string();
     let content = token
@@ -111,6 +112,43 @@ pub fn on_ext_link(
         .unwrap_or_default();
 
     let data_parsoid = token.data_parsoid().cloned().unwrap_or_default();
+
+    // Magic links (`RFC`/`PMID`/`ISBN`) are `extlink` tokens carrying a
+    // `typeof` attribute (`mw:ExtLink/RFC`, `mw:WikiLink/ISBN`, ...). They
+    // render as a plain `<a>` whose `rel`/`href` are derived from the type.
+    let magic_link_type = token
+        .get_attribute_v("typeof")
+        .and_then(parse_magic_link_type);
+
+    if let Some(magic_link_type) = magic_link_type {
+        let is_isbn = magic_link_type == "ISBN";
+        let new_href = if is_isbn {
+            format!("{relative_link_prefix}{orig_href}")
+        } else {
+            orig_href.clone()
+        };
+        let new_rel = if is_isbn { "mw:WikiLink" } else { "mw:ExtLink" };
+
+        // Remove the magic `typeof` from the token's attributes, then build a
+        // fresh href/rel pair (mirrors PHP's `removeAttribute('typeof')` then
+        // `buildLinkAttrs`).
+        let mut remaining = token.get_attribs().to_vec();
+        remaining.retain(|kv| kv.key.as_str() != Some("typeof"));
+        let link_attrs = [string_kv("href", &new_href), string_kv("rel", new_rel)];
+        let result = build_link_attrs(&remaining, false, None, Some(&link_attrs));
+
+        let a_tag = TagTk::new("a", result.attribs, data_parsoid);
+
+        return Some(vec![
+            Item::Tok(ParsoidToken::Tag(a_tag)),
+            Item::Str(content),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "a",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ]);
+    }
 
     // href is a plain string from our tokenizer, so no template wrapping.
     let href = clean(&orig_href)?;
@@ -148,6 +186,21 @@ pub fn on_ext_link(
     Some(out)
 }
 
+/// Parse a magic-link `typeof` value into the link type (`RFC`, `PMID`, or
+/// `ISBN`), or `None` if it is not a magic-link type. Mirrors PHP's
+/// `TokenUtils::matchTypeOf($token, '#^mw:(Ext|Wiki)Link/(ISBN|RFC|PMID)$#')`.
+fn parse_magic_link_type(typeof_val: &str) -> Option<&'static str> {
+    for ty in typeof_val.split_whitespace() {
+        match ty {
+            "mw:ExtLink/RFC" => return Some("RFC"),
+            "mw:ExtLink/PMID" => return Some("PMID"),
+            "mw:ExtLink/ISBN" | "mw:WikiLink/ISBN" => return Some("ISBN"),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,7 +233,7 @@ mod tests {
     #[test]
     fn test_extlink_renders_a_tag() {
         let token = extlink_token("http://example.com", "link");
-        let out = on_ext_link(&token, id_clean).unwrap();
+        let out = on_ext_link(&token, id_clean, "./").unwrap();
 
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "a"));
         assert!(matches!(out.last(), Some(Item::Tok(ParsoidToken::EndTag(t))) if t.name == "a"));

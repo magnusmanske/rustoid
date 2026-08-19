@@ -134,6 +134,19 @@ pub trait SiteConfig: Send + Sync {
     fn get_upload_url(&self, _title: &str) -> String {
         format!("{}/index.php?title=Special:Upload", self.server_url())
     }
+
+    /// Prefix to prepend to a page title to link to that page, relative to
+    /// the base URI. Mirrors PHP's `SiteConfig::relativeLinkPrefix`.
+    fn relative_link_prefix(&self) -> &str {
+        "./"
+    }
+
+    /// Whether the named magic-link syntax ("ISBN", "PMID", or "RFC") is
+    /// enabled on this wiki. Mirrors PHP's `SiteConfig::magicLinkEnabled`,
+    /// which defaults to `true` for graceful upgrades.
+    fn magic_link_enabled(&self, _which: &str) -> bool {
+        true
+    }
 }
 
 /// Information about a namespace.
