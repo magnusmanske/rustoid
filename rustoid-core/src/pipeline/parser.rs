@@ -101,10 +101,78 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
+    /// Expand `extlink`/`urllink` self-closing tokens into `<a>`/`<img>` tag
+    /// sequences (mirrors the TT2 `ExternalLinkHandler`).
+    fn render_external_links(&self, tokens: Vec<Item>) -> Vec<Item> {
+        use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
+
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+                out.push(item);
+                continue;
+            };
+
+            let clean = |href: &str| {
+                crate::sanitizer::clean_url(href, "external", |proto| {
+                    matches!(
+                        proto,
+                        "http:"
+                            | "https:"
+                            | "ftp:"
+                            | "ftps:"
+                            | "mailto:"
+                            | "news:"
+                            | "irc:"
+                            | "ircs:"
+                            | "gopher:"
+                            | "mms:"
+                            | "tel:"
+                            | "nntp:"
+                            | "//"
+                    )
+                })
+            };
+
+            match stt.name.as_str() {
+                "extlink" => {
+                    let Some(rendered) =
+                        on_ext_link(&ParsoidToken::SelfclosingTag(stt.clone()), clean)
+                    else {
+                        out.push(item);
+                        continue;
+                    };
+                    out.extend(rendered);
+                }
+                "urllink" => {
+                    let content_href = stt
+                        .attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("href"))
+                        .and_then(|kv| kv.value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let Some(rendered) = on_url_link(
+                        &ParsoidToken::SelfclosingTag(stt.clone()),
+                        &content_href,
+                        clean,
+                    ) else {
+                        out.push(item);
+                        continue;
+                    };
+                    out.extend(rendered);
+                }
+                _ => out.push(item),
+            }
+        }
+        out
+    }
+
     /// Convert wikitext to the format-agnostic AST (no template expansion).
     pub fn wikitext_to_ast(&self, wikitext: &str) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let tokens = self.render_links(tokens);
+        let tokens = self.render_external_links(tokens);
         let stage = TreeBuilderStage::new(false);
         Ok(stage.to_ast_with_source(tokens, Some(wikitext)))
     }
@@ -155,6 +223,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .expand_templates(&frame, tokens, source, about_counter)
             .await;
         let tokens = self.render_links(tokens);
+        let tokens = self.render_external_links(tokens);
 
         let stage = TreeBuilderStage::new(false);
         stage.to_ast_with_source(tokens, Some(page_source))
@@ -373,6 +442,22 @@ mod tests {
         assert!(html.contains("<a"), "got: {html}");
         assert!(html.contains("rel=\"mw:WikiLink\""), "got: {html}");
         assert!(html.contains("Main Page"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_extlink() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "[https://example.com Example]",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("<a"), "got: {html}");
+        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(html.contains("https://example.com"), "got: {html}");
+        assert!(html.contains("Example"), "got: {html}");
     }
 
     #[test]
