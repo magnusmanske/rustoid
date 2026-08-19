@@ -547,6 +547,34 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_definition_list() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(";term:definition", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<dl"), "got: {html}");
+        assert!(html.contains("<dt"), "got: {html}");
+        assert!(html.contains("<dd"), "got: {html}");
+        assert!(html.contains("term"), "got: {html}");
+        assert!(html.contains("definition"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_nested_list() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("* a\n** b", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<ul"), "got: {html}");
+        assert!(html.contains("a"), "got: {html}");
+        assert!(html.contains("b"), "got: {html}");
+        // Nested bullet means two nested <ul> elements.
+        assert!(html.matches("<ul").count() >= 2, "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
