@@ -141,6 +141,8 @@ pub struct DataParsoid {
     pub link_tk: Option<Box<ParsoidToken>>,
     /// Parser-function colon (':') separator source.
     pub colon: Option<String>,
+    /// Name of a stripped tag (on `mw:Placeholder/StrippedTag` metas).
+    pub name: Option<String>,
     /// Temporary node-related data (mirrors PHP's `TempData`).
     pub tmp: TempData,
 }
@@ -186,6 +188,9 @@ impl DataParsoid {
                 "colon".to_string(),
                 serde_json::Value::String(colon.clone()),
             );
+        }
+        if let Some(name) = &self.name {
+            obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
         }
         if self.auto_inserted_start {
             obj.insert(
@@ -840,8 +845,7 @@ mod tests {
 
     #[test]
     fn test_tag_token() {
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(SourceRange::new(0, 3));
+        let dp = DataParsoid::with_tsr(0, 3);
         let tag = TagTk::new("p", vec![], dp);
         let token = ParsoidToken::Tag(tag);
         assert_eq!(token.get_name(), "p");
@@ -849,8 +853,7 @@ mod tests {
 
     #[test]
     fn test_selfclosing_token() {
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(SourceRange::new(0, 5));
+        let dp = DataParsoid::with_tsr(0, 5);
         let tk = SelfclosingTagTk::new("br", vec![], dp);
         let token = ParsoidToken::SelfclosingTag(tk);
         assert_eq!(token.get_name(), "br");

@@ -71,6 +71,14 @@ pub fn void_tags() -> &'static HashSet<String> {
     &SET
 }
 
+/// HTML tags under which a text node/placeholder would be fostered out
+/// (mirrors `Consts::$HTML['FosterablePosition']`).
+pub fn fosterable_position() -> &'static HashSet<String> {
+    static SET: once_cell::sync::Lazy<HashSet<String>> =
+        once_cell::sync::Lazy::new(|| set!["table", "thead", "tbody", "tfoot", "tr"]);
+    &SET
+}
+
 /// HTML block-level tags (used for wikitext-to-HTML block detection).
 pub fn block_tags() -> &'static HashSet<String> {
     static SET: once_cell::sync::Lazy<HashSet<String>> = once_cell::sync::Lazy::new(|| {

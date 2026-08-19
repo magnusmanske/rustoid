@@ -46,6 +46,9 @@ pub struct Html5TreeBuilder {
     table_depth: usize,
     /// Buffered string/Nl tokens (mirrors `$textContentBuffer`).
     text_buffer: String,
+    /// The page source, for `tsr`-based source recovery (mirrors
+    /// `$this->frame->getSource()`).
+    source: String,
     /// Stashed node data, keyed by `data-object-id`.
     stash: HashMap<usize, StashedNodeData>,
     next_data_id: usize,
@@ -53,13 +56,17 @@ pub struct Html5TreeBuilder {
 
 impl Html5TreeBuilder {
     pub fn new() -> Self {
+        Self::with_source("")
+    }
+
+    /// Construct with the page source available for `tsr` resolution.
+    pub fn with_source(source: &str) -> Self {
         let handler = NodeTreeHandler::new();
         let mut builder = TreeBuilder::new(handler);
         // Parsoid builds a fragment with a `<body>` context element (mirrors
         // RemexPipeline's `startDocument(..., 'body')`).
         builder.start_document(Some(crate::html5::html_data::NS_HTML), Some("body"));
-        let dispatcher = Dispatcher::new();
-        let mut dispatcher = dispatcher;
+        let mut dispatcher = Dispatcher::new();
         dispatcher.switch_mode(ModeId::Initial);
         dispatcher.reset(&builder);
         Html5TreeBuilder {
@@ -69,6 +76,7 @@ impl Html5TreeBuilder {
             in_transclusion: false,
             table_depth: 0,
             text_buffer: String::new(),
+            source: source.to_string(),
             stash: HashMap::new(),
             next_data_id: 0,
         }
@@ -132,6 +140,67 @@ impl Html5TreeBuilder {
             0,
             0,
         );
+    }
+
+    /// Whether the current open element is a fosterable position (a text or
+    /// placeholder node inserted now would be fostered out). Mirrors
+    /// `RemexPipeline::isFosterablePosition`.
+    fn is_fosterable_position(&self) -> bool {
+        self.builder
+            .stack
+            .current()
+            .map(|elt| crate::wikitext::consts::fosterable_position().contains(&elt.html_name))
+            .unwrap_or(false)
+    }
+
+    /// Insert an `mw:Placeholder/StrippedTag` meta for a deleted start/end tag.
+    /// Mirrors `TreeBuilderStage::insertPlaceholderMeta`.
+    fn insert_placeholder_meta(&mut self, name: &str, dp: &TDataParsoid, is_start: bool) {
+        // If the placeholder would be fostered out, skip it (browsers move it
+        // out of the table anyway, so round-tripping wouldn't see it).
+        if self.is_fosterable_position() {
+            return;
+        }
+
+        let mut src = dp.src.clone();
+
+        // PHP treats both an unset `src` and an empty/`'0'`-falsy `src` as
+        // absent, so fall back to the TSR (or the literal tag name) accordingly.
+        if src.as_deref().is_none_or(str::is_empty) {
+            if let Some(tsr) = &dp.tsr {
+                src = Some(tsr.substr(&self.source).to_string());
+            } else if dp.stx.as_deref() == Some("html") {
+                src = Some(if is_start {
+                    format!("<{name}>")
+                } else {
+                    format!("</{name}>")
+                });
+            }
+        }
+
+        if let Some(src) = src
+            && !src.is_empty()
+        {
+            let meta_dp = TDataParsoid {
+                src: Some(src),
+                name: Some(name.to_string()),
+                ..TDataParsoid::default()
+            };
+            let attrs = self.stash_data_attribs(
+                &[KV {
+                    key: crate::wikitext::tokens_v2::KeyValue::Str("typeof".to_string()),
+                    value: crate::wikitext::tokens_v2::KeyValue::Str(
+                        "mw:Placeholder/StrippedTag".to_string(),
+                    ),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                }],
+                &meta_dp,
+                None,
+            );
+            self.insert_unfostered_meta(attrs);
+        }
     }
 
     /// Process a chunk of tokens.
@@ -222,40 +291,21 @@ impl Html5TreeBuilder {
     }
 
     fn process_start_tag(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
-        // Deleted wikitext-syntax table tag outside a table: re-emit source.
+        let data_mw = Self::extract_data_mw(attribs);
+        let attrs = self.stash_data_attribs(attribs, dp, data_mw);
+
+        // The faithful port needs to know whether `startTag` produced an element;
+        // when `TagTk` is stripped outside a table, `handleDeletedStartTag` takes
+        // over. The table-depth shortcut below covers the common `td|tr|th` case
+        // before handing off, mirroring the PHP `handleDeletedStartTag` guard.
         if self.table_depth == 0
             && dp.stx.as_deref() != Some("html")
             && matches!(name, "td" | "tr" | "th")
         {
-            let src = dp.src.clone().or_else(|| {
-                Some(
-                    match name {
-                        "td" => "|",
-                        "tr" => "|-",
-                        "th" => "!",
-                        _ => "",
-                    }
-                    .to_string(),
-                )
-            });
-            if let Some(orig) = src
-                && !orig.is_empty()
-            {
-                modes::characters(
-                    &mut self.builder,
-                    &mut self.dispatcher,
-                    &orig,
-                    0,
-                    orig.len(),
-                    0,
-                    0,
-                );
-                return;
-            }
+            self.handle_deleted_start_tag(name, dp);
+            return;
         }
 
-        let data_mw = Self::extract_data_mw(attribs);
-        let attrs = self.stash_data_attribs(attribs, dp, data_mw);
         modes::start_tag(
             &mut self.builder,
             &mut self.dispatcher,
@@ -265,6 +315,39 @@ impl Html5TreeBuilder {
             0,
             0,
         );
+    }
+
+    /// Insert `td/tr/th` tag source or a placeholder meta (mirrors
+    /// `TreeBuilderStage::handleDeletedStartTag`).
+    fn handle_deleted_start_tag(&mut self, name: &str, dp: &TDataParsoid) {
+        if dp.stx.as_deref() != Some("html") && matches!(name, "td" | "tr" | "th") {
+            // A stripped wikitext-syntax table tag outside of a table. Re-insert
+            // the original page source.
+            let orig_txt = if let Some(tsr) = &dp.tsr {
+                tsr.substr(&self.source).to_string()
+            } else {
+                match name {
+                    "td" => "|",
+                    "tr" => "|-",
+                    "th" => "!",
+                    _ => "",
+                }
+                .to_string()
+            };
+            if !orig_txt.is_empty() {
+                modes::characters(
+                    &mut self.builder,
+                    &mut self.dispatcher,
+                    &orig_txt,
+                    0,
+                    orig_txt.len(),
+                    0,
+                    0,
+                );
+            }
+        } else {
+            self.insert_placeholder_meta(name, dp, true);
+        }
     }
 
     fn process_selfclosing(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
@@ -368,7 +451,13 @@ fn resolve_data_ids(node: &mut Node, stash: &HashMap<usize, StashedNodeData>) {
 
 /// Run the HTML5 tree builder over a token stream.
 pub fn token_stream_to_ast_html(tokens: &[Item]) -> Node {
-    let mut builder = Html5TreeBuilder::new();
+    token_stream_to_ast_html_with_source(tokens, None)
+}
+
+/// Run the HTML5 tree builder over a token stream, with the page source
+/// available for `tsr`-based source recovery in deleted-tag placeholders.
+pub fn token_stream_to_ast_html_with_source(tokens: &[Item], source: Option<&str>) -> Node {
+    let mut builder = Html5TreeBuilder::with_source(source.unwrap_or(""));
     builder.process_chunk(tokens);
     builder.process_token(&Item::Tok(ParsoidToken::Eof(
         crate::wikitext::tokens_v2::EOFTk,
@@ -447,6 +536,44 @@ mod tests {
         ];
         let doc = token_stream_to_ast_html(&items);
         assert!(contains_data_parsoid(&doc), "{doc:?}");
+    }
+
+    #[test]
+    fn test_placeholder_meta() {
+        // A stripped end tag `</div>` carries its source and name into an
+        // `mw:Placeholder/StrippedTag` meta, unless fostered out.
+        let dp = DataParsoid {
+            src: Some("</div>".to_string()),
+            ..DataParsoid::default()
+        };
+
+        let mut builder = Html5TreeBuilder::with_source("");
+        assert!(!builder.is_fosterable_position());
+        builder.insert_placeholder_meta("div", &dp, false);
+        let doc = builder.finalize();
+
+        let placeholder = find_placeholder(&doc).expect("expected a placeholder meta");
+        assert_eq!(
+            placeholder.get_attr("typeof"),
+            Some("mw:Placeholder/StrippedTag")
+        );
+        if let Some(dp_json) = &placeholder.data_parsoid {
+            assert!(dp_json.contains("\"src\":\"</div>\""), "{dp_json}");
+            assert!(dp_json.contains("\"name\":\"div\""), "{dp_json}");
+        } else {
+            panic!("placeholder missing data-parsoid");
+        }
+    }
+
+    fn find_placeholder(node: &Node) -> Option<&Node> {
+        if node
+            .get_attr("typeof")
+            .map(|t| t == "mw:Placeholder/StrippedTag")
+            .unwrap_or(false)
+        {
+            return Some(node);
+        }
+        node.children.iter().find_map(find_placeholder)
     }
 
     fn contains_text(node: &Node, needle: &str) -> bool {

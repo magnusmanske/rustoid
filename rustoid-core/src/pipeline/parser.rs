@@ -53,7 +53,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     pub fn wikitext_to_ast(&self, wikitext: &str) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let stage = TreeBuilderStage::new(false);
-        Ok(stage.to_ast(tokens))
+        Ok(stage.to_ast_with_source(tokens, Some(wikitext)))
     }
 
     /// Convert wikitext to an HTML string (no native template expansion).
@@ -73,7 +73,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.tokenize(wikitext)?;
         let about_counter = std::cell::Cell::new(0usize);
         let ast = self
-            .build_ast(tokens, Some(source), &options.page_title, &about_counter)
+            .build_ast(
+                tokens,
+                Some(source),
+                &options.page_title,
+                &about_counter,
+                wikitext,
+            )
             .await;
         let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
         serializer.serialize(&ast)
@@ -87,6 +93,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         page_title: &str,
         about_counter: &std::cell::Cell<usize>,
+        page_source: &str,
     ) -> Node {
         let title = TitleParser::parse(page_title, self.config);
         let frame = Frame::new(title, vec![]);
@@ -96,7 +103,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .await;
 
         let stage = TreeBuilderStage::new(false);
-        stage.to_ast(tokens)
+        stage.to_ast_with_source(tokens, Some(page_source))
     }
 
     /// Expand `template`/`templatearg` tokens in-place.

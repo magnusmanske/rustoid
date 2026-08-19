@@ -15,7 +15,7 @@ use super::list_handler::ListHandler;
 use super::paragraph_wrapper_v2::ParagraphWrapper;
 use super::pre_handler::PreHandler;
 use super::quote_transformer_v2::QuoteTransformer;
-use super::tree_builder_html::token_stream_to_ast_html;
+use super::tree_builder_html::token_stream_to_ast_html_with_source;
 
 /// Run the TokenTransform3 (line-based) handlers over a token stream.
 ///
@@ -54,8 +54,14 @@ impl TreeBuilderStage {
 
     /// Run the TT3 handlers and convert the result to an AST.
     pub fn to_ast(&self, tokens: Vec<Item>) -> Node {
+        self.to_ast_with_source(tokens, None)
+    }
+
+    /// Run the TT3 handlers and convert to an AST, with the page source
+    /// available for `tsr`-based source recovery.
+    pub fn to_ast_with_source(&self, tokens: Vec<Item>, source: Option<&str>) -> Node {
         let tokens = self.process(tokens);
-        token_stream_to_ast_html(&tokens)
+        token_stream_to_ast_html_with_source(&tokens, source)
     }
 }
 
