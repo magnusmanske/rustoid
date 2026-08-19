@@ -575,6 +575,46 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_ordered_list() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("# one\n# two", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<ol"), "got: {html}");
+        assert!(html.contains("<li"), "got: {html}");
+        assert!(html.contains("one"), "got: {html}");
+        assert!(html.contains("two"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_multi_line_dl() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(";term\n:definition", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<dl"), "got: {html}");
+        assert!(html.contains("<dt"), "got: {html}");
+        assert!(html.contains("<dd"), "got: {html}");
+        assert!(html.contains("term"), "got: {html}");
+        assert!(html.contains("definition"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_heading_with_link() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("== See [[Main Page]] ==", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<h2"), "got: {html}");
+        assert!(html.contains("<a"), "got: {html}");
+        assert!(html.contains("rel=\"mw:WikiLink\""), "got: {html}");
+        assert!(html.contains("Main Page"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);

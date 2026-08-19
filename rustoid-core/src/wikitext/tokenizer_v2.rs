@@ -758,7 +758,19 @@ impl<'a> PegTokenizer<'a> {
         self.try_parse_inlineline_break_on_colon();
 
         if !self.starts_with(":") {
-            // No colon — this was a lone `;term` definition term, not a dtdd.
+            // No colon on this line: a `;term` definition term followed by a
+            // newline. Consume the newline so a following `:definition` is
+            // recognized as its own list item on the next line.
+            if self.starts_with("\r\n") {
+                let nl_start = self.pos;
+                self.advance(2);
+                self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(nl_start, self.pos))));
+            } else if self.starts_with("\n") {
+                let nl_start = self.pos;
+                self.advance(1);
+                self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(nl_start, self.pos))));
+            }
+            self.at_sol = true;
             return true;
         }
         self.advance(1); // consume ':'
