@@ -20,6 +20,10 @@ impl HtmlSerializer {
 
     /// Serialize a document node to HTML.
     pub fn serialize(&self, doc: &Node) -> Result<String> {
+        // The tree builder produces `<html><head>…</head><body>…</body></html>`;
+        // flatten that structure so we don't double-wrap it here.
+        let (head_children, body_children) = split_structure(doc);
+
         let mut buf = String::new();
 
         if !self.options.body_only {
@@ -30,10 +34,15 @@ impl HtmlSerializer {
             }
             buf.push_str(">\n<head>\n");
             buf.push_str("<meta charset=\"utf-8\"/>\n");
+            for child in &head_children {
+                self.serialize_node(child, &mut buf, 0)?;
+            }
             buf.push_str("</head>\n<body>\n");
         }
 
-        self.serialize_node(doc, &mut buf, 0)?;
+        for child in &body_children {
+            self.serialize_node(child, &mut buf, 0)?;
+        }
 
         if !self.options.body_only {
             buf.push_str("</body>\n</html>\n");
@@ -337,6 +346,35 @@ impl HtmlSerializer {
     }
 }
 
+/// Split a document node into `(head_children, body_children)`, flattening the
+/// `<html><head>…</head><body>…</body></html>` structure produced by the
+/// tree-construction fragment builder. If the document is a plain fragment
+/// (no structural `<html>`), `head_children` is empty and `body_children` is
+/// the document's own children.
+fn split_structure(doc: &Node) -> (Vec<Node>, Vec<Node>) {
+    // Look for an `<html>` element among the top-level children.
+    for child in &doc.children {
+        if let NodeKind::Element(ElementKind::Other(tag)) = &child.kind
+            && tag == "html"
+        {
+            let mut head = Vec::new();
+            let mut body = Vec::new();
+            for section in &child.children {
+                if let NodeKind::Element(ElementKind::Other(tag2)) = &section.kind {
+                    match tag2.as_str() {
+                        "head" => head = section.children.clone(),
+                        "body" => body = section.children.clone(),
+                        _ => {}
+                    }
+                }
+            }
+            return (head, body);
+        }
+    }
+
+    (Vec::new(), doc.children.clone())
+}
+
 /// Whether a tag is void (self-closing) in HTML serialization. Mirrors the
 /// HTML void-element list that Parsoid emits without an explicit close tag.
 fn is_void_element(tag: &str) -> bool {
@@ -426,8 +464,10 @@ mod tests {
         p.push_child(Node::text("text"));
         doc.push_child(p);
 
-        let mut opts = ParserOptions::default();
-        opts.body_only = true;
+        let opts = ParserOptions {
+            body_only: true,
+            ..ParserOptions::default()
+        };
         let serializer = HtmlSerializer::new(opts);
         let html = serializer.serialize(&doc).unwrap();
         assert!(!html.contains("<!DOCTYPE"));

@@ -460,6 +460,10 @@ mod tests {
         assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
         assert!(html.contains("https://example.com"), "got: {html}");
         assert!(html.contains("Example"), "got: {html}");
+        // The structural `<html>` wrapper must appear exactly once (the
+        // tree-builder fragment must not be nested inside another wrapper).
+        assert_eq!(html.matches("<html").count(), 1, "got: {html}");
+        assert_eq!(html.matches("<body").count(), 1, "got: {html}");
     }
 
     #[test]
