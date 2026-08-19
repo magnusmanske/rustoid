@@ -10,7 +10,7 @@ use std::fmt;
 /// once before de-duplication, but Parsoid feeds simple `name => value` pairs
 /// (via `TreeBuilderStage::kvArrToAttr`), so we keep a plain ordered list and
 /// a `get` that returns the first match.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attributes {
     entries: Vec<(String, String)>,
 }
@@ -62,7 +62,7 @@ impl Attributes {
 /// (a slot identity) is used by `Stack`; the active-formatting-elements linkage
 /// lives separately in `ActiveFormattingElements` (keyed by slot index) rather
 /// than on the element, to keep `Element` a plain value type.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Element {
     pub namespace: String,
     pub name: String,

@@ -119,6 +119,10 @@ impl NodeTreeHandler {
             "pre" => ElementKind::Preformatted,
             "hr" => ElementKind::HorizontalRule,
             "br" => ElementKind::LineBreak,
+            // Internal self-closing tag names emitted by the V2 tokenizer before
+            // the wiki-link renderer expands them to `<a rel="mw:WikiLink">`.
+            "wikilink" => ElementKind::Wikilink,
+            "extlink" => ElementKind::ExtLink,
             "h1" => ElementKind::Heading(1),
             "h2" => ElementKind::Heading(2),
             "h3" => ElementKind::Heading(3),

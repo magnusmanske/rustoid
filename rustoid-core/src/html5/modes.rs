@@ -198,7 +198,7 @@ mod initial {
         b.error("missing doctype", ss);
         b.quirks = super::super::tree_builder::QUIRKS;
         d.switch_mode(ModeId::BeforeHtml);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -212,7 +212,7 @@ mod initial {
         b.error("missing doctype", ss);
         b.quirks = super::super::tree_builder::QUIRKS;
         d.switch_mode(ModeId::BeforeHtml);
-        start_tag(b, d, name, attrs, sc, ss, sl);
+        super::start_tag(b, d, name, attrs, sc, ss, sl);
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -224,13 +224,13 @@ mod initial {
         b.error("missing doctype", ss);
         b.quirks = super::super::tree_builder::QUIRKS;
         d.switch_mode(ModeId::BeforeHtml);
-        end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl);
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.error("missing doctype", pos);
         b.quirks = super::super::tree_builder::QUIRKS;
         d.switch_mode(ModeId::BeforeHtml);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -251,7 +251,7 @@ mod before_html {
         }
         b.insert_element("html", Attributes::new(), false, ss, 0);
         d.switch_mode(ModeId::BeforeHead);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -268,7 +268,7 @@ mod before_html {
         } else {
             b.insert_element("html", Attributes::new(), false, ss, 0);
             d.switch_mode(ModeId::BeforeHead);
-            start_tag(b, d, name, attrs, sc, ss, sl);
+            super::start_tag(b, d, name, attrs, sc, ss, sl);
         }
     }
     pub fn end_tag<H: TreeHandler>(
@@ -284,12 +284,12 @@ mod before_html {
         }
         b.insert_element("html", Attributes::new(), false, ss, 0);
         d.switch_mode(ModeId::BeforeHead);
-        end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl);
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.insert_element("html", Attributes::new(), false, pos, 0);
         d.switch_mode(ModeId::BeforeHead);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -311,7 +311,7 @@ mod before_head {
         let head = b.insert_element("head", Attributes::new(), false, ss, 0);
         b.head_element = b.stack.item_by_uid(head).cloned();
         d.switch_mode(ModeId::InHead);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -332,7 +332,7 @@ mod before_head {
             let head = b.insert_element("head", Attributes::new(), false, ss, 0);
             b.head_element = b.stack.item_by_uid(head).cloned();
             d.switch_mode(ModeId::InHead);
-            start_tag(b, d, name, attrs, sc, ss, sl);
+            super::start_tag(b, d, name, attrs, sc, ss, sl);
         }
     }
     pub fn end_tag<H: TreeHandler>(
@@ -349,13 +349,13 @@ mod before_head {
         let head = b.insert_element("head", Attributes::new(), false, ss, 0);
         b.head_element = b.stack.item_by_uid(head).cloned();
         d.switch_mode(ModeId::InHead);
-        end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl);
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         let head = b.insert_element("head", Attributes::new(), false, pos, 0);
         b.head_element = b.stack.item_by_uid(head).cloned();
         d.switch_mode(ModeId::InHead);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -379,7 +379,7 @@ mod in_head {
         }
         b.pop(ss, 0);
         d.switch_mode(ModeId::AfterHead);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -413,7 +413,7 @@ mod in_head {
             _ => {
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::AfterHead);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
     }
@@ -432,7 +432,7 @@ mod in_head {
             "body" | "html" | "br" => {
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::AfterHead);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             "template" => {
                 if b.stack.has_template() {
@@ -459,7 +459,7 @@ mod in_head {
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.pop(pos, 0);
         d.switch_mode(ModeId::AfterHead);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -487,7 +487,7 @@ mod in_head_noscript {
         );
         b.pop(ss, 0);
         d.switch_mode(ModeId::InHead);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -516,7 +516,7 @@ mod in_head_noscript {
                 );
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InHead);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
     }
@@ -536,7 +536,7 @@ mod in_head_noscript {
                 b.error("unexpected </br> in head in noscript, closing noscript", ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InHead);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             _ => {
                 b.error(
@@ -550,7 +550,7 @@ mod in_head_noscript {
         b.error("unexpected end-of-file in head in noscript", pos);
         b.pop(pos, 0);
         d.switch_mode(ModeId::InHead);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -574,7 +574,7 @@ mod after_head {
         }
         b.insert_element("body", Attributes::new(), false, ss, 0);
         d.switch_mode(ModeId::InBody);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -604,13 +604,7 @@ mod after_head {
                 }
                 in_head::start_tag(b, d, name, attrs, sc, ss, sl);
                 if let Some(head) = b.head_element.clone() {
-                    b.stack.remove(
-                        b.stack
-                            .data()
-                            .iter()
-                            .position(|e| e.as_ref().map(|x| x.uid) == Some(head.uid))
-                            .unwrap_or(0),
-                    );
+                    b.stack.remove_by_uid(head.uid);
                 }
             }
             "head" => {
@@ -619,7 +613,7 @@ mod after_head {
             _ => {
                 b.insert_element("body", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InBody);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
     }
@@ -635,7 +629,7 @@ mod after_head {
             "body" | "html" | "br" => {
                 b.insert_element("body", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InBody);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             _ => {
                 b.error(&format!("unexpected </{name}> after head, ignoring"), ss);
@@ -645,7 +639,7 @@ mod after_head {
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.insert_element("body", Attributes::new(), false, pos, 0);
         d.switch_mode(ModeId::InBody);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -763,7 +757,7 @@ mod in_body {
                 is_new_afe = false;
             }
             "a" => {
-                b.afe.find_element_by_name("a", b.stack.data());
+                b.afe.find_element_by_name("a");
                 b.reconstruct_afe(ss);
                 is_new_afe = true;
             }
@@ -817,7 +811,7 @@ mod in_body {
                 return;
             }
             "image" => {
-                start_tag(b, d, "img", attrs, sc, ss, sl);
+                super::start_tag(b, d, "img", attrs, sc, ss, sl);
                 return;
             }
             "textarea" => {
@@ -894,9 +888,8 @@ mod in_body {
         }
 
         let uid = b.insert_element(name, attrs, false, ss, sl);
-        if is_new_afe {
-            b.afe
-                .push(uid, &b.stack.item_by_uid(uid).unwrap().noah_key());
+        if is_new_afe && let Some(elt) = b.stack.item_by_uid(uid) {
+            b.afe.push(elt);
         }
     }
     pub fn end_tag<H: TreeHandler>(
@@ -930,7 +923,7 @@ mod in_body {
                         ss,
                     );
                     d.switch_mode(ModeId::AfterBody);
-                    end_tag(b, d, name, ss, sl);
+                    super::end_tag(b, d, name, ss, sl);
                 }
             }
             "address" | "article" | "aside" | "blockquote" | "button" | "center" | "details"
@@ -987,7 +980,7 @@ mod in_body {
             }
             "br" => {
                 b.error("end tag </br> is invalid, assuming start tag", ss);
-                start_tag(b, d, name, Attributes::new(), false, ss, sl);
+                super::start_tag(b, d, name, Attributes::new(), false, ss, sl);
             }
             _ => {
                 b.any_other_end_tag(name, ss, sl);
@@ -1040,7 +1033,7 @@ mod text_mode {
         b.error("unexpected end of input in text mode", pos);
         b.pop(pos, 0);
         d.restore_mode();
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -1063,7 +1056,7 @@ mod in_table {
             == Some(true)
         {
             d.switch_and_save(ModeId::InTableText);
-            characters(b, d, text, start, length, ss, sl);
+            super::characters(b, d, text, start, length, ss, sl);
         } else {
             b.error("unexpected text in table, fostering", ss);
             b.foster_parenting = true;
@@ -1096,7 +1089,7 @@ mod in_table {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
                 b.insert_element("colgroup", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InColumnGroup);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "tbody" | "tfoot" | "thead" => {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
@@ -1107,7 +1100,7 @@ mod in_table {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
                 b.insert_element("tbody", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "table" => {
                 b.error("unexpected <table> in table", ss);
@@ -1116,7 +1109,7 @@ mod in_table {
                 }
                 b.pop_all_up_to_name("table", ss, 0);
                 d.reset(b);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "style" | "script" | "template" => {
                 in_head::start_tag(b, d, name, attrs, sc, ss, sl);
@@ -1210,7 +1203,7 @@ mod in_table_text {
     ) {
         d.flush_table_text(b);
         d.restore_mode();
-        start_tag(b, d, name, attrs, sc, ss, sl);
+        super::start_tag(b, d, name, attrs, sc, ss, sl);
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -1221,12 +1214,12 @@ mod in_table_text {
     ) {
         d.flush_table_text(b);
         d.restore_mode();
-        end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl);
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         d.flush_table_text(b);
         d.restore_mode();
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -1261,7 +1254,7 @@ mod in_caption {
                 b.pop_all_up_to_name("caption", ss, 0);
                 b.afe.clear_to_marker();
                 d.switch_mode(ModeId::InTable);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             _ => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1299,7 +1292,7 @@ mod in_caption {
                 b.pop_all_up_to_name("caption", ss, 0);
                 b.afe.clear_to_marker();
                 d.switch_mode(ModeId::InTable);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             "body" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th" | "thead"
             | "tr" => {
@@ -1340,7 +1333,7 @@ mod in_column_group {
         }
         b.pop(ss, 0);
         d.switch_mode(ModeId::InTable);
-        characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+        super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -1367,7 +1360,7 @@ mod in_column_group {
                 }
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTable);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
     }
@@ -1399,7 +1392,7 @@ mod in_column_group {
                 }
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTable);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
         }
     }
@@ -1441,7 +1434,7 @@ mod in_table_body {
                 b.clear_stack_back(TABLE_BODY_CONTEXT, ss);
                 b.insert_element("tr", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InRow);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" => {
                 let in_scope = b.stack.is_in_table_scope("tbody")
@@ -1454,7 +1447,7 @@ mod in_table_body {
                 b.clear_stack_back(TABLE_BODY_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTable);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             _ => in_table::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1528,7 +1521,7 @@ mod in_row {
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             _ => in_table::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1558,7 +1551,7 @@ mod in_row {
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             "tbody" | "tfoot" | "thead" => {
                 if !b.stack.is_in_table_scope(name) || !b.stack.is_in_table_scope("tr") {
@@ -1567,7 +1560,7 @@ mod in_row {
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" => {
                 b.error(&format!("</{name}> encountered in row mode, ignoring"), ss);
@@ -1624,7 +1617,7 @@ mod in_cell {
                     return;
                 }
                 close_the_cell(b, d, ss);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             _ => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1662,7 +1655,7 @@ mod in_cell {
                     return;
                 }
                 close_the_cell(b, d, ss);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             _ => in_body::end_tag(b, d, name, ss, sl),
         }
@@ -1736,7 +1729,7 @@ mod in_select {
                 }
                 b.pop_all_up_to_name("select", ss, 0);
                 d.reset(b);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "script" | "template" => in_head::start_tag(b, d, name, attrs, sc, ss, sl),
             _ => b.error(
@@ -1822,7 +1815,7 @@ mod in_select_in_table {
                 );
                 b.pop_all_up_to_name("select", ss, 0);
                 d.reset(b);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             _ => in_select::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1849,7 +1842,7 @@ mod in_select_in_table {
                 );
                 b.pop_all_up_to_name("select", ss, 0);
                 d.reset(b);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
             _ => in_select::end_tag(b, d, name, ss, sl),
         }
@@ -1913,7 +1906,7 @@ mod in_template {
                 d.switch_mode(ModeId::InBody);
             }
         }
-        start_tag(b, d, name, attrs, sc, ss, sl);
+        super::start_tag(b, d, name, attrs, sc, ss, sl);
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -1937,7 +1930,7 @@ mod in_template {
         b.afe.clear_to_marker();
         d.template_mode_stack_pop();
         d.reset(b);
-        end_document(b, d, pos);
+        super::end_document(b, d, pos);
     }
 }
 
@@ -1959,7 +1952,7 @@ mod after_body {
         if non_ws.1 > 0 {
             b.error("unexpected non-whitespace character after body", ss);
             d.switch_mode(ModeId::InBody);
-            characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+            super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
         }
     }
     pub fn start_tag<H: TreeHandler>(
@@ -1976,7 +1969,7 @@ mod after_body {
             _ => {
                 b.error("unexpected start tag after body", ss);
                 d.switch_mode(ModeId::InBody);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
     }
@@ -1998,7 +1991,7 @@ mod after_body {
             _ => {
                 b.error("unexpected end tag after body", ss);
                 d.switch_mode(ModeId::InBody);
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
             }
         }
     }
@@ -2025,7 +2018,7 @@ mod after_after_body {
         if non_ws.1 > 0 {
             b.error("unexpected non-whitespace characters after after body", ss);
             d.switch_mode(ModeId::InBody);
-            characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
+            super::characters(b, d, text, non_ws.0, non_ws.1, ss, sl);
         }
     }
     pub fn start_tag<H: TreeHandler>(
@@ -2042,7 +2035,7 @@ mod after_after_body {
             _ => {
                 b.error("unexpected start tag after after body", ss);
                 d.switch_mode(ModeId::InBody);
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
     }
@@ -2055,7 +2048,7 @@ mod after_after_body {
     ) {
         b.error("unexpected end tag after after body", ss);
         d.switch_mode(ModeId::InBody);
-        end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl);
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, _d: &mut Dispatcher, pos: usize) {
         b.stop_parsing(pos);
@@ -2144,7 +2137,7 @@ mod in_foreign {
                     }
                     b.pop(ss, 0);
                 }
-                start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl);
                 return;
             }
         }
@@ -2173,7 +2166,7 @@ mod in_foreign {
             }
             if elt.namespace == NS_HTML {
                 // Re-dispatch as the current handler's end tag.
-                end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl);
                 return;
             }
         }

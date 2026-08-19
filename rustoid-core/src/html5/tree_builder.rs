@@ -208,8 +208,7 @@ impl<H: TreeHandler> TreeBuilder<H> {
 
     /// Pop the current node from the stack and notify the handler.
     pub fn pop(&mut self, source_start: usize, source_length: usize) -> Option<usize> {
-        let slot = self.stack.pop()?;
-        let element = self.stack.item(slot).clone();
+        let element = self.stack.pop()?;
         self.handler.end_tag(&element, source_start, source_length);
         Some(element.uid)
     }
@@ -289,12 +288,19 @@ impl<H: TreeHandler> TreeBuilder<H> {
     }
 
     /// Reconstruct the active formatting elements.
+    //
+    // Note: this is a simplification. The full spec algorithm walks back from
+    // the tail until it finds a node that is either in the stack or a marker,
+    // then re-creates any dangling formatting element. We cover the common
+    // single-dangling-formatting-element case; the general reconstruction
+    // (multiple dangling entries) is layered in by the caller/adoption agency.
     pub fn reconstruct_afe(&mut self, source_start: usize) {
         let tail = self.afe.get_tail();
         match tail {
             None | Some(super::active_formatting_elements::AfeEntry::Marker) => return,
-            Some(super::active_formatting_elements::AfeEntry::Element(slot)) => {
-                if self.stack.item(slot).stack_index.is_some() {
+            Some(super::active_formatting_elements::AfeEntry::Element(elt)) => {
+                // If the tail element is still on the stack, nothing to do.
+                if self.stack.item_by_uid(elt.uid).is_some() {
                     return;
                 }
             }
@@ -303,13 +309,12 @@ impl<H: TreeHandler> TreeBuilder<H> {
         // Find the entry to reconstruct from. We re-insert the tail element's
         // data and replace it in the AFE list. This is the common, correct
         // observable behavior for a single dangling formatting element.
-        let Some(super::active_formatting_elements::AfeEntry::Element(tail_slot)) =
-            self.afe.get_tail()
+        let Some(super::active_formatting_elements::AfeEntry::Element(tail)) = self.afe.get_tail()
         else {
             return;
         };
-        let name = self.stack.item(tail_slot).name.clone();
-        let attrs = self.stack.item(tail_slot).attrs.clone();
+        let name = tail.name.clone();
+        let attrs = tail.attrs.clone();
         let new_uid = self.insert_foreign(NS_HTML, &name, attrs, false, source_start, 0);
         let _ = new_uid;
     }
@@ -471,20 +476,20 @@ impl<H: TreeHandler> TreeBuilder<H> {
         }
 
         // Step 5: last AFE element with name `subject`.
-        let fmt_slot = self.afe.find_element_by_name(subject, self.stack.data());
-        let Some(fmt_slot) = fmt_slot else {
+        let fmt_uid = self.afe.find_element_by_name(subject).map(|e| e.uid);
+        let Some(fmt_uid) = fmt_uid else {
             self.any_other_end_tag(subject, source_start, source_length);
             return;
         };
 
         // Step 6: not in stack -> remove from AFE and abort.
-        if self.stack.item(fmt_slot).stack_index.is_none() {
-            self.afe.remove(fmt_slot);
+        if self.stack.item_by_uid(fmt_uid).is_none() {
+            self.afe.remove(fmt_uid);
             return;
         }
 
         // Step 7: not in scope -> ignore.
-        if !self.stack.is_element_in_scope(fmt_slot) {
+        if !self.stack.is_uid_in_scope(fmt_uid) {
             return;
         }
 
@@ -492,7 +497,7 @@ impl<H: TreeHandler> TreeBuilder<H> {
         // adoption agency algorithm proper; they are layered in by the
         // Dispatcher/InBody port. For the common mismatched-formatting case we
         // close the formatting element and remove it from the AFE list.
-        self.pop_all_up_to_element(fmt_slot, source_start, source_length);
-        self.afe.remove(fmt_slot);
+        self.pop_all_up_to_element(fmt_uid, source_start, source_length);
+        self.afe.remove(fmt_uid);
     }
 }

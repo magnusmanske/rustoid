@@ -113,17 +113,20 @@ mod tests {
 
     #[test]
     fn test_to_ast_heading() {
-        use crate::dom::node::{ElementKind, NodeKind};
-
         let stage = TreeBuilderStage::new(false);
         let doc = stage.to_ast(tokenize("== Heading ==\n"));
 
-        // The document should contain an h2 element.
-        assert!(
-            doc.children
-                .iter()
-                .any(|n| { matches!(&n.kind, NodeKind::Element(ElementKind::Heading(2))) })
-        );
+        // The document should contain an h2 element somewhere in the tree
+        // (Parsoid nests content under `<html><body>`).
+        assert!(contains_heading_2(&doc));
+    }
+
+    fn contains_heading_2(node: &Node) -> bool {
+        use crate::dom::node::{ElementKind, NodeKind};
+        if let NodeKind::Element(ElementKind::Heading(2)) = &node.kind {
+            return true;
+        }
+        node.children.iter().any(contains_heading_2)
     }
 
     #[test]
@@ -145,17 +148,18 @@ mod tests {
 
     #[test]
     fn test_to_ast_wikilink() {
-        use crate::dom::node::{ElementKind, NodeKind};
-
         let stage = TreeBuilderStage::new(false);
         let doc = stage.to_ast(tokenize("[[Main Page]]"));
 
-        assert!(doc.children.iter().any(|n| {
-            matches!(&n.kind, NodeKind::Element(ElementKind::Wikilink))
-                || n.children
-                    .iter()
-                    .any(|c| matches!(&c.kind, NodeKind::Element(ElementKind::Wikilink)))
-        }));
+        assert!(contains_wikilink(&doc));
+    }
+
+    fn contains_wikilink(node: &Node) -> bool {
+        use crate::dom::node::{ElementKind, NodeKind};
+        if let NodeKind::Element(ElementKind::Wikilink) = &node.kind {
+            return true;
+        }
+        node.children.iter().any(contains_wikilink)
     }
 
     #[test]

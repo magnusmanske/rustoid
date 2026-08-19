@@ -1,23 +1,25 @@
 //! The list of active formatting elements (AFE), including the Noah's Ark
 //! clause. Ports `Wikimedia\RemexHtml\TreeBuilder\ActiveFormattingElements`.
 //!
-//! Entries are either a scope marker or a reference to an element by its stack
-//! slot index. The doubly-linked list uses stable indices into an arena so
-//! that `prevAFE`/`nextAFE` pointers mirror the PHP object links. Noah's Ark
-//! buckets are stored as ordered lists of node indices per segment (equivalent
-//! to the PHP `nextNoah` chains, at most 3 members each).
+//! Entries are either a scope marker or a reference to an element. Like the PHP
+//! implementation (which stores the `Element` object itself), we store a clone
+//! of the `Element`, so the AFE can answer name/attribute queries and
+//! reconstruction without depending on the (possibly already-popped) stack.
+//! Element identity is `Element::uid`.
 
 use std::collections::HashMap;
 
+use super::element::Element;
+
 /// An entry in the active-formatting-elements list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AfeEntry {
     Marker,
-    Element(usize),
+    Element(Element),
 }
 
 /// A node in the AFE arena.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AfeNode {
     entry: AfeEntry,
     prev: Option<usize>,
@@ -61,20 +63,20 @@ impl ActiveFormattingElements {
         self.noah.push(HashMap::new());
     }
 
-    /// Push an element onto the AFE list. `noah_key` is the precomputed Noah's
-    /// Ark bucket key for the element.
-    pub fn push(&mut self, slot: usize, noah_key: &str) {
+    /// Push an element onto the AFE list, applying the Noah's Ark clause.
+    pub fn push(&mut self, element: &Element) {
         let node_idx = self.nodes.len();
         self.nodes.push(AfeNode {
-            entry: AfeEntry::Element(slot),
+            entry: AfeEntry::Element(element.clone()),
             prev: self.tail,
             next: None,
         });
 
+        let noah_key = element.noah_key();
         // Noah's Ark clause: >3 identical copies before a marker → drop oldest.
         let to_remove = {
             let table = self.noah.last_mut().expect("noah stack is non-empty");
-            let bucket = table.entry(noah_key.to_string()).or_default();
+            let bucket = table.entry(noah_key.clone()).or_default();
             if bucket.len() >= 3 {
                 Some(bucket.remove(0))
             } else {
@@ -85,10 +87,7 @@ impl ActiveFormattingElements {
             self.remove_node(oldest);
         }
         let table = self.noah.last_mut().expect("noah stack is non-empty");
-        table
-            .entry(noah_key.to_string())
-            .or_default()
-            .push(node_idx);
+        table.entry(noah_key).or_default().push(node_idx);
 
         if let Some(tail) = self.tail {
             self.nodes[tail].next = Some(node_idx);
@@ -129,20 +128,14 @@ impl ActiveFormattingElements {
     }
 
     /// Find the last element with the given `html_name` before the last marker.
-    pub fn find_element_by_name(
-        &self,
-        name: &str,
-        elements: &[Option<crate::html5::element::Element>],
-    ) -> Option<usize> {
+    pub fn find_element_by_name(&self, name: &str) -> Option<&Element> {
         let mut cur = self.tail;
         while let Some(ci) = cur {
-            match self.nodes[ci].entry {
+            match &self.nodes[ci].entry {
                 AfeEntry::Marker => break,
-                AfeEntry::Element(slot) => {
-                    if let Some(e) = &elements[slot]
-                        && e.html_name == name
-                    {
-                        return Some(slot);
+                AfeEntry::Element(e) => {
+                    if e.html_name == name {
+                        return Some(e);
                     }
                 }
             }
@@ -151,17 +144,19 @@ impl ActiveFormattingElements {
         None
     }
 
-    /// Is the element (by slot) in the AFE *live* list?
-    pub fn is_in_list(&self, slot: usize) -> bool {
-        self.node_of(slot).is_some()
+    /// Is the element (by `uid`) in the AFE *live* list?
+    pub fn is_in_list(&self, uid: usize) -> bool {
+        self.node_of(uid).is_some()
     }
 
-    /// The live node index for a given element slot, if present. Walks the
+    /// The live node index for a given element `uid`, if present. Walks the
     /// live list from the head so removed nodes are skipped.
-    pub fn node_of(&self, slot: usize) -> Option<usize> {
+    pub fn node_of(&self, uid: usize) -> Option<usize> {
         let mut cur = self.head;
         while let Some(ci) = cur {
-            if self.nodes[ci].entry == AfeEntry::Element(slot) {
+            if let AfeEntry::Element(e) = &self.nodes[ci].entry
+                && e.uid == uid
+            {
                 return Some(ci);
             }
             cur = self.nodes[ci].next;
@@ -197,17 +192,24 @@ impl ActiveFormattingElements {
         }
     }
 
-    /// Remove an element (by slot) from the AFE list.
-    pub fn remove(&mut self, slot: usize) {
-        if let Some(node_idx) = self.node_of(slot) {
+    /// Remove an element (by `uid`) from the AFE list.
+    pub fn remove(&mut self, uid: usize) {
+        if let Some(node_idx) = self.node_of(uid) {
             self.remove_node(node_idx);
         }
     }
 
-    /// Replace node `a` with node `b` (entry and list position move to `b`).
-    pub fn replace_node(&mut self, a: usize, b: usize, noah_key: &str) {
+    /// Replace node `a_uid` with node `b_uid` (entry and list position move to
+    /// `b`).
+    pub fn replace_node(&mut self, a_uid: usize, b_uid: usize) {
+        let Some(a) = self.node_of(a_uid) else {
+            return;
+        };
+        let Some(b) = self.node_of(b_uid) else {
+            return;
+        };
         let (entry_a, prev_a, next_a) = {
-            let n = &self.nodes[a];
+            let n = self.nodes[a].clone();
             (n.entry, n.prev, n.next)
         };
         if self.head == Some(a) {
@@ -236,11 +238,16 @@ impl ActiveFormattingElements {
                 }
             }
         }
-        let _ = noah_key;
     }
 
-    /// Insert node `b` immediately after node `a`.
-    pub fn insert_after(&mut self, a: usize, b: usize) {
+    /// Insert node `b_uid` (by uid) immediately after node `a_uid`.
+    pub fn insert_after(&mut self, a_uid: usize, b_uid: usize) {
+        let Some(a) = self.node_of(a_uid) else {
+            return;
+        };
+        let Some(b) = self.node_of(b_uid) else {
+            return;
+        };
         let next_a = self.nodes[a].next;
         if self.tail == Some(a) {
             self.tail = Some(b);
@@ -254,8 +261,8 @@ impl ActiveFormattingElements {
     }
 
     /// The most recently inserted entry (tail), or `None`.
-    pub fn get_tail(&self) -> Option<AfeEntry> {
-        self.tail.map(|t| self.nodes[t].entry)
+    pub fn get_tail(&self) -> Option<&AfeEntry> {
+        self.tail.map(|t| &self.nodes[t].entry)
     }
 
     /// The tail node index.
@@ -269,43 +276,41 @@ impl ActiveFormattingElements {
     }
 
     /// The entry at a node index.
-    pub fn entry(&self, node_idx: usize) -> AfeEntry {
-        self.nodes[node_idx].entry
+    pub fn entry(&self, node_idx: usize) -> &AfeEntry {
+        &self.nodes[node_idx].entry
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html5::element::{Attributes, Element};
+    use crate::html5::element::Attributes;
     use crate::html5::html_data::NS_HTML;
 
-    fn el(name: &str, uid: usize) -> Option<Element> {
-        Some(Element::new(NS_HTML, name, Attributes::new(), uid))
+    fn el(name: &str, uid: usize) -> Element {
+        Element::new(NS_HTML, name, Attributes::new(), uid)
     }
 
     #[test]
     fn test_push_and_find() {
-        let elements = vec![el("b", 1), el("i", 2), el("b", 3)];
         let mut afe = ActiveFormattingElements::new();
-        afe.push(0, "b");
-        afe.push(1, "i");
-        afe.push(2, "b");
-        assert_eq!(afe.find_element_by_name("b", &elements), Some(2));
-        assert_eq!(afe.find_element_by_name("i", &elements), Some(1));
-        assert_eq!(afe.find_element_by_name("u", &elements), None);
+        afe.push(&el("b", 1));
+        afe.push(&el("i", 2));
+        afe.push(&el("b", 3));
+        assert_eq!(afe.find_element_by_name("b").map(|e| e.uid), Some(3));
+        assert_eq!(afe.find_element_by_name("i").map(|e| e.uid), Some(2));
+        assert_eq!(afe.find_element_by_name("u"), None);
     }
 
     #[test]
     fn test_noah_ark() {
-        let _elements = [el("b", 1), el("b", 2), el("b", 3), el("b", 4)];
         let mut afe = ActiveFormattingElements::new();
-        afe.push(0, "b");
-        afe.push(1, "b");
-        afe.push(2, "b");
-        // The fourth copy triggers Noah's Ark: oldest (slot 0) is dropped.
-        afe.push(3, "b");
-        assert!(!afe.is_in_list(0));
-        assert!(afe.is_in_list(3));
+        afe.push(&el("b", 1));
+        afe.push(&el("b", 2));
+        afe.push(&el("b", 3));
+        // The fourth copy triggers Noah's Ark: oldest (uid 1) is dropped.
+        afe.push(&el("b", 4));
+        assert!(!afe.is_in_list(1));
+        assert!(afe.is_in_list(4));
     }
 }
