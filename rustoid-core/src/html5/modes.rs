@@ -80,7 +80,7 @@ pub fn start_tag<H: TreeHandler>(
     self_close: bool,
     ss: usize,
     sl: usize,
-) {
+) -> Option<usize> {
     match d.mode {
         ModeId::Initial => initial::start_tag(b, d, name, attrs, self_close, ss, sl),
         ModeId::BeforeHtml => before_html::start_tag(b, d, name, attrs, self_close, ss, sl),
@@ -120,7 +120,7 @@ pub fn end_tag<H: TreeHandler>(
     name: &str,
     ss: usize,
     sl: usize,
-) {
+) -> Option<usize> {
     match d.mode {
         ModeId::Initial => initial::end_tag(b, d, name, ss, sl),
         ModeId::BeforeHtml => before_html::end_tag(b, d, name, ss, sl),
@@ -208,11 +208,11 @@ mod initial {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         b.error("missing doctype", ss);
         b.quirks = super::super::tree_builder::QUIRKS;
         d.switch_mode(ModeId::BeforeHtml);
-        super::start_tag(b, d, name, attrs, sc, ss, sl);
+        super::start_tag(b, d, name, attrs, sc, ss, sl)
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -220,11 +220,11 @@ mod initial {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         b.error("missing doctype", ss);
         b.quirks = super::super::tree_builder::QUIRKS;
         d.switch_mode(ModeId::BeforeHtml);
-        super::end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl)
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.error("missing doctype", pos);
@@ -261,15 +261,15 @@ mod before_html {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         if name == "html" {
-            b.insert_element(name, attrs, false, ss, sl);
+            let uid = b.insert_element(name, attrs, false, ss, sl);
             d.switch_mode(ModeId::BeforeHead);
-        } else {
-            b.insert_element("html", Attributes::new(), false, ss, 0);
-            d.switch_mode(ModeId::BeforeHead);
-            super::start_tag(b, d, name, attrs, sc, ss, sl);
+            return Some(uid);
         }
+        b.insert_element("html", Attributes::new(), false, ss, 0);
+        d.switch_mode(ModeId::BeforeHead);
+        super::start_tag(b, d, name, attrs, sc, ss, sl)
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -277,14 +277,14 @@ mod before_html {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         if !matches!(name, "head" | "body" | "html" | "br") {
             b.error("end tag not allowed before html", ss);
-            return;
+            return None;
         }
         b.insert_element("html", Attributes::new(), false, ss, 0);
         d.switch_mode(ModeId::BeforeHead);
-        super::end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl)
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.insert_element("html", Attributes::new(), false, pos, 0);
@@ -321,18 +321,19 @@ mod before_head {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         if name == "html" {
-            in_body::start_tag(b, d, name, attrs, sc, ss, sl);
+            in_body::start_tag(b, d, name, attrs, sc, ss, sl)
         } else if name == "head" {
             let head = b.insert_element(name, attrs, false, ss, sl);
             b.head_element = b.stack.item_by_uid(head).cloned();
             d.switch_mode(ModeId::InHead);
+            Some(head)
         } else {
             let head = b.insert_element("head", Attributes::new(), false, ss, 0);
             b.head_element = b.stack.item_by_uid(head).cloned();
             d.switch_mode(ModeId::InHead);
-            super::start_tag(b, d, name, attrs, sc, ss, sl);
+            super::start_tag(b, d, name, attrs, sc, ss, sl)
         }
     }
     pub fn end_tag<H: TreeHandler>(
@@ -341,15 +342,15 @@ mod before_head {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         if !matches!(name, "head" | "body" | "html" | "br") {
             b.error("end tag not allowed before head", ss);
-            return;
+            return None;
         }
         let head = b.insert_element("head", Attributes::new(), false, ss, 0);
         b.head_element = b.stack.item_by_uid(head).cloned();
         d.switch_mode(ModeId::InHead);
-        super::end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl)
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         let head = b.insert_element("head", Attributes::new(), false, pos, 0);
@@ -389,31 +390,31 @@ mod in_head {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
             "base" | "basefont" | "bgsound" | "link" | "meta" | "title" | "noframes" | "style"
-            | "script" => {
-                b.insert_element(name, attrs, true, ss, sl);
-            }
+            | "script" => Some(b.insert_element(name, attrs, true, ss, sl)),
             "noscript" if !b.scripting_flag => {
-                b.insert_element(name, attrs, false, ss, sl);
+                let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_mode(ModeId::InHeadNoscript);
+                Some(uid)
             }
             "template" => {
                 b.afe.insert_marker();
                 b.frameset_ok = false;
                 d.template_mode_stack_push(ModeId::InTemplate);
                 d.switch_mode(ModeId::InTemplate);
-                b.insert_element(name, attrs, false, ss, sl);
+                Some(b.insert_element(name, attrs, false, ss, sl))
             }
             "head" => {
                 b.error("unexpected head tag in head, ignoring", ss);
+                None
             }
             _ => {
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::AfterHead);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
         }
     }
@@ -423,16 +424,17 @@ mod in_head {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "head" => {
-                b.pop(ss, sl);
+                let popped = b.pop(ss, sl);
                 d.switch_mode(ModeId::AfterHead);
+                popped
             }
             "body" | "html" | "br" => {
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::AfterHead);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             "template" => {
                 if b.stack.has_template() {
@@ -440,19 +442,22 @@ mod in_head {
                     if b.stack.current().map(|e| e.html_name.as_str()) != Some("template") {
                         b.error("found </template> when other tags are still open", ss);
                     }
-                    b.pop_all_up_to_name("template", ss, sl);
+                    let result = b.pop_all_up_to_name("template", ss, sl);
                     b.afe.clear_to_marker();
                     d.template_mode_stack_pop();
                     d.reset(b);
+                    result
                 } else {
                     b.error(
                         "found </template> but there is no open template, ignoring",
                         ss,
                     );
+                    None
                 }
             }
             _ => {
                 b.error(&format!("ignoring </{name}> in head"), ss);
+                None
             }
         }
     }
@@ -497,7 +502,7 @@ mod in_head_noscript {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
             "basefont" | "bgsound" | "link" | "meta" | "noframes" | "style" => {
@@ -508,6 +513,7 @@ mod in_head_noscript {
                     &format!("unexpected <{name}> in head in noscript, ignoring"),
                     ss,
                 );
+                None
             }
             _ => {
                 b.error(
@@ -516,7 +522,7 @@ mod in_head_noscript {
                 );
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InHead);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
         }
     }
@@ -526,23 +532,25 @@ mod in_head_noscript {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "noscript" => {
-                b.pop(ss, sl);
+                let popped = b.pop(ss, sl);
                 d.switch_mode(ModeId::InHead);
+                popped
             }
             "br" => {
                 b.error("unexpected </br> in head in noscript, closing noscript", ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InHead);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             _ => {
                 b.error(
                     &format!("unexpected </{name}> in head in noscript, ignoring"),
                     ss,
                 );
+                None
             }
         }
     }
@@ -584,17 +592,19 @@ mod after_head {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
             "body" => {
-                b.insert_element(name, attrs, false, ss, sl);
+                let uid = b.insert_element(name, attrs, false, ss, sl);
                 b.frameset_ok = false;
                 d.switch_mode(ModeId::InBody);
+                Some(uid)
             }
             "frameset" => {
-                b.insert_element(name, attrs, false, ss, sl);
+                let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_mode(ModeId::InFrameset);
+                Some(uid)
             }
             "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style"
             | "template" | "title" => {
@@ -602,18 +612,20 @@ mod after_head {
                 if let Some(head) = b.head_element.clone() {
                     b.stack.push(head);
                 }
-                in_head::start_tag(b, d, name, attrs, sc, ss, sl);
+                let result = in_head::start_tag(b, d, name, attrs, sc, ss, sl);
                 if let Some(head) = b.head_element.clone() {
                     b.stack.remove_by_uid(head.uid);
                 }
+                result
             }
             "head" => {
                 b.error("unexpected <head> after </head>, ignoring", ss);
+                None
             }
             _ => {
                 b.insert_element("body", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InBody);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
         }
     }
@@ -623,16 +635,17 @@ mod after_head {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "template" => in_head::end_tag(b, d, name, ss, sl),
             "body" | "html" | "br" => {
                 b.insert_element("body", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InBody);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             _ => {
                 b.error(&format!("unexpected </{name}> after head, ignoring"), ss);
+                None
             }
         }
     }
@@ -668,31 +681,30 @@ mod in_body {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         // The full "in body" start-tag switch. Ported faithfully below.
         let is_new_afe: bool;
         match name {
             "html" => {
                 b.error("merging unexpected html tag", ss);
                 if b.stack.has_template() || b.stack.length() < 1 {
-                    return;
+                    return None;
                 }
                 let elt0 = b.stack.item(0).clone();
                 b.merge_attributes(elt0.uid, &attrs, ss);
-                return;
+                return None;
             }
             "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style"
             | "template" | "title" => {
-                in_head::start_tag(b, d, name, attrs, sc, ss, sl);
-                return;
+                return in_head::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "body" => {
                 b.error("ignored unexpected body tag", ss);
-                return;
+                return None;
             }
             "frameset" => {
                 b.error("ignored unexpected frameset tag", ss);
-                return;
+                return None;
             }
             "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dir"
             | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
@@ -715,14 +727,14 @@ mod in_body {
             "form" => {
                 if b.form_element.is_some() && !b.stack.has_template() {
                     b.error("ignoring nested form tag", ss);
-                    return;
+                    return None;
                 }
                 b.close_p_in_button_scope(ss);
                 let uid = b.insert_element("form", attrs, false, ss, sl);
                 if !b.stack.has_template() {
                     b.form_element = b.stack.item_by_uid(uid).cloned();
                 }
-                return;
+                return Some(uid);
             }
             "li" | "dd" | "dt" => {
                 b.frameset_ok = false;
@@ -791,28 +803,23 @@ mod in_body {
             "area" | "br" | "embed" | "img" | "keygen" | "wbr" => {
                 b.reconstruct_afe(ss);
                 b.frameset_ok = false;
-                b.insert_element(name, attrs, true, ss, sl);
-                return;
+                return Some(b.insert_element(name, attrs, true, ss, sl));
             }
             "input" => {
                 b.reconstruct_afe(ss);
                 b.frameset_ok = false;
-                b.insert_element(name, attrs, true, ss, sl);
-                return;
+                return Some(b.insert_element(name, attrs, true, ss, sl));
             }
             "menuitem" | "param" | "source" | "track" => {
-                b.insert_element(name, attrs, true, ss, sl);
-                return;
+                return Some(b.insert_element(name, attrs, true, ss, sl));
             }
             "hr" => {
                 b.close_p_in_button_scope(ss);
                 b.frameset_ok = false;
-                b.insert_element(name, attrs, true, ss, sl);
-                return;
+                return Some(b.insert_element(name, attrs, true, ss, sl));
             }
             "image" => {
-                super::start_tag(b, d, "img", attrs, sc, ss, sl);
-                return;
+                return super::start_tag(b, d, "img", attrs, sc, ss, sl);
             }
             "textarea" => {
                 b.frameset_ok = false;
@@ -866,20 +873,16 @@ mod in_body {
             }
             "math" => {
                 b.reconstruct_afe(ss);
-                let uid = b.insert_foreign(NS_MATHML, "math", attrs, sc, ss, sl);
-                let _ = uid;
-                return;
+                return Some(b.insert_foreign(NS_MATHML, "math", attrs, sc, ss, sl));
             }
             "svg" => {
                 b.reconstruct_afe(ss);
-                let uid = b.insert_foreign(NS_SVG, "svg", attrs, sc, ss, sl);
-                let _ = uid;
-                return;
+                return Some(b.insert_foreign(NS_SVG, "svg", attrs, sc, ss, sl));
             }
             "caption" | "col" | "colgroup" | "frame" | "head" | "tbody" | "td" | "tfoot" | "th"
             | "thead" | "tr" => {
                 b.error(&format!("{name} is invalid in body mode"), ss);
-                return;
+                return None;
             }
             _ => {
                 b.reconstruct_afe(ss);
@@ -891,6 +894,7 @@ mod in_body {
         if is_new_afe && let Some(elt) = b.stack.item_by_uid(uid) {
             b.afe.push(elt);
         }
+        Some(uid)
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -898,7 +902,7 @@ mod in_body {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "template" => in_head::end_tag(b, d, name, ss, sl),
             "body" => {
@@ -912,6 +916,7 @@ mod in_body {
                     );
                     d.switch_mode(ModeId::AfterBody);
                 }
+                None
             }
             "html" => {
                 if b.stack.is_in_scope("body") {
@@ -923,24 +928,29 @@ mod in_body {
                         ss,
                     );
                     d.switch_mode(ModeId::AfterBody);
-                    super::end_tag(b, d, name, ss, sl);
+                    return super::end_tag(b, d, name, ss, sl);
                 }
+                None
             }
             "address" | "article" | "aside" | "blockquote" | "button" | "center" | "details"
             | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
             | "listing" | "main" | "menu" | "nav" | "ol" | "pre" | "section" | "summary" | "ul" => {
                 if b.stack.is_in_scope(name) {
-                    b.generate_implied_end_tags_and_pop(name, ss, sl);
+                    return b.generate_implied_end_tags_and_pop(name, ss, sl);
                 }
+                None
             }
             "form" => {
                 if b.stack.has_template() {
                     if b.stack.is_in_scope("form") {
-                        b.generate_implied_end_tags_and_pop("form", ss, sl);
+                        return b.generate_implied_end_tags_and_pop("form", ss, sl);
                     }
+                    None
                 } else if b.form_element.is_some() {
                     b.generate_implied_end_tags(None, ss);
-                    let _ = b.pop(ss, sl);
+                    b.pop(ss, sl)
+                } else {
+                    None
                 }
             }
             "p" => {
@@ -948,15 +958,16 @@ mod in_body {
                     b.insert_element("p", Attributes::new(), false, ss, 0);
                     b.pop(ss, sl);
                 }
-                b.generate_implied_end_tags_and_pop("p", ss, sl);
+                b.generate_implied_end_tags_and_pop("p", ss, sl)
             }
             "li" | "dd" | "dt" => {
                 if b.stack.is_in_list_scope(name)
                     || (name == "dd" && b.stack.is_in_scope("dt"))
                     || (name == "dt" && b.stack.is_in_scope("dd"))
                 {
-                    b.generate_implied_end_tags_and_pop(name, ss, sl);
+                    return b.generate_implied_end_tags_and_pop(name, ss, sl);
                 }
+                None
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 if ["h1", "h2", "h3", "h4", "h5", "h6"]
@@ -964,27 +975,26 @@ mod in_body {
                     .any(|h| b.stack.is_in_scope(h))
                 {
                     b.generate_implied_end_tags(None, ss);
-                    b.pop_all_up_to_names(&["h1", "h2", "h3", "h4", "h5", "h6"], ss, sl);
+                    return b.pop_all_up_to_names(&["h1", "h2", "h3", "h4", "h5", "h6"], ss, sl);
                 }
+                None
             }
             "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" | "s" | "small"
-            | "strike" | "strong" | "tt" | "u" => {
-                b.adoption_agency(name, ss, sl);
-            }
+            | "strike" | "strong" | "tt" | "u" => b.adoption_agency(name, ss, sl),
             "applet" | "marquee" | "object" => {
                 if b.stack.is_in_scope(name) {
                     b.generate_implied_end_tags(None, ss);
-                    b.pop_all_up_to_name(name, ss, sl);
+                    let result = b.pop_all_up_to_name(name, ss, sl);
                     b.afe.clear_to_marker();
+                    return result;
                 }
+                None
             }
             "br" => {
                 b.error("end tag </br> is invalid, assuming start tag", ss);
-                super::start_tag(b, d, name, Attributes::new(), false, ss, sl);
+                super::start_tag(b, d, name, Attributes::new(), false, ss, sl)
             }
-            _ => {
-                b.any_other_end_tag(name, ss, sl);
-            }
+            _ => b.any_other_end_tag(name, ss, sl),
         }
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
@@ -1025,9 +1035,10 @@ mod text_mode {
         _name: &str,
         ss: usize,
         sl: usize,
-    ) {
-        b.pop(ss, sl);
+    ) -> Option<usize> {
+        let popped = b.pop(ss, sl);
         d.restore_mode();
+        popped
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         b.error("unexpected end of input in text mode", pos);
@@ -1072,75 +1083,76 @@ mod in_table {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "caption" => {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
                 b.afe.insert_marker();
                 d.switch_mode(ModeId::InCaption);
-                b.insert_element(name, attrs, false, ss, sl);
+                Some(b.insert_element(name, attrs, false, ss, sl))
             }
             "colgroup" => {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
                 d.switch_mode(ModeId::InColumnGroup);
-                b.insert_element(name, attrs, false, ss, sl);
+                Some(b.insert_element(name, attrs, false, ss, sl))
             }
             "col" => {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
                 b.insert_element("colgroup", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InColumnGroup);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             "tbody" | "tfoot" | "thead" => {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
-                b.insert_element(name, attrs, false, ss, sl);
+                let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_mode(ModeId::InTableBody);
+                Some(uid)
             }
             "td" | "th" | "tr" => {
                 b.clear_stack_back(TABLE_CONTEXT, ss);
                 b.insert_element("tbody", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             "table" => {
                 b.error("unexpected <table> in table", ss);
                 if !b.stack.is_in_table_scope("table") {
-                    return;
+                    return None;
                 }
                 b.pop_all_up_to_name("table", ss, 0);
                 d.reset(b);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
-            "style" | "script" | "template" => {
-                in_head::start_tag(b, d, name, attrs, sc, ss, sl);
-            }
+            "style" | "script" | "template" => in_head::start_tag(b, d, name, attrs, sc, ss, sl),
             "form" => {
                 if b.stack.has_template() || b.form_element.is_some() {
                     b.error("invalid form in table, ignoring", ss);
-                    return;
+                    return None;
                 }
                 b.error("invalid form in table, inserting void element", ss);
                 let uid = b.insert_element("form", attrs, true, ss, sl);
                 b.form_element = b.stack.item_by_uid(uid).cloned();
+                Some(uid)
             }
             "input" => {
                 let is_hidden =
                     attrs.get("type").map(|t| t.eq_ignore_ascii_case("hidden")) == Some(true);
                 if is_hidden {
                     b.error("begrudgingly accepting a hidden input in table mode", ss);
-                    b.insert_element(name, attrs, true, ss, sl);
-                    return;
+                    return Some(b.insert_element(name, attrs, true, ss, sl));
                 }
                 b.error("invalid start tag in table, fostering", ss);
                 b.foster_parenting = true;
-                in_body::start_tag(b, d, name, attrs, sc, ss, sl);
+                let result = in_body::start_tag(b, d, name, attrs, sc, ss, sl);
                 b.foster_parenting = false;
+                result
             }
             _ => {
                 b.error("invalid start tag in table, fostering", ss);
                 b.foster_parenting = true;
-                in_body::start_tag(b, d, name, attrs, sc, ss, sl);
+                let result = in_body::start_tag(b, d, name, attrs, sc, ss, sl);
                 b.foster_parenting = false;
+                result
             }
         }
     }
@@ -1150,26 +1162,29 @@ mod in_table {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "table" => {
                 if !b.stack.is_in_table_scope("table") {
                     b.error("</table> found but no table element in scope, ignoring", ss);
-                    return;
+                    return None;
                 }
-                b.pop_all_up_to_name("table", ss, sl);
+                let result = b.pop_all_up_to_name("table", ss, sl);
                 d.reset(b);
+                result
             }
             "body" | "caption" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th"
             | "thead" | "tr" => {
                 b.error("ignoring invalid end tag inside table", ss);
+                None
             }
             "template" => in_head::end_tag(b, d, name, ss, sl),
             _ => {
                 b.error("unexpected end tag in table, fostering", ss);
                 b.foster_parenting = true;
-                in_body::end_tag(b, d, name, ss, sl);
+                let result = in_body::end_tag(b, d, name, ss, sl);
                 b.foster_parenting = false;
+                result
             }
         }
     }
@@ -1200,10 +1215,10 @@ mod in_table_text {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         d.flush_table_text(b);
         d.restore_mode();
-        super::start_tag(b, d, name, attrs, sc, ss, sl);
+        super::start_tag(b, d, name, attrs, sc, ss, sl)
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -1211,10 +1226,10 @@ mod in_table_text {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         d.flush_table_text(b);
         d.restore_mode();
-        super::end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl)
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
         d.flush_table_text(b);
@@ -1244,17 +1259,17 @@ mod in_caption {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr" => {
                 b.error(&format!("start tag <{name}> not allowed in caption"), ss);
                 if !b.stack.is_in_table_scope("caption") {
-                    return;
+                    return None;
                 }
                 b.pop_all_up_to_name("caption", ss, 0);
                 b.afe.clear_to_marker();
                 d.switch_mode(ModeId::InTable);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             _ => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1265,7 +1280,7 @@ mod in_caption {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "caption" => {
                 if !b.stack.is_in_table_scope("caption") {
@@ -1273,12 +1288,13 @@ mod in_caption {
                         "</caption> matches a start tag which is not in scope, ignoring",
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.generate_implied_end_tags(None, ss);
-                b.pop_all_up_to_name("caption", ss, sl);
+                let result = b.pop_all_up_to_name("caption", ss, sl);
                 b.afe.clear_to_marker();
                 d.switch_mode(ModeId::InTable);
+                result
             }
             "table" => {
                 if !b.stack.is_in_table_scope("caption") {
@@ -1286,17 +1302,18 @@ mod in_caption {
                         "</table> found in caption, but there is no caption in scope, ignoring",
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.generate_implied_end_tags(None, ss);
                 b.pop_all_up_to_name("caption", ss, 0);
                 b.afe.clear_to_marker();
                 d.switch_mode(ModeId::InTable);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             "body" | "col" | "colgroup" | "html" | "tbody" | "td" | "tfoot" | "th" | "thead"
             | "tr" => {
                 b.error(&format!("end tag </{name}> ignored in caption mode"), ss);
+                None
             }
             _ => in_body::end_tag(b, d, name, ss, sl),
         }
@@ -1343,12 +1360,10 @@ mod in_column_group {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
-            "col" => {
-                b.insert_element(name, attrs, true, ss, sl);
-            }
+            "col" => Some(b.insert_element(name, attrs, true, ss, sl)),
             "template" => in_head::start_tag(b, d, name, attrs, sc, ss, sl),
             _ => {
                 if b.stack.current().map(|e| e.html_name.as_str()) != Some("colgroup") {
@@ -1356,11 +1371,11 @@ mod in_column_group {
                         "start tag should close the colgroup but another element is open",
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTable);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
         }
     }
@@ -1370,7 +1385,7 @@ mod in_column_group {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "colgroup" => {
                 if b.stack.current().map(|e| e.html_name.as_str()) != Some("colgroup") {
@@ -1378,21 +1393,25 @@ mod in_column_group {
                         "</colgroup> found but another element is open, ignoring",
                         ss,
                     );
-                    return;
+                    return None;
                 }
-                b.pop(ss, sl);
+                let popped = b.pop(ss, sl);
                 d.switch_mode(ModeId::InTable);
+                popped
             }
-            "col" => b.error("</col> found in column group mode, ignoring", ss),
+            "col" => {
+                b.error("</col> found in column group mode, ignoring", ss);
+                None
+            }
             "template" => in_head::end_tag(b, d, name, ss, sl),
             _ => {
                 if b.stack.current().map(|e| e.html_name.as_str()) != Some("colgroup") {
                     b.error("non-matching end tag should close the colgroup but another element is open", ss);
-                    return;
+                    return None;
                 }
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTable);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
         }
     }
@@ -1423,18 +1442,19 @@ mod in_table_body {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "tr" => {
                 b.clear_stack_back(TABLE_BODY_CONTEXT, ss);
-                b.insert_element(name, attrs, false, ss, sl);
+                let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_mode(ModeId::InRow);
+                Some(uid)
             }
             "th" | "td" => {
                 b.clear_stack_back(TABLE_BODY_CONTEXT, ss);
                 b.insert_element("tr", Attributes::new(), false, ss, 0);
                 d.switch_mode(ModeId::InRow);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" => {
                 let in_scope = b.stack.is_in_table_scope("tbody")
@@ -1442,12 +1462,12 @@ mod in_table_body {
                     || b.stack.is_in_table_scope("tfoot");
                 if !in_scope {
                     b.error(&format!("<{name}> encountered in table body mode when there is no tbody/thead/tfoot in scope"), ss);
-                    return;
+                    return None;
                 }
                 b.clear_stack_back(TABLE_BODY_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTable);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             _ => in_table::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1458,19 +1478,21 @@ mod in_table_body {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "tbody" | "tfoot" | "thead" => {
                 if !b.stack.is_in_table_scope(name) {
                     b.error(&format!("</{name}> found but no {name} in scope"), ss);
-                    return;
+                    return None;
                 }
                 b.clear_stack_back(TABLE_BODY_CONTEXT, ss);
-                b.pop(ss, sl);
+                let popped = b.pop(ss, sl);
                 d.switch_mode(ModeId::InTable);
+                popped
             }
             "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" | "tr" => {
                 b.error(&format!("</{name}> found in table body mode, ignoring"), ss);
+                None
             }
             _ => in_table::end_tag(b, d, name, ss, sl),
         }
@@ -1502,13 +1524,14 @@ mod in_row {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "th" | "td" => {
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
-                b.insert_element(name, attrs, false, ss, sl);
+                let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_mode(ModeId::InCell);
                 b.afe.insert_marker();
+                Some(uid)
             }
             "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" | "tr" => {
                 if !b.stack.is_in_table_scope("tr") {
@@ -1516,12 +1539,12 @@ mod in_row {
                         &format!("<{name}> should close the tr but it is not in scope"),
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             _ => in_table::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1532,38 +1555,40 @@ mod in_row {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "tr" => {
                 if !b.stack.is_in_table_scope("tr") {
                     b.error("</tr> found but no tr element in scope", ss);
-                    return;
+                    return None;
                 }
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
-                b.pop(ss, sl);
+                let popped = b.pop(ss, sl);
                 d.switch_mode(ModeId::InTableBody);
+                popped
             }
             "table" => {
                 if !b.stack.is_in_table_scope("tr") {
                     b.error("</table> should close the tr but it is not in scope", ss);
-                    return;
+                    return None;
                 }
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             "tbody" | "tfoot" | "thead" => {
                 if !b.stack.is_in_table_scope(name) || !b.stack.is_in_table_scope("tr") {
-                    return;
+                    return None;
                 }
                 b.clear_stack_back(TABLE_ROW_CONTEXT, ss);
                 b.pop(ss, 0);
                 d.switch_mode(ModeId::InTableBody);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" => {
                 b.error(&format!("</{name}> encountered in row mode, ignoring"), ss);
+                None
             }
             _ => in_table::end_tag(b, d, name, ss, sl),
         }
@@ -1606,7 +1631,7 @@ mod in_cell {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "caption" | "col" | "colgroup" | "tbody" | "td" | "tfoot" | "th" | "thead" | "tr" => {
                 if !b.stack.is_in_table_scope("td") && !b.stack.is_in_table_scope("th") {
@@ -1614,10 +1639,10 @@ mod in_cell {
                         &format!("<{name}> tag should close the cell but none is in scope"),
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 close_the_cell(b, d, ss);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             _ => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1628,7 +1653,7 @@ mod in_cell {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "td" | "th" => {
                 if !b.stack.is_in_table_scope(name) {
@@ -1636,15 +1661,17 @@ mod in_cell {
                         &format!("</{name}> encountered but there is no {name} in scope, ignoring"),
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.generate_implied_end_tags(None, ss);
-                b.pop_all_up_to_name(name, ss, sl);
+                let result = b.pop_all_up_to_name(name, ss, sl);
                 b.afe.clear_to_marker();
                 d.switch_mode(ModeId::InRow);
+                result
             }
             "body" | "caption" | "col" | "colgroup" | "html" => {
                 b.error(&format!("unexpected </{name}> in cell, ignoring"), ss);
+                None
             }
             "table" | "tbody" | "tfoot" | "thead" | "tr" => {
                 if !b.stack.is_in_table_scope(name) {
@@ -1652,10 +1679,10 @@ mod in_cell {
                         &format!("</{name}> encountered but there is no {name} in scope, ignoring"),
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 close_the_cell(b, d, ss);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             _ => in_body::end_tag(b, d, name, ss, sl),
         }
@@ -1692,14 +1719,14 @@ mod in_select {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
             "option" => {
                 if b.stack.current().map(|e| e.html_name.as_str()) == Some("option") {
                     b.pop(ss, 0);
                 }
-                b.insert_element("option", attrs, false, ss, sl);
+                Some(b.insert_element("option", attrs, false, ss, sl))
             }
             "optgroup" => {
                 if b.stack.current().map(|e| e.html_name.as_str()) == Some("option") {
@@ -1708,7 +1735,7 @@ mod in_select {
                 if b.stack.current().map(|e| e.html_name.as_str()) == Some("optgroup") {
                     b.pop(ss, 0);
                 }
-                b.insert_element("optgroup", attrs, false, ss, sl);
+                Some(b.insert_element("optgroup", attrs, false, ss, sl))
             }
             "select" => {
                 if !b.stack.is_in_select_scope("select") {
@@ -1716,26 +1743,30 @@ mod in_select {
                         "<select> found in select mode but no select element is in scope, ignoring",
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.error("<select> found inside a select element", ss);
                 b.pop_all_up_to_name("select", ss, sl);
                 d.reset(b);
+                None
             }
             "input" | "keygen" | "textarea" => {
                 b.error(&format!("<{name}> found inside a select element"), ss);
                 if !b.stack.is_in_select_scope("select") {
-                    return;
+                    return None;
                 }
                 b.pop_all_up_to_name("select", ss, 0);
                 d.reset(b);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             "script" | "template" => in_head::start_tag(b, d, name, attrs, sc, ss, sl),
-            _ => b.error(
-                &format!("<{name}> found inside a select element, ignoring"),
-                ss,
-            ),
+            _ => {
+                b.error(
+                    &format!("<{name}> found inside a select element, ignoring"),
+                    ss,
+                );
+                None
+            }
         }
     }
     pub fn end_tag<H: TreeHandler>(
@@ -1744,7 +1775,7 @@ mod in_select {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "optgroup" => {
                 if b.stack.current().map(|e| e.html_name.as_str()) == Some("option")
@@ -1757,27 +1788,31 @@ mod in_select {
                 }
                 if b.stack.current().map(|e| e.html_name.as_str()) != Some("optgroup") {
                     b.error("unexpected </optgroup>, ignoring", ss);
-                    return;
+                    return None;
                 }
-                b.pop(ss, sl);
+                b.pop(ss, sl)
             }
             "option" => {
                 if b.stack.current().map(|e| e.html_name.as_str()) != Some("option") {
                     b.error("unexpected </option>, ignoring", ss);
-                    return;
+                    return None;
                 }
-                b.pop(ss, sl);
+                b.pop(ss, sl)
             }
             "select" => {
                 if !b.stack.is_in_select_scope("select") {
                     b.error("</select> found but the select element is not in scope", ss);
-                    return;
+                    return None;
                 }
-                b.pop_all_up_to_name("select", ss, sl);
+                let result = b.pop_all_up_to_name("select", ss, sl);
                 d.reset(b);
+                result
             }
             "template" => in_head::end_tag(b, d, name, ss, sl),
-            _ => b.error(&format!("unexpected </{name}> in select, ignoring"), ss),
+            _ => {
+                b.error(&format!("unexpected </{name}> in select, ignoring"), ss);
+                None
+            }
         }
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
@@ -1806,7 +1841,7 @@ mod in_select_in_table {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th" => {
                 b.error(
@@ -1815,7 +1850,7 @@ mod in_select_in_table {
                 );
                 b.pop_all_up_to_name("select", ss, 0);
                 d.reset(b);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
             _ => in_select::start_tag(b, d, name, attrs, sc, ss, sl),
         }
@@ -1826,7 +1861,7 @@ mod in_select_in_table {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th" => {
                 if !b.stack.is_in_table_scope(name) {
@@ -1834,7 +1869,7 @@ mod in_select_in_table {
                         &format!("unexpected </{name}> in select in table, ignoring"),
                         ss,
                     );
-                    return;
+                    return None;
                 }
                 b.error(
                     &format!("unexpected </{name}> in select in table, closing select"),
@@ -1842,7 +1877,7 @@ mod in_select_in_table {
                 );
                 b.pop_all_up_to_name("select", ss, 0);
                 d.reset(b);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
             _ => in_select::end_tag(b, d, name, ss, sl),
         }
@@ -1873,12 +1908,11 @@ mod in_template {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "base" | "basefont" | "bgsound" | "link" | "meta" | "noframes" | "script" | "style"
             | "template" | "title" => {
-                in_head::start_tag(b, d, name, attrs, sc, ss, sl);
-                return;
+                return in_head::start_tag(b, d, name, attrs, sc, ss, sl);
             }
             "caption" | "colgroup" | "tbody" | "tfoot" | "thead" => {
                 d.template_mode_stack_pop();
@@ -1906,7 +1940,7 @@ mod in_template {
                 d.switch_mode(ModeId::InBody);
             }
         }
-        super::start_tag(b, d, name, attrs, sc, ss, sl);
+        super::start_tag(b, d, name, attrs, sc, ss, sl)
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -1914,10 +1948,13 @@ mod in_template {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "template" => in_head::end_tag(b, d, name, ss, sl),
-            _ => b.error(&format!("unexpected </{name}> in template, ignoring"), ss),
+            _ => {
+                b.error(&format!("unexpected </{name}> in template, ignoring"), ss);
+                None
+            }
         }
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, d: &mut Dispatcher, pos: usize) {
@@ -1963,13 +2000,13 @@ mod after_body {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
             _ => {
                 b.error("unexpected start tag after body", ss);
                 d.switch_mode(ModeId::InBody);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
         }
     }
@@ -1979,19 +2016,20 @@ mod after_body {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => {
                 if b.is_fragment {
                     b.error("unexpected </html> in fragment", ss);
-                    return;
+                    return None;
                 }
                 d.switch_mode(ModeId::AfterAfterBody);
+                None
             }
             _ => {
                 b.error("unexpected end tag after body", ss);
                 d.switch_mode(ModeId::InBody);
-                super::end_tag(b, d, name, ss, sl);
+                super::end_tag(b, d, name, ss, sl)
             }
         }
     }
@@ -2029,13 +2067,13 @@ mod after_after_body {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
             _ => {
                 b.error("unexpected start tag after after body", ss);
                 d.switch_mode(ModeId::InBody);
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
+                super::start_tag(b, d, name, attrs, sc, ss, sl)
             }
         }
     }
@@ -2045,10 +2083,10 @@ mod after_after_body {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         b.error("unexpected end tag after after body", ss);
         d.switch_mode(ModeId::InBody);
-        super::end_tag(b, d, name, ss, sl);
+        super::end_tag(b, d, name, ss, sl)
     }
     pub fn end_document<H: TreeHandler>(b: &mut TreeBuilder<H>, _d: &mut Dispatcher, pos: usize) {
         b.stop_parsing(pos);
@@ -2126,7 +2164,7 @@ mod in_foreign {
         sc: bool,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         let allowed = !NOT_ALLOWED.contains(&name);
         if !allowed {
             b.error(&format!("unexpected <{name}> tag in foreign content"), ss);
@@ -2137,15 +2175,14 @@ mod in_foreign {
                     }
                     b.pop(ss, 0);
                 }
-                super::start_tag(b, d, name, attrs, sc, ss, sl);
-                return;
+                return super::start_tag(b, d, name, attrs, sc, ss, sl);
             }
         }
         let acn_ns = b
             .adjusted_current_node()
             .and_then(|uid| b.stack.item_by_uid(uid).map(|e| e.namespace.clone()))
             .unwrap_or(NS_HTML.to_string());
-        b.insert_foreign(&acn_ns, name, attrs, sc, ss, sl);
+        Some(b.insert_foreign(&acn_ns, name, attrs, sc, ss, sl))
     }
     pub fn end_tag<H: TreeHandler>(
         b: &mut TreeBuilder<H>,
@@ -2153,7 +2190,7 @@ mod in_foreign {
         name: &str,
         ss: usize,
         sl: usize,
-    ) {
+    ) -> Option<usize> {
         let node = b.stack.current().map(|e| e.name.clone());
         if node.as_deref().map(|n| !n.eq_ignore_ascii_case(name)) == Some(true) {
             b.error("mismatched end tag in foreign content", ss);
@@ -2161,15 +2198,16 @@ mod in_foreign {
         for idx in (1..b.stack.length()).rev() {
             let elt = b.stack.item(idx);
             if elt.name.eq_ignore_ascii_case(name) {
-                b.pop_all_up_to_element(elt.uid, ss, sl);
-                return;
+                let uid = elt.uid;
+                b.pop_all_up_to_element(uid, ss, sl);
+                return Some(uid);
             }
             if elt.namespace == NS_HTML {
                 // Re-dispatch as the current handler's end tag.
-                super::end_tag(b, d, name, ss, sl);
-                return;
+                return super::end_tag(b, d, name, ss, sl);
             }
         }
+        None
     }
     pub fn end_document<H: TreeHandler>(_b: &mut TreeBuilder<H>, _d: &mut Dispatcher, _pos: usize) {
     }

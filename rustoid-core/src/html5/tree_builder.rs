@@ -340,12 +340,13 @@ impl<H: TreeHandler> TreeBuilder<H> {
     }
 
     /// Generate implied end tags and pop everything up to and including `name`.
+    /// Returns the uid of the popped element named `name`, or `None` if absent.
     pub fn generate_implied_end_tags_and_pop(
         &mut self,
         name: &str,
         source_start: usize,
         source_length: usize,
-    ) {
+    ) -> Option<usize> {
         self.generate_implied_end_tags(Some(name), source_start);
         if self.stack.current().map(|e| e.html_name.as_str()) != Some(name) {
             self.handler.error(
@@ -353,48 +354,70 @@ impl<H: TreeHandler> TreeBuilder<H> {
                 source_start,
             );
         }
-        self.pop_all_up_to_name(name, source_start, source_length);
+        self.pop_all_up_to_name(name, source_start, source_length)
     }
 
     /// Pop elements until an element with `uid` is popped.
-    pub fn pop_all_up_to_element(&mut self, uid: usize, source_start: usize, source_length: usize) {
+    /// Returns `Some(uid)` if that element was popped, `None` otherwise.
+    pub fn pop_all_up_to_element(
+        &mut self,
+        uid: usize,
+        source_start: usize,
+        source_length: usize,
+    ) -> Option<usize> {
+        let mut popped_uid = None;
         while let Some(popped) = self.pop(source_start, 0) {
             if popped == uid {
+                popped_uid = Some(uid);
                 break;
             }
         }
         let _ = source_length;
+        popped_uid
     }
 
     /// Pop elements until an element named `name` is popped.
-    pub fn pop_all_up_to_name(&mut self, name: &str, source_start: usize, source_length: usize) {
+    /// Returns the uid of the popped element named `name`, or `None`.
+    pub fn pop_all_up_to_name(
+        &mut self,
+        name: &str,
+        source_start: usize,
+        source_length: usize,
+    ) -> Option<usize> {
+        let mut matched = None;
         while let Some(uid) = self.pop(source_start, 0) {
             let Some(e) = self.stack.item_by_uid(uid) else {
                 break;
             };
             if e.html_name == name {
+                matched = Some(uid);
                 break;
             }
         }
         let _ = source_length;
+        matched
     }
 
     /// Pop elements until an element with one of `names` is popped.
+    /// Returns the uid of the popped matched element, or `None`.
     pub fn pop_all_up_to_names(
         &mut self,
         names: &[&str],
         source_start: usize,
         source_length: usize,
-    ) {
+    ) -> Option<usize> {
+        let mut matched = None;
         while let Some(uid) = self.pop(source_start, 0) {
             let Some(e) = self.stack.item_by_uid(uid) else {
                 break;
             };
             if names.contains(&e.html_name.as_str()) {
+                matched = Some(uid);
                 break;
             }
         }
         let _ = source_length;
+        matched
     }
 
     /// Clear the stack back to an element in `names` (without popping it).
@@ -426,7 +449,13 @@ impl<H: TreeHandler> TreeBuilder<H> {
     }
 
     /// The "any other end tag" algorithm in "in body" mode.
-    pub fn any_other_end_tag(&mut self, name: &str, source_start: usize, source_length: usize) {
+    /// Returns the uid of the popped matching element, or `None` if not found.
+    pub fn any_other_end_tag(
+        &mut self,
+        name: &str,
+        source_start: usize,
+        source_length: usize,
+    ) -> Option<usize> {
         let mut found_idx = None;
         let mut found_uid = None;
         for i in (0..self.stack.length()).rev() {
@@ -444,12 +473,12 @@ impl<H: TreeHandler> TreeBuilder<H> {
                     ),
                     source_start,
                 );
-                return;
+                return None;
             }
         }
 
         let (Some(idx), Some(uid)) = (found_idx, found_uid) else {
-            return;
+            return None;
         };
         self.generate_implied_end_tags(Some(name), source_start);
         if self.stack.current().map(|e| e.uid) != Some(uid) {
@@ -461,43 +490,48 @@ impl<H: TreeHandler> TreeBuilder<H> {
         for _j in ((idx + 1)..self.stack.length()).rev() {
             self.pop(source_start, 0);
         }
-        self.pop(source_start, source_length);
+        self.pop(source_start, source_length)
     }
 
     /// The adoption agency algorithm.
-    pub fn adoption_agency(&mut self, subject: &str, source_start: usize, source_length: usize) {
+    /// Returns the uid of the removed formatting element, or `None`.
+    pub fn adoption_agency(
+        &mut self,
+        subject: &str,
+        source_start: usize,
+        source_length: usize,
+    ) -> Option<usize> {
         // Step 1.
         if let Some(cur) = self.stack.current()
             && cur.html_name == subject
             && !self.afe.is_in_list(cur.uid)
         {
-            let _ = self.pop(source_start, source_length);
-            return;
+            return self.pop(source_start, source_length);
         }
 
         // Step 5: last AFE element with name `subject`.
         let fmt_uid = self.afe.find_element_by_name(subject).map(|e| e.uid);
         let Some(fmt_uid) = fmt_uid else {
-            self.any_other_end_tag(subject, source_start, source_length);
-            return;
+            return self.any_other_end_tag(subject, source_start, source_length);
         };
 
         // Step 6: not in stack -> remove from AFE and abort.
         if self.stack.item_by_uid(fmt_uid).is_none() {
             self.afe.remove(fmt_uid);
-            return;
+            return None;
         }
 
         // Step 7: not in scope -> ignore.
         if !self.stack.is_uid_in_scope(fmt_uid) {
-            return;
+            return None;
         }
 
         // Steps 9-19 (furthest block, bookmark, and reconstruction) are the
         // adoption agency algorithm proper; they are layered in by the
         // Dispatcher/InBody port. For the common mismatched-formatting case we
         // close the formatting element and remove it from the AFE list.
-        self.pop_all_up_to_element(fmt_uid, source_start, source_length);
+        let result = self.pop_all_up_to_element(fmt_uid, source_start, source_length);
         self.afe.remove(fmt_uid);
+        result
     }
 }

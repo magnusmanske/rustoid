@@ -240,7 +240,13 @@ impl Html5TreeBuilder {
                     if name == "table" && self.table_depth > 0 {
                         self.table_depth -= 1;
                     }
-                    modes::end_tag(&mut self.builder, &mut self.dispatcher, &name, 0, 0);
+                    let ended =
+                        modes::end_tag(&mut self.builder, &mut self.dispatcher, &name, 0, 0);
+                    if ended.is_none() {
+                        // The tag was stripped; insert an mw:Placeholder for
+                        // round-tripping (mirrors `insertPlaceholderMeta`).
+                        self.insert_placeholder_meta(&name, &t.data_parsoid, false);
+                    }
                 }
                 ParsoidToken::Comment(c) => {
                     self.builder.comment(None, &c.value, 0, 0);
@@ -294,19 +300,9 @@ impl Html5TreeBuilder {
         let data_mw = Self::extract_data_mw(attribs);
         let attrs = self.stash_data_attribs(attribs, dp, data_mw);
 
-        // The faithful port needs to know whether `startTag` produced an element;
-        // when `TagTk` is stripped outside a table, `handleDeletedStartTag` takes
-        // over. The table-depth shortcut below covers the common `td|tr|th` case
-        // before handing off, mirroring the PHP `handleDeletedStartTag` guard.
-        if self.table_depth == 0
-            && dp.stx.as_deref() != Some("html")
-            && matches!(name, "td" | "tr" | "th")
-        {
-            self.handle_deleted_start_tag(name, dp);
-            return;
-        }
-
-        modes::start_tag(
+        // Mirrors `insertExplicitStartTag`: if the tag produced no element
+        // (stripped/ignored), handle it as a deleted start tag.
+        let inserted = modes::start_tag(
             &mut self.builder,
             &mut self.dispatcher,
             name,
@@ -315,6 +311,9 @@ impl Html5TreeBuilder {
             0,
             0,
         );
+        if inserted.is_none() {
+            self.handle_deleted_start_tag(name, dp);
+        }
     }
 
     /// Insert `td/tr/th` tag source or a placeholder meta (mirrors
@@ -369,7 +368,7 @@ impl Html5TreeBuilder {
         if !was_inserted {
             let attrs = self.stash_data_attribs(attribs, dp, data_mw);
             let void = crate::html5::html_data::is_void_tag(name);
-            modes::start_tag(
+            let inserted = modes::start_tag(
                 &mut self.builder,
                 &mut self.dispatcher,
                 name,
@@ -378,8 +377,14 @@ impl Html5TreeBuilder {
                 0,
                 0,
             );
-            if !void {
-                modes::end_tag(&mut self.builder, &mut self.dispatcher, name, 0, 0);
+            if inserted.is_some() {
+                if !void {
+                    modes::end_tag(&mut self.builder, &mut self.dispatcher, name, 0, 0);
+                }
+            } else {
+                // The self-closing tag was stripped; insert a placeholder so it
+                // round-trips (mirrors `insertPlaceholderMeta`).
+                self.insert_placeholder_meta(name, dp, true);
             }
         }
     }
@@ -560,6 +565,34 @@ mod tests {
         if let Some(dp_json) = &placeholder.data_parsoid {
             assert!(dp_json.contains("\"src\":\"</div>\""), "{dp_json}");
             assert!(dp_json.contains("\"name\":\"div\""), "{dp_json}");
+        } else {
+            panic!("placeholder missing data-parsoid");
+        }
+    }
+
+    #[test]
+    fn test_stripped_end_tag_placeholder() {
+        // `</foo>` (literal HTML, no matching open element) is stripped and
+        // becomes an `mw:Placeholder/StrippedTag` meta with `src`/`name`.
+        let dp = DataParsoid {
+            stx: Some("html".to_string()),
+            ..DataParsoid::default()
+        };
+        let items = vec![Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "foo",
+            vec![],
+            dp,
+        )))];
+        let doc = token_stream_to_ast_html(&items);
+
+        let placeholder = find_placeholder(&doc).expect("expected a placeholder meta");
+        assert_eq!(
+            placeholder.get_attr("typeof"),
+            Some("mw:Placeholder/StrippedTag")
+        );
+        if let Some(dp_json) = &placeholder.data_parsoid {
+            assert!(dp_json.contains("\"name\":\"foo\""), "{dp_json}");
+            assert!(dp_json.contains("\"src\":\"</foo>\""), "{dp_json}");
         } else {
             panic!("placeholder missing data-parsoid");
         }
