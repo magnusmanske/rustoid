@@ -709,6 +709,16 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_hr() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("----", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<hr"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
@@ -779,5 +789,54 @@ mod tests {
             html.contains("Template loop detected") || html.contains("limit exceeded"),
             "got: {html}"
         );
+    }
+
+    #[test]
+    fn test_wikitext_to_html_entity_named() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("A &amp; B", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("typeof=\"mw:Entity\""), "got: {html}");
+        // The decoded `&` is HTML-escaped as `&amp;` inside the span.
+        assert!(
+            html.contains("> &amp;</span>") || html.contains(">&amp;</span>"),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn test_wikitext_to_html_entity_numeric() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("&#169;", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("typeof=\"mw:Entity\""), "got: {html}");
+        assert!(html.contains("©"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_entity_hex() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("&#x1F600;", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("typeof=\"mw:Entity\""), "got: {html}");
+        assert!(html.contains("😀"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_entity_unknown_left_literal() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("&foo;", &ParserOptions::for_page("Test"))
+            .unwrap();
+        // Unknown named entities are not wrapped in an mw:Entity span.
+        assert!(!html.contains("mw:Entity"), "got: {html}");
+        assert!(html.contains("&amp;foo;"), "got: {html}");
     }
 }
