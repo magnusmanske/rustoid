@@ -721,9 +721,10 @@ impl<'a> PegTokenizer<'a> {
             dp,
         )));
 
-        // Parse inline content after the bullets.
+        // Parse inline content after the bullets. The single space separator
+        // between the bullets and the content is not part of the item text.
+        self.consume_spaces();
         self.try_parse_inlineline();
-        self.at_sol = false;
         true
     }
 

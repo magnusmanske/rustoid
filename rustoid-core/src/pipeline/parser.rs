@@ -499,6 +499,54 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_italic() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("''italic''", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<i>"), "got: {html}");
+        assert!(html.contains("italic"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_bold_italic() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("'''''both'''''", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<b>"), "got: {html}");
+        assert!(html.contains("<i>"), "got: {html}");
+        assert!(html.contains("both"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_unordered_list() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("* one\n* two", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<ul"), "got: {html}");
+        assert!(html.contains("<li"), "got: {html}");
+        assert!(html.contains("one"), "got: {html}");
+        assert!(html.contains("two"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_paragraph_break() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("First\n\nSecond", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("First"), "got: {html}");
+        assert!(html.contains("Second"), "got: {html}");
+        assert!(html.matches("<p>").count() >= 2, "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_literal_html_tag_stx() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
