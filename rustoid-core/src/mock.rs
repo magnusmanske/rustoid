@@ -215,8 +215,11 @@ impl MockSiteConfig {
         config.add_interwiki("commons", "https://commons.wikimedia.org/wiki/$1", true);
         config.add_interwiki("meta", "https://meta.wikimedia.org/wiki/$1", true);
         config.add_interwiki("mw", "https://www.mediawiki.org/wiki/$1", true);
+        // Interwiki prefixes used by the upstream parser fixtures.
+        config.add_interwiki("meatball", "http://www.usemod.com/cgi-bin/mb.pl?$1", false);
 
         // Register language prefixes (language links, not plain interwikis).
+        config.add_language_interwiki("en", "https://en.wikipedia.org/wiki/$1");
         config.add_language_interwiki("de", "https://de.wikipedia.org/wiki/$1");
         config.add_language_interwiki("fr", "https://fr.wikipedia.org/wiki/$1");
 
@@ -290,6 +293,8 @@ impl MockSiteConfig {
         let mut info = InterwikiInfo::new(url, true);
         info.language = Some(prefix.to_string());
         info.extralanglink = Some(true);
+        // Language links are protocol-relative by default (strip http:/https:).
+        info.protorel = Some(true);
         self.interwiki_map.insert(prefix.to_string(), info);
     }
 

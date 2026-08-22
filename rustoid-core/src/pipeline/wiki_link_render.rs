@@ -860,7 +860,8 @@ mod tests {
                 .iter()
                 .find(|kv| kv.key.as_str() == Some("href"))
                 .and_then(|kv| kv.value.as_str());
-            assert_eq!(href, Some("https://de.wikipedia.org/wiki/Foo"));
+            // Language links are protocol-relative (protorel strips the scheme).
+            assert_eq!(href, Some("//de.wikipedia.org/wiki/Foo"));
         }
         // Language link should be recorded in metadata.
         assert_eq!(ctx.metadata_mut().language_links.len(), 1);
