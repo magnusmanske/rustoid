@@ -86,17 +86,35 @@ impl ParagraphWrapper {
     }
 
     /// Dispatch a single token to the correct handler.
+    ///
+    /// Mirrors PHP `LineBasedHandler::process`'s dispatch order:
+    /// NlTk → onNewline, CompoundTk → onCompoundTk, EOFTk → onEnd,
+    /// otherwise → onAny (when `onAnyEnabled`).
     fn on_token(&mut self, token: Item) -> Option<Vec<Item>> {
         match &token {
             Item::Tok(ParsoidToken::Nl(_)) => self.on_newline_or_eof(token),
             Item::Tok(ParsoidToken::Eof(_)) => self.on_newline_or_eof(token),
-            Item::Tok(ParsoidToken::EmptyLine(_)) => {
-                // onCompoundTk: EmptyLineTk → pass through (return None).
-                // But actually the PHP onAny handles EmptyLineTk as SOL-transparent.
-                self.on_any(token)
-            }
+            Item::Tok(ParsoidToken::List(_))
+            | Item::Tok(ParsoidToken::IndentPre(_))
+            | Item::Tok(ParsoidToken::EmptyLine(_)) => self.on_compound_tk(token),
             _ => self.on_any(token),
         }
+    }
+
+    /// Handle compound tokens (ListTk / IndentPreTk / EmptyLineTk).
+    ///
+    /// Faithful port of PHP `ParagraphWrapper::onCompoundTk`:
+    /// - DL-DD lists are flattened and their nested tokens re-wrapped;
+    /// - all other compound tokens pass through unchanged (return the token).
+    fn on_compound_tk(&mut self, token: Item) -> Option<Vec<Item>> {
+        if let Item::Tok(ParsoidToken::List(t)) = &token
+            && t.is_dl_dd_list()
+        {
+            let nested = t.get_nested_tokens().to_vec();
+            return Some(self.wrap(nested));
+        }
+        // EmptyLineTk / IndentPreTk / non-DL-DD ListTk: pass through.
+        Some(vec![token])
     }
 
     /// Handle newline or EOF tokens.
@@ -287,14 +305,15 @@ impl ParagraphWrapper {
         Some(res)
     }
 
-    /// Flush buffers with a token, emitting the token directly (SOL-transparent
-    /// tokens pass through immediately rather than being held for `<p>` wrapping).
+    /// Flush buffers with a token, holding the token in `curr_line_tokens`
+    /// rather than emitting it. Mirrors PHP `flushBuffers` exactly.
     fn flush_buffers(&mut self, token: Item) -> Option<Vec<Item>> {
+        // Assert: PHP requires newLineCount === 0 here (callers guarantee it).
+        self.curr_line_tokens.push(token);
         let mut res_toks = std::mem::take(&mut self.token_buffer);
         let nl_ws_tokens = std::mem::take(&mut self.nl_ws_tokens);
+        self.reset_buffers();
         res_toks.extend(nl_ws_tokens);
-        // Emit the SOL-transparent token at its position.
-        res_toks.push(token);
         Some(res_toks)
     }
 
@@ -526,5 +545,66 @@ mod tests {
             .iter()
             .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "div"));
         assert!(has_div);
+    }
+
+    #[test]
+    fn test_sol_transparent_link_followed_by_newline() {
+        // "#REDIRECT [[Main Page]]\nA newline" — the SOL-transparent redirect
+        // <link> must be flushed with exactly one literal newline before the
+        // following paragraph (no spurious blank line).
+        let link = Item::Tok(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
+            "link",
+            vec![],
+            DataParsoid::default(),
+        )));
+        // The ParagraphWrapper only inspects the tag name, not `rel`; mutate via
+        // a helper is unnecessary — a bare <link> is already SOL-transparent.
+        let mut wrapper = ParagraphWrapper::new();
+        let out = wrapper.wrap(vec![link, nl(), text("A newline"), eof()]);
+
+        // Expected token sequence:
+        //   <link> nl <p> "A newline" </p> eof
+        let names: Vec<String> = out
+            .iter()
+            .map(|it| match it {
+                Item::Tok(t) => format!("{t:?}"),
+                Item::Str(s) => format!("Str({s:?})"),
+            })
+            .collect();
+
+        let newline_count = out
+            .iter()
+            .filter(|it| matches!(it, Item::Tok(ParsoidToken::Nl(_))))
+            .count();
+        assert_eq!(
+            newline_count, 1,
+            "expected a single newline, got {:?}",
+            names
+        );
+
+        let p_open = out
+            .iter()
+            .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "p"));
+        assert!(p_open, "expected <p> open, got {:?}", names);
+    }
+
+    #[test]
+    fn test_list_compound_passes_through() {
+        // A non-DL-DD ListTk must pass through unchanged (not wrapped in <p>).
+        let list = Item::Tok(ParsoidToken::List(crate::wikitext::tokens_v2::ListTk::new()));
+        let mut wrapper = ParagraphWrapper::new();
+        let out = wrapper.wrap(vec![list, eof()]);
+
+        // Output must contain the List token and no <p>.
+        let list_count = out
+            .iter()
+            .filter(|it| matches!(it, Item::Tok(ParsoidToken::List(_))))
+            .count();
+        assert_eq!(list_count, 1, "expected the List token to pass through");
+        let p_count = out
+            .iter()
+            .filter(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "p"))
+            .count();
+        assert_eq!(p_count, 0, "expected no <p> wrapping around a list");
     }
 }
