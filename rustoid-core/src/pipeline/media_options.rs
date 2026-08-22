@@ -276,8 +276,10 @@ mod tests {
 
     #[test]
     fn test_get_wrapper_info() {
-        let mut opts = MediaOpts::default();
-        opts.halign = Some("right".to_string());
+        let opts = MediaOpts {
+            halign: Some("right".to_string()),
+            ..MediaOpts::default()
+        };
         let (classes, is_inline) = get_wrapper_info(&opts);
         assert!(!is_inline);
         assert!(classes.contains(&"mw-halign-right".to_string()));

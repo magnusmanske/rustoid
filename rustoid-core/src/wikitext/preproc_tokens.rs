@@ -710,10 +710,10 @@ mod tests {
         let pieces = tokenize_preproc_pieces("a<!-- c -->b");
         let mut has_comment = false;
         for p in &pieces {
-            if let PreprocPiece::Tk(PreprocTk::Simple { ty, .. }) = p {
-                if *ty == PreprocType::Comment {
-                    has_comment = true;
-                }
+            if let PreprocPiece::Tk(PreprocTk::Simple { ty, .. }) = p
+                && *ty == PreprocType::Comment
+            {
+                has_comment = true;
             }
         }
         assert!(has_comment);

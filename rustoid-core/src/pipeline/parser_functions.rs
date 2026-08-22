@@ -10,7 +10,7 @@
 //! Functions operate on `Params` (a key/value argument array) and return token
 //! arrays (strings and `<a>`/`<span>`/`<meta>` tokens).
 
-use crate::wikitext::preprocessor::evaluate_expression;
+use crate::error::RustoidError;
 use crate::wikitext::token_utils::tokens_to_string;
 use crate::wikitext::tokens_v2::{Item, KV, KeyValue, ParsoidToken};
 
@@ -447,6 +447,157 @@ fn key_value_to_item(v: &KeyValue) -> Item {
                 ))
             }
         }
+    }
+}
+
+/// Very basic expression evaluator for `#expr` and `#ifexpr`.
+/// Supports +, -, *, /, % and parentheses. Returns result as string.
+pub(crate) fn evaluate_expression(expr: &str) -> String {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return String::new();
+    }
+
+    // Try to parse as a simple integer expression.
+    let tokens = tokenize_expr(expr);
+    match eval_simple(&tokens) {
+        Ok(val) => {
+            if val == val.trunc() {
+                val.to_string()
+            } else {
+                format!("{val:.6}")
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
+            }
+        }
+        Err(_) => format!("<strong class=\"error\">Expression error: {expr}</strong>"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExprToken {
+    Num(f64),
+    Op(char),
+    LParen,
+    RParen,
+}
+
+fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let bytes = expr.as_bytes();
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' => {
+                i += 1;
+            }
+            b'+' | b'-' | b'*' | b'/' | b'%' => {
+                tokens.push(ExprToken::Op(bytes[i] as char));
+                i += 1;
+            }
+            b'(' => {
+                tokens.push(ExprToken::LParen);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(ExprToken::RParen);
+                i += 1;
+            }
+            b'0'..=b'9' | b'.' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                if let Ok(num) = expr[start..i].parse::<f64>() {
+                    tokens.push(ExprToken::Num(num));
+                }
+            }
+            _ => {
+                i += 1;
+            } // Skip unknown chars
+        }
+    }
+    tokens
+}
+
+/// Simple precedence-climbing expression evaluator.
+fn eval_simple(tokens: &[ExprToken]) -> std::result::Result<f64, RustoidError> {
+    let mut pos = 0;
+    expr_parse(tokens, &mut pos, 0)
+}
+
+fn expr_parse(
+    tokens: &[ExprToken],
+    pos: &mut usize,
+    min_prec: u8,
+) -> std::result::Result<f64, RustoidError> {
+    let mut lhs = expr_primary(tokens, pos)?;
+    while *pos < tokens.len() {
+        let op = match tokens.get(*pos) {
+            Some(ExprToken::Op(c)) => *c,
+            _ => break,
+        };
+        let prec = precedence(op);
+        if prec < min_prec {
+            break;
+        }
+        *pos += 1;
+        let rhs = expr_parse(tokens, pos, prec + 1)?;
+        lhs = match op {
+            '+' => lhs + rhs,
+            '-' => lhs - rhs,
+            '*' => lhs * rhs,
+            '/' => {
+                if rhs == 0.0 {
+                    return Err(RustoidError::Parse("division by zero".to_string()));
+                }
+                lhs / rhs
+            }
+            '%' => {
+                if rhs == 0.0 {
+                    return Err(RustoidError::Parse("modulo by zero".to_string()));
+                }
+                lhs - rhs * (lhs / rhs).trunc()
+            }
+            _ => lhs,
+        };
+    }
+    Ok(lhs)
+}
+
+fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f64, RustoidError> {
+    if *pos >= tokens.len() {
+        return Ok(0.0);
+    }
+    match tokens[*pos] {
+        ExprToken::Num(n) => {
+            *pos += 1;
+            Ok(n)
+        }
+        ExprToken::Op('-') => {
+            *pos += 1;
+            let val = expr_primary(tokens, pos)?;
+            Ok(-val)
+        }
+        ExprToken::LParen => {
+            *pos += 1;
+            let val = expr_parse(tokens, pos, 0)?;
+            if *pos < tokens.len() && tokens[*pos] == ExprToken::RParen {
+                *pos += 1;
+            }
+            Ok(val)
+        }
+        _ => Ok(0.0),
+    }
+}
+
+fn precedence(op: char) -> u8 {
+    match op {
+        '+' | '-' => 1,
+        '*' | '/' | '%' => 2,
+        _ => 0,
     }
 }
 

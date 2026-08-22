@@ -21,8 +21,14 @@ type ResolvedTarget = crate::pipeline::template_handler::ResolvedTarget;
 
 /// Locate the `<body>` element in the tree-builder output and wrap its children
 /// in `<section>` wrappers (see `pipeline::section_wrapper`).
-fn wrap_sections_in_ast(ast: &mut Node) {
+///
+/// No-op when `wrap_sections` is false (the fragment-rendering case).
+fn wrap_sections_in_ast(ast: &mut Node, wrap_sections: bool) {
     use crate::dom::node::{ElementKind, NodeKind};
+
+    if !wrap_sections {
+        return;
+    }
 
     // The tree builder produces `<html><head>…</head><body>…</body></html>`.
     for html in &mut ast.children {
@@ -221,20 +227,24 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 
     /// Convert wikitext to the format-agnostic AST (no template expansion).
-    pub fn wikitext_to_ast(&self, wikitext: &str) -> Result<Node> {
+    ///
+    /// When `wrap_sections` is true, heading content is wrapped in `<section>`
+    /// elements (matching PHP's `WrapSections` DOM post-processor in document
+    /// mode). Fragment rendering leaves it false.
+    pub fn wikitext_to_ast(&self, wikitext: &str, wrap_sections: bool) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_source(tokens, Some(wikitext));
-        wrap_sections_in_ast(&mut ast);
+        wrap_sections_in_ast(&mut ast, wrap_sections);
         Ok(ast)
     }
 
     /// Convert wikitext to an HTML string (no native template expansion).
     pub fn wikitext_to_html(&self, wikitext: &str, options: &ParserOptions) -> Result<String> {
-        let ast = self.wikitext_to_ast(wikitext)?;
+        let ast = self.wikitext_to_ast(wikitext, options.wrap_sections)?;
         let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
         serializer.serialize(&ast)
     }
@@ -255,6 +265,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &options.page_title,
                 &about_counter,
                 wikitext,
+                options.wrap_sections,
             )
             .await;
         let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
@@ -270,6 +281,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         page_title: &str,
         about_counter: &std::cell::Cell<usize>,
         page_source: &str,
+        wrap_sections: bool,
     ) -> Node {
         let title = TitleParser::parse(page_title, self.config);
         let frame = Frame::new(title, vec![]);
@@ -283,7 +295,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_source(tokens, Some(page_source));
-        wrap_sections_in_ast(&mut ast);
+        wrap_sections_in_ast(&mut ast, wrap_sections);
         ast
     }
 
@@ -982,11 +994,10 @@ mod tests {
     fn test_wikitext_to_html_section_wrapping() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
+        let mut opts = ParserOptions::for_page("Test");
+        opts.wrap_sections = true;
         let html = parser
-            .wikitext_to_html(
-                "lead\n== Heading ==\nbody\n",
-                &ParserOptions::for_page("Test"),
-            )
+            .wikitext_to_html("lead\n== Heading ==\nbody\n", &opts)
             .unwrap();
         // There is always a lead section, and each wikitext heading is wrapped.
         assert!(html.contains("data-mw-section-id=\"0\""), "got: {html}");
@@ -1000,8 +1011,10 @@ mod tests {
     fn test_wikitext_to_html_nested_section() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
+        let mut opts = ParserOptions::for_page("Test");
+        opts.wrap_sections = true;
         let html = parser
-            .wikitext_to_html("== A ==\n=== B ===\n", &ParserOptions::for_page("Test"))
+            .wikitext_to_html("== A ==\n=== B ===\n", &opts)
             .unwrap();
         assert!(html.contains("data-mw-section-id=\"1\""), "got: {html}");
         assert!(html.contains("data-mw-section-id=\"2\""), "got: {html}");

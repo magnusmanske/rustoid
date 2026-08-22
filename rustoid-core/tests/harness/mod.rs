@@ -1,8 +1,12 @@
 //! Parsoid parser test harness.
 //!
 //! Reads `parserTests.txt` files in the format used by the official Parsoid
-//! test suite and runs each test case through the rustoid parser, comparing
+//! test suite and runs each test case through the rustoid V2 parser, comparing
 //! output against expected HTML/wikitext.
+//!
+//! This module lives under `tests/` (test-only) because it depends on a Tokio
+//! runtime to drive the async template-expansion path. It is not part of the
+//! public library.
 //!
 //! ## Test file format
 //!
@@ -27,16 +31,20 @@
 //! !! end
 //! ```
 
+// This module is shared across multiple test binaries (integration tests and
+// debug tooling). Not every binary uses every entry point, so dead-code
+// analysis is intentionally suppressed here.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use crate::error::Result;
-use crate::mock::{MockDataSource, MockSiteConfig};
-use crate::options::ParserOptions;
-use crate::pipeline::stage2::run_stage2;
-use crate::pipeline::stage3::run_stage3_html;
-use crate::wikitext::tokenizer::{Tokenizer, TokenizerOptions};
+use rustoid_core::error::Result;
+use rustoid_core::error::RustoidError;
+use rustoid_core::mock::{MockDataSource, MockSiteConfig};
+use rustoid_core::options::ParserOptions;
+use rustoid_core::pipeline::parser::Parser;
 
 // ---------------------------------------------------------------------------
 // Test case representation
@@ -45,53 +53,36 @@ use crate::wikitext::tokenizer::{Tokenizer, TokenizerOptions};
 /// A single parser test case.
 #[derive(Debug, Clone, Default)]
 pub struct ParserTestCase {
-    /// Description / name of the test.
     pub description: String,
-    /// Raw options block text (can be key=value or JSON).
     pub options_raw: String,
-    /// Parsed options as key-value pairs.
     pub options: HashMap<String, String>,
-    /// Input wikitext.
     pub wikitext: String,
-    /// Expected HTML output (Parsoid format).
     pub html_parsoid: Option<String>,
-    /// Expected HTML output (PHP parser format, for comparison).
     pub html_php: Option<String>,
-    /// Expected HTML output (Parsoid + language variant).
     pub html_parsoid_lang: Option<(String, String)>,
-    /// Expected wikitext after round-trip or selser edit.
     pub wikitext_edited: Option<String>,
-    /// Source line number in the test file.
     pub line_number: usize,
 }
 
-/// Parsed test file content.
-#[derive(Debug, Clone)]
+/// A parsed test file.
+#[derive(Debug, Clone, Default)]
 pub struct ParserTestFile {
-    /// All test cases in the file.
     pub tests: Vec<ParserTestCase>,
-    /// Mock articles defined in the file (templates, etc.).
     pub articles: HashMap<String, String>,
-    /// Test file path.
     pub path: String,
-    /// Version string (usually "2").
     pub version: String,
 }
 
-/// Result of running a single test.
+/// The outcome of running a single test.
 #[derive(Debug, Clone)]
 pub enum TestResult {
-    /// Test passed — output matched expected.
     Pass,
-    /// Test failed — output didn't match.
     Fail {
         expected: String,
         actual: String,
         diff_hint: String,
     },
-    /// Test skipped (e.g., mode not supported).
     Skip(String),
-    /// Test errored during parsing.
     Error(String),
 }
 
@@ -139,9 +130,8 @@ impl fmt::Display for TestSummary {
 
 /// Parse a `parserTests.txt` file.
 pub fn parse_test_file(path: &Path) -> Result<ParserTestFile> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        crate::error::RustoidError::DataSource(format!("Cannot read {path:?}: {e}"))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| RustoidError::DataSource(format!("Cannot read {path:?}: {e}")))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
@@ -467,7 +457,7 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
     TestResult::Skip(format!("unsupported mode: {mode}"))
 }
 
-/// Run a wikitext → HTML test.
+/// Run a wikitext → HTML test using the V2 parser.
 fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
     if test.wikitext.is_empty() {
         return TestResult::Skip("no wikitext input".to_string());
@@ -481,7 +471,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         },
     };
 
-    // Build mock data source with test file articles
+    // Build mock data source with test file articles.
     let source = MockDataSource::new();
     for (name, text) in &test_file.articles {
         if name.starts_with("Template:") {
@@ -494,7 +484,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         }
     }
 
-    // Add the page being tested
+    // Add the page being tested.
     let page_title = test
         .options
         .get("title")
@@ -502,281 +492,70 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         .unwrap_or_else(|| "TestPage".to_string());
     source.add_page(&page_title, &test.wikitext);
 
-    let _config = MockSiteConfig::new();
-
-    // Expand simple templates in wikitext (sync, for test harness use)
-    let expanded = expand_simple_templates(&test.wikitext, &test_file.articles);
-
-    // Tokenize expanded wikitext
-    let tokenizer_opts = TokenizerOptions::default();
-    let mut tokenizer = Tokenizer::new(&expanded, tokenizer_opts);
-    let tokens = match tokenizer.tokenize() {
-        Ok(t) => t,
-        Err(e) => return TestResult::Error(format!("tokenization error: {e}")),
-    };
-
-    let ast = match run_stage2(tokens) {
-        Ok(ast) => ast,
-        Err(e) => return TestResult::Error(format!("tree building error: {e}")),
-    };
+    let config = MockSiteConfig::new();
+    let parser = Parser::new(&config);
 
     let options = ParserOptions {
-        page_title,
+        page_title: page_title.clone(),
         language: test
             .options
             .get("language")
             .cloned()
             .unwrap_or_else(|| "en".to_string()),
+        // The `html/parsoid` sections are bare fragments (no document wrapper
+        // and no section wrapping).
+        body_only: true,
+        wrap_sections: false,
         ..ParserOptions::default()
     };
 
-    let actual_html = match run_stage3_html(&ast, &options) {
-        Ok(h) => h,
-        Err(e) => return TestResult::Error(format!("serialization error: {e}")),
-    };
-
-    // Compare: strip the <!DOCTYPE><html><head>...</head><body> wrappers
-    let actual_body = extract_body(&actual_html);
-    let expected_body = if expected_html.contains("<!DOCTYPE") {
-        extract_body(&expected_html)
+    // Run the async, template-expanding parse on the caller's Tokio runtime.
+    let parse_result = if let Ok(rt) = tokio::runtime::Runtime::new() {
+        rt.block_on(parser.wikitext_to_html_expanded(&test.wikitext, &source, &options))
     } else {
-        expected_html.clone()
+        return TestResult::Error("failed to build tokio runtime".to_string());
     };
 
-    // Strip data-parsoid/data-mw from both sides for comparison
-    // (PHP-format tests don't have these; Parsoid tests do)
-    // Strip data-parsoid/data-mw and comments from both sides for comparison
-    let actual_body = normalize_paragraphs(&actual_body);
-    let expected_body = normalize_paragraphs(&expected_body);
-    let actual_body = strip_parsoid_attrs(&actual_body);
-    let actual_body = strip_transclusion_spans(&actual_body);
-    let expected_body = strip_transclusion_spans(&expected_body);
-    let expected_body = strip_parsoid_attrs(&expected_body);
-    let expected_body = strip_parsoid_attrs(&expected_body);
+    let actual_html = match parse_result {
+        Ok(h) => h,
+        Err(e) => return TestResult::Error(format!("parse error: {e}")),
+    };
 
-    if actual_body.trim() == expected_body.trim() {
+    compare_html(&actual_html, &expected_html)
+}
+
+/// Normalize and compare the actual V2 output against expected Parsoid HTML.
+///
+/// The V2 `Parser` emits a full HTML document (`<!DOCTYPE html><html><head>…
+/// </head><body>…</body></html>`), whereas the fixture `html/parsoid` sections
+/// are bare fragments. We extract the `<body>` content and strip the Parsoid
+/// round-trip metadata that the fixtures do not carry in `wt2html` mode, then
+/// compare.
+fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
+    let actual_body = extract_body(actual_html);
+    let expected_body = if expected_html.contains("<!DOCTYPE") {
+        extract_body(expected_html)
+    } else {
+        expected_html.to_string()
+    };
+
+    // Normalize both sides: strip data-parsoid/data-mw, comments, `rel`,
+    // `title`, `class="new"`, and the `./` href prefix. These are emitted by the
+    // V2 renderers for round-tripping but are not part of the simplified
+    // fixture expectations.
+    let actual_norm = normalize_paragraphs(&strip_parsoid_attrs(&actual_body));
+    let expected_norm = normalize_paragraphs(&strip_parsoid_attrs(&expected_body));
+
+    if actual_norm.trim() == expected_norm.trim() {
         TestResult::Pass
     } else {
-        // Debug: check wikilink test
-        if test.description.contains("Simple wikilink") {
-            eprintln!("DEBUG raw actual: [{}]", actual_body.replace("\n", "\\n"));
-        }
-        let diff_hint = compute_diff_hint(&expected_body, &actual_body);
+        let diff_hint = compute_diff_hint(&expected_norm, &actual_norm);
         TestResult::Fail {
-            expected: expected_body,
-            actual: actual_body,
+            expected: expected_norm,
+            actual: actual_norm,
             diff_hint,
         }
     }
-}
-
-/// Simple synchronous template expansion for test harness.
-/// Replaces {{TemplateName|arg1=val1|arg2=val2}} with the template content.
-fn expand_simple_templates(wikitext: &str, articles: &HashMap<String, String>) -> String {
-    if !wikitext.contains("{{") {
-        return wikitext.to_string();
-    }
-
-    let mut result = String::with_capacity(wikitext.len());
-    let chars: Vec<char> = wikitext.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if i + 1 < chars.len()
-            && chars[i] == '{'
-            && chars[i + 1] == '{'
-            && !(i + 2 < chars.len() && chars[i + 2] == '{')
-        {
-            // Count brace depth to find matching }}
-            let mut depth: usize = 2;
-            let mut j = i + 2;
-            while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '{' => depth = depth.saturating_add(1),
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-
-            if depth == 0 {
-                let inner: String = chars[i + 2..j - 1].iter().collect();
-                let parts: Vec<&str> = inner.split('|').collect();
-                let name = parts.first().map(|s| s.trim()).unwrap_or("").to_string();
-
-                // Build the template key
-                let key = if name.contains(':') {
-                    name.clone()
-                } else {
-                    format!("Template:{name}")
-                };
-
-                // Try as template or parser function
-                if name.starts_with('#') {
-                    // Parser function evaluation
-                    let expanded = evaluate_parser_fn(&name, &parts);
-                    // Wrap in span with mw:Transclusion type
-                    result.push_str("<span typeof=\"mw:Transclusion\">");
-                    result.push_str(&expanded);
-                    result.push_str("</span>");
-                } else if let Some(template_text) =
-                    articles.get(&key).or_else(|| articles.get(&name))
-                {
-                    // Template expansion with argument substitution
-                    let mut args_map: HashMap<String, String> = HashMap::new();
-                    for (idx, part) in parts.iter().skip(1).enumerate() {
-                        if let Some(eq_pos) = part.find('=') {
-                            let k = part[..eq_pos].trim().to_string();
-                            let v = part[eq_pos + 1..].to_string();
-                            args_map.insert(k, v);
-                        } else {
-                            args_map.insert((idx + 1).to_string(), (*part).to_string());
-                        }
-                    }
-                    let substituted = substitute_template_args(template_text, &args_map);
-                    // Wrap in span with mw:Transclusion type
-                    result.push_str("<span typeof=\"mw:Transclusion\">");
-                    result.push_str(&substituted);
-                    result.push_str("</span>");
-                } else {
-                    // Unknown template — keep as-is
-                    result.push_str(&chars[i..=j].iter().collect::<String>());
-                }
-                i = j + 1;
-                continue;
-            }
-        }
-
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    result
-}
-
-/// Replace {{{arg}}} in template text with values.
-/// Evaluate simple parser functions: #if, #ifeq, #switch, #tag
-fn evaluate_parser_fn(name: &str, parts: &[&str]) -> String {
-    let name = name.trim();
-    let (fn_name, colon_arg) = if let Some(pos) = name.find(':') {
-        (&name[1..pos], Some(name[pos + 1..].trim()))
-    } else {
-        (&name[1..], None)
-    };
-    let mut args: Vec<String> = Vec::new();
-    if let Some(a) = colon_arg {
-        if !a.is_empty() {
-            args.push(a.to_string());
-        }
-    }
-    for p in parts.iter().skip(1) {
-        args.push(p.trim().to_string());
-    }
-    match fn_name {
-        "if" => {
-            if !args.first().map(|s| s.trim()).unwrap_or("").is_empty() {
-                args.get(1).cloned().unwrap_or_default()
-            } else {
-                args.get(2).cloned().unwrap_or_default()
-            }
-        }
-        "ifeq" => {
-            let a = args.first().map(|s| s.trim()).unwrap_or("");
-            let b = args.get(1).map(|s| s.trim()).unwrap_or("");
-            if a == b {
-                args.get(2).cloned().unwrap_or_default()
-            } else {
-                args.get(3).cloned().unwrap_or_default()
-            }
-        }
-        "switch" => {
-            let val = args.first().map(|s| s.trim()).unwrap_or("");
-            let mut idx = 1;
-            while idx + 1 < args.len() {
-                if args[idx].trim() == val {
-                    return args[idx + 1].clone();
-                }
-                idx += 2;
-            }
-            if args.len() % 2 == 0 && args.len() > 1 {
-                args.last().cloned().unwrap_or_default()
-            } else {
-                String::new()
-            }
-        }
-        "tag" => {
-            let tag = args.first().map(|s| s.trim()).unwrap_or("");
-            let content = args.get(1).cloned().unwrap_or_default();
-            format!("<{tag}>{content}</{tag}>")
-        }
-        _ => format!("{{{{{name}|...}}}}"),
-    }
-}
-
-fn substitute_template_args(text: &str, args: &HashMap<String, String>) -> String {
-    if !text.contains("{{{") {
-        return text.to_string();
-    }
-
-    let mut result = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if i + 2 < chars.len() && chars[i] == '{' && chars[i + 1] == '{' && chars[i + 2] == '{' {
-            let mut depth: usize = 3;
-            let mut j = i + 3;
-            while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '{' => depth = depth.saturating_add(1),
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            if depth == 0 {
-                let inner: String = chars[i + 3..j - 2].iter().collect();
-                let arg_ref = crate::expand::tpl_args::parse_arg_reference(&inner);
-                let val = args
-                    .get(&arg_ref.name)
-                    .cloned()
-                    .or(arg_ref.default)
-                    .unwrap_or_else(|| format!("{{{}}}", arg_ref.name));
-                result.push_str(&val);
-                i = j + 1;
-                continue;
-            }
-        }
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    result
-}
-
-/// Run a selser (selective serialization) test. (selective serialization) test.
-fn run_selser_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
-    if test.wikitext.is_empty() {
-        return TestResult::Skip("no wikitext input".to_string());
-    }
-
-    let _expected_edited = match test.wikitext_edited.as_ref() {
-        Some(w) => w.clone(),
-        None => return TestResult::Skip("no expected edited wikitext".to_string()),
-    };
-
-    // For now, selser tests are skipped — they need the full VE pipeline
-    TestResult::Skip("selser not yet fully supported".to_string())
 }
 
 /// Extract the body content from a full HTML document.
@@ -789,7 +568,7 @@ fn extract_body(html: &str) -> String {
         }
     }
     // No body tags — return content inside <html> wrapper if present
-    if let Some(_html_start) = html.find("<html")
+    if html.find("<html").is_some()
         && let Some(after_head) = html.find("<body")
         && let Some(content_start) = html[after_head..].find('>')
     {
@@ -801,58 +580,34 @@ fn extract_body(html: &str) -> String {
     html.to_string()
 }
 
-/// Compute a short diff hint for test failures.
-/// Strip data-parsoid and data-mw attributes for comparison normalization.
-/// Strip mw:Transclusion span wrappers when expected doesn't have them.
-fn strip_transclusion_spans(html: &str) -> String {
-    let mut s = html.to_string();
-    // Strip <span ...>...</span> pairs that contain mw:Transclusion in typeof, keeping content
-    while let Some(start) = s.find("<span") {
-        // Find the matching >
-        let after_span = &s[start..];
-        if let Some(tag_end) = after_span.find('>') {
-            let full_tag = &after_span[..=tag_end];
-            // Only strip if it's a transclusion span
-            if full_tag.contains("mw:Transclusion") {
-                let open_end = start + tag_end + 1;
-                // Find matching </span>
-                if let Some(close) = s[open_end..].find("</span>") {
-                    let content = s[open_end..open_end + close].to_string();
-                    s.replace_range(start..open_end + close + "</span>".len(), &content);
-                    continue;
-                }
-            }
-        }
-        // Move past this <span>
-        if let Some(next) = s[start + 5..].find("<span") {
-            let _ = next;
-        }
-        break;
+/// Run a selser (selective serialization) test.
+fn run_selser_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
+    if test.wikitext.is_empty() {
+        return TestResult::Skip("no wikitext input".to_string());
     }
-    s
+
+    let expected_edited = match test.wikitext_edited.as_ref() {
+        Some(w) => w.clone(),
+        None => return TestResult::Skip("no expected edited wikitext".to_string()),
+    };
+    let _ = expected_edited;
+
+    // For now, selser tests are skipped — they need the full VE pipeline.
+    TestResult::Skip("selser not yet fully supported".to_string())
 }
 
 /// Strip newlines in paragraph context (PHP format difference).
-/// PHP test output sometimes has </p>\n<p>, sometimes </p><p>.
-/// Normalize both sides to </p><p> for comparison.
-/// Also strip \n before </p>.
 fn normalize_paragraphs(html: &str) -> String {
     let mut s = html.to_string();
-    // Remove \n before </p>
     while let Some(pos) = s.find("\n</p>") {
         s.replace_range(pos..pos + 1, "");
     }
-    // Remove \n between </p> and <p> -> </p><p>
     while let Some(pos) = s.find("</p>\n<p>") {
         s.replace_range(pos + 4..pos + 5, "");
     }
-    // Also handle </p>\n\n<p>
     while let Some(pos) = s.find("</p>\n\n<p>") {
         s.replace_range(pos + 4..pos + 6, "");
     }
-    // Strip empty bold/italic tags from auto-inserted quote balancing.
-    // PHP parsoid marks these as autoInserted and strips them at DOM stage.
-    // We strip them at comparison time to match.
     while let Some(pos) = s.find("<b></b>") {
         s.replace_range(pos..pos + 7, "");
     }
@@ -864,7 +619,7 @@ fn normalize_paragraphs(html: &str) -> String {
 
 fn strip_parsoid_attrs(html: &str) -> String {
     let mut s = html.to_string();
-    // Strip HTML comments (PHP tests strip them entirely)
+    // Strip HTML comments.
     while let Some(start) = s.find("<!--") {
         if let Some(end) = s[start..].find("-->") {
             s.replace_range(start..start + end + 3, "");
@@ -872,7 +627,7 @@ fn strip_parsoid_attrs(html: &str) -> String {
             break;
         }
     }
-    // Strip data-parsoid='...' and data-mw='...'
+    // Strip data-parsoid and data-mw attributes.
     while let Some(start) = s.find(" data-parsoid='") {
         if let Some(end) = s[start + 15..].find("'") {
             s.replace_range(start..start + 15 + end + 1, "");
@@ -887,17 +642,17 @@ fn strip_parsoid_attrs(html: &str) -> String {
             break;
         }
     }
-    // Strip rel="mw:WikiLink" (PHP-format tests don't have this)
+    // Strip rel="mw:WikiLink" (PHP-format fixtures don't have this).
     while let Some(start) = s.find(" rel=\"mw:WikiLink\"") {
         s.replace_range(start..start + 20, "");
     }
-    // Strip class="new" (red links)
+    // Strip class="new" (red links).
     while let Some(start) = s.find(" class=\"new\"") {
         s.replace_range(start..start + 12, "");
     }
-    // Strip ./ prefix from href values
+    // Strip ./ prefix from href values.
     s = s.replace("href=\"./", "href=\"");
-    // Strip title="..." from links (only when preceded by space+title=pattern)
+    // Strip title="..." from links.
     while let Some(start) = s.find(" title=\"") {
         if let Some(end) = s[start + 8..].find('"') {
             s.replace_range(start..start + 8 + end + 1, "");
@@ -909,7 +664,6 @@ fn strip_parsoid_attrs(html: &str) -> String {
 }
 
 fn compute_diff_hint(expected: &str, actual: &str) -> String {
-    // Simple: find the first character position where they differ
     let expected_chars: Vec<char> = expected.chars().collect();
     let actual_chars: Vec<char> = actual.chars().collect();
     let min_len = expected_chars.len().min(actual_chars.len());

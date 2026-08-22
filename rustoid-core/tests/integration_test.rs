@@ -1,6 +1,6 @@
 //! Integration tests for the Parsoid test harness.
 
-use rustoid_core::test_harness;
+mod harness;
 
 fn run_all_fixtures() {
     let fixture_dir = std::path::Path::new("tests/fixtures");
@@ -12,10 +12,10 @@ fn run_all_fixtures() {
     for entry in entries {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.extension().map_or(true, |e| e != "txt") {
+        if path.extension().is_none_or(|e| e != "txt") {
             continue;
         }
-        let summary = test_harness::run_test_file(&path).unwrap();
+        let summary = harness::run_test_file(&path).unwrap();
         total += summary.total;
         passed += summary.passed;
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
@@ -51,6 +51,6 @@ fn test_fixture_summary() {
 #[test]
 fn test_harness_parse_only() {
     let path = std::path::Path::new("tests/fixtures/minitests.txt");
-    let test_file = test_harness::parse_test_file(path).unwrap();
+    let test_file = harness::parse_test_file(path).unwrap();
     assert!(!test_file.tests.is_empty());
 }

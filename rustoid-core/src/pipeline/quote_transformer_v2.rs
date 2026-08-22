@@ -596,8 +596,10 @@ mod tests {
     use super::*;
 
     fn quote(value: &str) -> ParsoidToken {
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(SourceRange::new(0, value.len()));
+        let dp = DataParsoid {
+            tsr: Some(SourceRange::new(0, value.len())),
+            ..DataParsoid::default()
+        };
         let mut tk = SelfclosingTagTk::new("mw-quote", vec![], dp);
         tk.add_attribute_str("value", value);
         ParsoidToken::SelfclosingTag(tk)
