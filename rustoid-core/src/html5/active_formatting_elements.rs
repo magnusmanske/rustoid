@@ -49,10 +49,8 @@ impl ActiveFormattingElements {
 
     /// Insert a scope marker at the tail.
     pub fn insert_marker(&mut self) {
-        let idx = self.append(AfeEntry::Marker);
-        if idx > 0 {
-            self.noah.push(HashMap::new());
-        }
+        self.append(AfeEntry::Marker);
+        self.noah.push(HashMap::new());
     }
 
     /// Push an element onto the AFE list, applying the Noah's Ark clause.
