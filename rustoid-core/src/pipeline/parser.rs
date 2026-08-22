@@ -55,7 +55,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
     fn tokenize(&self, wikitext: &str) -> Result<Vec<Item>> {
-        let options = TokenizerOptions {
+        let mut options = TokenizerOptions {
             magic_links: crate::wikitext::tokenizer_v2::MagicLinkConfig {
                 rfc: self.config.magic_link_enabled("RFC"),
                 pmid: self.config.magic_link_enabled("PMID"),
@@ -63,6 +63,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             },
             ..TokenizerOptions::default()
         };
+        // Localized synonyms for the `redirect` magic word (each including the
+        // leading `#`), mirroring PHP's `getMagicWordMatcher( 'redirect' )`.
+        if let Some(entry) = self.config.magic_words().get("redirect") {
+            options.redirect_words = entry.aliases.clone();
+        }
         let mut tokenizer = PegTokenizer::new(wikitext, &options);
         let chunks = tokenizer.tokenize()?;
         Ok(chunks

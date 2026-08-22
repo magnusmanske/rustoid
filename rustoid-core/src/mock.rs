@@ -240,6 +240,20 @@ impl MockSiteConfig {
         );
         config.add_magic_word("pagename", &["PAGENAME", "PAGENAMEE"]);
         config.add_magic_word("fullpagename", &["FULLPAGENAME", "FULLPAGENAMEE"]);
+        // The `redirect` magic word. Each synonym includes the leading `#` and
+        // is matched case-insensitively, mirroring `MagicWord::getRegex`.
+        config.add_magic_word(
+            "redirect",
+            &[
+                "#REDIRECT",
+                "#TILVÍSUN",
+                "#WEITERLEITUNG",
+                "#REDIRECCIÓN",
+                "#REDIRECTION",
+                "#OMDIRIGERING",
+                "#DOORVERWIJZING",
+            ],
+        );
         config.add_magic_word("currentyear", &["CURRENTYEAR"]);
         config.add_magic_word("currentmonth", &["CURRENTMONTH", "CURRENTMONTHNAME"]);
         config.add_magic_word("currentday", &["CURRENTDAY", "CURRENTDAY2"]);

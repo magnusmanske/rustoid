@@ -42,6 +42,10 @@ pub struct TokenizerOptions {
     pub pipeline_offset: usize,
     /// Enabled magic-link types (RFC/PMID/ISBN).
     pub magic_links: MagicLinkConfig,
+    /// Localized synonyms for the `redirect` magic word (each including the
+    /// leading `#`), e.g. `#REDIRECT`, `#TILVÍSUN`. Matched case-insensitively,
+    /// mirroring PHP's `getMagicWordMatcher( 'redirect' )`.
+    pub redirect_words: Vec<String>,
 }
 
 impl Default for TokenizerOptions {
@@ -54,6 +58,7 @@ impl Default for TokenizerOptions {
             sol: true,
             pipeline_offset: 0,
             magic_links: MagicLinkConfig::default(),
+            redirect_words: vec!["#redirect".to_string()],
         }
     }
 }
@@ -85,6 +90,9 @@ pub struct PegTokenizer<'a> {
     has_sol_transparent_at_start: bool,
     /// Enabled magic-link types (RFC/PMID/ISBN).
     magic_links: MagicLinkConfig,
+    /// Localized synonyms for the `redirect` magic word (lowercased), each
+    /// including the leading `#`.
+    redirect_words: Vec<String>,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -101,6 +109,11 @@ impl<'a> PegTokenizer<'a> {
             heading_index: 0,
             has_sol_transparent_at_start: false,
             magic_links: options.magic_links,
+            redirect_words: options
+                .redirect_words
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
         }
     }
 
@@ -853,22 +866,21 @@ impl<'a> PegTokenizer<'a> {
         }
 
         let saved = self.pos;
-        let remaining = self.remaining();
 
         // Match redirect word (case-insensitive). Mirrors PHP's `redirect_word`,
-        // which uses a localized `redirect` magic word; we recognize the common
-        // English and Spanish forms. The word must be a complete match (not a
-        // bare prefix) so `#REDIRECTxyz` does not parse as a redirect.
+        // which matches `[ \t\n\r\0\x0b]*` then a run of
+        // `[^ \t\n\r\x0c:\[]+` and checks it against the localized `redirect`
+        // magic word synonyms (each including the leading `#`).
+        let remaining = self.remaining();
         let lower = remaining.to_lowercase();
-        let rw = if lower.starts_with("#redirect") {
-            "#redirect"
-        } else if lower.starts_with("#redireccion") {
-            "#redireccion"
-        } else {
-            return None;
-        };
+        let rw = self
+            .redirect_words
+            .iter()
+            .find(|w| lower.starts_with(w.as_str()))
+            .cloned()?;
         // The redirect word must be followed by a terminator (whitespace,
-        // colon, or the wikilink opener).
+        // colon, or the wikilink opener), mirroring PHP's `[^ \t\n\r\x0c:\[]+`
+        // (the word cannot contain `:`, `[`, or whitespace).
         let after = self.input[self.pos + rw.len()..].chars().next();
         if let Some(c) = after
             && !c.is_whitespace()
@@ -2572,5 +2584,25 @@ mod tests {
             .iter()
             .any(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "table"));
         assert!(has_table, "Expected table, got: {:?}", tokens);
+    }
+
+    #[test]
+    fn test_localized_redirect_word() {
+        // A redirect word must be matched against the configured localized
+        // `redirect` magic word synonyms (here, Icelandic `#TILVÍSUN`).
+        let options = TokenizerOptions {
+            redirect_words: vec!["#redirect".to_string(), "#tilvísun".to_string()],
+            ..TokenizerOptions::default()
+        };
+        let mut tokenizer = PegTokenizer::new("#TILVÍSUN [[Main Page]]", &options);
+        let tokens = tokenizer.tokenize().unwrap();
+        let has_redirect = tokens.iter().any(|t| {
+            matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw:redirect")
+        });
+        assert!(
+            has_redirect,
+            "expected mw:redirect for #TILVÍSUN, got {:?}",
+            tokens
+        );
     }
 }
