@@ -855,19 +855,18 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         let remaining = self.remaining();
 
-        // Match redirect word (case-insensitive prefix match).
+        // Match redirect word (case-insensitive prefix match). The PHP parser
+        // matches a localized `redirect` magic word; for now we recognize the
+        // common English and Spanish forms, mirroring the existing tokenizer.
         let lower = remaining.to_lowercase();
-        let redirect_match = if lower.starts_with("#redirect") {
-            Some("#redirect")
+        let rw = if lower.starts_with("#redirect") {
+            "#redirect"
         } else if lower.starts_with("#redireccion") {
-            Some("#redireccion")
+            "#redireccion"
         } else {
-            None
+            return None;
         };
-
-        let rw = redirect_match?;
-        let rw_len = rw.len();
-        self.advance(rw_len);
+        self.advance(rw.len());
 
         // Consume optional spaces/newlines.
         self.consume_spaces_or_newlines();
@@ -878,39 +877,28 @@ impl<'a> PegTokenizer<'a> {
             self.consume_spaces_or_newlines();
         }
 
-        // Parse the wikilink.
-        let link_start = self.pos;
-        if !self.try_wikilink_as_token() {
+        // Parse the wikilink target.
+        if !self.starts_with("[[") {
             self.pos = saved;
             return None;
         }
+        self.advance(2);
+        let target_start = self.pos;
+        let Some(end) = self.remaining().find("]]") else {
+            self.pos = saved;
+            return None;
+        };
+        let link_text = &self.input[target_start..self.pos + end];
+        // The redirect target is the part before the first `|` (link label).
+        let target = link_text.split('|').next().unwrap_or(link_text).trim();
+        self.advance(end + 2);
 
-        // Now find the wikilink target.
-        let _remaining_after = &self.input[link_start..self.pos];
-
-        let dp = self.make_dp(saved, self.pos);
-        let mut dp = dp;
+        let mut dp = self.make_dp(saved, self.pos);
         dp.src = Some(self.input[saved..self.pos].to_string());
 
-        let redirect =
-            ParsoidToken::SelfclosingTag(SelfclosingTagTk::new("mw:redirect", vec![], dp));
-        Some(redirect)
-    }
-
-    /// Parse a wikilink and return as part of redirect parsing.
-    fn try_wikilink_as_token(&mut self) -> bool {
-        if !self.starts_with("[[") {
-            return false;
-        }
-        self.advance(2);
-
-        // Find the matching `]]`.
-        if let Some(end) = self.remaining().find("]]") {
-            self.advance(end + 2);
-            return true;
-        }
-
-        false
+        let mut redirect = SelfclosingTagTk::new("mw:redirect", vec![], dp);
+        redirect.add_attribute_str("href", target);
+        Some(ParsoidToken::SelfclosingTag(redirect))
     }
 
     /// Try to parse a table line: table_start_tag / table_content_line / table_end_tag.

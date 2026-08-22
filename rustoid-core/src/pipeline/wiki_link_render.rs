@@ -9,7 +9,9 @@
 
 use crate::title::{Title, TitleParser, make_link};
 use crate::traits::SiteConfig;
-use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, Item, KV, ParsoidToken, TagTk};
+use crate::wikitext::tokens_v2::{
+    DataParsoid, EndTagTk, Item, KV, ParsoidToken, SelfclosingTagTk, TagTk,
+};
 
 use super::wiki_link_handler::{build_link_attrs, string_kv};
 
@@ -638,12 +640,21 @@ pub fn render_file(
 
 /// Dispatch a wikilink token to the correct renderer based on the target's
 /// namespace. Mirrors `WikiLinkHandler::wikiLinkHandler`.
+///
+/// When `is_redirect` is set, media/file/category targets are forced to render
+/// as a plain wikilink (mirrors the `redirect=true` token flag in PHP, which
+/// short-circuits those namespace special-cases).
 pub fn render_wiki_link_dispatched(
     ctx: &mut WikiLinkContext,
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
+    is_redirect: bool,
 ) -> Vec<Item> {
     if let Some(title) = &target.title {
+        if is_redirect {
+            return render_wiki_link(ctx, token, target);
+        }
+
         let media_ns = ctx.config.canonical_namespace_id("Media");
         let file_ns = ctx.config.canonical_namespace_id("File");
         let category_ns = ctx.config.canonical_namespace_id("Category");
@@ -670,6 +681,60 @@ pub fn render_wiki_link_dispatched(
     }
 
     render_wiki_link(ctx, token, target)
+}
+
+/// Render a `mw:redirect` self-closing token into a
+/// `<link rel="mw:PageProp/redirect" href="..."/>` token. Faithful port of
+/// `WikiLinkHandler::onRedirect`.
+///
+/// The redirect token carries the raw target in its `href` attribute (set by
+/// the tokenizer). We render an embedded wikilink against that target to
+/// obtain the normalized href (e.g. `./Target`), then emit the `link` token
+/// with `rel=mw:PageProp/redirect` and that normalized href.
+pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<Item> {
+    let href = token.get_attribute_v("href").unwrap_or("").to_string();
+    let target =
+        get_wiki_link_target_info(ctx, &href, &href).unwrap_or_else(|_| WikiLinkTargetInfo {
+            href: href.clone(),
+            href_src: href.clone(),
+            title: Some(crate::title::Title::new_main(href.clone())),
+            interwiki: None,
+            language: None,
+            local_prefix: None,
+            from_colon_escaped_text: false,
+            prefix: None,
+        });
+
+    // Synthesize the embedded wikilink token. It carries the same attributes
+    // (notably `href`) as the redirect token; the `redirect` flag is handled
+    // separately by the renderer via the `is_redirect` parameter.
+    let wikilink = SelfclosingTagTk::new(
+        "wikilink",
+        token.get_attribs().to_vec(),
+        DataParsoid::default(),
+    );
+    let wikilink_token = ParsoidToken::SelfclosingTag(wikilink);
+
+    let rendered = render_wiki_link_dispatched(ctx, &wikilink_token, &target, true);
+
+    // Extract the normalized href from the rendered first token (an `<a>` or
+    // `<link>`), mirroring PHP's `$da->a['href']`.
+    let normalized_href = rendered
+        .first()
+        .and_then(|item| match item {
+            Item::Tok(t) => t.get_attribute_v("href").map(|s| s.to_string()),
+            Item::Str(_) => None,
+        })
+        .unwrap_or_else(|| href.clone());
+
+    // Build the `<link rel="mw:PageProp/redirect" href="..."/>` token,
+    // preserving the redirect token's data-parsoid.
+    let dp = token.data_parsoid().cloned().unwrap_or_default();
+    let mut link = SelfclosingTagTk::new("link", vec![], dp);
+    link.add_attribute_str("rel", "mw:PageProp/redirect");
+    link.add_attribute_str("href", &normalized_href);
+
+    vec![Item::Tok(ParsoidToken::SelfclosingTag(link))]
 }
 
 #[cfg(test)]

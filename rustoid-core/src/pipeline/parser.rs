@@ -83,7 +83,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `pipeline::wiki_link_render`).
     fn render_links(&self, tokens: Vec<Item>) -> Vec<Item> {
         use crate::pipeline::wiki_link_render::{
-            WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+            WikiLinkContext, get_wiki_link_target_info, render_redirect,
+            render_wiki_link_dispatched,
         };
 
         let mut ctx = WikiLinkContext::new(self.config);
@@ -94,6 +95,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             };
+
+            // `mw:redirect` is handled separately: it becomes a single
+            // `<link rel="mw:PageProp/redirect" .../>` token.
+            if stt.name == "mw:redirect" {
+                out.extend(render_redirect(
+                    &mut ctx,
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                ));
+                continue;
+            }
+
             if stt.name != "wikilink" {
                 out.push(item);
                 continue;
@@ -123,6 +135,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &mut ctx,
                 &ParsoidToken::SelfclosingTag(stt.clone()),
                 &target,
+                false,
             );
             out.extend(rendered);
         }
@@ -710,7 +723,12 @@ mod tests {
         let html = parser
             .wikitext_to_html("#redirect [[Target]]", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("Target"), "got: {html}");
+        assert!(
+            html.contains(r#"rel="mw:PageProp/redirect""#),
+            "got: {html}"
+        );
+        assert!(html.contains(r#"href="./Target""#), "got: {html}");
+        assert!(!html.contains("<mw:redirect"), "got: {html}");
     }
 
     #[test]

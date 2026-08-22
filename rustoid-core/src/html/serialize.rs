@@ -231,11 +231,11 @@ impl HtmlSerializer {
                         // serialize without a closing tag.
                         if is_void_element(tag) {
                             buf.push_str(&format!("{indent}<{tag}"));
-                            self.serialize_attrs(node, buf);
+                            self.serialize_attrs_full(node, buf);
                             buf.push_str("/>\n");
                         } else {
                             buf.push_str(&format!("{indent}<{tag}"));
-                            self.serialize_attrs(node, buf);
+                            self.serialize_attrs_full(node, buf);
                             buf.push('>');
                             self.serialize_children(node, buf, depth)?;
                             buf.push_str(&format!("</{tag}>\n"));
@@ -281,11 +281,22 @@ impl HtmlSerializer {
     }
 
     fn serialize_attrs(&self, node: &Node, buf: &mut String) {
+        self.serialize_attrs_impl(node, buf, false);
+    }
+
+    /// Like [`serialize_attrs`], but keeps `href`/`src` attributes. Used for
+    /// generic elements (e.g. `<link rel="mw:PageProp/redirect">`) where the
+    /// attributes are not emitted inline by a special-cased arm.
+    fn serialize_attrs_full(&self, node: &Node, buf: &mut String) {
+        self.serialize_attrs_impl(node, buf, true);
+    }
+
+    fn serialize_attrs_impl(&self, node: &Node, buf: &mut String, include_href_src: bool) {
         // Sort attributes for deterministic output
         let mut sorted: Vec<_> = node
             .attrs
             .iter()
-            .filter(|a| a.key != "href" && a.key != "src")
+            .filter(|a| include_href_src || (a.key != "href" && a.key != "src"))
             .collect();
         sorted.sort_by(|a, b| a.key.cmp(&b.key));
         for attr in &sorted {
