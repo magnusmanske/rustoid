@@ -855,9 +855,10 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         let remaining = self.remaining();
 
-        // Match redirect word (case-insensitive prefix match). The PHP parser
-        // matches a localized `redirect` magic word; for now we recognize the
-        // common English and Spanish forms, mirroring the existing tokenizer.
+        // Match redirect word (case-insensitive). Mirrors PHP's `redirect_word`,
+        // which uses a localized `redirect` magic word; we recognize the common
+        // English and Spanish forms. The word must be a complete match (not a
+        // bare prefix) so `#REDIRECTxyz` does not parse as a redirect.
         let lower = remaining.to_lowercase();
         let rw = if lower.starts_with("#redirect") {
             "#redirect"
@@ -866,6 +867,16 @@ impl<'a> PegTokenizer<'a> {
         } else {
             return None;
         };
+        // The redirect word must be followed by a terminator (whitespace,
+        // colon, or the wikilink opener).
+        let after = self.input[self.pos + rw.len()..].chars().next();
+        if let Some(c) = after
+            && !c.is_whitespace()
+            && c != ':'
+            && c != '['
+        {
+            return None;
+        }
         self.advance(rw.len());
 
         // Consume optional spaces/newlines.
@@ -876,6 +887,11 @@ impl<'a> PegTokenizer<'a> {
             self.advance(1);
             self.consume_spaces_or_newlines();
         }
+
+        // The `src` of the redirect token is just the redirect word plus any
+        // trailing spaces/colon (mirrors PHP, which sets `$dp->src = $rw`); the
+        // wikilink itself is not part of `src`.
+        let link_start = self.pos;
 
         // Parse the wikilink target.
         if !self.starts_with("[[") {
@@ -894,7 +910,7 @@ impl<'a> PegTokenizer<'a> {
         self.advance(end + 2);
 
         let mut dp = self.make_dp(saved, self.pos);
-        dp.src = Some(self.input[saved..self.pos].to_string());
+        dp.src = Some(self.input[saved..link_start].to_string());
 
         let mut redirect = SelfclosingTagTk::new("mw:redirect", vec![], dp);
         redirect.add_attribute_str("href", target);

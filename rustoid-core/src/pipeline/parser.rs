@@ -732,6 +732,22 @@ mod tests {
     }
 
     #[test]
+    fn test_wikitext_to_html_redirect_piped_target() {
+        // The redirect target is the part before the `|`; the link label is
+        // ignored (matches PHP, which renders the target only).
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "#REDIRECT [[Target|label]]",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains(r#"href="./Target""#), "got: {html}");
+        assert!(!html.contains("label"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_to_html_table_caption() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
