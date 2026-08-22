@@ -705,6 +705,14 @@ pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<I
             prefix: None,
         });
 
+    // An empty redirect target (e.g. `#REDIRECT [[]]`) is invalid. Mirror PHP's
+    // `onRedirect` bail-out: re-emit the redirect source as a `#` list item
+    // (the leading `#` becomes the list bullet), so it renders as
+    // <ol><li>REDIRECT [[]]</li></ol>.
+    if href.trim().is_empty() {
+        return bail_redirect_as_list_item(token);
+    }
+
     // Synthesize the embedded wikilink token. It carries the same attributes
     // (notably `href`) as the redirect token; the `redirect` flag is handled
     // separately by the renderer via the `is_redirect` parameter.
@@ -735,6 +743,26 @@ pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<I
     link.add_attribute_str("href", &normalized_href);
 
     vec![Item::Tok(ParsoidToken::SelfclosingTag(link))]
+}
+
+/// Reconstruct an invalid redirect as a `#` list item, mirroring PHP's
+/// `WikiLinkHandler::onRedirect` bail-out. The redirect token's `src` is the
+/// redirect word (e.g. `#REDIRECT `); we strip the leading `#` and re-append the
+/// original (empty) wikilink target to reconstruct `REDIRECT [[]]` content.
+fn bail_redirect_as_list_item(token: &ParsoidToken) -> Vec<Item> {
+    let dp = token.data_parsoid().cloned().unwrap_or_default();
+    let src = dp.src.clone().unwrap_or_default();
+
+    // Reconstruct the list-item content: the redirect word minus the leading
+    // `#`, plus `[[<target>]]`.
+    let word = src.strip_prefix('#').unwrap_or(&src);
+    let content = format!("{word}[[]]");
+
+    // A `listItem` with the `#` bullet.
+    let mut li = TagTk::new("listItem", vec![], DataParsoid::default());
+    li.add_attribute_str("bullets", "#");
+
+    vec![Item::Tok(ParsoidToken::Tag(li)), Item::Str(content)]
 }
 
 #[cfg(test)]
@@ -991,5 +1019,20 @@ mod tests {
                 .and_then(|kv| kv.value.as_str());
             assert_eq!(type_of, Some("mw:File"));
         }
+    }
+
+    #[test]
+    fn test_render_redirect_empty_target_bails() {
+        // An empty redirect target (#REDIRECT [[]]) must bail out to a
+        // listItem rather than render as a <link>.
+        let mut ctx = WikiLinkContext::new(config_static());
+        let mut tk = SelfclosingTagTk::new("mw:redirect", vec![], DataParsoid::default());
+        tk.data_parsoid.src = Some("#REDIRECT ".to_string());
+        tk.add_attribute_str("href", "");
+
+        let out = render_redirect(&mut ctx, &ParsoidToken::SelfclosingTag(tk));
+
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem"));
+        assert!(matches!(&out[1], Item::Str(s) if s == "REDIRECT [[]]"));
     }
 }
