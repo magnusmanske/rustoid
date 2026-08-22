@@ -292,14 +292,13 @@ impl HtmlSerializer {
     }
 
     fn serialize_attrs_impl(&self, node: &Node, buf: &mut String, include_href_src: bool) {
-        // Sort attributes for deterministic output
-        let mut sorted: Vec<_> = node
+        // Preserve attribute insertion order (PHP Parsoid emits attributes in
+        // the order they were set, e.g. `rel` before `href` on redirect links).
+        let attrs = node
             .attrs
             .iter()
-            .filter(|a| include_href_src || (a.key != "href" && a.key != "src"))
-            .collect();
-        sorted.sort_by(|a, b| a.key.cmp(&b.key));
-        for attr in &sorted {
+            .filter(|a| include_href_src || (a.key != "href" && a.key != "src"));
+        for attr in attrs {
             buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
         }
         // Add data-parsoid and data-mw if present
@@ -378,16 +377,27 @@ fn split_structure(doc: &Node) -> (Vec<Node>, Vec<Node>) {
         {
             let mut head = Vec::new();
             let mut body = Vec::new();
+            let mut has_structural = false;
             for section in &child.children {
                 if let NodeKind::Element(ElementKind::Other(tag2)) = &section.kind {
                     match tag2.as_str() {
-                        "head" => head = section.children.clone(),
-                        "body" => body = section.children.clone(),
+                        "head" => {
+                            head = section.children.clone();
+                            has_structural = true;
+                        }
+                        "body" => {
+                            body = section.children.clone();
+                            has_structural = true;
+                        }
                         _ => {}
                     }
                 }
             }
-            return (head, body);
+            if has_structural {
+                return (head, body);
+            }
+            // Fragment mode: no <head>/<body> wrappers — all children are body.
+            return (Vec::new(), child.children.clone());
         }
     }
 

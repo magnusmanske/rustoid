@@ -152,7 +152,20 @@ fn appropriate_mode<H: TreeHandler>(
     for idx in (0..stack.length()).rev() {
         let last_iter = idx == 0;
         let node = stack.item(idx);
-        let html_name = node.html_name.as_str();
+
+        // In fragment mode, the bottommost stack element is the synthetic
+        // <html> root; the actual adjusted current node is the fragment
+        // context element (e.g. <body>). Mirror PHP's `getAppropriateMode`.
+        let html_name = if last_iter && builder.is_fragment {
+            builder
+                .fragment_context
+                .as_ref()
+                .map(|e| e.html_name.as_str())
+                .unwrap_or_else(|| node.html_name.as_str())
+        } else {
+            node.html_name.as_str()
+        };
+
         match html_name {
             "select" => {
                 if last_iter {

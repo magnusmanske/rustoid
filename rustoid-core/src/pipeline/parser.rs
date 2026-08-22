@@ -30,19 +30,15 @@ fn wrap_sections_in_ast(ast: &mut Node, wrap_sections: bool) {
         return;
     }
 
-    // The tree builder produces `<html><head>…</head><body>…</body></html>`.
+    // The tree builder runs in fragment mode: it produces a synthetic `<html>`
+    // whose children are the body content (no `<head>`/`<body>` wrappers). Wrap
+    // those children in sections.
     for html in &mut ast.children {
         if let NodeKind::Element(ElementKind::Other(tag)) = &html.kind
             && tag == "html"
         {
-            for section in &mut html.children {
-                if let NodeKind::Element(ElementKind::Other(tag)) = &section.kind
-                    && tag == "body"
-                {
-                    crate::pipeline::section_wrapper::wrap_sections(section);
-                    return;
-                }
-            }
+            crate::pipeline::section_wrapper::wrap_sections(html);
+            return;
         }
     }
 }
