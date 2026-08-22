@@ -4,21 +4,36 @@ mod harness;
 
 fn run_all_fixtures() {
     let fixture_dir = std::path::Path::new("tests/fixtures");
-    let entries = std::fs::read_dir(fixture_dir).expect("fixtures dir exists");
     let mut total = 0;
     let mut passed = 0;
     let mut file_results = Vec::new();
 
-    for entry in entries {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "txt") {
-            continue;
+    fn collect_txt_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_txt_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "txt") {
+                    out.push(path);
+                }
+            }
         }
+    }
+
+    let mut files = Vec::new();
+    collect_txt_files(fixture_dir, &mut files);
+    files.sort();
+
+    for path in files {
         let summary = harness::run_test_file(&path).unwrap();
         total += summary.total;
         passed += summary.passed;
-        let fname = path.file_name().unwrap().to_string_lossy().to_string();
+        let fname = path
+            .strip_prefix(fixture_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
         file_results.push(format!("  {fname}: {}/{}", summary.passed, summary.total));
     }
 

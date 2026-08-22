@@ -290,8 +290,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                     // Unknown html section — skip
                     section = Section::None;
                     *i += 1;
-                } else if trimmed.starts_with('#') {
-                    // Comment line
+                } else if section == Section::None && trimmed.starts_with('#') {
+                    // Comment line (only at the top level, between tests).
+                    // Inside a wikitext/html section, a `#`-prefixed line is
+                    // content (e.g. `#REDIRECT`, ordered-list items).
                     *i += 1;
                 } else {
                     match section {
@@ -495,6 +497,11 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     let config = MockSiteConfig::new();
     let parser = Parser::new(&config);
 
+    // The `parsoid` option can enable section wrapping via a JSON object like
+    // `parsoid={ "wrapSections": true }`. Mirror that here.
+    let wrap_sections = test.options_raw.contains("wrapSections\": true")
+        || test.options_raw.contains("wrapSections\":true");
+
     let options = ParserOptions {
         page_title: page_title.clone(),
         language: test
@@ -502,10 +509,9 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
             .get("language")
             .cloned()
             .unwrap_or_else(|| "en".to_string()),
-        // The `html/parsoid` sections are bare fragments (no document wrapper
-        // and no section wrapping).
+        // The `html/parsoid` sections are bare fragments (no document wrapper).
         body_only: true,
-        wrap_sections: false,
+        wrap_sections,
         ..ParserOptions::default()
     };
 
@@ -526,11 +532,10 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
 
 /// Normalize and compare the actual V2 output against expected Parsoid HTML.
 ///
-/// The V2 `Parser` emits a full HTML document (`<!DOCTYPE html><html><head>…
-/// </head><body>…</body></html>`), whereas the fixture `html/parsoid` sections
-/// are bare fragments. We extract the `<body>` content and strip the Parsoid
-/// round-trip metadata that the fixtures do not carry in `wt2html` mode, then
-/// compare.
+/// Comparison is faithful for structural HTML (`rel`, `href` with `./` prefix,
+/// `title`, `class`, element nesting). Only the round-trip metadata that the V2
+/// renderer does not yet emit faithfully (`data-parsoid`, `data-mw`) and HTML
+/// comments are normalized away before comparing.
 fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
     let actual_body = extract_body(actual_html);
     let expected_body = if expected_html.contains("<!DOCTYPE") {
@@ -539,12 +544,8 @@ fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
         expected_html.to_string()
     };
 
-    // Normalize both sides: strip data-parsoid/data-mw, comments, `rel`,
-    // `title`, `class="new"`, and the `./` href prefix. These are emitted by the
-    // V2 renderers for round-tripping but are not part of the simplified
-    // fixture expectations.
-    let actual_norm = normalize_paragraphs(&strip_parsoid_attrs(&actual_body));
-    let expected_norm = normalize_paragraphs(&strip_parsoid_attrs(&expected_body));
+    let actual_norm = normalize_paragraphs(&strip_data_attrs(&actual_body));
+    let expected_norm = normalize_paragraphs(&strip_data_attrs(&expected_body));
 
     if actual_norm.trim() == expected_norm.trim() {
         TestResult::Pass
@@ -617,7 +618,10 @@ fn normalize_paragraphs(html: &str) -> String {
     s
 }
 
-fn strip_parsoid_attrs(html: &str) -> String {
+/// Strip only the round-trip metadata (`data-parsoid`, `data-mw`) and HTML
+/// comments. Structural attributes (`rel`, `href`, `title`, `class`) are kept,
+/// so the comparison is faithful to Parsoid's rendered HTML.
+fn strip_data_attrs(html: &str) -> String {
     let mut s = html.to_string();
     // Strip HTML comments.
     while let Some(start) = s.find("<!--") {
@@ -627,35 +631,26 @@ fn strip_parsoid_attrs(html: &str) -> String {
             break;
         }
     }
-    // Strip data-parsoid and data-mw attributes.
+    // Strip data-parsoid and data-mw attributes (round-trip metadata that the
+    // V2 renderer does not yet emit faithfully).
     while let Some(start) = s.find(" data-parsoid='") {
-        if let Some(end) = s[start + 15..].find("'") {
+        if let Some(end) = s[start + 15..].find('\'') {
             s.replace_range(start..start + 15 + end + 1, "");
         } else {
             break;
         }
     }
     while let Some(start) = s.find(" data-mw='") {
-        if let Some(end) = s[start + 11..].find("'") {
+        if let Some(end) = s[start + 11..].find('\'') {
             s.replace_range(start..start + 11 + end + 1, "");
         } else {
             break;
         }
     }
-    // Strip rel="mw:WikiLink" (PHP-format fixtures don't have this).
-    while let Some(start) = s.find(" rel=\"mw:WikiLink\"") {
-        s.replace_range(start..start + 20, "");
-    }
-    // Strip class="new" (red links).
-    while let Some(start) = s.find(" class=\"new\"") {
-        s.replace_range(start..start + 12, "");
-    }
-    // Strip ./ prefix from href values.
-    s = s.replace("href=\"./", "href=\"");
-    // Strip title="..." from links.
-    while let Some(start) = s.find(" title=\"") {
-        if let Some(end) = s[start + 8..].find('"') {
-            s.replace_range(start..start + 8 + end + 1, "");
+    // Strip double-quoted data-parsoid/data-mw variants ("{}").
+    while let Some(start) = s.find(" data-parsoid=\"") {
+        if let Some(end) = s[start + 15..].find('\"') {
+            s.replace_range(start..start + 15 + end + 1, "");
         } else {
             break;
         }

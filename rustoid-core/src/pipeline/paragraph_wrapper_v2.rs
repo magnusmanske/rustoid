@@ -224,12 +224,31 @@ impl ParagraphWrapper {
     }
 
     /// Check if a token is a SOL-transparent tag (link/meta/style).
+    /// Mirrors PHP's `TokenUtils::isSolTransparent`, including
+    /// `isSolTransparentLinkTag` (a `<link>` with `rel` matching
+    /// `mw:PageProp/(?:Category|redirect|Language)`).
     fn is_sol_transparent_tag(&self, token: &Item, token_name: &str) -> bool {
         if matches!(token, Item::Tok(ParsoidToken::EndTag(t)) if t.name == "style") {
             return true;
         }
-        token_name == "style"
-            || (token_name == "meta" && matches!(token, Item::Tok(ParsoidToken::SelfclosingTag(_))))
+        if token_name == "style" {
+            return true;
+        }
+        if token_name == "meta" && matches!(token, Item::Tok(ParsoidToken::SelfclosingTag(_))) {
+            return true;
+        }
+        // SOL-transparent link tags: `<link rel="mw:PageProp/redirect|Category|Language">`.
+        if token_name == "link" {
+            let rel = match token {
+                Item::Tok(t) => t.get_attribute_v("rel").unwrap_or(""),
+                _ => "",
+            };
+            return matches!(
+                rel,
+                "mw:PageProp/redirect" | "mw:PageProp/Category" | "mw:PageProp/Language"
+            );
+        }
+        false
     }
 
     /// Reset everything.
@@ -268,12 +287,14 @@ impl ParagraphWrapper {
         Some(res)
     }
 
-    /// Flush buffers with a token.
+    /// Flush buffers with a token, emitting the token directly (SOL-transparent
+    /// tokens pass through immediately rather than being held for `<p>` wrapping).
     fn flush_buffers(&mut self, token: Item) -> Option<Vec<Item>> {
-        self.curr_line_tokens.push(token);
         let mut res_toks = std::mem::take(&mut self.token_buffer);
         let nl_ws_tokens = std::mem::take(&mut self.nl_ws_tokens);
         res_toks.extend(nl_ws_tokens);
+        // Emit the SOL-transparent token at its position.
+        res_toks.push(token);
         Some(res_toks)
     }
 
