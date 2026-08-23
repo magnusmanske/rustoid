@@ -283,10 +283,17 @@ impl<'a> PegTokenizer<'a> {
             // sol-transparent tokens (comments/behavior-switches) are consumed,
             // a list/heading/hr/table may still follow on the same line.
             if self.try_parse_sol() {
+                let block_saved = self.pos;
+                let block_output = self.output.len();
                 if self.try_block_line() {
                     self.has_sol_transparent_at_start = true;
                     return true;
                 }
+                // `try_block_line` may have consumed SOL whitespace via
+                // `try_table_line` and then backtracked internally, but the
+                // leading space must be preserved for indent-pre detection.
+                self.pos = block_saved;
+                self.output.truncate(block_output);
                 self.try_parse_inlineline();
                 return self.pos > start;
             }
