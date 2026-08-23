@@ -299,6 +299,33 @@ pub fn sanitize_title_uri(title: &str, _is_interwiki: bool) -> String {
     }
 }
 
+/// Escape a fraction string for use as an HTML `id` attribute value.
+/// Mirrors PHP's `Sanitizer::escapeIdForAttribute` (html5 mode): replaces
+/// space/tab/LF/CR/FF with `_`, truncating to 1024 chars.
+pub fn escape_id_for_attribute(id: &str) -> String {
+    escape_id_internal(id, "html5")
+}
+
+/// Normalize whitespace in a section name for use in an anchor id.
+/// Mirrors PHP's `Sanitizer::normalizeSectionNameWhitespace`: collapse runs of
+/// spaces/underscores to a single space and trim.
+pub fn normalize_section_name_whitespace(section: &str) -> String {
+    let mut out = String::with_capacity(section.len());
+    let mut prev_space = false;
+    for c in section.chars() {
+        if c == ' ' || c == '_' {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 /// Escape a fragment string as an HTML5 id (used by `sanitize_title_uri`).
 /// Mirrors PHP's `escapeIdForLink` with html5 mode.
 fn escape_id_for_link(id: &str) -> String {
@@ -390,5 +417,18 @@ mod tests {
             sanitize_title_uri("Cool \"Gator\"", false),
             "Cool%20%22Gator%22"
         );
+    }
+
+    #[test]
+    fn test_escape_id_for_attribute() {
+        assert_eq!(escape_id_for_attribute("Hello world"), "Hello_world");
+        assert_eq!(escape_id_for_attribute("a\tb\nc"), "a_b_c");
+    }
+
+    #[test]
+    fn test_normalize_section_name_whitespace() {
+        assert_eq!(normalize_section_name_whitespace("  a  b  "), "a b");
+        assert_eq!(normalize_section_name_whitespace("a__b"), "a b");
+        assert_eq!(normalize_section_name_whitespace("  a _ b  "), "a b");
     }
 }
