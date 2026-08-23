@@ -181,7 +181,7 @@ impl HtmlSerializer {
                     ElementKind::Wikilink => {
                         let href = node.get_attr("href").unwrap_or("");
                         buf.push_str(&format!("<a rel=\"mw:WikiLink\" href=\"{href}\""));
-                        self.serialize_attrs(node, buf);
+                        self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</a>");
@@ -189,7 +189,7 @@ impl HtmlSerializer {
                     ElementKind::ExtLink => {
                         let href = node.get_attr("href").unwrap_or("");
                         buf.push_str(&format!("<a rel=\"mw:ExtLink\" href=\"{href}\""));
-                        self.serialize_attrs(node, buf);
+                        self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</a>");
@@ -260,6 +260,28 @@ impl HtmlSerializer {
 
     fn serialize_attrs(&self, node: &Node, buf: &mut String) {
         self.serialize_attrs_impl(node, buf, false);
+    }
+
+    /// Serialize a `<a>` element's remaining attributes, skipping `rel`/`href`/`src`
+    /// which are emitted inline by the `Wikilink`/`ExtLink` arms (so they are not
+    /// duplicated). Mirrors PHP, where `buildLinkAttrs` emits `rel` once and
+    /// `addNormalizedAttribute` handles `href`.
+    fn serialize_attrs_skip_rel(&self, node: &Node, buf: &mut String) {
+        let attrs = node
+            .attrs
+            .iter()
+            .filter(|a| a.key != "href" && a.key != "src" && a.key != "rel");
+        for attr in attrs {
+            buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
+        }
+        if let Some(ref dp) = node.data_parsoid {
+            let escaped = dp.replace('&', "&amp;").replace('\'', "&#39;");
+            buf.push_str(&format!(" data-parsoid='{escaped}'"));
+        }
+        if let Some(ref dm) = node.data_mw {
+            let escaped = dm.replace('&', "&amp;").replace('\'', "&#39;");
+            buf.push_str(&format!(" data-mw='{escaped}'"));
+        }
     }
 
     /// Like [`serialize_attrs`], but keeps `href`/`src` attributes. Used for
