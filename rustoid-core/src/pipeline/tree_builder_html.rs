@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::dom::node::Node;
+use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::html5::dispatcher::{Dispatcher, ModeId};
 use crate::html5::element::Attributes;
 use crate::html5::modes;
@@ -394,6 +394,10 @@ impl Html5TreeBuilder {
     pub fn finalize(self) -> Node {
         let mut doc = self.builder.handler.finish();
         resolve_data_ids(&mut doc, &self.stash);
+        // Strip internal marker metas (e.g. `<meta typeof="mw:IndentPreWS">`),
+        // mirroring PHP's `CleanUp::stripMarkerMetas()` which runs after tree
+        // building and before serialization.
+        strip_marker_metas(&mut doc);
         doc
     }
 }
@@ -451,6 +455,30 @@ fn resolve_data_ids(node: &mut Node, stash: &HashMap<usize, StashedNodeData>) {
     }
     for child in &mut node.children {
         resolve_data_ids(child, stash);
+    }
+}
+
+/// Remove marker metas (`<meta typeof="mw:IndentPreWS">`) from the AST.
+/// These are internal bookkeeping placeholders inserted by the PreHandler;
+/// PHP strips them in `CleanUp::stripMarkerMetas()`.
+fn strip_marker_metas(node: &mut Node) {
+    node.children.retain(|child| {
+        let is_marker_meta = matches!(&child.kind, NodeKind::Element(kind) if {
+            match kind {
+                ElementKind::Other(name) => {
+                    name == "meta"
+                        && child
+                            .attrs
+                            .iter()
+                            .any(|a| a.key == "typeof" && a.value == "mw:IndentPreWS")
+                }
+                _ => false,
+            }
+        });
+        !is_marker_meta
+    });
+    for child in &mut node.children {
+        strip_marker_metas(child);
     }
 }
 
@@ -663,6 +691,23 @@ mod tests {
         for needle in ["a", "b", "c"] {
             assert!(contains_text(&doc, needle), "missing {needle}: {doc:?}");
         }
+    }
+
+    #[test]
+    fn test_strip_marker_metas() {
+        let mut doc = Node::document();
+        let mut pre = Node::element(ElementKind::Preformatted);
+        let mut meta = Node::element(ElementKind::Other("meta".to_string()));
+        meta.set_attr("typeof", "mw:IndentPreWS");
+        pre.push_child(meta);
+        pre.push_child(Node::text("asdf"));
+        doc.push_child(pre);
+
+        strip_marker_metas(&mut doc);
+
+        let pre = &doc.children[0];
+        assert_eq!(pre.children.len(), 1);
+        assert!(matches!(&pre.children[0].kind, NodeKind::Text(s) if s == "asdf"));
     }
 
     fn find_placeholder(node: &Node) -> Option<&Node> {
