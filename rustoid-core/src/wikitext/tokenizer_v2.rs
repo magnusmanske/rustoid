@@ -269,6 +269,15 @@ impl<'a> PegTokenizer<'a> {
             self.pos = block_saved;
             self.output.truncate(output_saved);
 
+            // 2a. At SOL with no preceding newline, a run of comment-only lines
+            // (each `space* comment space_or_comment* newline`) is consumed as a
+            // single `EmptyLineTk`, mirroring PHP's `empty_lines_with_comments`.
+            // This is reachable because `inlineline` already consumed the
+            // preceding newline that put us at SOL.
+            if self.try_empty_lines_with_comments() {
+                return true;
+            }
+
             // 4. SOL transparent + inline.
             if self.try_parse_sol() {
                 self.try_parse_inlineline();
@@ -334,16 +343,24 @@ impl<'a> PegTokenizer<'a> {
     }
 
     /// Try to match empty lines with comments.
+    ///
+    /// Mirrors PHP's `empty_lines_with_comments`: each `space* comment
+    /// space_or_comment* newline` cycle is wrapped into a single `EmptyLineTk`
+    /// (with the trailing newline as an `NlTk` nested inside), instead of
+    /// emitting a top-level `NlTk`. This matters because a top-level newline
+    /// would increment the ParagraphWrapper's `newLineCount` and spuriously
+    /// break a paragraph.
     fn try_empty_lines_with_comments(&mut self) -> bool {
-        let _start = self.pos;
+        let start = self.pos;
+        let mut inner: Vec<ParsoidToken> = Vec::new();
         let mut matched = false;
 
-        // Must have at least one cycle: space* comment space_or_comment* newline
         loop {
             if self.eof() {
                 break;
             }
             let cycle_start = self.pos;
+            let out_len = self.output.len();
             // space*
             self.consume_spaces();
             // comment
@@ -363,16 +380,30 @@ impl<'a> PegTokenizer<'a> {
                     } else {
                         self.advance(1);
                     }
-                    self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(nl_start, self.pos))));
+                    // Collect the comment tokens emitted during this cycle (in
+                    // the order they were produced), then the newline token.
+                    let emitted = self.output.drain(out_len..).filter_map(|e| match e {
+                        Either::Right(tok) => Some(tok),
+                        Either::Left(_) => None,
+                    });
+                    inner.extend(emitted);
+                    inner.push(ParsoidToken::Nl(NlTk::new(self.tsr(nl_start, self.pos))));
                     matched = true;
                 } else if !self.eof() {
                     // No newline - not a valid empty-line cycle; backtrack.
                     self.pos = cycle_start;
+                    // Drop any comment tokens emitted for the aborted cycle.
+                    self.output.truncate(out_len);
                     break;
                 }
             } else {
                 break;
             }
+        }
+
+        if matched {
+            let dp = self.make_dp(start, self.pos);
+            self.emit_token(ParsoidToken::EmptyLine(EmptyLineTk::new(inner, dp)));
         }
 
         matched
@@ -2604,5 +2635,28 @@ mod tests {
             "expected mw:redirect for #TILVÍSUN, got {:?}",
             tokens
         );
+    }
+
+    #[test]
+    fn test_comment_on_own_line_becomes_empty_line_tk() {
+        // "asdf\n<!-- c -->\njkl" — the comment+newline must be wrapped in an
+        // EmptyLineTk (not a top-level NlTk), so the ParagraphWrapper keeps
+        // the two text lines in a single paragraph.
+        let options = TokenizerOptions::default();
+        let mut tokenizer = PegTokenizer::new("asdf\n<!-- c -->\njkl", &options);
+        let tokens = tokenizer.tokenize().unwrap();
+
+        let has_empty_line = tokens
+            .iter()
+            .any(|t| matches!(t, Either::Right(ParsoidToken::EmptyLine(_))));
+        assert!(has_empty_line, "expected an EmptyLineTk, got {:?}", tokens);
+
+        // There must be no additional top-level Nl token after the comment line.
+        // (The first text line's newline IS a top-level Nl; the comment's is nested.)
+        let top_level_nl_count = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Nl(_))))
+            .count();
+        assert_eq!(top_level_nl_count, 1, "got {:?}", tokens);
     }
 }
