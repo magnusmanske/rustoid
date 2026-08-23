@@ -278,8 +278,15 @@ impl<'a> PegTokenizer<'a> {
                 return true;
             }
 
-            // 4. SOL transparent + inline.
+            // 4. SOL (newline + empty-lines + sol-transparent) then a block line
+            // or inline line. Mirrors PHP `block_lines = sol block_line` — after
+            // sol-transparent tokens (comments/behavior-switches) are consumed,
+            // a list/heading/hr/table may still follow on the same line.
             if self.try_parse_sol() {
+                if self.try_block_line() {
+                    self.has_sol_transparent_at_start = true;
+                    return true;
+                }
                 self.try_parse_inlineline();
                 return self.pos > start;
             }
