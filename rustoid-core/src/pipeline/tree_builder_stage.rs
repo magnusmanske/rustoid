@@ -52,6 +52,10 @@ impl TreeBuilderStage {
         let mut pw = ParagraphWrapper::with_options(self.inline_context);
         out = pw.wrap(out);
 
+        // 5. SanitizerHandler (drop disallowed tags/attributes; runs last).
+        let mut sanitizer = crate::pipeline::sanitizer_handler::SanitizerHandler::new(false);
+        out = sanitizer.run(out);
+
         out
     }
 

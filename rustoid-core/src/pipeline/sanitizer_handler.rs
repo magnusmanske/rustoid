@@ -132,23 +132,29 @@ impl SanitizerHandler {
             return None;
         };
 
+        // Only literal HTML tags (`stx: "html"`) are sanitized. Parsoid-inserted
+        // meta/link/behavior-switch tokens (with `typeof="mw:*"` etc.) bypass
+        // the sanitizer exactly as in PHP (`SanitizerHandler::onAny` only acts on
+        // `isHTMLTag` tokens).
+        if !token_utils::is_html_tag(tok) {
+            return None;
+        }
+
         let name = tok.get_name();
         let attribs = tok.get_attribs().to_vec();
 
         // Unknown/disallowed HTML tag → convert to plain text.
-        let is_html = token_utils::is_html_tag(tok);
         let disallowed = !is_allowed_literal_tag(name)
             || (matches!(tok, ParsoidToken::EndTag(_)) && no_end_tag_set(name));
 
-        if is_html && disallowed {
+        if disallowed {
             return Some(Item::Str(Self::tag_to_text(name, &attribs, tok)));
         }
 
-        // Sanitize attributes.
+        // Sanitize attributes (faithful `sanitizeTagAttrs` whitelist).
         if !attribs.is_empty() {
             if matches!(tok, ParsoidToken::Tag(_) | ParsoidToken::SelfclosingTag(_)) {
-                // Attribute sanitization: for now, drop obviously dangerous attrs.
-                let sanitized = sanitize_attribs(attribs);
+                let sanitized = crate::sanitizer::sanitize_tag_attrs(name, attribs, |_proto| true);
                 let mut new_tok = tok.clone();
                 new_tok.set_attribs(sanitized);
                 return Some(Item::Tok(new_tok));
@@ -197,27 +203,6 @@ impl SanitizerHandler {
             }
         }
     }
-}
-
-/// Sanitize attribute key-value pairs, dropping obviously dangerous ones.
-/// Mirrors the structure of `Sanitizer::sanitizeTagAttrs` (full whitelist
-/// logic is a separate, larger subsystem).
-fn sanitize_attribs(
-    attribs: Vec<crate::wikitext::tokens_v2::KV>,
-) -> Vec<crate::wikitext::tokens_v2::KV> {
-    attribs
-        .into_iter()
-        .filter(|kv| {
-            // Drop JavaScript/data URLs in attribute values for safety.
-            if let Some(v) = kv.value.as_str() {
-                let lower = v.to_lowercase();
-                if lower.starts_with("javascript:") || lower.starts_with("data:") {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect()
 }
 
 impl Default for SanitizerHandler {

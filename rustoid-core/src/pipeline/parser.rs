@@ -517,6 +517,22 @@ mod tests {
     }
 
     #[test]
+    fn test_attr_sanitization() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        // `onmouseover` is not in the `<pre>` whitelist and must be dropped;
+        // `width` is allowed.
+        let html = parser
+            .wikitext_to_html(
+                "<pre width=\"8\" onmouseover=\"alert()\">x</pre>",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("width=\"8\""), "got: {html}");
+        assert!(!html.contains("onmouseover"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_to_html_bold() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);

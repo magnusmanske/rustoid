@@ -266,6 +266,852 @@ pub fn escape_literal_html_tag(token: &ParsoidToken) -> bool {
     false
 }
 
+/// Fetch the list of acceptable attributes for a given element name (mirrors
+/// PHP's `Sanitizer::attributesAllowedInternal`).
+fn attributes_allowed(element: &str) -> &'static [&'static str] {
+    match element {
+        "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" | "caption" => BLOCK,
+        "center" | "span" | "bdo" | "em" | "strong" | "cite" | "dfn" | "code" | "samp" | "kbd"
+        | "var" | "abbr" | "sub" | "sup" | "dl" | "dd" | "dt" | "thead" | "tfoot" | "tbody"
+        | "tt" | "b" | "i" | "big" | "small" | "strike" | "s" | "u" | "ruby" | "rb" | "rp"
+        | "rt" | "rtc" | "figure" | "figcaption" | "bdi" | "mark" | "aside" => COMMON,
+        "blockquote" | "q" => BLOCKQUOTE,
+        "br" => BR,
+        "wbr" => COMMON,
+        "pre" => PRE,
+        "ins" | "del" | "time" => INS_DEL,
+        "ul" => UL,
+        "ol" => OL,
+        "li" => LI,
+        "table" => TABLE,
+        "colgroup" | "col" => COL,
+        "tr" => TR,
+        "td" | "th" => TD_TH,
+        "a" => A,
+        "img" => IMG,
+        "audio" => AUDIO,
+        "video" => VIDEO,
+        "source" => SOURCE,
+        "track" => TRACK,
+        "font" => FONT,
+        "hr" => HR,
+        "math" => MATH,
+        "data" => DATA,
+        "meta" => META,
+        "link" => LINK,
+        _ => EMPTY_ATTRS,
+    }
+}
+
+const EMPTY_ATTRS: &[&str] = &[];
+
+/// Common HTML attributes (from Sanitizer::setupAttributesAllowedInternal `$common`).
+const COMMON: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    // WAI-ARIA
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    // RDFa
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    // Microdata
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+];
+
+/// Block elements add `align`.
+const BLOCK: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "align",
+];
+
+const BLOCKQUOTE: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "cite",
+];
+
+const BR: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "clear",
+];
+
+const PRE: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "width",
+];
+
+const INS_DEL: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "cite",
+    "datetime",
+];
+
+const UL: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "type",
+];
+
+const OL: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "type",
+    "start",
+    "reversed",
+];
+
+const LI: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "type",
+    "value",
+];
+
+const TABLE: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "summary",
+    "width",
+    "border",
+    "frame",
+    "rules",
+    "cellspacing",
+    "cellpadding",
+    "align",
+    "bgcolor",
+];
+
+const COL: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "span",
+];
+
+const TR: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "bgcolor",
+    "align",
+    "valign",
+];
+
+const TD_TH: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "abbr",
+    "axis",
+    "headers",
+    "scope",
+    "rowspan",
+    "colspan",
+    "nowrap",
+    "width",
+    "height",
+    "bgcolor",
+    "align",
+    "valign",
+];
+
+const A: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "href",
+    "rel",
+    "rev",
+];
+
+const IMG: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "alt",
+    "src",
+    "width",
+    "height",
+    "srcset",
+];
+
+const AUDIO: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "controls",
+    "preload",
+    "width",
+    "height",
+];
+
+const VIDEO: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "poster",
+    "controls",
+    "preload",
+    "width",
+    "height",
+];
+
+const SOURCE: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "type",
+    "src",
+];
+
+const TRACK: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "type",
+    "src",
+    "srclang",
+    "kind",
+    "label",
+];
+
+const FONT: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "size",
+    "color",
+    "face",
+];
+
+const HR: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "width",
+];
+
+const MATH: &[&str] = &["class", "style", "id", "title"];
+
+const DATA: &[&str] = &[
+    "id",
+    "class",
+    "style",
+    "lang",
+    "dir",
+    "title",
+    "tabindex",
+    "aria-describedby",
+    "aria-flowto",
+    "aria-hidden",
+    "aria-label",
+    "aria-labelledby",
+    "aria-level",
+    "aria-owns",
+    "role",
+    "about",
+    "property",
+    "resource",
+    "datatype",
+    "typeof",
+    "itemid",
+    "itemprop",
+    "itemref",
+    "itemscope",
+    "itemtype",
+    "value",
+];
+
+const META: &[&str] = &["itemprop", "content"];
+const LINK: &[&str] = &["itemprop", "href", "title"];
+
+/// Whether an attribute name is a reserved data attribute (`data-mw*`,
+/// `data-parsoid*`, `data-ooui*`), mirroring `isReservedDataAttribute`.
+fn is_reserved_data_attribute(attr: &str) -> bool {
+    let lower = attr.to_lowercase();
+    lower.starts_with("data-mw")
+        || lower.starts_with("data-parsoid")
+        || lower.starts_with("data-ooui")
+}
+
+/// Sanitize the attributes of an HTML tag, keeping only the allowed subset.
+///
+/// A faithful port of `Sanitizer::sanitizeTagAttrs`. Returns the sanitized
+/// attribute list (an empty entry means "drop this attribute"). Attribute names
+/// are lowercased; `style` is normalized, `id` escaped, and `href`/`src`/`poster`
+/// are URL-cleaned.
+pub fn sanitize_tag_attrs(
+    tag_name: &str,
+    attrs: Vec<crate::wikitext::tokens_v2::KV>,
+    has_valid_protocol: impl Fn(&str) -> bool,
+) -> Vec<crate::wikitext::tokens_v2::KV> {
+    let allowed = attributes_allowed(tag_name);
+    let mut new_attrs: Vec<crate::wikitext::tokens_v2::KV> = Vec::new();
+
+    for mut a in attrs {
+        // Convert the key to a plain string name.
+        let key = match &a.key {
+            crate::wikitext::tokens_v2::KeyValue::Str(k) => k.clone(),
+            crate::wikitext::tokens_v2::KeyValue::Tokens(_) => continue, // non-string key: drop
+        };
+        let key_lower = key.to_lowercase();
+
+        // Convert the value to a string.
+        let value = match &a.value {
+            crate::wikitext::tokens_v2::KeyValue::Str(v) => v.clone(),
+            crate::wikitext::tokens_v2::KeyValue::Tokens(_) => continue, // expanded attr: not supported
+        };
+
+        // Allow any `data-*` attribute except reserved ones and namespaced.
+        let is_data_attr = key_lower.starts_with("data-")
+            && !key_lower.contains(':')
+            && key_lower.chars().all(|c| {
+                c != '=' && c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '/' && c != '>'
+            });
+        let allowed_by_list = allowed.contains(&key_lower.as_str());
+        if !(is_data_attr && !is_reserved_data_attribute(&key_lower)) && !allowed_by_list {
+            continue; // drop
+        }
+        if is_reserved_data_attribute(&key_lower) {
+            continue; // drop reserved data-* attributes
+        }
+
+        // Strip javascript "expression" from stylesheets (checkCss is a larger
+        // subsystem; apply the insecure-pattern rejection faithfully).
+        if key_lower == "style" && css_is_insecure(&value) {
+            continue;
+        }
+
+        // Escape HTML id attributes.
+        if key_lower == "id" {
+            let escaped = escape_id_for_attribute(&value);
+            if escaped.is_empty() {
+                continue;
+            }
+            a.value = crate::wikitext::tokens_v2::KeyValue::Str(escaped);
+        }
+
+        // Clean URLs for href/src/poster.
+        if key_lower == "href" || key_lower == "src" || key_lower == "poster" {
+            if let Some(cleaned) = clean_url(&value, "external", &has_valid_protocol) {
+                if cleaned != value {
+                    a.value = crate::wikitext::tokens_v2::KeyValue::Str(cleaned);
+                }
+            } else {
+                continue; // invalid URL: drop the attribute
+            }
+        }
+
+        // Only allow tabindex of 0.
+        if key_lower == "tabindex" && value != "0" {
+            continue;
+        }
+
+        new_attrs.push(a);
+    }
+
+    // itemtype/itemid/itemref require itemscope.
+    let has_itemscope = new_attrs
+        .iter()
+        .any(|a| a.key.as_str() == Some("itemscope"));
+    if !has_itemscope {
+        new_attrs.retain(|a| {
+            let k = a.key.as_str();
+            k != Some("itemtype") && k != Some("itemid") && k != Some("itemref")
+        });
+    }
+
+    new_attrs
+}
+
+/// A faithful subset of `Sanitizer::checkCss`'s insecure-pattern rejection
+/// (the `INSECURE_RE` regex). Returns true if the CSS value is unsafe.
+fn css_is_insecure(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("expression")
+        || lower.contains("accelerator:")
+        || lower.contains("-o-link:")
+        || lower.contains("-o-link-source:")
+        || lower.contains("-o-replace:")
+        || lower.contains("url(")
+        || lower.contains("src(")
+        || lower.contains("image(")
+        || lower.contains("image-set(")
+        || lower.contains("attr(")
+}
+
 /// Sanitize a title for use in a URI. Mirrors PHP's `Sanitizer::sanitizeTitleURI`.
 ///
 /// Percent-encodes characters in the set `[%? \[\]#|<>\\]`, and (if a fragment
@@ -430,5 +1276,43 @@ mod tests {
         assert_eq!(normalize_section_name_whitespace("  a  b  "), "a b");
         assert_eq!(normalize_section_name_whitespace("a__b"), "a b");
         assert_eq!(normalize_section_name_whitespace("  a _ b  "), "a b");
+    }
+
+    #[test]
+    fn test_sanitize_tag_attrs_whitelist() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+        let kv = |k: &str, v: &str| KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+
+        // `<pre>` only allows `common` + `width`; `onmouseover` is dropped.
+        let out = sanitize_tag_attrs(
+            "pre",
+            vec![kv("width", "8"), kv("onmouseover", "alert(1)")],
+            allow_all,
+        );
+        let keys: Vec<&str> = out.iter().filter_map(|a| a.key.as_str()).collect();
+        assert_eq!(keys, vec!["width"]);
+    }
+
+    #[test]
+    fn test_sanitize_tag_attrs_id() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+        let out = sanitize_tag_attrs(
+            "div",
+            vec![KV {
+                key: KeyValue::Str("id".to_string()),
+                value: KeyValue::Str("Hello world".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }],
+            allow_all,
+        );
+        assert_eq!(out[0].value.as_str(), Some("Hello_world"));
     }
 }
