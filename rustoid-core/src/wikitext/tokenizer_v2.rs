@@ -46,6 +46,8 @@ pub struct TokenizerOptions {
     /// leading `#`), e.g. `#REDIRECT`, `#TILVÍSUN`. Matched case-insensitively,
     /// mirroring PHP's `getMagicWordMatcher( 'redirect' )`.
     pub redirect_words: Vec<String>,
+    /// Recognized extension tag names (lowercased), e.g. `nowiki`, `pre`, `ref`.
+    pub ext_tags: Vec<String>,
 }
 
 impl Default for TokenizerOptions {
@@ -59,6 +61,7 @@ impl Default for TokenizerOptions {
             pipeline_offset: 0,
             magic_links: MagicLinkConfig::default(),
             redirect_words: vec!["#redirect".to_string()],
+            ext_tags: Vec::new(),
         }
     }
 }
@@ -103,7 +106,6 @@ impl<'a> PegTokenizer<'a> {
             input_len: input.len(),
             at_sol: options.sol,
             in_template: options.in_template,
-            ext_tags: Vec::new(),
             annotation_tags: Vec::new(),
             output: Vec::new(),
             heading_index: 0,
@@ -114,6 +116,7 @@ impl<'a> PegTokenizer<'a> {
                 .iter()
                 .map(|s| s.to_lowercase())
                 .collect(),
+            ext_tags: options.ext_tags.iter().map(|s| s.to_lowercase()).collect(),
         }
     }
 
@@ -1342,10 +1345,110 @@ impl<'a> PegTokenizer<'a> {
         if self.try_comment() {
             return true;
         }
+        if self.try_extension_tag() {
+            return true;
+        }
         if self.try_html_tag() {
             return true;
         }
         false
+    }
+
+    /// Try an extension tag (`<nowiki>`, `<pre>`, `<ref>`, ...) — a tag whose
+    /// name appears in the extension tag map. Faithful port of the
+    /// `maybe_extension_tag` grammar rule: the tag (including its content and
+    /// end tag, if matched) is collapsed into a single `SelfclosingTagTk` named
+    /// `extension`, carrying `typeof=...`, `name`, `source`, and `options`.
+    ///
+    /// Only `nowiki` is currently expanded end-to-end (in `extension_handler`);
+    /// other extension tags fall through to the HTML path until their handlers
+    /// are implemented.
+    fn try_extension_tag(&mut self) -> bool {
+        if self.starts_with("</") || !self.starts_with("<") {
+            return false;
+        }
+
+        let saved = self.pos;
+        self.advance(1);
+        let name = self.parse_tag_name();
+        if name.is_empty() {
+            self.pos = saved;
+            return false;
+        }
+        let lc_name = name.to_lowercase();
+        if lc_name != "nowiki" || !self.ext_tags.contains(&lc_name) {
+            self.pos = saved;
+            return false;
+        }
+
+        // Parse attributes (consumes source; the `nowiki` handler ignores them).
+        let _attrs = self.parse_html_attributes();
+
+        // Self-closing?
+        self.consume_spaces();
+        let self_closing = self.starts_with("/>");
+        if self_closing {
+            self.advance(2);
+        } else if self.starts_with(">") {
+            self.advance(1);
+        } else {
+            self.pos = saved;
+            return false;
+        }
+
+        // Locate the matching end tag (`</name ...>`), if any, in the remaining
+        // input. The whole `... </name>` region becomes the extension's `source`.
+        let end_tag_re = format!("</{}", lc_name);
+        let mut end_offset: Option<(usize, usize)> = None;
+        if !self_closing
+            && let Some(rel_end) = self.remaining().find(&end_tag_re)
+            && let Some(gt) = self.remaining()[rel_end..].find('>')
+        {
+            // Absolute end offset, and the width of the closing tag (`</name>`).
+            end_offset = Some((self.pos + rel_end + gt + 1, gt + 1));
+        }
+
+        let mut dp = self.make_dp(saved, self.pos);
+
+        if self_closing {
+            // `<name .../>` — no content.
+            dp.src = Some(self.input[saved..self.pos].to_string());
+        } else if let Some((end, close_width)) = end_offset {
+            // Tag with a matched end tag: content spans the whole region.
+            let ext_src = self.input[saved..end].to_string();
+            dp.src = Some(ext_src);
+            // extTagOffsets covers start..end with the end-tag width.
+            dp.ext_tag_offsets = Some(DomSourceRange {
+                start: saved,
+                end,
+                open_width: self.pos - saved,
+                close_width,
+            });
+            self.pos = end;
+        } else {
+            // Unmatched start tag (no end tag): the sanitizer falls back to the
+            // HTML equivalent. Emit the opening tag's source only.
+            dp.src = Some(self.input[saved..self.pos].to_string());
+        }
+
+        let mut stt = SelfclosingTagTk::new("extension", vec![], dp);
+        stt.add_attribute_str("typeof", "mw:Extension");
+        stt.add_attribute_str("name", &lc_name);
+        let source = stt.data_parsoid.src.clone().unwrap_or_default();
+        stt.add_attribute_str("source", &source);
+        // `options` carries the parsed start-tag attributes. The nowiki handler
+        // ignores them (nowiki takes no args), and richer attribute encoding is
+        // deferred; store the parsed attribute count as token placeholders is
+        // intentionally elided — keep an empty token list for now.
+        stt.attribs.push(KV {
+            key: KeyValue::Str("options".to_string()),
+            value: KeyValue::Tokens(vec![]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
     }
 
     /// Try an HTML comment: `<!-- ... -->`
@@ -2344,7 +2447,7 @@ fn is_space_or_nbsp(c: char) -> bool {
 /// The input includes the leading `&` and trailing `;`. A reference that does
 /// not denote a valid character is returned unchanged, matching the PHP
 /// semantic of leaving invalid/unknown references as literal text.
-fn decode_wt_entities(entity: &str) -> String {
+pub(crate) fn decode_wt_entities(entity: &str) -> String {
     // Numeric char references: `&#123;`, `&#x1F;`, `&#X1F;`.
     if let Some(rest) = entity.strip_prefix("&#") {
         let digits = match rest.strip_suffix(';') {

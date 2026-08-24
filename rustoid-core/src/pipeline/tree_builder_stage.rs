@@ -41,6 +41,9 @@ impl TreeBuilderStage {
         // 2. QuoteTransformer (mw-quote → b/i).
         out = QuoteTransformer::transform(out);
 
+        // 2b. ExtensionHandler (expand built-in `<nowiki>` extension tokens).
+        out = crate::pipeline::extension_handler::run(out);
+
         // 3. ListHandler (listItem → ul/ol/li).
         let mut list_handler = ListHandler::new();
         out = list_handler.run(out);

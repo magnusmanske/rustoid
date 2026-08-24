@@ -68,6 +68,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         if let Some(entry) = self.config.magic_words().get("redirect") {
             options.redirect_words = entry.aliases.clone();
         }
+        options.ext_tags = self.config.extension_tags().to_vec();
         let mut tokenizer = PegTokenizer::new(wikitext, &options);
         let chunks = tokenizer.tokenize()?;
         Ok(chunks
@@ -494,6 +495,25 @@ mod tests {
             .unwrap();
         assert!(html.contains("<h2"), "got: {html}");
         assert!(html.contains("Heading"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_nowiki() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        // `<nowiki>` renders as `<span typeof="mw:Nowiki">` with raw escaped text.
+        let html = parser
+            .wikitext_to_html("<nowiki>hi</nowiki>", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("typeof=\"mw:Nowiki\""), "got: {html}");
+        assert!(html.contains(">hi</span>"), "got: {html}");
+
+        // The nested `</pre>` is escaped, not treated as a tag.
+        let html = parser
+            .wikitext_to_html("<nowiki></pre></nowiki>", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("&lt;/pre>"), "got: {html}");
+        assert!(!html.contains("<pre>"), "got: {html}");
     }
 
     #[test]
