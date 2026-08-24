@@ -142,7 +142,6 @@ fn split_entities(s: &str) -> Vec<&str> {
     parts
 }
 
-/// Split a string on wikitext entity references (`&[#0-9a-zA-Z]+;`), retaining
 /// Expand extension tokens in a token stream. Runs before tree building,
 /// replacing `extension` self-closing tokens with their DOM token sequences.
 /// Faithful to the TT3 extension-handler stage in PHP Parsoid.
