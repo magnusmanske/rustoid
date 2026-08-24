@@ -239,6 +239,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_behavior_switches(tokens);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_source(tokens, Some(wikitext));
+        crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);
         Ok(ast)
@@ -297,6 +298,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_source(tokens, Some(page_source));
+        crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);
         ast

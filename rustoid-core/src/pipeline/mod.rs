@@ -11,6 +11,7 @@ pub mod frame;
 pub mod headings;
 pub mod list_handler;
 pub mod media_options;
+pub mod p_wrap;
 pub mod paragraph_wrapper_v2;
 pub mod parser;
 pub mod parser_functions;
