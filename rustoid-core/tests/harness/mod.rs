@@ -259,9 +259,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 *i += 1;
             }
             "!! html" | "!! html/*" => {
-                // Generic HTML: use for PHP format. If there's no parsoid section,
-                // we can use this, but it won't match Parsoid output.
-                section = Section::HtmlPhp;
+                // Generic HTML: canonical output. Served as BOTH the Parsoid
+                // and legacy expected output (the two parsers agree here),
+                // mirroring Parsoid's PARSOID_HTML_KEYS / LEGACY_HTML_KEYS.
+                section = Section::HtmlBoth;
                 *i += 1;
             }
             "!! html/php" => {
@@ -301,6 +302,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                         Section::Wikitext => wikitext_lines.push(line.to_string()),
                         Section::Html => html_parsoid_lines.push(line.to_string()),
                         Section::HtmlPhp => html_php_lines.push(line.to_string()),
+                        Section::HtmlBoth => {
+                            html_parsoid_lines.push(line.to_string());
+                            html_php_lines.push(line.to_string());
+                        }
                         Section::HtmlLang => html_parsoid_lang_lines.push(line.to_string()),
                         Section::WikitextEdited => wikitext_edited_lines.push(line.to_string()),
                         Section::None => { /* skip */ }
@@ -350,6 +355,7 @@ enum Section {
     Wikitext,
     Html,
     HtmlPhp,
+    HtmlBoth,
     HtmlLang,
     WikitextEdited,
 }
@@ -531,11 +537,6 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
 }
 
 /// Normalize and compare the actual V2 output against expected Parsoid HTML.
-///
-/// Comparison is faithful for structural HTML (`rel`, `href` with `./` prefix,
-/// `title`, `class`, element nesting). Only the round-trip metadata that the V2
-/// renderer does not yet emit faithfully (`data-parsoid`, `data-mw`) and HTML
-/// comments are normalized away before comparing.
 fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
     let actual_body = extract_body(actual_html);
     let expected_body = if expected_html.contains("<!DOCTYPE") {
