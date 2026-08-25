@@ -615,6 +615,10 @@ fn normalize_paragraphs(html: &str) -> String {
     while let Some(pos) = s.find("<i></i>") {
         s.replace_range(pos..pos + 7, "");
     }
+    // Parsoid's test runner normalizes `<br />`/`<br>` to `<br/>`.
+    while let Some(pos) = s.find("<br />") {
+        s.replace_range(pos..pos + 6, "<br/>");
+    }
     s
 }
 
