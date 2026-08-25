@@ -517,10 +517,12 @@ fn encapsulate_transclusions(node: &mut Node) {
     }
 
     let children = std::mem::take(&mut node.children);
-    node.children = wrap_transclusion_children(children);
+    let children = wrap_transclusion_children(children);
+    node.children = wrap_flipped_children(children);
 }
 
-/// Wrap transclusion ranges among a parent's direct children.
+/// Wrap transclusion ranges among a parent's direct children (the sibling case,
+/// where both the start and end marker metas are direct children).
 fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
@@ -559,6 +561,92 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
         i = end + 1;
     }
     out
+}
+
+/// Wrap transclusion ranges whose content was fostered out of a list/table (the
+/// "flipped" case in PHP's `DOMRangeBuilder`): the end marker meta ends up nested
+/// inside a *preceding* sibling element while the start marker is a sibling after
+/// it. The start marker's `about`/`typeof`/`data-mw`/`data-parsoid` are transferred
+/// onto that sibling element, and both markers are removed.
+fn wrap_flipped_children(mut children: Vec<Node>) -> Vec<Node> {
+    let mut i = 0;
+    while i < children.len() {
+        if !is_transclusion_start(&children[i]) {
+            i += 1;
+            continue;
+        }
+
+        let about: Option<String> = children[i].get_attr("about").map(str::to_string);
+
+        // Search preceding siblings (nearest first) for an element whose subtree
+        // contains the matching end marker.
+        let mut target = None;
+        for j in (0..i).rev() {
+            if matches!(children[j].kind, NodeKind::Element(_))
+                && subtree_contains_end_meta(&children[j], about.as_deref())
+            {
+                target = Some(j);
+                break;
+            }
+        }
+
+        let Some(j) = target else {
+            i += 1;
+            continue;
+        };
+
+        let start_meta = children[i].clone();
+        transfer_transclusion_to_element(&mut children[j], &start_meta);
+        remove_end_meta(&mut children[j], about.as_deref());
+        children.remove(i);
+        // Do not advance `i`: the next sibling shifted into this index.
+    }
+    children
+}
+
+/// Does this subtree contain a transclusion *end* marker with the given `about`?
+fn subtree_contains_end_meta(node: &Node, about: Option<&str>) -> bool {
+    if is_transclusion_end(node) && node.get_attr("about") == about {
+        return true;
+    }
+    node.children
+        .iter()
+        .any(|c| subtree_contains_end_meta(c, about))
+}
+
+/// Remove a transclusion *end* marker with the given `about` from a subtree.
+/// Returns true if one was removed.
+fn remove_end_meta(node: &mut Node, about: Option<&str>) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while i < node.children.len() {
+        if is_transclusion_end(&node.children[i]) && node.children[i].get_attr("about") == about {
+            node.children.remove(i);
+            found = true;
+        } else {
+            i += 1;
+        }
+    }
+    for child in &mut node.children {
+        if remove_end_meta(child, about) {
+            found = true;
+        }
+    }
+    found
+}
+
+/// Transfer the encapsulation data from a transclusion start marker meta onto
+/// the target element (mirrors `encapsulateTemplates`' type/`about`/data-mw
+/// transfer when the range start is a non-meta element).
+fn transfer_transclusion_to_element(target: &mut Node, start_meta: &Node) {
+    if let Some(about) = start_meta.get_attr("about") {
+        target.set_attr("about", about);
+    }
+    if let Some(typeof_) = start_meta.get_attr("typeof") {
+        target.set_attr("typeof", typeof_);
+    }
+    target.data_parsoid = start_meta.data_parsoid.clone();
+    target.data_mw = start_meta.data_mw.clone();
 }
 
 /// Build the wrapping `<span>` from a transclusion start marker meta.

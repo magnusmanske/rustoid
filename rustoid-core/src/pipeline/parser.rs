@@ -906,6 +906,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_template_expands_to_list_encapsulation() {
+        use crate::mock::MockDataSource;
+        let source = MockDataSource::new();
+        source.add_template("Template:1x", "{{{1}}}");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        // A template expanding to list syntax gets fostered out of the list;
+        // the transclusion `about`/`typeof` must be transferred onto the `<ul>`.
+        let html = parser
+            .wikitext_to_html_expanded("{{1x|*bar}}", &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        assert!(
+            html.contains("<ul about=\"#mwt1\" typeof=\"mw:Transclusion\""),
+            "got: {html}"
+        );
+        assert!(html.contains("<li"), "got: {html}");
+        assert!(html.contains(">bar</li>"), "got: {html}");
+        assert!(!html.contains("mw:Transclusion/End"), "got: {html}");
+    }
+
+    #[tokio::test]
     async fn test_wikitext_nested_template() {
         use crate::mock::MockDataSource;
 
