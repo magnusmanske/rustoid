@@ -88,15 +88,23 @@ impl ParagraphWrapper {
     /// Dispatch a single token to the correct handler.
     ///
     /// Mirrors PHP `LineBasedHandler::process`'s dispatch order:
-    /// NlTk → onNewline, CompoundTk → onCompoundTk, EOFTk → onEnd,
-    /// otherwise → onAny (when `onAnyEnabled`).
+    /// NlTk → onNewline, EOFTk → onEnd, CompoundTk → onCompoundTk (whose
+    /// `null` result falls through to onAny), otherwise → onAny.
     fn on_token(&mut self, token: Item) -> Option<Vec<Item>> {
         match &token {
             Item::Tok(ParsoidToken::Nl(_)) => self.on_newline_or_eof(token),
             Item::Tok(ParsoidToken::Eof(_)) => self.on_newline_or_eof(token),
             Item::Tok(ParsoidToken::List(_))
             | Item::Tok(ParsoidToken::IndentPre(_))
-            | Item::Tok(ParsoidToken::EmptyLine(_)) => self.on_compound_tk(token),
+            | Item::Tok(ParsoidToken::EmptyLine(_)) => {
+                let res = self.on_compound_tk(token.clone());
+                if res.is_none() {
+                    // onCompoundTk returned null → dispatch to onAny.
+                    self.on_any(token)
+                } else {
+                    res
+                }
+            }
             _ => self.on_any(token),
         }
     }
@@ -105,16 +113,70 @@ impl ParagraphWrapper {
     ///
     /// Faithful port of PHP `ParagraphWrapper::onCompoundTk`:
     /// - DL-DD lists are flattened and their nested tokens re-wrapped;
-    /// - all other compound tokens pass through unchanged (return the token).
+    /// - IndentPreTk / EmptyLineTk return `None` so the caller dispatches the
+    ///   token to `onAny` (PHP returns `null`);
+    /// - non-DL-DD ListTk is passed through unchanged. (PHP routes it through
+    ///   `onAny`, but the tree builder's transclusion encapsulation doesn't yet
+    ///   handle the resulting start-meta-before-list order, so we preserve the
+    ///   existing pass-through behaviour for now.)
     fn on_compound_tk(&mut self, token: Item) -> Option<Vec<Item>> {
-        if let Item::Tok(ParsoidToken::List(t)) = &token
-            && t.is_dl_dd_list()
-        {
-            let nested = t.get_nested_tokens().to_vec();
-            return Some(self.wrap(nested));
+        if let Item::Tok(ParsoidToken::List(t)) = &token {
+            if t.is_dl_dd_list() {
+                let nested = t.get_nested_tokens().to_vec();
+                return Some(self.wrap(nested));
+            }
+            // Non-DL-DD list: pass through (see doc comment above).
+            return Some(vec![token]);
         }
-        // EmptyLineTk / IndentPreTk / non-DL-DD ListTk: pass through.
-        Some(vec![token])
+        // IndentPreTk / EmptyLineTk: fall through to onAny.
+        None
+    }
+
+    /// Undo an indent-pre when it appears in a block element or blockquote.
+    ///
+    /// Faithful port of PHP `ParagraphWrapper::undoIndentPre`: re-emit the
+    /// nested tokens (skipping `<pre>`, `</pre>`, and converting the
+    /// `mw:IndentPreWS` meta to a space) through the normal line handlers.
+    fn undo_indent_pre(
+        &mut self,
+        ipre: &crate::wikitext::tokens_v2::IndentPreTk,
+    ) -> Option<Vec<Item>> {
+        let mut ret = if self.new_line_count == 0 {
+            // `flushBuffers('')` — flush the pending buffer, holding nothing.
+            self.flush_buffers(Item::Str(String::new()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let nested = ipre.get_nested_tokens().to_vec();
+        let n = nested.len();
+        let mut i = 1; // skip the <pre>
+        while i < n {
+            let token = nested[i].clone();
+            let is_ws = matches!(&token, Item::Tok(ParsoidToken::SelfclosingTag(tk))
+                if tk.attribs.iter().any(|kv| kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:IndentPreWS")));
+            let is_nl = matches!(&token, Item::Tok(ParsoidToken::Nl(_)));
+            let is_pre_end =
+                matches!(&token, Item::Tok(ParsoidToken::EndTag(t)) if t.name == "pre");
+
+            if is_ws {
+                self.nl_ws_tokens.push(Item::Str(" ".to_string()));
+            } else if is_pre_end {
+                // Skip `</pre>`.
+            } else if is_nl {
+                if let Some(res) = self.on_newline_or_eof(token) {
+                    ret.extend(res);
+                }
+            } else {
+                if let Some(res) = self.on_any(token) {
+                    ret.extend(res);
+                }
+            }
+            i += 1;
+        }
+
+        Some(ret)
     }
 
     /// Handle newline or EOF tokens.
@@ -201,10 +263,16 @@ impl ParagraphWrapper {
             return self.process_buffers(token, false);
         }
 
-        // List token (ListTk) — skip nested processing.
-        // Our token type doesn't have ListTk yet; handled by ListHandler elsewhere.
-
-        // IndentPreTk — undo if in block context.
+        // IndentPreTk: skip nested tokens, unless nested in a block or
+        // blockquote, in which case the pre is undone.
+        if let Item::Tok(ParsoidToken::IndentPre(t)) = &token {
+            let ipre = t.clone();
+            if self.in_block_elem || self.in_blockquote {
+                return self.undo_indent_pre(&ipre);
+            }
+            self.curr_line_block_tag_seen = true;
+            return self.process_buffers(token, true);
+        }
 
         // Wikitext block elements.
         if consts::wikitext_block_elems().contains(&token_name) {

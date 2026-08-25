@@ -771,7 +771,7 @@ fn collapse_text(s: &str, strip_leading: bool, strip_trailing: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_ws = false;
     for c in s.chars() {
-        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c') {
             if !in_ws {
                 out.push(' ');
                 in_ws = true;
@@ -782,15 +782,21 @@ fn collapse_text(s: &str, strip_leading: bool, strip_trailing: bool) -> String {
         }
     }
     let mut result = out;
+    strip_ws(&mut result, strip_leading, strip_trailing);
+    result
+}
+
+/// Strip leading/trailing `\s+` runs, mirroring PHP's `stripLeadingWS` /
+/// `stripTrailingWS` (which applies both inside and outside `<pre>`).
+fn strip_ws(s: &mut String, strip_leading: bool, strip_trailing: bool) {
     if strip_leading {
-        let trimmed = result.trim_start();
-        result = trimmed.to_string();
+        let trimmed = s.trim_start().to_string();
+        *s = trimmed;
     }
     if strip_trailing {
-        let trimmed = result.trim_end();
-        result = trimmed.to_string();
+        let trimmed = s.trim_end().to_string();
+        *s = trimmed;
     }
-    result
 }
 
 /// Normalization options threaded through the tree walk (mirrors
@@ -802,8 +808,9 @@ struct NOpts {
     strip_te: bool,
 }
 
-/// Recursively normalize text nodes: collapse whitespace runs and strip at block
-/// boundaries. Mirrors `normalizeIEWVisitor`.
+/// Recursively normalize text nodes: collapse whitespace runs (outside
+/// `<pre>`) and strip at block boundaries (inside and outside `<pre>`).
+/// Mirrors `normalizeIEWVisitor` faithfully.
 fn normalize_nodes(nodes: &mut [MNode], mut opts: NOpts) {
     let n = nodes.len();
     for (i, node) in nodes.iter_mut().enumerate() {
@@ -815,6 +822,12 @@ fn normalize_nodes(nodes: &mut [MNode], mut opts: NOpts) {
             MNode::Text(t) => {
                 if !node_opts.in_pre {
                     *t = collapse_text(t, node_opts.strip_le, node_opts.strip_te);
+                } else {
+                    // Inside `<pre>`: preserve newlines, but still strip the
+                    // leading/trailing whitespace runs per PHP (the
+                    // `stripLeadingWS`/`stripTrailingWS` regexes are applied
+                    // outside the `!inPRE` guard).
+                    strip_ws(t, node_opts.strip_le, node_opts.strip_te);
                 }
             }
             MNode::Elem { name, children, .. } => {
@@ -822,8 +835,8 @@ fn normalize_nodes(nodes: &mut [MNode], mut opts: NOpts) {
                 let is_pre = nm == "pre";
                 let next_in_pre = node_opts.in_pre || is_pre;
                 let (next_le, next_te) = if is_pre {
-                    // `<pre>`: preserve content, but strip a trailing newline
-                    // (legacy parser parity).
+                    // `<pre>`: preserve content newlines, but strip a trailing
+                    // newline before `</pre>` (legacy parser parity).
                     (false, true)
                 } else {
                     let around = newline_around(&nm);
