@@ -1843,10 +1843,14 @@ impl<'a> PegTokenizer<'a> {
         dp.src = Some(self.input[saved..self.pos].to_string());
         let mut stt = SelfclosingTagTk::new("templatearg", vec![], dp);
 
-        // Split content on the first '|' for name | default.
+        // Split content on the first '|' for name | default. Comments in the
+        // argument name are stripped (as in template targets).
         let (name, default) = match inner.split_once('|') {
-            Some((n, d)) => (n.trim().to_string(), Some(d.to_string())),
-            None => (inner.trim().to_string(), None),
+            Some((n, d)) => (
+                strip_html_comments(n).trim().to_string(),
+                Some(d.to_string()),
+            ),
+            None => (strip_html_comments(&inner).trim().to_string(), None),
         };
 
         // Mirrors `tplarg`: attribs[0] is KV(name, '') and attribs[1] (if any)
@@ -1927,8 +1931,14 @@ impl<'a> PegTokenizer<'a> {
         let mut stt = SelfclosingTagTk::new("template", vec![], dp);
 
         // attribs[0] = KV(target, '') — target is the part before the first '|'.
-        let target = parts.first().map(|s| s.as_str()).unwrap_or("").trim();
-        stt.attribs.push(kv_str(target, ""));
+        // Comments in the target are stripped (they are `CommentTk` tokens that
+        // `tokensToString` drops in PHP; here the target is raw source text so
+        // we strip the comment syntax directly).
+        let target = parts
+            .first()
+            .map(|s| strip_html_comments(s).trim().to_string())
+            .unwrap_or_default();
+        stt.attribs.push(kv_str(&target, ""));
 
         // attribs[1..] are the arguments: `name=value` is named, else positional.
         for part in parts.iter().skip(1) {
@@ -2775,6 +2785,26 @@ fn name_to_include_type(name: &str) -> &str {
     }
 }
 
+/// Strip `<!-- ... -->` comments from a raw string. Mirrors the effect of
+/// `TokenUtils::tokensToString` on a tokenized template/wikilink target, which
+/// drops `CommentTk` tokens. Used for template targets that are captured as raw
+/// source text rather than a token array.
+fn strip_html_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 4..];
+        match after.find("-->") {
+            Some(end) => rest = &after[end + 3..],
+            // Unclosed comment: consume to the end of the input.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Build a string-valued KV (key/value as string tokens).
 fn kv_str(key: &str, value: &str) -> KV {
     KV {
@@ -3160,6 +3190,19 @@ mod tests {
         assert_eq!(unescape_comment("--&amp;gt;"), "--&gt;");
         assert_eq!(unescape_comment("--&amp;amp;gt;"), "--&amp;gt;");
         assert_eq!(unescape_comment("no escapes"), "no escapes");
+    }
+
+    #[test]
+    fn test_strip_html_comments() {
+        // Empty and non-empty comments are removed.
+        assert_eq!(strip_html_comments("f<!---->oo"), "foo");
+        assert_eq!(strip_html_comments("a<!-- x -->b"), "ab");
+        // No comment: unchanged.
+        assert_eq!(strip_html_comments("plain"), "plain");
+        // An unclosed comment consumes the rest of the string.
+        assert_eq!(strip_html_comments("a<!-- b"), "a");
+        // Multiple comments.
+        assert_eq!(strip_html_comments("a<!--1-->b<!--2-->c"), "abc");
     }
 
     #[test]
