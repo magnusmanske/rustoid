@@ -108,10 +108,23 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // `mw:redirect` is handled separately: it becomes a single
             // `<link rel="mw:PageProp/redirect" .../>` token.
             if stt.name == "mw:redirect" {
-                out.extend(render_redirect(
-                    &mut ctx,
-                    &ParsoidToken::SelfclosingTag(stt.clone()),
-                ));
+                let href = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .and_then(|kv| kv.value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // A redirect to a `<nowiki>` or templated target cannot be rendered
+                // as a clean link; mirror PHP's `onRedirect`/`bailTokens` bail-out.
+                if href.contains("<nowiki") || href.contains("{{") {
+                    out.extend(self.bail_dirty_redirect(stt, &href));
+                } else {
+                    out.extend(render_redirect(
+                        &mut ctx,
+                        &ParsoidToken::SelfclosingTag(stt.clone()),
+                    ));
+                }
                 continue;
             }
 
@@ -149,6 +162,41 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             out.extend(rendered);
         }
 
+        out
+    }
+
+    /// Reconstruct an invalid redirect (target contains `<nowiki>` or a
+    /// template) as a `#` list item, mirroring PHP's `onRedirect` bail + `bailTokens`.
+    /// The redirect word (minus the leading `#`) is followed by the re-tokenized
+    /// wikilink source with its leading `[` restored.
+    fn bail_dirty_redirect(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        href: &str,
+    ) -> Vec<Item> {
+        // The redirect word source (e.g. `#REDIRECT `).
+        let src = stt.data_parsoid.src.clone().unwrap_or_default();
+        let word = src.strip_prefix('#').unwrap_or(&src).to_string();
+
+        // Re-tokenize the wikilink inner (`[{href}]]`, mirroring PHP's
+        // `bailTokens` which strips the first `[`) and expand `<nowiki>`.
+        let re_src = format!("[{href}]]");
+        let tokens = self.tokenize(&re_src).unwrap_or_default();
+        let expanded = crate::pipeline::extension_handler::run(tokens);
+
+        let mut li = crate::wikitext::tokens_v2::TagTk::new(
+            "listItem",
+            vec![],
+            crate::wikitext::tokens_v2::DataParsoid::default(),
+        );
+        li.add_attribute_str("bullets", "#");
+
+        let mut out = vec![
+            Item::Tok(ParsoidToken::Tag(li)),
+            Item::Str(word),
+            Item::Str("[".to_string()),
+        ];
+        out.extend(expanded);
         out
     }
 
@@ -805,6 +853,23 @@ mod tests {
         );
         assert!(html.contains(r#"href="./Target""#), "got: {html}");
         assert!(!html.contains("<mw:redirect"), "got: {html}");
+    }
+
+    #[test]
+    fn test_wikitext_to_html_redirect_nowiki_bail() {
+        // A redirect target containing `<nowiki>` cannot be rendered as a link;
+        // it bails to `<ol><li>REDIRECT [[<span typeof="mw:Nowiki">…</span>]]</li></ol>`.
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "#REDIRECT [[<nowiki>[[Bar]]</nowiki>]]",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("<ol><li>"), "got: {html}");
+        assert!(html.contains("typeof=\"mw:Nowiki\""), "got: {html}");
+        assert!(html.contains(">[[Bar]]</span>"), "got: {html}");
     }
 
     #[test]

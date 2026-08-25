@@ -907,6 +907,7 @@ impl<'a> PegTokenizer<'a> {
     }
 
     /// Try to match a redirect.
+    /// Try redirect.
     fn try_redirect(&mut self) -> Option<ParsoidToken> {
         // Only at very start of document.
         if self.pos != 0 {
@@ -960,7 +961,7 @@ impl<'a> PegTokenizer<'a> {
         }
         self.advance(2);
         let target_start = self.pos;
-        let Some(end) = self.remaining().find("]]") else {
+        let Some(end) = find_wikilink_close(self.remaining()) else {
             self.pos = saved;
             return None;
         };
@@ -1823,8 +1824,8 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(2);
 
-        // Find closing `]]`.
-        if let Some(end) = self.remaining().find("]]") {
+        // Find closing `]]` (skipping `<nowiki>` blocks).
+        if let Some(end) = find_wikilink_close(self.remaining()) {
             let content = &self.remaining()[..end];
             let (target, text) = if let Some(pipe) = content.find('|') {
                 (
@@ -2437,6 +2438,44 @@ fn is_space_or_nbsp(c: char) -> bool {
     )
 }
 
+/// Find the byte offset of the first `]]` that is not inside a `<nowiki>` element.
+///
+/// The PHP wikilink/redirect grammar parses `<nowiki>` as a directive, so a `]]`
+/// inside `<nowiki>…</nowiki>` does *not* terminate the enclosing `[[…]]`.
+fn find_wikilink_close(input: &str) -> Option<usize> {
+    let lower = input.to_ascii_lowercase();
+    let mut i = 0;
+    while i + 1 < input.len() {
+        if lower[i..].starts_with("<nowiki") {
+            let rest = &input[i + 7..];
+            // A real `<nowiki>` tag is followed by `>`, `/`, or whitespace.
+            if rest.starts_with('>')
+                || rest.starts_with('/')
+                || rest.starts_with(|c: char| c.is_whitespace())
+            {
+                if let Some(close_rel) = lower[i + 7..].find("</nowiki") {
+                    let close_start = i + 7 + close_rel;
+                    let after_close = &input[close_start + 8..];
+                    let gt = after_close
+                        .find('>')
+                        .map(|g| g + 1)
+                        .unwrap_or(after_close.len());
+                    i = close_start + 8 + gt;
+                    continue;
+                }
+                // Unclosed `<nowiki>`: the rest is literal, no `]]` terminator.
+                return None;
+            }
+        }
+        if input[i..].starts_with("]]") {
+            return Some(i);
+        }
+        let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        i += ch_len;
+    }
+    None
+}
+
 /// Decode a single wikitext HTML entity reference (mirrors PHP's
 /// `Utils::decodeWtEntities`, which is `decodeCharReferences` after
 /// `normalizeCharReferences`).
@@ -2864,5 +2903,15 @@ mod tests {
         assert_eq!(unescape_comment("--&amp;gt;"), "--&gt;");
         assert_eq!(unescape_comment("--&amp;amp;gt;"), "--&amp;gt;");
         assert_eq!(unescape_comment("no escapes"), "no escapes");
+    }
+
+    #[test]
+    fn test_find_wikilink_close() {
+        // Plain target: the first `]]` terminates.
+        assert_eq!(find_wikilink_close("Foo]]"), Some(3));
+        // A `]]` inside `<nowiki>` is skipped.
+        assert_eq!(find_wikilink_close("<nowiki>[[Bar]]</nowiki>]]"), Some(24));
+        // No closing brackets: None.
+        assert_eq!(find_wikilink_close("Foo"), None);
     }
 }
