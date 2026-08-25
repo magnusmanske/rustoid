@@ -157,9 +157,7 @@ pub fn tokens_to_string(tokens: &[Item]) -> String {
 pub fn key_value_to_string(kv: &KeyValue) -> String {
     match kv {
         KeyValue::Str(s) => s.clone(),
-        KeyValue::Tokens(tokens) => {
-            tokens_to_string(&tokens.iter().cloned().map(Item::Tok).collect::<Vec<_>>())
-        }
+        KeyValue::Tokens(items) => tokens_to_string(items),
     }
 }
 

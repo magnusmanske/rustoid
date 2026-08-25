@@ -231,9 +231,7 @@ pub fn add_link_attributes_and_get_content(
                 crate::wikitext::tokens_v2::KeyValue::Str(s) => {
                     vec![Item::Str(s.clone())]
                 }
-                crate::wikitext::tokens_v2::KeyValue::Tokens(t) => {
-                    t.iter().cloned().map(Item::Tok).collect()
-                }
+                crate::wikitext::tokens_v2::KeyValue::Tokens(t) => t.clone(),
             };
             out.extend(toks);
             if i < content_kvs.len() - 1 {

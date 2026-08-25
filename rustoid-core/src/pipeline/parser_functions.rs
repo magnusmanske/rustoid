@@ -78,9 +78,7 @@ pub struct NamedArgs {
 fn key_value_to_string(kv: &KeyValue) -> String {
     match kv {
         KeyValue::Str(s) => s.clone(),
-        KeyValue::Tokens(t) => {
-            tokens_to_string(&t.iter().cloned().map(Item::Tok).collect::<Vec<_>>())
-        }
+        KeyValue::Tokens(t) => tokens_to_string(t),
     }
 }
 
@@ -88,9 +86,7 @@ fn key_value_to_string(kv: &KeyValue) -> String {
 fn value_to_string(kv: &KeyValue) -> String {
     match kv {
         KeyValue::Str(s) => s.clone(),
-        KeyValue::Tokens(t) => {
-            tokens_to_string(&t.iter().cloned().map(Item::Tok).collect::<Vec<_>>())
-        }
+        KeyValue::Tokens(t) => tokens_to_string(t),
     }
 }
 
@@ -440,11 +436,9 @@ fn key_value_to_item(v: &KeyValue) -> Item {
         KeyValue::Str(s) => Item::Str(s.clone()),
         KeyValue::Tokens(t) => {
             if t.len() == 1 {
-                Item::Tok(t[0].clone())
+                t[0].clone()
             } else {
-                Item::Str(tokens_to_string(
-                    &t.iter().cloned().map(Item::Tok).collect::<Vec<_>>(),
-                ))
+                Item::Str(tokens_to_string(t))
             }
         }
     }

@@ -151,20 +151,23 @@ impl Frame {
 fn key_value_to_items(value: &KeyValue) -> Vec<Item> {
     match value {
         KeyValue::Str(s) => vec![Item::Str(s.clone())],
-        KeyValue::Tokens(tokens) => tokens.iter().cloned().map(Item::Tok).collect::<Vec<_>>(),
+        KeyValue::Tokens(items) => items.clone(),
     }
 }
 
-/// Convert a token list (`Vec<ParsoidToken>`) to a single concatenated string.
-fn to_strings(tokens: &[ParsoidToken]) -> String {
-    tokens
+/// Convert a token chunk (`Vec<Item>`) to a single concatenated string.
+fn to_strings(items: &[Item]) -> String {
+    items
         .iter()
-        .map(|t| match t {
-            ParsoidToken::Comment(_) | ParsoidToken::Nl(_) => String::new(),
-            other => other
-                .data_parsoid()
-                .and_then(|d| d.src.clone())
-                .unwrap_or_default(),
+        .map(|it| match it {
+            Item::Str(s) => s.clone(),
+            Item::Tok(t) => match t {
+                ParsoidToken::Comment(_) | ParsoidToken::Nl(_) => String::new(),
+                other => other
+                    .data_parsoid()
+                    .and_then(|d| d.src.clone())
+                    .unwrap_or_default(),
+            },
         })
         .collect()
 }

@@ -14,7 +14,7 @@
 //! depends on `PipelineUtils::expandAttrValuesToDOM` and `DataMwAttrib`, which
 //! are layered in once the value-to-DOM pipeline is ported.
 
-use crate::wikitext::tokens_v2::{Item, ParsoidToken};
+use crate::wikitext::tokens_v2::{Item, KV, KeyValue, ParsoidToken};
 
 /// The `typeof` regexp identifying the meta markers that isolate
 /// transclusion/param/language-variant/include/annotation content, mirroring
@@ -317,6 +317,201 @@ pub fn split_tokens(
             post_nl_buf: Vec::new(),
         }
     }
+}
+
+/// Allocate the next transclusion `about` id (mirrors `Env::newAboutId`).
+pub fn new_about_id(counter: &std::cell::Cell<usize>) -> String {
+    let id = counter.get() + 1;
+    counter.set(id);
+    format!("#mwt{id}")
+}
+
+/// Expand a token's already-expanded attribute KVs into its final attributes,
+/// handling the reparse-KV-string and (scenario 1) mixed-content cases, and
+/// marking templated attributes with `mw:ExpandedAttrs`. Mirrors PHP
+/// `AttributeExpander::buildExpandedAttrs`.
+///
+/// Returns `metaTokens ++ [token] ++ postNLToks` (hoisted transclusion markers
+/// before the token and, for scenario 1, content moved after it).
+#[allow(clippy::too_many_lines)]
+pub fn build_expanded_attrs(
+    mut token: ParsoidToken,
+    old_attrs: &[KV],
+    expanded_attrs: Vec<KV>,
+    about_counter: &std::cell::Cell<usize>,
+    in_template: bool,
+) -> Vec<Item> {
+    use super::attribute_transform_manager::{items_to_key_value, key_value_to_items};
+    use crate::wikitext::token_utils::{is_html_tag, tokens_to_string};
+
+    let wrap_templates = !in_template;
+    let token_name = token.get_name().to_string();
+    let nl_tk_okay = is_html_tag(&token) || (token_name != "table" && token_name != "tr");
+
+    let mut meta_tokens: Vec<Item> = Vec::new();
+    let mut post_nl_toks: Vec<Item> = Vec::new();
+    let mut new_attrs: Option<Vec<KV>> = None;
+    let mut should_mark_expanded = false;
+
+    for (i, old_a) in old_attrs.iter().enumerate() {
+        let mut expanded_a = expanded_attrs[i].clone();
+        // Preserve the key/value source and offsets on the expanded attribute.
+        if expanded_a.key != old_a.key || expanded_a.value != old_a.value {
+            expanded_a.ksrc = old_a.ksrc.clone();
+            expanded_a.vsrc = old_a.vsrc.clone();
+            expanded_a.src_offsets = old_a.src_offsets.clone();
+        }
+
+        let mut expanded_k = expanded_a.key.clone();
+        let expanded_v = expanded_a.value.clone();
+        let orig_k = old_a.key.clone();
+        let _orig_v = old_a.value.clone();
+
+        let mut reparsed_kv = false;
+        let mut key_uses_mixed_attr_content_tpl = false;
+        let mut val_uses_mixed_attr_content_tpl = false;
+        let mut key_generated = false;
+        let mut val_generated = false;
+
+        // Expand a templated attribute key.
+        if matches!(expanded_k, KeyValue::Tokens(_)) {
+            let mut expanded_k_items = key_value_to_items(&expanded_k);
+            let nl_tk_pos = nl_tk_index(&expanded_k_items, nl_tk_okay);
+            if nl_tk_pos != -1 {
+                // Scenario 1: split the expanded key around the newline, hoisting
+                // the transclusion start-meta and moving post-newline content after
+                // the token.
+                key_uses_mixed_attr_content_tpl = true;
+                let split = split_tokens(
+                    &expanded_k_items,
+                    nl_tk_pos,
+                    wrap_templates,
+                    0,
+                    &token_name,
+                    token.data_parsoid().and_then(|d| d.stx.as_deref()),
+                );
+                expanded_k_items = split.pre_nl_buf;
+                post_nl_toks = split.post_nl_buf;
+                meta_tokens = split.meta_tokens;
+                if expanded_a.src_offsets.is_some() {
+                    expanded_a.src_offsets = None;
+                    expanded_a.ksrc = None;
+                }
+            } else {
+                // Scenario 2: strip meta markers from the expanded key.
+                let stripped = strip_meta_tags(&expanded_k_items, wrap_templates);
+                key_generated = stripped.has_generated_content;
+                expanded_k_items = stripped.value;
+            }
+            expanded_a.key = items_to_key_value(expanded_k_items.clone());
+
+            // Reparse-KV-string: a template that generates one or more `k=v`
+            // strings is retokenized to recover the individual attributes.
+            if expanded_a.value.is_empty() {
+                let k_str = tokens_to_string(&expanded_k_items).trim().to_string();
+                if k_str.contains('=') {
+                    let kvs = crate::wikitext::tokenizer_v2::tokenize_as_attributes(&k_str);
+                    if !kvs.is_empty() {
+                        // At this point templates should have been expanded;
+                        // any leftovers are converted to plain strings.
+                        let clean_kvs: Vec<KV> = kvs
+                            .into_iter()
+                            .map(|kv| KV {
+                                key: items_to_key_value(vec![Item::Str(tpl_toks_to_string(
+                                    &key_value_to_items(&kv.key),
+                                ))]),
+                                value: items_to_key_value(vec![Item::Str(tpl_toks_to_string(
+                                    &key_value_to_items(&kv.value),
+                                ))]),
+                                src_offsets: None,
+                                ksrc: None,
+                                vsrc: None,
+                            })
+                            .collect();
+                        expanded_k = clean_kvs[0].key.clone();
+                        expanded_a.key = clean_kvs[0].key.clone();
+                        reparsed_kv = true;
+                        if new_attrs.is_none() {
+                            new_attrs = Some(if i == 0 {
+                                Vec::new()
+                            } else {
+                                expanded_attrs[..i].to_vec()
+                            });
+                        }
+                        if let Some(na) = new_attrs.as_mut() {
+                            na.extend(clean_kvs);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Expand a templated attribute value (when the key is a plain string).
+        if let KeyValue::Str(s) = &expanded_k
+            && !s.starts_with("mw:")
+            && matches!(old_a.value, KeyValue::Tokens(_))
+        {
+            let mut expanded_v_items = key_value_to_items(&expanded_v);
+            let nl_tk_pos = nl_tk_index(&expanded_v_items, nl_tk_okay);
+            if nl_tk_pos != -1 {
+                val_uses_mixed_attr_content_tpl = true;
+                let split = split_tokens(
+                    &expanded_v_items,
+                    nl_tk_pos,
+                    wrap_templates,
+                    0,
+                    &token_name,
+                    token.data_parsoid().and_then(|d| d.stx.as_deref()),
+                );
+                expanded_v_items = split.pre_nl_buf;
+                post_nl_toks = split.post_nl_buf;
+                meta_tokens = split.meta_tokens;
+                if expanded_a.src_offsets.is_some() {
+                    expanded_a.src_offsets = None;
+                    expanded_a.vsrc = None;
+                }
+            } else {
+                let stripped = strip_meta_tags(&expanded_v_items, wrap_templates);
+                val_generated = stripped.has_generated_content;
+                expanded_v_items = stripped.value;
+            }
+            expanded_a.value = items_to_key_value(expanded_v_items);
+        }
+
+        let _ = (
+            orig_k,
+            key_uses_mixed_attr_content_tpl,
+            val_uses_mixed_attr_content_tpl,
+        );
+
+        should_mark_expanded |=
+            key_generated || val_generated || (reparsed_kv && !meta_tokens.is_empty());
+
+        if let Some(na) = new_attrs.as_mut()
+            && !reparsed_kv
+        {
+            na.push(expanded_a);
+        }
+    }
+
+    if let Some(na) = new_attrs {
+        token.set_attribs(na);
+    } else {
+        token.set_attribs(expanded_attrs);
+    }
+
+    // Mark the token as having expanded attributes, unless it already carries
+    // an `about` (an existing transclusion/extension wrapping).
+    if token.get_attribute_v("about").is_none() && should_mark_expanded {
+        let about_id = new_about_id(about_counter);
+        token.set_attribute("about", &about_id);
+        token.add_space_separated_attribute("typeof", "mw:ExpandedAttrs");
+    }
+
+    let mut out = meta_tokens;
+    out.push(Item::Tok(token));
+    out.extend(post_nl_toks);
+    out
 }
 
 #[cfg(test)]

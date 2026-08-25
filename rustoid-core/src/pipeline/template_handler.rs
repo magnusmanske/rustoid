@@ -589,14 +589,12 @@ impl TemplateHandler {
             .args
             .first()
             .map(|kv| {
-                crate::wikitext::token_utils::tokens_to_string(&[Item::Str(match &kv.key {
-                    crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
+                crate::wikitext::token_utils::tokens_to_string(&[match &kv.key {
+                    crate::wikitext::tokens_v2::KeyValue::Str(s) => Item::Str(s.clone()),
                     crate::wikitext::tokens_v2::KeyValue::Tokens(t) => {
-                        crate::wikitext::token_utils::tokens_to_string(
-                            &t.iter().cloned().map(Item::Tok).collect::<Vec<_>>(),
-                        )
+                        Item::Str(crate::wikitext::token_utils::tokens_to_string(t))
                     }
-                })])
+                }])
             })
             .unwrap_or_default();
 

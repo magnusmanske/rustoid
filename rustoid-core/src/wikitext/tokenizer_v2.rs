@@ -750,11 +750,11 @@ impl<'a> PegTokenizer<'a> {
                         bullets
                             .iter()
                             .map(|_b| {
-                                ParsoidToken::Tag(TagTk::new(
+                                Item::Tok(ParsoidToken::Tag(TagTk::new(
                                     "listItem",
                                     vec![],
                                     DataParsoid::default(),
-                                ))
+                                )))
                             })
                             .collect(),
                     ),
@@ -1550,58 +1550,74 @@ impl<'a> PegTokenizer<'a> {
 
     fn parse_html_attributes(&mut self) -> Vec<KV> {
         let mut attrs = Vec::new();
-        loop {
-            self.consume_spaces();
-            if self.pos >= self.input_len {
-                break;
-            }
-            let ch = self.remaining().chars().next().unwrap();
-            if ch == '/' || ch == '>' {
-                break;
-            }
-
-            // Parse attribute name.
-            let name_start = self.pos;
-            let name = self.parse_attr_name();
-            let name_end = self.pos;
-            if name.is_empty() {
-                break;
-            }
-
-            self.consume_spaces();
-
-            if self.starts_with("=") {
-                self.advance(1);
-                self.consume_spaces();
-                let val = self.parse_attr_value();
-                attrs.push(KV {
-                    key: name,
-                    value: KeyValue::Str(val),
-                    src_offsets: Some(KVSourceRange {
-                        key_start: name_start,
-                        key_end: name_end,
-                        value_start: name_end + 1,
-                        value_end: self.pos,
-                    }),
-                    ksrc: None,
-                    vsrc: None,
-                });
-            } else {
-                attrs.push(KV {
-                    key: name,
-                    value: KeyValue::Str(String::new()),
-                    src_offsets: Some(KVSourceRange {
-                        key_start: name_start,
-                        key_end: name_end,
-                        value_start: name_end,
-                        value_end: name_end,
-                    }),
-                    ksrc: None,
-                    vsrc: None,
-                });
-            }
+        while let Some(attr) = self.parse_one_attribute() {
+            attrs.push(attr);
         }
         attrs
+    }
+
+    /// Parse `generic_newline_attributes` (used by AttributeExpander's
+    /// reparse-KV-string path to retokenize an expanded `k=v` string).
+    fn parse_generic_newline_attributes(&mut self) -> Vec<KV> {
+        let mut attrs = Vec::new();
+        while let Some(attr) = self.parse_one_attribute() {
+            attrs.push(attr);
+        }
+        attrs
+    }
+
+    /// Parse a single `name[=value]` attribute. Returns `None` at end-of-input
+    /// or when the next char terminates the attribute list (`/` or `>`).
+    fn parse_one_attribute(&mut self) -> Option<KV> {
+        self.consume_spaces();
+        if self.pos >= self.input_len {
+            return None;
+        }
+        let ch = self.remaining().chars().next().unwrap();
+        if ch == '/' || ch == '>' {
+            return None;
+        }
+
+        // Parse attribute name.
+        let name_start = self.pos;
+        let name = self.parse_attr_name();
+        let name_end = self.pos;
+        if name.is_empty() {
+            return None;
+        }
+
+        self.consume_spaces();
+
+        if self.starts_with("=") {
+            self.advance(1);
+            self.consume_spaces();
+            let val = self.parse_attr_value();
+            Some(KV {
+                key: name,
+                value: KeyValue::Str(val),
+                src_offsets: Some(KVSourceRange {
+                    key_start: name_start,
+                    key_end: name_end,
+                    value_start: name_end + 1,
+                    value_end: self.pos,
+                }),
+                ksrc: None,
+                vsrc: None,
+            })
+        } else {
+            Some(KV {
+                key: name,
+                value: KeyValue::Str(String::new()),
+                src_offsets: Some(KVSourceRange {
+                    key_start: name_start,
+                    key_end: name_end,
+                    value_start: name_end,
+                    value_end: name_end,
+                }),
+                ksrc: None,
+                vsrc: None,
+            })
+        }
     }
 
     /// Parse a generic HTML tag attribute name, recognizing template
@@ -1615,7 +1631,7 @@ impl<'a> PegTokenizer<'a> {
     /// otherwise it is a plain string. Mirrors `generic_attribute_name` and
     /// (for `table`) the directive portion of `table_attribute_name`.
     fn parse_attr_name_impl(&mut self, table: bool) -> KeyValue {
-        let mut tokens: Vec<ParsoidToken> = Vec::new();
+        let mut tokens: Vec<Item> = Vec::new();
         let mut buf = String::new();
 
         loop {
@@ -1623,9 +1639,9 @@ impl<'a> PegTokenizer<'a> {
                 && let Some(tok) = self.parse_directive()
             {
                 if !buf.is_empty() {
-                    tokens.push(synthetic_text_token(std::mem::take(&mut buf)));
+                    tokens.push(Item::Str(std::mem::take(&mut buf)));
                 }
-                tokens.push(ParsoidToken::SelfclosingTag(tok));
+                tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
                 continue;
             }
             // Unparseable `{{` falls through to single-char handling.
@@ -1653,7 +1669,7 @@ impl<'a> PegTokenizer<'a> {
             KeyValue::Str(buf)
         } else {
             if !buf.is_empty() {
-                tokens.push(synthetic_text_token(buf));
+                tokens.push(Item::Str(buf));
             }
             KeyValue::Tokens(tokens)
         }
@@ -2659,14 +2675,13 @@ fn kv_str(key: &str, value: &str) -> KV {
     }
 }
 
-/// Build a synthetic `text` self-closing token carrying a string piece. This is
-/// how plain-text runs are represented inside a `KeyValue::Tokens` array that
-/// also contains directive tokens (mirrors `AttributeTransformManager`'s
-/// string-to-token conversion).
-fn synthetic_text_token(src: String) -> ParsoidToken {
-    let mut tk = SelfclosingTagTk::new("text", vec![], DataParsoid::default());
-    tk.data_parsoid.src = Some(src);
-    ParsoidToken::SelfclosingTag(tk)
+/// Retokenize an expanded `k=v` string as `generic_newline_attributes`,
+/// returning the parsed KVs. Used by the AttributeExpander's reparse-KV-string
+/// path. Mirrors `PegTokenizer::tokenizeAs( ..., 'generic_newline_attributes' )`.
+pub fn tokenize_as_attributes(wikitext: &str) -> Vec<KV> {
+    let options = TokenizerOptions::default();
+    let mut tokenizer = PegTokenizer::new(wikitext, &options);
+    tokenizer.parse_generic_newline_attributes()
 }
 
 /// Build a `DataMw` carrying the parsed start-tag attributes of an extension,
@@ -2920,7 +2935,7 @@ mod tests {
             assert_eq!(parts.len(), 1);
             assert!(matches!(
                 &parts[0],
-                ParsoidToken::SelfclosingTag(tk) if tk.name == "template"
+                Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template"
             ));
         }
     }

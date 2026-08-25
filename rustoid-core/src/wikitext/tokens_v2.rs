@@ -54,11 +54,12 @@ pub struct KV {
     pub vsrc: Option<String>,
 }
 
-/// Value for a KV attribute key or value — can be a plain string or token array.
+/// Value for a KV attribute key or value — can be a plain string or a token
+/// array (a mix of plain strings and tokens, mirroring PHP's `string|Token`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyValue {
     Str(String),
-    Tokens(Vec<ParsoidToken>),
+    Tokens(Vec<Item>),
 }
 
 impl KeyValue {
@@ -803,6 +804,15 @@ impl Default for ListTk {
 pub enum Item {
     Str(String),
     Tok(ParsoidToken),
+}
+
+impl fmt::Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Item::Str(s) => write!(f, "{s}"),
+            Item::Tok(t) => write!(f, "{t}"),
+        }
+    }
 }
 
 /// Helper: flatten a list of `ParsoidToken | String` into a single Vec.

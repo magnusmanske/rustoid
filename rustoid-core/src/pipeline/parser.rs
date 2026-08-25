@@ -342,6 +342,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self
             .expand_templates(&frame, tokens, source, about_counter)
             .await;
+        let tokens = self
+            .expand_attributes(&frame, tokens, source, about_counter)
+            .await;
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
@@ -424,6 +427,83 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
 
             out.push(item);
+        }
+        out
+    }
+
+    /// Expand templated attribute keys/values on `Tag`/`SelfclosingTag` tokens,
+    /// then run `buildExpandedAttrs` to finalize the attributes (reparse-KV,
+    /// `mw:ExpandedAttrs` marking). Mirrors the TT2 `AttributeExpander` handler
+    /// (`onAny` → `processComplexAttributes`).
+    async fn expand_attributes(
+        &self,
+        frame: &Frame,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let mut out = Vec::new();
+        for item in tokens {
+            let Item::Tok(tok) = &item else {
+                out.push(item);
+                continue;
+            };
+            if !matches!(tok, ParsoidToken::Tag(_) | ParsoidToken::SelfclosingTag(_)) {
+                out.push(item);
+                continue;
+            }
+            if tok.get_name() == "mw:dom-fragment-token" {
+                out.push(item);
+                continue;
+            }
+
+            let attribs = tok.get_attribs().to_vec();
+            let has_tokens = attribs.iter().any(|kv| {
+                matches!(kv.key, KeyValue::Tokens(_)) || matches!(kv.value, KeyValue::Tokens(_))
+            });
+            if !has_tokens {
+                out.push(item);
+                continue;
+            }
+
+            // Expand each templated key/value (template args and templates).
+            let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
+            for kv in &attribs {
+                let new_key = if let KeyValue::Tokens(toks) = &kv.key {
+                    let expanded = self
+                        .expand_templates(frame, toks.clone(), source, about_counter)
+                        .await;
+                    crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
+                } else {
+                    kv.key.clone()
+                };
+                let new_value = if let KeyValue::Tokens(toks) = &kv.value {
+                    let expanded = self
+                        .expand_templates(frame, toks.clone(), source, about_counter)
+                        .await;
+                    crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
+                } else {
+                    kv.value.clone()
+                };
+                expanded_attrs.push(KV {
+                    key: new_key,
+                    value: new_value,
+                    src_offsets: kv.src_offsets.clone(),
+                    ksrc: kv.ksrc.clone(),
+                    vsrc: kv.vsrc.clone(),
+                });
+            }
+
+            let result = crate::pipeline::attribute_expander::build_expanded_attrs(
+                tok.clone(),
+                &attribs,
+                expanded_attrs,
+                about_counter,
+                false,
+            );
+            out.extend(result);
         }
         out
     }

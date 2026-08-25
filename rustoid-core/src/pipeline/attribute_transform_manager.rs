@@ -6,7 +6,7 @@
 //! key/value is run through the frame's `expand` (which substitutes `{{{...}}}`
 //! references and, when wired, expands templates).
 
-use crate::wikitext::tokens_v2::{Item, KV, KeyValue, ParsoidToken};
+use crate::wikitext::tokens_v2::{Item, KV, KeyValue};
 
 use super::frame::Frame;
 
@@ -73,39 +73,23 @@ fn contains_non_string(kv: &KeyValue) -> bool {
     matches!(kv, KeyValue::Tokens(_))
 }
 
-fn key_value_to_items(kv: &KeyValue) -> Vec<Item> {
+/// Convert a `KeyValue` into a flat `Vec<Item>` token chunk.
+pub fn key_value_to_items(kv: &KeyValue) -> Vec<Item> {
     match kv {
         KeyValue::Str(s) => vec![Item::Str(s.clone())],
-        KeyValue::Tokens(tokens) => tokens.iter().cloned().map(Item::Tok).collect(),
+        KeyValue::Tokens(items) => items.clone(),
     }
 }
 
-/// Convert a flat token chunk back into a `KeyValue`. A single string token
-/// becomes a `Str`; otherwise a `Tokens` list.
-fn items_to_key_value(items: Vec<Item>) -> KeyValue {
+/// Convert a flat token chunk back into a `KeyValue`. A single string becomes
+/// a `Str`; otherwise a `Tokens` list.
+pub fn items_to_key_value(items: Vec<Item>) -> KeyValue {
     if items.len() == 1
         && let Item::Str(s) = &items[0]
     {
         return KeyValue::Str(s.clone());
     }
-    KeyValue::Tokens(
-        items
-            .into_iter()
-            .map(|it| match it {
-                Item::Tok(t) => t,
-                Item::Str(s) => {
-                    // Preserve strings as a synthetic `src`-carrying text token.
-                    let mut tk = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
-                        "text",
-                        vec![],
-                        crate::wikitext::tokens_v2::DataParsoid::default(),
-                    );
-                    tk.data_parsoid.src = Some(s);
-                    ParsoidToken::SelfclosingTag(tk)
-                }
-            })
-            .collect(),
-    )
+    KeyValue::Tokens(items)
 }
 
 #[cfg(test)]
@@ -113,7 +97,7 @@ mod tests {
     use super::*;
     use crate::mock::MockSiteConfig;
     use crate::title::TitleParser;
-    use crate::wikitext::tokens_v2::SelfclosingTagTk;
+    use crate::wikitext::tokens_v2::{ParsoidToken, SelfclosingTagTk};
 
     fn str_kv(key: &str, value: &str) -> KV {
         KV {
@@ -154,7 +138,7 @@ mod tests {
 
         let attrs = vec![KV {
             key: KeyValue::Str("style".to_string()),
-            value: KeyValue::Tokens(vec![ParsoidToken::SelfclosingTag(tplarg)]),
+            value: KeyValue::Tokens(vec![Item::Tok(ParsoidToken::SelfclosingTag(tplarg))]),
             src_offsets: None,
             ksrc: None,
             vsrc: None,
