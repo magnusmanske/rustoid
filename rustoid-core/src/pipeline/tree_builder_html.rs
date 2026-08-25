@@ -394,6 +394,8 @@ impl Html5TreeBuilder {
     pub fn finalize(self) -> Node {
         let mut doc = self.builder.handler.finish();
         resolve_data_ids(&mut doc, &self.stash);
+        // Encapsulate transclusion meta markers into wrapping `<span>` elements.
+        encapsulate_transclusions(&mut doc);
         // Strip internal marker metas (e.g. `<meta typeof="mw:IndentPreWS">`),
         // mirroring PHP's `CleanUp::stripMarkerMetas()` which runs after tree
         // building and before serialization.
@@ -480,6 +482,98 @@ fn strip_marker_metas(node: &mut Node) {
     for child in &mut node.children {
         strip_marker_metas(child);
     }
+}
+
+/// Whether a node is a transclusion/param *start* marker meta
+/// (`typeof="mw:Transclusion"` or `"mw:Param"`, no `/End` suffix).
+fn is_transclusion_start(node: &Node) -> bool {
+    matches!(&node.kind, NodeKind::Element(ElementKind::Other(name)) if name == "meta")
+        && node
+            .get_attr("typeof")
+            .is_some_and(|t| t == "mw:Transclusion" || t == "mw:Param")
+}
+
+/// Whether a node is a transclusion/param *end* marker meta
+/// (`typeof="mw:Transclusion/End"` or `"mw:Param/End"`).
+fn is_transclusion_end(node: &Node) -> bool {
+    matches!(&node.kind, NodeKind::Element(ElementKind::Other(name)) if name == "meta")
+        && node
+            .get_attr("typeof")
+            .is_some_and(|t| t == "mw:Transclusion/End" || t == "mw:Param/End")
+}
+
+/// Encapsulate transclusion meta markers into wrapping `<span>` elements (the
+/// common, non-fostered case of PHP's `DOMRangeBuilder::encapsulateTemplates`).
+///
+/// Each `<meta typeof="mw:Transclusion">` … `<meta typeof="mw:Transclusion/End">`
+/// pair (with a matching `about`) is replaced by a `<span>` carrying `about`,
+/// `typeof`, `data-parsoid`, and `data-mw`, wrapping the intervening siblings.
+fn encapsulate_transclusions(node: &mut Node) {
+    // Recurse into element children first, then process direct children.
+    for child in &mut node.children {
+        if matches!(child.kind, NodeKind::Element(_)) {
+            encapsulate_transclusions(child);
+        }
+    }
+
+    let children = std::mem::take(&mut node.children);
+    node.children = wrap_transclusion_children(children);
+}
+
+/// Wrap transclusion ranges among a parent's direct children.
+fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
+    let mut out: Vec<Node> = Vec::with_capacity(children.len());
+    let mut i = 0;
+    while i < children.len() {
+        if !is_transclusion_start(&children[i]) {
+            out.push(children[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Find the matching end meta, accounting for nesting.
+        let mut depth = 0usize;
+        let mut end_idx = None;
+        for (j, child) in children.iter().enumerate().skip(i) {
+            if is_transclusion_start(child) {
+                depth += 1;
+            } else if is_transclusion_end(child) {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(j);
+                    break;
+                }
+            }
+        }
+
+        let Some(end) = end_idx else {
+            // Unmatched start marker: leave as-is.
+            out.push(children[i].clone());
+            i += 1;
+            continue;
+        };
+
+        let start_meta = children[i].clone();
+        let content: Vec<Node> = children[i + 1..end].to_vec();
+        out.push(build_transclusion_span(&start_meta, content));
+        i = end + 1;
+    }
+    out
+}
+
+/// Build the wrapping `<span>` from a transclusion start marker meta.
+fn build_transclusion_span(start_meta: &Node, content: Vec<Node>) -> Node {
+    let mut span = Node::element(ElementKind::Span);
+    if let Some(about) = start_meta.get_attr("about") {
+        span.set_attr("about", about);
+    }
+    if let Some(typeof_) = start_meta.get_attr("typeof") {
+        span.set_attr("typeof", typeof_);
+    }
+    span.data_parsoid = start_meta.data_parsoid.clone();
+    span.data_mw = start_meta.data_mw.clone();
+    span.children = content;
+    span
 }
 
 /// Run the HTML5 tree builder over a token stream.

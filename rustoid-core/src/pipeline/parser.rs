@@ -81,8 +81,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 
     fn new_about_id(&self, counter: &std::cell::Cell<usize>) -> String {
-        let id = counter.get();
-        counter.set(id + 1);
+        // PHP Parsoid numbers transclusion `about` ids starting from 1.
+        let id = counter.get() + 1;
+        counter.set(id);
         format!("#mwt{id}")
     }
 
@@ -893,6 +894,15 @@ mod tests {
         assert!(html.contains("Hello world"), "got: {html}");
         // The transclusion should carry a `data-mw` marker.
         assert!(html.contains("data-mw"), "expected data-mw in: {html}");
+        // The transclusion is encapsulated in a `<span about=... typeof="mw:Transclusion">`.
+        assert!(
+            html.contains("typeof=\"mw:Transclusion\""),
+            "expected mw:Transclusion span in: {html}"
+        );
+        assert!(
+            html.contains("about=\"#mwt1\""),
+            "expected about=#mwt1 in: {html}"
+        );
     }
 
     #[tokio::test]
