@@ -545,8 +545,8 @@ fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
         expected_html.to_string()
     };
 
-    let actual_norm = normalize_paragraphs(&strip_data_attrs(&actual_body));
-    let expected_norm = normalize_paragraphs(&strip_data_attrs(&expected_body));
+    let actual_norm = normalize_html(&actual_body);
+    let expected_norm = normalize_html(&expected_body);
 
     if actual_norm.trim() == expected_norm.trim() {
         TestResult::Pass
@@ -616,11 +616,319 @@ fn normalize_paragraphs(html: &str) -> String {
     while let Some(pos) = s.find("<i></i>") {
         s.replace_range(pos..pos + 7, "");
     }
-    // Parsoid's test runner normalizes `<br />`/`<br>` to `<br/>`.
-    while let Some(pos) = s.find("<br />") {
-        s.replace_range(pos..pos + 6, "<br/>");
-    }
     s
+}
+
+/// A minimal HTML tree node for the IEW normalizer. The raw opening tag string
+/// (including all attributes) is retained so attribute values survive.
+#[derive(Debug, Clone)]
+enum MNode {
+    Elem {
+        name: String,
+        open_tag: String,
+        self_closing: bool,
+        children: Vec<MNode>,
+    },
+    Text(String),
+}
+
+fn is_void(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+/// Lowercase the tag name from an opening tag's inner text (e.g. `a href="x"`).
+fn open_name(inner: &str) -> String {
+    let s = inner.trim().trim_end_matches('/').trim();
+    s.split(|c: char| c.is_whitespace() || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// Parse a well-formed HTML fragment into a minimal tree.
+fn parse_fragment(html: &str) -> Vec<MNode> {
+    fn walk(html: &str, pos: &mut usize, out: &mut Vec<MNode>) {
+        let bytes = html.as_bytes();
+        let mut text = String::new();
+        let flush = |text: &mut String, out: &mut Vec<MNode>| {
+            if !text.is_empty() {
+                out.push(MNode::Text(std::mem::take(text)));
+            }
+        };
+        while *pos < bytes.len() {
+            if bytes[*pos] != b'<' {
+                // Accumulate text (assume ASCII in the test fixtures).
+                text.push(bytes[*pos] as char);
+                *pos += 1;
+                continue;
+            }
+            if html[*pos..].starts_with("</") {
+                flush(&mut text, out);
+                return; // end tag: caller consumes it.
+            }
+            if html[*pos..].starts_with("<!--") {
+                flush(&mut text, out);
+                match html[*pos..].find("-->") {
+                    Some(e) => *pos += e + 3,
+                    None => *pos = bytes.len(),
+                }
+                continue;
+            }
+            let Some(gt_rel) = html[*pos..].find('>') else {
+                text.push_str(&html[*pos..]);
+                *pos = bytes.len();
+                break;
+            };
+            let open_tag = html[*pos..*pos + gt_rel + 1].to_string();
+            let inner = &html[*pos + 1..*pos + gt_rel];
+            let name = open_name(inner);
+            let self_closing = inner.trim_end().ends_with('/') || is_void(&name);
+            *pos += gt_rel + 1;
+            flush(&mut text, out);
+            if self_closing {
+                out.push(MNode::Elem {
+                    name,
+                    open_tag,
+                    self_closing: true,
+                    children: Vec::new(),
+                });
+            } else {
+                let mut children = Vec::new();
+                walk(html, pos, &mut children);
+                // Consume the matching end tag `</name>`.
+                if *pos < bytes.len()
+                    && bytes[*pos] == b'<'
+                    && html[*pos..].starts_with("</")
+                    && let Some(egt) = html[*pos..].find('>')
+                {
+                    *pos += egt + 1;
+                }
+                out.push(MNode::Elem {
+                    name,
+                    open_tag,
+                    self_closing: false,
+                    children,
+                });
+            }
+        }
+        flush(&mut text, out);
+    }
+
+    let mut pos = 0;
+    let mut out = Vec::new();
+    walk(html, &mut pos, &mut out);
+    out
+}
+
+fn newline_around(name: &str) -> bool {
+    matches!(
+        name,
+        "body"
+            | "caption"
+            | "div"
+            | "dd"
+            | "dt"
+            | "li"
+            | "p"
+            | "table"
+            | "tr"
+            | "td"
+            | "th"
+            | "tbody"
+            | "thead"
+            | "tfoot"
+            | "dl"
+            | "ol"
+            | "ul"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+    )
+}
+
+/// Collapse a text node's whitespace runs and strip a leading/trailing space at
+/// block boundaries (mirrors `normalizeIEWVisitor`'s text handling).
+fn collapse_text(s: &str, strip_leading: bool, strip_trailing: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    let mut result = out;
+    if strip_leading {
+        let trimmed = result.trim_start();
+        result = trimmed.to_string();
+    }
+    if strip_trailing {
+        let trimmed = result.trim_end();
+        result = trimmed.to_string();
+    }
+    result
+}
+
+/// Normalization options threaded through the tree walk (mirrors
+/// `normalizeIEWVisitor`'s opts).
+#[derive(Clone, Copy)]
+struct NOpts {
+    in_pre: bool,
+    strip_le: bool,
+    strip_te: bool,
+}
+
+/// Recursively normalize text nodes: collapse whitespace runs and strip at block
+/// boundaries. Mirrors `normalizeIEWVisitor`.
+fn normalize_nodes(nodes: &mut [MNode], mut opts: NOpts) {
+    let n = nodes.len();
+    for (i, node) in nodes.iter_mut().enumerate() {
+        // Only the last sibling strips trailing whitespace.
+        let mut node_opts = opts;
+        node_opts.strip_te = opts.strip_te && i == n - 1;
+
+        match node {
+            MNode::Text(t) => {
+                if !node_opts.in_pre {
+                    *t = collapse_text(t, node_opts.strip_le, node_opts.strip_te);
+                }
+            }
+            MNode::Elem { name, children, .. } => {
+                let nm = name.clone();
+                let is_pre = nm == "pre";
+                let next_in_pre = node_opts.in_pre || is_pre;
+                let (next_le, next_te) = if is_pre {
+                    // `<pre>`: preserve content, but strip a trailing newline
+                    // (legacy parser parity).
+                    (false, true)
+                } else {
+                    let around = newline_around(&nm);
+                    (around, around)
+                };
+                normalize_nodes(
+                    children,
+                    NOpts {
+                        in_pre: next_in_pre,
+                        strip_le: next_le,
+                        strip_te: next_te,
+                    },
+                );
+            }
+        }
+        // After the first child, no more leading-whitespace stripping.
+        opts.strip_le = false;
+    }
+}
+
+/// Insert a single newline text node around block elements and after `<br>`,
+/// mirroring `normalizeIEWVisitor`'s newline pass.
+fn add_newlines(nodes: &mut Vec<MNode>) {
+    for node in nodes.iter_mut() {
+        if let MNode::Elem { children, .. } = node {
+            add_newlines(children);
+        }
+    }
+
+    let mut out: Vec<MNode> = Vec::with_capacity(nodes.len());
+    for (i, node) in nodes.drain(..).enumerate() {
+        let block_around = matches!(&node, MNode::Elem { name, .. } if newline_around(name));
+        let is_br = matches!(&node, MNode::Elem { name, .. } if name == "br");
+        // A newline before this node if it's a block or br.
+        if (block_around || is_br) && i > 0 {
+            ensure_nl_before(&mut out);
+        }
+        out.push(node);
+        // A newline after a block (or br).
+        if block_around || is_br {
+            ensure_nl_after(&mut out);
+        }
+    }
+    *nodes = out;
+}
+
+/// Ensure `out` does not end with whitespace, then push a newline text node.
+fn ensure_nl_before(out: &mut Vec<MNode>) {
+    if let Some(MNode::Text(t)) = out.last_mut() {
+        *t = t.trim_end().to_string();
+        if t.is_empty() {
+            out.pop();
+        }
+    }
+    if !out.is_empty() && !matches!(out.last(), Some(MNode::Text(t)) if t.ends_with('\n')) {
+        out.push(MNode::Text("\n".to_string()));
+    }
+}
+
+fn ensure_nl_after(out: &mut Vec<MNode>) {
+    if !out.is_empty() && !matches!(out.last(), Some(MNode::Text(t)) if t.ends_with('\n')) {
+        out.push(MNode::Text("\n".to_string()));
+    }
+}
+
+/// Serialize the normalized tree with no further whitespace adjustments.
+fn serialize_iew(nodes: &[MNode], out: &mut String) {
+    for node in nodes {
+        match node {
+            MNode::Text(s) => out.push_str(s),
+            MNode::Elem {
+                name,
+                open_tag,
+                self_closing,
+                children,
+            } => {
+                if *self_closing {
+                    out.push_str(&format!("<{name}/>"));
+                } else {
+                    out.push_str(open_tag);
+                    serialize_iew(children, out);
+                    out.push_str(&format!("</{name}>"));
+                }
+            }
+        }
+    }
+}
+
+/// Full IEW normalization: strip metadata/comments, collapse inter-element
+/// whitespace, and place newlines around blocks.
+fn normalize_html(html: &str) -> String {
+    let stripped = strip_data_attrs(html);
+    let mut nodes = parse_fragment(&stripped);
+    normalize_nodes(
+        &mut nodes,
+        NOpts {
+            in_pre: false,
+            strip_le: false,
+            strip_te: false,
+        },
+    );
+    add_newlines(&mut nodes);
+    let mut out = String::new();
+    serialize_iew(&nodes, &mut out);
+    out
 }
 
 /// Strip only the round-trip metadata (`data-parsoid`, `data-mw`) and HTML
