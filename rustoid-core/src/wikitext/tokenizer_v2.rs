@@ -966,15 +966,23 @@ impl<'a> PegTokenizer<'a> {
             return None;
         };
         let link_text = &self.input[target_start..self.pos + end];
-        // The redirect target is the part before the first `|` (link label).
-        let target = link_text.split('|').next().unwrap_or(link_text).trim();
+        // The redirect target is the part before the first *top-level* `|`
+        // (link label), respecting pipes inside templates/nested links.
+        let parts = split_template_args(link_text);
+        let target = parts.first().map(|s| s.as_str()).unwrap_or("").trim();
         self.advance(end + 2);
 
         let mut dp = self.make_dp(saved, self.pos);
         dp.src = Some(self.input[saved..link_start].to_string());
 
         let mut redirect = SelfclosingTagTk::new("mw:redirect", vec![], dp);
-        redirect.add_attribute_str("href", target);
+        redirect.attribs.push(KV {
+            key: KeyValue::Str("href".to_string()),
+            value: tokenize_link_target(target),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
         Some(ParsoidToken::SelfclosingTag(redirect))
     }
 
@@ -1894,22 +1902,33 @@ impl<'a> PegTokenizer<'a> {
         // Find closing `]]` (skipping `<nowiki>` blocks).
         if let Some(end) = find_wikilink_close(self.remaining()) {
             let content = &self.remaining()[..end];
-            let (target, text) = if let Some(pipe) = content.find('|') {
-                (
-                    content[..pipe].to_string(),
-                    Some(content[pipe + 1..].to_string()),
-                )
+            // Split on the first *top-level* pipe (one not inside a template or
+            // nested wikilink), mirroring `wikilink_preprocessor_text` +
+            // `wikilink_content`.
+            let parts = split_template_args(content);
+            let target = parts.first().map(|s| s.as_str()).unwrap_or("");
+            let text = if parts.len() > 1 {
+                Some(parts[1..].join("|"))
             } else {
-                (content.to_string(), None)
+                None
             };
 
             self.advance(end + 2);
 
             let dp = self.make_dp(saved, self.pos);
             let mut stt = SelfclosingTagTk::new("wikilink", vec![], dp);
-            stt.add_attribute_str("href", target);
+            // The target is tokenized (templates become `template` tokens),
+            // matching PHP's `wikilink_preprocessor_text`, so templated targets
+            // can be expanded by the AttributeExpander.
+            stt.attribs.push(KV {
+                key: KeyValue::Str("href".to_string()),
+                value: tokenize_link_target(target.trim()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
             if let Some(text) = text {
-                stt.add_attribute_str("mw:maybeContent", text);
+                stt.add_attribute_str("mw:maybeContent", &text);
             }
 
             self.emit_token(ParsoidToken::SelfclosingTag(stt));
@@ -2672,6 +2691,46 @@ fn kv_str(key: &str, value: &str) -> KV {
         src_offsets: None,
         ksrc: None,
         vsrc: None,
+    }
+}
+
+/// Tokenize a wikilink/redirect target into a `KeyValue`, recognizing template
+/// directives (`{{...}}` / `{{{...}}}`) as `template`/`templatearg` tokens.
+/// Mirrors PHP's `wikilink_preprocessor_text` (which runs the `directive` rule
+/// over the target and flattens the result).
+///
+/// Returns `Str` for a pure-text target and `Tokens` (a mixed string/token
+/// array) when a directive is present.
+fn tokenize_link_target(target: &str) -> KeyValue {
+    let options = TokenizerOptions::default();
+    let mut tk = PegTokenizer::new(target, &options);
+    let mut items: Vec<Item> = Vec::new();
+    let mut buf = String::new();
+
+    while !tk.eof() {
+        if tk.starts_with("{{")
+            && let Some(tok) = tk.parse_directive()
+        {
+            if !buf.is_empty() {
+                items.push(Item::Str(std::mem::take(&mut buf)));
+            }
+            items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+            continue;
+        }
+        let Some(ch) = tk.peek_char() else {
+            break;
+        };
+        tk.advance(ch.len_utf8());
+        buf.push(ch);
+    }
+
+    if items.is_empty() {
+        KeyValue::Str(buf)
+    } else {
+        if !buf.is_empty() {
+            items.push(Item::Str(buf));
+        }
+        KeyValue::Tokens(items)
     }
 }
 

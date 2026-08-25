@@ -690,7 +690,14 @@ pub fn render_wiki_link_dispatched(
 /// obtain the normalized href (e.g. `./Target`), then emit the `link` token
 /// with `rel=mw:PageProp/redirect` and that normalized href.
 pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<Item> {
-    let href = token.get_attribute_v("href").unwrap_or("").to_string();
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    let href = token
+        .get_attribs()
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("href"))
+        .map(|kv| key_value_to_string(&kv.value))
+        .unwrap_or_default();
     let target =
         get_wiki_link_target_info(ctx, &href, &href).unwrap_or_else(|_| WikiLinkTargetInfo {
             href: href.clone(),
@@ -734,9 +741,19 @@ pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<I
         .unwrap_or_else(|| href.clone());
 
     // Build the `<link rel="mw:PageProp/redirect" href="..."/>` token,
-    // preserving the redirect token's data-parsoid.
+    // preserving the redirect token's data-parsoid and any `about`/`typeof`
+    // attributes added by attribute expansion (`mw:ExpandedAttrs`).
     let dp = token.data_parsoid().cloned().unwrap_or_default();
     let mut link = SelfclosingTagTk::new("link", vec![], dp);
+
+    // Retain `about` and `typeof` from the (templated) redirect token, in the
+    // order PHP emits them (about, typeof, then rel, then href).
+    if let Some(about) = token.get_attribute_v("about").map(|s| s.to_string()) {
+        link.add_attribute_str("about", &about);
+    }
+    if let Some(type_of) = token.get_attribute_v("typeof").map(|s| s.to_string()) {
+        link.add_attribute_str("typeof", &type_of);
+    }
     link.add_attribute_str("rel", "mw:PageProp/redirect");
     link.add_attribute_str("href", &normalized_href);
 

@@ -95,6 +95,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             WikiLinkContext, get_wiki_link_target_info, render_redirect,
             render_wiki_link_dispatched,
         };
+        use crate::wikitext::token_utils::key_value_to_string;
 
         let mut ctx = WikiLinkContext::new(self.config);
         let mut out: Vec<Item> = Vec::new();
@@ -112,12 +113,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .attribs
                     .iter()
                     .find(|kv| kv.key.as_str() == Some("href"))
-                    .and_then(|kv| kv.value.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                // A redirect to a `<nowiki>` or templated target cannot be rendered
-                // as a clean link; mirror PHP's `onRedirect`/`bailTokens` bail-out.
-                if href.contains("<nowiki") || href.contains("{{") {
+                    .map(|kv| key_value_to_string(&kv.value))
+                    .unwrap_or_default();
+                // A redirect to a `<nowiki>` target cannot be rendered as a clean
+                // link; mirror PHP's `onRedirect`/`bailTokens` bail-out. A
+                // templated target is expanded upstream (AttributeExpander), so
+                // by the time we get here any remaining `{{` indicates a failure
+                // to expand and must bail.
+                if href.contains("<nowiki") {
                     out.extend(self.bail_dirty_redirect(stt, &href));
                 } else {
                     out.extend(render_redirect(
@@ -137,9 +140,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .attribs
                 .iter()
                 .find(|kv| kv.key.as_str() == Some("href"))
-                .and_then(|kv| kv.value.as_str())
-                .unwrap_or("")
-                .to_string();
+                .map(|kv| key_value_to_string(&kv.value))
+                .unwrap_or_default();
             let href_src = href.clone();
             let target = get_wiki_link_target_info(&ctx, &href, &href_src).unwrap_or_else(|_| {
                 crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
