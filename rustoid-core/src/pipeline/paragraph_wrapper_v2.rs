@@ -113,20 +113,16 @@ impl ParagraphWrapper {
     ///
     /// Faithful port of PHP `ParagraphWrapper::onCompoundTk`:
     /// - DL-DD lists are flattened and their nested tokens re-wrapped;
-    /// - IndentPreTk / EmptyLineTk return `None` so the caller dispatches the
-    ///   token to `onAny` (PHP returns `null`);
-    /// - non-DL-DD ListTk is passed through unchanged. (PHP routes it through
-    ///   `onAny`, but the tree builder's transclusion encapsulation doesn't yet
-    ///   handle the resulting start-meta-before-list order, so we preserve the
-    ///   existing pass-through behaviour for now.)
+    /// - IndentPreTk / EmptyLineTk / non-DL-DD ListTk return `None` so the
+    ///   caller dispatches the token to `onAny` (PHP returns `null` in each of
+    ///   these cases).
     fn on_compound_tk(&mut self, token: Item) -> Option<Vec<Item>> {
         if let Item::Tok(ParsoidToken::List(t)) = &token {
             if t.is_dl_dd_list() {
                 let nested = t.get_nested_tokens().to_vec();
                 return Some(self.wrap(nested));
             }
-            // Non-DL-DD list: pass through (see doc comment above).
-            return Some(vec![token]);
+            return None;
         }
         // IndentPreTk / EmptyLineTk: fall through to onAny.
         None
@@ -261,6 +257,12 @@ impl ParagraphWrapper {
         if matches!(token, Item::Str(_)) {
             self.curr_line_has_wrappable_tokens = true;
             return self.process_buffers(token, false);
+        }
+
+        // List token (ListTk): skip nested tokens, treat as a block tag.
+        if matches!(token, Item::Tok(ParsoidToken::List(_))) {
+            self.curr_line_block_tag_seen = true;
+            return self.process_buffers(token, true);
         }
 
         // IndentPreTk: skip nested tokens, unless nested in a block or

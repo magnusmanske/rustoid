@@ -615,11 +615,20 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
     out
 }
 
-/// Wrap transclusion ranges whose content was fostered out of a list/table (the
-/// "flipped" case in PHP's `DOMRangeBuilder`): the end marker meta ends up nested
-/// inside a *preceding* sibling element while the start marker is a sibling after
-/// it. The start marker's `about`/`typeof`/`data-mw`/`data-parsoid` are transferred
-/// onto that sibling element, and both markers are removed.
+/// Wrap transclusion ranges whose start/end markers were not both emitted as
+/// direct siblings (PHP's `DOMRangeBuilder`'s common-ancestor handling).
+///
+/// When the start marker meta and the element containing the end marker are
+/// siblings under a common ancestor, the start marker's `about`/`typeof`/
+/// `data-mw`/`data-parsoid` are transferred onto the first non-meta element of
+/// the range, `about` is stamped on every other element in the range, and both
+/// marker metas are removed.
+///
+/// This covers both:
+///   - the end marker nested in a *following* sibling element (the common,
+///     non-fostered case, e.g. `{{1x|*bar}}` → `<meta/> <ul>…</ul>`), and
+///   - the "flipped" case where the end marker was fostered into a *preceding*
+///     sibling element.
 fn wrap_flipped_children(mut children: Vec<Node>) -> Vec<Node> {
     let mut i = 0;
     while i < children.len() {
@@ -630,26 +639,60 @@ fn wrap_flipped_children(mut children: Vec<Node>) -> Vec<Node> {
 
         let about: Option<String> = children[i].get_attr("about").map(str::to_string);
 
-        // Search preceding siblings (nearest first) for an element whose subtree
-        // contains the matching end marker.
+        // Find the sibling element (in either direction, nearest first) whose
+        // subtree contains the matching end marker.
         let mut target = None;
-        for j in (0..i).rev() {
-            if matches!(children[j].kind, NodeKind::Element(_))
-                && subtree_contains_end_meta(&children[j], about.as_deref())
+        for (j, child) in children.iter().enumerate().take(i).rev() {
+            if matches!(child.kind, NodeKind::Element(_))
+                && subtree_contains_end_meta(child, about.as_deref())
             {
                 target = Some(j);
                 break;
             }
         }
+        if target.is_none() {
+            for (j, child) in children.iter().enumerate().skip(i + 1) {
+                if matches!(child.kind, NodeKind::Element(_))
+                    && subtree_contains_end_meta(child, about.as_deref())
+                {
+                    target = Some(j);
+                    break;
+                }
+            }
+        }
 
-        let Some(j) = target else {
+        let Some(t) = target else {
             i += 1;
             continue;
         };
 
         let start_meta = children[i].clone();
-        transfer_transclusion_to_element(&mut children[j], &start_meta);
-        remove_end_meta(&mut children[j], about.as_deref());
+
+        // Determine the contiguous sibling range [lo, hi] spanned by the
+        // transclusion: from the start meta to the element holding the end
+        // marker. Every element in that range gets the `about` id; the first
+        // non-meta element becomes the encapsulation target.
+        let (lo, hi) = if t < i { (t, i) } else { (i, t) };
+        let mut encap_target = None;
+        for (j, child) in children.iter_mut().enumerate().skip(lo).take(hi - lo + 1) {
+            if matches!(child.kind, NodeKind::Element(_)) && !is_transclusion_start(child) {
+                child.set_attr("about", start_meta.get_attr("about").unwrap_or(""));
+                if encap_target.is_none() {
+                    encap_target = Some(j);
+                }
+            }
+        }
+
+        let Some(et) = encap_target else {
+            i += 1;
+            continue;
+        };
+
+        // Transfer encapsulation data onto the target element and drop the
+        // end marker from its subtree.
+        transfer_transclusion_to_element(&mut children[et], &start_meta);
+        remove_end_meta(&mut children[et], about.as_deref());
+        // Remove the start marker meta.
         children.remove(i);
         // Do not advance `i`: the next sibling shifted into this index.
     }
@@ -956,6 +999,50 @@ mod tests {
         let pre = &doc.children[0];
         assert_eq!(pre.children.len(), 1);
         assert!(matches!(&pre.children[0].kind, NodeKind::Text(s) if s == "asdf"));
+    }
+
+    #[test]
+    fn test_forward_transclusion_encapsulation_onto_list() {
+        // `{{1x|*bar}}` post-ListHandler: the start marker meta directly
+        // precedes a `<ul>` whose subtree holds the end marker meta. The
+        // encapsulation must transfer `about`/`typeof` onto the `<ul>` and
+        // drop both marker metas (the faithful forward case of
+        // `wrap_flipped_children`).
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt1");
+
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.set_attr("about", "#mwt1");
+
+        let mut li = Node::element(ElementKind::Other("li".to_string()));
+        li.push_child(Node::text("bar"));
+        li.push_child(end);
+        let mut ul = Node::element(ElementKind::Other("ul".to_string()));
+        ul.push_child(li);
+
+        let mut doc = Node::document();
+        doc.push_child(start);
+        doc.push_child(ul);
+
+        encapsulate_transclusions(&mut doc);
+
+        // The `<meta>` start marker is gone; only the `<ul>` remains.
+        assert_eq!(doc.children.len(), 1, "{doc:?}");
+        let ul = &doc.children[0];
+        assert_eq!(ul.get_attr("typeof"), Some("mw:Transclusion"));
+        assert_eq!(ul.get_attr("about"), Some("#mwt1"));
+        // The end marker meta inside `<li>` is removed; `bar` survives.
+        assert!(contains_text(ul, "bar"), "{doc:?}");
+        assert!(!contains_transclusion_end(ul), "{doc:?}");
+    }
+
+    fn contains_transclusion_end(node: &Node) -> bool {
+        if node.get_attr("about") == Some("#mwt1") && is_transclusion_end(node) {
+            return true;
+        }
+        node.children.iter().any(contains_transclusion_end)
     }
 
     fn find_placeholder(node: &Node) -> Option<&Node> {
