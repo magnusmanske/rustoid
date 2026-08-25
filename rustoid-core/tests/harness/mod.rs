@@ -291,9 +291,17 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 parsoid_only = true;
                 *i += 1;
             }
-            "!! html/parsoid+integrated" | "!! html/parsoid+standalone" => {
-                // Treat as Parsoid HTML
-                section = Section::Html;
+            "!! html/parsoid+integrated" => {
+                // The integrated (production) Parsoid mode, which registers
+                // extension tags (so #tag:pre → mw:Extension/pre).
+                section = Section::HtmlIntegrated;
+                parsoid_only = true;
+                *i += 1;
+            }
+            "!! html/parsoid+standalone" => {
+                // The standalone (native) Parsoid mode, where extension tags
+                // are not registered (so #tag:pre is a plain <pre>).
+                section = Section::HtmlStandalone;
                 parsoid_only = true;
                 *i += 1;
             }
@@ -320,6 +328,9 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                         Section::Options => options_lines.push(line.to_string()),
                         Section::Wikitext => wikitext_lines.push(line.to_string()),
                         Section::Html => html_parsoid_lines.push(line.to_string()),
+                        Section::HtmlIntegrated => html_parsoid_lines.push(line.to_string()),
+                        Section::HtmlStandalone => { /* standalone: ignore (integrated takes precedence) */
+                        }
                         Section::HtmlPhp => html_php_lines.push(line.to_string()),
                         Section::HtmlBoth => {
                             html_parsoid_lines.push(line.to_string());
@@ -379,6 +390,8 @@ enum Section {
     Options,
     Wikitext,
     Html,
+    HtmlIntegrated,
+    HtmlStandalone,
     HtmlPhp,
     HtmlBoth,
     HtmlLang,
