@@ -228,20 +228,26 @@ fn merge_runs(_wrapper: &Node, splits: Vec<Split>) -> Vec<Split> {
     ret
 }
 
-/// Holds the currently-open `<p>` element during p-wrapping.
+/// Holds the currently-open `<p>` element during p-wrapping, plus its index
+/// in the output vector so children can be appended into it in place.
 struct PWrapState {
-    p: Option<Node>,
+    /// Index of the open `<p>` in the caller's output vector, if any.
+    p_idx: Option<usize>,
 }
 
 impl PWrapState {
+    fn new() -> Self {
+        Self { p_idx: None }
+    }
+
     fn reset(&mut self) {
-        self.p = None;
+        self.p_idx = None;
     }
 }
 
 /// Wrap children of `root` in `<p>` tags. Faithful port of `PWrap::pWrapDOM`.
 fn p_wrap_dom(root: &mut Node) {
-    let mut state = PWrapState { p: None };
+    let mut state = PWrapState::new();
 
     let children = std::mem::take(&mut root.children);
     let mut out: Vec<Node> = Vec::new();
@@ -259,22 +265,19 @@ fn p_wrap_dom(root: &mut Node) {
                         out.push(v.node);
                     }
                     None => {
-                        if let Some(p) = state.p.as_mut() {
-                            if let NodeKind::Element(_) = p.kind {
-                                p.push_child(v.node);
-                            }
+                        if let Some(idx) = state.p_idx {
+                            push_into_paragraph(&mut out, idx, v.node);
                         } else {
                             out.push(v.node);
                         }
                     }
                     Some(true) => {
-                        if state.p.is_none() {
-                            state.p = Some(Node::element(ElementKind::Paragraph));
+                        if state.p_idx.is_none() {
+                            out.push(Node::element(ElementKind::Paragraph));
+                            state.p_idx = Some(out.len() - 1);
                         }
-                        if let Some(p) = state.p.as_mut()
-                            && let NodeKind::Element(_) = p.kind
-                        {
-                            p.push_child(v.node);
+                        if let Some(idx) = state.p_idx {
+                            push_into_paragraph(&mut out, idx, v.node);
                         }
                     }
                 }
@@ -282,11 +285,14 @@ fn p_wrap_dom(root: &mut Node) {
         }
     }
 
-    if let Some(p) = state.p {
-        out.push(p);
-    }
-
     root.children = out;
+}
+
+/// Append a child into the element at `idx` of `out` (which must be an element).
+fn push_into_paragraph(out: &mut [Node], idx: usize, child: Node) {
+    if let NodeKind::Element(_) = out[idx].kind {
+        out[idx].push_child(child);
+    }
 }
 
 /// Is this a Remex block node (a block element or an element that contains
@@ -316,21 +322,29 @@ fn p_wrap_inside_tag(root: &mut Node, tag_name: &str) {
 
 /// Run the PWrap pass over the document, wrapping `<body>` children (and any
 /// `<blockquote>` contents) in paragraphs. Faithful to `PWrap::run`.
-/// Run the PWrap pass over the document, wrapping `<body>` children (and any
-/// `<blockquote>` contents) in paragraphs. Faithful to `PWrap::run`.
 pub fn run(root: &mut Node) {
-    // Root is the document (fragment mode: `<html>` holding body content).
-    // Apply p-wrapping to the synthetic `<html>` element's children (which are
-    // the body content) and to any `<blockquote>` descendants.
-    for child in root.children.iter_mut() {
+    // The document holds a synthetic `<html>` element (fragment mode) whose
+    // children are the body content. Apply p-wrapping there, then recursively
+    // p-wrap the contents of any `<blockquote>` descendants (mirrors PHP's
+    // `pWrapDOM` + `pWrapInsideTag(…, 'blockquote')`).
+    let mut body_idx: Option<usize> = None;
+    for (i, child) in root.children.iter().enumerate() {
         if let NodeKind::Element(kind) = &child.kind {
             let tag = element_tag(kind);
-            if tag == "html" || tag == "body" || tag == "blockquote" {
-                p_wrap_dom(child);
-            } else {
-                p_wrap_inside_tag(child, "blockquote");
+            if tag == "html" || tag == "body" {
+                body_idx = Some(i);
+                break;
             }
         }
+    }
+
+    if let Some(i) = body_idx {
+        p_wrap_dom(&mut root.children[i]);
+        p_wrap_inside_tag(&mut root.children[i], "blockquote");
+    } else {
+        // No structural wrapper: the document's own children are body content.
+        p_wrap_dom(root);
+        p_wrap_inside_tag(root, "blockquote");
     }
 }
 

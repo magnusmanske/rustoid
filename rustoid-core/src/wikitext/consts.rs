@@ -71,6 +71,42 @@ pub fn void_tags() -> &'static HashSet<String> {
     &SET
 }
 
+/// Metadata content tags (mirrors `Consts::$HTML['MetaDataTags']`).
+pub fn meta_data_tags() -> &'static HashSet<String> {
+    static SET: once_cell::sync::Lazy<HashSet<String>> = once_cell::sync::Lazy::new(|| {
+        set![
+            "base", "link", "meta", "noscript", "script", "style", "template", "title"
+        ]
+    });
+    &SET
+}
+
+/// Formatting tags (mirrors `Consts::$HTML['FormattingTags']`).
+pub fn formatting_tags() -> &'static HashSet<String> {
+    static SET: once_cell::sync::Lazy<HashSet<String>> = once_cell::sync::Lazy::new(|| {
+        set![
+            "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong",
+            "tt", "u",
+        ]
+    });
+    &SET
+}
+
+/// Only-inline elements (mirrors `Consts::$HTML['OnlyInlineElements']`).
+pub fn only_inline_elements() -> &'static HashSet<String> {
+    static SET: once_cell::sync::Lazy<HashSet<String>> = once_cell::sync::Lazy::new(|| {
+        set![
+            "a", "abbr", "acronym", "applet", "audio", "b", "basefont", "bdi", "bdo", "big", "br",
+            "button", "cite", "code", "data", "del", "dfn", "em", "font", "i", "iframe", "img",
+            "input", "ins", "kbd", "label", "legend", "map", "mark", "object", "param", "q", "rb",
+            "rbc", "rp", "rt", "rtc", "ruby", "s", "samp", "select", "small", "source", "span",
+            "strike", "strong", "sub", "sup", "textarea", "time", "track", "tt", "u", "var",
+            "video", "wbr",
+        ]
+    });
+    &SET
+}
+
 /// HTML tags under which a text node/placeholder would be fostered out
 /// (mirrors `Consts::$HTML['FosterablePosition']`).
 pub fn fosterable_position() -> &'static HashSet<String> {
