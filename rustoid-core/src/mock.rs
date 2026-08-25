@@ -187,27 +187,31 @@ impl MockSiteConfig {
             language_code: "en".to_string(),
         };
 
-        // Register standard MediaWiki namespaces
+        // Register standard MediaWiki namespaces. `case_sensitive` reflects
+        // whether the first letter of a title is case-insensitive (MediaWiki's
+        // default `$wgCapitalLinks = true`): most content namespaces are
+        // first-letter case-insensitive (`false`); the Media (-2), MediaWiki (8),
+        // and MediaWiki talk (9) namespaces are fully case-sensitive (`true`).
         config.add_namespace(-2, "Media", &[], true, "wikitext");
-        config.add_namespace(-1, "Special", &[], true, "wikitext");
-        config.add_namespace(0, "Main", &[], true, "wikitext");
-        config.add_namespace(1, "Talk", &[], true, "wikitext");
-        config.add_namespace(2, "User", &[], true, "wikitext");
-        config.add_namespace(3, "User talk", &[], true, "wikitext");
-        config.add_namespace(4, "Project", &["Wikipedia"], true, "wikitext");
-        config.add_namespace(5, "Project talk", &["Wikipedia talk"], true, "wikitext");
-        config.add_namespace(6, "File", &["Image"], true, "wikitext");
-        config.add_namespace(7, "File talk", &["Image talk"], true, "wikitext");
+        config.add_namespace(-1, "Special", &[], false, "wikitext");
+        config.add_namespace(0, "Main", &[], false, "wikitext");
+        config.add_namespace(1, "Talk", &[], false, "wikitext");
+        config.add_namespace(2, "User", &[], false, "wikitext");
+        config.add_namespace(3, "User talk", &[], false, "wikitext");
+        config.add_namespace(4, "Project", &["Wikipedia"], false, "wikitext");
+        config.add_namespace(5, "Project talk", &["Wikipedia talk"], false, "wikitext");
+        config.add_namespace(6, "File", &["Image"], false, "wikitext");
+        config.add_namespace(7, "File talk", &["Image talk"], false, "wikitext");
         config.add_namespace(8, "MediaWiki", &[], true, "wikitext");
         config.add_namespace(9, "MediaWiki talk", &[], true, "wikitext");
-        config.add_namespace(10, "Template", &[], true, "wikitext");
-        config.add_namespace(11, "Template talk", &[], true, "wikitext");
-        config.add_namespace(12, "Help", &[], true, "wikitext");
-        config.add_namespace(13, "Help talk", &[], true, "wikitext");
-        config.add_namespace(14, "Category", &[], true, "wikitext");
-        config.add_namespace(15, "Category talk", &[], true, "wikitext");
-        config.add_namespace(828, "Module", &[], true, "Scribunto");
-        config.add_namespace(829, "Module talk", &[], true, "wikitext");
+        config.add_namespace(10, "Template", &[], false, "wikitext");
+        config.add_namespace(11, "Template talk", &[], false, "wikitext");
+        config.add_namespace(12, "Help", &[], false, "wikitext");
+        config.add_namespace(13, "Help talk", &[], false, "wikitext");
+        config.add_namespace(14, "Category", &[], false, "wikitext");
+        config.add_namespace(15, "Category talk", &[], false, "wikitext");
+        config.add_namespace(828, "Module", &[], false, "Scribunto");
+        config.add_namespace(829, "Module talk", &[], false, "wikitext");
 
         // Register some interwiki prefixes
         config.add_interwiki("wikipedia", "https://en.wikipedia.org/wiki/$1", true);

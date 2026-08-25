@@ -140,6 +140,44 @@ impl fmt::Display for Title {
     }
 }
 
+/// Uppercase the first character of a title, mirroring PHP's
+/// `SiteConfig::ucfirst`. ASCII fast-path matches PHP's `ucfirst()` (and the
+/// `$o < 96` / `$o < 128` byte checks); multibyte falls back to full
+/// title-casing of the first grapheme. The Turkish `i` special case is included
+/// for the configured language.
+pub fn ucfirst(s: &str, language_code: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+
+    let first = s.chars().next().unwrap();
+    // If already uppercase (ASCII), or unusual, pass through. The PHP code
+    // checks the first *byte* only; for ASCII this is equivalent to testing
+    // whether the first char is already uppercase.
+    if first.is_ascii_uppercase() {
+        return s.to_string();
+    }
+
+    if first.is_ascii() {
+        // ASCII lowercase (or other ASCII): uppercase the first byte.
+        if first == 'i' && matches!(language_code, "az" | "tr" | "kaa" | "kk") {
+            return format!("İ{}", &s[1..]);
+        }
+        let mut out = s.to_string();
+        if let Some(c) = out.get_mut(0..1) {
+            c.make_ascii_uppercase();
+        }
+        return out;
+    }
+
+    // Multibyte: title-case the first char, NFC-normalize.
+    let mut it = s.char_indices();
+    let (_, first_char) = it.next().unwrap();
+    let rest_start = it.next().map(|(i, _)| i).unwrap_or(s.len());
+    let upper = first_char.to_uppercase().collect::<String>();
+    format!("{upper}{}", &s[rest_start..])
+}
+
 /// Parser for constructing `Title` from a string, using `SiteConfig` for
 /// namespace alias resolution and interwiki prefix matching.
 pub struct TitleParser;
@@ -152,6 +190,10 @@ impl TitleParser {
     /// - Namespace prefixes resolved via `SiteConfig.namespaces()`.
     /// - Interwiki prefixes resolved via `SiteConfig.interwiki_map()`.
     /// - URL fragments (`#Section`).
+    ///
+    /// First-letter capitalization (`ucfirst`) is applied to the title text
+    /// when the resolved namespace is first-letter case-insensitive and there is
+    /// no interwiki prefix, mirroring `Title::newFromText`.
     pub fn parse(input: &str, config: &dyn SiteConfig) -> Title {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -169,12 +211,16 @@ impl TitleParser {
         };
 
         if !force_main {
-            // Try to match interwiki prefix first
+            // Try to match interwiki prefix first (case-insensitive, mirroring
+            // PHP's `$pLower = mb_strtolower($p)` lookup).
             for prefix in config.interwiki_map().keys() {
-                if let Some(after) = rest
-                    .strip_prefix(prefix.as_str())
-                    .and_then(|s| s.strip_prefix(':'))
-                {
+                let Some(colon) = rest.find(':') else {
+                    continue;
+                };
+                if rest[..colon].to_lowercase() == prefix.to_lowercase() {
+                    let after = &rest[colon + 1..];
+                    // Interwiki titles are NOT first-letter capitalized (the
+                    // remote wiki may be case-sensitive).
                     return Title {
                         interwiki: Some(prefix.clone()),
                         namespace_id: 0,
@@ -184,42 +230,72 @@ impl TitleParser {
                 }
             }
 
-            // Try to match namespace prefix by canonical name or alias
+            // Try to match namespace prefix by canonical name or alias.
+            // The prefix is matched case-insensitively (PHP lowercases the
+            // prefix with `mb_strtolower` before looking it up).
             for (&ns_id, ns_info) in config.namespaces() {
-                // Check canonical name first
-                if let Some(title_part) = rest
-                    .strip_prefix(&ns_info.canonical)
-                    .and_then(|s| s.strip_prefix(':'))
-                {
-                    return Title {
-                        interwiki: None,
-                        namespace_id: ns_id,
-                        text: title_part.to_string(),
+                let match_prefix = |name: &str| -> Option<&str> {
+                    let lower_name = name.to_lowercase();
+                    let colon = rest.find(':')?;
+                    if rest[..colon].to_lowercase() == lower_name {
+                        Some(&rest[colon + 1..])
+                    } else {
+                        None
+                    }
+                };
+                if let Some(title_part) = match_prefix(&ns_info.canonical) {
+                    return Self::with_case(
+                        title_part,
+                        ns_id,
+                        ns_info.case_sensitive,
                         fragment,
-                    };
+                        config,
+                    );
                 }
-                // Check localized aliases
                 for alias in &ns_info.aliases {
-                    if let Some(title_part) = rest
-                        .strip_prefix(alias.as_str())
-                        .and_then(|s| s.strip_prefix(':'))
-                    {
-                        return Title {
-                            interwiki: None,
-                            namespace_id: ns_id,
-                            text: title_part.to_string(),
+                    if let Some(title_part) = match_prefix(alias) {
+                        return Self::with_case(
+                            title_part,
+                            ns_id,
+                            ns_info.case_sensitive,
                             fragment,
-                        };
+                            config,
+                        );
                     }
                 }
             }
         }
 
-        // No namespace prefix matched — return mainspace title.
+        // No namespace prefix matched — return mainspace title, applying
+        // first-letter capitalization for the mainnamespace (case-insensitive).
+        let ns_id = 0;
+        let case_sensitive = config
+            .namespaces()
+            .get(&ns_id)
+            .map(|info| info.case_sensitive)
+            .unwrap_or(false);
+        Self::with_case(rest, ns_id, case_sensitive, fragment, config)
+    }
+
+    /// Build a `Title`, applying first-letter capitalization when the namespace
+    /// is case-insensitive (mirrors the `namespaceCase === 'first-letter'` branch
+    /// of `Title::newFromText`).
+    fn with_case(
+        text: &str,
+        namespace_id: i32,
+        case_sensitive: bool,
+        fragment: Option<String>,
+        config: &dyn SiteConfig,
+    ) -> Title {
+        let text = if case_sensitive {
+            text.to_string()
+        } else {
+            ucfirst(text, config.language_code())
+        };
         Title {
             interwiki: None,
-            namespace_id: 0,
-            text: rest.to_string(),
+            namespace_id,
+            text,
             fragment,
         }
     }
@@ -314,6 +390,39 @@ mod tests {
         assert_eq!(t.interwiki, Some("commons".to_string()));
         assert_eq!(t.namespace_id, 0);
         assert_eq!(t.text, "File:Example.jpg");
+    }
+
+    #[test]
+    fn test_first_letter_capitalization() {
+        let config = test_config();
+        // Mainspace titles are first-letter case-insensitive: ucfirst is applied.
+        let t = TitleParser::parse("foo", &config);
+        assert_eq!(t.namespace_id, 0);
+        assert_eq!(t.text, "Foo");
+
+        // Template namespace is also first-letter case-insensitive.
+        let t = TitleParser::parse("pre", &config);
+        // (Note: no namespace prefix means mainspace; see the template flow.)
+        assert_eq!(t.text, "Pre");
+
+        let t = TitleParser::parse("template:pre", &config);
+        assert_eq!(t.namespace_id, 10);
+        assert_eq!(t.text, "Pre");
+
+        // MediaWiki namespace is case-sensitive: no capitalization.
+        let t = TitleParser::parse("MediaWiki:common.css", &config);
+        assert_eq!(t.namespace_id, 8);
+        assert_eq!(t.text, "common.css");
+    }
+
+    #[test]
+    fn test_ucfirst_helper() {
+        assert_eq!(ucfirst("", "en"), "");
+        assert_eq!(ucfirst("foo", "en"), "Foo");
+        assert_eq!(ucfirst("Foo", "en"), "Foo");
+        assert_eq!(ucfirst("foo bar", "en"), "Foo bar");
+        // Turkish: 'i' capitalizes to 'İ'.
+        assert_eq!(ucfirst("istanbul", "tr"), "İstanbul");
     }
 
     #[test]
