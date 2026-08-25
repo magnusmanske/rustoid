@@ -414,6 +414,12 @@ impl<'a> PegTokenizer<'a> {
                     break;
                 }
             } else {
+                // No comment follows the consumed spaces: this isn't an
+                // empty-lines-with-comments run. Restore position and any
+                // emitted output so the leading whitespace survives for
+                // indent-pre detection.
+                self.pos = cycle_start;
+                self.output.truncate(out_len);
                 break;
             }
         }
@@ -992,11 +998,14 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
 
-        self.consume_spaces();
-        self.try_comment();
-
+        // Capture position and output *before* consuming SOL whitespace/comments
+        // so a failed attempt restores the leading spaces (they must survive for
+        // the PreHandler's indent-pre detection).
         let saved = self.pos;
         let output_saved = self.output.len();
+
+        self.consume_spaces();
+        self.try_comment();
 
         if self.try_table_start_tag() {
             return true;
