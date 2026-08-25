@@ -575,6 +575,13 @@ fn encapsulate_transclusions(node: &mut Node) {
 
 /// Wrap transclusion ranges among a parent's direct children (the sibling case,
 /// where both the start and end marker metas are direct children).
+///
+/// Faithful port of `DOMRangeBuilder::encapsulateTemplates` for the simple,
+/// non-fostered case: `ensureElementsInRangeAndAddAboutIds` stamps `about` on
+/// every element in the range (wrapping stray text in `about` spans),
+/// `findEncapTarget` picks the first non-meta element, and `addTypeOf` + data-mw
+/// transfer the `typeof`/`about`/metadata onto that target. The start and end
+/// marker metas are then removed.
 fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
@@ -608,8 +615,60 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
         };
 
         let start_meta = children[i].clone();
+        let about = start_meta.get_attr("about").map(str::to_string);
+        let typeof_attr = start_meta.get_attr("typeof").map(str::to_string);
         let content: Vec<Node> = children[i + 1..end].to_vec();
-        out.push(build_transclusion_span(&start_meta, content));
+
+        // Stamp `about` on every element in the range and find the first
+        // element (the encapsulation target), dropping deletable text and
+        // wrapping non-whitespace text in `about` spans.
+        let mut new_content: Vec<Node> = Vec::with_capacity(content.len());
+        let mut encap_target = None;
+        for child in content {
+            match &child.kind {
+                NodeKind::Element(_) => {
+                    let mut child = child;
+                    if let Some(about) = &about {
+                        child.set_attr("about", about.clone());
+                    }
+                    if encap_target.is_none() {
+                        encap_target = Some(new_content.len());
+                    }
+                    new_content.push(child);
+                }
+                NodeKind::Text(s) => {
+                    if s.trim().is_empty() {
+                        // Deletable (whitespace-only) text node: drop.
+                        continue;
+                    }
+                    // Wrap non-whitespace text in an `about` span so the range
+                    // is a contiguous chain of elements. The span becomes the
+                    // encapsulation target if no earlier element exists.
+                    let mut span = Node::element(ElementKind::Span);
+                    if let Some(about) = &about {
+                        span.set_attr("about", about.clone());
+                    }
+                    span.push_child(Node::text(s.clone()));
+                    span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+                    if encap_target.is_none() {
+                        encap_target = Some(new_content.len());
+                    }
+                    new_content.push(span);
+                }
+                _ => new_content.push(child),
+            }
+        }
+
+        // Transfer `typeof`/`about`/metadata onto the encapsulation target.
+        if let Some(et) = encap_target {
+            if let Some(typeof_) = &typeof_attr {
+                new_content[et].set_attr("typeof", typeof_.clone());
+            }
+            new_content[et].data_parsoid = start_meta.data_parsoid.clone();
+            new_content[et].data_mw = start_meta.data_mw.clone();
+        }
+
+        out.extend(new_content);
         i = end + 1;
     }
     out
@@ -742,21 +801,6 @@ fn transfer_transclusion_to_element(target: &mut Node, start_meta: &Node) {
     }
     target.data_parsoid = start_meta.data_parsoid.clone();
     target.data_mw = start_meta.data_mw.clone();
-}
-
-/// Build the wrapping `<span>` from a transclusion start marker meta.
-fn build_transclusion_span(start_meta: &Node, content: Vec<Node>) -> Node {
-    let mut span = Node::element(ElementKind::Span);
-    if let Some(about) = start_meta.get_attr("about") {
-        span.set_attr("about", about);
-    }
-    if let Some(typeof_) = start_meta.get_attr("typeof") {
-        span.set_attr("typeof", typeof_);
-    }
-    span.data_parsoid = start_meta.data_parsoid.clone();
-    span.data_mw = start_meta.data_mw.clone();
-    span.children = content;
-    span
 }
 
 /// Run the HTML5 tree builder over a token stream.

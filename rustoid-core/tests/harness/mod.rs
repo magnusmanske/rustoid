@@ -149,7 +149,12 @@ pub fn parse_test_file(path: &Path) -> Result<ParserTestFile> {
         if let Some(stripped) = line.strip_prefix("!! Version") {
             version = stripped.trim().to_string();
         }
-        if line == "!! Version 2" || line.starts_with("!! article") || line.starts_with("!! test") {
+        if line == "!! Version 2"
+            || line.starts_with("!! article")
+            || line == "!!article"
+            || line.starts_with("!! test")
+            || line == "!!test"
+        {
             break;
         }
         i += 1;
@@ -162,15 +167,19 @@ pub fn parse_test_file(path: &Path) -> Result<ParserTestFile> {
     while i < lines.len() {
         let line = lines[i].trim();
 
-        if line == "!! article" {
+        // Accept both `!!article` and `!! article` (and the same for text/end).
+        let article_start = line == "!! article" || line == "!!article";
+        if article_start {
             i += 1;
             let name = lines.get(i).map(|l| l.trim()).unwrap_or("");
             i += 1;
-            if lines.get(i).map(|l| l.trim()) == Some("!! text") {
+            let text_kw = lines.get(i).map(|l| l.trim()).unwrap_or("");
+            if text_kw == "!! text" || text_kw == "!!text" {
                 i += 1;
                 let mut text = String::new();
                 while i < lines.len()
                     && lines[i].trim() != "!! endarticle"
+                    && lines[i].trim() != "!!endarticle"
                     && lines[i].trim() != "!! end"
                 {
                     text.push_str(lines[i]);
