@@ -675,6 +675,20 @@ mod tests {
     }
 
     #[test]
+    fn test_pre_end_tag_no_placeholder() {
+        // `<pre>foo</pre>` must produce a single `<pre>` element and no
+        // spurious `mw:Placeholder/StrippedTag` meta for the matched end tag
+        // (regression test for the `pop_all_up_to_name` peek-before-pop fix).
+        let items = vec![tag("pre"), txt("foo"), end("pre")];
+        let doc = token_stream_to_ast_html(&items);
+        assert!(
+            find_placeholder(&doc).is_none(),
+            "unexpected placeholder: {doc:?}"
+        );
+        assert!(contains_kind(&doc, &ElementKind::Preformatted), "{doc:?}");
+    }
+
+    #[test]
     fn test_adoption_agency_misnested_bold() {
         // `<b>a<b>b</b>c</b>` exercises the adoption agency for the inner
         // `</b>`; it must terminate and preserve all text.
