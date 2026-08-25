@@ -1250,7 +1250,6 @@ impl<'a> PegTokenizer<'a> {
     fn parse_table_attribute(&mut self) -> Option<KV> {
         let name_start = self.pos;
         let name = self.parse_table_attribute_name()?;
-        self.advance(name.len());
         let name_end = self.pos;
 
         self.consume_spaces();
@@ -1259,7 +1258,7 @@ impl<'a> PegTokenizer<'a> {
             self.advance(1);
             let val = self.parse_table_att_value();
             Some(KV {
-                key: KeyValue::Str(name),
+                key: name,
                 value: KeyValue::Str(val.unwrap_or_default()),
                 src_offsets: Some(KVSourceRange {
                     key_start: name_start,
@@ -1278,18 +1277,9 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
-    fn parse_table_attribute_name(&self) -> Option<String> {
-        let rem = self.remaining();
-        let end = rem
-            .find(|c: char| {
-                c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '=' || c == '|' || c == '!'
-            })
-            .unwrap_or(rem.len());
-        if end == 0 {
-            None
-        } else {
-            Some(rem[..end].to_string())
-        }
+    fn parse_table_attribute_name(&mut self) -> Option<KeyValue> {
+        let name = self.parse_attr_name_impl(true);
+        if name.is_empty() { None } else { Some(name) }
     }
 
     fn parse_table_att_value(&mut self) -> Option<String> {
@@ -1585,7 +1575,7 @@ impl<'a> PegTokenizer<'a> {
                 self.consume_spaces();
                 let val = self.parse_attr_value();
                 attrs.push(KV {
-                    key: KeyValue::Str(name),
+                    key: name,
                     value: KeyValue::Str(val),
                     src_offsets: Some(KVSourceRange {
                         key_start: name_start,
@@ -1598,7 +1588,7 @@ impl<'a> PegTokenizer<'a> {
                 });
             } else {
                 attrs.push(KV {
-                    key: KeyValue::Str(name),
+                    key: name,
                     value: KeyValue::Str(String::new()),
                     src_offsets: Some(KVSourceRange {
                         key_start: name_start,
@@ -1614,16 +1604,59 @@ impl<'a> PegTokenizer<'a> {
         attrs
     }
 
-    fn parse_attr_name(&mut self) -> String {
-        let rem = self.remaining();
-        let end = rem
-            .find(|c: char| {
-                c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '=' || c == '/' || c == '>'
-            })
-            .unwrap_or(rem.len());
-        let name = rem[..end].to_string();
-        self.advance(end);
-        name
+    /// Parse a generic HTML tag attribute name, recognizing template
+    /// directives. Mirrors `generic_attribute_name`.
+    fn parse_attr_name(&mut self) -> KeyValue {
+        self.parse_attr_name_impl(false)
+    }
+
+    /// Parse an attribute name into a `KeyValue`. A name that contains a
+    /// template directive (`{{...}}` / `{{{...}}}`) becomes a token array;
+    /// otherwise it is a plain string. Mirrors `generic_attribute_name` and
+    /// (for `table`) the directive portion of `table_attribute_name`.
+    fn parse_attr_name_impl(&mut self, table: bool) -> KeyValue {
+        let mut tokens: Vec<ParsoidToken> = Vec::new();
+        let mut buf = String::new();
+
+        loop {
+            if self.starts_with("{{")
+                && let Some(tok) = self.parse_directive()
+            {
+                if !buf.is_empty() {
+                    tokens.push(synthetic_text_token(std::mem::take(&mut buf)));
+                }
+                tokens.push(ParsoidToken::SelfclosingTag(tok));
+                continue;
+            }
+            // Unparseable `{{` falls through to single-char handling.
+
+            let Some(ch) = self.peek_char() else {
+                break;
+            };
+            let is_stop = ch == ' '
+                || ch == '\t'
+                || ch == '\r'
+                || ch == '\n'
+                || ch == '\0'
+                || ch == '/'
+                || ch == '='
+                || ch == '>'
+                || (table && (ch == '|' || ch == '!'));
+            if is_stop {
+                break;
+            }
+            self.advance(ch.len_utf8());
+            buf.push(ch);
+        }
+
+        if tokens.is_empty() {
+            KeyValue::Str(buf)
+        } else {
+            if !buf.is_empty() {
+                tokens.push(synthetic_text_token(buf));
+            }
+            KeyValue::Tokens(tokens)
+        }
     }
 
     fn parse_attr_value(&mut self) -> String {
@@ -1651,10 +1684,30 @@ impl<'a> PegTokenizer<'a> {
         val
     }
 
-    /// Try template argument or template: `{{{ ... }}}` or `{{ ... }}`
+    /// Try template argument or template: `{{{ ... }}}` or `{{ ... }}`.
     fn try_tplarg_or_template(&mut self) -> bool {
+        let Some(tok) = self.parse_directive() else {
+            return false;
+        };
+        self.emit_token(ParsoidToken::SelfclosingTag(tok));
+        true
+    }
+
+    /// Parse a `directive` (a template argument or template) without emitting
+    /// it, returning the token. Mirrors the `directive` grammar rule, which is
+    /// shared by inline text and attribute-name positions.
+    fn parse_directive(&mut self) -> Option<SelfclosingTagTk> {
+        if self.starts_with("{{{") {
+            self.parse_templatearg_token()
+        } else {
+            self.parse_template_token()
+        }
+    }
+
+    /// Parse a `templatearg` token (`{{{ ... }}}`) without emitting it.
+    fn parse_templatearg_token(&mut self) -> Option<SelfclosingTagTk> {
         if !self.starts_with("{{{") {
-            return self.try_template();
+            return None;
         }
 
         let saved = self.pos;
@@ -1663,7 +1716,7 @@ impl<'a> PegTokenizer<'a> {
         // Find the closing `}}}` (respecting brace nesting).
         let Some(end) = self.find_closing('}', 3) else {
             self.pos = saved;
-            return false;
+            return None;
         };
 
         // `end` is a byte offset relative to `self.pos` (after `{{{`).
@@ -1688,8 +1741,7 @@ impl<'a> PegTokenizer<'a> {
                 stt.attribs.push(kv_str("", &default));
             }
         }
-        self.emit_token(ParsoidToken::SelfclosingTag(stt));
-        true
+        Some(stt)
     }
 
     /// Find the byte offset (within `remaining`, exclusive) of the closing
@@ -1728,10 +1780,10 @@ impl<'a> PegTokenizer<'a> {
         None
     }
 
-    /// Try template: `{{ ... }}`
-    fn try_template(&mut self) -> bool {
+    /// Parse a `template` token (`{{ ... }}`) without emitting it.
+    fn parse_template_token(&mut self) -> Option<SelfclosingTagTk> {
         if !self.starts_with("{{") || self.starts_with("{{{") {
-            return false;
+            return None;
         }
 
         let saved = self.pos;
@@ -1739,7 +1791,7 @@ impl<'a> PegTokenizer<'a> {
 
         let Some(end) = self.find_closing('}', 2) else {
             self.pos = saved;
-            return false;
+            return None;
         };
 
         // `end` is a byte offset relative to `self.pos` (after the `{{`);
@@ -1773,8 +1825,7 @@ impl<'a> PegTokenizer<'a> {
             }
         }
 
-        self.emit_token(ParsoidToken::SelfclosingTag(stt));
-        true
+        Some(stt)
     }
 
     /// Try language variant or template: `-{ ... }-`
@@ -2608,6 +2659,16 @@ fn kv_str(key: &str, value: &str) -> KV {
     }
 }
 
+/// Build a synthetic `text` self-closing token carrying a string piece. This is
+/// how plain-text runs are represented inside a `KeyValue::Tokens` array that
+/// also contains directive tokens (mirrors `AttributeTransformManager`'s
+/// string-to-token conversion).
+fn synthetic_text_token(src: String) -> ParsoidToken {
+    let mut tk = SelfclosingTagTk::new("text", vec![], DataParsoid::default());
+    tk.data_parsoid.src = Some(src);
+    ParsoidToken::SelfclosingTag(tk)
+}
+
 /// Build a `DataMw` carrying the parsed start-tag attributes of an extension,
 /// so the `pre` handler can sanitize them (mirrors PHP's `options` KV, which
 /// holds the extension's `$t->attribs` array).
@@ -2831,6 +2892,36 @@ mod tests {
             assert_eq!(tk.attribs[0].value.as_str(), Some("x"));
             assert_eq!(tk.attribs[1].key.as_str(), Some("style"));
             assert_eq!(tk.attribs[1].value.as_str(), Some("y"));
+        }
+    }
+
+    #[test]
+    fn test_html_tag_templated_attribute() {
+        // A directive in attribute-name position is parsed as a token array
+        // (not a string that truncates at the first `=`).
+        let tokens = tokenize("<div {{1x|1=style=\"color:red\"}}>hmm</div>");
+        let div = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::Tag(tk)) if tk.name == "div" => Some(tk),
+                _ => None,
+            })
+            .expect("expected <div> tag");
+
+        assert_eq!(div.attribs.len(), 1, "one templated attribute expected");
+        let kv = &div.attribs[0];
+        assert!(
+            matches!(kv.key, KeyValue::Tokens(_)),
+            "key is a token array"
+        );
+        // The value is empty (no `=` follows the directive).
+        assert_eq!(kv.value.as_str(), Some(""));
+        if let KeyValue::Tokens(parts) = &kv.key {
+            assert_eq!(parts.len(), 1);
+            assert!(matches!(
+                &parts[0],
+                ParsoidToken::SelfclosingTag(tk) if tk.name == "template"
+            ));
         }
     }
 
