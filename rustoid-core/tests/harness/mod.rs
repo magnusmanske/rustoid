@@ -62,6 +62,12 @@ pub struct ParserTestCase {
     pub html_parsoid_lang: Option<(String, String)>,
     pub wikitext_edited: Option<String>,
     pub line_number: usize,
+    /// Whether this test is Parsoid-only (has an `html/parsoid`,
+    /// `html/parsoid+standalone`, `html/parsoid+integrated`, or
+    /// `html/parsoid+langconv` section). Mirrors PHP `Test::normalizeHTML`'s
+    /// `parsoidOnly` flag, which selects between `normalizeOut` (Parsoid-only)
+    /// and `normalizeHTML` (legacy) expected-output normalization.
+    pub parsoid_only: bool,
 }
 
 /// A parsed test file.
@@ -240,6 +246,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     let mut wikitext_edited_lines = Vec::new();
 
     let mut section = Section::None;
+    let mut parsoid_only = false;
 
     while *i < lines.len() {
         let line = lines[*i];
@@ -256,6 +263,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
             }
             "!! html/parsoid" | "!! html/parsoid here" => {
                 section = Section::Html;
+                parsoid_only = true;
                 *i += 1;
             }
             "!! html" | "!! html/*" => {
@@ -271,11 +279,13 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
             }
             "!! html/parsoid+lang" => {
                 section = Section::HtmlLang;
+                parsoid_only = true;
                 *i += 1;
             }
             "!! html/parsoid+integrated" | "!! html/parsoid+standalone" => {
                 // Treat as Parsoid HTML
                 section = Section::Html;
+                parsoid_only = true;
                 *i += 1;
             }
             "!! wikitext/edited" => {
@@ -344,6 +354,12 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
 
     // Parse options
     test.options = parse_options(&test.options_raw);
+
+    // `parsoidOnly` (mirrors PHP `Test::normalizeHTML`): an explicit
+    // `html/parsoid` (+standalone/+integrated/+langconv) section, or a `parsoid`
+    // option without `normalizePhp`.
+    test.parsoid_only = parsoid_only
+        || (test.options.contains_key("parsoid") && !test.options_raw.contains("normalizePhp"));
 
     Ok(test)
 }
@@ -533,11 +549,11 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         Err(e) => return TestResult::Error(format!("parse error: {e}")),
     };
 
-    compare_html(&actual_html, &expected_html)
+    compare_html(&actual_html, &expected_html, test.parsoid_only)
 }
 
 /// Normalize and compare the actual V2 output against expected Parsoid HTML.
-fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
+fn compare_html(actual_html: &str, expected_html: &str, parsoid_only: bool) -> TestResult {
     let actual_body = extract_body(actual_html);
     let expected_body = if expected_html.contains("<!DOCTYPE") {
         extract_body(expected_html)
@@ -545,8 +561,8 @@ fn compare_html(actual_html: &str, expected_html: &str) -> TestResult {
         expected_html.to_string()
     };
 
-    let actual_norm = normalize_html(&actual_body);
-    let expected_norm = normalize_html(&expected_body);
+    let actual_norm = normalize_html(&actual_body, parsoid_only);
+    let expected_norm = normalize_html(&expected_body, parsoid_only);
 
     if actual_norm.trim() == expected_norm.trim() {
         TestResult::Pass
@@ -925,10 +941,14 @@ fn serialize_iew(nodes: &[MNode], out: &mut String) {
     }
 }
 
-/// Full IEW normalization: strip metadata/comments, collapse inter-element
+/// Full IEW normalization: strip metadata/comments (and, for legacy
+/// comparisons, the Parsoid-inserted attributes), collapse inter-element
 /// whitespace, and place newlines around blocks.
-fn normalize_html(html: &str) -> String {
-    let stripped = strip_data_attrs(html);
+fn normalize_html(html: &str, parsoid_only: bool) -> String {
+    let mut stripped = strip_data_attrs(html);
+    if !parsoid_only {
+        stripped = strip_legacy_attrs(&stripped);
+    }
     let mut nodes = parse_fragment(&stripped);
     normalize_nodes(
         &mut nodes,
@@ -981,6 +1001,65 @@ fn strip_data_attrs(html: &str) -> String {
             break;
         }
     }
+    s
+}
+
+/// Strip Parsoid-inserted attributes and `<meta>`/`<link>` elements for a
+/// *legacy* comparison (mirrors PHP `normalizeOut`'s `parsoidOnly = false`
+/// branch). The legacy parser doesn't emit these, so they must be removed from
+/// the Parsoid output before comparing against a legacy `html`/`html/php`
+/// expected value.
+fn strip_legacy_attrs(html: &str) -> String {
+    let mut s = html.to_string();
+
+    // Strip `<meta ...>` and `<link ...>` elements (void/self-closing).
+    while let Some(start) = s.find("<meta ") {
+        if let Some(end) = s[start..].find('>') {
+            s.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    while let Some(start) = s.find("<link ") {
+        if let Some(end) = s[start..].find('>') {
+            s.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+
+    // Strip Parsoid-inserted attributes (both single- and double-quoted).
+    // Order matters: `typeof` is stripped last in PHP.
+    for attr in [
+        "data-parsoid",
+        "data-mw",
+        "data-mw-original-href",
+        "prefix",
+        "about",
+        "rev",
+        "datatype",
+        "inlist",
+        "usemap",
+        "vocab",
+        "resource",
+        "rel",
+        "property",
+        "class",
+        "typeof",
+    ] {
+        for quote in ['\'', '"'] {
+            let needle = format!(" {attr}={quote}");
+            while let Some(start) = s.find(&needle) {
+                let after = &s[start + needle.len()..];
+                if let Some(end) = after.find(quote) {
+                    s.replace_range(start..start + needle.len() + end + 1, "");
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     s
 }
 

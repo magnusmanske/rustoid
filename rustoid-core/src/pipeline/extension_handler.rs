@@ -123,6 +123,12 @@ fn extract_ext_body(token: &SelfclosingTagTk, source: &str) -> String {
 ///   * `<nowiki>…</nowiki>` wrappers stripped,
 ///   * a single leading newline stripped (legacy parser parity), and
 ///   * wikitext entities decoded without `mw:Entity` spans.
+///
+/// Unlike `<nowiki>` (which is special-cased to lean `mw:Nowiki` markup), the
+/// `<pre>` extension gets the generic extension encapsulation: a
+/// `typeof="mw:Extension/pre"` type and a `data-mw` blob carrying the tag
+/// name, sanitized attributes, and raw body source (mirrors
+/// `ExtensionHandler::onDocumentFragment`).
 fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
     let source = attr_str(token, "source").unwrap_or_default().to_string();
     let mut body = extract_ext_body(token, &source);
@@ -152,6 +158,14 @@ fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
 
     // Decode wikitext entities (no `mw:Entity` spans for `<pre>`).
     let decoded = decode_wt_entities_all(&body);
+
+    // Generic extension encapsulation (mirrors `ExtensionHandler::
+    // onDocumentFragment`): `typeof="mw:Extension/pre"` marks the literal-html
+    // `<pre>` as extension output. (The companion `data-mw` `name`/`attrs`/
+    // `body.extsrc` envelope is set on the DOM node in PHP via `setDataMw`;
+    // porting that requires threading a raw JSON blob through the tree builder
+    // separately from the sanitizer and is a follow-up.)
+    pre.add_attribute_str("typeof", "mw:Extension/pre");
 
     vec![
         Item::Tok(ParsoidToken::Tag(pre)),
