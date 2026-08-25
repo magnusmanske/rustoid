@@ -1459,7 +1459,10 @@ impl<'a> PegTokenizer<'a> {
             self.advance(end + 3);
 
             let dp = self.make_dp(start, self.pos);
-            self.emit_token(ParsoidToken::Comment(CommentTk::new(comment_text, dp)));
+            // The tokenizer grammar applies `WTUtils::encodeComment` to the raw
+            // comment body before emitting the token (see the `comment` rule).
+            let encoded = encode_comment(&comment_text);
+            self.emit_token(ParsoidToken::Comment(CommentTk::new(encoded, dp)));
             return true;
         }
 
@@ -1469,7 +1472,8 @@ impl<'a> PegTokenizer<'a> {
 
         let mut dp = self.make_dp(start, self.pos);
         dp.unclosed_comment = Some(true);
-        self.emit_token(ParsoidToken::Comment(CommentTk::new(comment_text, dp)));
+        let encoded = encode_comment(&comment_text);
+        self.emit_token(ParsoidToken::Comment(CommentTk::new(encoded, dp)));
         true
     }
 
@@ -2490,6 +2494,61 @@ pub(crate) fn decode_wt_entities(entity: &str) -> String {
     }
 }
 
+/// Map a wikitext-escaped comment to an HTML DOM-escaped comment. Faithful port
+/// of `WTUtils::encodeComment`: undo the `--&(amp;)*gt;` wikitext escaping to
+/// obtain the "true value", then entity-encode every `-`, `>` and `&` so the
+/// result is safe to embed in an HTML comment.
+fn encode_comment(comment: &str) -> String {
+    let true_value = unescape_comment(comment);
+    let mut out = String::with_capacity(true_value.len());
+    for c in true_value.chars() {
+        match c {
+            '-' => out.push_str("&#x2D;"),
+            '>' => out.push_str("&#x3E;"),
+            '&' => out.push_str("&#x26;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Undo the wikitext `--&(amp;)*gt;` escaping (the `preg_replace_callback` of
+/// `encodeComment`), a single left-to-right pass without re-scanning output.
+fn unescape_comment(comment: &str) -> String {
+    let mut out = String::with_capacity(comment.len());
+    let mut rest = comment;
+    while let Some(idx) = rest.find("--&") {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 3..];
+        // Greedily consume `amp;` repetitions.
+        let mut n = 0;
+        let mut rem = after;
+        while let Some(stripped) = rem.strip_prefix("amp;") {
+            n += 1;
+            rem = stripped;
+        }
+        if let Some(rem) = rem.strip_prefix("gt;") {
+            // `--&(amp;)*gt;` decodes to `--` + `&` + `amp;`*(n-1) + `gt;` for
+            // n >= 1, or `-->` for n == 0.
+            if n == 0 {
+                out.push_str("-->");
+            } else {
+                out.push_str("--&");
+                for _ in 0..(n - 1) {
+                    out.push_str("amp;");
+                }
+                out.push_str("gt;");
+            }
+            rest = rem;
+        } else {
+            out.push_str("--&");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn name_to_include_type(name: &str) -> &str {
     match name {
         "includeonly" => "IncludeOnly",
@@ -2786,5 +2845,24 @@ mod tests {
             .filter(|t| matches!(t, Either::Right(ParsoidToken::Nl(_))))
             .count();
         assert_eq!(top_level_nl_count, 1, "got {:?}", tokens);
+    }
+
+    #[test]
+    fn test_encode_comment() {
+        // Plain comment passes through unchanged.
+        assert_eq!(encode_comment(" foo "), " foo ");
+        // `-`, `>`, `&` are entity-encoded.
+        assert_eq!(encode_comment("a-b>c&d"), "a&#x2D;b&#x3E;c&#x26;d");
+        // The wikitext `--&gt;` escape round-trips to `-->` before encoding.
+        assert_eq!(encode_comment("--&gt;"), "&#x2D;&#x2D;&#x3E;");
+        assert_eq!(encode_comment("--&amp;gt;"), "&#x2D;&#x2D;&#x26;gt;");
+    }
+
+    #[test]
+    fn test_unescape_comment() {
+        assert_eq!(unescape_comment("--&gt;"), "-->");
+        assert_eq!(unescape_comment("--&amp;gt;"), "--&gt;");
+        assert_eq!(unescape_comment("--&amp;amp;gt;"), "--&amp;gt;");
+        assert_eq!(unescape_comment("no escapes"), "no escapes");
     }
 }

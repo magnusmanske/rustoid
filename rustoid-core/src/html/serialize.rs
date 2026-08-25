@@ -232,12 +232,9 @@ impl HtmlSerializer {
                 }
             }
             NodeKind::Comment(content) => {
-                // Escape per Parsoid: & -> &#x26;, then - -> &#x2D;, then > -> &#x3E;
-                let escaped = content
-                    .replace("&", "&#x26;")
-                    .replace("-", "&#x2D;")
-                    .replace(">", "&#x3E;");
-                buf.push_str(&format!("<!--{escaped}-->"));
+                // The comment content is already DOM-escaped (the tokenizer
+                // applies `WTUtils::encodeComment`). Serialize it verbatim.
+                buf.push_str(&format!("<!--{content}-->"));
             }
         }
 
