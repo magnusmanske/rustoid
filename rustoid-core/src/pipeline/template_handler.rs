@@ -622,7 +622,7 @@ impl TemplateHandler {
                     ksrc: None,
                     vsrc: None,
                 };
-                let result = Self::call_parser_function(&name, &pf_params);
+                let result = Self::call_parser_function(config, &name, &pf_params);
                 let mut encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 if !colon.is_empty() {
                     encap.set_colon(Some(colon));
@@ -666,7 +666,7 @@ impl TemplateHandler {
     }
 
     /// Dispatch a parser function name to the `ParserFunctions` implementation.
-    fn call_parser_function(name: &str, params: &Params) -> Vec<Item> {
+    fn call_parser_function(config: &dyn SiteConfig, name: &str, params: &Params) -> Vec<Item> {
         match name {
             "if" => ParserFunctions::pf_if(params),
             "ifeq" => ParserFunctions::pf_ifeq(params),
@@ -680,7 +680,7 @@ impl TemplateHandler {
             "lcfirst" => ParserFunctions::pf_lcfirst(params),
             "padleft" => ParserFunctions::pf_padleft(params),
             "padright" => ParserFunctions::pf_padright(params),
-            "tag" => ParserFunctions::pf_tag(params),
+            "tag" => ParserFunctions::pf_tag(config, params),
             "urlencode" => ParserFunctions::pf_urlencode(params),
             // Unknown parser function: return its name in braces.
             _ => vec![Item::Str(format!("{{{{{{#{name}|...}}}}}}"))],

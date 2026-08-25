@@ -82,6 +82,39 @@ fn key_value_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// Serialize a `#tag` attribute list to a ` name="value"…` source fragment
+/// (mirrors the attribute serialization in core `tagObj`'s non-extension branch,
+/// used to reconstruct the opening tag source for an `extension` token).
+fn serialize_tag_attribs(_display_target: &str, tag_attribs: &[KV]) -> String {
+    let mut out = String::new();
+    for kv in tag_attribs {
+        let name = key_value_to_string(&kv.key);
+        let value = key_value_to_string(&kv.value);
+        out.push(' ');
+        out.push_str(&name);
+        out.push_str("=\"");
+        out.push_str(&value);
+        out.push('"');
+    }
+    out
+}
+
+/// Strip a single pair of surrounding single or double quotes from a `#tag`
+/// attribute value, mirroring core `tagObj`'s quote-stripping regexp.
+fn strip_attr_value_quotes(value: &str) -> String {
+    let b = value.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        // Surrounded by matching quotes: strip them (empty `""`/`''` → empty).
+        if b.len() == 2 {
+            String::new()
+        } else {
+            value[1..value.len() - 1].to_string()
+        }
+    } else {
+        value.to_string()
+    }
+}
+
 /// Extract a value as a string.
 fn value_to_string(kv: &KeyValue) -> String {
     match kv {
@@ -369,8 +402,10 @@ impl ParserFunctions {
         vec![Item::Str(result)]
     }
 
-    /// `#tag` — mirrors `pf_tag` / `tag_worker`.
-    pub fn pf_tag(params: &Params) -> Vec<Item> {
+    /// `#tag` — mirrors `pf_tag` / `tag_worker`, plus the extension-tag branch
+    /// of MediaWiki core's `tagObj` (which routes registered extension tags
+    /// through `extensionSubstitution` rather than emitting a plain tag).
+    pub fn pf_tag(config: &dyn crate::traits::SiteConfig, params: &Params) -> Vec<Item> {
         let args = &params.args;
         let target = args
             .first()
@@ -380,18 +415,33 @@ impl ParserFunctions {
             return vec![];
         }
 
-        let mut tag = crate::wikitext::tokens_v2::TagTk::new(&target, vec![], Default::default());
+        // Collect the tag attributes (named args) and content (positional args),
+        // losing the attribute order like the legacy `tagObj`/`tag_worker` do.
+        // Attribute values have any surrounding single/double quotes stripped,
+        // mirroring `tagObj`'s `preg_match('/^(?:["'](.+)["']|""|\'\')$/s', …)`.
         let mut content: Vec<Item> = Vec::new();
         let mut tag_attribs: Vec<KV> = Vec::new();
-
         for kv in &args[1..] {
             if key_value_to_string(&kv.key).is_empty() {
                 content.push(key_value_to_item(&kv.value));
             } else {
-                tag_attribs.push(kv.clone());
+                let mut kv = kv.clone();
+                kv.value = KeyValue::Str(strip_attr_value_quotes(&key_value_to_string(&kv.value)));
+                tag_attribs.push(kv);
             }
         }
 
+        let lc_target = target.to_lowercase();
+        let is_ext = config
+            .extension_tags()
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&lc_target));
+
+        if is_ext {
+            return Self::tag_extension_token(&lc_target, &target, &tag_attribs, &content);
+        }
+
+        let mut tag = crate::wikitext::tokens_v2::TagTk::new(&target, vec![], Default::default());
         tag.attribs = tag_attribs;
         let mut out = vec![Item::Tok(ParsoidToken::Tag(tag))];
         out.extend(content);
@@ -399,6 +449,66 @@ impl ParserFunctions {
             crate::wikitext::tokens_v2::EndTagTk::new(&target, vec![], Default::default()),
         )));
         out
+    }
+
+    /// Build an `extension` token for a `#tag` of a registered extension tag,
+    /// mirroring the tokenizer's `maybe_extension_tag` output (with `name`,
+    /// `source`, and parsed attributes stored as rich `data-mw` attribs). This
+    /// lets the extension handler (`extension_handler::run`) expand it into the
+    /// `mw:Extension/{name}` DOM shape, exactly as a literal `<name>` tag would.
+    fn tag_extension_token(
+        lc_target: &str,
+        display_target: &str,
+        tag_attribs: &[KV],
+        content: &[Item],
+    ) -> Vec<Item> {
+        use crate::wikitext::tokens_v2::{
+            DataMw, DataMwAttrib, DataMwValue, DomSourceRange, SelfclosingTagTk,
+        };
+
+        // Reconstruct the literal `<name attrs>content</name>` source so that
+        // `extract_ext_body` can recover the raw body via the open/close widths.
+        let content_src: String = content
+            .iter()
+            .map(|it| match it {
+                Item::Str(s) => s.clone(),
+                Item::Tok(t) => t.to_string(),
+            })
+            .collect();
+        let attr_src = serialize_tag_attribs(display_target, tag_attribs);
+        let open_tag = format!("<{}{attr_src}>", display_target.to_lowercase());
+        let close_tag = format!("</{lc_target}>");
+        let source = format!("{open_tag}{content_src}{close_tag}");
+
+        let dp = crate::wikitext::tokens_v2::DataParsoid {
+            tsr: None,
+            src: Some(source.clone()),
+            ext_tag_offsets: Some(DomSourceRange {
+                start: 0,
+                end: source.len(),
+                open_width: open_tag.len(),
+                close_width: close_tag.len(),
+            }),
+            ..Default::default()
+        };
+
+        let mut stt = SelfclosingTagTk::new("extension", vec![], dp);
+        stt.add_attribute_str("typeof", "mw:Extension");
+        stt.add_attribute_str("name", lc_target);
+        stt.add_attribute_str("source", &source);
+        stt.data_mw = Some(DataMw {
+            parts: Vec::new(),
+            attribs: tag_attribs
+                .iter()
+                .map(|kv| DataMwAttrib {
+                    key: DataMwValue::Str(key_value_to_string(&kv.key)),
+                    value: DataMwValue::Str(key_value_to_string(&kv.value)),
+                })
+                .collect(),
+            src: None,
+        });
+
+        vec![Item::Tok(ParsoidToken::SelfclosingTag(stt))]
     }
 
     /// `#urlencode` — mirrors `pf_urlencode`.
@@ -674,13 +784,48 @@ mod tests {
 
     #[test]
     fn test_pf_tag() {
-        // #tag:b|hello|class=foo
+        // #tag:b|hello|class=foo — `b` is not a registered extension tag, so it
+        // falls through to the plain `tag_worker` path.
+        let config = crate::mock::MockSiteConfig::new();
         let p = params(vec![("b", ""), ("", "hello"), ("class", "foo")]);
-        let out = ParserFunctions::pf_tag(&p);
+        let out = ParserFunctions::pf_tag(&config, &p);
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "b"));
         assert!(
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "hello"))
         );
+    }
+
+    #[test]
+    fn test_pf_tag_extension_routing() {
+        // `pre` is a registered extension tag, so `#tag:pre` must produce an
+        // `extension` token (not a plain `<pre>`), letting the extension handler
+        // emit `mw:Extension/pre` and sanitize `format` away.
+        let config = crate::mock::MockSiteConfig::new();
+        let p = params(vec![("pre", ""), ("", "123"), ("format", "\"wikitext\"")]);
+        let out = ParserFunctions::pf_tag(&config, &p);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) => {
+                assert_eq!(t.name, "extension");
+                let name = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("name"))
+                    .and_then(|kv| kv.value.as_str());
+                assert_eq!(name, Some("pre"));
+            }
+            other => panic!("expected extension token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strip_attr_value_quotes() {
+        assert_eq!(strip_attr_value_quotes("\"wikitext\""), "wikitext");
+        assert_eq!(strip_attr_value_quotes("'x'"), "x");
+        assert_eq!(strip_attr_value_quotes("noquotes"), "noquotes");
+        assert_eq!(strip_attr_value_quotes("\"\""), "");
+        // Mismatched quotes are left intact.
+        assert_eq!(strip_attr_value_quotes("\"oops'"), "\"oops'");
     }
 }

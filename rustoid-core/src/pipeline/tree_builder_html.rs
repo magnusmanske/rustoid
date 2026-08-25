@@ -659,10 +659,21 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
             }
         }
 
-        // Transfer `typeof`/`about`/metadata onto the encapsulation target.
+        // Transfer `typeof`/`about`/metadata onto the encapsulation target,
+        // merging (rather than overwriting) any existing `typeof` so that an
+        // extension `mw:Extension/pre` combines with `mw:Transclusion`
+        // (mirrors `DOMUtils::addTypeOf`'s multivalue handling).
         if let Some(et) = encap_target {
             if let Some(typeof_) = &typeof_attr {
-                new_content[et].set_attr("typeof", typeof_.clone());
+                let existing = new_content[et].get_attr("typeof").map(str::to_string);
+                let merged = match existing {
+                    Some(existing) if !existing.split_whitespace().any(|t| t == typeof_) => {
+                        format!("{existing} {typeof_}")
+                    }
+                    Some(existing) => existing,
+                    None => typeof_.clone(),
+                };
+                new_content[et].set_attr("typeof", merged);
             }
             new_content[et].data_parsoid = start_meta.data_parsoid.clone();
             new_content[et].data_mw = start_meta.data_mw.clone();
