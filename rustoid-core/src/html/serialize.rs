@@ -102,7 +102,10 @@ impl HtmlSerializer {
                         buf.push_str(&format!("{indent}<pre"));
                         self.serialize_attrs(node, buf);
                         buf.push('>');
-                        self.serialize_children_esc(node, buf, depth, false)?;
+                        // `<pre>` is not a raw-text escaping element in HTML
+                        // serialization; its text nodes are escaped like any other
+                        // element (`&` → `&amp;`, `<` → `&lt;`).
+                        self.serialize_children(node, buf, depth)?;
                         buf.push_str("</pre>");
                     }
                     ElementKind::Table => {

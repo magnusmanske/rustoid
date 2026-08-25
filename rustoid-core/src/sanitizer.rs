@@ -1048,10 +1048,9 @@ pub fn sanitize_tag_attrs(
             continue; // drop reserved data-* attributes
         }
 
-        // Strip javascript "expression" from stylesheets (checkCss is a larger
-        // subsystem; apply the insecure-pattern rejection faithfully).
-        if key_lower == "style" && css_is_insecure(&value) {
-            continue;
+        // Sanitize stylesheets (faithful port of `Sanitizer::checkCss`).
+        if key_lower == "style" {
+            a.value = crate::wikitext::tokens_v2::KeyValue::Str(check_css(&value));
         }
 
         // Escape HTML id attributes.
@@ -1096,11 +1095,25 @@ pub fn sanitize_tag_attrs(
     new_attrs
 }
 
-/// A faithful subset of `Sanitizer::checkCss`'s insecure-pattern rejection
-/// (the `INSECURE_RE` regex). Returns true if the CSS value is unsafe.
-fn css_is_insecure(value: &str) -> bool {
+/// Faithful port of `Sanitizer::checkCss`: rejects control characters and the
+/// insecure CSS patterns (`INSECURE_RE`), returning a marker comment in their
+/// place, and otherwise passes the value through. (CSS normalization — decoding
+/// char refs/escapes and stripping comments — is omitted for now.)
+fn check_css(value: &str) -> String {
+    // Reject problematic keywords and control characters.
+    if value.chars().any(|c| {
+        (c as u32) <= 0x08
+            || (0x0B..=0x0E).contains(&(c as u32))
+            || (0x10..=0x1F).contains(&(c as u32))
+            || c as u32 == 0x7F
+    }) || value.contains('\u{FFFD}')
+    {
+        return "/* invalid control char */".to_string();
+    }
+
+    // Reject insecure patterns (mirrors the `INSECURE_RE` regex).
     let lower = value.to_lowercase();
-    lower.contains("expression")
+    let insecure = lower.contains("expression")
         || lower.contains("accelerator:")
         || lower.contains("-o-link:")
         || lower.contains("-o-link-source:")
@@ -1109,7 +1122,32 @@ fn css_is_insecure(value: &str) -> bool {
         || lower.contains("src(")
         || lower.contains("image(")
         || lower.contains("image-set(")
-        || lower.contains("attr(")
+        || attr_url_pattern(&lower);
+    if insecure {
+        return "/* insecure input */".to_string();
+    }
+
+    value.to_string()
+}
+
+/// Match the `attr\([^)]+[\s,]+url` portion of `INSECURE_RE`.
+fn attr_url_pattern(lower: &str) -> bool {
+    let Some(start) = lower.find("attr(") else {
+        return false;
+    };
+    let rest = &lower[start + 5..];
+    // `[^)]+` then `[\s,]` then `url`.
+    let Some(close) = rest.find(')') else {
+        return false;
+    };
+    let inner = &rest[..close];
+    if inner.is_empty() {
+        return false;
+    }
+    let after = &rest[close + 1..];
+    after
+        .trim_start_matches([' ', ',', '\t', '\n', '\r'])
+        .starts_with("url")
 }
 
 /// Sanitize a title for use in a URI. Mirrors PHP's `Sanitizer::sanitizeTitleURI`.
@@ -1314,5 +1352,18 @@ mod tests {
             allow_all,
         );
         assert_eq!(out[0].value.as_str(), Some("Hello_world"));
+    }
+
+    #[test]
+    fn test_check_css() {
+        // Safe CSS passes through unchanged.
+        assert_eq!(check_css("color: blue"), "color: blue");
+        // Insecure CSS is replaced with a marker comment.
+        assert_eq!(
+            check_css("border-width: expression(alert())"),
+            "/* insecure input */"
+        );
+        // Control characters are rejected as invalid.
+        assert_eq!(check_css("color:\u{7F}blue"), "/* invalid control char */");
     }
 }

@@ -1360,9 +1360,9 @@ impl<'a> PegTokenizer<'a> {
     /// end tag, if matched) is collapsed into a single `SelfclosingTagTk` named
     /// `extension`, carrying `typeof=...`, `name`, `source`, and `options`.
     ///
-    /// Only `nowiki` is currently expanded end-to-end (in `extension_handler`);
-    /// other extension tags fall through to the HTML path until their handlers
-    /// are implemented.
+    /// Only `nowiki` and `pre` are currently expanded end-to-end (in
+    /// `extension_handler`); other extension tags fall through to the HTML path
+    /// until their handlers are implemented.
     fn try_extension_tag(&mut self) -> bool {
         if self.starts_with("</") || !self.starts_with("<") {
             return false;
@@ -1376,13 +1376,13 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
         let lc_name = name.to_lowercase();
-        if lc_name != "nowiki" || !self.ext_tags.contains(&lc_name) {
+        if !matches!(lc_name.as_str(), "nowiki" | "pre") || !self.ext_tags.contains(&lc_name) {
             self.pos = saved;
             return false;
         }
 
-        // Parse attributes (consumes source; the `nowiki` handler ignores them).
-        let _attrs = self.parse_html_attributes();
+        // Parse the start-tag attributes (the `pre` extension sanitizes them).
+        let attrs = self.parse_html_attributes();
 
         // Self-closing?
         self.consume_spaces();
@@ -1426,27 +1426,20 @@ impl<'a> PegTokenizer<'a> {
             });
             self.pos = end;
         } else {
-            // Unmatched start tag (no end tag): the sanitizer falls back to the
-            // HTML equivalent. Emit the opening tag's source only.
+            // Unmatched start tag (no end tag) or self-closed: the sanitizer falls
+            // back to the HTML equivalent. Emit the opening tag's source only.
             dp.src = Some(self.input[saved..self.pos].to_string());
         }
 
-        let mut stt = SelfclosingTagTk::new("extension", vec![], dp);
+        let mut stt = SelfclosingTagTk::new("extension", vec![], dp.clone());
         stt.add_attribute_str("typeof", "mw:Extension");
         stt.add_attribute_str("name", &lc_name);
-        let source = stt.data_parsoid.src.clone().unwrap_or_default();
+        let source = dp.src.clone().unwrap_or_default();
         stt.add_attribute_str("source", &source);
-        // `options` carries the parsed start-tag attributes. The nowiki handler
-        // ignores them (nowiki takes no args), and richer attribute encoding is
-        // deferred; store the parsed attribute count as token placeholders is
-        // intentionally elided — keep an empty token list for now.
-        stt.attribs.push(KV {
-            key: KeyValue::Str("options".to_string()),
-            value: KeyValue::Tokens(vec![]),
-            src_offsets: None,
-            ksrc: None,
-            vsrc: None,
-        });
+        // Store the parsed start-tag attributes as rich `data-mw` attribs so the
+        // `pre` extension handler can sanitize them faithfully (mirrors PHP's
+        // `maybe_extension_tag`, which stores `$t->attribs` as the `options` KV).
+        stt.data_mw = Some(extension_data_mw(&attrs));
         self.emit_token(ParsoidToken::SelfclosingTag(stt));
         true
     }
@@ -2514,6 +2507,24 @@ fn kv_str(key: &str, value: &str) -> KV {
         src_offsets: None,
         ksrc: None,
         vsrc: None,
+    }
+}
+
+/// Build a `DataMw` carrying the parsed start-tag attributes of an extension,
+/// so the `pre` handler can sanitize them (mirrors PHP's `options` KV, which
+/// holds the extension's `$t->attribs` array).
+fn extension_data_mw(attrs: &[KV]) -> DataMw {
+    let attribs = attrs
+        .iter()
+        .map(|kv| DataMwAttrib {
+            key: DataMwValue::Str(kv.key.to_string()),
+            value: DataMwValue::Str(kv.value.to_string()),
+        })
+        .collect();
+    DataMw {
+        parts: Vec::new(),
+        attribs,
+        src: None,
     }
 }
 

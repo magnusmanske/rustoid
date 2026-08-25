@@ -533,6 +533,28 @@ mod tests {
     }
 
     #[test]
+    fn test_pre_entity_and_style() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        // Entities inside `<pre>` decode to plain text (no `mw:Entity` span).
+        let html = parser
+            .wikitext_to_html("<pre>&lt;</pre>", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<pre"), "got: {html}");
+        assert!(html.contains("&lt;"), "got: {html}");
+        assert!(!html.contains("mw:Entity"), "got: {html}");
+
+        // Insecure `style` is replaced by a marker comment, not dropped.
+        let html = parser
+            .wikitext_to_html(
+                "<pre style=\"border-width: expression(alert())\">x</pre>",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("/* insecure input */"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_to_html_bold() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);

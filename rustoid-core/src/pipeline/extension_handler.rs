@@ -27,7 +27,8 @@ fn expand_extension(token: &SelfclosingTagTk) -> Option<Vec<Item>> {
     let name = attr_str(token, "name")?;
     match name {
         "nowiki" => Some(nowiki_items(token)),
-        // Other built-in extension tags (pre, gallery, …) are not yet handled.
+        "pre" => Some(pre_items(token)),
+        // Other built-in extension tags (gallery, …) are not yet handled.
         _ => None,
     }
 }
@@ -114,6 +115,99 @@ fn extract_ext_body(token: &SelfclosingTagTk, source: &str) -> String {
         return String::new();
     }
     source[start..end].to_string()
+}
+
+/// Build the token sequence for a `<pre>` extension. Faithful port of
+/// `Ext/Pre/Pre.php::sourceToDom`: a `<pre>` element carrying the sanitized
+/// start-tag attributes, whose single text node is the raw content with:
+///   * `<nowiki>…</nowiki>` wrappers stripped,
+///   * a single leading newline stripped (legacy parser parity), and
+///   * wikitext entities decoded without `mw:Entity` spans.
+fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
+    let source = attr_str(token, "source").unwrap_or_default().to_string();
+    let mut body = extract_ext_body(token, &source);
+
+    // Sanitize the start-tag attributes onto the `<pre>` element.
+    let attrs: Vec<crate::wikitext::tokens_v2::KV> = extension_kv_attrs(token);
+    let sanitized = crate::sanitizer::sanitize_tag_attrs("pre", attrs, |_proto| true);
+
+    // `dataParsoid.stx = 'html'` (the `<pre>` element came from literal HTML).
+    let mut dp = token.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+    dp.stx = Some("html".to_string());
+
+    let mut pre = TagTk::new("pre", sanitized, dp);
+    pre.data_mw = None;
+
+    // Strip `<nowiki>…</nowiki>` wrappers (mirrors the `preg_replace` in
+    // `Pre::sourceToDom`).
+    body = strip_nowiki_wrappers(&body);
+
+    // Strip a single leading newline (legacy PHP parser parity).
+    if let Some(stripped) = body.strip_prefix('\n') {
+        body = stripped.to_string();
+    }
+
+    // Decode wikitext entities (no `mw:Entity` spans for `<pre>`).
+    let decoded = decode_wt_entities_all(&body);
+
+    vec![
+        Item::Tok(ParsoidToken::Tag(pre)),
+        Item::Str(decoded),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "pre",
+            vec![],
+            DataParsoid::default(),
+        ))),
+    ]
+}
+
+/// Recover the parsed start-tag attributes from an extension token's `data-mw`
+/// rich attribs (set by the tokenizer's `extension_data_mw`).
+fn extension_kv_attrs(token: &SelfclosingTagTk) -> Vec<crate::wikitext::tokens_v2::KV> {
+    let Some(data_mw) = &token.data_mw else {
+        return Vec::new();
+    };
+    data_mw
+        .attribs
+        .iter()
+        .map(|a| crate::wikitext::tokens_v2::KV {
+            key: crate::wikitext::tokens_v2::KeyValue::Str(
+                a.key.as_str().unwrap_or_default().to_string(),
+            ),
+            value: crate::wikitext::tokens_v2::KeyValue::Str(
+                a.value.as_str().unwrap_or_default().to_string(),
+            ),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        })
+        .collect()
+}
+
+/// Strip `<nowiki>…</nowiki>` wrappers from `<pre>` content (mirrors the
+/// `preg_replace('/<nowiki\s*>(.*?)<\/nowiki\s*>/s', '$1', …)` in `Pre`).
+fn strip_nowiki_wrappers(content: &str) -> String {
+    content.replace("</nowiki>", "").replace("<nowiki>", "")
+}
+
+/// Decode all wikitext entities in a string in one pass (mirrors
+/// `Utils::decodeWtEntities`, which is `decodeCharReferences` over the whole
+/// string). Unlike the tokenizer's per-entity `htmlentity` rule, this produces
+/// plain decoded text with no `mw:Entity` wrappers.
+fn decode_wt_entities_all(text: &str) -> String {
+    let parts = split_entities(text);
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i % 2 == 1 {
+            out.push_str(&decode_wt_entities(part));
+        } else {
+            out.push_str(part);
+        }
+    }
+    out
 }
 
 /// Split a string on wikitext entity references (`&[#0-9a-zA-Z]+;`), retaining

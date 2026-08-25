@@ -164,6 +164,7 @@ impl MockSiteConfig {
             magic_words: HashMap::new(),
             extension_tags: vec![
                 "nowiki".to_string(),
+                "pre".to_string(),
                 "ref".to_string(),
                 "references".to_string(),
                 "gallery".to_string(),
