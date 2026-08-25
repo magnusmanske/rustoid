@@ -1454,8 +1454,20 @@ impl<'a> PegTokenizer<'a> {
 
     /// Try an HTML comment: `<!-- ... -->`
     fn try_comment(&mut self) -> bool {
+        if let Some(tok) = self.parse_comment_token() {
+            self.emit_token(ParsoidToken::Comment(tok));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parse `<!-- ... -->` without emitting it, returning the `CommentTk`.
+    /// Mirrors the `comment` grammar rule. Returns `None` if there is no
+    /// comment at the current position.
+    fn parse_comment_token(&mut self) -> Option<CommentTk> {
         if !self.starts_with("<!--") {
-            return false;
+            return None;
         }
 
         let start = self.pos;
@@ -1470,8 +1482,7 @@ impl<'a> PegTokenizer<'a> {
             // The tokenizer grammar applies `WTUtils::encodeComment` to the raw
             // comment body before emitting the token (see the `comment` rule).
             let encoded = encode_comment(&comment_text);
-            self.emit_token(ParsoidToken::Comment(CommentTk::new(encoded, dp)));
-            return true;
+            return Some(CommentTk::new(encoded, dp));
         }
 
         // Unclosed comment.
@@ -1481,8 +1492,7 @@ impl<'a> PegTokenizer<'a> {
         let mut dp = self.make_dp(start, self.pos);
         dp.unclosed_comment = Some(true);
         let encoded = encode_comment(&comment_text);
-        self.emit_token(ParsoidToken::Comment(CommentTk::new(encoded, dp)));
-        true
+        Some(CommentTk::new(encoded, dp))
     }
 
     /// Try an HTML tag: `<tag attr="val">` or `</tag>`
@@ -1608,18 +1618,28 @@ impl<'a> PegTokenizer<'a> {
         if self.starts_with("=") {
             self.advance(1);
             self.consume_spaces();
-            let val = self.parse_attr_value();
+            let (val, val_src) = self.parse_attr_value();
+            let val_end = self.pos;
+            // Preserve the raw source of the value for round-tripping (`vsrc`,
+            // used by the sanitizer's `sa` shadow attribute). Only token-array
+            // values need it, since a plain-string value's `vsrc` matches its
+            // stringified form. Mirrors PHP's `generic_newline_attribute`.
+            let vsrc = if matches!(val, KeyValue::Tokens(_)) {
+                Some(val_src)
+            } else {
+                None
+            };
             Some(KV {
                 key: name,
-                value: KeyValue::Str(val),
+                value: val,
                 src_offsets: Some(KVSourceRange {
                     key_start: name_start,
                     key_end: name_end,
                     value_start: name_end + 1,
-                    value_end: self.pos,
+                    value_end: val_end,
                 }),
                 ksrc: None,
-                vsrc: None,
+                vsrc,
             })
         } else {
             Some(KV {
@@ -1692,29 +1712,92 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
-    fn parse_attr_value(&mut self) -> String {
-        let rem = self.remaining();
-        if let Some(stripped) = rem.strip_prefix('"')
-            && let Some(end) = stripped.find('"')
-        {
-            let val = stripped[..end].to_string();
-            self.advance(end + 2);
-            return val;
-        } else if let Some(stripped) = rem.strip_prefix('\'')
-            && let Some(end) = stripped.find('\'')
-        {
-            let val = stripped[..end].to_string();
-            self.advance(end + 2);
-            return val;
+    /// Parse an attribute value into a `KeyValue`. Quoted or unquoted. Values
+    /// containing HTML comments (`<!-- ... -->`) or template directives become
+    /// token arrays (`KeyValue::Tokens`); plain values become `KeyValue::Str`.
+    /// Mirrors the PHP `attribute_preprocessor_text*` rules, whose non-plain
+    /// alternatives route through `directive` (comment / template / htmlentity).
+    ///
+    /// Returns the parsed `KeyValue` and the raw source of the value (between
+    /// any surrounding quotes, matching `srcOffsets` in PHP's `generic_att_value`).
+    fn parse_attr_value(&mut self) -> (KeyValue, String) {
+        // Quoted (double) value. The closing delimiter marks the end,
+        // mirroring `attribute_preprocessor_text_double`.
+        if self.starts_with("\"") {
+            self.advance(1);
+            let src_start = self.pos;
+            let tokens = self.parse_attr_value_text(&['\"']);
+            let src_end = self.pos;
+            if self.starts_with("\"") {
+                self.advance(1);
+            }
+            return (tokens, self.input[src_start..src_end].to_string());
+        } else if self.starts_with("'") {
+            self.advance(1);
+            let src_start = self.pos;
+            let tokens = self.parse_attr_value_text(&['\'']);
+            let src_end = self.pos;
+            if self.starts_with("'") {
+                self.advance(1);
+            }
+            return (tokens, self.input[src_start..src_end].to_string());
         }
 
-        // Unquoted.
-        let end = rem
-            .find([' ', '\t', '\n', '\r', '/', '>'])
-            .unwrap_or(rem.len());
-        let val = rem[..end].to_string();
-        self.advance(end);
-        val
+        // Unquoted. Stop at whitespace, `/`, or `>`.
+        let src_start = self.pos;
+        let tokens = self.parse_attr_value_text(&[' ', '\t', '\n', '\r', '/', '>']);
+        let src = self.input[src_start..self.pos].to_string();
+        (tokens, src)
+    }
+
+    /// Parse the interior of an attribute value (after any opening quote),
+    /// accumulating plain text and `CommentTk`/directive tokens into a
+    /// `KeyValue`. `stops` is the set of terminating characters for the value.
+    fn parse_attr_value_text(&mut self, stops: &[char]) -> KeyValue {
+        let mut tokens: Vec<Item> = Vec::new();
+        let mut buf = String::new();
+
+        loop {
+            // HTML comment.
+            if self.starts_with("<!--")
+                && let Some(comment) = self.parse_comment_token()
+            {
+                if !buf.is_empty() {
+                    tokens.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                tokens.push(Item::Tok(ParsoidToken::Comment(comment)));
+                continue;
+            }
+
+            // Template directive (`{{...}}` / `{{{...}}}`).
+            if self.starts_with("{{")
+                && let Some(tok) = self.parse_directive()
+            {
+                if !buf.is_empty() {
+                    tokens.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+                continue;
+            }
+
+            let Some(ch) = self.peek_char() else {
+                break;
+            };
+            if stops.contains(&ch) {
+                break;
+            }
+            self.advance(ch.len_utf8());
+            buf.push(ch);
+        }
+
+        if tokens.is_empty() {
+            KeyValue::Str(buf)
+        } else {
+            if !buf.is_empty() {
+                tokens.push(Item::Str(buf));
+            }
+            KeyValue::Tokens(tokens)
+        }
     }
 
     /// Try template argument or template: `{{{ ... }}}` or `{{ ... }}`.

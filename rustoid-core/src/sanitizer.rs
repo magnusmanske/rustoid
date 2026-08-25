@@ -1021,18 +1021,24 @@ pub fn sanitize_tag_attrs(
     let mut new_attrs: Vec<crate::wikitext::tokens_v2::KV> = Vec::new();
 
     for mut a in attrs {
-        // Convert the key to a plain string name.
+        // Convert the key to a plain string name, mutating in place (mirrors
+        // PHP `$a->k = TokenUtils::tokensToString($a->k)`).
         let key = match &a.key {
             crate::wikitext::tokens_v2::KeyValue::Str(k) => k.clone(),
-            crate::wikitext::tokens_v2::KeyValue::Tokens(_) => continue, // non-string key: drop
+            crate::wikitext::tokens_v2::KeyValue::Tokens(toks) => {
+                crate::wikitext::token_utils::tokens_to_string(toks)
+            }
         };
+        a.key = crate::wikitext::tokens_v2::KeyValue::Str(key.clone());
         let key_lower = key.to_lowercase();
 
-        // Convert the value to a string.
-        let value = match &a.value {
-            crate::wikitext::tokens_v2::KeyValue::Str(v) => v.clone(),
-            crate::wikitext::tokens_v2::KeyValue::Tokens(_) => continue, // expanded attr: not supported
-        };
+        // Convert the value to a string. A token-array value (e.g. an attribute
+        // value containing an HTML comment) is stringified; comments and
+        // newlines are dropped. Mirrors PHP `sanitizeTagAttrs`, which calls
+        // `TokenUtils::tokensToString($a->v)` for array values, mutating
+        // `$a->v` in place.
+        let value = crate::wikitext::token_utils::key_value_to_string(&a.value);
+        a.value = crate::wikitext::tokens_v2::KeyValue::Str(value.clone());
 
         // Allow any `data-*` attribute except reserved ones and namespaced.
         let is_data_attr = key_lower.starts_with("data-")
