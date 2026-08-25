@@ -189,8 +189,50 @@ fn extension_kv_attrs(token: &SelfclosingTagTk) -> Vec<crate::wikitext::tokens_v
 
 /// Strip `<nowiki>…</nowiki>` wrappers from `<pre>` content (mirrors the
 /// `preg_replace('/<nowiki\s*>(.*?)<\/nowiki\s*>/s', '$1', …)` in `Pre`).
+/// This is a non-greedy, case-sensitive global replacement: each `<nowiki>` is
+/// paired with the nearest `</nowiki>`, both discarded, and the intervening
+/// content kept.
 fn strip_nowiki_wrappers(content: &str) -> String {
-    content.replace("</nowiki>", "").replace("<nowiki>", "")
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(open) = find_tag(rest, "<nowiki") {
+        out.push_str(&rest[..open]);
+        // Content after the `<nowiki` prefix.
+        let after_open = &rest[open + "<nowiki".len()..];
+        // Skip optional whitespace then the required `>` to close the tag.
+        let trimmed = after_open.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let Some(body_start_rest) = trimmed.strip_prefix('>') else {
+            // Not a well-formed `<nowiki>` tag: leave it literal and stop.
+            out.push_str("<nowiki");
+            rest = after_open;
+            break;
+        };
+        // Find the nearest closing `</nowiki>`.
+        match find_tag(body_start_rest, "</nowiki") {
+            Some(close) => {
+                let inner = &body_start_rest[..close];
+                out.push_str(inner);
+                let after_close = &body_start_rest[close + "</nowiki".len()..];
+                let after_close = after_close.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                rest = after_close.strip_prefix('>').unwrap_or(after_close);
+            }
+            None => {
+                // No closing tag: emit the original `<nowiki>` literally and stop.
+                out.push_str("<nowiki");
+                out.push_str(after_open);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Find the next occurrence of the literal `tag` (a `<tag`/`</tag` prefix), as
+/// a byte offset into `s`.
+fn find_tag(s: &str, tag: &str) -> Option<usize> {
+    s.find(tag)
 }
 
 /// Decode all wikitext entities in a string in one pass (mirrors
@@ -284,5 +326,19 @@ mod tests {
 
         let source = "<nowiki>hello</nowiki>";
         assert_eq!(extract_ext_body(&tok, source), "hello");
+    }
+
+    #[test]
+    fn test_strip_nowiki_wrappers() {
+        // Simple wrapper is stripped.
+        assert_eq!(strip_nowiki_wrappers("<nowiki>a</nowiki>"), "a");
+        // No closing tag: left literal.
+        assert_eq!(strip_nowiki_wrappers("<nowiki>"), "<nowiki>");
+        // Nested nowikis (T15238): `<nowiki><nowiki></nowiki>Foo<nowiki></nowiki></nowiki>`
+        // collapses to `<nowiki>Foo</nowiki>` under non-greedy matching.
+        assert_eq!(
+            strip_nowiki_wrappers("<nowiki><nowiki></nowiki>Foo<nowiki></nowiki></nowiki>"),
+            "<nowiki>Foo</nowiki>"
+        );
     }
 }
