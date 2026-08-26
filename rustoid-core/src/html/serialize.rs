@@ -182,8 +182,8 @@ impl HtmlSerializer {
                         buf.push_str(&format!("{indent}<hr/>"));
                     }
                     ElementKind::Wikilink => {
-                        let href = node.get_attr("href").unwrap_or("");
-                        let rel = node.get_attr("rel").unwrap_or("mw:WikiLink");
+                        let href = attr_escape(node.get_attr("href").unwrap_or(""));
+                        let rel = attr_escape(node.get_attr("rel").unwrap_or("mw:WikiLink"));
                         buf.push_str(&format!("<a rel=\"{rel}\" href=\"{href}\""));
                         self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
@@ -191,8 +191,8 @@ impl HtmlSerializer {
                         buf.push_str("</a>");
                     }
                     ElementKind::ExtLink => {
-                        let href = node.get_attr("href").unwrap_or("");
-                        let rel = node.get_attr("rel").unwrap_or("mw:ExtLink");
+                        let href = attr_escape(node.get_attr("href").unwrap_or(""));
+                        let rel = attr_escape(node.get_attr("rel").unwrap_or("mw:ExtLink"));
                         buf.push_str(&format!("<a rel=\"{rel}\" href=\"{href}\""));
                         self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
@@ -274,7 +274,7 @@ impl HtmlSerializer {
             .iter()
             .filter(|a| a.key != "href" && a.key != "src" && a.key != "rel");
         for attr in attrs {
-            buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
+            serialize_attr(attr, buf);
         }
         if let Some(ref dp) = node.data_parsoid {
             let escaped = dp.replace('&', "&amp;").replace('\'', "&#39;");
@@ -301,7 +301,7 @@ impl HtmlSerializer {
             .iter()
             .filter(|a| include_href_src || (a.key != "href" && a.key != "src"));
         for attr in attrs {
-            buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
+            serialize_attr(attr, buf);
         }
         // Add data-parsoid and data-mw if present
         if let Some(ref dp) = node.data_parsoid {
@@ -426,6 +426,19 @@ fn is_void_element(tag: &str) -> bool {
             | "track"
             | "wbr"
     )
+}
+
+/// Serialize a single attribute. JSON data attributes set via `DOMDataUtils`
+/// (`data-mw-i18n`, and the `data-parsoid`/`data-mw` fields handled separately)
+/// are emitted single-quoted with raw inner quotes, matching PHP's
+/// `XHtmlSerializer`. All other attributes are double-quoted with full escaping.
+fn serialize_attr(attr: &crate::dom::node::Attribute, buf: &mut String) {
+    if attr.key.starts_with("data-mw-i18n") {
+        let escaped = attr.value.replace('&', "&amp;").replace('\'', "&#39;");
+        buf.push_str(&format!(" {}='{escaped}'", attr.key));
+    } else {
+        buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
+    }
 }
 
 /// Basic HTML entity escaping for text content.

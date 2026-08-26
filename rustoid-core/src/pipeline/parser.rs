@@ -340,6 +340,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         wrap_sections: bool,
     ) -> Node {
         let title = TitleParser::parse(page_title, self.config);
+        let page_title_prefixed = title.get_prefixed_text();
         let frame = Frame::new(title, vec![]);
 
         let tokens = self
@@ -357,6 +358,25 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
+        // AddRedLinks: resolve which wikilink targets exist, marking missing
+        // ones as red links. Gather the relevant page titles, batch-check their
+        // existence via the data source, then apply the pass.
+        let mut titles = Vec::new();
+        crate::pipeline::add_red_links::collect_wikilink_titles(&ast, &mut titles);
+        if !titles.is_empty() {
+            let mut known = std::collections::HashSet::new();
+            if let Some(source) = source {
+                for t in &titles {
+                    if let Ok(Some(_)) = source
+                        .get_page_content(&crate::title::Title::new_main(t.clone()))
+                        .await
+                    {
+                        known.insert(t.clone());
+                    }
+                }
+            }
+            crate::pipeline::add_red_links::run(&mut ast, &known, &page_title_prefixed);
+        }
         wrap_sections_in_ast(&mut ast, wrap_sections);
         ast
     }
