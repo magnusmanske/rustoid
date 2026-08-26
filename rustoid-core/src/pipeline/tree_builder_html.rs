@@ -587,6 +587,11 @@ fn encapsulate_transclusions(node: &mut Node) {
 /// `findEncapTarget` picks the first non-meta element, and `addTypeOf` + data-mw
 /// transfer the `typeof`/`about`/metadata onto that target. The start and end
 /// marker metas are then removed.
+///
+/// Nested transclusions (a marker pair fully contained within another) are
+/// fused innermost-first: an inner range's markers are removed and its
+/// `typeof`/metadata merged onto its target before the enclosing range is
+/// processed, so two nested `mw:Transclusion` markers collapse to one.
 fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
@@ -622,7 +627,10 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
         let start_meta = children[i].clone();
         let about = start_meta.get_attr("about").map(str::to_string);
         let typeof_attr = start_meta.get_attr("typeof").map(str::to_string);
+
+        // Fuse any *nested* ranges in the content first (innermost-first).
         let content: Vec<Node> = children[i + 1..end].to_vec();
+        let content = wrap_transclusion_children(content);
 
         // Stamp `about` on every element in the range and find the first
         // element (the encapsulation target), dropping deletable text and
