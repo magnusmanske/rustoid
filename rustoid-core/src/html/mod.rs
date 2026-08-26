@@ -6,6 +6,7 @@
 
 pub mod constrained_text;
 pub mod dom_tree;
+pub mod dom_utils;
 pub mod dsr;
 pub mod env;
 pub mod parse;
