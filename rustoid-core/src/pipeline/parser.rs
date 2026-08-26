@@ -322,24 +322,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             let clean = |href: &str| {
                 crate::sanitizer::clean_url(href, "external", |proto| {
-                    // `split_url` keeps the `//` when present, and no `//` for
-                    // scheme-only protocols like `mailto:`/`tel:`.
-                    matches!(
-                        proto,
-                        "http://"
-                            | "https://"
-                            | "ftp://"
-                            | "ftps://"
-                            | "mailto:"
-                            | "news:"
-                            | "irc:"
-                            | "ircs:"
-                            | "gopher://"
-                            | "mms://"
-                            | "tel:"
-                            | "nntp://"
-                            | "//"
-                    )
+                    self.config.has_valid_protocol(proto)
                 })
             };
 

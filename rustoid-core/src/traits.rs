@@ -164,6 +164,66 @@ pub trait SiteConfig: Send + Sync {
     fn parsoid_experimental_parser_function_output(&self) -> bool {
         false
     }
+
+    /// The set of URL protocol schemes valid on this wiki, e.g.
+    /// `["//", "http://", "https://", "ftp://", "ftps://", "mailto:", "news:",
+    /// "tel:"]`. Mirrors PHP's `SiteConfig::getProtocols`.
+    fn protocols(&self) -> &[&'static str] {
+        // Scheme-only entries are written without `//` (e.g. `mailto:`, `irc:`)
+        // and URL-scheme entries with `//` (e.g. `http://`), matching the
+        // `proto` produced by `Sanitizer::splitUrl` (scheme + optional `//`).
+        &[
+            "//",
+            "http://",
+            "https://",
+            "ftp://",
+            "ftps://",
+            "mailto:",
+            "news:",
+            "irc:",
+            "ircs:",
+            "gopher://",
+            "mms://",
+            "tel:",
+            "nntp://",
+        ]
+    }
+
+    /// Whether `potential_link` *begins with* a valid protocol scheme (anchored
+    /// at the start of the string). Mirrors PHP's `SiteConfig::hasValidProtocol`.
+    fn has_valid_protocol(&self, potential_link: &str) -> bool {
+        self.protocols()
+            .iter()
+            .any(|p| potential_link.starts_with(p))
+    }
+
+    /// Whether `potential_link` *contains* a valid protocol scheme at a word
+    /// boundary (used by the wikitext-escape autolink fast-path). Mirrors PHP's
+    /// `SiteConfig::findValidProtocol`.
+    fn find_valid_protocol(&self, potential_link: &str) -> bool {
+        self.protocols().iter().any(|p| {
+            // `p` must appear at a word boundary (start-of-string or after a
+            // non-word char), mirroring the `(?:\W|^)` lookbehind in PHP.
+            potential_link.match_indices(p).any(|(idx, _)| {
+                idx == 0 || {
+                    potential_link[..idx]
+                        .chars()
+                        .last()
+                        .map(|c| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(true)
+                }
+            })
+        })
+    }
+
+    /// Whether `name` (already lower-cased) is a configured extension/tag name.
+    /// Mirrors PHP's `SiteConfig::isExtensionTag`.
+    fn is_extension_tag(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.extension_tags()
+            .iter()
+            .any(|t| t.to_ascii_lowercase() == lower)
+    }
 }
 
 /// Information about a namespace.
@@ -257,4 +317,68 @@ pub trait ExtensionHandler: Send + Sync {
         body: &str,
         source: &dyn DataSource,
     ) -> Result<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal `SiteConfig` for exercising the default protocol helpers.
+    struct TestConfig;
+
+    impl SiteConfig for TestConfig {
+        fn namespaces(&self) -> &HashMap<i32, NamespaceInfo> {
+            static N: std::sync::OnceLock<HashMap<i32, NamespaceInfo>> = std::sync::OnceLock::new();
+            N.get_or_init(HashMap::new)
+        }
+        fn interwiki_map(&self) -> &HashMap<String, InterwikiInfo> {
+            static M: std::sync::OnceLock<HashMap<String, InterwikiInfo>> =
+                std::sync::OnceLock::new();
+            M.get_or_init(HashMap::new)
+        }
+        fn magic_words(&self) -> &MagicWordMap {
+            static W: std::sync::OnceLock<MagicWordMap> = std::sync::OnceLock::new();
+            W.get_or_init(HashMap::new)
+        }
+        fn extension_tags(&self) -> &[String] {
+            static T: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            T.get_or_init(|| vec!["ref".to_string(), "gallery".to_string()])
+        }
+        fn server_url(&self) -> &str {
+            "https://en.wikipedia.org"
+        }
+        fn article_path(&self) -> &str {
+            "/wiki/$1"
+        }
+        fn language_code(&self) -> &str {
+            "en"
+        }
+    }
+
+    #[test]
+    fn test_has_valid_protocol() {
+        let c = TestConfig;
+        assert!(c.has_valid_protocol("https://example.com"));
+        assert!(c.has_valid_protocol("//example.com"));
+        assert!(c.has_valid_protocol("mailto:a@b.c"));
+        assert!(!c.has_valid_protocol("example.com"));
+        // Anchored: a protocol later in the string does not count.
+        assert!(!c.has_valid_protocol("foo https://example.com"));
+    }
+
+    #[test]
+    fn test_find_valid_protocol() {
+        let c = TestConfig;
+        assert!(c.find_valid_protocol("see https://example.com now"));
+        assert!(c.find_valid_protocol("https://example.com"));
+        assert!(!c.find_valid_protocol("no protocol here"));
+    }
+
+    #[test]
+    fn test_is_extension_tag() {
+        let c = TestConfig;
+        assert!(c.is_extension_tag("ref"));
+        assert!(c.is_extension_tag("REF")); // lower-cased before matching
+        assert!(!c.is_extension_tag("div"));
+    }
 }
