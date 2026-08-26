@@ -1472,10 +1472,10 @@ impl<'a> PegTokenizer<'a> {
             dp.src = Some(ext_src);
             // extTagOffsets covers start..end with the end-tag width.
             dp.ext_tag_offsets = Some(DomSourceRange {
-                start: saved,
-                end,
-                open_width: self.pos - saved,
-                close_width,
+                start: Some(saved),
+                end: Some(end),
+                open_width: Some(self.pos - saved),
+                close_width: Some(close_width),
             });
             self.pos = end;
         } else {

@@ -490,10 +490,10 @@ impl ParserFunctions {
             tsr: None,
             src: Some(source.clone()),
             ext_tag_offsets: Some(DomSourceRange {
-                start: 0,
-                end: source.len(),
-                open_width: open_tag.len(),
-                close_width: close_tag.len(),
+                start: Some(0),
+                end: Some(source.len()),
+                open_width: Some(open_tag.len()),
+                close_width: Some(close_tag.len()),
             }),
             ..Default::default()
         };

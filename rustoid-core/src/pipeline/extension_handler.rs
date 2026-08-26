@@ -128,8 +128,10 @@ pub fn extract_ext_body(token: &SelfclosingTagTk, source: &str) -> String {
     let Some(offsets) = &token.data_parsoid.ext_tag_offsets else {
         return String::new();
     };
-    let start = offsets.open_width.min(source.len());
-    let end = source.len().saturating_sub(offsets.close_width);
+    let start = offsets.open_width.unwrap_or(0).min(source.len());
+    let end = source
+        .len()
+        .saturating_sub(offsets.close_width.unwrap_or(0));
     if end <= start {
         return String::new();
     }
@@ -338,10 +340,10 @@ mod tests {
     fn test_extract_ext_body() {
         let dp = DataParsoid {
             ext_tag_offsets: Some(crate::wikitext::tokens_v2::DomSourceRange {
-                start: 0,
-                end: 22,
-                open_width: 8,
-                close_width: 9,
+                start: Some(0),
+                end: Some(22),
+                open_width: Some(8),
+                close_width: Some(9),
             }),
             ..DataParsoid::default()
         };
@@ -372,10 +374,10 @@ mod tests {
         let full = format!("<nowiki>{body}</nowiki>");
         let dp = DataParsoid {
             ext_tag_offsets: Some(crate::wikitext::tokens_v2::DomSourceRange {
-                start: 0,
-                end: full.len(),
-                open_width: "<nowiki>".len(),
-                close_width: "</nowiki>".len(),
+                start: Some(0),
+                end: Some(full.len()),
+                open_width: Some("<nowiki>".len()),
+                close_width: Some("</nowiki>".len()),
             }),
             ..DataParsoid::default()
         };

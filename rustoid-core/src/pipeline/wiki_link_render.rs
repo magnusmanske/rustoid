@@ -215,7 +215,7 @@ pub fn add_link_attributes_and_get_content(
     _ctx: &mut WikiLinkContext,
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
-) -> (Vec<KV>, Vec<Item>, String) {
+) -> (Vec<KV>, Vec<Item>, DataParsoid) {
     let attribs = token.get_attribs().to_vec();
     let data_parsoid = token.data_parsoid().cloned().unwrap_or_default();
 
@@ -239,10 +239,12 @@ pub fn add_link_attributes_and_get_content(
             }
         }
 
-        // stx = 'piped' for round-tripping.
+        // Carries the original token's dataParsoid (src cleared, stx='piped'),
+        // faithfully mirroring PHP's `addLinkAttributesAndGetContent`.
         let mut dp = data_parsoid.clone();
+        dp.src = None;
         dp.stx = Some("piped".to_string());
-        (new_attr_data.attribs, out, "piped".to_string())
+        (new_attr_data.attribs, out, dp)
     } else {
         // No explicit link text; derive it from the title.
         let morecontent = target
@@ -252,12 +254,9 @@ pub fn add_link_attributes_and_get_content(
             .unwrap_or_else(|| target.href.clone());
 
         let mut dp = data_parsoid.clone();
+        dp.src = None;
         dp.stx = Some("simple".to_string());
-        (
-            new_attr_data.attribs,
-            vec![Item::Str(morecontent)],
-            "simple".to_string(),
-        )
+        (new_attr_data.attribs, vec![Item::Str(morecontent)], dp)
     }
 }
 
@@ -268,19 +267,24 @@ pub fn render_wiki_link(
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
 ) -> Vec<Item> {
-    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
+    let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
 
-    let mut a_tag = TagTk::new("a", attribs, DataParsoid::default());
+    let mut a_tag = TagTk::new("a", attribs, dp);
 
     // href = makeLink(title), title = getPrefixedText().
+    // `addNormalizedAttribute('href', normalized, src)` records the source href
+    // as `sa.href` and the normalized href as `a.href` (for ComputeDSR).
     if let Some(title) = &target.title {
         let href = make_link(title, ctx.config);
         let prefixed = title.get_prefixed_text();
-        // Set href and title (normalized attribute semantics approximated).
         a_tag.add_attribute_str("href", &href);
         a_tag.add_attribute_str("title", &prefixed);
+        a_tag.data_parsoid.set_sa("href", &target.href_src);
+        a_tag.data_parsoid.set_a("href", &href);
     } else {
         a_tag.add_attribute_str("href", &target.href);
+        a_tag.data_parsoid.set_sa("href", &target.href_src);
+        a_tag.data_parsoid.set_a("href", &target.href);
     }
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
@@ -305,8 +309,8 @@ pub fn render_interwiki_link(
 
     let info = target.interwiki.as_ref().expect("interwiki info");
 
-    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
-    let mut new_tk = TagTk::new("a", attribs, DataParsoid::default());
+    let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut new_tk = TagTk::new("a", attribs, dp);
 
     let is_local = info.local;
     let trimmed_href = target.href.trim();
@@ -320,6 +324,8 @@ pub fn render_interwiki_link(
             .unwrap_or(abs_href);
     }
     new_tk.add_attribute_str("href", &abs_href);
+    new_tk.data_parsoid.set_sa("href", &target.href_src);
+    new_tk.data_parsoid.set_a("href", &abs_href);
 
     // Replace the rel attribute value with mw:WikiLink/Interwiki.
     if let Some(kv) = new_tk
@@ -360,9 +366,8 @@ pub fn render_language_link(
 
     let info = target.language.as_ref().expect("language info");
 
-    let (attribs, _content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
-    let mut new_tk =
-        crate::wikitext::tokens_v2::SelfclosingTagTk::new("link", attribs, DataParsoid::default());
+    let (attribs, _content, dp) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut new_tk = crate::wikitext::tokens_v2::SelfclosingTagTk::new("link", attribs, dp);
 
     // Set absolute link to the article in the other language.
     let title = sanitize_title_uri(&decode_uri_component(&target.href), false);
@@ -375,6 +380,8 @@ pub fn render_language_link(
             .unwrap_or(abs_href);
     }
     new_tk.add_attribute_str("href", &abs_href);
+    new_tk.data_parsoid.set_sa("href", &target.href_src);
+    new_tk.data_parsoid.set_a("href", &abs_href);
 
     // Change rel to mw:PageProp/Language.
     if let Some(kv) = new_tk
@@ -402,9 +409,8 @@ pub fn render_category(
 ) -> Vec<Item> {
     use crate::sanitizer::sanitize_title_uri;
 
-    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
-    let mut new_tk =
-        crate::wikitext::tokens_v2::SelfclosingTagTk::new("link", attribs, DataParsoid::default());
+    let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut new_tk = crate::wikitext::tokens_v2::SelfclosingTagTk::new("link", attribs, dp);
 
     // Change rel to mw:PageProp/Category.
     if let Some(kv) = new_tk
@@ -463,8 +469,8 @@ pub fn link_to_media(
     target: &WikiLinkTargetInfo,
     info: Option<&crate::traits::FileInfo>,
 ) -> Vec<Item> {
-    let (attribs, content, _stx) = add_link_attributes_and_get_content(ctx, token, target);
-    let mut link = TagTk::new("a", attribs, DataParsoid::default());
+    let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
+    let mut link = TagTk::new("a", attribs, dp);
 
     // imgHref = info.url or upload URL.
     let img_href = info

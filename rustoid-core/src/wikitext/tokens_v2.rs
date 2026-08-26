@@ -156,6 +156,15 @@ pub struct DataParsoid {
     pub name: Option<String>,
     /// Set by MarkFosteredContent to indicate fostered content/content wrappers.
     pub fostered: bool,
+    /// Rendered attributes (shadow info): normalized attribute values keyed by
+    /// name (mirrors PHP's `DataParsoid->a`).
+    pub a: Option<std::collections::HashMap<String, String>>,
+    /// Source attributes (shadow info): original wikitext attribute values keyed
+    /// by name (mirrors PHP's `DataParsoid->sa`).
+    pub sa: Option<std::collections::HashMap<String, String>>,
+    /// DOM source range computed by `ComputeDSR` (mirrors PHP's
+    /// `DataParsoid->dsr`). Carries nullable offsets and tag widths.
+    pub dsr: Option<DomSourceRange>,
     /// Temporary node-related data (mirrors PHP's `TempData`).
     pub tmp: TempData,
 }
@@ -175,6 +184,20 @@ impl DataParsoid {
             tsr: Some(tsr),
             ..Default::default()
         }
+    }
+
+    /// Set a rendered (normalized) attribute in the `a` shadow map.
+    pub fn set_a(&mut self, key: &str, value: &str) {
+        self.a
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(key.to_string(), value.to_string());
+    }
+
+    /// Set a source attribute in the `sa` shadow map.
+    pub fn set_sa(&mut self, key: &str, value: &str) {
+        self.sa
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(key.to_string(), value.to_string());
     }
 
     /// Serialize this `DataParsoid` to the `data-parsoid` JSON object that
@@ -256,6 +279,30 @@ impl DataParsoid {
                 serde_json::Value::from(*extra_dashes),
             );
         }
+        if let Some(a) = &self.a
+            && !a.is_empty()
+        {
+            obj.insert("a".to_string(), serde_json::to_value(a).unwrap_or_default());
+        }
+        if let Some(sa) = &self.sa
+            && !sa.is_empty()
+        {
+            obj.insert(
+                "sa".to_string(),
+                serde_json::to_value(sa).unwrap_or_default(),
+            );
+        }
+        if let Some(dsr) = &self.dsr {
+            obj.insert(
+                "dsr".to_string(),
+                serde_json::Value::Array(vec![
+                    serde_json::Value::from(dsr.start.map(|v| v as u64)),
+                    serde_json::Value::from(dsr.end.map(|v| v as u64)),
+                    serde_json::Value::from(dsr.open_width.map(|v| v as u64)),
+                    serde_json::Value::from(dsr.close_width.map(|v| v as u64)),
+                ]),
+            );
+        }
 
         if obj.is_empty() {
             None
@@ -266,21 +313,23 @@ impl DataParsoid {
 }
 
 /// DOM source range with additional metadata (analogous to PHP's DomSourceRange).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DomSourceRange {
-    pub start: usize,
-    pub end: usize,
-    pub open_width: usize,
-    pub close_width: usize,
+    pub start: Option<usize>,
+    pub end: Option<usize>,
+    pub open_width: Option<usize>,
+    pub close_width: Option<usize>,
 }
 
 impl DomSourceRange {
     pub fn inner_start(&self) -> usize {
-        self.start + self.open_width
+        self.start.unwrap_or(0) + self.open_width.unwrap_or(0)
     }
 
     pub fn inner_end(&self) -> usize {
-        self.end - self.close_width
+        self.end
+            .unwrap_or(0)
+            .saturating_sub(self.close_width.unwrap_or(0))
     }
 }
 
