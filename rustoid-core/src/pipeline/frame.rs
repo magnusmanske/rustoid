@@ -93,6 +93,12 @@ impl Frame {
         let named = self.args.named();
 
         let arg_name = name.trim();
+        // The magic argument `!` (`{{{!}}}`) expands to `{|` (table start),
+        // mirroring the MediaWiki preprocessor's special handling so tables can
+        // be embedded in arguments without consuming the `|` as a separator.
+        if arg_name == "!" {
+            return vec![Item::Str("{|".to_string())];
+        }
         if let Some(value) = named.dict.get(arg_name) {
             let mut items = key_value_to_items(value);
             // Named arguments are trimmed (mirrors `TokenUtils::tokenTrim`).

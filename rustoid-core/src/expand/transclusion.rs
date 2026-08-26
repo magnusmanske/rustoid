@@ -84,6 +84,22 @@ pub fn substitute_args(wikitext: &str, args: &TemplateArgs, max_depth: u32) -> R
     let mut i = 0;
 
     while i < chars.len() {
+        // Magic pipe words — `{{!}}`, `{{{!}}}`, `{{{!}}` — are handled at the
+        // token level (`TemplateHandler`/`Frame::expand_template_arg`) and must
+        // be left *intact* here so they are not mis-parsed as a `{{{…}}}`
+        // argument reference (and so their `|` isn't emitted early and then
+        // consumed as a template-argument separator before the magic word is
+        // expanded). Skip `{{{!` atomically.
+        if i + 3 < chars.len()
+            && chars[i] == '{'
+            && chars[i + 1] == '{'
+            && chars[i + 2] == '{'
+            && chars[i + 3] == '!'
+        {
+            result.push_str("{{{");
+            i += 3;
+            continue;
+        }
         if i + 2 < chars.len() && chars[i] == '{' && chars[i + 1] == '{' && chars[i + 2] == '{' {
             // Found {{{ — count depth to find matching }}}
             let open_len = 3;
@@ -135,7 +151,6 @@ pub fn substitute_args(wikitext: &str, args: &TemplateArgs, max_depth: u32) -> R
         }
     }
 
-    let result = tpl_args::replace_magic_pipe(&result);
     Ok(result)
 }
 
@@ -324,6 +339,20 @@ mod tests {
         args.add_positional("a|b");
         let result = substitute_args("Value: {{{1}}}", &args, 5).unwrap();
         assert_eq!(result, "Value: a|b");
+    }
+
+    #[test]
+    fn test_magic_pipe_words_left_intact() {
+        // `{{{!}}` and `{{!}}` are token-level magic words (table escapes);
+        // `substitute_args` must leave them intact rather than mis-parsing
+        // `{{{!}}` as a `{{{…}}}` argument or eagerly emitting a `|`.
+        let args = TemplateArgs::new();
+        let result = substitute_args("{{{!}}", &args, 5).unwrap();
+        assert_eq!(result, "{{{!}}");
+        let result = substitute_args("{{!}}", &args, 5).unwrap();
+        assert_eq!(result, "{{!}}");
+        let result = substitute_args("a {{{!}} b {{!}} c", &args, 5).unwrap();
+        assert_eq!(result, "a {{{!}} b {{!}} c");
     }
 
     #[test]

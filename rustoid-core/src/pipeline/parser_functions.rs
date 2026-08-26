@@ -468,13 +468,19 @@ impl ParserFunctions {
 
         // Reconstruct the literal `<name attrs>content</name>` source so that
         // `extract_ext_body` can recover the raw body via the open/close widths.
-        let content_src: String = content
-            .iter()
-            .map(|it| match it {
-                Item::Str(s) => s.clone(),
-                Item::Tok(t) => t.to_string(),
-            })
-            .collect();
+        // Magic pipe words in the content (`{{!}}` → `|`, `{{{!}}` → `{|`) are
+        // expanded here, *after* the `#tag` arguments have been split, so the
+        // pipes they produce aren't consumed as argument separators (mirrors the
+        // token-level `processSpecialMagicWord`/`!` magic-variable handling).
+        let content_src: String = crate::expand::tpl_args::replace_magic_pipe(
+            &content
+                .iter()
+                .map(|it| match it {
+                    Item::Str(s) => s.clone(),
+                    Item::Tok(t) => t.to_string(),
+                })
+                .collect::<String>(),
+        );
         let attr_src = serialize_tag_attribs(display_target, tag_attribs);
         let open_tag = format!("<{}{attr_src}>", display_target.to_lowercase());
         let close_tag = format!("</{lc_target}>");

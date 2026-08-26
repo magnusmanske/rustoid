@@ -599,7 +599,18 @@ impl TemplateHandler {
             .unwrap_or_default();
 
         match resolve_template_target(config, &target_str) {
-            Some(ResolvedTarget::Variable { name, .. }) => {
+            Some(ResolvedTarget::Variable {
+                name,
+                magic_word_type,
+                ..
+            }) => {
+                // The `{{!}}` magic word expands to a literal `|` (table-pipe).
+                // This is a special token-level substitution (PHP
+                // `processSpecialMagicWord` with `magicWordType === '!'`); it must
+                // NOT be string-permuted or re-tokenized into a table delimiter.
+                if magic_word_type.as_deref() == Some("!") {
+                    return vec![Item::Str("|".to_string())];
+                }
                 let value = Self::variable_value(config, &name);
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 let mut info = template_info_from(Some(&name), None, vec![]);
