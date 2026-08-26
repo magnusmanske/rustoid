@@ -554,6 +554,11 @@ fn is_transclusion_end(node: &Node) -> bool {
             .is_some_and(|t| t == "mw:Transclusion/End" || t == "mw:Param/End")
 }
 
+/// Whether a node is any transclusion/param marker meta (start or end).
+fn is_transclusion_marker_meta(node: &Node) -> bool {
+    is_transclusion_start(node) || is_transclusion_end(node)
+}
+
 /// Encapsulate transclusion meta markers into wrapping `<span>` elements (the
 /// common, non-fostered case of PHP's `DOMRangeBuilder::encapsulateTemplates`).
 ///
@@ -621,7 +626,9 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
 
         // Stamp `about` on every element in the range and find the first
         // element (the encapsulation target), dropping deletable text and
-        // wrapping non-whitespace text in `about` spans.
+        // wrapping non-whitespace text in `about` spans. Nested template-marker
+        // metas are skipped as encapsulation targets (mirrors `findEncapTarget`
+        // skipping `isTplMarkerMeta`), but still receive the `about` stamp.
         let mut new_content: Vec<Node> = Vec::with_capacity(content.len());
         let mut encap_target = None;
         for child in content {
@@ -631,7 +638,8 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                     if let Some(about) = &about {
                         child.set_attr("about", about.clone());
                     }
-                    if encap_target.is_none() {
+                    let is_marker = is_transclusion_marker_meta(&child);
+                    if encap_target.is_none() && !is_marker {
                         encap_target = Some(new_content.len());
                     }
                     new_content.push(child);
