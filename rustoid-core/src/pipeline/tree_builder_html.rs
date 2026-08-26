@@ -864,6 +864,23 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
             }
             new_content[et].data_parsoid = start_meta.data_parsoid.clone();
             new_content[et].data_mw = start_meta.data_mw.clone();
+        } else {
+            // Empty transclusion: the start and end markers are adjacent (no
+            // content). PHP `DOMRangeBuilder::findEnclosingRange` inserts an
+            // empty `<span>` before the end marker, which then becomes the
+            // encapsulation target and receives `about`/`typeof`/metadata.
+            // Recreate that so an empty template round-trips as an editable
+            // (empty) transclusion rather than disappearing entirely.
+            let mut span = Node::element(ElementKind::Span);
+            if let Some(about) = &about {
+                span.set_attr("about", about.clone());
+            }
+            if let Some(typeof_) = &typeof_attr {
+                span.set_attr("typeof", typeof_.clone());
+            }
+            span.data_parsoid = start_meta.data_parsoid.clone();
+            span.data_mw = start_meta.data_mw.clone();
+            new_content.push(span);
         }
 
         out.extend(new_content);
@@ -1326,6 +1343,36 @@ mod tests {
             return true;
         }
         node.children.iter().any(contains_transclusion_end)
+    }
+
+    #[test]
+    fn test_empty_transclusion_encapsulated_as_span() {
+        // `{{blank}}` (empty template) post-expansion is a pair of adjacent
+        // transclusion marker metas with no content. Faithful Parsoid keeps this
+        // as an empty `<span about=... typeof="mw:Transclusion">` (mirrors
+        // `DOMRangeBuilder::findEnclosingRange`'s empty-content branch) rather
+        // than dropping both markers entirely.
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt1");
+        start.data_parsoid = Some("{\"src\":\"{{blank}}\"}".to_string());
+
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.set_attr("about", "#mwt1");
+
+        let mut doc = Node::document();
+        doc.push_child(start);
+        doc.push_child(end);
+
+        encapsulate_transclusions(&mut doc);
+
+        // Both metas are gone, replaced by a single empty transclusion span.
+        assert_eq!(doc.children.len(), 1, "{doc:?}");
+        let span = &doc.children[0];
+        assert_eq!(span.get_attr("about"), Some("#mwt1"));
+        assert_eq!(span.get_attr("typeof"), Some("mw:Transclusion"));
+        assert!(span.children.is_empty(), "{span:?}");
     }
 
     fn find_placeholder(node: &Node) -> Option<&Node> {

@@ -430,12 +430,22 @@ impl PreHandler {
     }
 
     /// Whether an item is sol-transparent.
+    ///
+    /// Faithful port of `TokenUtils::isSolTransparent`, including the
+    /// `meta` self-closing-tag case: a `<meta>` is SOL-transparent unless it
+    /// carries a literal-HTML marker (`stx === 'html'`). Template/param/
+    /// behavior-switch metas are therefore SOL-transparent.
     fn is_sol_transparent_item(item: &Item) -> bool {
         match item {
             Item::Str(s) => Self::is_sol_transparent_str(s),
             Item::Tok(ParsoidToken::Comment(_)) => true,
             Item::Tok(ParsoidToken::EmptyLine(_)) => true,
             Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "behavior-switch" => true,
+            Item::Tok(ParsoidToken::SelfclosingTag(tk))
+                if tk.name == "meta" && tk.data_parsoid.stx.as_deref() != Some("html") =>
+            {
+                true
+            }
             _ => false,
         }
     }
@@ -507,6 +517,44 @@ mod tests {
         let has_pre = out.iter().any(|it| {
             matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "pre")
                 || matches!(it, Item::Tok(ParsoidToken::EndTag(t)) if t.name == "pre")
+        });
+        assert!(!has_pre, "did not expect <pre> in {:?}", out);
+    }
+
+    #[test]
+    fn test_indented_sol_transparent_metas_not_pre() {
+        // A leading-space line whose remaining content is entirely
+        // SOL-transparent (transclusion metas + a comment + spaces) must NOT
+        // become an indent `<pre>`: `TokenUtils::isSolTransparent` treats a
+        // non-literal-HTML `<meta>` as SOL-transparent (mirrors the
+        // "empty-transclusion on its own line" comment tests).
+        let mut handler = PreHandler::new();
+
+        let mut meta_start = SelfclosingTagTk::new("meta", vec![], DataParsoid::default());
+        meta_start.attribs.push(crate::wikitext::tokens_v2::KV {
+            key: crate::wikitext::tokens_v2::KeyValue::Str("typeof".to_string()),
+            value: crate::wikitext::tokens_v2::KeyValue::Str("mw:Transclusion".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+
+        let out = handler.run(vec![
+            text(" "),
+            Item::Tok(ParsoidToken::SelfclosingTag(meta_start)),
+            text(" "),
+            Item::Tok(ParsoidToken::Comment(
+                crate::wikitext::tokens_v2::CommentTk::new("".to_string(), DataParsoid::default()),
+            )),
+            text(" "),
+            nl(),
+            eof(),
+        ]);
+
+        let has_pre = out.iter().any(|it| {
+            matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "pre")
+                || matches!(it, Item::Tok(ParsoidToken::EndTag(t)) if t.name == "pre")
+                || matches!(it, Item::Tok(ParsoidToken::IndentPre(_)))
         });
         assert!(!has_pre, "did not expect <pre> in {:?}", out);
     }
