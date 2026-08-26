@@ -184,6 +184,11 @@ pub fn on_ext_link(
     // `onUrlLink`). Mirrors PHP `ExternalLinkHandler::onExtLink`.
     let mut a_tag = TagTk::new("a", result.attribs, data_parsoid);
     a_tag.add_attribute_str("href", &href);
+    // Record source/normalized href shadow attrs for round-tripping. The `<a>`
+    // *width* for `ComputeDSR` is derived from `tmp.extLinkContentOffsets` (set
+    // by the tokenizer), not from these.
+    a_tag.data_parsoid.set_sa("href", &orig_href);
+    a_tag.data_parsoid.set_a("href", &href);
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
     out.extend(rendered_content);

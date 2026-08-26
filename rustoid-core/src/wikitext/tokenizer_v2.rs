@@ -2144,11 +2144,23 @@ impl<'a> PegTokenizer<'a> {
 
             let dp = self.make_dp(saved, self.pos);
             let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
-            stt.add_attribute_str("href", url);
-            if let Some(text) = text {
+            stt.add_attribute_str("href", &url);
+
+            // Text content spans from just after the URL + separating space to
+            // the closing `]`. `extLinkContentOffsets->start` covers "all spaces
+            // before content", used by `ExternalLinkHandler::onExtLink` and
+            // `ComputeDSR::computeATagWidth` (mirrors the PHP tokenizer).
+            if let Some(t) = &text {
+                let space_offset = 1; // the single separating space
+                let content_start = saved + 1 + url.len() + space_offset;
+                stt.data_parsoid.tmp.ext_link_content_offsets =
+                    Some(crate::wikitext::tokens_v2::SourceRange::new(
+                        content_start,
+                        content_start + t.len(),
+                    ));
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:content".to_string()),
-                    value: tokenize_link_content(&text),
+                    value: tokenize_link_content(t),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
