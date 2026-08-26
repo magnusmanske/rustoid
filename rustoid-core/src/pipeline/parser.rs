@@ -522,6 +522,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         crate::pipeline::p_wrap::run(&mut ast);
+        crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         wrap_sections_in_ast(&mut ast, wrap_sections);
@@ -593,6 +594,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut ast =
             stage.to_ast_with_fragments(tokens, Some(page_source), self.config, fragments);
         crate::pipeline::p_wrap::run(&mut ast);
+        crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         // AddRedLinks: resolve which wikilink targets exist, marking missing
