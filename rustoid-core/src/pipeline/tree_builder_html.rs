@@ -439,6 +439,13 @@ impl Html5TreeBuilder {
     pub fn finalize(self) -> Node {
         let mut doc = self.builder.handler.finish();
         resolve_data_ids(&mut doc, &self.stash);
+        // Promote transient autoInsertedStart/EndToken flags to their persistent
+        // final form (mirrors `TreeBuilderStage::processToken` end-tag branch).
+        promote_auto_inserted_flags(&mut doc);
+        // Remove empty auto-inserted elements (mirrors
+        // `ProcessTreeBuilderFixups::removeAutoInsertedEmptyTags`, which runs
+        // after tree building and before DOM-level p-wrapping).
+        remove_auto_inserted_empty_tags(&mut doc);
         // Unpack `mw:DOMFragment` placeholders (extension/template sub-content)
         // into their stashed children. Mirrors PHP's `UnpackDOMFragments` DOM
         // handler, which runs after tree building.
@@ -586,6 +593,100 @@ fn strip_marker_metas(node: &mut Node) {
     for child in &mut node.children {
         strip_marker_metas(child);
     }
+}
+
+/// Whether a `data-parsoid` JSON property is present and truthy.
+fn dp_bool(dp: &serde_json::Value, key: &str) -> bool {
+    dp.get(key)
+        .map(|v| v == &serde_json::Value::Bool(true))
+        .unwrap_or(false)
+}
+
+/// Promote the transient `autoInsertedStartToken`/`autoInsertedEndToken` flags
+/// to the persistent `autoInsertedStart`/`autoInsertedEnd` form, dropping the
+/// token-stage fields. Mirrors `TreeBuilderStage::processToken`'s `EndTagTk`
+/// branch (which promotes them onto the element when its end tag is seen).
+fn promote_auto_inserted_flags(node: &mut Node) {
+    if let Some(dp) = node.data_parsoid.as_deref()
+        && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(dp)
+        && let Some(obj) = json.as_object_mut()
+    {
+        if obj.remove("autoInsertedStartToken").is_some() {
+            obj.insert(
+                "autoInsertedStart".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if obj.remove("autoInsertedEndToken").is_some() {
+            obj.insert("autoInsertedEnd".to_string(), serde_json::Value::Bool(true));
+        }
+        node.data_parsoid = Some(json.to_string());
+    }
+    for child in &mut node.children {
+        promote_auto_inserted_flags(child);
+    }
+}
+
+/// Remove empty auto-inserted elements (those with both `autoInsertedStart` and
+/// `autoInsertedEnd`, no non-whitespace content, and no `mw:DOMFragment`
+/// typeof). Faithful port of
+/// `ProcessTreeBuilderFixups::removeAutoInsertedEmptyTags`, migrating any
+/// whitespace-only child out before removing the element.
+fn remove_auto_inserted_empty_tags(node: &mut Node) {
+    for child in &mut node.children {
+        if let NodeKind::Element(_) = child.kind {
+            remove_auto_inserted_empty_tags(child);
+        }
+    }
+
+    let children = std::mem::take(&mut node.children);
+    let mut out: Vec<Node> = Vec::with_capacity(children.len());
+    for child in children {
+        let remove = if let NodeKind::Element(_) = &child.kind {
+            let has_dom_fragment = child.attrs.iter().any(|a| {
+                a.key == "typeof" && a.value.split_whitespace().any(|t| t == "mw:DOMFragment")
+            });
+            if has_dom_fragment {
+                false
+            } else if let Some(dp) = child.data_parsoid.as_deref() {
+                let json = serde_json::from_str::<serde_json::Value>(dp).ok();
+                let dp = json.unwrap_or_default();
+                let auto_start = dp_bool(&dp, "autoInsertedStart");
+                let auto_end = dp_bool(&dp, "autoInsertedEnd");
+                if auto_start && auto_end {
+                    // Empty means no children, or a single non-element child that
+                    // is whitespace-only text.
+                    match child.children.as_slice() {
+                        [] => true,
+                        [only] if !matches!(only.kind, NodeKind::Element(_)) => {
+                            matches!(&only.kind, NodeKind::Text(t) if t.trim().is_empty())
+                                || matches!(only.kind, NodeKind::Comment(_))
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if remove {
+            // Migrate any whitespace-only child out before removing.
+            if let [only] = child.children.as_slice()
+                && !matches!(only.kind, NodeKind::Element(_))
+            {
+                out.push(only.clone());
+            }
+            // Otherwise, drop entirely.
+        } else {
+            out.push(child);
+        }
+    }
+    node.children = out;
 }
 
 /// Whether a node is a transclusion/param *start* marker meta

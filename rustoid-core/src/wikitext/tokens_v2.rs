@@ -110,9 +110,19 @@ pub struct DataParsoid {
     pub src: Option<String>,
     /// Magic word source text.
     pub magic_src: Option<String>,
-    /// Whether this is an auto-inserted start token.
+    /// Whether this start tag was auto-inserted by a token handler (transient;
+    /// promoted to `auto_inserted_start` at tree-build time). Mirrors PHP's
+    /// `DataParsoid->autoInsertedStartToken`.
+    pub auto_inserted_start_token: bool,
+    /// Whether this end tag was auto-inserted by a token handler (transient;
+    /// promoted to `auto_inserted_end` at tree-build time). Mirrors PHP's
+    /// `DataParsoid->autoInsertedEndToken`.
+    pub auto_inserted_end_token: bool,
+    /// Whether this start tag was auto-inserted to produce well-formed HTML
+    /// (final flag, set by the tree builder from the `...Token` form).
     pub auto_inserted_start: bool,
-    /// Whether this is an auto-inserted end token.
+    /// Whether this end tag was auto-inserted to produce well-formed HTML
+    /// (final flag, set by the tree builder from the `...Token` form).
     pub auto_inserted_end: bool,
     /// Self-closing flag.
     pub self_close: Option<bool>,
@@ -198,6 +208,18 @@ impl DataParsoid {
         }
         if let Some(name) = &self.name {
             obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        }
+        if self.auto_inserted_start_token {
+            obj.insert(
+                "autoInsertedStartToken".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if self.auto_inserted_end_token {
+            obj.insert(
+                "autoInsertedEndToken".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
         if self.auto_inserted_start {
             obj.insert(

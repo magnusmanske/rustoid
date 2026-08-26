@@ -1093,6 +1093,22 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_inserted_empty_bold_stripped() {
+        // `''foo''''bar''` (the "annoying" misnested case) produces an
+        // auto-inserted `<b></b>` at end of line in the legacy parser, but
+        // Parsoid strips it via `ProcessTreeBuilderFixups::removeAutoInsertedEmptyTags`.
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html("''foo''''bar''", &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(html.contains("<i>foo'<b>bar</b></i>"), "got: {html}");
+        // No stray empty `<b></b>` should remain.
+        assert!(!html.contains("<b></b>"), "got: {html}");
+        assert!(!html.contains("<i></i>"), "got: {html}");
+    }
+
+    #[test]
     fn test_wikitext_to_html_unordered_list() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);

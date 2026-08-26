@@ -23,8 +23,12 @@ struct State {
     /// Chunks alternate between quote tokens and non-quote token sequences.
     /// The first chunk is a non-quote chunk (always present).
     chunks: Vec<Vec<Item>>,
-    /// Last italic / last bold open tag seen, keyed by tag name.
-    last: std::collections::HashMap<String, ParsoidToken>,
+    /// Last italic / last bold open tag seen, keyed by tag name. Stores the
+    /// location `(chunk_index, item_index)` of the open tag token within
+    /// `chunks`, so post-hoc `autoInsertedEndToken` marks mutate the *actual*
+    /// emitted token (mirroring PHP's reference semantics where
+    /// `$this->last['b']` is the same object as `$this->chunks[$i]`).
+    last: std::collections::HashMap<String, (usize, usize)>,
     /// Whether onAny is currently enabled (accumulating into current chunk).
     on_any_enabled: bool,
 }
@@ -57,6 +61,20 @@ impl State {
     /// Get a clone of the first item in chunk `i`, if any.
     fn first_item(&self, i: usize) -> Option<Item> {
         self.chunks.get(i).and_then(|c| c.first()).cloned()
+    }
+
+    /// Set `auto_inserted_end_token` on the open tag at the recorded location
+    /// for `name`, if any.
+    fn mark_auto_inserted(&mut self, name: &str) {
+        if let Some(&(chunk_idx, item_idx)) = self.last.get(name)
+            && let Some(item) = self
+                .chunks
+                .get_mut(chunk_idx)
+                .and_then(|c| c.get_mut(item_idx))
+            && let Item::Tok(ParsoidToken::Tag(tk)) = item
+        {
+            tk.data_parsoid.auto_inserted_end_token = true;
+        }
     }
 
     fn chunk_count(&self) -> usize {
@@ -463,29 +481,18 @@ impl QuoteTransformer {
         }
         if s == S::B || s == S::Ib {
             let tag = Self::end("b");
-            Self::mark_auto_inserted(state, "b");
+            state.mark_auto_inserted("b");
             state.push_current(Item::Tok(tag));
         }
         if s == S::I || s == S::Bi || s == S::Ib {
             let tag = Self::end("i");
-            Self::mark_auto_inserted(state, "i");
+            state.mark_auto_inserted("i");
             state.push_current(Item::Tok(tag));
         }
         if s == S::Bi {
             let tag = Self::end("b");
-            Self::mark_auto_inserted(state, "b");
+            state.mark_auto_inserted("b");
             state.push_current(Item::Tok(tag));
-        }
-    }
-
-    /// Mark the last open tag of the given name as auto-inserted.
-    fn mark_auto_inserted(state: &mut State, name: &str) {
-        let open = state.last.get_mut(name).cloned();
-        if let Some(mut tok) = open {
-            if let Some(dp) = tok.data_parsoid_mut() {
-                dp.auto_inserted_end = true;
-            }
-            state.last.insert(name.to_string(), tok);
         }
     }
 
@@ -511,17 +518,19 @@ impl QuoteTransformer {
                 (None, None, None)
             };
 
-        let mut result = Vec::new();
+        let mut result: Vec<Item> = Vec::with_capacity(tags.len());
         let mut cur_start = start_pos;
 
         for (i, mut tag) in tags.into_iter().enumerate() {
             if tsr.is_some() {
                 if i == 0 && ignore_bogus_two {
+                    // Mark the *currently open* tag of this name as having an
+                    // auto-inserted end token (mirrors `$this->last[...]->autoInsertedEndToken`).
                     let name = tag.get_name().to_string();
-                    Self::mark_auto_inserted_named(state, &name, true);
+                    state.mark_auto_inserted(&name);
                 } else if i == 2 && ignore_bogus_two {
                     if let Some(dp) = tag.data_parsoid_mut() {
-                        dp.auto_inserted_start = true;
+                        dp.auto_inserted_start_token = true;
                     }
                 } else {
                     let name = tag.get_name().to_string();
@@ -542,28 +551,19 @@ impl QuoteTransformer {
                 }
             }
 
-            // Update `last` map.
+            // Update `last` map to record the location of the last open tag of
+            // each name (mirrors `$this->last[$name] = $tag`).
             let name = tag.get_name().to_string();
             if matches!(tag, ParsoidToken::EndTag(_)) {
                 state.last.remove(&name);
             } else {
-                state.last.insert(name.clone(), tag.clone());
+                state.last.insert(name, (chunk, result.len()));
             }
 
-            result.push(tag);
+            result.push(Item::Tok(tag));
         }
 
-        state.set_chunk(chunk, result.into_iter().map(Item::Tok).collect());
-    }
-
-    fn mark_auto_inserted_named(state: &mut State, name: &str, _end: bool) {
-        let open = state.last.get_mut(name).cloned();
-        if let Some(mut tok) = open {
-            if let Some(dp) = tok.data_parsoid_mut() {
-                dp.auto_inserted_end = true;
-            }
-            state.last.insert(name.to_string(), tok);
-        }
+        state.set_chunk(chunk, result);
     }
 
     fn start(name: &str) -> ParsoidToken {
