@@ -6,6 +6,12 @@ Template:1x
 {{{1}}}
 !! endarticle
 
+!! article
+Main Page
+!! text
+Main page content
+!! endarticle
+
 !! test
 Simple bold text
 !! wikitext
@@ -19,7 +25,7 @@ Simple wikilink
 !! wikitext
 [[Main Page]]
 !! html/parsoid
-<p><a href="Main Page">Main Page</a></p>
+<p><a href="./Main_Page" rel="mw:WikiLink" title="Main Page">Main Page</a></p>
 !! end
 
 !! test
@@ -27,7 +33,7 @@ Heading level 2
 !! wikitext
 == Section Title ==
 !! html/parsoid
-<h2>Section Title</h2>
+<h2 id="Section_Title">Section Title</h2>
 !! end
 
 !! test
@@ -46,7 +52,7 @@ Mixed inline formatting
 !! wikitext
 ''italic'' and '''bold''' and '''''both'''''
 !! html/parsoid
-<p><i>italic</i> and <b>bold</b> and <b><i>both</i></b></p>
+<p><i>italic</i> and <b>bold</b> and <i><b>both</b></i></p>
 !! end
 
 !! test
@@ -64,5 +70,5 @@ Template expansion
 !! wikitext
 {{1x|hello}}
 !! html/parsoid
-<p>hello</p>
+<p typeof="mw:Transclusion">hello</p>
 !! end
