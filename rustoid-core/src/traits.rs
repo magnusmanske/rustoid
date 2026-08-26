@@ -147,6 +147,14 @@ pub trait SiteConfig: Send + Sync {
     fn magic_link_enabled(&self, _which: &str) -> bool {
         true
     }
+
+    /// Extra attributes to add to external links, keyed by attribute name.
+    /// Mirrors PHP's `SiteConfig::getExternalLinkAttribs`, which defaults to
+    /// `rel = ["nofollow"]` (i.e. `$wgNoFollowLinks = true`). The `class` key
+    /// holds the class tokens to *add* (not replace) to any existing `class`.
+    fn external_link_attribs(&self, _href: &str) -> Vec<(String, Vec<String>)> {
+        vec![("rel".to_string(), vec!["nofollow".to_string()])]
+    }
 }
 
 /// Information about a namespace.

@@ -170,10 +170,10 @@ pub fn on_ext_link(
     let link_attrs = [string_kv("rel", "mw:ExtLink")];
     let result = build_link_attrs(token.get_attribs(), false, None, Some(&link_attrs));
 
-    let mut dp = data_parsoid;
-    dp.stx = Some("url".to_string());
-
-    let mut a_tag = TagTk::new("a", result.attribs, dp);
+    // A bracketed `[url text]` extlink keeps its original `data-parsoid` (it is
+    // *not* `stx: 'url'`, which is reserved for auto-linked bare URLs in
+    // `onUrlLink`). Mirrors PHP `ExternalLinkHandler::onExtLink`.
+    let mut a_tag = TagTk::new("a", result.attribs, data_parsoid);
     a_tag.add_attribute_str("href", &href);
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];

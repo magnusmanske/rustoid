@@ -293,6 +293,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut ast = stage.to_ast_with_source(tokens, Some(wikitext), self.config);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
+        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         wrap_sections_in_ast(&mut ast, wrap_sections);
         Ok(ast)
     }
@@ -355,6 +356,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut ast = stage.to_ast_with_source(tokens, Some(page_source), self.config);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
+        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         wrap_sections_in_ast(&mut ast, wrap_sections);
         ast
     }
@@ -719,7 +721,8 @@ mod tests {
             )
             .unwrap();
         assert!(html.contains("<a"), "got: {html}");
-        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(html.contains("rel=\"mw:ExtLink nofollow\""), "got: {html}");
+        assert!(html.contains("class=\"external text\""), "got: {html}");
         assert!(html.contains("https://example.com"), "got: {html}");
         assert!(html.contains("Example"), "got: {html}");
         // The structural `<html>` wrapper must appear exactly once (the
@@ -738,7 +741,7 @@ mod tests {
                 &ParserOptions::for_page("Test"),
             )
             .unwrap();
-        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(html.contains("rel=\"mw:ExtLink nofollow\""), "got: {html}");
         assert!(html.contains("https://example.com"), "got: {html}");
     }
 
@@ -1197,7 +1200,7 @@ mod tests {
         let html = parser
             .wikitext_to_html("See RFC 1234 here", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(html.contains("rel=\"mw:ExtLink nofollow\""), "got: {html}");
         assert!(
             html.contains("https://datatracker.ietf.org/doc/html/rfc1234"),
             "got: {html}"
@@ -1212,7 +1215,7 @@ mod tests {
         let html = parser
             .wikitext_to_html("PMID 1234", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("rel=\"mw:ExtLink\""), "got: {html}");
+        assert!(html.contains("rel=\"mw:ExtLink nofollow\""), "got: {html}");
         assert!(
             html.contains("//www.ncbi.nlm.nih.gov/pubmed/1234?dopt=Abstract"),
             "got: {html}"

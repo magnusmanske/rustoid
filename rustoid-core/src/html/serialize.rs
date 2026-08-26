@@ -183,7 +183,8 @@ impl HtmlSerializer {
                     }
                     ElementKind::Wikilink => {
                         let href = node.get_attr("href").unwrap_or("");
-                        buf.push_str(&format!("<a rel=\"mw:WikiLink\" href=\"{href}\""));
+                        let rel = node.get_attr("rel").unwrap_or("mw:WikiLink");
+                        buf.push_str(&format!("<a rel=\"{rel}\" href=\"{href}\""));
                         self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
@@ -191,7 +192,8 @@ impl HtmlSerializer {
                     }
                     ElementKind::ExtLink => {
                         let href = node.get_attr("href").unwrap_or("");
-                        buf.push_str(&format!("<a rel=\"mw:ExtLink\" href=\"{href}\""));
+                        let rel = node.get_attr("rel").unwrap_or("mw:ExtLink");
+                        buf.push_str(&format!("<a rel=\"{rel}\" href=\"{href}\""));
                         self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
