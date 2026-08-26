@@ -916,12 +916,13 @@ mod tests {
     fn test_wikitext_to_html_nowiki() {
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
-        // `<nowiki>` renders as `<span typeof="mw:Nowiki">` with raw escaped text.
+        // A plain-text `<nowiki>` (no decodable entities) renders as bare text,
+        // with no `mw:Nowiki` wrapper (matching Parsoid's rendered output).
         let html = parser
             .wikitext_to_html("<nowiki>hi</nowiki>", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("typeof=\"mw:Nowiki\""), "got: {html}");
-        assert!(html.contains(">hi</span>"), "got: {html}");
+        assert!(html.contains(">hi</p>"), "got: {html}");
+        assert!(!html.contains("mw:Nowiki"), "got: {html}");
 
         // The nested `</pre>` is escaped, not treated as a tag.
         let html = parser
@@ -1273,7 +1274,8 @@ mod tests {
     #[test]
     fn test_wikitext_to_html_redirect_nowiki_bail() {
         // A redirect target containing `<nowiki>` cannot be rendered as a link;
-        // it bails to `<ol><li>REDIRECT [[<span typeof="mw:Nowiki">…</span>]]</li></ol>`.
+        // it bails to `<ol><li>REDIRECT [[…]]</li></ol>`. The nowiki content is
+        // plain text, so it merges directly (no `mw:Nowiki` span).
         let config = MockSiteConfig::new();
         let parser = Parser::new(&config);
         let html = parser
@@ -1283,8 +1285,7 @@ mod tests {
             )
             .unwrap();
         assert!(html.contains("<ol><li>"), "got: {html}");
-        assert!(html.contains("typeof=\"mw:Nowiki\""), "got: {html}");
-        assert!(html.contains(">[[Bar]]</span>"), "got: {html}");
+        assert!(html.contains("REDIRECT [[[[Bar]]]]"), "got: {html}");
     }
 
     #[test]
