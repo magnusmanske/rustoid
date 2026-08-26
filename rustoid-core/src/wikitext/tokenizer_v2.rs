@@ -1550,11 +1550,15 @@ impl<'a> PegTokenizer<'a> {
             let saved = self.pos;
             self.advance(2);
             if let Some(end) = self.remaining().find('>') {
-                let name = self.remaining()[..end].trim().to_lowercase();
+                let raw = self.remaining()[..end].trim().to_string();
+                let name = raw.to_lowercase();
                 self.advance(end + 1);
 
                 let mut dp = self.make_dp(saved, self.pos);
                 dp.stx = Some("html".to_string());
+                // Preserve the original source so disallowed tags round-trip with
+                // their original case (mirrors PHP's `getWTSource` fallback).
+                dp.src = Some(self.input[saved..self.pos].to_string());
                 self.emit_token(ParsoidToken::EndTag(EndTagTk::new(name, vec![], dp)));
                 return true;
             }
@@ -1591,6 +1595,9 @@ impl<'a> PegTokenizer<'a> {
         let mut dp = self.make_dp(saved, self.pos);
         // Literal HTML tags carry `stx: "html"` (mirrors Parsoid's `StxInfo`).
         dp.stx = Some("html".to_string());
+        // Preserve the original source so disallowed tags round-trip with their
+        // original case (mirrors PHP's `getWTSource` fallback).
+        dp.src = Some(self.input[saved..self.pos].to_string());
 
         if self_closing {
             self.emit_token(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
@@ -3258,6 +3265,40 @@ mod tests {
             assert_eq!(tk.attribs[1].key.as_str(), Some("style"));
             assert_eq!(tk.attribs[1].value.as_str(), Some("y"));
         }
+    }
+
+    #[test]
+    fn test_html_tag_preserves_original_src() {
+        // The `name` is lowercased (HTML tag names are case-insensitive), but the
+        // original source (including case) is preserved in `dataParsoid.src` so a
+        // disallowed tag can round-trip without losing the author's casing
+        // (mirrors PHP's `getWTSource` fallback in `SanitizerHandler`).
+        let tokens = tokenize("<President>foo</President>");
+        let tag = tokens.iter().find_map(|t| match t {
+            Either::Right(ParsoidToken::Tag(tk)) if tk.name == "president" => Some(tk),
+            _ => None,
+        });
+        assert!(
+            tag.is_some(),
+            "expected a <president> tag token, got: {tokens:?}"
+        );
+        assert_eq!(
+            tag.unwrap().data_parsoid.src.as_deref(),
+            Some("<President>")
+        );
+
+        let end = tokens.iter().find_map(|t| match t {
+            Either::Right(ParsoidToken::EndTag(tk)) if tk.name == "president" => Some(tk),
+            _ => None,
+        });
+        assert!(
+            end.is_some(),
+            "expected a </president> end tag, got: {tokens:?}"
+        );
+        assert_eq!(
+            end.unwrap().data_parsoid.src.as_deref(),
+            Some("</President>")
+        );
     }
 
     #[test]

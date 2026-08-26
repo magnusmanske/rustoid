@@ -148,6 +148,14 @@ impl SanitizerHandler {
             || (matches!(tok, ParsoidToken::EndTag(_)) && no_end_tag_set(name));
 
         if disallowed {
+            // Prefer the original source (preserves the author's original tag
+            // case and spacing), mirroring PHP's `getWTSource` fallback when a
+            // TSR is available outside template context.
+            if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref())
+                && !src.is_empty()
+            {
+                return Some(Item::Str(src.to_string()));
+            }
             return Some(Item::Str(Self::tag_to_text(name, &attribs, tok)));
         }
 
@@ -257,5 +265,24 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "b"));
+    }
+
+    #[test]
+    fn test_disallowed_tag_preserves_src_case() {
+        // A disallowed <President> tag is converted back to text using its
+        // original source (preserving case), mirroring PHP's `getWTSource`
+        // fallback in `SanitizerHandler::sanitizeToken`.
+        let mut tk = TagTk::new("president", vec![], DataParsoid::default());
+        tk.data_parsoid.stx = Some("html".to_string());
+        tk.data_parsoid.src = Some("<President>".to_string());
+        let token = Item::Tok(ParsoidToken::Tag(tk));
+
+        let mut handler = SanitizerHandler::new(false);
+        let out = handler.run(vec![token]);
+
+        let has_text = out
+            .iter()
+            .any(|it| matches!(it, Item::Str(s) if s == "<President>"));
+        assert!(has_text, "expected '<President>' text, got {:?}", out);
     }
 }
