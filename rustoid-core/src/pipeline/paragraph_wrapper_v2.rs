@@ -200,11 +200,12 @@ impl ParagraphWrapper {
             self.reset();
             Some(res)
         } else {
-            // It's a newline.
-            self.curr_line_tokens.clear();
-            self.curr_line_has_wrappable_tokens = false;
-            self.curr_line_block_tag_seen = false;
-            self.curr_line_block_tag_open = false;
+            // It's a newline. Faithful to PHP `onNewlineOrEOF`: reset the
+            // current line (this also updates `in_block_elem` from
+            // `curr_line_block_tag_open`, so content after a block-level open
+            // tag on a previous line is treated as inside a block and not
+            // p-wrapped), then buffer the newline.
+            self.reset_curr_line();
             self.new_line_count += 1;
             self.nl_ws_tokens.push(token);
             None
