@@ -2134,12 +2134,25 @@ impl<'a> PegTokenizer<'a> {
         }
 
         // Emit the mw-quote token.
+        let quote_start = start + plain_ticks;
         let quote_chars = "'".repeat(quote_len);
         self.advance(quote_len);
 
-        let dp = self.make_dp(start + plain_ticks, self.pos);
+        let dp = self.make_dp(quote_start, self.pos);
         let mut stt = SelfclosingTagTk::new("mw-quote", vec![], dp);
-        stt.add_attribute_str("value", quote_chars);
+        stt.add_attribute_str("value", &quote_chars);
+
+        // The PEG `quote` rule also records whether the char(s) immediately
+        // before the quote run are spaces (for 3+ quote tokens). The
+        // QuoteTransformer's balancing heuristic reads these as
+        // `isSpace_1` / `isSpace_2`.
+        if count > 2 {
+            let bytes = self.input.as_bytes();
+            let is_space_1 = quote_start > 0 && bytes.get(quote_start - 1) == Some(&b' ');
+            let is_space_2 = quote_start > 1 && bytes.get(quote_start - 2) == Some(&b' ');
+            stt.add_attribute_str("isSpace_1", if is_space_1 { "true" } else { "false" });
+            stt.add_attribute_str("isSpace_2", if is_space_2 { "true" } else { "false" });
+        }
 
         self.emit_token(ParsoidToken::SelfclosingTag(stt));
         true
@@ -3014,6 +3027,42 @@ mod tests {
         let tokens = tokenize("'''bold'''");
         // Should produce: mw-quote('''), "bold", mw-quote(''')
         assert!(tokens.len() >= 2);
+    }
+
+    #[test]
+    fn test_quote_is_space_attributes() {
+        // The PEG `quote` rule records `isSpace_1` / `isSpace_2` on 3+ quote
+        // tokens so the QuoteTransformer's balancing heuristic can distinguish
+        // possessives from bold. Verify we set them faithfully.
+        let attr = |tokens: &[Either<String, ParsoidToken>], name: &str| -> Option<String> {
+            for t in tokens {
+                let Either::Right(ParsoidToken::SelfclosingTag(tk)) = t else {
+                    continue;
+                };
+                if tk.name != "mw-quote" {
+                    continue;
+                }
+                if let Some(kv) = tk.attribs.iter().find(|kv| kv.key.as_str() == Some(name)) {
+                    return kv.value.as_str().map(|s| s.to_string());
+                }
+            }
+            None
+        };
+
+        // `b '''c`: char before `'''` is a space, the one before that is `b`.
+        let tokens = tokenize("b '''c");
+        assert_eq!(attr(&tokens, "isSpace_1").as_deref(), Some("true"));
+        assert_eq!(attr(&tokens, "isSpace_2").as_deref(), Some("false"));
+
+        // `b  '''c`: two preceding spaces.
+        let tokens = tokenize("b  '''c");
+        assert_eq!(attr(&tokens, "isSpace_1").as_deref(), Some("true"));
+        assert_eq!(attr(&tokens, "isSpace_2").as_deref(), Some("true"));
+
+        // `b''c`: 2-quote tokens do not carry the space flags.
+        let tokens = tokenize("b''c");
+        assert_eq!(attr(&tokens, "isSpace_1"), None);
+        assert_eq!(attr(&tokens, "isSpace_2"), None);
     }
 
     #[test]

@@ -44,18 +44,6 @@ impl State {
         self.chunks[last_idx].push(item);
     }
 
-    /// Take the current chunk (leave empty vec in place).
-    fn take_current(&mut self) -> Vec<Item> {
-        let last_idx = self.chunks.len() - 1;
-        std::mem::take(&mut self.chunks[last_idx])
-    }
-
-    /// Set the current chunk.
-    fn set_current(&mut self, chunk: Vec<Item>) {
-        let last_idx = self.chunks.len() - 1;
-        self.chunks[last_idx] = chunk;
-    }
-
     /// Replace the chunk at index `i` with the given chunk.
     fn set_chunk(&mut self, i: usize, chunk: Vec<Item>) {
         self.chunks[i] = chunk;
@@ -88,40 +76,39 @@ impl QuoteTransformer {
                 Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote" => {
                     // onTag: mw-quote → onQuote
                     state.on_any_enabled = true;
-                    Self::start_new_chunk(&mut state);
-                    state.push_current(token.clone());
-                    Self::start_new_chunk(&mut state);
+                    let qlen = Self::quote_len(tk);
+                    if qlen == 2 || qlen == 3 || qlen == 5 {
+                        Self::start_new_chunk(&mut state);
+                        state.push_current(token.clone());
+                        Self::start_new_chunk(&mut state);
+                    }
+                    // Other quote lengths are dropped, matching PHP's onQuote.
                 }
                 Item::Tok(ParsoidToken::Tag(tk))
-                    if (tk.name == "td" || tk.name == "th")
-                        && QuoteTransformer::is_wikitext_tag(tk.name.as_str()) =>
+                    if (tk.name == "td" || tk.name == "th") && Self::is_wikitext_tag(tk) =>
                 {
-                    // onTag: td/th wikitext tag → processQuotes, then pass the token.
-                    let flushed = Self::process_quotes(&mut state);
-                    output.extend(flushed);
-                    state.on_any_enabled = false;
-                    output.push(token);
+                    // onTag: wikitext td/th → processQuotes($token). The token is
+                    // appended to the current chunk by processQuotes, so it is
+                    // already part of the returned (non-empty) output.
+                    let flushed = Self::process_quotes(&mut state, Some(token.clone()));
+                    if flushed.is_empty() {
+                        output.push(token);
+                    } else {
+                        output.extend(flushed);
+                    }
                 }
                 Item::Tok(ParsoidToken::Nl(_)) => {
-                    // onNewline: the newline token itself is the trigger.
-                    // In PHP, `processQuotes($token)` appends `$token` to the
-                    // current chunk then flushes. We append the token first.
-                    if state.on_any_enabled {
-                        state.push_current(token.clone());
-                    }
-                    let flushed = Self::process_quotes(&mut state);
+                    // onNewline: processQuotes($token).
+                    let flushed = Self::process_quotes(&mut state, Some(token.clone()));
                     if flushed.is_empty() {
-                        // No quote processing happened; pass newline through.
                         output.push(token);
                     } else {
                         output.extend(flushed);
                     }
                 }
                 Item::Tok(ParsoidToken::Eof(_)) => {
-                    if state.on_any_enabled {
-                        state.push_current(token.clone());
-                    }
-                    let flushed = Self::process_quotes(&mut state);
+                    // onEnd: processQuotes($token).
+                    let flushed = Self::process_quotes(&mut state, Some(token.clone()));
                     if flushed.is_empty() {
                         output.push(token);
                     } else {
@@ -129,8 +116,8 @@ impl QuoteTransformer {
                     }
                 }
                 Item::Tok(ParsoidToken::EmptyLine(_)) => {
-                    // onCompoundTk(EmptyLineTk): flush and pass through.
-                    let flushed = Self::process_quotes(&mut state);
+                    // onCompoundTk(EmptyLineTk): processQuotes($token).
+                    let flushed = Self::process_quotes(&mut state, Some(token.clone()));
                     if flushed.is_empty() {
                         output.push(token);
                     } else {
@@ -151,17 +138,21 @@ impl QuoteTransformer {
         output
     }
 
-    /// Start a new chunk (push current chunk and reset the accumulation buffer).
+    /// Start a new chunk (the current chunk is the last element of `chunks`;
+    /// pushing an empty chunk makes it the new accumulation buffer).
     fn start_new_chunk(state: &mut State) {
-        let current = state.take_current();
-        state.set_current(current);
         state.chunks.push(Vec::new());
     }
 
     /// Process quotes on the current line. Implements PHP's `processQuotes`.
     ///
+    /// `token` is the triggering token (newline, EOF, td/th, or an empty-line
+    /// compound token). When present, it is appended to the current chunk after
+    /// quote conversion — exactly as PHP does — so it is ordered after any
+    /// auto-inserted closing tags.
+    ///
     /// Returns the flattened output and resets the buffers.
-    fn process_quotes(state: &mut State) -> Vec<Item> {
+    fn process_quotes(state: &mut State, token: Option<Item>) -> Vec<Item> {
         if !state.on_any_enabled {
             // Quick abort.
             return Vec::new();
@@ -246,6 +237,11 @@ impl QuoteTransformer {
         // Convert the quote tokens into tags.
         Self::convert_quotes_to_tags(state);
 
+        // Return all collected tokens including the trigger token (if any).
+        if let Some(token) = token {
+            state.push_current(token);
+        }
+
         // Flatten chunks into output.
         let mut result = Vec::new();
         for idx in 0..state.chunk_count() {
@@ -256,6 +252,7 @@ impl QuoteTransformer {
         state.chunks.clear();
         state.chunks.push(Vec::new());
         state.last.clear();
+        state.on_any_enabled = false;
 
         result
     }
@@ -581,13 +578,12 @@ impl QuoteTransformer {
         ))
     }
 
-    fn is_wikitext_tag(_name: &str) -> bool {
-        // In the PHP code, `TokenizerUtils::isHTMLTag()` distinguishes HTML
-        // tags from wikitext-generated tags (e.g. table cells from `|` vs
-        // `<td>`). Our tokenizer emits wikitext `td`/`th` tags. For now we
-        // treat all as wikitext; refinement requires distinguishing
-        // HTML-sourced vs wikitext-sourced tags in the tokenizer.
-        true
+    /// Whether a `td`/`th` opening tag came from wikitext table syntax (`|`,
+    /// `!`, `||`) rather than a literal HTML `<td>`/`<th>`. Mirrors PHP's
+    /// `TokenizerUtils::isHTMLTag`, which returns true only when the token's
+    /// `dataParsoid->stx` is `"html"`.
+    fn is_wikitext_tag(tk: &TagTk) -> bool {
+        tk.data_parsoid.stx.as_deref() != Some("html")
     }
 }
 
@@ -696,5 +692,20 @@ mod tests {
         // after the close is attempted. For a single bold, we get <b> and
         // (on close) an auto-inserted </b>.
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn test_auto_inserted_end_tag_precedes_newline() {
+        // For an unbalanced `''foo`, the auto-inserted `</i>` must be emitted
+        // before the newline token (PHP's `processQuotes` appends the trigger
+        // token *after* `convertQuotesToTags`).
+        let input = vec![tok(quote("''")), text("foo"), tok(nl())];
+        let out = QuoteTransformer::transform(input);
+
+        assert_eq!(out.len(), 4, "expected <i>, foo, </i>, nl in {out:?}");
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "i"));
+        assert!(matches!(&out[1], Item::Str(s) if s == "foo"));
+        assert!(matches!(&out[2], Item::Tok(ParsoidToken::EndTag(t)) if t.name == "i"));
+        assert!(matches!(&out[3], Item::Tok(ParsoidToken::Nl(_))));
     }
 }
