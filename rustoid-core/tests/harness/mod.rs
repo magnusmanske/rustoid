@@ -699,6 +699,82 @@ fn open_name(inner: &str) -> String {
         .to_lowercase()
 }
 
+/// Re-serialize an opening tag (e.g. `<pre typeof="x" about="y">`) with its
+/// attributes sorted alphabetically by name, mirroring PHP's
+/// `XHtmlSerializer` `sortAttrs` option (enabled by the parser-test
+/// normalization). Attribute values with embedded `>` or quotes are preserved
+/// verbatim.
+fn sort_open_tag_attrs(open_tag: &str) -> String {
+    // Strip the leading `<` and the trailing `>` (and any `/` self-closing slash).
+    let body = open_tag.strip_prefix('<').unwrap_or(open_tag);
+    let (body, self_close) = match body.strip_suffix("/>") {
+        Some(b) => (b, "/>"),
+        None => match body.strip_suffix('>') {
+            Some(b) => (b, ">"),
+            None => (body, ""),
+        },
+    };
+    let body = body.strip_suffix('/').unwrap_or(body);
+
+    // Tag name is the first whitespace-delimited token.
+    let trimmed = body.trim_start();
+    let name_len = trimmed
+        .find([' ', '\t', '\n', '\r'])
+        .unwrap_or(trimmed.len());
+    let name = &trimmed[..name_len];
+    let rest = &trimmed[name_len..];
+
+    // Split the remaining attribute text on whitespace, respecting quoted
+    // values (which may contain spaces and `>`).
+    let mut attrs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in rest.chars() {
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    cur.push(c);
+                } else if c.is_whitespace() {
+                    if !cur.trim().is_empty() {
+                        attrs.push(cur.trim().to_string());
+                        cur.clear();
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    if !cur.trim().is_empty() {
+        attrs.push(cur.trim().to_string());
+    }
+
+    attrs.sort_by(|a, b| attr_name(a).cmp(attr_name(b)));
+
+    let mut out = format!("<{name}");
+    for a in &attrs {
+        out.push(' ');
+        out.push_str(a);
+    }
+    out.push_str(self_close);
+    if !out.ends_with('>') {
+        out.push('>');
+    }
+    out
+}
+
+/// Extract an attribute's name (up to the first `=`, trimmed).
+fn attr_name(attr: &str) -> &str {
+    attr.split('=').next().unwrap_or(attr).trim()
+}
+
 /// Parse a well-formed HTML fragment into a minimal tree.
 fn parse_fragment(html: &str) -> Vec<MNode> {
     fn walk(html: &str, pos: &mut usize, out: &mut Vec<MNode>) {
@@ -733,7 +809,8 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
                 *pos = bytes.len();
                 break;
             };
-            let open_tag = html[*pos..*pos + gt_rel + 1].to_string();
+            let open_tag_raw = html[*pos..*pos + gt_rel + 1].to_string();
+            let open_tag = sort_open_tag_attrs(&open_tag_raw);
             let inner = &html[*pos + 1..*pos + gt_rel];
             let name = open_name(inner);
             let self_closing = inner.trim_end().ends_with('/') || is_void(&name);
