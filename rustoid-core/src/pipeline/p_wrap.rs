@@ -117,6 +117,14 @@ fn is_nowiki_or_dom_fragment(node: &Node) -> bool {
         .any(|t| t == "mw:Nowiki" || t == "mw:DOMFragment")
 }
 
+/// Does this node carry the parsoid-added `wrapper` temp flag (a span inserted
+/// only to make a transclusion range contiguous)?
+fn is_wrapper(node: &Node) -> bool {
+    node.data_parsoid
+        .as_deref()
+        .is_some_and(|dp| dp.contains("\"wrapper\":true"))
+}
+
 /// Is a p-wrapper optional for this node? (whitespace/comment/meta-tag/nowiki)
 fn p_wrap_optional(node: &Node) -> bool {
     match &node.kind {
@@ -125,6 +133,7 @@ fn p_wrap_optional(node: &Node) -> bool {
         NodeKind::Element(kind) if is_nowiki_or_dom_fragment(node) => {
             node.children.iter().all(p_wrap_optional)
         }
+        NodeKind::Element(kind) if is_wrapper(node) => node.children.iter().all(p_wrap_optional),
         NodeKind::Element(kind) => {
             let tag = element_tag(kind);
             METADATA_TAGS.contains(&tag.as_str())

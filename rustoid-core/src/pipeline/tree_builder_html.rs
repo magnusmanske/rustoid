@@ -689,12 +689,16 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
         // wrapping non-whitespace text in `about` spans. Nested template-marker
         // metas are skipped as encapsulation targets (mirrors `findEncapTarget`
         // skipping `isTplMarkerMeta`), but still receive the `about` stamp.
+        //
+        // Whitespace-only text that sits *between* two non-marker elements is
+        // significant (it preserves a block boundary inside the transclusion),
+        // so it is wrapped in a single-space `about` span rather than dropped.
         let mut new_content: Vec<Node> = Vec::with_capacity(content.len());
         let mut encap_target = None;
-        for child in content {
+        for (idx, child) in content.iter().enumerate() {
             match &child.kind {
                 NodeKind::Element(_) => {
-                    let mut child = child;
+                    let mut child = child.clone();
                     if let Some(about) = &about {
                         child.set_attr("about", about.clone());
                     }
@@ -706,7 +710,21 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                 }
                 NodeKind::Text(s) => {
                     if s.trim().is_empty() {
-                        // Deletable (whitespace-only) text node: drop.
+                        // Whitespace-only: drop unless it separates two elements
+                        // (marks a block boundary inside the transclusion).
+                        let prev_is_elem =
+                            idx > 0 && matches!(content[idx - 1].kind, NodeKind::Element(_));
+                        let next_is_elem = idx + 1 < content.len()
+                            && matches!(content[idx + 1].kind, NodeKind::Element(_));
+                        if prev_is_elem && next_is_elem {
+                            let mut span = Node::element(ElementKind::Span);
+                            if let Some(about) = &about {
+                                span.set_attr("about", about.clone());
+                            }
+                            span.push_child(Node::text(" "));
+                            span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+                            new_content.push(span);
+                        }
                         continue;
                     }
                     // Wrap non-whitespace text in an `about` span so the range
@@ -723,7 +741,7 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                     }
                     new_content.push(span);
                 }
-                _ => new_content.push(child),
+                _ => new_content.push(child.clone()),
             }
         }
 
