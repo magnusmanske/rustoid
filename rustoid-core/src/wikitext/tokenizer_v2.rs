@@ -664,14 +664,10 @@ impl<'a> PegTokenizer<'a> {
             self.consume_spaces();
             self.consume_sol_transparent();
 
-            // Consume newline.
-            if self.starts_with("\r\n") {
-                self.advance(2);
-            } else if self.starts_with("\n") {
-                self.advance(1);
-            }
-
-            self.at_sol = true;
+            // The trailing newline is *not* consumed here: PHP's heading rule
+            // uses a `&eolf` lookahead, and the newline is consumed by the
+            // parent `sol`/`block_lines`, which emits an `Nl` token for it.
+            self.at_sol = false;
             return true;
         }
 

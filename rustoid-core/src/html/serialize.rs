@@ -102,9 +102,21 @@ impl HtmlSerializer {
                         buf.push_str(&format!("{indent}<pre"));
                         self.serialize_attrs(node, buf);
                         buf.push('>');
-                        // `<pre>` is not a raw-text escaping element in HTML
+                        // `<pre>` is a raw-text escaping element in HTML
                         // serialization; its text nodes are escaped like any other
                         // element (`&` → `&amp;`, `<` → `&lt;`).
+                        //
+                        // `<pre>`/`<textarea>`/`<listing>` are newline-stripping
+                        // elements (HTML fragment serialization): if the first
+                        // child is a text node whose data starts with `\n`, append
+                        // an extra `\n` so a re-parse of the output preserves the
+                        // leading newline (mirrors `XHtmlSerializer::NEWLINE_
+                        // STRIPPING_ELEMENTS` in PHP).
+                        if let Some(NodeKind::Text(first)) = node.children.first().map(|c| &c.kind)
+                            && first.starts_with('\n')
+                        {
+                            buf.push('\n');
+                        }
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</pre>");
                     }
