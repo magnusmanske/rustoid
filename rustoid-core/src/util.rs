@@ -74,6 +74,66 @@ pub fn normalize_namespace_name(name: &str) -> String {
     chars.into_iter().collect()
 }
 
+/// Entity-escape anything that would decode to a valid wikitext entity: escape
+/// the `&` of any `&…;` sequence that decodes to a different string (a valid
+/// entity), leaving non-entities untouched. Mirrors PHP's
+/// `Utils::escapeWtEntities`.
+///
+/// Consumed by the html2wt `WikitextEscapeHandlers` (pending), hence the
+/// dead-code allow until that port lands.
+#[allow(dead_code)]
+pub fn escape_wt_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            // Match `&[#0-9a-zA-Z\x80-\xff]+;` (the PHP regexp).
+            let mut j = i + 1;
+            while j < bytes.len() && !(bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() {
+                // Semicolon found at `j`; check the entity body is valid.
+                let body = &text[i + 1..j];
+                let body_ok = !body.is_empty()
+                    && body
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'#' || b >= 0x80);
+                if body_ok {
+                    let entity = &text[i..j + 1]; // includes '&' and ';'
+                    let decoded = crate::wikitext::tokenizer_v2::decode_wt_entities(entity);
+                    if decoded != entity {
+                        // It's a valid entity: escape the ampersand.
+                        out.push_str("&amp;");
+                        out.push_str(&text[i + 1..j + 1]);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Copy a single `char` (preserve UTF-8 boundaries).
+        let ch_len = utf8_len(bytes[i]);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 sequence starting at `b` (1-4).
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if (b >> 5) == 0b110 {
+        2
+    } else if (b >> 4) == 0b1110 {
+        3
+    } else {
+        4
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +149,17 @@ mod tests {
     fn test_normalize_namespace_name() {
         assert_eq!(normalize_namespace_name("Template"), "template");
         assert_eq!(normalize_namespace_name("  User talk  "), "user talk");
+    }
+
+    #[test]
+    fn test_escape_wt_entities() {
+        // A valid named entity's ampersand is escaped.
+        assert_eq!(escape_wt_entities("a &amp; b"), "a &amp;amp; b");
+        // A valid numeric entity is likewise escaped.
+        assert_eq!(escape_wt_entities("x &#65; y"), "x &amp;#65; y");
+        // A lone ampersand (no terminating entity) is untouched.
+        assert_eq!(escape_wt_entities("a & b"), "a & b");
+        // A non-entity `&...;` is left as-is.
+        assert_eq!(escape_wt_entities("&zzz;"), "&zzz;");
     }
 }
