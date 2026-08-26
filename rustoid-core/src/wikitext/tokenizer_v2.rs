@@ -2088,7 +2088,13 @@ impl<'a> PegTokenizer<'a> {
                 vsrc: None,
             });
             if let Some(text) = text {
-                stt.add_attribute_str("mw:maybeContent", &text);
+                stt.attribs.push(KV {
+                    key: KeyValue::Str("mw:maybeContent".to_string()),
+                    value: tokenize_link_content(&text),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                });
             }
 
             self.emit_token(ParsoidToken::SelfclosingTag(stt));
@@ -2139,7 +2145,13 @@ impl<'a> PegTokenizer<'a> {
             let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
             stt.add_attribute_str("href", url);
             if let Some(text) = text {
-                stt.add_attribute_str("mw:content", text);
+                stt.attribs.push(KV {
+                    key: KeyValue::Str("mw:content".to_string()),
+                    value: tokenize_link_content(&text),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                });
             }
 
             self.emit_token(ParsoidToken::SelfclosingTag(stt));
@@ -2936,8 +2948,24 @@ fn kv_str(key: &str, value: &str) -> KV {
 /// Returns `Str` for a pure-text target and `Tokens` (a mixed string/token
 /// array) when a directive is present.
 fn tokenize_link_target(target: &str) -> KeyValue {
+    tokenize_directives(target)
+}
+
+/// Tokenize inline link *content* (e.g. wikilink text, extlink text) into a
+/// `KeyValue`: plain text when no directives are present, or a `Tokens` array
+/// when the content contains `{{...}}`/`{{{...}}}`. Mirrors the PHP tokenizer's
+/// `inlineline`/`link_text` productions, which tokenize templates in link text
+/// so the AttributeExpander can expand them.
+fn tokenize_link_content(content: &str) -> KeyValue {
+    tokenize_directives(content)
+}
+
+/// Shared directive-tokenization used for both link targets and link content.
+/// Walks the string, emitting `{{...}}`/`{{{...}}}` as `template`/`templatearg`
+/// self-closing tokens and accumulating the surrounding text.
+fn tokenize_directives(input: &str) -> KeyValue {
     let options = TokenizerOptions::default();
-    let mut tk = PegTokenizer::new(target, &options);
+    let mut tk = PegTokenizer::new(input, &options);
     let mut items: Vec<Item> = Vec::new();
     let mut buf = String::new();
 
@@ -3468,5 +3496,51 @@ mod tests {
         assert_eq!(find_wikilink_close("<nowiki>[[Bar]]</nowiki>]]"), Some(24));
         // No closing brackets: None.
         assert_eq!(find_wikilink_close("Foo"), None);
+    }
+
+    #[test]
+    fn test_templated_link_content_is_tokenized() {
+        // A template in extlink content is captured as a token array (so the
+        // AttributeExpander can expand it), not a plain string.
+        let tokens = tokenize("[https://google.com {{1x|foo}}]");
+        let ext = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink" => Some(tk),
+                _ => None,
+            })
+            .expect("expected extlink token");
+        let content = ext
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:content"))
+            .expect("mw:content present");
+        assert!(
+            matches!(content.value, KeyValue::Tokens(_)),
+            "templated extlink content should be a token array, got {:?}",
+            content.value
+        );
+
+        // A template in wikilink content is likewise tokenized.
+        let tokens = tokenize("[[Foo|{{1x|bar}}]]");
+        let wl = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "wikilink" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected wikilink token");
+        let text = wl
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+            .expect("mw:maybeContent present");
+        assert!(
+            matches!(text.value, KeyValue::Tokens(_)),
+            "templated wikilink content should be a token array, got {:?}",
+            text.value
+        );
     }
 }

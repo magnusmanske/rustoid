@@ -106,10 +106,18 @@ pub fn on_ext_link(
     relative_link_prefix: &str,
 ) -> Option<Vec<Item>> {
     let orig_href = token.get_attribute_v("href")?.to_string();
-    let content = token
-        .get_attribute_v("mw:content")
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    // `mw:content` may be a plain string, or (after the AttributeExpander has
+    // expanded any embedded templates) a token array carrying `mw:Transclusion`
+    // markers / `template` tokens. Render it faithfully rather than collapsing
+    // it back to a string.
+    let content_items: Vec<Item> = {
+        let kv = token.get_attribute_kv("mw:content");
+        match kv.map(|kv| &kv.value) {
+            Some(crate::wikitext::tokens_v2::KeyValue::Str(s)) => vec![Item::Str(s.clone())],
+            Some(crate::wikitext::tokens_v2::KeyValue::Tokens(t)) => t.clone(),
+            None => vec![],
+        }
+    };
 
     let data_parsoid = token.data_parsoid().cloned().unwrap_or_default();
 
@@ -139,32 +147,33 @@ pub fn on_ext_link(
 
         let a_tag = TagTk::new("a", result.attribs, data_parsoid);
 
-        return Some(vec![
-            Item::Tok(ParsoidToken::Tag(a_tag)),
-            Item::Str(content),
-            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-                "a",
-                vec![],
-                DataParsoid::default(),
-            ))),
-        ]);
+        let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
+        out.extend(content_items);
+        out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "a",
+            vec![],
+            DataParsoid::default(),
+        ))));
+        return Some(out);
     }
 
     // href is a plain string from our tokenizer, so no template wrapping.
     let href = clean(&orig_href)?;
 
-    // If the content is itself a valid URL (and an image), render `<img>`.
-    let content_items: Vec<Item> = if has_image_link(&content, &[]) {
-        let alt = content.rsplit('/').next().unwrap_or(&content);
+    // If the content is a single plain-text URL (and an image), render `<img>`.
+    let rendered_content: Vec<Item> = if let [Item::Str(s)] = content_items.as_slice()
+        && has_image_link(s, &[])
+    {
+        let alt = s.rsplit('/').next().unwrap_or(s);
         let mut img = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
             "img",
-            vec![string_kv("src", &content), string_kv("alt", alt)],
+            vec![string_kv("src", s), string_kv("alt", alt)],
             DataParsoid::default(),
         );
         img.data_parsoid.stx = Some("url".to_string());
         vec![Item::Tok(ParsoidToken::SelfclosingTag(img))]
     } else {
-        vec![Item::Str(content)]
+        content_items
     };
 
     let link_attrs = [string_kv("rel", "mw:ExtLink")];
@@ -177,7 +186,7 @@ pub fn on_ext_link(
     a_tag.add_attribute_str("href", &href);
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
-    out.extend(content_items);
+    out.extend(rendered_content);
     out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
         "a",
         vec![],
