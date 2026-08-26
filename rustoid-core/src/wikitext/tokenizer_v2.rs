@@ -27,6 +27,7 @@ pub struct MagicLinkConfig {
 }
 
 /// Tokenizer configuration.
+#[derive(Clone)]
 pub struct TokenizerOptions {
     /// Whether we're inside a template context (affects include/noinclude handling).
     pub in_template: bool,
@@ -3005,6 +3006,25 @@ pub fn tokenize_as_attributes(wikitext: &str) -> Vec<KV> {
     tokenizer.parse_generic_newline_attributes()
 }
 
+/// Tokenize `wikitext` with the `start` rule and a caller-specified start-of-line
+/// flag, returning the token stream. Mirrors PHP's
+/// `PegTokenizer::tokenizeSync( $text, [ 'sol' => $sol ] )` (the `start` rule),
+/// which the html2wt `WikitextEscapeHandlers` use to detect wikitext tokens in
+/// text (for nowiki-escaping decisions).
+///
+/// `options` supplies the extension-tag / magic-link configuration the tokenizer
+/// uses to recognize extension tags and magic links; only `sol` is overridden.
+pub fn tokenize_as(
+    wikitext: &str,
+    sol: bool,
+    options: &TokenizerOptions,
+) -> Vec<Either<String, ParsoidToken>> {
+    let mut opts = options.clone();
+    opts.sol = sol;
+    let mut tokenizer = PegTokenizer::new(wikitext, &opts);
+    tokenizer.tokenize().unwrap_or_default()
+}
+
 /// Build a `DataMw` carrying the parsed start-tag attributes of an extension,
 /// so the `pre` handler can sanitize them (mirrors PHP's `options` KV, which
 /// holds the extension's `$t->attribs` array).
@@ -3096,6 +3116,33 @@ mod tests {
     fn test_empty_input() {
         let tokens = tokenize("");
         assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_as_respects_sol() {
+        // `tokenizeAs(text, 'start', sol:)` is the escape-handler entry point.
+        // Plain text round-trips as a single string token regardless of sol.
+        let opts = TokenizerOptions::default();
+        let toks = tokenize_as("hello", true, &opts);
+        assert_eq!(
+            toks.iter().filter(|t| matches!(t, Either::Left(_))).count(),
+            1
+        );
+        // Heading markup tokenizes into an h-element tag.
+        let toks = tokenize_as("== hi ==", true, &opts);
+        assert!(
+            toks.iter()
+                .any(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "h2")),
+            "expected a heading tag, got {toks:?}"
+        );
+        // A wikilink tokenizes into a self-closing wikilink token.
+        let toks = tokenize_as("[[Foo|bar]]", false, &opts);
+        assert!(
+            toks.iter().any(
+                |t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "wikilink")
+            ),
+            "expected a wikilink token, got {toks:?}"
+        );
     }
 
     #[test]
