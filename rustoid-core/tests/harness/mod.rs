@@ -1064,8 +1064,11 @@ fn normalize_html(html: &str, parsoid_only: bool) -> String {
 }
 
 /// Strip only the round-trip metadata (`data-parsoid`, `data-mw`) and HTML
-/// comments. Structural attributes (`rel`, `href`, `title`, `class`) are kept,
-/// so the comparison is faithful to Parsoid's rendered HTML.
+/// comments, plus the parsoid-only "unnecessary" attributes that PHP's
+/// `normalizeOut` removes even in `parsoidOnly` mode (`about`, `prefix`, `rev`,
+/// `datatype`, `inlist`, `usemap`, `vocab`, `data-mw-original-href`). Structural
+/// attributes (`rel`, `href`, `title`, `class`, `typeof`) are kept, so the
+/// comparison is faithful to Parsoid's rendered HTML.
 fn strip_data_attrs(html: &str) -> String {
     let mut s = html.to_string();
     // Strip HTML comments.
@@ -1076,28 +1079,31 @@ fn strip_data_attrs(html: &str) -> String {
             break;
         }
     }
-    // Strip data-parsoid and data-mw attributes (round-trip metadata that the
-    // V2 renderer does not yet emit faithfully).
-    while let Some(start) = s.find(" data-parsoid='") {
-        if let Some(end) = s[start + 15..].find('\'') {
-            s.replace_range(start..start + 15 + end + 1, "");
-        } else {
-            break;
-        }
-    }
-    while let Some(start) = s.find(" data-mw='") {
-        if let Some(end) = s[start + 11..].find('\'') {
-            s.replace_range(start..start + 11 + end + 1, "");
-        } else {
-            break;
-        }
-    }
-    // Strip double-quoted data-parsoid/data-mw variants ("{}").
-    while let Some(start) = s.find(" data-parsoid=\"") {
-        if let Some(end) = s[start + 15..].find('\"') {
-            s.replace_range(start..start + 15 + end + 1, "");
-        } else {
-            break;
+    // Strip data-parsoid, data-mw, and the parsoid-only "unnecessary"
+    // attributes (mirroring PHP `normalizeOut`'s `$unnecessaryAttribs` list),
+    // in both single- and double-quoted forms.
+    for attr in [
+        "data-mw-original-href",
+        "data-parsoid",
+        "data-mw",
+        "prefix",
+        "about",
+        "rev",
+        "datatype",
+        "inlist",
+        "usemap",
+        "vocab",
+    ] {
+        for quote in ['\'', '"'] {
+            let needle = format!(" {attr}={quote}");
+            while let Some(start) = s.find(&needle) {
+                let after = &s[start + needle.len()..];
+                if let Some(end) = after.find(quote) {
+                    s.replace_range(start..start + needle.len() + end + 1, "");
+                } else {
+                    break;
+                }
+            }
         }
     }
     s
