@@ -184,7 +184,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `bailTokens` which strips the first `[`) and expand `<nowiki>`.
         let re_src = format!("[{href}]]");
         let tokens = self.tokenize(&re_src).unwrap_or_default();
-        let expanded = crate::pipeline::extension_handler::run(tokens);
+        let expanded = crate::pipeline::extension_handler::run(tokens, self.config);
 
         let mut li = crate::wikitext::tokens_v2::TagTk::new(
             "listItem",
@@ -290,7 +290,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
         let stage = TreeBuilderStage::new(false);
-        let mut ast = stage.to_ast_with_source(tokens, Some(wikitext));
+        let mut ast = stage.to_ast_with_source(tokens, Some(wikitext), self.config);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);
@@ -352,7 +352,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_behavior_switches(tokens);
 
         let stage = TreeBuilderStage::new(false);
-        let mut ast = stage.to_ast_with_source(tokens, Some(page_source));
+        let mut ast = stage.to_ast_with_source(tokens, Some(page_source), self.config);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);

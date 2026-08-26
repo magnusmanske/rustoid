@@ -891,7 +891,8 @@ mod tests {
         // Run the heading tokens through the full TT3 stage, which is what the
         // Parser does, to see whether a stage handler introduces a placeholder.
         let stage = crate::pipeline::tree_builder_stage::TreeBuilderStage::new(false);
-        let doc = stage.to_ast(vec![tag("h2"), txt("H2"), end("h2")]);
+        let cfg = crate::mock::MockSiteConfig::new();
+        let doc = stage.to_ast(vec![tag("h2"), txt("H2"), end("h2")], &cfg);
         assert!(contains_kind(&doc, &ElementKind::Heading(2)), "{doc:?}");
         assert!(!contains_data_parsoid_name(&doc, "h2"), "{doc:?}");
     }

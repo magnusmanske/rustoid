@@ -31,7 +31,7 @@ impl TreeBuilderStage {
     }
 
     /// Run the TT3 handlers in order and return the transformed token stream.
-    pub fn process(&self, tokens: Vec<Item>) -> Vec<Item> {
+    pub fn process(&self, tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
         let mut out = tokens;
 
         // 1. PreHandler (indent-pre detection).
@@ -42,7 +42,7 @@ impl TreeBuilderStage {
         out = QuoteTransformer::transform(out);
 
         // 2b. ExtensionHandler (expand built-in `<nowiki>` extension tokens).
-        out = crate::pipeline::extension_handler::run(out);
+        out = crate::pipeline::extension_handler::run(out, config);
 
         // 3. ListHandler (listItem → ul/ol/li).
         let mut list_handler = ListHandler::new();
@@ -60,14 +60,19 @@ impl TreeBuilderStage {
     }
 
     /// Run the TT3 handlers and convert the result to an AST.
-    pub fn to_ast(&self, tokens: Vec<Item>) -> Node {
-        self.to_ast_with_source(tokens, None)
+    pub fn to_ast(&self, tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Node {
+        self.to_ast_with_source(tokens, None, config)
     }
 
     /// Run the TT3 handlers and convert to an AST, with the page source
     /// available for `tsr`-based source recovery.
-    pub fn to_ast_with_source(&self, tokens: Vec<Item>, source: Option<&str>) -> Node {
-        let tokens = self.process(tokens);
+    pub fn to_ast_with_source(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&str>,
+        config: &dyn crate::traits::SiteConfig,
+    ) -> Node {
+        let tokens = self.process(tokens, config);
         token_stream_to_ast_html_with_source(&tokens, source)
     }
 }
@@ -97,17 +102,21 @@ mod tests {
             .collect()
     }
 
+    fn config() -> crate::mock::MockSiteConfig {
+        crate::mock::MockSiteConfig::new()
+    }
+
     #[test]
     fn test_process_plain_text() {
         let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("hello world"));
+        let out = stage.process(tokenize("hello world"), &config());
         assert!(!out.is_empty());
     }
 
     #[test]
     fn test_process_heading() {
         let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("== Heading ==\n"));
+        let out = stage.process(tokenize("== Heading ==\n"), &config());
         // Should contain an h2 tag after TT3.
         assert!(out.iter().any(|it| {
             matches!(it, Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Tag(t)) if t.name == "h2")
@@ -117,7 +126,7 @@ mod tests {
     #[test]
     fn test_process_bold() {
         let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("'''bold'''"));
+        let out = stage.process(tokenize("'''bold'''"), &config());
         // Should contain a <b> tag (from quote transformer).
         assert!(out.iter().any(|it| {
             matches!(it, Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Tag(t)) if t.name == "b")
@@ -127,7 +136,7 @@ mod tests {
     #[test]
     fn test_to_ast_heading() {
         let stage = TreeBuilderStage::new(false);
-        let doc = stage.to_ast(tokenize("== Heading ==\n"));
+        let doc = stage.to_ast(tokenize("== Heading ==\n"), &config());
 
         // The document should contain an h2 element somewhere in the tree
         // (Parsoid nests content under `<html><body>`).
@@ -145,7 +154,7 @@ mod tests {
     #[test]
     fn test_to_ast_bold() {
         let stage = TreeBuilderStage::new(false);
-        let doc = stage.to_ast(tokenize("'''bold'''"));
+        let doc = stage.to_ast(tokenize("'''bold'''"), &config());
 
         // The document should contain a bold element (possibly nested in <p>).
         assert!(contains_bold(&doc), "expected a bold element: {doc:?}");
@@ -162,7 +171,7 @@ mod tests {
     #[test]
     fn test_to_ast_wikilink() {
         let stage = TreeBuilderStage::new(false);
-        let doc = stage.to_ast(tokenize("[[Main Page]]"));
+        let doc = stage.to_ast(tokenize("[[Main Page]]"), &config());
 
         assert!(contains_wikilink(&doc));
     }
@@ -178,7 +187,7 @@ mod tests {
     #[test]
     fn test_process_div() {
         let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("<div>foo</div>"));
+        let out = stage.process(tokenize("<div>foo</div>"), &config());
         assert!(!out.is_empty(), "empty output");
     }
 

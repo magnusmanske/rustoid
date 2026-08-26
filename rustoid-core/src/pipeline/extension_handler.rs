@@ -20,14 +20,17 @@ use crate::wikitext::tokens_v2::{
 /// extension), in which case the caller should leave it unchanged. Mirrors the
 /// dispatch in PHP's `ExtensionHandler` (which delegates to the module
 /// registered for the tag name).
-fn expand_extension(token: &SelfclosingTagTk) -> Option<Vec<Item>> {
+fn expand_extension(
+    token: &SelfclosingTagTk,
+    config: &dyn crate::traits::SiteConfig,
+) -> Option<Vec<Item>> {
     if token.name != "extension" {
         return None;
     }
     let name = attr_str(token, "name")?;
     match name {
         "nowiki" => Some(nowiki_items(token)),
-        "pre" => Some(pre_items(token)),
+        "pre" => Some(pre_items(token, config)),
         // Other built-in extension tags (gallery, …) are not yet handled.
         _ => None,
     }
@@ -129,7 +132,7 @@ fn extract_ext_body(token: &SelfclosingTagTk, source: &str) -> String {
 /// `typeof="mw:Extension/pre"` type and a `data-mw` blob carrying the tag
 /// name, sanitized attributes, and raw body source (mirrors
 /// `ExtensionHandler::onDocumentFragment`).
-fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
+fn pre_items(token: &SelfclosingTagTk, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
     let source = attr_str(token, "source").unwrap_or_default().to_string();
     let mut body = extract_ext_body(token, &source);
 
@@ -164,8 +167,8 @@ fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
     if format == "wikitext" {
         // `format="wikitext"`: parse the body as inline wikitext (mirrors
         // `Pre::sourceToDom`'s `extTagToDOM` branch with `context: 'inline'`),
-        // so `'''bold'''` becomes `<b>bold</b>` etc.
-        let items = wikitext_body_items(&body);
+        // so `'''bold'''` becomes `<b>bold</b>`, `[[…]]` becomes a link, etc.
+        let items = wikitext_body_items(&body, config);
         let mut out = vec![open];
         out.extend(items);
         out.push(close);
@@ -187,12 +190,11 @@ fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
     vec![open, Item::Str(decoded), close]
 }
 
-/// Tokenize a `<pre format="wikitext">` body as inline wikitext and run the
-/// quote transformer, so `''`/`'''` are converted to `<i>`/`<b>`. This is the
-/// `context: 'inline'` sub-parse of PHP's `extTagToDOM` for the common
-/// bold/italic case (wikilinks, lists, tables, and headings inside `pre` are
-/// not yet wired).
-fn wikitext_body_items(body: &str) -> Vec<Item> {
+/// Tokenize a `<pre format="wikitext">` body as inline wikitext, run the quote
+/// transformer, and render wikilinks and external links. This is the
+/// `context: 'inline'` sub-parse of PHP's `extTagToDOM`. (Lists, tables, and
+/// headings inside `pre` are not yet wired.)
+fn wikitext_body_items(body: &str, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
     use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
     use crate::wikitext::tokens_v2::Either;
 
@@ -223,6 +225,126 @@ fn wikitext_body_items(body: &str) -> Vec<Item> {
     let mut out = crate::pipeline::quote_transformer_v2::QuoteTransformer::transform(with_eof);
     if matches!(out.last(), Some(Item::Tok(ParsoidToken::Eof(_)))) {
         out.pop();
+    }
+    render_inline_links(out, config)
+}
+
+/// Render `wikilink`/`extlink`/`urllink` self-closing tokens in an inline body
+/// into `<a>` sequences (mirrors the TT2 `WikiLinkHandler` and
+/// `ExternalLinkHandler` rendering paths).
+fn render_inline_links(tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
+    use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
+    use crate::pipeline::wiki_link_render::{
+        WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+    };
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    let mut ctx = WikiLinkContext::new(config);
+    let mut out = Vec::new();
+    for item in tokens {
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+            out.push(item);
+            continue;
+        };
+        match stt.name.as_str() {
+            "wikilink" => {
+                let href = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .map(|kv| key_value_to_string(&kv.value))
+                    .unwrap_or_default();
+                let target = get_wiki_link_target_info(&ctx, &href, &href).unwrap_or_else(|_| {
+                    crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
+                        href: href.clone(),
+                        href_src: href.clone(),
+                        title: Some(crate::title::Title::new_main(href.clone())),
+                        interwiki: None,
+                        language: None,
+                        local_prefix: None,
+                        from_colon_escaped_text: false,
+                        prefix: None,
+                    }
+                });
+                let rendered = render_wiki_link_dispatched(
+                    &mut ctx,
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    &target,
+                    false,
+                );
+                out.extend(rendered);
+            }
+            "extlink" => {
+                let clean = |href: &str| {
+                    crate::sanitizer::clean_url(href, "external", |proto| {
+                        matches!(
+                            proto,
+                            "http://"
+                                | "https://"
+                                | "ftp://"
+                                | "ftps://"
+                                | "mailto:"
+                                | "news:"
+                                | "irc:"
+                                | "ircs:"
+                                | "gopher://"
+                                | "mms://"
+                                | "tel:"
+                                | "nntp://"
+                                | "//"
+                        )
+                    })
+                };
+                if let Some(rendered) = on_ext_link(
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    clean,
+                    config.relative_link_prefix(),
+                ) {
+                    out.extend(rendered);
+                } else {
+                    out.push(item);
+                }
+            }
+            "urllink" => {
+                let content_href = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .and_then(|kv| kv.value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let clean = |href: &str| {
+                    crate::sanitizer::clean_url(href, "external", |proto| {
+                        matches!(
+                            proto,
+                            "http://"
+                                | "https://"
+                                | "ftp://"
+                                | "ftps://"
+                                | "mailto:"
+                                | "news:"
+                                | "irc:"
+                                | "ircs:"
+                                | "gopher://"
+                                | "mms://"
+                                | "tel:"
+                                | "nntp://"
+                                | "//"
+                        )
+                    })
+                };
+                if let Some(rendered) = on_url_link(
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    &content_href,
+                    clean,
+                ) {
+                    out.extend(rendered);
+                } else {
+                    out.push(item);
+                }
+            }
+            _ => out.push(item),
+        }
     }
     out
 }
@@ -344,12 +466,12 @@ fn split_entities(s: &str) -> Vec<&str> {
 /// Expand extension tokens in a token stream. Runs before tree building,
 /// replacing `extension` self-closing tokens with their DOM token sequences.
 /// Faithful to the TT3 extension-handler stage in PHP Parsoid.
-pub fn run(tokens: Vec<Item>) -> Vec<Item> {
+pub fn run(tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
     let mut out = Vec::with_capacity(tokens.len());
     for item in tokens {
         match &item {
             Item::Tok(ParsoidToken::SelfclosingTag(t)) => {
-                if let Some(expanded) = expand_extension(t) {
+                if let Some(expanded) = expand_extension(t, config) {
                     out.extend(expanded);
                 } else {
                     out.push(item);
