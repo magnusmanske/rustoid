@@ -272,7 +272,13 @@ impl Html5TreeBuilder {
                     }
                     let ended =
                         modes::end_tag(&mut self.builder, &mut self.dispatcher, &name, 0, 0);
-                    if ended.is_none() {
+                    if let Some(uid) = ended {
+                        // The end tag matched an element: copy its source data
+                        // onto that element's node data, exactly as PHP's
+                        // `TreeBuilderStage::processToken` EndTag branch does
+                        // (`endTSR`, `stx`, `endTagSrc`, autoInserted promotion).
+                        self.apply_end_tag_data(uid, &t.data_parsoid);
+                    } else {
                         // The tag was stripped; insert an mw:Placeholder for
                         // round-tripping (mirrors `insertPlaceholderMeta`).
                         self.insert_placeholder_meta(&name, &t.data_parsoid, false);
@@ -376,6 +382,47 @@ impl Html5TreeBuilder {
             }
         } else {
             self.insert_placeholder_meta(name, dp, true);
+        }
+    }
+
+    /// Copy source data from a matched end tag onto its element's stashed node
+    /// data. Faithful to the `EndTagTk` branch of PHP's
+    /// `TreeBuilderStage::processToken`:
+    ///   - `endTSR` ← the end tag's `tsr` (for `ComputeDSR`).
+    ///   - `stx` ← transferred when present.
+    ///   - `endTagSrc` ← when present and not a literal-HTML element.
+    ///   - promote `autoInsertedStartToken`/`autoInsertedEndToken` to their
+    ///     persistent `autoInsertedStart`/`autoInsertedEnd` forms.
+    fn apply_end_tag_data(&mut self, uid: usize, dp: &TDataParsoid) {
+        // Read the element's `data-object-id` (a regular attribute, added by
+        // `stash_data_attribs`) from the stack while it's still there.
+        let data_id = self
+            .builder
+            .stack
+            .item_by_uid(uid)
+            .and_then(|elt| elt.attrs.get(DATA_OBJECT_ATTR_NAME))
+            .and_then(|v| v.parse::<usize>().ok());
+
+        let Some(data_id) = data_id else {
+            return;
+        };
+        let Some(stashed) = self.stash.get_mut(&data_id) else {
+            return;
+        };
+        let Some(node_dp) = stashed.dp.as_mut() else {
+            return;
+        };
+
+        if !matches!(node_dp.stx.as_deref(), Some("html"))
+            && let Some(end_tag_src) = &dp.end_tag_src
+        {
+            node_dp.end_tag_src = Some(end_tag_src.clone());
+        }
+        if let Some(stx) = &dp.stx {
+            node_dp.stx = Some(stx.clone());
+        }
+        if let Some(tsr) = &dp.tsr {
+            node_dp.tmp.end_tsr = Some(tsr.clone());
         }
     }
 
