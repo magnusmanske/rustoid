@@ -515,6 +515,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let (tokens, fragments) = self.expand_wikitext_pre_sync(tokens);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
+        crate::pipeline::compute_dsr::run(&mut ast, wikitext);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
@@ -587,6 +588,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let stage = TreeBuilderStage::new(false);
         let mut ast =
             stage.to_ast_with_fragments(tokens, Some(page_source), self.config, fragments);
+        crate::pipeline::compute_dsr::run(&mut ast, page_source);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
