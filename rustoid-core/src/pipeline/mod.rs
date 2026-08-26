@@ -27,5 +27,6 @@ pub mod template_handler;
 pub mod token_handler_pipeline;
 pub mod tree_builder_html;
 pub mod tree_builder_stage;
+pub mod unpack_dom_fragments;
 pub mod wiki_link_handler;
 pub mod wiki_link_render;

@@ -125,6 +125,11 @@ pub struct Node {
     pub data_parsoid: Option<String>,
     /// The `data-mw` JSON blob for transclusion/extension metadata.
     pub data_mw: Option<String>,
+    /// A stashed sub-fragment carried by a `mw:DOMFragment` placeholder.
+    /// Mirrors PHP's `data-parsoid.html` (a `DocumentFragment`), used by
+    /// `UnpackDOMFragments` to splice extension/template content back into the
+    /// tree during finalize.
+    pub fragment: Option<Box<Node>>,
 }
 
 impl Node {
@@ -136,6 +141,7 @@ impl Node {
             attrs: Vec::new(),
             data_parsoid: None,
             data_mw: None,
+            fragment: None,
         }
     }
 
@@ -147,6 +153,7 @@ impl Node {
             attrs: Vec::new(),
             data_parsoid: None,
             data_mw: None,
+            fragment: None,
         }
     }
 
@@ -158,6 +165,7 @@ impl Node {
             attrs: Vec::new(),
             data_parsoid: None,
             data_mw: None,
+            fragment: None,
         }
     }
 
@@ -169,6 +177,7 @@ impl Node {
             attrs: Vec::new(),
             data_parsoid: None,
             data_mw: None,
+            fragment: None,
         }
     }
 
