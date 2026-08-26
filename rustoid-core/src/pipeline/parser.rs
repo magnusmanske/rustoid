@@ -19,6 +19,17 @@ use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
 
 type ResolvedTarget = crate::pipeline::template_handler::ResolvedTarget;
 
+/// Extract the raw template target (the text between `{{` and the first
+/// top-level `|` or the closing `}}`) from a template token's source string.
+///
+/// This is the *unprocessed* target as written in the wikitext, before the
+/// PHP preprocessor strips comments. Used to detect a comment in the target
+/// (`{{f<!---->oo}}`), which suppresses `mw:Transclusion` encapsulation.
+fn raw_template_target(src: &str) -> Option<&str> {
+    let inner = src.strip_prefix("{{")?.strip_suffix("}}")?;
+    Some(inner.split_once('|').map_or(inner, |(t, _)| t))
+}
+
 /// If `item` is a `<pre format="wikitext">` extension token, return the
 /// self-closing token; otherwise `None`.
 fn wikitext_pre_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
@@ -655,6 +666,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .unwrap_or("")
                     .to_string();
 
+                // A comment in the template *target* (`{{f<!---->oo}}`) is
+                // stripped by the PHP preprocessor before target resolution,
+                // so the template still expands, but Parsoid does not wrap the
+                // expansion in a `mw:Transclusion` wrapper (the target is no
+                // longer cleanly stringifiable). Detect this from the raw
+                // template source so the expansion matches PHP's
+                // `convertToString(..., /* expandTemplates */ true)` path,
+                // which emits the expansion unencapsulated.
+                let target_has_comment = stt
+                    .data_parsoid
+                    .src
+                    .as_deref()
+                    .and_then(raw_template_target)
+                    .map(|t| t.contains("<!--"))
+                    .unwrap_or(false);
+
                 match resolve_template_target(self.config, &target_str) {
                     Some(ResolvedTarget::Template { name, title }) => {
                         let expanded = self
@@ -668,6 +695,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 tok,
                                 about_counter,
                                 in_template,
+                                target_has_comment,
                             )
                             .await;
                         out.extend(expanded);
@@ -794,6 +822,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         token: &ParsoidToken,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
+        target_has_comment: bool,
     ) -> Vec<Item> {
         const MAX_TEMPLATE_DEPTH: usize = 40;
 
@@ -885,8 +914,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Box::pin(self.expand_templates(&child_frame, items, Some(src), about_counter, true))
                 .await;
 
-        if in_template {
-            // Nested/extension-content context: no `mw:Transclusion` wrapping.
+        if in_template || target_has_comment {
+            // Nested/extension-content context, or a comment in the template
+            // target (`{{f<!---->oo}}`): no `mw:Transclusion` wrapping.
             return expanded;
         }
 

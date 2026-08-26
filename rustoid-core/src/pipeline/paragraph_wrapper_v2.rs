@@ -499,7 +499,10 @@ impl ParagraphWrapper {
             }
         }
         if let Some(end) = tpl_end_index {
-            insert_at = end;
+            // PHP `closeOpenPTag` splices the `</p>` *after* the end marker
+            // (`array_splice($out, $i + 1, 0, …)`), so the whole transclusion
+            // range (start + content + end) sits inside the paragraph.
+            insert_at = end + 1;
         }
 
         out.insert(
