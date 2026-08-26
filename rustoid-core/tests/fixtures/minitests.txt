@@ -70,5 +70,5 @@ Template expansion
 !! wikitext
 {{1x|hello}}
 !! html/parsoid
-<p typeof="mw:Transclusion">hello</p>
+<p><span typeof="mw:Transclusion">hello</span></p>
 !! end
