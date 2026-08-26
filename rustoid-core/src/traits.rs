@@ -155,6 +155,15 @@ pub trait SiteConfig: Send + Sync {
     fn external_link_attribs(&self, _href: &str) -> Vec<(String, Vec<String>)> {
         vec![("rel".to_string(), vec!["nofollow".to_string()])]
     }
+
+    /// Whether `ParsoidExperimentalParserFunctionOutput` should generate
+    /// v3.x HTML for parser functions (i.e. a `mw:ParserFunction/<name>`
+    /// `typeof` and a `"parserfunction"` `data-mw` parts key). Mirrors PHP's
+    /// `SiteConfig::getMWConfigValue('ParsoidExperimentalParserFunctionOutput')`,
+    /// which is an opt-in experimental flag (default `false`).
+    fn parsoid_experimental_parser_function_output(&self) -> bool {
+        false
+    }
 }
 
 /// Information about a namespace.

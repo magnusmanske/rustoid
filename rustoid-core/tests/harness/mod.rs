@@ -56,6 +56,9 @@ pub struct ParserTestCase {
     pub description: String,
     pub options_raw: String,
     pub options: HashMap<String, String>,
+    /// Raw `!! config` lines (MediaWiki config values like
+    /// `wgParsoidExperimentalParserFunctionOutput=true`).
+    pub config_raw: String,
     pub wikitext: String,
     pub html_parsoid: Option<String>,
     pub html_php: Option<String>,
@@ -248,6 +251,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     };
 
     let mut options_lines = Vec::new();
+    let mut config_lines = Vec::new();
     let mut wikitext_lines = Vec::new();
     let mut html_parsoid_lines = Vec::new();
     let mut html_php_lines = Vec::new();
@@ -264,6 +268,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
         match trimmed {
             "!! options" => {
                 section = Section::Options;
+                *i += 1;
+            }
+            "!! config" => {
+                section = Section::Config;
                 *i += 1;
             }
             "!! wikitext" => {
@@ -326,6 +334,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 } else {
                     match section {
                         Section::Options => options_lines.push(line.to_string()),
+                        Section::Config => config_lines.push(line.to_string()),
                         Section::Wikitext => wikitext_lines.push(line.to_string()),
                         Section::Html => html_parsoid_lines.push(line.to_string()),
                         Section::HtmlIntegrated => html_parsoid_lines.push(line.to_string()),
@@ -348,6 +357,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
 
     // Assemble collected lines
     test.options_raw = options_lines.join("\n");
+    test.config_raw = config_lines.join("\n");
     test.wikitext = wikitext_lines.join("\n").trim().to_string();
 
     if !html_parsoid_lines.is_empty() {
@@ -388,6 +398,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
 enum Section {
     None,
     Options,
+    Config,
     Wikitext,
     Html,
     HtmlIntegrated,
@@ -538,7 +549,16 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         .unwrap_or_else(|| "TestPage".to_string());
     source.add_page(&page_title, &test.wikitext);
 
-    let config = MockSiteConfig::new();
+    let mut config = MockSiteConfig::new();
+    // Apply `!! config` MediaWiki config values (e.g.
+    // `wgParsoidExperimentalParserFunctionOutput=true`).
+    if test
+        .config_raw
+        .lines()
+        .any(|l| l.trim() == "wgParsoidExperimentalParserFunctionOutput=true")
+    {
+        config.set_parsoid_experimental_parser_function_output(true);
+    }
     let parser = Parser::new(&config);
 
     // The `parsoid` option can enable section wrapping via a JSON object like

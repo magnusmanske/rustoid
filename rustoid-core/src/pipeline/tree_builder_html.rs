@@ -712,6 +712,18 @@ fn is_transclusion_marker_meta(node: &Node) -> bool {
     is_transclusion_start(node) || is_transclusion_end(node)
 }
 
+/// Extract a v3 parser-function name from a transclusion start marker's `data-mw`.
+/// For v3 parser functions (when `ParsoidExperimentalParserFunctionOutput` is on), the
+/// `data-mw` envelope is `{"parts":[{"parserfunction":{"target":{"key":"<name>"}}}]}`.
+/// Returns the `<name>` (e.g. `if`) if this is a v3 parser function, else `None`.
+fn parser_function_name(start_meta: &Node) -> Option<String> {
+    let data_mw_json: serde_json::Value =
+        serde_json::from_str(start_meta.data_mw.as_deref()?).ok()?;
+    let part = data_mw_json.get("parts")?.as_array()?.first()?;
+    let pf = part.get("parserfunction")?;
+    pf.get("target")?.get("key")?.as_str().map(str::to_string)
+}
+
 /// Encapsulate transclusion meta markers into wrapping `<span>` elements (the
 /// common, non-fostered case of PHP's `DOMRangeBuilder::encapsulateTemplates`).
 ///
@@ -859,6 +871,21 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                     }
                     Some(existing) => existing,
                     None => typeof_.clone(),
+                };
+                new_content[et].set_attr("typeof", merged);
+            }
+            // v3 parser functions add a `mw:ParserFunction/<name>` typeof
+            // (mirrors `DOMRangeBuilder::encapsulateTemplates`, which adds it
+            // when `TemplateInfo.type === 'parserfunction'`).
+            if let Some(pf_name) = parser_function_name(&start_meta) {
+                let existing = new_content[et].get_attr("typeof").map(str::to_string);
+                let pf_typeof = format!("mw:ParserFunction/{pf_name}");
+                let merged = match existing {
+                    Some(existing) if !existing.split_whitespace().any(|t| t == pf_typeof) => {
+                        format!("{existing} {pf_typeof}")
+                    }
+                    Some(existing) => existing,
+                    None => pf_typeof,
                 };
                 new_content[et].set_attr("typeof", merged);
             }
@@ -1373,6 +1400,26 @@ mod tests {
         assert_eq!(span.get_attr("about"), Some("#mwt1"));
         assert_eq!(span.get_attr("typeof"), Some("mw:Transclusion"));
         assert!(span.children.is_empty(), "{span:?}");
+    }
+
+    #[test]
+    fn test_parser_function_name() {
+        // A v3 parser-function start marker carries a "parserfunction" parts
+        // entry whose `target.key` is the function name.
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.data_mw =
+            Some("{\"parts\":[{\"parserfunction\":{\"target\":{\"key\":\"if\"}}}]}".to_string());
+        assert_eq!(parser_function_name(&start).as_deref(), Some("if"));
+
+        // A v2 (old) parser-function marker uses "template", not "parserfunction".
+        let mut v2 = Node::element(ElementKind::Other("meta".to_string()));
+        v2.data_mw =
+            Some("{\"parts\":[{\"template\":{\"target\":{\"function\":\"if\"}}}]}".to_string());
+        assert_eq!(parser_function_name(&v2), None);
+
+        // No data-mw at all → None.
+        let empty = Node::element(ElementKind::Other("meta".to_string()));
+        assert_eq!(parser_function_name(&empty), None);
     }
 
     fn find_placeholder(node: &Node) -> Option<&Node> {

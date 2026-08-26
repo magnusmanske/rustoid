@@ -271,15 +271,24 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
 /// Serialize a `TemplateInfo` into the full `data-mw` envelope that
 /// Parsoid stores on a transclusion/param marker, mirroring PHP's
 /// `DataMw::toJsonArray` legacy `parts` encoding, i.e.
-/// `{"parts": [{"template": <TemplateInfo>}]}`.
+/// `{"parts": [{"<type>": <TemplateInfo>}]}` where `<type>` is one of
+/// `template`, `parserfunction`, or `templatearg`.
 ///
-/// (Old parser functions use `"template"` here too, with `func` set on the
-/// inner TemplateInfo — see `DataMw::toJsonArray`.)
+/// Old parser functions (`ty = "old-parserfunction"`) map back to
+/// `"template"` (with `func` set on the inner TemplateInfo), while v3 parser
+/// functions (`ty = "parserfunction"`) use the `"parserfunction"` key.
 pub fn serialize_data_mw(info: &TemplateInfo) -> String {
+    // The parts key is `type`, with `old-parserfunction` normalized to
+    // `template` (mirrors `DataMw::toJsonArray`).
+    let type_key = match info.ty.as_deref() {
+        Some("parserfunction") => "parserfunction",
+        Some("templatearg" | "template") | None => "template",
+        Some(_) => "template",
+    };
     let mut part = serde_json::Map::new();
     let inner = serde_json::from_str::<serde_json::Value>(&serialize_template_info(info))
         .unwrap_or(serde_json::Value::Null);
-    part.insert("template".to_string(), inner);
+    part.insert(type_key.to_string(), inner);
 
     let mut out = serde_json::Map::new();
     out.insert(
@@ -566,5 +575,36 @@ mod tests {
         assert!(parsed.get("parts").and_then(|p| p.get(0)).is_some());
         assert!(parsed["parts"][0].get("template").is_some());
         assert_eq!(parsed["parts"][0]["template"]["target"]["wt"], "Foo");
+    }
+
+    #[test]
+    fn test_serialize_data_mw_parserfunction_v3() {
+        // A v3 parser function (ty = "parserfunction") uses the "parserfunction"
+        // parts key (mirrors `DataMw::toJsonArray`), with the func name in
+        // `target.key`.
+        let mut info = template_info_from(Some("if"), None, vec![]);
+        info.ty = Some("parserfunction".to_string());
+        info.target_wt = Some("#if:foo".to_string());
+
+        let json = serialize_data_mw(&info);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed["parts"][0].get("parserfunction").is_some());
+        assert!(parsed["parts"][0].get("template").is_none());
+        assert_eq!(parsed["parts"][0]["parserfunction"]["target"]["key"], "if");
+    }
+
+    #[test]
+    fn test_serialize_data_mw_parserfunction_v2() {
+        // An old parser function (ty = "old-parserfunction") maps back to the
+        // "template" parts key with `func` set (mirrors `DataMw::toJsonArray`).
+        let mut info = template_info_from(Some("if"), None, vec![]);
+        info.ty = Some("old-parserfunction".to_string());
+        info.target_wt = Some("#if:foo".to_string());
+
+        let json = serialize_data_mw(&info);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(parsed["parts"][0].get("template").is_some());
+        assert!(parsed["parts"][0].get("parserfunction").is_none());
+        assert_eq!(parsed["parts"][0]["template"]["target"]["function"], "if");
     }
 }

@@ -639,6 +639,15 @@ impl TemplateHandler {
                     encap.set_colon(Some(colon));
                 }
                 let mut info = template_info_from(Some(&name), None, vec![]);
+                // v3 parser-function output marks the transclusion with a
+                // `mw:ParserFunction/<name>` typeof and a `"parserfunction"`
+                // data-mw parts key; v2 uses `"old-parserfunction"` (serialized
+                // back to `"template"` with a `func` in `DataMw::toJsonArray`).
+                info.ty = if config.parsoid_experimental_parser_function_output() {
+                    Some("parserfunction".to_string())
+                } else {
+                    Some("old-parserfunction".to_string())
+                };
                 info.target_wt = Some(target_str.clone());
                 info.param_infos =
                     super::template_encapsulator::prepare_pf_param_infos(&target_str, params);

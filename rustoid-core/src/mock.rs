@@ -153,6 +153,7 @@ pub struct MockSiteConfig {
     server_url: String,
     article_path: String,
     language_code: String,
+    parsoid_experimental_parser_function_output: bool,
 }
 
 impl MockSiteConfig {
@@ -185,6 +186,7 @@ impl MockSiteConfig {
             server_url: "https://en.wikipedia.org".to_string(),
             article_path: "/wiki/$1".to_string(),
             language_code: "en".to_string(),
+            parsoid_experimental_parser_function_output: false,
         };
 
         // Register standard MediaWiki namespaces. `case_sensitive` reflects
@@ -328,6 +330,12 @@ impl MockSiteConfig {
             },
         );
     }
+
+    /// Enable/disable v3 parser-function output (for `!! config` sections in
+    /// the parser-test fixtures).
+    pub fn set_parsoid_experimental_parser_function_output(&mut self, enabled: bool) {
+        self.parsoid_experimental_parser_function_output = enabled;
+    }
 }
 
 impl Default for MockSiteConfig {
@@ -363,6 +371,10 @@ impl SiteConfig for MockSiteConfig {
 
     fn language_code(&self) -> &str {
         &self.language_code
+    }
+
+    fn parsoid_experimental_parser_function_output(&self) -> bool {
+        self.parsoid_experimental_parser_function_output
     }
 }
 
