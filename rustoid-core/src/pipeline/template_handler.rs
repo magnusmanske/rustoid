@@ -837,7 +837,7 @@ impl TemplateHandler {
             transclusion::substitute_args(&src, &invocation.to_template_args(), 40).unwrap_or(src);
 
         // Re-tokenize the expanded source.
-        let items = tokenize_wikitext_to_items(&expanded, /* in_template */ true);
+        let items = tokenize_wikitext_to_items(&expanded, /* in_template */ true, &[]);
 
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         let info = template_info_from(None, Some(name), vec![]);
@@ -847,9 +847,14 @@ impl TemplateHandler {
 
 /// Tokenize a plain wikitext string into a flat `Vec<Item>`. Used to
 /// re-tokenize expanded template source.
-pub fn tokenize_wikitext_to_items(wikitext: &str, in_template: bool) -> Vec<Item> {
+pub fn tokenize_wikitext_to_items(
+    wikitext: &str,
+    in_template: bool,
+    ext_tags: &[String],
+) -> Vec<Item> {
     let options = TokenizerOptions {
         in_template,
+        ext_tags: ext_tags.to_vec(),
         ..Default::default()
     };
     let mut tokenizer = PegTokenizer::new(wikitext, &options);
