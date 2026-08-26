@@ -133,8 +133,14 @@ fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
     let source = attr_str(token, "source").unwrap_or_default().to_string();
     let mut body = extract_ext_body(token, &source);
 
-    // Sanitize the start-tag attributes onto the `<pre>` element.
+    // Recover the parsed start-tag attributes (including the `format` option).
     let attrs: Vec<crate::wikitext::tokens_v2::KV> = extension_kv_attrs(token);
+    let format = attrs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("format"))
+        .and_then(|kv| kv.value.as_str())
+        .unwrap_or("")
+        .to_string();
     let sanitized = crate::sanitizer::sanitize_tag_attrs("pre", attrs, |_proto| true);
 
     // `dataParsoid.stx = 'html'` (the `<pre>` element came from literal HTML).
@@ -146,6 +152,25 @@ fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
 
     let mut pre = TagTk::new("pre", sanitized, dp);
     pre.data_mw = None;
+    pre.add_attribute_str("typeof", "mw:Extension/pre");
+
+    let open = Item::Tok(ParsoidToken::Tag(pre));
+    let close = Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+        "pre",
+        vec![],
+        DataParsoid::default(),
+    )));
+
+    if format == "wikitext" {
+        // `format="wikitext"`: parse the body as inline wikitext (mirrors
+        // `Pre::sourceToDom`'s `extTagToDOM` branch with `context: 'inline'`),
+        // so `'''bold'''` becomes `<b>bold</b>` etc.
+        let items = wikitext_body_items(&body);
+        let mut out = vec![open];
+        out.extend(items);
+        out.push(close);
+        return out;
+    }
 
     // Strip `<nowiki>…</nowiki>` wrappers (mirrors the `preg_replace` in
     // `Pre::sourceToDom`).
@@ -159,23 +184,47 @@ fn pre_items(token: &SelfclosingTagTk) -> Vec<Item> {
     // Decode wikitext entities (no `mw:Entity` spans for `<pre>`).
     let decoded = decode_wt_entities_all(&body);
 
-    // Generic extension encapsulation (mirrors `ExtensionHandler::
-    // onDocumentFragment`): `typeof="mw:Extension/pre"` marks the literal-html
-    // `<pre>` as extension output. (The companion `data-mw` `name`/`attrs`/
-    // `body.extsrc` envelope is set on the DOM node in PHP via `setDataMw`;
-    // porting that requires threading a raw JSON blob through the tree builder
-    // separately from the sanitizer and is a follow-up.)
-    pre.add_attribute_str("typeof", "mw:Extension/pre");
+    vec![open, Item::Str(decoded), close]
+}
 
-    vec![
-        Item::Tok(ParsoidToken::Tag(pre)),
-        Item::Str(decoded),
-        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-            "pre",
-            vec![],
-            DataParsoid::default(),
-        ))),
-    ]
+/// Tokenize a `<pre format="wikitext">` body as inline wikitext and run the
+/// quote transformer, so `''`/`'''` are converted to `<i>`/`<b>`. This is the
+/// `context: 'inline'` sub-parse of PHP's `extTagToDOM` for the common
+/// bold/italic case (wikilinks, lists, tables, and headings inside `pre` are
+/// not yet wired).
+fn wikitext_body_items(body: &str) -> Vec<Item> {
+    use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
+    use crate::wikitext::tokens_v2::Either;
+
+    let options = TokenizerOptions {
+        inline_context: true,
+        sol: false,
+        ext_tags: vec!["nowiki".to_string(), "pre".to_string()],
+        ..TokenizerOptions::default()
+    };
+    let mut tokenizer = PegTokenizer::new(body, &options);
+    let Ok(chunks) = tokenizer.tokenize() else {
+        return vec![Item::Str(body.to_string())];
+    };
+    let items: Vec<Item> = chunks
+        .into_iter()
+        .map(|e| match e {
+            Either::Left(s) => Item::Str(s),
+            Either::Right(t) => Item::Tok(t),
+        })
+        .collect();
+    // The quote transformer flushes pending quotes only on a newline or EOF
+    // token; the tokenizer does not emit a trailing one, so append a synthetic
+    // EOF, transform, then drop it again.
+    let mut with_eof = items;
+    with_eof.push(Item::Tok(ParsoidToken::Eof(
+        crate::wikitext::tokens_v2::EOFTk,
+    )));
+    let mut out = crate::pipeline::quote_transformer_v2::QuoteTransformer::transform(with_eof);
+    if matches!(out.last(), Some(Item::Tok(ParsoidToken::Eof(_)))) {
+        out.pop();
+    }
+    out
 }
 
 /// Recover the parsed start-tag attributes from an extension token's `data-mw`
