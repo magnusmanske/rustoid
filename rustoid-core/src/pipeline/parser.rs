@@ -397,7 +397,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // available (the synchronous `wikitext_to_ast` path has none).
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter)
+                .expand_templates(frame, tokens, source, about_counter, true)
                 .await;
             tokens = self
                 .expand_attributes(frame, tokens, source, about_counter)
@@ -574,7 +574,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let frame = Frame::new(title, vec![]);
 
         let tokens = self
-            .expand_templates(&frame, tokens, source, about_counter)
+            .expand_templates(&frame, tokens, source, about_counter, false)
             .await;
         let tokens = self
             .expand_attributes(&frame, tokens, source, about_counter)
@@ -619,12 +619,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 
     /// Expand `template`/`templatearg` tokens in-place.
+    ///
+    /// `in_template` mirrors PHP's `wrapTemplates = !$options['inTemplate']`:
+    /// when true (nested template / extension-content context), expanded
+    /// templates are returned *without* `mw:Transclusion` encapsulation.
     async fn expand_templates(
         &self,
         frame: &Frame,
         tokens: Vec<Item>,
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Vec<Item> {
         let mut out = Vec::new();
         for item in tokens {
@@ -660,6 +665,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 about_id,
                                 tok,
                                 about_counter,
+                                in_template,
                             )
                             .await;
                         out.extend(expanded);
@@ -682,7 +688,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .unwrap_or("");
                 let src = format!("{{{{{name}}}}}");
                 let expanded =
-                    TemplateHandler.handle_template_arg(frame, &src, about_id, tok, true);
+                    TemplateHandler.handle_template_arg(frame, &src, about_id, tok, !in_template);
                 out.extend(expanded);
                 continue;
             }
@@ -734,7 +740,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
                     let expanded = self
-                        .expand_templates(frame, toks.clone(), source, about_counter)
+                        .expand_templates(frame, toks.clone(), source, about_counter, false)
                         .await;
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
@@ -742,7 +748,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 };
                 let new_value = if let KeyValue::Tokens(toks) = &kv.value {
                     let expanded = self
-                        .expand_templates(frame, toks.clone(), source, about_counter)
+                        .expand_templates(frame, toks.clone(), source, about_counter, false)
                         .await;
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
@@ -785,6 +791,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_id: String,
         token: &ParsoidToken,
         about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Vec<Item> {
         const MAX_TEMPLATE_DEPTH: usize = 40;
 
@@ -801,6 +808,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         // Without a data source, a template becomes a redlink.
         let Some(src) = source else {
+            if in_template {
+                return vec![crate::pipeline::template_handler::template_to_wikilink(
+                    name,
+                )];
+            }
             let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
             let info = template_info_from(None, Some(name), vec![]);
             return encap.encap_tokens(
@@ -813,6 +825,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let fetched = src.get_template(title).await.ok().flatten();
         let Some(template_src) = fetched else {
+            if in_template {
+                return vec![crate::pipeline::template_handler::template_to_wikilink(
+                    name,
+                )];
+            }
             let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
             let info = template_info_from(None, Some(name), vec![]);
             return encap.encap_tokens(
@@ -863,7 +880,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             self.config.extension_tags(),
         );
         let expanded =
-            Box::pin(self.expand_templates(&child_frame, items, Some(src), about_counter)).await;
+            Box::pin(self.expand_templates(&child_frame, items, Some(src), about_counter, true))
+                .await;
+
+        if in_template {
+            // Nested/extension-content context: no `mw:Transclusion` wrapping.
+            return expanded;
+        }
 
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         let mut info = template_info_from(None, Some(name), vec![]);
