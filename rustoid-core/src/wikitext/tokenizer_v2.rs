@@ -1941,13 +1941,20 @@ impl<'a> PegTokenizer<'a> {
         stt.attribs.push(kv_str(&target, ""));
 
         // attribs[1..] are the arguments: `name=value` is named, else positional.
+        // A `=` only acts as the name/value separator when it is *not* at
+        // start-of-line. At SOL, `===…` is tokenized as a heading block by the
+        // PEG grammar (`block_lines → block_line → heading`) *before*
+        // `inline_breaks` can see the `=`, so it is consumed as content and no
+        // split occurs. (This mirrors `template_param_name` +
+        // `TokenizerUtils::inlineBreaks` in the PHP grammar.)
         for part in parts.iter().skip(1) {
-            if let Some(eq) = part.find('=') {
-                let k = part[..eq].trim().to_string();
-                let v = part[eq + 1..].to_string();
-                stt.attribs.push(kv_str(&k, &v));
-            } else {
-                stt.attribs.push(kv_str("", part));
+            match find_arg_separator_eq(part) {
+                Some(eq) => {
+                    let k = part[..eq].trim().to_string();
+                    let v = part[eq + 1..].to_string();
+                    stt.attribs.push(kv_str(&k, &v));
+                }
+                None => stt.attribs.push(kv_str("", part)),
             }
         }
 
@@ -2805,6 +2812,47 @@ fn strip_html_comments(input: &str) -> String {
     out
 }
 
+/// Find the name/value separator `=` in a template argument, as a byte offset.
+///
+/// Returns the byte index of the first `=` that can act as the `name=value`
+/// separator, or `None` if the argument is positional. A `=` at start-of-line
+/// introduces a heading (`===… ===`), which the PEG tokenizer consumes as a
+/// whole-line block before `inline_breaks` can see any of its `=` characters.
+/// A heading occupies its entire line, so every `=` on a line that begins with
+/// `=` (at SOL) is heading content, not a separator (mirrors
+/// `template_param_name` + `inlineBreaks` in `Grammar.pegphp`).
+fn find_arg_separator_eq(part: &str) -> Option<usize> {
+    let bytes = part.as_bytes();
+    let mut at_sol = true;
+    let mut in_heading = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'=' => {
+                if at_sol {
+                    // A `=` at start-of-line opens a heading; the rest of the
+                    // line (including any closing `=`) is heading content.
+                    in_heading = true;
+                } else if !in_heading {
+                    return Some(i);
+                }
+            }
+            b'\n' | b'\r' => {
+                at_sol = true;
+                in_heading = false;
+            }
+            b' ' | b'\t' => {
+                // Whitespace keeps the current SOL/heading state.
+            }
+            _ => {
+                // A non-`=` character ends SOL, and a non-whitespace character
+                // inside a heading does not re-enable line-start detection.
+                at_sol = false;
+            }
+        }
+    }
+    None
+}
+
 /// Build a string-valued KV (key/value as string tokens).
 fn kv_str(key: &str, value: &str) -> KV {
     KV {
@@ -3023,6 +3071,34 @@ mod tests {
         assert_eq!(template.attribs[1].value.as_str(), Some("bar"));
         assert_eq!(template.attribs[2].key.as_str(), Some("baz"));
         assert_eq!(template.attribs[2].value.as_str(), Some("qux"));
+    }
+
+    #[test]
+    fn test_template_arg_heading_not_split() {
+        // A `===` heading inside a template argument must not be read as a
+        // `name=value` separator; the whole line is positional content.
+        let tokens = tokenize("{{#tag:pre|new\n=== test ===\nline|format=\"wikitext\"}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected template token");
+
+        assert_eq!(template.attribs.len(), 3);
+        assert_eq!(template.attribs[0].key.as_str(), Some("#tag:pre"));
+        // Second arg is positional (empty key), not named `new`.
+        assert_eq!(template.attribs[1].key.as_str(), Some(""));
+        assert_eq!(
+            template.attribs[1].value.as_str(),
+            Some("new\n=== test ===\nline")
+        );
+        // Third arg is named `format`.
+        assert_eq!(template.attribs[2].key.as_str(), Some("format"));
+        assert_eq!(template.attribs[2].value.as_str(), Some("\"wikitext\""));
     }
 
     #[test]
