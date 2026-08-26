@@ -122,6 +122,11 @@ pub fn escape_wt_entities(text: &str) -> String {
 }
 
 /// Length in bytes of the UTF-8 sequence starting at `b` (1-4).
+pub fn utf8_len_public(b: u8) -> usize {
+    utf8_len(b)
+}
+
+/// Length in bytes of the UTF-8 sequence starting at `b` (1-4).
 fn utf8_len(b: u8) -> usize {
     if b < 0x80 {
         1

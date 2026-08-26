@@ -10,59 +10,12 @@
 //! This mirrors the empty-`<p>` handling in Parsoid's `CleanUp` pass, which runs
 //! after tree building and p-wrapping.
 
-use crate::dom::node::{ElementKind, Node, NodeKind};
+use crate::dom::node::{Node, NodeKind};
+use crate::html::wts_utils::element_tag;
 
 /// The "flagged empty elements" the cleanup pass inspects (`Consts::$Output['FlaggedEmptyElts']`).
 fn flagged_empty_elts() -> &'static [&'static str] {
     &["li", "tbody", "tr", "p"]
-}
-
-/// Map an `ElementKind` to its lowercase HTML tag name (mirrors `p_wrap::element_tag`).
-fn element_tag(kind: &ElementKind) -> String {
-    match kind {
-        ElementKind::Document => "html".to_string(),
-        ElementKind::Paragraph => "p".to_string(),
-        ElementKind::Heading(1) => "h1".to_string(),
-        ElementKind::Heading(2) => "h2".to_string(),
-        ElementKind::Heading(3) => "h3".to_string(),
-        ElementKind::Heading(4) => "h4".to_string(),
-        ElementKind::Heading(5) => "h5".to_string(),
-        ElementKind::Heading(6) => "h6".to_string(),
-        ElementKind::Heading(n) => format!("h{n}"),
-        ElementKind::Bold => "b".to_string(),
-        ElementKind::Italic => "i".to_string(),
-        ElementKind::Wikilink | ElementKind::ExtLink => "a".to_string(),
-        ElementKind::Image => "figure-inline".to_string(),
-        ElementKind::Gallery => "ul".to_string(),
-        ElementKind::Table => "table".to_string(),
-        ElementKind::TableRow => "tr".to_string(),
-        ElementKind::TableCell => "td".to_string(),
-        ElementKind::TableHeader => "th".to_string(),
-        ElementKind::TableCaption => "caption".to_string(),
-        ElementKind::UnorderedList => "ul".to_string(),
-        ElementKind::OrderedList => "ol".to_string(),
-        ElementKind::ListItem => "li".to_string(),
-        ElementKind::DefinitionList => "dl".to_string(),
-        ElementKind::DefinitionTerm => "dt".to_string(),
-        ElementKind::DefinitionDescription => "dd".to_string(),
-        ElementKind::Preformatted => "pre".to_string(),
-        ElementKind::HorizontalRule => "hr".to_string(),
-        ElementKind::Transclusion | ElementKind::Annotation => "meta".to_string(),
-        ElementKind::ExtensionTag | ElementKind::Span => "span".to_string(),
-        ElementKind::Div => "div".to_string(),
-        ElementKind::LineBreak => "br".to_string(),
-        ElementKind::Comment => "comment".to_string(),
-        ElementKind::RawHtml => "raw".to_string(),
-        ElementKind::Section => "section".to_string(),
-        ElementKind::InterlanguageLink | ElementKind::CategoryLink | ElementKind::Redirect => {
-            "link".to_string()
-        }
-        ElementKind::TableOfContents => "div".to_string(),
-        ElementKind::Indicator => "meta".to_string(),
-        ElementKind::Figure => "figure".to_string(),
-        ElementKind::FigCaption => "figcaption".to_string(),
-        ElementKind::Other(tag) => tag.clone(),
-    }
 }
 
 fn has_class(node: &Node, class: &str) -> bool {
@@ -232,6 +185,7 @@ pub fn run(root: &mut Node) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::node::ElementKind;
 
     #[test]
     fn test_empty_p_gets_mw_empty_elt() {
