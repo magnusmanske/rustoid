@@ -470,6 +470,21 @@ impl<'a> PegTokenizer<'a> {
 
     /// Try to parse an inline line (until newline or EOF).
     fn try_parse_inlineline(&mut self) -> bool {
+        self.try_parse_inlineline_impl(true)
+    }
+
+    /// Parse inline content that stops at (but does not consume) the newline.
+    /// Used by list items, whose trailing newline must be left for the parent
+    /// `sol`/`block_lines` rule to consume (mirrors PHP's `li = bullets inlineline?
+    /// &eolf`, where `inlineline` never matches a newline).
+    fn try_parse_inlineline_stop_at_nl(&mut self) -> bool {
+        self.try_parse_inlineline_impl(false)
+    }
+
+    /// Parse an inline line. When `consume_nl` is true, a trailing newline is
+    /// consumed and emitted as an `Nl` token (top-level inline line). When
+    /// false, the newline is left unconsumed (list-item content).
+    fn try_parse_inlineline_impl(&mut self, consume_nl: bool) -> bool {
         let mut matched = false;
 
         while self.pos < self.input_len {
@@ -477,17 +492,18 @@ impl<'a> PegTokenizer<'a> {
 
             // Check for inline breaks.
             if ch == '\n' || ch == '\r' {
-                if self.starts_with("\r\n") {
-                    let p = self.pos;
-                    self.advance(2);
-                    self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(p, self.pos))));
-                } else {
-                    let p = self.pos;
-                    self.advance(1);
-                    self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(p, self.pos))));
+                if consume_nl {
+                    if self.starts_with("\r\n") {
+                        let p = self.pos;
+                        self.advance(2);
+                        self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(p, self.pos))));
+                    } else {
+                        let p = self.pos;
+                        self.advance(1);
+                        self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(p, self.pos))));
+                    }
+                    self.at_sol = true;
                 }
-                self.at_sol = true;
-                matched = true;
                 break;
             }
 
@@ -820,7 +836,12 @@ impl<'a> PegTokenizer<'a> {
         // Parse inline content after the bullets. The single space separator
         // between the bullets and the content is not part of the item text.
         self.consume_spaces();
-        self.try_parse_inlineline();
+        self.try_parse_inlineline_stop_at_nl();
+        // The trailing newline is left unconsumed so the parent `sol`/`block_lines`
+        // rule emits its `Nl` token and can then consume following SOL-transparent
+        // comments before another list item (mirrors PHP's `li = bullets inlineline?
+        // &eolf`). `at_sol` is preserved so the next toplevel-block iteration
+        // re-enters the SOL path and consumes that newline.
         true
     }
 
@@ -3302,6 +3323,25 @@ mod tests {
             .filter(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote"))
             .count();
         assert_eq!(quote_count, 4, "expected 4 quote tokens in {tokens:?}");
+    }
+
+    #[test]
+    fn test_comments_sol_transparent_before_list_items() {
+        // Comments between list items are SOL-transparent: each `*item` is its
+        // own list item even when preceding comments separate them.
+        let tokens = tokenize("<!--c1-->*a\n<!--c2--><!--c3--><!--c4-->*b");
+        let list_items: Vec<_> = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "listItem"))
+            .collect();
+        assert_eq!(list_items.len(), 2, "expected 2 list items in {tokens:?}");
+        // The second `*` must be a bullet, not a bare `*` text run.
+        assert!(
+            !tokens
+                .iter()
+                .any(|t| matches!(t, Either::Left(s) if s == "*")),
+            "`*` should be a bullet, not a bare bullet text run: {tokens:?}"
+        );
     }
 
     #[test]
