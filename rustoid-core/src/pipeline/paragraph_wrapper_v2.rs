@@ -408,19 +408,47 @@ impl ParagraphWrapper {
     }
 
     /// Open a paragraph tag in `out` if not already open.
+    ///
+    /// Faithful port of PHP `ParagraphWrapper::openPTag`, including the
+    /// transclusion/annotation range bookkeeping that keeps `mw:Transclusion`
+    /// markers and other SOL-transparent tokens *outside* the `<p>`.
     fn open_p_tag(&mut self, out: &mut Vec<Item>) {
         if self.has_open_p_tag {
             return;
         }
-        // Find the insertion index: skip SOL-transparent tokens and newlines.
+        let mut tpl_start_index: Option<usize> = None;
+        // `i` is the eventual splice offset; default to the very end so that,
+        // when `out` is entirely SOL-transparent, `<p>` opens at the end.
         let mut insert_at = out.len();
         for (i, t) in out.iter().enumerate() {
-            let is_sol_transparent =
-                self.is_sol_transparent_item(t) || matches!(t, Item::Tok(ParsoidToken::Nl(_)));
-            if !is_sol_transparent {
+            if let Item::Tok(ParsoidToken::SelfclosingTag(meta)) = t
+                && meta.name == "meta"
+            {
+                let meta_type = transclusion_meta_type(t);
+                if meta_type.as_deref() == Some("mw:Transclusion") {
+                    // Start tag; remember it and keep scanning forward.
+                    tpl_start_index = Some(i);
+                    continue;
+                } else if meta_type
+                    .as_deref()
+                    .is_some_and(|ty| ty.starts_with("mw:Transclusion/"))
+                {
+                    // End tag; clear any pending start index.
+                    tpl_start_index = None;
+                    continue;
+                } else if is_annotation_start_item(t) {
+                    break;
+                }
+            }
+            // Not a transclusion meta; stop at the first non-SOL-transparent,
+            // non-newline token.
+            if !self.is_sol_transparent_item(t) && !matches!(t, Item::Tok(ParsoidToken::Nl(_))) {
                 insert_at = i;
                 break;
             }
+        }
+        if let Some(start) = tpl_start_index {
+            insert_at = start;
         }
 
         out.insert(
@@ -435,20 +463,43 @@ impl ParagraphWrapper {
     }
 
     /// Close an open paragraph tag in `out`.
+    ///
+    /// Faithful port of PHP `ParagraphWrapper::closeOpenPTag`, including the
+    /// transclusion/annotation range bookkeeping.
     fn close_open_p_tag(&mut self, out: &mut Vec<Item>) {
         if !self.has_open_p_tag {
             return;
         }
-        // Find insertion index from the end, skipping SOL-transparent tokens.
+        let mut tpl_end_index: Option<usize> = None;
         let mut insert_at = out.len();
         for i in (0..out.len()).rev() {
             let t = &out[i];
-            let is_sol_transparent =
-                self.is_sol_transparent_item(t) || matches!(t, Item::Tok(ParsoidToken::Nl(_)));
-            if !is_sol_transparent {
+            if let Item::Tok(ParsoidToken::SelfclosingTag(meta)) = t
+                && meta.name == "meta"
+            {
+                let meta_type = transclusion_meta_type(t);
+                if meta_type.as_deref() == Some("mw:Transclusion") {
+                    // Start tag; do not include it or anything after.
+                    tpl_end_index = None;
+                    continue;
+                } else if meta_type
+                    .as_deref()
+                    .is_some_and(|ty| ty.starts_with("mw:Transclusion/"))
+                {
+                    // End tag; leave it (and anything after) out.
+                    tpl_end_index = Some(i);
+                    continue;
+                } else if is_annotation_end_item(t) {
+                    break;
+                }
+            }
+            if !self.is_sol_transparent_item(t) && !matches!(t, Item::Tok(ParsoidToken::Nl(_))) {
                 insert_at = i + 1;
                 break;
             }
+        }
+        if let Some(end) = tpl_end_index {
+            insert_at = end;
         }
 
         out.insert(
@@ -542,6 +593,61 @@ impl ParagraphWrapper {
 impl Default for ParagraphWrapper {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Return the `typeof` value of a `<meta>`, or `None` if the item is not a
+/// `meta` self-closing tag that carries a transclusion-related `typeof`.
+/// Mirrors `TokenUtils::matchTypeOf`'s access to the `typeof` attribute
+/// (without the regex: callers do prefix checks here).
+fn transclusion_meta_type(item: &Item) -> Option<String> {
+    match item {
+        Item::Tok(ParsoidToken::SelfclosingTag(meta)) if meta.name == "meta" => meta
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str())
+            .and_then(|v| {
+                v.split_whitespace()
+                    .find(|ty| *ty == "mw:Transclusion" || ty.starts_with("mw:Transclusion/"))
+                    .map(|ty| ty.to_string())
+            }),
+        _ => None,
+    }
+}
+
+/// Does this item look like an annotation start meta token?
+/// Mirrors `TokenUtils::isAnnotationStartToken` (matched against the
+/// `mw:Annotation/<type>` regexp, excluding `/End`).
+fn is_annotation_start_item(item: &Item) -> bool {
+    match item {
+        Item::Tok(ParsoidToken::SelfclosingTag(meta)) if meta.name == "meta" => meta
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str())
+            .is_some_and(|v| {
+                v.split_whitespace()
+                    .any(|ty| ty.starts_with("mw:Annotation/") && !ty.ends_with("/End"))
+            }),
+        _ => false,
+    }
+}
+
+/// Does this item look like an annotation end meta token?
+/// Mirrors `TokenUtils::isAnnotationEndToken`.
+fn is_annotation_end_item(item: &Item) -> bool {
+    match item {
+        Item::Tok(ParsoidToken::SelfclosingTag(meta)) if meta.name == "meta" => meta
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str())
+            .is_some_and(|v| {
+                v.split_whitespace()
+                    .any(|ty| ty.starts_with("mw:Annotation/") && ty.ends_with("/End"))
+            }),
+        _ => false,
     }
 }
 
