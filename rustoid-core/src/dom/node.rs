@@ -123,6 +123,11 @@ pub struct Node {
     /// The `data-parsoid` JSON blob for round-tripping.
     /// Stored as raw JSON for now; parsed on demand.
     pub data_parsoid: Option<String>,
+    /// Structured `data-parsoid` metadata (token-level), preserved through tree
+    /// building so the `ComputeDSR` pass can read `tsr`/`src`/`end_tsr`/etc. and
+    /// write back `dsr`. This is the source of truth for DSR computation and
+    /// is re-serialized into `data_parsoid` when DSR is finalized.
+    pub dp: Option<crate::wikitext::tokens_v2::DataParsoid>,
     /// The `data-mw` JSON blob for transclusion/extension metadata.
     pub data_mw: Option<String>,
     /// A stashed sub-fragment carried by a `mw:DOMFragment` placeholder.
@@ -140,6 +145,7 @@ impl Node {
             children: Vec::new(),
             attrs: Vec::new(),
             data_parsoid: None,
+            dp: None,
             data_mw: None,
             fragment: None,
         }
@@ -152,6 +158,7 @@ impl Node {
             children: Vec::new(),
             attrs: Vec::new(),
             data_parsoid: None,
+            dp: None,
             data_mw: None,
             fragment: None,
         }
@@ -164,6 +171,7 @@ impl Node {
             children: Vec::new(),
             attrs: Vec::new(),
             data_parsoid: None,
+            dp: None,
             data_mw: None,
             fragment: None,
         }
@@ -176,6 +184,7 @@ impl Node {
             children: Vec::new(),
             attrs: Vec::new(),
             data_parsoid: None,
+            dp: None,
             data_mw: None,
             fragment: None,
         }

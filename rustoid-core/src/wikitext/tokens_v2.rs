@@ -154,6 +154,8 @@ pub struct DataParsoid {
     pub colon: Option<String>,
     /// Name of a stripped tag (on `mw:Placeholder/StrippedTag` metas).
     pub name: Option<String>,
+    /// Set by MarkFosteredContent to indicate fostered content/content wrappers.
+    pub fostered: bool,
     /// Temporary node-related data (mirrors PHP's `TempData`).
     pub tmp: TempData,
 }

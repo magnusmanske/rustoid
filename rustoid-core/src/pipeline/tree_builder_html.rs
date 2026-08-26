@@ -31,6 +31,8 @@ const DATA_OBJECT_ATTR_NAME: &str = "data-object-id";
 #[derive(Debug, Default)]
 struct StashedNodeData {
     data_parsoid: Option<String>,
+    /// Structured token-level `data-parsoid`, preserved for `ComputeDSR`.
+    dp: Option<TDataParsoid>,
     data_mw: Option<String>,
     /// A stashed sub-fragment for `mw:DOMFragment` placeholders.
     fragment: Option<Node>,
@@ -99,6 +101,7 @@ impl Html5TreeBuilder {
             id,
             StashedNodeData {
                 data_parsoid: dp.to_data_parsoid_json(),
+                dp: Some(dp.clone()),
                 data_mw,
                 fragment: None,
             },
@@ -114,6 +117,7 @@ impl Html5TreeBuilder {
             id,
             StashedNodeData {
                 data_parsoid: None,
+                dp: None,
                 data_mw: None,
                 fragment: Some(fragment),
             },
@@ -514,6 +518,7 @@ fn resolve_data_ids(node: &mut Node, stash: &HashMap<usize, StashedNodeData>) {
         && let Some(data) = stash.get(&id)
     {
         node.data_parsoid = data.data_parsoid.clone();
+        node.dp = data.dp.clone();
         node.data_mw = data.data_mw.clone();
         if let Some(fragment) = &data.fragment {
             node.fragment = Some(Box::new(fragment.clone()));
