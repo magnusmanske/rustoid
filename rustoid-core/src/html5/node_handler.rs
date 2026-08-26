@@ -15,6 +15,24 @@ use crate::dom::node::{ElementKind, Node, NodeKind};
 use super::element::{Attributes, Element};
 use super::tree_handler::{Preposition, TreeHandler};
 
+/// Normalize an attribute value per the HTML5 tree-construction algorithm: any
+/// U+000A LF, U+000C FF, U+000D CR, or U+0009 TAB is replaced with U+0020 SPACE.
+fn normalize_attr_value(value: &str) -> String {
+    if !value
+        .chars()
+        .any(|c| matches!(c, '\n' | '\u{000C}' | '\r' | '\t'))
+    {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .map(|c| match c {
+            '\n' | '\u{000C}' | '\r' | '\t' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
 /// A node reference within the arena.
 type DomNode = Rc<RefCell<Node>>;
 
@@ -211,7 +229,10 @@ impl TreeHandler for NodeTreeHandler {
         };
         let mut node = Node::element(kind);
         for (k, v) in element.attrs.get_values() {
-            node.set_attr(k.clone(), v.clone());
+            // HTML5 tree-construction attribute-value normalization
+            // ("create an element for a token"): replace LF/FF/CR/TAB with
+            // U+0020 SPACE, so `<pre class="one\ntwo">` yields `one two`.
+            node.set_attr(k.clone(), normalize_attr_value(v));
         }
         let dom = Rc::new(RefCell::new(node));
         let idx = self.arena.len();
@@ -272,5 +293,20 @@ impl TreeHandler for NodeTreeHandler {
             let children = std::mem::take(&mut self.children[from]);
             self.children[to].extend(children);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_attr_value() {
+        // Newlines, tabs, form feeds, and carriage returns become spaces
+        // (HTML5 tree-construction attribute-value normalization).
+        assert_eq!(normalize_attr_value("one\ntwo"), "one two");
+        assert_eq!(normalize_attr_value("one\t two"), "one  two");
+        assert_eq!(normalize_attr_value("plain"), "plain");
+        assert_eq!(normalize_attr_value("a\rb\u{000C}c"), "a b c");
     }
 }
