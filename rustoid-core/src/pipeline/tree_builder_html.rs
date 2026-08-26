@@ -28,10 +28,12 @@ use crate::wikitext::tokens_v2::{DataParsoid as TDataParsoid, Item, KV, ParsoidT
 const DATA_OBJECT_ATTR_NAME: &str = "data-object-id";
 
 /// A stashed `NodeData` (mirrors PHP's `NodeData`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct StashedNodeData {
     data_parsoid: Option<String>,
     data_mw: Option<String>,
+    /// A stashed sub-fragment for `mw:DOMFragment` placeholders.
+    fragment: Option<Node>,
 }
 
 /// The faithful tree-builder adapter.
@@ -52,6 +54,8 @@ pub struct Html5TreeBuilder {
     /// Stashed node data, keyed by `data-object-id`.
     stash: HashMap<usize, StashedNodeData>,
     next_data_id: usize,
+    /// Pre-built sub-fragments keyed by id (carried by `mw:dom-fragment-token`).
+    fragments: HashMap<usize, Node>,
 }
 
 impl Html5TreeBuilder {
@@ -61,6 +65,11 @@ impl Html5TreeBuilder {
 
     /// Construct with the page source available for `tsr` resolution.
     pub fn with_source(source: &str) -> Self {
+        Self::with_source_and_fragments(source, HashMap::new())
+    }
+
+    /// Construct with the page source and a map of pre-built sub-fragments.
+    pub fn with_source_and_fragments(source: &str, fragments: HashMap<usize, Node>) -> Self {
         let handler = NodeTreeHandler::new();
         let mut builder = TreeBuilder::new(handler);
         // Parsoid builds a fragment with a `<body>` context element (mirrors
@@ -79,6 +88,7 @@ impl Html5TreeBuilder {
             source: source.to_string(),
             stash: HashMap::new(),
             next_data_id: 0,
+            fragments,
         }
     }
 
@@ -90,6 +100,22 @@ impl Html5TreeBuilder {
             StashedNodeData {
                 data_parsoid: dp.to_data_parsoid_json(),
                 data_mw,
+                fragment: None,
+            },
+        );
+        id
+    }
+
+    /// Stash a pre-built sub-fragment node and return its id.
+    fn stash_fragment(&mut self, fragment: Node) -> usize {
+        let id = self.next_data_id;
+        self.next_data_id += 1;
+        self.stash.insert(
+            id,
+            StashedNodeData {
+                data_parsoid: None,
+                data_mw: None,
+                fragment: Some(fragment),
             },
         );
         id
@@ -353,6 +379,25 @@ impl Html5TreeBuilder {
         let data_mw = Self::extract_data_mw(attribs);
         let mut was_inserted = false;
 
+        if name == "mw:dom-fragment-token" {
+            // Look up the pre-built sub-fragment, stash it, and emit an unfostered
+            // `<span typeof="mw:DOMFragment">` placeholder carrying the id that
+            // resolves back to it (unpacked by `UnpackDOMFragments` in finalize).
+            let fragment_id = attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+                .and_then(|kv| kv.value.as_str())
+                .and_then(|s| s.parse::<usize>().ok());
+            let fragment = fragment_id.and_then(|id| self.fragments.remove(&id));
+            let id = self.stash_fragment(fragment.unwrap_or_else(Node::document));
+            let attrs = Attributes::from_pairs(vec![
+                ("typeof".to_string(), "mw:DOMFragment".to_string()),
+                (DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()),
+            ]);
+            self.insert_unfostered_meta(attrs);
+            return;
+        }
+
         if name == "meta" {
             let should_not_foster = match_type_of(attribs).is_some();
             if should_not_foster {
@@ -463,6 +508,9 @@ fn resolve_data_ids(node: &mut Node, stash: &HashMap<usize, StashedNodeData>) {
     {
         node.data_parsoid = data.data_parsoid.clone();
         node.data_mw = data.data_mw.clone();
+        if let Some(fragment) = &data.fragment {
+            node.fragment = Some(Box::new(fragment.clone()));
+        }
     }
     for child in &mut node.children {
         resolve_data_ids(child, stash);
@@ -842,7 +890,17 @@ pub fn token_stream_to_ast_html(tokens: &[Item]) -> Node {
 /// Run the HTML5 tree builder over a token stream, with the page source
 /// available for `tsr`-based source recovery in deleted-tag placeholders.
 pub fn token_stream_to_ast_html_with_source(tokens: &[Item], source: Option<&str>) -> Node {
-    let mut builder = Html5TreeBuilder::with_source(source.unwrap_or(""));
+    token_stream_to_ast_html_with_fragments(tokens, source, HashMap::new())
+}
+
+/// Like [`token_stream_to_ast_html_with_source`], but accepts pre-built
+/// sub-fragments keyed by id (for `mw:dom-fragment-token` placeholders).
+pub fn token_stream_to_ast_html_with_fragments(
+    tokens: &[Item],
+    source: Option<&str>,
+    fragments: HashMap<usize, Node>,
+) -> Node {
+    let mut builder = Html5TreeBuilder::with_source_and_fragments(source.unwrap_or(""), fragments);
     builder.process_chunk(tokens);
     builder.process_token(&Item::Tok(ParsoidToken::Eof(
         crate::wikitext::tokens_v2::EOFTk,
@@ -1025,6 +1083,36 @@ mod tests {
         } else {
             panic!("placeholder missing data-parsoid");
         }
+    }
+
+    #[test]
+    fn test_dom_fragment_injection() {
+        // A `mw:dom-fragment-token` carrying a pre-built sub-fragment must be
+        // spliced into the tree by `UnpackDOMFragments` during finalize.
+        let sub = Node::text("fragment-body");
+        let mut fragments = HashMap::new();
+        fragments.insert(7usize, sub);
+
+        let mut frag_tok =
+            SelfclosingTagTk::new("mw:dom-fragment-token", vec![], DataParsoid::default());
+        frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
+            key: crate::wikitext::tokens_v2::KeyValue::Str("data-fragment-id".to_string()),
+            value: crate::wikitext::tokens_v2::KeyValue::Str("7".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+
+        let items = vec![
+            tag("pre"),
+            Item::Tok(ParsoidToken::SelfclosingTag(frag_tok)),
+            end("pre"),
+        ];
+        let doc = token_stream_to_ast_html_with_fragments(&items, None, fragments);
+        assert!(
+            contains_text(&doc, "fragment-body"),
+            "fragment not spliced: {doc:?}"
+        );
     }
 
     #[test]

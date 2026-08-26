@@ -15,7 +15,7 @@ use super::list_handler::ListHandler;
 use super::paragraph_wrapper_v2::ParagraphWrapper;
 use super::pre_handler::PreHandler;
 use super::quote_transformer_v2::QuoteTransformer;
-use super::tree_builder_html::token_stream_to_ast_html_with_source;
+use super::tree_builder_html::token_stream_to_ast_html_with_fragments;
 
 /// Run the TokenTransform3 (line-based) handlers over a token stream.
 ///
@@ -61,7 +61,7 @@ impl TreeBuilderStage {
 
     /// Run the TT3 handlers and convert the result to an AST.
     pub fn to_ast(&self, tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Node {
-        self.to_ast_with_source(tokens, None, config)
+        self.to_ast_with_fragments(tokens, None, config, std::collections::HashMap::new())
     }
 
     /// Run the TT3 handlers and convert to an AST, with the page source
@@ -72,8 +72,20 @@ impl TreeBuilderStage {
         source: Option<&str>,
         config: &dyn crate::traits::SiteConfig,
     ) -> Node {
+        self.to_ast_with_fragments(tokens, source, config, std::collections::HashMap::new())
+    }
+
+    /// Like [`to_ast_with_source`], but accepts pre-built sub-fragments for
+    /// `mw:dom-fragment-token` placeholders.
+    pub fn to_ast_with_fragments(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&str>,
+        config: &dyn crate::traits::SiteConfig,
+        fragments: std::collections::HashMap<usize, crate::dom::node::Node>,
+    ) -> Node {
         let tokens = self.process(tokens, config);
-        token_stream_to_ast_html_with_source(&tokens, source)
+        token_stream_to_ast_html_with_fragments(&tokens, source, fragments)
     }
 }
 

@@ -108,7 +108,7 @@ fn nowiki_items(token: &SelfclosingTagTk) -> Vec<Item> {
 /// Extract an extension tag's body source (the text between the opening and
 /// closing tags). Mirrors PHP's `Utils::extractExtBody` / `stripTags`: strip
 /// `openWidth` leading and `closeWidth` trailing bytes from `source`.
-fn extract_ext_body(token: &SelfclosingTagTk, source: &str) -> String {
+pub fn extract_ext_body(token: &SelfclosingTagTk, source: &str) -> String {
     let Some(offsets) = &token.data_parsoid.ext_tag_offsets else {
         return String::new();
     };
@@ -351,7 +351,7 @@ fn render_inline_links(tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig
 
 /// Recover the parsed start-tag attributes from an extension token's `data-mw`
 /// rich attribs (set by the tokenizer's `extension_data_mw`).
-fn extension_kv_attrs(token: &SelfclosingTagTk) -> Vec<crate::wikitext::tokens_v2::KV> {
+pub fn extension_kv_attrs(token: &SelfclosingTagTk) -> Vec<crate::wikitext::tokens_v2::KV> {
     let Some(data_mw) = &token.data_mw else {
         return Vec::new();
     };

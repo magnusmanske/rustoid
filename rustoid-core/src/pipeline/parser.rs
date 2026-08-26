@@ -19,6 +19,24 @@ use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
 
 type ResolvedTarget = crate::pipeline::template_handler::ResolvedTarget;
 
+/// Extract the body-content children from a tree-builder document (`<html>`
+/// wrapped), returning them as a fragment document. Mirrors the `body`
+/// extraction in `HtmlSerializer::split_structure`.
+fn extract_fragment_children(ast: &Node) -> Node {
+    for child in &ast.children {
+        if let crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(tag)) =
+            &child.kind
+            && tag == "html"
+        {
+            let mut frag = crate::dom::node::Node::document();
+            frag.children = child.children.clone();
+            return frag;
+        }
+    }
+    // No `<html>` wrapper (e.g. a plain text body returned as a text node).
+    ast.clone()
+}
+
 /// Locate the `<body>` element in the tree-builder output and wrap its children
 /// in `<section>` wrappers (see `pipeline::section_wrapper`).
 ///
@@ -279,6 +297,114 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens)
     }
 
+    /// Run an inline sub-pipeline over an extension-tag body and return the
+    /// body-content children as a fragment document (mirrors
+    /// `PipelineUtils::processContentInPipeline` with `pipelineType
+    /// = 'wikitext-to-fragment'` + `inlineContext`).
+    fn process_fragment_body(&self, body: &str) -> Node {
+        let mut tokens = match self.tokenize(body) {
+            Ok(t) => t,
+            Err(_) => return crate::dom::node::Node::document(),
+        };
+        // The quote transformer flushes pending quotes only on a newline or EOF
+        // token; append a synthetic EOF so quotes (`'''bold'''`) flush.
+        tokens.push(Item::Tok(ParsoidToken::Eof(
+            crate::wikitext::tokens_v2::EOFTk,
+        )));
+        let tokens = self.render_links(tokens);
+        let tokens = self.render_external_links(tokens);
+        let tokens = self.render_behavior_switches(tokens);
+        let stage = TreeBuilderStage::new(true);
+        extract_fragment_children(&stage.to_ast(tokens, self.config))
+    }
+
+    /// Expand `<pre format="wikitext">` extension tokens in place: emit the
+    /// `<pre typeof="mw:Extension/pre">` wrapper, and tunnel the body through
+    /// the inline sub-pipeline as a `mw:dom-fragment-token` placeholder. Returns
+    /// the token stream and a map of fragment id → pre-built sub-`Node`.
+    fn expand_wikitext_pre(
+        &self,
+        tokens: Vec<Item>,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        use crate::wikitext::tokens_v2::{EndTagTk, KeyValue, SelfclosingTagTk, TagTk};
+
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let mut out: Vec<Item> = Vec::new();
+
+        for item in tokens {
+            let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+                out.push(item);
+                continue;
+            };
+            if stt.name != "extension" {
+                out.push(item);
+                continue;
+            }
+            let name = stt
+                .attribs
+                .iter()
+                .find(|a| a.key.as_str() == Some("name"))
+                .and_then(|a| a.value.as_str());
+            let format = crate::pipeline::extension_handler::extension_kv_attrs(stt)
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("format"))
+                .and_then(|kv| kv.value.as_str())
+                .map(str::to_string);
+            if name != Some("pre") || format.as_deref() != Some("wikitext") {
+                out.push(item);
+                continue;
+            }
+
+            // Build the `<pre typeof="mw:Extension/pre">` wrapper (mirroring
+            // `pre_items`), then tunnel the body through the sub-pipeline.
+            let source = stt
+                .attribs
+                .iter()
+                .find(|a| a.key.as_str() == Some("source"))
+                .and_then(|a| a.value.as_str())
+                .unwrap_or("");
+            let body = crate::pipeline::extension_handler::extract_ext_body(stt, source);
+            let sub = self.process_fragment_body(&body);
+
+            let id = next_id;
+            next_id += 1;
+            fragments.insert(id, sub);
+
+            let attrs: Vec<crate::wikitext::tokens_v2::KV> =
+                crate::pipeline::extension_handler::extension_kv_attrs(stt);
+            let sanitized = crate::sanitizer::sanitize_tag_attrs("pre", attrs, |_proto| true);
+            let mut dp = stt.data_parsoid.clone();
+            dp.src = None;
+            dp.src_content = None;
+            dp.ext_tag_offsets = None;
+            dp.stx = Some("html".to_string());
+            let mut pre = TagTk::new("pre", sanitized, dp);
+            pre.data_mw = None;
+            pre.add_attribute_str("typeof", "mw:Extension/pre");
+
+            let mut frag =
+                SelfclosingTagTk::new("mw:dom-fragment-token", vec![], stt.data_parsoid.clone());
+            frag.attribs.push(crate::wikitext::tokens_v2::KV {
+                key: KeyValue::Str("data-fragment-id".to_string()),
+                value: KeyValue::Str(id.to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
+
+            out.push(Item::Tok(ParsoidToken::Tag(pre)));
+            out.push(Item::Tok(ParsoidToken::SelfclosingTag(frag)));
+            out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "pre",
+                vec![],
+                crate::wikitext::tokens_v2::DataParsoid::default(),
+            ))));
+        }
+
+        (out, fragments)
+    }
+
     /// Convert wikitext to the format-agnostic AST (no template expansion).
     ///
     /// When `wrap_sections` is true, heading content is wrapped in `<section>`
@@ -289,8 +415,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
+        let (tokens, fragments) = self.expand_wikitext_pre(tokens);
         let stage = TreeBuilderStage::new(false);
-        let mut ast = stage.to_ast_with_source(tokens, Some(wikitext), self.config);
+        let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
@@ -352,9 +479,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
+        // Route `format="wikitext"` extension bodies through the inline
+        // sub-pipeline, producing `mw:dom-fragment-token` placeholders + their
+        // pre-built sub-fragments.
+        let (tokens, fragments) = self.expand_wikitext_pre(tokens);
 
         let stage = TreeBuilderStage::new(false);
-        let mut ast = stage.to_ast_with_source(tokens, Some(page_source), self.config);
+        let mut ast =
+            stage.to_ast_with_fragments(tokens, Some(page_source), self.config, fragments);
         crate::pipeline::p_wrap::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
@@ -667,6 +799,38 @@ mod tests {
             .unwrap();
         assert!(html.contains("&lt;/pre>"), "got: {html}");
         assert!(!html.contains("<pre>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_process_fragment_body_direct() {
+        use crate::dom::node::{ElementKind, NodeKind};
+        fn has_bold(n: &Node) -> bool {
+            matches!(n.kind, NodeKind::Element(ElementKind::Bold))
+                || n.children.iter().any(has_bold)
+        }
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let sub = parser.process_fragment_body("'''bold'''");
+        assert!(has_bold(&sub), "sub-fragment missing bold: {sub:?}");
+        // Inline context must not introduce a <p> wrapper around inline content.
+        assert!(!matches!(
+            sub.children[0].kind,
+            NodeKind::Element(ElementKind::Paragraph)
+        ));
+    }
+
+    #[test]
+    fn test_pre_format_wikitext_body() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html(
+                "<pre format=\"wikitext\">'''bold'''</pre>",
+                &ParserOptions::for_page("Test"),
+            )
+            .unwrap();
+        assert!(html.contains("<pre"), "got: {html}");
+        assert!(html.contains("<b>bold</b>"), "got: {html}");
     }
 
     #[test]
