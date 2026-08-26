@@ -494,62 +494,66 @@ impl<'a> PegTokenizer<'a> {
             // Try inline elements.
             let saved = self.pos;
 
-            if ch == '<' && self.try_angle_bracket_markup() {
-                matched = true;
-                continue;
-            }
-
-            if ch == '{' && self.try_tplarg_or_template() {
-                matched = true;
-                continue;
-            }
-
-            if self.starts_with("-{") && self.try_lang_variant_or_tpl() {
-                matched = true;
-                continue;
-            }
-
-            if ch == '[' && self.try_wikilink_or_extlink() {
-                matched = true;
-                continue;
-            }
-
-            if ch == '\'' && self.try_quote() {
-                matched = true;
-                continue;
-            }
-
-            if self.try_magic_link() {
-                matched = true;
-                continue;
-            }
-
-            if self.try_urltext() {
-                matched = true;
-                continue;
-            }
-
-            if self.starts_with("__") && self.try_behavior_switch() {
-                matched = true;
-                continue;
-            }
-
-            if ch == '&' && self.try_html_entity() {
-                matched = true;
-                continue;
-            }
-
-            // If no inline element matched, make sure we advance to avoid infinite loop.
-            if self.pos == saved {
-                let ch_len = ch.len_utf8();
-                let text = self.input[self.pos..self.pos + ch_len].to_string();
-                self.pos += ch_len;
-                self.emit_text(text);
+            if !self.try_inline_element() {
+                // If no inline element matched, make sure we advance to avoid infinite loop.
+                if self.pos == saved {
+                    let ch_len = ch.len_utf8();
+                    let text = self.input[self.pos..self.pos + ch_len].to_string();
+                    self.pos += ch_len;
+                    self.emit_text(text);
+                }
             }
             matched = true;
         }
 
         matched
+    }
+
+    /// Try to match a single inline element (wikilink, quote, template, HTML
+    /// tag/comment, entity, behavior switch, magic link, or a URL text run).
+    /// Returns true if any inline construct matched. Shared by inlineline and
+    /// table-cell-content parsing so cells tokenize quotes/links/templates the
+    /// same way a top-level inline line does.
+    fn try_inline_element(&mut self) -> bool {
+        let ch = match self.remaining().chars().next() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let saved = self.pos;
+
+        if ch == '<' && self.try_angle_bracket_markup() {
+            return true;
+        }
+        if ch == '{' && self.try_tplarg_or_template() {
+            return true;
+        }
+        if self.starts_with("-{") && self.try_lang_variant_or_tpl() {
+            return true;
+        }
+        if ch == '[' && self.try_wikilink_or_extlink() {
+            return true;
+        }
+        if ch == '\'' && self.try_quote() {
+            return true;
+        }
+        if self.try_magic_link() {
+            return true;
+        }
+        if self.try_urltext() {
+            return true;
+        }
+        if self.starts_with("__") && self.try_behavior_switch() {
+            return true;
+        }
+        if ch == '&' && self.try_html_entity() {
+            return true;
+        }
+
+        // Backtrack (no inline element matched) so the caller can consume a
+        // single character as text.
+        self.pos = saved;
+        false
     }
 
     // ---- Block-level constructs ----
@@ -1092,7 +1096,10 @@ impl<'a> PegTokenizer<'a> {
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
 
-        // Process additional heading cells: `!!`
+        // The cell content precedes any `!!` separator on the same line.
+        self.parse_table_cell_inline();
+
+        // Process additional heading cells: `!!`.
         self.parse_ths();
 
         self.at_sol = false;
@@ -1112,6 +1119,7 @@ impl<'a> PegTokenizer<'a> {
             let dp = self.make_dp_tsr(tsr);
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
+            self.parse_table_cell_inline();
         }
     }
 
@@ -1164,7 +1172,7 @@ impl<'a> PegTokenizer<'a> {
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
 
         // The cell content precedes any `||` separator on the same line.
-        self.parse_table_cell_text();
+        self.parse_table_cell_inline();
 
         // Parse additional `||` data cells.
         self.parse_tds();
@@ -1186,29 +1194,48 @@ impl<'a> PegTokenizer<'a> {
             dp.stx = Some("row".to_string());
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
-            self.parse_table_cell_text();
+            self.parse_table_cell_inline();
         }
     }
 
-    /// Consume a text run that is a table-cell's content, stopping before a
-    /// `||`, `|`, `!`, or end of line.
-    fn parse_table_cell_text(&mut self) {
-        if self.eof()
-            || self.starts_with("||")
+    /// Parse the inline content of a table cell, stopping before a cell
+    /// separator (`||`, `!!`, `|`, `!`, `{{!}}`) or end of line. Recursively
+    /// tokenizes quotes, wikilinks, templates, entities, and other inline
+    /// elements exactly as a top-level inline line does (mirrors PHP's
+    /// `nested_block_in_table` / `inlineline` cell body).
+    fn parse_table_cell_inline(&mut self) {
+        loop {
+            if self.eof() || self.at_cell_terminator() {
+                return;
+            }
+            let saved = self.pos;
+            if self.try_inline_element() {
+                continue;
+            }
+            // No inline element: consume one character as text (but do not
+            // cross a cell terminator).
+            if self.at_cell_terminator() {
+                self.pos = saved;
+                return;
+            }
+            if let Some(ch) = self.remaining().chars().next() {
+                let ch_len = ch.len_utf8();
+                let text = self.input[self.pos..self.pos + ch_len].to_string();
+                self.pos += ch_len;
+                self.emit_text(text);
+            }
+        }
+    }
+
+    /// Whether the current position is at a table-cell terminator.
+    fn at_cell_terminator(&self) -> bool {
+        self.starts_with("||")
+            || self.starts_with("!!")
+            || self.starts_with("{{!}}")
             || self.starts_with("|")
             || self.starts_with("!")
             || self.starts_with("\n")
             || self.starts_with("\r\n")
-        {
-            return;
-        }
-        let rem = self.remaining();
-        let end = rem.find(['|', '!', '\n', '\r']).unwrap_or(rem.len());
-        if end > 0 {
-            let text = rem[..end].to_string();
-            self.advance(end);
-            self.emit_text(text);
-        }
     }
 
     /// `|+` table caption.
@@ -3249,6 +3276,32 @@ mod tests {
             .iter()
             .any(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "table"));
         assert!(has_table, "Expected table, got: {:?}", tokens);
+    }
+
+    #[test]
+    fn test_table_cell_quote_tokenization() {
+        // Cell content must be tokenized as inline wikitext (quotes, etc.),
+        // not consumed as raw text. `!''a!!''b` → two `<th>` cells, each with
+        // italic `a`/`b`; `|''a||''b` → two `<td>` cells likewise.
+        let tokens = tokenize("{|\n!''a!!''b\n|''a||''b\n|}");
+
+        let th_count = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "th"))
+            .count();
+        assert_eq!(th_count, 2, "expected 2 th cells in {tokens:?}");
+        let td_count = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "td"))
+            .count();
+        assert_eq!(td_count, 2, "expected 2 td cells in {tokens:?}");
+
+        // The quote runs must be tokenized as `mw-quote`, not raw text.
+        let quote_count = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote"))
+            .count();
+        assert_eq!(quote_count, 4, "expected 4 quote tokens in {tokens:?}");
     }
 
     #[test]
