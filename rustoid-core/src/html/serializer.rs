@@ -87,6 +87,10 @@ impl WikitextSerializer {
 /// faithful-enough skeleton of `serializeAttributes` for the IGNORED list and
 /// the plain (non-shadow) attribute case; `data-parsoid`/`data-mw` and RDFa
 /// `about`/`typeof`/`rel` attributes are stripped.
+pub fn serialize_attributes_partial(node: &crate::dom::node::Node) -> String {
+    serialize_attributes(node)
+}
+
 fn serialize_attributes(node: &crate::dom::node::Node) -> String {
     let mut out = Vec::new();
     for attr in &node.attrs {

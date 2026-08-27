@@ -307,6 +307,36 @@ pub trait DomHandler {
         };
         dp.auto_inserted_start && dp.auto_inserted_end
     }
+
+    /// Serialize a table tag (`|`, `|+`, `|-`, `|`) with the given symbol and
+    /// optional end symbol + attributes. Faithful to
+    /// `DOMHandler::serializeTableElement`.
+    fn serialize_table_element(
+        &self,
+        symbol: &str,
+        end_symbol: Option<&str>,
+        tree: &DomTree,
+        node: NodeId,
+    ) -> String {
+        let s_attribs = crate::html::serializer::serialize_attributes_partial(tree.node(node));
+        if !s_attribs.is_empty() {
+            format!("{symbol} {s_attribs} {}", end_symbol.unwrap_or("|"))
+        } else {
+            format!("{symbol}{}", end_symbol.unwrap_or(""))
+        }
+    }
+
+    /// Serialize a table tag, using original source when `wrapper_unmodified`.
+    /// Faithful to `DOMHandler::serializeTableTag` (non-selser branch).
+    fn serialize_table_tag(
+        &self,
+        symbol: &str,
+        end_symbol: Option<&str>,
+        tree: &DomTree,
+        node: NodeId,
+    ) -> String {
+        self.serialize_table_element(symbol, end_symbol, tree, node)
+    }
 }
 
 /// The default handler used for unhandled nodes: `handle` raises (returns

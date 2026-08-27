@@ -7,6 +7,7 @@
 //! they only depend on `SerializerState::emit_chunk`/`serialize_children` and
 //! the `DomTree` navigation arena.
 
+use crate::dom::node::NodeKind;
 use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
@@ -490,6 +491,297 @@ impl DomHandler for LIHandler {
 
     fn force_sol(&self) -> bool {
         true
+    }
+}
+
+/// `PHandler` — serialize a `<p>`, with the paragraph newline constraints
+/// (`isPPTransition`) that `BRHandler` and others depend on. Faithful to
+/// `DOMHandlers/PHandler.php`; the block-node/sol-transparent line-walk helpers
+/// are stubbed.
+pub struct PHandler;
+
+impl PHandler {
+    /// `PHandler::treatAsPPTransition`: should `node` be treated as a P-wrapped
+    /// node for newline-constraint purposes? Faithful to the private PHP helper.
+    fn treat_as_pp_transition(tree: &DomTree, node: NodeId) -> bool {
+        if crate::html::dom_tree::is_iew(tree, node)
+            || matches!(tree.node(node).kind, NodeKind::Text(_))
+        {
+            // Text nodes are treated as P/P transitions.
+            return matches!(tree.node(node).kind, NodeKind::Text(_));
+        }
+        let name = dom_utils::node_name(tree.node(node));
+        !dom_utils::at_the_top(tree, node)
+            && !dom_utils::is_wikitext_block_node(tree.node(node))
+            && !dom_utils::is_literal_html_node(tree.node(node))
+            && name != "meta"
+    }
+
+    /// `PHandler::isPPTransition`: is `node` a P-wrapped node or one to treat as
+    /// such? Faithful to the static PHP method.
+    pub fn is_pp_transition(tree: &DomTree, node: Option<NodeId>) -> bool {
+        let Some(node) = node else {
+            return false;
+        };
+        if matches!(tree.node(node).kind, NodeKind::Element(_))
+            && dom_utils::node_name(tree.node(node)) == "p"
+            && tree
+                .node(node)
+                .dp
+                .as_ref()
+                .is_none_or(|d| d.stx.as_deref() != Some("html"))
+        {
+            return true;
+        }
+        Self::treat_as_pp_transition(tree, node)
+    }
+}
+
+impl DomHandler for PHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        crate::html::serializer::walk_children(tree, node, state);
+        tree.next_sibling(node)
+    }
+
+    fn force_sol(&self) -> bool {
+        true
+    }
+}
+
+/// `DTHandler` — serialize a `<dt>`. Faithful to `DOMHandlers/DTHandler.php`.
+pub struct DTHandler;
+
+impl DomHandler for DTHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let first_child_element = crate::html::dom_tree::first_non_sep_child(tree, node);
+        let first_is_list = first_child_element.is_some_and(|c| dom_utils::is_list(tree.node(c)));
+        let first_is_literal =
+            first_child_element.is_some_and(|c| dom_utils::is_literal_html_node(tree.node(c)));
+        if !first_is_list || first_is_literal {
+            let bullets = self.get_list_bullets(tree, node);
+            state.emit_chunk(bullets, node);
+        }
+        state.single_line_context.enforce();
+        crate::html::serializer::walk_children(tree, node, state);
+        state.single_line_context.pop();
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        _t: &DomTree,
+        _n: NodeId,
+        _o: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        Some(Constraints {
+            min: Some(1),
+            max: Some(2),
+        })
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let other_is_row_dd = dom_utils::node_name(tree.node(other)) == "dd"
+            && tree
+                .node(other)
+                .dp
+                .as_ref()
+                .is_some_and(|d| d.stx.as_deref() == Some("row"));
+        if other_is_row_dd {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(0),
+            })
+        } else {
+            self.wt_list_eol(tree, node, other)
+        }
+    }
+
+    fn first_child(
+        &mut self,
+        tree: &DomTree,
+        _n: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        if !dom_utils::is_list(tree.node(other)) {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(0),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn force_sol(&self) -> bool {
+        true
+    }
+}
+
+/// `DDHandler` — serialize a `<dd>` (single-line `row` or multi-line).
+/// Faithful to `DOMHandlers/DDHandler.php`.
+pub struct DDHandler {
+    pub stx: Option<String>,
+}
+
+impl DDHandler {
+    pub fn new(stx: Option<&str>) -> Self {
+        Self {
+            stx: stx.map(|s| s.to_string()),
+        }
+    }
+}
+
+impl DomHandler for DDHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let first_child_element = crate::html::dom_tree::first_non_sep_child(tree, node);
+        let chunk = if self.stx.as_deref() == Some("row") {
+            ":".to_string()
+        } else {
+            self.get_list_bullets(tree, node)
+        };
+        let first_is_list = first_child_element.is_some_and(|c| dom_utils::is_list(tree.node(c)));
+        let first_is_literal =
+            first_child_element.is_some_and(|c| dom_utils::is_literal_html_node(tree.node(c)));
+        if !first_is_list || first_is_literal {
+            state.emit_chunk(chunk, node);
+        }
+        state.single_line_context.enforce();
+        crate::html::serializer::walk_children(tree, node, state);
+        state.single_line_context.pop();
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        _t: &DomTree,
+        _n: NodeId,
+        _o: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        if self.stx.as_deref() == Some("row") {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(0),
+            })
+        } else {
+            Some(Constraints {
+                min: Some(1),
+                max: Some(2),
+            })
+        }
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        self.wt_list_eol(tree, node, other)
+    }
+
+    fn first_child(
+        &mut self,
+        tree: &DomTree,
+        _n: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        if !dom_utils::is_list(tree.node(other)) {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(0),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn force_sol(&self) -> bool {
+        self.stx.as_deref() != Some("row")
+    }
+}
+
+/// `CaptionHandler` — serialize a `<caption>`. Faithful to
+/// `DOMHandlers/CaptionHandler.php`.
+pub struct CaptionHandler;
+
+impl DomHandler for CaptionHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let symbol = tree
+            .node(node)
+            .dp
+            .as_ref()
+            .and_then(|d| d.start_tag_src.clone())
+            .unwrap_or_else(|| "|+".to_string());
+        let table_tag = self.serialize_table_tag(&symbol, None, tree, node);
+        state.emit_chunk(table_tag, node);
+        crate::html::serializer::walk_children(tree, node, state);
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let max = self.max_nls_in_table(tree, node, other);
+        if dom_utils::node_name(tree.node(other)) != "table" {
+            Some(Constraints {
+                min: Some(1),
+                max: Some(max),
+            })
+        } else {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(max),
+            })
+        }
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let max = self.max_nls_in_table(tree, node, other);
+        Some(Constraints {
+            min: Some(1),
+            max: Some(max),
+        })
     }
 }
 

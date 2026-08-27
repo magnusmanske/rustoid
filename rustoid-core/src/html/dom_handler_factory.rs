@@ -12,8 +12,8 @@ use crate::html::dom_handler::{DefaultDomHandler, DomHandler};
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::handlers::{
-    BRHandler, BodyHandler, FallbackHTMLHandler, HRHandler, HeadingHandler, JustChildrenHandler,
-    LIHandler, ListHandler, QuoteHandler,
+    BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler, HRHandler,
+    HeadingHandler, JustChildrenHandler, LIHandler, ListHandler, PHandler, QuoteHandler,
 };
 use crate::html::wts_utils;
 
@@ -161,6 +161,11 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::Dl) => Box::new(ListHandler::new(&["dt", "dd"])),
         Some(HandlerKind::OlUl) => Box::new(ListHandler::new(&["li"])),
         Some(HandlerKind::Li) => Box::new(LIHandler),
+        Some(HandlerKind::P) => Box::new(PHandler),
+        Some(HandlerKind::Dt) => Box::new(DTHandler),
+        Some(HandlerKind::Dd) => Box::new(DDHandler::new(None)),
+        Some(HandlerKind::DdRow) => Box::new(DDHandler::new(Some("row"))),
+        Some(HandlerKind::Caption) => Box::new(CaptionHandler),
         _ => Box::new(DefaultDomHandler),
     }
 }
