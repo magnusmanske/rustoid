@@ -259,6 +259,13 @@ impl SerializerState {
         self.curr_node_unmodified = false;
         self.prev_node = Some(node);
     }
+
+    /// Recover trimmed whitespace for `node` (leading/trailing). Faithful to
+    /// `SerializerState::recoverTrimmedWhitespace` → `Separators::recoverTrimmedWhitespace`:
+    /// returns `None` outside selser mode.
+    pub fn recover_trimmed_whitespace(&self, _node: NodeId, _leading: bool) -> Option<String> {
+        None
+    }
 }
 
 impl Default for SerializerState {

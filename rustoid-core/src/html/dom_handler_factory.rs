@@ -11,7 +11,10 @@
 use crate::html::dom_handler::{DefaultDomHandler, DomHandler};
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
-use crate::html::handlers::{BodyHandler, FallbackHTMLHandler, JustChildrenHandler, QuoteHandler};
+use crate::html::handlers::{
+    BRHandler, BodyHandler, FallbackHTMLHandler, HRHandler, HeadingHandler, JustChildrenHandler,
+    LIHandler, ListHandler, QuoteHandler,
+};
 use crate::html::wts_utils;
 
 /// The concrete DOM handler classes PHP maps tag names to (`DOMHandlerFactory::newFromTagHandler`).
@@ -147,6 +150,17 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::QuoteBold) => Box::new(QuoteHandler::new("'''")),
         Some(HandlerKind::QuoteItalic) => Box::new(QuoteHandler::new("''")),
         Some(HandlerKind::TableBody) => Box::new(JustChildrenHandler),
+        Some(HandlerKind::Br) => Box::new(BRHandler),
+        Some(HandlerKind::Hr) => Box::new(HRHandler),
+        Some(HandlerKind::Heading(1)) => Box::new(HeadingHandler::new("=")),
+        Some(HandlerKind::Heading(2)) => Box::new(HeadingHandler::new("==")),
+        Some(HandlerKind::Heading(3)) => Box::new(HeadingHandler::new("===")),
+        Some(HandlerKind::Heading(4)) => Box::new(HeadingHandler::new("====")),
+        Some(HandlerKind::Heading(5)) => Box::new(HeadingHandler::new("=====")),
+        Some(HandlerKind::Heading(6)) => Box::new(HeadingHandler::new("======")),
+        Some(HandlerKind::Dl) => Box::new(ListHandler::new(&["dt", "dd"])),
+        Some(HandlerKind::OlUl) => Box::new(ListHandler::new(&["li"])),
+        Some(HandlerKind::Li) => Box::new(LIHandler),
         _ => Box::new(DefaultDomHandler),
     }
 }

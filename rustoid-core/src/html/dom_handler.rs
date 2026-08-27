@@ -258,6 +258,55 @@ pub trait DomHandler {
             2
         }
     }
+
+    /// Whitespace to emit between a node's markup and its content, for *new*
+    /// elements (for prettier serialization). Faithful to
+    /// `DOMHandler::getLeadingSpace`.
+    fn get_leading_space(&self, tree: &DomTree, node: NodeId, new_elt_default: &str) -> String {
+        if !dom_utils::is_new_elt(tree, node) {
+            return String::new();
+        }
+        let Some(fc) = crate::html::dom_tree::first_non_deleted_child(tree, node) else {
+            return String::new();
+        };
+        // If the first child is a text node not beginning with whitespace, emit
+        // the default space.
+        match &tree.node(fc).kind {
+            crate::dom::node::NodeKind::Text(t) if t.starts_with(char::is_whitespace) => {
+                String::new()
+            }
+            crate::dom::node::NodeKind::Text(_) => new_elt_default.to_string(),
+            _ => new_elt_default.to_string(),
+        }
+    }
+
+    /// Whitespace to emit between a node's content and its markup, for *new*
+    /// elements. Faithful to `DOMHandler::getTrailingSpace`.
+    fn get_trailing_space(&self, tree: &DomTree, node: NodeId, new_elt_default: &str) -> String {
+        if !dom_utils::is_new_elt(tree, node) {
+            return String::new();
+        }
+        let Some(lc) = crate::html::dom_tree::last_non_deleted_child(tree, node) else {
+            return String::new();
+        };
+        match &tree.node(lc).kind {
+            crate::dom::node::NodeKind::Text(t) if t.ends_with(char::is_whitespace) => {
+                String::new()
+            }
+            crate::dom::node::NodeKind::Text(_) => new_elt_default.to_string(),
+            _ => new_elt_default.to_string(),
+        }
+    }
+
+    /// Is this node an element auto-inserted by the HTML5 tree builder
+    /// (`autoInsertedStart` && `autoInsertedEnd`). Faithful to
+    /// `DOMHandler::isBuilderInsertedElt`.
+    fn is_builder_inserted_elt(&self, tree: &DomTree, node: NodeId) -> bool {
+        let Some(dp) = tree.node(node).dp.as_ref() else {
+            return false;
+        };
+        dp.auto_inserted_start && dp.auto_inserted_end
+    }
 }
 
 /// The default handler used for unhandled nodes: `handle` raises (returns
