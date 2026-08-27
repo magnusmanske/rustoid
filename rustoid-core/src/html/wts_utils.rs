@@ -8,6 +8,18 @@
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
 
+/// Shadow-attribute info, mirroring PHP's `WTSUtils::getShadowInfo` result:
+/// `['value' => …, 'modified' => bool, 'fromsrc' => bool]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowInfo {
+    /// The attribute value to serialize (may differ from the DOM attribute).
+    pub value: String,
+    /// Did the value change since the wikitext was parsed?
+    pub modified: bool,
+    /// Was the value recovered from source-based round-tripping (`dp->sa`)?
+    pub fromsrc: bool,
+}
+
 /// Map an `ElementKind` to its HTML tag name. Consolidates the identical
 /// mapping previously duplicated in `cleanup`, `p_wrap`, and `serialize`.
 pub fn element_tag(kind: &ElementKind) -> String {
@@ -275,9 +287,114 @@ pub fn get_media_format(node: &Node) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shadow attributes: `WTSUtils::getShadowInfo` / `getAttributeShadowInfo`.
+// ---------------------------------------------------------------------------
+
+/// Whether a node is genuinely new (no `dsr`), mirroring `WTUtils::isNewElt` for
+/// the `getShadowInfo` fast path. Operates directly on `node.dp` (no tree).
+fn node_is_new(node: &Node) -> bool {
+    node.dp.as_ref().is_none_or(|dp| dp.dsr.is_none())
+}
+
+/// `WTSUtils::getShadowInfo` — resolve an attribute's shadowed value. Faithful
+/// to PHP's `getShadowInfo`, using `data-parsoid`'s `a`/`sa` shadow maps.
+pub fn get_shadow_info(node: &Node, name: &str, cur_val: Option<&str>) -> ShadowInfo {
+    let cur_val = cur_val.unwrap_or("");
+    let dp = node.dp.as_ref();
+
+    // No `a` shadow entry for `name` → plain round-trip.
+    if dp
+        .and_then(|d| d.a.as_ref())
+        .is_none_or(|a| !a.contains_key(name))
+    {
+        return ShadowInfo {
+            value: cur_val.to_string(),
+            modified: node_is_new(node),
+            fromsrc: false,
+        };
+    }
+
+    // `a[name] !== curVal` → the attribute changed.
+    let a_val = dp.map(|d| d.a.as_ref().unwrap().get(name).unwrap().as_str());
+    if a_val != Some(cur_val) {
+        return ShadowInfo {
+            value: cur_val.to_string(),
+            modified: true,
+            fromsrc: false,
+        };
+    }
+
+    // No `sa` shadow entry → unmodified, but not from source.
+    if dp
+        .and_then(|d| d.sa.as_ref())
+        .is_none_or(|sa| !sa.contains_key(name))
+    {
+        return ShadowInfo {
+            value: cur_val.to_string(),
+            modified: false,
+            fromsrc: false,
+        };
+    }
+
+    // Full shadow: use the source value.
+    ShadowInfo {
+        value: dp
+            .map(|d| d.sa.as_ref().unwrap().get(name).unwrap().clone())
+            .unwrap_or_default(),
+        modified: false,
+        fromsrc: true,
+    }
+}
+
+/// `WTSUtils::getAttributeShadowInfo` — [`get_shadow_info`] using the node's
+/// current attribute value.
+pub fn get_attribute_shadow_info(node: &Node, name: &str) -> ShadowInfo {
+    get_shadow_info(node, name, node.get_attr(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_get_shadow_info_falls_back_to_attr() {
+        // No `a` shadow entry → plain round-trip, `modified` = isNewElt.
+        let mut node = Node::element(ElementKind::Other("span".to_string()));
+        node.set_attr("title", "current");
+        // No dp → isNewElt true → modified.
+        let si = get_shadow_info(&node, "title", Some("current"));
+        assert_eq!(si.value, "current");
+        assert!(si.modified);
+        assert!(!si.fromsrc);
+    }
+
+    #[test]
+    fn test_get_shadow_info_from_src() {
+        let mut node = Node::element(ElementKind::Other("span".to_string()));
+        node.set_attr("title", "normalized");
+        let mut dp = crate::wikitext::tokens_v2::DataParsoid::default();
+        dp.set_a("title", "normalized");
+        dp.set_sa("title", "Original Title");
+        node.dp = Some(dp);
+        let si = get_attribute_shadow_info(&node, "title");
+        assert_eq!(si.value, "Original Title");
+        assert!(!si.modified);
+        assert!(si.fromsrc);
+    }
+
+    #[test]
+    fn test_get_shadow_info_modified() {
+        let mut node = Node::element(ElementKind::Other("span".to_string()));
+        node.set_attr("title", "changed");
+        let mut dp = crate::wikitext::tokens_v2::DataParsoid::default();
+        dp.set_a("title", "original");
+        node.dp = Some(dp);
+        let si = get_attribute_shadow_info(&node, "title");
+        assert_eq!(si.value, "changed");
+        assert!(si.modified);
+        assert!(!si.fromsrc);
+    }
 
     #[test]
     fn test_escape_nowiki_tags() {
