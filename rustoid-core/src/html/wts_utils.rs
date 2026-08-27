@@ -255,6 +255,26 @@ fn encode_comment_gt(s: &str) -> String {
     out
 }
 
+/// `WTUtils::isGeneratedFigure` — `typeof` matches `#^mw:File($|/)#D`.
+pub fn is_generated_figure(node: &Node) -> bool {
+    crate::html::dom_utils::match_type_of(node, "^mw:File($|/)").is_some()
+}
+
+/// `WTUtils::isInlineMedia` — a `<span>` that is a generated figure.
+pub fn is_inline_media(node: &Node) -> bool {
+    node_name(node) == "span" && is_generated_figure(node)
+}
+
+/// `WTUtils::getMediaFormat` — the `/Format` suffix of a `mw:File/…` `typeof`
+/// (empty string when none).
+pub fn get_media_format(node: &Node) -> String {
+    let media_type = crate::html::dom_utils::match_type_of(node, "^mw:File($|/)");
+    match media_type {
+        Some(ty) => ty.split('/').nth(1).unwrap_or("").to_string(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

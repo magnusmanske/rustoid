@@ -153,6 +153,94 @@ pub fn is_new_elt(tree: &DomTree, id: NodeId) -> bool {
     tree.node(id).dp.as_ref().is_none_or(|dp| dp.dsr.is_none())
 }
 
+// ---------------------------------------------------------------------------
+// Multivalued attributes (`typeof` / `rel`): `DOMUtils::matchTypeOf`/`hasTypeOf`
+// and `matchRel`/`hasRel`. The PHP regexes are PCRE with `#…#D` delimiters and a
+// `$`-end anchor; callers pass the Rust-`regex`-compatible body (delimiters and
+// flags already stripped, `$` kept as end-of-string).
+// ---------------------------------------------------------------------------
+
+/// Split a `typeof`/`rel` attribute value into its space-separated tokens,
+/// skipping empty tokens. Faithful to `DOMUtils::matchMultivalAttr`'s
+/// `explode(' ', $attrValue)`.
+fn multival_attr_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value.split(' ').filter(|s| !s.is_empty())
+}
+
+/// `DOMUtils::matchTypeOf` — return the first space-separated `typeof` token
+/// matching `ty_re` (a Rust-regex body), or `None`. Faithful to
+/// `DOMUtils::matchMultivalAttr($n, 'typeof', $typeRe)`.
+pub fn match_type_of(node: &Node, ty_re: &str) -> Option<String> {
+    match_multival_attr(node, "typeof", ty_re)
+}
+
+/// `DOMUtils::hasTypeOf` — literal-token membership in the `typeof` attribute.
+pub fn has_type_of(node: &Node, ty: &str) -> bool {
+    has_value_in_multival_attr(node, "typeof", ty)
+}
+
+/// `DOMUtils::matchRel` — first space-separated `rel` token matching `rel_re`.
+pub fn match_rel(node: &Node, rel_re: &str) -> Option<String> {
+    match_multival_attr(node, "rel", rel_re)
+}
+
+/// `DOMUtils::hasRel` — literal-token membership in the `rel` attribute.
+pub fn has_rel(node: &Node, rel: &str) -> bool {
+    has_value_in_multival_attr(node, "rel", rel)
+}
+
+/// `DOMUtils::matchMultivalAttr` — first token of `attr_name` matching `value_re`.
+fn match_multival_attr(node: &Node, attr_name: &str, value_re: &str) -> Option<String> {
+    let value = node.get_attr(attr_name)?;
+    if value.is_empty() {
+        return None;
+    }
+    let re = regex::Regex::new(value_re).ok()?;
+    for token in multival_attr_tokens(value) {
+        if re.is_match(token) {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+/// `DOMUtils::hasValueInMultivalAttr` — membership test for a multivalued attr.
+fn has_value_in_multival_attr(node: &Node, attr_name: &str, value: &str) -> bool {
+    match node.get_attr(attr_name) {
+        None => false,
+        Some(attr_value) => {
+            attr_value == value || multival_attr_tokens(attr_value).any(|t| t == value)
+        }
+    }
+}
+
+/// `DOMUtils::selectMediaElt` — the first descendant element matching
+/// `img`, `video`, or `audio` (depth-first, document order). Faithful to
+/// `DOMCompat::querySelector($node, 'img, video, audio')`.
+pub fn select_media_elt(tree: &DomTree, id: NodeId) -> Option<NodeId> {
+    select_first_descendant(tree, id, &["img", "video", "audio"])
+}
+
+/// Depth-first search for the first descendant whose tag name is in `tags`.
+fn select_first_descendant(tree: &DomTree, id: NodeId, tags: &[&str]) -> Option<NodeId> {
+    fn walk(tree: &DomTree, id: NodeId, tags: &[&str]) -> Option<NodeId> {
+        let mut child = tree.first_child(id);
+        while let Some(c) = child {
+            let name = node_name(tree.node(c));
+            if tags.contains(&name.as_str()) {
+                return Some(c);
+            }
+            if let Some(found) = walk(tree, c, tags) {
+                return Some(found);
+            }
+            child = tree.next_sibling(c);
+        }
+        None
+    }
+    // The PHP `selectMediaElt` searches descendants *of* `node` (not incl. node).
+    walk(tree, id, tags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +270,47 @@ mod tests {
         assert!(is_iew(&Node::text("  \n\t")));
         assert!(!is_iew(&Node::text(" x ")));
         assert!(!is_iew(&Node::element(ElementKind::Paragraph)));
+    }
+
+    #[test]
+    fn test_match_type_of_and_rel() {
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("typeof", "mw:File/Thumb mw:Transclusion");
+        span.set_attr("rel", "mw:WikiLink/Interwiki");
+        // match_type_of: first token matching the regex.
+        assert_eq!(
+            match_type_of(&span, "^mw:File($|/)").as_deref(),
+            Some("mw:File/Thumb")
+        );
+        // has_type_of: literal token membership.
+        assert!(has_type_of(&span, "mw:Transclusion"));
+        assert!(!has_type_of(&span, "mw:Param"));
+        // match_rel / has_rel.
+        assert_eq!(
+            match_rel(&span, "^mw:WikiLink").as_deref(),
+            Some("mw:WikiLink/Interwiki")
+        );
+        assert!(has_rel(&span, "mw:WikiLink/Interwiki"));
+        assert!(!has_rel(&span, "mw:ExtLink"));
+    }
+
+    #[test]
+    fn test_select_media_elt() {
+        let mut doc = Node::document();
+        let mut span = Node::element(ElementKind::Span);
+        let mut img = Node::element(ElementKind::Other("img".to_string()));
+        img.set_attr("resource", "Foo.jpg");
+        span.push_child(img);
+        doc.push_child(span);
+        let tree = DomTree::new(doc);
+        let span_id = tree.first_child(tree.root()).unwrap();
+        let media = select_media_elt(&tree, span_id).unwrap();
+        assert_eq!(node_name(tree.node(media)), "img");
+        // No media descendant → None.
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("x"));
+        let tree2 = DomTree::new(p);
+        assert!(select_media_elt(&tree2, tree2.root()).is_none());
     }
 
     #[test]
