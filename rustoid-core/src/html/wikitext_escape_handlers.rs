@@ -511,6 +511,44 @@ pub fn a_handler(text: &str) -> bool {
     text.contains(']')
 }
 
+/// `escapeLinkContent` — entity-escape, then wikitext-escape, link content.
+/// Faithful to `WikitextEscapeHandlers::escapeLinkContent`: pushes the
+/// `mediaOptionHandler`/`wikilinkHandler` predicate onto the stack, sets
+/// `inLink`, and runs `escapeWikitext` (then pops the handler).
+pub fn escape_link_content(
+    state: &mut SerializerState,
+    tree: &crate::html::dom_tree::DomTree,
+    str_: &str,
+    sol_state: bool,
+    node: crate::html::dom_tree::NodeId,
+    is_media: bool,
+) -> String {
+    // Entity-escape the content (so `&x;` renders literally, not as an entity).
+    let str_ = crate::util::escape_wt_entities(str_);
+
+    // Push the context-specific handler and set the link flags.
+    state.on_sol = sol_state;
+    let escaper: crate::html::serializer_state::WtEscapeHandler = if is_media {
+        Box::new(move |_state, text, _opts, _tree| media_option_handler(text))
+    } else {
+        Box::new(move |_state, text, _opts, _tree| wikilink_handler(text))
+    };
+    state.wte_handler_stack.push(escaper);
+    state.in_link = true;
+    let res = escape_wikitext(
+        state,
+        tree,
+        &str_,
+        EscapeOpts {
+            node: Some(node),
+            ..EscapeOpts::default()
+        },
+    );
+    state.in_link = false;
+    state.wte_handler_stack.pop();
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +654,28 @@ mod tests {
             escape_wikitext(&st, &tree, "a'b", EscapeOpts::default()),
             "<nowiki>a'b</nowiki>"
         );
+    }
+
+    #[test]
+    fn test_escape_link_content_wikilink() {
+        // Wikilink content containing `[[` must be protected; other text passes
+        // through unchanged.
+        let mut st = SerializerState::new();
+        let tree = empty_tree();
+        let esc = escape_link_content(&mut st, &tree, "a[[b", false, 0, false);
+        assert_eq!(esc, "<nowiki>a[[b</nowiki>");
+        // After the call, the handler stack is empty and inLink is false again.
+        assert!(st.wte_handler_stack.is_empty());
+        assert!(!st.in_link);
+    }
+
+    #[test]
+    fn test_escape_link_content_entity_escape() {
+        // A literal entity `&amp;` is entity-escaped so it renders as text.
+        let mut st = SerializerState::new();
+        let tree = empty_tree();
+        let esc = escape_link_content(&mut st, &tree, "a&nbsp;b", false, 0, false);
+        assert!(esc.contains("&amp;nbsp;"));
     }
 
     #[test]

@@ -32,6 +32,18 @@ pub type WtEscapeHandler = Box<
     ) -> bool,
 >;
 
+/// The single-flag context a [`SerializerState::serialize_children_to_string`]
+/// sub-serialization sets on `$inState`. Mirrors PHP's `$states = ['inLink',
+/// 'inCaption', 'inIndentPre', 'inPHPBlock', 'inAttribute']`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InState {
+    Link,
+    Caption,
+    IndentPre,
+    PhpBlock,
+    Attribute,
+}
+
 /// The mutable serializer state (port of `SerializerState`).
 pub struct SerializerState {
     /// Separator info (constraints / collected source / last source node).
@@ -313,17 +325,17 @@ impl SerializerState {
         self.wte_handler_stack.pop();
     }
 
-    /// Serialize the children of `node` to an owned string in indent-pre
-    /// context. Faithful to `SerializerState::serializeIndentPreChildrenToString`:
-    /// a sub-serialization that captures the child output, runs with
-    /// `inIndentPre = true` and `onSOL = false`, then restores the surrounding
-    /// state. (The full `serializeChildrenToString` save/restore is factored
-    /// here only for the indent-pre field; the other `in*` contexts are added
-    /// as their handlers land.)
-    pub fn serialize_indent_pre_children_to_string(
+    /// Serialize the children of `node` to an owned string in a specific
+    /// single-flag context (`inLink`/`inCaption`/`inIndentPre`/`inPHPBlock`/
+    /// `inAttribute`). Faithful to PHP's `SerializerState::serializeChildrenToString`:
+    /// save the surrounding state, run a sub-serialization with the flag set and
+    /// `onSOL = false`, then restore and return the captured output.
+    fn serialize_children_to_string(
         &mut self,
         tree: &DomTree,
         node: NodeId,
+        wt_escaper: Option<WtEscapeHandler>,
+        in_state: InState,
     ) -> String {
         // Save the portions of state the sub-serialization will mutate.
         let old_sep = std::mem::take(&mut self.separator);
@@ -331,7 +343,11 @@ impl SerializerState {
         let old_out = std::mem::take(&mut self.out);
         let old_start = self.at_start_of_output;
         let old_curr_line = std::mem::take(&mut self.curr_line);
-        let old_indent_pre = self.in_indent_pre;
+        let old_in_link = self.in_link;
+        let old_in_caption = self.in_caption;
+        let old_in_indent_pre = self.in_indent_pre;
+        let old_in_php_block = self.in_php_block;
+        let old_in_attribute = self.in_attribute;
         let old_slc = std::mem::take(&mut self.single_line_context);
         let old_prev_unmod = self.prev_node_unmodified;
         let old_curr_unmod = self.curr_node_unmodified;
@@ -341,13 +357,23 @@ impl SerializerState {
         self.reset_sep();
         self.on_sol = false;
         self.at_start_of_output = false;
-        self.in_indent_pre = true;
+        self.in_link = false;
+        self.in_caption = false;
+        self.in_indent_pre = false;
+        self.in_php_block = false;
+        self.in_attribute = false;
+        self.set_in_state(in_state, true);
         self.single_line_context.disable();
         self.reset_curr_line(None);
 
-        // Serialize the children and flush the buffered line into `out`.
+        // Serialize the children (with the optional escaping handler) and flush
+        // the buffered line into `out`.
         self.update_sep(node);
-        self.serialize_children(tree, node);
+        if let Some(escaper) = wt_escaper {
+            self.serialize_children_with_escaper(tree, node, escaper);
+        } else {
+            self.serialize_children(tree, node);
+        }
         self.flush_line();
 
         let bits = std::mem::take(&mut self.out);
@@ -358,13 +384,60 @@ impl SerializerState {
         self.on_sol = old_sol;
         self.at_start_of_output = old_start;
         self.curr_line = old_curr_line;
-        self.in_indent_pre = old_indent_pre;
+        self.in_link = old_in_link;
+        self.in_caption = old_in_caption;
+        self.in_indent_pre = old_in_indent_pre;
+        self.in_php_block = old_in_php_block;
+        self.in_attribute = old_in_attribute;
         self.single_line_context = old_slc;
         self.prev_node_unmodified = old_prev_unmod;
         self.curr_node_unmodified = old_curr_unmod;
         self.prev_node = old_prev_node;
 
         bits
+    }
+
+    /// Set the `in_state` flag (and clear the others).
+    fn set_in_state(&mut self, in_state: InState, value: bool) {
+        match in_state {
+            InState::Link => self.in_link = value,
+            InState::Caption => self.in_caption = value,
+            InState::IndentPre => self.in_indent_pre = value,
+            InState::PhpBlock => self.in_php_block = value,
+            InState::Attribute => self.in_attribute = value,
+        }
+    }
+
+    /// Serialize the children of `node` to an owned string in indent-pre
+    /// context. Faithful to `SerializerState::serializeIndentPreChildrenToString`.
+    pub fn serialize_indent_pre_children_to_string(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+    ) -> String {
+        self.serialize_children_to_string(tree, node, None, InState::IndentPre)
+    }
+
+    /// Serialize the children of a link to an owned string. Faithful to
+    /// `SerializerState::serializeLinkChildrenToString`.
+    pub fn serialize_link_children_to_string(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        wt_escaper: Option<WtEscapeHandler>,
+    ) -> String {
+        self.serialize_children_to_string(tree, node, wt_escaper, InState::Link)
+    }
+
+    /// Serialize the children of a caption to an owned string. Faithful to
+    /// `SerializerState::serializeCaptionChildrenToString`.
+    pub fn serialize_caption_children_to_string(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        wt_escaper: Option<WtEscapeHandler>,
+    ) -> String {
+        self.serialize_children_to_string(tree, node, wt_escaper, InState::Caption)
     }
 
     /// Set the current/previous node tracking (`SerializerState::updateModificationFlags`).
