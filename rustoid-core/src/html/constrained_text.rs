@@ -11,6 +11,40 @@
 
 use crate::html::dom_tree::NodeId;
 
+/// The escape behavior of a [`ConstrainedText`] chunk, encoding which of PHP's
+/// `ConstrainedText` subclasses the chunk instantiates. The `RegExpConstrainedText`
+/// subclasses (`WikiLinkText`, `ExtLinkText`, `AutoURLLinkText`, `MagicLinkText`)
+/// add `<nowiki/>` prefixes/suffixes when the surrounding context would merge
+/// with the chunk to form a different token; the base `ConstrainedText`
+/// (`Plain`) adds none.
+#[derive(Debug, Clone)]
+pub enum ConstrainedTextKind {
+    /// Base `ConstrainedText` — no boundary escaping.
+    Plain,
+    /// `WikiLinkText` — `[[…]]` links, with optional link-prefix/trail guards.
+    WikiLink {
+        /// Match link trails greedily when present (consumes any link-prefix
+        /// characters of an adjacent wikilink).
+        greedy: bool,
+        /// Compile `<nowiki/>` when the left context matches the bad-prefix
+        /// (link-prefix characters immediately before the link).
+        bad_prefix: Option<regex::Regex>,
+        /// Compile `<nowiki/>` when the right context starts a link trail.
+        bad_suffix: Option<regex::Regex>,
+    },
+    /// `ExtLinkText` — `[http://…]` links (no boundary escaping).
+    ExtLink,
+    /// `AutoURLLinkText` — bare `http://…` autolinks, with a word-boundary
+    /// prefix guard and a trailing-punctuation suffix guard.
+    AutoUrl { bad_prefix: regex::Regex },
+    /// `MagicLinkText` — `RFC`/`ISBN`/`PMID` magic links, with `\w` guards on
+    /// both sides.
+    MagicLink {
+        bad_prefix: regex::Regex,
+        bad_suffix: regex::Regex,
+    },
+}
+
 /// Result of escaping a single chunk: the (possibly escaped) text plus optional
 /// prefix/suffix strings. Mirrors PHP's `ConstrainedText\Result`.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +102,8 @@ pub struct ConstrainedText {
     pub node: NodeId,
     pub prefix: Option<String>,
     pub suffix: Option<String>,
+    /// The subclass that determines this chunk's `escape()` behavior.
+    pub kind: ConstrainedTextKind,
     /// Whether this chunk came from selective serialization (selser).
     pub selser: bool,
     /// Suppress separator emission before this chunk.
@@ -86,6 +122,7 @@ impl ConstrainedText {
             node,
             prefix,
             suffix,
+            kind: ConstrainedTextKind::Plain,
             selser: false,
             no_sep: false,
         }
@@ -97,13 +134,144 @@ impl ConstrainedText {
         Self::new(text, node, None, None)
     }
 
-    /// Determine the escape prefix/suffix for this chunk given the line context.
-    /// The base implementation applies no escaping. Mirrors `escape`.
-    pub fn escape(&self, _state: &State) -> Result {
-        Result::new(self.text.clone(), self.prefix.clone(), self.suffix.clone())
+    // ------------------------------------------------------------------
+    // Concrete `ConstrainedText` subclasses (the terminal link emitters).
+    // ------------------------------------------------------------------
+
+    /// `WikiLinkText` — an `[[…]]` link. `greedy` is true when the link trail
+    /// should be matched greedily. Faithful to `WikiLinkText::__construct`.
+    pub fn wiki_link(
+        text: impl Into<String>,
+        node: NodeId,
+        greedy: bool,
+        bad_prefix: Option<regex::Regex>,
+        bad_suffix: Option<regex::Regex>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            node,
+            prefix: None,
+            suffix: None,
+            kind: ConstrainedTextKind::WikiLink {
+                greedy,
+                bad_prefix,
+                bad_suffix,
+            },
+            selser: false,
+            no_sep: false,
+        }
     }
 
-    /// Simple equality (base-class text equality). Mirrors `equals`.
+    /// `ExtLinkText` — an `[http://…]` link (no boundary escaping).
+    pub fn ext_link(text: impl Into<String>, node: NodeId) -> Self {
+        Self {
+            text: text.into(),
+            node,
+            prefix: None,
+            suffix: None,
+            kind: ConstrainedTextKind::ExtLink,
+            selser: false,
+            no_sep: false,
+        }
+    }
+
+    /// `AutoURLLinkText` — a bare `http://…` autolink. The trailing-punctuation
+    /// suffix guard is computed from the URL (an open paren changes the set that
+    /// would be absorbed into the autolink).
+    pub fn auto_url_link(text: impl Into<String>, node: NodeId) -> Self {
+        Self {
+            text: text.into(),
+            node,
+            prefix: None,
+            suffix: None,
+            kind: ConstrainedTextKind::AutoUrl {
+                bad_prefix: regex::Regex::new(r"\w$").unwrap(),
+            },
+            selser: false,
+            no_sep: false,
+        }
+    }
+
+    /// `MagicLinkText` — an `RFC`/`ISBN`/`PMID` magic link.
+    pub fn magic_link(text: impl Into<String>, node: NodeId) -> Self {
+        Self {
+            text: text.into(),
+            node,
+            prefix: None,
+            suffix: None,
+            kind: ConstrainedTextKind::MagicLink {
+                bad_prefix: regex::Regex::new(r"\w$").unwrap(),
+                bad_suffix: regex::Regex::new(r"^\w").unwrap(),
+            },
+            selser: false,
+            no_sep: false,
+        }
+    }
+
+    /// Determine the escape prefix/suffix for this chunk given the line context.
+    /// Faithful to the `ConstrainedText::escape` override of each subclass.
+    pub fn escape(&self, state: &State) -> Result {
+        let mut result = Result::new(self.text.clone(), self.prefix.clone(), self.suffix.clone());
+        match &self.kind {
+            ConstrainedTextKind::Plain => {}
+            ConstrainedTextKind::ExtLink => {}
+            ConstrainedTextKind::WikiLink {
+                bad_prefix,
+                bad_suffix,
+                greedy,
+                ..
+            } => {
+                if let Some(re) = bad_prefix
+                    && re.is_match(&state.left_context)
+                {
+                    result.prefix = Some("<nowiki/>".to_string());
+                }
+                if let Some(re) = bad_suffix
+                    && re.is_match(&state.right_context)
+                {
+                    result.suffix = Some("<nowiki/>".to_string());
+                }
+                result.greedy = *greedy;
+            }
+            ConstrainedTextKind::AutoUrl { bad_prefix, .. } => {
+                // `RegExpConstrainedText::escape`: prefix guard on the left.
+                if bad_prefix.is_match(&state.left_context) {
+                    result.prefix = Some("<nowiki/>".to_string());
+                }
+                // Suffix guard is computed from the URL (paren presence) — see
+                // `AutoURLLinkText::badSuffix`; the trailing-punctuation set is
+                // tested against the right context below.
+                if auto_url_bad_suffix_matches(&self.text, &state.right_context) {
+                    result.suffix = Some("<nowiki/>".to_string());
+                }
+                // `escape()` special case: if the text ends with an incomplete
+                // entity and the right context completes it, protect the suffix.
+                if result.suffix.is_none()
+                    && regex::Regex::new(r"&[#0-9a-zA-Z]*$")
+                        .unwrap()
+                        .is_match(&result.text)
+                    && regex::Regex::new(r"^[#0-9a-zA-Z]*;")
+                        .unwrap()
+                        .is_match(&state.right_context)
+                {
+                    result.suffix = Some("<nowiki/>".to_string());
+                }
+            }
+            ConstrainedTextKind::MagicLink {
+                bad_prefix,
+                bad_suffix,
+            } => {
+                if bad_prefix.is_match(&state.left_context) {
+                    result.prefix = Some("<nowiki/>".to_string());
+                }
+                if bad_suffix.is_match(&state.right_context) {
+                    result.suffix = Some("<nowiki/>".to_string());
+                }
+            }
+        }
+        result
+    }
+
     pub fn equals(&self, other: &ConstrainedText) -> bool {
         self.text == other.text
     }
@@ -138,6 +306,88 @@ impl ConstrainedText {
         safe_left.push_str(&state.left_context);
         safe_left
     }
+}
+
+/// Whether the character is in the legacy parser's `EXT_LINK_URL_CLASS` — the
+/// set of characters that terminate a free external link. Faithful to
+/// `AutoURLLinkText::EXT_LINK_URL_CLASS` (negated `^` in the PHP source, so
+/// these are the chars that are *not* part of a link).
+fn is_ext_link_url_class(c: char) -> bool {
+    matches!(c, '[' | ']' | '<' | '>' | '"')
+        || matches!(c, '\u{00}'..='\u{20}' | '\u{7F}')
+        || matches!(
+            c,
+            '\u{00A0}' | '\u{1680}' | '\u{180E}' | '\u{2000}'
+                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+        )
+}
+
+/// Whether the character is in `TRAILING_PUNCT = ',;\\\\.:!?'` (the comma,
+/// semicolon, backslash, dot, colon, exclamation, question mark).
+fn is_trailing_punct(c: char) -> bool {
+    matches!(c, ',' | ';' | '\\' | '.' | ':' | '!' | '?')
+}
+
+/// Whether `ctx[i..]` begins with a `&lt;`/`&gt;`/`&nbsp;`/numeric form of those
+/// entities (the `NOT_LTGTNBSP` negative-lookahead assertion in the PHP regex).
+fn starts_with_protected_entity(ctx: &str) -> bool {
+    // `&(lt|gt|nbsp|#x0*(3[CcEe]|[Aa]0)|#0*(60|62|160));`
+    let rest = match ctx.strip_prefix('&') {
+        Some(r) => r,
+        None => return false,
+    };
+    let name = rest.split(';').next().unwrap_or(rest);
+    let lower = name.to_ascii_lowercase();
+    if lower == "lt" || lower == "gt" || lower == "nbsp" {
+        return true;
+    }
+    // Numeric forms: #x0*3[ce], #x0*a0, #0*60, #0*62, #0*160.
+    if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+        let hex = hex.trim_start_matches('0');
+        return matches!(hex.to_ascii_lowercase().as_str(), "3c" | "3e" | "a0");
+    }
+    if let Some(dec) = name.strip_prefix('#') {
+        let dec = dec.trim_start_matches('0');
+        return matches!(dec, "60" | "62" | "160");
+    }
+    false
+}
+
+/// Whether the right context requires a `<nowiki/>` suffix for an autolink,
+/// mirroring `AutoURLLinkText::escape`'s suffix guard. `url_has_paren` selects
+/// whether `)` is treated as trailing-punctuation (it is *not* when the URL
+/// contains an open paren).
+///
+/// The regex is anchored at the start of `right_context`:
+/// `^(?!&...;)(?!'')[tpun]*[urlclass tpun]`.
+fn auto_url_bad_suffix_matches(url: &str, right_context: &str) -> bool {
+    let bytes = right_context.as_bytes();
+    let mut i = 0;
+    // Negative-lookahead 1: no protected entity at position 0.
+    if starts_with_protected_entity(right_context) {
+        return false;
+    }
+    // Negative-lookahead 2: no `''` at position 0.
+    if right_context.starts_with("''") {
+        return false;
+    }
+    let url_has_paren = url.contains('(');
+    // Consume zero-or-more trailing punctuation (plus `)` when the URL has no
+    // open paren).
+    while i < bytes.len() {
+        let c = right_context[i..].chars().next().unwrap();
+        let is_trailing = is_trailing_punct(c) || (!url_has_paren && c == ')');
+        if !is_trailing {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    // One-or-more chars from URL-class ∪ trailing-punct (∪ `)` when no paren).
+    if i >= bytes.len() {
+        return false;
+    }
+    let c = right_context[i..].chars().next().unwrap();
+    is_ext_link_url_class(c) || is_trailing_punct(c) || (!url_has_paren && c == ')')
 }
 
 #[cfg(test)]
@@ -188,5 +438,62 @@ mod tests {
         a.prefix = Some("<nowiki>".to_string());
         let line = vec![a, ConstrainedText::cast("cd", 2)];
         assert_eq!(ConstrainedText::escape_line(&line), "<nowiki>abcd");
+    }
+
+    #[test]
+    fn test_wikilink_trail_suffix() {
+        // A wikilink followed by a word char (the enwiki link trail `[a-z]+`)
+        // needs a `<nowiki/>` suffix to prevent the word being absorbed.
+        let trail = Some(regex::Regex::new("[a-z]+").unwrap());
+        let link = ConstrainedText::wiki_link("[[Foo]]", 1, true, None, trail);
+        // Right context starting with a trail char.
+        let state = State {
+            left_context: "".to_string(),
+            right_context: "bar rest".to_string(),
+            pos: 0,
+        };
+        let r = link.escape(&state);
+        assert_eq!(r.suffix.as_deref(), Some("<nowiki/>"));
+        assert!(r.greedy);
+    }
+
+    #[test]
+    fn test_wikilink_plain_no_escape() {
+        // No trail regex (category/external/image link) → no suffix.
+        let link = ConstrainedText::wiki_link("[[Foo]]", 1, false, None, None);
+        let state = State {
+            left_context: "".to_string(),
+            right_context: "bar".to_string(),
+            pos: 0,
+        };
+        let r = link.escape(&state);
+        assert_eq!(r.suffix, None);
+    }
+
+    #[test]
+    fn test_auto_url_prefix_word_boundary() {
+        // An autolink preceded by a word char needs a `<nowiki/>` prefix (the
+        // `\w$` bad-prefix guard).
+        let link = ConstrainedText::auto_url_link("https://example.com", 1);
+        let state = State {
+            left_context: "see".to_string(),
+            right_context: "".to_string(),
+            pos: 0,
+        };
+        let r = link.escape(&state);
+        assert_eq!(r.prefix.as_deref(), Some("<nowiki/>"));
+    }
+
+    #[test]
+    fn test_magic_link_both_guards() {
+        let link = ConstrainedText::magic_link("RFC 1234", 1);
+        let state = State {
+            left_context: "x".to_string(),
+            right_context: "y".to_string(),
+            pos: 0,
+        };
+        let r = link.escape(&state);
+        assert_eq!(r.prefix.as_deref(), Some("<nowiki/>"));
+        assert_eq!(r.suffix.as_deref(), Some("<nowiki/>"));
     }
 }

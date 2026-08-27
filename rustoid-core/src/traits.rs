@@ -224,6 +224,20 @@ pub trait SiteConfig: Send + Sync {
             .iter()
             .any(|t| t.to_ascii_lowercase() == lower)
     }
+
+    /// The link-trail regular expression (body, without delimiters/flags) for
+    /// this wiki, e.g. enwiki's `[a-z]+`. Mirrors PHP's `SiteConfig::linkTrailRegex`.
+    /// Returns `None` for wikis with no link trail.
+    fn link_trail_regex(&self) -> Option<&'static str> {
+        Some("[a-z]+")
+    }
+
+    /// The link-prefix regular expression (body, without delimiters/flags) for
+    /// languages with link prefixes (e.g. Hebrew, Arabic). Mirrors PHP's
+    /// `SiteConfig::linkPrefixRegex`. Returns `None` for wikis without a link prefix.
+    fn link_prefix_regex(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Information about a namespace.
