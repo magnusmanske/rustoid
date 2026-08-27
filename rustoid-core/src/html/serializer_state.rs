@@ -81,6 +81,12 @@ pub struct SerializerState {
     /// Should the wikitext escaping code run on the next emitted chunk?
     pub needs_escaping: bool,
 
+    /// Whether the node whose chunk is about to be emitted is the last child of
+    /// its parent (used by the trailing-`=` heading-escape heuristic). Set by
+    /// `serialize_node` alongside `needs_escaping`; mirrors PHP computing
+    /// `nextNonDeletedSibling($node) === null` inside `emitChunk`.
+    pub is_last_child: bool,
+
     /// Fast path for special protected characters (from LanguageVariantHandler).
     pub protect: Option<String>,
 
@@ -138,6 +144,7 @@ impl SerializerState {
             prev_node_unmodified: false,
             curr_node_unmodified: false,
             needs_escaping: false,
+            is_last_child: false,
             protect: None,
             curr_node: None,
             prev_node: None,
@@ -242,6 +249,17 @@ impl SerializerState {
         self.emit_sep_for_node(node);
         if self.single_line_context.enforced() {
             text = text.replace('\n', " ");
+        }
+        // Escape the chunk if requested (only text nodes set `needs_escaping`).
+        // Faithful to `SerializerState::emitChunk` calling
+        // `$this->serializer->escapeWikitext(..., 'isLastChild' => ...)`.
+        if self.needs_escaping {
+            let opts = crate::html::wikitext_escape_handlers::EscapeOpts {
+                is_last_child: self.is_last_child,
+                in_multiline_mode: false,
+            };
+            text = crate::html::wikitext_escape_handlers::escape_wikitext(self, &text, opts);
+            self.needs_escaping = false;
         }
         self.push_to_curr_line(ConstrainedText::cast(text, node));
         // After emitting content, we are no longer at start-of-line.

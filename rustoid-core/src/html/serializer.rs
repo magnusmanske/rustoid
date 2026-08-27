@@ -46,6 +46,8 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
                 state.append_sep(text);
             } else {
                 state.needs_escaping = true;
+                state.is_last_child =
+                    crate::html::dom_tree::next_non_deleted_sibling(tree, node).is_none();
                 state.emit_chunk(text.clone(), node);
                 state.needs_escaping = false;
             }
@@ -254,5 +256,31 @@ mod tests {
 
         let wt = WikitextSerializer::serialize_dom(doc);
         assert_eq!(wt, "a\n\nb");
+    }
+
+    #[test]
+    fn test_serialize_dom_escapes_sol_markup() {
+        // A text node whose first char is SOL-sensitive (`*`) must be protected
+        // so it serializes back to the same literal text rather than a list.
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("*foo"));
+        doc.push_child(p);
+
+        let wt = WikitextSerializer::serialize_dom(doc);
+        assert_eq!(wt, "<nowiki/>*foo");
+    }
+
+    #[test]
+    fn test_serialize_dom_escapes_transclusion() {
+        // `{{foo}}` serializes as text, so it must be nowiki-protected to avoid
+        // re-parsing as a template transclusion.
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("{{foo}}"));
+        doc.push_child(p);
+
+        let wt = WikitextSerializer::serialize_dom(doc);
+        assert_eq!(wt, "<nowiki>{{foo}}</nowiki>");
     }
 }
