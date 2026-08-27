@@ -13,8 +13,8 @@ use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::handlers::{
     BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler, HRHandler,
-    HeadingHandler, JustChildrenHandler, LIHandler, ListHandler, PHandler, PreHandler,
-    QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
+    HTMLPreHandler, HeadingHandler, JustChildrenHandler, LIHandler, ListHandler, PHandler,
+    PreHandler, QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
 };
 use crate::html::wts_utils;
 
@@ -108,7 +108,7 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
 
     // DocumentFragment → BodyHandler (our Document root is handled the same way).
     if dom_utils::node_name(tree.node(node)).is_empty() {
-        return Box::new(DefaultDomHandler);
+        return Box::new(BodyHandler);
     }
 
     // First encapsulation wrapper → EncapsulatedContentHandler.
@@ -173,7 +173,27 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::Th) => Box::new(THHandler),
         Some(HandlerKind::Span) => Box::new(SpanHandler),
         Some(HandlerKind::Pre) => Box::new(PreHandler),
-        _ => Box::new(DefaultDomHandler),
+        Some(HandlerKind::PreHtml) => Box::new(HTMLPreHandler),
+        // Not yet ported: these concretely map to specialized handlers in PHP
+        // (`AHandler`/`LinkHandler` → linkHandler, `FigureHandler`/`ImgHandler`/
+        // `MediaHandler` → LinkHandlerUtils, `MetaHandler`). Until their
+        // `LinkHandlerUtils`/annotation/SiteConfig dependencies land, serialize
+        // literally so round-trips do not silently drop the element.
+        Some(
+            HandlerKind::A
+            | HandlerKind::Link
+            | HandlerKind::Figure
+            | HandlerKind::Img
+            | HandlerKind::Media
+            | HandlerKind::Meta,
+        ) => Box::new(FallbackHTMLHandler),
+        // No specialized/plain handler → literal HTML serialization (faithful to
+        // PHP's `?: new FallbackHTMLHandler()` final fallback). `FallbackHTML` is
+        // the tag→handler map's "no specialized handler" sentinel; `Heading(_)`
+        // covers the out-of-range levels the tag map never produces.
+        None | Some(HandlerKind::FallbackHTML) | Some(HandlerKind::Heading(_)) => {
+            Box::new(FallbackHTMLHandler)
+        }
     }
 }
 

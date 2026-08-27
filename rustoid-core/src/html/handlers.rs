@@ -1451,6 +1451,49 @@ impl DomHandler for PreHandler {
     }
 }
 
+/// `HTMLPreHandler` — serialize an HTML-syntax `<pre>` literally. Faithful to
+/// `DOMHandlers/HTMLPreHandler.php` (delegates to `FallbackHTMLHandler`).
+pub struct HTMLPreHandler;
+
+impl DomHandler for HTMLPreHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        // Delegate to the literal-HTML fallback.
+        FallbackHTMLHandler.handle(tree, node, state);
+        tree.next_sibling(node)
+    }
+
+    fn first_child(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        Some(Constraints {
+            min: None,
+            max: Some(usize::MAX),
+        })
+    }
+
+    fn last_child(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        Some(Constraints {
+            min: None,
+            max: Some(usize::MAX),
+        })
+    }
+}
+
 /// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
 /// is not a Parsoid bookkeeping attribute. Approximate stub.
 fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {
@@ -1618,5 +1661,27 @@ mod tests {
         // separator source.
         assert_eq!(state.out, "");
         assert_eq!(state.separator.src.as_deref(), Some("\n"));
+    }
+
+    #[test]
+    fn test_html_pre_handler_serializes_literally() {
+        let mut doc = Node::document();
+        let mut pre = Node::element(ElementKind::Preformatted);
+        // Mark it as HTML-syntax (`stx: "html"`) so it takes the HTML-pre path.
+        pre.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            stx: Some("html".to_string()),
+            ..Default::default()
+        });
+        pre.push_child(Node::text("foo"));
+        doc.push_child(pre);
+
+        let tree = DomTree::new(doc);
+        let pre_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = HTMLPreHandler;
+        handler.handle(&tree, pre_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, "<pre>foo</pre>");
     }
 }
