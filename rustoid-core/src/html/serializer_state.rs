@@ -287,6 +287,60 @@ impl SerializerState {
         crate::html::serializer::walk_children(tree, node, self);
     }
 
+    /// Serialize the children of `node` to an owned string in indent-pre
+    /// context. Faithful to `SerializerState::serializeIndentPreChildrenToString`:
+    /// a sub-serialization that captures the child output, runs with
+    /// `inIndentPre = true` and `onSOL = false`, then restores the surrounding
+    /// state. (The full `serializeChildrenToString` save/restore is factored
+    /// here only for the indent-pre field; the other `in*` contexts are added
+    /// as their handlers land.)
+    pub fn serialize_indent_pre_children_to_string(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+    ) -> String {
+        // Save the portions of state the sub-serialization will mutate.
+        let old_sep = std::mem::take(&mut self.separator);
+        let old_sol = self.on_sol;
+        let old_out = std::mem::take(&mut self.out);
+        let old_start = self.at_start_of_output;
+        let old_curr_line = std::mem::take(&mut self.curr_line);
+        let old_indent_pre = self.in_indent_pre;
+        let old_slc = std::mem::take(&mut self.single_line_context);
+        let old_prev_unmod = self.prev_node_unmodified;
+        let old_curr_unmod = self.curr_node_unmodified;
+        let old_prev_node = self.prev_node;
+
+        self.out = String::new();
+        self.reset_sep();
+        self.on_sol = false;
+        self.at_start_of_output = false;
+        self.in_indent_pre = true;
+        self.single_line_context.disable();
+        self.reset_curr_line(None);
+
+        // Serialize the children and flush the buffered line into `out`.
+        self.update_sep(node);
+        self.serialize_children(tree, node);
+        self.flush_line();
+
+        let bits = std::mem::take(&mut self.out);
+
+        // Restore the surrounding state.
+        self.out = old_out;
+        self.separator = old_sep;
+        self.on_sol = old_sol;
+        self.at_start_of_output = old_start;
+        self.curr_line = old_curr_line;
+        self.in_indent_pre = old_indent_pre;
+        self.single_line_context = old_slc;
+        self.prev_node_unmodified = old_prev_unmod;
+        self.curr_node_unmodified = old_curr_unmod;
+        self.prev_node = old_prev_node;
+
+        bits
+    }
+
     /// Set the current/previous node tracking (`SerializerState::updateModificationFlags`).
     pub fn update_modification_flags(&mut self, node: NodeId) {
         self.prev_node_unmodified = self.curr_node_unmodified;

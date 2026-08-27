@@ -13,8 +13,8 @@ use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::handlers::{
     BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler, HRHandler,
-    HeadingHandler, JustChildrenHandler, LIHandler, ListHandler, PHandler, QuoteHandler,
-    SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
+    HeadingHandler, JustChildrenHandler, LIHandler, ListHandler, PHandler, PreHandler,
+    QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
 };
 use crate::html::wts_utils;
 
@@ -172,6 +172,7 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::Td) => Box::new(TDHandler),
         Some(HandlerKind::Th) => Box::new(THHandler),
         Some(HandlerKind::Span) => Box::new(SpanHandler),
+        Some(HandlerKind::Pre) => Box::new(PreHandler),
         _ => Box::new(DefaultDomHandler),
     }
 }

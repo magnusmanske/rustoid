@@ -1209,6 +1209,248 @@ impl DomHandler for SpanHandler {
     }
 }
 
+/// `PreHandler` — serialize an indent-`<pre>` block. Faithful to
+/// `DOMHandlers/PreHandler.php`.
+pub struct PreHandler;
+
+/// Match a wikitext comment at `text[i..]`: `<!--` … `-->` (first closing).
+/// Returns the end index (past `-->`) when `text[i..]` begins with a comment.
+/// Mirrors PHP's `COMMENT_REGEXP = /<!--(?>[\s\S]*?-->)/`.
+fn match_comment_at(text: &str, i: usize) -> Option<usize> {
+    let rest = &text[i..];
+    if !rest.starts_with("<!--") {
+        return None;
+    }
+    // Non-greedy: the first `-->` terminates the comment.
+    let end = rest[4..].find("-->")?;
+    Some(i + 4 + end + 3)
+}
+
+/// Insert a leading space, then a space after each newline (and after any
+/// comments that immediately follow it), as required to re-indent a `<pre>`:
+/// PHP `' ' . preg_replace( $solRE, '$1 ', $content )` where
+/// `$solRE = '/(\n(' . COMMENT_REGEXP . ')*)/'`.
+fn indent_pre_insert(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len() + 1);
+    // Leading space (always, mirroring the `' ' .` prefix).
+    out.push(' ');
+    let mut i = 0;
+    while i < bytes.len() {
+        if content[i..].starts_with('\n') {
+            out.push('\n');
+            i += 1;
+            // Consume zero-or-more comments immediately following the newline.
+            let mut j = i;
+            while let Some(end) = match_comment_at(content, j) {
+                out.push_str(&content[j..end]);
+                j = end;
+            }
+            // Emit the rest-of-line up to the next newline, then the inserted
+            // space (the `$1` group is `\n(comment)*`, so the space is appended
+            // after the comments).
+            let line_end = content[j..]
+                .find('\n')
+                .map(|r| j + r)
+                .unwrap_or(content.len());
+            out.push_str(&content[j..line_end]);
+            out.push(' ');
+            i = line_end;
+        } else {
+            // Copy up to the next newline verbatim (first line has no match).
+            let line_end = content[i..]
+                .find('\n')
+                .map(|r| i + r)
+                .unwrap_or(content.len());
+            out.push_str(&content[i..line_end]);
+            i = line_end;
+        }
+    }
+    out
+}
+
+/// Remove the inserted indentation on comment-only "empty" lines, faithful to
+/// PHP's `$emptyLinesRE = '/(^|\n) ((?:[ \t]*comment[ \t]*)+)(?=\n|$)/D'`
+/// replaced once (`preg_replace(..., '$1$2', $content, 1)`).
+fn indent_pre_strip_empty(content: &str) -> String {
+    // Scan for `(^|\n) ` (the inserted space), then one-or-more runs of
+    // `[ \t]*comment[ \t]*`, up to `\n` or end-of-string.
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    let mut replaced = false;
+    while i < bytes.len() {
+        // Anchor: start-of-string or a `\n`.
+        let at_start = i == 0;
+        let at_nl = content[i..].starts_with('\n');
+        let space_pos = if at_start {
+            0
+        } else if at_nl {
+            i + 1
+        } else {
+            // No anchor here: copy one char and advance.
+            let c = content[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        };
+
+        // Need the inserted `' '` right after the anchor.
+        if !replaced && space_pos < content.len() && content[space_pos..].starts_with(' ') {
+            // Match `(?:[ \t]*comment[ \t]*)+` greedily and ensure it ends at
+            // `\n` or end-of-string.
+            let mut j = space_pos + 1;
+            let mut matched_any = false;
+            loop {
+                let mut k = j;
+                while k < content.len()
+                    && matches!(content[k..].chars().next().unwrap(), ' ' | '\t')
+                {
+                    let c = content[k..].chars().next().unwrap();
+                    k += c.len_utf8();
+                }
+                match match_comment_at(content, k) {
+                    Some(end) => {
+                        k = end;
+                        while k < content.len()
+                            && matches!(content[k..].chars().next().unwrap(), ' ' | '\t')
+                        {
+                            let c = content[k..].chars().next().unwrap();
+                            k += c.len_utf8();
+                        }
+                        matched_any = true;
+                        j = k;
+                    }
+                    None => break,
+                }
+            }
+            let end_ok = j == content.len() || content[j..].starts_with('\n');
+            if matched_any && end_ok {
+                // Drop the inserted space: emit anchor + the comment run.
+                if at_nl {
+                    out.push('\n');
+                }
+                out.push_str(&content[space_pos + 1..j]);
+                replaced = true;
+                i = j;
+                continue;
+            }
+        }
+
+        // No match: copy the anchor/space and continue.
+        if at_nl {
+            out.push('\n');
+            i += 1;
+        } else {
+            let c = content[space_pos..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+impl DomHandler for PreHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        // Serialize the children in indent-pre context, then re-indent.
+        let content = state.serialize_indent_pre_children_to_string(tree, node);
+
+        // Strip (only the) trailing newline.
+        let (body, trailing_nl) = match content.strip_suffix('\n') {
+            Some(body) => (body.to_string(), "\n"),
+            None => (content, ""),
+        };
+
+        // Insert indentation, then strip it on empty/comment-only lines.
+        let content = indent_pre_strip_empty(&indent_pre_insert(&body));
+
+        state.emit_chunk(content, node);
+
+        // Preserve the stripped trailing newline as separator source.
+        if !trailing_nl.is_empty() {
+            state.append_sep(trailing_nl);
+        }
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        _node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let other_name = dom_utils::node_name(tree.node(other));
+        let other_stx_is_non_html = tree
+            .node(other)
+            .dp
+            .as_ref()
+            .is_none_or(|dp| dp.stx.as_deref() != Some("html"));
+        if other_name == "pre" && other_stx_is_non_html {
+            Some(Constraints {
+                min: Some(2),
+                max: None,
+            })
+        } else {
+            Some(Constraints {
+                min: Some(1),
+                max: None,
+            })
+        }
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        _node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let other_name = dom_utils::node_name(tree.node(other));
+        let other_stx_is_non_html = tree
+            .node(other)
+            .dp
+            .as_ref()
+            .is_none_or(|dp| dp.stx.as_deref() != Some("html"));
+        if other_name == "pre" && other_stx_is_non_html {
+            Some(Constraints {
+                min: Some(2),
+                max: None,
+            })
+        } else {
+            Some(Constraints {
+                min: Some(1),
+                max: None,
+            })
+        }
+    }
+
+    fn first_child(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        None
+    }
+
+    fn last_child(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        None
+    }
+}
+
 /// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
 /// is not a Parsoid bookkeeping attribute. Approximate stub.
 fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {
@@ -1334,5 +1576,47 @@ mod tests {
         handler.handle(&tree, h2_id, &mut state);
         state.flush_line();
         assert_eq!(state.out, "==foo==");
+    }
+
+    #[test]
+    fn test_indent_pre_insert() {
+        assert_eq!(indent_pre_insert("foo\nbar"), " foo\nbar ");
+        assert_eq!(indent_pre_insert("foo"), " foo");
+    }
+
+    #[test]
+    fn test_pre_handler() {
+        let mut doc = Node::document();
+        let mut pre = Node::element(ElementKind::Preformatted);
+        pre.push_child(Node::text("foo\nbar"));
+        doc.push_child(pre);
+
+        let tree = DomTree::new(doc);
+        let pre_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = PreHandler;
+        handler.handle(&tree, pre_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, " foo\nbar ");
+    }
+
+    #[test]
+    fn test_pre_handler_trailing_newline_preserved() {
+        let mut doc = Node::document();
+        let mut pre = Node::element(ElementKind::Preformatted);
+        pre.push_child(Node::text("foo\n"));
+        doc.push_child(pre);
+
+        let tree = DomTree::new(doc);
+        let pre_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = PreHandler;
+        handler.handle(&tree, pre_id, &mut state);
+        // Trailing newline is stripped from the content and moved to the
+        // separator source.
+        assert_eq!(state.out, "");
+        assert_eq!(state.separator.src.as_deref(), Some("\n"));
     }
 }
