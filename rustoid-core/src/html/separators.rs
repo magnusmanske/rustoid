@@ -10,6 +10,7 @@
 //! associated functions taking `&mut SerializerState`. This flattens the PHP
 //! class/state split while preserving the exact data flow and logic.
 
+use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::serializer_state::SerializerState;
 
@@ -138,6 +139,88 @@ impl Separators {
         _constraints: &Constraints,
     ) -> String {
         sep.to_string()
+    }
+
+    /// Merge two newline-constraint sets (`Separators::getSepNlConstraints`).
+    /// Resolves min/max conflicts (nodeB wins on conflict), defaulting max to 2.
+    pub fn get_sep_nl_constraints(a: Option<&Constraints>, b: Option<&Constraints>) -> Constraints {
+        let mut nl = Constraints {
+            min: a.and_then(|c| c.min),
+            max: a.and_then(|c| c.max),
+        };
+
+        if let Some(b) = b {
+            if let Some(b_min) = b.min {
+                if let Some(cur_max) = nl.max {
+                    if cur_max < b_min {
+                        // Conflict: nodeB wins.
+                        nl.min = Some(b_min);
+                        nl.max = Some(b_min);
+                    } else {
+                        nl.min = Some(nl.min.unwrap_or(0).max(b_min));
+                    }
+                } else {
+                    nl.min = Some(nl.min.unwrap_or(0).max(b_min));
+                }
+            }
+            if let Some(b_max) = b.max {
+                if nl.min.unwrap_or(0) > b_max {
+                    // Conflict: nodeB wins.
+                    nl.min = Some(b_max);
+                    nl.max = Some(b_max);
+                } else {
+                    nl.max = Some(nl.max.unwrap_or(b_max).min(b_max));
+                }
+            }
+        }
+
+        if nl.max.is_none() {
+            nl.max = Some(2);
+        }
+        if nl.min.unwrap_or(0) > nl.max.unwrap() {
+            nl.max = nl.min;
+        }
+        nl
+    }
+
+    /// Figure out the separator constraints between `node_a` and `node_b` and
+    /// merge them into `state.separator.constraints`. Faithful to
+    /// `Separators::updateSeparatorConstraints`.
+    pub fn update_separator_constraints(
+        state: &mut SerializerState,
+        tree: &DomTree,
+        node_a: NodeId,
+        handler_a: &mut dyn DomHandler,
+        node_b: NodeId,
+        handler_b: &mut dyn DomHandler,
+    ) {
+        let (a_cons, b_cons) = if tree.parent(node_b) == Some(node_a) {
+            // parent-child: nodeA is parent of nodeB.
+            let a = handler_a.first_child(tree, node_a, node_b, state);
+            let b = handler_b.before(tree, node_b, node_a, state);
+            (a, b)
+        } else if tree.parent(node_a) == Some(node_b) {
+            // child-parent: nodeB is parent of nodeA.
+            let a = handler_a.after(tree, node_a, node_b, state);
+            let b = handler_b.last_child(tree, node_b, node_a, state);
+            (a, b)
+        } else {
+            // sibling.
+            let a = handler_a.after(tree, node_a, node_b, state);
+            let b = handler_b.before(tree, node_b, node_a, state);
+            (a, b)
+        };
+
+        let nl = Self::get_sep_nl_constraints(a_cons.as_ref(), b_cons.as_ref());
+        match &mut state.separator.constraints {
+            Some(existing) => {
+                let merged = Self::merge_constraints(Some(existing), &nl);
+                *existing = merged;
+            }
+            None => {
+                state.separator.constraints = Some(nl);
+            }
+        }
     }
 }
 

@@ -81,6 +81,23 @@ impl WikitextSerializer {
         let name = crate::html::wts_utils::node_name(node);
         format!("</{name}>")
     }
+
+    /// Serialize an owned DOM (`Node`) tree to wikitext, using the handler
+    /// dispatch and the `SerializerState` walk. Faithful skeleton of
+    /// `WikitextSerializer::serializeDOM` (no `DOMNormalizer`, no selser).
+    pub fn serialize_dom(root: crate::dom::node::Node) -> String {
+        let tree = DomTree::new(root);
+        let root_id = tree.root();
+        let mut state = SerializerState::new();
+        // Serialize all top-level children (the Document root's children).
+        crate::html::serializer::walk_children(&tree, root_id, &mut state);
+        state.flush_line();
+        if let Some(redirect) = state.redirect_text.clone() {
+            format!("{redirect}\\n{}", state.out)
+        } else {
+            state.out
+        }
+    }
 }
 
 /// Serialize an element's attributes to an HTML attribute string. This is a
@@ -150,5 +167,36 @@ mod tests {
         assert_eq!(state.curr_line.text, "hi");
         state.flush_line();
         assert_eq!(state.out, "hi");
+    }
+
+    #[test]
+    fn test_serialize_dom_heading() {
+        let mut doc = Node::document();
+        let mut h2 = Node::element(ElementKind::Heading(2));
+        h2.push_child(Node::text("foo"));
+        h2.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(7),
+                open_width: Some(2),
+                close_width: Some(2),
+            }),
+            ..Default::default()
+        });
+        doc.push_child(h2);
+
+        let wt = WikitextSerializer::serialize_dom(doc);
+        assert_eq!(wt, "==foo==");
+    }
+
+    #[test]
+    fn test_serialize_dom_italic() {
+        let mut doc = Node::document();
+        let mut i = Node::element(ElementKind::Italic);
+        i.push_child(Node::text("foo"));
+        doc.push_child(i);
+
+        let wt = WikitextSerializer::serialize_dom(doc);
+        assert_eq!(wt, "''foo''");
     }
 }
