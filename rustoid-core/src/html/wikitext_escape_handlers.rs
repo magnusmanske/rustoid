@@ -23,6 +23,9 @@ use crate::html::serializer_state::SerializerState;
 /// (`['node' => Node, 'inMultilineMode' => ?bool, 'isLastChild' => ?bool]`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EscapeOpts {
+    /// The text node being escaped (`$opts['node']`), used by the per-handler
+    /// predicates (`liHandler`/`tdHandler`/`thHandler`) to navigate.
+    pub node: Option<crate::html::dom_tree::NodeId>,
     /// Are we the last child of our parent (affects trailing-`=` protection)?
     pub is_last_child: bool,
     /// Are we recursing inside the multi-line mode split?
@@ -167,7 +170,12 @@ fn has_tildes(text: &str) -> bool {
 /// fast-path cases; the token-walk (`has_wikitext_tokens` /
 /// `text_can_parse_as_link`) is approximated by a conservative character-class
 /// check (over-escaping, never under-escaping).
-pub fn escape_wikitext(state: &SerializerState, text: &str, opts: EscapeOpts) -> String {
+pub fn escape_wikitext(
+    state: &SerializerState,
+    tree: &crate::html::dom_tree::DomTree,
+    text: &str,
+    opts: EscapeOpts,
+) -> String {
     let sol = state.on_sol && !(state.in_indent_pre || state.in_php_block);
 
     // $hasMagicWord / $hasAutolink force a full token-walk check.
@@ -206,6 +214,16 @@ pub fn escape_wikitext(state: &SerializerState, text: &str, opts: EscapeOpts) ->
         return text.to_string();
     }
 
+    // Context-specific escape handler: consult the top of the `wteHandlerStack`
+    // before the generic quote/markup tests. Faithful to PHP's
+    // `$wteHandler = lastItem($state->wteHandlerStack); if ($wteHandler(...)) {
+    //   return $this->escapedText($state, false, $text, true); }`.
+    if let Some(wte_handler) = state.wte_handler_stack.last()
+        && wte_handler(state, text, &opts, tree)
+    {
+        return escaped_text(state, false, text, true, false);
+    }
+
     // Quote-escape test.
     if text.contains("''") {
         if full_check_needed || indent_pre_unsafe || has_non_quote_escapable_chars {
@@ -235,6 +253,7 @@ pub fn escape_wikitext(state: &SerializerState, text: &str, opts: EscapeOpts) ->
                 // `sol` forced true (approximation of the state mutation).
                 out.push_str(&escape_wikitext_sol(
                     state,
+                    tree,
                     line,
                     EscapeOpts {
                         in_multiline_mode: true,
@@ -244,6 +263,7 @@ pub fn escape_wikitext(state: &SerializerState, text: &str, opts: EscapeOpts) ->
             } else {
                 out.push_str(&escape_wikitext(
                     state,
+                    tree,
                     line,
                     EscapeOpts {
                         in_multiline_mode: true,
@@ -314,13 +334,18 @@ pub fn escape_wikitext(state: &SerializerState, text: &str, opts: EscapeOpts) ->
 
 /// Internal helper: escape `text` as though we were at start-of-line (for the
 /// multi-line split recursion, which must set `onSOL = true` between lines).
-fn escape_wikitext_sol(state: &SerializerState, text: &str, opts: EscapeOpts) -> String {
+fn escape_wikitext_sol(
+    state: &SerializerState,
+    tree: &crate::html::dom_tree::DomTree,
+    text: &str,
+    opts: EscapeOpts,
+) -> String {
     // Approximate the PHP `$state->onSOL = true` reset between lines by using
     // the already-computed `sol` fast path. Since `escape_wikitext` derives
     // `sol` from `state.on_sol`, we need a variant that forces `sol = true`.
     // For correctness of the fast paths we reuse the same logic with `sol` set.
     // This is a minimal approximation; the token-walk dependency is unresolved.
-    escape_wikitext(state, text, opts)
+    escape_wikitext(state, tree, text, opts)
 }
 
 /// `escapedText` — wrap `orig_text` in `<nowiki>…</nowiki>` (or protect minimal
@@ -364,15 +389,19 @@ pub fn escaped_text(
 }
 
 /// `liHandler` — decide whether a `<li>`/`<dt>` text child needs escaping.
-/// Faithful port of the PHP predicate; returns the *decision* (not a string),
-/// matching how `escapeWikitext` uses the handler-delegate (a bool predicate).
+/// Faithful port of the PHP predicate; returns the *decision* (a bool, matching
+/// how `escapeWikitext` uses the handler-delegate). The text node under test is
+/// `opts.node`; `li_node` is the bound enclosing `<li>`/`<dt>`.
 pub fn li_handler(
     li_node: crate::html::dom_tree::NodeId,
     state: &SerializerState,
     text: &str,
+    opts: &EscapeOpts,
     tree: &crate::html::dom_tree::DomTree,
-    node: crate::html::dom_tree::NodeId,
 ) -> bool {
+    let Some(node) = opts.node else {
+        return false;
+    };
     // node.parentNode !== liNode → false
     if tree.parent(node) != Some(li_node) {
         return false;
@@ -403,6 +432,7 @@ pub fn li_handler(
 }
 
 /// `thHandler` — decide whether `<th>` content needs escaping (`!!`/`|`).
+/// Faithful to PHP (the `$thNode`/`$opts` are unused in the predicate).
 pub fn th_handler(state: &SerializerState, text: &str) -> bool {
     let line_is_heading = state.curr_line.text.trim_start().starts_with('!');
     if !line_is_heading {
@@ -414,19 +444,50 @@ pub fn th_handler(state: &SerializerState, text: &str) -> bool {
 }
 
 /// `tdHandler` — decide whether `<td>`/cell text needs escaping (pipe/dash/plus
-/// in SOL position). Approximated: the PHP version does a leftmost-path walk
-/// (`isFirstContentNode` + `isZeroWidthWikitextElt`), which is conservatively
-/// replaced by escaping a leading `|`, `-`, `+`, or `}` whenever the current
-/// line is exactly the open `|`.
-pub fn td_handler(state: &SerializerState, text: &str, _in_wide_td: bool) -> bool {
+/// in SOL position). The leftmost-path walk (`isFirstContentNode` +
+/// `isZeroWidthWikitextElt`) is conservatively approximated by escaping a
+/// leading `|`, `-`, `+`, or `}` whenever the current line is exactly the open
+/// `|` and the node is on the leftmost path (approximated as the direct child).
+pub fn td_handler(
+    td_node: crate::html::dom_tree::NodeId,
+    in_wide_td: bool,
+    state: &SerializerState,
+    text: &str,
+    opts: &EscapeOpts,
+    tree: &crate::html::dom_tree::DomTree,
+) -> bool {
+    let node = opts.node;
+    // PHP: `if (!$node || $state->currLine->firstNode === $tdNode)`.
+    let on_td_line = node.is_none() || state.curr_line.first_node == Some(td_node);
+    if !on_td_line {
+        return false;
+    }
     if text.contains('|') {
         return true;
     }
-    if state.curr_line.text == "|" {
-        return text
+    if !in_wide_td && state.curr_line.text == "|" {
+        let bullet = text
             .chars()
             .next()
             .is_some_and(|c| matches!(c, '-' | '+' | '}'));
+        if bullet && let Some(n) = node {
+            // Leftmost path from `n` up to `td_node`: every node must be a
+            // first content node and be zero-width wikitext (or `n` itself).
+            let mut cur = Some(n);
+            while let Some(c) = cur {
+                if c == td_node {
+                    return true;
+                }
+                let is_first =
+                    crate::html::dom_tree::previous_non_deleted_sibling(tree, c).is_none();
+                let is_zero_width =
+                    crate::html::wts_utils::is_zero_width_wikitext_elt(tree.node(c));
+                if !is_first || !(c == n || is_zero_width) {
+                    return false;
+                }
+                cur = tree.parent(c);
+            }
+        }
     }
     false
 }
@@ -453,6 +514,13 @@ pub fn a_handler(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::node::{ElementKind, Node};
+    use crate::html::dom_tree::DomTree;
+    use crate::html::serializer_state::WtEscapeHandler;
+
+    fn empty_tree() -> DomTree {
+        DomTree::new(Node::document())
+    }
 
     #[test]
     fn test_escaped_text_non_sol() {
@@ -484,8 +552,9 @@ mod tests {
     #[test]
     fn test_escape_wikitext_plain() {
         let st = SerializerState::new();
+        let tree = empty_tree();
         assert_eq!(
-            escape_wikitext(&st, "plain text", EscapeOpts::default()),
+            escape_wikitext(&st, &tree, "plain text", EscapeOpts::default()),
             "plain text"
         );
     }
@@ -494,8 +563,9 @@ mod tests {
     fn test_escape_wikitext_sol_markup() {
         let mut st = SerializerState::new();
         st.on_sol = true;
+        let tree = empty_tree();
         assert_eq!(
-            escape_wikitext(&st, "*foo", EscapeOpts::default()),
+            escape_wikitext(&st, &tree, "*foo", EscapeOpts::default()),
             "<nowiki/>*foo"
         );
     }
@@ -503,8 +573,9 @@ mod tests {
     #[test]
     fn test_escape_wikitext_transclusion() {
         let st = SerializerState::new();
+        let tree = empty_tree();
         assert_eq!(
-            escape_wikitext(&st, "{{foo}}", EscapeOpts::default()),
+            escape_wikitext(&st, &tree, "{{foo}}", EscapeOpts::default()),
             "<nowiki>{{foo}}</nowiki>"
         );
     }
@@ -533,6 +604,21 @@ mod tests {
     }
 
     #[test]
+    fn test_wte_handler_stack_consulted() {
+        // A context-specific handler that always requests escaping must be
+        // consulted once the text reaches the quote/markup path (here `a'b` has
+        // a quote char, so it skips the quick-skip fast path).
+        let mut st = SerializerState::new();
+        let tree = empty_tree();
+        let escaper: WtEscapeHandler = Box::new(|_state, _text, _opts, _tree| true);
+        st.wte_handler_stack.push(escaper);
+        assert_eq!(
+            escape_wikitext(&st, &tree, "a'b", EscapeOpts::default()),
+            "<nowiki>a'b</nowiki>"
+        );
+    }
+
+    #[test]
     fn test_delegates() {
         assert!(media_option_handler("a|b"));
         assert!(wikilink_handler("[[x]]"));
@@ -541,8 +627,24 @@ mod tests {
         let mut st2 = SerializerState::new();
         st2.curr_line.text = "!".to_string();
         assert!(th_handler(&st2, "a!!b"));
-        // tdHandler: pipe in text.
-        let st3 = SerializerState::new();
-        assert!(td_handler(&st3, "a|b", false));
+        // tdHandler: pipe in text (direct child of the td).
+        let mut doc = Node::document();
+        let td = Node::element(ElementKind::TableCell);
+        doc.push_child(td);
+        let tree = DomTree::new(doc);
+        let td_node = tree.first_child(tree.root()).unwrap();
+        let mut st3 = SerializerState::new();
+        st3.curr_line.first_node = Some(td_node);
+        assert!(td_handler(
+            td_node,
+            false,
+            &st3,
+            "a|b",
+            &EscapeOpts {
+                node: None,
+                ..EscapeOpts::default()
+            },
+            &tree,
+        ));
     }
 }

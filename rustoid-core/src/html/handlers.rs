@@ -12,7 +12,7 @@ use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::separators::Constraints;
-use crate::html::serializer_state::SerializerState;
+use crate::html::serializer_state::{SerializerState, WtEscapeHandler};
 
 /// `BodyHandler` — serializes children, ignoring the `<body>` wrapper.
 /// Faithful to `DOMHandlers/BodyHandler.php`.
@@ -109,18 +109,18 @@ impl DomHandler for QuoteHandler {
         state: &mut SerializerState,
     ) -> Option<NodeId> {
         if self.preceding_quote_elt_requires_escape(tree, node) {
-            state.emit_chunk("<nowiki/>", node);
+            state.emit_chunk("<nowiki/>", node, tree);
         }
-        state.emit_chunk(self.quotes.clone(), node);
+        state.emit_chunk(self.quotes.clone(), node, tree);
 
         if tree.first_child(node).is_some() {
             walk_children(tree, node, state);
         } else {
             // Empty nodes like <i></i> need a <nowiki/> placeholder.
-            state.emit_chunk("<nowiki/>", node);
+            state.emit_chunk("<nowiki/>", node, tree);
         }
 
-        state.emit_chunk(self.quotes.clone(), node);
+        state.emit_chunk(self.quotes.clone(), node, tree);
         tree.next_sibling(node)
     }
 }
@@ -142,7 +142,7 @@ impl DomHandler for HRHandler {
             .as_ref()
             .and_then(|d| d.extra_dashes)
             .unwrap_or(0);
-        state.emit_chunk("-".repeat(4 + extra), node);
+        state.emit_chunk("-".repeat(4 + extra), node, tree);
         tree.next_sibling(node)
     }
 
@@ -216,7 +216,7 @@ impl DomHandler for BRHandler {
             .parent(node)
             .is_some_and(|p| dom_utils::node_name(tree.node(p)) == "p");
         if state.single_line_context.enforced() || html_stx || !parent_is_p {
-            state.emit_chunk("<br />", node);
+            state.emit_chunk("<br />", node, tree);
         }
         tree.next_sibling(node)
     }
@@ -285,15 +285,15 @@ impl DomHandler for HeadingHandler {
         state: &mut SerializerState,
     ) -> Option<NodeId> {
         let space = self.get_leading_space(tree, node, " ");
-        state.emit_chunk(format!("{}{}", self.heading_wt, space), node);
+        state.emit_chunk(format!("{}{}", self.heading_wt, space), node, tree);
         state.single_line_context.enforce();
         if tree.first_child(node).is_some() {
             crate::html::serializer::walk_children(tree, node, state);
         } else {
-            state.emit_chunk("<nowiki/>", node);
+            state.emit_chunk("<nowiki/>", node, tree);
         }
         let space = self.get_trailing_space(tree, node, " ");
-        state.emit_chunk(format!("{}{}", space, self.heading_wt), node);
+        state.emit_chunk(format!("{}{}", space, self.heading_wt), node, tree);
         state.single_line_context.pop();
         tree.next_sibling(node)
     }
@@ -378,7 +378,7 @@ impl DomHandler for ListHandler {
         };
         if should_emit {
             let bullets = self.get_list_bullets(tree, node);
-            state.emit_chunk(bullets, node);
+            state.emit_chunk(bullets, node, tree);
         }
         crate::html::serializer::walk_children(tree, node, state);
         state.single_line_context.pop();
@@ -445,10 +445,15 @@ impl DomHandler for LIHandler {
             first_child_element.is_some_and(|c| dom_utils::is_literal_html_node(tree.node(c)));
         if !first_is_list || first_is_literal {
             let bullets = self.get_list_bullets(tree, node);
-            state.emit_chunk(bullets, node);
+            state.emit_chunk(bullets, node, tree);
         }
         state.single_line_context.enforce();
-        crate::html::serializer::walk_children(tree, node, state);
+        // Push a context-specific escaping handler for `<li>`/`<dt>` children,
+        // faithful to LIHandler's `$liHandler` closure.
+        let escaper: WtEscapeHandler = Box::new(move |state, text, opts, tree| {
+            crate::html::wikitext_escape_handlers::li_handler(node, state, text, opts, tree)
+        });
+        state.serialize_children_with_escaper(tree, node, escaper);
         state.single_line_context.pop();
         tree.next_sibling(node)
     }
@@ -641,7 +646,7 @@ impl DomHandler for DTHandler {
             first_child_element.is_some_and(|c| dom_utils::is_literal_html_node(tree.node(c)));
         if !first_is_list || first_is_literal {
             let bullets = self.get_list_bullets(tree, node);
-            state.emit_chunk(bullets, node);
+            state.emit_chunk(bullets, node, tree);
         }
         state.single_line_context.enforce();
         crate::html::serializer::walk_children(tree, node, state);
@@ -738,7 +743,7 @@ impl DomHandler for DDHandler {
         let first_is_literal =
             first_child_element.is_some_and(|c| dom_utils::is_literal_html_node(tree.node(c)));
         if !first_is_list || first_is_literal {
-            state.emit_chunk(chunk, node);
+            state.emit_chunk(chunk, node, tree);
         }
         state.single_line_context.enforce();
         crate::html::serializer::walk_children(tree, node, state);
@@ -816,7 +821,7 @@ impl DomHandler for CaptionHandler {
             .and_then(|d| d.start_tag_src.clone())
             .unwrap_or_else(|| "|+".to_string());
         let table_tag = self.serialize_table_tag(&symbol, None, tree, node);
-        state.emit_chunk(table_tag, node);
+        state.emit_chunk(table_tag, node, tree);
         crate::html::serializer::walk_children(tree, node, state);
         tree.next_sibling(node)
     }
@@ -881,7 +886,7 @@ impl DomHandler for TableHandler {
             state.single_line_context.disable();
         }
         let tag = self.serialize_table_tag(&wt, Some(""), tree, node);
-        state.emit_chunk(tag, node);
+        state.emit_chunk(tag, node, tree);
         if !dom_utils::is_literal_html_node(tree.node(node)) {
             state.wiki_table_nesting += 1;
         }
@@ -895,7 +900,7 @@ impl DomHandler for TableHandler {
             .as_ref()
             .and_then(|d| d.end_tag_src.clone())
             .unwrap_or_else(|| "|}".to_string());
-        state.emit_chunk(end_tag, node);
+        state.emit_chunk(end_tag, node, tree);
         if indent_table {
             state.single_line_context.pop();
         }
@@ -951,7 +956,7 @@ impl DomHandler for TRHandler {
                 .and_then(|d| d.start_tag_src.clone())
                 .unwrap_or_else(|| "|-".to_string());
             let tag = self.serialize_table_tag(&wt, Some(""), tree, node);
-            state.emit_chunk(tag, node);
+            state.emit_chunk(tag, node, tree);
         }
         crate::html::serializer::walk_children(tree, node, state);
         tree.next_sibling(node)
@@ -1029,8 +1034,13 @@ impl DomHandler for TDHandler {
         });
 
         let td_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
+        // `$inWideTD = (bool)preg_match('/\|\||^{{!}}({{!}}|\|)|^(\||{{!}}){{!}}/', $tdTag)`.
+        let in_wide_td = td_tag.contains("||")
+            || td_tag.starts_with("{{!}}{{!}}")
+            || td_tag.starts_with("{{!}}|")
+            || td_tag.starts_with("|{{!}}");
         let leading_space = self.get_leading_space(tree, node, "");
-        state.emit_chunk(format!("{td_tag}{leading_space}"), node);
+        state.emit_chunk(format!("{td_tag}{leading_space}"), node, tree);
 
         let next_td = crate::html::dom_tree::next_non_sep_sibling(tree, node);
         let next_uses_row_syntax = next_td.is_some_and(|n| {
@@ -1045,11 +1055,17 @@ impl DomHandler for TDHandler {
         if next_uses_row_syntax
             && crate::html::dom_tree::first_non_deleted_child(tree, node).is_none()
         {
-            state.emit_chunk(" ", node);
+            state.emit_chunk(" ", node, tree);
             return tree.next_sibling(node);
         }
 
-        crate::html::serializer::walk_children(tree, node, state);
+        // Push the `<td>` escaping handler (faithful to `$tdHandler` closure).
+        let escaper: WtEscapeHandler = Box::new(move |state, text, opts, tree| {
+            crate::html::wikitext_escape_handlers::td_handler(
+                node, in_wide_td, state, text, opts, tree,
+            )
+        });
+        state.serialize_children_with_escaper(tree, node, escaper);
         tree.next_sibling(node)
     }
 
@@ -1121,7 +1137,7 @@ impl DomHandler for THHandler {
 
         let th_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
         let leading_space = self.get_leading_space(tree, node, "");
-        state.emit_chunk(format!("{th_tag}{leading_space}"), node);
+        state.emit_chunk(format!("{th_tag}{leading_space}"), node, tree);
 
         let next_th = crate::html::dom_tree::next_non_sep_sibling(tree, node);
         let next_uses_row_syntax = next_th.is_some_and(|n| {
@@ -1135,11 +1151,15 @@ impl DomHandler for THHandler {
         if next_uses_row_syntax
             && crate::html::dom_tree::first_non_deleted_child(tree, node).is_none()
         {
-            state.emit_chunk(" ", node);
+            state.emit_chunk(" ", node, tree);
             return tree.next_sibling(node);
         }
 
-        crate::html::serializer::walk_children(tree, node, state);
+        // Push the `<th>` escaping handler (faithful to `$thHandler` closure).
+        let escaper: WtEscapeHandler = Box::new(move |state, text, _opts, _tree| {
+            crate::html::wikitext_escape_handlers::th_handler(state, text)
+        });
+        state.serialize_children_with_escaper(tree, node, escaper);
         tree.next_sibling(node)
     }
 
@@ -1200,11 +1220,11 @@ impl DomHandler for SpanHandler {
         // Fall back to plain HTML serialization for spans (the recognized
         // nowiki/entity/media/placeholder branches are deferred).
         let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(tree.node(node));
-        state.emit_chunk(tag, node);
+        state.emit_chunk(tag, node, tree);
         crate::html::serializer::walk_children(tree, node, state);
         let end_tag =
             crate::html::serializer::WikitextSerializer::serialize_html_end_tag(tree.node(node));
-        state.emit_chunk(end_tag, node);
+        state.emit_chunk(end_tag, node, tree);
         tree.next_sibling(node)
     }
 }
@@ -1369,7 +1389,7 @@ impl DomHandler for PreHandler {
         // Insert indentation, then strip it on empty/comment-only lines.
         let content = indent_pre_strip_empty(&indent_pre_insert(&body));
 
-        state.emit_chunk(content, node);
+        state.emit_chunk(content, node, tree);
 
         // Preserve the stripped trailing newline as separator source.
         if !trailing_nl.is_empty() {
@@ -1517,7 +1537,7 @@ impl DomHandler for FallbackHTMLHandler {
         state: &mut SerializerState,
     ) -> Option<NodeId> {
         let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(tree.node(node));
-        state.emit_chunk(tag, node);
+        state.emit_chunk(tag, node, tree);
 
         if tree.first_child(node).is_some() {
             let in_php_block = state.in_php_block;
@@ -1531,7 +1551,7 @@ impl DomHandler for FallbackHTMLHandler {
 
         let end_tag =
             crate::html::serializer::WikitextSerializer::serialize_html_end_tag(tree.node(node));
-        state.emit_chunk(end_tag, node);
+        state.emit_chunk(end_tag, node, tree);
         tree.next_sibling(node)
     }
 }

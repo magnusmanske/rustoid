@@ -48,7 +48,7 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
                 state.needs_escaping = true;
                 state.is_last_child =
                     crate::html::dom_tree::next_non_deleted_sibling(tree, node).is_none();
-                state.emit_chunk(text.clone(), node);
+                state.emit_chunk(text.clone(), node, tree);
                 state.needs_escaping = false;
             }
         }

@@ -16,9 +16,21 @@ use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::separators::SeparatorData;
 use crate::html::single_line_context::SingleLineContext;
 
-/// The `wikitext escaping handler` stack type: a per-node escaping callback.
-/// Mirrors `SerializerState::$wteHandlerStack` (a list of `?callable`).
-pub type WtEscapeHandler = Box<dyn Fn(&mut SerializerState, &str) -> String>;
+/// The `wikitext escaping handler` stack element: a context-specific escaping
+/// *predicate* (returns `true` when `text` must be escaped). Faithful to PHP's
+/// `SerializerState::$wteHandlerStack` of `?callable($state, $text, $opts): bool`.
+///
+/// The predicate captures the enclosing node (a `NodeId`) and receives, at call
+/// time, the `tree` and the text-node context (`opts.node`) so it can navigate
+/// exactly as the PHP closures do (via their bound `$liNode`/`$tdNode`/`$thNode`).
+pub type WtEscapeHandler = Box<
+    dyn Fn(
+        &SerializerState,
+        &str,
+        &crate::html::wikitext_escape_handlers::EscapeOpts,
+        &DomTree,
+    ) -> bool,
+>;
 
 /// The mutable serializer state (port of `SerializerState`).
 pub struct SerializerState {
@@ -242,7 +254,7 @@ impl SerializerState {
     /// single-line-context handling. Faithful to the non-selser skeleton of
     /// `SerializerState::emitChunk` (escaping is layered on by
     /// `WikitextSerializer::emitWikitext`/`escapeWikitext`).
-    pub fn emit_chunk(&mut self, text: impl Into<String>, node: NodeId) {
+    pub fn emit_chunk(&mut self, text: impl Into<String>, node: NodeId, tree: &DomTree) {
         let mut text = text.into();
         // Emit the pending separator first, gated on node identity (mirrors
         // `$origSepNeeded = $node !== $sep->lastSourceNode`).
@@ -255,10 +267,11 @@ impl SerializerState {
         // `$this->serializer->escapeWikitext(..., 'isLastChild' => ...)`.
         if self.needs_escaping {
             let opts = crate::html::wikitext_escape_handlers::EscapeOpts {
+                node: Some(node),
                 is_last_child: self.is_last_child,
                 in_multiline_mode: false,
             };
-            text = crate::html::wikitext_escape_handlers::escape_wikitext(self, &text, opts);
+            text = crate::html::wikitext_escape_handlers::escape_wikitext(self, tree, &text, opts);
             self.needs_escaping = false;
         }
         self.push_to_curr_line(ConstrainedText::cast(text, node));
@@ -281,10 +294,23 @@ impl SerializerState {
     }
 
     /// Walk the children of `node`, delegating each to the serializer. Faithful
-    /// to `SerializerState::serializeChildren` (the `serializer.serializeNode`
-    /// walk is held by `WikitextSerializer`).
+    /// to `SerializerState::serializeChildren`.
     pub fn serialize_children(&mut self, tree: &DomTree, node: NodeId) {
         crate::html::serializer::walk_children(tree, node, self);
+    }
+
+    /// Walk the children of `node` with a context-specific escaping handler
+    /// pushed onto the `wteHandlerStack` (popped afterwards). Faithful to
+    /// `SerializerState::serializeChildren($node, $wtEscaper)`.
+    pub fn serialize_children_with_escaper(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        wt_escaper: WtEscapeHandler,
+    ) {
+        self.wte_handler_stack.push(wt_escaper);
+        crate::html::serializer::walk_children(tree, node, self);
+        self.wte_handler_stack.pop();
     }
 
     /// Serialize the children of `node` to an owned string in indent-pre
