@@ -33,6 +33,9 @@ pub fn walk_children(tree: &DomTree, node: NodeId, state: &mut SerializerState) 
 /// Serialize a single node, delegating to its handler (or emitting text). This
 /// is the minimal `WikitextSerializer::serializeNode`: it handles the
 /// text/comment/diff-marker branches and delegates elements to the factory.
+/// (Separator-constraint wiring is staged behind a fuller `emitChunk` that has
+/// `lastSourceNode` bookkeeping; the constraint machinery lives in
+/// [`Separators`](crate::html::separators::Separators).)
 pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState) {
     let n = tree.node(node);
     match &n.kind {
@@ -44,10 +47,9 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
                 state.emit_chunk(text.clone(), node);
             }
         }
-        // Comment: merge into the separator source.
-        NodeKind::Comment(_c) => {
-            // `WTSUtils::commentWT` (decode → `<!--…-->`) is layered on later;
-            // for the skeleton, comments are dropped from output.
+        // Comment: merge its wikitext form into the separator source.
+        NodeKind::Comment(content) => {
+            state.append_sep(&crate::html::wts_utils::comment_wt(content));
         }
         // Element: delegate to the handler.
         NodeKind::Element(_) | NodeKind::Document => {

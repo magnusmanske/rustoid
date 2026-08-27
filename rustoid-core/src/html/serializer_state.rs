@@ -233,8 +233,9 @@ impl SerializerState {
 
     /// Emit a chunk of output for `node`, applying separator and (optionally)
     /// single-line-context handling. Faithful to the non-selser skeleton of
-    /// `SerializerState::emitChunk` (escaping is layered on by
-    /// `WikitextSerializer::emitWikitext`/`escapeWikitext`).
+    /// `SerializerState::emitChunk` (separator emission via `emitSepForNode` is
+    /// layered on once `lastSourceNode` bookkeeping is wired; see
+    /// `WikitextSerializer::serializeNode`).
     pub fn emit_chunk(&mut self, text: impl Into<String>, node: NodeId) {
         let mut text = text.into();
         if self.single_line_context.enforced() {

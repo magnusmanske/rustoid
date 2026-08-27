@@ -88,11 +88,7 @@ impl Separators {
     /// Build the separator to emit before `node`, based on the buffered
     /// constraints and source. Faithful to the *skeleton* of `Separators::buildSep`
     /// (DSR-based recovery is layered on once `getOrigSrc` is available).
-    pub fn build_sep(
-        state: &mut SerializerState,
-        _tree: &DomTree,
-        _node: NodeId,
-    ) -> Option<String> {
+    pub fn build_sep(state: &mut SerializerState, _node: NodeId) -> Option<String> {
         // In selser mode, recover the separator from source via DSR; for now,
         // fall back to the constraint-based construction.
         let constraints = state.separator.constraints.clone();
