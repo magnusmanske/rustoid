@@ -132,6 +132,11 @@ pub struct DataParsoid {
     pub start_tag_src: Option<String>,
     /// End tag source variation.
     pub end_tag_src: Option<String>,
+    /// Attribute-separator source for table cells (`|`/`||`/`!`/`!!`),
+    /// used by `TDHandler`/`THHandler` (`DataParsoid->attrSepSrc`).
+    pub attr_sep_src: Option<String>,
+    /// Source tag name preserving case variation (`DataParsoid->srcTagName`).
+    pub src_tag_name: Option<String>,
     /// First pipe source for wikilinks.
     pub first_pipe_src: Option<String>,
     /// Style flag for table cells.

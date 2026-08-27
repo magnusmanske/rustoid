@@ -337,6 +337,22 @@ pub trait DomHandler {
     ) -> String {
         self.serialize_table_element(symbol, end_symbol, tree, node)
     }
+
+    /// Whether `stx === 'row'` table-cell syntax is still valid after table edits
+    /// (i.e. there is an identical previous sibling). Faithful to
+    /// `DOMHandler::stxInfoValidForTableCell`.
+    fn stx_info_valid_for_table_cell(&self, tree: &DomTree, node: NodeId) -> bool {
+        let Some(dp) = tree.node(node).dp.clone() else {
+            return false;
+        };
+        if dp.stx.as_deref() != Some("row") {
+            return true;
+        }
+        let prev = crate::html::dom_tree::previous_non_deleted_sibling(tree, node);
+        prev.is_some_and(|p| {
+            dom_utils::node_name(tree.node(p)) == dom_utils::node_name(tree.node(node))
+        })
+    }
 }
 
 /// The default handler used for unhandled nodes: `handle` raises (returns

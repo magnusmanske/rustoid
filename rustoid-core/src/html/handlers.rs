@@ -785,6 +785,369 @@ impl DomHandler for CaptionHandler {
     }
 }
 
+/// `TableHandler` — serialize a `<table>`. Faithful to `DOMHandlers/TableHandler.php`.
+pub struct TableHandler;
+
+impl DomHandler for TableHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let wt = tree
+            .node(node)
+            .dp
+            .as_ref()
+            .and_then(|d| d.start_tag_src.clone())
+            .unwrap_or_else(|| "{|".to_string());
+        let indent_table = tree
+            .parent(node)
+            .is_some_and(|p| dom_utils::node_name(tree.node(p)) == "dd")
+            && crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_none();
+        if indent_table {
+            state.single_line_context.disable();
+        }
+        let tag = self.serialize_table_tag(&wt, Some(""), tree, node);
+        state.emit_chunk(tag, node);
+        if !dom_utils::is_literal_html_node(tree.node(node)) {
+            state.wiki_table_nesting += 1;
+        }
+        crate::html::serializer::walk_children(tree, node, state);
+        if !dom_utils::is_literal_html_node(tree.node(node)) {
+            state.wiki_table_nesting -= 1;
+        }
+        let end_tag = tree
+            .node(node)
+            .dp
+            .as_ref()
+            .and_then(|d| d.end_tag_src.clone())
+            .unwrap_or_else(|| "|}".to_string());
+        state.emit_chunk(end_tag, node);
+        if indent_table {
+            state.single_line_context.pop();
+        }
+        tree.next_sibling(node)
+    }
+
+    fn force_sol(&self) -> bool {
+        false
+    }
+}
+
+/// `TRHandler` — serialize a `<tr>`. Faithful to `DOMHandlers/TRHandler.php`
+/// (with `hasNonIgnorableAttributes` approximated).
+pub struct TRHandler;
+
+impl TRHandler {
+    fn tr_wikitext_needed(&self, tree: &DomTree, node: NodeId) -> bool {
+        let has_start_tag_src = tree
+            .node(node)
+            .dp
+            .as_ref()
+            .and_then(|d| d.start_tag_src.clone())
+            .is_some();
+        if has_start_tag_src
+            || crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_some()
+        {
+            return true;
+        }
+        let parent = tree.parent(node);
+        let parent_sibling =
+            parent.and_then(|p| crate::html::dom_tree::previous_non_sep_sibling(tree, p));
+        if let Some(ps) = parent_sibling
+            && dom_utils::node_name(tree.node(ps)) != "caption"
+        {
+            return true;
+        }
+        has_non_ignorable_attributes(tree.node(node))
+    }
+}
+
+impl DomHandler for TRHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        if self.tr_wikitext_needed(tree, node) {
+            let wt = tree
+                .node(node)
+                .dp
+                .as_ref()
+                .and_then(|d| d.start_tag_src.clone())
+                .unwrap_or_else(|| "|-".to_string());
+            let tag = self.serialize_table_tag(&wt, Some(""), tree, node);
+            state.emit_chunk(tag, node);
+        }
+        crate::html::serializer::walk_children(tree, node, state);
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let max = self.max_nls_in_table(tree, node, other);
+        if self.tr_wikitext_needed(tree, node) {
+            Some(Constraints {
+                min: Some(1),
+                max: Some(max),
+            })
+        } else {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(max),
+            })
+        }
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let max = self.max_nls_in_table(tree, node, other);
+        Some(Constraints {
+            min: Some(0),
+            max: Some(max),
+        })
+    }
+
+    fn force_sol(&self) -> bool {
+        true
+    }
+}
+
+/// `TDHandler` — serialize a `<td>`. Faithful to `DOMHandlers/TDHandler.php`,
+/// with `tdHandler` escaping and trimmed-whitespace recovery stubbed.
+pub struct TDHandler;
+
+impl DomHandler for TDHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let dp = tree.node(node).dp.clone().unwrap_or_default();
+        let usable = self.stx_info_valid_for_table_cell(tree, node);
+        let attr_sep_src = if usable {
+            dp.attr_sep_src.clone()
+        } else {
+            None
+        };
+        let start_tag_src = if usable {
+            dp.start_tag_src.clone()
+        } else {
+            None
+        };
+        let start_tag_src = start_tag_src.unwrap_or_else(|| {
+            if usable && dp.stx.as_deref() == Some("row") {
+                "||".to_string()
+            } else {
+                "|".to_string()
+            }
+        });
+
+        let td_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
+        let leading_space = self.get_leading_space(tree, node, "");
+        state.emit_chunk(format!("{td_tag}{leading_space}"), node);
+
+        let next_td = crate::html::dom_tree::next_non_sep_sibling(tree, node);
+        let next_uses_row_syntax = next_td.is_some_and(|n| {
+            matches!(tree.node(n).kind, NodeKind::Element(_))
+                && tree
+                    .node(n)
+                    .dp
+                    .as_ref()
+                    .is_some_and(|d| d.stx.as_deref() == Some("row"))
+        });
+
+        if next_uses_row_syntax
+            && crate::html::dom_tree::first_non_deleted_child(tree, node).is_none()
+        {
+            state.emit_chunk(" ", node);
+            return tree.next_sibling(node);
+        }
+
+        crate::html::serializer::walk_children(tree, node, state);
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let force_single_line = dom_utils::node_name(tree.node(other)) == "td"
+            && tree
+                .node(node)
+                .dp
+                .as_ref()
+                .is_some_and(|d| d.stx.as_deref() == Some("row"));
+        let max = self.max_nls_in_table(tree, node, other);
+        Some(Constraints {
+            min: Some(if force_single_line { 0 } else { 1 }),
+            max: Some(max),
+        })
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let max = self.max_nls_in_table(tree, node, other);
+        Some(Constraints {
+            min: Some(0),
+            max: Some(max),
+        })
+    }
+}
+
+/// `THHandler` — serialize a `<th>`. Faithful to `DOMHandlers/THHandler.php`,
+/// with `thHandler` escaping and trimmed-whitespace recovery stubbed.
+pub struct THHandler;
+
+impl DomHandler for THHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let dp = tree.node(node).dp.clone().unwrap_or_default();
+        let usable = self.stx_info_valid_for_table_cell(tree, node);
+        let attr_sep_src = if usable {
+            dp.attr_sep_src.clone()
+        } else {
+            None
+        };
+        let start_tag_src = if usable {
+            dp.start_tag_src.clone()
+        } else {
+            None
+        };
+        let start_tag_src = start_tag_src.unwrap_or_else(|| {
+            if usable && dp.stx.as_deref() == Some("row") {
+                "!!".to_string()
+            } else {
+                "!".to_string()
+            }
+        });
+
+        let th_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
+        let leading_space = self.get_leading_space(tree, node, "");
+        state.emit_chunk(format!("{th_tag}{leading_space}"), node);
+
+        let next_th = crate::html::dom_tree::next_non_sep_sibling(tree, node);
+        let next_uses_row_syntax = next_th.is_some_and(|n| {
+            matches!(tree.node(n).kind, NodeKind::Element(_))
+                && tree
+                    .node(n)
+                    .dp
+                    .as_ref()
+                    .is_some_and(|d| d.stx.as_deref() == Some("row"))
+        });
+        if next_uses_row_syntax
+            && crate::html::dom_tree::first_non_deleted_child(tree, node).is_none()
+        {
+            state.emit_chunk(" ", node);
+            return tree.next_sibling(node);
+        }
+
+        crate::html::serializer::walk_children(tree, node, state);
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let force_single_line = dom_utils::node_name(tree.node(other)) == "th"
+            && tree
+                .node(node)
+                .dp
+                .as_ref()
+                .is_some_and(|d| d.stx.as_deref() == Some("row"));
+        let max = self.max_nls_in_table(tree, node, other);
+        Some(Constraints {
+            min: Some(if force_single_line { 0 } else { 1 }),
+            max: Some(max),
+        })
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let max = self.max_nls_in_table(tree, node, other);
+        if dom_utils::node_name(tree.node(other)) == "td" {
+            Some(Constraints {
+                min: Some(1),
+                max: Some(max),
+            })
+        } else {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(max),
+            })
+        }
+    }
+}
+
+/// `SpanHandler` — serialize a `<span>` wrapper. Faithful to
+/// `DOMHandlers/SpanHandler.php`, with nowiki/media/entity/placeholder branches
+/// stubbed and plain-span falling back to HTML.
+pub struct SpanHandler;
+
+impl DomHandler for SpanHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        // Fall back to plain HTML serialization for spans (the recognized
+        // nowiki/entity/media/placeholder branches are deferred).
+        let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(tree.node(node));
+        state.emit_chunk(tag, node);
+        crate::html::serializer::walk_children(tree, node, state);
+        let end_tag =
+            crate::html::serializer::WikitextSerializer::serialize_html_end_tag(tree.node(node));
+        state.emit_chunk(end_tag, node);
+        tree.next_sibling(node)
+    }
+}
+
+/// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
+/// is not a Parsoid bookkeeping attribute. Approximate stub.
+fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {
+    node.attrs.iter().any(|a| {
+        !matches!(
+            a.key.as_str(),
+            "data-parsoid" | "data-mw" | "data-object-id" | "typeof" | "about" | "rel" | "class"
+        )
+    })
+}
+
 /// `FallbackHTMLHandler` — serialize a node as its literal HTML form.
 /// Faithful to `DOMHandlers/FallbackHTMLHandler.php`.
 pub struct FallbackHTMLHandler;
