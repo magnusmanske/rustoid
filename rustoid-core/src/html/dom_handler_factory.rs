@@ -11,6 +11,7 @@
 use crate::html::dom_handler::{DefaultDomHandler, DomHandler};
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
+use crate::html::handlers::{BodyHandler, FallbackHTMLHandler, JustChildrenHandler, QuoteHandler};
 use crate::html::wts_utils;
 
 /// The concrete DOM handler classes PHP maps tag names to (`DOMHandlerFactory::newFromTagHandler`).
@@ -119,15 +120,13 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
     // tags — but never for `<a>`.
     let specialized_kind = specialized.as_deref().and_then(handler_kind_for_tag);
     if specialized_kind.is_none() && stx.as_deref() == Some("html") && tag != "a" {
-        return Box::new(DefaultDomHandler); // TODO: FallbackHTMLHandler
+        return Box::new(FallbackHTMLHandler);
     }
 
-    // HTML table tags serialize via HTML tags inside an HTML table.
     if serialize_child_table_tag_as_html(tree, node) {
-        return Box::new(DefaultDomHandler); // TODO: FallbackHTMLHandler
+        return Box::new(FallbackHTMLHandler);
     }
 
-    // HTML-syntax list content serializes as HTML, not wikitext.
     if dom_utils::is_list_item(tree.node(node))
         && tree
             .parent(node)
@@ -136,15 +135,19 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
             .parent(node)
             .is_some_and(|p| wts_utils::is_literal_html_node(tree.node(p)))
     {
-        return Box::new(DefaultDomHandler); // TODO: FallbackHTMLHandler
+        return Box::new(FallbackHTMLHandler);
     }
 
-    if specialized_kind.is_some() || handler_kind_for_tag(&tag).is_some() {
-        // A specialized or plain handler applies; until the concrete handler
-        // classes land, fall back to the default (no-op) handler.
-        Box::new(DefaultDomHandler)
-    } else {
-        Box::new(DefaultDomHandler) // FallbackHTMLHandler
+    // Pick the best available specialized / plain handler. The three simplest
+    // concrete handlers are ported; the rest fall back to the no-op default
+    // until their modules land.
+    let kind = specialized_kind.or_else(|| handler_kind_for_tag(&tag));
+    match kind {
+        Some(HandlerKind::Body) => Box::new(BodyHandler),
+        Some(HandlerKind::QuoteBold) => Box::new(QuoteHandler::new("'''")),
+        Some(HandlerKind::QuoteItalic) => Box::new(QuoteHandler::new("''")),
+        Some(HandlerKind::TableBody) => Box::new(JustChildrenHandler),
+        _ => Box::new(DefaultDomHandler),
     }
 }
 

@@ -11,6 +11,7 @@ pub mod dom_tree;
 pub mod dom_utils;
 pub mod dsr;
 pub mod env;
+pub mod handlers;
 pub mod parse;
 pub mod selser;
 pub mod separators;
