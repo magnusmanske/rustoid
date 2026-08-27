@@ -12,7 +12,7 @@
 //! the flags they manage are present and faithfully named.
 
 use crate::html::constrained_text::ConstrainedText;
-use crate::html::dom_tree::NodeId;
+use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::separators::SeparatorData;
 use crate::html::single_line_context::SingleLineContext;
 
@@ -229,6 +229,35 @@ impl SerializerState {
         self.sep_introduced_sol(&text, node);
         self.reset_sep();
         self.update_sep(node);
+    }
+
+    /// Emit a chunk of output for `node`, applying separator and (optionally)
+    /// single-line-context handling. Faithful to the non-selser skeleton of
+    /// `SerializerState::emitChunk` (escaping is layered on by
+    /// `WikitextSerializer::emitWikitext`/`escapeWikitext`).
+    pub fn emit_chunk(&mut self, text: impl Into<String>, node: NodeId) {
+        let mut text = text.into();
+        if self.single_line_context.enforced() {
+            text = text.replace('\n', " ");
+        }
+        self.push_to_curr_line(ConstrainedText::cast(text, node));
+        // After emitting content, we are no longer at start-of-line.
+        self.on_sol = false;
+        self.at_start_of_output = false;
+    }
+
+    /// Walk the children of `node`, delegating each to the serializer. Faithful
+    /// to `SerializerState::serializeChildren` (the `serializer.serializeNode`
+    /// walk is held by `WikitextSerializer`).
+    pub fn serialize_children(&mut self, tree: &DomTree, node: NodeId) {
+        crate::html::serializer::walk_children(tree, node, self);
+    }
+
+    /// Set the current/previous node tracking (`SerializerState::updateModificationFlags`).
+    pub fn update_modification_flags(&mut self, node: NodeId) {
+        self.prev_node_unmodified = self.curr_node_unmodified;
+        self.curr_node_unmodified = false;
+        self.prev_node = Some(node);
     }
 }
 

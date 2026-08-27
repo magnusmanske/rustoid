@@ -16,6 +16,7 @@ pub mod selser;
 pub mod separators;
 pub mod serialize;
 pub mod serialize_wt;
+pub mod serializer;
 pub mod serializer_state;
 pub mod single_line_context;
 pub mod wts_utils;
