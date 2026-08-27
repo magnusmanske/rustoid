@@ -19,6 +19,15 @@
 
 use crate::html::serializer_state::SerializerState;
 
+/// Result of [`escape_link_target`]: the (entity-escaped, fragment-encoded)
+/// link target plus whether it is an invalid link. Mirrors PHP's
+/// `escapeLinkTarget` return `stdClass { linkTarget, invalidLink }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscapeLinkTargetResult {
+    pub link_target: String,
+    pub invalid_link: bool,
+}
+
 /// Escape context options for [`escape_wikitext`]. Mirrors PHP's `$opts` array
 /// (`['node' => Node, 'inMultilineMode' => ?bool, 'isLastChild' => ?bool]`).
 #[derive(Debug, Clone, Copy, Default)]
@@ -549,6 +558,60 @@ pub fn escape_link_content(
     res
 }
 
+/// `escapeLinkTarget` — entity-escape a link target, split off the fragment,
+/// and URL-encode the fragment hash so it stays a valid wikilink. Faithful to
+/// `WikitextEscapeHandlers::escapeLinkTarget` (up to the `isValidLinkTarget`
+/// character-class approximation and the `legal_title_chars` set).
+pub fn escape_link_target(
+    env: &crate::html::env::SerializerEnv,
+    link_target: &str,
+) -> EscapeLinkTargetResult {
+    // Entity-escape the content.
+    let link_target = crate::util::escape_wt_entities(link_target);
+    // Split the fragment (the part after `#`) from the target.
+    let (link_target, hash) = match link_target.split_once('#') {
+        Some((t, h)) => (t.to_string(), Some(h.to_string())),
+        None => (link_target, None),
+    };
+
+    // Is this a valid link? (`#foo` is also valid.)
+    let valid_link =
+        (link_target.is_empty() && hash.is_some()) || env.is_valid_link_target(&link_target);
+
+    let link_target = if valid_link && let Some(hash) = &hash {
+        // URL-encode the hash characters that are not legal title chars.
+        let legal = env.get_site_config().legal_title_chars();
+        let re = regex::Regex::new(&format!("[^{legal}]+")).ok();
+        let encoded = match &re {
+            Some(re) => re.replace_all(hash, |caps: &regex::Captures| {
+                urlencode_bytes(caps[0].as_bytes())
+            }),
+            None => std::borrow::Cow::Borrowed(hash.as_str()),
+        };
+        format!("{link_target}#{encoded}")
+    } else if let Some(hash) = &hash {
+        // Invalid link or no hash: keep the fragment verbatim.
+        format!("{link_target}#{hash}")
+    } else {
+        link_target
+    };
+
+    EscapeLinkTargetResult {
+        link_target,
+        invalid_link: !valid_link,
+    }
+}
+
+/// Percent-encode each byte (PHP's `urlencode($m[0])`).
+fn urlencode_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for &b in bytes {
+        out.push('%');
+        out.push_str(&format!("{b:02X}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +739,28 @@ mod tests {
         let tree = empty_tree();
         let esc = escape_link_content(&mut st, &tree, "a&nbsp;b", false, 0, false);
         assert!(esc.contains("&amp;nbsp;"));
+    }
+
+    #[test]
+    fn test_escape_link_target_simple() {
+        let config = crate::mock::MockSiteConfig::new();
+        let title = crate::title::Title::new_main("Test Page");
+        let env = crate::html::env::SerializerEnv::new(&config, &title);
+        let r = escape_link_target(&env, "Foo");
+        assert_eq!(r.link_target, "Foo");
+        assert!(!r.invalid_link);
+    }
+
+    #[test]
+    fn test_escape_link_target_fragment() {
+        let config = crate::mock::MockSiteConfig::new();
+        let title = crate::title::Title::new_main("Test Page");
+        let env = crate::html::env::SerializerEnv::new(&config, &title);
+        // A valid target with a fragment: the fragment is URL-encoded if it has
+        // chars outside `legalTitleChars` (`[` → %5B).
+        let r = escape_link_target(&env, "Foo#Section[1]");
+        assert_eq!(r.link_target, "Foo#Section%5B1%5D");
+        assert!(!r.invalid_link);
     }
 
     #[test]

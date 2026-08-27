@@ -238,6 +238,14 @@ pub trait SiteConfig: Send + Sync {
     fn link_prefix_regex(&self) -> Option<&'static str> {
         None
     }
+
+    /// The set of characters legal in a page title, used as a regex character
+    /// class body (without the enclosing `[]`). Mirrors PHP's
+    /// `SiteConfig::legalTitleChars()`. Used to URL-encode fragment hashes in
+    /// link targets. The default is the standard MediaWiki first-letter set.
+    fn legal_title_chars(&self) -> &'static str {
+        " %!\"$&'()*,\\-./0-9:;=?@A-Z\\^_`a-z~\\x80-\\xff+"
+    }
 }
 
 /// Information about a namespace.
