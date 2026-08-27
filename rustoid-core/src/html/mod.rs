@@ -5,6 +5,8 @@
 //! - `selser` — selective serialization for VE editing.
 
 pub mod constrained_text;
+pub mod dom_handler;
+pub mod dom_handler_factory;
 pub mod dom_tree;
 pub mod dom_utils;
 pub mod dsr;

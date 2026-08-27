@@ -244,6 +244,55 @@ pub fn has_n_children(tree: &DomTree, id: NodeId, n: usize) -> bool {
     remaining == 0
 }
 
+/// First non-deleted child. `DiffDOMUtils::firstNonDeletedChild` — skips only
+/// diff markers (not separators).
+pub fn first_non_deleted_child(tree: &DomTree, id: NodeId) -> Option<NodeId> {
+    let mut child = tree.first_child(id);
+    while let Some(c) = child {
+        if !is_diff_marker(tree, c) {
+            return Some(c);
+        }
+        child = tree.next_sibling(c);
+    }
+    None
+}
+
+/// Last non-deleted child. `DiffDOMUtils::lastNonDeletedChild`.
+pub fn last_non_deleted_child(tree: &DomTree, id: NodeId) -> Option<NodeId> {
+    let mut child = tree.last_child(id);
+    while let Some(c) = child {
+        if !is_diff_marker(tree, c) {
+            return Some(c);
+        }
+        child = tree.prev_sibling(c);
+    }
+    None
+}
+
+/// Next non-deleted sibling. `DiffDOMUtils::nextNonDeletedSibling`.
+pub fn next_non_deleted_sibling(tree: &DomTree, id: NodeId) -> Option<NodeId> {
+    let mut sib = tree.next_sibling(id);
+    while let Some(s) = sib {
+        if !is_diff_marker(tree, s) {
+            return Some(s);
+        }
+        sib = tree.next_sibling(s);
+    }
+    None
+}
+
+/// Previous non-deleted sibling. `DiffDOMUtils::previousNonDeletedSibling`.
+pub fn previous_non_deleted_sibling(tree: &DomTree, id: NodeId) -> Option<NodeId> {
+    let mut sib = tree.prev_sibling(id);
+    while let Some(s) = sib {
+        if !is_diff_marker(tree, s) {
+            return Some(s);
+        }
+        sib = tree.prev_sibling(s);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
