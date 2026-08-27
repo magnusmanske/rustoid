@@ -548,6 +548,78 @@ impl DomHandler for PHandler {
         tree.next_sibling(node)
     }
 
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let other_name = dom_utils::node_name(tree.node(other));
+        // parent is a list-item / td / th / body.
+        let parent_is_table_cell_or_body = tree.parent(node) == Some(other)
+            && (dom_utils::is_list_item(tree.node(other))
+                || matches!(other_name.as_str(), "td" | "th" | "body"));
+        if parent_is_table_cell_or_body {
+            let max = if matches!(other_name.as_str(), "td" | "th" | "body") {
+                1
+            } else {
+                0
+            };
+            return Some(Constraints {
+                min: Some(0),
+                max: Some(max),
+            });
+        }
+
+        // P-P transition: previous sibling is a wikitext `<p>`.
+        let prev = crate::html::dom_tree::previous_non_deleted_sibling(tree, node);
+        let is_p_p = prev == Some(other)
+            && matches!(tree.node(other).kind, NodeKind::Element(_))
+            && other_name == "p"
+            && tree
+                .node(other)
+                .dp
+                .as_ref()
+                .is_none_or(|d| d.stx.as_deref() != Some("html"));
+        if is_p_p || Self::treat_as_pp_transition(tree, other) {
+            return Some(Constraints {
+                min: Some(2),
+                max: Some(2),
+            });
+        }
+
+        Some(Constraints {
+            min: Some(0),
+            max: Some(2),
+        })
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        _node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        if Self::is_pp_transition(tree, Some(other)) {
+            return Some(Constraints {
+                min: Some(2),
+                max: Some(2),
+            });
+        }
+        if dom_utils::at_the_top(tree, other) {
+            return Some(Constraints {
+                min: Some(0),
+                max: Some(2),
+            });
+        }
+        Some(Constraints {
+            min: Some(0),
+            max: Some(2),
+        })
+    }
+
     fn force_sol(&self) -> bool {
         true
     }

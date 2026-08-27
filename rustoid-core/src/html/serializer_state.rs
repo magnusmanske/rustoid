@@ -233,11 +233,13 @@ impl SerializerState {
 
     /// Emit a chunk of output for `node`, applying separator and (optionally)
     /// single-line-context handling. Faithful to the non-selser skeleton of
-    /// `SerializerState::emitChunk` (separator emission via `emitSepForNode` is
-    /// layered on once `lastSourceNode` bookkeeping is wired; see
-    /// `WikitextSerializer::serializeNode`).
+    /// `SerializerState::emitChunk` (escaping is layered on by
+    /// `WikitextSerializer::emitWikitext`/`escapeWikitext`).
     pub fn emit_chunk(&mut self, text: impl Into<String>, node: NodeId) {
         let mut text = text.into();
+        // Emit the pending separator first, gated on node identity (mirrors
+        // `$origSepNeeded = $node !== $sep->lastSourceNode`).
+        self.emit_sep_for_node(node);
         if self.single_line_context.enforced() {
             text = text.replace('\n', " ");
         }
@@ -245,6 +247,19 @@ impl SerializerState {
         // After emitting content, we are no longer at start-of-line.
         self.on_sol = false;
         self.at_start_of_output = false;
+    }
+
+    /// Build and emit the pending separator for `node`, but only when `node`
+    /// differs from the last node a separator was emitted for. Faithful to
+    /// `SerializerState::emitSepForNode` (non-selser, no DSR recovery).
+    pub fn emit_sep_for_node(&mut self, node: NodeId) {
+        // A separator is only needed when this node hasn't already had one.
+        if self.separator.last_source_node == Some(node) {
+            return;
+        }
+        let sep = crate::html::separators::Separators::build_sep(self, node);
+        // `emit_sep` resets the separator and records `last_source_node`.
+        self.emit_sep(sep.as_deref().unwrap_or(""), node);
     }
 
     /// Walk the children of `node`, delegating each to the serializer. Faithful

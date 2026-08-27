@@ -31,12 +31,13 @@ pub fn walk_children(tree: &DomTree, node: NodeId, state: &mut SerializerState) 
 }
 
 /// Serialize a single node, delegating to its handler (or emitting text). This
-/// is the minimal `WikitextSerializer::serializeNode`: it handles the
-/// text/comment/diff-marker branches and delegates elements to the factory.
-/// (Separator-constraint wiring is staged behind a fuller `emitChunk` that has
-/// `lastSourceNode` bookkeeping; the constraint machinery lives in
-/// [`Separators`](crate::html::separators::Separators).)
+/// is the faithful `WikitextSerializer::serializeNode` (non-selser): it handles
+/// the text/comment/diff-marker branches, computes separator constraints before
+/// and after each element, and delegates elements to the handler chosen by the
+/// factory.
 pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState) {
+    use crate::html::separators::Separators;
+
     let n = tree.node(node);
     match &n.kind {
         // Text: accumulate pure whitespace into the separator, else emit.
@@ -44,17 +45,55 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
             if !state.in_indent_pre && text.chars().all(|c| c.is_whitespace()) {
                 state.append_sep(text);
             } else {
+                state.needs_escaping = true;
                 state.emit_chunk(text.clone(), node);
+                state.needs_escaping = false;
             }
         }
         // Comment: merge its wikitext form into the separator source.
         NodeKind::Comment(content) => {
             state.append_sep(&crate::html::wts_utils::comment_wt(content));
         }
-        // Element: delegate to the handler.
+        // Element: compute separator constraints and delegate to the handler.
         NodeKind::Element(_) | NodeKind::Document => {
+            state.curr_node = Some(node);
+
+            // Before-constraints: prev non-sep sibling, or parent.
+            let prev = crate::html::dom_tree::previous_non_sep_sibling(tree, node)
+                .or_else(|| tree.parent(node));
+            if let Some(prev) = prev {
+                let mut prev_handler = get_dom_handler(tree, prev);
+                let mut handler = get_dom_handler(tree, node);
+                Separators::update_separator_constraints(
+                    state,
+                    tree,
+                    prev,
+                    prev_handler.as_mut(),
+                    node,
+                    handler.as_mut(),
+                );
+            }
+
             let mut handler = get_dom_handler(tree, node);
             handler.handle(tree, node, state);
+
+            // After-constraints: next non-sep sibling, else parent.
+            let next = crate::html::dom_tree::next_non_sep_sibling(tree, node)
+                .or_else(|| tree.parent(node));
+            if let Some(next) = next {
+                let mut next_handler = get_dom_handler(tree, next);
+                let mut handler = get_dom_handler(tree, node);
+                Separators::update_separator_constraints(
+                    state,
+                    tree,
+                    node,
+                    handler.as_mut(),
+                    next,
+                    next_handler.as_mut(),
+                );
+            }
+
+            state.update_modification_flags(node);
         }
     }
 }
@@ -200,5 +239,20 @@ mod tests {
 
         let wt = WikitextSerializer::serialize_dom(doc);
         assert_eq!(wt, "''foo''");
+    }
+
+    #[test]
+    fn test_serialize_dom_two_paragraphs() {
+        // <p>a</p><p>b</p> → "a\n\nb" (paragraphs are separated by two newlines).
+        let mut doc = Node::document();
+        let mut p1 = Node::element(ElementKind::Paragraph);
+        p1.push_child(Node::text("a"));
+        let mut p2 = Node::element(ElementKind::Paragraph);
+        p2.push_child(Node::text("b"));
+        doc.push_child(p1);
+        doc.push_child(p2);
+
+        let wt = WikitextSerializer::serialize_dom(doc);
+        assert_eq!(wt, "a\n\nb");
     }
 }
