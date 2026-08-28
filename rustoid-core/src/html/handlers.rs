@@ -1671,6 +1671,245 @@ impl DomHandler for MediaHandler {
     }
 }
 
+/// `MetaHandler` — serialize a `<meta>` (placeholder, page property, include
+/// directive, or annotation marker). Faithful to `DOMHandlers/MetaHandler.php`
+/// (the annotation-attribute serialization and `getMagicWordWT` use the
+/// `SerializerEnv`; diff-marker metas are ignored).
+pub struct MetaHandler;
+
+impl DomHandler for MetaHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let n = tree.node(node);
+        let dp_src = n.dp.as_ref().and_then(|d| d.src.clone());
+        let placeholder = crate::html::dom_utils::match_type_of(n, "^mw:Placeholder(/|$)");
+
+        // `mw:Placeholder` → emit its source.
+        if dp_src.is_some() && placeholder.is_some() {
+            let src = dp_src.unwrap_or_default();
+            state.emit_chunk(src, node, tree);
+            return tree.next_sibling(node);
+        }
+
+        let property = n.get_attr("property").unwrap_or("");
+
+        if !property.is_empty() {
+            // `#^mw\:PageProp/(.*)$#`.
+            if let Some(prop) = property.strip_prefix("mw:PageProp/") {
+                let magic_src =
+                    n.dp.as_ref()
+                        .and_then(|d| d.magic_src.clone())
+                        .unwrap_or_default();
+                let out = if let Some(env) = state.env {
+                    env.get_site_config().get_magic_word_wt(prop, &magic_src)
+                } else {
+                    magic_src
+                };
+                state.emit_chunk(out, node, tree);
+            } else {
+                FallbackHTMLHandler.handle(tree, node, state);
+            }
+            return tree.next_sibling(node);
+        }
+
+        if crate::html::wts_utils::is_annotation_start_marker_meta(n) {
+            let mut is_start = false;
+            if let Some(ann_type) =
+                crate::html::wts_utils::extract_annotation_type(n, &mut is_start)
+            {
+                state.emit_chunk(format!("<{ann_type}>"), node, tree);
+            }
+            return tree.next_sibling(node);
+        }
+
+        if crate::html::wts_utils::is_annotation_end_marker_meta(n) {
+            let mut is_start = false;
+            if let Some(ann_type) =
+                crate::html::wts_utils::extract_annotation_type(n, &mut is_start)
+            {
+                state.emit_chunk(format!("</{ann_type}>"), node, tree);
+            }
+            return tree.next_sibling(node);
+        }
+
+        // The `typeof` switch.
+        let ty = n.get_attr("typeof").unwrap_or("");
+        match ty {
+            "mw:Includes/IncludeOnly" => {
+                let src = crate::html::wts_utils::get_data_mw_src(n)
+                    .or_else(|| n.dp.as_ref().and_then(|d| d.src.clone()))
+                    .unwrap_or_default();
+                state.emit_chunk(src, node, tree);
+            }
+            "mw:Includes/IncludeOnly/End" => {
+                // Just ignore.
+            }
+            "mw:Includes/NoInclude" => {
+                let src =
+                    n.dp.as_ref()
+                        .and_then(|d| d.src.clone())
+                        .unwrap_or_else(|| "<noinclude>".to_string());
+                state.emit_chunk(src, node, tree);
+            }
+            "mw:Includes/NoInclude/End" => {
+                let src =
+                    n.dp.as_ref()
+                        .and_then(|d| d.src.clone())
+                        .unwrap_or_else(|| "</noinclude>".to_string());
+                state.emit_chunk(src, node, tree);
+            }
+            "mw:Includes/OnlyInclude" => {
+                let src =
+                    n.dp.as_ref()
+                        .and_then(|d| d.src.clone())
+                        .unwrap_or_else(|| "<onlyinclude>".to_string());
+                state.emit_chunk(src, node, tree);
+            }
+            "mw:Includes/OnlyInclude/End" => {
+                let src =
+                    n.dp.as_ref()
+                        .and_then(|d| d.src.clone())
+                        .unwrap_or_else(|| "</onlyinclude>".to_string());
+                state.emit_chunk(src, node, tree);
+            }
+            "mw:DiffMarker/inserted"
+            | "mw:DiffMarker/deleted"
+            | "mw:DiffMarker/moved"
+            | "mw:Separator" => {
+                // Just ignore.
+            }
+            _ => {
+                FallbackHTMLHandler.handle(tree, node, state);
+            }
+        }
+
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let n = tree.node(node);
+        let other_name = crate::html::wts_utils::node_name(tree.node(other));
+        let other_is_element = !other_name.is_empty();
+
+        // `needNewLineSepBeforeMeta`: other is not the parent, and (other is a
+        // wikitext block element, or other is text and the next sibling is block).
+        let need_nl = other != tree.parent(node).unwrap_or(usize::MAX)
+            && (other_is_element && dom_utils::is_wikitext_block_node(tree.node(other)));
+
+        if crate::html::wts_utils::is_annotation_start_marker_meta(n) {
+            return if need_nl {
+                Some(Constraints {
+                    min: Some(2),
+                    max: None,
+                })
+            } else {
+                None
+            };
+        }
+        if crate::html::wts_utils::is_annotation_end_marker_meta(n) {
+            return if need_nl {
+                Some(Constraints {
+                    min: Some(1),
+                    max: None,
+                })
+            } else {
+                None
+            };
+        }
+
+        // `mw:PageProp/categorydefaultsort` needs a leading newline (2 before a
+        // plain `<p>`), otherwise a single newline.
+        let typeof_attr = n.get_attr("typeof").unwrap_or("");
+        let property_attr = n.get_attr("property").unwrap_or("");
+        if typeof_attr.contains("mw:PageProp/categorydefaultsort")
+            || property_attr.contains("mw:PageProp/categorydefaultsort")
+        {
+            let before_p = other_is_element
+                && other_name == "p"
+                && tree.node(other).dp.as_ref().and_then(|d| d.stx.as_deref()) != Some("html");
+            return Some(Constraints {
+                min: Some(if before_p { 2 } else { 1 }),
+                max: None,
+            });
+        }
+
+        // New elements (that are not placeholders/includes/annotations) need a
+        // leading newline.
+        if dom_utils::is_new_elt(tree, node)
+            && crate::html::dom_utils::match_type_of(
+                n,
+                "^mw:(Placeholder|Includes|Annotation)(/|$)",
+            )
+            .is_none()
+        {
+            return Some(Constraints {
+                min: Some(1),
+                max: None,
+            });
+        }
+
+        None
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let n = tree.node(node);
+        let other_is_block = dom_utils::is_wikitext_block_node(tree.node(other));
+        let other_not_parent = other != tree.parent(node).unwrap_or(usize::MAX);
+
+        if crate::html::wts_utils::is_annotation_end_marker_meta(n) {
+            return if other_not_parent && other_is_block {
+                Some(Constraints {
+                    min: Some(2),
+                    max: None,
+                })
+            } else {
+                None
+            };
+        }
+        if crate::html::wts_utils::is_annotation_start_marker_meta(n) {
+            return if other_not_parent && other_is_block {
+                Some(Constraints {
+                    min: Some(1),
+                    max: None,
+                })
+            } else {
+                None
+            };
+        }
+
+        if dom_utils::is_new_elt(tree, node)
+            && crate::html::dom_utils::match_type_of(
+                n,
+                "^mw:(Placeholder|Includes|Annotation)(/|$)",
+            )
+            .is_none()
+        {
+            return Some(Constraints {
+                min: Some(1),
+                max: None,
+            });
+        }
+
+        None
+    }
+}
+
 /// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
 /// is not a Parsoid bookkeeping attribute. Approximate stub.
 fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {
@@ -1860,5 +2099,39 @@ mod tests {
         handler.handle(&tree, pre_id, &mut state);
         state.flush_line();
         assert_eq!(state.out, "<pre>foo</pre>");
+    }
+
+    #[test]
+    fn test_meta_handler_noinclude() {
+        let mut doc = Node::document();
+        let mut meta = Node::element(ElementKind::Annotation);
+        meta.set_attr("typeof", "mw:Includes/NoInclude");
+        doc.push_child(meta);
+
+        let tree = DomTree::new(doc);
+        let meta_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = MetaHandler;
+        handler.handle(&tree, meta_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, "<noinclude>");
+    }
+
+    #[test]
+    fn test_meta_handler_annotation_start() {
+        let mut doc = Node::document();
+        let mut meta = Node::element(ElementKind::Annotation);
+        meta.set_attr("typeof", "mw:Annotation/translate");
+        doc.push_child(meta);
+
+        let tree = DomTree::new(doc);
+        let meta_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = MetaHandler;
+        handler.handle(&tree, meta_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, "<translate>");
     }
 }

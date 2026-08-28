@@ -288,6 +288,65 @@ pub fn get_media_format(node: &Node) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Annotation metas: `WTUtils::matchAnnotationMeta` / `isAnnotation*MarkerMeta` /
+// `isMarkerAnnotation` / `extractAnnotationType`.
+//
+// PHP's `ANNOTATION_META_TYPE_REGEXP = '#^mw:(?:Annotation/([\w\d]+))(?:/End)?$#uD'`.
+// ---------------------------------------------------------------------------
+
+/// Return the `mw:Annotation/<name>` `typeof` token (including optional `/End`),
+/// or `None`. Mirrors `WTUtils::matchAnnotationMeta`.
+fn match_annotation_meta_token(node: &Node) -> Option<String> {
+    let ty = node.get_attr("typeof")?;
+    ty.split(' ')
+        .find(|t| t.starts_with("mw:Annotation/"))
+        .map(str::to_string)
+}
+
+/// `WTUtils::extractAnnotationType` — the annotation name (without `mw:Annotation/`
+/// or `/End`), setting `is_start` to whether it is a start marker.
+pub fn extract_annotation_type(node: &Node, is_start: &mut bool) -> Option<String> {
+    let token = match_annotation_meta_token(node)?;
+    let rest = token.strip_prefix("mw:Annotation/")?;
+    *is_start = !rest.ends_with("/End");
+    let name = if *is_start {
+        rest
+    } else {
+        rest.strip_suffix("/End").unwrap_or(rest)
+    };
+    Some(name.to_string())
+}
+
+/// `WTUtils::isAnnotationStartMarkerMeta`.
+pub fn is_annotation_start_marker_meta(node: &Node) -> bool {
+    let mut is_start = false;
+    extract_annotation_type(node, &mut is_start).is_some() && is_start
+}
+
+/// `WTUtils::isAnnotationEndMarkerMeta`.
+pub fn is_annotation_end_marker_meta(node: &Node) -> bool {
+    let mut is_start = false;
+    let t = extract_annotation_type(node, &mut is_start);
+    t.is_some() && !is_start
+}
+
+/// `WTUtils::isMarkerAnnotation` — is this a start or end annotation meta?
+pub fn is_marker_annotation(node: &Node) -> bool {
+    is_annotation_start_marker_meta(node) || is_annotation_end_marker_meta(node)
+}
+
+/// The `data-mw.src` field (for `mw:Includes/IncludeOnly`), parsed from the raw
+/// `data-mw` JSON blob on the node.
+pub fn get_data_mw_src(node: &Node) -> Option<String> {
+    let json = node.data_mw.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value
+        .get("src")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
 // Shadow attributes: `WTSUtils::getShadowInfo` / `getAttributeShadowInfo`.
 // ---------------------------------------------------------------------------
 

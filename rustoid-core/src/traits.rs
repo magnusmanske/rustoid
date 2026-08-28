@@ -286,6 +286,22 @@ pub trait SiteConfig: Send + Sync {
         }
     }
 
+    /// `SiteConfig::getMagicWordWT` — the localized wikitext alias for a canonical
+    /// magic-word key, preferring the suggested alias when it is a known alias.
+    fn get_magic_word_wt(&self, word: &str, suggest: &str) -> String {
+        let Some(entry) = self.magic_words().get(word) else {
+            return suggest.to_string();
+        };
+        if !suggest.is_empty() && entry.aliases.iter().any(|a| a == suggest) {
+            return suggest.to_string();
+        }
+        entry
+            .aliases
+            .first()
+            .cloned()
+            .unwrap_or_else(|| suggest.to_string())
+    }
+
     /// The URL for uploading a file (used by media/file links). Mirrors PHP's
     /// `SiteConfig::getUploadUrl` (a sensible default, overridable).
     fn get_upload_url(&self, _title: &str) -> String {
