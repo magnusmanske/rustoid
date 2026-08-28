@@ -3,10 +3,8 @@
 //!
 //! Picks the right [`DomHandler`] for an element by its tag name, its `stx`
 //! (syntactic-form) data-parsoid field, and its context (first encapsulation
-//! wrapper, HTML-syntax list, HTML table). The individual handler *classes*
-//! (`PHandler`, `LIHandler`, …) are layered on in subsequent modules; until
-//! then, the faithful dispatch *selection* is computed and non-default cases
-//! currently resolve to the shared [`DefaultDomHandler`] placeholder.
+//! wrapper, HTML-syntax list, HTML table). Each concrete handler class is
+//! instantiated here.
 
 use crate::html::dom_handler::{DefaultDomHandler, DomHandler};
 use crate::html::dom_tree::{DomTree, NodeId};
@@ -20,8 +18,7 @@ use crate::html::handlers::{
 use crate::html::wts_utils;
 
 /// The concrete DOM handler classes PHP maps tag names to (`DOMHandlerFactory::newFromTagHandler`).
-/// Used to faithfully record the tag→handler correspondence; each variant is
-/// instantiated in its own module as those handlers are ported.
+/// Used to faithfully record the tag→handler correspondence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerKind {
     A,
@@ -99,10 +96,9 @@ pub fn handler_kind_for_tag(tag: &str) -> Option<HandlerKind> {
 
 /// The `DOMHandlerFactory` dispatch (`getDOMHandler`), faithful to PHP's logic.
 ///
-/// Returns the concrete handler for `node` (or the `DefaultDomHandler` fallback
-/// until the individual handlers are ported). The selection algorithm is
-/// complete and faithful; only the terminal handler *instantiation* is a
-/// placeholder.
+/// Returns the concrete handler for `node`. The selection algorithm is complete
+/// and faithful; the only remaining placeholder is `EncapsulatedContentHandler`
+/// (which depends on `serializeFromParts`/extension serialization not yet ported).
 pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
     let dp = tree.node(node).dp.clone();
     let stx = dp.as_ref().and_then(|d| d.stx.clone());
@@ -143,9 +139,7 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         return Box::new(FallbackHTMLHandler);
     }
 
-    // Pick the best available specialized / plain handler. The three simplest
-    // concrete handlers are ported; the rest fall back to the no-op default
-    // until their modules land.
+    // Pick the best available specialized / plain handler.
     let kind = specialized_kind.or_else(|| handler_kind_for_tag(&tag));
     match kind {
         Some(HandlerKind::Body) => Box::new(BodyHandler),
@@ -247,7 +241,6 @@ mod tests {
         doc.push_child(Node::element(ElementKind::Paragraph));
         let tree = DomTree::new(doc);
         let p = tree.first_child(tree.root()).unwrap();
-        // Returns a boxed handler (currently the default placeholder).
         let _handler = get_dom_handler(&tree, p);
     }
 
