@@ -1205,10 +1205,38 @@ impl DomHandler for THHandler {
     }
 }
 
-/// `SpanHandler` — serialize a `<span>` wrapper. Faithful to
-/// `DOMHandlers/SpanHandler.php`, with nowiki/media/entity/placeholder branches
-/// stubbed and plain-span falling back to HTML.
+/// `SpanHandler` — serialize a `<span>` wrapper bearing a recognized
+/// `typeof` marker (`mw:Nowiki`, `mw:Entity`, `mw:DisplaySpace`,
+/// `mw:Placeholder`, or inline `mw:File` media), falling back to literal HTML
+/// for unrecognized/editor spans. Faithful to `DOMHandlers/SpanHandler.php`.
 pub struct SpanHandler;
+
+impl SpanHandler {
+    /// `SpanHandler::isRecognizedSpanWrapper` — `typeof` matches one of the
+    /// recognized span-wrapper markers.
+    fn is_recognized_span_wrapper(node: &crate::dom::node::Node) -> bool {
+        crate::html::dom_utils::match_type_of(
+            node,
+            "^mw:(Nowiki|Entity|DisplaySpace|Placeholder(/\\w+)?|File(/(Frameless|Frame|Thumb))?)$",
+        )
+        .is_some()
+    }
+
+    /// `DOMHandler::emitPlaceholderSrc` — emit a placeholder's source, moving
+    /// newline-only source into the separator (mirrors PHP).
+    fn emit_placeholder_src(tree: &DomTree, node: NodeId, state: &mut SerializerState) {
+        let dp = tree.node(node).dp.clone();
+        let src = dp.and_then(|d| d.src).unwrap_or_default();
+        if src.contains("<nowiki") && src.contains("/>") {
+            state.has_self_closing_nowikis = true;
+        }
+        if !src.is_empty() && src.chars().all(|c| c == '\n') {
+            state.append_sep(&src);
+        } else {
+            state.emit_chunk(src, node, tree);
+        }
+    }
+}
 
 impl DomHandler for SpanHandler {
     fn handle(
@@ -1217,16 +1245,91 @@ impl DomHandler for SpanHandler {
         node: NodeId,
         state: &mut SerializerState,
     ) -> Option<NodeId> {
-        // Fall back to plain HTML serialization for spans (the recognized
-        // nowiki/entity/media/placeholder branches are deferred).
-        let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(tree.node(node));
-        state.emit_chunk(tag, node, tree);
-        crate::html::serializer::walk_children(tree, node, state);
-        let end_tag =
-            crate::html::serializer::WikitextSerializer::serialize_html_end_tag(tree.node(node));
-        state.emit_chunk(end_tag, node, tree);
+        let n = tree.node(node);
+        let dp = n.dp.clone();
+
+        if Self::is_recognized_span_wrapper(n) {
+            if crate::html::dom_utils::has_type_of(n, "mw:Nowiki") {
+                // `<nowiki>…</nowiki>`: the extension body is the span's
+                // serialized children (mirrors the native `nowiki` ext tag's
+                // `domToWikitext` for the plain case).
+                state.single_line_context.disable();
+                let inner = state.serialize_indent_pre_children_to_string(tree, node);
+                state.emit_chunk(format!("<nowiki>{inner}</nowiki>"), node, tree);
+                state.single_line_context.pop();
+            } else if crate::html::wts_utils::is_inline_media(n) {
+                if let Some(env) = state.env {
+                    let ms = crate::html::media_structure::MediaStructure::parse(tree, node);
+                    crate::html::link_handler_utils::figure_handler(state, tree, &env, node, ms);
+                } else {
+                    FallbackHTMLHandler.handle(tree, node, state);
+                }
+            } else if crate::html::dom_utils::has_type_of(n, "mw:Entity")
+                && crate::html::dom_tree::has_n_children(tree, node, 1)
+            {
+                // Serialize an `mw:Entity` span: reuse `src` when it matches the
+                // content, else re-encode its text child, else serialize children.
+                let content_src = first_text_content(tree, node).unwrap_or_default();
+                let src_content = dp
+                    .as_ref()
+                    .and_then(|d| d.src_content.as_deref())
+                    .unwrap_or("");
+                if dp.as_ref().and_then(|d| d.src.as_ref()).is_some() && content_src == src_content
+                {
+                    let src = dp.as_ref().and_then(|d| d.src.clone()).unwrap_or_default();
+                    state.emit_chunk(src, node, tree);
+                } else if let Some(fc) = tree.first_child(node)
+                    && let NodeKind::Text(t) = &tree.node(fc).kind
+                {
+                    state.emit_chunk(entity_encode_all(t), fc, tree);
+                } else {
+                    state.serialize_children(tree, node);
+                }
+            } else if crate::html::dom_utils::has_type_of(n, "mw:DisplaySpace") {
+                state.emit_chunk(" ", node, tree);
+            } else if crate::html::dom_utils::match_type_of(n, "^mw:Placeholder(/|$)").is_some() {
+                if dp.as_ref().and_then(|d| d.src.as_ref()).is_some() {
+                    Self::emit_placeholder_src(tree, node, state);
+                } else {
+                    FallbackHTMLHandler.handle(tree, node, state);
+                }
+            }
+        } else if n.get_attr("data-mw-selser-wrapper").is_some() {
+            state.serialize_children(tree, node);
+        } else {
+            let misnested = dp.as_ref().and_then(|d| d.misnested).unwrap_or(false);
+            let is_html_stx = dp.as_ref().and_then(|d| d.stx.as_deref()) == Some("html");
+            if misnested && !is_html_stx && !has_non_ignorable_attributes(n) {
+                // Discard span wrappers added to flag misnested content.
+                state.serialize_children(tree, node);
+            } else {
+                FallbackHTMLHandler.handle(tree, node, state);
+            }
+        }
         tree.next_sibling(node)
     }
+}
+
+/// The text content of the first text child of `node` (or `None`). Mirrors the
+/// `$node->textContent` fetch in the `mw:Entity` span branch (single-text-child
+/// spans only).
+fn first_text_content(tree: &DomTree, node: NodeId) -> Option<String> {
+    tree.first_child(node)
+        .and_then(|c| match &tree.node(c).kind {
+            crate::dom::node::NodeKind::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+}
+
+/// `Utils::entityEncodeAll` — encode every character as a numeric character
+/// reference (`&#xNN;`), mirroring the PHP helper used to re-encode decoded
+/// `mw:Entity` content.
+fn entity_encode_all(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 6);
+    for c in s.chars() {
+        out.push_str(&format!("&#x{:X};", c as u32));
+    }
+    out
 }
 
 /// `PreHandler` — serialize an indent-`<pre>` block. Faithful to
@@ -2133,5 +2236,42 @@ mod tests {
         handler.handle(&tree, meta_id, &mut state);
         state.flush_line();
         assert_eq!(state.out, "<translate>");
+    }
+
+    #[test]
+    fn test_span_handler_display_space() {
+        let mut doc = Node::document();
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("typeof", "mw:DisplaySpace");
+        doc.push_child(span);
+
+        let tree = DomTree::new(doc);
+        let span_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = SpanHandler;
+        handler.handle(&tree, span_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, " ");
+    }
+
+    #[test]
+    fn test_span_handler_entity_reencodes_text() {
+        // An `mw:Entity` span with a text child (and no matching `src`) re-encodes
+        // the text as numeric character references.
+        let mut doc = Node::document();
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("typeof", "mw:Entity");
+        span.push_child(Node::text("&").clone());
+        doc.push_child(span);
+
+        let tree = DomTree::new(doc);
+        let span_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = SpanHandler;
+        handler.handle(&tree, span_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, "&#x26;");
     }
 }
