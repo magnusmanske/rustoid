@@ -150,11 +150,11 @@ pub fn is_iew(tree: &DomTree, id: NodeId) -> bool {
     matches!(&tree.nodes[id].kind, NodeKind::Text(t) if t.trim().is_empty())
 }
 
-/// Whether a node is a diff marker. Diff markers are only introduced in selser
-/// mode (ported later in `DiffUtils`); for pure html2wt they never appear, so
-/// this is `false` until the selser foundation lands.
-pub fn is_diff_marker(_tree: &DomTree, _id: NodeId) -> bool {
-    false
+/// Whether a node is a diff marker (a `meta`/`mw:DiffMarker/…` element).
+/// Diff markers are only introduced in selser mode via `DiffUtils`; for pure
+/// html2wt they never appear.
+pub fn is_diff_marker(tree: &DomTree, id: NodeId) -> bool {
+    crate::html::diff_utils::DiffUtils::is_diff_marker(tree.node(id), None)
 }
 
 /// Is a node a "content" node (not a comment, not IEW, not a diff marker)?
