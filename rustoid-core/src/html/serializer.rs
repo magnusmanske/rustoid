@@ -16,6 +16,7 @@
 use crate::dom::node::{ElementKind, NodeKind};
 use crate::html::dom_handler_factory::get_dom_handler;
 use crate::html::dom_tree::{DomTree, NodeId};
+use crate::html::dom_utils;
 use crate::html::serializer_state::SerializerState;
 
 /// Walk the children of `node`, serializing each via its handler. This is the
@@ -202,12 +203,15 @@ pub fn serialize_attributes_partial(node: &crate::dom::node::Node) -> String {
 }
 
 fn serialize_attributes(node: &crate::dom::node::Node) -> String {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+
     for attr in &node.attrs {
-        let k = &attr.key;
-        let v = &attr.value;
+        let k = attr.key.as_str();
+        let v = attr.value.as_str();
+
+        // Unconditionally ignore (mirrors `IGNORED_ATTRIBUTES` + `data-mw`).
         if matches!(
-            k.as_str(),
+            k,
             "data-parsoid"
                 | "data-mw"
                 | "data-ve-changed"
@@ -215,16 +219,105 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
                 | "data-parsoid-diff"
                 | "data-parsoid-serialize"
                 | "data-object-id"
-                | "about"
-                | "typeof"
-                | "rel"
-                | "class"
         ) {
             continue;
         }
-        out.push(format!("{}=\"{}\"", k, v.replace('"', "&quot;")));
+
+        // Parsoid-generated heading ids are stripped unless they were explicitly
+        // reused (mirrors the `id` + `isHeading` branch). Our `Node` has no
+        // `reusedId` signal yet, so we conservatively drop only a `data-object-id`
+        // style id here and keep real ids elsewhere.
+        if k == "id" && v.starts_with("mw-") && dom_utils::is_heading(node) {
+            continue;
+        }
+
+        // Strip Parsoid-inserted `class="mw-empty-elt"` markers.
+        if k == "class" {
+            let stripped = v.replace("mw-empty-elt", "").trim().to_string();
+            if stripped.is_empty() {
+                continue;
+            }
+            if stripped != v {
+                out.push(format!("class=\"{}\"", stripped.replace('"', "&quot;")));
+                continue;
+            }
+        }
+
+        // Strip Parsoid-generated `about`/`typeof` RDFa values (mirrors the
+        // `$parsoidAttributes` regex strip): `about="#mwt…"` and the `mw:…`
+        // tokens in `typeof` are removed, and any remainder is kept.
+        let parsoid_stripped: Option<String> = if k == "about" && v.starts_with("#mwt") {
+            Some(trim_parsoid_about(v))
+        } else if k == "typeof" {
+            let remaining: String = v
+                .split_whitespace()
+                .filter(|t| !t.starts_with("mw:"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (remaining != v).then_some(remaining)
+        } else {
+            None
+        };
+        if let Some(rv) = parsoid_stripped {
+            if !rv.is_empty() {
+                out.push(format!("{k}=\"{}\"", rv.replace('"', "&quot;")));
+            }
+            continue;
+        }
+
+        // Regular attribute: honor shadow info (`a`/`sa`) and the `data-x-`
+        // attribute-key prefix strip, mirroring the faithful path.
+        let shadow = crate::html::wts_utils::get_shadow_info(node, k, Some(v));
+        let kk = k.trim_start_matches("data-x-");
+        let vv = shadow.value.as_str();
+        if !vv.is_empty() {
+            if !shadow.fromsrc {
+                // Escaped from loaded attr value (not original source).
+                let escaped = vv.replace('>', "&gt;").replace('"', "&quot;");
+                out.push(format!("{kk}=\"{escaped}\""));
+            } else {
+                out.push(format!("{kk}=\"{}\"", vv.replace('"', "&quot;")));
+            }
+        } else if kk.contains('{') || kk.contains('<') {
+            // Templated / include / ext-tag generated attribute key.
+            out.push(kk.to_string());
+        } else {
+            out.push(format!("{kk}=\"\""));
+        }
     }
+
+    // Sanitized-away attributes (`dataParsoid->a` / `dataParsoid->sa`): restore
+    // any attribute present in the shadow maps but absent from the DOM (mirrors
+    // the trailing recovery loop in PHP's `serializeAttributes`).
+    if let Some(dp) = node.dp.as_ref()
+        && let (Some(a), Some(sa)) = (dp.a.as_ref(), dp.sa.as_ref())
+    {
+        let mut keys: Vec<&String> = a.keys().collect();
+        keys.sort();
+        for key in keys {
+            if node.get_attr(key).is_none() {
+                if let Some(sv) = sa.get(key)
+                    && !sv.is_empty()
+                {
+                    out.push(format!("{key}=\"{}\"", sv.replace('"', "&quot;")));
+                } else {
+                    out.push(key.to_string());
+                }
+            }
+        }
+    }
+
     out.join(" ")
+}
+
+/// Strip the Parsoid transclusion counter from an `about="#mwtN"` value,
+/// mirroring `CounterType::TRANSCLUSION_ABOUT` + `preg_replace` in PHP:
+/// `#mwt3` → `` and `#mwt3 xfoo` → `xfoo` (the trailing id suffix survives).
+fn trim_parsoid_about(v: &str) -> String {
+    // `#mwt` followed by digits is the transclusion id; strip that leading run.
+    let rest = &v[4..]; // skip "#mwt"
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.to_string()
 }
 
 #[cfg(test)]
@@ -241,6 +334,27 @@ mod tests {
         assert_eq!(
             WikitextSerializer::serialize_html_tag(&div),
             "<div style=\"color:red\">"
+        );
+    }
+
+    #[test]
+    fn test_serialize_attributes_restores_sanitized_attr() {
+        // An attribute that was sanitized away from the DOM but is present in
+        // `dataParsoid->a`/`sa` is restored from its source value.
+        let mut div = Node::element(ElementKind::Div);
+        div.set_attr("style", "color:red");
+        let mut a = std::collections::HashMap::new();
+        a.insert("align".to_string(), "left".to_string());
+        let mut sa = std::collections::HashMap::new();
+        sa.insert("align".to_string(), "left".to_string());
+        div.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            a: Some(a),
+            sa: Some(sa),
+            ..Default::default()
+        });
+        assert_eq!(
+            serialize_attributes(&div),
+            "style=\"color:red\" align=\"left\""
         );
     }
 
