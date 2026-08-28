@@ -13,6 +13,7 @@
 
 use crate::html::constrained_text::ConstrainedText;
 use crate::html::dom_tree::{DomTree, NodeId};
+use crate::html::dsr::{DomSourceRange, SelectiveUpdateData, SourceRange, is_valid_dsr};
 use crate::html::env::SerializerEnv;
 use crate::html::separators::SeparatorData;
 use crate::html::single_line_context::SingleLineContext;
@@ -104,6 +105,11 @@ pub struct SerializerState<'a> {
     /// Are we in selective-serialization (selser) mode?
     pub selser_mode: bool,
 
+    /// (selser) The selective-update data (carrying the revision wikitext,
+    /// `revText`). `None` outside selser mode. Faithful to PHP's private
+    /// `?SelectiveUpdateData $selserData`.
+    pub selser_data: Option<SelectiveUpdateData>,
+
     /// (selser) Was the previous node unmodified by an edit?
     pub prev_node_unmodified: bool,
     /// (selser) Is the current node unmodified by an edit?
@@ -172,6 +178,7 @@ impl<'a> SerializerState<'a> {
             redirect_text: None,
             out: String::new(),
             selser_mode: false,
+            selser_data: None,
             prev_node_unmodified: false,
             curr_node_unmodified: false,
             needs_escaping: false,
@@ -191,6 +198,84 @@ impl<'a> SerializerState<'a> {
         let mut state = SerializerState::new();
         state.env = Some(env);
         state
+    }
+
+    /// Initialize a few boolean flags based on serialization mode. Faithful to
+    /// `SerializerState::initMode(bool $selserMode)` (for use by
+    /// `WikitextSerializer` once the selser path is wired).
+    pub fn init_mode(&mut self, selser_mode: bool) {
+        self.selser_mode = selser_mode;
+    }
+
+    /// Extracts a subset of the page source bound by the supplied source range.
+    /// Faithful to `SerializerState::getOrigSrc(SourceRange $sr): ?string`.
+    ///
+    /// Requires selser mode (PHP `Assert::invariant`); returns `None` when not
+    /// in selser mode, when no `selser_data` is present, or when the range is
+    /// out of bounds.
+    pub fn get_orig_src(&self, sr: &SourceRange) -> Option<String> {
+        if !self.selser_mode {
+            return None;
+        }
+        let rev_text = self.selser_data.as_ref()?.rev_text.as_str();
+        // `$sr->start <= $sr->end` treats null offsets as 0 (PHP null
+        // comparison); replicate that only for the bounds check used here,
+        // then delegate the actual substring to `SourceRange::substr` (which
+        // returns "" for ranges with null offsets, matching PHP's
+        // `safeSubstr` behavior for empty ranges).
+        let start = sr.start.unwrap_or(0);
+        let end = sr.end.unwrap_or(0);
+        if start <= end && start <= rev_text.len() {
+            // Prefer the range's own source, else the revision text.
+            let src = sr.source.as_deref().unwrap_or(rev_text);
+            Some(sr.substr(src).to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Check the validity of a DSR in the context of the page source. Faithful
+    /// to `SerializerState::isValidDSR(?DomSourceRange $dsr, bool $all)`:
+    /// returns `false` when `is_valid_dsr` would, or when the offsets are out
+    /// of bounds or would slice in the middle of a UTF-8 sequence.
+    pub fn is_valid_dsr(&self, dsr: Option<&DomSourceRange>, all: bool) -> bool {
+        if !is_valid_dsr(dsr, all) {
+            return false;
+        }
+        let dsr = dsr.unwrap();
+        let rev_text = match self.selser_data.as_ref() {
+            Some(sd) => sd.rev_text.as_str(),
+            None => return false,
+        };
+        let start = dsr.start.unwrap_or(0);
+        let end = dsr.end.unwrap_or(0);
+        if !(start <= end && end <= rev_text.len()) {
+            return false;
+        }
+        // UTF-8 boundary checks (faithful to PHP's `$check` closure).
+        let check = |s: usize, e: usize| -> bool { utf8_boundary_ok(rev_text.as_bytes(), s, e) };
+        if !all {
+            return check(start, end);
+        }
+        // Check each inner range.
+        let open_end = start + dsr.open_width.unwrap_or(0);
+        if open_end > end {
+            return false;
+        }
+        if !check(start, open_end) {
+            return false;
+        }
+        let close_start = end.saturating_sub(dsr.close_width.unwrap_or(0));
+        if start > close_start {
+            return false;
+        }
+        if !check(close_start, end) {
+            return false;
+        }
+        if open_end > close_start {
+            return false;
+        }
+        check(open_end, close_start)
     }
 
     /// Append to the buffered separator source without changing `on_sol`.
@@ -476,6 +561,45 @@ impl<'a> Default for SerializerState<'a> {
     }
 }
 
+/// Faithful port of the `$check` closure in PHP's `SerializerState::isValidDSR`:
+/// verify that the byte range `[start, end)` of `src` starts on a non-continuation
+/// byte and ends on a complete UTF-8 character boundary.
+fn utf8_boundary_ok(src: &[u8], start: usize, end: usize) -> bool {
+    if start == end {
+        // Zero-length string is always ok.
+        return true;
+    }
+    let first_char = src[start];
+    if (first_char & 0xC0) == 0x80 {
+        return false; // Bad UTF-8 at start of string.
+    }
+    let mut i = 0isize;
+    // This loop won't pass `start` because we've already asserted the first
+    // character isn't 10xx xxxx.
+    loop {
+        i -= 1;
+        if i <= -5 {
+            return false; // Bad UTF-8 at end (>4 byte sequence).
+        }
+        let last_char = src[(end as isize + i) as usize];
+        if (last_char & 0xC0) != 0x80 {
+            break;
+        }
+    }
+    let last_char = src[(end as isize + i) as usize];
+    if (last_char & 0x80) == 0 {
+        i == -1
+    } else if (last_char & 0xE0) == 0xC0 {
+        i == -2
+    } else if (last_char & 0xF0) == 0xE0 {
+        i == -3
+    } else if (last_char & 0xF8) == 0xF0 {
+        i == -4
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +638,84 @@ mod tests {
         st.on_sol = false;
         st.emit_sep("\n", 1);
         assert!(st.on_sol);
+    }
+
+    fn selser_state(rev_text: &str) -> SerializerState<'static> {
+        let mut st = SerializerState::new();
+        st.init_mode(true);
+        st.selser_data = Some(SelectiveUpdateData::new(rev_text.to_string()));
+        st
+    }
+
+    #[test]
+    fn test_get_orig_src_requires_selser_mode() {
+        let st = SerializerState::new();
+        let sr = SourceRange::new(Some(0), Some(3));
+        assert_eq!(st.get_orig_src(&sr), None);
+    }
+
+    #[test]
+    fn test_get_orig_src_in_bounds() {
+        let st = selser_state("hello world");
+        let sr = SourceRange::new(Some(0), Some(5));
+        assert_eq!(st.get_orig_src(&sr).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_get_orig_src_out_of_bounds() {
+        let st = selser_state("hi");
+        // end past the revision text length is clamped by substr
+        let sr = SourceRange::new(Some(0), Some(10));
+        assert_eq!(st.get_orig_src(&sr).as_deref(), Some("hi"));
+        // start > end returns None
+        let sr2 = SourceRange::new(Some(5), Some(1));
+        assert_eq!(st.get_orig_src(&sr2), None);
+    }
+
+    #[test]
+    fn test_get_orig_src_prefers_range_source() {
+        let st = selser_state("rev text");
+        let sr = SourceRange::with_source(Some(0), Some(3), Some("xyz".to_string()));
+        assert_eq!(st.get_orig_src(&sr).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn test_is_valid_dsr_utf8_boundaries() {
+        let st = selser_state("éé"); // two 2-byte chars
+        // [0,2) slices the first é correctly
+        assert!(st.is_valid_dsr(
+            Some(&DomSourceRange::new(Some(0), Some(2), None, None, 0, 0)),
+            false
+        ));
+        // [1,2) starts mid-é (continuation byte) => invalid
+        assert!(!st.is_valid_dsr(
+            Some(&DomSourceRange::new(Some(1), Some(2), None, None, 0, 0)),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_dsr_null_or_out_of_bounds() {
+        let st = selser_state("abc");
+        assert!(!st.is_valid_dsr(None, false));
+        // end beyond revision text
+        assert!(!st.is_valid_dsr(
+            Some(&DomSourceRange::new(Some(0), Some(99), None, None, 0, 0)),
+            false
+        ));
+        // start > end
+        assert!(!st.is_valid_dsr(
+            Some(&DomSourceRange::new(Some(3), Some(1), None, None, 0, 0)),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_is_valid_dsr_all_requires_widths() {
+        let st = selser_state("<b>x</b>");
+        let no_widths = DomSourceRange::new(Some(0), Some(8), None, None, 0, 0);
+        assert!(!st.is_valid_dsr(Some(&no_widths), true));
+        let with_widths = DomSourceRange::new(Some(0), Some(8), Some(3), Some(4), 0, 0);
+        assert!(st.is_valid_dsr(Some(&with_widths), true));
     }
 }

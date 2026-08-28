@@ -202,6 +202,60 @@ impl DomSourceRange {
     }
 }
 
+/// Data that's necessary for selective updates (whether html→wt or wt→html).
+/// Faithful port of PHP's `Core\SelectiveUpdateData`. This is always the
+/// revision (current or previous) wikitext & html.
+///
+/// Only `rev_text` is modeled for now: it is the sole field the selser
+/// serializer reads (`getOrigSrc`/`isValidDSR`). `rev_html`/`rev_dom`/
+/// `template_title`/`mode` are carried through when provided, but the
+/// `revDOM` document graph is a type this codebase does not yet materialize
+/// for the selective-update path (see `selser.rs` porting note).
+#[derive(Debug, Clone, Default)]
+pub struct SelectiveUpdateData {
+    /// The revision wikitext source.
+    pub rev_text: String,
+    /// The revision HTML (when available).
+    pub rev_html: Option<String>,
+    /// If doing a selective update for a template edit, the edited template's
+    /// title string.
+    pub template_title: Option<String>,
+    /// Options for selective HTML updates: template, section, generic.
+    pub mode: Option<String>,
+}
+
+impl SelectiveUpdateData {
+    pub fn new(rev_text: impl Into<String>) -> Self {
+        Self {
+            rev_text: rev_text.into(),
+            rev_html: None,
+            template_title: None,
+            mode: None,
+        }
+    }
+}
+
+/// Basic check if a DOM Source Range (DSR) is valid (faithful to
+/// `Utils::isValidDSR`).
+///
+/// Only checks for underflow (null / negative offsets), not overflow, and
+/// does not verify `start <= end` nor `openWidth + closeWidth <= end - start`;
+/// those checks live in `SerializerState::isValidDSR`.
+///
+/// When `all` is true, the container tag widths must also be valid
+/// (non-null, non-negative).
+pub fn is_valid_dsr(dsr: Option<&DomSourceRange>, all: bool) -> bool {
+    let is_valid_offset = |n: Option<usize>| n.is_some();
+    match dsr {
+        None => false,
+        Some(dsr) => {
+            is_valid_offset(dsr.start)
+                && is_valid_offset(dsr.end)
+                && (!all || (is_valid_offset(dsr.open_width) && is_valid_offset(dsr.close_width)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
