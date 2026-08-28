@@ -9,6 +9,7 @@
 
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::env::SerializerEnv;
+use crate::html::serializer_state::SerializerState;
 use crate::html::wts_utils::ShadowInfo;
 
 /// The resolved round-trip data for a link (mirrors PHP's `$rtData`/`$linkData`
@@ -305,6 +306,121 @@ fn strip_leading_dot(s: String) -> String {
     s[i..].to_string()
 }
 
+/// `hasAutoUrlTerminatingChars` — does the URL end with a character that would
+/// terminate a free external link? (The legacy parser's `makeFreeExternalLink`
+/// set, approximated with the trailing-punctuation + URL-class terminators.)
+fn has_auto_url_terminating_chars(url: &str) -> bool {
+    match url.chars().last() {
+        Some(c) => {
+            matches!(c, ',' | ';' | '\\' | '.' | ':' | '!' | '?')
+                || matches!(c, '[' | ']' | '<' | '>' | '"' | ' ')
+        }
+        None => false,
+    }
+}
+
+/// `isURLLink` — can this link be serialized as a bare auto-URL link (with the
+/// content being exactly the cleaned URL)? Faithful to `LinkHandlerUtils::isURLLink`
+/// (the `cleanUrl` comparison uses `crate::sanitizer::clean_url`).
+pub fn is_url_link(
+    env: &SerializerEnv,
+    tree: &DomTree,
+    node: NodeId,
+    link_data: &LinkData,
+) -> bool {
+    let target = &link_data.target;
+    let content_str = get_content_string(tree, node);
+
+    let Some(content_str) = content_str else {
+        return false;
+    };
+    if content_str.is_empty() {
+        return false;
+    }
+
+    let is_valid_protocol = |s: &str| env.get_site_config().has_valid_protocol(s);
+    let clean_content =
+        crate::sanitizer::clean_url(&content_str, "", is_valid_protocol).unwrap_or_default();
+    let clean_href = crate::sanitizer::clean_url(&get_href(tree, node), "", is_valid_protocol)
+        .unwrap_or_default();
+
+    (target.value == clean_content || clean_href == clean_content)
+        && !content_str.starts_with("//")
+        && env.get_site_config().has_valid_protocol(&content_str)
+        && !has_auto_url_terminating_chars(&content_str)
+}
+
+/// `serializeAsExtLink` — serialize a node as an external link (`[…]`, auto-URL,
+/// or hash-only internal `[[#…]]`). Faithful to `LinkHandlerUtils::serializeAsExtLink`
+/// (the `isURLLink` fast-path and the auto-numbered/anchor link forms).
+pub fn serialize_as_ext_link(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    node: NodeId,
+    link_data: &LinkData,
+) {
+    let target = &link_data.target;
+    let mut url_str = target.value.clone();
+    if target.modified || !target.fromsrc {
+        url_str = escape_ext_link_url(&url_str);
+    }
+
+    if is_url_link(env, tree, node, link_data) {
+        let ct = crate::html::constrained_text::ConstrainedText::auto_url_link(url_str, node);
+        state.push_to_curr_line(ct);
+        state.on_sol = false;
+        state.at_start_of_output = false;
+        return;
+    }
+
+    let pure_hash_match = url_str.starts_with('#');
+
+    // Serialize the content with the link-specific escaping handler.
+    let content_str = if pure_hash_match {
+        crate::html::serializer_state::SerializerState::serialize_link_children_to_string(
+            state,
+            tree,
+            node,
+            Some(Box::new(move |_s, text, _o, _t| {
+                crate::html::wikitext_escape_handlers::wikilink_handler(text)
+            })),
+        )
+    } else {
+        crate::html::serializer_state::SerializerState::serialize_link_children_to_string(
+            state,
+            tree,
+            node,
+            Some(Box::new(move |_s, text, _o, _t| {
+                crate::html::wikitext_escape_handlers::a_handler(text)
+            })),
+        )
+    };
+
+    let link_text = if pure_hash_match {
+        format!(
+            "[[{url_str}{}{}]]",
+            if content_str.is_empty() { "" } else { "|" },
+            content_str
+        )
+    } else {
+        format!(
+            "[{url_str}{}{}]",
+            if content_str.is_empty() { "" } else { " " },
+            content_str
+        )
+    };
+
+    let ct = if pure_hash_match {
+        crate::html::constrained_text::ConstrainedText::wiki_link(
+            link_text, node, false, None, None,
+        )
+    } else {
+        crate::html::constrained_text::ConstrainedText::ext_link(link_text, node)
+    };
+    state.push_to_curr_line(ct);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +497,42 @@ mod tests {
         assert_eq!(data.link_type.as_deref(), Some("mw:WikiLink"));
         assert_eq!(data.href, "Foo_Bar");
         assert_eq!(data.content_string.as_deref(), Some("Foo Bar"));
+    }
+
+    #[test]
+    fn test_serialize_as_ext_link() {
+        let config = crate::mock::MockSiteConfig::new();
+        let ctitle = crate::title::Title::new_main("Test");
+        let env = SerializerEnv::new(&config, &ctitle);
+
+        // A bracketed extlink `[https://example.com content]`.
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("rel", "mw:ExtLink");
+        a.set_attr("href", "https://example.com");
+        a.push_child(Node::text("content"));
+        let tree = DomTree::new(a);
+        let a_id = tree.root();
+
+        let data = get_link_round_trip_data(&env, &tree, a_id);
+        let mut state = SerializerState::new();
+        serialize_as_ext_link(&mut state, &tree, &env, a_id, &data);
+        state.flush_line();
+        assert_eq!(state.out, "[https://example.com content]");
+    }
+
+    #[test]
+    fn test_is_url_link() {
+        let config = crate::mock::MockSiteConfig::new();
+        let ctitle = crate::title::Title::new_main("Test");
+        let env = SerializerEnv::new(&config, &ctitle);
+
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("rel", "mw:ExtLink");
+        a.set_attr("href", "https://example.com");
+        a.push_child(Node::text("https://example.com"));
+        let tree = DomTree::new(a);
+        let a_id = tree.root();
+        let data = get_link_round_trip_data(&env, &tree, a_id);
+        assert!(is_url_link(&env, &tree, a_id, &data));
     }
 }
