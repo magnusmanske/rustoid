@@ -128,6 +128,9 @@ impl WikitextSerializer {
     /// Serialize an owned DOM (`Node`) tree to wikitext, using the handler
     /// dispatch and the `SerializerState` walk. Faithful skeleton of
     /// `WikitextSerializer::serializeDOM` (no `DOMNormalizer`, no selser).
+    ///
+    /// This variant carries no environment, so link/media handlers fall back to
+    /// literal HTML; use [`serialize_dom_with_env`] for full link serialization.
     pub fn serialize_dom(root: crate::dom::node::Node) -> String {
         let tree = DomTree::new(root);
         let root_id = tree.root();
@@ -136,7 +139,24 @@ impl WikitextSerializer {
         crate::html::serializer::walk_children(&tree, root_id, &mut state);
         state.flush_line();
         if let Some(redirect) = state.redirect_text.clone() {
-            format!("{redirect}\\n{}", state.out)
+            format!("{redirect}\n{}", state.out)
+        } else {
+            state.out
+        }
+    }
+
+    /// Serialize with a [`SerializerEnv`] so link/media handlers can run.
+    pub fn serialize_dom_with_env(
+        root: crate::dom::node::Node,
+        env: crate::html::env::SerializerEnv,
+    ) -> String {
+        let tree = DomTree::new(root);
+        let root_id = tree.root();
+        let mut state = SerializerState::with_env(env);
+        crate::html::serializer::walk_children(&tree, root_id, &mut state);
+        state.flush_line();
+        if let Some(redirect) = state.redirect_text.clone() {
+            format!("{redirect}\n{}", state.out)
         } else {
             state.out
         }
@@ -282,5 +302,24 @@ mod tests {
 
         let wt = WikitextSerializer::serialize_dom(doc);
         assert_eq!(wt, "<nowiki>{{foo}}</nowiki>");
+    }
+
+    #[test]
+    fn test_serialize_dom_with_env_wikilink() {
+        // A wikilink serializes to `[[Foo]]` when an environment is present.
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("rel", "mw:WikiLink");
+        a.set_attr("href", "./Foo");
+        a.push_child(Node::text("Foo"));
+        p.push_child(a);
+        doc.push_child(p);
+
+        let config = crate::mock::MockSiteConfig::new();
+        let title = crate::title::Title::new_main("Test");
+        let env = crate::html::env::SerializerEnv::new(&config, &title);
+        let wt = WikitextSerializer::serialize_dom_with_env(doc, env);
+        assert_eq!(wt, "[[Foo]]");
     }
 }

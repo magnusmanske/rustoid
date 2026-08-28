@@ -11,6 +11,7 @@ use crate::traits::SiteConfig;
 
 /// Serializer-facing environment. Mirrors the subset of `Env` the
 /// `WikitextEscapeHandlers`/serializer depends on.
+#[derive(Clone, Copy)]
 pub struct SerializerEnv<'a> {
     config: &'a dyn SiteConfig,
     context_title: &'a Title,

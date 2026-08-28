@@ -1514,6 +1514,67 @@ impl DomHandler for HTMLPreHandler {
     }
 }
 
+/// `AHandler` — serialize an `<a>` link via `link_handler`. Faithful to
+/// `DOMHandlers/AHandler.php` (delegates to `WikitextSerializer::linkHandler`).
+pub struct AHandler;
+
+impl DomHandler for AHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        // `SerializerEnv` is `Copy`; extract it before mutably borrowing `state`.
+        if let Some(env) = state.env {
+            crate::html::link_handler_utils::link_handler(state, tree, &env, node);
+        } else {
+            FallbackHTMLHandler.handle(tree, node, state);
+        }
+        tree.next_sibling(node)
+    }
+}
+
+/// `LinkHandler` — serialize a `<link>` (redirect/category/… link) via
+/// `link_handler`. Faithful to `DOMHandlers/LinkHandler.php`.
+pub struct LinkHandler;
+
+impl DomHandler for LinkHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        if let Some(env) = state.env {
+            crate::html::link_handler_utils::link_handler(state, tree, &env, node);
+        } else {
+            FallbackHTMLHandler.handle(tree, node, state);
+        }
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        None
+    }
+
+    fn after(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        None
+    }
+}
+
 /// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
 /// is not a Parsoid bookkeeping attribute. Approximate stub.
 fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {

@@ -12,9 +12,10 @@ use crate::html::dom_handler::{DefaultDomHandler, DomHandler};
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::handlers::{
-    BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler, HRHandler,
-    HTMLPreHandler, HeadingHandler, JustChildrenHandler, LIHandler, ListHandler, PHandler,
-    PreHandler, QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
+    AHandler, BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler,
+    HRHandler, HTMLPreHandler, HeadingHandler, JustChildrenHandler, LIHandler, LinkHandler,
+    ListHandler, PHandler, PreHandler, QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler,
+    TableHandler,
 };
 use crate::html::wts_utils;
 
@@ -174,19 +175,15 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::Span) => Box::new(SpanHandler),
         Some(HandlerKind::Pre) => Box::new(PreHandler),
         Some(HandlerKind::PreHtml) => Box::new(HTMLPreHandler),
-        // Not yet ported: these concretely map to specialized handlers in PHP
-        // (`AHandler`/`LinkHandler` → linkHandler, `FigureHandler`/`ImgHandler`/
-        // `MediaHandler` → LinkHandlerUtils, `MetaHandler`). Until their
-        // `LinkHandlerUtils`/annotation/SiteConfig dependencies land, serialize
-        // literally so round-trips do not silently drop the element.
-        Some(
-            HandlerKind::A
-            | HandlerKind::Link
-            | HandlerKind::Figure
-            | HandlerKind::Img
-            | HandlerKind::Media
-            | HandlerKind::Meta,
-        ) => Box::new(FallbackHTMLHandler),
+        // `A`/`Link` now dispatch via `linkHandler`; `Figure`/`Img`/`Media`
+        // still need `figureHandler`/`figureToConstrainedText` (media assembly),
+        // and `Meta` needs `MetaHandler` (magic-word/annotation). Until those
+        // land, they serialize literally so round-trips do not drop the element.
+        Some(HandlerKind::A) => Box::new(AHandler),
+        Some(HandlerKind::Link) => Box::new(LinkHandler),
+        Some(HandlerKind::Figure | HandlerKind::Img | HandlerKind::Media | HandlerKind::Meta) => {
+            Box::new(FallbackHTMLHandler)
+        }
         // No specialized/plain handler → literal HTML serialization (faithful to
         // PHP's `?: new FallbackHTMLHandler()` final fallback). `FallbackHTML` is
         // the tag→handler map's "no specialized handler" sentinel; `Heading(_)`

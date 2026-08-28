@@ -13,6 +13,7 @@
 
 use crate::html::constrained_text::ConstrainedText;
 use crate::html::dom_tree::{DomTree, NodeId};
+use crate::html::env::SerializerEnv;
 use crate::html::separators::SeparatorData;
 use crate::html::single_line_context::SingleLineContext;
 
@@ -45,7 +46,13 @@ pub enum InState {
 }
 
 /// The mutable serializer state (port of `SerializerState`).
-pub struct SerializerState {
+///
+/// `'a` is the lifetime of the borrowed [`SerializerEnv`] (carrying the
+/// `SiteConfig`/context `Title`); test-only states use `'static` with `env: None`.
+pub struct SerializerState<'a> {
+    /// The serializer environment (`None` in test-only states without a config).
+    pub env: Option<SerializerEnv<'a>>,
+
     /// Separator info (constraints / collected source / last source node).
     pub separator: SeparatorData,
 
@@ -140,11 +147,11 @@ pub struct CurrentLine {
     pub first_node: Option<NodeId>,
 }
 
-impl SerializerState {
-    /// Construct a fresh serializer state. `options` mirror the PHP constructor
-    /// options (`onSOL`, `inPHPBlock`, `inAttribute`, `protect`, `selserMode`).
+impl<'a> SerializerState<'a> {
+    /// Construct a fresh serializer state with no environment (for tests).
     pub fn new() -> Self {
         Self {
+            env: None,
             separator: SeparatorData::default(),
             on_sol: true,
             at_start_of_output: true,
@@ -176,6 +183,14 @@ impl SerializerState {
             log_prefix: "OUT:".to_string(),
             have_trimmed_ws_dsr: false,
         }
+    }
+
+    /// Construct a serializer state carrying the given environment (for real
+    /// html2wt serialization with a `SiteConfig`/context `Title`).
+    pub fn with_env(env: SerializerEnv<'a>) -> Self {
+        let mut state = SerializerState::new();
+        state.env = Some(env);
+        state
     }
 
     /// Append to the buffered separator source without changing `on_sol`.
@@ -455,7 +470,7 @@ impl SerializerState {
     }
 }
 
-impl Default for SerializerState {
+impl<'a> Default for SerializerState<'a> {
     fn default() -> Self {
         Self::new()
     }
