@@ -502,6 +502,13 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
     // Only run wt2html if the mode explicitly supports it
     let supports_wt2html = modes.is_empty() || modes.contains(&"wt2html");
 
+    if modes.contains(&"wt2wt") {
+        return run_wt2wt_test(test, test_file);
+    }
+    if modes.contains(&"html2wt") {
+        return run_html2wt_test(test, test_file);
+    }
+
     if supports_wt2html && (test.html_parsoid.is_some() || test.html_php.is_some()) {
         return run_wt2html_test(test, test_file);
     }
@@ -640,7 +647,82 @@ fn extract_body(html: &str) -> String {
     html.to_string()
 }
 
-/// Run a selser (selective serialization) test.
+/// Run a wikitext → wikitext (wt2wt) round-trip test: parse to AST, then
+/// serialize back, comparing against the input wikitext.
+fn run_wt2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
+    if test.wikitext.is_empty() {
+        return TestResult::Skip("no wikitext input".to_string());
+    }
+    let config = MockSiteConfig::new();
+    let parser = Parser::new(&config);
+
+    let wrap_sections = test.options_raw.contains("wrapSections\": true")
+        || test.options_raw.contains("wrapSections\":true");
+
+    let ast = match parser.wikitext_to_ast(&test.wikitext, wrap_sections) {
+        Ok(ast) => ast,
+        Err(e) => return TestResult::Error(format!("parse error: {e}")),
+    };
+
+    let page_title = test
+        .options
+        .get("title")
+        .cloned()
+        .unwrap_or_else(|| "TestPage".to_string());
+    let title = rustoid_core::title::Title::new_main(&page_title);
+    let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
+    let actual =
+        rustoid_core::html::serializer::WikitextSerializer::serialize_dom_with_env(ast, env);
+
+    let expected = test.wikitext.clone();
+    if actual == expected {
+        TestResult::Pass
+    } else {
+        TestResult::Fail {
+            expected,
+            actual,
+            diff_hint: String::new(),
+        }
+    }
+}
+
+/// Run an HTML → wikitext (html2wt) test.
+fn run_html2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
+    let html = match test.html_parsoid.as_ref() {
+        Some(h) => h.clone(),
+        None => match test.html_php.as_ref() {
+            Some(h) => h.clone(),
+            None => return TestResult::Skip("no HTML input".to_string()),
+        },
+    };
+    let expected = test.wikitext.clone();
+    // Parse the HTML fragment to an AST (semantic `data-parsoid` metadata is
+    // NOT recoverable from stripped fixture HTML; html2wt parity is limited).
+    let ast = match rustoid_core::html::parse::parse_html(&html) {
+        Ok(ast) => ast,
+        Err(e) => return TestResult::Error(format!("html parse error: {e}")),
+    };
+    let config = MockSiteConfig::new();
+    let page_title = test
+        .options
+        .get("title")
+        .cloned()
+        .unwrap_or_else(|| "TestPage".to_string());
+    let title = rustoid_core::title::Title::new_main(&page_title);
+    let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
+    let actual =
+        rustoid_core::html::serializer::WikitextSerializer::serialize_dom_with_env(ast, env);
+    if actual == expected {
+        TestResult::Pass
+    } else {
+        TestResult::Fail {
+            expected,
+            actual,
+            diff_hint: String::new(),
+        }
+    }
+}
+
 fn run_selser_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
     if test.wikitext.is_empty() {
         return TestResult::Skip("no wikitext input".to_string());

@@ -13,7 +13,7 @@
 //! `serializeAttributes`, `serializeDOM`) are stubbed and layered on with
 //! `WikitextEscapeHandlers`.
 
-use crate::dom::node::NodeKind;
+use crate::dom::node::{ElementKind, NodeKind};
 use crate::html::dom_handler_factory::get_dom_handler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::serializer_state::SerializerState;
@@ -135,8 +135,11 @@ impl WikitextSerializer {
         let tree = DomTree::new(root);
         let root_id = tree.root();
         let mut state = SerializerState::new();
-        // Serialize all top-level children (the Document root's children).
-        crate::html::serializer::walk_children(&tree, root_id, &mut state);
+        // Serialize the body content: `serializeDOM` extracts `<body>` (PHP's
+        // `DOMCompat::getBody`), so skip a synthetic `<html>`/`<body>` wrapper
+        // produced by our fragment-mode tree builder and serialize its children.
+        let body = body_content_node(&tree, root_id);
+        crate::html::serializer::walk_children(&tree, body, &mut state);
         state.flush_line();
         if let Some(redirect) = state.redirect_text.clone() {
             format!("{redirect}\n{}", state.out)
@@ -153,7 +156,8 @@ impl WikitextSerializer {
         let tree = DomTree::new(root);
         let root_id = tree.root();
         let mut state = SerializerState::with_env(env);
-        crate::html::serializer::walk_children(&tree, root_id, &mut state);
+        let body = body_content_node(&tree, root_id);
+        crate::html::serializer::walk_children(&tree, body, &mut state);
         state.flush_line();
         if let Some(redirect) = state.redirect_text.clone() {
             format!("{redirect}\n{}", state.out)
@@ -161,6 +165,32 @@ impl WikitextSerializer {
             state.out
         }
     }
+}
+
+/// Resolve the node whose children are the document body content, mirroring
+/// PHP's `WikitextSerializer::serializeDOM`, which extracts `<body>` from a
+/// `Document` and otherwise serializes a `DocumentFragment` directly.
+///
+/// Our fragment-mode tree builder emits a synthetic `<html>` wrapper (see
+/// `html5/tree_builder.rs::start_document`); both it and a literal `<body>` are
+/// transparent for serialization, so we descend into the single such wrapper
+/// and return it (or the root if there is none).
+fn body_content_node(tree: &DomTree, root: NodeId) -> NodeId {
+    if let Some(child) = tree.first_child(root)
+        && let NodeKind::Element(kind) = &tree.node(child).kind
+    {
+        // Only treat it as structural if it is the sole child (a synthetic
+        // wrapper has no siblings). PHP's `getBody` returns the body; a real
+        // comment/text sibling would not be the body wrapper.
+        let is_wrapper = matches!(
+            kind,
+            ElementKind::Other(tag) if tag == "html" || tag == "body"
+        );
+        if is_wrapper && tree.next_sibling(child).is_none() {
+            return child;
+        }
+    }
+    root
 }
 
 /// Serialize an element's attributes to an HTML attribute string. This is a

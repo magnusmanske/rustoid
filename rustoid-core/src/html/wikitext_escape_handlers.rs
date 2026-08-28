@@ -18,6 +18,8 @@
 // otherwise documented.
 
 use crate::html::serializer_state::SerializerState;
+use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
+use crate::wikitext::tokens_v2::{Either, ParsoidToken};
 
 /// Result of [`escape_link_target`]: the (entity-escaped, fragment-encoded)
 /// link target plus whether it is an invalid link. Mirrors PHP's
@@ -324,21 +326,53 @@ pub fn escape_wikitext(
         return escaped_text(state, sol, text, false, false);
     }
 
-    // `has_wikitext_tokens` is approximated: if any escapable character remains,
-    // conservatively wrap. Tildes always wrap.
-    if has_tildes || has_non_quote_escapable_chars || has_quote_char || full_check_needed {
+    // `hasWikitextTokens` / `textCanParseAsLink` need a real tokenizer walk,
+    // which we now have via `tokenizer_v2`. Tildes always wrap (PHP short-
+    // circuits before the token walk).
+    if has_tildes {
         return escaped_text(state, sol, text, false, false);
     }
 
-    // `text_can_parse_as_link` + trailing-`=` cases (approximated).
-    if text.ends_with(']') {
+    if has_wikitext_tokens(state, sol, text) {
         return escaped_text(state, sol, text, false, false);
     }
+
+    // An unmatched closing bracket could still parse as a link: verify by
+    // re-tokenizing the accumulated line + text.
+    if contains_closing_bracket(text) && text_can_parse_as_link(state, tree, opts.node, text) {
+        return escaped_text(state, sol, text, false, false);
+    }
+
+    // Trailing `=` in a heading context needs protection (heading-escape
+    // heuristic, ported conservatively).
     if opts.is_last_child && text.ends_with('=') && !state.curr_line.text.is_empty() {
         return escaped_text(state, sol, text, false, false);
     }
 
     text.to_string()
+}
+
+/// `hasWikitextTokens` — tokenize `text` and report whether it contains any
+/// wikitext markup token (a token that would re-parse as a construct, not as
+/// plain text). Faithful to PHP's `hasWikitextTokens`: only structural tokens
+/// (`TagTk`, `EndTagTk`, `SelfclosingTagTk`) — plus our compound
+/// `IndentPre`/`List` tokens — trigger escaping. `NlTk`, `CommentTk`,
+/// `EmptyLineTk`, `EOFTk`, and plain strings do not (PHP's loop ignores them).
+fn has_wikitext_tokens(_state: &SerializerState, sol: bool, text: &str) -> bool {
+    let tokens = tokenize(text, sol);
+    tokens.as_ref().is_none_or(|tokens| {
+        tokens.iter().any(|t| match t {
+            Either::Right(ParsoidToken::Tag(_)) => true,
+            Either::Right(ParsoidToken::EndTag(_)) => true,
+            Either::Right(ParsoidToken::SelfclosingTag(_)) => true,
+            // Compound markup tokens (lists / indent-pre) are real wikitext
+            // constructs and therefore require escaping.
+            Either::Right(ParsoidToken::IndentPre(_)) => true,
+            Either::Right(ParsoidToken::List(_)) => true,
+            // Newlines, comments, empty lines, and EOF are not markup.
+            _ => false,
+        })
+    })
 }
 
 /// Internal helper: escape `text` as though we were at start-of-line (for the
@@ -355,6 +389,60 @@ fn escape_wikitext_sol(
     // For correctness of the fast paths we reuse the same logic with `sol` set.
     // This is a minimal approximation; the token-walk dependency is unresolved.
     escape_wikitext(state, tree, text, opts)
+}
+
+/// Tokenize `text` with the PEG tokenizer in `sol` mode, mirroring PHP's
+/// `$this->tokenizer->tokenizeAs($text, 'start', sol: $sol)`. Returns `None` on
+/// a tokenizer error (callers choose whether to be conservative).
+fn tokenize(text: &str, sol: bool) -> Option<Vec<Either<String, ParsoidToken>>> {
+    let options = TokenizerOptions {
+        sol,
+        ..TokenizerOptions::default()
+    };
+    let mut tokenizer = PegTokenizer::new(text, &options);
+    tokenizer.tokenize().ok()
+}
+
+/// Does `text` contain an unmatched closing bracket (the `/[^\[]*\]/` test
+/// that gates the `textCanParseAsLink` link-resolution walk)?
+fn contains_closing_bracket(text: &str) -> bool {
+    text.contains(']')
+}
+
+/// `textCanParseAsLink` — re-tokenize the accumulated current line plus `text`
+/// and decide whether a trailing closing bracket would close a real link
+/// (re-parse as `]]`/`]` in a link), requiring nowiki protection. Faithful to
+/// the PHP fast-path: if the final token is a plain string ending in `text`
+/// (i.e. `text` stayed outside any link token), it is safe.
+fn text_can_parse_as_link(
+    state: &SerializerState,
+    _tree: &crate::html::dom_tree::DomTree,
+    _node: Option<crate::html::dom_tree::NodeId>,
+    text: &str,
+) -> bool {
+    // Strip extraneous characters after a `]` (inessential to link detection).
+    // Mirrors `/\][^\]]*$/D` → keep up to (and including) the first close.
+    let text = match text.find(']') {
+        Some(i) => &text[..=i],
+        None => text,
+    };
+    if text.contains('\n') {
+        return false;
+    }
+
+    let combined = format!("{}{}", state.curr_line.text, text);
+    let tokens = match tokenize(&combined, false) {
+        Some(tokens) => tokens,
+        None => return true,
+    };
+    let Some(last) = tokens.last() else {
+        return false;
+    };
+
+    match last {
+        Either::Left(s) => s == text || s.ends_with(text),
+        _ => true,
+    }
 }
 
 /// `escapedText` — wrap `orig_text` in `<nowiki>…</nowiki>` (or protect minimal
@@ -702,6 +790,43 @@ mod tests {
         assert!(has_tildes("~~~"));
         assert!(has_tildes("~~~~"));
         assert!(!has_tildes("~~"));
+    }
+
+    #[test]
+    fn test_has_wikitext_tokens_ignores_brackets_and_newlines() {
+        // Bare bracket text and newlines are not wikitext markup and must not
+        // trigger escaping (regression test for separatorTests "Newlines reset
+        // separator state").
+        assert!(!has_wikitext_tokens(&SerializerState::new(), false, "[1]"));
+        assert!(!has_wikitext_tokens(
+            &SerializerState::new(),
+            false,
+            " [1]\n"
+        ));
+        assert!(!has_wikitext_tokens(&SerializerState::new(), false, "Foo"));
+        // Real markup does require escaping.
+        assert!(has_wikitext_tokens(
+            &SerializerState::new(),
+            false,
+            "{{foo}}"
+        ));
+        assert!(has_wikitext_tokens(
+            &SerializerState::new(),
+            false,
+            "'''bold'''"
+        ));
+    }
+
+    #[test]
+    fn test_escape_wikitext_bracket_text_is_not_nowiked() {
+        // `[1]` is a bare text literal (not a valid link), so it must serialize
+        // back unchanged rather than being wrapped in `<nowiki>`.
+        let st = SerializerState::new();
+        let tree = empty_tree();
+        assert_eq!(
+            escape_wikitext(&st, &tree, "[1]", EscapeOpts::default()),
+            "[1]"
+        );
     }
 
     #[test]
