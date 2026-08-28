@@ -174,8 +174,7 @@ impl DomHandler for HRHandler {
 }
 
 /// `BRHandler` — serialize `<br>` (only when it has literal-HTML or
-/// single-line-context semantics). Faithful to `DOMHandlers/BRHandler.php`,
-/// except `PHandler::isPPTransition` is stubbed to `false`.
+/// single-line-context semantics). Faithful to `DOMHandlers/BRHandler.php`.
 pub struct BRHandler;
 
 impl BRHandler {
@@ -263,8 +262,7 @@ impl DomHandler for BRHandler {
     }
 }
 
-/// `HeadingHandler` — serialize `<hN>` as repeated `=`. Annotation-marker helper
-/// is stubbed to `false` until `WTUtils::isAnnotationStartMarkerMeta` lands.
+/// `HeadingHandler` — serialize `<hN>` as repeated `=`.
 pub struct HeadingHandler {
     pub heading_wt: String,
 }
@@ -338,7 +336,7 @@ impl DomHandler for HeadingHandler {
     }
 }
 
-/// `ListHandler` — serialize `<ul>`/`<ol>`/`<dl>`. `liHandler` escaping is stubbed.
+/// `ListHandler` — serialize `<ul>`/`<ol>`/`<dl>`.
 pub struct ListHandler {
     pub first_child_names: Vec<String>,
 }
@@ -429,7 +427,7 @@ impl DomHandler for ListHandler {
     }
 }
 
-/// `LIHandler` — serialize an `<li>`. Trailing-whitespace recovery is stubbed.
+/// `LIHandler` — serialize an `<li>`.
 pub struct LIHandler;
 
 impl DomHandler for LIHandler {
@@ -501,8 +499,7 @@ impl DomHandler for LIHandler {
 
 /// `PHandler` — serialize a `<p>`, with the paragraph newline constraints
 /// (`isPPTransition`) that `BRHandler` and others depend on. Faithful to
-/// `DOMHandlers/PHandler.php`; the block-node/sol-transparent line-walk helpers
-/// are stubbed.
+/// `DOMHandlers/PHandler.php`.
 pub struct PHandler;
 
 impl PHandler {
@@ -1002,8 +999,7 @@ impl DomHandler for TRHandler {
     }
 }
 
-/// `TDHandler` — serialize a `<td>`. Faithful to `DOMHandlers/TDHandler.php`,
-/// with `tdHandler` escaping and trimmed-whitespace recovery stubbed.
+/// `TDHandler` — serialize a `<td>`. Faithful to `DOMHandlers/TDHandler.php`.
 pub struct TDHandler;
 
 impl DomHandler for TDHandler {
@@ -1104,8 +1100,7 @@ impl DomHandler for TDHandler {
     }
 }
 
-/// `THHandler` — serialize a `<th>`. Faithful to `DOMHandlers/THHandler.php`,
-/// with `thHandler` escaping and trimmed-whitespace recovery stubbed.
+/// `THHandler` — serialize a `<th>`. Faithful to `DOMHandlers/THHandler.php`.
 pub struct THHandler;
 
 impl DomHandler for THHandler {
