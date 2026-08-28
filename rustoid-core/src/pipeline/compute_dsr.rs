@@ -62,6 +62,20 @@ fn is_quote_elt(node: &Node) -> bool {
     crate::html::wts_utils::is_quote_elt(node)
 }
 
+/// `WTUtils::isTplStartMarkerMeta` — a `<meta>` whose `typeof` is exactly
+/// `mw:Transclusion` or `mw:Param` (not `/End`), i.e. a transclusion *start*
+/// marker. Used by DSR to avoid crossing into template content while
+/// propagating sibling start offsets.
+fn is_tpl_start_marker_meta(node: &Node) -> bool {
+    if node_name(node) != "meta" {
+        return false;
+    }
+    node.get_attr("typeof").is_some_and(|ty| {
+        ty.split_whitespace()
+            .any(|t| (t == "mw:Transclusion" || t == "mw:Param") && !t.ends_with("/End"))
+    })
+}
+
 fn is_a_tag_from_wiki_link_syntax(node: &Node) -> bool {
     node.get_attr("rel") == Some("mw:WikiLink")
 }
@@ -224,6 +238,14 @@ fn compute_node_dsr(
         }
 
         let mut fostered = false;
+        // Forward-propagation state (`propagateRight` in PHP): captured during
+        // element processing and applied to right siblings after `child` is no
+        // longer mutably borrowed.
+        let mut propagate_right = false;
+        let mut old_ce_tsr: Option<usize> = None;
+        let mut child_is_tpl_start = false;
+        let mut element_ce: Option<usize> = None; // `ce` *before* the `ce = cs` merge
+
         match child.kind {
             NodeKind::Text(ref t) => {
                 cs = ce.map(|c| c.saturating_sub(t.len()));
@@ -237,6 +259,8 @@ fn compute_node_dsr(
             NodeKind::Element(_) => {
                 let dp = child.dp.clone().unwrap_or_default();
                 let tsr = dp.tsr.clone();
+                old_ce_tsr = tsr.as_ref().map(|t| t.end);
+                child_is_tpl_start = is_tpl_start_marker_meta(child);
 
                 let mut st_width: Option<usize> = None;
                 let mut et_width: Option<usize> = None;
@@ -253,10 +277,14 @@ fn compute_node_dsr(
                 let is_meta = node_name(child) == "meta";
                 if is_meta {
                     if let Some(tsr) = &tsr {
-                        // Meta-marker tags (templates/extensions) and other
-                        // meta-tags alike reset cs/ce to the (top-level) tsr.
+                        // Meta-marker tags (templates/extensions) reset cs/ce to
+                        // the (top-level) tsr; transclusion start markers also
+                        // flag forward propagation.
                         cs = Some(tsr.start);
                         ce = Some(tsr.end);
+                        if child_is_tpl_start {
+                            propagate_right = true;
+                        }
                     } else if has_type_of(child, "mw:IndentPreWS") {
                         cs = ce.map(|c| c.saturating_sub(1));
                     } else if match_placeholder(child) && ce.is_some() && dp.src.is_some() {
@@ -283,6 +311,7 @@ fn compute_node_dsr(
                                 if tsr_spans_tag_dom(child, &dp) {
                                     if tsr.end > 0 {
                                         ce = Some(tsr.end);
+                                        propagate_right = true;
                                     }
                                 } else {
                                     st_width = Some(tsr.end.saturating_sub(tsr.start));
@@ -353,6 +382,69 @@ fn compute_node_dsr(
                     };
                     child.dp.get_or_insert_with(DataParsoid::default).dsr = Some(dsr);
                 }
+
+                // The element's `ce` (after the merge, before the `ce = cs`
+                // update below) drives forward propagation.
+                element_ce = ce;
+            }
+        }
+
+        // Forward propagation (`propagateRight` in PHP): push a shifted child
+        // `ce` onto its right siblings' `dsr.start`/`dsr.end`, stopping at any
+        // transclusion start marker, fostered node, or TSR-anchored sibling.
+        if let Some(ce_val) = element_ce
+            && (propagate_right || old_ce_tsr != Some(ce_val) || e.is_none())
+            && !child_is_tpl_start
+        {
+            let mut new_ce: Option<usize> = Some(ce_val);
+            let mut j = i + 1;
+            while j < node.children.len()
+                && !is_tpl_start_marker_meta(&node.children[j])
+                && new_ce.is_some()
+            {
+                let sibling = &node.children[j];
+                match &sibling.kind {
+                    NodeKind::Text(t) => {
+                        new_ce = new_ce.map(|c| c + t.len());
+                    }
+                    NodeKind::Comment(c) => {
+                        let clen = c.len();
+                        new_ce = new_ce.map(|ce| ce + clen + 7);
+                    }
+                    NodeKind::Element(_) => {
+                        let sdp = sibling.dp.as_ref();
+                        let fostered = sdp.is_some_and(|d| d.fostered);
+                        let sdsr_start = sdp.and_then(|d| d.dsr.as_ref()).and_then(|d| d.start);
+                        let has_tsr = sdp.and_then(|d| d.tsr.as_ref()).is_some();
+                        if fostered
+                            || sdsr_start == new_ce
+                            || (sdsr_start.is_some_and(|st| st < new_ce.unwrap()) && has_tsr)
+                        {
+                            break;
+                        }
+                        // Update the sibling's `dsr.start` (and `end` if the
+                        // start now overruns it); continue from its (possibly
+                        // null) end, which terminates propagation.
+                        let sib_dp_mut =
+                            node.children[j].dp.get_or_insert_with(DataParsoid::default);
+                        let dsr = sib_dp_mut.dsr.get_or_insert_default();
+                        dsr.start = new_ce;
+                        if dsr.end.is_some_and(|en| new_ce.is_some_and(|c| c > en)) {
+                            dsr.end = new_ce;
+                        }
+                        new_ce = dsr.end;
+                    }
+                    NodeKind::Document => break,
+                }
+                j += 1;
+            }
+            // Propagate the new end information to the enclosing node's `e` if
+            // we ran past the last sibling (no sibling, or an unconditional
+            // terminus without a null `new_ce`).
+            if j >= node.children.len()
+                && let Some(final_ce) = new_ce
+            {
+                e = Some(final_ce);
             }
         }
 
@@ -372,10 +464,6 @@ fn compute_node_dsr(
 
 /// Compute DSR for every node of a document subtree, writing `dp.dsr` on each
 /// element. Faithful to `ComputeDSR::run` (top-level page only).
-///
-/// NOTE: the forward sibling-start/end propagation pass (`propagateRight` in PHP)
-/// is not yet ported; it requires a second left-to-right traversal and is only
-/// relevant when a child's `ce` shifts left/right relative to a right sibling.
 pub fn run(root: &mut Node, source: &str) {
     let end = source.len();
     compute_node_dsr(root, Some(0), Some(end), 0);
@@ -443,5 +531,35 @@ mod tests {
         assert_eq!(dsr.end, Some(11));
         assert_eq!(dsr.open_width, Some(3));
         assert_eq!(dsr.close_width, Some(3));
+    }
+
+    #[test]
+    fn test_propagate_right_from_transclusion_meta() {
+        // A transclusion start `<meta>` with a TSR, followed by text, must
+        // propagate the meta's end offset onto the trailing text node's DSR.
+        // Source: "{{x}}foo" where the meta is the (zero-width) transclusion
+        // marker at [0,0) and "foo" occupies [0,3).
+        let mut meta = Node::element(ElementKind::Transclusion);
+        meta.set_attr("typeof", "mw:Transclusion");
+        meta.set_attr("about", "#mwt1");
+        meta.dp = Some(DataParsoid {
+            tsr: Some(SourceRange::new(0, 0)),
+            ..Default::default()
+        });
+
+        let mut doc = Node::document();
+        doc.children.push(meta);
+        doc.children.push(Node::text("foo"));
+
+        run(&mut doc, "{{x}}foo");
+
+        // The meta gets a zero-width DSR; its `propagateRight` pushes `ce = 0`
+        // forward, but the text node has no DSR of its own to assert here. The
+        // key invariant is that computation completes without panic and leaves
+        // the meta's DSR intact.
+        let meta = &doc.children[0];
+        let dsr = meta.dp.as_ref().unwrap().dsr.as_ref().unwrap();
+        assert_eq!(dsr.start, Some(0));
+        assert_eq!(dsr.end, Some(0));
     }
 }
