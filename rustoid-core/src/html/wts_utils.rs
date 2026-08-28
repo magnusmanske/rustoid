@@ -212,7 +212,7 @@ pub fn decode_comment(comment: &str) -> String {
 
 /// Decode every `&…;` entity in `text` (leaving non-entities unchanged).
 /// Mirrors PHP's `Utils::decodeWtEntities` applied over a whole string.
-fn decode_wt_entities_all(text: &str) -> String {
+pub(crate) fn decode_wt_entities_all(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;

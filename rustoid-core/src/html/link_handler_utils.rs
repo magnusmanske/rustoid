@@ -421,6 +421,224 @@ pub fn serialize_as_ext_link(
     state.push_to_curr_line(ct);
 }
 
+/// `isSimpleWikiLink` — can the link be serialized as a pipeless `[[Foo]]` (i.e.
+/// the content string matches the target)? Faithful to
+/// `LinkHandlerUtils::isSimpleWikiLink` (the `normalizedTitleKey`/
+/// `resolveTitle` comparisons are approximated with exact/underscore-normalized
+/// string equality).
+pub fn is_simple_wiki_link(
+    _env: &SerializerEnv,
+    dp: &crate::wikitext::tokens_v2::DataParsoid,
+    target: &ShadowInfo,
+    link_data: &LinkData,
+) -> bool {
+    let Some(content_string) = link_data.content_string.as_ref() else {
+        return false;
+    };
+
+    // Would need to pipe for any modified/non-preserved/minimal-piped content.
+    if (target.modified || (dp.stx.as_deref() != Some("piped")))
+        && !content_string.starts_with("./")
+    {
+        // Strip colon-escapes and leading `./`/(spaces before) from the target.
+        let mut stripped = target.value.trim_start();
+        stripped = stripped.strip_prefix(':').unwrap_or(stripped);
+        stripped = stripped.strip_prefix("./").unwrap_or(stripped);
+        // rtrim spaces (moved out of links by DOMNormalizer).
+        let stripped = stripped.trim_end();
+
+        let decoded_target = crate::html::wts_utils::decode_wt_entities_all(stripped);
+
+        // Normalize content string and decoded target before comparison.
+        let content_norm = content_string.replace('_', " ");
+        let decoded_norm = decoded_target.replace('_', " ");
+
+        // See if the (normalized) content matches the target, either directly
+        // or wrapped in forward slashes (relative-link stripping).
+        return content_norm == decoded_norm
+            || format!("/{content_norm}/") == decoded_norm
+            || content_norm == crate::util::decode_uri_component(&link_data.href);
+    }
+
+    false
+}
+
+/// `serializeAsWikiLink` — serialize a node as a wikilink (`[[…]]`), handling
+/// redirects, simple links, auto-URL links, piped links, category links, and the
+/// invalid-link fallback. Faithful to `LinkHandlerUtils::serializeAsWikiLink`
+/// (the category sort-key and template-affected sort-key handling are deferred).
+pub fn serialize_as_wiki_link(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    node: NodeId,
+    link_data: &LinkData,
+) {
+    let dp = tree.node(node).dp.clone().unwrap_or_default();
+    let mut target = link_data.target.clone();
+    let mut is_piped = false;
+    let mut content_src: Option<String> = None;
+    let mut needs_escaping = true;
+
+    // Decode any link that did not come from source.
+    if !target.fromsrc {
+        let value = target.value.clone();
+        let decoded = match value.find('#') {
+            Some(pos) => format!(
+                "{}{}",
+                crate::util::decode_uri_component(&value[..pos]),
+                &value[pos..]
+            ),
+            None => crate::util::decode_uri_component(&value),
+        };
+        target.value = decoded;
+    }
+
+    // `link_target` is always assigned in a non-early-return branch below; the
+    // `None` seed is required to satisfy definite-assignment without an unsafe
+    // or sentinel value (mirrors PHP's two-phase `$linkTarget = …` pattern).
+    #[allow(unused_assignments)]
+    let mut link_target: Option<String> = None;
+    let mut escaped_tgt: Option<crate::html::wikitext_escape_handlers::EscapeLinkTargetResult> =
+        None;
+
+    if link_data.is_redirect {
+        if target.modified || !target.fromsrc {
+            let lt = target.value.clone();
+            let escaped = crate::html::wikitext_escape_handlers::escape_link_target(env, &lt);
+            escaped_tgt = Some(escaped);
+            link_target = escaped_tgt.as_ref().map(|e| e.link_target.clone());
+        } else {
+            link_target = Some(target.value.clone());
+        }
+    } else if is_simple_wiki_link(env, &dp, &target, link_data) {
+        // Simple case: `[[Foo]]`.
+        link_target = Some(target.value.trim_start_matches("./").to_string());
+    } else if is_url_link(env, tree, node, link_data) {
+        let ct = crate::html::constrained_text::ConstrainedText::auto_url_link(
+            target.value.clone(),
+            node,
+        );
+        state.push_to_curr_line(ct);
+        state.on_sol = false;
+        state.at_start_of_output = false;
+        return;
+    } else {
+        // Emit piped wikilink syntax.
+        is_piped = true;
+
+        if let Some(content_node) = link_data.content_node {
+            let cs =
+                crate::html::serializer_state::SerializerState::serialize_link_children_to_string(
+                    state,
+                    tree,
+                    content_node,
+                    Some(Box::new(move |_s, text, _o, _t| {
+                        crate::html::wikitext_escape_handlers::wikilink_handler(text)
+                    })),
+                );
+            content_src = Some(cs);
+            needs_escaping = false;
+        } else {
+            content_src = link_data.content_string.clone();
+            needs_escaping = true;
+        }
+
+        if content_src.as_deref() == Some("")
+            && link_data.link_type.as_deref() != Some("mw:PageProp/Category")
+        {
+            // Protect empty link content from the PST pipe trick.
+            content_src = Some("<nowiki/>".to_string());
+            needs_escaping = false;
+        }
+
+        if target.modified || !target.fromsrc {
+            let lt = target.value.clone();
+            let escaped = crate::html::wikitext_escape_handlers::escape_link_target(env, &lt);
+            escaped_tgt = Some(escaped);
+            link_target = escaped_tgt.as_ref().map(|e| e.link_target.clone());
+        } else {
+            link_target = Some(target.value.clone());
+        }
+    }
+
+    let link_target = link_target.unwrap_or_default();
+    let escaped_tgt = escaped_tgt;
+
+    // Redirect handling: buffer the redirect text if not at start-of-output.
+    if link_data.is_redirect {
+        if state.redirect_text.is_some() {
+            return;
+        }
+        let so_far = format!("{}{}", state.out, state.curr_line.text);
+        if !so_far.trim().is_empty() {
+            state.redirect_text = Some(format!("{}[[{}]]", link_data.prefix, link_target));
+            return;
+        }
+        state.redirect_text = Some("unbuffered".to_string());
+    }
+
+    if let Some(escaped) = &escaped_tgt
+        && escaped.invalid_link
+    {
+        // Invalid link target: omit the link and serialize just the content.
+        let piped_text = if is_piped {
+            content_src.clone().unwrap_or_default()
+        } else {
+            link_target.clone()
+        };
+        state.needs_escaping = needs_escaping;
+        let text = format!("{}{}{}", link_data.prefix, piped_text, link_data.tail);
+        state.emit_chunk(text, node, tree);
+    } else {
+        let pipe = dp.first_pipe_src.clone().unwrap_or_else(|| "|".to_string());
+        let piped_text = if is_piped && needs_escaping {
+            format!(
+                "{}{}",
+                pipe,
+                crate::html::wikitext_escape_handlers::escape_link_content(
+                    state,
+                    tree,
+                    content_src.as_deref().unwrap_or(""),
+                    false,
+                    node,
+                    false,
+                )
+            )
+        } else if is_piped {
+            format!("{}{}", pipe, content_src.unwrap_or_default())
+        } else {
+            String::new()
+        };
+
+        if is_piped {
+            state.single_line_context.disable();
+        }
+
+        let wt = format!(
+            "{}[[{}{}]]{}",
+            link_data.prefix, link_target, piped_text, link_data.tail
+        );
+        let trail = env
+            .get_site_config()
+            .link_trail_regex()
+            .and_then(|t| regex::Regex::new(t).ok());
+        let no_trails = link_data
+            .link_type
+            .as_deref()
+            .is_some_and(|t| t.starts_with("mw:PageProp/") || t == "mw:MediaLink");
+        let greedy = !no_trails && !wt.ends_with(']');
+        let ct = crate::html::constrained_text::ConstrainedText::wiki_link(
+            wt, node, greedy, None, trail,
+        );
+        state.push_to_curr_line(ct);
+
+        if is_piped {
+            state.single_line_context.pop();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +752,26 @@ mod tests {
         let a_id = tree.root();
         let data = get_link_round_trip_data(&env, &tree, a_id);
         assert!(is_url_link(&env, &tree, a_id, &data));
+    }
+
+    #[test]
+    fn test_serialize_as_wiki_link_simple() {
+        let config = crate::mock::MockSiteConfig::new();
+        let ctitle = crate::title::Title::new_main("Test");
+        let env = SerializerEnv::new(&config, &ctitle);
+
+        // <a rel="mw:WikiLink" href="./Foo">Foo</a> → [[Foo]].
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("rel", "mw:WikiLink");
+        a.set_attr("href", "./Foo");
+        a.push_child(Node::text("Foo"));
+        let tree = DomTree::new(a);
+        let a_id = tree.root();
+        let data = get_link_round_trip_data(&env, &tree, a_id);
+
+        let mut state = SerializerState::new();
+        serialize_as_wiki_link(&mut state, &tree, &env, a_id, &data);
+        state.flush_line();
+        assert_eq!(state.out, "[[Foo]]");
     }
 }
