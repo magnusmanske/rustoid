@@ -8,6 +8,7 @@
 //! the `DomTree` navigation arena.
 
 use crate::dom::node::NodeKind;
+use crate::html::dom_handler::DefaultDomHandler;
 use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
@@ -1327,6 +1328,175 @@ fn entity_encode_all(s: &str) -> String {
     out
 }
 
+/// `EncapsulatedContentHandler` — serialize a transclusion/extension/language-
+/// variant content wrapper (the first encapsulation wrapper node). Faithful to
+/// `DOMHandlers/EncapsulatedContentHandler.php`.
+///
+/// Transclusions are reconstructed from `data-mw.parts` (via
+/// [`template_serializer`]); extension tags from their `data-mw` name/attrs/body;
+/// language variants are currently a no-op (the variant handler is not ported).
+pub struct EncapsulatedContentHandler;
+
+impl EncapsulatedContentHandler {
+    /// `languageVariantHandler` placeholder: faithfully no-op until the
+    /// language-variant serializer is ported (PHP routes to a dedicated handler).
+    /// Returns `true` when `node` is a `mw:LanguageVariant` wrapper.
+    fn is_language_variant(tree: &DomTree, node: NodeId) -> bool {
+        crate::html::dom_utils::has_type_of(tree.node(node), "mw:LanguageVariant")
+    }
+
+    /// Serialize an extension tag from `data-mw` (name/attrs/body), mirroring
+    /// `WikitextSerializer::defaultExtensionHandler` for the plain (non-`extApi`)
+    /// case.
+    fn default_extension_handler(tree: &DomTree, node: NodeId) -> String {
+        let n = tree.node(node);
+        let mut out = String::new();
+        let ext_name = n
+            .data_mw
+            .as_deref()
+            .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .or_else(|| crate::html::wts_utils::get_ext_tag_name(n))
+            .unwrap_or_default();
+
+        out.push('<');
+        out.push_str(&ext_name);
+
+        if let Some(attrs) = n
+            .data_mw
+            .as_deref()
+            .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+            .and_then(|v| v.get("attrs").and_then(|a| a.as_object()).cloned())
+        {
+            for (k, v) in attrs {
+                out.push(' ');
+                out.push_str(&k);
+                out.push_str("=\"");
+                out.push_str(v.as_str().unwrap_or(""));
+                out.push('\"');
+            }
+        }
+
+        if let Some(body) = n
+            .data_mw
+            .as_deref()
+            .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+            .and_then(|v| {
+                v.get("body")
+                    .and_then(|b| b.get("extsrc"))
+                    .and_then(|e| e.as_str())
+                    .map(str::to_string)
+            })
+        {
+            out.push('>');
+            out.push_str(&body);
+            out.push_str("</");
+            out.push_str(&ext_name);
+            out.push('>');
+        } else {
+            out.push_str(" />");
+        }
+        out
+    }
+}
+
+impl DomHandler for EncapsulatedContentHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        let n = tree.node(node);
+        let dp = n.dp.clone();
+
+        let transclusion_type =
+            crate::html::dom_utils::match_type_of(n, "^mw:(Transclusion|Param)$");
+        let ext_tag_name = crate::html::wts_utils::get_ext_tag_name(n);
+
+        let src = if transclusion_type.is_some() {
+            // Transclusion: serialize from `data-mw.parts`, or fall back to src.
+            match n
+                .data_mw
+                .as_deref()
+                .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+                .and_then(|v| v.get("parts").cloned())
+                .and_then(|parts| crate::html::template_serializer::parse_parts(&parts))
+            {
+                Some(parts) => crate::html::template_serializer::serialize_from_parts(&parts),
+                None => dp.as_ref().and_then(|d| d.src.clone()).unwrap_or_default(),
+            }
+        } else if ext_tag_name.is_some() {
+            // Extension tag: reconstruct from data-mw.
+            Self::default_extension_handler(tree, node)
+        } else if Self::is_language_variant(tree, node) {
+            // Language variant: not yet ported; skip (faithful no-op until the
+            // variant serializer lands).
+            return tree.next_sibling(node);
+        } else {
+            // Should never reach here (the dispatch only calls us for an
+            // encapsulation wrapper). Fall back to literal HTML.
+            FallbackHTMLHandler.handle(tree, node, state);
+            return tree.next_sibling(node);
+        };
+
+        state.single_line_context.disable();
+        let bullets = Self::handle_list_prefix(tree, node);
+        state.emit_chunk(format!("{bullets}{src}"), node, tree);
+        state.single_line_context.pop();
+
+        // Skip over the rest of the encapsulated forest (siblings with the same
+        // `about` id).
+        skip_over_encapsulated_content(tree, node)
+    }
+}
+
+/// `EncapsulatedContentHandler::handleListPrefix` (simplified: the shared-list-
+/// prefix bullet recovery is only relevant for about-id-marked list items; we
+/// return the parent list bullets when the node is a first-content list item).
+impl EncapsulatedContentHandler {
+    fn handle_list_prefix(tree: &DomTree, node: NodeId) -> String {
+        let n = tree.node(node);
+        if !crate::html::dom_utils::is_list_or_list_item(n) {
+            return String::new();
+        }
+        // Only the first (no previous non-sep sibling) about-id list item that
+        // lacks a shared prefix needs its parent's bullets.
+        if crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_some() {
+            return String::new();
+        }
+        let Some(parent) = tree.parent(node) else {
+            return String::new();
+        };
+        if !crate::html::dom_utils::is_list(tree.node(parent)) {
+            return String::new();
+        }
+        DefaultDomHandler.get_list_bullets(tree, parent)
+    }
+}
+
+/// `WTUtils::skipOverEncapsulatedContent` — advance past siblings carrying the
+/// same `about` id (the encapsulated forest), returning the next node.
+fn skip_over_encapsulated_content(tree: &DomTree, node: NodeId) -> Option<NodeId> {
+    let about = tree.node(node).get_attr("about").map(str::to_string);
+    let Some(about) = about else {
+        return tree.next_sibling(node);
+    };
+    let mut cur = tree.next_sibling(node);
+    while let Some(c) = cur {
+        let same_about = tree
+            .node(c)
+            .get_attr("about")
+            .map(|a| a == about)
+            .unwrap_or(false);
+        if !same_about {
+            break;
+        }
+        cur = tree.next_sibling(c);
+    }
+    cur
+}
+
 /// `PreHandler` — serialize an indent-`<pre>` block. Faithful to
 /// `DOMHandlers/PreHandler.php`.
 pub struct PreHandler;
@@ -2268,5 +2438,28 @@ mod tests {
         handler.handle(&tree, span_id, &mut state);
         state.flush_line();
         assert_eq!(state.out, "&#x26;");
+    }
+
+    #[test]
+    fn test_encapsulated_transclusion_serializes_from_parts() {
+        // A transclusion wrapper serializes `{{Foo|bar}}` from `data-mw.parts`.
+        let mut doc = Node::document();
+        let mut span = Node::element(ElementKind::Transclusion);
+        span.set_attr("typeof", "mw:Transclusion");
+        span.set_attr("about", "#mwt1");
+        span.data_mw = Some(
+            r#"{"parts":[{"template":{"target":{"wt":"Foo"},"params":{"1":{"wt":"bar"}}}}]}"#
+                .to_string(),
+        );
+        doc.push_child(span);
+
+        let tree = DomTree::new(doc);
+        let span_id = tree.first_child(tree.root()).unwrap();
+
+        let mut state = SerializerState::new();
+        let mut handler = EncapsulatedContentHandler;
+        handler.handle(&tree, span_id, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, "{{Foo|bar}}");
     }
 }

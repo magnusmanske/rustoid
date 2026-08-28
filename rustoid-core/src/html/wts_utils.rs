@@ -273,6 +273,15 @@ fn encode_comment_gt(s: &str) -> String {
     out
 }
 
+/// `WTUtils::getExtTagName` — the lowercase extension tag name from an
+/// `mw:Extension/…` `typeof` token, or `None`.
+pub fn get_ext_tag_name(node: &Node) -> Option<String> {
+    let matched = crate::html::dom_utils::match_type_of(node, "^mw:Extension/(.+?)$")?;
+    matched
+        .strip_prefix("mw:Extension/")
+        .map(|name| name.to_lowercase())
+}
+
 /// `WTUtils::isGeneratedFigure` — `typeof` matches `#^mw:File($|/)#D`.
 pub fn is_generated_figure(node: &Node) -> bool {
     crate::html::dom_utils::match_type_of(node, "^mw:File($|/)").is_some()

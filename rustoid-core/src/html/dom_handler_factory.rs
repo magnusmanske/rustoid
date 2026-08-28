@@ -6,14 +6,15 @@
 //! wrapper, HTML-syntax list, HTML table). Each concrete handler class is
 //! instantiated here.
 
-use crate::html::dom_handler::{DefaultDomHandler, DomHandler};
+use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::handlers::{
-    AHandler, BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler,
-    FigureHandler, HRHandler, HTMLPreHandler, HeadingHandler, ImgHandler, JustChildrenHandler,
-    LIHandler, LinkHandler, ListHandler, MediaHandler, MetaHandler, PHandler, PreHandler,
-    QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
+    AHandler, BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler,
+    EncapsulatedContentHandler, FallbackHTMLHandler, FigureHandler, HRHandler, HTMLPreHandler,
+    HeadingHandler, ImgHandler, JustChildrenHandler, LIHandler, LinkHandler, ListHandler,
+    MediaHandler, MetaHandler, PHandler, PreHandler, QuoteHandler, SpanHandler, TDHandler,
+    THHandler, TRHandler, TableHandler,
 };
 use crate::html::wts_utils;
 
@@ -110,7 +111,7 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
 
     // First encapsulation wrapper → EncapsulatedContentHandler.
     if wts_utils::is_first_encapsulation_wrapper_node(tree.node(node)) {
-        return Box::new(DefaultDomHandler); // TODO: EncapsulatedContentHandler
+        return Box::new(EncapsulatedContentHandler);
     }
 
     // Specialized handler for `nodeName_stx` (e.g. `dd_row`, `pre_html`).
