@@ -564,7 +564,6 @@ pub fn serialize_as_wiki_link(
 
     let link_target = link_target.unwrap_or_default();
     let escaped_tgt = escaped_tgt;
-
     // Redirect handling: buffer the redirect text if not at start-of-output.
     if link_data.is_redirect {
         if state.redirect_text.is_some() {
@@ -637,6 +636,86 @@ pub fn serialize_as_wiki_link(
             state.single_line_context.pop();
         }
     }
+}
+
+/// `linkHandler` — the top-level link dispatcher. Faithful to
+/// `LinkHandlerUtils::linkHandler`: resolve round-trip data, handle magic links,
+/// and dispatch to `serializeAsWikiLink`/`serializeAsExtLink` based on the link
+/// type. (The complex-link / figure fallback is simplified to an extlink.)
+pub fn link_handler(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    node: NodeId,
+) {
+    let link_data = get_link_round_trip_data(env, tree, node);
+    let link_type = link_data.link_type.clone();
+
+    // Magic-link detection (RFC/PMID/ISBN).
+    let orig_href = link_data.orig_href.clone();
+    if let Some(matched) = env
+        .get_site_config()
+        .ext_resource_url_pattern_match(&crate::util::decode_uri_component(&orig_href))
+    {
+        // Round-trip PMIDs as interwikis if that's how they were originally.
+        let pmid_as_iw = matched.0 == "PMID"
+            && link_type.as_deref() == Some("mw:WikiLink")
+            && crate::html::dom_utils::has_rel(tree.node(node), "mw:WikiLink/Interwiki");
+        if !pmid_as_iw {
+            let content_str =
+                crate::html::serializer_state::SerializerState::serialize_link_children_to_string(
+                    state,
+                    tree,
+                    node,
+                    Some(Box::new(move |_s, text, _o, _t| {
+                        crate::html::wikitext_escape_handlers::a_handler(text)
+                    })),
+                );
+            let serialized =
+                env.get_site_config()
+                    .make_ext_resource_url(&matched, &orig_href, &content_str);
+            if !serialized.starts_with('[') {
+                let ct =
+                    crate::html::constrained_text::ConstrainedText::magic_link(serialized, node);
+                state.push_to_curr_line(ct);
+                return;
+            }
+        }
+    }
+
+    if let Some(link_type) = &link_type {
+        // [[..]] links (normal, category, redirect, lang) — except images.
+        let is_wiki = link_type == "mw:WikiLink"
+            || link_type == "mw:MediaLink"
+            || (link_type.starts_with("mw:PageProp/"));
+        if is_wiki {
+            serialize_as_wiki_link(state, tree, env, node, &link_data);
+            return;
+        }
+        if link_type == "mw:ExtLink" {
+            serialize_as_ext_link(state, tree, env, node, &link_data);
+            return;
+        }
+    }
+
+    // No type/target info: serialize as a plain external link with escaped href.
+    let href_str = escape_ext_link_url(&link_data.orig_href);
+    let content_str =
+        crate::html::serializer_state::SerializerState::serialize_link_children_to_string(
+            state,
+            tree,
+            node,
+            Some(Box::new(move |_s, text, _o, _t| {
+                crate::html::wikitext_escape_handlers::a_handler(text)
+            })),
+        );
+    let chunk = if href_str.is_empty() {
+        content_str
+    } else {
+        format!("[{href_str} {content_str}]")
+    };
+    let ct = crate::html::constrained_text::ConstrainedText::ext_link(chunk, node);
+    state.push_to_curr_line(ct);
 }
 
 #[cfg(test)]
@@ -771,6 +850,26 @@ mod tests {
 
         let mut state = SerializerState::new();
         serialize_as_wiki_link(&mut state, &tree, &env, a_id, &data);
+        state.flush_line();
+        assert_eq!(state.out, "[[Foo]]");
+    }
+
+    #[test]
+    fn test_link_handler_wikilink() {
+        let config = crate::mock::MockSiteConfig::new();
+        let ctitle = crate::title::Title::new_main("Test");
+        let env = SerializerEnv::new(&config, &ctitle);
+
+        // A simple wikilink round-trips via `link_handler`.
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("rel", "mw:WikiLink");
+        a.set_attr("href", "./Foo");
+        a.push_child(Node::text("Foo"));
+        let tree = DomTree::new(a);
+        let a_id = tree.root();
+
+        let mut state = SerializerState::new();
+        link_handler(&mut state, &tree, &env, a_id);
         state.flush_line();
         assert_eq!(state.out, "[[Foo]]");
     }

@@ -242,6 +242,50 @@ pub trait SiteConfig: Send + Sync {
         None
     }
 
+    /// `SiteConfig::makeExtResourceURL` — serialize a matched RFC/PMID/ISBN magic
+    /// link. Returns the magic-link wikitext when the content matches the
+    /// canonical form; otherwise a fallback `[href content]` or `[[href|content]]`.
+    fn make_ext_resource_url(
+        &self,
+        matched: &(String, String),
+        href: &str,
+        content: &str,
+    ) -> String {
+        // Normalize runs of Unicode whitespace to a single space.
+        let normalized = content
+            .split([
+                ' ', '\u{00A0}', '\u{1680}', '\u{2000}', '\u{200A}', '\u{202F}', '\u{205F}',
+                '\u{3000}',
+            ])
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        match matched.0.as_str() {
+            "ISBN" => {
+                let normalized = normalized.replace(['-', ' ', '\t'], "").to_uppercase();
+                // Validate ISBN length/format so we don't emit a non-magic link.
+                let valid = regex::Regex::new(r"^ISBN(97[89])?\d{9}(\d|X)$")
+                    .map(|re| re.is_match(&normalized))
+                    .unwrap_or(false);
+                if format!("ISBN{}", matched.1) == normalized && valid {
+                    return content.to_string();
+                }
+                let href = href.trim_start_matches("./");
+                format!("[[{href}|{content}]]")
+            }
+            "RFC" | "PMID" => {
+                let normalized = normalized.replace([' ', '\t'], "");
+                if format!("{}{}", matched.0, matched.1) == normalized {
+                    content.to_string()
+                } else {
+                    format!("[{href} {content}]")
+                }
+            }
+            _ => format!("[{href} {content}]"),
+        }
+    }
+
     /// The URL for uploading a file (used by media/file links). Mirrors PHP's
     /// `SiteConfig::getUploadUrl` (a sensible default, overridable).
     fn get_upload_url(&self, _title: &str) -> String {
