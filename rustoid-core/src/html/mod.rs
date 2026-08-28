@@ -22,5 +22,6 @@ pub mod serialize_wt;
 pub mod serializer;
 pub mod serializer_state;
 pub mod single_line_context;
+pub mod template_serializer;
 pub mod wikitext_escape_handlers;
 pub mod wts_utils;
