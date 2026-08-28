@@ -9,7 +9,8 @@
 //! The `escapeLine` entry point threads left/right context through a line of
 //! chunks so each chunk can decide whether to emit `<nowiki>`-style escapes.
 
-use crate::html::dom_tree::NodeId;
+use crate::html::dom_tree::{DomTree, NodeId};
+use crate::html::env::SerializerEnv;
 
 /// The escape behavior of a [`ConstrainedText`] chunk, encoding which of PHP's
 /// `ConstrainedText` subclasses the chunk instantiates. The `RegExpConstrainedText`
@@ -43,6 +44,10 @@ pub enum ConstrainedTextKind {
         bad_prefix: regex::Regex,
         bad_suffix: regex::Regex,
     },
+    /// `LanguageVariantText` — `-{ … }-` language-variant markup, with a `\|`
+    /// bad-prefix guard (vertical bars immediately preceding cause problems in
+    /// tables).
+    LanguageVariant,
 }
 
 /// Result of escaping a single chunk: the (possibly escaped) text plus optional
@@ -208,6 +213,21 @@ impl ConstrainedText {
         }
     }
 
+    /// `LanguageVariantText` — a `-{ … }-` language-variant chunk, with a `|`
+    /// bad-prefix guard (the `badPrefix` is `^\|$`, matching a bare vertical bar
+    /// as the left context).
+    pub fn language_variant(text: impl Into<String>, node: NodeId) -> Self {
+        Self {
+            text: text.into(),
+            node,
+            prefix: None,
+            suffix: None,
+            kind: ConstrainedTextKind::LanguageVariant,
+            selser: false,
+            no_sep: false,
+        }
+    }
+
     /// Determine the escape prefix/suffix for this chunk given the line context.
     /// Faithful to the `ConstrainedText::escape` override of each subclass.
     pub fn escape(&self, state: &State) -> Result {
@@ -268,6 +288,13 @@ impl ConstrainedText {
                     result.suffix = Some("<nowiki/>".to_string());
                 }
             }
+            ConstrainedTextKind::LanguageVariant => {
+                // `LanguageVariantText` badPrefix is `/^\|$/D`: a bare vertical
+                // bar immediately preceding the variant.
+                if state.left_context == "|" {
+                    result.prefix = Some("<nowiki/>".to_string());
+                }
+            }
         }
         result
     }
@@ -306,6 +333,270 @@ impl ConstrainedText {
         safe_left.push_str(&state.left_context);
         safe_left
     }
+}
+
+/// Options for [`from_sel_ser`], mirroring the `$opts` array passed to PHP's
+/// `ConstrainedText::fromSelSer` (`ignorePrefix`/`ignoreSuffix`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FromSelSerOpts {
+    pub ignore_prefix: bool,
+    pub ignore_suffix: bool,
+}
+
+/// SelSer support: partition an unmodified node's wikitext (`text`) into
+/// `ConstrainedText` chunks, deferring the leftmost/rightmost child to the
+/// specialized subclass (wikilink/extlink/autourl/magiclink/language-variant)
+/// when its DSR bounds coincide with the node's, so boundary escapes are
+/// preserved. Faithful to `ConstrainedText::fromSelSer` + `fromSelSerImpl`.
+///
+/// Operates on the `DomTree`/`NodeId` navigation arena so the per-child
+/// recursion can look up the first/last non-deleted child by id.
+pub fn from_sel_ser(
+    tree: &DomTree,
+    id: NodeId,
+    text: &str,
+    env: Option<SerializerEnv>,
+    opts: FromSelSerOpts,
+) -> Vec<ConstrainedText> {
+    // Main dispatch: try each concrete subclass (backwards, so subtypes are
+    // checked before the base `ConstrainedText` itself), then fall through to
+    // the base `fromSelSerImpl` which handles everything that reaches it.
+    for kind in [
+        ConstrainedTextKind::LanguageVariant,
+        ConstrainedTextKind::MagicLink {
+            bad_prefix: regex::Regex::new(r"\w$").unwrap(),
+            bad_suffix: regex::Regex::new(r"^\w").unwrap(),
+        },
+        ConstrainedTextKind::AutoUrl {
+            bad_prefix: regex::Regex::new(r"\w$").unwrap(),
+        },
+        ConstrainedTextKind::ExtLink,
+        ConstrainedTextKind::WikiLink {
+            greedy: false,
+            bad_prefix: None,
+            bad_suffix: None,
+        },
+    ] {
+        if let Some(chunks) = from_sel_ser_impl_kind(tree, id, text, env, &kind) {
+            // Tag these chunks as coming from selser.
+            return chunks;
+        }
+    }
+    // Base case (should never be reached, but be non-panicking).
+    from_sel_ser_impl_base(tree, id, text, env, opts)
+}
+
+/// Dispatch to the relevant `fromSelSerImpl` for a concrete `kind`.
+fn from_sel_ser_impl_kind(
+    tree: &DomTree,
+    id: NodeId,
+    text: &str,
+    env: Option<SerializerEnv>,
+    kind: &ConstrainedTextKind,
+) -> Option<Vec<ConstrainedText>> {
+    let node = tree.node(id);
+    let dp = node.dp.as_ref();
+    let stx = dp.and_then(|d| d.stx.as_deref()).unwrap_or("");
+    let name = crate::html::wts_utils::node_name(node);
+    let rel = node.get_attr("rel");
+
+    let chunk = match kind {
+        ConstrainedTextKind::LanguageVariant => {
+            if crate::html::dom_utils::has_type_of(node, "mw:LanguageVariant") {
+                ConstrainedText::language_variant(text, id)
+            } else {
+                return None;
+            }
+        }
+        ConstrainedTextKind::MagicLink { .. } => {
+            if stx == "magiclink" {
+                ConstrainedText::magic_link(text, id)
+            } else {
+                return None;
+            }
+        }
+        ConstrainedTextKind::AutoUrl { .. } => {
+            let link_type = dp.and_then(|d| d.link_type.as_deref());
+            if (name == "a" && stx == "url") || (name == "img" && link_type == Some("extlink")) {
+                ConstrainedText::auto_url_link(text, id)
+            } else {
+                return None;
+            }
+        }
+        ConstrainedTextKind::ExtLink => {
+            if crate::html::dom_utils::has_rel(node, "mw:ExtLink")
+                && stx != "simple"
+                && stx != "piped"
+            {
+                ConstrainedText::ext_link(text, id)
+            } else {
+                return None;
+            }
+        }
+        ConstrainedTextKind::WikiLink { .. } => {
+            let is_wiki_rel = rel
+                .map(|r| {
+                    r.split_whitespace()
+                        .any(|t| t == "mw:WikiLink" || t == "mw:WikiLink/Interwiki")
+                })
+                .unwrap_or(false);
+            if is_wiki_rel && (stx == "simple" || stx == "piped") {
+                // Build the WikiLink chunk with its link-prefix/trail guards.
+                from_wiki_link_chunk(tree, id, text, env)
+            } else {
+                return None;
+            }
+        }
+        ConstrainedTextKind::Plain => {
+            return None;
+        }
+    };
+
+    let mut ct = chunk;
+    ct.selser = true;
+    Some(vec![ct])
+}
+
+/// Construct the `WikiLinkText` chunk, faithfully replicating its constructor's
+/// `noTrails`/`badPrefix`/`badSuffix`/`greedy` logic.
+fn from_wiki_link_chunk(
+    tree: &DomTree,
+    id: NodeId,
+    text: &str,
+    env: Option<SerializerEnv>,
+) -> ConstrainedText {
+    let node = tree.node(id);
+    let rel = node.get_attr("rel").unwrap_or("");
+    // category links/external links/images don't use link trails or prefixes
+    let no_trails = rel
+        .split_whitespace()
+        .all(|t| t != "mw:WikiLink" && t != "mw:WikiLink/Interwiki");
+
+    let link_prefix_regex = env.and_then(|e| e.get_site_config().link_prefix_regex());
+    let link_trail_regex = env.and_then(|e| e.get_site_config().link_trail_regex());
+
+    // Default bad prefix: `(^|[^\[])(\[\[)*\[$`.
+    let default_bad_prefix = r"(^|[^\[])(\[\[)*\[$";
+    let bad_prefix = if !no_trails && let Some(lp) = link_prefix_regex {
+        // PHP combines the link-prefix regex with the default via alternation:
+        // `(linkPrefixRegex)|((^|[^\[])(\[\[)*\[$)`.
+        regex::Regex::new(&format!("({lp})|({default_bad_prefix})")).unwrap()
+    } else {
+        regex::Regex::new(default_bad_prefix).unwrap()
+    };
+    let bad_suffix = if no_trails {
+        None
+    } else {
+        link_trail_regex.and_then(|lt| regex::Regex::new(lt).ok())
+    };
+    let greedy = !(no_trails || text.ends_with(']'));
+
+    ConstrainedText {
+        text: text.to_string(),
+        node: id,
+        prefix: None,
+        suffix: None,
+        kind: ConstrainedTextKind::WikiLink {
+            greedy,
+            bad_prefix: Some(bad_prefix),
+            bad_suffix,
+        },
+        selser: true,
+        no_sep: false,
+    }
+}
+
+/// The base-case `fromSelSerImpl`: partition the text around the leftmost/
+/// rightmost non-deleted children whose DSR bounds coincide with the node's,
+/// tagging the whole result as selser chunks with `noSep` on all but the first.
+fn from_sel_ser_impl_base(
+    tree: &DomTree,
+    id: NodeId,
+    text: &str,
+    env: Option<SerializerEnv>,
+    opts: FromSelSerOpts,
+) -> Vec<ConstrainedText> {
+    let node = tree.node(id);
+    let node_dsr = crate::html::wts_utils::get_dsr(node);
+    let mut text = text.to_string();
+    let mut prefix_chunks: Vec<ConstrainedText> = Vec::new();
+    let mut suffix_chunks: Vec<ConstrainedText> = Vec::new();
+
+    // First non-deleted child.
+    let first_child = crate::html::dom_tree::first_non_deleted_child(tree, id);
+    let last_child = crate::html::dom_tree::last_non_deleted_child(tree, id);
+
+    if !opts.ignore_prefix
+        && let Some(fc) = first_child
+        && let Some(fc_dsr) = crate::html::wts_utils::get_dsr(tree.node(fc))
+        && crate::html::dsr::is_valid_dsr(Some(&fc_dsr), false)
+        && node_dsr.as_ref().and_then(|d| d.start) == fc_dsr.start
+    {
+        let len = fc_dsr.length();
+        if len <= text.len() {
+            prefix_chunks = from_sel_ser(
+                tree,
+                fc,
+                &text[..len],
+                env,
+                FromSelSerOpts {
+                    ignore_suffix: true,
+                    ignore_prefix: false,
+                },
+            );
+            text = text[len..].to_string();
+        }
+    }
+
+    if !opts.ignore_suffix
+        && let (Some(fc), Some(lc)) = (first_child, last_child)
+        && fc != lc
+        && let Some(lc_dsr) = crate::html::wts_utils::get_dsr(tree.node(lc))
+        && crate::html::dsr::is_valid_dsr(Some(&lc_dsr), false)
+        && node_dsr.as_ref().and_then(|d| d.end) == lc_dsr.end
+    {
+        let len = lc_dsr.length();
+        if len <= text.len() {
+            suffix_chunks = from_sel_ser(
+                tree,
+                lc,
+                &text[text.len() - len..],
+                env,
+                FromSelSerOpts {
+                    ignore_prefix: true,
+                    ignore_suffix: false,
+                },
+            );
+            text = text[..text.len() - len].to_string();
+        }
+    }
+
+    // Glue together prefixChunks, the middle text, and suffixChunks.
+    let mut chunks: Vec<ConstrainedText> = prefix_chunks;
+    chunks.push(ConstrainedText::cast(text, id));
+    chunks.extend(suffix_chunks);
+
+    // Top-level chunks only.
+    if !(opts.ignore_prefix || opts.ignore_suffix) {
+        // Ensure the first chunk belongs to `node` for correct separator
+        // emission before `node`.
+        if chunks.first().is_none_or(|c| c.node != id) {
+            chunks.insert(0, ConstrainedText::cast("", id));
+        }
+        // Set `no_sep` on all but the first chunk.
+        for (i, t) in chunks.iter_mut().enumerate() {
+            if i > 0 {
+                t.no_sep = true;
+            }
+        }
+    }
+
+    // Tag all chunks as selser.
+    for c in &mut chunks {
+        c.selser = true;
+    }
+
+    chunks
 }
 
 /// Whether the character is in the legacy parser's `EXT_LINK_URL_CLASS` — the
@@ -495,5 +786,70 @@ mod tests {
         let r = link.escape(&state);
         assert_eq!(r.prefix.as_deref(), Some("<nowiki/>"));
         assert_eq!(r.suffix.as_deref(), Some("<nowiki/>"));
+    }
+
+    #[test]
+    fn test_language_variant_escape() {
+        let lv = ConstrainedText::language_variant("-{x}-", 1);
+        let state = State {
+            left_context: "|".to_string(),
+            right_context: "".to_string(),
+            pos: 0,
+        };
+        let r = lv.escape(&state);
+        assert_eq!(r.prefix.as_deref(), Some("<nowiki/>"));
+        // Not preceded by a bare pipe → no prefix.
+        let state2 = State {
+            left_context: "x".to_string(),
+            right_context: "".to_string(),
+            pos: 0,
+        };
+        assert_eq!(lv.escape(&state2).prefix, None);
+    }
+
+    #[test]
+    fn test_from_sel_ser_base_plain() {
+        use crate::dom::node::{ElementKind, Node};
+
+        // A plain paragraph with no link children and no DSR → single plain
+        // selser chunk owned by the element.
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("hello"));
+        doc.push_child(p);
+        let tree = DomTree::new(doc);
+        let p_id = tree.first_child(tree.root()).unwrap();
+
+        let chunks = from_sel_ser(&tree, p_id, "hello", None, FromSelSerOpts::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hello");
+        assert_eq!(chunks[0].node, p_id);
+        assert!(chunks[0].selser);
+    }
+
+    #[test]
+    fn test_from_sel_ser_detects_magic_link() {
+        use crate::dom::node::{ElementKind, Node};
+
+        // An `<a>` element with `stx=magiclink` produces a MagicLink chunk.
+        let mut doc = Node::document();
+        let mut a = Node::element(ElementKind::ExtLink);
+        let dp = crate::wikitext::tokens_v2::DataParsoid {
+            stx: Some("magiclink".to_string()),
+            ..Default::default()
+        };
+        a.dp = Some(dp);
+        a.set_attr("rel", "mw:ExtLink");
+        doc.push_child(a);
+        let tree = DomTree::new(doc);
+        let a_id = tree.first_child(tree.root()).unwrap();
+
+        let chunks = from_sel_ser(&tree, a_id, "RFC 1234", None, FromSelSerOpts::default());
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            chunks[0].kind,
+            ConstrainedTextKind::MagicLink { .. }
+        ));
+        assert!(chunks[0].selser);
     }
 }

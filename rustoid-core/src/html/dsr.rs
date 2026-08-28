@@ -122,6 +122,15 @@ impl DomSourceRange {
         self.inner_end().saturating_sub(self.inner_start())
     }
 
+    /// Length of the full range (`end - start`), saturating at 0 (faithful to
+    /// `SourceRange::length`, which `DomSourceRange` inherits in PHP).
+    pub fn length(&self) -> usize {
+        match (self.start, self.end) {
+            (Some(s), Some(e)) if e >= s => e - s,
+            _ => 0,
+        }
+    }
+
     /// Range of the open portion.
     pub fn open_range(&self) -> SourceRange {
         SourceRange::with_source(self.start, Some(self.inner_start()), self.source.clone())
