@@ -4,12 +4,14 @@
 //! Handles "smart escaping" of wikitext: wrapping substrings in `<nowiki>` (or
 //! `<nowiki/>`) when they would otherwise be re-parsed as markup.
 //!
-//! Porting status: the entry points (`escape_wikitext`, `escaped_text`) and the
+//! Porting status: the entry points (`escape_wikitext`, `escaped_text`), the
 //! per-handler *predicate delegates* (`li_handler`, `td_handler`, `th_handler`,
-//! `wikilink_handler`, `a_handler`, `media_option_handler`) are ported. The
+//! `wikilink_handler`, `a_handler`, `media_option_handler`), and the
 //! token-walking machinery (`has_wikitext_tokens`, `text_can_parse_as_link`,
-//! `escaped_ib_sibling_node_text`) depends on the tokenizer's `tokenize_as` plus
-//! `SiteConfig` protocol / ext-tag lookups, so it is approximated conservatively
+//! backed by `tokenizer_v2`) are ported. `escaped_ib_sibling_node_text` (the
+//! selective `<nowiki/>` quote protection around `<i>`/`<b>` siblings) and the
+//! entity/tag-specific ignore cases inside `has_wikitext_tokens` still depend on
+//! `SiteConfig` protocol / ext-tag lookups and are approximated conservatively
 //! (over-escaping is safe; under-escaping is a correctness bug).
 //
 // Note: PHP uses PCRE with distinctive semantics (`/D`, `\W`, etc.). Rust's
@@ -179,8 +181,8 @@ fn has_tildes(text: &str) -> bool {
 /// Escape a text chunk for wikitext, using the current `SerializerState`
 /// context. Faithful to `WikitextEscapeHandlers::escapeWikitext` for the common
 /// fast-path cases; the token-walk (`has_wikitext_tokens` /
-/// `text_can_parse_as_link`) is approximated by a conservative character-class
-/// check (over-escaping, never under-escaping).
+/// `text_can_parse_as_link`) is backed by `tokenizer_v2` (the entity/tag-specific
+/// ignore cases remain approximate: over-escaping, never under-escaping).
 pub fn escape_wikitext(
     state: &SerializerState,
     tree: &crate::html::dom_tree::DomTree,
