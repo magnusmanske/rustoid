@@ -7,6 +7,7 @@
 //! `serializeAsWikiLink` / `serializeAsExtLink` / `linkHandler` orchestrators
 //! follow as their `data-mw` / shadow-attribute dependencies land.
 
+use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::env::SerializerEnv;
 use crate::html::serializer_state::SerializerState;
@@ -716,6 +717,83 @@ pub fn link_handler(
     };
     let ct = crate::html::constrained_text::ConstrainedText::ext_link(chunk, node);
     state.push_to_curr_line(ct);
+}
+
+/// `figureHandler` — serialize a `<figure>`/media node. Faithful to
+/// `LinkHandlerUtils::figureHandler`: parse the `MediaStructure` and delegate to
+/// `figure_to_constrained_text` (falling back to literal HTML on failure).
+pub fn figure_handler(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    node: NodeId,
+    ms: Option<crate::html::media_structure::MediaStructure>,
+) {
+    let Some(ms) = ms else {
+        let mut fallback = crate::html::handlers::FallbackHTMLHandler;
+        fallback.handle(tree, node, state);
+        return;
+    };
+    let ct = figure_to_constrained_text(state, tree, env, node, &ms);
+    state.push_to_curr_line(ct);
+}
+
+/// `figureToConstrainedText` — assemble the `[[File:resource|…]]` wikitext for a
+/// media element. Faithful to `LinkHandlerUtils::figureToConstrainedText` for the
+/// core resource + caption + basic format options; the localized media-option
+/// aliases (`img_*`/`timedmedia_*` magic words) and `data-mw` option list are
+/// deferred (they need per-wiki magic-word config not yet on the `SiteConfig`).
+pub fn figure_to_constrained_text(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    _node: NodeId,
+    ms: &crate::html::media_structure::MediaStructure,
+) -> crate::html::constrained_text::ConstrainedText {
+    let outer_elt = ms.container_elt;
+    let media_elt = ms.media_elt;
+
+    // The resource (file title): from `resource`, or fp/File:filename from `src`.
+    let resource = ms
+        .get_resource(tree)
+        .or_else(|| {
+            tree.node(media_elt)
+                .get_attr("src")
+                .map(|s| format!("File:{}", s.rsplit('/').next().unwrap_or("")))
+        })
+        .unwrap_or_default();
+
+    // The caption text (from the figcaption element).
+    let caption = ms
+        .caption_elt
+        .map(|c| {
+            crate::html::serializer_state::SerializerState::serialize_caption_children_to_string(
+                state,
+                tree,
+                c,
+                Some(Box::new(move |_s, text, _o, _t| {
+                    crate::html::wikitext_escape_handlers::media_option_handler(text)
+                })),
+            )
+        })
+        .unwrap_or_default();
+
+    // Assemble `[[File:resource|caption]]` (or just `[[File:resource]]`).
+    let wt = if caption.is_empty() {
+        format!("[[{resource}]]")
+    } else {
+        format!("[[{resource}|{caption}]]")
+    };
+
+    crate::html::constrained_text::ConstrainedText::wiki_link(
+        wt,
+        outer_elt,
+        false,
+        None,
+        env.get_site_config()
+            .link_trail_regex()
+            .and_then(|t| regex::Regex::new(t).ok()),
+    )
 }
 
 #[cfg(test)]

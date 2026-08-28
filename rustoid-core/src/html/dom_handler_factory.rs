@@ -13,9 +13,9 @@ use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::dom_utils;
 use crate::html::handlers::{
     AHandler, BRHandler, BodyHandler, CaptionHandler, DDHandler, DTHandler, FallbackHTMLHandler,
-    HRHandler, HTMLPreHandler, HeadingHandler, JustChildrenHandler, LIHandler, LinkHandler,
-    ListHandler, PHandler, PreHandler, QuoteHandler, SpanHandler, TDHandler, THHandler, TRHandler,
-    TableHandler,
+    FigureHandler, HRHandler, HTMLPreHandler, HeadingHandler, ImgHandler, JustChildrenHandler,
+    LIHandler, LinkHandler, ListHandler, MediaHandler, PHandler, PreHandler, QuoteHandler,
+    SpanHandler, TDHandler, THHandler, TRHandler, TableHandler,
 };
 use crate::html::wts_utils;
 
@@ -175,15 +175,15 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::Span) => Box::new(SpanHandler),
         Some(HandlerKind::Pre) => Box::new(PreHandler),
         Some(HandlerKind::PreHtml) => Box::new(HTMLPreHandler),
-        // `A`/`Link` now dispatch via `linkHandler`; `Figure`/`Img`/`Media`
-        // still need `figureHandler`/`figureToConstrainedText` (media assembly),
-        // and `Meta` needs `MetaHandler` (magic-word/annotation). Until those
-        // land, they serialize literally so round-trips do not drop the element.
+        // `A`/`Link` dispatch via `linkHandler`; `Figure`/`Img`/`Media` dispatch
+        // via `figureHandler`; `Meta` still needs `MetaHandler` (magic-word/
+        // annotation) and falls back to literal HTML until then.
         Some(HandlerKind::A) => Box::new(AHandler),
         Some(HandlerKind::Link) => Box::new(LinkHandler),
-        Some(HandlerKind::Figure | HandlerKind::Img | HandlerKind::Media | HandlerKind::Meta) => {
-            Box::new(FallbackHTMLHandler)
-        }
+        Some(HandlerKind::Figure) => Box::new(FigureHandler),
+        Some(HandlerKind::Img) => Box::new(ImgHandler),
+        Some(HandlerKind::Media) => Box::new(MediaHandler),
+        Some(HandlerKind::Meta) => Box::new(FallbackHTMLHandler),
         // No specialized/plain handler → literal HTML serialization (faithful to
         // PHP's `?: new FallbackHTMLHandler()` final fallback). `FallbackHTML` is
         // the tag→handler map's "no specialized handler" sentinel; `Heading(_)`

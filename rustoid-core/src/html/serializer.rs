@@ -322,4 +322,25 @@ mod tests {
         let wt = WikitextSerializer::serialize_dom_with_env(doc, env);
         assert_eq!(wt, "[[Foo]]");
     }
+
+    #[test]
+    fn test_serialize_dom_with_env_figure() {
+        // A `<figure>` with a resource serializes to `[[File:…|caption]]`.
+        let mut doc = Node::document();
+        let mut figure = Node::element(ElementKind::Figure);
+        figure.set_attr("typeof", "mw:File/Thumb");
+        let mut img = Node::element(ElementKind::Other("img".to_string()));
+        img.set_attr("resource", "Example.jpg");
+        figure.push_child(img);
+        let mut caption = Node::element(ElementKind::FigCaption);
+        caption.push_child(Node::text("A caption"));
+        figure.push_child(caption);
+        doc.push_child(figure);
+
+        let config = crate::mock::MockSiteConfig::new();
+        let title = crate::title::Title::new_main("Test");
+        let env = crate::html::env::SerializerEnv::new(&config, &title);
+        let wt = WikitextSerializer::serialize_dom_with_env(doc, env);
+        assert_eq!(wt, "[[Example.jpg|A caption]]");
+    }
 }

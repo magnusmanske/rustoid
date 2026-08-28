@@ -1575,6 +1575,102 @@ impl DomHandler for LinkHandler {
     }
 }
 
+/// `FigureHandler` — serialize a `<figure>` via `figure_handler`. Faithful to
+/// `DOMHandlers/FigureHandler.php`.
+pub struct FigureHandler;
+
+impl DomHandler for FigureHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        if let Some(env) = state.env {
+            let ms = crate::html::media_structure::MediaStructure::parse(tree, node);
+            crate::html::link_handler_utils::figure_handler(state, tree, &env, node, ms);
+        } else {
+            FallbackHTMLHandler.handle(tree, node, state);
+        }
+        tree.next_sibling(node)
+    }
+
+    fn before(
+        &mut self,
+        _tree: &DomTree,
+        node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        let _ = node;
+        None
+    }
+
+    fn after(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        None
+    }
+}
+
+/// `ImgHandler` — serialize an `<img>`. Faithful to `DOMHandlers/ImgHandler.php`
+/// (external image → `src`; otherwise `figure_handler`).
+pub struct ImgHandler;
+
+impl DomHandler for ImgHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        if let Some(env) = state.env {
+            if crate::html::dom_utils::has_rel(tree.node(node), "mw:externalImage") {
+                let src = tree.node(node).get_attr("src").unwrap_or("");
+                state.emit_chunk(src, node, tree);
+            } else {
+                let ms = crate::html::media_structure::MediaStructure::parse(tree, node);
+                crate::html::link_handler_utils::figure_handler(state, tree, &env, node, ms);
+            }
+        } else {
+            FallbackHTMLHandler.handle(tree, node, state);
+        }
+        tree.next_sibling(node)
+    }
+}
+
+/// `MediaHandler` — serialize an `<audio>`/`<video>` via `figure_handler`. Faithful
+/// to `DOMHandlers/MediaHandler.php` (the element is its own media element).
+pub struct MediaHandler;
+
+impl DomHandler for MediaHandler {
+    fn handle(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<NodeId> {
+        if let Some(env) = state.env {
+            // `MediaStructure::parse` would reject a bare `<audio>`/`<video>` (not
+            // inline `<span>`/`figure`); construct the structure directly.
+            let ms = crate::html::media_structure::MediaStructure {
+                container_elt: node,
+                link_elt: None,
+                media_elt: node,
+                caption_elt: None,
+            };
+            crate::html::link_handler_utils::figure_handler(state, tree, &env, node, Some(ms));
+        } else {
+            FallbackHTMLHandler.handle(tree, node, state);
+        }
+        tree.next_sibling(node)
+    }
+}
+
 /// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
 /// is not a Parsoid bookkeeping attribute. Approximate stub.
 fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {
