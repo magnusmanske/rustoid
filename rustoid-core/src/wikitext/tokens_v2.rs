@@ -170,8 +170,37 @@ pub struct DataParsoid {
     /// DOM source range computed by `ComputeDSR` (mirrors PHP's
     /// `DataParsoid->dsr`). Carries nullable offsets and tag widths.
     pub dsr: Option<DomSourceRange>,
+    /// Link trail source (e.g. the `l` in `[[Foo]]l`). Mirrors `DataParsoid->tail`.
+    pub tail: Option<String>,
+    /// Link prefix source. Mirrors `DataParsoid->prefix`.
+    pub prefix: Option<String>,
+    /// Did the link use interwiki syntax? Mirrors `DataParsoid->isIW`.
+    pub is_iw: Option<bool>,
+    /// The `type` field (e.g. `"extlink"` on auto-URL image links). Mirrors
+    /// `DataParsoid->type`.
+    pub link_type: Option<String>,
+    /// Image rendering options, attached to the image container. Mirrors
+    /// `DataParsoid->optList`.
+    pub opt_list: Option<Vec<OptListEntry>>,
+    /// Whether an annotation meta was moved. Mirrors `DataParsoid->wasMoved`.
+    pub was_moved: Option<bool>,
+    /// Whether the element had an explicit `id` (suppressing auto-id). Mirrors
+    /// `DataParsoid->reusedId`.
+    pub reused_id: Option<bool>,
+    /// Whether the element is misnested. Mirrors `DataParsoid->misnested`.
+    pub misnested: Option<bool>,
     /// Temporary node-related data (mirrors PHP's `TempData`).
     pub tmp: TempData,
+}
+
+/// A single image-rendering option entry (mirrors PHP's `optList` elements:
+/// an associative array with `ck` (canonical key), `ak` (aliased key), `v`
+/// (value)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptListEntry {
+    pub ck: Option<String>,
+    pub ak: Option<String>,
+    pub v: Option<String>,
 }
 
 impl DataParsoid {
@@ -307,6 +336,33 @@ impl DataParsoid {
                     serde_json::Value::from(dsr.close_width.map(|v| v as u64)),
                 ]),
             );
+        }
+        if let Some(tail) = &self.tail {
+            obj.insert("tail".to_string(), serde_json::Value::String(tail.clone()));
+        }
+        if let Some(prefix) = &self.prefix {
+            obj.insert(
+                "prefix".to_string(),
+                serde_json::Value::String(prefix.clone()),
+            );
+        }
+        if let Some(is_iw) = &self.is_iw {
+            obj.insert("isIW".to_string(), serde_json::Value::Bool(*is_iw));
+        }
+        if let Some(link_type) = &self.link_type {
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(link_type.clone()),
+            );
+        }
+        if let Some(was_moved) = &self.was_moved {
+            obj.insert("wasMoved".to_string(), serde_json::Value::Bool(*was_moved));
+        }
+        if let Some(reused_id) = &self.reused_id {
+            obj.insert("reusedId".to_string(), serde_json::Value::Bool(*reused_id));
+        }
+        if let Some(misnested) = &self.misnested {
+            obj.insert("misnested".to_string(), serde_json::Value::Bool(*misnested));
         }
 
         if obj.is_empty() {
