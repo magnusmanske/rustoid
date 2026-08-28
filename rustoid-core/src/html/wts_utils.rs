@@ -10,7 +10,7 @@ use crate::dom::node::{ElementKind, Node, NodeKind};
 
 /// Shadow-attribute info, mirroring PHP's `WTSUtils::getShadowInfo` result:
 /// `['value' => …, 'modified' => bool, 'fromsrc' => bool]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShadowInfo {
     /// The attribute value to serialize (may differ from the DOM attribute).
     pub value: String,

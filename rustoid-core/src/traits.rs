@@ -100,12 +100,14 @@ pub trait SiteConfig: Send + Sync {
     }
 
     /// Resolve a canonical namespace name (e.g. "Media", "File", "Category")
-    /// to its namespace ID. Mirrors PHP's `SiteConfig::canonicalNamespaceId`.
+    /// to its namespace ID. Mirrors PHP's `SiteConfig::canonicalNamespaceId`,
+    /// which takes an all-lowercase name and matches case-insensitively.
     /// Returns `None` if the namespace is not configured.
     fn canonical_namespace_id(&self, canonical: &str) -> Option<i32> {
+        let target = crate::util::normalize_namespace_name(canonical);
         self.namespaces()
             .iter()
-            .find(|(_, info)| info.canonical == canonical)
+            .find(|(_, info)| crate::util::normalize_namespace_name(&info.canonical) == target)
             .map(|(id, _)| *id)
     }
 
