@@ -195,10 +195,36 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
 
 /// `WTUtils::serializeChildTableTagAsHTML` — whether a table tag should be
 /// serialized as HTML (because it is inside an HTML-syntax table). Faithful to
-/// PHP's `serializeChildTableTagAsHTML`.
-pub fn serialize_child_table_tag_as_html(_tree: &DomTree, _node: NodeId) -> bool {
-    // Requires walking up to find an HTML-syntax `<table>` ancestor. STUB until
-    // the table handlers are ported; returns `false` (native wikitext tables).
+/// PHP's `serializeChildTableTagAsHTML` + `inHTMLTableTag`.
+pub fn serialize_child_table_tag_as_html(tree: &DomTree, node: NodeId) -> bool {
+    let name = dom_utils::node_name(tree.node(node));
+    if !crate::wikitext::consts::child_table_tags().contains(&name)
+        || crate::wikitext::consts::zero_width_wikitext_tags().contains(&name)
+    {
+        return false;
+    }
+    in_html_table_tag(tree, node)
+}
+
+/// `WTUtils::inHTMLTableTag` — is `node` nested inside a table that uses HTML
+/// (rather than native wikitext) syntax? Walks up through table-tag ancestors:
+/// an HTML-syntax ancestor returns `true`, reaching a `<table>` boundary returns
+/// `false`, and leaving the table-tag chain returns `false`.
+fn in_html_table_tag(tree: &DomTree, node: NodeId) -> bool {
+    let mut p = tree.parent(node);
+    while let Some(parent) = p {
+        if !dom_utils::is_table_tag(tree.node(parent)) {
+            return false;
+        }
+        if wts_utils::is_literal_html_node(tree.node(parent)) {
+            return true;
+        }
+        if dom_utils::node_name(tree.node(parent)) == "table" {
+            // Don't cross `<table>` boundaries.
+            return false;
+        }
+        p = tree.parent(parent);
+    }
     false
 }
 
@@ -223,5 +249,37 @@ mod tests {
         let p = tree.first_child(tree.root()).unwrap();
         // Returns a boxed handler (currently the default placeholder).
         let _handler = get_dom_handler(&tree, p);
+    }
+
+    #[test]
+    fn test_serialize_child_table_tag_as_html() {
+        // A `<td>` inside a native-wikitext table is NOT HTML; a `<td>` inside
+        // an HTML-syntax `<table>` IS.
+        let mut native_table = Node::element(ElementKind::Table);
+        native_table.push_child(Node::element(ElementKind::TableCell));
+        let mut doc = Node::document();
+        doc.push_child(native_table);
+        let tree = DomTree::new(doc);
+        let td = tree
+            .first_child(tree.root())
+            .and_then(|t| tree.first_child(t))
+            .unwrap();
+        assert!(!serialize_child_table_tag_as_html(&tree, td));
+
+        // HTML-syntax table: stx="html" on the table node.
+        let mut html_table = Node::element(ElementKind::Table);
+        html_table.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            stx: Some("html".to_string()),
+            ..Default::default()
+        });
+        html_table.push_child(Node::element(ElementKind::TableCell));
+        let mut doc2 = Node::document();
+        doc2.push_child(html_table);
+        let tree2 = DomTree::new(doc2);
+        let td2 = tree2
+            .first_child(tree2.root())
+            .and_then(|t| tree2.first_child(t))
+            .unwrap();
+        assert!(serialize_child_table_tag_as_html(&tree2, td2));
     }
 }
