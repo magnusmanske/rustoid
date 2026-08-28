@@ -168,6 +168,143 @@ pub fn add_colon_escape(env: &SerializerEnv, link_target: &str, link_data: &Link
     }
 }
 
+/// `getLinkRoundTripData` — resolve everything the link serializer needs to
+/// serialize a node as a link. Faithful to `LinkHandlerUtils::getLinkRoundTripData`
+/// (the `mw:MediaLink` resource branch, the interwiki conversion block, and the
+/// `isURLLink`/magic-link content checks are ported; the localized magic-link
+/// ISBN branch is deferred).
+pub fn get_link_round_trip_data(env: &SerializerEnv, tree: &DomTree, node: NodeId) -> LinkData {
+    let dp = tree.node(node).dp.clone().unwrap_or_default();
+
+    let mut data = LinkData {
+        tail: dp.tail.clone().unwrap_or_default(),
+        prefix: dp.prefix.clone().unwrap_or_default(),
+        ..Default::default()
+    };
+
+    // Figure out the type of the link from the `rel` attribute.
+    if let Some(rel) = tree.node(node).get_attr("rel")
+        && let Some(ty) = match_link_rel(rel)
+    {
+        data.link_type = Some(ty.clone());
+    }
+
+    // Default type if nothing else set, and not a media element.
+    if data.link_type.is_none() && crate::html::dom_utils::select_media_elt(tree, node).is_none() {
+        data.link_type = Some("mw:ExtLink".to_string());
+    }
+
+    // Get href; strip leading `./`/`../` prefixes for the canonical form.
+    data.orig_href = get_href(tree, node);
+    data.href = strip_leading_dot(data.orig_href.clone());
+
+    // WikiLinks should be relative; fix up absolute WikiLinks to ExtLinks.
+    if data.link_type.as_deref() == Some("mw:WikiLink")
+        && (data.href.starts_with("//")
+            || data.href.starts_with("http://")
+            || data.href.starts_with("https://")
+            || data.orig_href.starts_with('/'))
+    {
+        data.link_type = Some("mw:ExtLink".to_string());
+    }
+
+    // The serialized target (shadow info) for `href`.
+    data.target = crate::html::wts_utils::get_attribute_shadow_info(tree.node(node), "href");
+
+    // Get the content string or (when not plain text) the content node.
+    data.content_string = get_content_string(tree, node);
+    let has_children = tree.first_child(node).is_some();
+    if data.content_string.is_none() && has_children {
+        data.content_node = Some(node);
+    }
+
+    // Redirect links.
+    if data.link_type.as_deref() == Some("mw:PageProp/redirect")
+        && data.content_string.is_none()
+        && !has_children
+    {
+        data.is_redirect = true;
+        data.prefix = dp.src.clone().unwrap_or_else(|| "#REDIRECT ".to_string());
+    }
+
+    // mw:MediaLink is authoritative; interwiki matches are not made for it.
+    if data.link_type.as_deref() == Some("mw:MediaLink") {
+        let resource =
+            crate::html::wts_utils::get_attribute_shadow_info(tree.node(node), "resource");
+        if resource.value.is_empty() {
+            // Non-parsoid HTML: reconstruct resource from the href (File:filename).
+            let file_name = data.orig_href.rsplit('/').next().unwrap_or("");
+            data.target = ShadowInfo {
+                value: format!("File:{file_name}"),
+                modified: false,
+                fromsrc: false,
+            };
+        } else {
+            data.target = resource;
+        }
+        data.href = strip_leading_dot(data.target.value.clone());
+        return data;
+    }
+
+    // Interwiki matching and conversion.
+    if let Some((interwiki_key, interwiki_target)) =
+        env.get_site_config().interwiki_matcher(&data.orig_href)
+    {
+        // External link that is really an interwiki link: convert it.
+        if data.link_type.as_deref() == Some("mw:ExtLink") {
+            data.link_type = Some("mw:WikiLink".to_string());
+        }
+        data.is_interwiki = true;
+        // Is it a language link / local link?
+        let iw_info = env
+            .get_site_config()
+            .interwiki_map_no_namespaces()
+            .into_iter()
+            .find(|(k, _)| normalize_iwp(k) == normalize_iwp(&interwiki_key));
+        if let Some((_, info)) = iw_info {
+            data.is_interwiki_lang = info.language.is_some();
+            data.is_local = info.localinterwiki == Some(true);
+        }
+        data.target = ShadowInfo {
+            value: interwiki_target,
+            modified: !data.target.fromsrc,
+            fromsrc: false,
+        };
+    }
+
+    data
+}
+
+/// Match the `rel` attribute's first recognized `mw:(WikiLink|ExtLink|MediaLink|PageProp)…`
+/// token, returning the full matched token (including subtype).
+fn match_link_rel(rel: &str) -> Option<String> {
+    for token in rel.split(' ').filter(|s| !s.is_empty()) {
+        if token.starts_with("mw:WikiLink")
+            || token.starts_with("mw:ExtLink")
+            || token.starts_with("mw:MediaLink")
+            || token.starts_with("mw:PageProp")
+        {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+/// Strip leading `./`/`../` prefix sequences (PHP's `#^(../)+#`).
+fn strip_leading_dot(s: String) -> String {
+    let mut i = 0;
+    loop {
+        if s[i..].starts_with("./") {
+            i += 2;
+        } else if s[i..].starts_with("../") {
+            i += 3;
+        } else {
+            break;
+        }
+    }
+    s[i..].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +362,24 @@ mod tests {
         );
         // Non-category wikilink target is left alone.
         assert_eq!(add_colon_escape(&env, "Foo", &ld), "Foo");
+    }
+
+    #[test]
+    fn test_get_link_round_trip_data_wikilink() {
+        let config = crate::mock::MockSiteConfig::new();
+        let ctitle = crate::title::Title::new_main("Test");
+        let env = SerializerEnv::new(&config, &ctitle);
+
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("rel", "mw:WikiLink");
+        a.set_attr("href", "./Foo_Bar");
+        a.push_child(Node::text("Foo Bar"));
+        let tree = DomTree::new(a);
+        let a_id = tree.root();
+
+        let data = get_link_round_trip_data(&env, &tree, a_id);
+        assert_eq!(data.link_type.as_deref(), Some("mw:WikiLink"));
+        assert_eq!(data.href, "Foo_Bar");
+        assert_eq!(data.content_string.as_deref(), Some("Foo Bar"));
     }
 }
