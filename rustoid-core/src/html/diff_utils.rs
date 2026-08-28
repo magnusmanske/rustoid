@@ -160,8 +160,8 @@ impl DiffUtils {
     }
 
     /// `DiffUtils::hasDiffMark` — `deleted`/non-element `inserted` marks live on
-    /// the *preceding* `mw:DiffMarker` meta; every other mark lives in the
-    /// node's own `data-parsoid-diff`.
+    /// the *preceding* `mw:DiffMarker` meta (given via `prev`); every other mark
+    /// lives in the node's own `data-parsoid-diff`.
     pub fn has_diff_mark(node: &Node, prev: Option<&Node>, mark: DiffMarkers) -> bool {
         if mark == DiffMarkers::Deleted
             || (mark == DiffMarkers::Inserted && !matches!(node.kind, NodeKind::Element(_)))
@@ -175,9 +175,10 @@ impl DiffUtils {
         }
     }
 
-    /// `DiffUtils::hasInsertedDiffMark`.
-    pub fn has_inserted_diff_mark(node: &Node, prev: Option<&Node>) -> bool {
-        Self::has_diff_mark(node, prev, DiffMarkers::Inserted)
+    /// `DiffUtils::hasInsertedDiffMark` — the element-level inserted mark (reads
+    /// the node's own `data-parsoid-diff`, not a preceding marker meta).
+    pub fn has_inserted_diff_mark(node: &Node) -> bool {
+        Self::get_diff_mark(node).is_some_and(|d| d.has_diff_marker(DiffMarkers::Inserted))
     }
 
     /// `DiffUtils::maybeDeletedNode` — an element that is a `deleted` diff marker.

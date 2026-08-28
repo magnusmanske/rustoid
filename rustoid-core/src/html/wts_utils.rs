@@ -141,6 +141,23 @@ pub fn is_quote_elt(node: &Node) -> bool {
     )
 }
 
+/// The DOM Source Range (`data-parsoid.dsr`) of a node as the serializer-facing
+/// [`DomSourceRange`](crate::html::dsr::DomSourceRange), or `None` when the node
+/// has no structured `data-parsoid`/`dsr`. Faithful to
+/// `DOMDataUtils::getDataParsoid($node)->dsr`.
+///
+/// The tokenizer stores DSR as `tokens_v2::DomSourceRange` (without the
+/// html2wt-only `source`/trimmed-WS fields); this lifts it into the serializer's
+/// richer model, leaving `source` empty for `getOrigSrc` to supply.
+pub fn get_dsr(node: &Node) -> Option<crate::html::dsr::DomSourceRange> {
+    node.dp.as_ref()?.dsr.clone().map(Into::into)
+}
+
+/// `WTSUtils::hasValidTagWidths` — non-null DSR with valid tag widths.
+pub fn has_valid_tag_widths(dsr: Option<&crate::html::dsr::DomSourceRange>) -> bool {
+    dsr.is_some_and(|d| d.has_valid_tag_widths())
+}
+
 /// Escape `<nowiki>` tags (so they tokenize as literal text rather than
 /// nowiki markup). Mirrors `WTSUtils::escapeNowikiTags`.
 pub fn escape_nowiki_tags(text: &str) -> String {
@@ -427,6 +444,244 @@ pub fn get_attribute_shadow_info(node: &Node, name: &str) -> ShadowInfo {
     get_shadow_info(node, name, node.get_attr(name))
 }
 
+/// `WTUtils::isRedirectLink` — a `<link>` element whose `rel` matches
+/// `mw:PageProp/redirect` as a word-bounded token.
+pub fn is_redirect_link(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Element(_))
+        && node_name(node) == "link"
+        && crate::html::dom_utils::match_rel(node, r"\bmw:PageProp/redirect\b").is_some()
+}
+
+/// `TokenUtils::SOL_TRANSPARENT_LINK_REGEX` — a `<link>` whose `rel` is a
+/// page-prop category/redirect/language link (rendering-transparent / SOL).
+fn is_sol_transparent_link(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Element(_))
+        && node_name(node) == "link"
+        && crate::html::dom_utils::match_rel(
+            node,
+            r"\bmw:PageProp/(?:Category|redirect|Language)\b",
+        )
+        .is_some()
+}
+
+/// `WTUtils::isFallbackIdSpan` — a `<span typeof="mw:FallbackId">`.
+pub fn is_fallback_id_span(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Element(_))
+        && node_name(node) == "span"
+        && crate::html::dom_utils::has_type_of(node, "mw:FallbackId")
+}
+
+/// `WTUtils::isRenderingTransparentNode` — metadata-like nodes that don't show
+/// up in output rendering (comments, SOL-transparent links, non-HTML metas, and
+/// fallback-id spans).
+pub fn is_rendering_transparent_node(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::Comment(_) => true,
+        _ if is_sol_transparent_link(node) => true,
+        NodeKind::Element(_) => {
+            let is_meta = node_name(node) == "meta";
+            let is_non_html_meta = is_meta
+                && !is_marker_annotation(node)
+                && !crate::html::dom_utils::has_type_of(node, "mw:DOMFragment")
+                && node
+                    .dp
+                    .as_ref()
+                    .is_none_or(|dp| dp.stx.as_deref() != Some("html"));
+            is_non_html_meta || is_fallback_id_span(node)
+        }
+        _ => false,
+    }
+}
+
+/// `WTUtils::emitsSolTransparentSingleLineWT` — the node emits wikitext that is
+/// SOL-transparent and single-line (whitespace text, or a rendering-transparent
+/// node).
+pub fn emits_sol_transparent_single_line_wt(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::Text(t) => !t.is_empty() && t.chars().all(|c| c == ' ' || c == '\t'),
+        _ => is_rendering_transparent_node(node),
+    }
+}
+
+/// `DOMUtils::isNestedListOrListItem` — a list or list-item that is nested
+/// inside a list item (requires ancestor navigation).
+pub fn is_nested_list_or_list_item(
+    tree: &crate::html::dom_tree::DomTree,
+    id: crate::html::dom_tree::NodeId,
+) -> bool {
+    let node = tree.node(id);
+    let is_list_or_item =
+        crate::html::dom_utils::is_list(node) || crate::html::dom_utils::is_list_item(node);
+    if !is_list_or_item {
+        return false;
+    }
+    crate::html::dom_utils::is_nested_in_list_item(tree, id)
+}
+
+/// `WTSUtils::nextToDeletedBlockNodeInWT` — is `id` adjacent (in wikitext
+/// terms) to a deleted block node, looking past SOL-transparent nodes?
+pub fn next_to_deleted_block_node_in_wt(
+    tree: &crate::html::dom_tree::DomTree,
+    id: crate::html::dom_tree::NodeId,
+    before: bool,
+) -> bool {
+    if crate::html::dom_utils::at_the_top(tree, id) {
+        return false;
+    }
+    let mut orig = id;
+    loop {
+        // Find the nearest node that shows up in HTML.
+        let mut cur: Option<crate::html::dom_tree::NodeId> = Some(orig);
+        loop {
+            cur = cur.and_then(|c| {
+                if before {
+                    tree.prev_sibling(c)
+                } else {
+                    tree.next_sibling(c)
+                }
+            });
+            let Some(c) = cur else { break };
+            let node = tree.node(c);
+            if crate::html::diff_utils::DiffUtils::maybe_deleted_node(node) {
+                return crate::html::diff_utils::DiffUtils::is_deleted_block_node(node);
+            }
+            if !emits_sol_transparent_single_line_wt(node) {
+                // This sibling is not transparent; it is the adjacent node.
+                break;
+            }
+        }
+
+        if cur.is_some() {
+            return false;
+        }
+
+        // Walk up past zero-width wikitext parents.
+        let Some(parent) = tree.parent(orig) else {
+            return false;
+        };
+        if !is_zero_width_wikitext_elt(tree.node(parent)) {
+            return false;
+        }
+        orig = parent;
+    }
+}
+
+/// `WTSUtils::dsrContainsOpenExtendedRangeAnnotationTag` — does the wikitext
+/// pointed at by `node`'s inner DSR contain an opening/closing annotation tag
+/// for any *extended* open annotation range?
+pub fn dsr_contains_open_extended_range_annotation_tag(
+    state: &crate::html::serializer_state::SerializerState,
+    node: &Node,
+) -> bool {
+    if state.open_annotations.is_empty() || !matches!(node.kind, NodeKind::Element(_)) {
+        return false;
+    }
+    let Some(dsr) = get_dsr(node) else {
+        return false;
+    };
+    let Some(src) = state.get_orig_src(&dsr.inner_range()) else {
+        return false;
+    };
+    for (ann, extended) in &state.open_annotations {
+        if *extended {
+            let pat = format!("</?{ann}.*>");
+            if let Ok(re) = regex::Regex::new(&pat)
+                && re.is_match(&src)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `WTSUtils::origSrcValidInEditedContext` — in selser mode, is an unedited
+/// node's wikitext source reusable as-is in the surrounding edited context?
+pub fn orig_src_valid_in_edited_context(
+    state: &crate::html::serializer_state::SerializerState,
+    tree: &crate::html::dom_tree::DomTree,
+    id: crate::html::dom_tree::NodeId,
+) -> bool {
+    let node = tree.node(id);
+    let name = node_name(node);
+
+    if is_redirect_link(node) {
+        return !tree.prev_sibling(id).is_some()
+            && crate::html::dom_utils::at_the_top(tree, tree.parent(id).unwrap_or(id));
+    }
+
+    if dsr_contains_open_extended_range_annotation_tag(state, node) {
+        return false;
+    }
+
+    if name == "th" || name == "td" {
+        // Cell wikitext depends on position (first cell is single char).
+        let Some(prev_id) = tree.prev_sibling(id) else {
+            return true;
+        };
+        let prev = tree.node(prev_id);
+        if crate::html::diff_utils::DiffUtils::has_inserted_diff_mark(prev)
+            || crate::html::diff_utils::DiffUtils::has_inserted_diff_mark(node)
+        {
+            return false;
+        }
+        if !crate::html::diff_utils::DiffUtils::is_diff_marker(prev, None)
+            && !crate::html::diff_utils::DiffUtils::direct_children_changed(prev)
+        {
+            return true;
+        }
+        return node.dp.as_ref().and_then(|d| d.stx.as_deref()) != Some("row");
+    }
+
+    if matches!(node.kind, NodeKind::Element(_))
+        && name == "tr"
+        && node.dp.as_ref().is_none_or(|d| d.start_tag_src.is_none())
+    {
+        // First row of a table (no startTagSrc) is reusable only if it stays
+        // the first row.
+        return crate::html::dom_tree::previous_non_sep_sibling(tree, id).is_none();
+    }
+
+    if is_nested_list_or_list_item(tree, id) {
+        if crate::html::dom_utils::is_list(node) {
+            // Lists never get bullets; nested lists can't be reused unless
+            // they have a previous sibling.
+            if tree.prev_sibling(id).is_none() {
+                return false;
+            }
+        } else {
+            // Reusable nested list items always have multiple bullets.
+            let dp = node.dp.as_ref();
+            let open_width_ok = dp
+                .and_then(|d| d.dsr.as_ref())
+                .and_then(|d| d.open_width)
+                .is_some_and(|w| w >= 2);
+            if !open_width_ok {
+                return false;
+            }
+        }
+
+        // If a previous sibling was modified, we can't reuse the start dsr.
+        let mut prev = tree.prev_sibling(id);
+        while let Some(p) = prev {
+            let pn = tree.node(p);
+            if crate::html::diff_utils::DiffUtils::is_diff_marker(pn, None)
+                || crate::html::diff_utils::DiffUtils::has_inserted_diff_mark(pn)
+            {
+                return false;
+            }
+            prev = tree.prev_sibling(p);
+        }
+        return true;
+    }
+
+    if is_moved_meta_tag(node) {
+        return false;
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +761,118 @@ mod tests {
         assert!(is_quote_elt(&Node::element(ElementKind::Italic)));
         assert!(is_quote_elt(&Node::element(ElementKind::Bold)));
         assert!(!is_quote_elt(&Node::element(ElementKind::Paragraph)));
+    }
+
+    #[test]
+    fn test_get_dsr_and_has_valid_tag_widths() {
+        use crate::html::dsr::DomSourceRange as SerializerDsr;
+        use crate::wikitext::tokens_v2::DomSourceRange;
+
+        // No dp → None.
+        let plain = Node::element(ElementKind::Paragraph);
+        assert!(get_dsr(&plain).is_none());
+
+        // dp with dsr → lifted to the serializer DSR.
+        let mut node = Node::element(ElementKind::Paragraph);
+        let dp = crate::wikitext::tokens_v2::DataParsoid {
+            dsr: Some(DomSourceRange {
+                start: Some(10),
+                end: Some(30),
+                open_width: Some(2),
+                close_width: Some(3),
+            }),
+            ..Default::default()
+        };
+        node.dp = Some(dp);
+
+        let dsr = get_dsr(&node).unwrap();
+        assert_eq!(dsr.start, Some(10));
+        assert_eq!(dsr.end, Some(30));
+        assert_eq!(dsr.open_width, Some(2));
+        assert_eq!(dsr.close_width, Some(3));
+        // html2wt-only fields default.
+        assert_eq!(dsr.leading_ws, 0);
+        assert_eq!(dsr.trailing_ws, 0);
+        assert!(dsr.source.is_none());
+        assert!(has_valid_tag_widths(Some(&dsr)));
+
+        // Null widths → not valid.
+        let wide = SerializerDsr::new(Some(10), Some(30), None, Some(3), 0, 0);
+        assert!(!has_valid_tag_widths(Some(&wide)));
+        assert!(!has_valid_tag_widths(None));
+    }
+
+    fn link_node(rel: &str) -> Node {
+        let mut node = Node::element(ElementKind::InterlanguageLink);
+        node.set_attr("rel", rel);
+        node
+    }
+
+    #[test]
+    fn test_is_redirect_link() {
+        assert!(is_redirect_link(&link_node("mw:PageProp/redirect")));
+        assert!(is_redirect_link(&link_node(
+            "mw:PageProp/redirect mw:something"
+        )));
+        assert!(!is_redirect_link(&link_node("mw:PageProp/redirectto"))); // word boundary
+        assert!(!is_redirect_link(&link_node("mw:PageProp/Category")));
+    }
+
+    #[test]
+    fn test_emits_sol_transparent_single_line_wt() {
+        assert!(emits_sol_transparent_single_line_wt(&Node::text("  \t")));
+        assert!(!emits_sol_transparent_single_line_wt(&Node::text(" x")));
+        assert!(!emits_sol_transparent_single_line_wt(&Node::text("")));
+        assert!(emits_sol_transparent_single_line_wt(&Node::comment("c")));
+        assert!(emits_sol_transparent_single_line_wt(&link_node(
+            "mw:PageProp/Category"
+        )));
+        assert!(!emits_sol_transparent_single_line_wt(&Node::element(
+            ElementKind::Paragraph
+        )));
+    }
+
+    #[test]
+    fn test_orig_src_valid_in_edited_context_plain() {
+        use crate::html::dom_tree::DomTree;
+        use crate::html::serializer_state::SerializerState;
+
+        // A plain, unmarked paragraph reuses source.
+        let mut root = Node::document();
+        root.push_child(Node::element(ElementKind::Paragraph));
+        let tree = DomTree::new(root);
+        let st = SerializerState::new();
+        let p = tree.first_child(tree.root()).unwrap();
+        assert!(orig_src_valid_in_edited_context(&st, &tree, p));
+    }
+
+    #[test]
+    fn test_orig_src_valid_moved_meta_false() {
+        use crate::html::dom_tree::DomTree;
+        use crate::html::serializer_state::SerializerState;
+
+        // A moved annotation meta cannot reuse source.
+        let mut root = Node::document();
+        let mut meta = Node::element(ElementKind::Annotation);
+        meta.data_parsoid = Some(r#"{"wasMoved":true}"#.to_string());
+        root.push_child(meta);
+        let tree = DomTree::new(root);
+        let st = SerializerState::new();
+        let m = tree.first_child(tree.root()).unwrap();
+        assert!(!orig_src_valid_in_edited_context(&st, &tree, m));
+    }
+
+    #[test]
+    fn test_next_to_deleted_block_node_in_wt() {
+        use crate::html::dom_tree::DomTree;
+
+        // No diff markers → not next to a deleted block node.
+        let mut root = Node::document();
+        root.push_child(Node::element(ElementKind::Paragraph));
+        root.push_child(Node::element(ElementKind::Paragraph));
+        let tree = DomTree::new(root);
+        let p1 = tree.first_child(tree.root()).unwrap();
+        assert!(!next_to_deleted_block_node_in_wt(&tree, p1, true));
+        assert!(!next_to_deleted_block_node_in_wt(&tree, p1, false));
     }
 }

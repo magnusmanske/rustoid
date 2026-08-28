@@ -256,6 +256,23 @@ pub fn is_valid_dsr(dsr: Option<&DomSourceRange>, all: bool) -> bool {
     }
 }
 
+impl From<crate::wikitext::tokens_v2::DomSourceRange> for DomSourceRange {
+    /// Lift the tokenizer-side DSR into the serializer-facing DSR, defaulting
+    /// the html2wt-only fields that the tokenizer does not model (trimmed-WS
+    /// widths, and the `source` text — which `getOrigSrc` supplies at call time).
+    fn from(tsr: crate::wikitext::tokens_v2::DomSourceRange) -> Self {
+        DomSourceRange {
+            start: tsr.start,
+            end: tsr.end,
+            source: None,
+            open_width: tsr.open_width,
+            close_width: tsr.close_width,
+            leading_ws: 0,
+            trailing_ws: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
