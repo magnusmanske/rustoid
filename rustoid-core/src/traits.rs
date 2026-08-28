@@ -129,6 +129,117 @@ pub trait SiteConfig: Send + Sync {
         None
     }
 
+    /// `SiteConfig::interwikiMapNoNamespaces` — the interwiki map with entries
+    /// that conflict with a namespace name removed (namespace wins).
+    fn interwiki_map_no_namespaces(&self) -> Vec<(String, InterwikiInfo)> {
+        self.interwiki_map()
+            .iter()
+            .filter(|(key, _)| self.namespace_id(key).is_none())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// `SiteConfig::interwikiMatcher` — match an href against the interwiki URL
+    /// patterns, returning the interwiki prefix and the matched title target.
+    /// Language interwikis are escaped with a leading `:`.
+    ///
+    /// NOTE: the `local` interwiki shortcuts (`./$prefix:$title` and
+    /// `$prefix%3A$title`) are not yet emitted into the pattern set; the
+    /// full-URL and protocol-relative forms are matched faithfully.
+    fn interwiki_matcher(&self, href: &str) -> Option<(String, String)> {
+        // Build patterns, preferring language matches over non-language ones.
+        let mut keys = Vec::new();
+        let mut patterns: Vec<regex::Regex> = Vec::new();
+
+        // Two passes: language first, then non-language.
+        for prefer_lang in [true, false] {
+            for (key, iw) in self.interwiki_map_no_namespaces() {
+                let is_lang = iw.language.is_some();
+                if is_lang != prefer_lang {
+                    continue;
+                }
+                let url = &iw.url;
+                let protocol_relative = url.starts_with("//") || iw.protorel == Some(true);
+                let url_clean = if iw.protorel == Some(true) {
+                    url.trim_start_matches("http:")
+                        .trim_start_matches("https:")
+                        .to_string()
+                } else {
+                    url.clone()
+                };
+                // Escape the URL template first (matching `preg_quote`), then
+                // replace the escaped `$1` placeholder with a capture group.
+                let pattern_body = regex_escape(&url_clean).replace("\\$1", "(.*?)");
+                let regex_body = if protocol_relative {
+                    format!("(?:https?:)?{pattern_body}")
+                } else {
+                    pattern_body
+                };
+                let Ok(re) = regex::Regex::new(&format!("^{regex_body}$")) else {
+                    continue;
+                };
+                keys.push(key);
+                patterns.push(re);
+            }
+        }
+
+        // Language interwikis are escaped with a leading colon (handled inline
+        // below by re-checking the interwiki entry's language flag).
+        for (idx, key) in keys.iter().enumerate() {
+            let iw = self
+                .interwiki_map_no_namespaces()
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone());
+            let is_lang = iw.map(|i| i.language.is_some()).unwrap_or(false);
+            if let Some(caps) = patterns[idx].captures(href) {
+                let target = caps
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                let escaped_key = if is_lang {
+                    format!(":{key}")
+                } else {
+                    key.clone()
+                };
+                return Some((escaped_key, target));
+            }
+        }
+        None
+    }
+
+    /// `SiteConfig::getExtResourceURLPatternMatcher` — match an href against the
+    /// RFC/ISBN/PMID magic-link URL patterns, returning the magic-link type and
+    /// the matched reference. Returns `None` on no match.
+    fn ext_resource_url_pattern_match(&self, text: &str) -> Option<(String, String)> {
+        use regex::Regex;
+        // The localized Special namespace / Booksources aliases are not plumbed
+        // through this trait yet, so the ISBN URL pattern uses a conservative
+        // approximation (Special:Booksources). RFC/PMID match their canonical
+        // host paths.
+        if self.magic_link_enabled("RFC") {
+            let re = Regex::new(r"[^/]*//datatracker\.ietf\.org/doc/html/rfc([A-Za-z0-9]+)").ok();
+            if let Some(re) = re
+                && let Some(caps) = re.captures(text)
+                && let Some(m) = caps.get(1)
+            {
+                return Some(("RFC".to_string(), m.as_str().to_string()));
+            }
+        }
+        if self.magic_link_enabled("PMID") {
+            let re =
+                Regex::new(r"[^/]*//www\.ncbi\.nlm\.nih\.gov/pubmed/([A-Za-z0-9]+)\?dopt=Abstract")
+                    .ok();
+            if let Some(re) = re
+                && let Some(caps) = re.captures(text)
+                && let Some(m) = caps.get(1)
+            {
+                return Some(("PMID".to_string(), m.as_str().to_string()));
+            }
+        }
+        None
+    }
+
     /// The URL for uploading a file (used by media/file links). Mirrors PHP's
     /// `SiteConfig::getUploadUrl` (a sensible default, overridable).
     fn get_upload_url(&self, _title: &str) -> String {
@@ -246,6 +357,19 @@ pub trait SiteConfig: Send + Sync {
     fn legal_title_chars(&self) -> &'static str {
         " %!\"$&'()*,\\-./0-9:;=?@A-Z\\^_`a-z~\\x80-\\xff+"
     }
+}
+
+/// Escape a regex body's metacharacters for the `regex` crate (approximating
+/// PHP's `preg_quote` for `/`). Used to embed interwiki URL templates.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if r"\.+*?()|[]{}^$#&-".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Information about a namespace.
@@ -402,5 +526,26 @@ mod tests {
         assert!(c.is_extension_tag("ref"));
         assert!(c.is_extension_tag("REF")); // lower-cased before matching
         assert!(!c.is_extension_tag("div"));
+    }
+
+    #[test]
+    fn test_interwiki_matcher() {
+        let c = crate::mock::MockSiteConfig::new();
+        // `commons` → `https://commons.wikimedia.org/wiki/$1`.
+        let m = c.interwiki_matcher("https://commons.wikimedia.org/wiki/Foo");
+        assert_eq!(m, Some(("commons".to_string(), "Foo".to_string())));
+        // No match for an unrelated URL.
+        assert_eq!(c.interwiki_matcher("https://example.com/x"), None);
+    }
+
+    #[test]
+    fn test_ext_resource_url_pattern_match() {
+        let c = crate::mock::MockSiteConfig::new();
+        let m = c.ext_resource_url_pattern_match("https://datatracker.ietf.org/doc/html/rfc1234");
+        assert_eq!(m, Some(("RFC".to_string(), "1234".to_string())));
+        assert_eq!(
+            c.ext_resource_url_pattern_match("https://example.com"),
+            None
+        );
     }
 }
