@@ -472,6 +472,12 @@ pub struct TempData {
     /// The first wikitext node of a multi-template-content-block (html→wt
     /// serialization).
     pub first_wikitext_node: Option<String>,
+    /// Set by `TreeBuilderStage` while inside a transclusion (mirrors
+    /// `TempData::IN_TRANSCLUSION`).
+    pub in_transclusion: bool,
+    /// Set by `MarkFosteredContent` on the transclusion start meta of a fostered
+    /// transclusion (mirrors `TempData::FROM_FOSTER`).
+    pub from_foster: bool,
 }
 
 /// A single Parsoid token — mirrors the PHP token hierarchy.

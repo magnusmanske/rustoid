@@ -15,6 +15,7 @@ pub mod external_link_handler;
 pub mod frame;
 pub mod headings;
 pub mod list_handler;
+pub mod mark_fostered_content;
 pub mod media_options;
 pub mod p_wrap;
 pub mod paragraph_wrapper_v2;
