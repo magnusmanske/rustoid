@@ -260,6 +260,12 @@ impl WikitextSerializer {
         selser: bool,
         selser_rev_text: Option<&str>,
     ) -> String {
+        let mut root = root;
+        // DOM normalization (quote-tag minimization / empty-tag stripping) runs
+        // before serialization, faithfully mirroring `serializeDOM`'s
+        // `DOMNormalizer::normalize` call. (Selser diff-marker bookkeeping is
+        // layered on once the selser pipeline is fully wired.)
+        crate::html::dom_normalizer::normalize(&mut root);
         let tree = DomTree::new(root);
         let root_id = tree.root();
         let mut state = match env {

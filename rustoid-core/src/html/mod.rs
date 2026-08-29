@@ -9,6 +9,7 @@ pub mod diff_utils;
 pub mod dom_diff;
 pub mod dom_handler;
 pub mod dom_handler_factory;
+pub mod dom_normalizer;
 pub mod dom_tree;
 pub mod dom_utils;
 pub mod dsr;
