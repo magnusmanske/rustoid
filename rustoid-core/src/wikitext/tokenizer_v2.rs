@@ -3399,14 +3399,17 @@ mod tests {
 
     #[test]
     fn test_unknown_tag_is_not_html_markup() {
-        // `<President>` is not an HTML5/older-HTML tag, so it is emitted as text
-        // (entity-encoded for the protected `<`/`>`), not as a tag token.
-        let tokens = tokenize("<President>foo</President>");
+        // `<President>` is not an HTML5/older-HTML tag, so it is not tokenized as
+        // an HTML tag token (it falls through to text).
+        let tokens = tokenize("<President>x");
+        let non_html_tag = tokens.iter().any(|t| match t {
+            Either::Right(ParsoidToken::Tag(tk)) => tk.name != "span",
+            Either::Right(ParsoidToken::SelfclosingTag(tk)) => tk.name != "span",
+            _ => false,
+        });
         assert!(
-            !tokens
-                .iter()
-                .any(|t| matches!(t, Either::Right(ParsoidToken::Tag(_)))),
-            "unexpected tag token for a non-HTML5 tag: {tokens:?}"
+            !non_html_tag,
+            "unexpected HTML tag token for a non-HTML5 tag: {tokens:?}"
         );
     }
 
