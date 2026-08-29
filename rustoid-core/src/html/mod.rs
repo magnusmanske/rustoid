@@ -6,6 +6,7 @@
 
 pub mod constrained_text;
 pub mod diff_utils;
+pub mod dom_diff;
 pub mod dom_handler;
 pub mod dom_handler_factory;
 pub mod dom_tree;

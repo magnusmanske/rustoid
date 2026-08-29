@@ -217,6 +217,38 @@ impl DiffUtils {
             Some(d) => d.has_only_diff_markers(&[DiffMarkers::ModifiedWrapper]),
         }
     }
+
+    /// `DiffUtils::setDiffMark` — add a diff marker to an element node's
+    /// `data-parsoid-diff` set (a no-op for non-element nodes). Faithful to the
+    /// private `setDiffMark` helper.
+    pub fn set_diff_mark(node: &mut Node, mark: DiffMarkers) {
+        if !matches!(node.kind, NodeKind::Element(_)) {
+            return;
+        }
+        let mut dpd = Self::get_diff_mark(node).unwrap_or_default();
+        dpd.add_diff_marker(mark);
+        node.set_attr("data-parsoid-diff", dpd.to_json());
+    }
+
+    /// `DiffUtils::getAttributes` — the attributes considered for equality,
+    /// with `data-parsoid`/`data-mw`/`data-mw-variant`/`data-mw-i18n` normalized
+    /// to their rich (JSON) forms and `data-parsoid-diff` always excluded.
+    pub fn get_attributes(node: &Node, ignoreable: &[&str]) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for attr in &node.attrs {
+            if ignoreable.contains(&attr.key.as_str()) {
+                continue;
+            }
+            if attr.key == "data-parsoid-diff" {
+                continue; // always ignored
+            }
+            out.push((attr.key.clone(), attr.value.clone()));
+        }
+        // Normalize rich attributes to their plain serialized form (for us, the
+        // raw `data-parsoid`/`data-mw` values are already JSON strings).
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 #[cfg(test)]

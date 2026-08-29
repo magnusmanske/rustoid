@@ -141,6 +141,12 @@ pub fn is_quote_elt(node: &Node) -> bool {
     )
 }
 
+/// `WTUtils::isBlockNodeWithVisibleWT` — a wikitext block node that is visible
+/// in wikitext (i.e. not a zero-width wikitext element).
+pub fn is_block_node_with_visible_wt(node: &Node) -> bool {
+    crate::html::dom_utils::is_wikitext_block_node(node) && !is_zero_width_wikitext_elt(node)
+}
+
 /// The DOM Source Range (`data-parsoid.dsr`) of a node as the serializer-facing
 /// [`DomSourceRange`](crate::html::dsr::DomSourceRange), or `None` when the node
 /// has no structured `data-parsoid`/`dsr`. Faithful to
