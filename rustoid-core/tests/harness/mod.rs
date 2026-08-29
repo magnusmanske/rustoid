@@ -804,8 +804,9 @@ fn open_name(inner: &str) -> String {
 /// Re-serialize an opening tag (e.g. `<pre typeof="x" about="y">`) with its
 /// attributes sorted alphabetically by name, mirroring PHP's
 /// `XHtmlSerializer` `sortAttrs` option (enabled by the parser-test
-/// normalization). Attribute values with embedded `>` or quotes are preserved
-/// verbatim.
+/// normalization). Attribute quoting is normalized per PHP's `smartQuote` rule
+/// (single quotes only when the value contains `"` and no `'`, or more `"`
+/// than `'`), matching `XHtmlSerializer::serializeToString`.
 fn sort_open_tag_attrs(open_tag: &str) -> String {
     // Strip the leading `<` and the trailing `>` (and any `/` self-closing slash).
     let body = open_tag.strip_prefix('<').unwrap_or(open_tag);
@@ -863,13 +864,59 @@ fn sort_open_tag_attrs(open_tag: &str) -> String {
     let mut out = format!("<{name}");
     for a in &attrs {
         out.push(' ');
-        out.push_str(a);
+        out.push_str(&normalize_attr_quoting(a));
     }
     out.push_str(self_close);
     if !out.ends_with('>') {
         out.push('>');
     }
     out
+}
+
+/// Normalize a single attribute (`name="value"` or `name='value'` or a bare
+/// boolean `name`) to its `XHtmlSerializer` `smartQuote` form: single quotes
+/// only when the value contains `"` and (no `'` or more `"` than `'`), else
+/// double quotes, with the value's entities re-escaped for the chosen quote.
+fn normalize_attr_quoting(attr: &str) -> String {
+    // Bare boolean attribute (no `=`): emit verbatim.
+    let Some(eq) = attr.find('=') else {
+        return attr.to_string();
+    };
+    let name = attr[..eq].trim();
+    let raw_value = attr[eq + 1..].trim();
+
+    // Strip the surrounding quotes (either single or double).
+    let value = if raw_value.len() >= 2 {
+        let first = raw_value.as_bytes()[0];
+        let last = raw_value.as_bytes()[raw_value.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            &raw_value[1..raw_value.len() - 1]
+        } else {
+            raw_value
+        }
+    } else {
+        raw_value
+    };
+
+    // smartQuote: single quotes when there is a `"` and (no `'` or more `"`
+    // than `'`).
+    let dq = value.matches('"').count();
+    let sq = value.matches('\'').count();
+    let use_single = value.contains('"') && (sq == 0 || dq > sq);
+
+    if use_single {
+        let escaped = value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('\'', "&apos;");
+        format!("{name}='{escaped}'")
+    } else {
+        let escaped = value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('"', "&quot;");
+        format!("{name}=\"{escaped}\"")
+    }
 }
 
 /// Extract an attribute's name (up to the first `=`, trimmed).
@@ -1397,5 +1444,30 @@ mod tests {
         // matching Parsoid's `XHtmlSerializer` output for the same text.
         let decoded = decode_xml_entities("&lt;President&gt;");
         assert_eq!(html_escape(&decoded), "&lt;President>");
+    }
+
+    #[test]
+    fn test_normalize_attr_quoting_smart_quote() {
+        // No embedded quotes → double quotes.
+        assert_eq!(
+            normalize_attr_quoting("class='mw-empty-elt'"),
+            "class=\"mw-empty-elt\""
+        );
+        assert_eq!(
+            normalize_attr_quoting("class=\"mw-empty-elt\""),
+            "class=\"mw-empty-elt\""
+        );
+        // Value with a `"` and no `'` → single quotes.
+        assert_eq!(
+            normalize_attr_quoting("title='has \"quote\"'"),
+            "title='has \"quote\"'"
+        );
+        // Value with a `'` and a `"` → double quotes (single-count > double-count).
+        assert_eq!(
+            normalize_attr_quoting("title='it runs'"),
+            "title=\"it runs\""
+        );
+        // Bare boolean attribute is left verbatim.
+        assert_eq!(normalize_attr_quoting("hidden"), "hidden");
     }
 }
