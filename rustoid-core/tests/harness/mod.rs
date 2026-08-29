@@ -566,6 +566,16 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     {
         config.set_parsoid_experimental_parser_function_output(true);
     }
+    // The `i18next` option registers the `i18ntag`/`i18nattr` extension tags
+    // (mirrors `SiteConfig::registerParserTestExtension(I18nTag::class)`).
+    if test
+        .options
+        .get("i18next")
+        .is_some_and(|v| v == "1" || v == "true")
+    {
+        config.add_extension_tag("i18ntag");
+        config.add_extension_tag("i18nattr");
+    }
     let parser = Parser::new(&config);
 
     // The `parsoid` option can enable section wrapping via a JSON object like

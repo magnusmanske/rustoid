@@ -336,6 +336,16 @@ impl MockSiteConfig {
     pub fn set_parsoid_experimental_parser_function_output(&mut self, enabled: bool) {
         self.parsoid_experimental_parser_function_output = enabled;
     }
+
+    /// Register an additional extension tag name (e.g. `i18ntag`, `i18nattr` for
+    /// the `i18next` parser-test option). Mirrors PHP's
+    /// `SiteConfig::registerParserTestExtension`.
+    pub fn add_extension_tag(&mut self, name: &str) {
+        let lower = name.to_lowercase();
+        if !self.extension_tags.contains(&lower) {
+            self.extension_tags.push(lower);
+        }
+    }
 }
 
 impl Default for MockSiteConfig {

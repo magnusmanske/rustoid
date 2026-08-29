@@ -1429,7 +1429,9 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
         let lc_name = name.to_lowercase();
-        if !matches!(lc_name.as_str(), "nowiki" | "pre") || !self.ext_tags.contains(&lc_name) {
+        if !matches!(lc_name.as_str(), "nowiki" | "pre" | "i18ntag" | "i18nattr")
+            || !self.ext_tags.contains(&lc_name)
+        {
             self.pos = saved;
             return false;
         }

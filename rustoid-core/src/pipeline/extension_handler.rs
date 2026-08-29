@@ -31,6 +31,7 @@ fn expand_extension(
     match name {
         "nowiki" => Some(nowiki_items(token)),
         "pre" => Some(pre_items(token, config)),
+        "i18ntag" | "i18nattr" => Some(i18n_items(token)),
         // Other built-in extension tags (gallery, …) are not yet handled.
         _ => None,
     }
@@ -119,6 +120,75 @@ fn nowiki_items(token: &SelfclosingTagTk) -> Vec<Item> {
         ))));
     }
     out
+}
+
+/// Build the token sequence for an `<i18ntag>` or `<i18nattr>` extension.
+/// Faithful port of `ParserTests\I18nTag::sourceToDom` (and the generic
+/// `ExtensionHandler` encapsulation that wraps its fragment).
+///
+/// - `<i18ntag>` → `<span typeof="mw:I18n mw:Extension/i18ntag" …>` (empty),
+///   with `data-mw-i18n` holding the span info in the page-content language.
+/// - `<i18nattr>` → `<span typeof="mw:LocalizedAttrs mw:Extension/i18nattr">`
+///   wrapping the body text, with `data-mw-i18n` holding the localized
+///   attribute info in the interface language.
+fn i18n_items(token: &SelfclosingTagTk) -> Vec<Item> {
+    let source = attr_str(token, "source").unwrap_or_default().to_string();
+    let body = extract_ext_body(token, &source);
+    let tag_name = attr_str(token, "name").unwrap_or("i18ntag").to_string();
+
+    // Recover the parsed start-tag attributes (for `<i18nattr>`, the `message`
+    // attribute carries the localization key).
+    let attrs = extension_kv_attrs(token);
+
+    let mut dp = token.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+
+    let mut span = TagTk::new("span", vec![], dp);
+
+    if tag_name == "i18ntag" {
+        // `<span typeof="mw:I18n mw:Extension/i18ntag">` with span info in the
+        // page-content language (mirrors `createPageContentI18nFragment`).
+        span.add_attribute_str("typeof", "mw:I18n mw:Extension/i18ntag");
+        let key = body.trim();
+        span.add_attribute_str(
+            "data-mw-i18n",
+            format!("{{\"/\":{{\"lang\":\"x-page\",\"key\":\"{key}\"}}}}"),
+        );
+        // Empty span: no children.
+        vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "span",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ]
+    } else {
+        // `<span typeof="mw:LocalizedAttrs mw:Extension/i18nattr">…body…</span>`
+        // with the `message` attribute localized in the interface language
+        // (mirrors `addInterfaceI18nAttribute`).
+        span.add_attribute_str("typeof", "mw:LocalizedAttrs mw:Extension/i18nattr");
+        let key = attrs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("message"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default();
+        span.add_attribute_str(
+            "data-mw-i18n",
+            format!("{{\"message\":{{\"lang\":\"x-user\",\"key\":\"{key}\"}}}}"),
+        );
+        vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str(body),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "span",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ]
+    }
 }
 
 /// Extract an extension tag's body source (the text between the opening and
@@ -328,6 +398,7 @@ pub fn run(tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Vec<Ite
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wikitext::tokens_v2::{DataMw, KV, KeyValue};
 
     #[test]
     fn test_split_entities() {
@@ -415,6 +486,115 @@ mod tests {
                 .iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "\u{2192}")),
             "expected decoded arrow in {items:?}"
+        );
+    }
+
+    // Build an `extension` token for an i18n tag body (with optional parsed
+    // start-tag attributes for `<i18nattr>`).
+    fn i18n_token(name: &str, body: &str, attrs: Vec<KV>) -> SelfclosingTagTk {
+        let full = format!("<{name}>{body}</{name}>");
+        let dp = DataParsoid {
+            ext_tag_offsets: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(full.len()),
+                open_width: Some(format!("<{name}>").len()),
+                close_width: Some(format!("</{name}>").len()),
+            }),
+            ..DataParsoid::default()
+        };
+        let mut tok = SelfclosingTagTk::new("extension", vec![], dp);
+        tok.add_attribute_str("name", name);
+        tok.add_attribute_str("source", &full);
+        // Store the parsed attrs as rich `data-mw` attribs (mirrors the
+        // tokenizer's `extension_data_mw`).
+        tok.data_mw = Some(DataMw {
+            parts: vec![],
+            src: None,
+            attribs: attrs
+                .iter()
+                .map(|kv| {
+                    crate::wikitext::tokens_v2::DataMwAttrib::new(
+                        crate::wikitext::tokens_v2::DataMwValue::Str(
+                            kv.key.as_str().unwrap_or_default().to_string(),
+                        ),
+                        crate::wikitext::tokens_v2::DataMwValue::Str(
+                            kv.value.as_str().unwrap_or_default().to_string(),
+                        ),
+                    )
+                })
+                .collect(),
+        });
+        tok
+    }
+
+    fn kv(key: &str, value: &str) -> KV {
+        KV {
+            key: KeyValue::Str(key.to_string()),
+            value: KeyValue::Str(value.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }
+    }
+
+    #[test]
+    fn test_i18n_items_i18ntag() {
+        let items = i18n_items(&i18n_token("i18ntag", "message.key", vec![]));
+        let tag = items
+            .iter()
+            .find_map(|it| match it {
+                Item::Tok(ParsoidToken::Tag(t)) if t.name == "span" => Some(t),
+                _ => None,
+            })
+            .expect("span tag");
+        assert_eq!(
+            tag.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("mw:I18n mw:Extension/i18ntag")
+        );
+        assert_eq!(
+            tag.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("data-mw-i18n"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("{\"/\":{\"lang\":\"x-page\",\"key\":\"message.key\"}}")
+        );
+    }
+
+    #[test]
+    fn test_i18n_items_i18nattr() {
+        let items = i18n_items(&i18n_token(
+            "i18nattr",
+            "some text",
+            vec![kv("message", "message.key")],
+        ));
+        let tag = items
+            .iter()
+            .find_map(|it| match it {
+                Item::Tok(ParsoidToken::Tag(t)) if t.name == "span" => Some(t),
+                _ => None,
+            })
+            .expect("span tag");
+        assert_eq!(
+            tag.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("mw:LocalizedAttrs mw:Extension/i18nattr")
+        );
+        assert_eq!(
+            tag.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("data-mw-i18n"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("{\"message\":{\"lang\":\"x-user\",\"key\":\"message.key\"}}")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, Item::Str(s) if s == "some text"))
         );
     }
 }
