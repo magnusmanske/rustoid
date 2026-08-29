@@ -1555,6 +1555,15 @@ impl<'a> PegTokenizer<'a> {
                 let name = raw.to_lowercase();
                 self.advance(end + 1);
 
+                // Only HTML5/older-HTML tags are recognized as markup; anything
+                // else (e.g. `</President>`) is entity-encoded text.
+                if !crate::wikitext::consts::html5_tags().contains(&name)
+                    && !crate::wikitext::consts::older_html_tags().contains(&name)
+                {
+                    self.pos = saved;
+                    return false;
+                }
+
                 let mut dp = self.make_dp(saved, self.pos);
                 dp.stx = Some("html".to_string());
                 // Preserve the original source so disallowed tags round-trip with
@@ -1574,6 +1583,16 @@ impl<'a> PegTokenizer<'a> {
         // Parse tag name.
         let name = self.parse_tag_name();
         if name.is_empty() {
+            self.pos = saved;
+            return false;
+        }
+
+        // Only recognized HTML5/older-HTML tags are markup; unknown names are
+        // entity-encoded text (e.g. `<President>`).
+        let lc = name.to_lowercase();
+        if !crate::wikitext::consts::html5_tags().contains(&lc)
+            && !crate::wikitext::consts::older_html_tags().contains(&lc)
+        {
             self.pos = saved;
             return false;
         }
@@ -3356,35 +3375,38 @@ mod tests {
 
     #[test]
     fn test_html_tag_preserves_original_src() {
-        // The `name` is lowercased (HTML tag names are case-insensitive), but the
-        // original source (including case) is preserved in `dataParsoid.src` so a
-        // disallowed tag can round-trip without losing the author's casing
+        // A *recognized* HTML5 tag is lowercased, with the original source
+        // (including case) preserved in `dataParsoid.src` so it can round-trip
         // (mirrors PHP's `getWTSource` fallback in `SanitizerHandler`).
-        let tokens = tokenize("<President>foo</President>");
+        let tokens = tokenize("<span>foo</span>");
         let tag = tokens.iter().find_map(|t| match t {
-            Either::Right(ParsoidToken::Tag(tk)) if tk.name == "president" => Some(tk),
+            Either::Right(ParsoidToken::Tag(tk)) if tk.name == "span" => Some(tk),
             _ => None,
         });
         assert!(
             tag.is_some(),
-            "expected a <president> tag token, got: {tokens:?}"
+            "expected a <span> tag token, got: {tokens:?}"
         );
-        assert_eq!(
-            tag.unwrap().data_parsoid.src.as_deref(),
-            Some("<President>")
-        );
+        assert_eq!(tag.unwrap().data_parsoid.src.as_deref(), Some("<span>"));
 
         let end = tokens.iter().find_map(|t| match t {
-            Either::Right(ParsoidToken::EndTag(tk)) if tk.name == "president" => Some(tk),
+            Either::Right(ParsoidToken::EndTag(tk)) if tk.name == "span" => Some(tk),
             _ => None,
         });
+        assert!(end.is_some(), "expected a </span> end tag, got: {tokens:?}");
+        assert_eq!(end.unwrap().data_parsoid.src.as_deref(), Some("</span>"));
+    }
+
+    #[test]
+    fn test_unknown_tag_is_not_html_markup() {
+        // `<President>` is not an HTML5/older-HTML tag, so it is emitted as text
+        // (entity-encoded for the protected `<`/`>`), not as a tag token.
+        let tokens = tokenize("<President>foo</President>");
         assert!(
-            end.is_some(),
-            "expected a </president> end tag, got: {tokens:?}"
-        );
-        assert_eq!(
-            end.unwrap().data_parsoid.src.as_deref(),
-            Some("</President>")
+            !tokens
+                .iter()
+                .any(|t| matches!(t, Either::Right(ParsoidToken::Tag(_)))),
+            "unexpected tag token for a non-HTML5 tag: {tokens:?}"
         );
     }
 
