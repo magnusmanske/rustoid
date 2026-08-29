@@ -395,8 +395,11 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
         let vv = shadow.value.as_str();
         if !vv.is_empty() {
             if !shadow.fromsrc {
-                // Escaped from loaded attr value (not original source).
-                let escaped = vv.replace('>', "&gt;").replace('"', "&quot;");
+                // Escaped from loaded attr value (not original source). Comments
+                // and annotation tags embedded in the value are left unescaped
+                // (faithful to `preg_split(commentsOrAnnotationsRE)` walking the
+                // odd (delimiter) segments unescaped).
+                let escaped = escape_non_comment_segments(vv);
                 out.push(format!("{kk}=\"{escaped}\""));
             } else {
                 out.push(format!("{kk}=\"{}\"", vv.replace('"', "&quot;")));
@@ -431,6 +434,43 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
     }
 
     out.join(" ")
+}
+
+/// Escape the non-comment/non-annotation segments of an attribute value that
+/// does *not* come from source (`fromsrc == false`), leaving wikitext comments
+/// (`<!-- … -->`) and annotation tags untouched. Faithful to PHP's
+/// `preg_split(commentsOrAnnotationsRE, …, PREG_SPLIT_DELIM_CAPTURE)` then
+/// escaping only the even (non-delimiter) segments via `escapeWtEntities` +
+/// `>`/`"` replacement.
+fn escape_non_comment_segments(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("<!--") {
+        // Emit the pre-comment segment (escaped).
+        out.push_str(&escape_attr_segment(&rest[..start]));
+        // Find the comment end; emit the comment unescaped.
+        match rest[start..].find("-->") {
+            Some(rel_end) => {
+                let abs_end = start + rel_end + 3;
+                out.push_str(&rest[start..abs_end]);
+                rest = &rest[abs_end..];
+            }
+            None => {
+                // Unterminated comment: emit the rest unescaped and stop.
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(&escape_attr_segment(rest));
+    out
+}
+
+/// Escape a single non-comment attribute segment: `>` → `&gt;`, `"` → `&quot;`
+/// (the `escapeWtEntities` entity-escape is a no-op here since we don't
+/// entity-decode).
+fn escape_attr_segment(seg: &str) -> String {
+    seg.replace('>', "&gt;").replace('"', "&quot;")
 }
 
 /// Strip the Parsoid transclusion counter from an `about="#mwtN"` value,
