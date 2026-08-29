@@ -220,16 +220,20 @@ impl HtmlSerializer {
                         buf.push_str("</figure-inline>");
                     }
                     _ => {
-                        // Generic element serialization.
+                        // Generic element serialization. No leading `indent`
+                        // here: Parsoid's `XHtmlSerializer` emits compact output
+                        // with no synthetic whitespace between elements (inline
+                        // elements like `<small>`/`<code>` reach this arm, and a
+                        // pretty-print indent would inject spurious text nodes).
                         let tag = self.element_tag(kind);
                         // Void/self-closing elements (meta, link, img, etc.)
                         // serialize without a closing tag.
                         if is_void_element(tag) {
-                            buf.push_str(&format!("{indent}<{tag}"));
+                            buf.push_str(&format!("<{tag}"));
                             self.serialize_attrs_full(node, buf);
                             buf.push_str("/>");
                         } else {
-                            buf.push_str(&format!("{indent}<{tag}"));
+                            buf.push_str(&format!("<{tag}"));
                             self.serialize_attrs_full(node, buf);
                             buf.push('>');
                             self.serialize_children(node, buf, depth)?;
@@ -530,6 +534,29 @@ mod tests {
         let html = serializer.serialize(&doc).unwrap();
         assert!(!html.contains("<!DOCTYPE"));
         assert!(html.contains("<p>"));
+    }
+
+    #[test]
+    fn test_generic_inline_elements_compact() {
+        // Generic `ElementKind::Other` inline elements (e.g. `<small>`, `<em>`,
+        // `<code>`) must not receive pretty-print indentation, which would
+        // inject spurious text nodes into the output (XHtmlSerializer emits
+        // compact markup with no synthetic whitespace).
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        let mut small = Node::element(ElementKind::Other("small".to_string()));
+        small.push_child(Node::element(ElementKind::Other("em".to_string())));
+        p.push_child(small);
+        doc.push_child(p);
+
+        let opts = ParserOptions {
+            body_only: true,
+            ..ParserOptions::default()
+        };
+        let serializer = HtmlSerializer::new(opts);
+        let html = serializer.serialize(&doc).unwrap();
+        assert!(!html.contains("<p> <"), "indentation leaked: {html}");
+        assert!(html.contains("<small><em></em></small>"), "got: {html}");
     }
 
     #[test]
