@@ -877,6 +877,65 @@ fn attr_name(attr: &str) -> &str {
     attr.split('=').next().unwrap_or(attr).trim()
 }
 
+/// Decode XML/HTML character references in a *text* (non-attribute) string,
+/// mirroring PHP's `DOMUtils::parseHTML` pass in `TestUtils::normalizeHTML`.
+/// The decoded characters are re-escaped later by `html_escape` in
+/// `serialize_iew`, so the net effect matches Parsoid's `XHtmlSerializer`
+/// (which escapes `&` and `<` but leaves `>` literal).
+fn decode_xml_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'&' {
+            // Fast path: copy ASCII byte-by-byte (fixtures are ASCII); fall
+            // back to a char boundary for the rare non-ASCII text.
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        // Scan for the terminating `;`.
+        let Some(semi_rel) = s[i..].find(';') else {
+            out.push_str(&s[i..]);
+            break;
+        };
+        let semi = i + semi_rel;
+        let body = &s[i + 1..semi]; // text between `&` and `;`
+        let decoded: Option<String> =
+            if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string())
+            } else if let Some(dec) = body.strip_prefix('#') {
+                dec.parse::<u32>()
+                    .ok()
+                    .and_then(char::from_u32)
+                    .map(|c| c.to_string())
+            } else {
+                match body {
+                    "lt" => Some("<".to_string()),
+                    "gt" => Some(">".to_string()),
+                    "amp" => Some("&".to_string()),
+                    "quot" => Some("\"".to_string()),
+                    "apos" => Some("'".to_string()),
+                    "rarr" => Some("\u{2192}".to_string()),
+                    _ => None,
+                }
+            };
+        match decoded {
+            Some(d) => out.push_str(&d),
+            None => out.push_str(&s[i..=semi]), // unknown entity: leave verbatim
+        }
+        i = semi + 1;
+    }
+    out
+}
+
 /// Parse a well-formed HTML fragment into a minimal tree.
 fn parse_fragment(html: &str) -> Vec<MNode> {
     fn walk(html: &str, pos: &mut usize, out: &mut Vec<MNode>) {
@@ -884,7 +943,7 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
         let mut text = String::new();
         let flush = |text: &mut String, out: &mut Vec<MNode>| {
             if !text.is_empty() {
-                out.push(MNode::Text(std::mem::take(text)));
+                out.push(MNode::Text(decode_xml_entities(&std::mem::take(text))));
             }
         };
         while *pos < bytes.len() {
@@ -1119,11 +1178,18 @@ fn ensure_nl_after(out: &mut Vec<MNode>) {
     }
 }
 
+/// HTML entity escaping for text content, mirroring Parsoid's
+/// `XHtmlSerializer` (`&` → `&amp;`, `<` → `&lt;`; `>` is left literal, unlike
+/// the legacy PHP parser).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;")
+}
+
 /// Serialize the normalized tree with no further whitespace adjustments.
 fn serialize_iew(nodes: &[MNode], out: &mut String) {
     for node in nodes {
         match node {
-            MNode::Text(s) => out.push_str(s),
+            MNode::Text(s) => out.push_str(&html_escape(s)),
             MNode::Elem {
                 name,
                 open_tag,
@@ -1297,5 +1363,39 @@ fn compute_diff_hint(expected: &str, actual: &str) -> String {
         )
     } else {
         "unknown difference".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_xml_entities_predefines() {
+        assert_eq!(decode_xml_entities("&lt;&gt;&amp;&quot;&apos;"), "<>&\"'");
+        assert_eq!(decode_xml_entities("&rarr;"), "\u{2192}");
+    }
+
+    #[test]
+    fn test_decode_xml_entities_numeric() {
+        assert_eq!(decode_xml_entities("&#8594;"), "\u{2192}");
+        assert_eq!(decode_xml_entities("&#x2192;"), "\u{2192}");
+        assert_eq!(decode_xml_entities("&#x2D;"), "-");
+        assert_eq!(decode_xml_entities("&#160;"), "\u{a0}");
+    }
+
+    #[test]
+    fn test_decode_xml_entities_unknown_leaves_verbatim() {
+        assert_eq!(decode_xml_entities("&unknown;foo"), "&unknown;foo");
+        assert_eq!(decode_xml_entities("no entities"), "no entities");
+    }
+
+    #[test]
+    fn test_decode_then_re_escape_matches_xhtml_serializer() {
+        // Legacy expected `&lt;President&gt;` decodes to `<President>` then
+        // re-escapes to `&lt;President>` (the `>` is NOT re-escaped), exactly
+        // matching Parsoid's `XHtmlSerializer` output for the same text.
+        let decoded = decode_xml_entities("&lt;President&gt;");
+        assert_eq!(html_escape(&decoded), "&lt;President>");
     }
 }
