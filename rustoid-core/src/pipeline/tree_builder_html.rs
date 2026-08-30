@@ -56,6 +56,13 @@ pub struct Html5TreeBuilder {
     /// Stashed node data, keyed by `data-object-id`.
     stash: HashMap<usize, StashedNodeData>,
     next_data_id: usize,
+    /// `data-object-id`s of elements closed by an *explicit* end tag (mirror
+    /// `TreeMutationRelay`'s matched-vs-auto-inserted end-tag distinction).
+    explicitly_ended: std::collections::HashSet<usize>,
+    /// Maps a tree-builder element `uid` to its stashed `data-object-id`, so an
+    /// explicit end tag can mark the *correct* stash entry as explicitly ended
+    /// even though `modes::end_tag` has already popped the element.
+    uid_to_data_id: HashMap<usize, usize>,
     /// Pre-built sub-fragments keyed by id (carried by `mw:dom-fragment-token`).
     fragments: HashMap<usize, Node>,
 }
@@ -90,6 +97,8 @@ impl Html5TreeBuilder {
             source: source.to_string(),
             stash: HashMap::new(),
             next_data_id: 0,
+            explicitly_ended: std::collections::HashSet::new(),
+            uid_to_data_id: HashMap::new(),
             fragments,
         }
     }
@@ -132,7 +141,7 @@ impl Html5TreeBuilder {
         attribs: &[KV],
         dp: &TDataParsoid,
         data_mw: Option<String>,
-    ) -> Attributes {
+    ) -> (Attributes, usize) {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for kv in attribs {
             if let (Some(k), Some(v)) = (kv.key.as_str(), kv.value.as_str())
@@ -145,7 +154,7 @@ impl Html5TreeBuilder {
         }
         let id = self.stash(dp, data_mw);
         pairs.push((DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()));
-        Attributes::from_pairs(pairs)
+        (Attributes::from_pairs(pairs), id)
     }
 
     /// Extract `data-mw` string attribute from a token's attribs.
@@ -216,7 +225,7 @@ impl Html5TreeBuilder {
                 name: Some(name.to_string()),
                 ..TDataParsoid::default()
             };
-            let attrs = self.stash_data_attribs(
+            let (attrs, _) = self.stash_data_attribs(
                 &[KV {
                     key: crate::wikitext::tokens_v2::KeyValue::Str("typeof".to_string()),
                     value: crate::wikitext::tokens_v2::KeyValue::Str(
@@ -334,7 +343,7 @@ impl Html5TreeBuilder {
 
     fn process_start_tag(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
         let data_mw = Self::extract_data_mw(attribs);
-        let attrs = self.stash_data_attribs(attribs, dp, data_mw);
+        let (attrs, data_id) = self.stash_data_attribs(attribs, dp, data_mw);
 
         // Mirrors `insertExplicitStartTag`: if the tag produced no element
         // (stripped/ignored), handle it as a deleted start tag.
@@ -347,7 +356,12 @@ impl Html5TreeBuilder {
             0,
             0,
         );
-        if inserted.is_none() {
+        if let Some(uid) = inserted {
+            // Record the element identity → stash id mapping while the element
+            // is still on the stack (needed later by the EndTag branch, which
+            // only receives the `uid` after `modes::end_tag` has popped it).
+            self.uid_to_data_id.insert(uid, data_id);
+        } else {
             self.handle_deleted_start_tag(name, dp);
         }
     }
@@ -394,18 +408,17 @@ impl Html5TreeBuilder {
     ///   - promote `autoInsertedStartToken`/`autoInsertedEndToken` to their
     ///     persistent `autoInsertedStart`/`autoInsertedEnd` forms.
     fn apply_end_tag_data(&mut self, uid: usize, dp: &TDataParsoid) {
-        // Read the element's `data-object-id` (a regular attribute, added by
-        // `stash_data_attribs`) from the stack while it's still there.
-        let data_id = self
-            .builder
-            .stack
-            .item_by_uid(uid)
-            .and_then(|elt| elt.attrs.get(DATA_OBJECT_ATTR_NAME))
-            .and_then(|v| v.parse::<usize>().ok());
+        // Look up the element's stashed `data-object-id` from the identity map
+        // recorded at start-tag time (the element is already popped from the
+        // stack by `modes::end_tag`, so the stack is unusable here).
+        let data_id = self.uid_to_data_id.get(&uid).copied();
 
         let Some(data_id) = data_id else {
             return;
         };
+        // Record that this element was ended by an explicit end tag (so it does
+        // NOT get `autoInsertedEnd` in finalize).
+        self.explicitly_ended.insert(data_id);
         let Some(stashed) = self.stash.get_mut(&data_id) else {
             return;
         };
@@ -455,14 +468,14 @@ impl Html5TreeBuilder {
                 if let Some(ty) = match_transclusion(attribs) {
                     self.in_transclusion = ty == "mw:Transclusion";
                 }
-                let attrs = self.stash_data_attribs(attribs, dp, data_mw.clone());
+                let (attrs, _) = self.stash_data_attribs(attribs, dp, data_mw.clone());
                 self.insert_unfostered_meta(attrs);
                 was_inserted = true;
             }
         }
 
         if !was_inserted {
-            let attrs = self.stash_data_attribs(attribs, dp, data_mw);
+            let (attrs, _) = self.stash_data_attribs(attribs, dp, data_mw);
             let void = crate::html5::html_data::is_void_tag(name);
             let inserted = modes::start_tag(
                 &mut self.builder,
@@ -493,7 +506,21 @@ impl Html5TreeBuilder {
     /// `migrate_br_newlines`, `strip_marker_metas`) happen later via
     /// [`post_pwrap_transforms`], so p-wrapping runs before encapsulation
     /// (mirrors PHP's `NESTED_PIPELINE_DOM_TRANSFORMS` order).
-    pub fn finalize(self) -> Node {
+    pub fn finalize(mut self) -> Node {
+        // Mark `autoInsertedEnd` on stashed elements that were NOT closed by an
+        // explicit end tag (mirrors `TreeMutationRelay::endTag`: an element ended
+        // implicitly at a block boundary / EOF gets `autoInsertedEnd`).
+        for (id, data) in self.stash.iter_mut() {
+            if self.explicitly_ended.contains(id) {
+                continue;
+            }
+            if let Some(dp) = data.dp.as_mut() {
+                dp.auto_inserted_end = true;
+                dp.tmp.end_tsr = None;
+                data.data_parsoid = dp.to_data_parsoid_json();
+            }
+        }
+
         let mut doc = self.builder.handler.finish();
         resolve_data_ids(&mut doc, &self.stash, &mut std::collections::HashSet::new());
         // Promote transient autoInsertedStart/EndToken flags to their persistent
