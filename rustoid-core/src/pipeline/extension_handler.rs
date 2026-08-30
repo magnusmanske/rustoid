@@ -23,6 +23,8 @@ use crate::wikitext::tokens_v2::{
 fn expand_extension(
     token: &SelfclosingTagTk,
     config: &dyn crate::traits::SiteConfig,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
 ) -> Option<Vec<Item>> {
     if token.name != "extension" {
         return None;
@@ -32,7 +34,7 @@ fn expand_extension(
         "nowiki" => Some(nowiki_items(token)),
         "pre" => Some(pre_items(token, config)),
         "i18ntag" | "i18nattr" => Some(i18n_items(token)),
-        "pwraptest" => Some(pwraptest_items(token)),
+        "pwraptest" => Some(pwraptest_fragment_items(token, fragments, next_id)),
         // Other built-in extension tags (gallery, …) are not yet handled.
         _ => None,
     }
@@ -192,51 +194,57 @@ fn i18n_items(token: &SelfclosingTagTk) -> Vec<Item> {
     }
 }
 
-/// Build the token sequence for a `<pwraptest>` parser-test extension. Faithful
-/// port of `ParserHook::sourceToDom`'s `pwraptest` case combined with the
-/// generic extension encapsulation (`ExtensionHandler::onDocumentFragment`).
+/// Build the `mw:dom-fragment-token` sequence for a `<pwraptest>` parser-test
+/// extension. Faithful port of `ParserHook::sourceToDom`'s `pwraptest` case
+/// combined with the generic extension encapsulation
+/// (`ExtensionHandler::onDocumentFragment`).
 ///
 /// `pwraptest` always produces the DOM `<!--CMT--><style>p{}</style>` regardless
 /// of its content (mirrors `$extApi->htmlToDom( '<!--CMT--><style>p{}</style>' )`).
-/// The comment is wrapped in a `<span typeof="mw:Extension/pwraptest">` (the
-/// encapsulation target), while the `<style>` metadata element stays as a sibling
-/// (mirrors `PipelineUtils::addSpanWrappers`, which only wraps text/comment nodes).
-fn pwraptest_items(token: &SelfclosingTagTk) -> Vec<Item> {
+/// `PipelineUtils::addSpanWrappers` then wraps the comment in the encapsulation
+/// `<span typeof="mw:Extension/pwraptest">`, leaving the `<style>` metadata element
+/// as a sibling. The whole fragment is tunneled through a `mw:dom-fragment-token`
+/// placeholder so its content bypasses token-level p-wrapping.
+fn pwraptest_fragment_items(
+    token: &SelfclosingTagTk,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Vec<Item> {
+    use crate::dom::node::{ElementKind, Node};
+    use crate::wikitext::tokens_v2::KeyValue;
+
+    // Build the encapsulation span: `<span typeof="mw:Extension/pwraptest">`
+    // wrapping the comment, with the `<style>` element as a sibling.
+    let mut span = Node::element(ElementKind::Span);
+    span.set_attr("typeof", "mw:Extension/pwraptest");
+    span.push_child(Node::comment("CMT"));
+
+    let mut style = Node::element(ElementKind::Other("style".to_string()));
+    style.push_child(Node::text("p{}"));
+
+    let mut frag = Node::document();
+    frag.push_child(span);
+    frag.push_child(style);
+
+    let id = *next_id;
+    *next_id += 1;
+    fragments.insert(id, frag);
+
+    // Emit an `mw:dom-fragment-token` placeholder carrying the fragment id.
     let mut dp = token.data_parsoid.clone();
     dp.src = None;
     dp.src_content = None;
     dp.ext_tag_offsets = None;
+    let mut frag_tok = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
+    frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
+        key: KeyValue::Str("data-fragment-id".to_string()),
+        value: KeyValue::Str(id.to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
 
-    let mut span = TagTk::new("span", vec![], dp);
-    span.add_attribute_str("typeof", "mw:Extension/pwraptest");
-
-    vec![
-        // The comment `<!--CMT-->` is wrapped in a `<span>` (the extension
-        // encapsulation target, which receives `typeof="mw:Extension/pwraptest"`).
-        // The `<style>` element is a *sibling*, not a child: `addSpanWrappers` only
-        // wraps text/comment nodes, leaving element nodes as-is (so metadata
-        // elements like `<style>` are hoisted out of the wrapper).
-        Item::Tok(ParsoidToken::Tag(span)),
-        Item::Tok(ParsoidToken::Comment(
-            crate::wikitext::tokens_v2::CommentTk::new("CMT", DataParsoid::default()),
-        )),
-        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-            "span",
-            vec![],
-            DataParsoid::default(),
-        ))),
-        Item::Tok(ParsoidToken::Tag(TagTk::new(
-            "style",
-            vec![],
-            DataParsoid::default(),
-        ))),
-        Item::Str("p{}".to_string()),
-        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-            "style",
-            vec![],
-            DataParsoid::default(),
-        ))),
-    ]
+    vec![Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))]
 }
 
 /// Extract an extension tag's body source (the text between the opening and
@@ -426,12 +434,23 @@ fn split_entities(s: &str) -> Vec<&str> {
 /// Expand extension tokens in a token stream. Runs before tree building,
 /// replacing `extension` self-closing tokens with their DOM token sequences.
 /// Faithful to the TT3 extension-handler stage in PHP Parsoid.
-pub fn run(tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
+///
+/// Generic extensions whose content must bypass token-level p-wrapping (i.e.
+/// whose PHP `sourceToDom` returns an HTML DOM fragment — `pwraptest`, `style`,
+/// `divtag`, …) are instead built as pre-built sub-`Node` fragments, registered
+/// in `fragments`, and referenced via an `mw:dom-fragment-token` placeholder
+/// (mirrors `PipelineUtils::tunnelDOMThroughTokens`).
+pub fn run(
+    tokens: Vec<Item>,
+    config: &dyn crate::traits::SiteConfig,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Vec<Item> {
     let mut out = Vec::with_capacity(tokens.len());
     for item in tokens {
         match &item {
             Item::Tok(ParsoidToken::SelfclosingTag(t)) => {
-                if let Some(expanded) = expand_extension(t, config) {
+                if let Some(expanded) = expand_extension(t, config, fragments, next_id) {
                     out.extend(expanded);
                 } else {
                     out.push(item);
@@ -648,47 +667,56 @@ mod tests {
 
     #[test]
     fn test_pwraptest_items() {
-        // `<pwraptest />` always produces `<!--CMT--><style>p{}</style>` inside
-        // a `<span typeof="mw:Extension/pwraptest">` wrapper (mirrors
-        // `ParserHook::sourceToDom`'s `pwraptest` case).
+        // `<pwraptest />` always produces `<!--CMT--><style>p{}</style>`, wrapped
+        // by `addSpanWrappers` into `<span typeof="mw:Extension/pwraptest">
+        // <!--CMT--></span><style>p{}</style>`, and tunneled through a
+        // `mw:dom-fragment-token` placeholder (mirrors `ParserHook::sourceToDom`).
         let mut tok = SelfclosingTagTk::new("extension", vec![], DataParsoid::default());
         tok.add_attribute_str("name", "pwraptest");
-        let items = pwraptest_items(&tok);
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let items = pwraptest_fragment_items(&tok, &mut fragments, &mut next_id);
 
-        // The span carries the extension typeof.
-        let span = items
-            .iter()
-            .find_map(|it| match it {
-                Item::Tok(ParsoidToken::Tag(t)) if t.name == "span" => Some(t),
-                _ => None,
-            })
-            .expect("span tag");
+        // The output is a single `mw:dom-fragment-token` placeholder.
+        assert_eq!(items.len(), 1);
+        assert!(
+            matches!(&items[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw:dom-fragment-token"),
+            "expected fragment token: {items:?}"
+        );
+        // The fragment id resolves to the pre-built fragment.
+        let id = match &items[0] {
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) => t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+                .and_then(|kv| kv.value.as_str())
+                .and_then(|s| s.parse::<usize>().ok())
+                .expect("data-fragment-id"),
+            _ => panic!("expected fragment token"),
+        };
+        let frag = fragments.get(&id).expect("fragment");
+        // The fragment has a span (typeof mw:Extension/pwraptest) wrapping a
+        // comment, plus a style sibling with text `p{}`.
+        assert_eq!(frag.children.len(), 2);
+        let span = &frag.children[0];
+        assert_eq!(span.get_attr("typeof"), Some("mw:Extension/pwraptest"));
+        assert!(
+            span.children
+                .iter()
+                .any(|c| matches!(&c.kind, crate::dom::node::NodeKind::Comment(c) if c == "CMT"))
+        );
+        let style = &frag.children[1];
         assert_eq!(
-            span.attribs
-                .iter()
-                .find(|kv| kv.key.as_str() == Some("typeof"))
-                .and_then(|kv| kv.value.as_str()),
-            Some("mw:Extension/pwraptest")
-        );
-        // The comment is present.
-        assert!(
-            items
-                .iter()
-                .any(|it| matches!(it, Item::Tok(ParsoidToken::Comment(c)) if c.value == "CMT")),
-            "expected <!--CMT--> in {items:?}"
-        );
-        // The style element with its `p{}` content is present.
-        assert!(
-            items
-                .iter()
-                .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "style")),
-            "expected <style> in {items:?}"
+            style.get_attr("typeof"),
+            None,
+            "style should have no typeof"
         );
         assert!(
-            items
+            style
+                .children
                 .iter()
-                .any(|it| matches!(it, Item::Str(s) if s == "p{}")),
-            "expected p{{}} in {items:?}"
+                .any(|c| matches!(&c.kind, crate::dom::node::NodeKind::Text(t) if t == "p{}"))
         );
+        assert_eq!(next_id, 1);
     }
 }

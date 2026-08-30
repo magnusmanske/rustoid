@@ -326,6 +326,12 @@ impl ParagraphWrapper {
         if token_name == "meta" && matches!(token, Item::Tok(ParsoidToken::SelfclosingTag(_))) {
             return true;
         }
+        // `mw:dom-fragment-token` placeholders (tunnelled extension/template
+        // content) are opaque and SOL-transparent, mirroring PHP's
+        // `mw:DOMFragment` meta token.
+        if token_name == "mw:dom-fragment-token" {
+            return true;
+        }
         // SOL-transparent link tags: `<link rel="mw:PageProp/redirect|Category|Language">`.
         if token_name == "link" {
             let rel = match token {

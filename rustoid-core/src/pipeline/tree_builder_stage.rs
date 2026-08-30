@@ -31,7 +31,13 @@ impl TreeBuilderStage {
     }
 
     /// Run the TT3 handlers in order and return the transformed token stream.
-    pub fn process(&self, tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Vec<Item> {
+    pub fn process(
+        &self,
+        tokens: Vec<Item>,
+        config: &dyn crate::traits::SiteConfig,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &mut usize,
+    ) -> Vec<Item> {
         let mut out = tokens;
 
         // 1. PreHandler (indent-pre detection).
@@ -42,7 +48,7 @@ impl TreeBuilderStage {
         out = QuoteTransformer::transform(out);
 
         // 2b. ExtensionHandler (expand built-in `<nowiki>` extension tokens).
-        out = crate::pipeline::extension_handler::run(out, config);
+        out = crate::pipeline::extension_handler::run(out, config, fragments, next_id);
 
         // 3. ListHandler (listItem → ul/ol/li).
         let mut list_handler = ListHandler::new();
@@ -82,9 +88,12 @@ impl TreeBuilderStage {
         tokens: Vec<Item>,
         source: Option<&str>,
         config: &dyn crate::traits::SiteConfig,
-        fragments: std::collections::HashMap<usize, crate::dom::node::Node>,
+        mut fragments: std::collections::HashMap<usize, crate::dom::node::Node>,
     ) -> Node {
-        let tokens = self.process(tokens, config);
+        // Continue fragment-id allocation after any pre-built fragments (from
+        // `format="wikitext"` pre, etc.).
+        let mut next_id = fragments.len();
+        let tokens = self.process(tokens, config, &mut fragments, &mut next_id);
         token_stream_to_ast_html_with_fragments(&tokens, source, fragments)
     }
 }
@@ -118,17 +127,24 @@ mod tests {
         crate::mock::MockSiteConfig::new()
     }
 
+    /// Run `process` with fresh fragment bookkeeping, discarding the fragments
+    /// (these tests only inspect the token stream).
+    fn process(tokens: Vec<Item>) -> Vec<Item> {
+        let stage = TreeBuilderStage::new(false);
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        stage.process(tokens, &config(), &mut fragments, &mut next_id)
+    }
+
     #[test]
     fn test_process_plain_text() {
-        let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("hello world"), &config());
+        let out = process(tokenize("hello world"));
         assert!(!out.is_empty());
     }
 
     #[test]
     fn test_process_heading() {
-        let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("== Heading ==\n"), &config());
+        let out = process(tokenize("== Heading ==\n"));
         // Should contain an h2 tag after TT3.
         assert!(out.iter().any(|it| {
             matches!(it, Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Tag(t)) if t.name == "h2")
@@ -137,8 +153,7 @@ mod tests {
 
     #[test]
     fn test_process_bold() {
-        let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("'''bold'''"), &config());
+        let out = process(tokenize("'''bold'''"));
         // Should contain a <b> tag (from quote transformer).
         assert!(out.iter().any(|it| {
             matches!(it, Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Tag(t)) if t.name == "b")
@@ -198,8 +213,7 @@ mod tests {
 
     #[test]
     fn test_process_div() {
-        let stage = TreeBuilderStage::new(false);
-        let out = stage.process(tokenize("<div>foo</div>"), &config());
+        let out = process(tokenize("<div>foo</div>"));
         assert!(!out.is_empty(), "empty output");
     }
 

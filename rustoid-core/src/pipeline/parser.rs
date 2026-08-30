@@ -290,7 +290,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `bailTokens` which strips the first `[`) and expand `<nowiki>`.
         let re_src = format!("[{href}]]");
         let tokens = self.tokenize(&re_src).unwrap_or_default();
-        let expanded = crate::pipeline::extension_handler::run(tokens, self.config);
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let expanded = crate::pipeline::extension_handler::run(
+            tokens,
+            self.config,
+            &mut fragments,
+            &mut next_id,
+        );
 
         let mut li = crate::wikitext::tokens_v2::TagTk::new(
             "listItem",
