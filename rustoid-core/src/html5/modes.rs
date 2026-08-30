@@ -393,8 +393,17 @@ mod in_head {
     ) -> Option<usize> {
         match name {
             "html" => in_body::start_tag(b, d, name, attrs, sc, ss, sl),
-            "base" | "basefont" | "bgsound" | "link" | "meta" | "title" | "noframes" | "style"
-            | "script" => Some(b.insert_element(name, attrs, true, ss, sl)),
+            // Void metadata elements.
+            "base" | "basefont" | "bgsound" | "link" | "meta" => {
+                Some(b.insert_element(name, attrs, true, ss, sl))
+            }
+            // Raw-text / RCDATA elements: NOT void; switch to text mode to
+            // consume the following characters as raw text until the end tag.
+            "title" | "noframes" | "style" | "script" => {
+                let uid = b.insert_element(name, attrs, false, ss, sl);
+                d.switch_and_save(ModeId::Text);
+                Some(uid)
+            }
             "noscript" if !b.scripting_flag => {
                 let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_mode(ModeId::InHeadNoscript);

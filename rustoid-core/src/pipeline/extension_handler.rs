@@ -193,11 +193,14 @@ fn i18n_items(token: &SelfclosingTagTk) -> Vec<Item> {
 }
 
 /// Build the token sequence for a `<pwraptest>` parser-test extension. Faithful
-/// port of `ParserHook::sourceToDom`'s `pwraptest` case, wrapped in the generic
-/// extension encapsulation `<span typeof="mw:Extension/pwraptest">`.
+/// port of `ParserHook::sourceToDom`'s `pwraptest` case combined with the
+/// generic extension encapsulation (`ExtensionHandler::onDocumentFragment`).
 ///
 /// `pwraptest` always produces the DOM `<!--CMT--><style>p{}</style>` regardless
 /// of its content (mirrors `$extApi->htmlToDom( '<!--CMT--><style>p{}</style>' )`).
+/// The comment is wrapped in a `<span typeof="mw:Extension/pwraptest">` (the
+/// encapsulation target), while the `<style>` metadata element stays as a sibling
+/// (mirrors `PipelineUtils::addSpanWrappers`, which only wraps text/comment nodes).
 fn pwraptest_items(token: &SelfclosingTagTk) -> Vec<Item> {
     let mut dp = token.data_parsoid.clone();
     dp.src = None;
@@ -208,10 +211,20 @@ fn pwraptest_items(token: &SelfclosingTagTk) -> Vec<Item> {
     span.add_attribute_str("typeof", "mw:Extension/pwraptest");
 
     vec![
+        // The comment `<!--CMT-->` is wrapped in a `<span>` (the extension
+        // encapsulation target, which receives `typeof="mw:Extension/pwraptest"`).
+        // The `<style>` element is a *sibling*, not a child: `addSpanWrappers` only
+        // wraps text/comment nodes, leaving element nodes as-is (so metadata
+        // elements like `<style>` are hoisted out of the wrapper).
         Item::Tok(ParsoidToken::Tag(span)),
         Item::Tok(ParsoidToken::Comment(
             crate::wikitext::tokens_v2::CommentTk::new("CMT", DataParsoid::default()),
         )),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
         Item::Tok(ParsoidToken::Tag(TagTk::new(
             "style",
             vec![],
@@ -220,11 +233,6 @@ fn pwraptest_items(token: &SelfclosingTagTk) -> Vec<Item> {
         Item::Str("p{}".to_string()),
         Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
             "style",
-            vec![],
-            DataParsoid::default(),
-        ))),
-        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-            "span",
             vec![],
             DataParsoid::default(),
         ))),

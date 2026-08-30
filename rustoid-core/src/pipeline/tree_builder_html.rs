@@ -1433,6 +1433,17 @@ mod tests {
     }
 
     #[test]
+    fn test_style_raw_text_content() {
+        // `<style>p{}</style>` must be a raw-text element: the text `p{}` is
+        // consumed as its content (not emitted as a separate text node), and
+        // the `<style>` is not self-closing.
+        let items = vec![tag("style"), txt("p{}"), end("style")];
+        let doc = token_stream_to_ast_html(&items);
+        // The style element must contain the text `p{}`.
+        assert!(contains_text(&doc, "p{}"), "style content lost: {doc:?}");
+    }
+
+    #[test]
     fn test_strip_marker_metas() {
         let mut doc = Node::document();
         let mut pre = Node::element(ElementKind::Preformatted);
