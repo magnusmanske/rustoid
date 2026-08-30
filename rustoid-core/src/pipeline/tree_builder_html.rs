@@ -1117,9 +1117,12 @@ fn wrap_flipped_children(mut children: Vec<Node>) -> Vec<Node> {
         };
 
         // Transfer encapsulation data onto the target element and drop the
-        // end marker from its subtree.
+        // end marker from its subtree. The end marker lives under the sibling
+        // element `t` (located via `subtree_contains_end_meta`), which may
+        // differ from the encapsulation target `et` when an intervening
+        // element precedes `t` (e.g. `<meta/> <p>..</p> <i><div>..</div><meta/End></i>`).
         transfer_transclusion_to_element(&mut children[et], &start_meta);
-        remove_end_meta(&mut children[et], about.as_deref());
+        remove_end_meta(&mut children[t], about.as_deref());
         // Remove the start marker meta.
         children.remove(i);
         // Do not advance `i`: the next sibling shifted into this index.
