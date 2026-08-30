@@ -708,6 +708,9 @@ fn dp_bool(dp: &serde_json::Value, key: &str) -> bool {
 /// strip internal marker metas. Called from the full-page pipeline after
 /// `p_wrap::run`.
 pub fn post_pwrap_transforms(node: &mut Node) {
+    // Hoist trailing newlines out of line-ending / auto-closed elements before
+    // template encapsulation (mirrors PHP's `migrate-nls` … `tplwrap` order).
+    crate::pipeline::migrate_trailing_nls::run(node);
     // Encapsulate transclusion meta markers into wrapping `<span>` elements.
     encapsulate_transclusions(node);
     // Unpack `mw:DOMFragment` placeholders (extension/template sub-content)

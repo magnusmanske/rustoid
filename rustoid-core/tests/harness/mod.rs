@@ -1199,8 +1199,11 @@ fn add_newlines(nodes: &mut Vec<MNode>) {
         }
     }
 
-    let mut out: Vec<MNode> = Vec::with_capacity(nodes.len());
-    for (i, node) in nodes.drain(..).enumerate() {
+    let n = nodes.len();
+    let mut out: Vec<MNode> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let node = std::mem::replace(&mut nodes[i], MNode::Text(String::new()));
         let block_around = matches!(&node, MNode::Elem { name, .. } if newline_around(name));
         let is_br = matches!(&node, MNode::Elem { name, .. } if name == "br");
         // A newline before this node if it's a block or br.
@@ -1208,10 +1211,22 @@ fn add_newlines(nodes: &mut Vec<MNode>) {
             ensure_nl_before(&mut out);
         }
         out.push(node);
-        // A newline after a block (or br).
+        // A newline after a block (or br): if the next sibling is a text node,
+        // force its leading whitespace to a newline (mirrors PHP `addAfter`'s
+        // `preg_replace('/^\\s*/', "\\n", $next->data)`); otherwise insert a
+        // newline node.
         if block_around || is_br {
-            ensure_nl_after(&mut out);
+            if i + 1 < n {
+                if let MNode::Text(t) = &mut nodes[i + 1] {
+                    *t = format!("\n{}", t.trim_start());
+                } else {
+                    ensure_nl_after(&mut out);
+                }
+            } else {
+                ensure_nl_after(&mut out);
+            }
         }
+        i += 1;
     }
     *nodes = out;
 }

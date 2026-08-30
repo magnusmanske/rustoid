@@ -16,16 +16,12 @@
 //! before their parent, so a child's trailing newlines first migrate up into the
 //! parent, then the parent (and the accumulated newlines) migrate up again.
 //!
-//! NOTE: this pass is currently **not wired** into
-//! [`super::tree_builder_html::post_pwrap_transforms`]. The port itself is
-//! faithful and relies on `autoInsertedEnd` (correctly marked in `finalize`,
-//! including for AFE-reconstructed clones). Wiring it is currently held back
-//! because the test-harness *legacy* normalization path (`normalize_html` with
-//! `parsoid_only = false`) does not faithfully reproduce PHP's
-//! `TestUtils::normalizeIEWVisitor`: e.g. `blockquote` is absent from its
-//! `newlineAround` set, so a faithfully-hoisted newline inside `<blockquote>`
-//! renders as a stray space in the comparison. That is a harness-normalization
-//! fidelity gap to fix, not a parser divergence.
+//! It relies on `autoInsertedEnd` (correctly marked in `finalize`, including for
+//! AFE-reconstructed clones). Wire-up also required fixing the test harness's
+//! legacy normalization path (`normalize_html` with `parsoid_only = false`) to
+//! faithfully reproduce PHP's `TestUtils::normalizeIEWVisitor` `addAfter`
+//! behavior: a hoisted newline that becomes the next sibling of a block element
+//! must have its leading whitespace forced back to a newline, not a space.
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::wikitext::tokens_v2::DataParsoid;
