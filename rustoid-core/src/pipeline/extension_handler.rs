@@ -32,6 +32,7 @@ fn expand_extension(
         "nowiki" => Some(nowiki_items(token)),
         "pre" => Some(pre_items(token, config)),
         "i18ntag" | "i18nattr" => Some(i18n_items(token)),
+        "pwraptest" => Some(pwraptest_items(token)),
         // Other built-in extension tags (gallery, …) are not yet handled.
         _ => None,
     }
@@ -189,6 +190,45 @@ fn i18n_items(token: &SelfclosingTagTk) -> Vec<Item> {
             ))),
         ]
     }
+}
+
+/// Build the token sequence for a `<pwraptest>` parser-test extension. Faithful
+/// port of `ParserHook::sourceToDom`'s `pwraptest` case, wrapped in the generic
+/// extension encapsulation `<span typeof="mw:Extension/pwraptest">`.
+///
+/// `pwraptest` always produces the DOM `<!--CMT--><style>p{}</style>` regardless
+/// of its content (mirrors `$extApi->htmlToDom( '<!--CMT--><style>p{}</style>' )`).
+fn pwraptest_items(token: &SelfclosingTagTk) -> Vec<Item> {
+    let mut dp = token.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+
+    let mut span = TagTk::new("span", vec![], dp);
+    span.add_attribute_str("typeof", "mw:Extension/pwraptest");
+
+    vec![
+        Item::Tok(ParsoidToken::Tag(span)),
+        Item::Tok(ParsoidToken::Comment(
+            crate::wikitext::tokens_v2::CommentTk::new("CMT", DataParsoid::default()),
+        )),
+        Item::Tok(ParsoidToken::Tag(TagTk::new(
+            "style",
+            vec![],
+            DataParsoid::default(),
+        ))),
+        Item::Str("p{}".to_string()),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "style",
+            vec![],
+            DataParsoid::default(),
+        ))),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
+    ]
 }
 
 /// Extract an extension tag's body source (the text between the opening and
@@ -595,6 +635,52 @@ mod tests {
             items
                 .iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "some text"))
+        );
+    }
+
+    #[test]
+    fn test_pwraptest_items() {
+        // `<pwraptest />` always produces `<!--CMT--><style>p{}</style>` inside
+        // a `<span typeof="mw:Extension/pwraptest">` wrapper (mirrors
+        // `ParserHook::sourceToDom`'s `pwraptest` case).
+        let mut tok = SelfclosingTagTk::new("extension", vec![], DataParsoid::default());
+        tok.add_attribute_str("name", "pwraptest");
+        let items = pwraptest_items(&tok);
+
+        // The span carries the extension typeof.
+        let span = items
+            .iter()
+            .find_map(|it| match it {
+                Item::Tok(ParsoidToken::Tag(t)) if t.name == "span" => Some(t),
+                _ => None,
+            })
+            .expect("span tag");
+        assert_eq!(
+            span.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("typeof"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("mw:Extension/pwraptest")
+        );
+        // The comment is present.
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::Comment(c)) if c.value == "CMT")),
+            "expected <!--CMT--> in {items:?}"
+        );
+        // The style element with its `p{}` content is present.
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "style")),
+            "expected <style> in {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, Item::Str(s) if s == "p{}")),
+            "expected p{{}} in {items:?}"
         );
     }
 }
