@@ -1307,8 +1307,10 @@ impl<'a> PegTokenizer<'a> {
         attrs
     }
 
-    /// Parse a single table attribute (`name=value`). Bare words are not table
-    /// attributes; they are cell/table content and are left unconsumed.
+    /// Parse a single table attribute (`name[=value]`). A valueless name is a
+    /// valid ("discarded") table attribute with an empty value, mirroring PHP's
+    /// `table_attribute` rule (whose `vd:(optional_spaces "=" value?)?` is
+    /// optional and defaults the value to `''`).
     fn parse_table_attribute(&mut self) -> Option<KV> {
         let name_start = self.pos;
         let name = self.parse_table_attribute_name()?;
@@ -1332,10 +1334,18 @@ impl<'a> PegTokenizer<'a> {
                 vsrc: None,
             })
         } else {
-            // Not a `name=value` attribute — backtrack so the caller can treat
-            // the word as content.
-            self.pos = name_start;
-            None
+            Some(KV {
+                key: name,
+                value: KeyValue::Str(String::new()),
+                src_offsets: Some(KVSourceRange {
+                    key_start: name_start,
+                    key_end: name_end,
+                    value_start: name_end,
+                    value_end: name_end,
+                }),
+                ksrc: None,
+                vsrc: None,
+            })
         }
     }
 
@@ -1377,18 +1387,26 @@ impl<'a> PegTokenizer<'a> {
         Some(val)
     }
 
-    /// Parse row syntax table args (attributes followed by single pipe).
+    /// Parse row syntax table args (attributes followed by *required* single
+    /// pipe). Mirrors PHP's `row_syntax_table_args = table_attributes
+    /// optional_spaces pipe !pipe`. The trailing `|` is required: when absent the
+    /// whole match backtracks so the consumed input is re-parsed as cell content
+    /// (a bare word is NOT treated as a valueless attribute in cell position).
     fn parse_row_syntax_table_args(&mut self) -> Vec<KV> {
+        let saved = self.pos;
         let attrs = self.parse_table_attributes();
 
         self.consume_spaces();
 
-        // Optional single pipe (not followed by another pipe).
+        // Required single pipe (not followed by another pipe), mirroring
+        // PHP's `pipe !pipe`. Backtrack fully if absent.
         if self.starts_with("|") && !self.starts_with("||") {
             self.advance(1);
+            attrs
+        } else {
+            self.pos = saved;
+            Vec::new()
         }
-
-        attrs
     }
 
     // ---- Inline elements ----
@@ -1758,6 +1776,41 @@ impl<'a> PegTokenizer<'a> {
             }
             // Unparseable `{{` falls through to single-char handling.
 
+            // `table_attribute_name` additionally accepts wikilinks and HTML
+            // tags in attribute-name position (PHP's `table_attribute_name_piece`:
+            // `$wikilink / directive / &'<' html_tag inlineline?`). These produce
+            // token-array attribute names whose empty value is "discarded" by the
+            // AttributeExpander (the "discarded table attribute" scenario).
+            if table {
+                if self.starts_with("[[") {
+                    let out_saved = self.output.len();
+                    if self.try_wikilink() {
+                        if !buf.is_empty() {
+                            tokens.push(Item::Str(std::mem::take(&mut buf)));
+                        }
+                        for e in self.output.drain(out_saved..) {
+                            if let Either::Right(tok) = e {
+                                tokens.push(Item::Tok(tok));
+                            }
+                        }
+                        continue;
+                    }
+                } else if self.starts_with("<") {
+                    let out_saved = self.output.len();
+                    if self.try_html_tag() {
+                        if !buf.is_empty() {
+                            tokens.push(Item::Str(std::mem::take(&mut buf)));
+                        }
+                        for e in self.output.drain(out_saved..) {
+                            if let Either::Right(tok) = e {
+                                tokens.push(Item::Tok(tok));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             let Some(ch) = self.peek_char() else {
                 break;
             };
@@ -1769,6 +1822,8 @@ impl<'a> PegTokenizer<'a> {
                 || ch == '/'
                 || ch == '='
                 || ch == '>'
+                || ch == '<'
+                || ch == '['
                 || (table && (ch == '|' || ch == '!'));
             if is_stop {
                 break;
