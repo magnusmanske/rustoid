@@ -419,7 +419,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
         let stage = TreeBuilderStage::new(true);
-        extract_fragment_children(&stage.to_ast(tokens, self.config))
+        let mut frag = extract_fragment_children(&stage.to_ast(tokens, self.config));
+        // Inline fragments have no transclusion encapsulation or p-wrapping, but
+        // `mw:DOMFragment` placeholders (nested `format="wikitext"` content) must
+        // still be unpacked (mirrors the nested sub-pipeline's `dom-unpack`).
+        crate::pipeline::unpack_dom_fragments::run(&mut frag);
+        frag
     }
 
     /// Build an inline fragment document from raw body wikitext, without
@@ -524,6 +529,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         crate::pipeline::compute_dsr::run(&mut ast, wikitext);
         crate::pipeline::p_wrap::run(&mut ast);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
@@ -596,7 +602,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut ast =
             stage.to_ast_with_fragments(tokens, Some(page_source), self.config, fragments);
         crate::pipeline::compute_dsr::run(&mut ast, page_source);
+        // DOM-level p-wrapping runs before transclusion encapsulation (mirrors
+        // PHP's `pwrap` … `tplwrap` order).
         crate::pipeline::p_wrap::run(&mut ast);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
