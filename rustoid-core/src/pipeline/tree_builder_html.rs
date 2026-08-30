@@ -408,10 +408,16 @@ impl Html5TreeBuilder {
     ///   - promote `autoInsertedStartToken`/`autoInsertedEndToken` to their
     ///     persistent `autoInsertedStart`/`autoInsertedEnd` forms.
     fn apply_end_tag_data(&mut self, uid: usize, dp: &TDataParsoid) {
-        // Look up the element's stashed `data-object-id` from the identity map
-        // recorded at start-tag time (the element is already popped from the
-        // stack by `modes::end_tag`, so the stack is unusable here).
-        let data_id = self.uid_to_data_id.get(&uid).copied();
+        // Look up the element's stashed `data-object-id`. Explicit start tags are
+        // recorded in `uid_to_data_id` at start-tag time; AFE-reconstructed
+        // clones (which copy the original's attributes, including
+        // `data-object-id`) are resolved from the tree handler instead.
+        let data_id = self.uid_to_data_id.get(&uid).copied().or_else(|| {
+            self.builder
+                .handler
+                .data_object_id(uid)
+                .and_then(|v| v.parse::<usize>().ok())
+        });
 
         let Some(data_id) = data_id else {
             return;

@@ -64,6 +64,16 @@ impl NodeTreeHandler {
         self.materialize(self.root)
     }
 
+    /// The `data-object-id` attribute value of the node for `uid`, if any.
+    /// Used by the tree-builder stage to correlate a popped element (including an
+    /// AFE-reconstructed clone, whose attributes were copied from its
+    /// formatting-element source) with its stashed node data.
+    pub fn data_object_id(&self, uid: usize) -> Option<String> {
+        let &idx = self.uids.get(&uid)?;
+        let node = self.arena[idx].borrow();
+        node.get_attr("data-object-id").map(str::to_string)
+    }
+
     fn materialize(&self, idx: usize) -> Node {
         let node = self.arena[idx].borrow().clone();
         let mut node = node;
@@ -308,5 +318,20 @@ mod tests {
         assert_eq!(normalize_attr_value("one\t two"), "one  two");
         assert_eq!(normalize_attr_value("plain"), "plain");
         assert_eq!(normalize_attr_value("a\rb\u{000C}c"), "a b c");
+    }
+
+    #[test]
+    fn test_data_object_id() {
+        use super::super::element::{Attributes, Element};
+        use super::super::tree_handler::{Preposition, TreeHandler};
+
+        let mut handler = NodeTreeHandler::new();
+        let attrs = Attributes::from_pairs(vec![("data-object-id".to_string(), "42".to_string())]);
+        let mut elt = Element::new(super::super::html_data::NS_HTML, "code", attrs, 7);
+        // The handler records `uid -> arena idx` in `insert_element`; an
+        // AFE-reconstructed clone calls it with the original's copied attrs.
+        TreeHandler::insert_element(&mut handler, Preposition::Root, None, &mut elt, false, 0, 0);
+        assert_eq!(handler.data_object_id(7).as_deref(), Some("42"));
+        assert_eq!(handler.data_object_id(999), None);
     }
 }

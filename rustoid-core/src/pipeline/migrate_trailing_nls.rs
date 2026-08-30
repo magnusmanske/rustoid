@@ -17,13 +17,11 @@
 //! parent, then the parent (and the accumulated newlines) migrate up again.
 //!
 //! NOTE: this pass is currently **not wired** into
-//! [`super::tree_builder_html::post_pwrap_transforms`]. Wiring it faithfully
-//! regresses the `!! html` (legacy-parser) fixtures in `comments.txt` and
-//! elsewhere, because those fixtures assert *legacy* newline placement (trailing
-//! `\n` kept inside `<p>`/`<li>`) while Parsoid's `MigrateTrailingNLs` hoists it
-//! out. Enabling this requires the test harness to classify `!! html` as
-//! legacy-only (skip in Parsoid mode) rather than treating it as a Parsoid
-//! reference.
+//! [`super::tree_builder_html::post_pwrap_transforms`]. Wiring it relies on
+//! `autoInsertedEnd` (correctly marked in `finalize`, including for
+//! AFE-reconstructed clones) and is faithful to PHP, but a couple of
+//! `html/parsoid` fixtures in `pWrapping.txt` still diverge (e.g. a stray space
+//! before `</blockquote>`), so it is kept unwired until those are root-caused.
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::wikitext::tokens_v2::DataParsoid;
