@@ -670,7 +670,14 @@ mod in_body {
         if !is_html_ws(text, start, length) {
             b.frameset_ok = false;
         }
-        b.reconstruct_afe(ss);
+        // Avoid reconstructing the active formatting elements for whitespace-only
+        // text (Parsoid's T368720 behavior): a whitespace run between block
+        // elements (e.g. the newline separating two `<p>`s) must not revive a
+        // formatting element (like `<code>`) that was implicitly closed at the
+        // block boundary, otherwise the subsequent block would nest inside it.
+        if !is_html_ws(text, start, length) {
+            b.reconstruct_afe(ss);
+        }
         b.insert_characters(text, start, length, ss, sl);
     }
     pub fn start_tag<H: TreeHandler>(

@@ -489,7 +489,7 @@ impl Html5TreeBuilder {
     /// stashed `data-parsoid`/`data-mw`.
     pub fn finalize(self) -> Node {
         let mut doc = self.builder.handler.finish();
-        resolve_data_ids(&mut doc, &self.stash);
+        resolve_data_ids(&mut doc, &self.stash, &mut std::collections::HashSet::new());
         // Promote transient autoInsertedStart/EndToken flags to their persistent
         // final form (mirrors `TreeBuilderStage::processToken` end-tag branch).
         promote_auto_inserted_flags(&mut doc);
@@ -553,7 +553,18 @@ fn match_transclusion(attribs: &[KV]) -> Option<String> {
 
 /// Walk the AST, resolving `data-object-id` attributes into stashed
 /// `data-parsoid`/`data-mw`.
-fn resolve_data_ids(node: &mut Node, stash: &HashMap<usize, StashedNodeData>) {
+///
+/// `seen` tracks stash ids already resolved earlier in the walk. A stash id
+/// resolved by a *second* element is an AFE-reconstruction clone (a formatting
+/// element reconstructed by the HTML5 "active formatting elements" algorithm),
+/// which must not carry the original `src`/`tsr`: it is marked `autoInsertedStart`
+/// (keeping `stx`, mirroring PHP's `TreeMutationRelay::insertElement`, which sets
+/// `autoInsertedStart` on elements not matching an explicit start tag).
+fn resolve_data_ids(
+    node: &mut Node,
+    stash: &HashMap<usize, StashedNodeData>,
+    seen: &mut std::collections::HashSet<usize>,
+) {
     let mut data_id: Option<usize> = None;
     for attr in &node.attrs {
         if attr.key == DATA_OBJECT_ATTR_NAME {
@@ -564,15 +575,28 @@ fn resolve_data_ids(node: &mut Node, stash: &HashMap<usize, StashedNodeData>) {
     if let Some(id) = data_id
         && let Some(data) = stash.get(&id)
     {
-        node.data_parsoid = data.data_parsoid.clone();
-        node.dp = data.dp.clone();
-        node.data_mw = data.data_mw.clone();
-        if let Some(fragment) = &data.fragment {
-            node.fragment = Some(Box::new(fragment.clone()));
+        if seen.insert(id) {
+            // First resolution: the explicit element gets the full stashed data.
+            node.data_parsoid = data.data_parsoid.clone();
+            node.dp = data.dp.clone();
+            node.data_mw = data.data_mw.clone();
+            if let Some(fragment) = &data.fragment {
+                node.fragment = Some(Box::new(fragment.clone()));
+            }
+        } else {
+            // AFE-reconstruction clone: keep `stx`, drop positional source info
+            // (`src`/`tsr`), and mark auto-inserted start.
+            let mut dp = data.dp.clone().unwrap_or_default();
+            dp.tsr = None;
+            dp.src = None;
+            dp.auto_inserted_start = true;
+            node.data_parsoid = dp.to_data_parsoid_json();
+            node.dp = Some(dp);
+            node.data_mw = data.data_mw.clone();
         }
     }
     for child in &mut node.children {
-        resolve_data_ids(child, stash);
+        resolve_data_ids(child, stash, seen);
     }
 }
 
@@ -1361,6 +1385,51 @@ mod tests {
         for needle in ["a", "b", "c"] {
             assert!(contains_text(&doc, needle), "missing {needle}: {doc:?}");
         }
+    }
+
+    #[test]
+    fn test_resolve_data_ids_marks_afe_clone_auto_inserted() {
+        // A stash id resolved by a second element is an AFE-reconstruction clone:
+        // it must keep `stx` but drop `src`/`tsr` and gain `autoInsertedStart`.
+        let mut stash = std::collections::HashMap::new();
+        stash.insert(
+            1usize,
+            StashedNodeData {
+                data_parsoid: Some(
+                    "{\"src\":\"<code>\",\"tsr\":[0,6],\"stx\":\"html\"}".to_string(),
+                ),
+                dp: Some(crate::wikitext::tokens_v2::DataParsoid {
+                    src: Some("<code>".to_string()),
+                    tsr: Some(crate::wikitext::tokens_v2::SourceRange::new(0, 6)),
+                    stx: Some("html".to_string()),
+                    ..crate::wikitext::tokens_v2::DataParsoid::default()
+                }),
+                data_mw: None,
+                fragment: None,
+            },
+        );
+
+        let mut root = Node::element(ElementKind::Other("html".to_string()));
+        let mut first = Node::element(ElementKind::Other("code".to_string()));
+        first.set_attr("data-object-id", "1");
+        let mut dup = Node::element(ElementKind::Other("code".to_string()));
+        dup.set_attr("data-object-id", "1");
+        root.push_child(first);
+        root.push_child(dup);
+
+        resolve_data_ids(&mut root, &stash, &mut std::collections::HashSet::new());
+
+        // First element keeps the full data.
+        assert_eq!(
+            root.children[0].data_parsoid.as_deref(),
+            Some("{\"src\":\"<code>\",\"tsr\":[0,6],\"stx\":\"html\"}")
+        );
+        // Duplicate (AFE clone) drops src/tsr and gains autoInsertedStart.
+        let dp2 = root.children[1].dp.as_ref().expect("dp");
+        assert!(dp2.auto_inserted_start, "should be autoInsertedStart");
+        assert!(dp2.src.is_none(), "src should be dropped");
+        assert!(dp2.tsr.is_none(), "tsr should be dropped");
+        assert_eq!(dp2.stx.as_deref(), Some("html"), "stx should be preserved");
     }
 
     #[test]
