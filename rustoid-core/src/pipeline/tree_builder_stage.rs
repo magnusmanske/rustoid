@@ -161,6 +161,56 @@ mod tests {
     }
 
     #[test]
+    fn test_dl_table_two_tables() {
+        let stage = TreeBuilderStage::new(false);
+        let ast = stage.to_ast(
+            tokenize(":{|\n|foo\nbar\n|}\n\n:::{|\n|foo\nbar\n|}"),
+            &config(),
+        );
+        // Two `<dl>` blocks each containing a `<table>` must both survive, and
+        // must stay under the single synthetic `<html>` wrapper (not be forced
+        // out as siblings of `<html>` by a spurious mid-stream EOF).
+        fn count_tables(n: &Node) -> usize {
+            let mut c = if matches!(
+                &n.kind,
+                crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Table)
+            ) {
+                1
+            } else {
+                0
+            };
+            for ch in &n.children {
+                c += count_tables(ch);
+            }
+            c
+        }
+        assert_eq!(count_tables(&ast), 2, "expected 2 tables, got {ast:?}");
+
+        // The whole document must wrap in a single `<html>`; no top-level
+        // fragment siblings may leak outside it.
+        assert_eq!(ast.children.len(), 1, "single <html> child: {ast:?}");
+        assert!(matches!(
+            &ast.children[0].kind,
+            crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(t))
+                if t == "html"
+        ));
+        let html = &ast.children[0];
+        let n_dl = html
+            .children
+            .iter()
+            .filter(|c| {
+                matches!(
+                    &c.kind,
+                    crate::dom::node::NodeKind::Element(
+                        crate::dom::node::ElementKind::DefinitionList
+                    )
+                )
+            })
+            .count();
+        assert_eq!(n_dl, 2, "two <dl> blocks under <html>: {ast:?}");
+    }
+
+    #[test]
     fn test_to_ast_heading() {
         let stage = TreeBuilderStage::new(false);
         let doc = stage.to_ast(tokenize("== Heading ==\n"), &config());

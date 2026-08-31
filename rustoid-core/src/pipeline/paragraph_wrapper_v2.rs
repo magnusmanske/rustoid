@@ -56,6 +56,19 @@ impl ParagraphWrapper {
 
     /// Wrap a token stream in paragraphs.
     pub fn wrap(&mut self, tokens: Vec<Item>) -> Vec<Item> {
+        self.wrap_impl(tokens, true)
+    }
+
+    /// Process a token stream, wrapping content in `<p>` tags.
+    ///
+    /// `synthesize_eof` mirrors PHP's `LineBasedHandler::process`: at the top
+    /// level the stream is guaranteed to end in an explicit `EOFTk` (the
+    /// tokenizer/pipeline appends one), so no EOF is synthesized. But when
+    /// recursively re-processing a nested DL-DD `ListTk` (see `onCompoundTk`),
+    /// the nested tokens carry no EOF and must be flushed *without* emitting
+    /// an `EOFTk` into the middle of the parent stream (that would prematurely
+    /// end the HTML5 document).
+    fn wrap_impl(&mut self, tokens: Vec<Item>, synthesize_eof: bool) -> Vec<Item> {
         if self.disabled {
             // P-wrapping disabled (inline context): pass through unchanged.
             return tokens;
@@ -72,9 +85,10 @@ impl ParagraphWrapper {
         }
 
         // If EOF wasn't in the stream, flush any pending newlines.
-        if self.new_line_count > 0
-            || !self.token_buffer.is_empty()
-            || !self.curr_line_tokens.is_empty()
+        if synthesize_eof
+            && (self.new_line_count > 0
+                || !self.token_buffer.is_empty()
+                || !self.curr_line_tokens.is_empty())
         {
             let eof = Item::Tok(ParsoidToken::Eof(crate::wikitext::tokens_v2::EOFTk));
             if let Some(res) = self.on_newline_or_eof(eof) {
@@ -120,7 +134,11 @@ impl ParagraphWrapper {
         if let Item::Tok(ParsoidToken::List(t)) = &token {
             if t.is_dl_dd_list() {
                 let nested = t.get_nested_tokens().to_vec();
-                return Some(self.wrap(nested));
+                // Faithful to PHP `onCompoundTk`: re-process the nested tokens
+                // *without* synthesizing an EOF (PHP's `process` relies on a
+                // trailing EOFTk already being present in the stream; the nested
+                // DL-DD tokens carry none, so no EOF is emitted mid-stream).
+                return Some(self.wrap_impl(nested, false));
             }
             return None;
         }

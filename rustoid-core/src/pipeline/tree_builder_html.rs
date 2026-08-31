@@ -1226,6 +1226,69 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_dl_table_blocks() {
+        // `:{| ...|}` then `:::{| ...|}` — two dl blocks, the second nested 3
+        // deep, separated by a blank line. Both must survive.
+        let doc = token_stream_to_ast_html(&[
+            tag("dl"),
+            tag("dd"),
+            tag("table"),
+            txt("\n"),
+            tag("tbody"),
+            tag("tr"),
+            tag("td"),
+            txt("foo\n"),
+            tag("p"),
+            txt("bar"),
+            end("p"),
+            end("td"),
+            end("tr"),
+            end("tbody"),
+            end("table"),
+            end("dd"),
+            end("dl"),
+            txt("\n\n"),
+            tag("dl"),
+            tag("dd"),
+            tag("dl"),
+            tag("dd"),
+            tag("dl"),
+            tag("dd"),
+            tag("table"),
+            txt("\n"),
+            tag("tbody"),
+            tag("tr"),
+            tag("td"),
+            txt("foo\n"),
+            tag("p"),
+            txt("bar"),
+            end("p"),
+            end("td"),
+            end("tr"),
+            end("tbody"),
+            end("table"),
+            end("dd"),
+            end("dl"),
+            end("dd"),
+            end("dl"),
+            end("dd"),
+            end("dl"),
+        ]);
+        fn count_tables(n: &Node) -> usize {
+            let mut c = if matches!(&n.kind, NodeKind::Element(ElementKind::Table)) {
+                1
+            } else {
+                0
+            };
+            for ch in &n.children {
+                c += count_tables(ch);
+            }
+            c
+        }
+        assert_eq!(count_tables(&doc), 2, "expected 2 tables: {doc:?}");
+    }
+
+    #[test]
     fn test_div_roundtrip() {
         let doc = token_stream_to_ast_html(&[tag("div"), txt("foo"), end("div")]);
         assert!(contains_kind(&doc, &ElementKind::Div), "{doc:?}");
