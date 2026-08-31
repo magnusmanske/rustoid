@@ -950,21 +950,25 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                 }
                 NodeKind::Text(s) => {
                     if s.trim().is_empty() {
-                        // Whitespace-only: drop unless it separates two elements
-                        // (marks a block boundary inside the transclusion).
-                        let prev_is_elem =
-                            idx > 0 && matches!(content[idx - 1].kind, NodeKind::Element(_));
-                        let next_is_elem = idx + 1 < content.len()
-                            && matches!(content[idx + 1].kind, NodeKind::Element(_));
-                        if prev_is_elem && next_is_elem {
-                            let mut span = Node::element(ElementKind::Span);
-                            if let Some(about) = &about {
-                                span.set_attr("about", about.clone());
-                            }
-                            span.push_child(Node::text(" "));
-                            span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
-                            new_content.push(span);
+                        // Whitespace-only text inside a transclusion range.
+                        // Mirror PHP `isDeletableNode`: drop it only in the
+                        // narrowly-targeted cases (it separates a wikitext
+                        // block from a following wikitext list/table, or it
+                        // sits between two sol-transparent links); otherwise
+                        // wrap it in a single-space `about` span so the range
+                        // stays contiguous and editable.
+                        if is_deletable_in_range(&content, idx) {
+                            continue;
                         }
+                        // Span-wrap the newline (single space) to keep the
+                        // transclusion boundary inside the paragraph.
+                        let mut span = Node::element(ElementKind::Span);
+                        if let Some(about) = &about {
+                            span.set_attr("about", about.clone());
+                        }
+                        span.push_child(Node::text(" "));
+                        span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+                        new_content.push(span);
                         continue;
                     }
                     // Wrap non-whitespace text in an `about` span so the range
@@ -1063,6 +1067,39 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
         i = end + 1;
     }
     out
+}
+
+/// Whether a newline-only text node inside a transclusion range should be
+/// deleted (rather than wrapped in a single-space `about` span). Faithful port
+/// of PHP `DOMRangeBuilder::isDeletableNode` (minus the fosterable-position
+/// case, which is handled by `fostered` flags elsewhere): a newline is
+/// deletable when it separates a wikitext block node from a following wikitext
+/// list/table, or when it sits between two sol-transparent links. Otherwise it
+/// must be preserved (span-wrapped) so the range stays contiguous.
+fn is_deletable_in_range(content: &[Node], idx: usize) -> bool {
+    let prev = idx.checked_sub(1).map(|p| &content[p]);
+    let next = content.get(idx + 1);
+
+    if let Some(prev) = prev
+        && crate::html::dom_utils::is_wikitext_block_node(prev)
+        && let Some(next) = next
+        && matches!(&next.kind, NodeKind::Element(_))
+    {
+        let next_name = crate::html::wts_utils::node_name(next);
+        if matches!(next_name.as_str(), "ul" | "ol" | "table") {
+            return true;
+        }
+    }
+
+    if let Some(prev) = prev
+        && let Some(next) = next
+        && crate::html::wts_utils::is_sol_transparent_link(prev)
+        && crate::html::wts_utils::is_sol_transparent_link(next)
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Wrap transclusion ranges whose start/end markers were not both emitted as
@@ -1714,6 +1751,84 @@ mod tests {
         let inner = &span.children[0];
         assert_eq!(inner.get_attr("rel"), Some("mw:PageProp/Category"));
         assert_eq!(inner.get_attr("about"), None, "{inner:?}");
+    }
+
+    #[test]
+    fn test_transclusion_trailing_newline_span_wrapped() {
+        // A newline-only text inside a transclusion range (e.g. the trailing
+        // `\n` of `{{1x|<div/>\n}}`) must be span-wrapped as a single-space
+        // `about` span (WRAPPER flag), not dropped — mirrors PHP
+        // `isDeletableNode` (a newline between a block and a following
+        // non-list/table sibling is *not* deletable).
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt1");
+
+        let mut div = Node::element(ElementKind::Div);
+        div.push_child(Node::text("x"));
+
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.set_attr("about", "#mwt1");
+
+        let mut doc = Node::document();
+        doc.push_child(start);
+        doc.push_child(div);
+        doc.push_child(Node::text("\n"));
+        doc.push_child(end);
+
+        encapsulate_transclusions(&mut doc);
+
+        // The trailing newline is preserved as a single-space wrapper span
+        // (a sibling of the encapsulated div, since it is part of the same
+        // transclusion range).
+        assert_eq!(doc.children.len(), 2, "{doc:?}");
+        let div = &doc.children[0];
+        assert_eq!(div.get_attr("typeof"), Some("mw:Transclusion"), "{doc:?}");
+        let wrapper = &doc.children[1];
+        assert_eq!(wrapper.get_attr("about"), Some("#mwt1"), "{doc:?}");
+        assert!(
+            wrapper
+                .data_parsoid
+                .as_deref()
+                .is_some_and(|d| d.contains("wrapper")),
+            "{doc:?}"
+        );
+        assert_eq!(wrapper.children.len(), 1);
+        assert!(matches!(
+            &wrapper.children[0].kind,
+            NodeKind::Text(t) if t == " "
+        ));
+    }
+
+    #[test]
+    fn test_is_deletable_in_range() {
+        // A newline between a div and a table is deletable (T370751).
+        assert!(is_deletable_in_range(
+            &[
+                Node::element(ElementKind::Div),
+                Node::text("\n"),
+                Node::element(ElementKind::Table),
+            ],
+            1
+        ));
+
+        // A newline between a div and a paragraph is NOT deletable.
+        assert!(!is_deletable_in_range(
+            &[
+                Node::element(ElementKind::Div),
+                Node::text("\n"),
+                Node::element(ElementKind::Paragraph),
+            ],
+            1
+        ));
+
+        // A newline between two sol-transparent links is deletable (T407798).
+        let mut l1 = Node::element(ElementKind::Other("link".to_string()));
+        l1.set_attr("rel", "mw:PageProp/Category");
+        let mut l2 = Node::element(ElementKind::Other("link".to_string()));
+        l2.set_attr("rel", "mw:PageProp/Category");
+        assert!(is_deletable_in_range(&[l1, Node::text("\n"), l2], 1));
     }
 
     #[test]

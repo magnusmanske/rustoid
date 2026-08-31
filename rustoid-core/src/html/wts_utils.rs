@@ -460,7 +460,7 @@ pub fn is_redirect_link(node: &Node) -> bool {
 
 /// `TokenUtils::SOL_TRANSPARENT_LINK_REGEX` — a `<link>` whose `rel` is a
 /// page-prop category/redirect/language link (rendering-transparent / SOL).
-fn is_sol_transparent_link(node: &Node) -> bool {
+pub fn is_sol_transparent_link(node: &Node) -> bool {
     matches!(node.kind, NodeKind::Element(_))
         && node_name(node) == "link"
         && crate::html::dom_utils::match_rel(
