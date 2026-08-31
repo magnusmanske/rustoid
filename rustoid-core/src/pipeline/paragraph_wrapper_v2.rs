@@ -324,7 +324,17 @@ impl ParagraphWrapper {
             return true;
         }
         if token_name == "meta" && matches!(token, Item::Tok(ParsoidToken::SelfclosingTag(_))) {
-            return true;
+            // PHP's `TokenUtils::isSolTransparent` excludes `meta` tokens that
+            // carry a literal-HTML marker (`stx === 'html'`, i.e. an explicit
+            // `<meta>` written in the source rather than a Parsoid-generated
+            // transclusion/annotation marker). Such source-`<meta>` tags are not
+            // SOL-transparent and must not swallow the newline/paragraph state.
+            let has_literal_html_marker = matches!(
+                token,
+                Item::Tok(ParsoidToken::SelfclosingTag(t))
+                    if t.data_parsoid.stx.as_deref() == Some("html")
+            );
+            return !has_literal_html_marker;
         }
         // `mw:dom-fragment-token` placeholders (tunnelled extension/template
         // content) are opaque and SOL-transparent, mirroring PHP's
