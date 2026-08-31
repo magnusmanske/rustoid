@@ -206,13 +206,20 @@ fn attr_to_json(value: &crate::wikitext::tokens_v2::DataMwValue) -> serde_json::
     use crate::wikitext::tokens_v2::DataMwValue as V;
     match value {
         V::Str(s) => serde_json::Value::String(s.clone()),
-        V::Object { txt, html } => {
+        V::Object {
+            txt,
+            html,
+            uneditable,
+        } => {
             let mut obj = serde_json::Map::new();
             if let Some(t) = txt {
                 obj.insert("txt".to_string(), serde_json::Value::String(t.clone()));
             }
             if let Some(h) = html {
                 obj.insert("html".to_string(), serde_json::Value::String(h.clone()));
+            }
+            if *uneditable {
+                obj.insert("uneditable".to_string(), serde_json::Value::Bool(true));
             }
             serde_json::Value::Object(obj)
         }
@@ -577,6 +584,37 @@ mod tests {
 
         let json = serialize_data_mw_attribs(&attribs);
         assert_eq!(json, "[[\"style\",\"color:red\"]]");
+    }
+
+    #[test]
+    fn test_serialize_data_mw_attribs_uneditable() {
+        use crate::wikitext::tokens_v2::{DataMwAttrib, DataMwValue};
+
+        // An uneditable rich key (portion of a template's output) serializes
+        // with `txt`, `html`, and `uneditable:true` (mirrors DataMwAttrib).
+        let attribs = vec![DataMwAttrib::new(
+            DataMwValue::Object {
+                txt: Some("a".to_string()),
+                html: Some("<span>a</span>".to_string()),
+                uneditable: true,
+            },
+            DataMwValue::Object {
+                txt: None,
+                html: Some(String::new()),
+                uneditable: false,
+            },
+        )];
+
+        let json = serialize_data_mw_attribs(&attribs);
+        // serde_json sorts object keys; assert on the parsed structure instead
+        // of exact key order (the harness strips data-mw before comparison).
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr[0][0]["txt"], "a");
+        assert_eq!(arr[0][0]["html"], "<span>a</span>");
+        assert_eq!(arr[0][0]["uneditable"], true);
+        assert_eq!(arr[0][1]["html"], "");
+        assert!(arr[0][1].get("uneditable").is_none());
     }
 
     #[test]

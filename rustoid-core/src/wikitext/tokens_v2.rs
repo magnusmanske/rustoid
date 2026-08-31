@@ -395,13 +395,17 @@ impl DomSourceRange {
 }
 
 /// A rich attribute's key or value — either a plain string or a structured
-/// `{ txt, html }` object (mirrors PHP's `DataMwAttrib`'s key/value shape).
+/// `{ txt, html, uneditable }` object (mirrors PHP's `DataMwAttrib`'s
+/// key/value shape; `html` is a serialized DOM fragment).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataMwValue {
     Str(String),
     Object {
         txt: Option<String>,
         html: Option<String>,
+        /// The attribute is a portion of a template's output and cannot be
+        /// edited on its own (mirrors `DataMwAttrib`'s `uneditable` flag).
+        uneditable: bool,
     },
 }
 
