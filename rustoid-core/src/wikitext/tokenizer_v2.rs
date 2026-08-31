@@ -766,21 +766,12 @@ impl<'a> PegTokenizer<'a> {
                 // This is hacky_dl_uses: colons before a table.
                 let tsr_start = saved;
                 let dp = self.make_dp(tsr_start, tsr_start + colons);
-                let bullets: Vec<String> = (0..colons).map(|_| ":".to_string()).collect();
+                // The `bullets` are just the colon string (mirrors the standard
+                // `li` path above and PHP's `hacky_dl_uses = ":"+`, whose ListHandler
+                // consumes `bullets` as a plain string).
                 let bullet_kv = KV {
                     key: KeyValue::Str("bullets".to_string()),
-                    value: KeyValue::Tokens(
-                        bullets
-                            .iter()
-                            .map(|_b| {
-                                Item::Tok(ParsoidToken::Tag(TagTk::new(
-                                    "listItem",
-                                    vec![],
-                                    DataParsoid::default(),
-                                )))
-                            })
-                            .collect(),
-                    ),
+                    value: KeyValue::Str(":".repeat(colons)),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
