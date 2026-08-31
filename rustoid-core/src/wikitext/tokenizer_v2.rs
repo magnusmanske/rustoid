@@ -1350,7 +1350,7 @@ impl<'a> PegTokenizer<'a> {
     }
 
     fn parse_table_attribute_name(&mut self) -> Option<KeyValue> {
-        let name = self.parse_attr_name_impl(true);
+        let name = self.parse_attr_name_impl(true, false);
         if name.is_empty() { None } else { Some(name) }
     }
 
@@ -1457,7 +1457,9 @@ impl<'a> PegTokenizer<'a> {
         }
 
         // Parse the start-tag attributes (the `pre` extension sanitizes them).
-        let attrs = self.parse_html_attributes();
+        // Extension tags allow a literal `<` in attribute-name position
+        // (`less_than`), e.g. `<pre <pre>`.
+        let attrs = self.parse_html_attributes(true);
 
         // Self-closing?
         self.consume_spaces();
@@ -1619,8 +1621,9 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
 
-        // Parse attributes.
-        let attrs = self.parse_html_attributes();
+        // Parse attributes. HTML tags do not allow a literal `<` in
+        // attribute-name position (mirrors `less_than`'s `!html_or_empty` guard).
+        let attrs = self.parse_html_attributes(false);
 
         // Self-closing?
         self.consume_spaces();
@@ -1668,9 +1671,9 @@ impl<'a> PegTokenizer<'a> {
         name
     }
 
-    fn parse_html_attributes(&mut self) -> Vec<KV> {
+    fn parse_html_attributes(&mut self, allow_less_than: bool) -> Vec<KV> {
         let mut attrs = Vec::new();
-        while let Some(attr) = self.parse_one_attribute() {
+        while let Some(attr) = self.parse_one_attribute(allow_less_than) {
             attrs.push(attr);
         }
         attrs
@@ -1680,7 +1683,7 @@ impl<'a> PegTokenizer<'a> {
     /// reparse-KV-string path to retokenize an expanded `k=v` string).
     fn parse_generic_newline_attributes(&mut self) -> Vec<KV> {
         let mut attrs = Vec::new();
-        while let Some(attr) = self.parse_one_attribute() {
+        while let Some(attr) = self.parse_one_attribute(false) {
             attrs.push(attr);
         }
         attrs
@@ -1688,7 +1691,11 @@ impl<'a> PegTokenizer<'a> {
 
     /// Parse a single `name[=value]` attribute. Returns `None` at end-of-input
     /// or when the next char terminates the attribute list (`/` or `>`).
-    fn parse_one_attribute(&mut self) -> Option<KV> {
+    ///
+    /// `allow_less_than` mirrors PHP's `less_than` guard (`!html_or_empty`):
+    /// extension tags permit a literal `<` in attribute-name position, whereas
+    /// HTML tags (and the reparse-KV path, where `tagType` is empty) do not.
+    fn parse_one_attribute(&mut self, allow_less_than: bool) -> Option<KV> {
         self.consume_spaces();
         if self.pos >= self.input_len {
             return None;
@@ -1700,7 +1707,7 @@ impl<'a> PegTokenizer<'a> {
 
         // Parse attribute name.
         let name_start = self.pos;
-        let name = self.parse_attr_name();
+        let name = self.parse_attr_name(allow_less_than);
         let name_end = self.pos;
         if name.is_empty() {
             return None;
@@ -1752,15 +1759,18 @@ impl<'a> PegTokenizer<'a> {
 
     /// Parse a generic HTML tag attribute name, recognizing template
     /// directives. Mirrors `generic_attribute_name`.
-    fn parse_attr_name(&mut self) -> KeyValue {
-        self.parse_attr_name_impl(false)
+    fn parse_attr_name(&mut self, allow_less_than: bool) -> KeyValue {
+        self.parse_attr_name_impl(false, allow_less_than)
     }
 
     /// Parse an attribute name into a `KeyValue`. A name that contains a
     /// template directive (`{{...}}` / `{{{...}}}`) becomes a token array;
     /// otherwise it is a plain string. Mirrors `generic_attribute_name` and
     /// (for `table`) the directive portion of `table_attribute_name`.
-    fn parse_attr_name_impl(&mut self, table: bool) -> KeyValue {
+    ///
+    /// `allow_less_than` mirrors PHP's `less_than` guard: a literal `<` is only
+    /// accepted in attribute-name position for extension tags (`tagType=ext`).
+    fn parse_attr_name_impl(&mut self, table: bool, allow_less_than: bool) -> KeyValue {
         let mut tokens: Vec<Item> = Vec::new();
         let mut buf = String::new();
 
@@ -1811,6 +1821,15 @@ impl<'a> PegTokenizer<'a> {
                 }
             }
 
+            // Generic attribute names accept a literal `<` as `less_than` when
+            // parsing an extension tag's attributes (PHP's
+            // `generic_attribute_name_piece` → `less_than` alternative).
+            if !table && allow_less_than && self.starts_with("<") {
+                self.advance(1);
+                buf.push('<');
+                continue;
+            }
+
             let Some(ch) = self.peek_char() else {
                 break;
             };
@@ -1823,8 +1842,7 @@ impl<'a> PegTokenizer<'a> {
                 || ch == '='
                 || ch == '>'
                 || ch == '<'
-                || ch == '['
-                || (table && (ch == '|' || ch == '!'));
+                || (table && (ch == '[' || ch == '|' || ch == '!'));
             if is_stop {
                 break;
             }
