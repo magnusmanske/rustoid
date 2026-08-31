@@ -990,6 +990,28 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
         // extension `mw:Extension/pre` combines with `mw:Transclusion`
         // (mirrors `DOMUtils::addTypeOf`'s multivalue handling).
         if let Some(et) = encap_target {
+            // If the encapsulation target is rendering-transparent (a
+            // category/redirect/language link, comment, or non-HTML meta), it
+            // cannot carry content; wrap it in a `<span class="mw-empty-elt">`
+            // that becomes the encapsulation target instead (mirrors PHP
+            // `DOMRangeBuilder::handleFirstRenderingTransparentNode`, which
+            // stashes such nodes into an `mw-empty-elt` span at a range
+            // boundary and moves the transclusion metadata onto the span).
+            if crate::html::wts_utils::is_rendering_transparent_node(&new_content[et]) {
+                let mut inner = new_content.remove(et);
+                // The `about` id was stamped on the transparent node during
+                // range stamping; move it onto the wrapper span.
+                let about_id = inner.get_attr("about").map(str::to_string);
+                inner.attrs.retain(|a| a.key != "about");
+                let mut span = Node::element(ElementKind::Span);
+                span.set_attr("class", "mw-empty-elt");
+                if let Some(id) = about_id {
+                    span.set_attr("about", id);
+                }
+                span.children.push(inner);
+                new_content.insert(et, span);
+            }
+
             if let Some(typeof_) = &typeof_attr {
                 let existing = new_content[et].get_attr("typeof").map(str::to_string);
                 let merged = match existing {
@@ -1653,6 +1675,45 @@ mod tests {
         assert_eq!(span.get_attr("about"), Some("#mwt1"));
         assert_eq!(span.get_attr("typeof"), Some("mw:Transclusion"));
         assert!(span.children.is_empty(), "{span:?}");
+    }
+
+    #[test]
+    fn test_rendering_transparent_encap_target_wrapped_in_mw_empty_elt() {
+        // `{{1x|[[Category:Foo]]}}` encapsulates a rendering-transparent
+        // category `<link>`. The transclusion metadata must move onto a
+        // `<span class="mw-empty-elt">` wrapper rather than directly onto the
+        // `<link>` (mirrors PHP `handleRenderingTransparentEltsBetweenBlocks`).
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt1");
+        start.data_mw = Some("{\"parts\":[{}]}".to_string());
+
+        let mut link = Node::element(ElementKind::Other("link".to_string()));
+        link.set_attr("rel", "mw:PageProp/Category");
+        link.set_attr("href", "./Category:Foo");
+
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.set_attr("about", "#mwt1");
+
+        let mut doc = Node::document();
+        doc.push_child(start);
+        doc.push_child(link);
+        doc.push_child(end);
+
+        encapsulate_transclusions(&mut doc);
+
+        assert_eq!(doc.children.len(), 1, "{doc:?}");
+        let span = &doc.children[0];
+        assert_eq!(span.get_attr("class"), Some("mw-empty-elt"), "{span:?}");
+        assert_eq!(span.get_attr("typeof"), Some("mw:Transclusion"), "{span:?}");
+        assert_eq!(span.get_attr("about"), Some("#mwt1"), "{span:?}");
+        // The category link is preserved inside the wrapper, minus the moved
+        // about id.
+        assert_eq!(span.children.len(), 1, "{span:?}");
+        let inner = &span.children[0];
+        assert_eq!(inner.get_attr("rel"), Some("mw:PageProp/Category"));
+        assert_eq!(inner.get_attr("about"), None, "{inner:?}");
     }
 
     #[test]
