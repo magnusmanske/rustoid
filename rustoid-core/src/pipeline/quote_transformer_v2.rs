@@ -314,7 +314,7 @@ impl QuoteTransformer {
         };
 
         // Build a new mw-quote (italic) token with shifted tsr.
-        let new_tsr = old_tsr.map(|tsr| SourceRange::new(tsr.start + 1, tsr.end));
+        let new_tsr = old_tsr.map(|tsr| SourceRange::new(tsr.start.unwrap_or(0) + 1, tsr.end));
         let new_dp = DataParsoid {
             tsr: new_tsr,
             ..Default::default()
@@ -511,7 +511,7 @@ impl QuoteTransformer {
         let (tsr, start_pos, end_pos) =
             if let Item::Tok(ParsoidToken::SelfclosingTag(tk)) = &old_tag {
                 let tsr = tk.data_parsoid.tsr.clone();
-                let start = tsr.as_ref().map(|t| t.start);
+                let start = tsr.as_ref().and_then(|t| t.start);
                 let end = tsr.as_ref().map(|t| t.end);
                 (tsr, start, end)
             } else {

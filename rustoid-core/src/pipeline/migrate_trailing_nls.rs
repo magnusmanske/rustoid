@@ -72,7 +72,12 @@ fn has_zero_width_wt(node: &Node) -> bool {
     let Some(tsr) = dp.tsr.as_ref() else {
         return false;
     };
-    if tsr.start != tsr.end {
+    // A `null` (unknown) start is not zero-width (mirrors PHP's
+    // `$tsr->start === null` early-return).
+    let Some(start) = tsr.start else {
+        return false;
+    };
+    if start != tsr.end {
         return false;
     }
     node.children
@@ -349,7 +354,9 @@ fn migrate_out_of(elt: &mut Node) -> Vec<Node> {
                 && let Some(dp) = node.dp.as_mut()
                 && let Some(tsr) = dp.tsr.as_mut()
             {
-                tsr.start = tsr.start.saturating_sub(tsr_correction as usize);
+                if let Some(start) = tsr.start.as_mut() {
+                    *start = start.saturating_sub(tsr_correction as usize);
+                }
                 tsr.end = tsr.end.saturating_sub(tsr_correction as usize);
             }
         }
@@ -494,6 +501,16 @@ mod tests {
         });
         el3.push_child(Node::text("x"));
         assert!(!has_zero_width_wt(&el3));
+
+        // A `null` start (unknown) tsr — like a template end marker meta with
+        // `tsr = [ null, end ]` — is NOT zero-width (mirrors PHP's
+        // `$tsr->start === null` early-return), so migrate-nls won't cross it.
+        let mut el4 = elt(ElementKind::Other("meta".to_string()));
+        el4.dp = Some(DataParsoid {
+            tsr: Some(crate::wikitext::tokens_v2::SourceRange::with_null_start(18)),
+            ..DataParsoid::default()
+        });
+        assert!(!has_zero_width_wt(&el4));
     }
 
     #[test]

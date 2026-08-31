@@ -72,7 +72,7 @@ impl PreprocType {
     /// covering just the contents. Mirrors `PreprocType::shrinkRange`.
     pub fn shrink_range(self, sr: &SourceRange, count: usize) -> SourceRange {
         SourceRange::new(
-            sr.start + count * self.open().len(),
+            sr.start.unwrap_or(0) + count * self.open().len(),
             sr.end.saturating_sub(count * self.close().len()),
         )
     }
@@ -80,7 +80,9 @@ impl PreprocType {
     /// The inverse of `shrink_range`. Mirrors `PreprocType::growRange`.
     pub fn grow_range(self, sr: &SourceRange, count: usize) -> SourceRange {
         SourceRange::new(
-            sr.start.saturating_sub(count * self.open().len()),
+            sr.start
+                .unwrap_or(0)
+                .saturating_sub(count * self.open().len()),
             sr.end + count * self.close().len(),
         )
     }

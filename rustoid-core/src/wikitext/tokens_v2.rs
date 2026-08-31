@@ -20,23 +20,34 @@ use std::fmt;
 /// A source range (analogous to PHP's SourceRange).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRange {
-    pub start: usize,
+    /// Starting offset; `None` mirrors PHP's `SourceRange` `start === null`
+    /// (an *unknown* start, which is distinct from a known `0`).
+    pub start: Option<usize>,
     pub end: usize,
 }
 
 impl SourceRange {
     pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+        Self {
+            start: Some(start),
+            end,
+        }
+    }
+
+    /// A range with an unknown (`null`) start, mirroring PHP's
+    /// `new SourceRange( null, $end )` (e.g. a template end marker meta).
+    pub fn with_null_start(end: usize) -> Self {
+        Self { start: None, end }
     }
 
     pub fn length(&self) -> usize {
-        self.end.saturating_sub(self.start)
+        self.end.saturating_sub(self.start.unwrap_or(self.end))
     }
 
     /// Extract the substring from the source input.
     pub fn substr<'a>(&self, input: &'a str) -> &'a str {
         let end = self.end.min(input.len());
-        let start = self.start.min(end);
+        let start = self.start.unwrap_or(end).min(end);
         &input[start..end]
     }
 }
@@ -242,9 +253,15 @@ impl DataParsoid {
         let mut obj = serde_json::Map::new();
 
         if let Some(tsr) = &self.tsr {
+            // A `null` start serializes as JSON `null` (mirrors PHP, where the
+            // end marker meta has `tsr = [ null, end ]`).
+            let start_json = match tsr.start {
+                Some(s) => serde_json::Value::from(s),
+                None => serde_json::Value::Null,
+            };
             obj.insert(
                 "tsr".to_string(),
-                serde_json::Value::Array(vec![tsr.start.into(), tsr.end.into()]),
+                serde_json::Value::Array(vec![start_json, tsr.end.into()]),
             );
         }
         if let Some(src) = &self.src {

@@ -116,9 +116,9 @@ fn compute_a_tag_width(node: &Node, dp: &DataParsoid) -> Option<(Option<usize>, 
             .tmp
             .ext_link_content_offsets
             .as_ref()
-            .map(|sr| sr.start)
+            .and_then(|sr| sr.start)
             .unwrap_or(0);
-        let start = dp.tsr.as_ref().map(|sr| sr.start).unwrap_or(0);
+        let start = dp.tsr.as_ref().and_then(|sr| sr.start).unwrap_or(0);
         Some((Some(content_start.saturating_sub(start)), Some(1)))
     } else if is_a_tag_from_url_or_magic_syntax(node) {
         Some((Some(0), Some(0)))
@@ -280,7 +280,7 @@ fn compute_node_dsr(
                         // Meta-marker tags (templates/extensions) reset cs/ce to
                         // the (top-level) tsr; transclusion start markers also
                         // flag forward propagation.
-                        cs = Some(tsr.start);
+                        cs = tsr.start;
                         ce = Some(tsr.end);
                         if child_is_tpl_start {
                             propagate_right = true;
@@ -307,14 +307,14 @@ fn compute_node_dsr(
                         }
                         if let Some(tsr) = &tsr {
                             if !dp.auto_inserted_start {
-                                cs = Some(tsr.start);
+                                cs = tsr.start;
                                 if tsr_spans_tag_dom(child, &dp) {
                                     if tsr.end > 0 {
                                         ce = Some(tsr.end);
                                         propagate_right = true;
                                     }
                                 } else {
-                                    st_width = Some(tsr.end.saturating_sub(tsr.start));
+                                    st_width = Some(tsr.end.saturating_sub(tsr.start.unwrap_or(0)));
                                 }
                             }
                         } else if s.is_some() {

@@ -120,7 +120,7 @@ impl TemplateEncapsulator {
             tsr: self
                 .token_tsr
                 .as_ref()
-                .map(|tsr| SourceRange::new(tsr.end, tsr.end)),
+                .map(|tsr| SourceRange::with_null_start(tsr.end)),
             ..Default::default()
         };
 

@@ -618,11 +618,10 @@ impl ListHandler {
     /// Make a DataParsoid that is a slice of a source DataParsoid's tsr.
     fn make_dp(source_dp: &DataParsoid, start_offset: usize, end_offset: usize) -> DataParsoid {
         let mut new_dp = source_dp.clone();
-        if let Some(tsr) = &source_dp.tsr {
-            new_dp.tsr = Some(SourceRange::new(
-                tsr.start + start_offset,
-                tsr.start + end_offset,
-            ));
+        if let Some(tsr) = &source_dp.tsr
+            && let Some(start) = tsr.start
+        {
+            new_dp.tsr = Some(SourceRange::new(start + start_offset, start + end_offset));
         }
         new_dp
     }
