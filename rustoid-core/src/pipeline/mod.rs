@@ -29,6 +29,7 @@ pub mod section_wrapper;
 pub mod template_encapsulator;
 pub mod template_handler;
 pub mod token_handler_pipeline;
+pub mod token_stream_patcher;
 pub mod tree_builder_html;
 pub mod tree_builder_stage;
 pub mod unpack_dom_fragments;

@@ -40,6 +40,12 @@ impl TreeBuilderStage {
     ) -> Vec<Item> {
         let mut out = tokens;
 
+        // 0. TokenStreamPatcher (re-wrap buffered newlines around
+        //    SOL-transparent links into EmptyLineTk; runs first, mirroring
+        //    PHP's TokenTransform3 order).
+        let mut tsp = crate::pipeline::token_stream_patcher::TokenStreamPatcher::new();
+        out = tsp.run(out);
+
         // 1. PreHandler (indent-pre detection).
         let mut pre_handler = PreHandler::with_options(self.inline_context);
         out = pre_handler.run(out);
