@@ -791,29 +791,30 @@ impl<'a> PegTokenizer<'a> {
             self.pos = saved;
         }
 
-        // Standard list item: count bullets.
+        // Standard list item: count bullets. Mirrors PHP's `li = bullets:list_char+`,
+        // where `list_char = [*#:;]` matches ANY sequence of list characters
+        // (not just a run of one kind): `:*b` → bullets `:*` + content `b`.
         let start = self.pos;
-        let mut count = 0;
+        let mut bullets = String::new();
         while self.pos < self.input_len {
             let ch = self.remaining().chars().next().unwrap();
-            if ch == first {
-                count += 1;
+            if matches!(ch, '*' | '#' | ';' | ':') {
+                bullets.push(ch);
                 self.advance(ch.len_utf8());
             } else {
                 break;
             }
         }
 
-        if count == 0 {
+        if bullets.is_empty() {
             return false;
         }
 
-        let dp = self.make_dp(start, start + count);
-        let bullets: Vec<String> = (0..count).map(|_| first.to_string()).collect();
+        let dp = self.make_dp(start, self.pos);
 
         let bullet_kv = KV {
             key: KeyValue::Str("bullets".to_string()),
-            value: KeyValue::Str(bullets.concat()),
+            value: KeyValue::Str(bullets),
             src_offsets: None,
             ksrc: None,
             vsrc: None,
