@@ -175,8 +175,14 @@ impl ListHandler {
             Item::Tok(ParsoidToken::Nl(_)) => self.on_newline(token),
             Item::Tok(ParsoidToken::Eof(_)) => self.on_end(token),
             Item::Tok(ParsoidToken::EmptyLine(_)) | Item::Tok(ParsoidToken::IndentPre(_)) => {
-                // Compound tokens of no interest: nothing to do (pass through).
-                Some(vec![token])
+                // PHP's `onCompoundTk` returns `null` for EmptyLineTk / IndentPreTk,
+                // which routes them to `onAny`. An empty line is *not* SOL-transparent,
+                // so it closes the open list (a blank line terminates the list).
+                if self.on_any_enabled {
+                    self.on_any(token)
+                } else {
+                    Some(vec![token])
+                }
             }
             _ if self.on_any_enabled => self.on_any(token),
             _ => Some(vec![token]),
