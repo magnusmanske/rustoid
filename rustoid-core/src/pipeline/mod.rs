@@ -17,6 +17,7 @@ pub mod headings;
 pub mod list_handler;
 pub mod mark_fostered_content;
 pub mod media_options;
+pub mod migrate_template_marker_metas;
 pub mod migrate_trailing_nls;
 pub mod p_wrap;
 pub mod paragraph_wrapper_v2;

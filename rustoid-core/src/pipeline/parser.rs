@@ -527,9 +527,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let (tokens, fragments) = self.expand_wikitext_pre_sync(tokens);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
+        let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::compute_dsr::run(&mut ast, wikitext);
         crate::pipeline::p_wrap::run(&mut ast);
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
@@ -601,11 +602,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let stage = TreeBuilderStage::new(false);
         let mut ast =
             stage.to_ast_with_fragments(tokens, Some(page_source), self.config, fragments);
+        // Capture transclusion marker depth map over the freshly-built DOM
+        // (before p-wrapping restructures it), mirroring PHP's
+        // `transclusionMetaTagDepthMap` recorded at tree-build time.
+        let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::compute_dsr::run(&mut ast, page_source);
         // DOM-level p-wrapping runs before transclusion encapsulation (mirrors
         // PHP's `pwrap` … `tplwrap` order).
         crate::pipeline::p_wrap::run(&mut ast);
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);

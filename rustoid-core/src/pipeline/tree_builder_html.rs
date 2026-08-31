@@ -703,11 +703,17 @@ fn dp_bool(dp: &serde_json::Value, key: &str) -> bool {
 }
 
 /// Run the DOM transforms that must occur *after* p-wrapping, in PHP's
-/// `NESTED_PIPELINE_DOM_TRANSFORMS` order (`pwrap` … `tplwrap` … `migrate-nls` …
-/// `strip-metas`): encapsulate transclusions, migrate trailing newlines, and
-/// strip internal marker metas. Called from the full-page pipeline after
-/// `p_wrap::run`.
-pub fn post_pwrap_transforms(node: &mut Node) {
+/// `NESTED_PIPELINE_DOM_TRANSFORMS` order (`pwrap` … `migrate-metas` …
+/// `migrate-nls` … `dsr` … `tplwrap` … `strip-metas`). Called from the full-page
+/// pipeline after `p_wrap::run`. `depths` is the `about → (start, end)` marker
+/// depth map captured over the freshly-built DOM (before p-wrapping).
+pub fn post_pwrap_transforms(
+    node: &mut Node,
+    depths: &std::collections::HashMap<String, (usize, usize)>,
+) {
+    // Migrate transclusion marker metas toward a canonical position before
+    // migrate-nls (mirrors PHP's `migrate-metas` … `migrate-nls` order).
+    crate::pipeline::migrate_template_marker_metas::run(node, depths);
     // Hoist trailing newlines out of line-ending / auto-closed elements before
     // template encapsulation (mirrors PHP's `migrate-nls` … `tplwrap` order).
     crate::pipeline::migrate_trailing_nls::run(node);
