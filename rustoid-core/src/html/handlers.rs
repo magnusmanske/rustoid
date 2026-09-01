@@ -301,16 +301,33 @@ impl DomHandler for HeadingHandler {
         &mut self,
         tree: &DomTree,
         node: NodeId,
-        _o: NodeId,
+        other: NodeId,
         _s: &mut SerializerState,
     ) -> Option<Constraints> {
+        let prev_non_sep = crate::html::dom_tree::previous_non_sep_sibling(tree, node);
         if dom_utils::is_new_elt(tree, node)
-            && crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_some()
+            && prev_non_sep.is_some()
+            && !crate::html::wts_utils::is_annotation_start_marker_meta(tree.node(other))
         {
+            // Default to two preceding newlines for new content.
             Some(Constraints {
                 min: Some(2),
                 max: Some(2),
             })
+        } else if dom_utils::is_new_elt(tree, other) && prev_non_sep == Some(other) {
+            // T72791: the previous node was newly inserted; separate for
+            // readability, except immediately after an annotation start tag.
+            if crate::html::wts_utils::is_annotation_start_marker_meta(tree.node(other)) {
+                Some(Constraints {
+                    min: Some(1),
+                    max: Some(2),
+                })
+            } else {
+                Some(Constraints {
+                    min: Some(2),
+                    max: Some(2),
+                })
+            }
         } else {
             Some(Constraints {
                 min: Some(1),
