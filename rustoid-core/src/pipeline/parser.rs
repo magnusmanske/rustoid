@@ -401,7 +401,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .expand_templates(frame, tokens, source, about_counter, true)
                 .await;
             tokens = self
-                .expand_attributes(frame, tokens, source, about_counter)
+                .expand_attributes(frame, tokens, source, about_counter, None)
                 .await;
         }
         // The quote transformer flushes pending quotes only on a newline or EOF
@@ -609,7 +609,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .expand_templates(&frame, tokens, source, about_counter, false)
             .await;
         let tokens = self
-            .expand_attributes(&frame, tokens, source, about_counter)
+            .expand_attributes(&frame, tokens, source, about_counter, Some(page_source))
             .await;
         let tokens = self.render_links(tokens);
         let tokens = self.render_external_links(tokens);
@@ -766,6 +766,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens: Vec<Item>,
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
+        page_source: Option<&str>,
     ) -> Vec<Item> {
         use crate::wikitext::tokens_v2::{KV, KeyValue};
 
@@ -828,6 +829,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 about_counter,
                 false,
                 &|kv| self.value_to_dom_html(kv),
+                page_source,
             );
             out.extend(result);
         }

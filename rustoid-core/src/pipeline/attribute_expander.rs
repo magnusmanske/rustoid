@@ -242,8 +242,9 @@ pub struct SplitTokensResult {
 /// first line to before the whole chunk. Mirrors
 /// `AttributeExpander::splitTokens`.
 ///
-/// `token_tsr_start` is the enclosing token's source-range start (for
-/// computing `unwrappedWT` and `firstWikitextNode`).
+/// `token_tsr_start` is the enclosing token's source-range start, and `source`
+/// the full page source text (for computing `unwrappedWT` and the extended
+/// `tsr.start` on the hoisted start-meta).
 pub fn split_tokens(
     tokens: &[Item],
     nl_tk_pos: isize,
@@ -251,6 +252,7 @@ pub fn split_tokens(
     token_tsr_start: usize,
     token_name: &str,
     token_stx: Option<&str>,
+    source: Option<&str>,
 ) -> SplitTokensResult {
     let mut pre_nl_buf = Vec::new();
     let mut post_nl_buf = Vec::new();
@@ -298,10 +300,18 @@ pub fn split_tokens(
         // Build the hoisted meta token with updated data-parsoid.
         let mut meta_tokens = Vec::new();
         if let Item::Tok(ParsoidToken::SelfclosingTag(mut m)) = meta {
-            // `unwrappedWT` should be the wikitext between the enclosing token
-            // start and the start-meta; computing it needs the source text,
-            // which isn't threaded through this helper yet.
-            m.data_parsoid.tmp.unwrapped_wt = Some(String::new());
+            // `unwrappedWT` is the leading wikitext between the enclosing token
+            // start and the transclusion start-meta (mirrors PHP's `splitTokens`),
+            // recovered from the page source when available.
+            let start_meta_tsr_start = m.data_parsoid.tsr.as_ref().and_then(|t| t.start);
+            m.data_parsoid.tmp.unwrapped_wt = match (source, start_meta_tsr_start) {
+                (Some(src), Some(start)) => {
+                    let end = start.min(src.len());
+                    let start = token_tsr_start.min(end);
+                    Some(src[start..end].to_string())
+                }
+                _ => None,
+            };
             m.data_parsoid.tmp.first_wikitext_node = token_stx
                 .map(|stx| format!("{}_{}", token_name.to_uppercase(), stx))
                 .or_else(|| Some(token_name.to_uppercase()));
@@ -379,6 +389,8 @@ impl TmpDataMwPart {
 /// `value_to_html` converts an attribute key/value source (a token array or
 /// string) into a serialized DOM-fragment HTML string (the `html` value of a
 /// `data-mw.attribs` entry), mirroring PHP's `expandAttrValuesToDOM`.
+/// `source` is the full page source text (for `unwrappedWT` recovery in
+/// `split_tokens`).
 ///
 /// Returns `metaTokens ++ [token] ++ postNLToks` (hoisted transclusion markers
 /// before the token and, for scenario 1, content moved after it).
@@ -390,6 +402,7 @@ pub fn build_expanded_attrs(
     about_counter: &std::cell::Cell<usize>,
     in_template: bool,
     value_to_html: &dyn Fn(&KeyValue) -> String,
+    source: Option<&str>,
 ) -> Vec<Item> {
     use super::attribute_transform_manager::{items_to_key_value, key_value_to_items};
     use crate::wikitext::token_utils::{is_html_tag, tokens_to_string};
@@ -397,6 +410,11 @@ pub fn build_expanded_attrs(
     let wrap_templates = !in_template;
     let token_name = token.get_name().to_string();
     let nl_tk_okay = is_html_tag(&token) || (token_name != "table" && token_name != "tr");
+    let token_tsr_start = token
+        .data_parsoid()
+        .and_then(|dp| dp.tsr.as_ref())
+        .and_then(|tsr| tsr.start)
+        .unwrap_or(0);
 
     let mut meta_tokens: Vec<Item> = Vec::new();
     let mut post_nl_toks: Vec<Item> = Vec::new();
@@ -438,9 +456,10 @@ pub fn build_expanded_attrs(
                     &expanded_k_items,
                     nl_tk_pos,
                     wrap_templates,
-                    0,
+                    token_tsr_start,
                     &token_name,
                     token.data_parsoid().and_then(|d| d.stx.as_deref()),
+                    source,
                 );
                 expanded_k_items = split.pre_nl_buf;
                 post_nl_toks = split.post_nl_buf;
@@ -511,9 +530,10 @@ pub fn build_expanded_attrs(
                     &expanded_v_items,
                     nl_tk_pos,
                     wrap_templates,
-                    0,
+                    token_tsr_start,
                     &token_name,
                     token.data_parsoid().and_then(|d| d.stx.as_deref()),
+                    source,
                 );
                 expanded_v_items = split.pre_nl_buf;
                 post_nl_toks = split.post_nl_buf;
@@ -732,7 +752,7 @@ mod tests {
             Item::Str("b".to_string()),
         ];
         // No start-meta: PHP returns the whole token array as `preNLBuf`.
-        let result = split_tokens(&tokens, 1, true, 0, "table", None);
+        let result = split_tokens(&tokens, 1, true, 0, "table", None, None);
         assert!(result.meta_tokens.is_empty());
         assert_eq!(result.pre_nl_buf, tokens);
         assert!(result.post_nl_buf.is_empty());
@@ -749,7 +769,7 @@ mod tests {
             ))),
             Item::Str("b".to_string()),
         ];
-        let result = split_tokens(&tokens, 2, true, 0, "table", None);
+        let result = split_tokens(&tokens, 2, true, 0, "table", None, None);
         assert_eq!(result.meta_tokens.len(), 1);
         // The meta is hoisted; pre_nl_buf has "" (cleared meta) + "a".
         assert_eq!(
@@ -757,6 +777,48 @@ mod tests {
             vec![Item::Str(String::new()), Item::Str("a".to_string())]
         );
         assert_eq!(result.post_nl_buf.len(), 2);
+    }
+
+    #[test]
+    fn test_split_tokens_computes_unwrapped_wt() {
+        // A transclusion start-meta with a TSR starting at offset 2; the
+        // enclosing token starts at 0 with source "01{{tpl}}\nrest". The
+        // hoisted meta must carry `unwrappedWT` = source[0..2] = "01" and
+        // `firstWikitextNode` = "TABLE", with its TSR start extended to 0.
+        let source = "01xyz\nrest";
+        let mut meta = SelfclosingTagTk::new(
+            "meta",
+            vec![],
+            crate::wikitext::tokens_v2::DataParsoid::with_tsr(2, 9),
+        );
+        meta.add_attribute_str("typeof", "mw:Transclusion");
+
+        let tokens = vec![
+            Item::Tok(ParsoidToken::SelfclosingTag(meta)),
+            Item::Str("x".to_string()),
+            Item::Tok(ParsoidToken::Nl(NlTk::new(
+                crate::wikitext::tokens_v2::SourceRange::new(4, 5),
+            ))),
+            Item::Str("rest".to_string()),
+        ];
+        let result = split_tokens(&tokens, 2, true, 0, "table", None, Some(source));
+        assert_eq!(result.meta_tokens.len(), 1);
+        let Item::Tok(ParsoidToken::SelfclosingTag(hoisted)) = &result.meta_tokens[0] else {
+            panic!("expected selfclosing meta");
+        };
+        assert_eq!(
+            hoisted.data_parsoid.tmp.unwrapped_wt.as_deref(),
+            Some("01"),
+            "unwrappedWT should be source[0..2]"
+        );
+        assert_eq!(
+            hoisted.data_parsoid.tmp.first_wikitext_node.as_deref(),
+            Some("TABLE")
+        );
+        assert_eq!(
+            hoisted.data_parsoid.tsr.as_ref().and_then(|t| t.start),
+            Some(0)
+        );
     }
 
     #[test]
@@ -781,9 +843,15 @@ mod tests {
         let expanded_attrs = old_attrs.clone();
 
         let counter = std::cell::Cell::new(0usize);
-        let out = build_expanded_attrs(token, &old_attrs, expanded_attrs, &counter, false, &|kv| {
-            crate::wikitext::token_utils::key_value_to_string(kv)
-        });
+        let out = build_expanded_attrs(
+            token,
+            &old_attrs,
+            expanded_attrs,
+            &counter,
+            false,
+            &|kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            None,
+        );
 
         // Exactly one token: the `<div>` (no meta/post-nl tokens for the simple
         // scenario-2 case).
