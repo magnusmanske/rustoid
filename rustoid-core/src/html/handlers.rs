@@ -231,8 +231,20 @@ impl DomHandler for BRHandler {
         if state.single_line_context.enforced() || !self.is_pbr(tree, node) {
             return None;
         }
+
+        // <h2>..</h2><p><br/>..
+        // <p>..</p><p><br/>..
+        // In all cases, we need at least 3 newlines before any content that
+        // follows the <br/>; whether we need 4 depends on what comes after
+        // (content or a </p>), handled by `after`.
+        let cur_min = state
+            .separator
+            .constraints
+            .as_ref()
+            .and_then(|c| c.min)
+            .unwrap_or(0);
         Some(Constraints {
-            min: Some(3),
+            min: Some(3.max(cur_min + 1)),
             max: None,
         })
     }
@@ -244,17 +256,35 @@ impl DomHandler for BRHandler {
         _o: NodeId,
         state: &mut SerializerState,
     ) -> Option<Constraints> {
-        if state.single_line_context.enforced() {
+        // Nothing changes with constraints if we are not in a P-P transition.
+        // <br/> has special newline-based semantics only in parser-generated
+        // <p><br/>.. HTML.
+        let parent = tree.parent(node);
+        if state.single_line_context.enforced()
+            || !PHandler::is_pp_transition(
+                tree,
+                parent.and_then(|p| crate::html::dom_tree::next_non_sep_sibling(tree, p)),
+            )
+        {
             return None;
         }
+
+        // The `before` handler has already forced 1 additional newline for all
+        // <p><br/> scenarios, which simplifies the after handler's work.
+        let cur_min = state
+            .separator
+            .constraints
+            .as_ref()
+            .and_then(|c| c.min)
+            .unwrap_or(0);
         if self.is_pbr_p(tree, node) {
             Some(Constraints {
-                min: Some(4),
+                min: Some(4.max(cur_min + 1)),
                 max: None,
             })
         } else if self.is_pbr(tree, node) {
             Some(Constraints {
-                min: Some(2),
+                min: Some(2.max(cur_min)),
                 max: None,
             })
         } else {
@@ -546,6 +576,23 @@ impl DomHandler for LIHandler {
         _s: &mut SerializerState,
     ) -> Option<Constraints> {
         self.wt_list_eol(tree, node, other)
+    }
+
+    fn first_child(
+        &mut self,
+        tree: &DomTree,
+        _n: NodeId,
+        other: NodeId,
+        _s: &mut SerializerState,
+    ) -> Option<Constraints> {
+        if !dom_utils::is_list(tree.node(other)) {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(0),
+            })
+        } else {
+            None
+        }
     }
 
     fn force_sol(&self) -> bool {
@@ -1129,6 +1176,16 @@ impl DomHandler for TableHandler {
         if !dom_utils::is_literal_html_node(tree.node(node)) {
             state.wiki_table_nesting -= 1;
         }
+        if state.separator.constraints.is_none() {
+            // Special case hack for "{|\n|}" since state.sep is cleared in
+            // SSP.emitSep after a separator is emitted. However, for "{|\n|}",
+            // the <table> tag has no element children which means lastchild ->
+            // parent constraint is never computed and set here.
+            state.separator.constraints = Some(Constraints {
+                min: Some(1),
+                max: Some(2),
+            });
+        }
         let end_tag = tree
             .node(node)
             .dp
@@ -1142,8 +1199,73 @@ impl DomHandler for TableHandler {
         tree.next_sibling(node)
     }
 
-    fn force_sol(&self) -> bool {
-        false
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        // Handle special table indentation case!
+        if tree.parent(node) == Some(other) && dom_utils::node_name(tree.node(other)) == "dd" {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(2),
+            })
+        } else {
+            Some(Constraints {
+                min: Some(1),
+                max: Some(2),
+            })
+        }
+    }
+
+    fn after(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        if (dom_utils::is_new_elt(tree, node) || dom_utils::is_new_elt(tree, other))
+            && !dom_utils::at_the_top(tree, other)
+        {
+            Some(Constraints {
+                min: Some(1),
+                max: Some(2),
+            })
+        } else {
+            Some(Constraints {
+                min: Some(0),
+                max: Some(2),
+            })
+        }
+    }
+
+    fn first_child(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        Some(Constraints {
+            min: Some(1),
+            max: Some(self.max_nls_in_table(tree, node, other)),
+        })
+    }
+
+    fn last_child(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        Some(Constraints {
+            min: Some(1),
+            max: Some(self.max_nls_in_table(tree, node, other)),
+        })
     }
 }
 
@@ -2256,22 +2378,47 @@ impl DomHandler for LinkHandler {
 
     fn before(
         &mut self,
-        _tree: &DomTree,
-        _node: NodeId,
-        _other: NodeId,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
         _state: &mut SerializerState,
     ) -> Option<Constraints> {
-        None
+        Self::sol_transparent_link_constraint(tree, node, other)
     }
 
     fn after(
         &mut self,
-        _tree: &DomTree,
-        _node: NodeId,
-        _other: NodeId,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
         _state: &mut SerializerState,
     ) -> Option<Constraints> {
-        None
+        Self::sol_transparent_link_constraint(tree, node, other)
+    }
+}
+
+impl LinkHandler {
+    /// Sol-transparent link nodes are the only thing on their line; force a
+    /// single newline separator relative to their neighbors, unless the neighbor
+    /// is the node's parent (body, p, list, td, etc.), the link is a redirect, or
+    /// it is an encapsulation wrapper. Faithful to `DOMHandlers/LinkHandler.php`.`
+    fn sol_transparent_link_constraint(
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+    ) -> Option<Constraints> {
+        if other != tree.parent(node).unwrap_or(usize::MAX)
+            && crate::html::wts_utils::is_sol_transparent_link(tree.node(node))
+            && !crate::html::wts_utils::is_redirect_link(tree.node(node))
+            && !crate::html::wts_utils::is_first_encapsulation_wrapper_node(tree.node(node))
+        {
+            Some(Constraints {
+                min: Some(1),
+                max: None,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -2297,23 +2444,44 @@ impl DomHandler for FigureHandler {
 
     fn before(
         &mut self,
-        _tree: &DomTree,
+        tree: &DomTree,
         node: NodeId,
         _other: NodeId,
         _state: &mut SerializerState,
     ) -> Option<Constraints> {
-        let _ = node;
-        None
+        if dom_utils::is_new_elt(tree, node)
+            && tree
+                .parent(node)
+                .is_some_and(|p| dom_utils::at_the_top(tree, p))
+        {
+            Some(Constraints {
+                min: Some(1),
+                max: None,
+            })
+        } else {
+            None
+        }
     }
 
     fn after(
         &mut self,
-        _tree: &DomTree,
-        _node: NodeId,
+        tree: &DomTree,
+        node: NodeId,
         _other: NodeId,
         _state: &mut SerializerState,
     ) -> Option<Constraints> {
-        None
+        if dom_utils::is_new_elt(tree, node)
+            && tree
+                .parent(node)
+                .is_some_and(|p| dom_utils::at_the_top(tree, p))
+        {
+            Some(Constraints {
+                min: Some(1),
+                max: None,
+            })
+        } else {
+            None
+        }
     }
 }
 
