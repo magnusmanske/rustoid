@@ -250,9 +250,8 @@ pub trait DomHandler {
     }
 
     /// Newline-constraint helper for table nodes. Faithful to `maxNLsInTable`.
-    fn max_nls_in_table(&self, _tree: &DomTree, node: NodeId, _orig: NodeId) -> usize {
-        // `WTUtils::isNewElt` is approximated (selser flag not yet available).
-        if dom_utils::is_new_elt(_tree, node) {
+    fn max_nls_in_table(&self, tree: &DomTree, node: NodeId, orig: NodeId) -> usize {
+        if dom_utils::is_new_elt(tree, node) || dom_utils::is_new_elt(tree, orig) {
             1
         } else {
             2

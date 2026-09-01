@@ -2841,14 +2841,39 @@ impl DomHandler for MetaHandler {
 }
 
 /// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute that
-/// is not a Parsoid bookkeeping attribute. Approximate stub.
+/// `WTSUtils::hasNonIgnorableAttributes` — whether a node has any attribute
+/// that isn't Parsoid bookkeeping. An attribute is *ignorable* only when its key
+/// starts with `data-parsoid`, is `data-object-id` (`DATA_OBJECT_ATTR_NAME`), or
+/// is an `id` carrying a node-data-id counter value (`^mw[\w-]{2,}$`).
 fn has_non_ignorable_attributes(node: &crate::dom::node::Node) -> bool {
     node.attrs.iter().any(|a| {
-        !matches!(
-            a.key.as_str(),
-            "data-parsoid" | "data-mw" | "data-object-id" | "typeof" | "about" | "rel" | "class"
-        )
+        let k = a.key.as_str();
+        if k.starts_with("data-parsoid") {
+            return false;
+        }
+        if k == "data-object-id" {
+            return false;
+        }
+        // An `id` whose value is a node-data-id counter is ignorable
+        // (`CounterType::NODE_DATA_ID::matches` → `/^mw[\w-]{2,}$/D`).
+        if k == "id" && is_node_data_id(&a.value) {
+            return false;
+        }
+        true
     })
+}
+
+/// `CounterType::NODE_DATA_ID::matches` → `/^mw[\w-]{2,}$/D` (the `mw` prefix
+/// followed by at least two word-/hyphen characters, e.g. `mw-xy`).
+fn is_node_data_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if !id.starts_with("mw") {
+        return false;
+    }
+    bytes[2..].len() >= 2
+        && bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
 }
 
 /// `FallbackHTMLHandler` — serialize a node as its literal HTML form.
