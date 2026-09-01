@@ -316,8 +316,10 @@ pub trait DomHandler {
         end_symbol: Option<&str>,
         tree: &DomTree,
         node: NodeId,
+        state: &SerializerState,
     ) -> String {
-        let s_attribs = crate::html::serializer::serialize_attributes_partial(tree.node(node));
+        let s_attribs =
+            crate::html::serializer::serialize_attributes_partial(tree.node(node), state.env);
         if !s_attribs.is_empty() {
             format!("{symbol} {s_attribs} {}", end_symbol.unwrap_or("|"))
         } else {
@@ -333,8 +335,9 @@ pub trait DomHandler {
         end_symbol: Option<&str>,
         tree: &DomTree,
         node: NodeId,
+        state: &SerializerState,
     ) -> String {
-        self.serialize_table_element(symbol, end_symbol, tree, node)
+        self.serialize_table_element(symbol, end_symbol, tree, node, state)
     }
 
     /// Whether `stx === 'row'` table-cell syntax is still valid after table edits

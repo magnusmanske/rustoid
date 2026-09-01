@@ -1102,7 +1102,7 @@ impl DomHandler for CaptionHandler {
             .as_ref()
             .and_then(|d| d.start_tag_src.clone())
             .unwrap_or_else(|| "|+".to_string());
-        let table_tag = self.serialize_table_tag(&symbol, None, tree, node);
+        let table_tag = self.serialize_table_tag(&symbol, None, tree, node, state);
         state.emit_chunk(table_tag, node, tree);
         crate::html::serializer::walk_children(tree, node, state);
         tree.next_sibling(node)
@@ -1167,7 +1167,7 @@ impl DomHandler for TableHandler {
         if indent_table {
             state.single_line_context.disable();
         }
-        let tag = self.serialize_table_tag(&wt, Some(""), tree, node);
+        let tag = self.serialize_table_tag(&wt, Some(""), tree, node, state);
         state.emit_chunk(tag, node, tree);
         if !dom_utils::is_literal_html_node(tree.node(node)) {
             state.wiki_table_nesting += 1;
@@ -1312,7 +1312,7 @@ impl DomHandler for TRHandler {
                 .as_ref()
                 .and_then(|d| d.start_tag_src.clone())
                 .unwrap_or_else(|| "|-".to_string());
-            let tag = self.serialize_table_tag(&wt, Some(""), tree, node);
+            let tag = self.serialize_table_tag(&wt, Some(""), tree, node, state);
             state.emit_chunk(tag, node, tree);
         }
         crate::html::serializer::walk_children(tree, node, state);
@@ -1450,7 +1450,8 @@ impl DomHandler for TDHandler {
             start_tag_src
         };
 
-        let td_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
+        let td_tag =
+            self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node, state);
         // `$inWideTD = (bool)preg_match('/\|\||^{{!}}({{!}}|\|)|^(\||{{!}}){{!}}/', $tdTag)`.
         let in_wide_td = td_tag.contains("||")
             || td_tag.starts_with("{{!}}{{!}}")
@@ -1582,7 +1583,8 @@ impl DomHandler for THHandler {
             start_tag_src
         };
 
-        let th_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
+        let th_tag =
+            self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node, state);
         let leading_space = self.get_leading_space(tree, node, "");
         state.emit_chunk(format!("{th_tag}{leading_space}"), node, tree);
 
@@ -2887,7 +2889,10 @@ impl DomHandler for FallbackHTMLHandler {
         node: NodeId,
         state: &mut SerializerState,
     ) -> Option<NodeId> {
-        let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(tree.node(node));
+        let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(
+            tree.node(node),
+            state.env,
+        );
         state.emit_chunk(tag, node, tree);
 
         if tree.first_child(node).is_some() {

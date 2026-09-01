@@ -263,9 +263,12 @@ pub struct WikitextSerializer;
 impl WikitextSerializer {
     /// Serialize the opening HTML tag for a literal-HTML node. Faithful to the
     /// non-selser, non-`autoInsertedStart` skeleton of `serializeHTMLTag`.
-    pub fn serialize_html_tag(node: &crate::dom::node::Node) -> String {
+    pub fn serialize_html_tag(
+        node: &crate::dom::node::Node,
+        env: Option<crate::html::env::SerializerEnv>,
+    ) -> String {
         let name = crate::html::wts_utils::node_name(node);
-        let attrs = serialize_attributes(node);
+        let attrs = serialize_attributes(node, env);
         let suffix = if attrs.is_empty() {
             String::new()
         } else {
@@ -288,7 +291,7 @@ impl WikitextSerializer {
     /// This variant carries no environment, so link/media handlers fall back to
     /// literal HTML; use [`serialize_dom_with_env`] for full link serialization.
     pub fn serialize_dom(root: crate::dom::node::Node) -> String {
-        Self::serialize_dom_internal(root, None, false, None)
+        Self::serialize_dom_internal(root, None, false, None, false)
     }
 
     /// Serialize with a [`SerializerEnv`] so link/media handlers can run.
@@ -296,7 +299,7 @@ impl WikitextSerializer {
         root: crate::dom::node::Node,
         env: crate::html::env::SerializerEnv,
     ) -> String {
-        Self::serialize_dom_internal(root, Some(env), false, None)
+        Self::serialize_dom_internal(root, Some(env), false, None, false)
     }
 
     /// Serialize in selective-serialization (selser) mode: unmodified nodes with
@@ -310,17 +313,29 @@ impl WikitextSerializer {
         env: Option<crate::html::env::SerializerEnv>,
         original_wikitext: &str,
     ) -> String {
-        Self::serialize_dom_internal(root, env, true, Some(original_wikitext))
+        Self::serialize_dom_internal(root, env, true, Some(original_wikitext), false)
+    }
+
+    /// Serialize a sub-DOM in attribute context (`domToWikitext` with
+    /// `onSOL => false` + `inAttribute => true`): used to reconstruct a
+    /// template-generated attribute key/value from its `data-mw.attribs` `html`.
+    pub fn dom_to_wikitext_in_attribute(
+        root: crate::dom::node::Node,
+        env: crate::html::env::SerializerEnv,
+    ) -> String {
+        Self::serialize_dom_internal(root, Some(env), false, None, true)
     }
 
     /// The shared `serializeDOM` implementation. `selser` toggles the reuse-
     /// original-source branch; `selser_data` carries the revision wikitext for
-    /// that branch.
+    /// that branch. `in_attribute` serializes the fragment as a template-generated
+    /// attribute value (`onSOL = false`, `inAttribute = true`).
     fn serialize_dom_internal(
         root: crate::dom::node::Node,
         env: Option<crate::html::env::SerializerEnv>,
         selser: bool,
         selser_rev_text: Option<&str>,
+        in_attribute: bool,
     ) -> String {
         let mut root = root;
         // DOM normalization (quote-tag minimization / empty-tag stripping) runs
@@ -338,6 +353,11 @@ impl WikitextSerializer {
             state.init_mode(true);
             state.selser_data =
                 selser_rev_text.map(|t| crate::html::dsr::SelectiveUpdateData::new(t.to_string()));
+        }
+        if in_attribute {
+            state.in_attribute = true;
+            state.on_sol = false;
+            state.at_start_of_output = false;
         }
         // Serialize the body content: `serializeDOM` extracts `<body>` (PHP's
         // `DOMCompat::getBody`), so skip a synthetic `<html>`/`<body>` wrapper
@@ -379,15 +399,22 @@ fn body_content_node(tree: &DomTree, root: NodeId) -> NodeId {
     root
 }
 
-/// Serialize an element's attributes to an HTML attribute string. This is a
-/// faithful-enough skeleton of `serializeAttributes` for the IGNORED list and
-/// the plain (non-shadow) attribute case; `data-parsoid`/`data-mw` and RDFa
-/// `about`/`typeof`/`rel` attributes are stripped.
-pub fn serialize_attributes_partial(node: &crate::dom::node::Node) -> String {
-    serialize_attributes(node)
+/// Serialize an element's attributes to an HTML attribute string. This is the
+/// faithful port of `serializeAttributes`: `data-parsoid`/`data-mw`/RDFa are
+/// stripped, node-data-id and auto-generated heading ids are dropped unless
+/// reused, `mw-empty-elt` is stripped from flagged empty elements, and
+/// template-generated keys/values are reconstructed from `data-mw.attribs`.
+pub fn serialize_attributes_partial(
+    node: &crate::dom::node::Node,
+    env: Option<crate::html::env::SerializerEnv>,
+) -> String {
+    serialize_attributes(node, env)
 }
 
-fn serialize_attributes(node: &crate::dom::node::Node) -> String {
+fn serialize_attributes(
+    node: &crate::dom::node::Node,
+    env: Option<crate::html::env::SerializerEnv>,
+) -> String {
     let mut out: Vec<String> = Vec::new();
 
     for attr in &node.attrs {
@@ -469,25 +496,25 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
             continue;
         }
 
-        // Regular attribute: honor shadow info (`a`/`sa`) and the `data-x-`
-        // attribute-key prefix strip, mirroring the faithful path.
+        // Regular attribute: honor shadow info (`a`/`sa`) plus template-generated
+        // key/value reconstruction (`data-mw.attribs` `key.html`/`value.html`).
         let shadow = crate::html::wts_utils::get_shadow_info(node, k, Some(v));
-        let kk = k.trim_start_matches("data-x-");
-        let vv = shadow.value.as_str();
+        let value = shadow.value.as_str();
+        let kk = get_attribute_key(node, k, env);
+        let vv = get_attribute_value(node, k, env).unwrap_or_else(|| value.to_string());
+        let kk = strip_data_x_prefix(&kk).to_string();
         if !vv.is_empty() {
             if !shadow.fromsrc {
                 // Escaped from loaded attr value (not original source). Comments
-                // and annotation tags embedded in the value are left unescaped
-                // (faithful to `preg_split(commentsOrAnnotationsRE)` walking the
-                // odd (delimiter) segments unescaped).
-                let escaped = escape_non_comment_segments(vv);
+                // and annotation tags embedded in the value are left unescaped.
+                let escaped = escape_non_comment_segments(&vv);
                 out.push(format!("{kk}=\"{escaped}\""));
             } else {
                 out.push(format!("{kk}=\"{}\"", vv.replace('"', "&quot;")));
             }
         } else if kk.contains('{') || kk.contains('<') {
             // Templated / include / ext-tag generated attribute key.
-            out.push(kk.to_string());
+            out.push(kk);
         } else {
             out.push(format!("{kk}=\"\""));
         }
@@ -515,6 +542,126 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
     }
 
     out.join(" ")
+}
+
+/// `WikitextSerializer::getAttributeKey` — reconstruct a template-generated
+/// attribute key from `data-mw.attribs[i].key.html`. Returns the reconstructed
+/// wikitext, or `key` unchanged when there is no matching generated key.
+fn get_attribute_key(
+    node: &crate::dom::node::Node,
+    key: &str,
+    env: Option<crate::html::env::SerializerEnv>,
+) -> String {
+    for (k_str, k_html) in attribs_key_value_html(node) {
+        if k_str == key
+            && let Some(html) = k_html
+        {
+            return dom_to_wikitext_from_html(html, env);
+        }
+    }
+    key.to_string()
+}
+
+/// `WikitextSerializer::getAttributeValue` — reconstruct a template-generated
+/// attribute *value* from `data-mw.attribs[i].value.html`. Returns `None` when
+/// there is no matching generated value (so the caller falls back to the shadow
+/// value).
+fn get_attribute_value(
+    node: &crate::dom::node::Node,
+    key: &str,
+    env: Option<crate::html::env::SerializerEnv>,
+) -> Option<String> {
+    for (k_str, v_html) in attribs_value_html(node) {
+        if k_str == key
+            && let Some(html) = v_html
+        {
+            return Some(dom_to_wikitext_from_html(html, env));
+        }
+    }
+    None
+}
+
+/// Iterate over `data-mw.attribs`, yielding `(keyString, key.html?)` for each
+/// entry (mirrors `getAttributeKey` walking `$tplAttrs`).
+fn attribs_key_value_html(
+    node: &crate::dom::node::Node,
+) -> impl Iterator<Item = (String, Option<String>)> {
+    let attribs = parse_attribs(node);
+    attribs.into_iter().filter_map(|entry| {
+        let mut kv = entry.as_array()?.iter();
+        let key_obj = kv.next()?;
+        let key_str = data_mw_value_txt(key_obj)?;
+        let key_html = data_mw_value_html(key_obj);
+        Some((key_str, key_html))
+    })
+}
+
+/// Iterate over `data-mw.attribs`, yielding `(keyString, value.html?)` for each
+/// entry (mirrors `getAttributeValue` walking `$tplAttrs`).
+fn attribs_value_html(
+    node: &crate::dom::node::Node,
+) -> impl Iterator<Item = (String, Option<String>)> {
+    let attribs = parse_attribs(node);
+    attribs.into_iter().filter_map(|entry| {
+        let mut kv = entry.as_array()?.iter();
+        let key_obj = kv.next()?;
+        let value_obj = kv.next()?;
+        let key_str = data_mw_value_txt(key_obj)?;
+        let value_html = data_mw_value_html(value_obj);
+        Some((key_str, value_html))
+    })
+}
+
+/// Parse `node.data_mw` (a raw JSON string) and return its `attribs` array (an
+/// array of `[key, value]` pairs). Empty when absent/malformed.
+fn parse_attribs(node: &crate::dom::node::Node) -> Vec<serde_json::Value> {
+    let Some(dm) = node.data_mw.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(dm) else {
+        return Vec::new();
+    };
+    json.get("attribs")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The plain-text key string of a `data-mw.attribs` key object (`getKeyString`).
+fn data_mw_value_txt(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o.get("txt").and_then(|t| t.as_str()).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The `html` field of a `data-mw.attribs` key/value object, if present.
+fn data_mw_value_html(v: &serde_json::Value) -> Option<String> {
+    v.get("html").and_then(|h| h.as_str()).map(str::to_string)
+}
+
+/// Serialize a template-generated attribute key/value `html` fragment back to
+/// wikitext (`domToWikitext` with `onSOL => false` + `inAttribute => true`).
+fn dom_to_wikitext_from_html(html: String, env: Option<crate::html::env::SerializerEnv>) -> String {
+    let Ok(root) = crate::html::parse::parse_html(&html) else {
+        return String::new();
+    };
+    match env {
+        Some(env) => WikitextSerializer::dom_to_wikitext_in_attribute(root, env),
+        None => WikitextSerializer::serialize_dom(root),
+    }
+}
+
+/// Remove a leading `data-x-` prefix (case-insensitive), mirroring PHP's
+/// `preg_replace('/^data-x-/i', '', $kk, 1)`.
+fn strip_data_x_prefix(kk: &str) -> &str {
+    const PREFIX: &str = "data-x-";
+    if kk.len() >= PREFIX.len() && kk[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        &kk[PREFIX.len()..]
+    } else {
+        kk
+    }
 }
 
 /// Escape the non-comment/non-annotation segments of an attribute value that
@@ -606,7 +753,7 @@ mod tests {
         p.set_attr("class", "mw-empty-elt");
         p.set_attr("style", "color:red");
         assert_eq!(
-            WikitextSerializer::serialize_html_tag(&p),
+            WikitextSerializer::serialize_html_tag(&p, None),
             "<p style=\"color:red\">"
         );
 
@@ -615,7 +762,7 @@ mod tests {
         let mut div = Node::element(ElementKind::Div);
         div.set_attr("class", "mw-empty-elt");
         assert_eq!(
-            WikitextSerializer::serialize_html_tag(&div),
+            WikitextSerializer::serialize_html_tag(&div, None),
             "<div class=\"mw-empty-elt\">"
         );
     }
@@ -636,9 +783,56 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            serialize_attributes(&div),
+            serialize_attributes(&div, None),
             "style=\"color:red\" align=\"left\""
         );
+    }
+
+    #[test]
+    fn test_parse_attribs_and_data_mw_helpers() {
+        // `data-mw.attribs` is a JSON array of `[key, value]` pairs where each
+        // key/value is a string or `{txt, html, uneditable}` object.
+        let dm = r#"{"attribs":[[{"txt":"style","html":"<b>x</b>"},{"html":""}]]}"#;
+        let mut div = Node::element(ElementKind::Div);
+        div.data_mw = Some(dm.to_string());
+
+        let attribs = parse_attribs(&div);
+        assert_eq!(attribs.len(), 1);
+
+        // keyString = `.txt`; key.html / value.html are extracted separately.
+        let keys: Vec<(String, Option<String>)> = attribs_key_value_html(&div).collect();
+        assert_eq!(keys[0].0, "style");
+        assert_eq!(keys[0].1.as_deref(), Some("<b>x</b>"));
+
+        let vals: Vec<(String, Option<String>)> = attribs_value_html(&div).collect();
+        assert_eq!(vals[0].0, "style");
+        assert_eq!(vals[0].1.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_strip_data_x_prefix() {
+        assert_eq!(strip_data_x_prefix("data-x-foo"), "foo");
+        assert_eq!(strip_data_x_prefix("DATA-X-foo"), "foo");
+        assert_eq!(strip_data_x_prefix("foo"), "foo");
+    }
+
+    #[test]
+    fn test_is_node_data_id() {
+        assert!(is_node_data_id("mw-xy"));
+        assert!(is_node_data_id("mwA1"));
+        assert!(is_node_data_id("mw__"));
+        assert!(is_node_data_id("mw-x")); // two trailing chars ("-x")
+        assert!(!is_node_data_id("mwx")); // only one trailing char
+        assert!(!is_node_data_id("x-mw-xy"));
+    }
+
+    #[test]
+    fn test_is_transclusion_about() {
+        assert!(is_transclusion_about("#mwt1"));
+        assert!(is_transclusion_about("#mwt123"));
+        assert!(!is_transclusion_about("#mwt"));
+        assert!(!is_transclusion_about("#mwt1 foo"));
+        assert!(!is_transclusion_about("#mwtx"));
     }
 
     #[test]
