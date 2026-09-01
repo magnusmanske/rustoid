@@ -211,6 +211,13 @@ impl Html5TreeBuilder {
             return;
         }
 
+        // Parsoid drops unmatched closing `<pre>` tags (they're always a parse
+        // error outside a `<pre>` block, so there's nothing meaningful to
+        // round-trip). See the `<nowiki> and <pre> preference` fixture.
+        if name == "pre" && !is_start {
+            return;
+        }
+
         let mut src = dp.src.clone();
 
         // PHP treats both an unset `src` and an empty/`'0'`-falsy `src` as
@@ -1753,6 +1760,24 @@ mod tests {
         } else {
             panic!("placeholder missing data-parsoid");
         }
+    }
+
+    #[test]
+    fn test_unmatched_pre_end_tag_dropped() {
+        // An unmatched `</pre>` end tag is dropped (no placeholder), per the
+        // `<nowiki> and <pre> preference` fixture (Parsoid drops unmatched
+        // closing pre tags).
+        let dp = DataParsoid {
+            src: Some("</pre>".to_string()),
+            stx: Some("html".to_string()),
+            ..DataParsoid::default()
+        };
+
+        let mut builder = Html5TreeBuilder::with_source("");
+        builder.insert_placeholder_meta("pre", &dp, false);
+        let doc = builder.finalize();
+
+        assert!(find_placeholder(&doc).is_none(), "got: {doc:?}");
     }
 
     #[test]
