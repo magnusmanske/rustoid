@@ -529,19 +529,25 @@ pub struct PHandler;
 
 impl PHandler {
     /// `PHandler::treatAsPPTransition`: should `node` be treated as a P-wrapped
-    /// node for newline-constraint purposes? Faithful to the private PHP helper.
+    /// node for newline-constraint purposes? Faithful to the private PHP helper
+    /// (Text, or a non-block/non-literal/non-meta/non-encapsulated/non-link/
+    /// non-include/non-annotation element).
     fn treat_as_pp_transition(tree: &DomTree, node: NodeId) -> bool {
-        if crate::html::dom_tree::is_iew(tree, node)
-            || matches!(tree.node(node).kind, NodeKind::Text(_))
-        {
-            // Text nodes are treated as P/P transitions.
-            return matches!(tree.node(node).kind, NodeKind::Text(_));
+        if matches!(tree.node(node).kind, NodeKind::Text(_)) {
+            return true;
         }
-        let name = dom_utils::node_name(tree.node(node));
+        if matches!(tree.node(node).kind, NodeKind::Comment(_)) {
+            return false;
+        }
+        let n = tree.node(node);
         !dom_utils::at_the_top(tree, node)
-            && !dom_utils::is_wikitext_block_node(tree.node(node))
-            && !dom_utils::is_literal_html_node(tree.node(node))
-            && name != "meta"
+            && !dom_utils::is_wikitext_block_node(n)
+            && !dom_utils::is_literal_html_node(n)
+            && !crate::html::wts_utils::is_first_encapsulation_wrapper_node(n)
+            && dom_utils::node_name(n) != "meta"
+            && !crate::html::wts_utils::is_sol_transparent_link(n)
+            && dom_utils::match_type_of(n, "^mw:Includes/").is_none()
+            && dom_utils::match_type_of(n, "^mw:Annotation/").is_none()
     }
 
     /// `PHandler::isPPTransition`: is `node` a P-wrapped node or one to treat as
