@@ -1039,7 +1039,13 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         let output_saved = self.output.len();
 
+        // PHP's `table_line = sc:space_or_comment* … tl:(…) { array_merge($sc, $tl) }`
+        // captures the leading `sc` (spaces/comments) and merges it *before* the
+        // table tokens. Emit the leading spaces as text so they survive as
+        // separator content (e.g. `\n |[[Bar]]` keeps its leading space).
+        let sc_start = self.pos;
         self.consume_spaces();
+        self.emit_text(self.input[sc_start..self.pos].to_string());
         self.try_comment();
 
         if self.try_table_start_tag() {

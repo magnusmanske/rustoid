@@ -31,6 +31,66 @@ pub fn walk_children(tree: &DomTree, node: NodeId, state: &mut SerializerState) 
     }
 }
 
+/// Serialize a text node's value, splitting off a trailing `\n`-run into the
+/// separator buffer and a leading `\n`-run out of it. Faithful to
+/// `WikitextSerializer::serializeText` (the `SEPARATOR_SUFFIX_WITH_NLS_RE` /
+/// `SEPARATOR_PREFIX_WITH_NLS_RE` splitting), which is what lets a table cell's
+/// trailing `\n ` (`[1]\n `) round-trip as the `\n ` separator before the next
+/// cell rather than as inline content.
+pub fn serialize_text(text: &str, node: NodeId, tree: &DomTree, state: &mut SerializerState) {
+    // `SEPARATOR_SUFFIX_WITH_NLS_RE = /\n[ \t\r\n]*$/D`: a trailing newline run.
+    let mut body = text;
+    let trailing = match body.rfind('\n') {
+        Some(i)
+            if body[i + 1..]
+                .chars()
+                .all(|c| c == ' ' || c == '\t' || c == '\r') =>
+        {
+            let tail = &body[i..];
+            body = &body[..i];
+            tail
+        }
+        _ => "",
+    };
+
+    // `SEPARATOR_PREFIX_WITH_NLS_RE = /^[ \t]*\n+[ \t\r\n]*/`: a leading newline run.
+    if !state.in_indent_pre
+        && let Some(idx) = first_nl_run_end(body)
+    {
+        state.append_sep(&body[..idx]);
+        body = &body[idx..];
+    }
+
+    // Emit the (now separator-stripped) body.
+    state.emit_chunk(body, node, tree);
+
+    // Move the trailing newline run into the next separator (`$newSepMatch`).
+    if !trailing.is_empty() && state.separator.src.is_none() {
+        state.append_sep(trailing);
+    }
+}
+
+/// Byte index just past the leading `[ \t]*\n+[ \t\r\n]*` run of `s`, or `None` if
+/// there is no such leading run. Faithful to `SEPARATOR_PREFIX_WITH_NLS_RE`.
+fn first_nl_run_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    let nl_start = i;
+    while i < bytes.len() && matches!(bytes[i], b'\n' | b'\r') {
+        i += 1;
+    }
+    if i == nl_start {
+        return None; // no newline after the leading spaces/tabs
+    }
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    Some(i)
+}
+
 /// Serialize a single node, delegating to its handler (or emitting text). This
 /// is the faithful `WikitextSerializer::serializeNode` (non-selser): it handles
 /// the text/comment/diff-marker branches, computes separator constraints before
@@ -41,7 +101,9 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
 
     let n = tree.node(node);
     match &n.kind {
-        // Text: accumulate pure whitespace into the separator, else emit.
+        // Text: accumulate pure whitespace into the separator, else emit
+        // (splitting a trailing `\n`-run back into the separator, mirroring
+        // `serializeTextNode` / `serializeText`).
         NodeKind::Text(text) => {
             if !state.in_indent_pre && text.chars().all(|c| c.is_whitespace()) {
                 state.append_sep(text);
@@ -49,7 +111,7 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
                 state.needs_escaping = true;
                 state.is_last_child =
                     crate::html::dom_tree::next_non_deleted_sibling(tree, node).is_none();
-                state.emit_chunk(text.clone(), node, tree);
+                serialize_text(text, node, tree, state);
                 state.needs_escaping = false;
             }
         }
@@ -677,5 +739,57 @@ mod tests {
         let env = crate::html::env::SerializerEnv::new(&config, &title);
         let wt = WikitextSerializer::serialize_dom_selser(doc, Some(env), original);
         assert_eq!(wt, original);
+    }
+
+    #[test]
+    fn test_first_nl_run_end() {
+        // Leading `[ \t]*\n+[ \t\r\n]*` runs.
+        assert_eq!(first_nl_run_end("\n "), Some(2));
+        assert_eq!(first_nl_run_end(" \n \t"), Some(4));
+        assert_eq!(first_nl_run_end("\t\n\nbar"), Some(3));
+        // No newline → None.
+        assert_eq!(first_nl_run_end(" "), None);
+        assert_eq!(first_nl_run_end("foo"), None);
+        // Space/newline mixed then content.
+        assert_eq!(first_nl_run_end("\nfoo"), Some(1));
+    }
+
+    #[test]
+    fn test_serialize_text_splits_trailing_nl_into_separator() {
+        // A table cell's text `[1]\n ` keeps `[1]` inline and moves `\n ` into
+        // the separator (the `Newlines reset separator state` round-trip).
+        let mut doc = Node::document();
+        let mut td = Node::element(ElementKind::TableCell);
+        td.push_child(Node::text("[1]\n "));
+        doc.push_child(td);
+
+        let tree = DomTree::new(doc);
+        let td_id = tree.first_child(tree.root()).unwrap();
+        let text_id = tree.first_child(td_id).unwrap();
+
+        let mut state = SerializerState::new();
+        serialize_text("[1]\n ", text_id, &tree, &mut state);
+        assert_eq!(state.separator.src.as_deref(), Some("\n "));
+        state.flush_line();
+        assert_eq!(state.out, "[1]");
+    }
+
+    #[test]
+    fn test_serialize_text_leading_nl_becomes_separator() {
+        // A leading newline run is re-emitted as a separator before the body
+        // (faithful to `SEPARATOR_PREFIX_WITH_NLS_RE` splitting).
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("\nfoo"));
+        doc.push_child(p);
+
+        let tree = DomTree::new(doc);
+        let p_id = tree.first_child(tree.root()).unwrap();
+        let text_id = tree.first_child(p_id).unwrap();
+
+        let mut state = SerializerState::new();
+        serialize_text("\nfoo", text_id, &tree, &mut state);
+        state.flush_line();
+        assert_eq!(state.out, "\nfoo");
     }
 }

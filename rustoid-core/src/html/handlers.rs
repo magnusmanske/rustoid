@@ -2330,6 +2330,13 @@ mod tests {
 
     #[test]
     fn test_pre_handler_trailing_newline_preserved() {
+        // `<pre>foo\n</pre>`: `serialize_text` strips the trailing newline
+        // (faithful to `WikitextSerializer::serializeText`'s unconditional
+        // `SEPARATOR_SUFFIX_WITH_NLS_RE` split) into the indent-pre
+        // sub-serialization's discarded separator, so the `<pre>` body is
+        // `foo` and the trailing newline does not leak into the outer
+        // separator. The PreHandler's own `append_sep(trailing_nl)` is
+        // therefore a no-op (mirroring PHP's dead `str_ends_with` check).
         let mut doc = Node::document();
         let mut pre = Node::element(ElementKind::Preformatted);
         pre.push_child(Node::text("foo\n"));
@@ -2341,10 +2348,11 @@ mod tests {
         let mut state = SerializerState::new();
         let mut handler = PreHandler;
         handler.handle(&tree, pre_id, &mut state);
-        // Trailing newline is stripped from the content and moved to the
-        // separator source.
-        assert_eq!(state.out, "");
-        assert_eq!(state.separator.src.as_deref(), Some("\n"));
+        // The trailing newline is consumed by the indent-pre sub-serialization,
+        // not moved into the outer separator.
+        assert_eq!(state.separator.src.as_deref(), None);
+        state.flush_line();
+        assert_eq!(state.out, " foo");
     }
 
     #[test]
