@@ -1451,27 +1451,110 @@ impl DomHandler for EncapsulatedContentHandler {
     }
 }
 
-/// `EncapsulatedContentHandler::handleListPrefix` (simplified: the shared-list-
-/// prefix bullet recovery is only relevant for about-id-marked list items; we
-/// return the parent list bullets when the node is a first-content list item).
+/// `EncapsulatedContentHandler::handleListPrefix` — recover list bullets for a
+/// first-encapsulation-wrapper list/list-item whose template source lacks the
+/// shared bullet prefix (so serializing `data-mw.parts`/`src` alone would drop
+/// the container's assigned bullet). Faithful to the three PHP helpers
+/// (`handleListPrefix`, `parentBulletsHaveBeenEmitted`,
+/// `isTplListWithoutSharedPrefix`).
 impl EncapsulatedContentHandler {
     fn handle_list_prefix(tree: &DomTree, node: NodeId) -> String {
         let n = tree.node(node);
-        if !crate::html::dom_utils::is_list_or_list_item(n) {
+        if !dom_utils::is_list_or_list_item(n)
+            || Self::parent_bullets_have_been_emitted(tree, node)
+            || crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_some()
+            || !Self::is_tpl_list_without_shared_prefix(tree, node)
+            // Definition-list rows are emitted for the parent node, so there's
+            // nothing to prefix for a `dd` in row syntax.
+            || (dom_utils::node_name(n) == "dd"
+                && n.dp.as_ref().and_then(|d| d.stx.as_deref()) == Some("row"))
+        {
             return String::new();
         }
-        // Only the first (no previous non-sep sibling) about-id list item that
-        // lacks a shared prefix needs its parent's bullets.
-        if crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_some() {
-            return String::new();
+        // `getListBullets` on the *parent* list node.
+        match tree.parent(node) {
+            Some(parent) => DefaultDomHandler.get_list_bullets(tree, parent),
+            None => String::new(),
         }
-        let Some(parent) = tree.parent(node) else {
-            return String::new();
+    }
+
+    /// `EncapsulatedContentHandler::parentBulletsHaveBeenEmitted` — whether the
+    /// containing list's bullets are already emitted (so we must not re-emit).
+    fn parent_bullets_have_been_emitted(tree: &DomTree, node: NodeId) -> bool {
+        let n = tree.node(node);
+        if dom_utils::is_literal_html_node(n) {
+            return true;
+        }
+        if dom_utils::is_list(n) {
+            // A list's bullets are emitted unless it is itself a list item's
+            // child (nested list); in that case the parent item owns them.
+            return !tree
+                .parent(node)
+                .is_some_and(|p| dom_utils::is_list_item(tree.node(p)));
+        }
+        // Otherwise the node must be a list item (`li`/`dt`/`dd`): its bullets
+        // are already emitted unless its (unwrapped) parent is the expected
+        // container (`ul`/`ol` for `li`, `dl` for `dt`/`dd`).
+        let name = dom_utils::node_name(n);
+        let expected: &[&str] = match name.as_str() {
+            "li" => &["ul", "ol"],
+            "dt" | "dd" => &["dl"],
+            _ => return true,
         };
-        if !crate::html::dom_utils::is_list(tree.node(parent)) {
-            return String::new();
+        let mut parent = match tree.parent(node) {
+            Some(p) => p,
+            None => return true,
+        };
+        // Skip builder-inserted wrappers.
+        while DefaultDomHandler.is_builder_inserted_elt(tree, parent) {
+            match tree.parent(parent) {
+                Some(p) => parent = p,
+                None => return true,
+            }
         }
-        DefaultDomHandler.get_list_bullets(tree, parent)
+        !expected.contains(&dom_utils::node_name(tree.node(parent)).as_str())
+    }
+
+    /// `EncapsulatedContentHandler::isTplListWithoutSharedPrefix` — whether a
+    /// transclusion/extension/param wrapper's list lacks the shared bullet
+    /// prefix (so the container's bullet must be recovered).
+    fn is_tpl_list_without_shared_prefix(tree: &DomTree, node: NodeId) -> bool {
+        let n = tree.node(node);
+        if !crate::html::wts_utils::is_first_encapsulation_wrapper_node(n) {
+            return false;
+        }
+        if dom_utils::has_type_of(n, "mw:Transclusion") {
+            // If the first part is a string, the template range was expanded to
+            // include this list element; otherwise the container isn't part of
+            // the template source and we must emit its bullets.
+            let first_part_is_string = n
+                .data_mw
+                .as_deref()
+                .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+                .and_then(|v| v.get("parts").and_then(|p| p.get(0)).cloned())
+                .is_some_and(|p| p.is_string());
+            if !first_part_is_string {
+                return true;
+            }
+            // Less than two bullets => no shared prefix was assigned.
+            let first = n
+                .data_mw
+                .as_deref()
+                .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+                .and_then(|v| {
+                    v.get("parts")
+                        .and_then(|p| p.get(0))
+                        .and_then(|p| p.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            !first.chars().all(|c| matches!(c, '*' | '#' | ':' | ';')) || first.chars().count() < 2
+        } else if dom_utils::match_type_of(n, "^mw:(Extension|Param)").is_some() {
+            // Containers aren't part of the source here, so emit their bullets.
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -2469,5 +2552,72 @@ mod tests {
         handler.handle(&tree, span_id, &mut state);
         state.flush_line();
         assert_eq!(state.out, "{{Foo|bar}}");
+    }
+
+    #[test]
+    fn test_parent_bullets_have_been_emitted() {
+        // <ul><li>a</li></ul>: the `li`'s containing `ul` owns the bullet, so it
+        // has NOT been emitted yet.
+        let mut doc = Node::document();
+        let mut ul = Node::element(ElementKind::UnorderedList);
+        ul.push_child(Node::element(ElementKind::ListItem));
+        doc.push_child(ul);
+        let tree = DomTree::new(doc);
+        let ul_id = tree.first_child(tree.root()).unwrap();
+        let li_id = tree.first_child(ul_id).unwrap();
+        assert!(!EncapsulatedContentHandler::parent_bullets_have_been_emitted(&tree, li_id));
+
+        // A top-level `ul` (parent is not a list item) has its bullets already
+        // emitted (there is no wrapping item).
+        assert!(EncapsulatedContentHandler::parent_bullets_have_been_emitted(&tree, ul_id));
+
+        // Literal-HTML list item has its bullets emitted as literal HTML.
+        let mut doc2 = Node::document();
+        let mut li = Node::element(ElementKind::ListItem);
+        li.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            stx: Some("html".to_string()),
+            ..Default::default()
+        });
+        doc2.push_child(li);
+        let tree2 = DomTree::new(doc2);
+        let li_id2 = tree2.first_child(tree2.root()).unwrap();
+        assert!(EncapsulatedContentHandler::parent_bullets_have_been_emitted(&tree2, li_id2));
+    }
+
+    #[test]
+    fn test_is_tpl_list_without_shared_prefix() {
+        // A transclusion wrapper whose first part is a plain string with fewer
+        // than two bullets => no shared prefix.
+        let mut doc = Node::document();
+        let mut li = Node::element(ElementKind::ListItem);
+        li.set_attr("typeof", "mw:Transclusion");
+        li.set_attr("about", "#mwt1");
+        li.data_mw = Some(r#"{"parts":["a"]}"#.to_string());
+        doc.push_child(li);
+        let tree = DomTree::new(doc);
+        let li_id = tree.first_child(tree.root()).unwrap();
+        assert!(EncapsulatedContentHandler::is_tpl_list_without_shared_prefix(&tree, li_id));
+
+        // A transclusion wrapper whose first part is `**` (two bullets) has a
+        // shared prefix, so no recovery is needed.
+        let mut doc2 = Node::document();
+        let mut li2 = Node::element(ElementKind::ListItem);
+        li2.set_attr("typeof", "mw:Transclusion");
+        li2.set_attr("about", "#mwt2");
+        li2.data_mw = Some(r#"{"parts":["**"]}"#.to_string());
+        doc2.push_child(li2);
+        let tree2 = DomTree::new(doc2);
+        let li_id2 = tree2.first_child(tree2.root()).unwrap();
+        assert!(!EncapsulatedContentHandler::is_tpl_list_without_shared_prefix(&tree2, li_id2));
+
+        // An extension wrapper (no bullet string first part) needs recovery.
+        let mut doc3 = Node::document();
+        let mut li3 = Node::element(ElementKind::ListItem);
+        li3.set_attr("typeof", "mw:Extension/foo");
+        li3.set_attr("about", "#mwt3");
+        doc3.push_child(li3);
+        let tree3 = DomTree::new(doc3);
+        let li_id3 = tree3.first_child(tree3.root()).unwrap();
+        assert!(EncapsulatedContentHandler::is_tpl_list_without_shared_prefix(&tree3, li_id3));
     }
 }
