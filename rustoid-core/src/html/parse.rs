@@ -15,10 +15,25 @@ use crate::dom::node::NodeKind;
 
 /// Parse a Parsoid HTML string into our AST.
 pub fn parse_html(html: &str) -> Result<Node> {
+    // Mirror PHP's `DOMUtils::parseHTML`: wrap a bare fragment in `<body>` so
+    // leading comments/text land in the body rather than in `<head>` (HTML5
+    // document parsing hoists a leading comment that precedes `<body>` into
+    // `<head>`). This keeps fragment round-tripping faithful.
+    let wrapped;
+    let source = if !html.trim_start().to_lowercase().starts_with("<!doctype")
+        && !html.trim_start().to_lowercase().starts_with("<html")
+        && !html.trim_start().to_lowercase().starts_with("<body")
+    {
+        wrapped = format!("<body>{html}");
+        wrapped.as_str()
+    } else {
+        html
+    };
+
     let opts = ParseOpts::default();
     let rc_dom = html5ever::parse_document(RcDom::default(), opts)
         .from_utf8()
-        .read_from(&mut html.as_bytes())
+        .read_from(&mut source.as_bytes())
         .map_err(|e| RustoidError::Parse(format!("HTML parse error: {e}")))?;
 
     convert_document(&rc_dom.document)
