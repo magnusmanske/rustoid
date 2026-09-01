@@ -444,6 +444,27 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
+    /// Consume `space_or_newline_or_solidus`: whitespace, or a `/` that is not
+    /// followed by `>` (so a `/>` self-close is left for the caller to detect).
+    /// Mirrors PHP's `space_or_newline_or_solidus = space_or_newline / (@"/" !">")`,
+    /// which lets a `/` act as an attribute separator inside a (broken) tag such
+    /// as `<pre </table>`.
+    fn consume_space_or_newline_or_solidus(&mut self) {
+        loop {
+            if self.pos >= self.input_len {
+                break;
+            }
+            let ch = self.input.as_bytes()[self.pos];
+            let is_space = matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | 0x0c);
+            let is_solidus = ch == b'/' && !self.starts_with("/>");
+            if is_space || is_solidus {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Try to parse block_lines: sol + optional empty line + block_line.
     fn try_parse_block_lines(&mut self) -> bool {
         if !self.at_sol {
@@ -1453,8 +1474,8 @@ impl<'a> PegTokenizer<'a> {
         // (`less_than`), e.g. `<pre <pre>`.
         let attrs = self.parse_html_attributes(true);
 
-        // Self-closing?
-        self.consume_spaces();
+        // Self-closing? Trailing `/` separators (not `/>`) are consumed first.
+        self.consume_space_or_newline_or_solidus();
         let self_closing = self.starts_with("/>");
         if self_closing {
             self.advance(2);
@@ -1475,6 +1496,29 @@ impl<'a> PegTokenizer<'a> {
         {
             // Absolute end offset, and the width of the closing tag (`</name>`).
             end_offset = Some((self.pos + rel_end + gt + 1, gt + 1));
+        }
+
+        // An *unmatched* extension tag that shadows an HTML tag does not become an
+        // `extension` token: PHP's `maybe_extension_tag` returns the raw `TagTk`
+        // (see the `return $t; // not text()` path), so it falls through to the
+        // HTML-equivalent rendering (with `stx: "html"`). The sanitizer/tree
+        // builder then convert it to text where necessary. This is what makes
+        // `<table><pre </table>` produce an empty `<pre></pre>` fostered before
+        // the `<table>` rather than the escaped text `<p>&lt;pre</p>`.
+        if !self_closing
+            && end_offset.is_none()
+            && (crate::wikitext::consts::html5_tags().contains(&lc_name)
+                || crate::wikitext::consts::older_html_tags().contains(&lc_name))
+        {
+            let mut html_dp = self.make_dp(saved, self.pos);
+            html_dp.stx = Some("html".to_string());
+            html_dp.src = Some(self.input[saved..self.pos].to_string());
+            self.emit_token(ParsoidToken::Tag(TagTk::new(
+                name.to_lowercase(),
+                attrs,
+                html_dp,
+            )));
+            return true;
         }
 
         let mut dp = self.make_dp(saved, self.pos);
@@ -1617,8 +1661,9 @@ impl<'a> PegTokenizer<'a> {
         // attribute-name position (mirrors `less_than`'s `!html_or_empty` guard).
         let attrs = self.parse_html_attributes(false);
 
-        // Self-closing?
-        self.consume_spaces();
+        // Self-closing? Trailing `/` separators (not `/>`) are consumed first,
+        // mirroring PHP's `space_or_newline_or_solidus* selfclose? space* ">"`.
+        self.consume_space_or_newline_or_solidus();
         let self_closing = self.starts_with("/>");
         if self_closing {
             self.advance(2);
@@ -1688,7 +1733,7 @@ impl<'a> PegTokenizer<'a> {
     /// extension tags permit a literal `<` in attribute-name position, whereas
     /// HTML tags (and the reparse-KV path, where `tagType` is empty) do not.
     fn parse_one_attribute(&mut self, allow_less_than: bool) -> Option<KV> {
-        self.consume_spaces();
+        self.consume_space_or_newline_or_solidus();
         if self.pos >= self.input_len {
             return None;
         }
