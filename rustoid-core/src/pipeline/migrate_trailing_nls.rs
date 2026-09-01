@@ -43,6 +43,17 @@ fn has_literal_html_marker(dp: &DataParsoid) -> bool {
     dp.stx.as_deref() == Some("html")
 }
 
+/// Whether a node is a `<span typeof="mw:Nowiki">` (the lean nowiki wrapper).
+/// Mirrors the PHP reality that `<nowiki>` content is a DOM fragment unpacked
+/// by `UnpackDOMFragments` *after* `MigrateTrailingNLs` runs, so its trailing
+/// newline is never hoisted out.
+fn is_nowiki_span(node: &Node) -> bool {
+    matches!(&node.kind, NodeKind::Element(ElementKind::Span))
+        && node
+            .get_attr("typeof")
+            .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:Nowiki"))
+}
+
 /// Whether a node ends a line in wikitext: its tag name is in the migration set
 /// and it is not a literal-HTML element. Mirrors
 /// `MigrateTrailingNLs::nodeEndsLineInWT`.
@@ -145,6 +156,14 @@ fn can_migrate_nl_out_of_node(
     // process here has a parent (the document root is never passed), `atTheTop`
     // is always false; the root is handled by `run`.
     if name == "table" {
+        return false;
+    }
+
+    // `mw:Nowiki` content is a DOM fragment that PHP unpacks *after* this pass
+    // (see `ExtensionHandler::onDocumentFragment` → `tunnelDOMThroughTokens`),
+    // so its trailing newline is never subject to migration there. Our nowiki is
+    // emitted as inline tokens, so we reproduce that opacity here: skip it.
+    if is_nowiki_span(node) {
         return false;
     }
 
