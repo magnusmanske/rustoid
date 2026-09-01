@@ -1032,6 +1032,58 @@ impl DomHandler for TRHandler {
     }
 }
 
+/// `T149209` helper: is the current separator about to put us in a SOL state
+/// (or already has)? Mirrors the `min > 0 || (max > 0 && str_contains(sep->src, "\n"))`
+/// guard in the PHP `TDHandler`/`THHandler`.
+fn already_at_sol(state: &SerializerState) -> bool {
+    let min = state
+        .separator
+        .constraints
+        .as_ref()
+        .and_then(|c| c.min)
+        .unwrap_or(0);
+    let max = state
+        .separator
+        .constraints
+        .as_ref()
+        .and_then(|c| c.max)
+        .unwrap_or(0);
+    min > 0
+        || (max > 0
+            && state
+                .separator
+                .src
+                .as_deref()
+                .is_some_and(|s| s.contains('\n')))
+}
+
+/// `TDHandler` SOL normalization: `(\||{{!}})\|` → `|`, then `(\||{{!}}){{!}}` → `{{!}}`,
+/// once each (mirrors PHP's `preg_replace(..., 1)`).
+fn normalize_td_start_src_sol(src: &str) -> String {
+    let s = replace_first(src, "||", "|");
+    let s = replace_first(&s, "{{!}}|", "|");
+    let s = replace_first(&s, "|{{!}}", "{{!}}");
+    replace_first(&s, "{{!}}{{!}}", "{{!}}")
+}
+
+/// `THHandler` SOL normalization: `!!` → `!`, then `(\||{{!}})\|` → `!`, then
+/// `(\||{{!}}){{!}}` → `!`, once each (mirrors PHP's `preg_replace(..., 1)`).
+fn normalize_th_start_src_sol(src: &str) -> String {
+    let s = replace_first(src, "!!", "!");
+    let s = replace_first(&s, "||", "!");
+    let s = replace_first(&s, "{{!}}|", "!");
+    let s = replace_first(&s, "|{{!}}", "!");
+    replace_first(&s, "{{!}}{{!}}", "!")
+}
+
+/// Replace the first occurrence of `needle` with `replacement` in `s`.
+fn replace_first(s: &str, needle: &str, replacement: &str) -> String {
+    match s.find(needle) {
+        Some(i) => format!("{}{}{}", &s[..i], replacement, &s[i + needle.len()..]),
+        None => s.to_string(),
+    }
+}
+
 /// `TDHandler` — serialize a `<td>`. Faithful to `DOMHandlers/TDHandler.php`.
 pub struct TDHandler;
 
@@ -1061,6 +1113,15 @@ impl DomHandler for TDHandler {
                 "|".to_string()
             }
         });
+
+        // T149209: if the previous sibling put us in a SOL state (or will, when
+        // the separator is emitted), `||`/`{{!}}|` row syntax can't be used this
+        // line — collapse to `|` (mirrors PHP's `preg_replace` pair).
+        let start_tag_src = if already_at_sol(state) {
+            normalize_td_start_src_sol(&start_tag_src)
+        } else {
+            start_tag_src
+        };
 
         let td_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
         // `$inWideTD = (bool)preg_match('/\|\||^{{!}}({{!}}|\|)|^(\||{{!}}){{!}}/', $tdTag)`.
@@ -1162,6 +1223,15 @@ impl DomHandler for THHandler {
                 "!".to_string()
             }
         });
+
+        // T149209: if the previous sibling put us in a SOL state (or will, when
+        // the separator is emitted), `!!`/`{{!}}|`/`{{!}}{{!}}` row syntax can't
+        // be used this line — collapse to `!` (mirrors PHP's `preg_replace` trio).
+        let start_tag_src = if already_at_sol(state) {
+            normalize_th_start_src_sol(&start_tag_src)
+        } else {
+            start_tag_src
+        };
 
         let th_tag = self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node);
         let leading_space = self.get_leading_space(tree, node, "");
@@ -2651,5 +2721,46 @@ mod tests {
         let tree3 = DomTree::new(doc3);
         let li_id3 = tree3.first_child(tree3.root()).unwrap();
         assert!(EncapsulatedContentHandler::is_tpl_list_without_shared_prefix(&tree3, li_id3));
+    }
+
+    #[test]
+    fn test_normalize_table_start_src_sol() {
+        // TD: `||`/`{{!}}|`/`|{{!}}` collapse toward `|`.
+        assert_eq!(normalize_td_start_src_sol("||"), "|");
+        assert_eq!(normalize_td_start_src_sol("{{!}}|"), "|");
+        assert_eq!(normalize_td_start_src_sol("|{{!}}"), "{{!}}");
+        assert_eq!(normalize_td_start_src_sol("|"), "|");
+
+        // TH: `!!`/`||`/`{{!}}|`/`|{{!}}` collapse toward `!`.
+        assert_eq!(normalize_th_start_src_sol("!!"), "!");
+        assert_eq!(normalize_th_start_src_sol("||"), "!");
+        assert_eq!(normalize_th_start_src_sol("{{!}}|"), "!");
+        assert_eq!(normalize_th_start_src_sol("!"), "!");
+    }
+
+    #[test]
+    fn test_already_at_sol() {
+        let mut state = SerializerState::new();
+        // No constraints / src → not at SOL.
+        assert!(!already_at_sol(&state));
+
+        // min > 0 → at SOL.
+        state.separator.constraints = Some(Constraints {
+            min: Some(1),
+            max: Some(2),
+        });
+        assert!(already_at_sol(&state));
+
+        // min == 0, max > 0 with a newline in the buffered separator → at SOL.
+        state.separator.constraints = Some(Constraints {
+            min: Some(0),
+            max: Some(2),
+        });
+        state.separator.src = Some("\n".to_string());
+        assert!(already_at_sol(&state));
+
+        // min == 0, max > 0, no newline → not at SOL.
+        state.separator.src = Some(" ".to_string());
+        assert!(!already_at_sol(&state));
     }
 }
