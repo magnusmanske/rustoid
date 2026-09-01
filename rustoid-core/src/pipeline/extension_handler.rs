@@ -51,39 +51,23 @@ fn attr_str<'t>(token: &'t SelfclosingTagTk, name: &str) -> Option<&'t str> {
 
 /// Build the token sequence for a `<nowiki>` extension. Faithful port of
 /// `Nowiki::sourceToDom` (without the DOM indirection): the raw body text is
-/// escaped and split on entity references, with decodable entities wrapped in
-/// `<span typeof="mw:Entity">`.
-///
-/// When the body decodes to plain text only (no decodable entities), the
-/// `mw:Nowiki` wrapper is redundant and is omitted, so the nowiki's literal
-/// text merges directly with the surrounding content (matching Parsoid's
-/// rendered output — see the `… w/ nowiki` quote fixtures and
-/// `</pre> inside nowiki`).
+/// split on entity references, with decodable entities wrapped in
+/// `<span typeof="mw:Entity">`, all inside a `<span typeof="mw:Nowiki">`.
 fn nowiki_items(token: &SelfclosingTagTk) -> Vec<Item> {
     let source = attr_str(token, "source").unwrap_or_default().to_string();
     let body = extract_ext_body(token, &source);
 
     let parts = split_entities(&body);
 
-    // If every entity reference decodes to a different value, we need the
-    // `mw:Entity` spans (and therefore the `mw:Nowiki` wrapper). Otherwise,
-    // emit the plain text directly.
-    let has_decodable_entity = parts
-        .iter()
-        .enumerate()
-        .any(|(i, part)| i % 2 == 1 && decode_wt_entities(part) != *part);
-
     let mut out: Vec<Item> = Vec::new();
 
-    if has_decodable_entity {
-        // `<span typeof="mw:Nowiki">`
-        let mut span_dp = token.data_parsoid.clone();
-        span_dp.src = None;
-        span_dp.src_content = None;
-        let mut span = TagTk::new("span", vec![], span_dp);
-        span.add_attribute_str("typeof", "mw:Nowiki");
-        out.push(Item::Tok(ParsoidToken::Tag(span)));
-    }
+    // `<span typeof="mw:Nowiki">` (always emitted, as in PHP `Nowiki::sourceToDom`).
+    let mut span_dp = token.data_parsoid.clone();
+    span_dp.src = None;
+    span_dp.src_content = None;
+    let mut span = TagTk::new("span", vec![], span_dp);
+    span.add_attribute_str("typeof", "mw:Nowiki");
+    out.push(Item::Tok(ParsoidToken::Tag(span)));
 
     // Emit the body parts: raw text for even indices, decoded entity spans
     // for decodable odd indices, and raw text for undecodable odd indices.
@@ -115,13 +99,11 @@ fn nowiki_items(token: &SelfclosingTagTk) -> Vec<Item> {
         }
     }
 
-    if has_decodable_entity {
-        out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-            "span",
-            vec![],
-            DataParsoid::default(),
-        ))));
-    }
+    out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+        "span",
+        vec![],
+        DataParsoid::default(),
+    ))));
     out
 }
 
@@ -526,11 +508,20 @@ mod tests {
     }
 
     #[test]
-    fn test_nowiki_items_plain_text_omits_wrapper() {
-        // Plain text (no decodable entities) renders with no `mw:Nowiki` span.
+    fn test_nowiki_items_plain_text_wraps() {
+        // Plain text (no decodable entities) still gets a `mw:Nowiki` wrapper
+        // (matching PHP `Nowiki::sourceToDom`).
         let items = nowiki_items(&nowiki_token("</pre>"));
-        assert_eq!(items.len(), 1);
-        assert!(matches!(&items[0], Item::Str(s) if s == "</pre>"));
+        let has_nowiki = items.iter().any(|it| {
+            matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "span"
+                && t.attribs.iter().any(|kv| kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:Nowiki")))
+        });
+        assert!(has_nowiki, "expected mw:Nowiki span in {items:?}");
+        assert!(
+            items
+                .iter()
+                .any(|it| matches!(it, Item::Str(s) if s == "</pre>"))
+        );
     }
 
     #[test]

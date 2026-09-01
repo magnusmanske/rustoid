@@ -1441,6 +1441,11 @@ fn strip_data_attrs(html: &str) -> String {
 fn strip_legacy_attrs(html: &str) -> String {
     let mut s = html.to_string();
 
+    // Flatten `mw:Nowiki`/`mw:Entity` spans first (while their `typeof` is still
+    // present): the legacy parser unwraps `<nowiki>` to plain text, so the
+    // Parsoid span wrapper must be removed for a structural legacy comparison.
+    s = flatten_nowiki_spans(&s);
+
     // Strip `<meta ...>` and `<link ...>` elements (void/self-closing).
     while let Some(start) = s.find("<meta ") {
         if let Some(end) = s[start..].find('>') {
@@ -1490,6 +1495,80 @@ fn strip_legacy_attrs(html: &str) -> String {
     }
 
     s
+}
+
+/// Unwrap `<span>` elements whose `typeof` is `mw:Nowiki` or `mw:Entity`, for
+/// the legacy comparison. Recurses so nested `mw:Entity` spans inside a
+/// `mw:Nowiki` span are unwrapped too. The content of these spans is plain text
+/// (possibly nested spans), so a balanced scan for the matching `</span>` is
+/// sufficient.
+fn flatten_nowiki_spans(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' || !s[i..].starts_with("<span") {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let Some(gt) = s[i..].find('>') else {
+            out.push_str(&s[i..]);
+            break;
+        };
+        let open_tag = &s[i..i + gt + 1];
+        let is_nowiki = open_tag.contains("mw:Nowiki") || open_tag.contains("mw:Entity");
+        if !is_nowiki {
+            // Not a nowiki/entity span: keep the open tag and recurse into its
+            // content by advancing past the tag and continuing.
+            out.push_str(open_tag);
+            i += gt + 1;
+            continue;
+        }
+        // Unwrap: find the matching `</span>` (balanced over nested spans).
+        let content_start = i + gt + 1;
+        let mut depth = 1usize;
+        let mut j = content_start;
+        let mut content_end = None;
+        while j < bytes.len() {
+            if s[j..].starts_with("<span") {
+                depth += 1;
+                if let Some(nxt) = s[j..].find('>') {
+                    j += nxt + 1;
+                    continue;
+                }
+                break;
+            }
+            if s[j..].starts_with("</span") {
+                depth -= 1;
+                if depth == 0 {
+                    content_end = Some(j);
+                    break;
+                }
+                if let Some(nxt) = s[j..].find('>') {
+                    j += nxt + 1;
+                    continue;
+                }
+                break;
+            }
+            j += 1;
+        }
+        match content_end {
+            Some(end) => {
+                // Recurse into the inner content (to unwrap nested entity spans).
+                let inner = &s[content_start..end];
+                out.push_str(&flatten_nowiki_spans(inner));
+                // Skip past the closing `</span>`.
+                let close_len = s[end..].find('>').map(|e| e + 1).unwrap_or(0);
+                i = end + close_len;
+            }
+            None => {
+                out.push_str(&s[i..]);
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn compute_diff_hint(expected: &str, actual: &str) -> String {
