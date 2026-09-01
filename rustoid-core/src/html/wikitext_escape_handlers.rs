@@ -360,19 +360,40 @@ pub fn escape_wikitext(
 /// (`TagTk`, `EndTagTk`, `SelfclosingTagTk`) — plus our compound
 /// `IndentPre`/`List` tokens — trigger escaping. `NlTk`, `CommentTk`,
 /// `EmptyLineTk`, `EOFTk`, and plain strings do not (PHP's loop ignores them).
-fn has_wikitext_tokens(_state: &SerializerState, sol: bool, text: &str) -> bool {
+fn has_wikitext_tokens(state: &SerializerState, sol: bool, text: &str) -> bool {
+    let in_linkish = state.in_attribute || state.in_link;
     let tokens = tokenize(text, sol);
     tokens.as_ref().is_none_or(|tokens| {
-        tokens.iter().any(|t| match t {
-            Either::Right(ParsoidToken::Tag(_)) => true,
-            Either::Right(ParsoidToken::EndTag(_)) => true,
-            Either::Right(ParsoidToken::SelfclosingTag(_)) => true,
-            // Compound markup tokens (lists / indent-pre) are real wikitext
-            // constructs and therefore require escaping.
-            Either::Right(ParsoidToken::IndentPre(_)) => true,
-            Either::Right(ParsoidToken::List(_)) => true,
-            // Newlines, comments, empty lines, and EOF are not markup.
-            _ => false,
+        tokens.iter().any(|t| {
+            match t {
+                Either::Right(ParsoidToken::Tag(_)) => true,
+                Either::Right(ParsoidToken::EndTag(_)) => true,
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) => {
+                    // Faithful to `hasWikitextTokens::SelfclosingTagTk`:
+                    //
+                    // * Ignore RFC/ISBN/PMID magic-link tokens when encountered
+                    //   in link/attribute content (T109371).
+                    if matches!(tk.name.as_str(), "extlink" | "wikilink")
+                        && tk.data_parsoid.stx.as_deref() == Some("magiclink")
+                        && in_linkish
+                    {
+                        return false;
+                    }
+                    // Ignore url links in attributes (href, mostly) since they
+                    // aren't in danger of being autolink-ified there.
+                    if tk.name == "urllink" && in_linkish {
+                        return false;
+                    }
+                    // `wikilink` is real wikitext markup (require escaping).
+                    true
+                }
+                // Compound markup tokens (lists / indent-pre) are real wikitext
+                // constructs and therefore require escaping.
+                Either::Right(ParsoidToken::IndentPre(_)) => true,
+                Either::Right(ParsoidToken::List(_)) => true,
+                // Newlines, comments, empty lines, and EOF are not markup.
+                _ => false,
+            }
         })
     })
 }
@@ -817,6 +838,26 @@ mod tests {
             false,
             "'''bold'''"
         ));
+    }
+
+    #[test]
+    fn test_has_wikitext_tokens_urllink_in_attribute() {
+        // A bare URL tokenizes to a `urllink` self-closing token. Outside
+        // attribute/link context it requires escaping; inside attribute context
+        // (`in_attribute`) it does not, since it can't be autolink-ified there.
+        assert!(has_wikitext_tokens(
+            &SerializerState::new(),
+            false,
+            "http://example.org"
+        ));
+
+        let mut attr = SerializerState::new();
+        attr.in_attribute = true;
+        assert!(!has_wikitext_tokens(&attr, false, "http://example.org"));
+
+        let mut link = SerializerState::new();
+        link.in_link = true;
+        assert!(!has_wikitext_tokens(&link, false, "http://example.org"));
     }
 
     #[test]
