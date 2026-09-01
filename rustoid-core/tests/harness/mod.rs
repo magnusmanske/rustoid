@@ -80,6 +80,34 @@ pub struct ParserTestFile {
     pub articles: HashMap<String, String>,
     pub path: String,
     pub version: String,
+    /// Known divergences between Parsoid and the legacy parser, recorded in a
+    /// sibling `*-standalone-knownFailures.json` file (mirroring Parsoid's own
+    /// `tests/parser/*-standalone-knownFailures.json`). Each entry maps a test
+    /// description to the Parsoid output it is *expected* to produce in a given
+    /// mode; when a test's actual (normalized) output matches the recorded
+    /// value, it is accepted as an expected divergence rather than a failure.
+    pub known_failures: KnownFailures,
+}
+
+/// A known-failures file: test description → mode → recorded Parsoid output.
+///
+/// Mirrors the shape of Parsoid's `*-standalone-knownFailures.json`, where each
+/// value is a map of mode (`wt2html`, `html2wt`, `wt2wt`, …) to the output
+/// string Parsoid actually produces (which differs from the fixture's `!! html`
+/// legacy expectation).
+#[derive(Debug, Clone, Default)]
+pub struct KnownFailures {
+    pub entries: HashMap<String, HashMap<String, String>>,
+}
+
+impl KnownFailures {
+    /// Look up the recorded Parsoid output for a test in a given mode.
+    pub fn get(&self, test_name: &str, mode: &str) -> Option<&str> {
+        self.entries
+            .get(test_name)
+            .and_then(|modes| modes.get(mode))
+            .map(String::as_str)
+    }
 }
 
 /// The outcome of running a single test.
@@ -237,9 +265,51 @@ pub fn parse_test_file(path: &Path) -> Result<ParserTestFile> {
     Ok(ParserTestFile {
         tests,
         articles,
+        known_failures: load_known_failures(path),
         path: path.to_string_lossy().to_string(),
         version,
     })
+}
+
+/// Load a sibling `*-standalone-knownFailures.json` file, if present.
+///
+/// Parsoid ships each fixture with a corresponding known-failures file that
+/// records cases where its native (standalone) output diverges from the legacy
+/// `!! html` expectation. We honor those so the harness reflects Parsoid's own
+/// pass/fail accounting rather than treating a faithful divergence as a bug.
+fn load_known_failures(path: &Path) -> KnownFailures {
+    // `foo.txt` → `foo-standalone-knownFailures.json` (and `.txt` is stripped
+    // so `php/foo.txt` maps to `php/foo-standalone-knownFailures.json`).
+    let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+        return KnownFailures::default();
+    };
+    let sidecar = path.with_file_name(format!("{stem}-standalone-knownFailures.json"));
+    let Ok(text) = std::fs::read_to_string(&sidecar) else {
+        return KnownFailures::default();
+    };
+
+    // Tolerate a missing/empty file; only parse well-formed JSON.
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return KnownFailures::default();
+    };
+    let Some(obj) = json.as_object() else {
+        return KnownFailures::default();
+    };
+
+    let mut entries = HashMap::new();
+    for (name, value) in obj {
+        let Some(modes) = value.as_object() else {
+            continue;
+        };
+        let mut map = HashMap::new();
+        for (mode, output) in modes {
+            if let Some(s) = output.as_str() {
+                map.insert(mode.clone(), s.to_string());
+            }
+        }
+        entries.insert(name.clone(), map);
+    }
+    KnownFailures { entries }
 }
 
 /// Parse a single test case starting after the !! test line.
@@ -608,7 +678,21 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         Err(e) => return TestResult::Error(format!("parse error: {e}")),
     };
 
-    compare_html(&actual_html, &expected_html, test.parsoid_only)
+    let result = compare_html(&actual_html, &expected_html, test.parsoid_only);
+    if let TestResult::Fail { actual, .. } = &result {
+        // A known divergence: Parsoid's own `*-standalone-knownFailures.json`
+        // records the output it actually produces here (which differs from the
+        // fixture's legacy `!! html`). If our normalized output matches that
+        // recorded value, the parser is faithful — accept it as an expected
+        // divergence instead of failing.
+        if let Some(recorded) = test_file.known_failures.get(&test.description, "wt2html") {
+            let recorded_norm = normalize_html(&extract_body(recorded), test.parsoid_only);
+            if actual.trim() == recorded_norm.trim() {
+                return TestResult::Skip("known Parsoid divergence (standalone)".to_string());
+            }
+        }
+    }
+    result
 }
 
 /// Normalize and compare the actual V2 output against expected Parsoid HTML.
