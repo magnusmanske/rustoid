@@ -622,6 +622,73 @@ fn templated_attrib_keys(data_mw: &str) -> std::collections::HashSet<String> {
     keys
 }
 
+/// Prepend a leading-wikitext string (a `recordTemplateInfo` `unwrappedWT`) to
+/// the `data-mw.parts` array, producing a multi-template-content-block.
+/// Mirrors PHP's `DOMRangeBuilder::recordTemplateInfo`, which prepends the
+/// recovered `unwrappedWT` so that the leading source wikitext survives as a
+/// literal `data-mw.parts` entry before the template object.
+fn prepend_unwrapped_wt_part(data_mw: &str, unwrapped_wt: &str) -> String {
+    let mut json: serde_json::Value = serde_json::from_str(data_mw)
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(parts) = json.get_mut("parts").and_then(|p| p.as_array_mut())
+        && !parts
+            .first()
+            .is_some_and(|f| f.as_str() == Some(unwrapped_wt))
+    {
+        parts.insert(0, serde_json::Value::String(unwrapped_wt.to_string()));
+    }
+    json.to_string()
+}
+
+/// Append a trailing-wikitext string to the `data-mw.parts` array, mirroring the
+/// `encapsulateTemplates` trailing-wikitext step (the gap between the last
+/// template's `dsr.end` and the range's `dsr.end`, recovered from `source`).
+fn append_trailing_wt_part(data_mw: &str, trailing: &str) -> String {
+    let mut json: serde_json::Value = serde_json::from_str(data_mw)
+        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(parts) = json.get_mut("parts").and_then(|p| p.as_array_mut())
+        && !parts.last().is_some_and(|f| f.as_str() == Some(trailing))
+    {
+        parts.push(serde_json::Value::String(trailing.to_string()));
+    }
+    json.to_string()
+}
+
+/// Build the compound `data-mw.parts` for an encapsulation target from its
+/// transclusion start-meta: any leading `unwrappedWT`, the existing template
+/// object(s), and any trailing wikitext recovered from the range's DSR tail.
+/// Faithful to PHP `DOMRangeBuilder::recordTemplateInfo` +
+/// `encapsulateTemplates` (leading/trailing-wikitext steps).
+fn build_compound_data_mw(
+    start_meta: &Node,
+    source: Option<&str>,
+    range_end: Option<usize>,
+) -> Option<String> {
+    let data_mw = start_meta.data_mw.clone()?;
+    let dp = start_meta.dp.as_ref();
+
+    let data_mw = match dp.and_then(|d| d.tmp.unwrapped_wt.as_deref()) {
+        Some(wt) if !wt.is_empty() => prepend_unwrapped_wt_part(&data_mw, wt),
+        _ => data_mw,
+    };
+
+    let tpl_end = dp.and_then(|d| d.dsr.as_ref().and_then(|r| r.end));
+    let data_mw = match (tpl_end, range_end) {
+        (Some(tpl_end), Some(range_end)) if range_end > tpl_end => {
+            match source
+                .and_then(|s| s.get(tpl_end..range_end))
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) => append_trailing_wt_part(&data_mw, t),
+                None => data_mw,
+            }
+        }
+        _ => data_mw,
+    };
+
+    Some(data_mw)
+}
+
 /// Walk the AST, resolving `data-object-id` attributes into stashed
 /// `data-parsoid`/`data-mw`.
 ///
@@ -757,6 +824,7 @@ fn dp_bool(dp: &serde_json::Value, key: &str) -> bool {
 pub fn post_pwrap_transforms(
     node: &mut Node,
     depths: &std::collections::HashMap<String, (usize, usize)>,
+    source: Option<&str>,
 ) {
     // Migrate transclusion marker metas toward a canonical position before
     // migrate-nls (mirrors PHP's `migrate-metas` … `migrate-nls` order).
@@ -765,7 +833,7 @@ pub fn post_pwrap_transforms(
     // template encapsulation (mirrors PHP's `migrate-nls` … `tplwrap` order).
     crate::pipeline::migrate_trailing_nls::run(node);
     // Encapsulate transclusion meta markers into wrapping `<span>` elements.
-    encapsulate_transclusions(node);
+    encapsulate_transclusions(node, source);
     // Unpack `mw:DOMFragment` placeholders (extension/template sub-content)
     // into their stashed children. This runs *after* encapsulation (mirrors
     // PHP's `tplwrap` … `dom-unpack` order), so the transclusion range is first
@@ -910,17 +978,17 @@ fn parser_function_name(start_meta: &Node) -> Option<String> {
 /// Each `<meta typeof="mw:Transclusion">` … `<meta typeof="mw:Transclusion/End">`
 /// pair (with a matching `about`) is replaced by a `<span>` carrying `about`,
 /// `typeof`, `data-parsoid`, and `data-mw`, wrapping the intervening siblings.
-fn encapsulate_transclusions(node: &mut Node) {
+fn encapsulate_transclusions(node: &mut Node, source: Option<&str>) {
     // Recurse into element children first, then process direct children.
     for child in &mut node.children {
         if matches!(child.kind, NodeKind::Element(_)) {
-            encapsulate_transclusions(child);
+            encapsulate_transclusions(child, source);
         }
     }
 
     let children = std::mem::take(&mut node.children);
-    let children = wrap_transclusion_children(children);
-    node.children = wrap_flipped_children(children);
+    let children = wrap_transclusion_children(children, source);
+    node.children = wrap_flipped_children(children, source);
 }
 
 /// Wrap transclusion ranges among a parent's direct children (the sibling case,
@@ -937,7 +1005,7 @@ fn encapsulate_transclusions(node: &mut Node) {
 /// fused innermost-first: an inner range's markers are removed and its
 /// `typeof`/metadata merged onto its target before the enclosing range is
 /// processed, so two nested `mw:Transclusion` markers collapse to one.
-fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
+fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
     while i < children.len() {
@@ -975,7 +1043,7 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
 
         // Fuse any *nested* ranges in the content first (innermost-first).
         let content: Vec<Node> = children[i + 1..end].to_vec();
-        let content = wrap_transclusion_children(content);
+        let content = wrap_transclusion_children(content, source);
 
         // Stamp `about` on every element in the range and find the first
         // element (the encapsulation target), dropping deletable text and
@@ -1096,7 +1164,7 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                 new_content[et].set_attr("typeof", merged);
             }
             new_content[et].data_parsoid = start_meta.data_parsoid.clone();
-            new_content[et].data_mw = start_meta.data_mw.clone();
+            new_content[et].data_mw = build_compound_data_mw(&start_meta, source, None);
         } else {
             // Empty transclusion: the start and end markers are adjacent (no
             // content). PHP `DOMRangeBuilder::findEnclosingRange` inserts an
@@ -1112,7 +1180,7 @@ fn wrap_transclusion_children(children: Vec<Node>) -> Vec<Node> {
                 span.set_attr("typeof", typeof_.clone());
             }
             span.data_parsoid = start_meta.data_parsoid.clone();
-            span.data_mw = start_meta.data_mw.clone();
+            span.data_mw = build_compound_data_mw(&start_meta, source, None);
             new_content.push(span);
         }
 
@@ -1169,7 +1237,7 @@ fn is_deletable_in_range(content: &[Node], idx: usize) -> bool {
 ///     non-fostered case, e.g. `{{1x|*bar}}` → `<meta/> <ul>…</ul>`), and
 ///   - the "flipped" case where the end marker was fostered into a *preceding*
 ///     sibling element.
-fn wrap_flipped_children(mut children: Vec<Node>) -> Vec<Node> {
+fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<Node> {
     let mut i = 0;
     while i < children.len() {
         if !is_transclusion_start(&children[i]) {
@@ -1228,12 +1296,34 @@ fn wrap_flipped_children(mut children: Vec<Node>) -> Vec<Node> {
             continue;
         };
 
+        // Determine the range's end DSR by merging the start-meta's `dsr.end`
+        // with any *following* sibling whose DSR extends past it (mirrors PHP's
+        // `encapsulateTemplates` `$dp1DSR->end = $dp2DSR->end` merge). This
+        // covers multi-template-content-blocks where the transclusion output
+        // spills past the element holding the end marker (e.g. a fostered
+        // `<p>` followed by a `<table>`), so the trailing wikitext part and the
+        // range's `about` chain both include the whole block.
+        let tpl_end = start_meta
+            .dp
+            .as_ref()
+            .and_then(|d| d.dsr.as_ref().and_then(|r| r.end));
+        let mut range_end = tpl_end;
+        for child in children.iter().skip(i + 1) {
+            if let Some(end) = child
+                .dp
+                .as_ref()
+                .and_then(|d| d.dsr.as_ref().and_then(|r| r.end))
+            {
+                range_end = Some(range_end.map_or(end, |cur| cur.max(end)));
+            }
+        }
+
         // Transfer encapsulation data onto the target element and drop the
         // end marker from its subtree. The end marker lives under the sibling
         // element `t` (located via `subtree_contains_end_meta`), which may
         // differ from the encapsulation target `et` when an intervening
         // element precedes `t` (e.g. `<meta/> <p>..</p> <i><div>..</div><meta/End></i>`).
-        transfer_transclusion_to_element(&mut children[et], &start_meta);
+        transfer_transclusion_to_element(&mut children[et], &start_meta, source, range_end);
         remove_end_meta(&mut children[t], about.as_deref());
         // Remove the start marker meta.
         children.remove(i);
@@ -1276,7 +1366,12 @@ fn remove_end_meta(node: &mut Node, about: Option<&str>) -> bool {
 /// Transfer the encapsulation data from a transclusion start marker meta onto
 /// the target element (mirrors `encapsulateTemplates`' type/`about`/data-mw
 /// transfer when the range start is a non-meta element).
-fn transfer_transclusion_to_element(target: &mut Node, start_meta: &Node) {
+fn transfer_transclusion_to_element(
+    target: &mut Node,
+    start_meta: &Node,
+    source: Option<&str>,
+    range_end: Option<usize>,
+) {
     if let Some(about) = start_meta.get_attr("about") {
         target.set_attr("about", about);
     }
@@ -1284,7 +1379,7 @@ fn transfer_transclusion_to_element(target: &mut Node, start_meta: &Node) {
         target.set_attr("typeof", typeof_);
     }
     target.data_parsoid = start_meta.data_parsoid.clone();
-    target.data_mw = start_meta.data_mw.clone();
+    target.data_mw = build_compound_data_mw(start_meta, source, range_end);
 }
 
 /// Run the HTML5 tree builder over a token stream.
@@ -1352,6 +1447,55 @@ mod tests {
         let data_mw = r#"{"attribs":[["style","color:red"],["title","hi"]]}"#;
         let keys = templated_attrib_keys(data_mw);
         assert!(keys.contains("style") && keys.contains("title"), "{keys:?}");
+    }
+
+    #[test]
+    fn test_prepend_unwrapped_wt_part() {
+        // A single-template `data-mw.parts` gains a leading literal-wikitext part
+        // for the recovered `unwrappedWT` (T322557 multi-template-content-block).
+        let data_mw = r#"{"parts":[{"template":{"target":{"wt":"1x"}}}]}"#;
+        let out = prepend_unwrapped_wt_part(data_mw, "{| <span>x</span> ");
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let parts = json["parts"].as_array().unwrap();
+        assert_eq!(
+            parts[0],
+            serde_json::Value::String("{| <span>x</span> ".into())
+        );
+        assert!(parts[1].get("template").is_some(), "{parts:?}");
+
+        // Idempotent: an already-present leading part is not duplicated.
+        let out2 = prepend_unwrapped_wt_part(&out, "{| <span>x</span> ");
+        assert_eq!(out, out2);
+    }
+
+    #[test]
+    fn test_build_compound_data_mw() {
+        // A start-meta with `unwrappedWT` + a `dsr.end` and a following range-end
+        // DSR produce all three parts: leading wikitext, template, trailing WT.
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.data_mw = Some(r#"{"parts":[{"template":{"target":{"wt":"1x"}}}]}"#.to_string());
+        let mut dp = DataParsoid::default();
+        dp.tmp.unwrapped_wt = Some("{| <span>x</span> ".to_string());
+        dp.dsr = Some(crate::wikitext::tokens_v2::DomSourceRange {
+            start: Some(0),
+            end: Some(38),
+            open_width: None,
+            close_width: None,
+        });
+        start.dp = Some(dp);
+
+        // A 38-char prefix followed by `\n|}` so `source[38..41] == "\n|}"`.
+        let source = format!("{:width$}\n|}}", "", width = 38);
+        let out = build_compound_data_mw(&start, Some(&source), Some(41)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let parts = json["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(
+            parts[0],
+            serde_json::Value::String("{| <span>x</span> ".into())
+        );
+        assert!(parts[1].get("template").is_some());
+        assert_eq!(parts[2], serde_json::Value::String("\n|}".into()));
     }
 
     #[test]
@@ -1735,7 +1879,7 @@ mod tests {
         doc.push_child(start);
         doc.push_child(ul);
 
-        encapsulate_transclusions(&mut doc);
+        encapsulate_transclusions(&mut doc, None);
 
         // The `<meta>` start marker is gone; only the `<ul>` remains.
         assert_eq!(doc.children.len(), 1, "{doc:?}");
@@ -1774,7 +1918,7 @@ mod tests {
         doc.push_child(start);
         doc.push_child(end);
 
-        encapsulate_transclusions(&mut doc);
+        encapsulate_transclusions(&mut doc, None);
 
         // Both metas are gone, replaced by a single empty transclusion span.
         assert_eq!(doc.children.len(), 1, "{doc:?}");
@@ -1808,7 +1952,7 @@ mod tests {
         doc.push_child(link);
         doc.push_child(end);
 
-        encapsulate_transclusions(&mut doc);
+        encapsulate_transclusions(&mut doc, None);
 
         assert_eq!(doc.children.len(), 1, "{doc:?}");
         let span = &doc.children[0];
@@ -1847,7 +1991,7 @@ mod tests {
         doc.push_child(Node::text("\n"));
         doc.push_child(end);
 
-        encapsulate_transclusions(&mut doc);
+        encapsulate_transclusions(&mut doc, None);
 
         // The trailing newline is preserved as a single-space wrapper span
         // (a sibling of the encapsulated div, since it is part of the same

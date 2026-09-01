@@ -552,7 +552,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::compute_dsr::run(&mut ast, wikitext);
         crate::pipeline::p_wrap::run(&mut ast);
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(
+            &mut ast,
+            &depths,
+            Some(wikitext),
+        );
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
@@ -632,7 +636,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // DOM-level p-wrapping runs before transclusion encapsulation (mirrors
         // PHP's `pwrap` … `tplwrap` order).
         crate::pipeline::p_wrap::run(&mut ast);
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(
+            &mut ast,
+            &depths,
+            Some(page_source),
+        );
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
