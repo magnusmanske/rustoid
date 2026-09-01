@@ -333,6 +333,37 @@ pub fn new_about_id(counter: &std::cell::Cell<usize>) -> String {
     format!("#mwt{id}")
 }
 
+/// A single entry accumulated during `buildExpandedAttrs` for the `data-mw.
+/// attribs` structure (mirrors the `$tmpDataMW[$key]` map in PHP).
+struct TmpDataMw {
+    /// The `k` object: plain-text label plus (optional) HTML source and the
+    /// `uneditable` flag for a key that is only part of a template's output.
+    k: TmpDataMwPart,
+    /// The `v` object: (optional) HTML source and `uneditable` flag.
+    v: TmpDataMwPart,
+}
+
+struct TmpDataMwPart {
+    txt: Option<String>,
+    html: Option<String>,
+    uneditable: bool,
+}
+
+impl TmpDataMwPart {
+    fn into_data_mw_value(self) -> crate::wikitext::tokens_v2::DataMwValue {
+        use crate::wikitext::tokens_v2::DataMwValue;
+        if self.html.is_some() || self.uneditable {
+            DataMwValue::Object {
+                txt: self.txt,
+                html: self.html,
+                uneditable: self.uneditable,
+            }
+        } else {
+            DataMwValue::Str(self.txt.unwrap_or_default())
+        }
+    }
+}
+
 /// Expand a token's already-expanded attribute KVs into its final attributes,
 /// handling the reparse-KV-string and (scenario 1) mixed-content cases, and
 /// marking templated attributes with `mw:ExpandedAttrs`. Mirrors PHP
@@ -358,7 +389,9 @@ pub fn build_expanded_attrs(
     let mut meta_tokens: Vec<Item> = Vec::new();
     let mut post_nl_toks: Vec<Item> = Vec::new();
     let mut new_attrs: Option<Vec<KV>> = None;
-    let mut should_mark_expanded = false;
+    // Accumulated rich-attribute metadata (mirrors PHP's `$tmpDataMW`): keyed
+    // by attribute name, in source order.
+    let mut tmp_data_mw: Vec<TmpDataMw> = Vec::new();
 
     for (i, old_a) in old_attrs.iter().enumerate() {
         let mut expanded_a = expanded_attrs[i].clone();
@@ -372,7 +405,7 @@ pub fn build_expanded_attrs(
         let mut expanded_k = expanded_a.key.clone();
         let expanded_v = expanded_a.value.clone();
         let orig_k = old_a.key.clone();
-        let _orig_v = old_a.value.clone();
+        let orig_v = old_a.value.clone();
 
         let mut reparsed_kv = false;
         let mut key_uses_mixed_attr_content_tpl = false;
@@ -485,14 +518,55 @@ pub fn build_expanded_attrs(
             expanded_a.value = items_to_key_value(expanded_v_items);
         }
 
-        let _ = (
-            orig_k,
-            key_uses_mixed_attr_content_tpl,
-            val_uses_mixed_attr_content_tpl,
-        );
+        // Update data-mw to account for templated attributes. For editability,
+        // assign the HTML for the original wikitext string (mirrors PHP's
+        // `$tmpDataMW[$key]` accumulation).
+        if key_generated || val_generated || (reparsed_kv && !meta_tokens.is_empty()) {
+            let key = crate::wikitext::token_utils::key_value_to_string(&expanded_a.key);
 
-        should_mark_expanded |=
-            key_generated || val_generated || (reparsed_kv && !meta_tokens.is_empty());
+            // For the mixed-attr-content cases, the generated HTML cannot be
+            // edited on its own (the content part would be duplicated in both
+            // this data-mw and the body — see T249740), so assign just the
+            // key/value part and mark it uneditable.
+            let (k_html, v_html) = if reparsed_kv {
+                // Reparse-KV: the value's HTML is empty (editable via the key's
+                // HTML or the value's HTML, not both).
+                let khtml = if key_uses_mixed_attr_content_tpl {
+                    Some(crate::wikitext::token_utils::key_value_to_string(
+                        &expanded_a.key,
+                    ))
+                } else {
+                    Some(crate::wikitext::token_utils::key_value_to_string(&orig_k))
+                };
+                (khtml, Some(String::new()))
+            } else {
+                // keyUsesMixedAttrContentTpl must be false here (PHP asserts it),
+                // so the key HTML is only present when the key was generated.
+                let khtml = key_generated
+                    .then(|| crate::wikitext::token_utils::key_value_to_string(&orig_k));
+                let vhtml = if val_uses_mixed_attr_content_tpl {
+                    Some(crate::wikitext::token_utils::key_value_to_string(
+                        &expanded_a.value,
+                    ))
+                } else {
+                    Some(crate::wikitext::token_utils::key_value_to_string(&orig_v))
+                };
+                (khtml, vhtml)
+            };
+
+            tmp_data_mw.push(TmpDataMw {
+                k: TmpDataMwPart {
+                    txt: Some(key),
+                    html: k_html,
+                    uneditable: key_uses_mixed_attr_content_tpl,
+                },
+                v: TmpDataMwPart {
+                    txt: None,
+                    html: v_html,
+                    uneditable: val_uses_mixed_attr_content_tpl,
+                },
+            });
+        }
 
         if let Some(na) = new_attrs.as_mut()
             && !reparsed_kv
@@ -508,11 +582,36 @@ pub fn build_expanded_attrs(
     }
 
     // Mark the token as having expanded attributes, unless it already carries
-    // an `about` (an existing transclusion/extension wrapping).
-    if token.get_attribute_v("about").is_none() && should_mark_expanded {
+    // an `about` (an existing transclusion/extension wrapping). Template tokens
+    // are omitted because the attribute expander is just resolving the target.
+    if token.get_attribute_v("about").is_none()
+        && !tmp_data_mw.is_empty()
+        && token_name != "template"
+    {
         let about_id = new_about_id(about_counter);
         token.set_attribute("about", &about_id);
         token.add_space_separated_attribute("typeof", "mw:ExpandedAttrs");
+
+        // Serialize the accumulated rich attributes into `data-mw.attribs` as
+        // a flat `[k, v]` pair list (mirrors `DataMw::toJsonArray`), then store
+        // it as a `data-mw` string attribute so the tree builder stashes it for
+        // the rendered element.
+        //
+        // The `html` values are plain strings here (from `tokensToString`); the
+        // full `expandAttrValuesToDOM` sub-pipeline (which turns these into
+        // serialized DOM fragments) is layered in on top.
+        let attribs: Vec<crate::wikitext::tokens_v2::DataMwAttrib> = tmp_data_mw
+            .into_iter()
+            .map(|t| {
+                crate::wikitext::tokens_v2::DataMwAttrib::new(
+                    t.k.into_data_mw_value(),
+                    t.v.into_data_mw_value(),
+                )
+            })
+            .collect();
+        let data_mw_attribs = serialize_data_mw_attribs(&attribs);
+        let data_mw_json = format!("{{\"attribs\":{data_mw_attribs}}}");
+        token.set_attribute("data-mw", &data_mw_json);
     }
 
     let mut out = meta_tokens;
@@ -652,5 +751,52 @@ mod tests {
             vec![Item::Str(String::new()), Item::Str("a".to_string())]
         );
         assert_eq!(result.post_nl_buf.len(), 2);
+    }
+
+    #[test]
+    fn test_build_expanded_attrs_marks_data_mw_attribs() {
+        use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
+
+        // A `<div>` with a templated value, already expanded to a transclusion
+        // meta pair wrapping the literal content (scenario 2: strip_meta_tags).
+        let token = ParsoidToken::Tag(TagTk::new("div", vec![], DataParsoid::default()));
+
+        let old_attrs = vec![KV {
+            key: KeyValue::Str("style".to_string()),
+            value: KeyValue::Tokens(vec![
+                meta_token("mw:Transclusion"),
+                Item::Str("color:red".to_string()),
+                meta_token("mw:Transclusion/End"),
+            ]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        let expanded_attrs = old_attrs.clone();
+
+        let counter = std::cell::Cell::new(0usize);
+        let out = build_expanded_attrs(token, &old_attrs, expanded_attrs, &counter, false);
+
+        // Exactly one token: the `<div>` (no meta/post-nl tokens for the simple
+        // scenario-2 case).
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Item::Tok(ParsoidToken::Tag(div)) = &out[0] else {
+            panic!("expected a Tag, got: {out:?}");
+        };
+        let attr_v = |tk: &crate::wikitext::tokens_v2::TagTk, name: &str| {
+            ParsoidToken::Tag(tk.clone())
+                .get_attribute_v(name)
+                .map(str::to_string)
+        };
+        assert_eq!(attr_v(div, "about").as_deref(), Some("#mwt1"));
+        assert_eq!(attr_v(div, "typeof").as_deref(), Some("mw:ExpandedAttrs"));
+        // The `data-mw` string attribute carries the rich `attribs` envelope.
+        let data_mw = div
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("data-mw"))
+            .and_then(|kv| kv.value.as_str())
+            .expect("expected data-mw attribute");
+        assert!(data_mw.contains("\"attribs\""), "got: {data_mw}");
     }
 }
