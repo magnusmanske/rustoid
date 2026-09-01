@@ -125,6 +125,55 @@ fn extract_fragment_children(ast: &Node) -> Node {
     ast.clone()
 }
 
+/// Flatten `mw:Nowiki` spans into their text content (mirrors PHP
+/// `Pre::sourceToDom` + `removeNowikiEscapesFromContent`): inside a
+/// `<pre format="wikitext">` body the `<nowiki>` content has already been
+/// protected from markup expansion during the fragment parse, so the nowiki
+/// wrapper is redundant and is unwrapped to its literal text. The `mw:Entity`
+/// children contribute their *decoded* text (so `&amp;` re-escapes correctly
+/// when the `<pre>` is rendered).
+fn flatten_nowiki_spans(root: &mut Node) {
+    let children = std::mem::take(&mut root.children);
+    let mut out: Vec<Node> = Vec::with_capacity(children.len());
+    for mut child in children {
+        if is_nowiki_span(&child) {
+            let text = text_content(&child);
+            if !text.is_empty() {
+                out.push(Node::text(text));
+            }
+        } else {
+            if matches!(child.kind, crate::dom::node::NodeKind::Element(_)) {
+                flatten_nowiki_spans(&mut child);
+            }
+            out.push(child);
+        }
+    }
+    root.children = out;
+}
+
+/// Is this an element node carrying a `mw:Nowiki` `typeof`?
+fn is_nowiki_span(node: &Node) -> bool {
+    node.get_attr("typeof")
+        .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:Nowiki"))
+}
+
+/// Concatenate all descendant text nodes (a faithful `Node::textContent`).
+fn text_content(node: &Node) -> String {
+    let mut out = String::new();
+    fn collect(node: &Node, out: &mut String) {
+        match &node.kind {
+            crate::dom::node::NodeKind::Text(t) => out.push_str(t),
+            _ => {
+                for child in &node.children {
+                    collect(child, out);
+                }
+            }
+        }
+    }
+    collect(node, &mut out);
+    out
+}
+
 /// Locate the `<body>` element in the tree-builder output and wrap its children
 /// in `<section>` wrappers (see `pipeline::section_wrapper`).
 ///
@@ -409,7 +458,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        self.fragment_from_tokens(tokens)
+        let mut frag = self.fragment_from_tokens(tokens);
+        flatten_nowiki_spans(&mut frag);
+        frag
     }
 
     /// Build an inline fragment document from an already-tokenized (and
@@ -459,7 +510,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        self.fragment_from_tokens(tokens)
+        let mut frag = self.fragment_from_tokens(tokens);
+        flatten_nowiki_spans(&mut frag);
+        frag
     }
 
     /// Expand `<pre format="wikitext">` extension tokens in place: emit the
@@ -1033,6 +1086,31 @@ mod tests {
             .unwrap();
         assert!(html.contains("<pre"), "got: {html}");
         assert!(html.contains("<b>bold</b>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_flatten_nowiki_spans() {
+        use crate::dom::node::ElementKind;
+        // A `mw:Nowiki` span wrapping a decoded `mw:Entity` is flattened to its
+        // text content (the decoded `&`), so it re-escapes correctly inside pre.
+        let mut nowiki = Node::element(ElementKind::Span);
+        nowiki.set_attr("typeof", "mw:Nowiki");
+        let mut entity = Node::element(ElementKind::Span);
+        entity.set_attr("typeof", "mw:Entity");
+        entity.push_child(Node::text("&"));
+        nowiki.push_child(entity);
+        nowiki.push_child(Node::text("plitude"));
+
+        let mut root = Node::document();
+        root.push_child(nowiki);
+
+        flatten_nowiki_spans(&mut root);
+
+        assert_eq!(root.children.len(), 1, "{root:?}");
+        match &root.children[0].kind {
+            crate::dom::node::NodeKind::Text(t) => assert_eq!(t, "&plitude"),
+            other => panic!("expected text node, got {other:?}"),
+        }
     }
 
     #[test]
