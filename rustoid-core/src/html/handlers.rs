@@ -1816,6 +1816,23 @@ impl EncapsulatedContentHandler {
         crate::html::dom_utils::has_type_of(tree.node(node), "mw:LanguageVariant")
     }
 
+    /// Extract `(extPrefix, extSuffix)` from `data-mw` (both default to empty).
+    /// Faithful to `$dataMw->extPrefix ?? ''` / `$dataMw->extSuffix ?? ''`.
+    fn ext_prefix_suffix(node: &crate::dom::node::Node) -> (String, String) {
+        let json = node
+            .data_mw
+            .as_deref()
+            .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok());
+        let get = |key: &str| -> String {
+            json.as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        (get("extPrefix"), get("extSuffix"))
+    }
+
     /// Serialize an extension tag from `data-mw` (name/attrs/body), mirroring
     /// `WikitextSerializer::defaultExtensionHandler` for the plain (non-`extApi`)
     /// case.
@@ -1912,6 +1929,10 @@ impl DomHandler for EncapsulatedContentHandler {
         };
 
         state.single_line_context.disable();
+        // FIXME: https://phabricator.wikimedia.org/T184779
+        // Apply any `data-mw.extPrefix`/`extSuffix` around the serialized source.
+        let (ext_prefix, ext_suffix) = Self::ext_prefix_suffix(n);
+        let src = format!("{ext_prefix}{src}{ext_suffix}");
         let bullets = Self::handle_list_prefix(tree, node);
         state.emit_chunk(format!("{bullets}{src}"), node, tree);
         state.single_line_context.pop();
@@ -1919,6 +1940,53 @@ impl DomHandler for EncapsulatedContentHandler {
         // Skip over the rest of the encapsulated forest (siblings with the same
         // `about` id).
         skip_over_encapsulated_content(tree, node)
+    }
+
+    fn before(
+        &mut self,
+        tree: &DomTree,
+        node: NodeId,
+        other: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        // If this content came from a multi-part-template-block, use the first
+        // node in that block for determining newline constraints.
+        if let Some(ftn) = tree
+            .node(node)
+            .dp
+            .as_ref()
+            .and_then(|d| d.first_wikitext_node.clone())
+        {
+            // Note: `firstWikitextNode` may be uppercase (`DD_ROW`) — lowercase
+            // it, preserving the `_` so that specialized keys (`dd_row`,
+            // `pre_html`) still match.
+            let ftn = ftn.to_lowercase();
+            if crate::html::dom_handler_factory::handler_kind_for_tag(&ftn).is_some() {
+                let mut h = crate::html::dom_handler_factory::handler_for_tag(&ftn);
+                return h.before(tree, node, other, state);
+            }
+            // html-stx fallback (mirrors `if (!$h && stx === 'html' &&
+            // $ftn !== 'a_html') { $h = new FallbackHTMLHandler(); }`).
+            if tree.node(node).dp.as_ref().and_then(|d| d.stx.as_deref()) == Some("html")
+                && ftn != "a_html"
+            {
+                let mut h = FallbackHTMLHandler;
+                return h.before(tree, node, other, state);
+            }
+        }
+        None
+    }
+
+    fn after(
+        &mut self,
+        _tree: &DomTree,
+        _node: NodeId,
+        _other: NodeId,
+        _state: &mut SerializerState,
+    ) -> Option<Constraints> {
+        // Native-extension `format === 'block'` constraints are not reachable
+        // (the config carries no extension tag config); the default is empty ([]).
+        None
     }
 }
 
@@ -2670,9 +2738,14 @@ impl DomHandler for MetaHandler {
         let other_is_element = !other_name.is_empty();
 
         // `needNewLineSepBeforeMeta`: other is not the parent, and (other is a
-        // wikitext block element, or other is text and the next sibling is block).
+        // wikitext block element, or other is text and the meta's next
+        // non-separator sibling is a block node).
+        let other_is_text = matches!(tree.node(other).kind, NodeKind::Text(_));
+        let next_sibling_is_block = crate::html::dom_tree::next_non_sep_sibling(tree, node)
+            .is_some_and(|s| dom_utils::is_wikitext_block_node(tree.node(s)));
         let need_nl = other != tree.parent(node).unwrap_or(usize::MAX)
-            && (other_is_element && dom_utils::is_wikitext_block_node(tree.node(other)));
+            && ((other_is_element && dom_utils::is_wikitext_block_node(tree.node(other)))
+                || (other_is_text && next_sibling_is_block));
 
         if crate::html::wts_utils::is_annotation_start_marker_meta(n) {
             return if need_nl {

@@ -142,6 +142,13 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
 
     // Pick the best available specialized / plain handler.
     let kind = specialized_kind.or_else(|| handler_kind_for_tag(&tag));
+    handler_for_kind(kind)
+}
+
+/// Construct the concrete handler for a [`HandlerKind`] (faithful to the
+/// `newFromTagHandler` `match` arms). `None`/unknown kinds fall back to
+/// [`FallbackHTMLHandler`], matching PHP's `?: new FallbackHTMLHandler()`.
+pub fn handler_for_kind(kind: Option<HandlerKind>) -> Box<dyn DomHandler> {
     match kind {
         Some(HandlerKind::Body) => Box::new(BodyHandler),
         Some(HandlerKind::QuoteBold) => Box::new(QuoteHandler::new("'''")),
@@ -170,22 +177,25 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         Some(HandlerKind::Span) => Box::new(SpanHandler),
         Some(HandlerKind::Pre) => Box::new(PreHandler),
         Some(HandlerKind::PreHtml) => Box::new(HTMLPreHandler),
-        // `A`/`Link` dispatch via `linkHandler`; `Figure`/`Img`/`Media` dispatch
-        // via `figureHandler`; `Meta` uses `MetaHandler`.
         Some(HandlerKind::A) => Box::new(AHandler),
         Some(HandlerKind::Link) => Box::new(LinkHandler),
         Some(HandlerKind::Figure) => Box::new(FigureHandler),
         Some(HandlerKind::Img) => Box::new(ImgHandler),
         Some(HandlerKind::Media) => Box::new(MediaHandler),
         Some(HandlerKind::Meta) => Box::new(MetaHandler),
-        // No specialized/plain handler → literal HTML serialization (faithful to
-        // PHP's `?: new FallbackHTMLHandler()` final fallback). `FallbackHTML` is
-        // the tag→handler map's "no specialized handler" sentinel; `Heading(_)`
-        // covers the out-of-range levels the tag map never produces.
+        // No specialized/plain handler → literal HTML serialization.
         None | Some(HandlerKind::FallbackHTML) | Some(HandlerKind::Heading(_)) => {
             Box::new(FallbackHTMLHandler)
         }
     }
+}
+
+/// Construct a concrete handler for a (possibly specialized) tag name, mirroring
+/// PHP's `DOMHandlerFactory::newFromTagHandler` (returns the handler, or
+/// [`FallbackHTMLHandler`] for unknown tags). Used by the
+/// `EncapsulatedContentHandler::before` `firstWikitextNode` delegation.
+pub fn handler_for_tag(tag: &str) -> Box<dyn DomHandler> {
+    handler_for_kind(handler_kind_for_tag(tag))
 }
 
 /// `WTUtils::serializeChildTableTagAsHTML` — whether a table tag should be
