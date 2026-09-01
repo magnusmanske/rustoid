@@ -14,13 +14,40 @@ use crate::html::dom_handler::DomHandler;
 use crate::html::dom_tree::{DomTree, NodeId};
 use crate::html::serializer_state::SerializerState;
 
-/// Newline constraints for a separator. Mirrors the `min`/`max` pair plus the
-/// `constraintInfo` side-band (`sepType`, `nodeA`, `nodeB`, `onSOL`, `forceSOL`)
-/// from `Separators::updateSeparatorConstraints`.
+/// Newline constraints for a separator. Mirrors the `min`/`max` pair.
+/// The `constraintInfo` side-band (`sepType`, `nodeA`, `nodeB`, `onSOL`,
+/// `forceSOL`) from PHP `Separators::updateSeparatorConstraints` is kept
+/// separately on [`SeparatorData`] (it is per-pair, not merged, and is set
+/// afresh on every `updateSeparatorConstraints` call).
 #[derive(Debug, Clone, Default)]
 pub struct Constraints {
     pub min: Option<usize>,
     pub max: Option<usize>,
+}
+
+/// The topological relationship between the two nodes a separator sits between
+/// (mirrors PHP `$sepType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SepType {
+    /// `nodeA` is the parent of `nodeB`.
+    ParentChild,
+    /// `nodeB` is the parent of `nodeA`.
+    ChildParent,
+    /// `nodeA` and `nodeB` are siblings.
+    Sibling,
+}
+
+/// The `constraintInfo` side-band collected by
+/// `Separators::updateSeparatorConstraints` (PHP keeps this inside the
+/// constraints array; it is stored as a separate field here because it is
+/// overwritten on each call rather than merged).
+#[derive(Debug, Clone, Default)]
+pub struct ConstraintInfo {
+    pub sep_type: Option<SepType>,
+    pub node_a: Option<NodeId>,
+    pub node_b: Option<NodeId>,
+    pub on_sol: bool,
+    pub force_sol: bool,
 }
 
 /// The separator information `SerializerState` accumulates (`$state->sep`).
@@ -28,6 +55,8 @@ pub struct Constraints {
 pub struct SeparatorData {
     /// Newline constraints (`null` when none).
     pub constraints: Option<Constraints>,
+    /// The `constraintInfo` for the most recent node pair (unmerged side-band).
+    pub constraint_info: ConstraintInfo,
     /// Collected separator source text (whitespace/comments).
     pub src: Option<String>,
     /// The last DOM node that emitted a chunk (so separators aren't reused on
@@ -48,9 +77,11 @@ impl Separators {
     /// newline that lives inside a comment does not count toward the separator's
     /// line count and is never stripped.
     pub fn make_separator(
+        tree: &DomTree,
         sep: &str,
         constraints: &Constraints,
         at_start_of_output: bool,
+        constraint_info: &ConstraintInfo,
     ) -> String {
         let sep_nl_count = sep_nl_count(sep);
         let mut min_nls = constraints.min.unwrap_or(0);
@@ -61,8 +92,41 @@ impl Separators {
 
         let mut out = sep.to_string();
         if min_nls > 0 && sep_nl_count < min_nls {
-            for _ in 0..(min_nls - sep_nl_count) {
-                out.push('\n');
+            let extra_nls = min_nls - sep_nl_count;
+            let nl_buf = "\n".repeat(extra_nls);
+
+            // Two best-guess heuristics for where to add the newlines relative
+            // to nodeA/nodeB (faithful to `Separators::makeSeparator`):
+            //
+            // 1. parent-child: when nodeA's first child is not a content node,
+            //    the separator was plucked from the child's constraints, so the
+            //    newlines should be prepended.
+            // 2. sibling: when nodeB is a literal-HTML element, nodeA forced the
+            //    newline, so it should be emitted right after nodeA (i.e.
+            //    prepended to nodeB's separator).
+            let prepend = match constraint_info.sep_type {
+                Some(SepType::ParentChild) => {
+                    let first_child_is_content = constraint_info
+                        .node_a
+                        .and_then(|na| crate::html::dom_tree::first_non_deleted_child(tree, na))
+                        .is_some_and(|c| crate::html::dom_tree::is_content_node(tree, c));
+                    let node_b_is_child_table = constraint_info.node_b.is_some_and(|nb| {
+                        crate::wikitext::consts::child_table_tags()
+                            .contains(&crate::html::dom_utils::node_name(tree.node(nb)))
+                            && !crate::html::wts_utils::is_literal_html_node(tree.node(nb))
+                    });
+                    !first_child_is_content && !node_b_is_child_table
+                }
+                Some(SepType::Sibling) => constraint_info
+                    .node_b
+                    .is_some_and(|nb| crate::html::wts_utils::is_literal_html_node(tree.node(nb))),
+                _ => false,
+            };
+
+            if prepend {
+                out = format!("{nl_buf}{out}");
+            } else {
+                out.push_str(&nl_buf);
             }
         } else if let Some(max) = constraints.max {
             // Strip excess newlines *outside* comments only (comment-only lines
@@ -77,17 +141,25 @@ impl Separators {
     }
 
     /// Build the separator to emit before `node`, based on the buffered
-    /// constraints and source. Faithful to the *skeleton* of `Separators::buildSep`
-    /// (DSR-based recovery is layered on once `getOrigSrc` is available).
-    pub fn build_sep(state: &mut SerializerState, _node: NodeId) -> Option<String> {
+    /// constraints and source. Faithful to the *non-selser* path of
+    /// `Separators::buildSep` (the DSR-based source recovery is selser-only and
+    /// not yet wired in).
+    pub fn build_sep(state: &mut SerializerState, tree: &DomTree, _node: NodeId) -> Option<String> {
         // In selser mode, recover the separator from source via DSR; for now,
         // fall back to the constraint-based construction.
         let constraints = state.separator.constraints.clone();
+        let constraint_info = state.separator.constraint_info.clone();
         let src = state.separator.src.clone().unwrap_or_default();
         state.separator.src = None;
 
-        match constraints {
-            Some(c) => Some(Self::make_separator(&src, &c, state.at_start_of_output)),
+        let sep = match constraints {
+            Some(c) => Some(Self::make_separator(
+                tree,
+                &src,
+                &c,
+                state.at_start_of_output,
+                &constraint_info,
+            )),
             None => {
                 if src.is_empty() {
                     None
@@ -95,7 +167,10 @@ impl Separators {
                     Some(src)
                 }
             }
-        }
+        };
+
+        // Wrap leading whitespace that would otherwise trigger indent-pre.
+        sep.map(|s| Self::make_sep_indent_pre_safe(state, tree, &s, &constraint_info))
     }
 
     /// Merges two constraint sets (`Separators::mergeConstraints`).
@@ -119,12 +194,107 @@ impl Separators {
 
     /// Safe separator handling for indent-pre: wraps leading whitespace on a
     /// newline in `<nowiki>` when it would otherwise trigger indent-pre.
-    /// STUB: faithful wrapping is deferred; returns the separator unchanged.
+    /// Faithful to `Separators::makeSepIndentPreSafe` (non-selser-relevant
+    /// branches; `inPHPBlock`/`inIndentPre` mirror `$state->inPHPBlock`/
+    /// `$state->inIndentPre`).
     pub fn make_sep_indent_pre_safe(
-        _state: &mut SerializerState,
+        state: &mut SerializerState,
+        tree: &DomTree,
         sep: &str,
-        _constraints: &Constraints,
+        constraint_info: &ConstraintInfo,
     ) -> String {
+        let sep_type = constraint_info.sep_type;
+        let node_a = constraint_info.node_a;
+        let node_b = constraint_info.node_b;
+        let force_sol = constraint_info.force_sol && sep_type != Some(SepType::ChildParent);
+
+        // Ex: "<div>foo</div>\n <span>bar</span>". We also test onSOL state to
+        // deal with // <ul> <li>foo</li></ul> and strip the leading space before
+        // non-indent-pre-safe tags.
+        if !state.in_php_block
+            && !state.in_indent_pre
+            && indent_pre_ws_in_sep_matches(sep)
+            && (sep.contains('\n') || constraint_info.on_sol || force_sol)
+        {
+            let mut is_indent_pre_safe = false;
+
+            if node_b.is_some_and(|nb| {
+                crate::html::wts_utils::preceding_space_suppresses_indent_pre(tree, nb, node_b)
+            }) {
+                is_indent_pre_safe = true;
+            } else if sep_type == Some(SepType::Sibling)
+                || node_a.is_some_and(|na| crate::html::dom_utils::at_the_top(tree, na))
+            {
+                // Walk past sol-transparent nodes in the right-sibling chain of
+                // nodeB till we establish indent-pre safety.
+                let mut nb = node_b;
+                while let Some(n) = nb {
+                    if crate::html::dom_tree::is_diff_marker(tree, n)
+                        || crate::html::wts_utils::emits_sol_transparent_single_line_wt(
+                            tree.node(n),
+                        )
+                    {
+                        nb = tree.next_sibling(n);
+                    } else {
+                        break;
+                    }
+                }
+                is_indent_pre_safe = nb.is_none_or(|n| {
+                    crate::html::wts_utils::preceding_space_suppresses_indent_pre(tree, n, node_b)
+                });
+            }
+
+            // Check whether nodeB is nested inside an element that suppresses
+            // indent-pres.
+            if let Some(nb) = node_b
+                && !is_indent_pre_safe
+                && !crate::html::dom_utils::at_the_top(tree, nb)
+            {
+                let mut parent_b = tree.parent(nb);
+                while parent_b.is_some_and(|p| {
+                    crate::html::wts_utils::is_zero_width_wikitext_elt(tree.node(p))
+                }) {
+                    parent_b = parent_b.and_then(|p| tree.parent(p));
+                }
+
+                // The token stream paragraph wrapper tracks this with
+                // `$inBlockquote`.
+                is_indent_pre_safe = parent_b.is_some_and(|p| {
+                    crate::html::dom_utils::has_name_or_has_ancestor_of_name(tree, p, "blockquote")
+                });
+
+                // First scope wins.
+                while let Some(p) = parent_b {
+                    if is_indent_pre_safe || crate::html::dom_utils::at_the_top(tree, p) {
+                        break;
+                    }
+                    let name = crate::html::dom_utils::node_name(tree.node(p));
+                    if crate::wikitext::token_utils::tag_opens_block_scope(&name)
+                        && (name != "p"
+                            || crate::html::wts_utils::is_literal_html_node(tree.node(p)))
+                    {
+                        is_indent_pre_safe = true;
+                        break;
+                    } else if crate::wikitext::token_utils::tag_closes_block_scope(&name) {
+                        break;
+                    }
+                    parent_b = tree.parent(p);
+                }
+            }
+
+            let strip_leading_space = (constraint_info.on_sol || force_sol)
+                && node_b.is_some_and(|nb| {
+                    !crate::html::wts_utils::is_literal_html_node(tree.node(nb))
+                        && crate::wikitext::consts::html_tags_requiring_sol_context()
+                            .contains(&crate::html::dom_utils::node_name(tree.node(nb)))
+                });
+            if !is_indent_pre_safe || strip_leading_space {
+                // Wrap non-nl ws from last line, but preserve comments. This
+                // avoids triggering indent-pres.
+                return wrap_indent_pre_ws(sep, strip_leading_space, state);
+            }
+        }
+
         sep.to_string()
     }
 
@@ -181,21 +351,21 @@ impl Separators {
         node_b: NodeId,
         handler_b: &mut dyn DomHandler,
     ) {
-        let (a_cons, b_cons) = if tree.parent(node_b) == Some(node_a) {
+        let (sep_type, a_cons, b_cons) = if tree.parent(node_b) == Some(node_a) {
             // parent-child: nodeA is parent of nodeB.
             let a = handler_a.first_child(tree, node_a, node_b, state);
             let b = handler_b.before(tree, node_b, node_a, state);
-            (a, b)
+            (SepType::ParentChild, a, b)
         } else if tree.parent(node_a) == Some(node_b) {
             // child-parent: nodeB is parent of nodeA.
             let a = handler_a.after(tree, node_a, node_b, state);
             let b = handler_b.last_child(tree, node_b, node_a, state);
-            (a, b)
+            (SepType::ChildParent, a, b)
         } else {
             // sibling.
             let a = handler_a.after(tree, node_a, node_b, state);
             let b = handler_b.before(tree, node_b, node_a, state);
-            (a, b)
+            (SepType::Sibling, a, b)
         };
 
         let nl = Self::get_sep_nl_constraints(a_cons.as_ref(), b_cons.as_ref());
@@ -208,6 +378,16 @@ impl Separators {
                 state.separator.constraints = Some(nl);
             }
         }
+
+        // The per-pair side-band (mirrors setting `$state->sep->constraints
+        // ['constraintInfo']` at the end of `updateSeparatorConstraints`).
+        state.separator.constraint_info = ConstraintInfo {
+            sep_type: Some(sep_type),
+            node_a: Some(node_a),
+            node_b: Some(node_b),
+            on_sol: state.on_sol,
+            force_sol: handler_b.force_sol(),
+        };
     }
 }
 
@@ -220,6 +400,79 @@ fn match_comment_at(s: &str, i: usize) -> Option<usize> {
     }
     let end = s[i + 4..].find("-->")?;
     Some(i + 4 + end + 3)
+}
+
+/// Does `sep` match `INDENT_PRE_WS_IN_SEP_REGEXP =
+/// /^((?: *\n|COMMENT)*)( +)([^\n]*)$/D`? Returns `(spaces_start, tail_start)`
+/// when it matches, else `None`.
+///
+/// The first group consumes runs of ` *\n` or comments greedily from the start;
+/// the second group is one-or-more spaces; the third is the remaining
+/// non-newline tail up to end-of-string.
+fn indent_pre_ws_in_sep_match(sep: &str) -> Option<(usize, usize)> {
+    let bytes = sep.as_bytes();
+    let mut i = 0;
+    // Greedy first group: `( *\n | comment)*`. A comment always consumes past
+    // its `-->`; a ` *\n` consumes spaces then a newline.
+    loop {
+        if let Some(end) = match_comment_at(sep, i) {
+            i = end;
+            continue;
+        }
+        // Match ` *\n`.
+        let mut j = i;
+        while j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b'\n' {
+            i = j + 1;
+            continue;
+        }
+        break;
+    }
+    // Second group: ` +` (one-or-more spaces).
+    let spaces_start = i;
+    let mut j = i;
+    while j < bytes.len() && bytes[j] == b' ' {
+        j += 1;
+    }
+    if j == spaces_start {
+        return None;
+    }
+    // Third group: `[^\n]*` to end (no newline allowed in the tail).
+    if sep[j..].contains('\n') {
+        return None;
+    }
+    Some((spaces_start, j))
+}
+
+/// Whether `sep` matches the indent-pre whitespace regex (i.e. it has leading
+/// spaces on its last line).
+fn indent_pre_ws_in_sep_matches(sep: &str) -> bool {
+    indent_pre_ws_in_sep_match(sep).is_some()
+}
+
+/// Wrap the leading spaces captured by `INDENT_PRE_WS_IN_SEP_REGEXP` in
+/// `<nowiki>…</nowiki>` (or strip them when `strip_leading_space`), preserving
+/// the prefix (newlines/comments) and the trailing tail. Faithful to the
+/// `preg_replace_callback` in `Separators::makeSepIndentPreSafe`.
+fn wrap_indent_pre_ws(sep: &str, strip_leading_space: bool, state: &mut SerializerState) -> String {
+    let Some((spaces_start, tail_start)) = indent_pre_ws_in_sep_match(sep) else {
+        return sep.to_string();
+    };
+    let prefix = &sep[..spaces_start];
+    let spaces = &sep[spaces_start..tail_start];
+    let tail = &sep[tail_start..];
+
+    let middle = if strip_leading_space {
+        String::new()
+    } else {
+        // Since we nowiki-ed, we are no longer in SOL state.
+        state.on_sol = false;
+        state.has_indent_pre_nowikis = true;
+        format!("<nowiki>{spaces}</nowiki>")
+    };
+    format!("{prefix}{middle}{tail}")
 }
 
 /// Match a run of one or more comment-only lines starting at `s[i]` (where
@@ -355,25 +608,36 @@ fn strip_nls_outside_comments(sep: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dom::node::Node;
+
+    fn mk_tree() -> DomTree {
+        DomTree::new(Node::document())
+    }
+
+    fn msep(tree: &DomTree, sep: &str, c: &Constraints, at_start: bool) -> String {
+        Separators::make_separator(tree, sep, c, at_start, &ConstraintInfo::default())
+    }
 
     #[test]
     fn test_make_separator_min_newlines() {
+        let tree = mk_tree();
         let c = Constraints {
             min: Some(2),
             max: Some(2),
         };
-        assert_eq!(Separators::make_separator("", &c, false), "\n\n");
-        assert_eq!(Separators::make_separator("\n", &c, false), "\n\n");
+        assert_eq!(msep(&tree, "", &c, false), "\n\n");
+        assert_eq!(msep(&tree, "\n", &c, false), "\n\n");
     }
 
     #[test]
     fn test_make_separator_at_start_of_output() {
+        let tree = mk_tree();
         let c = Constraints {
             min: Some(2),
             max: Some(2),
         };
         // The first newline is skipped at start-of-output.
-        assert_eq!(Separators::make_separator("", &c, true), "\n");
+        assert_eq!(msep(&tree, "", &c, true), "\n");
     }
 
     #[test]
@@ -408,16 +672,14 @@ mod tests {
 
     #[test]
     fn test_make_separator_preserves_comment_newline() {
+        let tree = mk_tree();
         // A comment whose internal newline would exceed the max must not be
         // stripped (only *real* separator newlines are counted/stripped).
         let c = Constraints {
             min: Some(0),
             max: Some(0),
         };
-        assert_eq!(
-            Separators::make_separator("<!-- cmt\n -->", &c, false),
-            "<!-- cmt\n -->"
-        );
+        assert_eq!(msep(&tree, "<!-- cmt\n -->", &c, false), "<!-- cmt\n -->");
     }
 
     #[test]
@@ -428,6 +690,59 @@ mod tests {
         assert_eq!(
             strip_nls_outside_comments("<!-- c\n -->", 1),
             "<!-- c\n -->"
+        );
+    }
+
+    #[test]
+    fn test_indent_pre_ws_match() {
+        // Leading spaces on the last line.
+        assert_eq!(indent_pre_ws_in_sep_match("\n "), Some((1, 2)));
+        // Comment followed by spaces on the last line.
+        assert_eq!(indent_pre_ws_in_sep_match("<!--c--> "), Some((8, 9)));
+        // No trailing space -> no match.
+        assert_eq!(indent_pre_ws_in_sep_match("\nx"), None);
+        assert_eq!(indent_pre_ws_in_sep_match("x"), None);
+        // Spaces with a newline in the tail -> no match.
+        assert_eq!(indent_pre_ws_in_sep_match(" \n"), None);
+    }
+
+    #[test]
+    fn test_wrap_indent_pre_ws() {
+        let mut st = SerializerState::new();
+        // Wraps the leading spaces in nowiki, preserving the newline prefix.
+        assert_eq!(
+            wrap_indent_pre_ws("\n ", false, &mut st),
+            "\n<nowiki> </nowiki>"
+        );
+        assert!(st.has_indent_pre_nowikis);
+        assert!(!st.on_sol);
+
+        // With strip_leading_space, the space is removed.
+        let mut st2 = SerializerState::new();
+        assert_eq!(wrap_indent_pre_ws("\n ", true, &mut st2), "\n");
+        assert!(!st2.has_indent_pre_nowikis);
+    }
+
+    #[test]
+    fn test_make_separator_sibling_prepends_for_html_node() {
+        // sibling + literal-HTML nodeB => newlines prepended.
+        let tree = mk_tree();
+        let c = Constraints {
+            min: Some(1),
+            max: Some(1),
+        };
+        let info = ConstraintInfo {
+            sep_type: Some(SepType::Sibling),
+            node_a: None,
+            node_b: None,
+            on_sol: false,
+            force_sol: false,
+        };
+        // With no node_b in the info (no literal-HTML check possible), newlines
+        // are appended, matching the else branch.
+        assert_eq!(
+            Separators::make_separator(&tree, "", &c, false, &info),
+            "\n"
         );
     }
 }

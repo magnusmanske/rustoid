@@ -370,7 +370,7 @@ impl<'a> SerializerState<'a> {
         let mut text = text.into();
         // Emit the pending separator first, gated on node identity (mirrors
         // `$origSepNeeded = $node !== $sep->lastSourceNode`).
-        self.emit_sep_for_node(node);
+        self.emit_sep_for_node(tree, node);
         if self.single_line_context.enforced() {
             text = text.replace('\n', " ");
         }
@@ -395,12 +395,12 @@ impl<'a> SerializerState<'a> {
     /// Build and emit the pending separator for `node`, but only when `node`
     /// differs from the last node a separator was emitted for. Faithful to
     /// `SerializerState::emitSepForNode` (non-selser, no DSR recovery).
-    pub fn emit_sep_for_node(&mut self, node: NodeId) {
+    pub fn emit_sep_for_node(&mut self, tree: &DomTree, node: NodeId) {
         // A separator is only needed when this node hasn't already had one.
         if self.separator.last_source_node == Some(node) {
             return;
         }
-        let sep = crate::html::separators::Separators::build_sep(self, node);
+        let sep = crate::html::separators::Separators::build_sep(self, tree, node);
         // `emit_sep` resets the separator and records `last_source_node`.
         self.emit_sep(sep.as_deref().unwrap_or(""), node);
     }

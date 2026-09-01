@@ -147,6 +147,42 @@ pub fn is_block_node_with_visible_wt(node: &Node) -> bool {
     crate::html::dom_utils::is_wikitext_block_node(node) && !is_zero_width_wikitext_elt(node)
 }
 
+/// `WTSUtils::precedingSpaceSuppressesIndentPre` — whether leading whitespace in
+/// the separator before `node` is safe to leave un-nowiki'd (i.e. it will not
+/// trigger indent-pre). `sep_node` is the node the separator text was plucked
+/// from (distinct from `node` when the separator came from a sibling).
+pub fn preceding_space_suppresses_indent_pre(
+    tree: &crate::html::dom_tree::DomTree,
+    node: crate::html::dom_tree::NodeId,
+    sep_node: Option<crate::html::dom_tree::NodeId>,
+) -> bool {
+    let n = tree.node(node);
+    if Some(node) != sep_node && matches!(n.kind, NodeKind::Text(_)) {
+        // If `node` is the same as `sep_node`, the separator text at its start
+        // was already stripped and can't be used to test indent-pre safety.
+        let value = match &n.kind {
+            NodeKind::Text(t) => t.as_str(),
+            _ => return false,
+        };
+        let trimmed = value.trim_start_matches([' ', '\t']);
+        return trimmed.starts_with('\n');
+    }
+    if node_name(n) == "br" {
+        return true;
+    }
+    if is_first_encapsulation_wrapper_node(n) {
+        // Don't try any harder than this.
+        let Some(first) = tree.first_child(node) else {
+            return true;
+        };
+        return match &tree.node(first).kind {
+            NodeKind::Text(t) => t.starts_with('\n'),
+            _ => false,
+        };
+    }
+    is_block_node_with_visible_wt(n)
+}
+
 /// The DOM Source Range (`data-parsoid.dsr`) of a node as the serializer-facing
 /// [`DomSourceRange`](crate::html::dsr::DomSourceRange), or `None` when the node
 /// has no structured `data-parsoid`/`dsr`. Faithful to
