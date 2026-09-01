@@ -2163,15 +2163,13 @@ impl<'a> PegTokenizer<'a> {
 
         // Find closing `}-`.
         if let Some(end) = self.remaining().find("}-") {
-            let _inner = self.remaining()[..end].to_string();
             self.advance(end + 2);
 
-            let dp = self.make_dp(saved, self.pos);
-            self.emit_token(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
-                "language-variant",
-                vec![],
-                dp,
-            )));
+            // Language conversion is not supported (always disabled), so faithful
+            // to PHP's `lang_variant_preproc` disabled-langconv branch: `-{ … }-` is
+            // re-emitted as plain text rather than a `language-variant` self-closing
+            // tag (which would drop the body). Emit the whole construct verbatim.
+            self.emit_text(self.input[saved..self.pos].to_string());
             return true;
         }
 
@@ -3301,6 +3299,27 @@ mod tests {
         let tokens = tokenize("Hello world");
         assert_eq!(tokens.len(), 1);
         assert!(matches!(&tokens[0], Either::Left(s) if s == "Hello world"));
+    }
+
+    #[test]
+    fn test_lang_variant_plain_text() {
+        // Language conversion is disabled (no LangConverter support), so
+        // `-{ … }-` tokenizes as plain text rather than a `language-variant`
+        // self-closing tag (which would drop the body). Faithful to PHP's
+        // disabled-`langConverterEnabled` branch.
+        let tokens = tokenize("a -{foo|bar}- b");
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant")));
+        // The entire `-{foo|bar}-` survives as literal text.
+        let text: String = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Either::Left(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("-{foo|bar}-"), "body lost: {tokens:?}");
     }
 
     #[test]
