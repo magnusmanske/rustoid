@@ -792,28 +792,79 @@ fn migrate_br_newlines(node: &mut Node) {
     node.children = out;
 }
 
-/// Remove marker metas (`<meta typeof="mw:IndentPreWS">`) from the AST.
-/// These are internal bookkeeping placeholders inserted by the PreHandler;
-/// PHP strips them in `CleanUp::stripMarkerMetas()`.
-fn strip_marker_metas(node: &mut Node) {
-    node.children.retain(|child| {
-        let is_marker_meta = matches!(&child.kind, NodeKind::Element(kind) if {
-            match kind {
-                ElementKind::Other(name) => {
-                    name == "meta"
-                        && child
-                            .attrs
-                            .iter()
-                            .any(|a| a.key == "typeof" && a.value == "mw:IndentPreWS")
-                }
+/// Whether a `Node` is a list item (`li`/`dd`/`dt`), used by the
+/// `isNestedInListItem` ancestry check.
+fn is_list_item_node(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::Element(
+            ElementKind::ListItem
+                | ElementKind::DefinitionTerm
+                | ElementKind::DefinitionDescription
+        )
+    )
+}
+
+/// Whether `node`'s `data-mw` is absent or an empty JSON object/array, faithful
+/// to `DOMDataUtils::getDataMw($node)->isEmpty()`.
+fn data_mw_is_empty(node: &Node) -> bool {
+    node.data_mw.as_deref().is_none_or(|json| {
+        serde_json::from_str::<serde_json::Value>(json)
+            .map(|v| match v {
+                serde_json::Value::Object(o) => o.is_empty(),
+                serde_json::Value::Array(a) => a.is_empty(),
                 _ => false,
-            }
-        });
-        !is_marker_meta
-    });
-    for child in &mut node.children {
-        strip_marker_metas(child);
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether `node` should be stripped by the marker-meta cleanup, faithful to
+/// `CleanUp::stripMarkerMetas`. `in_list_item` is true when `node` has a
+/// list-item ancestor (see `isNestedInListItem`).
+fn should_strip_marker_meta(node: &Node, in_list_item: bool) -> bool {
+    if !matches!(node.kind, NodeKind::Element(ElementKind::Other(ref name)) if name == "meta") {
+        return false;
     }
+    if crate::html::dom_utils::has_type_of(node, "mw:IndentPreWS") {
+        // PHP's `stripMarkerMetas` keeps `mw:IndentPreWS` here (setting the
+        // parent's `dsr.openWidth`) and strips it in `finalCleanup`. This
+        // pipeline has no `finalCleanup`, so both removals are folded here.
+        // The DSR open-width adjustment is handled by `ComputeDSR` (`mw:IndentPreWS`
+        // resets `cs`/`ce`), so early removal is observationally equivalent.
+        return true;
+    }
+    if crate::html::dom_utils::has_type_of(node, "mw:Placeholder/UnclosedComment") {
+        return true;
+    }
+    // A non-template meta may carry the `mw:Transclusion` typeof without
+    // data-mw; keep it only when it actually has data-mw.
+    if data_mw_is_empty(node) {
+        if crate::html::dom_utils::has_type_of(node, "mw:Placeholder/StrippedTag") && !in_list_item
+        {
+            return true;
+        }
+        if crate::html::dom_utils::has_type_of(node, "mw:Transclusion") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove marker metas from the AST, faithful to PHP's
+/// `CleanUp::stripMarkerMetas` (with `finalCleanup`'s `mw:IndentPreWS` removal
+/// folded in, since this pipeline has no separate `finalCleanup` pass).
+fn strip_marker_metas(node: &mut Node) {
+    strip_marker_metas_rec(node, false);
+}
+
+fn strip_marker_metas_rec(node: &mut Node, in_list_item: bool) {
+    for child in &mut node.children {
+        let child_in_li = in_list_item || is_list_item_node(child);
+        strip_marker_metas_rec(child, child_in_li);
+    }
+    node.children
+        .retain(|child| !should_strip_marker_meta(child, in_list_item));
 }
 
 /// Whether a `data-parsoid` JSON property is present and truthy.
@@ -1946,6 +1997,55 @@ mod tests {
         let pre = &doc.children[0];
         assert_eq!(pre.children.len(), 1);
         assert!(matches!(&pre.children[0].kind, NodeKind::Text(s) if s == "asdf"));
+    }
+
+    #[test]
+    fn test_strip_marker_metas_stripped_tag() {
+        // A stray/unmatched closing tag (`</code>`) becomes a
+        // `mw:Placeholder/StrippedTag` meta with no data-mw; it must be
+        // stripped unless nested in a list item (T66025).
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        let mut meta = Node::element(ElementKind::Other("meta".to_string()));
+        meta.set_attr("typeof", "mw:Placeholder/StrippedTag");
+        meta.data_parsoid = Some("{\"name\":\"code\",\"src\":\"</code>\"}".to_string());
+        p.push_child(meta);
+        doc.push_child(p);
+
+        strip_marker_metas(&mut doc);
+
+        assert!(doc.children[0].children.is_empty(), "{:?}", doc.children[0]);
+    }
+
+    #[test]
+    fn test_strip_marker_metas_stripped_tag_kept_in_list_item() {
+        // The same marker nested inside a `<li>` must be kept (see
+        // `ComputeDSR` width handling for markers that stay in the DOM).
+        let mut doc = Node::document();
+        let mut li = Node::element(ElementKind::ListItem);
+        let mut meta = Node::element(ElementKind::Other("meta".to_string()));
+        meta.set_attr("typeof", "mw:Placeholder/StrippedTag");
+        li.push_child(meta);
+        doc.push_child(li);
+
+        strip_marker_metas(&mut doc);
+
+        assert_eq!(doc.children[0].children.len(), 1, "{:?}", doc.children[0]);
+    }
+
+    #[test]
+    fn test_strip_marker_metas_keeps_stripped_tag_with_data_mw() {
+        // A StrippedTag marker carrying data-mw is a template artifact and
+        // must be retained.
+        let mut doc = Node::document();
+        let mut meta = Node::element(ElementKind::Other("meta".to_string()));
+        meta.set_attr("typeof", "mw:Placeholder/StrippedTag");
+        meta.data_mw = Some("{\"name\":\"code\"}".to_string());
+        doc.push_child(meta);
+
+        strip_marker_metas(&mut doc);
+
+        assert_eq!(doc.children.len(), 1, "{:?}", doc);
     }
 
     #[test]
