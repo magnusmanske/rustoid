@@ -136,18 +136,28 @@ impl Html5TreeBuilder {
 
     /// Stash data-parsoid/data-mw and return an attributes list carrying the
     /// `data-object-id` indirection (mirrors `stashDataAttribs`).
+    ///
+    /// Templated attributes recorded in `data-mw.attribs` (for `mw:ExpandedAttrs`
+    /// elements) are dropped from the plain attribute list: they are reconstructed
+    /// from `data-mw` at serialization time, so leaking them as plain DOM
+    /// attributes (e.g. a templated `k=""` table attribute) is incorrect.
     fn stash_data_attribs(
         &mut self,
         attribs: &[KV],
         dp: &TDataParsoid,
         data_mw: Option<String>,
     ) -> (Attributes, usize) {
+        let templated = data_mw
+            .as_deref()
+            .map(templated_attrib_keys)
+            .unwrap_or_default();
         let mut pairs: Vec<(String, String)> = Vec::new();
         for kv in attribs {
             if let (Some(k), Some(v)) = (kv.key.as_str(), kv.value.as_str())
                 && k != "data-parsoid"
                 && k != "data-mw"
                 && k != DATA_OBJECT_ATTR_NAME
+                && !templated.contains(k)
             {
                 pairs.push((k.to_string(), v.to_string()));
             }
@@ -163,7 +173,7 @@ impl Html5TreeBuilder {
             .iter()
             .find(|kv| kv.key.as_str() == Some("data-mw"))
             .and_then(|kv| kv.value.as_str())
-            .map(String::from)
+            .map(str::to_string)
     }
 
     /// Insert a `<meta>` tag *unfostered* (mirrors `insertUnfosteredMeta` +
@@ -577,6 +587,39 @@ fn match_transclusion(attribs: &[KV]) -> Option<String> {
     v.split_whitespace()
         .find(|ty| ty.starts_with("mw:Transclusion"))
         .map(String::from)
+}
+
+/// Collect the plain-text attribute keys recorded in a `data-mw.attribs`
+/// envelope, so [`Html5TreeBuilder::stash_data_attribs`] can drop those
+/// templated attributes from the rendered element. Mirrors PHP's
+/// `TreeBuilderStage` (which keeps only non-templated attributes on the DOM
+/// node once `data-mw.attribs` captures the templated ones).
+///
+/// `data-mw.attribs` is a flat `[k, v]` pair list; each `k` is a plain string
+/// or a `{ txt, html, uneditable }` object whose `txt` names the attribute.
+fn templated_attrib_keys(data_mw: &str) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(data_mw) else {
+        return keys;
+    };
+    let Some(attribs) = json.get("attribs").and_then(|a| a.as_array()) else {
+        return keys;
+    };
+    for pair in attribs {
+        let Some(k) = pair.get(0) else { continue };
+        match k {
+            serde_json::Value::String(s) => {
+                keys.insert(s.clone());
+            }
+            serde_json::Value::Object(obj) => {
+                if let Some(txt) = obj.get("txt").and_then(|t| t.as_str()) {
+                    keys.insert(txt.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    keys
 }
 
 /// Walk the AST, resolving `data-object-id` attributes into stashed
@@ -1292,6 +1335,23 @@ mod tests {
     }
     fn txt(s: &str) -> Item {
         Item::Str(s.to_string())
+    }
+
+    #[test]
+    fn test_templated_attrib_keys() {
+        // A `data-mw.attribs` envelope names the templated attributes (both as
+        // plain strings and as `{ txt, html, uneditable }` objects) that must be
+        // dropped from the rendered element's plain attributes.
+        let data_mw = r#"{"attribs":[[{"txt":"a","html":"<span>x</span>"},{"html":""}],[{"txt":"k","html":"k","uneditable":true},""]]}"#;
+        let keys = templated_attrib_keys(data_mw);
+        assert!(keys.contains("a"), "{keys:?}");
+        assert!(keys.contains("k"), "{keys:?}");
+        assert!(!keys.contains("style"), "{keys:?}");
+
+        // Plain-string keys are also collected.
+        let data_mw = r#"{"attribs":[["style","color:red"],["title","hi"]]}"#;
+        let keys = templated_attrib_keys(data_mw);
+        assert!(keys.contains("style") && keys.contains("title"), "{keys:?}");
     }
 
     #[test]
