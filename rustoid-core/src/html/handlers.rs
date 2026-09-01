@@ -477,6 +477,20 @@ impl DomHandler for LIHandler {
             crate::html::wikitext_escape_handlers::li_handler(node, state, text, opts, tree)
         });
         state.serialize_children_with_escaper(tree, node, escaper);
+
+        // Recover trailing whitespace on unmodified innermost `<li>` nodes
+        // (faithful to `LIHandler::handle`; a no-op in non-selser mode).
+        let last_child = crate::html::dom_tree::last_non_sep_child(tree, node);
+        if last_child.is_some_and(|c| {
+            !dom_utils::is_list(tree.node(c))
+                && !crate::html::diff_utils::DiffUtils::has_diff_markers(tree.node(c))
+        }) {
+            let trailing_space = state
+                .recover_trimmed_whitespace(tree, node, false)
+                .unwrap_or_default();
+            state.append_sep(&trailing_space);
+        }
+
         state.single_line_context.pop();
         tree.next_sibling(node)
     }
@@ -937,6 +951,20 @@ impl DomHandler for DDHandler {
             crate::html::wikitext_escape_handlers::li_handler(node, state, text, opts, tree)
         });
         state.serialize_children_with_escaper(tree, node, escaper);
+
+        // Recover trailing whitespace on unmodified innermost `<dd>` nodes
+        // (faithful to `DDHandler::handle`; a no-op in non-selser mode).
+        let last_child = crate::html::dom_tree::last_non_sep_child(tree, node);
+        if last_child.is_some_and(|c| {
+            !dom_utils::is_list(tree.node(c))
+                && !crate::html::diff_utils::DiffUtils::has_diff_markers(tree.node(c))
+        }) {
+            let trailing_space = state
+                .recover_trimmed_whitespace(tree, node, false)
+                .unwrap_or_default();
+            state.append_sep(&trailing_space);
+        }
+
         state.single_line_context.pop();
         tree.next_sibling(node)
     }
@@ -1316,6 +1344,28 @@ impl DomHandler for TDHandler {
             )
         });
         state.serialize_children_with_escaper(tree, node, escaper);
+
+        // Recover trailing trimmed whitespace (only when the current line doesn't
+        // already end in whitespace). Faithful to `TDHandler::handle`'s trailing
+        // block; in non-selser mode `recoverTrimmedWhitespace` returns `None`.
+        if !state.curr_line.text.ends_with(char::is_whitespace) {
+            let mut trailing_space = String::new();
+            if next_uses_row_syntax {
+                trailing_space = self.get_trailing_space(tree, node, "");
+            }
+            if trailing_space.is_empty() {
+                let last_child = crate::html::dom_tree::last_non_sep_child(tree, node);
+                if last_child.is_some_and(|c| {
+                    !crate::html::diff_utils::DiffUtils::has_diff_markers(tree.node(c))
+                }) {
+                    trailing_space = state
+                        .recover_trimmed_whitespace(tree, node, false)
+                        .unwrap_or_default();
+                }
+            }
+            state.append_sep(&trailing_space);
+        }
+
         tree.next_sibling(node)
     }
 
@@ -1418,6 +1468,26 @@ impl DomHandler for THHandler {
             crate::html::wikitext_escape_handlers::th_handler(state, text)
         });
         state.serialize_children_with_escaper(tree, node, escaper);
+
+        // Recover trailing trimmed whitespace (faithful to `THHandler::handle`).
+        if !state.curr_line.text.ends_with(char::is_whitespace) {
+            let mut trailing_space = String::new();
+            if next_uses_row_syntax {
+                trailing_space = self.get_trailing_space(tree, node, "");
+            }
+            if trailing_space.is_empty() {
+                let last_child = crate::html::dom_tree::last_non_sep_child(tree, node);
+                if last_child.is_some_and(|c| {
+                    !crate::html::diff_utils::DiffUtils::has_diff_markers(tree.node(c))
+                }) {
+                    trailing_space = state
+                        .recover_trimmed_whitespace(tree, node, false)
+                        .unwrap_or_default();
+                }
+            }
+            state.append_sep(&trailing_space);
+        }
+
         tree.next_sibling(node)
     }
 

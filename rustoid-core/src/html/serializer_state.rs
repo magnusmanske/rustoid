@@ -550,7 +550,151 @@ impl<'a> SerializerState<'a> {
     /// Recover trimmed whitespace for `node` (leading/trailing). Faithful to
     /// `SerializerState::recoverTrimmedWhitespace` → `Separators::recoverTrimmedWhitespace`:
     /// returns `None` outside selser mode.
-    pub fn recover_trimmed_whitespace(&self, _node: NodeId, _leading: bool) -> Option<String> {
+    pub fn recover_trimmed_whitespace(
+        &self,
+        tree: &DomTree,
+        node: NodeId,
+        leading: bool,
+    ) -> Option<String> {
+        if !self.selser_mode {
+            return None;
+        }
+        if leading {
+            self.fetch_leading_trimmed_space(tree, node)
+        } else {
+            let last_child = crate::html::dom_tree::last_non_deleted_child(tree, node)?;
+            self.fetch_trailing_trimmed_space(tree, last_child)
+        }
+    }
+
+    /// `Separators::fetchLeadingTrimmedSpace` — recover a leading space/tab that
+    /// was trimmed from `node` in the wt→html direction, using DSR + source. Only
+    /// applies to a first non-separator child of a `WikitextTagsWithTrimmableWS`
+    /// element.
+    fn fetch_leading_trimmed_space(&self, tree: &DomTree, node: NodeId) -> Option<String> {
+        let orig = node;
+
+        // Skip a `data-mw-selser-wrapper` span (not modeled yet).
+
+        // Leading trimmed whitespace only makes sense for the first child (no
+        // previous non-separator sibling).
+        if crate::html::dom_tree::previous_non_sep_sibling(tree, node).is_some() {
+            return None;
+        }
+
+        let parent = tree.parent(node)?;
+        if !crate::wikitext::consts::wikitext_tags_with_trimmable_ws()
+            .contains(&crate::html::dom_utils::node_name(tree.node(parent)))
+        {
+            return None;
+        }
+
+        // The originating node must be an element, or a text node NOT starting
+        // with a space/tab (a text leading ws is already captured as text).
+        let orig_n = tree.node(orig);
+        match &orig_n.kind {
+            crate::dom::node::NodeKind::Text(t) if t.starts_with([' ', '\t']) => return None,
+            _ => {}
+        }
+
+        // Don't reintroduce whitespace already captured as a `mw:DisplaySpace`.
+        if crate::html::dom_utils::has_type_of(orig_n, "mw:DisplaySpace") {
+            return None;
+        }
+
+        let dsr = crate::html::wts_utils::get_dsr(tree.node(parent));
+        if !self.is_valid_dsr(dsr.as_ref(), true) {
+            return None;
+        }
+        let dsr = dsr.unwrap();
+
+        if self.have_trimmed_ws_dsr && dsr.has_trimmed_ws() && dsr.has_valid_leading_ws() {
+            let inner = self.get_orig_src(&dsr.inner_range())?;
+            let leading = inner
+                .bytes()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .count();
+            let n = dsr.leading_ws.max(0) as usize;
+            return Some(inner[..leading.min(n)].to_string());
+        }
+
+        // Fallback: the first character of the inner range, iff space/tab.
+        let inner_start = dsr.inner_start();
+        let inner_end = dsr.inner_end();
+        if inner_start < inner_end {
+            let sep = self.get_orig_src(&dsr.inner_range())?;
+            let first = sep.chars().next()?;
+            if first == ' ' || first == '\t' {
+                return Some(first.to_string());
+            }
+        }
+        None
+    }
+
+    /// `Separators::fetchTrailingTrimmedSpace` — recover a trailing space/tab that
+    /// was trimmed from `node` in the wt→html direction, using DSR + source. Only
+    /// applies to a last non-separator child of a `WikitextTagsWithTrimmableWS`
+    /// element.
+    fn fetch_trailing_trimmed_space(&self, tree: &DomTree, node: NodeId) -> Option<String> {
+        let orig = node;
+
+        // Trailing trimmed whitespace only makes sense for the last child (no
+        // next non-separator sibling).
+        if crate::html::dom_tree::next_non_sep_sibling(tree, node).is_some() {
+            return None;
+        }
+
+        let parent = tree.parent(node)?;
+        if !crate::wikitext::consts::wikitext_tags_with_trimmable_ws()
+            .contains(&crate::html::dom_utils::node_name(tree.node(parent)))
+        {
+            return None;
+        }
+
+        // The originating node must be an element, or a text node NOT ending with
+        // a space/tab.
+        let orig_n = tree.node(orig);
+        match &orig_n.kind {
+            crate::dom::node::NodeKind::Text(t) if t.ends_with([' ', '\t']) => return None,
+            _ => {}
+        }
+
+        if crate::html::dom_utils::has_type_of(orig_n, "mw:DisplaySpace") {
+            return None;
+        }
+
+        let dsr = crate::html::wts_utils::get_dsr(tree.node(parent));
+        if !self.is_valid_dsr(dsr.as_ref(), true) {
+            return None;
+        }
+        let dsr = dsr.unwrap();
+
+        if self.have_trimmed_ws_dsr && dsr.has_trimmed_ws() && dsr.has_valid_trailing_ws() {
+            let inner = self.get_orig_src(&dsr.inner_range())?;
+            let trailing = inner
+                .bytes()
+                .rev()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .count();
+            let n = dsr.trailing_ws.max(0) as usize;
+            if trailing > 0 {
+                return Some(inner[inner.len() - trailing.min(n)..].to_string());
+            }
+            return None;
+        }
+
+        // Fallback: the last character of the inner range, iff space/tab.
+        // The `> instead of >=` guard: inner range must be length > 1 so a single
+        // space is claimed by the leading-space case above, not here.
+        let inner_end = dsr.inner_end();
+        let inner_start = dsr.inner_start();
+        if inner_end.saturating_sub(1) > inner_start {
+            let sep = self.get_orig_src(&dsr.inner_range())?;
+            let last = sep.chars().next_back()?;
+            if last == ' ' || last == '\t' {
+                return Some(last.to_string());
+            }
+        }
         None
     }
 }
@@ -717,5 +861,51 @@ mod tests {
         assert!(!st.is_valid_dsr(Some(&no_widths), true));
         let with_widths = DomSourceRange::new(Some(0), Some(8), Some(3), Some(4), 0, 0);
         assert!(st.is_valid_dsr(Some(&with_widths), true));
+    }
+
+    #[test]
+    fn test_recover_trimmed_whitespace_outside_selser_is_none() {
+        use crate::dom::node::{ElementKind, Node};
+        let mut li = Node::element(ElementKind::ListItem);
+        li.push_child(Node::text("foo"));
+        let mut doc = Node::document();
+        doc.push_child(li);
+        let tree = DomTree::new(doc);
+        let li_id = tree.first_child(tree.root()).unwrap();
+        let st = SerializerState::new();
+        assert_eq!(st.recover_trimmed_whitespace(&tree, li_id, false), None);
+        assert_eq!(st.recover_trimmed_whitespace(&tree, li_id, true), None);
+    }
+
+    #[test]
+    fn test_recover_leading_trimmed_space_in_selser() {
+        use crate::dom::node::{ElementKind, Node};
+        // `<ul>` (trimmable) → `<li>` child, `ul` DSR `[0, 6, 1, 0]` indexing
+        // `"* foo "` → inner `[1,6]` = `" foo "`. Recovering leading ws for the
+        // `<li>` reads the `ul`'s inner range and yields the single leading space.
+        let mut ul = Node::element(ElementKind::UnorderedList);
+        ul.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(6),
+                open_width: Some(1),
+                close_width: Some(0),
+            }),
+            ..Default::default()
+        });
+        let mut li = Node::element(ElementKind::ListItem);
+        li.push_child(Node::text("foo"));
+        ul.push_child(li);
+        let mut doc = Node::document();
+        doc.push_child(ul);
+        let tree = DomTree::new(doc);
+        let ul_id = tree.first_child(tree.root()).unwrap();
+        let li_id = tree.first_child(ul_id).unwrap();
+
+        let st = selser_state("* foo ");
+        assert_eq!(
+            st.recover_trimmed_whitespace(&tree, li_id, true).as_deref(),
+            Some(" ")
+        );
     }
 }
