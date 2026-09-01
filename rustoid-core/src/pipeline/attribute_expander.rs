@@ -345,17 +345,24 @@ struct TmpDataMw {
 
 struct TmpDataMwPart {
     txt: Option<String>,
-    html: Option<String>,
+    /// The raw HTML source (a token array or string), converted to a serialized
+    /// DOM fragment by the caller-provided `value_to_html` at finalization time
+    /// (mirrors PHP's `expandAttrValuesToDOM`).
+    html_src: Option<KeyValue>,
     uneditable: bool,
 }
 
 impl TmpDataMwPart {
-    fn into_data_mw_value(self) -> crate::wikitext::tokens_v2::DataMwValue {
+    fn into_data_mw_value(
+        self,
+        value_to_html: &dyn Fn(&KeyValue) -> String,
+    ) -> crate::wikitext::tokens_v2::DataMwValue {
         use crate::wikitext::tokens_v2::DataMwValue;
-        if self.html.is_some() || self.uneditable {
+        let html = self.html_src.map(|kv| value_to_html(&kv));
+        if html.is_some() || self.uneditable {
             DataMwValue::Object {
                 txt: self.txt,
-                html: self.html,
+                html,
                 uneditable: self.uneditable,
             }
         } else {
@@ -369,6 +376,10 @@ impl TmpDataMwPart {
 /// marking templated attributes with `mw:ExpandedAttrs`. Mirrors PHP
 /// `AttributeExpander::buildExpandedAttrs`.
 ///
+/// `value_to_html` converts an attribute key/value source (a token array or
+/// string) into a serialized DOM-fragment HTML string (the `html` value of a
+/// `data-mw.attribs` entry), mirroring PHP's `expandAttrValuesToDOM`.
+///
 /// Returns `metaTokens ++ [token] ++ postNLToks` (hoisted transclusion markers
 /// before the token and, for scenario 1, content moved after it).
 #[allow(clippy::too_many_lines)]
@@ -378,6 +389,7 @@ pub fn build_expanded_attrs(
     expanded_attrs: Vec<KV>,
     about_counter: &std::cell::Cell<usize>,
     in_template: bool,
+    value_to_html: &dyn Fn(&KeyValue) -> String,
 ) -> Vec<Item> {
     use super::attribute_transform_manager::{items_to_key_value, key_value_to_items};
     use crate::wikitext::token_utils::{is_html_tag, tokens_to_string};
@@ -528,28 +540,23 @@ pub fn build_expanded_attrs(
             // edited on its own (the content part would be duplicated in both
             // this data-mw and the body — see T249740), so assign just the
             // key/value part and mark it uneditable.
-            let (k_html, v_html) = if reparsed_kv {
+            let (k_html_src, v_html_src) = if reparsed_kv {
                 // Reparse-KV: the value's HTML is empty (editable via the key's
                 // HTML or the value's HTML, not both).
                 let khtml = if key_uses_mixed_attr_content_tpl {
-                    Some(crate::wikitext::token_utils::key_value_to_string(
-                        &expanded_a.key,
-                    ))
+                    Some(expanded_a.key.clone())
                 } else {
-                    Some(crate::wikitext::token_utils::key_value_to_string(&orig_k))
+                    Some(orig_k.clone())
                 };
-                (khtml, Some(String::new()))
+                (khtml, None)
             } else {
                 // keyUsesMixedAttrContentTpl must be false here (PHP asserts it),
                 // so the key HTML is only present when the key was generated.
-                let khtml = key_generated
-                    .then(|| crate::wikitext::token_utils::key_value_to_string(&orig_k));
+                let khtml = key_generated.then(|| orig_k.clone());
                 let vhtml = if val_uses_mixed_attr_content_tpl {
-                    Some(crate::wikitext::token_utils::key_value_to_string(
-                        &expanded_a.value,
-                    ))
+                    Some(expanded_a.value.clone())
                 } else {
-                    Some(crate::wikitext::token_utils::key_value_to_string(&orig_v))
+                    Some(orig_v.clone())
                 };
                 (khtml, vhtml)
             };
@@ -557,12 +564,12 @@ pub fn build_expanded_attrs(
             tmp_data_mw.push(TmpDataMw {
                 k: TmpDataMwPart {
                     txt: Some(key),
-                    html: k_html,
+                    html_src: k_html_src,
                     uneditable: key_uses_mixed_attr_content_tpl,
                 },
                 v: TmpDataMwPart {
                     txt: None,
-                    html: v_html,
+                    html_src: v_html_src,
                     uneditable: val_uses_mixed_attr_content_tpl,
                 },
             });
@@ -597,15 +604,14 @@ pub fn build_expanded_attrs(
         // it as a `data-mw` string attribute so the tree builder stashes it for
         // the rendered element.
         //
-        // The `html` values are plain strings here (from `tokensToString`); the
-        // full `expandAttrValuesToDOM` sub-pipeline (which turns these into
-        // serialized DOM fragments) is layered in on top.
+        // Each `html` source is converted to a serialized DOM fragment via the
+        // caller-provided `value_to_html` (mirrors `expandAttrValuesToDOM`).
         let attribs: Vec<crate::wikitext::tokens_v2::DataMwAttrib> = tmp_data_mw
             .into_iter()
             .map(|t| {
                 crate::wikitext::tokens_v2::DataMwAttrib::new(
-                    t.k.into_data_mw_value(),
-                    t.v.into_data_mw_value(),
+                    t.k.into_data_mw_value(value_to_html),
+                    t.v.into_data_mw_value(value_to_html),
                 )
             })
             .collect();
@@ -775,7 +781,9 @@ mod tests {
         let expanded_attrs = old_attrs.clone();
 
         let counter = std::cell::Cell::new(0usize);
-        let out = build_expanded_attrs(token, &old_attrs, expanded_attrs, &counter, false);
+        let out = build_expanded_attrs(token, &old_attrs, expanded_attrs, &counter, false, &|kv| {
+            crate::wikitext::token_utils::key_value_to_string(kv)
+        });
 
         // Exactly one token: the `<div>` (no meta/post-nl tokens for the simple
         // scenario-2 case).

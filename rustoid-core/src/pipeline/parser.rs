@@ -427,6 +427,28 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frag
     }
 
+    /// Serialize an attribute key/value source (a token array or plain string)
+    /// into a DOM-fragment HTML string, for the `html` field of a
+    /// `data-mw.attribs` entry. Mirrors PHP's `PipelineUtils::
+    /// expandAttrValueToDOM` (which pipes the value through the
+    /// `expanded-tokens-to-fragment` pipeline in inline context and serializes).
+    ///
+    /// The result carries `data-parsoid`/`data-mw`/`about`/`typeof` intact
+    /// (matching Parsoid's round-trippable attribute fragments); the caller
+    /// HTML-escapes it when embedding in the `data-mw` JSON envelope.
+    fn value_to_dom_html(&self, kv: &crate::wikitext::tokens_v2::KeyValue) -> String {
+        use crate::pipeline::attribute_transform_manager::key_value_to_items;
+
+        let items = key_value_to_items(kv);
+        let frag = self.fragment_from_tokens(items);
+        let serializer =
+            crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions {
+                body_only: true,
+                ..crate::options::ParserOptions::for_page("")
+            });
+        serializer.serialize(&frag).unwrap_or_default()
+    }
+
     /// Build an inline fragment document from raw body wikitext, without
     /// template expansion (used by the synchronous `wikitext_to_ast` path).
     fn fragment_from_body(&self, body: &str) -> Node {
@@ -805,6 +827,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 expanded_attrs,
                 about_counter,
                 false,
+                &|kv| self.value_to_dom_html(kv),
             );
             out.extend(result);
         }
@@ -1038,6 +1061,17 @@ mod tests {
             )
             .unwrap();
         assert!(html.contains("/* insecure input */"), "got: {html}");
+    }
+
+    #[test]
+    fn test_value_to_dom_html_plain_string() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        // A plain string value serializes as itself (no <p> wrapper in inline
+        // context).
+        let kv = crate::wikitext::tokens_v2::KeyValue::Str("color:red".to_string());
+        let html = parser.value_to_dom_html(&kv);
+        assert_eq!(html, "color:red", "got: {html:?}");
     }
 
     #[test]
