@@ -568,6 +568,106 @@ impl PHandler {
         }
         Self::treat_as_pp_transition(tree, node)
     }
+
+    /// `PHandler::currWikitextLineHasBlockNode` — whether the already-emitted
+    /// serialization on the current wikitext line includes a visible block node
+    /// (so a single newline, not two, before/after this P-tag is enough). Faithful
+    /// port; note PHP walks backward from `node`/`line.firstNode`.
+    fn curr_wikitext_line_has_block_node(
+        tree: &DomTree,
+        state: &SerializerState,
+        node: NodeId,
+        skip_node: bool,
+    ) -> bool {
+        let parent = tree.parent(node);
+        if !skip_node {
+            // If this node could break the wikitext line (emit non-ws on a new
+            // line), the P-tag will be on that new line, so there is no block node.
+            if crate::html::dom_tree::text_content(tree, node).contains("\n") {
+                // Faithful simplification: `preg_match('/\n\S/', textContent)`.
+                if text_has_nl_nonspace(tree, node) {
+                    return false;
+                }
+            }
+        }
+        let mut cur = crate::html::dom_tree::previous_non_deleted_sibling(tree, node);
+        let mut cur_parent = parent;
+        loop {
+            while let Some(n) = cur {
+                if crate::html::wts_utils::is_block_node_with_visible_wt(tree.node(n)) {
+                    return true;
+                }
+                // Conservative: any embedded newline stops the search.
+                if crate::html::dom_tree::text_content(tree, n).contains('\n') {
+                    return false;
+                }
+                // Don't walk past the current line's first node.
+                if let Some(first) = state.curr_line.first_node
+                    && crate::html::dom_tree::is_ancestor_of(tree, n, first)
+                {
+                    return false;
+                }
+                cur = crate::html::dom_tree::previous_non_deleted_sibling(tree, n);
+            }
+            match cur_parent {
+                Some(p) => {
+                    if crate::html::dom_utils::at_the_top(tree, p) {
+                        return false;
+                    }
+                    cur = Some(p);
+                    cur_parent = tree.parent(p);
+                }
+                None => return false,
+            }
+        }
+    }
+
+    /// `PHandler::newWikitextLineMightHaveBlockNode` — whether a following sibling
+    /// implies the next wikitext line may contain a block node (so a single newline
+    /// separator suffices). Faithful port.
+    fn new_wikitext_line_might_have_block_node(tree: &DomTree, node: NodeId) -> bool {
+        let mut cur = crate::html::dom_tree::next_non_deleted_sibling(tree, node);
+        while let Some(n) = cur {
+            match &tree.node(n).kind {
+                NodeKind::Text(t) => {
+                    if t.contains('\n') {
+                        return false;
+                    }
+                }
+                NodeKind::Element(_) => {
+                    let name = dom_utils::node_name(tree.node(n));
+                    if crate::wikitext::consts::html_tags_requiring_sol_context().contains(&name)
+                        && !dom_utils::is_literal_html_node(tree.node(n))
+                    {
+                        return false;
+                    }
+                    if crate::html::wts_utils::is_block_node_with_visible_wt(tree.node(n)) {
+                        return true;
+                    }
+                    // Go conservative.
+                    return false;
+                }
+                _ => {}
+            }
+            cur = crate::html::dom_tree::next_non_deleted_sibling(tree, n);
+        }
+        false
+    }
+}
+
+/// Whether `tree.node(id)`'s text content contains `\n` followed by a
+/// non-whitespace character (mirrors PHP's `/\n\S/` test).
+fn text_has_nl_nonspace(tree: &DomTree, id: NodeId) -> bool {
+    let text = crate::html::dom_tree::text_content(tree, id);
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' && i + 1 < bytes.len() && !bytes[i + 1].is_ascii_whitespace() {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 impl DomHandler for PHandler {
@@ -586,27 +686,29 @@ impl DomHandler for PHandler {
         tree: &DomTree,
         node: NodeId,
         other: NodeId,
-        _state: &mut SerializerState,
+        state: &mut SerializerState,
     ) -> Option<Constraints> {
         let other_name = dom_utils::node_name(tree.node(other));
         // parent is a list-item / td / th / body.
-        let parent_is_table_cell_or_body = tree.parent(node) == Some(other)
+        if tree.parent(node) == Some(other)
             && (dom_utils::is_list_item(tree.node(other))
-                || matches!(other_name.as_str(), "td" | "th" | "body"));
-        if parent_is_table_cell_or_body {
-            let max = if matches!(other_name.as_str(), "td" | "th" | "body") {
-                1
-            } else {
-                0
-            };
+                || matches!(other_name.as_str(), "td" | "th" | "body"))
+        {
+            if matches!(other_name.as_str(), "td" | "th" | "body") {
+                return Some(Constraints {
+                    min: Some(0),
+                    max: Some(1),
+                });
+            }
             return Some(Constraints {
                 min: Some(0),
-                max: Some(max),
+                max: Some(0),
             });
         }
 
-        // P-P transition: previous sibling is a wikitext `<p>`.
+        // P-P transition / block-node-on-line / marker-annotation → 2 newlines.
         let prev = crate::html::dom_tree::previous_non_deleted_sibling(tree, node);
+        let prev_non_sep = crate::html::dom_tree::previous_non_sep_sibling(tree, node);
         let is_p_p = prev == Some(other)
             && matches!(tree.node(other).kind, NodeKind::Element(_))
             && other_name == "p"
@@ -615,9 +717,38 @@ impl DomHandler for PHandler {
                 .dp
                 .as_ref()
                 .is_none_or(|d| d.stx.as_deref() != Some("html"));
-        if is_p_p || Self::treat_as_pp_transition(tree, other) {
+        let pp_transition_no_block = Self::treat_as_pp_transition(tree, other)
+            && prev_non_sep == Some(other)
+            && !Self::curr_wikitext_line_has_block_node(tree, state, other, false);
+        let marker_annotation_between = {
+            let next = crate::html::dom_tree::next_non_sep_sibling(tree, other);
+            next.is_some_and(|m| crate::html::wts_utils::is_marker_annotation(tree.node(m)))
+                && next.and_then(|m| crate::html::dom_tree::next_non_sep_sibling(tree, m))
+                    == Some(node)
+        };
+        if is_p_p || pp_transition_no_block || marker_annotation_between {
             return Some(Constraints {
                 min: Some(2),
+                max: Some(2),
+            });
+        }
+
+        // PP-transition / block-node / sol-transparent-new-elt → 1..2 newlines.
+        let block_parent = dom_utils::is_wikitext_block_node(tree.node(other))
+            && other_name != "blockquote"
+            && tree.parent(node) == Some(other);
+        let sol_transparent_new =
+            crate::html::wts_utils::emits_sol_transparent_single_line_wt(tree.node(other))
+                && dom_utils::is_new_elt(tree, node);
+        if Self::treat_as_pp_transition(tree, other) || block_parent || sol_transparent_new {
+            if dom_utils::has_name_or_has_ancestor_of_name(tree, other, "figcaption") {
+                return Some(Constraints {
+                    min: Some(0),
+                    max: Some(2),
+                });
+            }
+            return Some(Constraints {
+                min: Some(1),
                 max: Some(2),
             });
         }
@@ -631,11 +762,19 @@ impl DomHandler for PHandler {
     fn after(
         &mut self,
         tree: &DomTree,
-        _node: NodeId,
+        node: NodeId,
         other: NodeId,
-        _state: &mut SerializerState,
+        state: &mut SerializerState,
     ) -> Option<Constraints> {
-        if Self::is_pp_transition(tree, Some(other)) {
+        let other_name = dom_utils::node_name(tree.node(other));
+        let last_is_br = tree
+            .last_child(node)
+            .is_some_and(|c| dom_utils::node_name(tree.node(c)) == "br");
+        if !last_is_br
+            && Self::is_pp_transition(tree, Some(other))
+            && !Self::curr_wikitext_line_has_block_node(tree, state, node, true)
+            && !Self::new_wikitext_line_might_have_block_node(tree, other)
+        {
             return Some(Constraints {
                 min: Some(2),
                 max: Some(2),
@@ -644,6 +783,21 @@ impl DomHandler for PHandler {
         if dom_utils::at_the_top(tree, other) {
             return Some(Constraints {
                 min: Some(0),
+                max: Some(2),
+            });
+        }
+        let block_parent = dom_utils::is_wikitext_block_node(tree.node(other))
+            && other_name != "blockquote"
+            && tree.parent(node) == Some(other);
+        if Self::treat_as_pp_transition(tree, other) || block_parent {
+            if dom_utils::has_name_or_has_ancestor_of_name(tree, other, "figcaption") {
+                return Some(Constraints {
+                    min: Some(0),
+                    max: Some(2),
+                });
+            }
+            return Some(Constraints {
+                min: Some(1),
                 max: Some(2),
             });
         }

@@ -293,6 +293,36 @@ pub fn previous_non_deleted_sibling(tree: &DomTree, id: NodeId) -> Option<NodeId
     None
 }
 
+/// Concatenated text of all descendant text nodes (document order). Mirrors
+/// the `textContent` accessor PHP's `currWikitextLineHasBlockNode` relies on.
+pub fn text_content(tree: &DomTree, id: NodeId) -> String {
+    let mut out = String::new();
+    fn collect(tree: &DomTree, id: NodeId, out: &mut String) {
+        if let NodeKind::Text(t) = &tree.node(id).kind {
+            out.push_str(t);
+        }
+        let mut child = tree.first_child(id);
+        while let Some(c) = child {
+            collect(tree, c, out);
+            child = tree.next_sibling(c);
+        }
+    }
+    collect(tree, id, &mut out);
+    out
+}
+
+/// Is `ancestor` an ancestor of (or equal to) `id`? Mirrors `DOMUtils::isAncestorOf`.
+pub fn is_ancestor_of(tree: &DomTree, ancestor: NodeId, id: NodeId) -> bool {
+    let mut cur = tree.parent(id);
+    while let Some(p) = cur {
+        if p == ancestor {
+            return true;
+        }
+        cur = tree.parent(p);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +387,19 @@ mod tests {
         let tree = build_doc();
         assert!(is_iew(&tree, 3)); // "\n"
         assert!(!is_iew(&tree, 1)); // <p>
+    }
+
+    #[test]
+    fn test_text_content_and_is_ancestor_of() {
+        let tree = build_doc();
+        // <p>a</p> concatenates its text descendant "a".
+        assert_eq!(text_content(&tree, 1), "a");
+        // Root text content is "a\nb".
+        assert_eq!(text_content(&tree, 0), "a\nb");
+        // is_ancestor_of: root is an ancestor of p1 and text "a"; p1 of text "a".
+        assert!(is_ancestor_of(&tree, 0, 1));
+        assert!(is_ancestor_of(&tree, 1, 2));
+        assert!(!is_ancestor_of(&tree, 1, 4)); // p1 is not an ancestor of p2
+        assert!(!is_ancestor_of(&tree, 2, 1)); // text "a" is not an ancestor of p1
     }
 }
