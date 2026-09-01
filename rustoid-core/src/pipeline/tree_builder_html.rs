@@ -1293,6 +1293,29 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
             }
         }
 
+        // Adoption scenario (PHP `findWrappableTemplateRangesRecursive`): when
+        // the transclusion content was fostered out of a `<table>`, that table
+        // follows the element holding the end marker as a sibling and shares the
+        // transclusion's source start. Stamp `about` on it (and any subsequent
+        // sibling sharing that start) so the whole fostered block + table form a
+        // single `about` chain.
+        let range_start = start_meta
+            .dp
+            .as_ref()
+            .and_then(|d| d.dsr.as_ref().and_then(|r| r.start));
+        if let Some(range_start) = range_start {
+            for child in children.iter_mut().skip(t + 1) {
+                let same_start = child
+                    .dp
+                    .as_ref()
+                    .and_then(|d| d.dsr.as_ref().and_then(|r| r.start))
+                    == Some(range_start);
+                if matches!(child.kind, NodeKind::Element(_)) && same_start {
+                    child.set_attr("about", start_meta.get_attr("about").unwrap_or(""));
+                }
+            }
+        }
+
         let Some(et) = encap_target else {
             i += 1;
             continue;
@@ -1942,6 +1965,62 @@ mod tests {
             return true;
         }
         node.children.iter().any(contains_transclusion_end)
+    }
+
+    #[test]
+    fn test_flipped_range_adopts_following_table() {
+        // The T322557 adoption scenario: the transclusion content is fostered
+        // out of a `<table>` into a preceding `<p>`, and the (fostered) `<table>`
+        // follows as a sibling sharing the transclusion's `dsr.start`. The range
+        // merge must stamp `about` onto the `<table>` too, so both the `<p>` and
+        // the `<table>` form a single `about` chain.
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt2");
+        start.data_parsoid = Some("{}".to_string());
+        start.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(38),
+                open_width: None,
+                close_width: None,
+            }),
+            ..DataParsoid::default()
+        });
+
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.set_attr("about", "#mwt2");
+
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("v"));
+        p.push_child(end);
+
+        let mut table = Node::element(ElementKind::Table);
+        table.set_attr("about", "#mwt3");
+        table.set_attr("typeof", "mw:ExpandedAttrs");
+        table.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(41),
+                open_width: None,
+                close_width: None,
+            }),
+            ..DataParsoid::default()
+        });
+
+        let mut doc = Node::document();
+        doc.push_child(start);
+        doc.push_child(p);
+        doc.push_child(table);
+
+        encapsulate_transclusions(&mut doc, None);
+
+        // Start marker is gone; both the `<p>` and the `<table>` remain and
+        // share the transclusion `about` id.
+        assert_eq!(doc.children.len(), 2, "{doc:?}");
+        assert_eq!(doc.children[0].get_attr("about"), Some("#mwt2"));
+        assert_eq!(doc.children[1].get_attr("about"), Some("#mwt2"));
     }
 
     #[test]
