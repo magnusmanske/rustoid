@@ -149,6 +149,16 @@ impl TemplateEncapsulator {
             if !data_mw.is_empty() {
                 meta.attribs.push(string_kv("data-mw", &data_mw));
             }
+
+            // Preserve the *rich* parameter list (`named`/`spc`) for the
+            // `DOMRangeBuilder` `pi` build step (mirrors PHP's
+            // `TempData->tplarginfo`, a serialized `TemplateInfo`). The
+            // `data-mw.parts` editor form drops `named`/`spc`, so this is the
+            // only place they survive to data-parsoid.pi.
+            let tplarginfo = serialize_param_infos(&info.param_infos);
+            if !tplarginfo.is_empty() {
+                meta.data_parsoid.tmp.tplarginfo = Some(tplarginfo);
+            }
         }
 
         out
@@ -185,6 +195,35 @@ fn string_kv(key: &str, value: &str) -> KV {
         ksrc: None,
         vsrc: None,
     }
+}
+
+/// Serialize a template's ordered parameter list to the `data-parsoid.pi` inner
+/// array form (a `list<ParamInfo>` → `[{k, named?, spc?}]`). Faithful to PHP
+/// `ParamInfo::toJsonArray` (T404772): only `k`, `named`, and `spc` are kept;
+/// the temporary value-wikitext/HTML are dropped (they live in `data-mw.parts`).
+pub fn serialize_param_infos(param_infos: &[ParamInfo]) -> String {
+    let arr: Vec<serde_json::Value> = param_infos
+        .iter()
+        .map(|p| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("k".to_string(), serde_json::Value::String(p.k.clone()));
+            if p.named {
+                obj.insert("named".to_string(), serde_json::Value::Bool(true));
+            }
+            if let Some(spc) = &p.spc {
+                obj.insert(
+                    "spc".to_string(),
+                    serde_json::Value::Array(
+                        spc.iter()
+                            .map(|s| serde_json::Value::String(s.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
 }
 
 /// Serialize a `TemplateInfo` to the JSON object that PHP's
@@ -606,5 +645,47 @@ mod tests {
         assert!(parsed["parts"][0].get("template").is_some());
         assert!(parsed["parts"][0].get("parserfunction").is_none());
         assert_eq!(parsed["parts"][0]["template"]["target"]["function"], "if");
+    }
+
+    #[test]
+    fn test_serialize_param_infos() {
+        // A named parameter serializes to `{k, named}` (the `pi` inner form).
+        let mut named = ParamInfo::new("1");
+        named.named = true;
+        let mut positional = ParamInfo::new("1");
+        positional.named = false;
+
+        let json = serialize_param_infos(&[named, positional]);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr[0]["k"], "1");
+        assert_eq!(arr[0]["named"], true);
+        // Unnamed (positional) params omit `named`, per ParamInfo::toJsonArray.
+        assert_eq!(arr[1]["k"], "1");
+        assert!(arr[1].get("named").is_none());
+    }
+
+    #[test]
+    fn test_encap_tokens_stores_tplarginfo() {
+        // A templated token records its rich parameter list as `tmp.tplarginfo`
+        // (for the DOMRangeBuilder `pi` build), in addition to `data-mw`.
+        let token = template_token();
+        let encap = TemplateEncapsulator::new("mw:Transclusion", "#mwt1".to_string(), &token);
+
+        let mut info = TemplateInfo::default();
+        let mut p = ParamInfo::new("1");
+        p.named = true;
+        p.value_wt = "v".to_string();
+        info.param_infos = vec![p];
+
+        let out = encap.encap_tokens(vec![Item::Str("v".to_string())], &info);
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] {
+            assert_eq!(
+                t.data_parsoid.tmp.tplarginfo.as_deref(),
+                Some("[{\"k\":\"1\",\"named\":true}]")
+            );
+        } else {
+            panic!("expected start meta");
+        }
     }
 }

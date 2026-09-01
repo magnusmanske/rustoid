@@ -1165,6 +1165,7 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
             }
             new_content[et].data_parsoid = start_meta.data_parsoid.clone();
             new_content[et].data_mw = build_compound_data_mw(&start_meta, source, None);
+            apply_encap_dp_fields(&mut new_content[et], &start_meta);
         } else {
             // Empty transclusion: the start and end markers are adjacent (no
             // content). PHP `DOMRangeBuilder::findEnclosingRange` inserts an
@@ -1181,6 +1182,7 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
             }
             span.data_parsoid = start_meta.data_parsoid.clone();
             span.data_mw = build_compound_data_mw(&start_meta, source, None);
+            apply_encap_dp_fields(&mut span, &start_meta);
             new_content.push(span);
         }
 
@@ -1380,6 +1382,50 @@ fn transfer_transclusion_to_element(
     }
     target.data_parsoid = start_meta.data_parsoid.clone();
     target.data_mw = build_compound_data_mw(start_meta, source, range_end);
+    apply_encap_dp_fields(target, start_meta);
+}
+
+/// Apply `firstWikitextNode` and `pi` onto an encapsulation target, derived
+/// from the transclusion start-meta's transient `TempData` (mirrors
+/// `encapsulateTemplates`' `$encapDP->firstWikitextNode`/`$encapDP->pi`).
+/// Both the structured `dp` and the serialized `data-parsoid` string are
+/// updated (the serializer emits the string form).
+fn apply_encap_dp_fields(target: &mut Node, start_meta: &Node) {
+    let Some(src) = start_meta.dp.as_ref() else {
+        return;
+    };
+    let first_wikitext_node = src.tmp.first_wikitext_node.clone();
+    let pi = src.tmp.tplarginfo.clone().map(|inner| format!("[{inner}]"));
+
+    if let Some(dp) = target.dp.as_mut() {
+        dp.first_wikitext_node = first_wikitext_node.clone();
+        dp.pi = pi.clone();
+    }
+
+    // Nothing to add to the serialized form: leave `data-parsoid` untouched.
+    if first_wikitext_node.is_none() && pi.is_none() {
+        return;
+    }
+
+    let mut json: serde_json::Value = target
+        .data_parsoid
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(obj) = json.as_object_mut() {
+        if let Some(fwn) = &first_wikitext_node {
+            obj.insert(
+                "firstWikitextNode".to_string(),
+                serde_json::Value::String(fwn.clone()),
+            );
+        }
+        if let Some(pi) = &pi
+            && let Ok(pi_json) = serde_json::from_str::<serde_json::Value>(pi)
+        {
+            obj.insert("pi".to_string(), pi_json);
+        }
+    }
+    target.data_parsoid = Some(json.to_string());
 }
 
 /// Run the HTML5 tree builder over a token stream.

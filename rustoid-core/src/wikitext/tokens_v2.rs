@@ -200,6 +200,15 @@ pub struct DataParsoid {
     pub reused_id: Option<bool>,
     /// Whether the element is misnested. Mirrors `DataParsoid->misnested`.
     pub misnested: Option<bool>,
+    /// The first wikitext node of a multi-template-content-block (serialized as
+    /// `firstWikitextNode`; set by `DOMRangeBuilder::encapsulateTemplates` when
+    /// the transclusion range spans content beyond the first template).
+    pub first_wikitext_node: Option<String>,
+    /// Template parameter info for round-tripping (serialized as `pi`): an array
+    /// of `paramInfos` arrays, one per template part. Stored pre-serialized as a
+    /// JSON string (mirrors `TempData::tplarginfo` being a serialized
+    /// `TemplateInfo.paramInfos`).
+    pub pi: Option<String>,
     /// Temporary node-related data (mirrors PHP's `TempData`).
     pub tmp: TempData,
 }
@@ -380,6 +389,17 @@ impl DataParsoid {
         }
         if let Some(misnested) = &self.misnested {
             obj.insert("misnested".to_string(), serde_json::Value::Bool(*misnested));
+        }
+        if let Some(first_wikitext_node) = &self.first_wikitext_node {
+            obj.insert(
+                "firstWikitextNode".to_string(),
+                serde_json::Value::String(first_wikitext_node.clone()),
+            );
+        }
+        if let Some(pi) = &self.pi
+            && let Ok(pi_json) = serde_json::from_str::<serde_json::Value>(pi)
+        {
+            obj.insert("pi".to_string(), pi_json);
         }
 
         if obj.is_empty() {
