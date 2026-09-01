@@ -407,8 +407,32 @@ impl DomHandler for ListHandler {
                 max: Some(1),
             });
         }
+        // A list in a block node (<div>, <td>, etc.) doesn't need a leading
+        // empty line if it is the first non-separator child.
+        let parent = tree.parent(node);
+        if parent.is_some_and(|p| dom_utils::is_wikitext_block_node(tree.node(p)))
+            && crate::html::dom_tree::first_non_sep_child(tree, parent.unwrap()) == Some(node)
+        {
+            return Some(Constraints {
+                min: Some(1),
+                max: Some(2),
+            });
+        }
+        if dom_utils::is_formatting_elt(tree.node(other)) {
+            return Some(Constraints {
+                min: Some(1),
+                max: Some(1),
+            });
+        }
+        let min = if dom_utils::is_new_elt(tree, node)
+            && !crate::html::wts_utils::is_marker_annotation(tree.node(other))
+        {
+            2
+        } else {
+            1
+        };
         Some(Constraints {
-            min: Some(1),
+            min: Some(min),
             max: Some(2),
         })
     }
@@ -647,7 +671,11 @@ impl DomHandler for DTHandler {
             state.emit_chunk(bullets, node, tree);
         }
         state.single_line_context.enforce();
-        crate::html::serializer::walk_children(tree, node, state);
+        // Faithful to DTHandler's `$liHandler` closure (same escapeds as LI).
+        let escaper: WtEscapeHandler = Box::new(move |state, text, opts, tree| {
+            crate::html::wikitext_escape_handlers::li_handler(node, state, text, opts, tree)
+        });
+        state.serialize_children_with_escaper(tree, node, escaper);
         state.single_line_context.pop();
         tree.next_sibling(node)
     }
@@ -744,7 +772,11 @@ impl DomHandler for DDHandler {
             state.emit_chunk(chunk, node, tree);
         }
         state.single_line_context.enforce();
-        crate::html::serializer::walk_children(tree, node, state);
+        // Faithful to DDHandler's `$liHandler` closure (same escapes as LI).
+        let escaper: WtEscapeHandler = Box::new(move |state, text, opts, tree| {
+            crate::html::wikitext_escape_handlers::li_handler(node, state, text, opts, tree)
+        });
+        state.serialize_children_with_escaper(tree, node, escaper);
         state.single_line_context.pop();
         tree.next_sibling(node)
     }
