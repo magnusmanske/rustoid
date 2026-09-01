@@ -408,17 +408,37 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
             continue;
         }
 
-        // Parsoid-generated heading ids are stripped unless they were explicitly
-        // reused (mirrors the `id` + `isHeading` branch). Our `Node` has no
-        // `reusedId` signal yet, so we conservatively drop only a `data-object-id`
-        // style id here and keep real ids elsewhere.
-        if k == "id" && v.starts_with("mw-") && dom_utils::is_heading(node) {
+        // Ignore parsoid-like ids (`^mw[\w-]{2,}$`). They may have been left
+        // behind by clients and shouldn't be serialized. Re-emit only when the
+        // id was recovered from source and unmodified (faithful to
+        // `CounterType::NODE_DATA_ID->matches`).
+        if k == "id" && is_node_data_id(v) {
+            if !node.dp.as_ref().is_none_or(|dp| dp.dsr.is_none()) {
+                let v_info = crate::html::wts_utils::get_shadow_info(node, k, Some(v));
+                if !v_info.modified && v_info.fromsrc && !v_info.value.is_empty() {
+                    out.push(format!("id=\"{}\"", v_info.value.replace('"', "&quot;")));
+                }
+            }
             continue;
         }
 
-        // Strip Parsoid-inserted `class="mw-empty-elt"` markers.
-        if k == "class" {
-            let stripped = v.replace("mw-empty-elt", "").trim().to_string();
+        // Parsoid auto-generates ids for headings and they should be stripped,
+        // except if this is a non-auto-generated (`reusedId`) id.
+        if k == "id" && dom_utils::is_heading(node) {
+            if node.dp.as_ref().and_then(|d| d.reused_id).unwrap_or(false) {
+                let v_info = crate::html::wts_utils::get_shadow_info(node, k, Some(v));
+                out.push(format!("id=\"{}\"", v_info.value.replace('"', "&quot;")));
+            }
+            continue;
+        }
+
+        // Strip Parsoid-inserted `class="mw-empty-elt"` markers (only for
+        // flagged empty elements — `li`/`tbody`/`tr`/`p`).
+        if k == "class"
+            && crate::wikitext::consts::flagged_empty_elts()
+                .contains(&crate::html::wts_utils::node_name(node))
+        {
+            let stripped = strip_mw_empty_elt_once(v);
             if stripped.is_empty() {
                 continue;
             }
@@ -428,11 +448,10 @@ fn serialize_attributes(node: &crate::dom::node::Node) -> String {
             }
         }
 
-        // Strip Parsoid-generated `about`/`typeof` RDFa values (mirrors the
-        // `$parsoidAttributes` regex strip): `about="#mwt…"` and the `mw:…`
-        // tokens in `typeof` are removed, and any remainder is kept.
-        let parsoid_stripped: Option<String> = if k == "about" && v.starts_with("#mwt") {
-            Some(trim_parsoid_about(v))
+        // Strip other Parsoid-generated values (`about="#mwtN"`, `typeof` `mw:…`
+        // tokens). Mirrors `$parsoidAttributes`.
+        let parsoid_stripped: Option<String> = if k == "about" && is_transclusion_about(v) {
+            Some(String::new())
         } else if k == "typeof" {
             let remaining: String = v
                 .split_whitespace()
@@ -535,14 +554,42 @@ fn escape_attr_segment(seg: &str) -> String {
     seg.replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Strip the Parsoid transclusion counter from an `about="#mwtN"` value,
-/// mirroring `CounterType::TRANSCLUSION_ABOUT` + `preg_replace` in PHP:
-/// `#mwt3` → `` and `#mwt3 xfoo` → `xfoo` (the trailing id suffix survives).
-fn trim_parsoid_about(v: &str) -> String {
-    // `#mwt` followed by digits is the transclusion id; strip that leading run.
-    let rest = &v[4..]; // skip "#mwt"
-    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-    rest.to_string()
+/// `CounterType::NODE_DATA_ID::matches` → `/^mw[\w-]{2,}$/D` (the `mw` prefix
+/// followed by at least two word-/hyphen characters, e.g. `mw-xy`).
+fn is_node_data_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if !id.starts_with("mw") {
+        return false;
+    }
+    bytes[2..].len() >= 2
+        && bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+}
+
+/// `CounterType::TRANSCLUSION_ABOUT::matches` → `/^#mwt\d+$/D`: an `about` value
+/// that is exactly `#mwt` followed by digits (the transclusion id).
+fn is_transclusion_about(v: &str) -> bool {
+    let Some(rest) = v.strip_prefix("#mwt") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Remove a single `mw-empty-elt` class token (with an optional adjacent
+/// space), mirroring `preg_replace('/\b ?mw-empty-elt\b/', '', $v, 1)`.
+fn strip_mw_empty_elt_once(v: &str) -> String {
+    let Some(start) = v.find("mw-empty-elt") else {
+        return v.to_string();
+    };
+    // Extend back over a single preceding space (word boundary already ensured
+    // by the token being boxed by non-`\w` characters in practice).
+    let mut s = start;
+    if s > 0 && &v[s - 1..s] == " " {
+        s -= 1;
+    }
+    let end = start + "mw-empty-elt".len();
+    format!("{}{}", &v[..s], &v[end..])
 }
 
 #[cfg(test)]
@@ -552,13 +599,24 @@ mod tests {
 
     #[test]
     fn test_serialize_html_tag() {
+        // `mw-empty-elt` is only stripped from flagged empty elements (`p`,
+        // `li`, `tr`, `tbody`). A `p` strips its `class="mw-empty-elt"`; other
+        // data-* attributes are always ignored.
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.set_attr("class", "mw-empty-elt");
+        p.set_attr("style", "color:red");
+        assert_eq!(
+            WikitextSerializer::serialize_html_tag(&p),
+            "<p style=\"color:red\">"
+        );
+
+        // A `div` is not a flagged empty element, so its `mw-empty-elt` class
+        // is preserved (faithful to `FlaggedEmptyElts`).
         let mut div = Node::element(ElementKind::Div);
         div.set_attr("class", "mw-empty-elt");
-        div.set_attr("style", "color:red");
-        // data-* and class are stripped.
         assert_eq!(
             WikitextSerializer::serialize_html_tag(&div),
-            "<div style=\"color:red\">"
+            "<div class=\"mw-empty-elt\">"
         );
     }
 
