@@ -1736,7 +1736,7 @@ impl DomHandler for SpanHandler {
             {
                 // Serialize an `mw:Entity` span: reuse `src` when it matches the
                 // content, else re-encode its text child, else serialize children.
-                let content_src = first_text_content(tree, node).unwrap_or_default();
+                let content_src = crate::html::dom_tree::text_content(tree, node);
                 let src_content = dp
                     .as_ref()
                     .and_then(|d| d.src_content.as_deref())
@@ -1775,17 +1775,6 @@ impl DomHandler for SpanHandler {
         }
         tree.next_sibling(node)
     }
-}
-
-/// The text content of the first text child of `node` (or `None`). Mirrors the
-/// `$node->textContent` fetch in the `mw:Entity` span branch (single-text-child
-/// spans only).
-fn first_text_content(tree: &DomTree, node: NodeId) -> Option<String> {
-    tree.first_child(node)
-        .and_then(|c| match &tree.node(c).kind {
-            crate::dom::node::NodeKind::Text(t) => Some(t.clone()),
-            _ => None,
-        })
 }
 
 /// `Utils::entityEncodeAll` — encode every character as a numeric character
