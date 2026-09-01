@@ -536,6 +536,10 @@ impl Html5TreeBuilder {
         // `ProcessTreeBuilderFixups::removeAutoInsertedEmptyTags`, which runs
         // after tree building and before DOM-level p-wrapping).
         remove_auto_inserted_empty_tags(&mut doc);
+        // MarkFosteredContent: strip `mw:TransclusionShadow` bookkeeping metas
+        // and (once foster-box emission is ported) mark fostered content. Runs
+        // before `ComputeDSR` so the `fostered` flag yields zero-width ranges.
+        crate::pipeline::mark_fostered_content::run(&mut doc);
         doc
     }
 }

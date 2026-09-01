@@ -42,6 +42,8 @@ pub struct NodeTreeHandler {
     arena: Vec<DomNode>,
     /// Children of each arena index (in document order).
     children: Vec<Vec<usize>>,
+    /// Parent arena index of each node (`None` for the root).
+    parents: Vec<Option<usize>>,
     /// Maps element `uid` → arena index.
     uids: HashMap<usize, usize>,
     /// The root arena index.
@@ -54,6 +56,7 @@ impl NodeTreeHandler {
         Self {
             arena: vec![Rc::clone(&root_node)],
             children: vec![Vec::new()],
+            parents: vec![None],
             uids: HashMap::new(),
             root: 0,
         }
@@ -95,7 +98,10 @@ impl NodeTreeHandler {
     /// Attach a child (arena index or text) under a parent arena index.
     fn attach_under(&mut self, parent_idx: usize, child: Child) {
         match child {
-            Child::Node(idx) => self.children[parent_idx].push(idx),
+            Child::Node(idx) => {
+                self.children[parent_idx].push(idx);
+                self.parents[idx] = Some(parent_idx);
+            }
             Child::Text(text) => {
                 // Merge with the last text child if it is text.
                 if let Some(&last) = self.children[parent_idx].last() {
@@ -109,16 +115,60 @@ impl NodeTreeHandler {
                 let idx = self.arena.len();
                 self.arena.push(text_node);
                 self.children.push(Vec::new());
+                self.parents.push(Some(parent_idx));
                 self.children[parent_idx].push(idx);
+            }
+        }
+    }
+
+    /// Insert a child (arena index or text) immediately before the reference
+    /// arena index (i.e. as its previous sibling). Falls back to attaching under
+    /// the reference's parent if the reference is not yet linked into a children
+    /// list (it should always be by the time foster-parenting fires).
+    fn insert_before(&mut self, ref_idx: usize, child: Child) {
+        let Some(parent_idx) = self.parents[ref_idx] else {
+            self.attach_under(self.root, child);
+            return;
+        };
+        let Some(pos) = self.children[parent_idx].iter().position(|&c| c == ref_idx) else {
+            self.attach_under(parent_idx, child);
+            return;
+        };
+        match child {
+            Child::Node(idx) => {
+                self.children[parent_idx].insert(pos, idx);
+                self.parents[idx] = Some(parent_idx);
+            }
+            Child::Text(text) => {
+                // Merge into an immediately preceding text sibling when possible.
+                if pos > 0 {
+                    let &prev = &self.children[parent_idx][pos - 1];
+                    let mut prev_node = self.arena[prev].borrow_mut();
+                    if let NodeKind::Text(existing) = &mut prev_node.kind {
+                        existing.push_str(&text);
+                        return;
+                    }
+                }
+                let text_node = Rc::new(RefCell::new(Node::text(text)));
+                let idx = self.arena.len();
+                self.arena.push(text_node);
+                self.children.push(Vec::new());
+                self.parents.push(Some(parent_idx));
+                self.children[parent_idx].insert(pos, idx);
             }
         }
     }
 
     fn place(&mut self, preposition: Preposition, reference: Option<usize>, child: Child) {
         match preposition {
-            Preposition::Root | Preposition::Before => {
-                // BEFORE (foster) and ROOT both attach under the root for now.
+            Preposition::Root => {
                 self.attach_under(self.root, child);
+            }
+            Preposition::Before => {
+                // Foster parenting: insert as a sibling immediately before the
+                // reference element (rather than under it).
+                let ref_idx = self.reference_idx(reference);
+                self.insert_before(ref_idx, child);
             }
             Preposition::Under => {
                 let parent = self.reference_idx(reference);
@@ -202,6 +252,8 @@ impl TreeHandler for NodeTreeHandler {
         self.arena.push(root_node);
         self.children.clear();
         self.children.push(Vec::new());
+        self.parents.clear();
+        self.parents.push(None);
         self.uids.clear();
         self.root = 0;
     }
@@ -248,6 +300,7 @@ impl TreeHandler for NodeTreeHandler {
         let idx = self.arena.len();
         self.arena.push(dom);
         self.children.push(Vec::new());
+        self.parents.push(None);
         element.user_data = idx;
         self.uids.insert(element.uid, idx);
         self.place(preposition, reference, Child::Node(idx));
@@ -278,6 +331,7 @@ impl TreeHandler for NodeTreeHandler {
         let idx = self.arena.len();
         self.arena.push(dom);
         self.children.push(Vec::new());
+        self.parents.push(None);
         self.place(preposition, reference, Child::Node(idx));
     }
 
@@ -301,6 +355,9 @@ impl TreeHandler for NodeTreeHandler {
             (self.uids.get(&element.uid), self.uids.get(&new_parent.uid))
         {
             let children = std::mem::take(&mut self.children[from]);
+            for &c in &children {
+                self.parents[c] = Some(to);
+            }
             self.children[to].extend(children);
         }
     }
