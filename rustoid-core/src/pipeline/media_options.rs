@@ -245,6 +245,8 @@ pub struct MediaOpts {
     pub link: Option<String>,
     /// The `alt=` option value.
     pub alt: Option<String>,
+    /// The `class=` option value (space-separated class list).
+    pub class: Option<String>,
 }
 
 /// Determine wrapper classes and inline-ness. Mirrors PHP's `getWrapperInfo`.
@@ -277,6 +279,12 @@ pub fn get_wrapper_info(opts: &MediaOpts) -> (Vec<String>, bool) {
         && VERTICAL_ALIGNS.contains(&valign_opt.as_str())
     {
         classes.push(format!("mw-valign-{}", valign_opt.replace('_', "-")));
+    }
+
+    // A user `class=` option is appended (space-separated) to the wrapper
+    // (mirrors `renderFile`'s `$classes[] = explode(' ', $opts['class']['v'])`).
+    if let Some(class_opt) = &opts.class {
+        classes.extend(class_opt.split_whitespace().map(str::to_string));
     }
 
     (classes, is_inline)

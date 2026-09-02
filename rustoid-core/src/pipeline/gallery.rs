@@ -237,6 +237,13 @@ fn broken_media_span(
 
     let mut container = Node::element(ElementKind::Span);
     container.set_attr("typeof", "mw:File");
+    // A `class=` option is applied to the wrapper (mirrors `renderFile`, where
+    // the user class is appended to the container's class list).
+    if let Some(class) = &media_opts.class
+        && !class.trim().is_empty()
+    {
+        container.set_attr("class", class.as_str());
+    }
     if let Some(data_mw) = media_opts_to_data_mw(media_opts, caption) {
         container.data_mw = Some(data_mw);
     }
@@ -264,6 +271,7 @@ fn parse_media_opts(
             "manualthumb" => opts.manualthumb = Some(info.v),
             "link" => opts.link = Some(info.v),
             "alt" => opts.alt = Some(info.v),
+            "class" => opts.class = Some(info.v),
             _ => {}
         }
     }

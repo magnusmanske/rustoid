@@ -633,6 +633,7 @@ pub fn render_file(
                     "upright" => opts.upright = Some(info.v),
                     "link" => opts.link = Some(info.v),
                     "alt" => opts.alt = Some(info.v),
+                    "class" => opts.class = Some(info.v),
                     "width" => {
                         // Parse WxH (separated by 'x').
                         if let Some((w, h)) = info.v.split_once('x') {
