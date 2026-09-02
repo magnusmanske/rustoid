@@ -404,7 +404,10 @@ fn caption_text_from_source(source: &str) -> String {
         out.push(c);
         i += 1;
     }
-    out
+    // The caption was stored as raw wikitext (entities not yet decoded); decode
+    // them so `&#9792;` → `♀` (mirrors PHP's `textContentFromCaption`, which runs
+    // on the already-re-tokenized caption DOM).
+    crate::html::wts_utils::decode_wt_entities_all(&out)
 }
 
 /// The index of the `]]` closing the `[[…` at `start` (balancing nested links).
