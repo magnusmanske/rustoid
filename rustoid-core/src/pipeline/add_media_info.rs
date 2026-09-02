@@ -50,6 +50,18 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
         }
         let info = source.get_file_info(&job.title).await.unwrap_or(None);
         infos.insert(key, info);
+
+        // `manualthumb=Thumb.png` uses the manual-thumb file's media info for
+        // `src`/dimensions, while `href`/`resource` keep the original title.
+        if let Some(mt) = &job.manualthumb {
+            let mt_title = Title::new(6, mt.clone());
+            let mt_key = mt_title.full_text();
+            if infos.contains_key(&mt_key) {
+                continue;
+            }
+            let mt_info = source.get_file_info(&mt_title).await.unwrap_or(None);
+            infos.insert(mt_key, mt_info);
+        }
     }
 
     for job in &jobs {
@@ -65,6 +77,8 @@ struct ContainerJob {
     title: Title,
     /// The broken span's `data-width` (dims.width), if any.
     data_width: Option<String>,
+    /// The `manualthumb=` title (a file name in the File namespace), if any.
+    manualthumb: Option<String>,
 }
 
 /// Parse the file title from a media container's broken span text.
@@ -140,6 +154,7 @@ fn collect_containers(
             path: path.clone(),
             title: title_from_container(node, config),
             data_width: data_width_from_container(node),
+            manualthumb: data_mw_txt(node, "manualthumb"),
         });
         return;
     }
@@ -163,16 +178,66 @@ fn apply_media_info(
 
     let Some(info) = info else {
         // Missing file: leave broken, add `mw:Error` (mirrors `handleErrors`).
-        mark_error(root, &job.path);
+        mark_error(
+            root,
+            &job.path,
+            "apierror-filedoesnotexist",
+            "This image does not exist.",
+        );
         return;
     };
 
-    // Compute the rendered size (mirrors `handleSize` for bitmaps).
-    let (width, height) = handle_size(job, &info);
+    // A file on the bad-image list stems a broken span but keeps a description
+    // link (mirrors `$info['badFile']` → `apierror-badfile` + `handleErrors`).
+    if info.bad_file {
+        mark_bad_file(
+            root,
+            &job.path,
+            &job.title,
+            config,
+            job.manualthumb.is_some(),
+        );
+        return;
+    }
+
+    // `manualthumb=Thumb.png` renders the manual-thumb file's media (its
+    // dimensions/`src`/`data-file-*`), while `href`/`resource`/`data-file-*`
+    // still describe the original file. Mirrors PHP's manualthumb `$info`
+    // replacement in the `AddMediaInfo::run` loop.
+    let media_info = if let Some(mt) = &job.manualthumb {
+        let mt_title = Title::new(6, mt.clone());
+        infos
+            .get(&mt_title.full_text())
+            .and_then(|i| i.clone())
+            .unwrap_or(info.clone())
+    } else {
+        info.clone()
+    };
+
+    // A bad manual-thumb file also errors the whole media (mirrors the
+    // manualthumb-`badFile` case in `AddMediaInfo::run`).
+    if media_info.bad_file {
+        mark_bad_file(
+            root,
+            &job.path,
+            &job.title,
+            config,
+            job.manualthumb.is_some(),
+        );
+        return;
+    }
+
+    // Compute the rendered size (mirrors `handleSize` for bitmaps). The manual
+    // thumb is unscaled, so `data-width` (if any) is ignored for it.
+    let (width, height) = if job.manualthumb.is_some() {
+        (media_info.width, media_info.height)
+    } else {
+        handle_size(job, &media_info)
+    };
 
     // The image `src` (thumbnail when the file has one for the requested width,
     // else the raw file URL).
-    let src = image_src(&info, job.data_width.as_deref());
+    let src = image_src(&media_info, job.data_width.as_deref());
 
     // `link=` / `alt=` options stored in `data-mw.attribs` by `renderFile`.
     let explicit_alt = data_mw_attrib(root, &job.path, "alt");
@@ -205,13 +270,17 @@ fn apply_media_info(
     for (k, v) in IMG_ATTRIBS {
         img.set_attr(k, v);
     }
-    // data-file-* read-only original size info (T64881).
-    img.set_attr("data-file-width", info.width.to_string());
-    img.set_attr("data-file-height", info.height.to_string());
-    img.set_attr("data-file-type", media_type_from_mime(&info.mime_type));
+    // data-file-* read-only original size info (T64881). For manualthumb these
+    // reflect the manual-thumb file, matching PHP's `$info` replacement.
+    img.set_attr("data-file-width", media_info.width.to_string());
+    img.set_attr("data-file-height", media_info.height.to_string());
+    img.set_attr(
+        "data-file-type",
+        media_type_from_mime(&media_info.mime_type),
+    );
     // src + srcset (responsive 2x).
     img.set_attr("src", src);
-    if let Some(srcset) = srcset(&info) {
+    if let Some(srcset) = srcset(&media_info) {
         img.set_attr("srcset", srcset);
     }
     // Rendered dimensions.
@@ -225,8 +294,11 @@ fn apply_media_info(
         &job.title,
         img,
         config,
-        caption_text.as_deref(),
-        link_target.as_deref(),
+        &AnchorOpts {
+            caption_text: caption_text.as_deref(),
+            link_target: link_target.as_deref(),
+            is_manual_thumb: job.manualthumb.is_some(),
+        },
     );
 }
 
@@ -234,7 +306,12 @@ fn apply_media_info(
 /// present. Mirrors `WTSUtils::getAttrFromDataMw($dataMw, $key, true)`.
 fn data_mw_attrib(root: &Node, path: &[usize], key: &str) -> Option<String> {
     let container = node_at_read(root, path)?;
-    let json: serde_json::Value = serde_json::from_str(container.data_mw.as_deref()?).ok()?;
+    data_mw_txt(container, key)
+}
+
+/// The `txt` value of a named option in a node's `data-mw.attribs`, if present.
+fn data_mw_txt(node: &Node, key: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(node.data_mw.as_deref()?).ok()?;
     let attribs = json.get("attribs")?.as_array()?;
     for pair in attribs {
         let arr = pair.as_array()?;
@@ -356,11 +433,17 @@ fn media_type_from_mime(mime: &str) -> String {
 
 /// Mark a media container as `mw:Error` and keep the broken markup (mirrors
 /// `handleErrors`).
-fn mark_error(root: &mut Node, path: &[usize]) {
+fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str) {
     let Some(node) = node_at(root, path) else {
         return;
     };
-    // Add `mw:Error` to the typeof (space-separated, non-duplicated, first).
+    add_error_type(node);
+    let errors = format!("{{\"errors\":[{{\"key\":\"{key}\",\"message\":\"{message}\"}}]}}");
+    node.data_mw = Some(errors);
+}
+
+/// Mark a container as `mw:Error` (space-separated, non-duplicated, first).
+fn add_error_type(node: &mut Node) {
     let mut tokens: Vec<String> = node
         .get_attr("typeof")
         .map(|t| t.split_whitespace().map(str::to_string).collect())
@@ -369,10 +452,52 @@ fn mark_error(root: &mut Node, path: &[usize]) {
         tokens.insert(0, "mw:Error".to_string());
         node.set_attr("typeof", tokens.join(" "));
     }
+}
 
-    // data-mw errors array, mirroring `handleErrors`'s merged errors.
-    let errors = r#"{"errors":[{"key":"apierror-filedoesnotexist","message":"This image does not exist."}]}"#;
-    node.data_mw = Some(errors.to_string());
+/// Handle a file on the bad-image list: keep the broken `<span>` but rewrite the
+/// anchor into a file-description link and mark `mw:Error` + `apierror-badfile`.
+/// Mirrors `AddMediaInfo::handleErrors` + the `$errs` `replaceAnchor` path.
+fn mark_bad_file(
+    root: &mut Node,
+    path: &[usize],
+    title: &Title,
+    config: &dyn SiteConfig,
+    is_manual_thumb: bool,
+) {
+    let Some(container) = node_at(root, path) else {
+        return;
+    };
+    add_error_type(container);
+
+    // The anchor is the first element child; rewrite it to a description link
+    // (mirrors `replaceAnchor`'s `$addDescriptionLink`, which still runs when
+    // `$errs` are present). The `mw-file-description` class is omitted for
+    // manual-thumb images.
+    if let Some(anchor_idx) = container
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::Element(_)))
+    {
+        let anchor = &mut container.children[anchor_idx];
+        anchor
+            .attrs
+            .retain(|a| a.key != "class" && a.key != "title" && a.key != "href");
+        anchor.set_attr("href", crate::title::make_link(title, config));
+        if !is_manual_thumb {
+            anchor.set_attr("class", "mw-file-description");
+        }
+    }
+
+    let errors = r##"{"errors":[{"key":"apierror-badfile","message":"This image is on the bad file list."}]}"##;
+    container.data_mw = Some(errors.to_string());
+}
+
+/// The anchor-rewrite parameters computed by `apply_media_info` (bundled to
+/// keep `rewrite_structure`'s arity manageable).
+struct AnchorOpts<'a> {
+    caption_text: Option<&'a str>,
+    link_target: Option<&'a str>,
+    is_manual_thumb: bool,
 }
 
 /// Replace the broken `<span>` with the built `<img>` and rewrite the anchor to
@@ -384,8 +509,7 @@ fn rewrite_structure(
     title: &Title,
     img: Node,
     config: &dyn SiteConfig,
-    caption_text: Option<&str>,
-    link_target: Option<&str>,
+    opts: &AnchorOpts,
 ) {
     let Some(container) = node_at(root, path) else {
         return;
@@ -409,7 +533,7 @@ fn rewrite_structure(
             .attrs
             .retain(|a| a.key != "class" && a.key != "title" && a.key != "href" && a.key != "rel");
 
-        if let Some(link) = link_target {
+        if let Some(link) = opts.link_target {
             if link.is_empty() {
                 // `link=` (empty): no link at all → a bare `<span>`.
                 anchor.kind = NodeKind::Element(ElementKind::Span);
@@ -431,15 +555,19 @@ fn rewrite_structure(
             }
             // A caption may still override the `title` (mirrors
             // `$anchor->setAttribute('title', $captionText)`).
-            if let Some(cap) = caption_text {
+            if let Some(cap) = opts.caption_text {
                 anchor.set_attr("title", cap);
             }
         } else {
             // Description link to the file page (mirrors `$addDescriptionLink`).
             anchor.set_attr("href", crate::title::make_link(title, config));
-            anchor.set_attr("class", "mw-file-description");
+            // The file-description class is omitted for manual-thumb images so
+            // MultimediaViewer does not launch (mirrors `replaceAnchor`).
+            if !opts.is_manual_thumb {
+                anchor.set_attr("class", "mw-file-description");
+            }
             // `title` from the caption (or absent when the caption is empty).
-            if let Some(cap) = caption_text {
+            if let Some(cap) = opts.caption_text {
                 anchor.set_attr("title", cap);
             }
         }
@@ -520,6 +648,7 @@ mod tests {
                 description_url: "http://example.com/images/Foobar.jpg".to_string(),
                 file_url: "http://example.com/images/3/3a/Foobar.jpg".to_string(),
                 thumb_urls,
+                bad_file: false,
             },
         );
     }
@@ -569,6 +698,42 @@ mod tests {
     fn test_media_type_from_mime() {
         assert_eq!(media_type_from_mime("image/jpeg"), "bitmap");
         assert_eq!(media_type_from_mime("image/svg+xml"), "drawing");
+    }
+
+    #[tokio::test]
+    async fn test_bad_file_becomes_error() {
+        let mut doc = Node::document();
+        doc.push_child(container(None));
+        let ds = MockDataSource::new();
+        // A bad-file image errors and keeps a description link to the file page.
+        ds.add_file(
+            "File:Foobar.jpg",
+            FileInfo {
+                title: "Foobar.jpg".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                size: 1,
+                width: 100,
+                height: 100,
+                description_url: "".to_string(),
+                file_url: "http://example.com/images/Foobar.jpg".to_string(),
+                thumb_urls: HashMap::new(),
+                bad_file: true,
+            },
+        );
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        assert!(c.get_attr("typeof").unwrap().contains("mw:Error"));
+        let a = &c.children[0];
+        assert_eq!(a.get_attr("class"), Some("mw-file-description"));
+        assert_eq!(a.get_attr("href"), Some("./File:Foobar.jpg"));
+        // The broken span is kept (not replaced with an <img>).
+        assert_eq!(
+            a.children[0].get_attr("class"),
+            Some("mw-file-element mw-broken-media")
+        );
+        assert!(c.data_mw.as_deref().unwrap().contains("apierror-badfile"));
     }
 
     /// A `<figure typeof="mw:File">` container with an empty `<a>` anchor and a

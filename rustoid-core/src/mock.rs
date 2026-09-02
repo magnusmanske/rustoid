@@ -287,7 +287,7 @@ impl MockSiteConfig {
         config.add_magic_word("server", &["SERVER", "SERVERNAME"]);
         config.add_magic_word("sitename", &["SITENAME"]);
         config.add_magic_word("img_thumbnail", &["thumbnail", "thumb"]);
-        config.add_magic_word("img_manualthumb", &["thumbnail=", "thumb="]);
+        config.add_magic_word("img_manualthumb", &["thumbnail=$1", "thumb=$1"]);
         config.add_magic_word("img_right", &["right"]);
         config.add_magic_word("img_left", &["left"]);
         config.add_magic_word("img_none", &["none"]);

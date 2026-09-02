@@ -593,25 +593,28 @@ pub fn render_file(
         );
     }
 
-    // Non-`getUsed()` options (`link`, `alt`, `page`, `class`, etc.) are stored
-    // in `data-mw.attribs` so `AddMediaInfo` can apply them after file-info
-    // retrieval (mirrors `renderFile`'s `dataMw->attribs` accumulation).
-    let data_mw_attribs: Vec<DataMwAttrib> =
-        [("link", opts.link.as_ref()), ("alt", opts.alt.as_ref())]
-            .into_iter()
-            .filter_map(|(key, val)| {
-                val.map(|v| {
-                    DataMwAttrib::new(
-                        DataMwValue::Str(key.to_string()),
-                        DataMwValue::Object {
-                            txt: Some(v.clone()),
-                            html: None,
-                            uneditable: false,
-                        },
-                    )
-                })
-            })
-            .collect();
+    // Non-`getUsed()` options (`link`, `alt`, `manualthumb`, `page`, `class`,
+    // etc.) are stored in `data-mw.attribs` so `AddMediaInfo` can apply them
+    // after file-info retrieval (mirrors `renderFile`'s `dataMw->attribs`).
+    let data_mw_attribs: Vec<DataMwAttrib> = [
+        ("link", opts.link.as_ref()),
+        ("alt", opts.alt.as_ref()),
+        ("manualthumb", opts.manualthumb.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(key, val)| {
+        val.map(|v| {
+            DataMwAttrib::new(
+                DataMwValue::Str(key.to_string()),
+                DataMwValue::Object {
+                    txt: Some(v.clone()),
+                    html: None,
+                    uneditable: false,
+                },
+            )
+        })
+    })
+    .collect();
 
     let mut container = TagTk::new(container_name, container_attribs, DataParsoid::default());
     if !data_mw_attribs.is_empty() {

@@ -250,6 +250,7 @@ impl MediaWikiApiDataSource {
                         description_url: info["descriptionurl"].as_str().unwrap_or("").to_string(),
                         file_url: info["url"].as_str().unwrap_or("").to_string(),
                         thumb_urls: HashMap::new(),
+                        bad_file: page["badfile"].as_bool().unwrap_or(false),
                     }));
                 }
             }

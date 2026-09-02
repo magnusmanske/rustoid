@@ -130,6 +130,7 @@ fn seed_media_files(source: &MockDataSource) {
                 description_url: format!("{BASE}/{fname}"),
                 file_url,
                 thumb_urls,
+                bad_file: *fname == "Bad.jpg",
             },
         );
     }

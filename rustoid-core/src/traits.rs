@@ -62,6 +62,9 @@ pub struct FileInfo {
     pub file_url: String,
     /// Thumbnail URLs keyed by width (e.g. `"120"`, `"300"`).
     pub thumb_urls: HashMap<String, String>,
+    /// Whether the file is on the wiki's bad-image list (rendered broken with
+    /// `mw:Error` + `apierror-badfile` even though the file exists).
+    pub bad_file: bool,
 }
 
 // ---------------------------------------------------------------------------

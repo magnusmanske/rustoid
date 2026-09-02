@@ -155,27 +155,38 @@ fn prefix_option_info(
     magic_words: &MagicWordMap,
     opt_text: &str,
 ) -> Option<(&'static str, String)> {
-    // Try `key=value` first: the `key` must equal (or be a localized alias of)
-    // a parameterized prefix option such as `link`, `alt`, `page`, `lang`,
-    // `class`, `upright`, `manualthumb` (alias `thumb=`/`thumbnail=`).
-    if let Some((key, val)) = opt_text.split_once('=') {
-        let key = key.trim();
-        let val = val.trim();
-        for (canonical, entry) in magic_words {
-            if !(entry.canonical.starts_with("img_") || entry.canonical.starts_with("timedmedia_"))
-            {
+    // A parameterized alias is `prefix=$1` (e.g. `link=$1`, `alt=$1`,
+    // `thumb=$1`); the literal prefix is everything before `$1`, and the rest
+    // of `opt_text` past that prefix is the captured value.
+    for (canonical, entry) in magic_words {
+        if !(entry.canonical.starts_with("img_") || entry.canonical.starts_with("timedmedia_")) {
+            continue;
+        }
+        let Some(group) = prefix_options(canonical) else {
+            continue;
+        };
+        for alias in &entry.aliases {
+            let literal = if let Some(base) = alias.strip_suffix("$1") {
+                base
+            } else {
+                // A non-parameterized alias only matches as a bare prefix when
+                // followed by `=` (e.g. `thumb=` implies `thumb=<value>`).
+                alias.trim_end_matches('=')
+            };
+            if literal.is_empty() {
                 continue;
             }
-            // A parameterized alias strips the `$1` placeholder.
-            let alias_matches = entry.aliases.iter().any(|a| {
-                let base = a.strip_suffix("$1").unwrap_or(a);
-                base.to_lowercase() == key.to_lowercase()
-            });
-            if alias_matches && let Some(group) = prefix_options(canonical) {
-                // `manualthumb`'s `thumb=`/`thumbnail=` aliases map to the
-                // `manualthumb` group even though the canonical is
-                // `img_manualthumb`.
-                return Some((group, val.to_string()));
+            let opt_lower = opt_text.to_lowercase();
+            let lit_lower = literal.to_lowercase();
+            // Match against the prefix *lowercased*, but capture the value from
+            // the original string to preserve case (`link=Main_Page` → `Main_Page`,
+            // not `main_page`).
+            if let Some(lower_rest) = opt_lower.strip_prefix(&lit_lower) {
+                let consumed = opt_text.len() - lower_rest.len();
+                let value = opt_text[consumed..]
+                    .strip_prefix('=')
+                    .unwrap_or(&opt_text[consumed..]);
+                return Some((group, value.trim().to_string()));
             }
         }
     }
