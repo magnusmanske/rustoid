@@ -501,6 +501,51 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
         .collect()
 }
 
+/// Render the `wikilink` tokens inside a media caption into `<a>` tags (mirrors
+/// the `WikiLinkHandler` link rendering that runs on the main token stream but
+/// not on the caption sub-pipeline). `extlink`/`urllink`/`mw-quote` tokens are
+/// left for the later `renderExternalLinks`/`QuoteTransformer` stages.
+fn render_caption_wikilinks(ctx: &mut WikiLinkContext, items: Vec<Item>) -> Vec<Item> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+            out.push(item);
+            continue;
+        };
+        if stt.name != "wikilink" {
+            out.push(item);
+            continue;
+        }
+        let href = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("href"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let target =
+            get_wiki_link_target_info(ctx, &href, &href).unwrap_or_else(|_| WikiLinkTargetInfo {
+                href: href.clone(),
+                href_src: href.clone(),
+                title: Some(crate::title::Title::new_main(href.clone())),
+                interwiki: None,
+                language: None,
+                local_prefix: None,
+                from_colon_escaped_text: false,
+                prefix: None,
+            });
+        out.extend(render_wiki_link_dispatched(
+            ctx,
+            &ParsoidToken::SelfclosingTag(stt.clone()),
+            &target,
+            false,
+        ));
+    }
+    out
+}
+
 /// Split a media option string on *top-level* pipes, respecting nested
 /// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling.
@@ -835,8 +880,10 @@ pub fn render_file(
         if let Some(cap) = &caption {
             // A caption is re-tokenized as wikitext so quotes/entities/links are
             // rendered (mirrors PHP's `processContentInPipeline` inline caption
-            // processing).
-            out.extend(tokenize_caption(cap, ctx.config));
+            // processing). Wikilinks are rendered here (the main `renderLinks`
+            // stage already ran); `extlink`/quotes are left for the later stages.
+            let items = tokenize_caption(cap, ctx.config);
+            out.extend(render_caption_wikilinks(ctx, items));
         }
         out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
             "figcaption",
