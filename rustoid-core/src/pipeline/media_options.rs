@@ -132,7 +132,23 @@ pub fn strip_quote_markers(value: &str) -> String {
     }
 
     let mut out = String::with_capacity(value.len());
-    let chars: Vec<char> = value.chars().collect();
+    let mut rest = value;
+    // Strip HTML comments (`<!-- … -->`) so their content contributes no text
+    // (mirrors `textContent`, which ignores comment nodes).
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(rel) => rest = &rest[start + rel + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+
+    let chars: Vec<char> = out.chars().collect();
+    out.clear();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '\'' {
@@ -162,6 +178,7 @@ pub fn has_wikitext_markup(value: &str) -> bool {
         || value.contains("&")
         || value.contains("[[")
         || value.contains("{{")
+        || value.contains("<!--")
         || value.contains("<nowiki")
         || value.contains("<NOWIKI")
         || value.contains("<ref")
