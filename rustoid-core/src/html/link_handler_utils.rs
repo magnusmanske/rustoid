@@ -505,7 +505,10 @@ pub fn serialize_as_wiki_link(
 
     if link_data.is_redirect {
         if target.modified || !target.fromsrc {
-            let lt = target.value.clone();
+            // Strip leading `./`/`../`, replace `_`→` `, then escape.
+            let mut lt = target.value.clone();
+            lt = strip_leading_dot(lt);
+            lt = lt.replace('_', " ");
             let escaped = crate::html::wikitext_escape_handlers::escape_link_target(env, &lt);
             escaped_tgt = Some(escaped);
             link_target = escaped_tgt.as_ref().map(|e| e.link_target.clone());
