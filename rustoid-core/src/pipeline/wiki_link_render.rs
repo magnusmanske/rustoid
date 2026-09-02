@@ -111,7 +111,7 @@ pub fn get_wiki_link_target_info(
     let mut prefix: Option<String> = None;
 
     // Capture the (decoded) title before handling colon escape.
-    let title_decoded = decode_uri_component(&href);
+    let mut title_decoded = decode_uri_component(&href);
 
     if href.trim_start().starts_with(':') {
         from_colon_escaped_text = true;
@@ -120,6 +120,15 @@ pub fn get_wiki_link_target_info(
     if href.starts_with(':') {
         // Multiple colons — caught by caller as an invalid title.
         return Err("Multiple colons prefixing href.".to_string());
+    }
+
+    // The decoded title used for (re-)parsing must not carry the leading colon
+    // escape, or `TitleParser` would treat it as force-mainspace.
+    if from_colon_escaped_text {
+        title_decoded = title_decoded
+            .strip_prefix(':')
+            .unwrap_or(&title_decoded)
+            .to_string();
     }
 
     let href_bits = crate::pipeline::wiki_link_handler::href_parts(&href);
@@ -136,9 +145,12 @@ pub fn get_wiki_link_target_info(
         let ns_id = namespace_id(ctx.config, &normalized);
         let interwiki_info = ctx.config.interwiki_map().get(&normalized).cloned();
 
-        if let Some(ns_id) = ns_id {
-            // Namespace prefix → local title.
-            title = Some(Title::new(ns_id, title_part.to_string()));
+        if ns_id.is_some() {
+            // Namespace prefix → local title. Re-parse the decoded full string
+            // (rather than `Title::new`) so first-letter capitalization is
+            // applied for case-insensitive namespaces (mirrors
+            // `makeTitleFromURLDecodedStr`).
+            title = Some(TitleParser::parse(&title_decoded, ctx.config));
         } else if let Some(info) = &interwiki_info {
             if info.localinterwiki == Some(true) {
                 // Local interwiki: empty title means main page (T66167).
@@ -196,6 +208,9 @@ pub fn get_wiki_link_target_info(
 }
 
 /// Resolve a (possibly localized/canonical) namespace name to its id.
+/// `name` is already first-letter-lowercased (`normalizeNamespaceName`); the
+/// comparison stays case-sensitive so an interwiki prefix like `wikipedia` does
+/// not collide with a namespace alias like `Wikipedia`.
 fn namespace_id(config: &dyn SiteConfig, name: &str) -> Option<i32> {
     for (&id, ns) in config.namespaces() {
         if ns.canonical == name {
