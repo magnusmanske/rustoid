@@ -10,7 +10,8 @@
 use crate::title::{Title, TitleParser, make_link};
 use crate::traits::SiteConfig;
 use crate::wikitext::tokens_v2::{
-    DataParsoid, EndTagTk, Item, KV, ParsoidToken, SelfclosingTagTk, TagTk,
+    DataMwAttrib, DataMwValue, DataParsoid, EndTagTk, Item, KV, ParsoidToken, SelfclosingTagTk,
+    TagTk,
 };
 
 use super::wiki_link_handler::{build_link_attrs, string_kv};
@@ -549,6 +550,8 @@ pub fn render_file(
                     "valign" => opts.valign = Some(info.v),
                     "border" => opts.border = Some(info.v),
                     "upright" => opts.upright = Some(info.v),
+                    "link" => opts.link = Some(info.v),
+                    "alt" => opts.alt = Some(info.v),
                     "width" => {
                         // Parse WxH (separated by 'x').
                         if let Some((w, h)) = info.v.split_once('x') {
@@ -589,7 +592,32 @@ pub fn render_file(
             crate::pipeline::wiki_link_handler::string_kv("class", &classes.join(" ")),
         );
     }
-    let container = TagTk::new(container_name, container_attribs, DataParsoid::default());
+
+    // Non-`getUsed()` options (`link`, `alt`, `page`, `class`, etc.) are stored
+    // in `data-mw.attribs` so `AddMediaInfo` can apply them after file-info
+    // retrieval (mirrors `renderFile`'s `dataMw->attribs` accumulation).
+    let data_mw_attribs: Vec<DataMwAttrib> =
+        [("link", opts.link.as_ref()), ("alt", opts.alt.as_ref())]
+            .into_iter()
+            .filter_map(|(key, val)| {
+                val.map(|v| {
+                    DataMwAttrib::new(
+                        DataMwValue::Str(key.to_string()),
+                        DataMwValue::Object {
+                            txt: Some(v.clone()),
+                            html: None,
+                            uneditable: false,
+                        },
+                    )
+                })
+            })
+            .collect();
+
+    let mut container = TagTk::new(container_name, container_attribs, DataParsoid::default());
+    if !data_mw_attribs.is_empty() {
+        let json = crate::pipeline::attribute_expander::serialize_data_mw_attribs(&data_mw_attribs);
+        container.add_attribute_str("data-mw", format!("{{\"attribs\":{json}}}"));
+    }
 
     // Anchor wraps the file element.
     let mut anchor = TagTk::new("a", vec![], DataParsoid::default());

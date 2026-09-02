@@ -287,11 +287,32 @@ impl MockSiteConfig {
         config.add_magic_word("server", &["SERVER", "SERVERNAME"]);
         config.add_magic_word("sitename", &["SITENAME"]);
         config.add_magic_word("img_thumbnail", &["thumbnail", "thumb"]);
+        config.add_magic_word("img_manualthumb", &["thumbnail=", "thumb="]);
         config.add_magic_word("img_right", &["right"]);
         config.add_magic_word("img_left", &["left"]);
+        config.add_magic_word("img_none", &["none"]);
         config.add_magic_word("img_center", &["center", "centre"]);
-        config.add_magic_word("img_framed", &["framed", "frame"]);
+        config.add_magic_word(
+            "img_framed",
+            &["framed", "frame", "enframed", "frame-horiz"],
+        );
         config.add_magic_word("img_frameless", &["frameless"]);
+        config.add_magic_word("img_border", &["border"]);
+        config.add_magic_word("img_baseline", &["baseline"]);
+        config.add_magic_word("img_sub", &["sub"]);
+        config.add_magic_word("img_super", &["super", "sup"]);
+        config.add_magic_word("img_top", &["top"]);
+        config.add_magic_word("img_text_top", &["text-top"]);
+        config.add_magic_word("img_middle", &["middle"]);
+        config.add_magic_word("img_bottom", &["bottom"]);
+        config.add_magic_word("img_text_bottom", &["text-bottom"]);
+        config.add_magic_word("img_link", &["link"]);
+        config.add_magic_word("img_alt", &["alt"]);
+        config.add_magic_word("img_page", &["page"]);
+        config.add_magic_word("img_upright", &["upright"]);
+        config.add_magic_word("img_width", &["width"]);
+        config.add_magic_word("img_class", &["class"]);
+        config.add_magic_word("img_lang", &["lang"]);
 
         config
     }

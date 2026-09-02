@@ -107,57 +107,82 @@ fn short_canonical_option(canonical: &str) -> String {
 }
 
 /// Classify a media option string. Mirrors PHP's `getOptionInfo` for the
-/// simple-option and width prefix cases.
+/// simple-option and prefix-option cases.
 pub fn get_option_info(config: &dyn SiteConfig, opt_str: &str) -> Option<OptionInfo> {
     let o_text = opt_str.trim();
-    let canonical = canonical_magic_word_for_option(config.magic_words(), o_text)?;
-    let short = short_canonical_option(&canonical);
+    let canonical = canonical_magic_word_for_option(config.magic_words(), o_text);
 
-    // Simple option?
-    if let Some(group) = simple_options(&canonical) {
+    // Simple option (exact alias match) → group + short canonical value.
+    if let Some(canonical) = &canonical
+        && let Some(group) = simple_options(canonical)
+    {
         return Some(OptionInfo {
             ck: group.to_string(),
-            v: short,
+            v: short_canonical_option(canonical),
             ak: o_text.to_string(),
             s: true,
         });
     }
 
-    // Prefix option?
-    if let Some(group) = prefix_options(&canonical) {
-        // For width, match `\d+(x\d+)?px?`.
+    // Prefix option: match a parameterized alias (`link=$1`, `$1px`, …) where
+    // the option text has a `key=value` form, or (`width`) a trailing `px`.
+    if let Some((group, val)) = prefix_option_info(config.magic_words(), o_text) {
+        // `width` is matched against a bare numeric string (`200px`).
         if group == "width" {
-            if let Some(dim) = parse_media_dimension(o_text) {
-                return Some(OptionInfo {
-                    ck: "width".to_string(),
-                    v: dim,
-                    ak: o_text.to_string(),
-                    s: false,
-                });
-            }
-            return None;
-        }
-        // For other prefix options, the value is everything after the alias.
-        // (We don't yet parse arbitrary `alt=`, `lang=`, etc., faithfully; the
-        // simple `=value` syntax is handled via `key=value`.)
-        if let Some((key, val)) = o_text.split_once('=')
-            && (key.trim() == short || {
-                // Accept the localized alias followed by '='.
-                config
-                    .magic_words()
-                    .get(&canonical)
-                    .map(|e| e.aliases.iter().any(|a| a == key.trim()))
-                    .unwrap_or(false)
-            })
-        {
             return Some(OptionInfo {
-                ck: group.to_string(),
-                v: val.trim().to_string(),
+                ck: "width".to_string(),
+                v: val,
                 ak: o_text.to_string(),
                 s: false,
             });
         }
-        return None;
+        return Some(OptionInfo {
+            ck: group.to_string(),
+            v: val,
+            ak: o_text.to_string(),
+            s: false,
+        });
+    }
+
+    None
+}
+
+/// Find the canonical magic word whose (parameterized) alias matches the given
+/// option-text prefix, returning the option group and the captured value.
+/// Mirrors `SiteConfig::getMediaPrefixParameterizedAliasMatcher` + the
+/// `key=value`/`$1` placeholder extraction.
+fn prefix_option_info(
+    magic_words: &MagicWordMap,
+    opt_text: &str,
+) -> Option<(&'static str, String)> {
+    // Try `key=value` first: the `key` must equal (or be a localized alias of)
+    // a parameterized prefix option such as `link`, `alt`, `page`, `lang`,
+    // `class`, `upright`, `manualthumb` (alias `thumb=`/`thumbnail=`).
+    if let Some((key, val)) = opt_text.split_once('=') {
+        let key = key.trim();
+        let val = val.trim();
+        for (canonical, entry) in magic_words {
+            if !(entry.canonical.starts_with("img_") || entry.canonical.starts_with("timedmedia_"))
+            {
+                continue;
+            }
+            // A parameterized alias strips the `$1` placeholder.
+            let alias_matches = entry.aliases.iter().any(|a| {
+                let base = a.strip_suffix("$1").unwrap_or(a);
+                base.to_lowercase() == key.to_lowercase()
+            });
+            if alias_matches && let Some(group) = prefix_options(canonical) {
+                // `manualthumb`'s `thumb=`/`thumbnail=` aliases map to the
+                // `manualthumb` group even though the canonical is
+                // `img_manualthumb`.
+                return Some((group, val.to_string()));
+            }
+        }
+    }
+
+    // `width`: a bare dimension string (`100`, `100px`, `200x300`).
+    if let Some(dim) = parse_media_dimension(opt_text) {
+        return Some(("width", dim));
     }
 
     None
@@ -205,6 +230,10 @@ pub struct MediaOpts {
     pub upright: Option<String>,
     pub width: Option<String>,
     pub height: Option<String>,
+    /// The `link=` option target (a wiki title, a URL, or empty).
+    pub link: Option<String>,
+    /// The `alt=` option value.
+    pub alt: Option<String>,
 }
 
 /// Determine wrapper classes and inline-ness. Mirrors PHP's `getWrapperInfo`.

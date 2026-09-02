@@ -174,22 +174,31 @@ fn apply_media_info(
     // else the raw file URL).
     let src = image_src(&info, job.data_width.as_deref());
 
+    // `link=` / `alt=` options stored in `data-mw.attribs` by `renderFile`.
+    let explicit_alt = data_mw_attrib(root, &job.path, "alt");
+    let link_target = data_mw_attrib(root, &job.path, "link");
+
     // The caption text (trimmed) for `alt`/`title` when no explicit `alt`/`link`
     // option is present (mirrors `$captionText` → `$alt` in `AddMediaInfo`).
     // `hasVisibleCaption` (Thumb/Frame formats) suppresses the caption from
     // becoming `alt`/`title`; those captions live only in the `<figcaption>`.
-    let caption_text = if has_visible_caption(root, &job.path) {
+    let caption_text = if explicit_alt.is_some() || has_visible_caption(root, &job.path) {
         None
     } else {
         caption_text(root, &job.path)
     };
 
+    // The final `alt` for the image: explicit `alt=` wins, else the caption.
+    let alt = explicit_alt.or_else(|| caption_text.clone());
+
     // Build the `<img>` replacement.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
     // resource copied from the broken span's title (the file DB key).
     img.set_attr("resource", crate::title::make_link(&job.title, config));
-    // alt from the caption (when present), before the fixed attrs.
-    if let Some(alt) = &caption_text {
+    // alt from the explicit option/caption (when present), before the fixed
+    // attrs (mirrors PHP's `thumbattribs` ordering: `src`, `decoding`,
+    // `loading`, then `data-file-*`, then `width`/`height`).
+    if let Some(alt) = &alt {
         img.set_attr("alt", alt);
     }
     // Fixed attribute set (decoding/loading).
@@ -217,7 +226,31 @@ fn apply_media_info(
         img,
         config,
         caption_text.as_deref(),
+        link_target.as_deref(),
     );
+}
+
+/// The `txt` value of a named option in the container's `data-mw.attribs`, if
+/// present. Mirrors `WTSUtils::getAttrFromDataMw($dataMw, $key, true)`.
+fn data_mw_attrib(root: &Node, path: &[usize], key: &str) -> Option<String> {
+    let container = node_at_read(root, path)?;
+    let json: serde_json::Value = serde_json::from_str(container.data_mw.as_deref()?).ok()?;
+    let attribs = json.get("attribs")?.as_array()?;
+    for pair in attribs {
+        let arr = pair.as_array()?;
+        let k = arr
+            .first()?
+            .as_str()
+            .or_else(|| arr.first()?.get("txt").and_then(|t| t.as_str()))?;
+        if k == key {
+            let v = arr.get(1)?;
+            if let Some(txt) = v.get("txt").and_then(|t| t.as_str()) {
+                return Some(txt.to_string());
+            }
+            return v.as_str().map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Whether a media container has a *visible* caption (Thumb/Frame formats).
@@ -343,8 +376,8 @@ fn mark_error(root: &mut Node, path: &[usize]) {
 }
 
 /// Replace the broken `<span>` with the built `<img>` and rewrite the anchor to
-/// a file-description link. Mirrors `replaceAnchor` (image branch) +
-/// `$anchor->appendChild($elt)`.
+/// a file-description link (or an explicit `link=` target; or a `<span>` when
+/// `link=` is empty). Mirrors `replaceAnchor` + `$anchor->appendChild($elt)`.
 fn rewrite_structure(
     root: &mut Node,
     path: &[usize],
@@ -352,6 +385,7 @@ fn rewrite_structure(
     img: Node,
     config: &dyn SiteConfig,
     caption_text: Option<&str>,
+    link_target: Option<&str>,
 ) {
     let Some(container) = node_at(root, path) else {
         return;
@@ -369,14 +403,47 @@ fn rewrite_structure(
 
     {
         let anchor = &mut container.children[anchor_idx];
-        // Description link to the file page (mirrors `$addDescriptionLink`).
-        anchor.set_attr("href", crate::title::make_link(title, config));
-        anchor.set_attr("class", "mw-file-description");
-        // `title` from the caption (or absent when the caption is empty).
-        anchor.attrs.retain(|a| a.key != "title");
-        if let Some(cap) = caption_text {
-            anchor.set_attr("title", cap);
+        // Strip the red-link markers left by `renderFile` (class="new",
+        // title=file-name, href=upload-url). They are replaced below.
+        anchor
+            .attrs
+            .retain(|a| a.key != "class" && a.key != "title" && a.key != "href" && a.key != "rel");
+
+        if let Some(link) = link_target {
+            if link.is_empty() {
+                // `link=` (empty): no link at all → a bare `<span>`.
+                anchor.kind = NodeKind::Element(ElementKind::Span);
+            } else if is_url(link) {
+                // An external URL link (`rel=nofollow`, matching
+                // `AddLinkAttributes`).
+                anchor.set_attr("href", link);
+                anchor.set_attr("rel", "nofollow");
+            } else {
+                // A wiki-title link (with optional `#fragment`).
+                let link_title = TitleParser::parse(link, config);
+                let mut href = crate::title::make_link(&link_title, config);
+                if let Some(fragment) = &link_title.fragment {
+                    href.push('#');
+                    href.push_str(fragment);
+                }
+                anchor.set_attr("href", href);
+                anchor.set_attr("title", link_title.get_prefixed_text());
+            }
+            // A caption may still override the `title` (mirrors
+            // `$anchor->setAttribute('title', $captionText)`).
+            if let Some(cap) = caption_text {
+                anchor.set_attr("title", cap);
+            }
+        } else {
+            // Description link to the file page (mirrors `$addDescriptionLink`).
+            anchor.set_attr("href", crate::title::make_link(title, config));
+            anchor.set_attr("class", "mw-file-description");
+            // `title` from the caption (or absent when the caption is empty).
+            if let Some(cap) = caption_text {
+                anchor.set_attr("title", cap);
+            }
         }
+
         // Replace the broken span (first element child) with the img.
         if let Some(span_idx) = anchor
             .children
@@ -386,6 +453,12 @@ fn rewrite_structure(
             anchor.children[span_idx] = img;
         }
     }
+}
+
+/// Whether a `link=` value is an external URL (has a scheme or is
+/// protocol-relative). Mirrors the URL-vs-title decision in `replaceAnchor`.
+fn is_url(s: &str) -> bool {
+    s.starts_with("//") || s.contains("://")
 }
 
 /// Navigate to the node at `path` (a sequence of child indices from `root`).
@@ -560,5 +633,76 @@ mod tests {
         assert_eq!(a.get_attr("title"), None);
         let img = &a.children[0];
         assert_eq!(img.get_attr("alt"), None);
+    }
+
+    /// A `<span typeof="mw:File">` container carrying `data-mw.attribs` for a
+    /// single option (mirrors `renderFile` storing `link`/`alt` into data-mw).
+    fn container_with_data_mw(key: &str, value: &str) -> Node {
+        let mut c = container(None);
+        c.data_mw = Some(format!(
+            "{{\"attribs\":[[\"{key}\",{{\"txt\":\"{value}\"}}]]}}"
+        ));
+        c
+    }
+
+    #[tokio::test]
+    async fn test_link_parameter_wiki_target() {
+        let mut doc = Node::document();
+        doc.push_child(container_with_data_mw("link", "Main Page"));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        let a = &c.children[0];
+        assert_eq!(a.get_attr("class"), None);
+        assert_eq!(a.get_attr("href"), Some("./Main_Page"));
+        assert_eq!(a.get_attr("title"), Some("Main Page"));
+    }
+
+    #[tokio::test]
+    async fn test_link_parameter_empty_becomes_span() {
+        let mut doc = Node::document();
+        doc.push_child(container_with_data_mw("link", ""));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        let a = &c.children[0];
+        assert!(matches!(a.kind, NodeKind::Element(ElementKind::Span)));
+        assert_eq!(a.get_attr("href"), None);
+    }
+
+    #[tokio::test]
+    async fn test_link_parameter_url() {
+        let mut doc = Node::document();
+        doc.push_child(container_with_data_mw("link", "http://example.com/"));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        let a = &c.children[0];
+        assert_eq!(a.get_attr("href"), Some("http://example.com/"));
+        assert_eq!(a.get_attr("rel"), Some("nofollow"));
+    }
+
+    #[tokio::test]
+    async fn test_alt_parameter_wins() {
+        let mut doc = Node::document();
+        doc.push_child(container_with_data_mw("alt", "alttext"));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        let a = &c.children[0];
+        let img = &a.children[0];
+        assert_eq!(img.get_attr("alt"), Some("alttext"));
     }
 }
