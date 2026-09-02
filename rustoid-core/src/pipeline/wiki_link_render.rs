@@ -627,7 +627,8 @@ pub fn render_file(
     target: &WikiLinkTargetInfo,
 ) -> Vec<Item> {
     use super::media_options::{
-        MediaOpts, get_format, get_option_info, get_wrapper_info, strip_quote_markers,
+        MediaOpts, get_format, get_option_info, get_wrapper_info, has_wikitext_markup,
+        strip_quote_markers,
     };
 
     let title = target.title.as_ref().expect("file title");
@@ -648,8 +649,17 @@ pub fn render_file(
                     "valign" => opts.valign = Some(info.v),
                     "border" => opts.border = Some(info.v),
                     "upright" => opts.upright = Some(info.v),
-                    "link" => opts.link = Some(strip_quote_markers(&info.v)),
-                    "alt" => opts.alt = Some(strip_quote_markers(&info.v)),
+                    "link" => {
+                        // `link` is only "expanded" when it is a transclusion
+                        // (mirrors `renderFile`'s `hasTransclusion` guard); plain
+                        // quotes/entities just stringify into the title.
+                        opts.link = Some(strip_quote_markers(&info.v));
+                    }
+                    "alt" => {
+                        // A non-`link` option value with any markup is "expanded".
+                        opts.expanded_attrs |= has_wikitext_markup(&info.v);
+                        opts.alt = Some(strip_quote_markers(&info.v));
+                    }
                     "class" => opts.class = Some(info.v),
                     "page" => opts.page = Some(info.v),
                     "lang" => opts.lang = Some(info.v),
@@ -675,17 +685,24 @@ pub fn render_file(
     let (classes, is_inline) = get_wrapper_info(&opts);
 
     // rdfa type and container.
-    let rdfa_type = match format.as_deref() {
+    let mut rdfa_type = match format.as_deref() {
         Some("manualthumb") | Some("thumbnail") => "mw:File/Thumb",
         Some("framed") => "mw:File/Frame",
         Some("frameless") => "mw:File/Frameless",
         _ => "mw:File",
-    };
+    }
+    .to_string();
+    // An expanded (rich-markup) attribute value marks the container so the
+    // attribute can be round-tripped via `data-mw.attribs` (mirrors
+    // `$container->addSpaceSeparatedAttribute('typeof', 'mw:ExpandedAttrs')`).
+    if opts.expanded_attrs {
+        rdfa_type.push_str(" mw:ExpandedAttrs");
+    }
 
     let container_name = if is_inline { "span" } else { "figure" };
 
     let mut container_attribs = vec![crate::pipeline::wiki_link_handler::string_kv(
-        "typeof", rdfa_type,
+        "typeof", &rdfa_type,
     )];
     if !classes.is_empty() {
         container_attribs.insert(

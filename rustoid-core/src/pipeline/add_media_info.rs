@@ -192,11 +192,11 @@ fn apply_media_info(
     let page = data_mw_attrib(root, &job.path, "page");
     let lang = lang_from_container(root, &job.path);
 
-    // The caption text (trimmed) for `alt`/`title` when no explicit `alt`/`link`
-    // option is present (mirrors `$captionText` → `$alt` in `AddMediaInfo`).
-    // `hasVisibleCaption` (Thumb/Frame formats) suppresses the caption from
-    // becoming `alt`/`title`; those captions live only in the `<figcaption>`.
-    let caption_text = if explicit_alt.is_some() || has_visible_caption(root, &job.path) {
+    // The caption text (trimmed) for the anchor `title` (mirrors
+    // `$captionText`, which is independent of `alt`). `hasVisibleCaption`
+    // (Thumb/Frame formats) suppresses the caption from becoming the title;
+    // those captions live only in the `<figcaption>`.
+    let caption_text = if has_visible_caption(root, &job.path) {
         None
     } else {
         caption_text(root, &job.path)

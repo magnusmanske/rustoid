@@ -252,7 +252,11 @@ fn broken_media_span(
     a.push_child(span);
 
     let mut container = Node::element(ElementKind::Span);
-    container.set_attr("typeof", "mw:File");
+    if media_opts.expanded_attrs {
+        container.set_attr("typeof", "mw:File mw:ExpandedAttrs");
+    } else {
+        container.set_attr("typeof", "mw:File");
+    }
     // A `class=` option is applied to the wrapper (mirrors `renderFile`, where
     // the user class is appended to the container's class list).
     if let Some(class) = &media_opts.class
@@ -288,7 +292,10 @@ fn parse_media_opts(
             "link" => {
                 opts.link = Some(crate::pipeline::media_options::strip_quote_markers(&info.v))
             }
-            "alt" => opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(&info.v)),
+            "alt" => {
+                opts.expanded_attrs |= crate::pipeline::media_options::has_wikitext_markup(&info.v);
+                opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(&info.v));
+            }
             "class" => opts.class = Some(info.v),
             _ => {}
         }

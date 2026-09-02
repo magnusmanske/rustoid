@@ -132,6 +132,22 @@ pub fn strip_quote_markers(value: &str) -> String {
     out
 }
 
+/// Whether a media option value carries wikitext markup that makes the attribute
+/// "expanded" (marked `mw:ExpandedAttrs` and stored as `html`+`txt` in
+/// `data-mw.attribs`). Mirrors PHP `renderFile`'s `$expOpt = is_array($origOptSrc)`
+/// for non-`link` options: any entity, quote, link, template, or extension-tag
+/// token qualifies.
+pub fn has_wikitext_markup(value: &str) -> bool {
+    value.contains("''")
+        || value.contains("&")
+        || value.contains("[[")
+        || value.contains("{{")
+        || value.contains("<nowiki")
+        || value.contains("<NOWIKI")
+        || value.contains("<ref")
+        || value.contains("<REF")
+}
+
 /// Classify a media option string. Mirrors PHP's `getOptionInfo` for the
 /// simple-option and prefix-option cases.
 pub fn get_option_info(config: &dyn SiteConfig, opt_str: &str) -> Option<OptionInfo> {
@@ -277,6 +293,9 @@ pub struct MediaOpts {
     pub page: Option<String>,
     /// The `lang=` option value (file language code).
     pub lang: Option<String>,
+    /// Whether an `alt=` (or similarly rich) option value carries wikitext
+    /// markup, marking the container `mw:ExpandedAttrs`.
+    pub expanded_attrs: bool,
 }
 
 /// Determine wrapper classes and inline-ness. Mirrors PHP's `getWrapperInfo`.
