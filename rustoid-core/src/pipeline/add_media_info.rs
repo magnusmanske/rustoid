@@ -729,8 +729,11 @@ fn rewrite_structure(
                     }
                 }
             } else {
-                // A wiki-title link (with optional `#fragment`).
-                let link_title = TitleParser::parse(link, config);
+                // A wiki-title link (with optional `#fragment`). The value is
+                // percent-decoded first (mirrors `replaceAnchor`'s
+                // `makeTitleFromText($val, ...)`, which decodes `%XX`).
+                let decoded = crate::util::decode_uri_component(link);
+                let link_title = TitleParser::parse(&decoded, config);
                 // An invalid link title (illegal chars like `<`) falls back to the
                 // description link (mirrors `replaceAnchor`, where a null
                 // `$link` is treated as `link=` not present).
