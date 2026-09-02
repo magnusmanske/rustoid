@@ -200,6 +200,10 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
     // wikitext (external-URL autolinks, wikilinks, quotes, …).
     let mut gallerytext = Node::element(ElementKind::Div);
     gallerytext.set_attr("class", "gallerytext");
+    // `showfilename` prepends a filename link (mirrors `Gallery::pLine`).
+    if opts.showfilename {
+        gallerytext.push_child(showfilename_anchor(&title, config));
+    }
     if let Some(cap) = &caption {
         for node in caption_to_nodes(cap, config) {
             gallerytext.push_child(node);
@@ -208,6 +212,18 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
     li.push_child(gallerytext);
 
     Some(li)
+}
+
+/// The `<a class="galleryfilename galleryfilename-truncate">` link prepended by
+/// the `showfilename` option (mirrors `Gallery::pLine`).
+fn showfilename_anchor(title: &Title, config: &dyn SiteConfig) -> Node {
+    let file = title.get_prefixed_text();
+    let mut a = Node::element(ElementKind::Other("a".to_string()));
+    a.set_attr("href", crate::title::make_link(title, config));
+    a.set_attr("class", "galleryfilename galleryfilename-truncate");
+    a.set_attr("title", file.as_str());
+    a.push_child(Node::text(file));
+    a
 }
 
 /// Build the broken-media `<span typeof="mw:File">` inside a gallery thumb. This
