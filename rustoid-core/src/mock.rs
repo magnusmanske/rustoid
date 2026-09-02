@@ -154,6 +154,12 @@ pub struct MockSiteConfig {
     article_path: String,
     language_code: String,
     parsoid_experimental_parser_function_output: bool,
+    /// `wgExternalLinkTarget`: target attribute for external links (default none).
+    external_link_target: Option<String>,
+    /// `wgNoFollowLink`: whether external links get `rel="nofollow"`.
+    no_follow_links: bool,
+    /// `wgNoFollowDomainExceptions`: domains exempt from `nofollow`.
+    no_follow_domain_exceptions: Vec<String>,
 }
 
 impl MockSiteConfig {
@@ -196,6 +202,9 @@ impl MockSiteConfig {
             article_path: "/wiki/$1".to_string(),
             language_code: "en".to_string(),
             parsoid_experimental_parser_function_output: false,
+            external_link_target: None,
+            no_follow_links: true,
+            no_follow_domain_exceptions: Vec::new(),
         };
 
         // Register standard MediaWiki namespaces. `case_sensitive` reflects
@@ -376,6 +385,21 @@ impl MockSiteConfig {
             self.extension_tags.push(lower);
         }
     }
+
+    /// Set `wgExternalLinkTarget` (the `target` attribute for external links).
+    pub fn set_external_link_target(&mut self, target: &str) {
+        self.external_link_target = Some(target.to_string());
+    }
+
+    /// Set `wgNoFollowLinks` (whether external links get `rel="nofollow"`).
+    pub fn set_no_follow_links(&mut self, enabled: bool) {
+        self.no_follow_links = enabled;
+    }
+
+    /// Add a `wgNoFollowDomainExceptions` entry.
+    pub fn add_no_follow_domain_exception(&mut self, domain: &str) {
+        self.no_follow_domain_exceptions.push(domain.to_string());
+    }
 }
 
 impl Default for MockSiteConfig {
@@ -421,6 +445,24 @@ impl SiteConfig for MockSiteConfig {
 
     fn parsoid_experimental_parser_function_output(&self) -> bool {
         self.parsoid_experimental_parser_function_output
+    }
+
+    fn external_link_attribs(&self, href: &str) -> Vec<(String, Vec<String>)> {
+        // `wgNoFollowDomainExceptions` exempts matching domains from `nofollow`.
+        let nofollow = self.no_follow_links
+            && !self
+                .no_follow_domain_exceptions
+                .iter()
+                .any(|d| href.contains(d));
+
+        let mut attribs: Vec<(String, Vec<String>)> = Vec::new();
+        if nofollow {
+            attribs.push(("rel".to_string(), vec!["nofollow".to_string()]));
+        }
+        if let Some(target) = &self.external_link_target {
+            attribs.push(("target".to_string(), vec![target.clone()]));
+        }
+        attribs
     }
 }
 

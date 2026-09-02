@@ -40,7 +40,7 @@ fn has_rel(node: &Node, token: &str) -> bool {
 }
 
 /// Add a token to the node's `rel` attribute (space-separated, de-duplicated).
-fn add_rel(node: &mut Node, token: &str) {
+pub(crate) fn add_rel(node: &mut Node, token: &str) {
     let mut tokens = rel_tokens(node);
     if !tokens.iter().any(|t| t == token) {
         tokens.push(token.to_string());
@@ -49,7 +49,7 @@ fn add_rel(node: &mut Node, token: &str) {
 }
 
 /// Add a token to the node's `class` attribute, preserving existing classes.
-fn add_class(node: &mut Node, class: &str) {
+pub(crate) fn add_class(node: &mut Node, class: &str) {
     let mut classes: Vec<String> = node
         .get_attr("class")
         .map(|c| c.split_whitespace().map(str::to_string).collect())

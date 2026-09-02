@@ -692,20 +692,46 @@ fn rewrite_structure(
                 // `link=` (empty): no link at all → a bare `<span>`.
                 anchor.kind = NodeKind::Element(ElementKind::Span);
             } else if is_url(link) {
-                // An external URL link (`rel=nofollow`, matching
-                // `AddLinkAttributes`).
-                anchor.set_attr("href", link);
-                anchor.set_attr("rel", "nofollow");
+                // An external URL link (mirrors `replaceAnchor`'s external
+                // branch, which applies the `getExternalLinkAttribs` set).
+                let cleaned = crate::sanitizer::clean_url(link, "external", |proto| {
+                    config.has_valid_protocol(proto)
+                })
+                .unwrap_or_else(|| link.to_string());
+                anchor.set_attr("href", &cleaned);
+                for (key, values) in config.external_link_attribs(&cleaned) {
+                    if key == "rel" {
+                        for v in &values {
+                            crate::pipeline::add_link_attributes::add_rel(anchor, v);
+                        }
+                    } else if key == "class" {
+                        for v in &values {
+                            crate::pipeline::add_link_attributes::add_class(anchor, v);
+                        }
+                    } else {
+                        anchor.set_attr(&key, values.join(" "));
+                    }
+                }
             } else {
                 // A wiki-title link (with optional `#fragment`).
                 let link_title = TitleParser::parse(link, config);
-                let mut href = crate::title::make_link(&link_title, config);
-                if let Some(fragment) = &link_title.fragment {
-                    href.push('#');
-                    href.push_str(fragment);
+                // An invalid link title (illegal chars like `<`) falls back to the
+                // description link (mirrors `replaceAnchor`, where a null
+                // `$link` is treated as `link=` not present).
+                if is_invalid_title_text(&link_title.text) {
+                    anchor.set_attr("href", crate::title::make_link(title, config));
+                    if !opts.is_manual_thumb {
+                        anchor.set_attr("class", "mw-file-description");
+                    }
+                } else {
+                    let mut href = crate::title::make_link(&link_title, config);
+                    if let Some(fragment) = &link_title.fragment {
+                        href.push('#');
+                        href.push_str(fragment);
+                    }
+                    anchor.set_attr("href", href);
+                    anchor.set_attr("title", link_title.get_prefixed_text());
                 }
-                anchor.set_attr("href", href);
-                anchor.set_attr("title", link_title.get_prefixed_text());
             }
             // A caption may still override the `title` (mirrors
             // `$anchor->setAttribute('title', $captionText)`).
@@ -741,6 +767,15 @@ fn rewrite_structure(
 /// protocol-relative). Mirrors the URL-vs-title decision in `replaceAnchor`.
 fn is_url(s: &str) -> bool {
     s.starts_with("//") || s.contains("://")
+}
+
+/// Whether a title text contains characters MediaWiki rejects (making the title
+/// invalid, so `makeTitleFromText` returns null). Mirrors the illegal-character
+/// check in `Title::newFromText`.
+fn is_invalid_title_text(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c, '<' | '>' | '[' | ']' | '|' | '{' | '}') || c == '\0' || (c as u32) < 0x20
+    })
 }
 
 /// Navigate to the node at `path` (a sequence of child indices from `root`).

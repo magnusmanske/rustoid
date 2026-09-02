@@ -1167,13 +1167,15 @@ pub fn sanitize_title_uri(title: &str, _is_interwiki: bool) -> String {
         None => (title, None),
     };
 
-    // Replace the unsafe set with percent-encoding.
+    // Replace the unsafe set with percent-encoding. Mirrors PHP's
+    // `sanitizeTitleURI` regex `/[%? \[\]#|<>\\]/` — note `"` and `'` are
+    // intentionally NOT escaped.
     let encoded: String = main_part
         .chars()
         .map(|c| {
             if matches!(
                 c,
-                '%' | '?' | ' ' | '[' | ']' | '#' | '|' | '<' | '>' | '\\' | '\"' | '\''
+                '%' | '?' | ' ' | '[' | ']' | '#' | '|' | '<' | '>' | '\\'
             ) {
                 percent_encode_char(c)
             } else {
@@ -1301,11 +1303,11 @@ mod tests {
         assert_eq!(sanitize_title_uri("Foo", false), "Foo");
         assert_eq!(sanitize_title_uri("Foo bar", false), "Foo%20bar");
         assert_eq!(sanitize_title_uri("Foo#Section", false), "Foo#Section");
-        // Quotes are percent-encoded so they can appear safely in an href
-        // attribute (matches Parsoid's normalized link href, e.g. ./Cool_%22Gator%22).
+        // Quotes are NOT percent-encoded (mirrors PHP's `sanitizeTitleURI`,
+        // whose unsafe set is `/[%? \[\]#|<>\\]/`).
         assert_eq!(
             sanitize_title_uri("Cool \"Gator\"", false),
-            "Cool%20%22Gator%22"
+            "Cool%20\"Gator\""
         );
     }
 

@@ -745,12 +745,27 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     let mut config = MockSiteConfig::new();
     // Apply `!! config` MediaWiki config values (e.g.
     // `wgParsoidExperimentalParserFunctionOutput=true`).
-    if test
-        .config_raw
-        .lines()
-        .any(|l| l.trim() == "wgParsoidExperimentalParserFunctionOutput=true")
-    {
-        config.set_parsoid_experimental_parser_function_output(true);
+    for line in test.config_raw.lines() {
+        let line = line.trim();
+        if line == "wgParsoidExperimentalParserFunctionOutput=true" {
+            config.set_parsoid_experimental_parser_function_output(true);
+        } else if let Some(v) = line.strip_prefix("wgExternalLinkTarget=") {
+            config.set_external_link_target(v.trim_matches('"'));
+        } else if let Some(v) = line.strip_prefix("wgNoFollowLinks=") {
+            config.set_no_follow_links(v.trim_matches('"') == "true");
+        } else if let Some(v) = line.strip_prefix("wgNoFollowDomainExceptions=") {
+            // The config value is a JSON array (`["example.com", ...]`).
+            let v = v.trim();
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(v) {
+                for domain in arr {
+                    config.add_no_follow_domain_exception(&domain);
+                }
+            } else {
+                for domain in v.split(',') {
+                    config.add_no_follow_domain_exception(domain.trim().trim_matches('"'));
+                }
+            }
+        }
     }
     // The `i18next` option registers the `i18ntag`/`i18nattr` extension tags
     // (mirrors `SiteConfig::registerParserTestExtension(I18nTag::class)`).
