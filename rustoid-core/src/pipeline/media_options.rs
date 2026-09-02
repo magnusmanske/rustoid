@@ -84,11 +84,12 @@ pub struct OptionInfo {
 
 /// Find the canonical magic word (from the site config) whose alias matches
 /// the given option text. Mirrors `SiteConfig::getMagicWordForMediaOption`.
+/// Media-option names are case-sensitive (unlike namespace names), so the
+/// alias must match exactly.
 fn canonical_magic_word_for_option(magic_words: &MagicWordMap, opt_text: &str) -> Option<String> {
-    let opt_lower = opt_text.to_lowercase();
     for (canonical, entry) in magic_words {
         if (entry.canonical.starts_with("img_") || entry.canonical.starts_with("timedmedia_"))
-            && entry.aliases.iter().any(|a| a.to_lowercase() == opt_lower)
+            && entry.aliases.iter().any(|a| *a == opt_text)
         {
             return Some(canonical.clone());
         }
@@ -237,16 +238,11 @@ fn prefix_option_info(
             if literal.is_empty() {
                 continue;
             }
-            let opt_lower = opt_text.to_lowercase();
-            let lit_lower = literal.to_lowercase();
-            // Match against the prefix *lowercased*, but capture the value from
-            // the original string to preserve case (`link=Main_Page` → `Main_Page`,
-            // not `main_page`).
-            if let Some(lower_rest) = opt_lower.strip_prefix(&lit_lower) {
-                let consumed = opt_text.len() - lower_rest.len();
-                let value = opt_text[consumed..]
-                    .strip_prefix('=')
-                    .unwrap_or(&opt_text[consumed..]);
+            // Prefix match is case-sensitive (media-option names are), but the
+            // captured value preserves its original case (`link=Main_Page` →
+            // `Main_Page`).
+            if let Some(rest) = opt_text.strip_prefix(literal) {
+                let value = rest.strip_prefix('=').unwrap_or(rest);
                 return Some((group, value.trim().to_string()));
             }
         }
