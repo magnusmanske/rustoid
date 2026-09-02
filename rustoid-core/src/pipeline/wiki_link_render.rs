@@ -626,7 +626,9 @@ pub fn render_file(
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
 ) -> Vec<Item> {
-    use super::media_options::{MediaOpts, get_format, get_option_info, get_wrapper_info};
+    use super::media_options::{
+        MediaOpts, get_format, get_option_info, get_wrapper_info, strip_quote_markers,
+    };
 
     let title = target.title.as_ref().expect("file title");
 
@@ -646,8 +648,8 @@ pub fn render_file(
                     "valign" => opts.valign = Some(info.v),
                     "border" => opts.border = Some(info.v),
                     "upright" => opts.upright = Some(info.v),
-                    "link" => opts.link = Some(info.v),
-                    "alt" => opts.alt = Some(info.v),
+                    "link" => opts.link = Some(strip_quote_markers(&info.v)),
+                    "alt" => opts.alt = Some(strip_quote_markers(&info.v)),
                     "class" => opts.class = Some(info.v),
                     "page" => opts.page = Some(info.v),
                     "lang" => opts.lang = Some(info.v),

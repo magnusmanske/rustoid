@@ -285,8 +285,10 @@ fn parse_media_opts(
         };
         match info.ck.as_str() {
             "manualthumb" => opts.manualthumb = Some(info.v),
-            "link" => opts.link = Some(info.v),
-            "alt" => opts.alt = Some(info.v),
+            "link" => {
+                opts.link = Some(crate::pipeline::media_options::strip_quote_markers(&info.v))
+            }
+            "alt" => opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(&info.v)),
             "class" => opts.class = Some(info.v),
             _ => {}
         }

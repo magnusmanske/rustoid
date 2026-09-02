@@ -106,6 +106,32 @@ fn short_canonical_option(canonical: &str) -> String {
         .to_string()
 }
 
+/// Strip wikitext quote markers (`'''`/`''`) from a media option value, so the
+/// text content of `link=`/`alt=` is the plain form (`Foo''s bar''s` → `Foos bars`,
+/// `''x''` → `x`). Mirrors the `stringifyOptionTokens` treatment of quote tokens
+/// for non-transcluded `link`/`alt` values.
+pub fn strip_quote_markers(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let chars: Vec<char> = value.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            // Count the run of apostrophes.
+            let mut j = i;
+            while j < chars.len() && chars[j] == '\'' {
+                j += 1;
+            }
+            // A run of 2 apostrophes is the italic marker; skip it entirely.
+            // Longer runs are treated the same (the `mw-quote` token covers both).
+            i = j;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Classify a media option string. Mirrors PHP's `getOptionInfo` for the
 /// simple-option and prefix-option cases.
 pub fn get_option_info(config: &dyn SiteConfig, opt_str: &str) -> Option<OptionInfo> {
@@ -311,6 +337,14 @@ mod tests {
         assert_eq!(info.ck, "halign");
         assert_eq!(info.v, "right");
         assert!(info.s);
+    }
+
+    #[test]
+    fn test_strip_quote_markers() {
+        assert_eq!(strip_quote_markers("Foo''s bar''s"), "Foos bars");
+        assert_eq!(strip_quote_markers("''Main Page''"), "Main Page");
+        assert_eq!(strip_quote_markers("''x''"), "x");
+        assert_eq!(strip_quote_markers("plain"), "plain");
     }
 
     #[test]
