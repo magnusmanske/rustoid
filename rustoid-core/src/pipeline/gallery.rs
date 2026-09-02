@@ -143,16 +143,16 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
         return None;
     }
 
-    // Caption: everything after the first `|`, ignoring empty pipe segments.
-    // The last non-empty segment is the caption text (mirrors renderMedia's
-    // option parsing, where trailing/leading empty options contribute no
-    // caption); `300px`/`centre`-style options are ignored (dimensions are
-    // forced by the gallery).
+    // Caption: split the remainder on `|`, skipping recognized media options
+    // (`300px`, `centre`, `link=…`, …). The last *unrecognized* non-empty segment
+    // is the caption (mirrors `renderMedia`'s option parsing, where recognized
+    // options are consumed and only the final non-option becomes the caption).
     let caption = rest.and_then(|r| {
         r.split('|')
             .rev()
             .map(str::trim)
-            .find(|s| !s.is_empty())
+            .filter(|s| !s.is_empty())
+            .find(|seg| crate::pipeline::media_options::get_option_info(config, seg).is_none())
             .map(str::to_string)
     });
 
