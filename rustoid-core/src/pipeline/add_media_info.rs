@@ -176,6 +176,23 @@ fn apply_media_info(
 ) {
     let info = infos.get(&job.title.full_text()).and_then(|i| i.clone());
 
+    // `link=` / `alt=` options stored in `data-mw.attribs` by `renderFile`.
+    let explicit_alt = data_mw_attrib(root, &job.path, "alt");
+    let link_target = data_mw_attrib(root, &job.path, "link");
+
+    // The caption text (trimmed) for `alt`/`title` when no explicit `alt`/`link`
+    // option is present (mirrors `$captionText` → `$alt` in `AddMediaInfo`).
+    // `hasVisibleCaption` (Thumb/Frame formats) suppresses the caption from
+    // becoming `alt`/`title`; those captions live only in the `<figcaption>`.
+    let caption_text = if explicit_alt.is_some() || has_visible_caption(root, &job.path) {
+        None
+    } else {
+        caption_text(root, &job.path)
+    };
+
+    // The final `alt` for the image: explicit `alt=` wins, else the caption.
+    let alt = explicit_alt.clone().or_else(|| caption_text.clone());
+
     let Some(info) = info else {
         // Missing file: leave broken, add `mw:Error` (mirrors `handleErrors`).
         mark_error(
@@ -183,6 +200,7 @@ fn apply_media_info(
             &job.path,
             "apierror-filedoesnotexist",
             "This image does not exist.",
+            alt.as_deref(),
         );
         return;
     };
@@ -196,6 +214,7 @@ fn apply_media_info(
             &job.title,
             config,
             job.manualthumb.is_some(),
+            alt.as_deref(),
         );
         return;
     }
@@ -223,6 +242,7 @@ fn apply_media_info(
             &job.title,
             config,
             job.manualthumb.is_some(),
+            alt.as_deref(),
         );
         return;
     }
@@ -238,23 +258,6 @@ fn apply_media_info(
     // The image `src` (thumbnail when the file has one for the requested width,
     // else the raw file URL).
     let src = image_src(&media_info, job.data_width.as_deref());
-
-    // `link=` / `alt=` options stored in `data-mw.attribs` by `renderFile`.
-    let explicit_alt = data_mw_attrib(root, &job.path, "alt");
-    let link_target = data_mw_attrib(root, &job.path, "link");
-
-    // The caption text (trimmed) for `alt`/`title` when no explicit `alt`/`link`
-    // option is present (mirrors `$captionText` → `$alt` in `AddMediaInfo`).
-    // `hasVisibleCaption` (Thumb/Frame formats) suppresses the caption from
-    // becoming `alt`/`title`; those captions live only in the `<figcaption>`.
-    let caption_text = if explicit_alt.is_some() || has_visible_caption(root, &job.path) {
-        None
-    } else {
-        caption_text(root, &job.path)
-    };
-
-    // The final `alt` for the image: explicit `alt=` wins, else the caption.
-    let alt = explicit_alt.or_else(|| caption_text.clone());
 
     // Build the `<img>` replacement.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
@@ -505,7 +508,7 @@ fn media_type_from_mime(mime: &str) -> String {
 
 /// Mark a media container as `mw:Error` and keep the broken markup (mirrors
 /// `handleErrors`).
-fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str) {
+fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str, alt: Option<&str>) {
     // Adjust the parent gallery thumb's `style` before borrowing the container.
     strip_gallery_thumb_width(root, path);
 
@@ -513,8 +516,37 @@ fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str) {
         return;
     };
     add_error_type(node);
+    replace_broken_span_text(node, alt);
     let errors = format!("{{\"errors\":[{{\"key\":\"{key}\",\"message\":\"{message}\"}}]}}");
     node.data_mw = Some(errors);
+}
+
+/// For a broken media container, replace the broken `<span>`'s text content with
+/// the caption/alt text (mirrors `AddMediaInfo::handleErrors`, which does
+/// `replaceChildren($span, textNode($alt))` when `$alt` is non-empty).
+fn replace_broken_span_text(container: &mut Node, alt: Option<&str>) {
+    let Some(alt) = alt else {
+        return;
+    };
+    if alt.is_empty() {
+        return;
+    }
+    // The broken span is the anchor's first element child (the anchor is the
+    // container's first element child).
+    let Some(anchor) = container
+        .children
+        .iter_mut()
+        .find(|c| matches!(c.kind, NodeKind::Element(_)))
+    else {
+        return;
+    };
+    if let Some(span) = anchor
+        .children
+        .iter_mut()
+        .find(|c| matches!(c.kind, NodeKind::Element(_)))
+    {
+        span.children = vec![Node::text(alt.to_string())];
+    }
 }
 
 /// For a gallery media (whose parent is a `div.thumb`), drop the `width:` from
@@ -576,6 +608,7 @@ fn mark_bad_file(
     title: &Title,
     config: &dyn SiteConfig,
     is_manual_thumb: bool,
+    alt: Option<&str>,
 ) {
     // Adjust the parent gallery thumb's `style` before borrowing the container
     // (the two need disjoint `&mut` borrows of `root`).
@@ -585,6 +618,7 @@ fn mark_bad_file(
         return;
     };
     add_error_type(container);
+    replace_broken_span_text(container, alt);
 
     // The anchor is the first element child; rewrite it to a description link
     // (mirrors `replaceAnchor`'s `$addDescriptionLink`, which still runs when

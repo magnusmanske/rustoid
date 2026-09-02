@@ -185,11 +185,14 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
 
     li.push_child(thumb);
 
-    // `<div class="gallerytext">caption</div>`
+    // `<div class="gallerytext">caption</div>` — the caption is rendered as
+    // wikitext (external-URL autolinks, wikilinks, quotes, …).
     let mut gallerytext = Node::element(ElementKind::Div);
     gallerytext.set_attr("class", "gallerytext");
     if let Some(cap) = &caption {
-        gallerytext.push_child(Node::text(cap.clone()));
+        for node in caption_to_nodes(cap, config) {
+            gallerytext.push_child(node);
+        }
     }
     li.push_child(gallerytext);
 
@@ -281,6 +284,121 @@ fn parse_dimension(s: &str) -> Option<u32> {
     let s = s.strip_suffix("px").unwrap_or(s);
     let first = s.split('x').next()?.trim();
     first.parse::<u32>().ok()
+}
+
+/// Render gallery caption wikitext into a list of inline DOM nodes, following
+/// wikilinks/external-URL autolinks the same way the main pipeline does.
+/// Mirrors `renderMedia`'s caption handling (`processContentInPipeline` with
+/// `inlineContext => true`).
+fn caption_to_nodes(caption: &str, config: &dyn SiteConfig) -> Vec<Node> {
+    use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
+    use crate::pipeline::wiki_link_render::{
+        WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+    };
+    use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
+    use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
+
+    // Tokenize the caption (quotes, entities, urllink/extlink/wikilink tokens).
+    let options = TokenizerOptions {
+        magic_links: crate::wikitext::tokenizer_v2::MagicLinkConfig {
+            rfc: config.magic_link_enabled("RFC"),
+            pmid: config.magic_link_enabled("PMID"),
+            isbn: config.magic_link_enabled("ISBN"),
+        },
+        ext_tags: config.extension_tags().to_vec(),
+        ..TokenizerOptions::default()
+    };
+    let mut tokenizer = PegTokenizer::new(caption, &options);
+    let chunks = tokenizer.tokenize().unwrap_or_default();
+
+    let clean = |href: &str| {
+        crate::sanitizer::clean_url(href, "external", |proto| config.has_valid_protocol(proto))
+    };
+
+    let mut ctx = WikiLinkContext::new(config);
+    let mut items: Vec<Item> = Vec::new();
+    for chunk in chunks {
+        match chunk {
+            Either::Left(s) => items.push(Item::Str(s)),
+            Either::Right(t) => match t {
+                ParsoidToken::SelfclosingTag(stt) if stt.name == "urllink" => {
+                    let href = stt
+                        .attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("href"))
+                        .and_then(|kv| kv.value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(rendered) =
+                        on_url_link(&ParsoidToken::SelfclosingTag(stt), &href, clean)
+                    {
+                        items.extend(rendered);
+                    } else {
+                        items.push(Item::Str(href));
+                    }
+                }
+                ParsoidToken::SelfclosingTag(stt) if stt.name == "extlink" => {
+                    if let Some(rendered) = on_ext_link(
+                        &ParsoidToken::SelfclosingTag(stt),
+                        clean,
+                        config.relative_link_prefix(),
+                    ) {
+                        items.extend(rendered);
+                    }
+                }
+                ParsoidToken::SelfclosingTag(stt) if stt.name == "wikilink" => {
+                    let href = stt
+                        .attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("href"))
+                        .and_then(|kv| kv.value.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let target =
+                        get_wiki_link_target_info(&ctx, &href, &href).unwrap_or_else(|_| {
+                            crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
+                                href: href.clone(),
+                                href_src: href.clone(),
+                                title: Some(crate::title::Title::new_main(href.clone())),
+                                interwiki: None,
+                                language: None,
+                                local_prefix: None,
+                                from_colon_escaped_text: false,
+                                prefix: None,
+                            }
+                        });
+                    items.extend(render_wiki_link_dispatched(
+                        &mut ctx,
+                        &ParsoidToken::SelfclosingTag(stt),
+                        &target,
+                        false,
+                    ));
+                }
+                other => items.push(Item::Tok(other)),
+            },
+        }
+    }
+
+    // Build the inline fragment via the tree builder.
+    let stage = crate::pipeline::tree_builder_stage::TreeBuilderStage::new(true);
+    let ast = stage.to_ast(items, config);
+    extract_fragment_children(&ast).children
+}
+
+/// Extract the children of the synthetic `<html>` wrapper from a tree-builder
+/// document (mirrors `Parser::extract_fragment_children`).
+fn extract_fragment_children(ast: &Node) -> Node {
+    for child in &ast.children {
+        if let crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(tag)) =
+            &child.kind
+            && tag == "html"
+        {
+            let mut frag = crate::dom::node::Node::document();
+            frag.children = child.children.clone();
+            return frag;
+        }
+    }
+    ast.clone()
 }
 
 /// Append a value to an attribute (mirrors `TraditionalMode::appendAttr`).
