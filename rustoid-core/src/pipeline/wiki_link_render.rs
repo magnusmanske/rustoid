@@ -481,6 +481,56 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
         .collect()
 }
 
+/// Split a media option string on *top-level* pipes, respecting nested
+/// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
+/// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling.
+fn split_media_options(content: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut bracket = 0i32;
+    let mut braces = 0i32;
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '[' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            bracket += 1;
+            current.push_str("[[");
+            i += 2;
+            continue;
+        }
+        if c == ']' && i + 1 < chars.len() && chars[i + 1] == ']' {
+            bracket = bracket.saturating_sub(1);
+            current.push_str("]]");
+            i += 2;
+            continue;
+        }
+        if c == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            braces += 1;
+            current.push_str("{{");
+            i += 2;
+            continue;
+        }
+        if c == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
+            braces = braces.saturating_sub(1);
+            current.push_str("}}");
+            i += 2;
+            continue;
+        }
+        if c == '|' && bracket == 0 && braces == 0 {
+            parts.push(std::mem::take(&mut current));
+            i += 1;
+            continue;
+        }
+        current.push(c);
+        i += 1;
+    }
+    if !current.is_empty() || parts.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 /// Render a `[[Media:Foo]]` link (a direct media link). Mirrors
 /// `WikiLinkHandler::renderMedia` + `linkToMedia` for the no-file-info case.
 pub fn render_media(
@@ -565,14 +615,15 @@ pub fn render_file(
 
     let title = target.title.as_ref().expect("file title");
 
-    // Extract option strings from mw:maybeContent (pipe-separated). The last
+    // Extract option strings from mw:maybeContent (pipe-separated, but only on
+    // *top-level* pipes — not inside nested `[[…]]`/`{{…}}`). The last
     // unrecognized part is the caption (mirrors PHP `renderFile`'s
     // `recordCaption`, where the final non-option is captured as the caption).
     let mut opts = MediaOpts::default();
     let mut caption: Option<String> = None;
     if let Some(content) = token.get_attribute_v("mw:maybeContent") {
-        for part in content.split('|') {
-            if let Some(info) = get_option_info(ctx.config, part) {
+        for part in split_media_options(content) {
+            if let Some(info) = get_option_info(ctx.config, &part) {
                 match info.ck.as_str() {
                     "format" => opts.format = Some(info.v),
                     "manualthumb" => opts.manualthumb = Some(info.v),
@@ -595,7 +646,7 @@ pub fn render_file(
                 }
             } else {
                 // Unrecognized ⇒ caption (last one wins).
-                caption = Some(part.to_string());
+                caption = Some(part);
             }
         }
     }
@@ -647,9 +698,25 @@ pub fn render_file(
     .collect();
 
     let mut container = TagTk::new(container_name, container_attribs, DataParsoid::default());
-    if !data_mw_attribs.is_empty() {
-        let json = crate::pipeline::attribute_expander::serialize_data_mw_attribs(&data_mw_attribs);
-        container.add_attribute_str("data-mw", format!("{{\"attribs\":{json}}}"));
+    if !data_mw_attribs.is_empty() || (is_inline && caption.is_some()) {
+        let mut obj = serde_json::Map::new();
+        if !data_mw_attribs.is_empty() {
+            let json =
+                crate::pipeline::attribute_expander::serialize_data_mw_attribs(&data_mw_attribs);
+            obj.insert(
+                "attribs".to_string(),
+                serde_json::from_str(&json).unwrap_or(serde_json::Value::Array(vec![])),
+            );
+        }
+        // Inline-media captions are stored in `data-mw.caption` (mirrors PHP's
+        // `$dataMw->caption`, a serialized DOM fragment of the re-parsed caption).
+        if is_inline && let Some(cap) = &caption {
+            obj.insert(
+                "caption".to_string(),
+                serde_json::Value::String(cap.clone()),
+            );
+        }
+        container.add_attribute_str("data-mw", serde_json::Value::Object(obj).to_string());
     }
 
     // Anchor wraps the file element.
@@ -1160,5 +1227,21 @@ mod tests {
                 .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "span")),
             "expected mw:Entity span: {out:?}"
         );
+    }
+
+    #[test]
+    fn test_split_media_options_nested_pipe() {
+        // A `|` inside a piped link must not split the options.
+        let parts = split_media_options("thumb|text with a [[MeatBall:Link|link]] in it");
+        assert_eq!(
+            parts,
+            vec!["thumb", "text with a [[MeatBall:Link|link]] in it"]
+        );
+    }
+
+    #[test]
+    fn test_split_media_options_simple() {
+        let parts = split_media_options("right|Caption text");
+        assert_eq!(parts, vec!["right", "Caption text"]);
     }
 }

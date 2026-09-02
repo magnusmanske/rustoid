@@ -347,24 +347,96 @@ fn media_format(node: &Node) -> String {
     crate::html::wts_utils::get_media_format(node)
 }
 
-/// The trimmed caption text of a media container (its `<figcaption>` content,
-/// if non-empty). Mirrors `$captionText = trim(textContentFromCaption($caption))`.
-/// Note: only block (`<figure>`) media has a `<figcaption>` child; inline
-/// (`<span>`) captions live in `data-mw.caption` instead and are handled
-/// separately.
+/// The trimmed caption text of a media container. Block (`<figure>`) media
+/// carry the caption in a `<figcaption>` child; inline (`<span>`) media carry it
+/// in `data-mw.caption` (a serialized fragment). Mirrors
+/// `$captionText = trim(textContentFromCaption($caption))`.
 fn caption_text(root: &Node, path: &[usize]) -> Option<String> {
     let container = node_at_read(root, path)?;
-    let figcaption = container
+    // Block case: trim the `<figcaption>` text content.
+    if let Some(figcaption) = container
         .children
         .iter()
-        .find(|c| matches!(c.kind, NodeKind::Element(ElementKind::FigCaption)))?;
-    let text = text_content(figcaption);
+        .find(|c| matches!(c.kind, NodeKind::Element(ElementKind::FigCaption)))
+    {
+        let text = text_content(figcaption);
+        let trimmed = text.trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    // Inline case: extract the text from `data-mw.caption` by stripping
+    // wikilink/quote/entity markup.
+    let caption = json_string_field(container, "caption")?;
+    let text = caption_text_from_source(&caption);
     let trimmed = text.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// The text content of a caption *source* string: follows `[[target|display]]`
+/// (→ `display`) and `[[target]]` (→ `target`). Mirrors the text produced by
+/// `textContentFromCaption` (entity decoding is handled during re-tokenization
+/// of the caption, not here).
+fn caption_text_from_source(source: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = source.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '[' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            // A wikilink: `[[target|display]]` or `[[target]]`.
+            if let Some(link_close) = find_matching_brackets(&chars, i) {
+                let inner: String = chars[i + 2..link_close].iter().collect();
+                out.push_str(link_display_text(&inner));
+                i = link_close + 2;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The index of the `]]` closing the `[[…` at `start` (balancing nested links).
+fn find_matching_brackets(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start + 2;
+    let mut depth = 1;
+    while i + 1 < chars.len() {
+        if chars[i] == '[' && chars[i + 1] == '[' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if chars[i] == ']' && chars[i + 1] == ']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The display text of a wikilink inner string (`target|display` → `display`,
+/// else the target).
+fn link_display_text(inner: &str) -> &str {
+    inner.rsplit('|').next().unwrap_or(inner).trim()
+}
+
+/// Read a top-level string field from a node's `data-mw` JSON object.
+fn json_string_field(node: &Node, key: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(node.data_mw.as_deref()?).ok()?;
+    json.get(key)?.as_str().map(str::to_string)
 }
 
 /// Navigate to the node at `path` (read-only).
@@ -698,6 +770,19 @@ mod tests {
     fn test_media_type_from_mime() {
         assert_eq!(media_type_from_mime("image/jpeg"), "bitmap");
         assert_eq!(media_type_from_mime("image/svg+xml"), "drawing");
+    }
+
+    #[test]
+    fn test_caption_text_from_source() {
+        // Wikilinks resolve to their display text; piped links use the display.
+        assert_eq!(
+            caption_text_from_source("text with a [[link]] in it"),
+            "text with a link in it"
+        );
+        assert_eq!(
+            caption_text_from_source("see [[Target|display]] here"),
+            "see display here"
+        );
     }
 
     #[tokio::test]
