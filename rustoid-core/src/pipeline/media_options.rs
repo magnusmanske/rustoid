@@ -108,9 +108,28 @@ fn short_canonical_option(canonical: &str) -> String {
 
 /// Strip wikitext quote markers (`'''`/`''`) from a media option value, so the
 /// text content of `link=`/`alt=` is the plain form (`Foo''s bar''s` → `Foos bars`,
-/// `''x''` → `x`). Mirrors the `stringifyOptionTokens` treatment of quote tokens
-/// for non-transcluded `link`/`alt` values.
+/// `''x''` → `x`). A `<nowiki>` wrapper is also unwrapped, with its inner content
+/// preserved verbatim (quotes inside nowiki are literal). Mirrors the
+/// `stringifyOptionTokens` treatment of quote/nowiki tokens for non-transcluded
+/// `link`/`alt` values.
 pub fn strip_quote_markers(value: &str) -> String {
+    // A `<nowiki>…</nowiki>` wrapper: unwrap and keep the content literal.
+    let lower = value.to_lowercase();
+    if let Some(start) = lower.find("<nowiki>") {
+        let inner_start = start + "<nowiki>".len();
+        if let Some(end) = lower[inner_start..].find("</nowiki>") {
+            let inner = &value[inner_start..inner_start + end];
+            let before = &value[..start];
+            let after = &value[inner_start + end + "</nowiki>".len()..];
+            return format!(
+                "{}{}{}",
+                strip_quote_markers(before),
+                inner,
+                strip_quote_markers(after)
+            );
+        }
+    }
+
     let mut out = String::with_capacity(value.len());
     let chars: Vec<char> = value.chars().collect();
     let mut i = 0;
@@ -364,6 +383,16 @@ mod tests {
         assert_eq!(strip_quote_markers("''Main Page''"), "Main Page");
         assert_eq!(strip_quote_markers("''x''"), "x");
         assert_eq!(strip_quote_markers("plain"), "plain");
+        // A <nowiki> wrapper preserves its inner quotes literally.
+        assert_eq!(strip_quote_markers("<nowiki>''x''</nowiki>"), "''x''");
+    }
+
+    #[test]
+    fn test_has_wikitext_markup() {
+        assert!(has_wikitext_markup("''x''"));
+        assert!(has_wikitext_markup("&amp;amp;"));
+        assert!(has_wikitext_markup("<nowiki>''x''</nowiki>"));
+        assert!(!has_wikitext_markup("plain"));
     }
 
     #[test]
