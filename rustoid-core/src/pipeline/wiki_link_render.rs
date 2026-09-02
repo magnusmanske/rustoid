@@ -560,7 +560,7 @@ pub fn link_to_media(
             target
                 .title
                 .as_ref()
-                .map(|t| ctx.config.get_upload_url(&t.get_full_db_key()))
+                .map(|t| ctx.config.get_upload_url(&t.get_dbkey()))
         })
         .unwrap_or_default();
 
@@ -721,7 +721,7 @@ pub fn render_file(
 
     // Anchor wraps the file element.
     let mut anchor = TagTk::new("a", vec![], DataParsoid::default());
-    anchor.add_attribute_str("href", ctx.config.get_upload_url(&title.get_full_db_key()));
+    anchor.add_attribute_str("href", ctx.config.get_upload_url(&title.get_dbkey()));
     anchor.add_attribute_str("class", "new");
     anchor.add_attribute_str("title", title.get_prefixed_text());
 

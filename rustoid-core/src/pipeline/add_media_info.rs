@@ -506,12 +506,53 @@ fn media_type_from_mime(mime: &str) -> String {
 /// Mark a media container as `mw:Error` and keep the broken markup (mirrors
 /// `handleErrors`).
 fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str) {
+    // Adjust the parent gallery thumb's `style` before borrowing the container.
+    strip_gallery_thumb_width(root, path);
+
     let Some(node) = node_at(root, path) else {
         return;
     };
     add_error_type(node);
     let errors = format!("{{\"errors\":[{{\"key\":\"{key}\",\"message\":\"{message}\"}}]}}");
     node.data_mw = Some(errors);
+}
+
+/// For a gallery media (whose parent is a `div.thumb`), drop the `width:` from
+/// the thumb's `style` so a broken/error thumbnail renders `height`-only
+/// (mirrors `TraditionalMode::thumbStyle`, which omits `width` when `hasError`).
+fn strip_gallery_thumb_width(root: &mut Node, path: &[usize]) {
+    if path.is_empty() {
+        return;
+    }
+    let parent_path = &path[..path.len() - 1];
+    let Some(parent) = node_at(root, parent_path) else {
+        return;
+    };
+    if parent.get_attr("class") != Some("thumb") {
+        return;
+    }
+    let Some(style) = parent.get_attr("style").map(str::to_string) else {
+        return;
+    };
+    // Remove the `width: …px;` component, leaving only `height:`.
+    let cleaned: String = style
+        .split(';')
+        .filter(|part| !part.trim_start().starts_with("width:"))
+        .map(|part| {
+            let p = part.trim();
+            if p.is_empty() {
+                String::new()
+            } else {
+                format!("{p}; ")
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_end().to_string();
+    if cleaned.is_empty() {
+        parent.attrs.retain(|a| a.key != "style");
+    } else {
+        parent.set_attr("style", cleaned);
+    }
 }
 
 /// Mark a container as `mw:Error` (space-separated, non-duplicated, first).
@@ -536,6 +577,10 @@ fn mark_bad_file(
     config: &dyn SiteConfig,
     is_manual_thumb: bool,
 ) {
+    // Adjust the parent gallery thumb's `style` before borrowing the container
+    // (the two need disjoint `&mut` borrows of `root`).
+    strip_gallery_thumb_width(root, path);
+
     let Some(container) = node_at(root, path) else {
         return;
     };

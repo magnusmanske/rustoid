@@ -413,6 +413,12 @@ impl SiteConfig for MockSiteConfig {
         &self.language_code
     }
 
+    fn get_upload_url(&self, title: &str) -> String {
+        // The parser-test harness uses a relative Special:Upload URL with the
+        // destination file name (mirrors `MockApiHelper`-backed `getUploadUrl`).
+        format!("./Special:Upload?wpDestFile={title}")
+    }
+
     fn parsoid_experimental_parser_function_output(&self) -> bool {
         self.parsoid_experimental_parser_function_output
     }

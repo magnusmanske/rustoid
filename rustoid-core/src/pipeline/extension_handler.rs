@@ -35,7 +35,8 @@ fn expand_extension(
         "pre" => Some(pre_items(token, config)),
         "i18ntag" | "i18nattr" => Some(i18n_items(token)),
         "pwraptest" => Some(pwraptest_fragment_items(token, fragments, next_id)),
-        // Other built-in extension tags (gallery, …) are not yet handled.
+        "gallery" => Some(gallery_items(token, config, fragments, next_id)),
+        // Other built-in extension tags (poem, …) are not yet handled.
         _ => None,
     }
 }
@@ -221,6 +222,42 @@ fn pwraptest_fragment_items(
     frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
         key: KeyValue::Str("data-fragment-id".to_string()),
         value: KeyValue::Str(id.to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
+
+    vec![Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))]
+}
+
+/// Build the `<ul class="gallery …">` output for a `<gallery>` extension and
+/// tunnel it through an `mw:dom-fragment-token` placeholder (so its nested
+/// `mw:File` media — resolved later by `AddMediaInfo` — bypasses token-level
+/// p-wrapping). Mirrors `Gallery::sourceToDom` + the generic extension
+/// encapsulation.
+fn gallery_items(
+    token: &SelfclosingTagTk,
+    config: &dyn crate::traits::SiteConfig,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Vec<Item> {
+    let ul = crate::pipeline::gallery::build(token, config);
+
+    let mut frag = crate::dom::node::Node::document();
+    frag.push_child(ul);
+
+    let id = *next_id;
+    *next_id += 1;
+    fragments.insert(id, frag);
+
+    let mut dp = token.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+    let mut frag_tok = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
+    frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
+        key: crate::wikitext::tokens_v2::KeyValue::Str("data-fragment-id".to_string()),
+        value: crate::wikitext::tokens_v2::KeyValue::Str(id.to_string()),
         src_offsets: None,
         ksrc: None,
         vsrc: None,

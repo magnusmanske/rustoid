@@ -90,6 +90,12 @@ impl Title {
             text
         }
     }
+
+    /// The unprefixed DB key (title text with underscores, no namespace).
+    /// Mirrors PHP's `Title::getDBKey()`.
+    pub fn get_dbkey(&self) -> String {
+        self.text.replace(' ', "_")
+    }
 }
 
 /// Map a namespace ID to its canonical English prefix (fallback without SiteConfig).
