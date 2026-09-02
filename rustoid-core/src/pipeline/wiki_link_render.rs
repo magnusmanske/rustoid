@@ -634,6 +634,8 @@ pub fn render_file(
                     "link" => opts.link = Some(info.v),
                     "alt" => opts.alt = Some(info.v),
                     "class" => opts.class = Some(info.v),
+                    "page" => opts.page = Some(info.v),
+                    "lang" => opts.lang = Some(info.v),
                     "width" => {
                         // Parse WxH (separated by 'x').
                         if let Some((w, h)) = info.v.split_once('x') {
@@ -682,6 +684,7 @@ pub fn render_file(
         ("link", opts.link.as_ref()),
         ("alt", opts.alt.as_ref()),
         ("manualthumb", opts.manualthumb.as_ref()),
+        ("page", opts.page.as_ref()),
     ]
     .into_iter()
     .filter_map(|(key, val)| {
@@ -735,6 +738,12 @@ pub fn render_file(
     }
     if let Some(height) = &opts.height {
         span.add_attribute_str("data-height", height);
+    }
+    // `lang=` is applied to the broken span (mirrors `renderFile`'s
+    // `$span->addNormalizedAttribute('lang', ...)`); `AddMediaInfo` reads it back
+    // to build the `?lang=` description-link query.
+    if let Some(lang) = &opts.lang {
+        span.add_attribute_str("lang", lang);
     }
 
     let mut out = vec![

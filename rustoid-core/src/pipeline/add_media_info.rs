@@ -109,6 +109,15 @@ fn data_width_from_container(container: &Node) -> Option<String> {
     span.get_attr("data-width").map(str::to_string)
 }
 
+/// The `lang` attribute on a container's broken span, if present (mirrors
+/// `$lang = getAttribute($span, 'lang')` in `AddMediaInfo::run`).
+fn lang_from_container(root: &Node, path: &[usize]) -> Option<String> {
+    let container = node_at_read(root, path)?;
+    let anchor = first_element_child(container)?;
+    let span = first_element_child(anchor)?;
+    span.get_attr("lang").map(str::to_string)
+}
+
 /// The first element (non-text) child of `node`, if any.
 fn first_element_child(node: &Node) -> Option<&Node> {
     node.children
@@ -176,9 +185,12 @@ fn apply_media_info(
 ) {
     let info = infos.get(&job.title.full_text()).and_then(|i| i.clone());
 
-    // `link=` / `alt=` options stored in `data-mw.attribs` by `renderFile`.
+    // `link=` / `alt=` / `page=` options stored in `data-mw.attribs` by
+    // `renderFile` (`lang=` lives on the broken span, read separately below).
     let explicit_alt = data_mw_attrib(root, &job.path, "alt");
     let link_target = data_mw_attrib(root, &job.path, "link");
+    let page = data_mw_attrib(root, &job.path, "page");
+    let lang = lang_from_container(root, &job.path);
 
     // The caption text (trimmed) for `alt`/`title` when no explicit `alt`/`link`
     // option is present (mirrors `$captionText` → `$alt` in `AddMediaInfo`).
@@ -301,6 +313,8 @@ fn apply_media_info(
             caption_text: caption_text.as_deref(),
             link_target: link_target.as_deref(),
             is_manual_thumb: job.manualthumb.is_some(),
+            page: page.as_deref(),
+            lang: lang.as_deref(),
         },
     );
 }
@@ -652,6 +666,8 @@ struct AnchorOpts<'a> {
     caption_text: Option<&'a str>,
     link_target: Option<&'a str>,
     is_manual_thumb: bool,
+    page: Option<&'a str>,
+    lang: Option<&'a str>,
 }
 
 /// Replace the broken `<span>` with the built `<img>` and rewrite the anchor to
@@ -719,7 +735,7 @@ fn rewrite_structure(
                 // description link (mirrors `replaceAnchor`, where a null
                 // `$link` is treated as `link=` not present).
                 if is_invalid_title_text(&link_title.text) {
-                    anchor.set_attr("href", crate::title::make_link(title, config));
+                    anchor.set_attr("href", description_link_href(title, opts, config));
                     if !opts.is_manual_thumb {
                         anchor.set_attr("class", "mw-file-description");
                     }
@@ -740,7 +756,7 @@ fn rewrite_structure(
             }
         } else {
             // Description link to the file page (mirrors `$addDescriptionLink`).
-            anchor.set_attr("href", crate::title::make_link(title, config));
+            anchor.set_attr("href", description_link_href(title, opts, config));
             // The file-description class is omitted for manual-thumb images so
             // MultimediaViewer does not launch (mirrors `replaceAnchor`).
             if !opts.is_manual_thumb {
@@ -776,6 +792,37 @@ fn is_invalid_title_text(text: &str) -> bool {
     text.chars().any(|c| {
         matches!(c, '<' | '>' | '[' | ']' | '|' | '{' | '}') || c == '\0' || (c as u32) < 0x20
     })
+}
+
+/// The description-link href for a media container, appending `?page=`/`?lang=`
+/// query parameters (mirrors `replaceAnchor`'s `$addDescriptionLink`).
+fn description_link_href(title: &Title, opts: &AnchorOpts, config: &dyn SiteConfig) -> String {
+    let mut href = crate::title::make_link(title, config);
+    let mut qs: Vec<(&str, &str)> = Vec::new();
+    if let Some(page) = opts.page
+        && page.parse::<u32>().is_ok_and(|n| n > 0)
+    {
+        qs.push(("page", page));
+    }
+    if let Some(lang) = opts.lang
+        && !lang.is_empty()
+    {
+        qs.push(("lang", lang));
+    }
+    if !qs.is_empty() {
+        let mut q = String::new();
+        for (i, (k, v)) in qs.iter().enumerate() {
+            if i > 0 {
+                q.push('&');
+            }
+            q.push_str(k);
+            q.push('=');
+            q.push_str(v);
+        }
+        href.push('?');
+        href.push_str(&q);
+    }
+    href
 }
 
 /// Navigate to the node at `path` (a sequence of child indices from `root`).

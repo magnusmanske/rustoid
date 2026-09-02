@@ -247,6 +247,10 @@ pub struct MediaOpts {
     pub alt: Option<String>,
     /// The `class=` option value (space-separated class list).
     pub class: Option<String>,
+    /// The `page=` option value (document page number).
+    pub page: Option<String>,
+    /// The `lang=` option value (file language code).
+    pub lang: Option<String>,
 }
 
 /// Determine wrapper classes and inline-ness. Mirrors PHP's `getWrapperInfo`.
