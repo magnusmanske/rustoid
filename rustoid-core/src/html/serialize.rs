@@ -465,12 +465,14 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;")
 }
 
-/// HTML entity escaping for attribute values (also escapes quotes).
+/// HTML entity escaping for attribute values (double-quoted). Mirrors PHP's
+/// `XHtmlSerializer` (which uses `htmlspecialchars` with `ENT_COMPAT`): escapes
+/// `&`, `<` and `"`, but leaves `'` unescaped (it is not the attribute quote
+/// delimiter here).
 fn attr_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -563,7 +565,7 @@ mod tests {
     fn test_html_escape() {
         // html_escape: escapes & and < (matches Parsoid XHtmlSerializer).
         assert_eq!(html_escape("<>&\"'"), "&lt;>&amp;\"'");
-        // attr_escape: also escapes " and '
-        assert_eq!(attr_escape("<>&\"'"), "&lt;>&amp;&quot;&#39;");
+        // attr_escape: escapes &, <, and " (ENT_COMPAT), leaves ' unescaped.
+        assert_eq!(attr_escape("<>&\"'"), "&lt;>&amp;&quot;'");
     }
 }
