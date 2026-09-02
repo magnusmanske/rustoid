@@ -115,8 +115,11 @@ pub fn get_wiki_link_target_info(
     let mut local_prefix: Option<String> = None;
     let mut prefix: Option<String> = None;
 
-    // Capture the (decoded) title before handling colon escape.
-    let mut title_decoded = decode_uri_component(&href);
+    // Capture the (decoded) title before handling colon escape. The wikilink
+    // target is entity-decoded here as well (`&#45;` → `-`), mirroring the PEG
+    // grammar's entity rules which are preserved in the title string.
+    let mut title_decoded =
+        crate::html::wts_utils::decode_wt_entities_all(&decode_uri_component(&href));
 
     if href.trim_start().starts_with(':') {
         from_colon_escaped_text = true;

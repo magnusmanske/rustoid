@@ -129,9 +129,10 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
         None => (line, None),
     };
 
-    // Title resolution: try the title as-is (File namespace), else prefix File:.
+    // Title resolution: decode entities (`&#45;` → `-`), mirroring
+    // `Gallery::pLine`'s `Utils::decodeWtEntities($oTitleStr)`.
     let file_ns = config.canonical_namespace_id("File").unwrap_or(6);
-    let decoded = title_str.replace("_", " ");
+    let decoded = crate::html::wts_utils::decode_wt_entities_all(&title_str.replace("_", " "));
     let mut title = TitleParser::parse(&decoded, config);
     if title.namespace_id != file_ns {
         // Re-parse with an explicit `File:` prefix so first-letter capitalization
