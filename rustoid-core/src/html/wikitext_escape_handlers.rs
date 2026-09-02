@@ -8,11 +8,10 @@
 //! per-handler *predicate delegates* (`li_handler`, `td_handler`, `th_handler`,
 //! `wikilink_handler`, `a_handler`, `media_option_handler`), and the
 //! token-walking machinery (`has_wikitext_tokens`, `text_can_parse_as_link`,
-//! backed by `tokenizer_v2`) are ported. `escaped_ib_sibling_node_text` (the
-//! selective `<nowiki/>` quote protection around `<i>`/`<b>` siblings) and the
-//! entity/tag-specific ignore cases inside `has_wikitext_tokens` still depend on
-//! `SiteConfig` protocol / ext-tag lookups and are approximated conservatively
-//! (over-escaping is safe; under-escaping is a correctness bug).
+//! backed by `tokenizer_v2`) are ported. `escape_ib_sibling_node_text` (the
+//! selective `<nowiki/>` quote protection around `<i>`/`<b>` siblings) is the
+//! remaining approximation (over-escaping there is safe; under-escaping is a
+//! correctness bug).
 //
 // Note: PHP uses PCRE with distinctive semantics (`/D`, `\W`, etc.). Rust's
 // `regex` crate has no direct equivalent; the handful of patterns below are
@@ -360,42 +359,165 @@ pub fn escape_wikitext(
 /// (`TagTk`, `EndTagTk`, `SelfclosingTagTk`) — plus our compound
 /// `IndentPre`/`List` tokens — trigger escaping. `NlTk`, `CommentTk`,
 /// `EmptyLineTk`, `EOFTk`, and plain strings do not (PHP's loop ignores them).
+/// `hasWikitextTokens` — tokenize `text` and report whether it contains any
+/// wikitext markup token (a token that would re-parse as a construct, not as
+/// plain text). Faithful port of PHP's `hasWikitextTokens`, including the
+/// HTML-tag (extension/allowed-literal) handling, the `SelfclosingTagTk` link
+/// special-cases (`urllink`/magiclink in link/attribute context), the entity
+/// (`mw:Entity` span) tracking, the `in_caption` list-item skip, the table-token
+/// skip outside tables, and the heading-token handling.
 fn has_wikitext_tokens(state: &SerializerState, sol: bool, text: &str) -> bool {
     let in_linkish = state.in_attribute || state.in_link;
     let tokens = tokenize(text, sol);
-    tokens.as_ref().is_none_or(|tokens| {
-        tokens.iter().any(|t| {
-            match t {
-                Either::Right(ParsoidToken::Tag(_)) => true,
-                Either::Right(ParsoidToken::EndTag(_)) => true,
-                Either::Right(ParsoidToken::SelfclosingTag(tk)) => {
-                    // Faithful to `hasWikitextTokens::SelfclosingTagTk`:
-                    //
-                    // * Ignore RFC/ISBN/PMID magic-link tokens when encountered
-                    //   in link/attribute content (T109371).
-                    if matches!(tk.name.as_str(), "extlink" | "wikilink")
-                        && tk.data_parsoid.stx.as_deref() == Some("magiclink")
-                        && in_linkish
-                    {
-                        return false;
-                    }
-                    // Ignore url links in attributes (href, mostly) since they
-                    // aren't in danger of being autolink-ified there.
-                    if tk.name == "urllink" && in_linkish {
-                        return false;
-                    }
-                    // `wikilink` is real wikitext markup (require escaping).
-                    true
-                }
-                // Compound markup tokens (lists / indent-pre) are real wikitext
-                // constructs and therefore require escaping.
-                Either::Right(ParsoidToken::IndentPre(_)) => true,
-                Either::Right(ParsoidToken::List(_)) => true,
-                // Newlines, comments, empty lines, and EOF are not markup.
-                _ => false,
+    let Some(tokens) = tokens.as_ref() else {
+        // Tokenizer error: be conservative and require escaping.
+        return true;
+    };
+
+    let mut num_entities = 0;
+    for t in tokens {
+        let Either::Right(token) = t else {
+            continue;
+        };
+
+        // ---- HTML tags (`stx === 'html'`) ----
+        if crate::wikitext::token_utils::is_html_tag(token) {
+            // An extension tag whose `name` differs from the extension currently
+            // being serialized still needs escaping.
+            if crate::wikitext::token_utils::match_type_of(token, "^mw:Extension(/|$)").is_some() {
+                return true;
             }
-        })
-    })
+            // Always escape isolated extension tags (T59469): a `<ref>`/`</ref>`
+            // token that is not part of the current extension's re-serialization.
+            let name = token.get_name();
+            if matches!(token, ParsoidToken::Tag(_) | ParsoidToken::EndTag(_))
+                && state
+                    .env
+                    .is_some_and(|env| env.get_site_config().is_extension_tag(&name.to_lowercase()))
+            {
+                return true;
+            }
+            // If the tag is one allowed as a literal in wikitext, we need to
+            // escape it inside `<nowiki>`s (a text node's `nodeValue` always
+            // returns non-escaped entities). Tags the sanitizer would itself
+            // escape (`<meta>`/`<link>` without the required attributes) are
+            // left alone.
+            if crate::pipeline::sanitizer_handler::allowed_literal_tags()
+                .contains(&name.to_lowercase().as_str())
+            {
+                if escape_literal_html_tag(token) {
+                    continue;
+                }
+                return true;
+            }
+            continue;
+        }
+
+        // ---- Self-closing tags ----
+        if let ParsoidToken::SelfclosingTag(tk) = token {
+            // * Ignore RFC/ISBN/PMID magic-link tokens when encountered in the
+            //   context of another link's content (T109371).
+            if matches!(tk.name.as_str(), "extlink" | "wikilink")
+                && tk.data_parsoid.stx.as_deref() == Some("magiclink")
+                && in_linkish
+            {
+                continue;
+            }
+            // Ignore url links in attributes (href, mostly) since they aren't in
+            // danger of being autolink-ified there.
+            if tk.name == "urllink" && in_linkish {
+                continue;
+            }
+            if tk.name == "wikilink" {
+                let href = tk
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .and_then(|kv| kv.value.as_str())
+                    .unwrap_or("");
+                let valid = state.env.is_none_or(|env| env.is_valid_link_target(href));
+                if valid {
+                    return true;
+                }
+                continue;
+            }
+            return true;
+        }
+
+        // ---- `listItem` in caption context is ignored ----
+        if state.in_caption && matches!(token, ParsoidToken::Tag(tk) if tk.name == "listItem") {
+            continue;
+        }
+
+        // ---- Opening tags ----
+        if let ParsoidToken::Tag(tk) = token {
+            // Ignore `mw:Entity` tokens (they are re-serialized verbatim).
+            if tk.name == "span" && crate::wikitext::token_utils::has_type_of(token, "mw:Entity") {
+                num_entities += 1;
+                continue;
+            }
+            // Ignore table tokens outside of tables (they'd be text, not markup).
+            if matches!(tk.name.as_str(), "caption" | "td" | "tr" | "th")
+                && state.wiki_table_nesting == 0
+            {
+                continue;
+            }
+            // Headings have both SOL and EOL requirements; this tokenization only
+            // verifies SOL requirements. The heading token itself is real markup.
+            if is_heading_name(&tk.name) {
+                return true;
+            }
+            return true;
+        }
+
+        // ---- End tags ----
+        if let ParsoidToken::EndTag(tk) = token {
+            // Ignore `mw:Entity` end tags (matched against a pending start).
+            if num_entities > 0 && tk.name == "span" {
+                num_entities -= 1;
+                continue;
+            }
+            // Ignore heading end tags.
+            if is_heading_name(&tk.name) {
+                continue;
+            }
+            // Ignore table end tags outside of tables.
+            if matches!(tk.name.as_str(), "caption" | "table") && state.wiki_table_nesting == 0 {
+                continue;
+            }
+            // `</br>` is ignored.
+            if tk.name.to_lowercase() == "br" {
+                continue;
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
+/// `Sanitizer::escapeLiteralHTMLTag` — `<meta>`/`<link>` must carry the required
+/// attributes, otherwise the sanitizer will escape them (so *we* don't need to).
+fn escape_literal_html_tag(token: &ParsoidToken) -> bool {
+    let name = token.get_name();
+    if name != "meta" && name != "link" {
+        return false;
+    }
+    if token.get_attribute_v("itemprop").is_none() {
+        return true;
+    }
+    if name == "meta" && token.get_attribute_v("content").is_none() {
+        return true;
+    }
+    if name == "link" && token.get_attribute_v("href").is_none() {
+        return true;
+    }
+    false
+}
+
+/// Whether a tag/end-tag name is a heading (`h1`..`h6`).
+fn is_heading_name(name: &str) -> bool {
+    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
 }
 
 /// Internal helper: escape `text` as though we were at start-of-line (for the
@@ -858,6 +980,30 @@ mod tests {
         let mut link = SerializerState::new();
         link.in_link = true;
         assert!(!has_wikitext_tokens(&link, false, "http://example.org"));
+    }
+
+    #[test]
+    fn test_has_wikitext_tokens_extension_tag() {
+        // A literal HTML tag that is allowed as a literal in wikitext must be
+        // escaped inside `<nowiki>` (its text would otherwise re-parse as markup).
+        assert!(has_wikitext_tokens(&SerializerState::new(), false, "<div>"));
+    }
+
+    #[test]
+    fn test_has_wikitext_tokens_table_outside_table() {
+        // A table row/cell token outside any table (`wiki_table_nesting == 0`)
+        // is just text and must not require escaping (it can't be a table there).
+        assert!(!has_wikitext_tokens(&SerializerState::new(), true, "| foo"));
+    }
+
+    #[test]
+    fn test_has_wikitext_tokens_heading() {
+        // A heading is real wikitext markup and must require escaping.
+        assert!(has_wikitext_tokens(
+            &SerializerState::new(),
+            true,
+            "== foo =="
+        ));
     }
 
     #[test]

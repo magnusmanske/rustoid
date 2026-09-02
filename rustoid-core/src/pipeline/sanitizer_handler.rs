@@ -13,7 +13,7 @@ fn no_end_tag_set(name: &str) -> bool {
 }
 
 /// The set of allowed literal HTML tags (from Consts::$Sanitizer['AllowedLiteralTags']).
-fn allowed_literal_tags() -> &'static [&'static str] {
+pub fn allowed_literal_tags() -> &'static [&'static str] {
     &[
         "abbr",
         "b",
