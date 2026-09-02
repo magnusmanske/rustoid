@@ -2866,6 +2866,7 @@ fn is_space_or_nbsp(c: char) -> bool {
 fn find_wikilink_close(input: &str) -> Option<usize> {
     let lower = input.to_ascii_lowercase();
     let mut i = 0;
+    let mut bracket_depth: i32 = 0;
     while i + 1 < input.len() {
         if lower[i..].starts_with("<nowiki") {
             let rest = &input[i + 7..];
@@ -2888,8 +2889,21 @@ fn find_wikilink_close(input: &str) -> Option<usize> {
                 return None;
             }
         }
+        // A nested `[[…]]` (e.g. a link inside a caption) must not terminate
+        // the surrounding wikilink. Track bracket depth so the first
+        // depth-0 `]]` is the real close.
+        if input[i..].starts_with("[[") {
+            bracket_depth += 1;
+            i += 2;
+            continue;
+        }
         if input[i..].starts_with("]]") {
-            return Some(i);
+            if bracket_depth == 0 {
+                return Some(i);
+            }
+            bracket_depth -= 1;
+            i += 2;
+            continue;
         }
         let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         i += ch_len;
