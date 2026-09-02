@@ -45,6 +45,95 @@ use rustoid_core::error::RustoidError;
 use rustoid_core::mock::{MockDataSource, MockSiteConfig};
 use rustoid_core::options::ParserOptions;
 use rustoid_core::pipeline::parser::Parser;
+use rustoid_core::traits::FileInfo;
+
+// ---------------------------------------------------------------------------
+// Standard mock media files (faithful to `MockApiHelper::FILE_PROPS`)
+// ---------------------------------------------------------------------------
+
+/// Seed the mock data source with the standard image files Parsoid's own test
+/// runner hardcodes in `MockApiHelper` (`FILE_PROPS` / `imageInfo`). Each file
+/// gets its natural dimensions and the `http://example.com/images/<md5-prefix>`
+/// raw URL, plus thumbnail URLs for the widths the media fixture exercises.
+fn seed_media_files(source: &MockDataSource) {
+    const BASE: &str = "http://example.com/images";
+
+    // (canonical title, file name as it appears in the URL, width, height, mime,
+    //  md5 prefix dirs, natural/thumb URL template).
+    let files: &[(&str, &str, u32, u32, &str, &str)] = &[
+        (
+            "File:Foobar.jpg",
+            "Foobar.jpg",
+            1941,
+            220,
+            "image/jpeg",
+            "3/3a",
+        ),
+        (
+            "File:File_&_file.jpg",
+            "File_%26_file.jpg",
+            1941,
+            220,
+            "image/jpeg",
+            "7/74",
+        ),
+        ("File:Thumb.png", "Thumb.png", 135, 135, "image/png", "e/ea"),
+        (
+            "File:Foobar.svg",
+            "Foobar.svg",
+            240,
+            180,
+            "image/svg+xml",
+            "f/ff",
+        ),
+        ("File:Bad.jpg", "Bad.jpg", 320, 240, "image/jpeg", "0/09"),
+        (
+            "File:LoremIpsum.djvu",
+            "LoremIpsum.djvu",
+            2480,
+            3508,
+            "image/vnd.djvu",
+            "5/5f",
+        ),
+        (
+            "File:Hi-ho.jpg",
+            "Hi-ho.jpg",
+            1941,
+            220,
+            "image/jpeg",
+            "9/9d",
+        ),
+        ("File:Tall.jpg", "Tall.jpg", 400, 600, "image/jpeg", "8/88"),
+    ];
+
+    for (title, fname, width, height, mime, prefix) in files {
+        let file_url = format!("{BASE}/{prefix}/{fname}");
+        let mut thumb_urls = HashMap::new();
+        // Populate thumbnails for a representative set of widths (the fixture
+        // exercises 50/120/137/180/220/274/320/360/440/…-px variants). The
+        // exact value for a given width is recomputed by the parser's
+        // `handle_size`; here we only need the *URL* string.
+        for w in [50u32, 100, 120, 137, 180, 220, 240, 274, 320, 360, 440] {
+            thumb_urls.insert(
+                w.to_string(),
+                format!("{BASE}/thumb/{prefix}/{fname}/{w}px-{fname}"),
+            );
+        }
+        source.add_file(
+            title,
+            FileInfo {
+                title: (*fname).to_string(),
+                mime_type: (*mime).to_string(),
+                size: 0,
+                width: *width,
+                height: *height,
+                description_url: format!("{BASE}/{fname}"),
+                file_url,
+                thumb_urls,
+            },
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test case representation
@@ -607,6 +696,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
 
     // Build mock data source with test file articles.
     let source = MockDataSource::new();
+    seed_media_files(&source);
     for (name, text) in &test_file.articles {
         if name.starts_with("Template:") {
             source.add_template(name, text);

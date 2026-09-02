@@ -4,6 +4,7 @@
 //! and serialization. It is the primary entry point for library consumers.
 
 pub mod add_link_attributes;
+pub mod add_media_info;
 pub mod add_red_links;
 pub mod attribute_expander;
 pub mod attribute_transform_manager;

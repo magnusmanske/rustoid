@@ -716,6 +716,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             crate::pipeline::add_red_links::run(&mut ast, &known, &page_title_prefixed);
         }
+        // AddMediaInfo: resolve file metadata for `mw:File` containers and
+        // replace broken-media placeholders with real `<img>` elements (or mark
+        // missing files as `mw:Error`). Mirrors PHP's `AddMediaInfo` pass.
+        if let Some(source) = source {
+            crate::pipeline::add_media_info::run(&mut ast, source, self.config).await;
+        }
         wrap_sections_in_ast(&mut ast, wrap_sections);
         ast
     }
