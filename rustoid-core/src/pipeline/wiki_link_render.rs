@@ -534,8 +534,11 @@ pub fn render_file(
 
     let title = target.title.as_ref().expect("file title");
 
-    // Extract option strings from mw:maybeContent (pipe-separated).
+    // Extract option strings from mw:maybeContent (pipe-separated). The last
+    // unrecognized part is the caption (mirrors PHP `renderFile`'s
+    // `recordCaption`, where the final non-option is captured as the caption).
     let mut opts = MediaOpts::default();
+    let mut caption: Option<String> = None;
     if let Some(content) = token.get_attribute_v("mw:maybeContent") {
         for part in content.split('|') {
             if let Some(info) = get_option_info(ctx.config, part) {
@@ -557,6 +560,9 @@ pub fn render_file(
                     }
                     _ => {}
                 }
+            } else {
+                // Unrecognized ⇒ caption (last one wins).
+                caption = Some(part.to_string());
             }
         }
     }
@@ -619,13 +625,16 @@ pub fn render_file(
         ))),
     ];
 
-    // For block formats, add a figcaption (empty) then close the figure.
+    // For block formats, add a figcaption holding the caption (or empty).
     if !is_inline {
         out.push(Item::Tok(ParsoidToken::Tag(TagTk::new(
             "figcaption",
             vec![],
             DataParsoid::default(),
         ))));
+        if let Some(cap) = &caption {
+            out.push(Item::Str(cap.clone()));
+        }
         out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
             "figcaption",
             vec![],

@@ -135,6 +135,26 @@ fn seed_media_files(source: &MockDataSource) {
     }
 }
 
+/// Extract the target of a `#REDIRECT [[Target]]` article, if `text` is a
+/// redirect. Mirrors the redirect-detection used by the MediaWiki API when it
+/// reports redirects.
+fn redirect_target(text: &str) -> Option<String> {
+    let mut rest = text.trim_start();
+    rest = rest
+        .strip_prefix("#REDIRECT")
+        .or_else(|| rest.strip_prefix("#redirect"))?;
+    rest = rest.trim_start();
+    let start = rest.find("[[")?;
+    let inner = &rest[start + 2..];
+    let end = inner.find("]]")?;
+    let target = inner[..end].trim();
+    if target.is_empty() {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test case representation
 // ---------------------------------------------------------------------------
@@ -700,6 +720,11 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     for (name, text) in &test_file.articles {
         if name.starts_with("Template:") {
             source.add_template(name, text);
+        } else if let Some(target) = redirect_target(text) {
+            // A `#REDIRECT [[Target]]` article: register it as both a page and a
+            // redirect mapping so `resolve_redirect` follows it.
+            source.add_page(name, text);
+            source.add_redirect(name, &target);
         } else {
             source.add_page(name, text);
             if !name.contains(':') {

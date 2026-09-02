@@ -33,10 +33,17 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
     let mut jobs: Vec<ContainerJob> = Vec::new();
     collect_containers(root, &mut Vec::new(), &mut jobs, config);
 
-    // Batch-resolve file info (PHP issues a single getFileInfo API call).
-    // Deduplicate by title so each distinct file is fetched once.
+    // Resolve redirects (a redirect-to-file title yields its target's media
+    // info; mirrors the API's `redirects=1` following) and batch-fetch file info
+    // (PHP issues a single getFileInfo API call). Deduplicate by title so each
+    // distinct file is fetched once.
     let mut infos: HashMap<String, Option<FileInfo>> = HashMap::new();
-    for job in &jobs {
+    for job in jobs.iter_mut() {
+        if let Ok(Some(target)) = source.resolve_redirect(&job.title).await {
+            // Re-target: the description link and `resource` use the resolved
+            // title, not the redirect title.
+            job.title = target;
+        }
         let key = job.title.full_text();
         if infos.contains_key(&key) {
             continue;
@@ -167,10 +174,24 @@ fn apply_media_info(
     // else the raw file URL).
     let src = image_src(&info, job.data_width.as_deref());
 
+    // The caption text (trimmed) for `alt`/`title` when no explicit `alt`/`link`
+    // option is present (mirrors `$captionText` → `$alt` in `AddMediaInfo`).
+    // `hasVisibleCaption` (Thumb/Frame formats) suppresses the caption from
+    // becoming `alt`/`title`; those captions live only in the `<figcaption>`.
+    let caption_text = if has_visible_caption(root, &job.path) {
+        None
+    } else {
+        caption_text(root, &job.path)
+    };
+
     // Build the `<img>` replacement.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
     // resource copied from the broken span's title (the file DB key).
     img.set_attr("resource", crate::title::make_link(&job.title, config));
+    // alt from the caption (when present), before the fixed attrs.
+    if let Some(alt) = &caption_text {
+        img.set_attr("alt", alt);
+    }
     // Fixed attribute set (decoding/loading).
     for (k, v) in IMG_ATTRIBS {
         img.set_attr(k, v);
@@ -189,7 +210,60 @@ fn apply_media_info(
     img.set_attr("width", width.to_string());
     img.set_attr("class", "mw-file-element");
 
-    rewrite_structure(root, &job.path, &job.title, img, config);
+    rewrite_structure(
+        root,
+        &job.path,
+        &job.title,
+        img,
+        config,
+        caption_text.as_deref(),
+    );
+}
+
+/// Whether a media container has a *visible* caption (Thumb/Frame formats).
+/// Mirrors PHP `WTUtils::hasVisibleCaption`, which suppresses the caption from
+/// being mirrored into `alt`/`title` (those captions render only in the
+/// `<figcaption>`).
+fn has_visible_caption(root: &Node, path: &[usize]) -> bool {
+    let Some(container) = node_at_read(root, path) else {
+        return false;
+    };
+    matches!(media_format(container).as_str(), "Thumb" | "Frame")
+}
+
+/// The `/Format` suffix of a media container's `mw:File/…` `typeof` (empty when
+/// none). Mirrors `WTUtils::getMediaFormat`.
+fn media_format(node: &Node) -> String {
+    crate::html::wts_utils::get_media_format(node)
+}
+
+/// The trimmed caption text of a media container (its `<figcaption>` content,
+/// if non-empty). Mirrors `$captionText = trim(textContentFromCaption($caption))`.
+/// Note: only block (`<figure>`) media has a `<figcaption>` child; inline
+/// (`<span>`) captions live in `data-mw.caption` instead and are handled
+/// separately.
+fn caption_text(root: &Node, path: &[usize]) -> Option<String> {
+    let container = node_at_read(root, path)?;
+    let figcaption = container
+        .children
+        .iter()
+        .find(|c| matches!(c.kind, NodeKind::Element(ElementKind::FigCaption)))?;
+    let text = text_content(figcaption);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Navigate to the node at `path` (read-only).
+fn node_at_read<'a>(root: &'a Node, path: &[usize]) -> Option<&'a Node> {
+    let mut node = root;
+    for &idx in path {
+        node = node.children.get(idx)?;
+    }
+    Some(node)
 }
 
 /// Compute the rendered width/height for a bitmap image (mirrors `handleSize`
@@ -277,6 +351,7 @@ fn rewrite_structure(
     title: &Title,
     img: Node,
     config: &dyn SiteConfig,
+    caption_text: Option<&str>,
 ) {
     let Some(container) = node_at(root, path) else {
         return;
@@ -297,8 +372,11 @@ fn rewrite_structure(
         // Description link to the file page (mirrors `$addDescriptionLink`).
         anchor.set_attr("href", crate::title::make_link(title, config));
         anchor.set_attr("class", "mw-file-description");
-        // The description link has no `title` unless a caption supplies one.
+        // `title` from the caption (or absent when the caption is empty).
         anchor.attrs.retain(|a| a.key != "title");
+        if let Some(cap) = caption_text {
+            anchor.set_attr("title", cap);
+        }
         // Replace the broken span (first element child) with the img.
         if let Some(span_idx) = anchor
             .children
@@ -418,5 +496,69 @@ mod tests {
     fn test_media_type_from_mime() {
         assert_eq!(media_type_from_mime("image/jpeg"), "bitmap");
         assert_eq!(media_type_from_mime("image/svg+xml"), "drawing");
+    }
+
+    /// A `<figure typeof="mw:File">` container with an empty `<a>` anchor and a
+    /// `<figcaption>` caption (the shape `renderFile` emits for block media).
+    fn figure_with_caption(typeof_attr: &str, caption: &str) -> Node {
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("resource", "./File:Foobar.jpg");
+        span.push_child(Node::text("File:Foobar.jpg"));
+
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("class", "new");
+        a.push_child(span);
+
+        let mut figcaption = Node::element(ElementKind::FigCaption);
+        figcaption.push_child(Node::text(caption));
+
+        let mut figure = Node::element(ElementKind::Figure);
+        figure.set_attr("typeof", typeof_attr);
+        figure.push_child(a);
+        figure.push_child(figcaption);
+        figure
+    }
+
+    #[test]
+    fn test_has_visible_caption() {
+        let mut doc = Node::document();
+        doc.push_child(figure_with_caption("mw:File/Thumb", "caption"));
+        assert!(has_visible_caption(&doc, &[0]));
+
+        let mut doc2 = Node::document();
+        doc2.push_child(figure_with_caption("mw:File", "caption"));
+        assert!(!has_visible_caption(&doc2, &[0]));
+    }
+
+    #[tokio::test]
+    async fn test_non_thumb_caption_becomes_alt_and_title() {
+        let mut doc = Node::document();
+        doc.push_child(figure_with_caption("mw:File", "Caption text"));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let figure = &doc.children[0];
+        let a = &figure.children[0];
+        assert_eq!(a.get_attr("title"), Some("Caption text"));
+        let img = &a.children[0];
+        assert_eq!(img.get_attr("alt"), Some("Caption text"));
+    }
+
+    #[tokio::test]
+    async fn test_thumb_caption_not_alt() {
+        let mut doc = Node::document();
+        doc.push_child(figure_with_caption("mw:File/Thumb", "caption"));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let figure = &doc.children[0];
+        let a = &figure.children[0];
+        assert_eq!(a.get_attr("title"), None);
+        let img = &a.children[0];
+        assert_eq!(img.get_attr("alt"), None);
     }
 }
