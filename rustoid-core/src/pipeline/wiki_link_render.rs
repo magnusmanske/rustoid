@@ -484,7 +484,7 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
 /// Split a media option string on *top-level* pipes, respecting nested
 /// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling.
-fn split_media_options(content: &str) -> Vec<String> {
+pub(crate) fn split_media_options(content: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut bracket = 0i32;

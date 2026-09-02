@@ -156,6 +156,11 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
             .map(str::to_string)
     });
 
+    // Also parse the non-caption options (`link=`, `alt=`, `manualthumb=`) into
+    // `data-mw.attribs` so `AddMediaInfo` applies them (mirrors `renderFile`'s
+    // `$dataMw->attribs`). The gallery thumbnails are regenerated per-line.
+    let media_opts = parse_media_opts(rest, config);
+
     let has_error = false;
 
     // Thumbnail dims: thumbWidth = imageWidth + 30, thumbHeight = imageHeight + 30,
@@ -181,7 +186,13 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
     thumb.set_attr("style", thumb_style);
 
     // Broken-media span (mirrors `renderFile`, resolved later by AddMediaInfo).
-    thumb.push_child(broken_media_span(&title, opts, config));
+    thumb.push_child(broken_media_span(
+        &title,
+        opts,
+        config,
+        &media_opts,
+        caption.as_deref(),
+    ));
 
     li.push_child(thumb);
 
@@ -202,7 +213,15 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
 /// Build the broken-media `<span typeof="mw:File">` inside a gallery thumb. This
 /// is the same structure `renderFile` emits (a red link + broken span), which
 /// `AddMediaInfo` then resolves into an `<img>` (or `mw:Error` for missing files).
-fn broken_media_span(title: &Title, opts: &GalleryOpts, config: &dyn SiteConfig) -> Node {
+/// `media_opts` carries the non-caption `link=`/`alt=`/`manualthumb=` options as
+/// `data-mw.attribs` (mirrors `renderFile`'s `$dataMw->attribs`).
+fn broken_media_span(
+    title: &Title,
+    opts: &GalleryOpts,
+    config: &dyn SiteConfig,
+    media_opts: &crate::pipeline::media_options::MediaOpts,
+    caption: Option<&str>,
+) -> Node {
     let mut span = Node::element(ElementKind::Span);
     span.set_attr("class", "mw-file-element mw-broken-media");
     span.set_attr("resource", crate::title::make_link(title, config));
@@ -218,8 +237,84 @@ fn broken_media_span(title: &Title, opts: &GalleryOpts, config: &dyn SiteConfig)
 
     let mut container = Node::element(ElementKind::Span);
     container.set_attr("typeof", "mw:File");
+    if let Some(data_mw) = media_opts_to_data_mw(media_opts, caption) {
+        container.data_mw = Some(data_mw);
+    }
     container.push_child(a);
     container
+}
+
+/// The media options that influence `AddMediaInfo`/`rewrite_structure` (the
+/// gallery subset of `renderFile`'s `data-mw.attribs`).
+fn parse_media_opts(
+    rest: Option<&str>,
+    config: &dyn SiteConfig,
+) -> crate::pipeline::media_options::MediaOpts {
+    use crate::pipeline::media_options::{MediaOpts, get_option_info};
+
+    let Some(r) = rest else {
+        return MediaOpts::default();
+    };
+    let mut opts = MediaOpts::default();
+    for part in crate::pipeline::wiki_link_render::split_media_options(r) {
+        let Some(info) = get_option_info(config, part.trim()) else {
+            continue;
+        };
+        match info.ck.as_str() {
+            "manualthumb" => opts.manualthumb = Some(info.v),
+            "link" => opts.link = Some(info.v),
+            "alt" => opts.alt = Some(info.v),
+            _ => {}
+        }
+    }
+    opts
+}
+
+/// Serialize the gallery media options into a `data-mw` JSON string carrying an
+/// `attribs` array and (when present) a `caption` string (mirrors `renderFile`'s
+/// `dataMw->attribs` + inline-media `dataMw->caption`), or `None` when there is
+/// nothing to store.
+fn media_opts_to_data_mw(
+    opts: &crate::pipeline::media_options::MediaOpts,
+    caption: Option<&str>,
+) -> Option<String> {
+    use crate::wikitext::tokens_v2::{DataMwAttrib, DataMwValue};
+
+    let mut attribs: Vec<DataMwAttrib> = Vec::new();
+    for (key, val) in [
+        ("link", opts.link.as_ref()),
+        ("alt", opts.alt.as_ref()),
+        ("manualthumb", opts.manualthumb.as_ref()),
+    ] {
+        if let Some(v) = val {
+            attribs.push(DataMwAttrib::new(
+                DataMwValue::Str(key.to_string()),
+                DataMwValue::Object {
+                    txt: Some(v.clone()),
+                    html: None,
+                    uneditable: false,
+                },
+            ));
+        }
+    }
+    if attribs.is_empty() && caption.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if !attribs.is_empty() {
+        let json = crate::pipeline::attribute_expander::serialize_data_mw_attribs(&attribs);
+        obj.insert(
+            "attribs".to_string(),
+            serde_json::from_str(&json).unwrap_or(serde_json::Value::Array(vec![])),
+        );
+    }
+    if let Some(cap) = caption {
+        obj.insert(
+            "caption".to_string(),
+            serde_json::Value::String(cap.to_string()),
+        );
+    }
+    Some(serde_json::Value::Object(obj).to_string())
 }
 
 /// Parse the `<gallery …>` start-tag attributes into options.
