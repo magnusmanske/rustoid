@@ -315,13 +315,13 @@ impl MockSiteConfig {
         config.add_magic_word("img_middle", &["middle"]);
         config.add_magic_word("img_bottom", &["bottom"]);
         config.add_magic_word("img_text_bottom", &["text-bottom"]);
-        config.add_magic_word("img_link", &["link"]);
-        config.add_magic_word("img_alt", &["alt"]);
-        config.add_magic_word("img_page", &["page"]);
-        config.add_magic_word("img_upright", &["upright"]);
-        config.add_magic_word("img_width", &["width"]);
-        config.add_magic_word("img_class", &["class"]);
-        config.add_magic_word("img_lang", &["lang"]);
+        config.add_magic_word("img_link", &["link=$1"]);
+        config.add_magic_word("img_alt", &["alt=$1"]);
+        config.add_magic_word("img_page", &["page=$1"]);
+        config.add_magic_word("img_upright", &["upright=$1"]);
+        config.add_magic_word("img_width", &["$1px"]);
+        config.add_magic_word("img_class", &["class=$1"]);
+        config.add_magic_word("img_lang", &["lang=$1"]);
 
         config
     }
