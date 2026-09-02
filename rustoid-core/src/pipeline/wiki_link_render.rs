@@ -451,6 +451,36 @@ fn token_utils_tokens_to_string(items: &[Item]) -> String {
     tokens_to_string(items)
 }
 
+/// Re-tokenize a media caption string as full wikitext (quotes, entities,
+/// links, nowiki, magic links, …), returning the inline token stream. Mirrors
+/// PHP `processContentInPipeline` with `inlineContext => true` for the caption
+/// (which re-parses the caption with the inline grammar). The main pipeline's
+/// TT3 handlers (QuoteTransformer, etc.) then turn `mw-quote`/`mw:Entity` into
+/// `<i>`/`mw:Entity` spans during tree-building.
+fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
+    use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
+
+    let options = TokenizerOptions {
+        magic_links: crate::wikitext::tokenizer_v2::MagicLinkConfig {
+            rfc: config.magic_link_enabled("RFC"),
+            pmid: config.magic_link_enabled("PMID"),
+            isbn: config.magic_link_enabled("ISBN"),
+        },
+        ext_tags: config.extension_tags().to_vec(),
+        ..TokenizerOptions::default()
+    };
+    let mut tokenizer = PegTokenizer::new(caption, &options);
+    tokenizer
+        .tokenize()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| match e {
+            crate::wikitext::tokens_v2::Either::Left(s) => Item::Str(s),
+            crate::wikitext::tokens_v2::Either::Right(t) => Item::Tok(t),
+        })
+        .collect()
+}
+
 /// Render a `[[Media:Foo]]` link (a direct media link). Mirrors
 /// `WikiLinkHandler::renderMedia` + `linkToMedia` for the no-file-info case.
 pub fn render_media(
@@ -664,7 +694,10 @@ pub fn render_file(
             DataParsoid::default(),
         ))));
         if let Some(cap) = &caption {
-            out.push(Item::Str(cap.clone()));
+            // A caption is re-tokenized as wikitext so quotes/entities/links are
+            // rendered (mirrors PHP's `processContentInPipeline` inline caption
+            // processing).
+            out.extend(tokenize_caption(cap, ctx.config));
         }
         out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
             "figcaption",
@@ -1095,5 +1128,37 @@ mod tests {
 
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem"));
         assert!(matches!(&out[1], Item::Str(s) if s == "REDIRECT [[]]"));
+    }
+
+    #[test]
+    fn test_tokenize_caption_plain() {
+        // A plain caption with no wikitext constructs re-tokenizes as a single
+        // text run.
+        let out = tokenize_caption("Caption text", config_static());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], Item::Str(s) if s == "Caption text"));
+    }
+
+    #[test]
+    fn test_tokenize_caption_quotes() {
+        // `''two''` must become `mw-quote` tokens so QuoteTransformer renders
+        // `<i>two</i>`.
+        let out = tokenize_caption("one ''two'' three", config_static());
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote")),
+            "expected mw-quote tokens: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_tokenize_caption_entity() {
+        // `&#x7C;` must become an `mw:Entity` span.
+        let out = tokenize_caption("a &#x7C; b", config_static());
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "span")),
+            "expected mw:Entity span: {out:?}"
+        );
     }
 }
