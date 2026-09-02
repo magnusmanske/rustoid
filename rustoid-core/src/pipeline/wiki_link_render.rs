@@ -16,6 +16,11 @@ use crate::wikitext::tokens_v2::{
 
 use super::wiki_link_handler::{build_link_attrs, string_kv};
 
+/// The default thumbnail width (MediaWiki's `$wgThumbLimits[0]`, 180px), applied
+/// when a `thumb`/`frameless` format has no explicit size (mirrors
+/// `SiteConfig::widthOption()`).
+const DEFAULT_THUMB_WIDTH: u32 = 180;
+
 /// A lightweight analogue of PHP's `Env` — wraps a `SiteConfig` plus a small
 /// amount of per-parse state (the about-id counter used for transclusions).
 pub struct WikiLinkContext<'a> {
@@ -693,6 +698,19 @@ pub fn render_file(
 
     let format = get_format(&opts);
     let (classes, is_inline) = get_wrapper_info(&opts);
+
+    // A `thumb`/`frameless` format with no explicit size defaults to the site's
+    // default thumbnail width (180px), stamped as `data-width` on the broken
+    // span (mirrors `renderFile`'s default-size handling). `framed`/`manualthumb`
+    // are unscaled, so they get no default. This runs *after* `getWrapperInfo`
+    // so the `mw-default-size` class is still added (the default is not an
+    // explicit size).
+    if matches!(format.as_deref(), Some("thumbnail") | Some("frameless"))
+        && opts.width.is_none()
+        && opts.height.is_none()
+    {
+        opts.width = Some(DEFAULT_THUMB_WIDTH.to_string());
+    }
 
     // rdfa type and container.
     let mut rdfa_type = match format.as_deref() {
