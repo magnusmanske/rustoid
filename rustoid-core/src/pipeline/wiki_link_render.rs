@@ -643,13 +643,21 @@ pub fn render_file(
         for part in split_media_options(content) {
             if let Some(info) = get_option_info(ctx.config, &part) {
                 match info.ck.as_str() {
-                    "format" => opts.format = Some(info.v),
-                    "manualthumb" => opts.manualthumb = Some(info.v),
-                    "halign" => opts.halign = Some(info.v),
-                    "valign" => opts.valign = Some(info.v),
-                    "border" => opts.border = Some(info.v),
-                    "upright" => opts.upright = Some(info.v),
-                    "link" => {
+                    // All options except `width` are "first wins" (later
+                    // occurrences become bogus), mirroring PHP `renderFile`'s
+                    // `isset($opts[$ck])` guard. `format`/`manualthumb` are
+                    // jointly "first wins" (once one is set, the other is bogus).
+                    "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
+                        opts.format = Some(info.v)
+                    }
+                    "manualthumb" if opts.manualthumb.is_none() && opts.format.is_none() => {
+                        opts.manualthumb = Some(info.v)
+                    }
+                    "halign" if opts.halign.is_none() => opts.halign = Some(info.v),
+                    "valign" if opts.valign.is_none() => opts.valign = Some(info.v),
+                    "border" if opts.border.is_none() => opts.border = Some(info.v),
+                    "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
+                    "link" if opts.link.is_none() => {
                         // `link` is only "expanded" when it is a transclusion
                         // (mirrors `renderFile`'s `hasTransclusion` guard); plain
                         // quotes/entities just stringify into the title.
@@ -658,13 +666,15 @@ pub fn render_file(
                     "alt" => {
                         // A non-`link` option value with any markup is "expanded".
                         opts.expanded_attrs |= has_wikitext_markup(&info.v);
-                        opts.alt = Some(strip_quote_markers(&info.v));
+                        if opts.alt.is_none() {
+                            opts.alt = Some(strip_quote_markers(&info.v));
+                        }
                     }
-                    "class" => opts.class = Some(info.v),
-                    "page" => opts.page = Some(info.v),
-                    "lang" => opts.lang = Some(info.v),
+                    "class" if opts.class.is_none() => opts.class = Some(info.v),
+                    "page" if opts.page.is_none() => opts.page = Some(info.v),
+                    "lang" if opts.lang.is_none() => opts.lang = Some(info.v),
                     "width" => {
-                        // Parse WxH (separated by 'x').
+                        // `width` is "last wins" (mirrors PHP's special case).
                         if let Some((w, h)) = info.v.split_once('x') {
                             opts.width = Some(w.to_string());
                             opts.height = Some(h.to_string());
