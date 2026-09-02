@@ -2617,6 +2617,7 @@ impl<'a> PegTokenizer<'a> {
 
         let mut dp = self.make_dp(start, tsr_end);
         dp.stx = Some("magiclink".to_string());
+        dp.tmp.ref_ = Some(ref_name.to_lowercase());
 
         let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
         stt.add_attribute_str("href", &href);
@@ -2732,6 +2733,7 @@ impl<'a> PegTokenizer<'a> {
         let end = self.pos + cursor;
         let mut dp = self.make_dp(start, end);
         dp.stx = Some("magiclink".to_string());
+        dp.tmp.ref_ = Some("isbn".to_string());
 
         let content = format!("ISBN{sp}{raw}");
         let href = format!("Special:BookSources/{code}");

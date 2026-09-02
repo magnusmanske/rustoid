@@ -27,6 +27,21 @@ pub fn run(node: &mut Node, config: &dyn SiteConfig) {
             _ => {}
         }
     }
+
+    // A magic link (`stx: 'magiclink'`) gets `internal|external` +
+    // `mw-magiclink mw-magiclink-<ref>`, regardless of `rel` (ISBN uses
+    // `mw:WikiLink`, RFC/PMID use `mw:ExtLink`). Mirrors the trailing block in
+    // `AddLinkAttributes::handler`.
+    if let Some(ref_) = data_parsoid_ref(node) {
+        let base = if ref_ == "isbn" {
+            "internal"
+        } else {
+            "external"
+        };
+        add_class(node, base);
+        add_class(node, "mw-magiclink");
+        add_class(node, &format!("mw-magiclink-{ref_}"));
+    }
 }
 
 fn rel_tokens(node: &Node) -> Vec<String> {
@@ -60,16 +75,22 @@ pub(crate) fn add_class(node: &mut Node, class: &str) {
     node.set_attr("class", classes.join(" "));
 }
 
-/// Extract the `stx` field from a node's serialized `data-parsoid` JSON blob.
-/// Returns `None` when the node has no `data-parsoid` or no `stx` field.
+/// Extract the `stx` field from a node's structured `data-parsoid` (falls back
+/// to the serialized blob). Returns `None` when there is no `stx`.
 fn data_parsoid_stx(node: &Node) -> Option<String> {
-    let dp = node.data_parsoid.as_deref()?;
-    // The serializer wraps primitive values; `stx` appears as `"stx":"..."`.
-    let marker = "\"stx\":\"";
-    let start = dp.find(marker)? + marker.len();
-    let rest = &dp[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    node.dp.as_ref().and_then(|dp| dp.stx.clone()).or_else(|| {
+        let blob = node.data_parsoid.as_deref()?;
+        let marker = "\"stx\":\"";
+        let start = blob.find(marker)? + marker.len();
+        let rest = &blob[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    })
+}
+
+/// The magic-link type (`rfc`/`pmid`/`isbn`) from a node's `data-parsoid->tmp->ref`.
+fn data_parsoid_ref(node: &Node) -> Option<String> {
+    node.dp.as_ref().and_then(|dp| dp.tmp.ref_.clone())
 }
 
 /// `AddLinkAttributes::handler` for an external (`rel="mw:ExtLink"`) link.
@@ -170,5 +191,29 @@ mod tests {
         let config = MockSiteConfig::new();
         run(&mut doc, &config);
         assert_eq!(doc.children[0].get_attr("class"), Some("extiw"));
+    }
+
+    #[test]
+    fn test_magic_link_adds_class() {
+        // An RFC magic link (rel mw:ExtLink, tmp.ref = "rfc").
+        let mut n = Node::element(ElementKind::ExtLink);
+        n.set_attr("rel", "mw:ExtLink");
+        n.set_attr("href", "https://datatracker.ietf.org/doc/html/rfc123");
+        n.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            stx: Some("magiclink".to_string()),
+            tmp: crate::wikitext::tokens_v2::TempData {
+                ref_: Some("rfc".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut doc = Node::document();
+        doc.push_child(n);
+        let config = MockSiteConfig::new();
+        run(&mut doc, &config);
+        assert_eq!(
+            doc.children[0].get_attr("class"),
+            Some("external mw-magiclink mw-magiclink-rfc")
+        );
     }
 }
