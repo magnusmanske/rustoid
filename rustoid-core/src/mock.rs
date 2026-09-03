@@ -322,6 +322,9 @@ impl MockSiteConfig {
         config.add_magic_word("img_width", &["$1px"]);
         config.add_magic_word("img_class", &["class=$1"]);
         config.add_magic_word("img_lang", &["lang=$1"]);
+        // The `!` magic word (`{{!}}` → literal `|`, or a `<td>` inside a
+        // template) — used to emit pipe characters from templates.
+        config.add_magic_word("!", &["!"]);
 
         config
     }
