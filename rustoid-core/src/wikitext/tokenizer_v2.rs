@@ -2241,16 +2241,14 @@ impl<'a> PegTokenizer<'a> {
         // Find closing `]]` (skipping `<nowiki>` blocks).
         if let Some(end) = find_wikilink_close(self.remaining()) {
             let content = &self.remaining()[..end];
-            // Split on the first *top-level* pipe (one not inside a template or
-            // nested wikilink), mirroring `wikilink_preprocessor_text` +
-            // `wikilink_content`.
+            // Split on *top-level* pipes (one not inside a template, nested
+            // wikilink, or table), mirroring `wikilink_preprocessor_text` +
+            // `wikilink_content`. The first part is the target; each remaining
+            // part becomes its own `mw:maybeContent` KV (with its own token
+            // array), so `renderFile` can distinguish options from the caption
+            // without flattening the caption's transclusion/table structure.
             let parts = split_template_args(content);
             let target = parts.first().map(|s| s.as_str()).unwrap_or("");
-            let text = if parts.len() > 1 {
-                Some(parts[1..].join("|"))
-            } else {
-                None
-            };
 
             self.advance(end + 2);
 
@@ -2275,10 +2273,13 @@ impl<'a> PegTokenizer<'a> {
                 ksrc: None,
                 vsrc: None,
             });
-            if let Some(text) = text {
+            // Emit one `mw:maybeContent` KV per pipe-separated content part
+            // (mirrors PHP's `wikilink_content`, whose `(pipe link_text?)*`
+            // produces a `mw:maybeContent` KV for each `|`-separated segment).
+            for part in parts.iter().skip(1) {
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:maybeContent".to_string()),
-                    value: tokenize_link_content(&text),
+                    value: tokenize_link_content(part),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
@@ -3277,6 +3278,7 @@ fn split_template_args(inner: &str) -> Vec<String> {
     let mut double_brace: i32 = 0;
     let mut triple_brace: i32 = 0;
     let mut bracket: i32 = 0;
+    let mut table: i32 = 0;
     let chars: Vec<char> = inner.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -3318,7 +3320,27 @@ fn split_template_args(inner: &str) -> Vec<String> {
             i += 2;
             continue;
         }
-        if c == '|' && double_brace == 0 && triple_brace == 0 && bracket == 0 {
+        // A `{| … |}` table block is balanced: its internal `|` cell/row markers
+        // must not split the enclosing option/argument list.
+        if c == '{'
+            && i + 1 < chars.len()
+            && chars[i + 1] == '|'
+            && double_brace == 0
+            && triple_brace == 0
+            && bracket == 0
+        {
+            table += 1;
+            current.push_str("{|");
+            i += 2;
+            continue;
+        }
+        if c == '|' && i + 1 < chars.len() && chars[i + 1] == '}' && table > 0 {
+            table -= 1;
+            current.push_str("|}");
+            i += 2;
+            continue;
+        }
+        if c == '|' && double_brace == 0 && triple_brace == 0 && bracket == 0 && table == 0 {
             parts.push(std::mem::take(&mut current));
         } else {
             current.push(c);

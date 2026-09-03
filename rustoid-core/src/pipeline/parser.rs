@@ -514,10 +514,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         )));
         let stage = TreeBuilderStage::new(true);
         let mut frag = extract_fragment_children(&stage.to_ast(tokens, self.config));
-        // Inline fragments have no transclusion encapsulation or p-wrapping, but
-        // `mw:DOMFragment` placeholders (nested `format="wikitext"` content) must
-        // still be unpacked (mirrors the nested sub-pipeline's `dom-unpack`).
-        crate::pipeline::unpack_dom_fragments::run(&mut frag);
+        // Encapsulate transclusion markers (`meta mw:Transclusion`) into
+        // `<span typeof="mw:Transclusion">` wrappers, mirroring the main
+        // pipeline's `post_pwrap_transforms` (minus p-wrapping, which the inline
+        // context already suppressed). This is what renders `{{Test}}` in a
+        // caption as a transclusion span rather than bare `mw:Transclusion` metas.
+        let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
         frag
     }
 

@@ -512,6 +512,23 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
         .collect()
 }
 
+/// Re-tokenize caption *items* as full wikitext. Unlike `tokenize_caption`, this
+/// walks a mixed token array (text chunks + transclusion markers produced by
+/// `expandAttributes`) and re-tokenizes only the text chunks, passing through
+/// the `mw:Transclusion` meta markers untouched (so templates in captions render
+/// as `mw:Transclusion` spans rather than flattening to text).
+fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Item::Str(s) = item {
+            out.extend(tokenize_caption(s, config));
+        } else {
+            out.push(item.clone());
+        }
+    }
+    out
+}
+
 /// Split a media option string on *top-level* pipes, respecting nested
 /// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling,
@@ -669,85 +686,95 @@ pub fn render_file(
 
     let title = target.title.as_ref().expect("file title");
 
-    // Extract option strings from mw:maybeContent (pipe-separated, but only on
-    // *top-level* pipes — not inside nested `[[…]]`/`{{…}}`). The last
-    // unrecognized part is the caption (mirrors PHP `renderFile`'s
-    // `recordCaption`, where the final non-option is captured as the caption).
+    // Extract options from the pipe-separated `mw:maybeContent` KVs (the
+    // tokenizer emits one KV per top-level `|`-separated segment). Each part is
+    // stringified for option recognition, but the caption part keeps its raw
+    // token array so transclusions/tables round-trip (mirrors PHP `renderFile`'s
+    // `buildLinkAttrs` content-KV loop).
     let mut opts = MediaOpts::default();
-    let mut caption: Option<String> = None;
-    // `mw:maybeContent` may be a plain string or a token array (when the content
-    // contains templates/entities). For token arrays, strip the transclusion/param
-    // meta markers and concatenate the remaining text to recover the *expanded*
-    // option wikitext (`137px`, `thumb`, …). A template contribution marks the
-    // container `mw:ExpandedAttrs` (mirrors PHP `renderFile`'s `hasTransclusion` /
-    // `tokensToString` treatment of the expanded `mw:maybeContent`).
-    if let Some(kv) = token.get_attribute_kv("mw:maybeContent") {
-        let content = match &kv.value {
+    let mut caption: Option<Vec<Item>> = None;
+    for kv in token.get_attribs() {
+        if kv.key.as_str() != Some("mw:maybeContent") {
+            continue;
+        }
+        // Stringify this part for option recognition, stripping transclusion/
+        // param meta markers (`strip_meta_tags` with `wrap_templates`), keeping
+        // the raw tokens for a caption. A template contribution marks the
+        // container `mw:ExpandedAttrs` (mirrors PHP `renderFile`'s
+        // `hasTransclusion`/`tokensToString` treatment).
+        let raw_items = crate::pipeline::attribute_transform_manager::key_value_to_items(&kv.value);
+        // Whether this part's raw source is a token array (i.e. it contained a
+        // template/entity, not a plain string). Used to detect `mw:ExpandedAttrs`
+        // on *options* (not captions), mirroring PHP's `is_array($origOptSrc)`.
+        let is_token_array = matches!(kv.value, crate::wikitext::tokens_v2::KeyValue::Tokens(_));
+        let part = match &kv.value {
             crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
             crate::wikitext::tokens_v2::KeyValue::Tokens(items) => {
                 let stripped = crate::pipeline::attribute_expander::strip_meta_tags(items, true);
-                if stripped.has_generated_content {
-                    opts.expanded_attrs = true;
-                }
                 crate::wikitext::token_utils::tokens_to_string(&stripped.value)
             }
         };
-        for part in split_media_options(&content) {
-            if let Some(info) = get_option_info(ctx.config, &part) {
-                match info.ck.as_str() {
-                    // All options except `width` are "first wins" (later
-                    // occurrences become bogus), mirroring PHP `renderFile`'s
-                    // `isset($opts[$ck])` guard. `format`/`manualthumb` are
-                    // jointly "first wins" (once one is set, the other is bogus).
-                    "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
-                        opts.format = Some(info.v)
-                    }
-                    "manualthumb" if opts.manualthumb.is_none() && opts.format.is_none() => {
-                        opts.manualthumb = Some(info.v)
-                    }
-                    "halign" if opts.halign.is_none() => opts.halign = Some(info.v),
-                    "valign" if opts.valign.is_none() => opts.valign = Some(info.v),
-                    "border" if opts.border.is_none() => opts.border = Some(info.v),
-                    "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
-                    "link" if opts.link.is_none() => {
-                        // `link` is only "expanded" when it is a transclusion
-                        // (mirrors `renderFile`'s `hasTransclusion` guard); plain
-                        // quotes/entities just stringify into the title.
-                        opts.link = Some(strip_quote_markers(&info.v));
-                    }
-                    "alt" => {
-                        // A non-`link` option value with any markup is "expanded".
-                        opts.expanded_attrs |= has_wikitext_markup(&info.v);
-                        if opts.alt.is_none() {
-                            opts.alt = Some(strip_quote_markers(&info.v));
-                        }
-                    }
-                    "class" if opts.class.is_none() => opts.class = Some(info.v),
-                    "page" if opts.page.is_none() => opts.page = Some(info.v),
-                    // An invalid internal language code makes the option `bogus`
-                    // (dropped), mirroring `renderFile`'s `Language::isValidInternalCode`
-                    // guard.
-                    "lang"
-                        if opts.lang.is_none()
-                            && crate::pipeline::media_options::is_valid_internal_lang(&info.v) =>
-                    {
-                        opts.lang = Some(info.v)
-                    }
-                    "width" => {
-                        // `width` is "last wins" (mirrors PHP's special case).
-                        if let Some((w, h)) = info.v.split_once('x') {
-                            opts.width = Some(w.to_string());
-                            opts.height = Some(h.to_string());
-                        } else {
-                            opts.width = Some(info.v);
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                // Unrecognized ⇒ caption (last one wins).
-                caption = Some(part);
+        let Some(info) = get_option_info(ctx.config, &part) else {
+            // Unrecognized ⇒ caption (last one wins). Keep the raw tokens.
+            caption = Some(raw_items);
+            continue;
+        };
+        // A templated option value (a token array, not a plain string) marks the
+        // container `mw:ExpandedAttrs` so the attribute round-trips via
+        // `data-mw.attribs` (mirrors `renderFile`'s `$expOpt = is_array($origOptSrc)`,
+        // which applies to all *options* — but not the caption).
+        if is_token_array {
+            opts.expanded_attrs = true;
+        }
+        match info.ck.as_str() {
+            // All options except `width` are "first wins" (later
+            // occurrences become bogus), mirroring PHP `renderFile`'s
+            // `isset($opts[$ck])` guard. `format`/`manualthumb` are
+            // jointly "first wins" (once one is set, the other is bogus).
+            "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
+                opts.format = Some(info.v)
             }
+            "manualthumb" if opts.manualthumb.is_none() && opts.format.is_none() => {
+                opts.manualthumb = Some(info.v)
+            }
+            "halign" if opts.halign.is_none() => opts.halign = Some(info.v),
+            "valign" if opts.valign.is_none() => opts.valign = Some(info.v),
+            "border" if opts.border.is_none() => opts.border = Some(info.v),
+            "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
+            "link" if opts.link.is_none() => {
+                // `link` is only "expanded" when it is a transclusion
+                // (mirrors `renderFile`'s `hasTransclusion` guard); plain
+                // quotes/entities just stringify into the title.
+                opts.link = Some(strip_quote_markers(&info.v));
+            }
+            "alt" => {
+                // A non-`link` option value with any markup is "expanded".
+                opts.expanded_attrs |= has_wikitext_markup(&info.v);
+                if opts.alt.is_none() {
+                    opts.alt = Some(strip_quote_markers(&info.v));
+                }
+            }
+            "class" if opts.class.is_none() => opts.class = Some(info.v),
+            "page" if opts.page.is_none() => opts.page = Some(info.v),
+            // An invalid internal language code makes the option `bogus`
+            // (dropped), mirroring `renderFile`'s `Language::isValidInternalCode`
+            // guard.
+            "lang"
+                if opts.lang.is_none()
+                    && crate::pipeline::media_options::is_valid_internal_lang(&info.v) =>
+            {
+                opts.lang = Some(info.v)
+            }
+            "width" => {
+                // `width` is "last wins" (mirrors PHP's special case).
+                if let Some((w, h)) = info.v.split_once('x') {
+                    opts.width = Some(w.to_string());
+                    opts.height = Some(h.to_string());
+                } else {
+                    opts.width = Some(info.v);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -845,9 +872,12 @@ pub fn render_file(
         // Inline-media captions are stored in `data-mw.caption` (mirrors PHP's
         // `$dataMw->caption`, a serialized DOM fragment of the re-parsed caption).
         if is_inline && let Some(cap) = &caption {
+            // Stringify the caption tokens (inline media has no rendered block
+            // structure). The raw tokens preserve transclusion markers for
+            // round-tripping when present.
             obj.insert(
                 "caption".to_string(),
-                serde_json::Value::String(cap.clone()),
+                serde_json::Value::String(crate::wikitext::token_utils::tokens_to_string(cap)),
             );
         }
         container.add_attribute_str("data-mw", serde_json::Value::Object(obj).to_string());
@@ -908,12 +938,13 @@ pub fn render_file(
         ))));
         if let Some(cap) = &caption {
             // The caption is re-tokenized as full wikitext (quotes/entities/
-            // links/tables/…) and tunneled through an inline sub-pipeline via an
+            // links/tables/…) while preserving transclusion markers, then
+            // tunneled through an inline sub-pipeline via an
             // `mw:dom-fragment-token` placeholder, mirroring PHP's
             // `getDOMFragmentToken($optsCaption['v'], …, ['inlineContext' => true])`.
             // The inline context disables the ParagraphWrapper so newlines stay
             // literal rather than breaking the caption into `<p>` runs.
-            let items = tokenize_caption(cap, ctx.config);
+            let items = tokenize_caption_items(cap, ctx.config);
             let frag = build_fragment(items);
             out.push(dom_fragment_token(frag, token, fragments, next_id));
         }
