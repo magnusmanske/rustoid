@@ -802,7 +802,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, true)
+                .expand_templates(frame, tokens, source, about_counter, false)
                 .await;
             tokens = self
                 .expand_attributes(frame, tokens, source, about_counter, None)

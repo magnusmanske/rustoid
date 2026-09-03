@@ -261,17 +261,18 @@ where
         return None;
     }
 
-    // Caption: split the remainder on `|`, skipping recognized media options
-    // (`300px`, `centre`, `link=…`, …). The last *unrecognized* non-empty segment
-    // is the caption (mirrors `renderMedia`'s option parsing, where recognized
-    // options are consumed and only the final non-option becomes the caption).
+    // Caption: split the remainder on `|` (template/table/wikilink aware),
+    // skipping recognized media options (`300px`, `centre`, `link=…`, …). The
+    // last *unrecognized* non-empty segment is the caption (mirrors `renderMedia`'s
+    // option parsing, where recognized options are consumed and only the final
+    // non-option becomes the caption).
     let caption = rest.and_then(|r| {
-        r.split('|')
+        crate::pipeline::wiki_link_render::split_media_options(r)
+            .into_iter()
             .rev()
-            .map(str::trim)
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .find(|seg| crate::pipeline::media_options::get_option_info(config, seg).is_none())
-            .map(str::to_string)
     });
 
     // Also parse the non-caption options (`link=`, `alt=`, `manualthumb=`) into

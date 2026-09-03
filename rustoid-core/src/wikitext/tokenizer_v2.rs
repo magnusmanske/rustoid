@@ -3260,7 +3260,15 @@ fn extension_data_mw(attrs: &[KV]) -> DataMw {
         .iter()
         .map(|kv| DataMwAttrib {
             key: DataMwValue::Str(kv.key.to_string()),
-            value: DataMwValue::Str(kv.value.to_string()),
+            // Preserve the *raw* source of a templated value (e.g.
+            // `caption="{{1x|hi}}"`) rather than stringifying its token array
+            // (which would produce `<template/>`). The extension handler
+            // re-tokenizes the raw value. Mirrors PHP, where the extension's
+            // `options`/`attribs` carry the raw source.
+            value: DataMwValue::Str(match &kv.value {
+                KeyValue::Tokens(_) => kv.vsrc.clone().unwrap_or_else(|| kv.value.to_string()),
+                _ => kv.value.to_string(),
+            }),
         })
         .collect();
     DataMw {
