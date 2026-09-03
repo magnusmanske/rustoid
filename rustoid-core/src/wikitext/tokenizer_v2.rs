@@ -3323,6 +3323,7 @@ fn split_template_args(inner: &str) -> Vec<String> {
     let mut double_brace: i32 = 0;
     let mut triple_brace: i32 = 0;
     let mut bracket: i32 = 0;
+    let mut extlink: i32 = 0;
     let mut table: i32 = 0;
     let chars: Vec<char> = inner.chars().collect();
     let mut i = 0;
@@ -3392,6 +3393,21 @@ fn split_template_args(inner: &str) -> Vec<String> {
             i += 2;
             continue;
         }
+        // A single-bracket `[...]` external link is a balanced atom: pipes in the
+        // URL must not split the option/argument list (mirrors the PEG `url`/
+        // `bracket` productions, which keep `|` inside an extlink intact).
+        if c == '[' && bracket == 0 && double_brace == 0 && triple_brace == 0 {
+            extlink += 1;
+            current.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ']' && extlink > 0 {
+            extlink -= 1;
+            current.push(c);
+            i += 1;
+            continue;
+        }
         // A `{| … |}` table block is balanced: its internal `|` cell/row markers
         // must not split the enclosing option/argument list.
         if c == '{'
@@ -3412,7 +3428,13 @@ fn split_template_args(inner: &str) -> Vec<String> {
             i += 2;
             continue;
         }
-        if c == '|' && double_brace == 0 && triple_brace == 0 && bracket == 0 && table == 0 {
+        if c == '|'
+            && double_brace == 0
+            && triple_brace == 0
+            && bracket == 0
+            && table == 0
+            && extlink == 0
+        {
             parts.push(std::mem::take(&mut current));
         } else {
             current.push(c);
