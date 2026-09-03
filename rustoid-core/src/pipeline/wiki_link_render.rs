@@ -585,10 +585,6 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling,
 /// including the `{| … |}` table block, whose internal pipes are cell/row
 /// markers (not option separators) and must stay glued to the caption.
-// FEATURE: temporarily unused after the gallery refactor routed media lines
-// through `renderFile`; still a faithful port of `WikiLinkHandler::splitMediaOptions`
-// and needed by the html2wt serializer (`serializeFileLinks`).
-#[allow(dead_code)]
 pub(crate) fn split_media_options(content: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -769,32 +765,34 @@ pub fn render_file(
                 crate::wikitext::token_utils::tokens_to_string(&stripped.value)
             }
         };
-        // A template that expanded to a `|`-separated string yields multiple
-        // option parts (no editing support). Split and process each; the
-        // container is marked `mw:Placeholder` (mirrors PHP `renderFile`'s
-        // `explode('|', $oText)` + `$dataParsoid->uneditable = true`). A plain
-        // string part may contain `|` from table syntax in a caption, so it is
-        // NOT re-split here.
-        if is_token_array && part.contains('|') {
+        // A template that expanded to a top-level `|`-separated string yields
+        // multiple option parts (no editing support). Split and process each;
+        // the container is marked `mw:Placeholder` (mirrors PHP `renderFile`'s
+        // `explode('|', $oText)` + `$dataParsoid->uneditable = true`). Pipes in
+        // table syntax (`{| … |}`) or nested `{{…}}`/`[[…]]` within a caption are
+        // NOT top-level option separators, so they must not trigger the split
+        // (mirrors PHP, where an array `$oText` skips `explode`).
+        let pipe_parts = split_media_options(&part);
+        if is_token_array && pipe_parts.len() > 1 {
             opts.placeholder = true;
-            for sub in part.split('|') {
+            for sub in pipe_parts {
                 // The pipe-split pieces are plain strings (a template expanded to
                 // a `|`-separated option string), so each is a *non*-array option
                 // source: no `mw:ExpandedAttrs` for them (mirrors PHP, where the
                 // `explode('|', $oText)` path `continue`s before `$expOpt`).
-                if !record_media_option(ctx, &mut opts, &mut opt_list, sub, sub, false) {
+                if !record_media_option(ctx, &mut opts, &mut opt_list, &sub, &sub, false) {
                     // Unrecognized sub-part ⇒ caption (last one wins). A previous
                     // caption becomes a `bogus` optList entry at its position
                     // (mirrors PHP's `array_splice` bogus-marker for displaced captions).
                     if caption.is_some() {
                         let pos = caption_pos.min(opt_list.len());
-                        opt_list.insert(pos, bogus_opt(sub));
+                        opt_list.insert(pos, bogus_opt(&sub));
                         caption_pos = pos + 1;
                     } else {
                         caption_pos = opt_list.len();
                     }
-                    caption_ak = Some(sub.to_string());
-                    caption = Some(vec![Item::Str(sub.to_string())]);
+                    caption_ak = Some(sub.clone());
+                    caption = Some(vec![Item::Str(sub.clone())]);
                 }
             }
             continue;
