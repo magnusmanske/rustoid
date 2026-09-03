@@ -1095,6 +1095,11 @@ impl<'a> PegTokenizer<'a> {
         let ts_end = self.pos;
 
         self.consume_spaces();
+        // A bare trailing `|` on the start-tag line (e.g. `{| class="123" |`) is
+        // a valueless first cell; the tree builder drops empty cells, so absorb
+        // it here (mirrors `table_data_tags` matching an empty `<td>` that is
+        // later discarded).
+        self.consume_empty_cell_pipe();
 
         let mut dp = self.make_dp(start, ts_end);
         dp.start_tag_src = Some("{|".to_string());
@@ -1103,6 +1108,21 @@ impl<'a> PegTokenizer<'a> {
 
         self.at_sol = false;
         true
+    }
+
+    /// Consume a trailing bare `|` that acts as a valueless (and therefore
+    /// dropped) table cell on a start/row tag line: `|` immediately followed by
+    /// (spaces then) a newline or EOF. Mirrors `table_data_tags` matching an
+    /// empty `<td>` that the tree builder discards.
+    fn consume_empty_cell_pipe(&mut self) {
+        if !self.starts_with("|") || self.starts_with("||") {
+            return;
+        }
+        let after = &self.input[self.pos + 1..];
+        let rest = after.trim_start_matches([' ', '\t']);
+        if rest.starts_with('\n') || rest.starts_with("\r\n") || rest.is_empty() {
+            self.advance(1);
+        }
     }
 
     /// Try `|}` table end tag.
@@ -1196,6 +1216,9 @@ impl<'a> PegTokenizer<'a> {
         let tag_end = self.pos;
 
         self.consume_spaces();
+        // A bare trailing `|` on the row-tag line is a valueless first cell,
+        // dropped by the tree builder (see `try_table_start_tag`).
+        self.consume_empty_cell_pipe();
 
         let mut dp = self.make_dp(start, tag_end);
         dp.start_tag_src = Some("|-".to_string());
@@ -1395,30 +1418,27 @@ impl<'a> PegTokenizer<'a> {
         self.consume_spaces();
 
         let rem = self.remaining();
-        let mut end = rem.len();
-
-        // Quoted?
-        if let Some(stripped) = rem.strip_prefix('"') {
-            if let Some(quote_end) = stripped.find('"') {
-                end = quote_end + 2;
+        // Quoted value: the closing delimiter ends it; the quotes themselves are
+        // stripped (mirrors PHP's `TokenizerUtils::getAttrVal`, which trims the
+        // surrounding quote characters from the value source).
+        for quote in ['"', '\''] {
+            let Some(stripped) = rem.strip_prefix(quote) else {
+                continue;
+            };
+            if let Some(quote_end) = stripped.find(quote) {
+                let val = &rem[1..1 + quote_end];
+                self.advance(1 + quote_end + 1);
+                return Some(val.to_string());
             }
-        } else if let Some(stripped) = rem.strip_prefix('\'') {
-            if let Some(quote_end) = stripped.find('\'') {
-                end = quote_end + 2;
-            }
-        } else {
-            // Unquoted: stop at space, pipe, newline.
-            end = rem
-                .find(|c: char| {
-                    c == ' ' || c == '\t' || c == '|' || c == '\n' || c == '\r' || c == '!'
-                })
-                .unwrap_or(rem.len());
         }
 
+        // Unquoted: stop at space, pipe, newline.
+        let end = rem
+            .find([' ', '\t', '|', '\n', '\r', '!'])
+            .unwrap_or(rem.len());
         if end == 0 {
             return None;
         }
-
         let val = rem[..end].to_string();
         self.advance(end);
         Some(val)
