@@ -415,6 +415,25 @@ fn caption_text_from_source(source: &str) -> String {
                 continue;
             }
         }
+        if c == '<' {
+            // An HTML tag in a caption: recognized inline tags are stripped to
+            // their text content (`a<i>b</i>c` → `abc`), but meta-data tags
+            // (`<script>`, `<style>`, …) stay as literal (escaped) text. Mirrors
+            // the `textContent` of a re-tokenized caption fragment, where those
+            // tags become elements vs. escaped text respectively.
+            if let Some((name, end)) = parse_html_tag_boundary(&chars, i) {
+                if crate::wikitext::consts::meta_data_tags().contains(&name) {
+                    // Meta-data tag: keep the `<` literal and continue (the rest
+                    // of the tag text is appended normally).
+                    out.push('<');
+                    i += 1;
+                    continue;
+                }
+                // Recognized inline tag: skip the whole tag (element boundary).
+                i = end;
+                continue;
+            }
+        }
         out.push(c);
         i += 1;
     }
@@ -422,6 +441,34 @@ fn caption_text_from_source(source: &str) -> String {
     // them so `&#9792;` → `♀` (mirrors PHP's `textContentFromCaption`, which runs
     // on the already-re-tokenized caption DOM).
     crate::html::wts_utils::decode_wt_entities_all(&out)
+}
+
+/// If `chars[start] == '<'` and starts an HTML tag, return `(name, end)` where
+/// `end` is the index just past the tag. Recognizes only HTML5/older-HTML tag
+/// names; returns `None` for unknown `<...>` or malformed tags (which are
+/// treated as literal text).
+fn parse_html_tag_boundary(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let closing = start + 1 < chars.len() && chars[start + 1] == '/';
+    let mut i = start + 1 + usize::from(closing);
+    // Tag name (letters/digits).
+    let name_start = i;
+    while i < chars.len() && (chars[i].is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
+    let name: String = chars[name_start..i].iter().collect();
+    // Only recognized tags qualify as elements; anything else is literal.
+    if !crate::wikitext::consts::html5_tags().contains(&name)
+        && !crate::wikitext::consts::older_html_tags().contains(&name)
+    {
+        return None;
+    }
+    // Find the closing `>`.
+    let gt = chars[i..].iter().position(|&c| c == '>')?;
+    let end = i + gt + 1;
+    Some((name, end))
 }
 
 /// The index of the `]]` closing the `[[…` at `start` (balancing nested links).
