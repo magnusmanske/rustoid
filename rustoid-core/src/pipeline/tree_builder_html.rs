@@ -1406,13 +1406,45 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
         // element `t` (located via `subtree_contains_end_meta`), which may
         // differ from the encapsulation target `et` when an intervening
         // element precedes `t` (e.g. `<meta/> <p>..</p> <i><div>..</div><meta/End></i>`).
-        transfer_transclusion_to_element(&mut children[et], &start_meta, source, range_end);
+        //
+        // Table fostering (PHP `getDOMRange`'s `getStartConsideringFosteredContent` +
+        // `MAP_TBODY_TR` migration): when the encapsulation target is a `<table>`, the
+        // transclusion content was fostered out of the table, so the encap data goes on
+        // the table *body* (`<tbody>`/`<thead>`/`<tfoot>`/`<tr>`), not the `<table>`.
+        //
+        // Drop the end marker (a `<table>` child, sibling of the `<tbody>`) *before*
+        // transferring onto the nested body, so the two `&mut` borrows don't alias.
         remove_end_meta(&mut children[t], about.as_deref());
+        {
+            let encap_node = table_body_content_target(&mut children[et]);
+            transfer_transclusion_to_element(encap_node, &start_meta, source, range_end);
+        }
         // Remove the start marker meta.
         children.remove(i);
         // Do not advance `i`: the next sibling shifted into this index.
     }
     children
+}
+
+/// Resolve the actual encapsulation target for a fostered table range.
+///
+/// When the range start is a `<table>` whose content was fostered (PHP
+/// `getStartConsideringFosteredContent` + `MAP_TBODY_TR`), the transclusion
+/// encapsulation goes on the table *body* (`<tbody>`/`<thead>`/`<tfoot>`/`<tr>`)
+/// rather than the `<table>` element itself. The body is the table's first
+/// element child whose tag is a table-body/row tag.
+fn table_body_content_target(table: &mut Node) -> &mut Node {
+    if !matches!(table.kind, NodeKind::Element(ElementKind::Table)) {
+        return table;
+    }
+    let Some(body_idx) = table.children.iter().position(|c| {
+        matches!(&c.kind, NodeKind::Element(ElementKind::Other(name))
+            if matches!(name.as_str(), "tbody" | "thead" | "tfoot"))
+            || matches!(c.kind, NodeKind::Element(ElementKind::TableRow))
+    }) else {
+        return table;
+    };
+    &mut table.children[body_idx]
 }
 
 /// Does this subtree contain a transclusion *end* marker with the given `about`?
