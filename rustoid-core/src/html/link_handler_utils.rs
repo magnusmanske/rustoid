@@ -800,6 +800,14 @@ fn attribute_shadow(tree: &DomTree, node: NodeId, key: &str) -> Shadow {
     }
 }
 
+/// Read a string property from the node's `data-mw` JSON object (e.g.
+/// `thumb`, `page`, `starttime`). Returns `None` when absent or non-string.
+fn data_mw_prop(tree: &DomTree, node: NodeId, key: &str) -> Option<String> {
+    let json = tree.node(node).data_mw.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
 /// The wikitext aliases for a canonical magic-word key (e.g. `img_link`),
 /// preferring the suggested alias when present. Faithful to
 /// `$mwAliases[$alias]` in `figureToConstrainedText`.
@@ -1016,9 +1024,39 @@ pub fn figure_to_constrained_text(
         });
     }
 
-    // Format option (from `typeof` suffix).
-    let has_manualthumb = false; // no data-mw in basic HTML
-    match format.as_str() {
+    // Reconstruct options that only live in `data-mw` (manualthumb, page,
+    // timedmedia start/end/thumb time). Faithful to the `$mwParams` loop in
+    // `figureToConstrainedText` (basic `data-mw` property access; template
+    // attributed (`value.html`) forms are deferred).
+    let mut has_manualthumb = false;
+    let mut effective_format = format.clone();
+    {
+        let mut push_mw = |prop: &str, ck: &str, alias: &str| {
+            let Some(v) = data_mw_prop(tree, outer_elt, prop) else {
+                return;
+            };
+            let ak = aliases_first(env, alias);
+            nopts.push(Nopt {
+                ck: ck.to_string(),
+                ak,
+                v: Some(v),
+            });
+            if prop == "thumb" {
+                has_manualthumb = true;
+                effective_format.clear();
+            }
+        };
+        // `thumb` (manualthumb) first, so it lands before the format option.
+        push_mw("thumb", "manualthumb", "img_manualthumb");
+        push_mw("page", "page", "img_page");
+        push_mw("starttime", "starttime", "timedmedia_starttime");
+        push_mw("endtime", "endtime", "timedmedia_endtime");
+        push_mw("thumbtime", "thumbtime", "timedmedia_thumbtime");
+    }
+
+    // Format option (from `typeof` suffix); suppressed when a manual thumb is
+    // present (the `thumbnail=…` option already encodes the format).
+    match effective_format.as_str() {
         "Thumb" => {
             let ak = aliases_first(env, "img_thumbnail");
             nopts.push(Nopt {
@@ -1064,7 +1102,7 @@ pub fn figure_to_constrained_text(
     let is_audio = crate::html::dom_utils::node_name(tree.node(media_elt)) == "audio";
     let has_default_audio_height = classes.iter().any(|c| c == "mw-default-audio-height");
 
-    if !has_default_size && format != "Frame" && !has_manualthumb {
+    if !has_default_size && effective_format != "Frame" && !has_manualthumb {
         let size_string = String::new(); // no data-mw optList to recover from
         if size_unmodified && !size_string.is_empty() {
             // preserve original width/height string (n/a in basic HTML)
