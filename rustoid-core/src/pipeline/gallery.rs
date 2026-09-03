@@ -46,6 +46,21 @@ fn padding_for_mode(mode: &str) -> Padding {
     }
 }
 
+/// The packed/overlay/hover scale factor (mirrors `PackedMode::__construct`).
+const PACKED_SCALE: f64 = 1.5;
+
+/// The requested (pre-scaling) thumbnail dimensions for packed/overlay/hover
+/// modes, mirroring `PackedMode::dimensions`: a large width so the height is
+/// not the constraining factor, both scaled by `PACKED_SCALE`. Returns
+/// `(width, height)`; the caller stores these as `data-width`/`data-height` on
+/// the broken-media span (so `AddMediaInfo` requests the large thumbnail).
+fn packed_dimensions(image_height: u32) -> (u32, u32) {
+    let height = ((image_height as f64) * PACKED_SCALE).floor() as u32;
+    // The legacy parser does this so the width is not the constraining factor.
+    let width = (((image_height * 10 + 100) as f64) * PACKED_SCALE).floor() as u32;
+    (width, height)
+}
+
 /// Parsed `<gallery>` options.
 #[derive(Debug)]
 struct GalleryOpts {
@@ -390,8 +405,20 @@ fn broken_media_span(
     let mut span = Node::element(ElementKind::Span);
     span.set_attr("class", "mw-file-element mw-broken-media");
     span.set_attr("resource", crate::title::make_link(title, config));
-    span.set_attr("data-width", opts.image_width.to_string());
-    span.set_attr("data-height", opts.image_height.to_string());
+    // For packed/overlay/hover modes, request the large `dimensions()` thumbnail
+    // (scaled down later by `AddMediaInfo`'s `scaleMedia`). Other modes request
+    // the plain gallery width/height.
+    if matches!(
+        opts.mode.as_str(),
+        "packed" | "packed-overlay" | "packed-hover"
+    ) {
+        let (pw, ph) = packed_dimensions(opts.image_height);
+        span.set_attr("data-width", pw.to_string());
+        span.set_attr("data-height", ph.to_string());
+    } else {
+        span.set_attr("data-width", opts.image_width.to_string());
+        span.set_attr("data-height", opts.image_height.to_string());
+    }
     // `lang=` is a global attribute applied to the broken span (mirrors
     // `renderFile`), read back by `AddMediaInfo::lang_from_container` to build
     // the `?lang=` description-link query.
