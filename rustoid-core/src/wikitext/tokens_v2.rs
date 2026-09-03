@@ -401,6 +401,27 @@ impl DataParsoid {
         {
             obj.insert("pi".to_string(), pi_json);
         }
+        if let Some(opt_list) = &self.opt_list
+            && !opt_list.is_empty()
+        {
+            let arr: Vec<serde_json::Value> = opt_list
+                .iter()
+                .map(|e| {
+                    let mut o = serde_json::Map::new();
+                    if let Some(ck) = &e.ck {
+                        o.insert("ck".to_string(), serde_json::Value::String(ck.clone()));
+                    }
+                    if let Some(ak) = &e.ak {
+                        o.insert("ak".to_string(), serde_json::Value::String(ak.clone()));
+                    }
+                    if let Some(v) = &e.v {
+                        o.insert("v".to_string(), serde_json::Value::String(v.clone()));
+                    }
+                    serde_json::Value::Object(o)
+                })
+                .collect();
+            obj.insert("optList".to_string(), serde_json::Value::Array(arr));
+        }
 
         if obj.is_empty() {
             None

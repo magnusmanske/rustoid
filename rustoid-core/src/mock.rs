@@ -499,6 +499,10 @@ impl MockSiteConfig {
                 // Esperanto width suffix: `100ra` → `img_width` value `100`
                 // (localized `ra` first, English `px` last).
                 self.add_magic_word("img_width", &["$1ra", "$1px"]);
+                // Esperanto align and format aliases (localized-first).
+                self.add_magic_word("img_left", &["maldekstra", "left"]);
+                self.add_magic_word("img_right", &["dekstra", "right"]);
+                self.add_magic_word("img_center", &["centre", "center"]);
             }
             _ => {}
         }

@@ -706,7 +706,10 @@ pub fn render_file(
     // token array so transclusions/tables round-trip (mirrors PHP `renderFile`'s
     // `buildLinkAttrs` content-KV loop).
     let mut opts = MediaOpts::default();
+    let mut opt_list: Vec<crate::wikitext::tokens_v2::OptListEntry> = Vec::new();
     let mut caption: Option<Vec<Item>> = None;
+    let mut caption_ak: Option<String> = None;
+    let mut caption_pos: usize = 0;
     for kv in token.get_attribs() {
         if kv.key.as_str() != Some("mw:maybeContent") {
             continue;
@@ -719,6 +722,8 @@ pub fn render_file(
         // template/entity, not a plain string). Used to detect `mw:ExpandedAttrs`
         // on *options* (not captions), mirroring PHP's `is_array($origOptSrc)`.
         let is_token_array = matches!(kv.value, crate::wikitext::tokens_v2::KeyValue::Tokens(_));
+        // The raw source wikitext for round-tripping (`$oContent->vsrc` in PHP).
+        let vsrc = kv.vsrc.clone();
         let part = match &kv.value {
             crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
             crate::wikitext::tokens_v2::KeyValue::Tokens(items) => {
@@ -729,25 +734,47 @@ pub fn render_file(
         // A template that expanded to a `|`-separated string yields multiple
         // option parts (no editing support). Split and process each; the
         // container is marked `mw:Placeholder` (mirrors PHP `renderFile`'s
-        // `explode('|', $oText)` + `$dataParsoid->uneditable = true`).
-        // A *templated* part that expanded to a `|`-separated string yields
-        // multiple option parts (no editing support). Split and process each;
-        // the container is marked `mw:Placeholder` (mirrors PHP `renderFile`'s
         // `explode('|', $oText)` + `$dataParsoid->uneditable = true`). A plain
         // string part may contain `|` from table syntax in a caption, so it is
         // NOT re-split here.
         if is_token_array && part.contains('|') {
             opts.placeholder = true;
             for sub in part.split('|') {
-                if !apply_media_option(ctx, &mut opts, sub, is_token_array) {
-                    // Unrecognized sub-part ⇒ caption (last one wins).
+                if !record_media_option(ctx, &mut opts, &mut opt_list, sub, sub, is_token_array) {
+                    // Unrecognized sub-part ⇒ caption (last one wins). A previous
+                    // caption becomes a `bogus` optList entry at its position
+                    // (mirrors PHP's `array_splice` bogus-marker for displaced captions).
+                    if caption.is_some() {
+                        let pos = caption_pos.min(opt_list.len());
+                        opt_list.insert(pos, bogus_opt(sub));
+                        caption_pos = pos + 1;
+                    } else {
+                        caption_pos = opt_list.len();
+                    }
+                    caption_ak = Some(sub.to_string());
                     caption = Some(vec![Item::Str(sub.to_string())]);
                 }
             }
             continue;
         }
-        if !apply_media_option(ctx, &mut opts, &part, is_token_array) {
+        if !record_media_option(
+            ctx,
+            &mut opts,
+            &mut opt_list,
+            &part,
+            vsrc.as_deref().unwrap_or(&part),
+            is_token_array,
+        ) {
             // Unrecognized ⇒ caption (last one wins). Keep the raw tokens.
+            if caption.is_some() {
+                let pos = caption_pos.min(opt_list.len());
+                let src = vsrc.clone().unwrap_or_else(|| part.clone());
+                opt_list.insert(pos, bogus_opt(&src));
+                caption_pos = pos + 1;
+            } else {
+                caption_pos = opt_list.len();
+            }
+            caption_ak = Some(vsrc.unwrap_or_else(|| part.clone()));
             caption = Some(raw_items);
         }
     }
@@ -839,6 +866,28 @@ pub fn render_file(
     .collect();
 
     let mut container = TagTk::new(container_name, container_attribs, DataParsoid::default());
+
+    // Build the container's `data-parsoid` (mirrors PHP `renderFile` attaching
+    // `$dataParsoid` — the optList — to the container token). Insert the caption
+    // entry at its recorded position (preceding captions become `bogus`).
+    {
+        let mut dp = DataParsoid::default();
+        if caption.is_some() {
+            if caption_pos > opt_list.len() {
+                caption_pos = opt_list.len();
+            }
+            opt_list.insert(
+                caption_pos,
+                crate::wikitext::tokens_v2::OptListEntry {
+                    ck: Some("caption".to_string()),
+                    ak: caption_ak.clone(),
+                    v: None,
+                },
+            );
+        }
+        dp.opt_list = Some(opt_list);
+        container.data_parsoid = dp;
+    }
     if !data_mw_attribs.is_empty() || (is_inline && caption.is_some()) {
         let mut obj = serde_json::Map::new();
         if !data_mw_attribs.is_empty() {
@@ -870,7 +919,13 @@ pub fn render_file(
     anchor.add_attribute_str("title", title.get_prefixed_text());
 
     // Inner span (broken media placeholder) with resource/lang/data-* attrs.
-    let mut span = TagTk::new("span", vec![], DataParsoid::default());
+    // The `resource` attribute carries normalized (`a`) and source (`sa`) shadow
+    // info so html2wt can round-trip the title (mirrors PHP's
+    // `$span->addNormalizedAttribute('resource', $opts['title']['v'], $opts['title']['src'])`).
+    let mut span_dp = DataParsoid::default();
+    span_dp.set_a("resource", &make_link(title, ctx.config));
+    span_dp.set_sa("resource", &target.href_src);
+    let mut span = TagTk::new("span", vec![], span_dp);
     span.add_attribute_str("class", "mw-file-element mw-broken-media");
     span.add_attribute_str("resource", make_link(title, ctx.config));
     if let Some(width) = &opts.width {
@@ -944,16 +999,25 @@ pub fn render_file(
     out
 }
 
-/// Resolve a single option string and apply it to `opts`. Returns `true` when
-/// the string is a recognized option (so the caller can treat `false` as a
-/// caption). Mirrors the option-dispatch loop of PHP `renderFile`.
-fn apply_media_option(
+/// Resolve a single option string, apply it to `opts`, and record its
+/// round-trip entry in `opt_list` (the `data-parsoid.optList`). Returns `true`
+/// when the string is a recognized option (so the caller treats `false` as a
+/// caption). Faithful to the option-dispatch loop of PHP `renderFile`.
+///
+/// `vsrc` is the raw source wikitext for the option (`$oContent->vsrc`), used
+/// as the `ak` (aliased key) so whitespace/entities round-trip; `part` is the
+/// stringified option text used for recognition.
+fn record_media_option(
     ctx: &WikiLinkContext,
     opts: &mut super::media_options::MediaOpts,
+    opt_list: &mut Vec<crate::wikitext::tokens_v2::OptListEntry>,
     part: &str,
+    vsrc: &str,
     is_token_array: bool,
 ) -> bool {
-    use super::media_options::get_option_info;
+    use super::media_options::{
+        get_option_info, has_wikitext_markup, is_valid_internal_lang, strip_quote_markers,
+    };
 
     let Some(info) = get_option_info(ctx.config, part) else {
         return false;
@@ -961,41 +1025,34 @@ fn apply_media_option(
     if is_token_array {
         opts.expanded_attrs = true;
     }
-    apply_media_option_info(opts, info);
-    true
-}
 
-/// Apply an already-resolved option `info` to `opts`. Mirrors the per-option
-/// "first wins"/"last wins" dispatch of PHP `renderFile` (minus `width`, which
-/// is "last wins").
-fn apply_media_option_info(
-    opts: &mut super::media_options::MediaOpts,
-    info: super::media_options::OptionInfo,
-) {
-    use super::media_options::{has_wikitext_markup, is_valid_internal_lang, strip_quote_markers};
+    // The optList `ck` is the short canonical name for simple options and the
+    // group key for prefix options; `ak` is the source wikitext (mirrors the
+    // `$opt = ['ck' => …, 'ak' => …]` construction in PHP `renderFile`).
+    let opt_ck = if info.s {
+        info.v.clone()
+    } else {
+        info.ck.clone()
+    };
+    let opt_ak = vsrc.to_string();
 
+    // First-wins / last-wins dispatch (mirrors the PHP `isset($opts[$ck])` guard
+    // plus the `format`/`manualthumb` joint guard and `width`'s last-wins rule).
     match info.ck.as_str() {
-        // All options except `width` are "first wins" (later occurrences become
-        // bogus), mirroring PHP `renderFile`'s `isset($opts[$ck])` guard.
-        // `format`/`manualthumb` are jointly "first wins".
         "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
-            opts.format = Some(info.v)
+            opts.format = Some(info.v);
         }
         "manualthumb" if opts.manualthumb.is_none() && opts.format.is_none() => {
-            opts.manualthumb = Some(info.v)
+            opts.manualthumb = Some(info.v);
         }
         "halign" if opts.halign.is_none() => opts.halign = Some(info.v),
         "valign" if opts.valign.is_none() => opts.valign = Some(info.v),
         "border" if opts.border.is_none() => opts.border = Some(info.v),
         "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
         "link" if opts.link.is_none() => {
-            // `link` is only "expanded" when it is a transclusion (mirrors
-            // `renderFile`'s `hasTransclusion` guard); plain quotes/entities just
-            // stringify into the title.
             opts.link = Some(strip_quote_markers(&info.v));
         }
         "alt" => {
-            // A non-`link` option value with any markup is "expanded".
             opts.expanded_attrs |= has_wikitext_markup(&info.v);
             if opts.alt.is_none() {
                 opts.alt = Some(strip_quote_markers(&info.v));
@@ -1003,13 +1060,18 @@ fn apply_media_option_info(
         }
         "class" if opts.class.is_none() => opts.class = Some(info.v),
         "page" if opts.page.is_none() => opts.page = Some(info.v),
-        // An invalid internal language code makes the option `bogus` (dropped),
-        // mirroring `renderFile`'s `Language::isValidInternalCode` guard.
         "lang" if opts.lang.is_none() && is_valid_internal_lang(&info.v) => {
-            opts.lang = Some(info.v)
+            opts.lang = Some(info.v);
         }
         "width" => {
-            // `width` is "last wins" (mirrors PHP's special case).
+            // `width` is "last wins" (mirrors PHP's special case): a previous
+            // `width` entry becomes bogus.
+            for entry in opt_list.iter_mut() {
+                if entry.ck.as_deref() == Some("width") {
+                    entry.ck = Some("bogus".to_string());
+                    break;
+                }
+            }
             if let Some((w, h)) = info.v.split_once('x') {
                 opts.width = Some(w.to_string());
                 opts.height = Some(h.to_string());
@@ -1017,7 +1079,33 @@ fn apply_media_option_info(
                 opts.width = Some(info.v);
             }
         }
-        _ => {}
+        // A duplicate (or invalid-lang) option becomes a `bogus` optList entry.
+        _ => {
+            opt_list.push(crate::wikitext::tokens_v2::OptListEntry {
+                ck: Some("bogus".to_string()),
+                ak: Some(opt_ak),
+                v: None,
+            });
+            return true;
+        }
+    }
+
+    opt_list.push(crate::wikitext::tokens_v2::OptListEntry {
+        ck: Some(opt_ck),
+        ak: Some(opt_ak),
+        v: None,
+    });
+    true
+}
+
+/// A `bogus` optList entry carrying the given source (`ak`) — used to mark
+/// displaced captions/options for faithful serialization (mirrors PHP's
+/// `['ck' => 'bogus', 'ak' => …]` entries).
+fn bogus_opt(ak: &str) -> crate::wikitext::tokens_v2::OptListEntry {
+    crate::wikitext::tokens_v2::OptListEntry {
+        ck: Some("bogus".to_string()),
+        ak: Some(ak.to_string()),
+        v: None,
     }
 }
 
