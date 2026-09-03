@@ -408,6 +408,22 @@ fn caption_text_from_source(source: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        if c == '<' && is_nowiki_open(&chars, i) {
+            // A `<nowiki>` block: its content is literal (wikilinks/quotes inside
+            // are NOT processed), but the block itself is an element boundary.
+            // Append the raw content and skip past `</nowiki>`.
+            let open_len = 8; // `<nowiki>`
+            if let Some(inner_close) = find_nowiki_close(&chars, i + open_len) {
+                for ch in &chars[i + open_len..inner_close] {
+                    out.push(*ch);
+                }
+                i = inner_close + 9; // `</nowiki>`
+            } else {
+                out.push('<');
+                i += 1;
+            }
+            continue;
+        }
         if c == '[' && i + 1 < chars.len() && chars[i + 1] == '[' {
             // A wikilink: `[[target|display]]` or `[[target]]`.
             if let Some(link_close) = find_matching_brackets(&chars, i) {
@@ -513,6 +529,24 @@ fn link_display_text(inner: &str) -> String {
     } else {
         crate::util::decode_uri_component(text)
     }
+}
+
+/// The char index of the (case-insensitive) `</nowiki>` closing tag at or after
+/// `start`, if present.
+fn find_nowiki_close(chars: &[char], start: usize) -> Option<usize> {
+    let lower: String = chars[start..].iter().collect();
+    let lower = lower.to_lowercase();
+    let rel = lower.find("</nowiki>")?;
+    Some(start + rel)
+}
+
+/// Whether `chars[i..]` begins with a case-insensitive `<nowiki>` opening tag.
+fn is_nowiki_open(chars: &[char], i: usize) -> bool {
+    if chars.len() < i + 8 {
+        return false;
+    }
+    let lower: String = chars[i..i + 8].iter().collect();
+    lower.to_lowercase() == "<nowiki>"
 }
 
 /// Read a top-level string field from a node's `data-mw` JSON object.
