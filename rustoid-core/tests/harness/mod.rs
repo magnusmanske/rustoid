@@ -622,7 +622,7 @@ fn parse_options(raw: &str) -> HashMap<String, String> {
     }
 
     // Key=value format (comma or newline separated)
-    for part in raw.split(',') {
+    for part in raw.split([',', '\n']) {
         let part = part.trim();
         if let Some((key, value)) = part.split_once('=') {
             opts.insert(key.trim().to_string(), value.trim().to_string());
