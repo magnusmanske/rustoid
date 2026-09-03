@@ -14,6 +14,38 @@ use crate::traits::{
     DataSource, FileInfo, InterwikiInfo, MagicWordEntry, MagicWordMap, NamespaceInfo, SiteConfig,
 };
 
+/// Look up a canonical title key in a map, falling back to a first-letter
+/// case-insensitive match on the *title part* (after the `Namespace:` prefix).
+/// MediaWiki titles are first-letter case-insensitive, so a fixture seeded as
+/// `Template:test` must still resolve when queried as `Template:Test`. Mirrors
+/// the `ucfirst` title normalization applied by `Title::newFromText`.
+fn case_insensitive_get<T: Clone>(map: &RwLock<HashMap<String, T>>, key: &str) -> Option<T> {
+    // Fast path: the exact key is already handled by the caller; only fall back
+    // here when the caller's exact lookup missed. We toggle the case of the
+    // first character of the title part (after the last ':').
+    let (prefix, rest) = match key.rsplit_once(':') {
+        Some((p, r)) if !p.is_empty() => (p, r),
+        _ => return None,
+    };
+    let mut alternate = String::with_capacity(key.len());
+    alternate.push_str(prefix);
+    alternate.push(':');
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii() => {
+            if c.is_ascii_uppercase() {
+                alternate.extend(c.to_lowercase());
+            } else {
+                alternate.extend(c.to_uppercase());
+            }
+        }
+        Some(c) => alternate.push(c),
+        None => {}
+    }
+    alternate.push_str(chars.as_str());
+    map.read().unwrap().get(&alternate).cloned()
+}
+
 // ---------------------------------------------------------------------------
 // MockDataSource
 // ---------------------------------------------------------------------------
@@ -99,8 +131,11 @@ impl Default for MockDataSource {
 impl DataSource for MockDataSource {
     async fn get_page_content(&self, title: &Title) -> Result<Option<String>> {
         let key = title.full_text();
-        // Check pages first, then templates (since templates are also pages)
+        // Check pages first, then templates (since templates are also pages).
         if let Some(content) = self.pages.read().unwrap().get(&key) {
+            return Ok(Some(content.clone()));
+        }
+        if let Some(content) = case_insensitive_get(&self.pages, &key) {
             return Ok(Some(content.clone()));
         }
         Ok(self.templates.read().unwrap().get(&key).cloned())
@@ -108,17 +143,35 @@ impl DataSource for MockDataSource {
 
     async fn get_template(&self, title: &Title) -> Result<Option<String>> {
         let key = title.full_text();
-        Ok(self.templates.read().unwrap().get(&key).cloned())
+        Ok(self
+            .templates
+            .read()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .or_else(|| case_insensitive_get(&self.templates, &key)))
     }
 
     async fn get_module(&self, title: &Title) -> Result<Option<String>> {
         let key = title.full_text();
-        Ok(self.modules.read().unwrap().get(&key).cloned())
+        Ok(self
+            .modules
+            .read()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .or_else(|| case_insensitive_get(&self.modules, &key)))
     }
 
     async fn get_file_info(&self, title: &Title) -> Result<Option<FileInfo>> {
         let key = title.full_text();
-        Ok(self.files.read().unwrap().get(&key).cloned())
+        Ok(self
+            .files
+            .read()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .or_else(|| case_insensitive_get(&self.files, &key)))
     }
 
     async fn resolve_redirect(&self, title: &Title) -> Result<Option<Title>> {
