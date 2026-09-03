@@ -197,6 +197,16 @@ fn collect_containers(
     out: &mut Vec<ContainerJob>,
     config: &dyn SiteConfig,
 ) {
+    // Recurse into children *first* so nested media (e.g. an image inside a
+    // figcaption) are collected before their outer container. This is
+    // deepest-first: a nested image is resolved (and its broken text replaced
+    // by an `<img>`) before the outer media reads its caption text, so the
+    // outer caption text does not leak the nested image's filename.
+    for i in 0..node.children.len() {
+        path.push(i);
+        collect_containers(&mut node.children[i], path, out, config);
+        path.pop();
+    }
     if is_media_container(node) && has_broken_span(node) {
         out.push(ContainerJob {
             path: path.clone(),
@@ -206,12 +216,6 @@ fn collect_containers(
             manualthumb: data_mw_txt(node, "manualthumb"),
             upright: upright_from_container(node),
         });
-        // Descend so nested media (e.g. within a caption) are also collected.
-    }
-    for i in 0..node.children.len() {
-        path.push(i);
-        collect_containers(&mut node.children[i], path, out, config);
-        path.pop();
     }
 }
 
