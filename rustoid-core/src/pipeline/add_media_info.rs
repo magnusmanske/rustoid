@@ -412,7 +412,7 @@ fn caption_text_from_source(source: &str) -> String {
             // A wikilink: `[[target|display]]` or `[[target]]`.
             if let Some(link_close) = find_matching_brackets(&chars, i) {
                 let inner: String = chars[i + 2..link_close].iter().collect();
-                out.push_str(link_display_text(&inner));
+                out.push_str(&link_display_text(&inner));
                 i = link_close + 2;
                 continue;
             }
@@ -497,9 +497,18 @@ fn find_matching_brackets(chars: &[char], start: usize) -> Option<usize> {
 }
 
 /// The display text of a wikilink inner string (`target|display` → `display`,
-/// else the target).
-fn link_display_text(inner: &str) -> &str {
-    inner.rsplit('|').next().unwrap_or(inner).trim()
+/// else the percent-decoded target). The target is percent-decoded because a
+/// bare `[[Target]]` renders with `title.get_text()` (decoded) as its link text,
+/// mirroring PHP's `textContentFromCaption` running on the re-rendered caption
+/// DOM.
+fn link_display_text(inner: &str) -> String {
+    let text = inner.rsplit('|').next().unwrap_or(inner).trim();
+    // Only decode when the target itself is the display (no `|` separator).
+    if inner.contains('|') {
+        text.to_string()
+    } else {
+        crate::util::decode_uri_component(text)
+    }
 }
 
 /// Read a top-level string field from a node's `data-mw` JSON object.
