@@ -447,10 +447,28 @@ fn is_void_element(tag: &str) -> bool {
 /// Serialize a single attribute. JSON data attributes set via `DOMDataUtils`
 /// (`data-mw-i18n`, and the `data-parsoid`/`data-mw` fields handled separately)
 /// are emitted single-quoted with raw inner quotes, matching PHP's
-/// `XHtmlSerializer`. All other attributes are double-quoted with full escaping.
+/// `XHtmlSerializer`. All other attributes follow PHP's `smartQuote` rule:
+/// single quotes when the value contains `"` and (no `'` or more `"` than `'`),
+/// else double quotes, with the value escaped for the chosen quote.
 fn serialize_attr(attr: &crate::dom::node::Attribute, buf: &mut String) {
     if attr.key.starts_with("data-mw-i18n") {
         let escaped = attr.value.replace('&', "&amp;").replace('\'', "&#39;");
+        buf.push_str(&format!(" {}='{escaped}'", attr.key));
+        return;
+    }
+
+    let dq = attr.value.matches('"').count();
+    let sq = attr.value.matches('\'').count();
+    let use_single = attr.value.contains('"') && (sq == 0 || dq > sq);
+
+    if use_single {
+        // Single-quoted: escape `&`, `<`, and `'` (the delimiter), leaving `"`
+        // literal (mirrors `smartQuote`).
+        let escaped = attr
+            .value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('\'', "&apos;");
         buf.push_str(&format!(" {}='{escaped}'", attr.key));
     } else {
         buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));

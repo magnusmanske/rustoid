@@ -1247,7 +1247,7 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
                 }
                 continue;
             }
-            let Some(gt_rel) = html[*pos..].find('>') else {
+            let Some(gt_rel) = find_tag_end(&html[*pos..]) else {
                 text.push_str(&html[*pos..]);
                 *pos = bytes.len();
                 break;
@@ -1473,6 +1473,29 @@ fn ensure_nl_after(out: &mut Vec<MNode>) {
     if !out.is_empty() && !matches!(out.last(), Some(MNode::Text(t)) if t.ends_with('\n')) {
         out.push(MNode::Text("\n".to_string()));
     }
+}
+
+/// Find the first `>` that terminates an HTML tag in `s`, skipping `>`
+/// characters that appear inside quoted attribute values (so a literal `>` in
+/// e.g. a caption-mirrored `title` attribute does not truncate the tag).
+/// Mirrors the quote-aware tag scanning of a real HTML parser.
+fn find_tag_end(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '>' => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// HTML entity escaping for text content, mirroring Parsoid's
