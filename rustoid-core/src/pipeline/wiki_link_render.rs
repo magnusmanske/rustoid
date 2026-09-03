@@ -757,7 +757,11 @@ pub fn render_file(
         if is_token_array && part.contains('|') {
             opts.placeholder = true;
             for sub in part.split('|') {
-                if !record_media_option(ctx, &mut opts, &mut opt_list, sub, sub, is_token_array) {
+                // The pipe-split pieces are plain strings (a template expanded to
+                // a `|`-separated option string), so each is a *non*-array option
+                // source: no `mw:ExpandedAttrs` for them (mirrors PHP, where the
+                // `explode('|', $oText)` path `continue`s before `$expOpt`).
+                if !record_media_option(ctx, &mut opts, &mut opt_list, sub, sub, false) {
                     // Unrecognized sub-part ⇒ caption (last one wins). A previous
                     // caption becomes a `bogus` optList entry at its position
                     // (mirrors PHP's `array_splice` bogus-marker for displaced captions).

@@ -1275,6 +1275,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             params.args.iter().skip(1).cloned().collect();
         let child_frame = frame.new_child(title.clone(), child_args);
 
+        // Resolve the include directives (`<noinclude>` / `<includeonly>` /
+        // `<onlyinclude>`) in the template source before substituting arguments,
+        // mirroring `expandTemplate`'s pre-processing (a transcluded template's
+        // `<noinclude>` self-documentation is *not* part of the expansion).
+        let template_src = crate::expand::transclusion::strip_noinclude_sections(&template_src);
+        let template_src = crate::expand::transclusion::extract_includeonly_sections(&template_src);
+        let template_src = crate::expand::transclusion::extract_onlyinclude_sections(&template_src);
+
         // Substitute the template's arguments into its source.
         use crate::expand::transclusion::TemplateInvocation;
         use crate::wikitext::token_utils::key_value_to_string;
