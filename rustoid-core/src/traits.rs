@@ -134,6 +134,15 @@ pub trait SiteConfig: Send + Sync {
         None
     }
 
+    /// The localized (display) name for a namespace, e.g. `"Archivo"` for the
+    /// File namespace in Spanish, `"File"` in English. Mirrors PHP's
+    /// `SiteConfig::namespaceName`. Falls back to the canonical name.
+    fn namespace_name(&self, ns: i32) -> Option<String> {
+        self.namespaces()
+            .get(&ns)
+            .map(|info| info.canonical.clone())
+    }
+
     /// `SiteConfig::interwikiMapNoNamespaces` — the interwiki map with entries
     /// that conflict with a namespace name removed (namespace wins).
     fn interwiki_map_no_namespaces(&self) -> Vec<(String, InterwikiInfo)> {

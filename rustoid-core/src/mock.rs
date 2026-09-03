@@ -160,6 +160,9 @@ pub struct MockSiteConfig {
     no_follow_links: bool,
     /// `wgNoFollowDomainExceptions`: domains exempt from `nofollow`.
     no_follow_domain_exceptions: Vec<String>,
+    /// Localized namespace names per language (language code → namespace ID →
+    /// localized name), mirroring PHP's `SiteConfig::namespaceName`.
+    localized_namespace_names: HashMap<String, HashMap<i32, String>>,
 }
 
 impl MockSiteConfig {
@@ -205,6 +208,7 @@ impl MockSiteConfig {
             external_link_target: None,
             no_follow_links: true,
             no_follow_domain_exceptions: Vec::new(),
+            localized_namespace_names: HashMap::new(),
         };
 
         // Register standard MediaWiki namespaces. `case_sensitive` reflects
@@ -403,6 +407,44 @@ impl MockSiteConfig {
     pub fn add_no_follow_domain_exception(&mut self, domain: &str) {
         self.no_follow_domain_exceptions.push(domain.to_string());
     }
+
+    /// Set the content language and register localized namespace names + media
+    /// option aliases for it (mirrors PHP's `SiteConfig` localization used by
+    /// the parser-test `language=` option). Covers the languages the media
+    /// fixture exercises (`es`, `fa`).
+    pub fn set_language(&mut self, lang: &str) {
+        self.language_code = lang.to_string();
+        let mut ns = HashMap::new();
+        match lang {
+            "es" => {
+                ns.insert(6, "Archivo".to_string()); // File
+                // Localized namespace aliases (so `Archivo:` resolves to File).
+                if let Some(info) = self.namespaces.get_mut(&6) {
+                    info.aliases.push("Archivo".to_string());
+                    info.aliases.push("archivo".to_string());
+                }
+                // Localized media option aliases.
+                self.add_magic_word(
+                    "img_manualthumb",
+                    &["thumbnail=$1", "thumb=$1", "miniatura=$1"],
+                );
+                self.add_magic_word("img_thumbnail", &["thumbnail", "thumb", "miniatura"]);
+                self.add_magic_word("img_left", &["left", "izquierda"]);
+                self.add_magic_word("img_link", &["link=$1", "enlace=$1"]);
+            }
+            "fa" => {
+                ns.insert(6, "فایل".to_string()); // File
+                if let Some(info) = self.namespaces.get_mut(&6) {
+                    info.aliases.push("فایل".to_string());
+                }
+                self.add_magic_word("img_thumbnail", &["thumbnail", "thumb", "بندانگشتی"]);
+            }
+            _ => {}
+        }
+        if !ns.is_empty() {
+            self.localized_namespace_names.insert(lang.to_string(), ns);
+        }
+    }
 }
 
 impl Default for MockSiteConfig {
@@ -414,6 +456,13 @@ impl Default for MockSiteConfig {
 impl SiteConfig for MockSiteConfig {
     fn namespaces(&self) -> &HashMap<i32, NamespaceInfo> {
         &self.namespaces
+    }
+
+    fn namespace_name(&self, ns: i32) -> Option<String> {
+        self.localized_namespace_names
+            .get(&self.language_code)
+            .and_then(|m| m.get(&ns).cloned())
+            .or_else(|| self.namespaces.get(&ns).map(|info| info.canonical.clone()))
     }
 
     fn interwiki_map(&self) -> &HashMap<String, InterwikiInfo> {

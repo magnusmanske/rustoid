@@ -22,6 +22,11 @@ pub struct Title {
     pub text: String,
     /// The URL fragment (section anchor), if any.
     pub fragment: Option<String>,
+    /// The localized namespace name used for display/links (e.g. `"Archivo"` for
+    /// the File namespace in Spanish). `None` falls back to the canonical
+    /// English prefix. Kept separate from `text` so data-lookup keys
+    /// (`full_text`) stay canonical.
+    pub namespace_name: Option<String>,
 }
 
 impl Title {
@@ -32,6 +37,7 @@ impl Title {
             namespace_id: 0,
             text: text.into(),
             fragment: None,
+            namespace_name: None,
         }
     }
 
@@ -42,6 +48,7 @@ impl Title {
             namespace_id,
             text: text.into(),
             fragment: None,
+            namespace_name: None,
         }
     }
 
@@ -71,7 +78,7 @@ impl Title {
     /// `Title::getPrefixedText()`.
     pub fn get_prefixed_text(&self) -> String {
         let text = self.text.replace('_', " ");
-        let prefix = namespace_prefix(self.namespace_id);
+        let prefix = self.prefix_for_display();
         if self.namespace_id != 0 && !prefix.is_empty() {
             format!("{prefix}:{text}")
         } else {
@@ -83,12 +90,20 @@ impl Title {
     /// `Title::getPrefixedDBKey()` / `getFullDBKey()`.
     pub fn get_full_db_key(&self) -> String {
         let text = self.text.replace(' ', "_");
-        let prefix = namespace_prefix(self.namespace_id);
+        let prefix = self.prefix_for_display();
         if self.namespace_id != 0 && !prefix.is_empty() {
             format!("{prefix}:{text}")
         } else {
             text
         }
+    }
+
+    /// The namespace prefix used for display/links: the localized name when
+    /// known, else the canonical English prefix.
+    fn prefix_for_display(&self) -> &str {
+        self.namespace_name
+            .as_deref()
+            .unwrap_or_else(|| namespace_prefix(self.namespace_id))
     }
 
     /// The unprefixed DB key (title text with underscores, no namespace).
@@ -132,7 +147,7 @@ impl fmt::Display for Title {
             s.push_str(iw);
             s.push(':');
         }
-        let prefix = namespace_prefix(self.namespace_id);
+        let prefix = self.prefix_for_display();
         if !prefix.is_empty() {
             s.push_str(prefix);
             s.push(':');
@@ -232,6 +247,7 @@ impl TitleParser {
                         namespace_id: 0,
                         text: after.to_string(),
                         fragment,
+                        namespace_name: None,
                     };
                 }
             }
@@ -298,11 +314,13 @@ impl TitleParser {
         } else {
             ucfirst(text, config.language_code())
         };
+        let namespace_name = config.namespace_name(namespace_id);
         Title {
             interwiki: None,
             namespace_id,
             text,
             fragment,
+            namespace_name,
         }
     }
 }

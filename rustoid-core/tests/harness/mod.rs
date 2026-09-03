@@ -753,6 +753,11 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     source.add_page(&page_title, &test.wikitext);
 
     let mut config = MockSiteConfig::new();
+    // The `language=` option sets the content language, localizing namespace
+    // names and media option aliases (mirrors PHP's `SiteConfig` language).
+    if let Some(lang) = test.options.get("language") {
+        config.set_language(lang);
+    }
     // Apply `!! config` MediaWiki config values (e.g.
     // `wgParsoidExperimentalParserFunctionOutput=true`).
     for line in test.config_raw.lines() {
