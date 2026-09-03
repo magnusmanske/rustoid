@@ -344,6 +344,9 @@ pub struct MediaOpts {
     /// Whether an `alt=` (or similarly rich) option value carries wikitext
     /// markup, marking the container `mw:ExpandedAttrs`.
     pub expanded_attrs: bool,
+    /// Whether a template expanded to a `|`-separated option string (no editing
+    /// support), marking the container `mw:Placeholder`.
+    pub placeholder: bool,
 }
 
 /// Determine wrapper classes and inline-ness. Mirrors PHP's `getWrapperInfo`.

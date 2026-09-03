@@ -679,10 +679,7 @@ pub fn render_file(
     next_id: &mut usize,
     build_fragment: CaptionFragmentBuilder,
 ) -> Vec<Item> {
-    use super::media_options::{
-        MediaOpts, get_format, get_option_info, get_wrapper_info, has_wikitext_markup,
-        strip_quote_markers,
-    };
+    use super::media_options::{MediaOpts, get_format, get_wrapper_info};
 
     let title = target.title.as_ref().expect("file title");
 
@@ -699,9 +696,7 @@ pub fn render_file(
         }
         // Stringify this part for option recognition, stripping transclusion/
         // param meta markers (`strip_meta_tags` with `wrap_templates`), keeping
-        // the raw tokens for a caption. A template contribution marks the
-        // container `mw:ExpandedAttrs` (mirrors PHP `renderFile`'s
-        // `hasTransclusion`/`tokensToString` treatment).
+        // the raw tokens for a caption.
         let raw_items = crate::pipeline::attribute_transform_manager::key_value_to_items(&kv.value);
         // Whether this part's raw source is a token array (i.e. it contained a
         // template/entity, not a plain string). Used to detect `mw:ExpandedAttrs`
@@ -714,67 +709,29 @@ pub fn render_file(
                 crate::wikitext::token_utils::tokens_to_string(&stripped.value)
             }
         };
-        let Some(info) = get_option_info(ctx.config, &part) else {
+        // A template that expanded to a `|`-separated string yields multiple
+        // option parts (no editing support). Split and process each; the
+        // container is marked `mw:Placeholder` (mirrors PHP `renderFile`'s
+        // `explode('|', $oText)` + `$dataParsoid->uneditable = true`).
+        // A *templated* part that expanded to a `|`-separated string yields
+        // multiple option parts (no editing support). Split and process each;
+        // the container is marked `mw:Placeholder` (mirrors PHP `renderFile`'s
+        // `explode('|', $oText)` + `$dataParsoid->uneditable = true`). A plain
+        // string part may contain `|` from table syntax in a caption, so it is
+        // NOT re-split here.
+        if is_token_array && part.contains('|') {
+            opts.placeholder = true;
+            for sub in part.split('|') {
+                if !apply_media_option(ctx, &mut opts, sub, is_token_array) {
+                    // Unrecognized sub-part ⇒ caption (last one wins).
+                    caption = Some(vec![Item::Str(sub.to_string())]);
+                }
+            }
+            continue;
+        }
+        if !apply_media_option(ctx, &mut opts, &part, is_token_array) {
             // Unrecognized ⇒ caption (last one wins). Keep the raw tokens.
             caption = Some(raw_items);
-            continue;
-        };
-        // A templated option value (a token array, not a plain string) marks the
-        // container `mw:ExpandedAttrs` so the attribute round-trips via
-        // `data-mw.attribs` (mirrors `renderFile`'s `$expOpt = is_array($origOptSrc)`,
-        // which applies to all *options* — but not the caption).
-        if is_token_array {
-            opts.expanded_attrs = true;
-        }
-        match info.ck.as_str() {
-            // All options except `width` are "first wins" (later
-            // occurrences become bogus), mirroring PHP `renderFile`'s
-            // `isset($opts[$ck])` guard. `format`/`manualthumb` are
-            // jointly "first wins" (once one is set, the other is bogus).
-            "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
-                opts.format = Some(info.v)
-            }
-            "manualthumb" if opts.manualthumb.is_none() && opts.format.is_none() => {
-                opts.manualthumb = Some(info.v)
-            }
-            "halign" if opts.halign.is_none() => opts.halign = Some(info.v),
-            "valign" if opts.valign.is_none() => opts.valign = Some(info.v),
-            "border" if opts.border.is_none() => opts.border = Some(info.v),
-            "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
-            "link" if opts.link.is_none() => {
-                // `link` is only "expanded" when it is a transclusion
-                // (mirrors `renderFile`'s `hasTransclusion` guard); plain
-                // quotes/entities just stringify into the title.
-                opts.link = Some(strip_quote_markers(&info.v));
-            }
-            "alt" => {
-                // A non-`link` option value with any markup is "expanded".
-                opts.expanded_attrs |= has_wikitext_markup(&info.v);
-                if opts.alt.is_none() {
-                    opts.alt = Some(strip_quote_markers(&info.v));
-                }
-            }
-            "class" if opts.class.is_none() => opts.class = Some(info.v),
-            "page" if opts.page.is_none() => opts.page = Some(info.v),
-            // An invalid internal language code makes the option `bogus`
-            // (dropped), mirroring `renderFile`'s `Language::isValidInternalCode`
-            // guard.
-            "lang"
-                if opts.lang.is_none()
-                    && crate::pipeline::media_options::is_valid_internal_lang(&info.v) =>
-            {
-                opts.lang = Some(info.v)
-            }
-            "width" => {
-                // `width` is "last wins" (mirrors PHP's special case).
-                if let Some((w, h)) = info.v.split_once('x') {
-                    opts.width = Some(w.to_string());
-                    opts.height = Some(h.to_string());
-                } else {
-                    opts.width = Some(info.v);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -820,6 +777,12 @@ pub fn render_file(
     // `$container->addSpaceSeparatedAttribute('typeof', 'mw:ExpandedAttrs')`).
     if opts.expanded_attrs {
         rdfa_type.push_str(" mw:ExpandedAttrs");
+    }
+    // A template that expanded to a `|`-separated option string has no editing
+    // support; mark the container `mw:Placeholder` (mirrors `renderFile`'s
+    // `$dataParsoid->uneditable` + `$rdfaType .= ' mw:Placeholder'`).
+    if opts.placeholder {
+        rdfa_type.push_str(" mw:Placeholder");
     }
 
     let container_name = if is_inline { "span" } else { "figure" };
@@ -962,6 +925,83 @@ pub fn render_file(
     ))));
 
     out
+}
+
+/// Resolve a single option string and apply it to `opts`. Returns `true` when
+/// the string is a recognized option (so the caller can treat `false` as a
+/// caption). Mirrors the option-dispatch loop of PHP `renderFile`.
+fn apply_media_option(
+    ctx: &WikiLinkContext,
+    opts: &mut super::media_options::MediaOpts,
+    part: &str,
+    is_token_array: bool,
+) -> bool {
+    use super::media_options::get_option_info;
+
+    let Some(info) = get_option_info(ctx.config, part) else {
+        return false;
+    };
+    if is_token_array {
+        opts.expanded_attrs = true;
+    }
+    apply_media_option_info(opts, info);
+    true
+}
+
+/// Apply an already-resolved option `info` to `opts`. Mirrors the per-option
+/// "first wins"/"last wins" dispatch of PHP `renderFile` (minus `width`, which
+/// is "last wins").
+fn apply_media_option_info(
+    opts: &mut super::media_options::MediaOpts,
+    info: super::media_options::OptionInfo,
+) {
+    use super::media_options::{has_wikitext_markup, is_valid_internal_lang, strip_quote_markers};
+
+    match info.ck.as_str() {
+        // All options except `width` are "first wins" (later occurrences become
+        // bogus), mirroring PHP `renderFile`'s `isset($opts[$ck])` guard.
+        // `format`/`manualthumb` are jointly "first wins".
+        "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
+            opts.format = Some(info.v)
+        }
+        "manualthumb" if opts.manualthumb.is_none() && opts.format.is_none() => {
+            opts.manualthumb = Some(info.v)
+        }
+        "halign" if opts.halign.is_none() => opts.halign = Some(info.v),
+        "valign" if opts.valign.is_none() => opts.valign = Some(info.v),
+        "border" if opts.border.is_none() => opts.border = Some(info.v),
+        "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
+        "link" if opts.link.is_none() => {
+            // `link` is only "expanded" when it is a transclusion (mirrors
+            // `renderFile`'s `hasTransclusion` guard); plain quotes/entities just
+            // stringify into the title.
+            opts.link = Some(strip_quote_markers(&info.v));
+        }
+        "alt" => {
+            // A non-`link` option value with any markup is "expanded".
+            opts.expanded_attrs |= has_wikitext_markup(&info.v);
+            if opts.alt.is_none() {
+                opts.alt = Some(strip_quote_markers(&info.v));
+            }
+        }
+        "class" if opts.class.is_none() => opts.class = Some(info.v),
+        "page" if opts.page.is_none() => opts.page = Some(info.v),
+        // An invalid internal language code makes the option `bogus` (dropped),
+        // mirroring `renderFile`'s `Language::isValidInternalCode` guard.
+        "lang" if opts.lang.is_none() && is_valid_internal_lang(&info.v) => {
+            opts.lang = Some(info.v)
+        }
+        "width" => {
+            // `width` is "last wins" (mirrors PHP's special case).
+            if let Some((w, h)) = info.v.split_once('x') {
+                opts.width = Some(w.to_string());
+                opts.height = Some(h.to_string());
+            } else {
+                opts.width = Some(info.v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Register a pre-built inline caption fragment in `fragments` and return the
