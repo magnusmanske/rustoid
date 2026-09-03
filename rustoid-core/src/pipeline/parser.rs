@@ -87,6 +87,27 @@ fn gallery_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosin
     }
 }
 
+/// Reconstruct the full wikilink source (`[[href|content0|content1…]]`) from a
+/// `wikilink` token's `href` and `mw:maybeContent` KVs. Used by the media-in-link
+/// bail to re-tokenize the source without the leading `[` (mirrors PHP's
+/// `bailTokens`, which strips the first `[` from the TSR source). Nested wikilinks
+/// are preserved verbatim (our tokenizer keeps them as `[[…]]` text).
+fn reconstruct_link_src(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, href: &str) -> String {
+    use crate::wikitext::token_utils::key_value_to_string;
+    let mut src = String::from("[[");
+    src.push_str(href);
+    for kv in stt
+        .attribs
+        .iter()
+        .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+    {
+        src.push('|');
+        src.push_str(&key_value_to_string(&kv.value));
+    }
+    src.push_str("]]");
+    src
+}
+
 /// Emit the `mw:dom-fragment-token` placeholder for a `<gallery>` extension,
 /// referencing the pre-built gallery fragment by `id` (mirrors the generic
 /// extension encapsulation in `extension_handler::gallery_items`).
@@ -502,6 +523,32 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     continue;
                 }
             };
+
+            // Media-in-link / Link-in-link: a nested wikilink inside the link text
+            // cannot nest inside the outer `<a>`, so the link bails to literal
+            // syntax with the nested media/link rendered in place (mirrors PHP's
+            // `addLinkAttributesAndGetContent` throwing `Media-in-link`/`Link-in-link`,
+            // caught by `renderWikiLink` → `bailTokens`). Only `renderFile` skips
+            // `addLinkAttributesAndGetContent`, so every other dispatch path bails.
+            // Our tokenizer keeps nested `[[…]]` as literal text, so detect that here.
+            let is_file_path = target.title.as_ref().is_some_and(|t| {
+                !target.from_colon_escaped_text
+                    && !target.href.starts_with('#')
+                    && Some(t.namespace_id) == ctx.config.canonical_namespace_id("File")
+            });
+            let content_has_nested = stt.attribs.iter().any(|kv| {
+                kv.key.as_str() == Some("mw:maybeContent")
+                    && key_value_to_string(&kv.value).contains("[[")
+            });
+            if !is_file_path && content_has_nested {
+                let src = reconstruct_link_src(stt, &href);
+                out.push(Item::Str("[".to_string()));
+                let sub = self.tokenize(&src[1..]).unwrap_or_default();
+                let sub = self.render_links(sub, fragments, next_id);
+                out.extend(sub);
+                continue;
+            }
+
             let rendered = render_wiki_link_dispatched(
                 &mut ctx,
                 &ParsoidToken::SelfclosingTag(stt.clone()),
