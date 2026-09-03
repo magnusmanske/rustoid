@@ -318,7 +318,7 @@ impl MockSiteConfig {
         config.add_magic_word("img_link", &["link=$1"]);
         config.add_magic_word("img_alt", &["alt=$1"]);
         config.add_magic_word("img_page", &["page=$1"]);
-        config.add_magic_word("img_upright", &["upright=$1"]);
+        config.add_magic_word("img_upright", &["upright=$1", "upright"]);
         config.add_magic_word("img_width", &["$1px"]);
         config.add_magic_word("img_class", &["class=$1"]);
         config.add_magic_word("img_lang", &["lang=$1"]);

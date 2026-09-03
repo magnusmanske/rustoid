@@ -776,12 +776,25 @@ pub fn render_file(
     // span (mirrors `renderFile`'s default-size handling). `framed`/`manualthumb`
     // are unscaled, so they get no default. This runs *after* `getWrapperInfo`
     // so the `mw-default-size` class is still added (the default is not an
-    // explicit size).
+    // explicit size). `upright` scales the default by the given factor (bare
+    // `upright` → 0.75) and rounds to the nearest 10px.
+    let mut upright_factor: Option<f64> = None;
     if matches!(format.as_deref(), Some("thumbnail") | Some("frameless"))
         && opts.width.is_none()
         && opts.height.is_none()
     {
-        opts.width = Some(DEFAULT_THUMB_WIDTH.to_string());
+        let mut default_width: f64 = DEFAULT_THUMB_WIDTH as f64;
+        if let Some(u) = &opts.upright {
+            let factor = if u == "upright" {
+                0.75
+            } else {
+                u.parse::<f64>().unwrap_or(0.0)
+            };
+            upright_factor = Some(factor);
+            default_width *= factor;
+            default_width = 10.0 * (default_width / 10.0).round();
+        }
+        opts.width = Some(default_width.to_string());
     }
 
     // rdfa type and container.
@@ -872,6 +885,12 @@ pub fn render_file(
     }
     if let Some(height) = &opts.height {
         span.add_attribute_str("data-height", height);
+    }
+    // `upright` factor is stamped as `data-upright` on the broken span (mirrors
+    // `renderFile`); `AddMediaInfo` reads it to add the `mw-file-upright` class
+    // and `--mw-file-upright` style on the final `<img>`.
+    if let Some(factor) = upright_factor {
+        span.add_attribute_str("data-upright", factor.to_string());
     }
     // `lang=` is applied to the broken span (mirrors `renderFile`'s
     // `$span->addNormalizedAttribute('lang', ...)`); `AddMediaInfo` reads it back
