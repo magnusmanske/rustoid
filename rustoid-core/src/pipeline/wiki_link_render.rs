@@ -692,8 +692,24 @@ pub fn render_file(
     // `recordCaption`, where the final non-option is captured as the caption).
     let mut opts = MediaOpts::default();
     let mut caption: Option<String> = None;
-    if let Some(content) = token.get_attribute_v("mw:maybeContent") {
-        for part in split_media_options(content) {
+    // `mw:maybeContent` may be a plain string or a token array (when the content
+    // contains templates/entities). For token arrays, strip the transclusion/param
+    // meta markers and concatenate the remaining text to recover the *expanded*
+    // option wikitext (`137px`, `thumb`, …). A template contribution marks the
+    // container `mw:ExpandedAttrs` (mirrors PHP `renderFile`'s `hasTransclusion` /
+    // `tokensToString` treatment of the expanded `mw:maybeContent`).
+    if let Some(kv) = token.get_attribute_kv("mw:maybeContent") {
+        let content = match &kv.value {
+            crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
+            crate::wikitext::tokens_v2::KeyValue::Tokens(items) => {
+                let stripped = crate::pipeline::attribute_expander::strip_meta_tags(items, true);
+                if stripped.has_generated_content {
+                    opts.expanded_attrs = true;
+                }
+                crate::wikitext::token_utils::tokens_to_string(&stripped.value)
+            }
+        };
+        for part in split_media_options(&content) {
             if let Some(info) = get_option_info(ctx.config, &part) {
                 match info.ck.as_str() {
                     // All options except `width` are "first wins" (later
