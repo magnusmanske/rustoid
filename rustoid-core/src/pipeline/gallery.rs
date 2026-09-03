@@ -124,9 +124,22 @@ pub fn build(
 fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Option<Node> {
     let line = line.trim();
     // Split on the first `|` (title | caption+options).
-    let (title_str, rest) = match line.split_once('|') {
-        Some((t, r)) => (t.trim(), Some(r)),
-        None => (line, None),
+    let (title_str, mut rest_str) = match line.split_once('|') {
+        Some((t, r)) => (t.trim(), r.to_string()),
+        None => (line, String::new()),
+    };
+
+    // A common editor mistake is closing a gallery line with `]]` (from a
+    // converted `[[File:…]]` wikilink). Strip a trailing `]]` unless the option
+    // string contains `[[` (a pending wikilink in a caption). Mirrors
+    // `Gallery::pLine`.
+    if !rest_str.contains("[[") {
+        rest_str = rest_str.strip_suffix("]]").unwrap_or(&rest_str).to_string();
+    }
+    let rest = if rest_str.is_empty() {
+        None
+    } else {
+        Some(rest_str.as_str())
     };
 
     // Title resolution: decode entities (`&#45;` → `-`), mirroring
