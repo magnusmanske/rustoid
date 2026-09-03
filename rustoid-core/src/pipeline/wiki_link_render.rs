@@ -780,7 +780,7 @@ pub fn render_file(
                 // a `|`-separated option string), so each is a *non*-array option
                 // source: no `mw:ExpandedAttrs` for them (mirrors PHP, where the
                 // `explode('|', $oText)` path `continue`s before `$expOpt`).
-                if !record_media_option(ctx, &mut opts, &mut opt_list, &sub, &sub, false) {
+                if !record_media_option(ctx, &mut opts, &mut opt_list, &sub, &sub, false, false) {
                     // Unrecognized sub-part ⇒ caption (last one wins). A previous
                     // caption becomes a `bogus` optList entry at its position
                     // (mirrors PHP's `array_splice` bogus-marker for displaced captions).
@@ -797,6 +797,11 @@ pub fn render_file(
             }
             continue;
         }
+        let has_transclusion = if is_token_array {
+            contains_transclusion(&raw_items)
+        } else {
+            false
+        };
         if !record_media_option(
             ctx,
             &mut opts,
@@ -804,6 +809,7 @@ pub fn render_file(
             &part,
             vsrc.as_deref().unwrap_or(&part),
             is_token_array,
+            has_transclusion,
         ) {
             // Unrecognized ⇒ caption (last one wins). Keep the raw tokens.
             if caption.is_some() {
@@ -1039,6 +1045,26 @@ pub fn render_file(
     out
 }
 
+/// Whether a token array contains a transclusion start marker (a self-closing
+/// token whose `typeof` space-separated list includes `mw:Transclusion`).
+/// Mirrors PHP `WikiLinkHandler::hasTransclusion`, used to gate `link` options on
+/// `is_array($origOptSrc) && hasTransclusion($origOptSrc)`.
+fn contains_transclusion(items: &[Item]) -> bool {
+    items.iter().any(|item| {
+        if let Item::Tok(ParsoidToken::SelfclosingTag(tk)) = item {
+            tk.attribs.iter().any(|kv| {
+                kv.key.as_str() == Some("typeof")
+                    && kv
+                        .value
+                        .as_str()
+                        .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:Transclusion"))
+            })
+        } else {
+            false
+        }
+    })
+}
+
 /// Resolve a single option string, apply it to `opts`, and record its
 /// round-trip entry in `opt_list` (the `data-parsoid.optList`). Returns `true`
 /// when the string is a recognized option (so the caller treats `false` as a
@@ -1054,6 +1080,7 @@ fn record_media_option(
     part: &str,
     vsrc: &str,
     is_token_array: bool,
+    has_transclusion: bool,
 ) -> bool {
     use super::media_options::{
         get_option_info, has_wikitext_markup, is_valid_internal_lang, strip_quote_markers,
@@ -1062,7 +1089,18 @@ fn record_media_option(
     let Some(info) = get_option_info(ctx.config, part) else {
         return false;
     };
-    if is_token_array {
+    // Whether this option is "expanded" (marks the container `mw:ExpandedAttrs`
+    // and stashes its `html` in `data-mw.attribs`). Mirrors PHP `renderFile`:
+    //   for `link`, `$expOpt = is_array($origOptSrc) && hasTransclusion(...)`
+    //   otherwise, `$expOpt = is_array($origOptSrc)`
+    // (the stricter `link` test avoids treating a mere autourl/entity in the link
+    // target as an editable expansion).
+    let exp_opt = if info.ck == "link" {
+        is_token_array && has_transclusion
+    } else {
+        is_token_array
+    };
+    if exp_opt {
         opts.expanded_attrs = true;
     }
 
