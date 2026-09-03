@@ -458,6 +458,14 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 section = Section::Wikitext;
                 *i += 1;
             }
+            "!! metadata" | "!! metadata/php" | "!! metadata/parsoid+standalone" => {
+                // Tracking categories/links emitted by the parser (e.g.
+                // `cat=Pages_with_broken_file_links sort=`). Not part of the
+                // rendered HTML; skipped by the harness (mirrors the PHP
+                // TestRunner, which compares metadata separately).
+                section = Section::Metadata;
+                *i += 1;
+            }
             "!! html/parsoid" | "!! html/parsoid here" => {
                 section = Section::Html;
                 parsoid_only = true;
@@ -527,6 +535,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                         }
                         Section::HtmlLang => html_parsoid_lang_lines.push(line.to_string()),
                         Section::WikitextEdited => wikitext_edited_lines.push(line.to_string()),
+                        Section::Metadata => { /* tracking metadata: not compared */ }
                         Section::None => { /* skip */ }
                     }
                     *i += 1;
@@ -587,6 +596,7 @@ enum Section {
     HtmlBoth,
     HtmlLang,
     WikitextEdited,
+    Metadata,
 }
 
 /// Parse options text into key-value pairs.
