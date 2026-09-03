@@ -125,6 +125,133 @@ fn extract_fragment_children(ast: &Node) -> Node {
     ast.clone()
 }
 
+/// Render an already-tokenized inline caption fragment into a fragment document
+/// (mirrors PHP's `processContentInPipeline` with `inlineContext => true`).
+/// Resolves wikilinks, external links/autolinks, and behavior switches, flushes
+/// pending quotes with a synthetic EOF, then runs the inline tree builder and
+/// the post-pwrap transforms (so transclusion markers become `mw:Transclusion`
+/// spans).
+///
+/// Shared by the `Parser::build_inline_fragment` caption path and the gallery
+/// caption renderer (`gallery::caption_to_nodes`), so both produce identical
+/// markup. `fragments`/`next_id` are threaded through for nested media captions.
+pub fn render_inline_fragment(
+    config: &dyn SiteConfig,
+    tokens: Vec<Item>,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Node {
+    use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
+    use crate::pipeline::wiki_link_render::{
+        WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+    };
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    // Step 1: render wikilinks (`[[…]]` → `<a>`/`<link>` tags).
+    let mut link_ctx = WikiLinkContext::new(config);
+    let tokens: Vec<Item> = tokens
+        .into_iter()
+        .flat_map(|item| {
+            let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+                return vec![item];
+            };
+            if stt.name != "wikilink" {
+                return vec![item];
+            }
+            let href = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .map(|kv| key_value_to_string(&kv.value))
+                .unwrap_or_default();
+            let href_src = href.clone();
+            let target =
+                get_wiki_link_target_info(&link_ctx, &href, &href_src).unwrap_or_else(|_| {
+                    crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
+                        href: href.clone(),
+                        href_src: href_src.clone(),
+                        title: Some(crate::title::Title::new_main(href.clone())),
+                        interwiki: None,
+                        language: None,
+                        local_prefix: None,
+                        from_colon_escaped_text: false,
+                        prefix: None,
+                    }
+                });
+            render_wiki_link_dispatched(
+                &mut link_ctx,
+                &ParsoidToken::SelfclosingTag(stt.clone()),
+                &target,
+                false,
+                fragments,
+                next_id,
+                &mut |items| {
+                    let mut f = std::collections::HashMap::new();
+                    let mut id = 0usize;
+                    render_inline_fragment(config, items, &mut f, &mut id)
+                },
+            )
+        })
+        .collect();
+
+    // Step 2: render external links / autolinks.
+    let clean = |href: &str| {
+        crate::sanitizer::clean_url(href, "external", |proto| config.has_valid_protocol(proto))
+    };
+    let mut out: Vec<Item> = Vec::with_capacity(tokens.len());
+    for item in tokens {
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+            out.push(item);
+            continue;
+        };
+        match stt.name.as_str() {
+            "extlink" => {
+                match on_ext_link(
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    clean,
+                    config.relative_link_prefix(),
+                ) {
+                    Some(rendered) => out.extend(rendered),
+                    None => out.push(item),
+                }
+            }
+            "urllink" => {
+                let content_href = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .and_then(|kv| kv.value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match on_url_link(
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    &content_href,
+                    clean,
+                ) {
+                    Some(rendered) => out.extend(rendered),
+                    None => out.push(item),
+                }
+            }
+            _ => out.push(item),
+        }
+    }
+    let mut tokens = out;
+
+    // Step 3: behavior switches → `mw:PageProp` metas.
+    tokens = crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens);
+
+    // Step 4: flush pending quotes with a synthetic EOF, build the inline tree,
+    // and apply the pwrap transforms (transclusion encapsulation).
+    tokens.push(Item::Tok(ParsoidToken::Eof(
+        crate::wikitext::tokens_v2::EOFTk,
+    )));
+    let stage = TreeBuilderStage::new(true);
+    let mut frag = extract_fragment_children(&stage.to_ast(tokens, config));
+    let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
+    crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
+    frag
+}
+
 /// Flatten `mw:Nowiki` spans into their text content (mirrors PHP
 /// `Pre::sourceToDom` + `removeNowikiEscapesFromContent`): inside a
 /// `<pre format="wikitext">` body the `<nowiki>` content has already been
@@ -503,25 +630,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
         next_id: &mut usize,
     ) -> crate::dom::node::Node {
-        let tokens = self.render_links(tokens, fragments, next_id);
-        let tokens = self.render_external_links(tokens);
-        let tokens = self.render_behavior_switches(tokens);
-        // The quote transformer flushes pending quotes only on a newline or EOF
-        // token; append a synthetic EOF so trailing quotes (`''italic''`) flush.
-        let mut tokens = tokens;
-        tokens.push(Item::Tok(ParsoidToken::Eof(
-            crate::wikitext::tokens_v2::EOFTk,
-        )));
-        let stage = TreeBuilderStage::new(true);
-        let mut frag = extract_fragment_children(&stage.to_ast(tokens, self.config));
-        // Encapsulate transclusion markers (`meta mw:Transclusion`) into
-        // `<span typeof="mw:Transclusion">` wrappers, mirroring the main
-        // pipeline's `post_pwrap_transforms` (minus p-wrapping, which the inline
-        // context already suppressed). This is what renders `{{Test}}` in a
-        // caption as a transclusion span rather than bare `mw:Transclusion` metas.
-        let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
-        frag
+        render_inline_fragment(self.config, tokens, fragments, next_id)
     }
 
     /// Serialize an attribute key/value source (a token array or plain string)
