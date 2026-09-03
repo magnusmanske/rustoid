@@ -206,19 +206,16 @@ pub fn render_inline_fragment(
                 .map(|kv| key_value_to_string(&kv.value))
                 .unwrap_or_default();
             let href_src = href.clone();
-            let target =
-                get_wiki_link_target_info(&link_ctx, &href, &href_src).unwrap_or_else(|_| {
-                    crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
-                        href: href.clone(),
-                        href_src: href_src.clone(),
-                        title: Some(crate::title::Title::new_main(href.clone())),
-                        interwiki: None,
-                        language: None,
-                        local_prefix: None,
-                        from_colon_escaped_text: false,
-                        prefix: None,
-                    }
-                });
+            let target = match get_wiki_link_target_info(&link_ctx, &href, &href_src) {
+                Ok(t) => t,
+                Err(_) => {
+                    // Invalid title (bad chars, stray `%hh`, multiple colons):
+                    // bail the link to literal `[[…]]` text (mirrors PHP's
+                    // `bailTokens`, which re-tokenizes the source without a
+                    // leading `[[` so it no longer re-links).
+                    return vec![Item::Str(format!("[[{href}]]"))];
+                }
+            };
             render_wiki_link_dispatched(
                 &mut link_ctx,
                 &ParsoidToken::SelfclosingTag(stt.clone()),
@@ -477,18 +474,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .map(|kv| key_value_to_string(&kv.value))
                 .unwrap_or_default();
             let href_src = href.clone();
-            let target = get_wiki_link_target_info(&ctx, &href, &href_src).unwrap_or_else(|_| {
-                crate::pipeline::wiki_link_render::WikiLinkTargetInfo {
-                    href: href.clone(),
-                    href_src: href_src.clone(),
-                    title: Some(crate::title::Title::new_main(href.clone())),
-                    interwiki: None,
-                    language: None,
-                    local_prefix: None,
-                    from_colon_escaped_text: false,
-                    prefix: None,
+            let target = match get_wiki_link_target_info(&ctx, &href, &href_src) {
+                Ok(t) => t,
+                Err(_) => {
+                    // Invalid title: bail to literal `[[…]]` text (mirrors PHP's
+                    // `bailTokens`).
+                    out.push(Item::Str(format!("[[{href}]]")));
+                    continue;
                 }
-            });
+            };
             let rendered = render_wiki_link_dispatched(
                 &mut ctx,
                 &ParsoidToken::SelfclosingTag(stt.clone()),

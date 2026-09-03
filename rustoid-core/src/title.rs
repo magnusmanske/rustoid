@@ -142,13 +142,44 @@ fn namespace_prefix(ns_id: i32) -> &'static str {
 
 /// Whether the title text contains characters MediaWiki rejects, making the
 /// title invalid (so `Title::newFromText`/`makeTitle` return null). Mirrors
-/// `Title::checkBadChars`, which rejects `<`, `>`, `[`, `]`, `{`, `}`, `|`, the
-/// NUL byte, and other control characters. (`#` and `:` are handled elsewhere
-/// as fragment/namespace separators, so they are not rejected here.)
+/// `Title::checkBadChars` plus `TitleParser::getTitleInvalidRegex`:
+/// - `<`, `>`, `[`, `]`, `{`, `}`, `|`, the NUL byte, and other control chars;
+/// - percent-encoding sequences (`%[0-9A-Fa-f]{2}`), which can't be round-tripped;
+/// - entity/character references (`&…;`).
 pub fn has_invalid_chars(text: &str) -> bool {
-    text.chars().any(|c| {
-        matches!(c, '<' | '>' | '[' | ']' | '|' | '{' | '}') || c == '\0' || (c as u32) < 0x20
-    })
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' | b'>' | b'[' | b']' | b'|' | b'{' | b'}' | b'\0' => return true,
+            // Control char (mirrors `[\0-\x20]`/`checkBadChars` ASCII range).
+            b if b < 0x20 => return true,
+            // Percent-encoding sequence `%hh` is illegal (round-trip hazard).
+            b'%' if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit() =>
+            {
+                return true;
+            }
+            // Entity/character reference `&name;` is illegal (`&[A-Za-z0-9…]+;`).
+            b'&' => {
+                let rest = &bytes[i + 1..];
+                let name_len = rest.iter().take_while(|&&c| c != b';').count();
+                // The `+` requires at least one name char; a valid reference
+                // ends in `;` with only alphanumeric/high-byte chars between.
+                if name_len >= 1
+                    && name_len < rest.len()
+                    && rest[name_len] == b';'
+                    && rest[..name_len]
+                        .iter()
+                        .all(|&c| c.is_ascii_alphanumeric() || c >= 0x80)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 impl fmt::Display for Title {

@@ -194,18 +194,22 @@ impl HtmlSerializer {
                         buf.push_str(&format!("{indent}<hr/>"));
                     }
                     ElementKind::Wikilink => {
-                        let href = attr_escape(node.get_attr("href").unwrap_or(""));
-                        let rel = attr_escape(node.get_attr("rel").unwrap_or("mw:WikiLink"));
-                        buf.push_str(&format!("<a rel=\"{rel}\" href=\"{href}\""));
+                        buf.push_str("<a");
+                        serialize_attr_kv(
+                            "rel",
+                            node.get_attr("rel").unwrap_or("mw:WikiLink"),
+                            buf,
+                        );
+                        serialize_attr_kv("href", node.get_attr("href").unwrap_or(""), buf);
                         self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</a>");
                     }
                     ElementKind::ExtLink => {
-                        let href = attr_escape(node.get_attr("href").unwrap_or(""));
-                        let rel = attr_escape(node.get_attr("rel").unwrap_or("mw:ExtLink"));
-                        buf.push_str(&format!("<a rel=\"{rel}\" href=\"{href}\""));
+                        buf.push_str("<a");
+                        serialize_attr_kv("rel", node.get_attr("rel").unwrap_or("mw:ExtLink"), buf);
+                        serialize_attr_kv("href", node.get_attr("href").unwrap_or(""), buf);
                         self.serialize_attrs_skip_rel(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
@@ -451,27 +455,33 @@ fn is_void_element(tag: &str) -> bool {
 /// single quotes when the value contains `"` and (no `'` or more `"` than `'`),
 /// else double quotes, with the value escaped for the chosen quote.
 fn serialize_attr(attr: &crate::dom::node::Attribute, buf: &mut String) {
-    if attr.key.starts_with("data-mw-i18n") {
-        let escaped = attr.value.replace('&', "&amp;").replace('\'', "&#39;");
-        buf.push_str(&format!(" {}='{escaped}'", attr.key));
+    serialize_attr_kv(&attr.key, &attr.value, buf);
+}
+
+/// The `smartQuote` attribute serializer, taking a key/value pair directly (so
+/// callers that synthesize an attribute inline — e.g. `href` on a wikilink — can
+/// get the same quote/escaping behavior as the generic element path).
+fn serialize_attr_kv(key: &str, value: &str, buf: &mut String) {
+    if key.starts_with("data-mw-i18n") {
+        let escaped = value.replace('&', "&amp;").replace('\'', "&#39;");
+        buf.push_str(&format!(" {key}='{escaped}'"));
         return;
     }
 
-    let dq = attr.value.matches('"').count();
-    let sq = attr.value.matches('\'').count();
-    let use_single = attr.value.contains('"') && (sq == 0 || dq > sq);
+    let dq = value.matches('"').count();
+    let sq = value.matches('\'').count();
+    let use_single = value.contains('"') && (sq == 0 || dq > sq);
 
     if use_single {
         // Single-quoted: escape `&`, `<`, and `'` (the delimiter), leaving `"`
         // literal (mirrors `smartQuote`).
-        let escaped = attr
-            .value
+        let escaped = value
             .replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('\'', "&apos;");
-        buf.push_str(&format!(" {}='{escaped}'", attr.key));
+        buf.push_str(&format!(" {key}='{escaped}'"));
     } else {
-        buf.push_str(&format!(" {}=\"{}\"", attr.key, attr_escape(&attr.value)));
+        buf.push_str(&format!(" {key}=\"{}\"", attr_escape(value)));
     }
 }
 

@@ -213,6 +213,20 @@ pub fn get_wiki_link_target_info(
         title = Some(TitleParser::parse(&title_decoded, ctx.config));
     }
 
+    // A title that (after URL-decoding) still carries a percent-encoding
+    // sequence (`%hh`) or an entity reference (`&…;`) is invalid: it cannot be
+    // round-tripped consistently (mirrors `Title::newFromText`'s
+    // `getTitleInvalidRegex`, which `makeTitleFromURLDecodedStr` enforces). The
+    // caller bails the link to plain text.
+    if let Some(t) = &title
+        && crate::title::has_invalid_chars(&t.text)
+    {
+        return Err("Invalid characters in title.".to_string());
+    }
+    if interwiki.is_some() && crate::title::has_invalid_chars(&href) {
+        return Err("Invalid characters in title.".to_string());
+    }
+
     Ok(WikiLinkTargetInfo {
         href,
         href_src: href_src.to_string(),
@@ -1119,7 +1133,7 @@ fn bogus_opt(ak: &str) -> crate::wikitext::tokens_v2::OptListEntry {
 /// for `alt`. Non-wikilink values are returned unchanged. Faithful to the
 /// `mw:WikiLink`/`mw:WikiLink/Interwiki` branches of PHP's
 /// `stringifyOptionTokens` (which, for a *local* wikilink, capture the content).
-fn resolve_wikilink_option(value: &str, is_link: bool) -> String {
+pub(crate) fn resolve_wikilink_option(value: &str, is_link: bool) -> String {
     let trimmed = value.trim();
     if !trimmed.starts_with("[[") || !trimmed.ends_with("]]") {
         return value.to_string();

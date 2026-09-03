@@ -481,11 +481,19 @@ fn parse_media_opts(
         match info.ck.as_str() {
             "manualthumb" => opts.manualthumb = Some(info.v),
             "link" => {
-                opts.link = Some(crate::pipeline::media_options::strip_quote_markers(&info.v))
+                let resolved =
+                    crate::pipeline::wiki_link_render::resolve_wikilink_option(&info.v, true);
+                opts.link = Some(crate::pipeline::media_options::strip_quote_markers(
+                    &resolved,
+                ))
             }
             "alt" => {
                 opts.expanded_attrs |= crate::pipeline::media_options::has_wikitext_markup(&info.v);
-                opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(&info.v));
+                let resolved =
+                    crate::pipeline::wiki_link_render::resolve_wikilink_option(&info.v, false);
+                opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(
+                    &resolved,
+                ));
             }
             "class" => opts.class = Some(info.v),
             "lang" if crate::pipeline::media_options::is_valid_internal_lang(&info.v) => {
