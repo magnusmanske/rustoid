@@ -15,6 +15,7 @@
 //! fields are plumbed through.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::title::{Title, TitleParser};
@@ -45,22 +46,23 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
             job.title = target;
         }
         let key = job.title.full_text();
-        if infos.contains_key(&key) {
-            continue;
+        if let Entry::Vacant(entry) = infos.entry(key) {
+            let info = source.get_file_info(&job.title).await.unwrap_or(None);
+            entry.insert(info);
         }
-        let info = source.get_file_info(&job.title).await.unwrap_or(None);
-        infos.insert(key, info);
 
         // `manualthumb=Thumb.png` uses the manual-thumb file's media info for
         // `src`/dimensions, while `href`/`resource` keep the original title.
+        // This fetch is independent of the main-file dedup above: a manual-thumb
+        // job whose main file was already fetched (e.g. another gallery line for
+        // the same file) must still retrieve the manual-thumb info.
         if let Some(mt) = &job.manualthumb {
             let mt_title = Title::new(6, mt.clone());
             let mt_key = mt_title.full_text();
-            if infos.contains_key(&mt_key) {
-                continue;
+            if let Entry::Vacant(entry) = infos.entry(mt_key) {
+                let mt_info = source.get_file_info(&mt_title).await.unwrap_or(None);
+                entry.insert(mt_info);
             }
-            let mt_info = source.get_file_info(&mt_title).await.unwrap_or(None);
-            infos.insert(mt_key, mt_info);
         }
     }
 
@@ -81,6 +83,9 @@ struct ContainerJob {
     data_height: Option<String>,
     /// The `manualthumb=` title (a file name in the File namespace), if any.
     manualthumb: Option<String>,
+    /// The `data-upright` factor on the broken span (only present for
+    /// `thumb`/`frameless` + `upright`), if any.
+    upright: Option<f64>,
 }
 
 /// Parse the file title from a media container's broken span text.
@@ -116,6 +121,14 @@ fn data_height_from_container(container: &Node) -> Option<String> {
     let anchor = first_element_child(container)?;
     let span = first_element_child(anchor)?;
     span.get_attr("data-height").map(str::to_string)
+}
+
+/// The `data-upright` factor on a container's broken span, if present (mirrors
+/// `$uprightFactor = getAttribute($span, 'data-upright')` in `AddMediaInfo::run`).
+fn upright_from_container(container: &Node) -> Option<f64> {
+    let anchor = first_element_child(container)?;
+    let span = first_element_child(anchor)?;
+    span.get_attr("data-upright")?.parse::<f64>().ok()
 }
 
 /// The `lang` attribute on a container's broken span, if present (mirrors
@@ -176,6 +189,7 @@ fn collect_containers(
             data_width: data_width_from_container(node),
             data_height: data_height_from_container(node),
             manualthumb: data_mw_txt(node, "manualthumb"),
+            upright: upright_from_container(node),
         });
         // Descend so nested media (e.g. within a caption) are also collected.
     }
@@ -354,7 +368,14 @@ fn apply_media_info(
     // Rendered dimensions.
     img.set_attr("height", height.to_string());
     img.set_attr("width", width.to_string());
-    img.set_attr("class", "mw-file-element");
+    // `upright` adds the client-side scaling class and a custom property that
+    // CSS uses for responsive image scaling (mirrors `AddMediaInfo::run`).
+    if let Some(factor) = job.upright {
+        img.set_attr("class", "mw-file-element mw-file-upright");
+        img.set_attr("style", format!("--mw-file-upright: {factor}"));
+    } else {
+        img.set_attr("class", "mw-file-element");
+    }
 
     rewrite_structure(
         root,
