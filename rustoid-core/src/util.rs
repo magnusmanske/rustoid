@@ -35,6 +35,21 @@ pub fn decode_uri_component(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Percent-encode a string for a URL query value, mirroring PHP's `urlencode`:
+/// `A-Z a-z 0-9 - _ .` are left verbatim, space becomes `+`, and every other
+/// byte becomes an uppercase `%XX` sequence.
+pub fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Convert a hex nibble to its value.
 fn hex_val(b: u8) -> Option<u8> {
     match b {

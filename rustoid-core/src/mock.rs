@@ -439,8 +439,12 @@ impl SiteConfig for MockSiteConfig {
 
     fn get_upload_url(&self, title: &str) -> String {
         // The parser-test harness uses a relative Special:Upload URL with the
-        // destination file name (mirrors `MockApiHelper`-backed `getUploadUrl`).
-        format!("./Special:Upload?wpDestFile={title}")
+        // destination file name, url-encoded except the `:`/`*` kept literal
+        // (mirrors `MockApiHelper`-backed `getUploadUrl`).
+        let encoded = crate::util::urlencode(title)
+            .replace("%3A", ":")
+            .replace("%2A", "*");
+        format!("./Special:Upload?wpDestFile={encoded}")
     }
 
     fn parsoid_experimental_parser_function_output(&self) -> bool {
