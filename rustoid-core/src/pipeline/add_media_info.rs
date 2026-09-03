@@ -88,13 +88,140 @@ struct ContainerJob {
     upright: Option<f64>,
 }
 
+/// Resolve the `<a>` anchor inside a media container, descending through any
+/// reopened formatting elements (`<i>`, `<b>`, …) the tree builder inserted to
+/// repair a content-model violation (PHP's `reopenedAFE`, T314059).
+///
+/// Returns the index path from `container` to the anchor (each hop follows the
+/// first element child). The last hop is the `<a>` anchor; preceding hops are the
+/// reopened formatting elements (if any). When the first element child is not an
+/// `<a>` and not a formatting tag, the result is the single-hop path to it.
+fn anchor_path(container: &Node) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut node = container;
+    while let Some(idx) = node
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::Element(_)))
+    {
+        path.push(idx);
+        node = &node.children[idx];
+        if crate::html::wts_utils::node_name(node) == "a" {
+            break;
+        }
+        if !crate::html::dom_utils::is_formatting_elt(node) {
+            break;
+        }
+    }
+    path
+}
+
+/// Navigate to a node via an index path (from `anchor_path`).
+fn node_at_path<'a>(container: &'a Node, path: &[usize]) -> Option<&'a Node> {
+    let mut node = container;
+    for &idx in path {
+        node = node.children.get(idx)?;
+    }
+    Some(node)
+}
+
+/// Migrate reopened formatting elements out of the media anchor and into the
+/// figcaption (PHP `AddMediaInfo::run`'s `reopenedAFE` handling, T314059).
+///
+/// When `renderFile`'s `<figure>` was opened inside a formatting element (an
+/// active-formatting-element reconstruction), the tree builder nests the reopened
+/// `<i>`/`<b>`/… around both the `<a>` and the `<figcaption>`:
+/// `<figure><i><a>…</a><figcaption>…</figcaption></i></figure>`. The spec wants
+/// the `<a>` and `<figcaption>` as direct children of the container, with the
+/// formatting element moved into the `<figcaption>`:
+/// `<figure><a>…</a><figcaption><i>…</i></figcaption></figure>`. Inline media
+/// (a `<span>` container) simply drops the formatting element.
+fn migrate_reopened_afe(container: &mut Node) {
+    let path = anchor_path(container);
+    // A single-hop path means the anchor is already a direct child (no AFE).
+    if path.len() <= 1 {
+        return;
+    }
+
+    let is_block = matches!(container.kind, NodeKind::Element(ElementKind::Figure));
+
+    // Remove the anchor from the innermost AFE.
+    let anchor = take_node_at_path(container, &path);
+    let Some(anchor) = anchor else {
+        return;
+    };
+
+    // Peel the (now anchor-less) AFE chain off the container. It is the
+    // container's first element child.
+    let mut chain = container.children.remove(path[0]);
+
+    // For block media, peel the figcaption out of the innermost AFE and move its
+    // caption content into that AFE (so the reopened formatting wraps the caption
+    // text), then re-home the chain inside the figcaption.
+    let figcaption = if is_block {
+        peel_figcaption(&mut chain)
+    } else {
+        None
+    };
+
+    let mut rebuilt = Vec::with_capacity(container.children.len() + 2);
+    rebuilt.push(anchor);
+    if let Some(mut fig) = figcaption {
+        if is_block {
+            fig.children.insert(0, chain);
+        }
+        rebuilt.push(fig);
+    }
+    rebuilt.extend(std::mem::take(&mut container.children));
+    container.children = rebuilt;
+}
+
+/// Peel the `<figcaption>` out of the *innermost* AFE of `chain` (the deepest
+/// formatting element, which held the anchor and now holds the figcaption), and
+/// move the figcaption's caption content into that AFE. Returns the figcaption
+/// (now childless) and leaves `chain` as the (now-empty) nested formatting tree.
+fn peel_figcaption(chain: &mut Node) -> Option<Node> {
+    // Walk down the single-element-child formatting chain to the innermost AFE.
+    let mut node = chain;
+    loop {
+        let idx = node
+            .children
+            .iter()
+            .position(|c| matches!(c.kind, NodeKind::Element(_)))?;
+        let child_is_fmt = crate::html::dom_utils::is_formatting_elt(&node.children[idx]);
+        if child_is_fmt {
+            node = &mut node.children[idx];
+            continue;
+        }
+        // `node` is the innermost AFE; its first element child is the figcaption.
+        let mut fig = node.children.remove(idx);
+        // Move the caption content into the innermost AFE.
+        let caption = std::mem::take(&mut fig.children);
+        node.children.extend(caption);
+        return Some(fig);
+    }
+}
+
+/// Remove and return the node at `path` from `container` (the final sibling is
+/// removed; intermediate hops remain). The path maps `path[0]` to an index in
+/// `container.children`, and each subsequent index to a child of the prior hop.
+fn take_node_at_path(container: &mut Node, path: &[usize]) -> Option<Node> {
+    if path.len() == 1 {
+        return Some(container.children.remove(path[0]));
+    }
+    let mut node = container;
+    for &idx in &path[..path.len() - 1] {
+        node = node.children.get_mut(idx)?;
+    }
+    Some(node.children.remove(path[path.len() - 1]))
+}
+
 /// Parse the file title from a media container's broken span text.
 ///
 /// PHP resolves the title from `$span->textContent` (the prefixed DB text the
 /// tokenizer stashed inside the broken span). Mirrors that behavior.
 fn title_from_container(container: &Node, config: &dyn SiteConfig) -> Title {
-    let anchor = first_element_child(container);
-    let span = anchor.and_then(first_element_child);
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
     let text = span.map(text_content).unwrap_or_default();
     // Strip leading/trailing whitespace; empty text falls back to the resource.
     let text = text.trim();
@@ -111,33 +238,29 @@ fn title_from_container(container: &Node, config: &dyn SiteConfig) -> Title {
 
 /// The `data-width` attribute on a container's broken span, if present.
 fn data_width_from_container(container: &Node) -> Option<String> {
-    let anchor = first_element_child(container)?;
-    let span = first_element_child(anchor)?;
-    span.get_attr("data-width").map(str::to_string)
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
+    span.and_then(|s| s.get_attr("data-width").map(str::to_string))
 }
 
 /// The `data-height` attribute on a container's broken span, if present.
 fn data_height_from_container(container: &Node) -> Option<String> {
-    let anchor = first_element_child(container)?;
-    let span = first_element_child(anchor)?;
-    span.get_attr("data-height").map(str::to_string)
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
+    span.and_then(|s| s.get_attr("data-height").map(str::to_string))
 }
 
 /// The `data-upright` factor on a container's broken span, if present (mirrors
 /// `$uprightFactor = getAttribute($span, 'data-upright')` in `AddMediaInfo::run`).
 fn upright_from_container(container: &Node) -> Option<f64> {
-    let anchor = first_element_child(container)?;
-    let span = first_element_child(anchor)?;
-    span.get_attr("data-upright")?.parse::<f64>().ok()
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
+    span.and_then(|s| s.get_attr("data-upright")?.parse::<f64>().ok())
 }
 
 /// The `lang` attribute on a container's broken span, if present (mirrors
 /// `$lang = getAttribute($span, 'lang')` in `AddMediaInfo::run`).
 fn lang_from_container(root: &Node, path: &[usize]) -> Option<String> {
     let container = node_at_read(root, path)?;
-    let anchor = first_element_child(container)?;
-    let span = first_element_child(anchor)?;
-    span.get_attr("lang").map(str::to_string)
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
+    span.and_then(|s| s.get_attr("lang").map(str::to_string))
 }
 
 /// The first element (non-text) child of `node`, if any.
@@ -186,7 +309,7 @@ fn has_error_type(node: &Node) -> bool {
 /// sub-pipeline, e.g. a gallery line). Resolved media is skipped on a later pass
 /// (mirrors PHP's `$span instanceof span` guard in `AddMediaInfo::run`).
 fn has_broken_span(container: &Node) -> bool {
-    let Some(anchor) = first_element_child(container) else {
+    let Some(anchor) = node_at_path(container, &anchor_path(container)) else {
         return false;
     };
     matches!(
@@ -240,6 +363,14 @@ fn apply_media_info(
     config: &dyn SiteConfig,
 ) {
     let info = infos.get(&job.title.full_text()).and_then(|i| i.clone());
+
+    // T314059: migrate any reopened formatting elements (from a content-model
+    // violation, e.g. `<p>''[[File:…|thumb]]''</p>`) out of the anchor and into
+    // the figcaption, so the resolved `<a>` becomes a direct child of the
+    // container (mirrors PHP `AddMediaInfo::run`'s `reopenedAFE` handling).
+    if let Some(container) = node_at(root, &job.path) {
+        migrate_reopened_afe(container);
+    }
 
     // `link=` / `alt=` / `page=` options stored in `data-mw.attribs` by
     // `renderFile` (`lang=` lives on the broken span, read separately below).
