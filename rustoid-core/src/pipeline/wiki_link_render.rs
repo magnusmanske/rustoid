@@ -206,8 +206,11 @@ pub fn get_wiki_link_target_info(
             title = Some(TitleParser::parse(&title_decoded, ctx.config));
         }
     } else {
-        // No colon → plain mainspace title.
-        title = Some(Title::new_main(title_decoded.clone()));
+        // No colon → plain mainspace title. Use `TitleParser::parse` (rather
+        // than `Title::new_main`) so the URL fragment is split off and
+        // first-letter capitalization is applied (mirrors
+        // `makeTitleFromURLDecodedStr`).
+        title = Some(TitleParser::parse(&title_decoded, ctx.config));
     }
 
     Ok(WikiLinkTargetInfo {
@@ -277,12 +280,19 @@ pub fn add_link_attributes_and_get_content(
         dp.stx = Some("piped".to_string());
         (new_attr_data.attribs, out, dp)
     } else {
-        // No explicit link text; derive it from the title.
-        let morecontent = target
-            .title
-            .as_ref()
-            .map(|t| t.get_prefixed_text())
-            .unwrap_or_else(|| target.href.clone());
+        // No explicit link text; derive it from the (decoded) target href,
+        // which carries the fragment and namespace (mirrors PHP's
+        // `addLinkAttributesAndGetContent`: `decodeURIComponent($target->href)`,
+        // plus interwiki/local prefix prepending).
+        let mut morecontent = crate::util::decode_uri_component(&target.href);
+        if target.interwiki.is_some() {
+            if let Some(ref p) = target.prefix {
+                morecontent = format!("{p}:{morecontent}");
+            }
+        }
+        if let Some(ref lp) = target.local_prefix {
+            morecontent = format!("{lp}:{morecontent}");
+        }
 
         let mut dp = data_parsoid.clone();
         dp.src = None;
@@ -306,7 +316,14 @@ pub fn render_wiki_link(
     // `addNormalizedAttribute('href', normalized, src)` records the source href
     // as `sa.href` and the normalized href as `a.href` (for ComputeDSR).
     if let Some(title) = &target.title {
-        let href = make_link(title, ctx.config);
+        let mut href = make_link(title, ctx.config);
+        // `makeLink(title)` omits the fragment; append it so `[[Main Page#section]]`
+        // renders `./Main_Page#section` (mirrors PHP, where the anchor href
+        // carries the title's fragment).
+        if let Some(fragment) = &title.fragment {
+            href.push('#');
+            href.push_str(fragment);
+        }
         let prefixed = title.get_prefixed_text();
         a_tag.add_attribute_str("href", &href);
         a_tag.add_attribute_str("title", &prefixed);
