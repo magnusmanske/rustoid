@@ -157,8 +157,15 @@ pub fn strip_quote_markers(value: &str) -> String {
             while j < chars.len() && chars[j] == '\'' {
                 j += 1;
             }
-            // A run of 2 apostrophes is the italic marker; skip it entirely.
-            // Longer runs are treated the same (the `mw-quote` token covers both).
+            // A single apostrophe is a literal character (`Foo's`), not a quote
+            // marker. Only a run of 2+ apostrophes is an `mw-quote` token (the
+            // `''`/`'''` markers), which we drop. (The PEG tokenizer does not
+            // emit an `mw-quote` token for a lone `'`.)
+            if j - i == 1 {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
             i = j;
             continue;
         }
@@ -415,6 +422,11 @@ mod tests {
         assert_eq!(strip_quote_markers("''Main Page''"), "Main Page");
         assert_eq!(strip_quote_markers("''x''"), "x");
         assert_eq!(strip_quote_markers("plain"), "plain");
+        // A lone apostrophe is literal, not an italic marker.
+        assert_eq!(
+            strip_quote_markers("Foo's ''italic'' bar"),
+            "Foo's italic bar"
+        );
         // A <nowiki> wrapper preserves its inner quotes literally.
         assert_eq!(strip_quote_markers("<nowiki>''x''</nowiki>"), "''x''");
     }
