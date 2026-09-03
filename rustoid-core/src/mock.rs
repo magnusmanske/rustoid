@@ -352,16 +352,13 @@ impl MockSiteConfig {
         config.add_magic_word("revisiontimestamp", &["REVISIONTIMESTAMP"]);
         config.add_magic_word("server", &["SERVER", "SERVERNAME"]);
         config.add_magic_word("sitename", &["SITENAME"]);
-        config.add_magic_word("img_thumbnail", &["thumbnail", "thumb"]);
+        config.add_magic_word("img_thumbnail", &["thumb", "thumbnail"]);
         config.add_magic_word("img_manualthumb", &["thumbnail=$1", "thumb=$1"]);
         config.add_magic_word("img_right", &["right"]);
         config.add_magic_word("img_left", &["left"]);
         config.add_magic_word("img_none", &["none"]);
         config.add_magic_word("img_center", &["center", "centre"]);
-        config.add_magic_word(
-            "img_framed",
-            &["framed", "frame", "enframed", "frame-horiz"],
-        );
+        config.add_magic_word("img_framed", &["frame", "framed", "enframed"]);
         config.add_magic_word("img_frameless", &["frameless"]);
         config.add_magic_word("img_border", &["border"]);
         config.add_magic_word("img_baseline", &["baseline"]);
@@ -374,8 +371,8 @@ impl MockSiteConfig {
         config.add_magic_word("img_text_bottom", &["text-bottom"]);
         config.add_magic_word("img_link", &["link=$1"]);
         config.add_magic_word("img_alt", &["alt=$1"]);
-        config.add_magic_word("img_page", &["page=$1"]);
-        config.add_magic_word("img_upright", &["upright=$1", "upright"]);
+        config.add_magic_word("img_page", &["page=$1", "page $1"]);
+        config.add_magic_word("img_upright", &["upright", "upright=$1", "upright $1"]);
         config.add_magic_word("img_width", &["$1px"]);
         config.add_magic_word("img_class", &["class=$1"]);
         config.add_magic_word("img_lang", &["lang=$1"]);

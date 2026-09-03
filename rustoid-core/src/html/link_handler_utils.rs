@@ -702,6 +702,23 @@ pub fn link_handler(
         }
     }
 
+    // No type/target info. Detect a basic-HTML figure: `<a><img/></a>` (or
+    // `<a><audio/|video/></a>`), where the link wraps the media element.
+    // Faithful to the `$isFigure` check in `LinkHandlerUtils::linkHandler`.
+    let media = media_child_of_link(tree, node);
+    if let Some(media_elt) = media {
+        // `new MediaStructure($media, $node)` → container is the media elt
+        // itself (no figure/span wrapper), the `<a>` is the link elt.
+        let ms = crate::html::media_structure::MediaStructure {
+            container_elt: media_elt,
+            link_elt: Some(node),
+            media_elt,
+            caption_elt: None,
+        };
+        figure_handler(state, tree, env, node, Some(ms));
+        return;
+    }
+
     // No type/target info: serialize as a plain external link with escaped href.
     let href_str = escape_ext_link_url(&link_data.orig_href);
     let content_str =
@@ -741,11 +758,71 @@ pub fn figure_handler(
     state.push_to_curr_line(ct);
 }
 
+/// The media element wrapped directly by a link element (the `<a><img/>`
+/// basic-HTML figure shape). Returns the media `NodeId` when `node` is an
+/// `<a>`/`<span>` whose first non-separator child is an `img`/`audio`/`video`.
+/// Faithful to `DOMUtils::selectMediaElt` + the `$isFigure` parent check in
+/// `LinkHandlerUtils::linkHandler`.
+fn media_child_of_link(tree: &DomTree, node: NodeId) -> Option<NodeId> {
+    let name = crate::html::dom_utils::node_name(tree.node(node));
+    if name != "a" && name != "span" {
+        return None;
+    }
+    let media = crate::html::dom_tree::first_non_sep_child(tree, node)?;
+    let mname = crate::html::dom_utils::node_name(tree.node(media));
+    if matches!(mname.as_str(), "img" | "audio" | "video" | "span") {
+        Some(media)
+    } else {
+        None
+    }
+}
+
+/// Shadow info for a media attribute — the `{ value, modified, fromsrc,
+/// fromDataMW }` tuple PHP's `serializedImageAttrVal`/`serializedAttrVal` produce.
+/// For basic (non-data-parsoid/html import) HTML all flags are `false` and
+/// `value` is the raw attribute value (or `None` when absent).
+#[derive(Debug, Clone, Default)]
+struct Shadow {
+    value: Option<String>,
+    #[allow(dead_code)]
+    modified: bool,
+    fromsrc: bool,
+    #[allow(dead_code)]
+    from_data_mw: bool,
+}
+
+/// Read an attribute as shadow info (basic-HTML semantics: no data-parsoid, so
+/// `value` is the attribute value and everything else is `false`).
+fn attribute_shadow(tree: &DomTree, node: NodeId, key: &str) -> Shadow {
+    Shadow {
+        value: tree.node(node).get_attr(key).map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// The wikitext aliases for a canonical magic-word key (e.g. `img_link`),
+/// preferring the suggested alias when present. Faithful to
+/// `$mwAliases[$alias]` in `figureToConstrainedText`.
+fn mw_aliases<'a>(
+    env: &'a SerializerEnv,
+    alias: &str,
+) -> Option<&'a crate::traits::MagicWordEntry> {
+    env.get_site_config().magic_words().get(alias)
+}
+
+/// A single assembled media option (`[[File:resource|opt…]]` argument) in the
+/// internal `$nopts` order, before alias/ordering resolution. `ak` holds the
+/// alias(es) (string form, possibly multi-alias preserved from data-mw);
+/// `v` is the substituted `$1` value, `ck` the canonical key.
+struct Nopt {
+    #[allow(dead_code)]
+    ck: String,
+    ak: String,
+    v: Option<String>,
+}
+
 /// `figureToConstrainedText` — assemble the `[[File:resource|…]]` wikitext for a
-/// media element. Faithful to `LinkHandlerUtils::figureToConstrainedText` for the
-/// core resource + caption + basic format options; the localized media-option
-/// aliases (`img_*`/`timedmedia_*` magic words) and `data-mw` option list are
-/// deferred (they need per-wiki magic-word config not yet on the `SiteConfig`).
+/// media element. Faithful port of `LinkHandlerUtils::figureToConstrainedText`.
 pub fn figure_to_constrained_text(
     state: &mut SerializerState,
     tree: &DomTree,
@@ -754,42 +831,293 @@ pub fn figure_to_constrained_text(
     ms: &crate::html::media_structure::MediaStructure,
 ) -> crate::html::constrained_text::ConstrainedText {
     let outer_elt = ms.container_elt;
+    let link_elt = ms.link_elt;
     let media_elt = ms.media_elt;
+    let caption_elt = ms.caption_elt;
+    let format = crate::html::wts_utils::get_media_format(tree.node(outer_elt));
+    let is_img = crate::html::dom_utils::node_name(tree.node(media_elt)) == "img";
 
-    // The resource (file title): from `resource`, or fp/File:filename from `src`.
-    let resource = ms
-        .get_resource(tree)
-        .or_else(|| {
-            tree.node(media_elt)
-                .get_attr("src")
-                .map(|s| format!("File:{}", s.rsplit('/').next().unwrap_or("")))
-        })
+    // Try to identify the local title for this image (from `resource`, else
+    // reconstruct from `src`, stripping the `.`/`..` relative prefix).
+    let mut resource: Shadow = attribute_shadow(tree, media_elt, "resource");
+    if resource.value.is_none() {
+        let src = tree.node(media_elt).get_attr("src").unwrap_or("");
+        if src.is_empty() {
+            // No `resource`/`src`: nothing to serialize (PHP returns null).
+            return crate::html::constrained_text::ConstrainedText::cast("", outer_elt);
+        }
+        // External image link (the `https?://` case) — emit as an autolink.
+        if src.starts_with("https:") || src.starts_with("http:") {
+            return crate::html::constrained_text::ConstrainedText::auto_url_link(src, outer_elt);
+        }
+        resource.value = Some(src.to_string());
+    }
+    if let Some(v) = &mut resource.value
+        && !resource.fromsrc
+    {
+        *v = strip_dot_prefix(v);
+    }
+    let resource_value = resource.value.clone().unwrap_or_default();
+
+    // Reconstruct the caption.
+    let caption = caption_elt.map(|c| {
+        crate::html::serializer_state::SerializerState::serialize_caption_children_to_string(
+            state,
+            tree,
+            c,
+            Some(Box::new(move |_s, text, _o, _t| {
+                crate::html::wikitext_escape_handlers::media_option_handler(text)
+            })),
+        )
+    });
+
+    // Identify the link target.
+    let mut link: Option<Shadow> = None;
+    if let Some(l) = link_elt
+        && tree.node(l).get_attr("href").is_some()
+    {
+        let mut lk = attribute_shadow(tree, l, "href");
+        if !lk.fromsrc {
+            // Strip page/lang parameters from the href.
+            let stripped = strip_page_lang(tree.node(l).get_attr("href").unwrap_or(""));
+            if stripped == tree.node(media_elt).get_attr("resource").unwrap_or("") {
+                // default link: same place as resource
+                lk = resource.clone();
+            }
+            if let Some(v) = &mut lk.value {
+                *v = strip_dot_prefix(v);
+            }
+        }
+        link = Some(lk);
+    }
+    if link.is_none() {
+        // Otherwise, just try and get it from `href` on the outer elt.
+        let h = attribute_shadow(tree, outer_elt, "href");
+        if h.value.is_some() {
+            link = Some(h);
+        }
+    }
+
+    // Fetch the alt / lang / muted / loop.
+    let alt = attribute_shadow(tree, media_elt, "alt");
+    let lang = attribute_shadow(tree, media_elt, "lang");
+    let muted = attribute_shadow(tree, media_elt, "muted");
+    let loop_attr = attribute_shadow(tree, media_elt, "loop");
+
+    // Determine whether an explicit `link=` is needed.
+    let mut link_cond = is_img;
+    if link_cond
+        && let Some(lk) = &link
+        && let Some(lv) = &lk.value
+    {
+        let link_title = env.normalized_title_key(&crate::util::decode_uri_component(lv), true);
+        let resource_title =
+            env.normalized_title_key(&crate::util::decode_uri_component(&resource_value), true);
+        if *lv == resource_value || (link_title.is_some() && link_title == resource_title) {
+            link_cond = false;
+        }
+    }
+
+    let alt_cond = alt.value.is_some() && is_img;
+
+    // Assemble the initial set of options (link, alt, lang, muted, loop).
+    let mut nopts: Vec<Nopt> = Vec::new();
+    {
+        let mut push_simple = |ck: &str, shadow: &Shadow, cond: bool, alias: &str| {
+            if !cond {
+                return;
+            }
+            let ak = aliases_first(env, alias);
+            if shadow.fromsrc {
+                let v = shadow.value.clone().unwrap_or_default();
+                nopts.push(Nopt {
+                    ck: ck.to_string(),
+                    ak: v,
+                    v: None,
+                });
+            } else {
+                let mut value = shadow.value.clone().unwrap_or_default();
+                if ck == "link" || ck == "alt" {
+                    value = crate::html::wikitext_escape_handlers::escape_link_content(
+                        state, tree, &value, false, outer_elt, true,
+                    );
+                }
+                nopts.push(Nopt {
+                    ck: ck.to_string(),
+                    ak,
+                    v: Some(value),
+                });
+            }
+        };
+        push_simple("link", &link.unwrap_or_default(), link_cond, "img_link");
+        push_simple("alt", &alt, alt_cond, "img_alt");
+        push_simple("lang", &lang, lang.value.is_some(), "img_lang");
+        push_simple("muted", &muted, muted.value.is_some(), "timedmedia_muted");
+        push_simple(
+            "loop",
+            &loop_attr,
+            loop_attr.value.is_some(),
+            "timedmedia_loop",
+        );
+    }
+
+    // Handle the class-derived options (halign/valign/border + extra classes).
+    let classes: Vec<String> = tree
+        .node(outer_elt)
+        .get_attr("class")
+        .map(|c| c.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
+    let mut extra: Vec<String> = Vec::new();
+    for c in &classes {
+        match c.as_str() {
+            "mw-halign-none" | "mw-halign-right" | "mw-halign-left" | "mw-halign-center" => {
+                let val = &c[10..]; // strip mw-halign-
+                let ak = aliases_first(env, &format!("img_{val}"));
+                nopts.push(Nopt {
+                    ck: val.to_string(),
+                    ak,
+                    v: None,
+                });
+            }
+            "mw-valign-top"
+            | "mw-valign-middle"
+            | "mw-valign-baseline"
+            | "mw-valign-sub"
+            | "mw-valign-super"
+            | "mw-valign-text-top"
+            | "mw-valign-bottom"
+            | "mw-valign-text-bottom" => {
+                let val = c[10..].replace('-', "_");
+                let ak = aliases_first(env, &format!("img_{val}"));
+                nopts.push(Nopt {
+                    ck: val,
+                    ak,
+                    v: None,
+                });
+            }
+            "mw-image-border" => {
+                let ak = aliases_first(env, "img_border");
+                nopts.push(Nopt {
+                    ck: "border".to_string(),
+                    ak,
+                    v: None,
+                });
+            }
+            "mw-default-size" | "mw-default-audio-height" => { /* handled below */ }
+            _ => extra.push(c.clone()),
+        }
+    }
+    if !extra.is_empty() {
+        let ak = aliases_first(env, "img_class");
+        nopts.push(Nopt {
+            ck: "class".to_string(),
+            ak,
+            v: Some(extra.join(" ")),
+        });
+    }
 
-    // The caption text (from the figcaption element).
-    let caption = ms
-        .caption_elt
-        .map(|c| {
-            crate::html::serializer_state::SerializerState::serialize_caption_children_to_string(
-                state,
-                tree,
-                c,
-                Some(Box::new(move |_s, text, _o, _t| {
-                    crate::html::wikitext_escape_handlers::media_option_handler(text)
-                })),
-            )
-        })
-        .unwrap_or_default();
+    // Format option (from `typeof` suffix).
+    let has_manualthumb = false; // no data-mw in basic HTML
+    match format.as_str() {
+        "Thumb" => {
+            let ak = aliases_first(env, "img_thumbnail");
+            nopts.push(Nopt {
+                ck: "thumbnail".to_string(),
+                ak,
+                v: None,
+            });
+        }
+        "Frame" => {
+            let ak = aliases_first(env, "img_framed");
+            nopts.push(Nopt {
+                ck: "framed".to_string(),
+                ak,
+                v: None,
+            });
+        }
+        "Frameless" => {
+            let ak = aliases_first(env, "img_frameless");
+            nopts.push(Nopt {
+                ck: "frameless".to_string(),
+                ak,
+                v: None,
+            });
+        }
+        _ => {}
+    }
 
-    // Assemble `[[File:resource|caption]]` (or just `[[File:resource]]`).
-    let wt = if caption.is_empty() {
-        format!("[[{resource}]]")
-    } else {
-        format!("[[{resource}|{caption}]]")
-    };
+    // Size options.
+    let is_redlink = ms.is_red_link(tree);
+    let wh = attribute_shadow(
+        tree,
+        media_elt,
+        if is_redlink { "data-height" } else { "height" },
+    );
+    let ww = attribute_shadow(
+        tree,
+        media_elt,
+        if is_redlink { "data-width" } else { "width" },
+    );
+
+    let size_unmodified = ww.from_data_mw || (!ww.modified && !wh.modified);
+    let has_default_size = classes.iter().any(|c| c == "mw-default-size");
+    let is_audio = crate::html::dom_utils::node_name(tree.node(media_elt)) == "audio";
+    let has_default_audio_height = classes.iter().any(|c| c == "mw-default-audio-height");
+
+    if !has_default_size && format != "Frame" && !has_manualthumb {
+        let size_string = String::new(); // no data-mw optList to recover from
+        if size_unmodified && !size_string.is_empty() {
+            // preserve original width/height string (n/a in basic HTML)
+        } else {
+            let mut bbox: Option<i64> = None;
+            if let Some(v) = &ww.value
+                && let Ok(n) = leading_int(v)
+            {
+                bbox = Some(n);
+            }
+            if let Some(v) = &wh.value
+                && let Ok(h) = leading_int(v)
+                && !(is_audio && has_default_audio_height)
+                && bbox.is_none_or(|b| h > b)
+            {
+                bbox = Some(h);
+            }
+            if let Some(bbox) = bbox {
+                let ak = aliases_first(env, "img_width");
+                nopts.push(Nopt {
+                    ck: "width".to_string(),
+                    ak,
+                    v: Some(format!("{bbox}x{bbox}")),
+                });
+            }
+        }
+    }
+
+    // Put the caption last, by default.
+    if let Some(caption) = &caption
+        && !caption.is_empty()
+    {
+        nopts.push(Nopt {
+            ck: "caption".to_string(),
+            ak: caption.clone(),
+            v: None,
+        });
+    }
+
+    // Emit all the options in order.
+    let mut wikitext = format!("[[{resource_value}");
+    for o in &nopts {
+        wikitext.push('|');
+        if let Some(v) = &o.v {
+            wikitext.push_str(&o.ak.replace("$1", v));
+        } else {
+            wikitext.push_str(&o.ak);
+        }
+    }
+    wikitext.push_str("]]");
 
     crate::html::constrained_text::ConstrainedText::wiki_link(
-        wt,
+        wikitext,
         outer_elt,
         false,
         None,
@@ -797,6 +1125,80 @@ pub fn figure_to_constrained_text(
             .link_trail_regex()
             .and_then(|t| regex::Regex::new(t).ok()),
     )
+}
+
+/// Strip the `./`/`../` relative-prefix segments from a title string, faithful
+/// to `preg_replace('#^(\\.\\.?/)+#', '', $value, 1)`.
+fn strip_dot_prefix(s: &str) -> String {
+    let mut rest = s;
+    loop {
+        let mut changed = false;
+        if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+            changed = true;
+        } else if let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    rest.to_string()
+}
+
+/// Strip a trailing `?page=NNN` or `?lang=xx` query from an href, faithful to
+/// `preg_replace('#[?]((?:page=\\d+)|(?:lang=[a-z]+(?:-[a-z]+)*))$#Di', '', $href)`.
+fn strip_page_lang(href: &str) -> String {
+    if let Some(pos) = href.rfind('?') {
+        let query = &href[pos + 1..];
+        let is_page = query
+            .strip_prefix("page=")
+            .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+        let is_lang = query.strip_prefix("lang=").is_some_and(|seg| {
+            !seg.is_empty()
+                && seg
+                    .split('-')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
+        });
+        if is_page || is_lang {
+            return href[..pos].to_string();
+        }
+    }
+    href.to_string()
+}
+
+/// The first alias for a canonical magic-word key (the preferred English form),
+/// or a bare fallback when the key is not configured. Faithful to
+/// `$mwAliases[$alias][0]` (with `img_width` falling back to `$1px`).
+fn aliases_first(env: &SerializerEnv, alias: &str) -> String {
+    if let Some(entry) = mw_aliases(env, alias)
+        && let Some(first) = entry.aliases.first()
+    {
+        return first.clone();
+    }
+    // Fallback aliases so unconfigured wikis still produce sane output.
+    match alias {
+        "img_link" => "link=$1".to_string(),
+        "img_alt" => "alt=$1".to_string(),
+        "img_lang" => "lang=$1".to_string(),
+        "img_width" => "$1px".to_string(),
+        "img_class" => "class=$1".to_string(),
+        "timedmedia_muted" => "muted".to_string(),
+        "timedmedia_loop" => "loop".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The leading decimal integer of a size string (e.g. `"100"` or `"10px"` → 100).
+/// Faithful to `preg_match('/^\\d+/', $value)` + `intval`.
+fn leading_int(s: &str) -> Result<i64, ()> {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        Err(())
+    } else {
+        digits.parse::<i64>().map_err(|_| ())
+    }
 }
 
 #[cfg(test)]
