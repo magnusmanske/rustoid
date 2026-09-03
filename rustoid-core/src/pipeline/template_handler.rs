@@ -867,7 +867,7 @@ pub fn tokenize_wikitext_to_items(
         ..Default::default()
     };
     let mut tokenizer = PegTokenizer::new(wikitext, &options);
-    match tokenizer.tokenize() {
+    let items = match tokenizer.tokenize() {
         Ok(chunks) => chunks
             .into_iter()
             .map(|either| match either {
@@ -876,7 +876,88 @@ pub fn tokenize_wikitext_to_items(
             })
             .collect(),
         Err(_) => vec![Item::Str(wikitext.to_string())],
+    };
+    filter_include_directives(items, in_template)
+}
+
+/// Drop/keep `<includeonly>`/`<noinclude>`/`<onlyinclude>` regions according to
+/// the template context, mirroring PHP `TemplateHandler::processPreprocToString`:
+/// - `<noinclude>` content is kept on the page (`in_template == false`) but dropped
+///   when transcluded (`in_template == true`).
+/// - `<includeonly>` content is the reverse (dropped on the page, kept in
+///   transclusion).
+/// - `<onlyinclude>` content is always kept.
+///
+/// The boundary markers emitted by the tokenizer are `meta` self-closing tokens
+/// with `typeof="mw:Includes/<Type>[/End]"`. We track a stack of open regions to
+/// support (the common) non-nested uses and ignore unbalanced/misordered markers
+/// defensively.
+pub fn filter_include_directives(items: Vec<Item>, in_template: bool) -> Vec<Item> {
+    fn inc_type_of(item: &Item) -> Option<(String, bool)> {
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+            return None;
+        };
+        if stt.name != "meta" {
+            return None;
+        }
+        let ty = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))?;
+        let ty = ty.value.as_str()?;
+        let k = ty.strip_prefix("mw:Includes/")?;
+        let (kind, closing) = match k.strip_suffix("/End") {
+            Some(k) => (k.to_string(), true),
+            None => (k.to_string(), false),
+        };
+        Some((kind, closing))
     }
+
+    let mut out: Vec<Item> = Vec::new();
+    // Whether the current top-of-stack region is being dropped (its content
+    // excluded). `true` when the region's content should be kept but the markers
+    // dropped is encoded by simply not pushing the markers.
+    let mut stack: Vec<bool> = Vec::new(); // each entry: is-content-dropped
+
+    for item in items {
+        if let Some((kind, closing)) = inc_type_of(&item) {
+            match kind.as_str() {
+                "NoInclude" => {
+                    if !closing {
+                        // Content dropped when transcluding; kept otherwise.
+                        stack.push(in_template);
+                    } else {
+                        stack.pop();
+                    }
+                    // Boundary markers are never emitted.
+                }
+                "IncludeOnly" => {
+                    if !closing {
+                        // Content kept when transcluding; dropped otherwise.
+                        stack.push(!in_template);
+                    } else {
+                        let _ = stack.pop();
+                    }
+                }
+                "OnlyInclude" => {
+                    if !closing {
+                        stack.push(false); // always keep content
+                    } else {
+                        let _ = stack.pop();
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Emit content only if the innermost region is not a dropped one.
+        if stack.last().copied().unwrap_or(false) {
+            continue;
+        }
+        out.push(item);
+    }
+    out
 }
 
 #[cfg(test)]

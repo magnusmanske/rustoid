@@ -1438,6 +1438,9 @@ impl<'a> PegTokenizer<'a> {
         if self.try_extension_tag() {
             return true;
         }
+        if self.try_include_limits() {
+            return true;
+        }
         if self.try_html_tag() {
             return true;
         }
@@ -2401,28 +2404,43 @@ impl<'a> PegTokenizer<'a> {
         false
     }
 
-    /// Try include limits: `<includeonly>`, `<noinclude>`, `<onlyinclude>`.
+    /// Try include limits: `<includeonly>`, `<noinclude>`, `<onlyinclude>` and
+    /// their closing tags (`</includeonly>`, ...), emitting `mw:Includes/<Type>`
+    /// and `mw:Includes/<Type>/End` markers respectively.
     fn try_include_limits(&mut self) -> bool {
         let saved = self.pos;
         if !self.starts_with("<") {
             return false;
         }
 
-        let tag = if self.starts_with("<includeonly>") {
-            Some(("includeonly", "<includeonly>".len()))
+        let closing = self.starts_with("</");
+        let (name, tag_len) = if closing {
+            if self.starts_with("</includeonly>") {
+                ("includeonly", "</includeonly>".len())
+            } else if self.starts_with("</noinclude>") {
+                ("noinclude", "</noinclude>".len())
+            } else if self.starts_with("</onlyinclude>") {
+                ("onlyinclude", "</onlyinclude>".len())
+            } else {
+                return false;
+            }
+        } else if self.starts_with("<includeonly>") {
+            ("includeonly", "<includeonly>".len())
         } else if self.starts_with("<noinclude>") {
-            Some(("noinclude", "<noinclude>".len()))
+            ("noinclude", "<noinclude>".len())
         } else if self.starts_with("<onlyinclude>") {
-            Some(("onlyinclude", "<onlyinclude>".len()))
+            ("onlyinclude", "<onlyinclude>".len())
         } else {
             return false;
         };
 
-        let (name, tag_len) = tag.unwrap();
         self.advance(tag_len);
 
         let dp = self.make_dp(saved, self.pos);
-        let meta_type = format!("mw:Includes/{}", name_to_include_type(name));
+        let mut meta_type = format!("mw:Includes/{}", name_to_include_type(name));
+        if closing {
+            meta_type.push_str("/End");
+        }
 
         let mut stt = SelfclosingTagTk::new("meta", vec![], dp);
         stt.add_attribute_str("typeof", meta_type);
