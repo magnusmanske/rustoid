@@ -67,6 +67,47 @@ fn extension_body(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String 
     crate::pipeline::extension_handler::extract_ext_body(stt, ext_src)
 }
 
+/// If `item` is a `<gallery>` extension token, return the self-closing token.
+fn gallery_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    if stt.name != "extension" {
+        return None;
+    }
+    let name = stt
+        .attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str());
+    if name == Some("gallery") {
+        Some(stt)
+    } else {
+        None
+    }
+}
+
+/// Emit the `mw:dom-fragment-token` placeholder for a `<gallery>` extension,
+/// referencing the pre-built gallery fragment by `id` (mirrors the generic
+/// extension encapsulation in `extension_handler::gallery_items`).
+fn emit_gallery_placeholder(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, id: usize) -> Item {
+    use crate::wikitext::tokens_v2::{KeyValue, SelfclosingTagTk};
+
+    let mut dp = stt.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+    let mut frag_tok = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
+    frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
+        key: KeyValue::Str("data-fragment-id".to_string()),
+        value: KeyValue::Str(id.to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
+    Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))
+}
+
 /// Emit the `<pre typeof="mw:Extension/pre">` + `mw:dom-fragment-token` +
 /// `</pre>` placeholder sequence for a `<pre format="wikitext">` extension,
 /// referencing the sub-fragment by `id`.
@@ -744,6 +785,98 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         (out, fragments)
     }
 
+    /// Render a gallery caption (wikitext) into fragment children, expanding
+    /// templates/parser functions when a data source is present. Mirrors PHP's
+    /// `renderMedia` caption handling (`processContentInPipeline` with
+    /// `inlineContext => true` + `expandTemplates`).
+    async fn render_caption_expanded(
+        &self,
+        caption: &str,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Vec<Node> {
+        let mut tokens = match self.tokenize(caption) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        if source.is_some() {
+            tokens = self
+                .expand_templates(frame, tokens, source, about_counter, true)
+                .await;
+            tokens = self
+                .expand_attributes(frame, tokens, source, about_counter, None)
+                .await;
+        }
+        let mut frag = self.fragment_from_tokens(tokens);
+        std::mem::take(&mut frag.children)
+    }
+
+    /// Expand `<gallery>` extension tokens in place: build each gallery fragment
+    /// (expanding caption templates when a data source is present) and tunnel it
+    /// through an `mw:dom-fragment-token` placeholder. Uses the shared `next_id`
+    /// counter so gallery fragments never collide with `render_links`'s caption
+    /// fragments (mirrors PHP's `Gallery::sourceToDom` + extension encapsulation).
+    async fn expand_gallery(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &mut usize,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+
+        for item in tokens {
+            let Some(stt) = gallery_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let ul = crate::pipeline::gallery::build_with(stt, self.config, |caption: &str| {
+                let caption = caption.to_string();
+                async move {
+                    self.render_caption_expanded(&caption, source, frame, about_counter)
+                        .await
+                }
+            })
+            .await;
+            let mut frag = crate::dom::node::Node::document();
+            frag.push_child(ul);
+            let id = *next_id;
+            *next_id += 1;
+            fragments.insert(id, frag);
+            out.push(emit_gallery_placeholder(stt, id));
+        }
+
+        out
+    }
+
+    /// Synchronous [`expand_gallery`] for the `wikitext_to_ast` path (no data
+    /// source, so no template expansion).
+    fn expand_gallery_sync(
+        &self,
+        tokens: Vec<Item>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &mut usize,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = gallery_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let ul = crate::pipeline::gallery::build_with_sync(stt, self.config);
+            let mut frag = crate::dom::node::Node::document();
+            frag.push_child(ul);
+            let id = *next_id;
+            *next_id += 1;
+            fragments.insert(id, frag);
+            out.push(emit_gallery_placeholder(stt, id));
+        }
+        out
+    }
+
     /// Convert wikitext to the format-agnostic AST (no template expansion).
     ///
     /// When `wrap_sections` is true, heading content is wrapped in `<section>`
@@ -759,6 +892,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_behavior_switches(tokens);
         let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens);
         fragments.extend(pre_fragments);
+        let tokens = self.expand_gallery_sync(tokens, &mut fragments, &mut next_id);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
@@ -840,6 +974,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .expand_wikitext_pre(tokens, source, &frame, about_counter)
             .await;
         fragments.extend(pre_fragments);
+        let tokens = self
+            .expand_gallery(
+                tokens,
+                source,
+                &frame,
+                about_counter,
+                &mut fragments,
+                &mut next_id,
+            )
+            .await;
 
         let stage = TreeBuilderStage::new(false);
         let mut ast =

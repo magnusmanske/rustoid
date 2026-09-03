@@ -87,6 +87,24 @@ pub fn build(
     token: &crate::wikitext::tokens_v2::SelfclosingTagTk,
     config: &dyn SiteConfig,
 ) -> Node {
+    build_with_sync(token, config)
+}
+
+/// Build the `<ul …>` fragment, rendering every caption through `render_caption`
+/// (returning a future of the rendered inline nodes). `build`/`build_with_sync`
+/// use the plain [`caption_to_nodes`] renderer; the async parser path provides a
+/// renderer that additionally expands caption templates (mirrors PHP's
+/// `Gallery::pCaption`/`renderMedia` running the caption through
+/// `processContentInPipeline` with `expandTemplates => true`).
+pub async fn build_with<F, Fut>(
+    token: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    config: &dyn SiteConfig,
+    mut render_caption: F,
+) -> Node
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = Vec<Node>>,
+{
     let opts = parse_opts(token, config);
     let source = token
         .attribs
@@ -150,7 +168,7 @@ pub fn build(
     if !opts.caption.is_empty() {
         let mut li = Node::element(ElementKind::ListItem);
         li.set_attr("class", "gallerycaption");
-        for node in caption_to_nodes(&opts.caption, config) {
+        for node in render_caption(&opts.caption).await {
             li.push_child(node);
         }
         ul.push_child(li);
@@ -161,7 +179,7 @@ pub fn build(
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(li) = render_line(&opts, line, config) {
+        if let Some(li) = render_line_with(&opts, line, config, &mut render_caption).await {
             ul.push_child(li);
         }
     }
@@ -169,8 +187,40 @@ pub fn build(
     ul
 }
 
-/// Parse a single gallery line into a `<li class="gallerybox">`.
-fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Option<Node> {
+/// Synchronous [`build_with`] entry point (used by the `wikitext_to_ast` path
+/// and tests): render each caption through [`caption_to_nodes`] and block on the
+/// (immediately-ready) future.
+pub fn build_with_sync(
+    token: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    config: &dyn SiteConfig,
+) -> Node {
+    use std::task::{Context, Poll, Waker};
+
+    let fut = build_with(token, config, |caption: &str| {
+        std::future::ready(caption_to_nodes(caption, config))
+    });
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut fut = Box::pin(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(node) => node,
+        // `caption_to_nodes` returns a `ready` future, so this branch is
+        // unreachable in practice.
+        Poll::Pending => unreachable!("gallery caption future is always ready"),
+    }
+}
+
+/// [`render_line`] with a caller-supplied caption renderer (see [`build_with`]).
+async fn render_line_with<F, Fut>(
+    opts: &GalleryOpts,
+    line: &str,
+    config: &dyn SiteConfig,
+    render_caption: &mut F,
+) -> Option<Node>
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = Vec<Node>>,
+{
     let line = line.trim();
     // Split on the first `|` (title | caption+options).
     let (title_str, mut rest_str) = match line.split_once('|') {
@@ -278,7 +328,7 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
         gallerytext.push_child(showfilename_anchor(&title, config));
     }
     if let Some(cap) = &caption {
-        for node in caption_to_nodes(cap, config) {
+        for node in render_caption(cap).await {
             gallerytext.push_child(node);
         }
     }
