@@ -314,6 +314,12 @@ fn broken_media_span(
     span.set_attr("resource", crate::title::make_link(title, config));
     span.set_attr("data-width", opts.image_width.to_string());
     span.set_attr("data-height", opts.image_height.to_string());
+    // `lang=` is a global attribute applied to the broken span (mirrors
+    // `renderFile`), read back by `AddMediaInfo::lang_from_container` to build
+    // the `?lang=` description-link query.
+    if let Some(lang) = &media_opts.lang {
+        span.set_attr("lang", lang);
+    }
     span.push_child(Node::text(title.get_prefixed_text()));
 
     let mut a = Node::element(ElementKind::Other("a".to_string()));
@@ -368,6 +374,9 @@ fn parse_media_opts(
                 opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(&info.v));
             }
             "class" => opts.class = Some(info.v),
+            "lang" if crate::pipeline::media_options::is_valid_internal_lang(&info.v) => {
+                opts.lang = Some(info.v)
+            }
             _ => {}
         }
     }

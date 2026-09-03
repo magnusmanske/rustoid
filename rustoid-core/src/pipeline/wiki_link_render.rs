@@ -741,7 +741,15 @@ pub fn render_file(
                     }
                     "class" if opts.class.is_none() => opts.class = Some(info.v),
                     "page" if opts.page.is_none() => opts.page = Some(info.v),
-                    "lang" if opts.lang.is_none() => opts.lang = Some(info.v),
+                    // An invalid internal language code makes the option `bogus`
+                    // (dropped), mirroring `renderFile`'s `Language::isValidInternalCode`
+                    // guard.
+                    "lang"
+                        if opts.lang.is_none()
+                            && crate::pipeline::media_options::is_valid_internal_lang(&info.v) =>
+                    {
+                        opts.lang = Some(info.v)
+                    }
                     "width" => {
                         // `width` is "last wins" (mirrors PHP's special case).
                         if let Some((w, h)) = info.v.split_once('x') {

@@ -310,6 +310,16 @@ pub fn get_format(opts: &MediaOpts) -> Option<String> {
     opts.format.clone()
 }
 
+/// Whether a `lang=` value is a valid MediaWiki-internal language code. Mirrors
+/// `Language::isValidInternalCode`: no `:/\\\0&<>'"` characters and at most 128
+/// chars. An invalid code makes the `lang` option `bogus` (dropped).
+pub fn is_valid_internal_lang(code: &str) -> bool {
+    code.len() <= 128
+        && !code
+            .chars()
+            .any(|c| matches!(c, ':' | '/' | '\\' | '\0' | '&' | '<' | '>' | '\'' | '"'))
+}
+
 /// A collection of parsed media options (mirrors PHP's `$opts` array).
 #[derive(Debug, Default, Clone)]
 pub struct MediaOpts {
