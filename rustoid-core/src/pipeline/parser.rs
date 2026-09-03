@@ -375,7 +375,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
     fn tokenize(&self, wikitext: &str) -> Result<Vec<Item>> {
+        self.tokenize_with(wikitext, false, true)
+    }
+
+    /// Tokenize wikitext in *inline* context (no start-of-line, so a leading
+    /// `#`/`*`/`=` does not begin a list/heading). Mirrors PHP's
+    /// `processContentInPipeline` with `inlineContext => true` (and the `sol`
+    /// flag `false` passed by `extArgToDOM`), used for media/gallery captions.
+    fn tokenize_inline(&self, wikitext: &str) -> Result<Vec<Item>> {
+        self.tokenize_with(wikitext, true, false)
+    }
+
+    fn tokenize_with(&self, wikitext: &str, inline_context: bool, sol: bool) -> Result<Vec<Item>> {
         let mut options = TokenizerOptions {
+            inline_context,
+            sol,
             magic_links: crate::wikitext::tokenizer_v2::MagicLinkConfig {
                 rfc: self.config.magic_link_enabled("RFC"),
                 pmid: self.config.magic_link_enabled("PMID"),
@@ -790,7 +804,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
     ) -> Vec<Node> {
-        let mut tokens = match self.tokenize(caption) {
+        // Whitespace-normalize the caption in inline context (mirrors PHP's
+        // `extArgToDOM`, which does `preg_replace('/[\t\r\n ]/', ' ', $vsrc)` so
+        // a multi-line `caption=` (e.g. `# …` with blank lines) is folded onto one
+        // line and a leading `#`/`*` does not start a list).
+        let caption = caption
+            .chars()
+            .map(|c| {
+                if matches!(c, '\t' | '\r' | '\n' | ' ') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect::<String>();
+        let mut tokens = match self.tokenize_inline(&caption) {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
