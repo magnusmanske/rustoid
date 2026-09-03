@@ -1039,6 +1039,35 @@ fn rewrite_structure(
                     if !opts.is_manual_thumb {
                         anchor.set_attr("class", "mw-file-description");
                     }
+                } else if let Some(iw) = &link_title.interwiki
+                    && let Some(info) = config.interwiki_map().get(iw)
+                {
+                    // An interwiki link target resolves to the interwiki URL
+                    // (mirrors `replaceAnchor`'s interwiki branch, which builds
+                    // the absolute URL and applies the nofollow attribs).
+                    let title_part = crate::sanitizer::sanitize_title_uri(&link_title.text, false);
+                    let mut href = info.url.replace("$1", &title_part);
+                    if info.protorel == Some(true) {
+                        href = href
+                            .strip_prefix("http:")
+                            .or_else(|| href.strip_prefix("https:"))
+                            .map(|s| s.to_string())
+                            .unwrap_or(href);
+                    }
+                    anchor.set_attr("href", &href);
+                    for (key, values) in config.external_link_attribs(&href) {
+                        if key == "rel" {
+                            for v in &values {
+                                crate::pipeline::add_link_attributes::add_rel(anchor, v);
+                            }
+                        } else if key == "class" {
+                            for v in &values {
+                                crate::pipeline::add_link_attributes::add_class(anchor, v);
+                            }
+                        } else {
+                            anchor.set_attr(&key, values.join(" "));
+                        }
+                    }
                 } else {
                     let mut href = crate::title::make_link(&link_title, config);
                     if let Some(fragment) = &link_title.fragment {
