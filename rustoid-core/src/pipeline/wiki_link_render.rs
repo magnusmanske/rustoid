@@ -1050,12 +1050,14 @@ fn record_media_option(
         "border" if opts.border.is_none() => opts.border = Some(info.v),
         "upright" if opts.upright.is_none() => opts.upright = Some(info.v),
         "link" if opts.link.is_none() => {
-            opts.link = Some(strip_quote_markers(&info.v));
+            let resolved = resolve_wikilink_option(&info.v, true);
+            opts.link = Some(strip_quote_markers(&resolved));
         }
         "alt" => {
             opts.expanded_attrs |= has_wikitext_markup(&info.v);
             if opts.alt.is_none() {
-                opts.alt = Some(strip_quote_markers(&info.v));
+                let resolved = resolve_wikilink_option(&info.v, false);
+                opts.alt = Some(strip_quote_markers(&resolved));
             }
         }
         "class" if opts.class.is_none() => opts.class = Some(info.v),
@@ -1106,6 +1108,29 @@ fn bogus_opt(ak: &str) -> crate::wikitext::tokens_v2::OptListEntry {
         ck: Some("bogus".to_string()),
         ak: Some(ak.to_string()),
         v: None,
+    }
+}
+
+/// Resolve wikilink syntax (`[[target|display]]`) inside a `link`/`alt` option
+/// value to a plain string: the target for `link` (`is_link`), the display text
+/// for `alt`. Non-wikilink values are returned unchanged. Faithful to the
+/// `mw:WikiLink`/`mw:WikiLink/Interwiki` branches of PHP's
+/// `stringifyOptionTokens` (which, for a *local* wikilink, capture the content).
+fn resolve_wikilink_option(value: &str, is_link: bool) -> String {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("[[") || !trimmed.ends_with("]]") {
+        return value.to_string();
+    }
+    let inner = &trimmed[2..trimmed.len() - 2];
+    // A piped link: `[[target|display]]` → target (link) or display (alt).
+    if let Some((target, display)) = inner.split_once('|') {
+        if is_link {
+            target.trim().to_string()
+        } else {
+            display.trim().to_string()
+        }
+    } else {
+        inner.trim().to_string()
     }
 }
 
