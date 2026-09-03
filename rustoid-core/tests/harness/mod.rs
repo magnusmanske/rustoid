@@ -75,7 +75,7 @@ fn seed_media_files(source: &MockDataSource) {
             1941,
             220,
             "image/jpeg",
-            "7/74",
+            "1/1f",
         ),
         ("File:Thumb.png", "Thumb.png", 135, 135, "image/png", "e/ea"),
         (

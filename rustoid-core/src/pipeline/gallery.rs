@@ -256,10 +256,13 @@ where
         Some(rest_str.as_str())
     };
 
-    // Title resolution: decode entities (`&#45;` → `-`), mirroring
-    // `Gallery::pLine`'s `Utils::decodeWtEntities($oTitleStr)`.
+    // Title resolution: decode entities (`&#45;` → `-`, `&amp;` → `&`) and
+    // percent-escapes (`%26` → `&`), mirroring `Gallery::pLine`'s entity-decoding
+    // plus the tokenizer's URL-decoding inside `renderMedia`/`renderFile`.
     let file_ns = config.canonical_namespace_id("File").unwrap_or(6);
-    let decoded = crate::html::wts_utils::decode_wt_entities_all(&title_str.replace("_", " "));
+    let decoded_entities =
+        crate::html::wts_utils::decode_wt_entities_all(&title_str.replace("_", " "));
+    let decoded = crate::util::decode_uri_component(&decoded_entities);
     // A title with illegal characters (e.g. `[[x`) is rejected, mirroring
     // `makeTitle` returning null in `Gallery::pLine` (the line is then dropped).
     if crate::title::has_invalid_chars(&decoded) {

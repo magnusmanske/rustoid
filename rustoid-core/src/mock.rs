@@ -164,7 +164,16 @@ impl DataSource for MockDataSource {
     }
 
     async fn get_file_info(&self, title: &Title) -> Result<Option<FileInfo>> {
-        let key = title.full_text();
+        // Files are keyed by their canonical prefixed DB key (English `File:`
+        // prefix + underscore-separated name), independent of the localized
+        // content-language alias (e.g. `Dosiero:`/`Файл:` map to the same file).
+        let dbkey = title.get_dbkey();
+        let canon = crate::title::namespace_prefix(title.namespace_id);
+        let key = if canon.is_empty() {
+            dbkey
+        } else {
+            format!("{canon}:{dbkey}")
+        };
         Ok(self
             .files
             .read()
