@@ -237,15 +237,38 @@ fn apply_media_info(
     // dimensions/`src`/`data-file-*`), while `href`/`resource`/`data-file-*`
     // still describe the original file. Mirrors PHP's manualthumb `$info`
     // replacement in the `AddMediaInfo::run` loop.
+    let mut manualthumb_missing = false;
     let media_info = if let Some(mt) = &job.manualthumb {
         let mt_title = Title::new(6, mt.clone());
-        infos
-            .get(&mt_title.full_text())
-            .and_then(|i| i.clone())
-            .unwrap_or(info.clone())
+        match infos.get(&mt_title.full_text()).and_then(|i| i.clone()) {
+            Some(mt_info) => mt_info,
+            // A missing manual-thumb file errors the whole media (mirrors the
+            // `!$manualinfo` → `apierror-filedoesnotexist` branch).
+            None => {
+                manualthumb_missing = true;
+                info.clone()
+            }
+        }
     } else {
         info.clone()
     };
+
+    // A missing manual-thumb file keeps the broken media and adds `mw:Error`;
+    // the anchor is still rewritten to a file-description link (the original
+    // file exists, so `$broken` is false and `replaceAnchor` runs with
+    // `$isManualThumb = false`, keeping the `mw-file-description` class).
+    if manualthumb_missing {
+        mark_error_with_description_link(
+            root,
+            &job.path,
+            &job.title,
+            config,
+            "apierror-filedoesnotexist",
+            "This image does not exist.",
+            alt.as_deref(),
+        );
+        return;
+    }
 
     // A bad manual-thumb file also errors the whole media (mirrors the
     // manualthumb-`badFile` case in `AddMediaInfo::run`).
@@ -632,6 +655,45 @@ fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str, alt: Op
     replace_broken_span_text(node, alt);
     let errors = format!("{{\"errors\":[{{\"key\":\"{key}\",\"message\":\"{message}\"}}]}}");
     node.data_mw = Some(errors);
+}
+
+/// Mark an error while also rewriting the anchor to a file-description link
+/// (mirrors the manualthumb-missing case, where the original file exists so
+/// `replaceAnchor` still runs with the `mw-file-description` class).
+fn mark_error_with_description_link(
+    root: &mut Node,
+    path: &[usize],
+    title: &Title,
+    config: &dyn SiteConfig,
+    key: &str,
+    message: &str,
+    alt: Option<&str>,
+) {
+    strip_gallery_thumb_width(root, path);
+    let Some(container) = node_at(root, path) else {
+        return;
+    };
+    add_error_type(container);
+    replace_broken_span_text(container, alt);
+
+    // Rewrite the anchor to a description link (keeps the `mw-file-description`
+    // class, since `$isManualThumb` is false when the manual-thumb info is
+    // missing).
+    if let Some(anchor_idx) = container
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::Element(_)))
+    {
+        let anchor = &mut container.children[anchor_idx];
+        anchor
+            .attrs
+            .retain(|a| a.key != "class" && a.key != "title" && a.key != "href");
+        anchor.set_attr("href", crate::title::make_link(title, config));
+        anchor.set_attr("class", "mw-file-description");
+    }
+
+    let errors = format!("{{\"errors\":[{{\"key\":\"{key}\",\"message\":\"{message}\"}}]}}");
+    container.data_mw = Some(errors);
 }
 
 /// For a broken media container, replace the broken `<span>`'s text content with
