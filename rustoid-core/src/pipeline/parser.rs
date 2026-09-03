@@ -284,7 +284,12 @@ pub fn render_inline_fragment(
         crate::wikitext::tokens_v2::EOFTk,
     )));
     let stage = TreeBuilderStage::new(true);
-    let mut frag = extract_fragment_children(&stage.to_ast(tokens, config));
+    let mut frag = extract_fragment_children(&stage.to_ast_with_fragments(
+        tokens,
+        None,
+        config,
+        std::mem::take(fragments),
+    ));
     let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
     crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
     frag
