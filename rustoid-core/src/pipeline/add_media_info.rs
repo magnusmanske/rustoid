@@ -149,15 +149,17 @@ fn is_media_container(node: &Node) -> bool {
 
 /// Collect `[typeof~="mw:File"]` containers, deepest-first so rewrites don't
 /// invalidate the recorded paths of outer containers. Mirrors PHP's
-/// `querySelectorAll('[typeof*="mw:File"]')` + traversal guard.
+/// `querySelectorAll('[typeof*="mw:File"]')`, which finds *every* media
+/// container including those nested in a figcaption (e.g. an image inside an
+/// image caption). Media nested in a DOM-fragment wrapper was already resolved
+/// in its own sub-pipeline (the `isDOMFragmentWrapper` invariant), but media
+/// nested inside an ordinary caption must still be discovered here.
 fn collect_containers(
     node: &mut Node,
     path: &mut Vec<usize>,
     out: &mut Vec<ContainerJob>,
     config: &dyn SiteConfig,
 ) {
-    // Do not descend into a media container (a fragment-embedded media is
-    // handled in its own pipeline; mirrors PHP's `isDOMFragmentWrapper` guard).
     if is_media_container(node) {
         out.push(ContainerJob {
             path: path.clone(),
@@ -165,7 +167,7 @@ fn collect_containers(
             data_width: data_width_from_container(node),
             manualthumb: data_mw_txt(node, "manualthumb"),
         });
-        return;
+        // Descend so nested media (e.g. within a caption) are also collected.
     }
     for i in 0..node.children.len() {
         path.push(i);
