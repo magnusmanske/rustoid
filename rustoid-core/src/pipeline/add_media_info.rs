@@ -442,7 +442,11 @@ fn caption_text_from_source(source: &str) -> String {
     // The caption was stored as raw wikitext (entities not yet decoded); decode
     // them so `&#9792;` → `♀` (mirrors PHP's `textContentFromCaption`, which runs
     // on the already-re-tokenized caption DOM).
-    crate::html::wts_utils::decode_wt_entities_all(&out)
+    let decoded = crate::html::wts_utils::decode_wt_entities_all(&out);
+    // Quote markers (`''`, `'''`) become `<i>`/`<b>` elements in the re-rendered
+    // caption, whose text is just the inner content; strip them for the
+    // alt/title text (mirrors `textContentFromCaption` on that DOM).
+    crate::pipeline::media_options::strip_quote_markers(&decoded)
 }
 
 /// If `chars[start] == '<'` and starts an HTML tag, return `(name, end)` where
