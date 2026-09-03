@@ -285,10 +285,10 @@ pub fn add_link_attributes_and_get_content(
         // `addLinkAttributesAndGetContent`: `decodeURIComponent($target->href)`,
         // plus interwiki/local prefix prepending).
         let mut morecontent = crate::util::decode_uri_component(&target.href);
-        if target.interwiki.is_some() {
-            if let Some(ref p) = target.prefix {
-                morecontent = format!("{p}:{morecontent}");
-            }
+        if target.interwiki.is_some()
+            && let Some(ref p) = target.prefix
+        {
+            morecontent = format!("{p}:{morecontent}");
         }
         if let Some(ref lp) = target.local_prefix {
             morecontent = format!("{lp}:{morecontent}");
