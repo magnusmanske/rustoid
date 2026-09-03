@@ -186,6 +186,7 @@ pub fn has_wikitext_markup(value: &str) -> bool {
         || value.contains("[[")
         || value.contains("{{")
         || value.contains("<!--")
+        || value.contains("-{")
         || value.contains("<nowiki")
         || value.contains("<NOWIKI")
         || value.contains("<ref")
