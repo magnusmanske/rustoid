@@ -198,6 +198,11 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
     // `Gallery::pLine`'s `Utils::decodeWtEntities($oTitleStr)`.
     let file_ns = config.canonical_namespace_id("File").unwrap_or(6);
     let decoded = crate::html::wts_utils::decode_wt_entities_all(&title_str.replace("_", " "));
+    // A title with illegal characters (e.g. `[[x`) is rejected, mirroring
+    // `makeTitle` returning null in `Gallery::pLine` (the line is then dropped).
+    if crate::title::has_invalid_chars(&decoded) {
+        return None;
+    }
     let mut title = TitleParser::parse(&decoded, config);
     if title.namespace_id != file_ns {
         // Re-parse with an explicit `File:` prefix so first-letter capitalization

@@ -895,7 +895,7 @@ fn rewrite_structure(
                 // An invalid link title (illegal chars like `<`) falls back to the
                 // description link (mirrors `replaceAnchor`, where a null
                 // `$link` is treated as `link=` not present).
-                if is_invalid_title_text(&link_title.text) {
+                if crate::title::has_invalid_chars(&link_title.text) {
                     anchor.set_attr("href", description_link_href(title, opts, config));
                     if !opts.is_manual_thumb {
                         anchor.set_attr("class", "mw-file-description");
@@ -944,15 +944,6 @@ fn rewrite_structure(
 /// protocol-relative). Mirrors the URL-vs-title decision in `replaceAnchor`.
 fn is_url(s: &str) -> bool {
     s.starts_with("//") || s.contains("://")
-}
-
-/// Whether a title text contains characters MediaWiki rejects (making the title
-/// invalid, so `makeTitleFromText` returns null). Mirrors the illegal-character
-/// check in `Title::newFromText`.
-fn is_invalid_title_text(text: &str) -> bool {
-    text.chars().any(|c| {
-        matches!(c, '<' | '>' | '[' | ']' | '|' | '{' | '}') || c == '\0' || (c as u32) < 0x20
-    })
 }
 
 /// The description-link href for a media container, appending `?page=`/`?lang=`

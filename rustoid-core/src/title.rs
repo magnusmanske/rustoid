@@ -140,6 +140,17 @@ fn namespace_prefix(ns_id: i32) -> &'static str {
     }
 }
 
+/// Whether the title text contains characters MediaWiki rejects, making the
+/// title invalid (so `Title::newFromText`/`makeTitle` return null). Mirrors
+/// `Title::checkBadChars`, which rejects `<`, `>`, `[`, `]`, `{`, `}`, `|`, the
+/// NUL byte, and other control characters. (`#` and `:` are handled elsewhere
+/// as fragment/namespace separators, so they are not rejected here.)
+pub fn has_invalid_chars(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(c, '<' | '>' | '[' | ']' | '|' | '{' | '}') || c == '\0' || (c as u32) < 0x20
+    })
+}
+
 impl fmt::Display for Title {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = String::new();
