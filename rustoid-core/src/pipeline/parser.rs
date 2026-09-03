@@ -806,6 +806,105 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         std::mem::take(&mut frag.children)
     }
 
+    /// Render a single gallery line's media as a block `<figure>` (or, when the
+    /// line's options force inline, a `<span>`), mirroring PHP's
+    /// `ParsoidExtensionAPI::renderMedia(forceBlock=true, suppressMediaFormats=true)`.
+    ///
+    /// Builds `[[titleStr|optsStr|none]]`, runs it through tokenize → template/
+    /// attribute expansion → `renderFile`, then `AddMediaInfo` (so the file is
+    /// resolved — `<img>` + `title`/`alt` — while the `<figcaption>` is still
+    /// attached). The caller detaches the `<figcaption>` into the gallery text.
+    #[allow(clippy::too_many_arguments)]
+    async fn render_gallery_media(
+        &self,
+        title_str: &str,
+        opts_str: &str,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::pipeline::wiki_link_render::{
+            WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+        };
+        use crate::wikitext::token_utils::key_value_to_string;
+
+        // Assemble the wikitext `[[<title>|<opts>|none]]` (the trailing `|none`
+        // forces the block figure, per `renderMedia`'s `$pieces[] = '|none'`).
+        let wikitext = format!("[[{title_str}|{opts_str}|none]]");
+        let mut tokens = self.tokenize(&wikitext).ok()?;
+        if source.is_some() {
+            tokens = self
+                .expand_templates(frame, tokens, source, about_counter, false)
+                .await;
+            tokens = self
+                .expand_attributes(frame, tokens, source, about_counter, None)
+                .await;
+        }
+
+        // Render the wikilink (→ `renderFile`) with media formats suppressed.
+        let mut link_ctx = WikiLinkContext::new(self.config);
+        link_ctx.set_suppress_media_formats();
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let tokens: Vec<Item> = tokens
+            .into_iter()
+            .flat_map(|item| {
+                let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+                    return vec![item];
+                };
+                if stt.name != "wikilink" {
+                    return vec![item];
+                }
+                let href = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .map(|kv| key_value_to_string(&kv.value))
+                    .unwrap_or_default();
+                let href_src = href.clone();
+                let target = match get_wiki_link_target_info(&link_ctx, &href, &href_src) {
+                    Ok(t) => t,
+                    Err(_) => return vec![Item::Str(format!("[[{href}]]"))],
+                };
+                render_wiki_link_dispatched(
+                    &mut link_ctx,
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    &target,
+                    false,
+                    &mut fragments,
+                    &mut next_id,
+                    &mut |items| {
+                        let mut f = std::collections::HashMap::new();
+                        let mut id = 0usize;
+                        render_inline_fragment(self.config, items, &mut f, &mut id)
+                    },
+                )
+            })
+            .collect();
+        let tokens = self.render_external_links(tokens);
+        let mut tokens = self.render_behavior_switches(tokens);
+        tokens.push(Item::Tok(ParsoidToken::Eof(
+            crate::wikitext::tokens_v2::EOFTk,
+        )));
+        // Build the inline tree, splicing the caption `mw:dom-fragment-token`
+        // placeholders via the fragments map populated by `renderFile`.
+        let stage = TreeBuilderStage::new(true);
+        let frag = stage.to_ast_with_fragments(tokens, None, self.config, fragments);
+        let mut frag = extract_fragment_children(&frag);
+        let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
+
+        // Resolve the file (replace the broken span with `<img>` and stamp
+        // `title`/`alt` from the caption) before the figcaption is detached —
+        // mirrors `renderMedia`'s sub-pipeline running `AddMediaInfo`.
+        if let Some(src) = source {
+            crate::pipeline::add_media_info::run(&mut frag, src, self.config).await;
+        }
+
+        // The media is the sole child of the inline fragment.
+        frag.children.into_iter().next()
+    }
+
     /// Expand `<gallery>` extension tokens in place: build each gallery fragment
     /// (expanding caption templates when a data source is present) and tunnel it
     /// through an `mw:dom-fragment-token` placeholder. Uses the shared `next_id`
@@ -827,13 +926,25 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             };
-            let ul = crate::pipeline::gallery::build_with(stt, self.config, |caption: &str| {
-                let caption = caption.to_string();
-                async move {
-                    self.render_caption_expanded(&caption, source, frame, about_counter)
-                        .await
-                }
-            })
+            let ul = crate::pipeline::gallery::build_with(
+                stt,
+                self.config,
+                |caption: &str| {
+                    let caption = caption.to_string();
+                    async move {
+                        self.render_caption_expanded(&caption, source, frame, about_counter)
+                            .await
+                    }
+                },
+                |title: &str, opts: &str| {
+                    let title = title.to_string();
+                    let opts = opts.to_string();
+                    async move {
+                        self.render_gallery_media(&title, &opts, source, frame, about_counter)
+                            .await
+                    }
+                },
+            )
             .await;
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);

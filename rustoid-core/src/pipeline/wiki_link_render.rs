@@ -585,6 +585,10 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling,
 /// including the `{| … |}` table block, whose internal pipes are cell/row
 /// markers (not option separators) and must stay glued to the caption.
+// FEATURE: temporarily unused after the gallery refactor routed media lines
+// through `renderFile`; still a faithful port of `WikiLinkHandler::splitMediaOptions`
+// and needed by the html2wt serializer (`serializeFileLinks`).
+#[allow(dead_code)]
 pub(crate) fn split_media_options(content: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();

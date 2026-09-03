@@ -159,13 +159,24 @@ fn text_content(node: &Node) -> String {
     out
 }
 
-/// Whether a node is a media container (has a `mw:File` `typeof` token).
+/// Whether a media container is a media container (has a `mw:File` `typeof` token).
 fn is_media_container(node: &Node) -> bool {
     node.get_attr("typeof")
         .map(|t| {
             t.split_whitespace()
                 .any(|tok| tok == "mw:File" || tok.starts_with("mw:File/"))
         })
+        .unwrap_or(false)
+}
+
+/// Whether a container is already marked `mw:Error` (a missing/bad file resolved
+/// in a prior `AddMediaInfo` pass, e.g. a gallery line resolved in its own
+/// sub-pipeline). These keep their broken `<span>`, so they must not be re-run
+/// by a later top-level pass (mirrors PHP, where sub-pipeline media is guarded
+/// by the DOM-fragment wrapper invariant).
+fn has_error_type(node: &Node) -> bool {
+    node.get_attr("typeof")
+        .map(|t| t.split_whitespace().any(|tok| tok == "mw:Error"))
         .unwrap_or(false)
 }
 
@@ -207,7 +218,7 @@ fn collect_containers(
         collect_containers(&mut node.children[i], path, out, config);
         path.pop();
     }
-    if is_media_container(node) && has_broken_span(node) {
+    if is_media_container(node) && has_broken_span(node) && !has_error_type(node) {
         out.push(ContainerJob {
             path: path.clone(),
             title: title_from_container(node, config),
@@ -328,33 +339,22 @@ fn apply_media_info(
     }
 
     // Compute the rendered size (mirrors `handleSize` for bitmaps). The manual
-    // thumb is unscaled, so `data-width` (if any) is ignored for it.
-    let (resolved_width, mut resolved_height) = if job.manualthumb.is_some() {
+    // thumb is unscaled, so `data-width` (if any) is ignored for it. Any packed-
+    // gallery re-scaling is applied later by `TraditionalMode::line`'s
+    // `scaleMedia` (see `gallery.rs`), which reads the resolved `<img>` width.
+    let (resolved_width, resolved_height) = if job.manualthumb.is_some() {
         (media_info.width, media_info.height)
     } else {
         handle_size(job, &media_info)
     };
 
     // The image `src` is the thumbnail at the *resolved* width (before any
-    // packed-gallery scaling), mirroring how `scaleMedia` reads the rendered
-    // `<img>` width before dividing by the scale.
+    // packed-gallery scaling).
     let src = {
         let resolved_key = resolved_width.to_string();
         image_src(&media_info, Some(&resolved_key))
     };
-
-    // Packed/overlay/hover galleries scale the rendered `<img>` down by 1.5
-    // (`PackedMode::scaleMedia`): the image is displayed at a width of
-    // `ceil(renderedWidth / scale)` and the gallery's `imageHeight`, while the
-    // `.gallerybox`/`.thumb` get the unrounded `renderedWidth / scale` float
-    // widths. `scale` is `None` outside those gallery modes.
-    let gallery_scale = gallery_scale(root, &job.path);
-    let scaled_width = gallery_scale.map(|s| {
-        let w = resolved_width as f64 / s;
-        resolved_height = gallery_image_height(root, &job.path).unwrap_or(resolved_height);
-        (w.ceil() as u32, w)
-    });
-    let width = scaled_width.as_ref().map_or(resolved_width, |(w, _)| *w);
+    let width = resolved_width;
     let height = resolved_height;
 
     // Build the `<img>` replacement.
@@ -410,92 +410,6 @@ fn apply_media_info(
             lang: lang.as_deref(),
         },
     );
-
-    // Packed/overlay/hover galleries: write the unrounded `renderedWidth / scale`
-    // float widths onto the parent `.thumb` and `.gallerybox` (mirrors
-    // `PackedMode::scaleMedia` → `thumbStyle`/`boxStyle`).
-    if let Some((_, scale_w)) = scaled_width {
-        apply_gallery_box_widths(root, &job.path, scale_w);
-    }
-}
-
-/// Whether the media container (at `path`) sits inside a packed/overlay/hover
-/// gallery, returning that gallery's scale factor (`PackedMode::scale = 1.5`).
-/// The container is `li.gallerybox > div.thumb > span[mw:File]`, whose ancestor
-/// `ul` carries the `mw-gallery-packed`/`-overlay`/`-hover` class.
-fn gallery_scale(root: &Node, path: &[usize]) -> Option<f64> {
-    // The `ul` is three levels up: [ul, li, div.thumb, ...span].
-    if path.len() < 3 {
-        return None;
-    }
-    let ul_path = &path[..path.len() - 3];
-    let ul = node_at_read(root, ul_path)?;
-    let class = ul.get_attr("class")?;
-    if class.contains("mw-gallery-packed")
-        || class.contains("mw-gallery-overlay")
-        || class.contains("mw-gallery-hover")
-    {
-        Some(1.5)
-    } else {
-        None
-    }
-}
-
-/// The raw gallery `imageHeight` (the `<ul>`'s configured height) for a packed
-/// gallery, derived from the broken span's `data-height` (= `floor(height*1.5)`).
-fn gallery_image_height(root: &Node, path: &[usize]) -> Option<u32> {
-    let container = node_at_read(root, path)?;
-    let anchor = first_element_child(container)?;
-    let span = first_element_child(anchor)?;
-    let dh = span.get_attr("data-height")?.parse::<f64>().ok()?;
-    // `dimensions()` sets `data-height = floor(imageHeight * 1.5)`, so undo it.
-    Some((dh / 1.5).round() as u32)
-}
-
-/// Set the `.thumb` (width = w) and `.gallerybox` (width = w + box padding)
-/// `style` widths for a packed gallery, where `w` is the unrounded scaled width
-/// (`PackedMode::scaleMedia` return value). `.thumb` gets `w`px, `.gallerybox`
-/// gets `w + 2`px (box padding for packed modes). Widths are formatted with up
-/// to 10 fractional digits (matching PHP's `precision=14` for these values),
-/// trimming trailing zeros so integral widths render without a decimal.
-fn apply_gallery_box_widths(root: &mut Node, path: &[usize], w: f64) {
-    if path.len() < 2 {
-        return;
-    }
-    let thumb_w = gallery_thumb_width(w);
-    // `.thumb` is the container's parent; `.gallerybox` is its grandparent.
-    let thumb_path = &path[..path.len() - 1];
-    let box_path = &path[..path.len() - 2];
-    if let Some(thumb) = node_at(root, thumb_path) {
-        thumb.set_attr("style", format!("width: {}px;", fmt_gallery_width(thumb_w)));
-    }
-    if let Some(box_node) = node_at(root, box_path) {
-        box_node.set_attr(
-            "style",
-            format!("width: {}px;", fmt_gallery_width(thumb_w + 2.0)),
-        );
-        // Overlay/hover modes wrap the caption in a `.gallerytextwrapper` whose
-        // width is `ceil(scaledWidth - 20)` (mirrors `PackedMode::galleryText`).
-        for child in &mut box_node.children {
-            if child.get_attr("class") == Some("gallerytextwrapper") {
-                child.set_attr("style", format!("width: {}px;", (w - 20.0).ceil() as u32));
-            }
-        }
-    }
-}
-
-/// The packed-modes `thumbWidth(`: at least 60px (mirrors `PackedMode::thumbWidth`,
-/// which the legacy parser requires so the caption is wide enough).
-fn gallery_thumb_width(w: f64) -> f64 {
-    if w < 60.0 { 60.0 } else { w }
-}
-
-/// Format a gallery width like PHP's default `precision=14` float-to-string:
-/// up to 10 fractional digits, trimming trailing zeros (so `618.0` → `618`).
-fn fmt_gallery_width(w: f64) -> String {
-    let s = format!("{w:.10}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    s.to_string()
 }
 
 /// The `txt` value of a named option in the container's `data-mw.attribs`, if
@@ -824,9 +738,6 @@ fn media_type_from_mime(mime: &str) -> String {
 /// Mark a media container as `mw:Error` and keep the broken markup (mirrors
 /// `handleErrors`).
 fn mark_error(root: &mut Node, path: &[usize], key: &str, message: &str, alt: Option<&str>) {
-    // Adjust the parent gallery thumb's `style` before borrowing the container.
-    strip_gallery_thumb_width(root, path);
-
     let Some(node) = node_at(root, path) else {
         return;
     };
@@ -848,7 +759,6 @@ fn mark_error_with_description_link(
     message: &str,
     alt: Option<&str>,
 ) {
-    strip_gallery_thumb_width(root, path);
     let Some(container) = node_at(root, path) else {
         return;
     };
@@ -903,44 +813,6 @@ fn replace_broken_span_text(container: &mut Node, alt: Option<&str>) {
     }
 }
 
-/// For a gallery media (whose parent is a `div.thumb`), drop the `width:` from
-/// the thumb's `style` so a broken/error thumbnail renders `height`-only
-/// (mirrors `TraditionalMode::thumbStyle`, which omits `width` when `hasError`).
-fn strip_gallery_thumb_width(root: &mut Node, path: &[usize]) {
-    if path.is_empty() {
-        return;
-    }
-    let parent_path = &path[..path.len() - 1];
-    let Some(parent) = node_at(root, parent_path) else {
-        return;
-    };
-    if parent.get_attr("class") != Some("thumb") {
-        return;
-    }
-    let Some(style) = parent.get_attr("style").map(str::to_string) else {
-        return;
-    };
-    // Remove the `width: …px;` component, leaving only `height:`.
-    let cleaned: String = style
-        .split(';')
-        .filter(|part| !part.trim_start().starts_with("width:"))
-        .map(|part| {
-            let p = part.trim();
-            if p.is_empty() {
-                String::new()
-            } else {
-                format!("{p}; ")
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim_end().to_string();
-    if cleaned.is_empty() {
-        parent.attrs.retain(|a| a.key != "style");
-    } else {
-        parent.set_attr("style", cleaned);
-    }
-}
-
 /// Mark a container as `mw:Error` (space-separated, non-duplicated, first).
 fn add_error_type(node: &mut Node) {
     let mut tokens: Vec<String> = node
@@ -964,10 +836,6 @@ fn mark_bad_file(
     is_manual_thumb: bool,
     alt: Option<&str>,
 ) {
-    // Adjust the parent gallery thumb's `style` before borrowing the container
-    // (the two need disjoint `&mut` borrows of `root`).
-    strip_gallery_thumb_width(root, path);
-
     let Some(container) = node_at(root, path) else {
         return;
     };

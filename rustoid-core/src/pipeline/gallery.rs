@@ -6,9 +6,10 @@
 //! `perrow`/`caption`/`mode`/`showfilename`/`class`/`style` options. Other modes
 //! (nolines, slideshow, packed, packed-overlay, packed-hover) are deferred.
 
-use crate::dom::node::{ElementKind, Node};
+use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::title::{Title, TitleParser};
 use crate::traits::SiteConfig;
+use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 
 /// The default gallery options (mirrors `SiteConfig::galleryOptions()`).
 const DEFAULT_IMAGE_WIDTH: u32 = 120;
@@ -48,6 +49,22 @@ fn padding_for_mode(mode: &str) -> Padding {
 
 /// The packed/overlay/hover scale factor (mirrors `PackedMode::__construct`).
 const PACKED_SCALE: f64 = 1.5;
+
+/// The gallery's default thumbnail dimensions as a media `width`/`height` option
+/// string (mirrors `TraditionalMode::dimensions` → `"{w}x{h}px"`, and
+/// `PackedMode::dimensions` for the packed/overlay/hover modes, which request a
+/// large pre-scaling thumbnail).
+fn gallery_dimensions(opts: &GalleryOpts) -> String {
+    if matches!(
+        opts.mode.as_str(),
+        "packed" | "packed-overlay" | "packed-hover"
+    ) {
+        let (w, h) = packed_dimensions(opts.image_height);
+        format!("{w}x{h}px")
+    } else {
+        format!("{}x{}px", opts.image_width, opts.image_height)
+    }
+}
 
 /// The requested (pre-scaling) thumbnail dimensions for packed/overlay/hover
 /// modes, mirroring `PackedMode::dimensions`: a large width so the height is
@@ -105,20 +122,23 @@ pub fn build(
     build_with_sync(token, config)
 }
 
-/// Build the `<ul …>` fragment, rendering every caption through `render_caption`
-/// (returning a future of the rendered inline nodes). `build`/`build_with_sync`
-/// use the plain [`caption_to_nodes`] renderer; the async parser path provides a
-/// renderer that additionally expands caption templates (mirrors PHP's
-/// `Gallery::pCaption`/`renderMedia` running the caption through
-/// `processContentInPipeline` with `expandTemplates => true`).
-pub async fn build_with<F, Fut>(
+/// Build the `<ul …>` fragment. Two renderers are supplied:
+/// - `render_caption` renders the `caption=` attribute (inline wikitext).
+/// - `render_media(title, opts)` renders a single line's media as a block
+///   `<figure>` (with the caption in a `<figcaption>` and the `title`/`alt`
+///   already resolved), mirroring PHP's `ParsoidExtensionAPI::renderMedia`
+///   (`forceBlock=true`); it returns `None` when the line is not a valid file.
+pub async fn build_with<F, Fut, G, GFut>(
     token: &crate::wikitext::tokens_v2::SelfclosingTagTk,
     config: &dyn SiteConfig,
     mut render_caption: F,
+    mut render_media: G,
 ) -> Node
 where
     F: FnMut(&str) -> Fut,
     Fut: std::future::Future<Output = Vec<Node>>,
+    G: FnMut(&str, &str) -> GFut,
+    GFut: std::future::Future<Output = Option<Node>>,
 {
     let opts = parse_opts(token, config);
     let source = token
@@ -194,7 +214,7 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(li) = render_line_with(&opts, line, config, &mut render_caption).await {
+        if let Some(li) = render_line_with(&opts, line, config, &mut render_media).await {
             ul.push_child(li);
         }
     }
@@ -203,38 +223,111 @@ where
 }
 
 /// Synchronous [`build_with`] entry point (used by the `wikitext_to_ast` path
-/// and tests): render each caption through [`caption_to_nodes`] and block on the
-/// (immediately-ready) future.
+/// and tests): render each caption through [`caption_to_nodes`] and each media
+/// line through a no-expansion `renderFile` (see [`render_media_sync`]), blocking
+/// on the immediately-ready future.
 pub fn build_with_sync(
     token: &crate::wikitext::tokens_v2::SelfclosingTagTk,
     config: &dyn SiteConfig,
 ) -> Node {
     use std::task::{Context, Poll, Waker};
 
-    let fut = build_with(token, config, |caption: &str| {
-        std::future::ready(caption_to_nodes(caption, config))
-    });
+    let fut = build_with(
+        token,
+        config,
+        |caption: &str| std::future::ready(caption_to_nodes(caption, config)),
+        |title: &str, opts: &str| std::future::ready(render_media_sync(title, opts, config)),
+    );
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut fut = Box::pin(fut);
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(node) => node,
-        // `caption_to_nodes` returns a `ready` future, so this branch is
-        // unreachable in practice.
-        Poll::Pending => unreachable!("gallery caption future is always ready"),
+        // `caption_to_nodes`/`render_media_sync` return ready futures, so this
+        // branch is unreachable in practice.
+        Poll::Pending => unreachable!("gallery media future is always ready"),
     }
 }
 
-/// [`render_line`] with a caller-supplied caption renderer (see [`build_with`]).
-async fn render_line_with<F, Fut>(
+/// Render a single gallery line's media as a block `<figure>` without template
+/// expansion (used by the synchronous `wikitext_to_ast` path): tokenize
+/// `[[title|opts|none]]` and run it through `renderFile` with media formats
+/// suppressed. Mirrors `render_gallery_media` minus template expansion and the
+/// `AddMediaInfo` pass.
+fn render_media_sync(title_str: &str, opts_str: &str, config: &dyn SiteConfig) -> Option<Node> {
+    use crate::pipeline::parser::render_inline_fragment;
+    use crate::pipeline::wiki_link_render::{
+        WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+    };
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    let wikitext = format!("[[{title_str}|{opts_str}|none]]");
+    let options = crate::wikitext::tokenizer_v2::TokenizerOptions::default();
+    let mut tokenizer = crate::wikitext::tokenizer_v2::PegTokenizer::new(&wikitext, &options);
+    let tokens = tokenizer
+        .tokenize()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| match c {
+            crate::wikitext::tokens_v2::Either::Left(s) => Item::Str(s),
+            crate::wikitext::tokens_v2::Either::Right(t) => Item::Tok(t),
+        })
+        .collect::<Vec<_>>();
+
+    let mut link_ctx = WikiLinkContext::new(config);
+    link_ctx.set_suppress_media_formats();
+    let mut fragments = std::collections::HashMap::new();
+    let mut next_id = 0usize;
+    let tokens: Vec<Item> = tokens
+        .into_iter()
+        .flat_map(|item| {
+            let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
+                return vec![item];
+            };
+            if stt.name != "wikilink" {
+                return vec![item];
+            }
+            let href = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .map(|kv| key_value_to_string(&kv.value))
+                .unwrap_or_default();
+            let href_src = href.clone();
+            let target = match get_wiki_link_target_info(&link_ctx, &href, &href_src) {
+                Ok(t) => t,
+                Err(_) => return vec![Item::Str(format!("[[{href}]]"))],
+            };
+            render_wiki_link_dispatched(
+                &mut link_ctx,
+                &ParsoidToken::SelfclosingTag(stt.clone()),
+                &target,
+                false,
+                &mut fragments,
+                &mut next_id,
+                &mut |items| {
+                    let mut f = std::collections::HashMap::new();
+                    let mut id = 0usize;
+                    render_inline_fragment(config, items, &mut f, &mut id)
+                },
+            )
+        })
+        .collect();
+    let frag = render_inline_fragment(config, tokens, &mut fragments, &mut next_id);
+    frag.children.into_iter().next()
+}
+
+/// [`render_line`] with a caller-supplied media renderer (see [`build_with`]).
+/// Mirrors `Gallery::pLine` + `TraditionalMode::line`.
+async fn render_line_with<G, GFut>(
     opts: &GalleryOpts,
     line: &str,
     config: &dyn SiteConfig,
-    render_caption: &mut F,
+    render_media: &mut G,
 ) -> Option<Node>
 where
-    F: FnMut(&str) -> Fut,
-    Fut: std::future::Future<Output = Vec<Node>>,
+    G: FnMut(&str, &str) -> GFut,
+    GFut: std::future::Future<Output = Option<Node>>,
 {
     let line = line.trim();
     // Split on the first `|` (title | caption+options).
@@ -250,11 +343,6 @@ where
     if !rest_str.contains("[[") {
         rest_str = rest_str.strip_suffix("]]").unwrap_or(&rest_str).to_string();
     }
-    let rest = if rest_str.is_empty() {
-        None
-    } else {
-        Some(rest_str.as_str())
-    };
 
     // Title resolution: decode entities (`&#45;` → `-`, `&amp;` → `&`) and
     // percent-escapes (`%26` → `&`), mirroring `Gallery::pLine`'s entity-decoding
@@ -269,7 +357,8 @@ where
         return None;
     }
     let mut title = TitleParser::parse(&decoded, config);
-    if title.namespace_id != file_ns {
+    let no_prefix = title.namespace_id != file_ns;
+    if no_prefix {
         // Re-parse with an explicit `File:` prefix so first-letter capitalization
         // (ucfirst) is applied to the title text (mirrors `renderMedia`'s
         // `makeTitle( $decodedTitleStr, $fileNs )`).
@@ -278,96 +367,81 @@ where
     if title.namespace_id != file_ns {
         return None;
     }
+    // The wikilink target: a namespace-less title gets an explicit `File:` prefix
+    // (mirrors PHP's `$titleStr = $noPrefix ? $title->getPrefixedDBKey() : $oTitleStr`).
+    let link_title = if no_prefix {
+        title.get_prefixed_text()
+    } else {
+        title_str.to_string()
+    };
 
-    // Caption: split the remainder on `|` (template/table/wikilink aware),
-    // skipping recognized media options (`300px`, `centre`, `link=…`, …). The
-    // last *unrecognized* non-empty segment is the caption (mirrors `renderMedia`'s
-    // option parsing, where recognized options are consumed and only the final
-    // non-option becomes the caption).
-    let caption = rest.and_then(|r| {
-        crate::pipeline::wiki_link_render::split_media_options(r)
-            .into_iter()
-            .rev()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .find(|seg| crate::pipeline::media_options::get_option_info(config, seg).is_none())
-    });
+    // Append the gallery's default dimensions so `renderFile` stamps
+    // `data-width`/`data-height` on the broken span (mirrors PHP's
+    // `$imageOpts[] = "|{$mode->dimensions($opts)}"`).
+    let opts_with_dims = format!("{rest_str}|{}", gallery_dimensions(opts));
 
-    // Also parse the non-caption options (`link=`, `alt=`, `manualthumb=`) into
-    // `data-mw.attribs` so `AddMediaInfo` applies them (mirrors `renderFile`'s
-    // `$dataMw->attribs`). The gallery thumbnails are regenerated per-line.
-    let media_opts = parse_media_opts(rest, config);
+    // Render the line's media as a block figure via the full `renderFile`
+    // pipeline (mirrors `renderMedia(forceBlock=true, suppressMediaFormats=true)`);
+    // `None` means the line is not a valid file and is dropped.
+    let mut figure = render_media(&link_title, &opts_with_dims).await?;
 
-    let has_error = false;
+    // `hasError` (a missing/bad file) is decided from the figure's `mw:Error`
+    // RDFa type after `AddMediaInfo` runs (mirrors `ParsedLine::__construct`).
+    let has_error = figure
+        .get_attr("typeof")
+        .is_some_and(|ty| ty.split_whitespace().any(|tok| tok == "mw:Error"));
 
-    // Thumbnail dims: thumbWidth = imageWidth + padding.thumb, thumbHeight =
-    // imageHeight + padding.thumb, boxWidth = thumbWidth + padding.box.
+    // Detach the `<figcaption>` (becomes `.gallerytext`) from the figure.
+    let caption_nodes = take_figcaption(&mut figure);
+
+    // Packed/overlay/hover modes re-scale the resolved `<img>` (mirrors
+    // `PackedMode::scaleMedia`, called by `TraditionalMode::line` *after*
+    // `renderMedia`/`AddMediaInfo`). `width` becomes the unrounded
+    // `renderedWidth / scale` for box sizing; other modes use `imageWidth`.
+    let scale_width = scale_media(&mut figure, opts);
+
+    // `thumbWidth` (PackedMode: at least 60px so the caption is wide enough;
+    // Traditional modes: width + padding.thumb) and `boxWidth = thumbWidth +
+    // padding.box` drive the `.thumb`/`.gallerybox` styles.
     let padding = padding_for_mode(&opts.mode);
-    let thumb_width = opts.image_width + padding.thumb;
+    let thumb_width = gallery_thumb_width(scale_width, &padding);
     let thumb_height = opts.image_height + padding.thumb;
-    let box_width = thumb_width + padding.box_padding;
+    let box_width = thumb_width + padding.box_padding as f64;
 
     // `<li class="gallerybox" style="width: <boxWidth>px;">`
     let mut li = Node::element(ElementKind::ListItem);
     li.set_attr("class", "gallerybox");
-    li.set_attr("style", format!("width: {box_width}px;"));
+    li.set_attr(
+        "style",
+        format!("width: {}px;", fmt_gallery_width(box_width)),
+    );
     li.data_mw = Some("{}".to_string());
 
-    // `<div class="thumb" style="...">`
+    // `<div class="thumb" style="…">` — the width is omitted for an error thumb
+    // (mirrors `TraditionalMode::thumbStyle`), and the height only appears in
+    // `traditional` mode or when there is an error.
     let mut thumb = Node::element(ElementKind::Div);
     thumb.set_attr("class", "thumb");
-    // The `height` is only emitted on error or for `traditional` mode; the
-    // nolines/slideshow/packed modes omit it (mirrors `TraditionalMode::thumbStyle`).
-    let thumb_style = if has_error {
-        format!("height: {thumb_height}px;")
-    } else if opts.mode == "traditional" {
-        format!("width: {thumb_width}px; height: {thumb_height}px;")
-    } else {
-        format!("width: {thumb_width}px;")
-    };
-    thumb.set_attr("style", thumb_style);
+    let mut style = String::new();
+    if !has_error {
+        style.push_str(&format!("width: {}px; ", fmt_gallery_width(thumb_width)));
+    }
+    if has_error || opts.mode == "traditional" {
+        style.push_str(&format!("height: {}px;", thumb_height));
+    }
+    thumb.set_attr("style", style.trim_end());
 
-    // Expand the caption once (wikitext → inline nodes; templates are expanded
-    // by the async renderer). Its text content becomes the anchor `title` (via
-    // `data-mw.caption`, read by `AddMediaInfo`) and the `gallerytext` content.
-    let caption_nodes = match &caption {
-        Some(cap) => render_caption(cap).await,
-        None => Vec::new(),
-    };
-
-    // Broken-media span (mirrors `renderFile`, resolved later by AddMediaInfo).
-    // The caption is stored *expanded* (its text content) so the generated
-    // anchor `title` is the plain, template-expanded caption. An empty rendered
-    // caption (e.g. a caption consisting solely of a nested image, whose text is
-    // empty after `AddMediaInfo` resolves it) produces `None`, so no `caption`
-    // is stored and no anchor `title` is set (mirrors PHP).
-    let caption_text_for_dmw = if caption_nodes.is_empty() {
-        caption.clone()
-    } else {
-        let text = nodes_text_content(&caption_nodes);
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    };
-    thumb.push_child(broken_media_span(
-        &title,
-        opts,
-        config,
-        &media_opts,
-        caption_text_for_dmw.as_deref(),
-    ));
-
+    // Wrap the figure (a `<figure typeof="mw:File">`) as an inline `<span>` and
+    // migrate its children (the `<a>`→`<img>`) into it, mirroring
+    // `TraditionalMode::line`. The `mw-halign-*` class from the forced `|none` is
+    // dropped.
+    thumb.push_child(figure_to_span(&mut figure));
     li.push_child(thumb);
 
-    // `<div class="gallerytext">caption</div>` — the caption is rendered as
-    // wikitext (external-URL autolinks, wikilinks, quotes, …). The overlay/hover
-    // modes wrap this in a `.gallerytextwrapper` (whose `width` is set later by
-    // `AddMediaInfo`'s `scaleMedia`, since it depends on the resolved image width).
+    // `<div class="gallerytext">caption</div>` — the detached `<figcaption>`
+    // content, plus the optional `showfilename` filename link.
     let mut gallerytext = Node::element(ElementKind::Div);
     gallerytext.set_attr("class", "gallerytext");
-    // `showfilename` prepends a filename link (mirrors `Gallery::pLine`).
     if opts.showfilename {
         gallerytext.push_child(showfilename_anchor(&title, config));
     }
@@ -375,8 +449,14 @@ where
         gallerytext.push_child(node);
     }
     if matches!(opts.mode.as_str(), "packed-overlay" | "packed-hover") {
+        // Overlay/hover wrap the caption in a `.gallerytextwrapper` whose width
+        // is `ceil(scaledWidth - 20)` (mirrors `PackedMode::galleryText`).
         let mut wrapper = Node::element(ElementKind::Div);
         wrapper.set_attr("class", "gallerytextwrapper");
+        wrapper.set_attr(
+            "style",
+            format!("width: {}px;", (scale_width - 20.0).ceil() as u32),
+        );
         wrapper.push_child(gallerytext);
         li.push_child(wrapper);
     } else {
@@ -386,30 +466,111 @@ where
     Some(li)
 }
 
-/// The concatenated text content of a list of nodes, mirroring the `textContent`
-/// of the rendered caption DOM (`AddMediaInfo::textContentFromCaption`). Nested
-/// media (`[typeof*="mw:File"]`) is an `<img>` with no text child once
-/// `AddMediaInfo` resolves it, so its broken-media placeholder text (`File:…`)
-/// must not contribute to the caption text (mirrors PHP, where the caption's
-/// nested image is resolved before the outer caption text is read).
-fn nodes_text_content(nodes: &[Node]) -> String {
-    let mut out = String::new();
-    for node in nodes {
-        // A nested media container (`mw:File` span) has no text content:
-        // the broken placeholder text it temporarily carries is replaced by an
-        // `<img>` (empty text) during `AddMediaInfo`.
-        if node.get_attr("typeof").is_some_and(|ty| {
-            ty.split_whitespace()
-                .any(|t| t == "mw:File" || t.starts_with("mw:File/"))
-        }) {
-            continue;
-        }
-        match &node.kind {
-            crate::dom::node::NodeKind::Text(t) => out.push_str(t),
-            _ => out.push_str(&nodes_text_content(&node.children)),
+/// Apply the packed/overlay/hover gallery's post-`AddMediaInfo` `scaleMedia`
+/// step: read the rendered `<img>` width, divide by the mode's scale factor, and
+/// re-stamp `width`/`height` on the media (mirrors `PackedMode::scaleMedia`).
+/// Returns the unrounded scaled width used for `.thumb`/`.gallerybox` sizing;
+/// non-packed modes return `opts.imageWidth` and leave the media untouched.
+fn scale_media(figure: &mut Node, opts: &GalleryOpts) -> f64 {
+    let scale = match opts.mode.as_str() {
+        "packed" | "packed-overlay" | "packed-hover" => 1.5,
+        _ => return opts.image_width as f64,
+    };
+
+    // The media element sits at `figure > a > <img|audio|span>`. A missing or
+    // bad file leaves a broken `<span>` (no `width`), which is treated as a
+    // non-numeric width (mirrors `scaleMedia`'s `is_numeric($width)` check).
+    let media = figure
+        .children
+        .first_mut()
+        .and_then(|a| a.children.first_mut());
+    let Some(media) = media else {
+        return opts.image_width as f64;
+    };
+
+    let is_audio =
+        matches!(&media.kind, NodeKind::Element(ElementKind::Other(name)) if name == "audio");
+    let width = media
+        .get_attr("width")
+        .and_then(|w| w.parse::<f64>().ok())
+        .filter(|_| !is_audio);
+    let scaled = match width {
+        // Audio (or a broken span with no numeric width) gets the default
+        // gallery width (mirrors `scaleMedia`'s `$opts->imageWidth` fallback).
+        None => opts.image_width as f64,
+        Some(w) => w / scale,
+    };
+
+    media.set_attr("width", (scaled.ceil() as u32).to_string());
+    if is_audio {
+        media.set_attr("style", format!("width: {scaled}px;"));
+    }
+    media.set_attr("height", opts.image_height.to_string());
+    scaled
+}
+
+/// `thumbWidth` (mirrors `TraditionalMode::thumbWidth`/`PackedMode::thumbWidth`):
+/// `width + padding.thumb`, with packed modes clamping to a minimum of 60px.
+fn gallery_thumb_width(width: f64, padding: &Padding) -> f64 {
+    let w = if padding.thumb == 0 {
+        width.max(60.0)
+    } else {
+        width
+    };
+    w + padding.thumb as f64
+}
+
+/// Format a gallery `style` width like PHP's default `precision=14`
+/// float-to-string: up to 10 fractional digits, trimming trailing zeros (so
+/// `618.0` becomes `618`).
+fn fmt_gallery_width(w: f64) -> String {
+    let s = format!("{w:.10}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
+}
+
+/// Detach the `<figcaption>` child from a media `<figure>`, returning its
+/// children (the caption content). Mirrors `Gallery::pLine`'s figcaption
+/// removal. When there is no figcaption (an inline `<span>` media), returns an
+/// empty list.
+fn take_figcaption(figure: &mut Node) -> Vec<Node> {
+    let Some(idx) = figure
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::Element(ElementKind::FigCaption)))
+    else {
+        return Vec::new();
+    };
+    std::mem::take(&mut figure.children.remove(idx).children)
+}
+
+/// Convert a media `<figure>` (with its `<figcaption>` already removed) into an
+/// inline `<span>`, migrating the remaining children (the `<a>`/broken-span) and
+/// transferring `typeof`/`class`/`data-mw`/`data-parsoid`. The forced
+/// `mw-halign-none` class from the `|none` option is dropped (mirrors
+/// `TraditionalMode::line`).
+fn figure_to_span(figure: &mut Node) -> Node {
+    let mut span = Node::element(ElementKind::Span);
+    // Transfer `typeof` (the media rdfa type, e.g. `mw:File`).
+    if let Some(ty) = figure.get_attr("typeof").map(str::to_string) {
+        span.set_attr("typeof", ty);
+    }
+    // Transfer `class`, dropping the horizontal-alignment marker from `|none`.
+    if let Some(class) = figure.get_attr("class").map(str::to_string) {
+        let filtered: Vec<&str> = class
+            .split_whitespace()
+            .filter(|c| !c.starts_with("mw-halign-"))
+            .collect();
+        if !filtered.is_empty() {
+            span.set_attr("class", filtered.join(" "));
         }
     }
-    out
+    span.data_mw = figure.data_mw.take();
+    span.data_parsoid = figure.data_parsoid.take();
+    span.dp = figure.dp.take();
+    // Migrate the figure's children (the `<a>` + broken span).
+    span.children = std::mem::take(&mut figure.children);
+    span
 }
 
 /// The `<a class="galleryfilename galleryfilename-truncate">` link prepended by
@@ -422,159 +583,6 @@ fn showfilename_anchor(title: &Title, config: &dyn SiteConfig) -> Node {
     a.set_attr("title", file.as_str());
     a.push_child(Node::text(file));
     a
-}
-
-/// Build the broken-media `<span typeof="mw:File">` inside a gallery thumb. This
-/// is the same structure `renderFile` emits (a red link + broken span), which
-/// `AddMediaInfo` then resolves into an `<img>` (or `mw:Error` for missing files).
-/// `media_opts` carries the non-caption `link=`/`alt=`/`manualthumb=` options as
-/// `data-mw.attribs` (mirrors `renderFile`'s `$dataMw->attribs`).
-fn broken_media_span(
-    title: &Title,
-    opts: &GalleryOpts,
-    config: &dyn SiteConfig,
-    media_opts: &crate::pipeline::media_options::MediaOpts,
-    caption: Option<&str>,
-) -> Node {
-    let mut span = Node::element(ElementKind::Span);
-    span.set_attr("class", "mw-file-element mw-broken-media");
-    span.set_attr("resource", crate::title::make_link(title, config));
-    // For packed/overlay/hover modes, request the large `dimensions()` thumbnail
-    // (scaled down later by `AddMediaInfo`'s `scaleMedia`). Other modes request
-    // the plain gallery width/height.
-    if matches!(
-        opts.mode.as_str(),
-        "packed" | "packed-overlay" | "packed-hover"
-    ) {
-        let (pw, ph) = packed_dimensions(opts.image_height);
-        span.set_attr("data-width", pw.to_string());
-        span.set_attr("data-height", ph.to_string());
-    } else {
-        span.set_attr("data-width", opts.image_width.to_string());
-        span.set_attr("data-height", opts.image_height.to_string());
-    }
-    // `lang=` is a global attribute applied to the broken span (mirrors
-    // `renderFile`), read back by `AddMediaInfo::lang_from_container` to build
-    // the `?lang=` description-link query.
-    if let Some(lang) = &media_opts.lang {
-        span.set_attr("lang", lang);
-    }
-    span.push_child(Node::text(title.get_prefixed_text()));
-
-    let mut a = Node::element(ElementKind::Other("a".to_string()));
-    a.set_attr("href", config.get_upload_url(&title.get_dbkey()));
-    a.set_attr("class", "new");
-    a.set_attr("title", title.get_prefixed_text());
-    a.push_child(span);
-
-    let mut container = Node::element(ElementKind::Span);
-    if media_opts.expanded_attrs {
-        container.set_attr("typeof", "mw:File mw:ExpandedAttrs");
-    } else {
-        container.set_attr("typeof", "mw:File");
-    }
-    // A `class=` option is applied to the wrapper (mirrors `renderFile`, where
-    // the user class is appended to the container's class list).
-    if let Some(class) = &media_opts.class
-        && !class.trim().is_empty()
-    {
-        container.set_attr("class", class.as_str());
-    }
-    if let Some(data_mw) = media_opts_to_data_mw(media_opts, caption) {
-        container.data_mw = Some(data_mw);
-    }
-    container.push_child(a);
-    container
-}
-
-/// The media options that influence `AddMediaInfo`/`rewrite_structure` (the
-/// gallery subset of `renderFile`'s `data-mw.attribs`).
-fn parse_media_opts(
-    rest: Option<&str>,
-    config: &dyn SiteConfig,
-) -> crate::pipeline::media_options::MediaOpts {
-    use crate::pipeline::media_options::{MediaOpts, get_option_info};
-
-    let Some(r) = rest else {
-        return MediaOpts::default();
-    };
-    let mut opts = MediaOpts::default();
-    for part in crate::pipeline::wiki_link_render::split_media_options(r) {
-        let Some(info) = get_option_info(config, part.trim()) else {
-            continue;
-        };
-        match info.ck.as_str() {
-            "manualthumb" => opts.manualthumb = Some(info.v),
-            "link" => {
-                let resolved =
-                    crate::pipeline::wiki_link_render::resolve_wikilink_option(&info.v, true);
-                opts.link = Some(crate::pipeline::media_options::strip_quote_markers(
-                    &resolved,
-                ))
-            }
-            "alt" => {
-                opts.expanded_attrs |= crate::pipeline::media_options::has_wikitext_markup(&info.v);
-                let resolved =
-                    crate::pipeline::wiki_link_render::resolve_wikilink_option(&info.v, false);
-                opts.alt = Some(crate::pipeline::media_options::strip_quote_markers(
-                    &resolved,
-                ));
-            }
-            "class" => opts.class = Some(info.v),
-            "lang" if crate::pipeline::media_options::is_valid_internal_lang(&info.v) => {
-                opts.lang = Some(info.v)
-            }
-            _ => {}
-        }
-    }
-    opts
-}
-
-/// Serialize the gallery media options into a `data-mw` JSON string carrying an
-/// `attribs` array and (when present) a `caption` string (mirrors `renderFile`'s
-/// `dataMw->attribs` + inline-media `dataMw->caption`), or `None` when there is
-/// nothing to store.
-fn media_opts_to_data_mw(
-    opts: &crate::pipeline::media_options::MediaOpts,
-    caption: Option<&str>,
-) -> Option<String> {
-    use crate::wikitext::tokens_v2::{DataMwAttrib, DataMwValue};
-
-    let mut attribs: Vec<DataMwAttrib> = Vec::new();
-    for (key, val) in [
-        ("link", opts.link.as_ref()),
-        ("alt", opts.alt.as_ref()),
-        ("manualthumb", opts.manualthumb.as_ref()),
-    ] {
-        if let Some(v) = val {
-            attribs.push(DataMwAttrib::new(
-                DataMwValue::Str(key.to_string()),
-                DataMwValue::Object {
-                    txt: Some(v.clone()),
-                    html: None,
-                    uneditable: false,
-                },
-            ));
-        }
-    }
-    if attribs.is_empty() && caption.is_none() {
-        return None;
-    }
-    let mut obj = serde_json::Map::new();
-    if !attribs.is_empty() {
-        let json = crate::pipeline::attribute_expander::serialize_data_mw_attribs(&attribs);
-        obj.insert(
-            "attribs".to_string(),
-            serde_json::from_str(&json).unwrap_or(serde_json::Value::Array(vec![])),
-        );
-    }
-    if let Some(cap) = caption {
-        obj.insert(
-            "caption".to_string(),
-            serde_json::Value::String(cap.to_string()),
-        );
-    }
-    Some(serde_json::Value::Object(obj).to_string())
 }
 
 /// Parse the `<gallery …>` start-tag attributes into options.
