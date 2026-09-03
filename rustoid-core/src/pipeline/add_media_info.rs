@@ -169,6 +169,21 @@ fn is_media_container(node: &Node) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a media container still carries its *broken* placeholder — an `<a>`
+/// whose first element child is a `<span>` (the broken-media span) rather than an
+/// already-resolved `<img>` (which happens when `AddMediaInfo` ran in a
+/// sub-pipeline, e.g. a gallery line). Resolved media is skipped on a later pass
+/// (mirrors PHP's `$span instanceof span` guard in `AddMediaInfo::run`).
+fn has_broken_span(container: &Node) -> bool {
+    let Some(anchor) = first_element_child(container) else {
+        return false;
+    };
+    matches!(
+        first_element_child(anchor).map(|s| &s.kind),
+        Some(NodeKind::Element(ElementKind::Span))
+    )
+}
+
 /// Collect `[typeof~="mw:File"]` containers, deepest-first so rewrites don't
 /// invalidate the recorded paths of outer containers. Mirrors PHP's
 /// `querySelectorAll('[typeof*="mw:File"]')`, which finds *every* media
@@ -182,7 +197,7 @@ fn collect_containers(
     out: &mut Vec<ContainerJob>,
     config: &dyn SiteConfig,
 ) {
-    if is_media_container(node) {
+    if is_media_container(node) && has_broken_span(node) {
         out.push(ContainerJob {
             path: path.clone(),
             title: title_from_container(node, config),

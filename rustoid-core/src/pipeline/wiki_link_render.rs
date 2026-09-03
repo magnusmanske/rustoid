@@ -34,6 +34,12 @@ pub struct WikiLinkContext<'a> {
     pub config: &'a dyn SiteConfig,
     about_id_counter: usize,
     metadata: MetadataCollector,
+    /// Suppress media format options (`thumb`/`frame`/`framed`/`frameless`/
+    /// `manualthumb`), treating them as `bogus` so the media renders as a bare
+    /// `mw:File` rather than `mw:File/Thumb` etc. Set in gallery context (mirrors
+    /// PHP `renderMedia`'s `suppressMediaFormats` → `renderFile`'s
+    /// `extTagOpts['suppressMediaFormats']`).
+    suppress_media_formats: bool,
 }
 
 /// A lightweight `ContentMetadataCollector` analogue, tracking categories and
@@ -68,7 +74,18 @@ impl<'a> WikiLinkContext<'a> {
             config,
             about_id_counter: 0,
             metadata: MetadataCollector::new(),
+            suppress_media_formats: false,
         }
+    }
+
+    /// Enable suppression of media format options (gallery context).
+    pub fn set_suppress_media_formats(&mut self) {
+        self.suppress_media_formats = true;
+    }
+
+    /// Whether media format options are suppressed (gallery context).
+    pub fn suppress_media_formats(&self) -> bool {
+        self.suppress_media_formats
     }
 
     /// Generate a fresh about id (mirrors `Env::newAboutId`). In PHP these are
@@ -1059,6 +1076,22 @@ fn record_media_option(
 
     // First-wins / last-wins dispatch (mirrors the PHP `isset($opts[$ck])` guard
     // plus the `format`/`manualthumb` joint guard and `width`'s last-wins rule).
+    //
+    // `suppressMediaFormats` (gallery context) makes a `format`/`manualthumb`
+    // option `bogus` unless a format was already set (mirrors PHP `renderFile`).
+    if ctx.suppress_media_formats()
+        && matches!(info.ck.as_str(), "format" | "manualthumb")
+        && opts.format.is_none()
+        && opts.manualthumb.is_none()
+    {
+        opt_list.push(crate::wikitext::tokens_v2::OptListEntry {
+            ck: Some("bogus".to_string()),
+            ak: Some(opt_ak),
+            v: None,
+        });
+        return true;
+    }
+
     match info.ck.as_str() {
         "format" if opts.format.is_none() && opts.manualthumb.is_none() => {
             opts.format = Some(info.v);
