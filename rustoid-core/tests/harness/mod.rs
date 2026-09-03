@@ -942,7 +942,12 @@ fn run_html2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestR
         Ok(ast) => ast,
         Err(e) => return TestResult::Error(format!("html parse error: {e}")),
     };
-    let config = MockSiteConfig::new();
+    let mut config = MockSiteConfig::new();
+    // The `language=` option sets the content language, localizing namespace
+    // names and media option aliases (mirrors `run_wt2html_test` and PHP).
+    if let Some(lang) = test.options.get("language") {
+        config.set_language(lang);
+    }
     let page_title = test
         .options
         .get("title")

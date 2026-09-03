@@ -473,21 +473,22 @@ impl MockSiteConfig {
                     info.aliases.push("Archivo".to_string());
                     info.aliases.push("archivo".to_string());
                 }
-                // Localized media option aliases.
+                // Localized media option aliases (localized form first, per
+                // MediaWiki's "local first, English last" convention).
                 self.add_magic_word(
                     "img_manualthumb",
-                    &["thumbnail=$1", "thumb=$1", "miniatura=$1"],
+                    &["miniatura=$1", "thumbnail=$1", "thumb=$1"],
                 );
-                self.add_magic_word("img_thumbnail", &["thumbnail", "thumb", "miniatura"]);
-                self.add_magic_word("img_left", &["left", "izquierda"]);
-                self.add_magic_word("img_link", &["link=$1", "enlace=$1"]);
+                self.add_magic_word("img_thumbnail", &["miniatura", "thumbnail", "thumb"]);
+                self.add_magic_word("img_left", &["izquierda", "left"]);
+                self.add_magic_word("img_link", &["enlace=$1", "link=$1"]);
             }
             "fa" => {
                 ns.insert(6, "فایل".to_string()); // File
                 if let Some(info) = self.namespaces.get_mut(&6) {
                     info.aliases.push("فایل".to_string());
                 }
-                self.add_magic_word("img_thumbnail", &["thumbnail", "thumb", "بندانگشتی"]);
+                self.add_magic_word("img_thumbnail", &["بندانگشتی", "thumb", "thumbnail"]);
             }
             "eo" => {
                 ns.insert(6, "Dosiero".to_string()); // File
@@ -495,7 +496,8 @@ impl MockSiteConfig {
                     info.aliases.push("Dosiero".to_string());
                     info.aliases.push("dosiero".to_string());
                 }
-                // Esperanto width suffix: `100ra` → `img_width` value `100`.
+                // Esperanto width suffix: `100ra` → `img_width` value `100`
+                // (localized `ra` first, English `px` last).
                 self.add_magic_word("img_width", &["$1ra", "$1px"]);
             }
             _ => {}
