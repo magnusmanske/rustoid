@@ -2936,22 +2936,27 @@ fn find_wikilink_close(input: &str) -> Option<usize> {
         if lower[i..].starts_with("<nowiki") {
             let rest = &input[i + 7..];
             // A real `<nowiki>` tag is followed by `>`, `/`, or whitespace.
-            if rest.starts_with('>')
+            let is_tag = rest.starts_with('>')
                 || rest.starts_with('/')
-                || rest.starts_with(|c: char| c.is_whitespace())
-            {
-                if let Some(close_rel) = lower[i + 7..].find("</nowiki") {
-                    let close_start = i + 7 + close_rel;
+                || rest.starts_with(|c: char| c.is_whitespace());
+            if is_tag && let Some((tag_end, self_closing)) = nowiki_start_tag_end(input, i) {
+                if self_closing {
+                    // `<nowiki … />`: skip the whole self-closing tag; its `|`
+                    // (if any, inside an attribute) is not a pipe separator.
+                    i = tag_end;
+                } else {
+                    // Paired `<nowiki>…</nowiki>`: skip to just past the close tag.
+                    // Unclosed `<nowiki>` (no close tag) has no `]]` terminator.
+                    let close_rel = lower[tag_end..].find("</nowiki")?;
+                    let close_start = tag_end + close_rel;
                     let after_close = &input[close_start + 8..];
                     let gt = after_close
                         .find('>')
                         .map(|g| g + 1)
                         .unwrap_or(after_close.len());
                     i = close_start + 8 + gt;
-                    continue;
                 }
-                // Unclosed `<nowiki>`: the rest is literal, no `]]` terminator.
-                return None;
+                continue;
             }
         }
         // A nested `[[…]]` (e.g. a link inside a caption) must not terminate
@@ -2972,6 +2977,37 @@ fn find_wikilink_close(input: &str) -> Option<usize> {
         }
         let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         i += ch_len;
+    }
+    None
+}
+
+/// If `input[i..]` starts a `<nowiki>` start tag, return `(end, self_closing)`
+/// where `end` is the byte index just past the start tag's closing `>` and
+/// `self_closing` is whether that `>` closed a `/>` self-closing tag. The scan
+/// honors quoted attribute values, so a `>` inside `bogus="a>b"` (or a `|`
+/// inside `bogus="a|b"`) is not mistaken for the tag terminator.
+fn nowiki_start_tag_end(input: &str, i: usize) -> Option<(usize, bool)> {
+    let bytes = input.as_bytes();
+    if !input[i..].to_ascii_lowercase().starts_with("<nowiki") {
+        return None;
+    }
+    let mut j = i + 7;
+    let mut in_quote: Option<u8> = None;
+    while j < bytes.len() {
+        let b = bytes[j];
+        match in_quote {
+            Some(q) => {
+                if b == q {
+                    in_quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => in_quote = Some(b),
+                b'>' => return Some((j + 1, bytes[j - 1] == b'/')),
+                _ => {}
+            },
+        }
+        j += 1;
     }
     None
 }
@@ -3292,6 +3328,33 @@ fn split_template_args(inner: &str) -> Vec<String> {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        // A `<nowiki>` (self-closing or paired) is opaque: its content — including
+        // any `|` — is literal and must not split the option/argument list.
+        if c == '<' && inner[i..].to_ascii_lowercase().starts_with("<nowiki") {
+            let rest = &inner[i + 7..];
+            let is_tag = rest.starts_with('>')
+                || rest.starts_with('/')
+                || rest.starts_with(|c: char| c.is_whitespace());
+            if is_tag && let Some((tag_end, self_closing)) = nowiki_start_tag_end(inner, i) {
+                current.push_str(&inner[i..tag_end]);
+                i = tag_end;
+                if !self_closing {
+                    // Paired `<nowiki>…</nowiki>`: consume up to (and incl.) the
+                    // close tag.
+                    if let Some(close_rel) = inner[i..].to_ascii_lowercase().find("</nowiki") {
+                        let close_end = i + close_rel + "</nowiki>".len();
+                        let gt = inner[close_end..].find('>').map(|g| g + 1).unwrap_or(0);
+                        current.push_str(&inner[i..close_end + gt]);
+                        i = close_end + gt;
+                    } else {
+                        // Unclosed nowiki: the rest is literal.
+                        current.push_str(&inner[i..]);
+                        i = inner.len();
+                    }
+                }
+                continue;
+            }
+        }
         // Track nesting of `{{{`, `{{`, and `[[`.
         if c == '{' && i + 2 < chars.len() && chars[i + 1] == '{' && chars[i + 2] == '{' {
             triple_brace += 1;
@@ -3854,6 +3917,20 @@ mod tests {
         assert_eq!(find_wikilink_close("<nowiki>[[Bar]]</nowiki>]]"), Some(24));
         // No closing brackets: None.
         assert_eq!(find_wikilink_close("Foo"), None);
+    }
+
+    #[test]
+    fn test_split_template_args_skips_nowiki_pipe() {
+        // A `|` inside a `<nowiki>` (including inside an attribute, as a
+        // self-closing tag) must not split the option/argument list.
+        let parts = split_template_args("thumb|Test <nowiki bogus=\"attri|bute\"/> 123");
+        assert_eq!(
+            parts,
+            vec!["thumb", "Test <nowiki bogus=\"attri|bute\"/> 123"]
+        );
+        // A paired nowiki protects its whole body, pipes included.
+        let parts = split_template_args("thumb|caption <nowiki>a|b</nowiki> tail");
+        assert_eq!(parts, vec!["thumb", "caption <nowiki>a|b</nowiki> tail"]);
     }
 
     #[test]
