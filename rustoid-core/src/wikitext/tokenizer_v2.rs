@@ -49,6 +49,10 @@ pub struct TokenizerOptions {
     pub redirect_words: Vec<String>,
     /// Recognized extension tag names (lowercased), e.g. `nowiki`, `pre`, `ref`.
     pub ext_tags: Vec<String>,
+    /// URL protocol schemes recognized for extlinks and autolinks (e.g.
+    /// `http:`, `https:`, `irc:`, `//`). Mirrors PHP's
+    /// `SiteConfig::getProtocols`. Empty relies on a built-in fallback set.
+    pub protocols: Vec<String>,
 }
 
 impl Default for TokenizerOptions {
@@ -63,8 +67,19 @@ impl Default for TokenizerOptions {
             magic_links: MagicLinkConfig::default(),
             redirect_words: vec!["#redirect".to_string()],
             ext_tags: Vec::new(),
+            protocols: default_protocols(),
         }
     }
+}
+
+/// The built-in fallback protocol set, matching `MockSiteConfig::getProtocols`.
+fn default_protocols() -> Vec<String> {
+    [
+        "http:", "https:", "irc:", "ircs:", "news:", "ftp:", "mailto:", "gopher:", "//",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// The PEG tokenizer state.
@@ -97,6 +112,8 @@ pub struct PegTokenizer<'a> {
     /// Localized synonyms for the `redirect` magic word (lowercased), each
     /// including the leading `#`.
     redirect_words: Vec<String>,
+    /// URL protocol schemes recognized for extlinks/autolinks.
+    protocols: Vec<String>,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -118,6 +135,7 @@ impl<'a> PegTokenizer<'a> {
                 .map(|s| s.to_lowercase())
                 .collect(),
             ext_tags: options.ext_tags.iter().map(|s| s.to_lowercase()).collect(),
+            protocols: options.protocols.clone(),
         }
     }
 
@@ -2255,13 +2273,9 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(1);
 
-        // Check for URL protocol.
+        // Check for URL protocol (from the configured protocol set).
         let rem = self.remaining();
-        let has_protocol = rem.starts_with("http://")
-            || rem.starts_with("https://")
-            || rem.starts_with("ftp://")
-            || rem.starts_with("mailto:")
-            || rem.starts_with("//");
+        let has_protocol = self.protocols.iter().any(|p| rem.starts_with(p.as_str()));
 
         if !has_protocol {
             self.pos = saved;

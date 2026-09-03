@@ -490,6 +490,7 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
             isbn: config.magic_link_enabled("ISBN"),
         },
         ext_tags: config.extension_tags().to_vec(),
+        protocols: config.protocols().iter().map(|s| s.to_string()).collect(),
         ..TokenizerOptions::default()
     };
     let mut tokenizer = PegTokenizer::new(caption, &options);

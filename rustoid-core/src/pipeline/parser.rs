@@ -224,6 +224,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             options.redirect_words = entry.aliases.clone();
         }
         options.ext_tags = self.config.extension_tags().to_vec();
+        options.protocols = self
+            .config
+            .protocols()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mut tokenizer = PegTokenizer::new(wikitext, &options);
         let chunks = tokenizer.tokenize()?;
         Ok(chunks
