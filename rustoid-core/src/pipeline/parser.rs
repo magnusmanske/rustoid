@@ -251,7 +251,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
     /// (mirrors the TT2 `WikiLinkHandler`, whose rendering path lives in
     /// `pipeline::wiki_link_render`).
-    fn render_links(&self, tokens: Vec<Item>) -> Vec<Item> {
+    fn render_links(
+        &self,
+        tokens: Vec<Item>,
+        fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+        next_id: &mut usize,
+    ) -> Vec<Item> {
         use crate::pipeline::wiki_link_render::{
             WikiLinkContext, get_wiki_link_target_info, render_redirect,
             render_wiki_link_dispatched,
@@ -321,6 +326,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &ParsoidToken::SelfclosingTag(stt.clone()),
                 &target,
                 false,
+                fragments,
+                next_id,
+                &mut |items| {
+                    // Build the caption fragment with a fresh sub-pipeline context
+                    // (nested captions resolve their own nested fragments locally).
+                    let mut f = std::collections::HashMap::new();
+                    let mut id = 0usize;
+                    self.build_inline_fragment(items, &mut f, &mut id)
+                },
             );
             out.extend(rendered);
         }
@@ -472,9 +486,32 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// Build an inline fragment document from an already-tokenized (and
     /// optionally template-expanded) token stream.
     fn fragment_from_tokens(&self, tokens: Vec<Item>) -> Node {
-        let tokens = self.render_links(tokens);
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        self.build_inline_fragment(tokens, &mut fragments, &mut next_id)
+    }
+
+    /// Build an inline fragment document from caption tokens, resolving links
+    /// and suppressing p-wrapping via the inline tree-builder context (mirrors
+    /// PHP's `processContentInPipeline` with `inlineContext => true`).
+    /// `fragments`/`next_id` are threaded through so any nested media captions
+    /// register their own sub-fragments in the same map the outer tree builder
+    /// will splice.
+    fn build_inline_fragment(
+        &self,
+        tokens: Vec<Item>,
+        fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+        next_id: &mut usize,
+    ) -> crate::dom::node::Node {
+        let tokens = self.render_links(tokens, fragments, next_id);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
+        // The quote transformer flushes pending quotes only on a newline or EOF
+        // token; append a synthetic EOF so trailing quotes (`''italic''`) flush.
+        let mut tokens = tokens;
+        tokens.push(Item::Tok(ParsoidToken::Eof(
+            crate::wikitext::tokens_v2::EOFTk,
+        )));
         let stage = TreeBuilderStage::new(true);
         let mut frag = extract_fragment_children(&stage.to_ast(tokens, self.config));
         // Inline fragments have no transclusion encapsulation or p-wrapping, but
@@ -602,10 +639,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// mode). Fragment rendering leaves it false.
     pub fn wikitext_to_ast(&self, wikitext: &str, wrap_sections: bool) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
-        let tokens = self.render_links(tokens);
+        let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
+            std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
-        let (tokens, fragments) = self.expand_wikitext_pre_sync(tokens);
+        let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens);
+        fragments.extend(pre_fragments);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
@@ -674,15 +715,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self
             .expand_attributes(&frame, tokens, source, about_counter, Some(page_source))
             .await;
-        let tokens = self.render_links(tokens);
+        let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
+            std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
         // Route `format="wikitext"` extension bodies through the inline
         // sub-pipeline, producing `mw:dom-fragment-token` placeholders + their
         // pre-built sub-fragments.
-        let (tokens, fragments) = self
+        let (tokens, pre_fragments) = self
             .expand_wikitext_pre(tokens, source, &frame, about_counter)
             .await;
+        fragments.extend(pre_fragments);
 
         let stage = TreeBuilderStage::new(false);
         let mut ast =

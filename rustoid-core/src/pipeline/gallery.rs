@@ -594,6 +594,9 @@ fn caption_to_nodes(caption: &str, config: &dyn SiteConfig) -> Vec<Node> {
                         &ParsoidToken::SelfclosingTag(stt),
                         &target,
                         false,
+                        &mut std::collections::HashMap::new(),
+                        &mut 0usize,
+                        &mut |_| crate::dom::node::Node::document(),
                     ));
                 }
                 other => items.push(Item::Tok(other)),

@@ -14,6 +14,13 @@ use crate::wikitext::tokens_v2::{
     TagTk,
 };
 
+/// A callback that builds an inline DOM fragment document from an
+/// already-tokenized (and optionally template-expanded) token stream, for
+/// tunneled media captions (mirrors PHP's `processContentInPipeline` with
+/// `inlineContext => true`). The caller (the `Parser`) wires this to its
+/// `renderLinks` + `renderExternalLinks` + inline tree-builder pipeline.
+pub type CaptionFragmentBuilder<'a> = &'a mut dyn FnMut(Vec<Item>) -> crate::dom::node::Node;
+
 use super::wiki_link_handler::{build_link_attrs, string_kv};
 
 /// The default thumbnail width (MediaWiki's `$wgThumbLimits[0]`, 180px), applied
@@ -505,51 +512,6 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
         .collect()
 }
 
-/// Render the `wikilink` tokens inside a media caption into `<a>` tags (mirrors
-/// the `WikiLinkHandler` link rendering that runs on the main token stream but
-/// not on the caption sub-pipeline). `extlink`/`urllink`/`mw-quote` tokens are
-/// left for the later `renderExternalLinks`/`QuoteTransformer` stages.
-fn render_caption_wikilinks(ctx: &mut WikiLinkContext, items: Vec<Item>) -> Vec<Item> {
-    use crate::wikitext::tokens_v2::ParsoidToken;
-
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
-            out.push(item);
-            continue;
-        };
-        if stt.name != "wikilink" {
-            out.push(item);
-            continue;
-        }
-        let href = stt
-            .attribs
-            .iter()
-            .find(|kv| kv.key.as_str() == Some("href"))
-            .and_then(|kv| kv.value.as_str())
-            .unwrap_or("")
-            .to_string();
-        let target =
-            get_wiki_link_target_info(ctx, &href, &href).unwrap_or_else(|_| WikiLinkTargetInfo {
-                href: href.clone(),
-                href_src: href.clone(),
-                title: Some(crate::title::Title::new_main(href.clone())),
-                interwiki: None,
-                language: None,
-                local_prefix: None,
-                from_colon_escaped_text: false,
-                prefix: None,
-            });
-        out.extend(render_wiki_link_dispatched(
-            ctx,
-            &ParsoidToken::SelfclosingTag(stt.clone()),
-            &target,
-            false,
-        ));
-    }
-    out
-}
-
 /// Split a media option string on *top-level* pipes, respecting nested
 /// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling,
@@ -696,6 +658,9 @@ pub fn render_file(
     ctx: &mut WikiLinkContext,
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+    build_fragment: CaptionFragmentBuilder,
 ) -> Vec<Item> {
     use super::media_options::{
         MediaOpts, get_format, get_option_info, get_wrapper_info, has_wikitext_markup,
@@ -942,12 +907,15 @@ pub fn render_file(
             DataParsoid::default(),
         ))));
         if let Some(cap) = &caption {
-            // A caption is re-tokenized as wikitext so quotes/entities/links are
-            // rendered (mirrors PHP's `processContentInPipeline` inline caption
-            // processing). Wikilinks are rendered here (the main `renderLinks`
-            // stage already ran); `extlink`/quotes are left for the later stages.
+            // The caption is re-tokenized as full wikitext (quotes/entities/
+            // links/tables/…) and tunneled through an inline sub-pipeline via an
+            // `mw:dom-fragment-token` placeholder, mirroring PHP's
+            // `getDOMFragmentToken($optsCaption['v'], …, ['inlineContext' => true])`.
+            // The inline context disables the ParagraphWrapper so newlines stay
+            // literal rather than breaking the caption into `<p>` runs.
             let items = tokenize_caption(cap, ctx.config);
-            out.extend(render_caption_wikilinks(ctx, items));
+            let frag = build_fragment(items);
+            out.push(dom_fragment_token(frag, token, fragments, next_id));
         }
         out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
             "figcaption",
@@ -965,6 +933,31 @@ pub fn render_file(
     out
 }
 
+/// Register a pre-built inline caption fragment in `fragments` and return the
+/// `mw:dom-fragment-token` placeholder that the tree builder splices in its
+/// place (mirrors `PipelineUtils::getDOMFragmentToken` + `tunnelDOMThroughTokens`).
+fn dom_fragment_token(
+    frag: crate::dom::node::Node,
+    token: &ParsoidToken,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Item {
+    let id = *next_id;
+    *next_id += 1;
+    fragments.insert(id, frag);
+
+    let dp = token.data_parsoid().cloned().unwrap_or_default();
+    let mut frag_tok = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
+    frag_tok.attribs.push(KV {
+        key: crate::wikitext::tokens_v2::KeyValue::Str("data-fragment-id".to_string()),
+        value: crate::wikitext::tokens_v2::KeyValue::Str(id.to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
+    Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))
+}
+
 /// Dispatch a wikilink token to the correct renderer based on the target's
 /// namespace. Mirrors `WikiLinkHandler::wikiLinkHandler`.
 ///
@@ -976,6 +969,9 @@ pub fn render_wiki_link_dispatched(
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
     is_redirect: bool,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+    build_fragment: CaptionFragmentBuilder,
 ) -> Vec<Item> {
     if let Some(title) = &target.title {
         if is_redirect {
@@ -991,7 +987,7 @@ pub fn render_wiki_link_dispatched(
         }
         if !target.from_colon_escaped_text && !target.href.starts_with('#') {
             if Some(title.namespace_id) == file_ns {
-                return render_file(ctx, token, target);
+                return render_file(ctx, token, target, fragments, next_id, build_fragment);
             }
             if Some(title.namespace_id) == category_ns {
                 return render_category(ctx, token, target);
@@ -1057,7 +1053,15 @@ pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<I
     );
     let wikilink_token = ParsoidToken::SelfclosingTag(wikilink);
 
-    let rendered = render_wiki_link_dispatched(ctx, &wikilink_token, &target, true);
+    let rendered = render_wiki_link_dispatched(
+        ctx,
+        &wikilink_token,
+        &target,
+        true,
+        &mut std::collections::HashMap::new(),
+        &mut 0usize,
+        &mut |_| crate::dom::node::Node::document(),
+    );
 
     // Extract the normalized href from the rendered first token (an `<a>` or
     // `<link>`), mirroring PHP's `$da->a['href']`.
@@ -1323,7 +1327,14 @@ mod tests {
             get_wiki_link_target_info(&ctx, "File:Example.jpg", "File:Example.jpg").unwrap();
         assert_eq!(target.title.as_ref().unwrap().namespace_id, 6);
 
-        let out = render_file(&mut ctx, &token, &target);
+        let out = render_file(
+            &mut ctx,
+            &token,
+            &target,
+            &mut std::collections::HashMap::new(),
+            &mut 0usize,
+            &mut |_| crate::dom::node::Node::document(),
+        );
 
         // With 'thumb' (thumbnail format), the container should be a <figure>
         // with typeof='mw:File/Thumb'.
@@ -1351,7 +1362,14 @@ mod tests {
             get_wiki_link_target_info(&ctx, "File:Example.jpg", "File:Example.jpg").unwrap();
         assert_eq!(target.title.as_ref().unwrap().namespace_id, 6);
 
-        let out = render_file(&mut ctx, &token, &target);
+        let out = render_file(
+            &mut ctx,
+            &token,
+            &target,
+            &mut std::collections::HashMap::new(),
+            &mut 0usize,
+            &mut |_| crate::dom::node::Node::document(),
+        );
 
         // Container is <span typeof="mw:File" class="mw-default-size">.
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "span"));
