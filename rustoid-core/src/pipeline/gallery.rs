@@ -351,7 +351,9 @@ where
     li.push_child(thumb);
 
     // `<div class="gallerytext">caption</div>` — the caption is rendered as
-    // wikitext (external-URL autolinks, wikilinks, quotes, …).
+    // wikitext (external-URL autolinks, wikilinks, quotes, …). The overlay/hover
+    // modes wrap this in a `.gallerytextwrapper` (whose `width` is set later by
+    // `AddMediaInfo`'s `scaleMedia`, since it depends on the resolved image width).
     let mut gallerytext = Node::element(ElementKind::Div);
     gallerytext.set_attr("class", "gallerytext");
     // `showfilename` prepends a filename link (mirrors `Gallery::pLine`).
@@ -361,7 +363,14 @@ where
     for node in caption_nodes {
         gallerytext.push_child(node);
     }
-    li.push_child(gallerytext);
+    if matches!(opts.mode.as_str(), "packed-overlay" | "packed-hover") {
+        let mut wrapper = Node::element(ElementKind::Div);
+        wrapper.set_attr("class", "gallerytextwrapper");
+        wrapper.push_child(gallerytext);
+        li.push_child(wrapper);
+    } else {
+        li.push_child(gallerytext);
+    }
 
     Some(li)
 }

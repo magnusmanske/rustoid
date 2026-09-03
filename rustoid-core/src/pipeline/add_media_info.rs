@@ -296,17 +296,33 @@ fn apply_media_info(
 
     // Compute the rendered size (mirrors `handleSize` for bitmaps). The manual
     // thumb is unscaled, so `data-width` (if any) is ignored for it.
-    let (width, height) = if job.manualthumb.is_some() {
+    let (resolved_width, mut resolved_height) = if job.manualthumb.is_some() {
         (media_info.width, media_info.height)
     } else {
         handle_size(job, &media_info)
     };
 
-    // The image `src` (thumbnail when the file has one for the resolved width,
-    // else the raw file URL). Uses the *resolved* width (which for a
-    // height-constrained/packed thumbnail differs from the requested `data-width`).
-    let width_key = width.to_string();
-    let src = image_src(&media_info, Some(&width_key));
+    // The image `src` is the thumbnail at the *resolved* width (before any
+    // packed-gallery scaling), mirroring how `scaleMedia` reads the rendered
+    // `<img>` width before dividing by the scale.
+    let src = {
+        let resolved_key = resolved_width.to_string();
+        image_src(&media_info, Some(&resolved_key))
+    };
+
+    // Packed/overlay/hover galleries scale the rendered `<img>` down by 1.5
+    // (`PackedMode::scaleMedia`): the image is displayed at a width of
+    // `ceil(renderedWidth / scale)` and the gallery's `imageHeight`, while the
+    // `.gallerybox`/`.thumb` get the unrounded `renderedWidth / scale` float
+    // widths. `scale` is `None` outside those gallery modes.
+    let gallery_scale = gallery_scale(root, &job.path);
+    let scaled_width = gallery_scale.map(|s| {
+        let w = resolved_width as f64 / s;
+        resolved_height = gallery_image_height(root, &job.path).unwrap_or(resolved_height);
+        (w.ceil() as u32, w)
+    });
+    let width = scaled_width.as_ref().map_or(resolved_width, |(w, _)| *w);
+    let height = resolved_height;
 
     // Build the `<img>` replacement.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
@@ -354,6 +370,92 @@ fn apply_media_info(
             lang: lang.as_deref(),
         },
     );
+
+    // Packed/overlay/hover galleries: write the unrounded `renderedWidth / scale`
+    // float widths onto the parent `.thumb` and `.gallerybox` (mirrors
+    // `PackedMode::scaleMedia` → `thumbStyle`/`boxStyle`).
+    if let Some((_, scale_w)) = scaled_width {
+        apply_gallery_box_widths(root, &job.path, scale_w);
+    }
+}
+
+/// Whether the media container (at `path`) sits inside a packed/overlay/hover
+/// gallery, returning that gallery's scale factor (`PackedMode::scale = 1.5`).
+/// The container is `li.gallerybox > div.thumb > span[mw:File]`, whose ancestor
+/// `ul` carries the `mw-gallery-packed`/`-overlay`/`-hover` class.
+fn gallery_scale(root: &Node, path: &[usize]) -> Option<f64> {
+    // The `ul` is three levels up: [ul, li, div.thumb, ...span].
+    if path.len() < 3 {
+        return None;
+    }
+    let ul_path = &path[..path.len() - 3];
+    let ul = node_at_read(root, ul_path)?;
+    let class = ul.get_attr("class")?;
+    if class.contains("mw-gallery-packed")
+        || class.contains("mw-gallery-overlay")
+        || class.contains("mw-gallery-hover")
+    {
+        Some(1.5)
+    } else {
+        None
+    }
+}
+
+/// The raw gallery `imageHeight` (the `<ul>`'s configured height) for a packed
+/// gallery, derived from the broken span's `data-height` (= `floor(height*1.5)`).
+fn gallery_image_height(root: &Node, path: &[usize]) -> Option<u32> {
+    let container = node_at_read(root, path)?;
+    let anchor = first_element_child(container)?;
+    let span = first_element_child(anchor)?;
+    let dh = span.get_attr("data-height")?.parse::<f64>().ok()?;
+    // `dimensions()` sets `data-height = floor(imageHeight * 1.5)`, so undo it.
+    Some((dh / 1.5).round() as u32)
+}
+
+/// Set the `.thumb` (width = w) and `.gallerybox` (width = w + box padding)
+/// `style` widths for a packed gallery, where `w` is the unrounded scaled width
+/// (`PackedMode::scaleMedia` return value). `.thumb` gets `w`px, `.gallerybox`
+/// gets `w + 2`px (box padding for packed modes). Widths are formatted with up
+/// to 10 fractional digits (matching PHP's `precision=14` for these values),
+/// trimming trailing zeros so integral widths render without a decimal.
+fn apply_gallery_box_widths(root: &mut Node, path: &[usize], w: f64) {
+    if path.len() < 2 {
+        return;
+    }
+    let thumb_w = gallery_thumb_width(w);
+    // `.thumb` is the container's parent; `.gallerybox` is its grandparent.
+    let thumb_path = &path[..path.len() - 1];
+    let box_path = &path[..path.len() - 2];
+    if let Some(thumb) = node_at(root, thumb_path) {
+        thumb.set_attr("style", format!("width: {}px;", fmt_gallery_width(thumb_w)));
+    }
+    if let Some(box_node) = node_at(root, box_path) {
+        box_node.set_attr(
+            "style",
+            format!("width: {}px;", fmt_gallery_width(thumb_w + 2.0)),
+        );
+        // Overlay/hover modes wrap the caption in a `.gallerytextwrapper` whose
+        // width is `ceil(scaledWidth - 20)` (mirrors `PackedMode::galleryText`).
+        for child in &mut box_node.children {
+            if child.get_attr("class") == Some("gallerytextwrapper") {
+                child.set_attr("style", format!("width: {}px;", (w - 20.0).ceil() as u32));
+            }
+        }
+    }
+}
+
+/// The packed-modes `thumbWidth(`: at least 60px (mirrors `PackedMode::thumbWidth`,
+/// which the legacy parser requires so the caption is wide enough).
+fn gallery_thumb_width(w: f64) -> f64 {
+    if w < 60.0 { 60.0 } else { w }
+}
+
+/// Format a gallery width like PHP's default `precision=14` float-to-string:
+/// up to 10 fractional digits, trimming trailing zeros (so `618.0` → `618`).
+fn fmt_gallery_width(w: f64) -> String {
+    let s = format!("{w:.10}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
 }
 
 /// The `txt` value of a named option in the container's `data-mw.attribs`, if
@@ -618,15 +720,15 @@ fn handle_size(job: &ContainerJob, info: &FileInfo) -> (u32, u32) {
 
     // Height-constrained thumbnail: a concrete `data-height` smaller than the
     // file height drives the thumbnail dimensions; the width preserves the
-    // aspect ratio (mirrors core's thumbnail generation).
+    // aspect ratio (mirrors core's thumbnail generation, which rounds up).
     if let Some(h) = req_h
         && h > 0
         && h < info.height
         && info.height > 0
     {
         height = h;
-        width =
-            ((info.width as u64 * h as u64 + info.height as u64 / 2) / info.height as u64) as u32;
+        let w = (info.width as u64 * h as u64).div_ceil(info.height as u64);
+        width = w as u32;
         return (width, height);
     }
 
