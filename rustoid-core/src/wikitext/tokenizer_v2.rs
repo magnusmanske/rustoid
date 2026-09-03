@@ -2254,6 +2254,15 @@ impl<'a> PegTokenizer<'a> {
 
             self.advance(end + 2);
 
+            // An empty target (`[[]]`, or the `[[|…]]` pipe trick) is not a link:
+            // it is re-emitted as literal `[[…]]` text (mirrors PHP's
+            // `wikilink_preproc_internal`, which bails to `$textTokens` when
+            // `$target === null` or the pipe trick is detected).
+            if target.trim().is_empty() {
+                self.emit_text(self.input[saved..self.pos].to_string());
+                return true;
+            }
+
             let dp = self.make_dp(saved, self.pos);
             let mut stt = SelfclosingTagTk::new("wikilink", vec![], dp);
             // The target is tokenized (templates become `template` tokens),
