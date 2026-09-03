@@ -337,11 +337,19 @@ where
 
     // Broken-media span (mirrors `renderFile`, resolved later by AddMediaInfo).
     // The caption is stored *expanded* (its text content) so the generated
-    // anchor `title` is the plain, template-expanded caption.
+    // anchor `title` is the plain, template-expanded caption. An empty rendered
+    // caption (e.g. a caption consisting solely of a nested image, whose text is
+    // empty after `AddMediaInfo` resolves it) produces `None`, so no `caption`
+    // is stored and no anchor `title` is set (mirrors PHP).
     let caption_text_for_dmw = if caption_nodes.is_empty() {
         caption.clone()
     } else {
-        Some(nodes_text_content(&caption_nodes))
+        let text = nodes_text_content(&caption_nodes);
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     };
     thumb.push_child(broken_media_span(
         &title,
@@ -378,10 +386,24 @@ where
     Some(li)
 }
 
-/// The concatenated text content of a list of nodes (mirrors DOM `textContent`).
+/// The concatenated text content of a list of nodes, mirroring the `textContent`
+/// of the rendered caption DOM (`AddMediaInfo::textContentFromCaption`). Nested
+/// media (`[typeof*="mw:File"]`) is an `<img>` with no text child once
+/// `AddMediaInfo` resolves it, so its broken-media placeholder text (`File:…`)
+/// must not contribute to the caption text (mirrors PHP, where the caption's
+/// nested image is resolved before the outer caption text is read).
 fn nodes_text_content(nodes: &[Node]) -> String {
     let mut out = String::new();
     for node in nodes {
+        // A nested media container (`mw:File` span) has no text content:
+        // the broken placeholder text it temporarily carries is replaced by an
+        // `<img>` (empty text) during `AddMediaInfo`.
+        if node.get_attr("typeof").is_some_and(|ty| {
+            ty.split_whitespace()
+                .any(|t| t == "mw:File" || t.starts_with("mw:File/"))
+        }) {
+            continue;
+        }
         match &node.kind {
             crate::dom::node::NodeKind::Text(t) => out.push_str(t),
             _ => out.push_str(&nodes_text_content(&node.children)),
