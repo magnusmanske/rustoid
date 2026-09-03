@@ -2510,6 +2510,7 @@ impl<'a> PegTokenizer<'a> {
                             || c == '\n'
                             || c == '\r'
                             || c == ']'
+                            || c == '['
                             || c == '>'
                             || c == '<'
                     })
@@ -3494,6 +3495,33 @@ mod tests {
         let tokens = tokenize("[http://example.com link]");
         let has_extlink = tokens.iter().any(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink"));
         assert!(has_extlink, "Expected extlink, got: {:?}", tokens);
+    }
+
+    #[test]
+    fn test_bare_url_stops_before_wikilink() {
+        // `http://example.com[[File:Foobar.jpg]]` must split into an autolinked
+        // URL ending at the first `[` and a separate `[[…]]` wikilink (T3219).
+        let tokens = tokenize("http://example.com[[File:Foobar.jpg]]");
+        let urllinks: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "urllink" => Some(
+                    tk.attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("href"))
+                        .and_then(|kv| kv.value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urllinks, vec!["http://example.com".to_string()]);
+        let has_wikilink = tokens.iter().any(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "wikilink"));
+        assert!(
+            has_wikilink,
+            "Expected wikilink after bare URL, got: {tokens:?}"
+        );
     }
 
     #[test]
