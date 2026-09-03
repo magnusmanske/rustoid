@@ -384,9 +384,12 @@ pub fn render_interwiki_link(
         kv.value = crate::wikitext::tokens_v2::KeyValue::Str("mw:WikiLink/Interwiki".to_string());
     }
 
-    // Add title unless it's just a fragment.
+    // Add title unless it's just a fragment (and trim off fragment).
+    // The title prefix is the *canonical* interwiki map key (`$target->interwiki['prefix']`
+    // in PHP), not the raw input prefix (which may differ in case).
     if target.href.is_empty() || !target.href.starts_with('#') {
-        let mut title_attr = format!("{}:", target.prefix.clone().unwrap_or_default());
+        let prefix = info.prefix.clone().unwrap_or_default();
+        let mut title_attr = format!("{prefix}:");
         let stripped_fragment = trimmed_href.split('#').next().unwrap_or(trimmed_href);
         title_attr.push_str(&decode_uri_component(&stripped_fragment.replace('_', " ")));
         new_tk.add_attribute_str("title", &title_attr);
@@ -1419,7 +1422,7 @@ mod tests {
                 .iter()
                 .find(|kv| kv.key.as_str() == Some("href"))
                 .and_then(|kv| kv.value.as_str());
-            assert_eq!(href, Some("https://en.wikipedia.org/wiki/Foo"));
+            assert_eq!(href, Some("http://en.wikipedia.org/wiki/Foo"));
         }
     }
 

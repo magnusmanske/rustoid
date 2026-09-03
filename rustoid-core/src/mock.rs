@@ -290,21 +290,24 @@ impl MockSiteConfig {
         config.add_namespace(828, "Module", &[], false, "Scribunto");
         config.add_namespace(829, "Module talk", &[], false, "wikitext");
 
-        // Register some interwiki prefixes
-        config.add_interwiki("wikipedia", "https://en.wikipedia.org/wiki/$1", true);
-        config.add_interwiki("wiktionary", "https://en.wiktionary.org/wiki/$1", true);
-        config.add_interwiki("wikibooks", "https://en.wikibooks.org/wiki/$1", true);
-        config.add_interwiki("wikiquote", "https://en.wikiquote.org/wiki/$1", true);
-        config.add_interwiki("commons", "https://commons.wikimedia.org/wiki/$1", true);
-        config.add_interwiki("meta", "https://meta.wikimedia.org/wiki/$1", true);
-        config.add_interwiki("mw", "https://www.mediawiki.org/wiki/$1", true);
+        // Register some interwiki prefixes.
+        // NOTE: the upstream Parsoid parser-test site config uses `http://`
+        // (not `https://`) as its canonical protocol, and the fixtures embed
+        // these URLs verbatim (e.g. `http://en.wikipedia.org/wiki/Foo`).
+        config.add_interwiki("wikipedia", "http://en.wikipedia.org/wiki/$1", true);
+        config.add_interwiki("wiktionary", "http://en.wiktionary.org/wiki/$1", true);
+        config.add_interwiki("wikibooks", "http://en.wikibooks.org/wiki/$1", true);
+        config.add_interwiki("wikiquote", "http://en.wikiquote.org/wiki/$1", true);
+        config.add_interwiki("commons", "http://commons.wikimedia.org/wiki/$1", true);
+        config.add_interwiki("meta", "http://meta.wikimedia.org/wiki/$1", true);
+        config.add_interwiki("mw", "http://www.mediawiki.org/wiki/$1", true);
         // Interwiki prefixes used by the upstream parser fixtures.
         config.add_interwiki("meatball", "http://www.usemod.com/cgi-bin/mb.pl?$1", false);
 
         // Register language prefixes (language links, not plain interwikis).
-        config.add_language_interwiki("en", "https://en.wikipedia.org/wiki/$1");
-        config.add_language_interwiki("de", "https://de.wikipedia.org/wiki/$1");
-        config.add_language_interwiki("fr", "https://fr.wikipedia.org/wiki/$1");
+        config.add_language_interwiki("en", "http://en.wikipedia.org/wiki/$1");
+        config.add_language_interwiki("de", "http://de.wikipedia.org/wiki/$1");
+        config.add_language_interwiki("fr", "http://fr.wikipedia.org/wiki/$1");
 
         // Register common magic words (English)
         config.add_magic_word("toc", &["__TOC__", "__NOTOC__", "__FORCETOC__"]);
@@ -403,14 +406,16 @@ impl MockSiteConfig {
     }
 
     fn add_interwiki(&mut self, prefix: &str, url: &str, local: bool) {
-        self.interwiki_map
-            .insert(prefix.to_string(), InterwikiInfo::new(url, local));
+        let mut info = InterwikiInfo::new(url, local);
+        info.prefix = Some(prefix.to_string());
+        self.interwiki_map.insert(prefix.to_string(), info);
     }
 
     fn add_language_interwiki(&mut self, prefix: &str, url: &str) {
         let mut info = InterwikiInfo::new(url, true);
         info.language = Some(prefix.to_string());
         info.extralanglink = Some(true);
+        info.prefix = Some(prefix.to_string());
         // Language links are protocol-relative by default (strip http:/https:).
         info.protorel = Some(true);
         self.interwiki_map.insert(prefix.to_string(), info);
@@ -482,6 +487,37 @@ impl MockSiteConfig {
                 self.add_magic_word("img_thumbnail", &["miniatura", "thumbnail", "thumb"]);
                 self.add_magic_word("img_left", &["izquierda", "left"]);
                 self.add_magic_word("img_link", &["enlace=$1", "link=$1"]);
+            }
+            "de" => {
+                ns.insert(6, "Datei".to_string()); // File
+                if let Some(info) = self.namespaces.get_mut(&6) {
+                    info.aliases.push("Datei".to_string());
+                    info.aliases.push("datei".to_string());
+                    info.aliases.push("Bild".to_string());
+                    info.aliases.push("bild".to_string());
+                }
+                // German media option aliases (localized-first).
+                self.add_magic_word("img_thumbnail", &["miniatur", "thumb", "thumbnail"]);
+                self.add_magic_word("img_left", &["links", "left"]);
+                self.add_magic_word("img_right", &["rechts", "right"]);
+                self.add_magic_word("img_center", &["zentriert", "center", "centre"]);
+                // German `lang=` for SVGs (localized `sprache=$1` first).
+                self.add_magic_word("img_lang", &["sprache=$1", "lang=$1"]);
+            }
+            "ru" => {
+                ns.insert(6, "Файл".to_string()); // File
+                if let Some(info) = self.namespaces.get_mut(&6) {
+                    info.aliases.push("Файл".to_string());
+                    info.aliases.push("файл".to_string());
+                }
+                // Russian media option aliases (localized-first).
+                self.add_magic_word(
+                    "img_thumbnail",
+                    &["мини", "миниатюра", "thumbnail", "thumb"],
+                );
+                self.add_magic_word("img_right", &["справа", "right"]);
+                self.add_magic_word("img_left", &["слева", "left"]);
+                self.add_magic_word("img_center", &["центр", "center", "centre"]);
             }
             "fa" => {
                 ns.insert(6, "فایل".to_string()); // File

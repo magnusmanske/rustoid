@@ -481,6 +481,9 @@ pub struct InterwikiInfo {
     /// If true, strip the `http:`/`https:` scheme from the absolute href.
     /// Mirrors PHP's `protorel`.
     pub protorel: Option<bool>,
+    /// The interwiki prefix (the map key, lowercased/normalized). Mirrors PHP's
+    /// interwiki-map `prefix` key, used to build interwiki link titles.
+    pub prefix: Option<String>,
 }
 
 impl InterwikiInfo {
@@ -494,6 +497,7 @@ impl InterwikiInfo {
             language: None,
             extralanglink: None,
             protorel: None,
+            prefix: None,
         }
     }
 }
@@ -607,8 +611,8 @@ mod tests {
     #[test]
     fn test_interwiki_matcher() {
         let c = crate::mock::MockSiteConfig::new();
-        // `commons` → `https://commons.wikimedia.org/wiki/$1`.
-        let m = c.interwiki_matcher("https://commons.wikimedia.org/wiki/Foo");
+        // `commons` → `http://commons.wikimedia.org/wiki/$1`.
+        let m = c.interwiki_matcher("http://commons.wikimedia.org/wiki/Foo");
         assert_eq!(m, Some(("commons".to_string(), "Foo".to_string())));
         // No match for an unrelated URL.
         assert_eq!(c.interwiki_matcher("https://example.com/x"), None);
