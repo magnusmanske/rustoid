@@ -112,27 +112,24 @@ pub fn build(
     ul.set_attr("class", class);
     ul.set_attr("typeof", "mw:Extension/gallery");
 
-    // Remaining sanitized attrs (style, data-test, …).
-    for (k, v) in &opts.attrs {
-        if k == "class" {
-            continue;
-        }
-        // Append to existing (mirrors `appendAttr`), but for simplicity set.
-        if let Some(existing) = ul.get_attr(k) {
-            let merged = format!("{existing} {v}");
-            ul.set_attr(k, merged);
-        } else {
-            ul.set_attr(k, v);
-        }
-    }
-
     // perrow → max-width on the <ul> (mirrors `TraditionalMode::perRow`);
-    // slideshow mode ignores perrow entirely.
+    // slideshow mode ignores perrow entirely. This is applied BEFORE the user
+    // attributes, matching `TraditionalMode::ul` (perRow first, then attrs).
     if opts.images_per_row > 0 && opts.mode != "slideshow" {
         let padding = padding_for_mode(&opts.mode);
         let total = opts.image_width + padding.thumb + padding.box_padding + padding.border;
         let total = total * opts.images_per_row;
         append_attr(&mut ul, "style", &format!("max-width: {total}px;"));
+    }
+
+    // Remaining sanitized attrs (style, data-test, …) appended after the
+    // defaults (mirrors `TraditionalMode::ul`, which loops `$opts->attrs` and
+    // `appendAttr`s each onto the `<ul>`).
+    for (k, v) in &opts.attrs {
+        if k == "class" {
+            continue;
+        }
+        append_attr(&mut ul, k, v);
     }
 
     // slideshow `showthumbnails` → `data-showthumbnails="1"`/`""` (mirrors
