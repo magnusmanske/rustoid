@@ -77,6 +77,8 @@ struct ContainerJob {
     title: Title,
     /// The broken span's `data-width` (dims.width), if any.
     data_width: Option<String>,
+    /// The broken span's `data-height` (dims.height), if any.
+    data_height: Option<String>,
     /// The `manualthumb=` title (a file name in the File namespace), if any.
     manualthumb: Option<String>,
 }
@@ -107,6 +109,13 @@ fn data_width_from_container(container: &Node) -> Option<String> {
     let anchor = first_element_child(container)?;
     let span = first_element_child(anchor)?;
     span.get_attr("data-width").map(str::to_string)
+}
+
+/// The `data-height` attribute on a container's broken span, if present.
+fn data_height_from_container(container: &Node) -> Option<String> {
+    let anchor = first_element_child(container)?;
+    let span = first_element_child(anchor)?;
+    span.get_attr("data-height").map(str::to_string)
 }
 
 /// The `lang` attribute on a container's broken span, if present (mirrors
@@ -165,6 +174,7 @@ fn collect_containers(
             path: path.clone(),
             title: title_from_container(node, config),
             data_width: data_width_from_container(node),
+            data_height: data_height_from_container(node),
             manualthumb: data_mw_txt(node, "manualthumb"),
         });
         // Descend so nested media (e.g. within a caption) are also collected.
@@ -292,9 +302,11 @@ fn apply_media_info(
         handle_size(job, &media_info)
     };
 
-    // The image `src` (thumbnail when the file has one for the requested width,
-    // else the raw file URL).
-    let src = image_src(&media_info, job.data_width.as_deref());
+    // The image `src` (thumbnail when the file has one for the resolved width,
+    // else the raw file URL). Uses the *resolved* width (which for a
+    // height-constrained/packed thumbnail differs from the requested `data-width`).
+    let width_key = width.to_string();
+    let src = image_src(&media_info, Some(&width_key));
 
     // Build the `<img>` replacement.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
@@ -588,15 +600,40 @@ fn node_at_read<'a>(root: &'a Node, path: &[usize]) -> Option<&'a Node> {
 }
 
 /// Compute the rendered width/height for a bitmap image (mirrors `handleSize`
-/// for the common non-upscaling bitmap cases).
+/// for the common non-upscaling bitmap cases). When `data-height` is present and
+/// smaller than the file height, the thumbnail is *height-constrained* (as for
+/// the packed gallery, whose `dimensions()` requests a large width but a concrete
+/// height), so the width is derived from the aspect ratio.
 fn handle_size(job: &ContainerJob, info: &FileInfo) -> (u32, u32) {
     let (mut width, mut height) = (info.width, info.height);
+
+    let req_w = job
+        .data_width
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok());
+    let req_h = job
+        .data_height
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok());
+
+    // Height-constrained thumbnail: a concrete `data-height` smaller than the
+    // file height drives the thumbnail dimensions; the width preserves the
+    // aspect ratio (mirrors core's thumbnail generation).
+    if let Some(h) = req_h
+        && h > 0
+        && h < info.height
+        && info.height > 0
+    {
+        height = h;
+        width =
+            ((info.width as u64 * h as u64 + info.height as u64 / 2) / info.height as u64) as u32;
+        return (width, height);
+    }
 
     // A `thumb`/`frameless` request carries the target width on the broken span
     // (`data-width`). Scale proportionally (exact thumb-height is not derivable
     // from `FileInfo`, so we preserve the file's aspect ratio).
-    if let Some(w_str) = job.data_width.as_deref()
-        && let Ok(w) = w_str.parse::<u32>()
+    if let Some(w) = req_w
         && w > 0
         && info.width > 0
     {
