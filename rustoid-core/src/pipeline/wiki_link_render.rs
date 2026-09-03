@@ -552,12 +552,15 @@ fn render_caption_wikilinks(ctx: &mut WikiLinkContext, items: Vec<Item>) -> Vec<
 
 /// Split a media option string on *top-level* pipes, respecting nested
 /// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
-/// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling.
+/// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling,
+/// including the `{| … |}` table block, whose internal pipes are cell/row
+/// markers (not option separators) and must stay glued to the caption.
 pub(crate) fn split_media_options(content: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut bracket = 0i32;
     let mut braces = 0i32;
+    let mut table = 0i32;
     let chars: Vec<char> = content.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -586,7 +589,21 @@ pub(crate) fn split_media_options(content: &str) -> Vec<String> {
             i += 2;
             continue;
         }
-        if c == '|' && bracket == 0 && braces == 0 {
+        // A `{| … |}` table block is a single balanced atom: its internal `|`
+        // (cell/row markers) must not split the option/caption list.
+        if c == '{' && i + 1 < chars.len() && chars[i + 1] == '|' && bracket == 0 && braces == 0 {
+            table += 1;
+            current.push_str("{|");
+            i += 2;
+            continue;
+        }
+        if c == '|' && i + 1 < chars.len() && chars[i + 1] == '}' && table > 0 {
+            table -= 1;
+            current.push_str("|}");
+            i += 2;
+            continue;
+        }
+        if c == '|' && bracket == 0 && braces == 0 && table == 0 {
             parts.push(std::mem::take(&mut current));
             i += 1;
             continue;
