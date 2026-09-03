@@ -309,13 +309,28 @@ where
     };
     thumb.set_attr("style", thumb_style);
 
+    // Expand the caption once (wikitext → inline nodes; templates are expanded
+    // by the async renderer). Its text content becomes the anchor `title` (via
+    // `data-mw.caption`, read by `AddMediaInfo`) and the `gallerytext` content.
+    let caption_nodes = match &caption {
+        Some(cap) => render_caption(cap).await,
+        None => Vec::new(),
+    };
+
     // Broken-media span (mirrors `renderFile`, resolved later by AddMediaInfo).
+    // The caption is stored *expanded* (its text content) so the generated
+    // anchor `title` is the plain, template-expanded caption.
+    let caption_text_for_dmw = if caption_nodes.is_empty() {
+        caption.clone()
+    } else {
+        Some(nodes_text_content(&caption_nodes))
+    };
     thumb.push_child(broken_media_span(
         &title,
         opts,
         config,
         &media_opts,
-        caption.as_deref(),
+        caption_text_for_dmw.as_deref(),
     ));
 
     li.push_child(thumb);
@@ -328,14 +343,24 @@ where
     if opts.showfilename {
         gallerytext.push_child(showfilename_anchor(&title, config));
     }
-    if let Some(cap) = &caption {
-        for node in render_caption(cap).await {
-            gallerytext.push_child(node);
-        }
+    for node in caption_nodes {
+        gallerytext.push_child(node);
     }
     li.push_child(gallerytext);
 
     Some(li)
+}
+
+/// The concatenated text content of a list of nodes (mirrors DOM `textContent`).
+fn nodes_text_content(nodes: &[Node]) -> String {
+    let mut out = String::new();
+    for node in nodes {
+        match &node.kind {
+            crate::dom::node::NodeKind::Text(t) => out.push_str(t),
+            _ => out.push_str(&nodes_text_content(&node.children)),
+        }
+    }
+    out
 }
 
 /// The `<a class="galleryfilename galleryfilename-truncate">` link prepended by
