@@ -443,12 +443,16 @@ fn parse_opts(
         let val = kv.value.as_str().unwrap_or_default();
         match key {
             "widths" => {
-                if let Some(w) = parse_dimension(val) {
+                // Mirrors `Opts::__construct`: `parseMediaDimensions(..., true, false)`.
+                // The `true` means only a single dimension (the width) is accepted,
+                // i.e. `x` is present in `100x50` → `null`. The localized width suffix
+                // (`px`/`ra`) is stripped by the `img_width` parameterized alias matcher.
+                if let Some(w) = parse_gallery_dimension(config, val, true) {
                     opts.image_width = w;
                 }
             }
             "heights" => {
-                if let Some(h) = parse_dimension(val) {
+                if let Some(h) = parse_gallery_dimension(config, val, true) {
                     opts.image_height = h;
                 }
             }
@@ -499,12 +503,45 @@ fn parse_opts(
     opts
 }
 
-/// Parse a bare dimension (`120`, `120px`, `120x100`).
-fn parse_dimension(s: &str) -> Option<u32> {
-    let s = s.trim();
+/// Parse a gallery `widths`/`heights` value following PHP's
+/// `Utils::parseMediaDimensions(siteConfig, str, onlyOne=true, localized=false)`.
+///
+/// 1. The localized `px`/`ra` suffix is stripped by matching the `img_width`
+///    parameterized alias (via `get_option_info`), yielding the bare numeric
+///    string. (`100ra` → `100`, `120px` → `120`.)
+/// 2. The remaining string is matched against `^(\d*)(?:x(\d+))?\s*(px\s*)?$`;
+///    with `onlyOne=true`, an `x` (height) portion makes the result `null`.
+/// 3. `validateMediaParam` requires the value to be `> 0`.
+fn parse_gallery_dimension(config: &dyn SiteConfig, s: &str, only_one: bool) -> Option<u32> {
+    use crate::pipeline::media_options::get_option_info;
+
+    // Step 1: strip the localized width/height suffix. `img_width` is registered
+    // with aliases like `$1px` and (for `eo`) `$1ra`; `get_option_info` matches the
+    // parameterized alias and captures the `$1` value.
+    let bare = match get_option_info(config, s) {
+        Some(info) if info.ck == "width" => info.v,
+        _ => s.trim().to_string(),
+    };
+
+    // Step 2: `$str` is now the bare numeric string (still possibly with a
+    // trailing `px`; the `px` is consumed either by the alias match above or by
+    // the regex below). Mirror the regex `^(\d*)(?:x(\d+))?\s*(px\s*)?$`.
+    let s = bare.trim();
     let s = s.strip_suffix("px").unwrap_or(s);
-    let first = s.split('x').next()?.trim();
-    first.parse::<u32>().ok()
+    let s = s.trim();
+
+    let mut parts = s.split('x');
+    let x_str = parts.next()?.trim();
+    let x: u32 = x_str.parse().ok()?;
+    if only_one && parts.next().is_some() {
+        // An explicit height is present; `onlyOne` rejects multi-dimensional input.
+        return None;
+    }
+    // Step 3: `validateMediaParam` (`> 0`).
+    if x == 0 {
+        return None;
+    }
+    Some(x)
 }
 
 /// Render gallery caption wikitext into a list of inline DOM nodes, following
@@ -672,12 +709,5 @@ mod tests {
             ul.children[0].kind,
             crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::ListItem)
         ));
-    }
-
-    #[test]
-    fn test_parse_dimension() {
-        assert_eq!(parse_dimension("120"), Some(120));
-        assert_eq!(parse_dimension("120px"), Some(120));
-        assert_eq!(parse_dimension("120x100"), Some(120));
     }
 }

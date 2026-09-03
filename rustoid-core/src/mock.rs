@@ -439,6 +439,15 @@ impl MockSiteConfig {
                 }
                 self.add_magic_word("img_thumbnail", &["thumbnail", "thumb", "بندانگشتی"]);
             }
+            "eo" => {
+                ns.insert(6, "Dosiero".to_string()); // File
+                if let Some(info) = self.namespaces.get_mut(&6) {
+                    info.aliases.push("Dosiero".to_string());
+                    info.aliases.push("dosiero".to_string());
+                }
+                // Esperanto width suffix: `100ra` → `img_width` value `100`.
+                self.add_magic_word("img_width", &["$1ra", "$1px"]);
+            }
             _ => {}
         }
         if !ns.is_empty() {
