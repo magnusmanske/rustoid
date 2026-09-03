@@ -14,9 +14,37 @@ use crate::traits::SiteConfig;
 const DEFAULT_IMAGE_WIDTH: u32 = 120;
 const DEFAULT_IMAGE_HEIGHT: u32 = 120;
 
-/// Traditional-mode padding (mirrors `TraditionalMode`).
-const PADDING_THUMB: u32 = 30;
-const PADDING_BOX: u32 = 5;
+/// Per-mode box padding (mirrors the `padding` objects on `TraditionalMode` and
+/// its subclasses). `border` is the per-image border used only in the `perrow`
+/// max-width computation.
+struct Padding {
+    thumb: u32,
+    box_padding: u32,
+    border: u32,
+}
+
+fn padding_for_mode(mode: &str) -> Padding {
+    match mode {
+        // `NoLinesMode`: thumb 0, box 5, border 4.
+        "nolines" => Padding {
+            thumb: 0,
+            box_padding: 5,
+            border: 4,
+        },
+        // `PackedMode`/`Packed-overlay`/`Packed-hover`: thumb 0, box 2, border 8.
+        "packed" | "packed-overlay" | "packed-hover" => Padding {
+            thumb: 0,
+            box_padding: 2,
+            border: 8,
+        },
+        // `TraditionalMode` and `SlideshowMode`: thumb 30, box 5, border 8.
+        _ => Padding {
+            thumb: 30,
+            box_padding: 5,
+            border: 8,
+        },
+    }
+}
 
 /// Parsed `<gallery>` options.
 #[derive(Debug)]
@@ -26,7 +54,8 @@ struct GalleryOpts {
     images_per_row: u32,
     mode: String,
     showfilename: bool,
-    caption: bool,
+    showthumbnails: bool,
+    caption: String,
     /// Additional sanitized attributes (`class`, `style`, …) applied to the
     /// `<ul>`.
     attrs: Vec<(String, String)>,
@@ -40,7 +69,8 @@ impl Default for GalleryOpts {
             images_per_row: 0,
             mode: "traditional".to_string(),
             showfilename: false,
-            caption: false,
+            showthumbnails: false,
+            caption: String::new(),
             attrs: Vec::new(),
         }
     }
@@ -96,16 +126,38 @@ pub fn build(
         }
     }
 
-    // perrow → max-width on the <ul> (mirrors `TraditionalMode::perRow`).
-    if opts.images_per_row > 0 {
-        let total = opts.image_width + PADDING_THUMB + PADDING_BOX + 8; // + border
+    // perrow → max-width on the <ul> (mirrors `TraditionalMode::perRow`);
+    // slideshow mode ignores perrow entirely.
+    if opts.images_per_row > 0 && opts.mode != "slideshow" {
+        let padding = padding_for_mode(&opts.mode);
+        let total = opts.image_width + padding.thumb + padding.box_padding + padding.border;
         let total = total * opts.images_per_row;
         append_attr(&mut ul, "style", &format!("max-width: {total}px;"));
+    }
+
+    // slideshow `showthumbnails` → `data-showthumbnails="1"`/`""` (mirrors
+    // `SlideshowMode::setAdditionalOptions`).
+    if opts.mode == "slideshow" {
+        ul.set_attr(
+            "data-showthumbnails",
+            if opts.showthumbnails { "1" } else { "" },
+        );
     }
 
     // data-mw names the extension (stripped in harness comparison, but set for
     // round-trip fidelity).
     ul.data_mw = Some(r#"{"name":"gallery","attrs":{},"body":{}}"#.to_string());
+
+    // A non-empty `caption=` renders a leading `<li class="gallerycaption">`
+    // (mirrors `TraditionalMode::caption`).
+    if !opts.caption.is_empty() {
+        let mut li = Node::element(ElementKind::ListItem);
+        li.set_attr("class", "gallerycaption");
+        for node in caption_to_nodes(&opts.caption, config) {
+            li.push_child(node);
+        }
+        ul.push_child(li);
+    }
 
     // Parse and render each line.
     for line in body.lines() {
@@ -177,11 +229,12 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
 
     let has_error = false;
 
-    // Thumbnail dims: thumbWidth = imageWidth + 30, thumbHeight = imageHeight + 30,
-    // boxWidth = thumbWidth + 5.
-    let thumb_width = opts.image_width + PADDING_THUMB;
-    let thumb_height = opts.image_height + PADDING_THUMB;
-    let box_width = thumb_width + PADDING_BOX;
+    // Thumbnail dims: thumbWidth = imageWidth + padding.thumb, thumbHeight =
+    // imageHeight + padding.thumb, boxWidth = thumbWidth + padding.box.
+    let padding = padding_for_mode(&opts.mode);
+    let thumb_width = opts.image_width + padding.thumb;
+    let thumb_height = opts.image_height + padding.thumb;
+    let box_width = thumb_width + padding.box_padding;
 
     // `<li class="gallerybox" style="width: <boxWidth>px;">`
     let mut li = Node::element(ElementKind::ListItem);
@@ -192,10 +245,14 @@ fn render_line(opts: &GalleryOpts, line: &str, config: &dyn SiteConfig) -> Optio
     // `<div class="thumb" style="...">`
     let mut thumb = Node::element(ElementKind::Div);
     thumb.set_attr("class", "thumb");
+    // The `height` is only emitted on error or for `traditional` mode; the
+    // nolines/slideshow/packed modes omit it (mirrors `TraditionalMode::thumbStyle`).
     let thumb_style = if has_error {
         format!("height: {thumb_height}px;")
-    } else {
+    } else if opts.mode == "traditional" {
         format!("width: {thumb_width}px; height: {thumb_height}px;")
+    } else {
+        format!("width: {thumb_width}px;")
     };
     thumb.set_attr("style", thumb_style);
 
@@ -407,7 +464,20 @@ fn parse_opts(
                 }
             }
             "showfilename" => opts.showfilename = true,
-            "caption" => opts.caption = true,
+            // `showthumbnails` (slideshow mode) is a presence flag; its value
+            // (often the empty string) is irrelevant (mirrors `Opts`'s `isset`).
+            "showthumbnails" => opts.showthumbnails = true,
+            // `showfilenames` (plural) is NOT a recognized gallery option; it is
+            // preserved in `data-mw` only and does not enable filename links nor
+            // become a `<ul>` attribute (mirrors PHP `Opts`, which keys on the
+            // singular `showfilename`).
+            "showfilenames" => {}
+            // `caption` is rendered as a leading `<li class="gallerycaption">`.
+            "caption" => {
+                if !val.is_empty() {
+                    opts.caption = val.to_string();
+                }
+            }
             // `summary` is a legacy gallery attribute with no HTML5 `ul`
             // equivalent; it is recorded in `data-mw` only (not emitted).
             "summary" => {}
