@@ -392,6 +392,21 @@ impl<'a> SerializerState<'a> {
         self.at_start_of_output = false;
     }
 
+    /// Emit a `ConstrainedText` chunk for `node`, applying separator and
+    /// single-line-context handling (mirrors the `ConstrainedText` branch of
+    /// PHP's `SerializerState::emitChunk`). Unlike [`Self::push_to_curr_line`],
+    /// this flushes the pending separator first — required by handlers that emit
+    /// typed chunks (e.g. `WikiLinkText` from the figure/link handlers).
+    pub fn emit_ct(&mut self, mut chunk: ConstrainedText, node: NodeId, tree: &DomTree) {
+        self.emit_sep_for_node(tree, node);
+        if self.single_line_context.enforced() {
+            chunk.text = chunk.text.replace('\n', " ");
+        }
+        self.push_to_curr_line(chunk);
+        self.on_sol = false;
+        self.at_start_of_output = false;
+    }
+
     /// Build and emit the pending separator for `node`, but only when `node`
     /// differs from the last node a separator was emitted for. Faithful to
     /// `SerializerState::emitSepForNode` (non-selser, no DSR recovery).

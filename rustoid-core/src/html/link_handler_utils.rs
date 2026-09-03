@@ -755,7 +755,7 @@ pub fn figure_handler(
         return;
     };
     let ct = figure_to_constrained_text(state, tree, env, node, &ms);
-    state.push_to_curr_line(ct);
+    state.emit_ct(ct, node, tree);
 }
 
 /// The media element wrapped directly by a link element (the `<a><img/>`
