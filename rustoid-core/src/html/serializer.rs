@@ -946,13 +946,17 @@ mod tests {
 
     #[test]
     fn test_serialize_dom_with_env_figure() {
-        // A `<figure>` with a resource serializes to `[[File:…|caption]]`.
+        // A thumbnail `<figure>` (with the description-page `<a>` link, as real
+        // Parsoid emits) serializes to `[[File:Example.jpg|thumb|caption]]`.
         let mut doc = Node::document();
         let mut figure = Node::element(ElementKind::Figure);
         figure.set_attr("typeof", "mw:File/Thumb");
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr("href", "./File:Example.jpg");
         let mut img = Node::element(ElementKind::Other("img".to_string()));
-        img.set_attr("resource", "Example.jpg");
-        figure.push_child(img);
+        img.set_attr("resource", "./File:Example.jpg");
+        a.push_child(img);
+        figure.push_child(a);
         let mut caption = Node::element(ElementKind::FigCaption);
         caption.push_child(Node::text("A caption"));
         figure.push_child(caption);
@@ -962,7 +966,7 @@ mod tests {
         let title = crate::title::Title::new_main("Test");
         let env = crate::html::env::SerializerEnv::new(&config, &title);
         let wt = WikitextSerializer::serialize_dom_with_env(doc, env);
-        assert_eq!(wt, "[[Example.jpg|A caption]]");
+        assert_eq!(wt, "[[File:Example.jpg|thumb|A caption]]");
     }
 
     #[test]
