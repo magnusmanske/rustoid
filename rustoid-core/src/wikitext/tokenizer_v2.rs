@@ -2467,11 +2467,11 @@ impl<'a> PegTokenizer<'a> {
     fn try_urltext(&mut self) -> bool {
         // First check for URL protocols.
         let rem = self.remaining();
-        let prefixes = ["http://", "https://", "ftp://", "//"];
+        let prefixes: Vec<String> = self.protocols.clone();
 
         // If we are at the start of a URL, emit a `urllink` token.
-        for prefix in prefixes {
-            if rem.starts_with(prefix) {
+        for prefix in &prefixes {
+            if rem.starts_with(prefix.as_str()) {
                 let start = self.pos;
                 let end = rem
                     .find(|c: char| {
