@@ -2560,8 +2560,11 @@ impl DomHandler for ImgHandler {
                 let src = tree.node(node).get_attr("src").unwrap_or("");
                 state.emit_chunk(src, node, tree);
             } else {
-                let ms = crate::html::media_structure::MediaStructure::parse(tree, node);
-                crate::html::link_handler_utils::figure_handler(state, tree, &env, node, ms);
+                // A bare `<img>` (or media element) is its own media element,
+                // with no link/container wrapper (mirrors PHP's
+                // `new MediaStructure($node)` in `ImgHandler`).
+                let ms = crate::html::media_structure::cradle_media_structure(node);
+                crate::html::link_handler_utils::figure_handler(state, tree, &env, node, Some(ms));
             }
         } else {
             FallbackHTMLHandler.handle(tree, node, state);
@@ -2582,14 +2585,9 @@ impl DomHandler for MediaHandler {
         state: &mut SerializerState,
     ) -> Option<NodeId> {
         if let Some(env) = state.env {
-            // `MediaStructure::parse` would reject a bare `<audio>`/`<video>` (not
-            // inline `<span>`/`figure`); construct the structure directly.
-            let ms = crate::html::media_structure::MediaStructure {
-                container_elt: node,
-                link_elt: None,
-                media_elt: node,
-                caption_elt: None,
-            };
+            // A bare `<audio>`/`<video>` (whose media element is itself) →
+            // `MediaStructure::parse` would reject it; construct directly.
+            let ms = crate::html::media_structure::cradle_media_structure(node);
             crate::html::link_handler_utils::figure_handler(state, tree, &env, node, Some(ms));
         } else {
             FallbackHTMLHandler.handle(tree, node, state);

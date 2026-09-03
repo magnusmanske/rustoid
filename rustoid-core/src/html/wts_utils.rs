@@ -36,7 +36,8 @@ pub fn element_tag(kind: &ElementKind) -> String {
         ElementKind::Bold => "b".to_string(),
         ElementKind::Italic => "i".to_string(),
         ElementKind::Wikilink | ElementKind::ExtLink => "a".to_string(),
-        ElementKind::Image => "figure-inline".to_string(),
+        // The html2wt view: an `Image` element came from an `<img>` tag.
+        ElementKind::Image => "img".to_string(),
         ElementKind::Gallery => "ul".to_string(),
         ElementKind::Table => "table".to_string(),
         ElementKind::TableRow => "tr".to_string(),

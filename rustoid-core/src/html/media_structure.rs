@@ -112,6 +112,18 @@ impl MediaStructure {
     }
 }
 
+/// Construct a `MediaStructure` for a bare media element (an `<img>`/`<audio>`/
+/// `<video>` with no link/container wrapper), mirroring PHP's
+/// `new MediaStructure($node)` in `ImgHandler`/`MediaHandler`.
+pub fn cradle_media_structure(node: NodeId) -> MediaStructure {
+    MediaStructure {
+        container_elt: node,
+        link_elt: None,
+        media_elt: node,
+        caption_elt: None,
+    }
+}
+
 /// Depth-first search for the first descendant element with a given tag name.
 fn select_first_descendant_tag(tree: &DomTree, id: NodeId, tag: &str) -> Option<NodeId> {
     fn walk(tree: &DomTree, id: NodeId, tag: &str) -> Option<NodeId> {
