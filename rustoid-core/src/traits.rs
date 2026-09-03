@@ -411,10 +411,12 @@ pub trait SiteConfig: Send + Sync {
     }
 
     /// The link-trail regular expression (body, without delimiters/flags) for
-    /// this wiki, e.g. enwiki's `[a-z]+`. Mirrors PHP's `SiteConfig::linkTrailRegex`.
-    /// Returns `None` for wikis with no link trail.
+    /// this wiki, e.g. enwiki's `^[a-z]+`. Mirrors PHP's `SiteConfig::linkTrailRegex`,
+    /// which strips the trailing `(.*)$` from `/^([a-z]+)(.*)$/sD` and keeps the
+    /// leading `^` anchor (a link trail only continues a word directly following
+    /// `]]`, never mid-string). Returns `None` for wikis with no link trail.
     fn link_trail_regex(&self) -> Option<&'static str> {
-        Some("[a-z]+")
+        Some("^[a-z]+")
     }
 
     /// The link-prefix regular expression (body, without delimiters/flags) for
