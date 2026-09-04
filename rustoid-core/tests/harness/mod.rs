@@ -894,6 +894,24 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         config.add_extension_tag("i18ntag");
         config.add_extension_tag("i18nattr");
     }
+    // The `styletag` option registers the `style` extension tag (mirrors
+    // `registerParserTestExtension(StyleTag::class)`), and `linktag` the `link`
+    // extension tag. Core's parser-test runner registers both when their
+    // options are set.
+    if test
+        .options
+        .get("styletag")
+        .is_some_and(|v| v == "1" || v == "true")
+    {
+        config.add_extension_tag("style");
+    }
+    if test
+        .options
+        .get("linktag")
+        .is_some_and(|v| v == "1" || v == "true")
+    {
+        config.add_extension_tag("link");
+    }
     let parser = Parser::new(&config);
 
     // The `parsoid` option can enable section wrapping via a JSON object like

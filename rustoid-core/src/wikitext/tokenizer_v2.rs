@@ -1549,11 +1549,10 @@ impl<'a> PegTokenizer<'a> {
             return ExtensionParse::NotExtension;
         }
         let lc_name = name.to_lowercase();
-        if !matches!(
-            lc_name.as_str(),
-            "nowiki" | "pre" | "i18ntag" | "i18nattr" | "pwraptest" | "gallery"
-        ) || !self.ext_tags.contains(&lc_name)
-        {
+        // Faithful to PHP's `ext_check`/`maybe_extension_tag`: the decision is
+        // driven purely by the configured extension-tag registry (`extTags`),
+        // not a hardcoded list.
+        if !self.ext_tags.contains(&lc_name) {
             self.pos = saved;
             return ExtensionParse::NotExtension;
         }
@@ -4419,6 +4418,24 @@ mod tests {
             assert_eq!(tk.attribs[1].key.as_str(), Some("style"));
             assert_eq!(tk.attribs[1].value.as_str(), Some("y"));
         }
+    }
+
+    #[test]
+    fn test_style_extension_tokenized_when_registered() {
+        let mut opts = TokenizerOptions::default();
+        opts.ext_tags.push("style".to_string());
+        let mut tokenizer = PegTokenizer::new("<style>.foo{}</style>", &opts);
+        let tokens = tokenizer.tokenize().unwrap();
+        let ext = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extension"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ext.len(),
+            1,
+            "expected one extension token, got: {:?}",
+            tokens
+        );
     }
 
     #[test]

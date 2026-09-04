@@ -240,7 +240,15 @@ impl HtmlSerializer {
                             buf.push_str(&format!("<{tag}"));
                             self.serialize_attrs_full(node, buf);
                             buf.push('>');
-                            self.serialize_children(node, buf, depth)?;
+                            // Raw-text elements (`style`, `script`, `xmp`, …)
+                            // serialize their text content verbatim (no `&`/`<`
+                            // escaping), mirroring PHP's `XHtmlSerializer`
+                            // `DOMUtils::isRawTextElement` branch.
+                            if crate::html5::html_data::is_raw_text(tag) {
+                                self.serialize_children_esc(node, buf, depth, false)?;
+                            } else {
+                                self.serialize_children(node, buf, depth)?;
+                            }
                             buf.push_str(&format!("</{tag}>"));
                         }
                     }
