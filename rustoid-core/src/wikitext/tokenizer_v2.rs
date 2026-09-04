@@ -3166,7 +3166,57 @@ fn find_arg_separator_eq(part: &str) -> Option<usize> {
     let bytes = part.as_bytes();
     let mut at_sol = true;
     let mut in_heading = false;
-    for (i, &b) in bytes.iter().enumerate() {
+    // Track nested `[[…]]`/`{{…}}`/`[…]` depth so an `=` inside a wikilink,
+    // template, or extlink is *not* misread as the `name=value` separator
+    // (mirrors the PEG `template_param_name` production, which only splits on a
+    // top-level `=`).
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut extlink = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Nested `[[` / `]]` atoms.
+        if b == b'[' && bytes.get(i + 1) == Some(&b'[') {
+            bracket += 1;
+            i += 2;
+            at_sol = false;
+            continue;
+        }
+        if b == b']' && bytes.get(i + 1) == Some(&b']') && bracket > 0 {
+            bracket -= 1;
+            i += 2;
+            continue;
+        }
+        // Nested `{{` / `}}` (and `{{{` / `}}}`) atoms.
+        if b == b'{' && bytes.get(i + 1) == Some(&b'{') {
+            brace += 1;
+            i += 2;
+            at_sol = false;
+            continue;
+        }
+        if b == b'}' && bytes.get(i + 1) == Some(&b'}') && brace > 0 {
+            brace -= 1;
+            i += 2;
+            continue;
+        }
+        // Single-bracket `[…]` extlink atom.
+        if b == b'[' && bracket == 0 && brace == 0 {
+            extlink += 1;
+            i += 1;
+            at_sol = false;
+            continue;
+        }
+        if b == b']' && extlink > 0 {
+            extlink -= 1;
+            i += 1;
+            continue;
+        }
+        if bracket > 0 || brace > 0 || extlink > 0 {
+            // Inside a nested construct: `=` is content, not a separator.
+            i += 1;
+            continue;
+        }
         match b {
             b'=' => {
                 if at_sol {
@@ -3190,6 +3240,7 @@ fn find_arg_separator_eq(part: &str) -> Option<usize> {
                 at_sol = false;
             }
         }
+        i += 1;
     }
     None
 }
