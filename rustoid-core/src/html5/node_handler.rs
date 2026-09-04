@@ -67,6 +67,40 @@ impl NodeTreeHandler {
         self.materialize(self.root)
     }
 
+    /// Mark `autoInsertedEnd` on the DOM node of every markable element that was
+    /// ended *implicitly* (its uid is not in `explicitly_ended`). Mirrors
+    /// `TreeMutationRelay::endTag`.
+    pub fn mark_implicit_auto_inserted_end(
+        &mut self,
+        explicitly_ended: &std::collections::HashSet<usize>,
+    ) {
+        for (&uid, &idx) in &self.uids {
+            if explicitly_ended.contains(&uid) {
+                continue;
+            }
+            let mut node = self.arena[idx].borrow_mut();
+            if let NodeKind::Element(ref name_kind) = node.kind {
+                // html/head/body/tbody/meta are not markable (mirrors
+                // `TreeMutationRelay::isMarkable`).
+                let name = match name_kind {
+                    ElementKind::Other(n) => n.as_str(),
+                    ElementKind::Table => "table",
+                    ElementKind::TableRow => "tr",
+                    ElementKind::TableCell => "td",
+                    ElementKind::TableHeader => "th",
+                    ElementKind::Paragraph => "p",
+                    _ => "",
+                };
+                if matches!(name, "html" | "head" | "body" | "tbody" | "meta") {
+                    continue;
+                }
+                let dp = node.dp.get_or_insert_with(Default::default);
+                dp.auto_inserted_end = true;
+                dp.tmp.end_tsr = None;
+            }
+        }
+    }
+
     /// The `data-object-id` attribute value of the node for `uid`, if any.
     /// Used by the tree-builder stage to correlate a popped element (including an
     /// AFE-reconstructed clone, whose attributes were copied from its

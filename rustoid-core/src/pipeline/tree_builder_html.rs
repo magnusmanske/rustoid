@@ -57,8 +57,11 @@ pub struct Html5TreeBuilder {
     /// Stashed node data, keyed by `data-object-id`.
     stash: HashMap<usize, StashedNodeData>,
     next_data_id: usize,
-    /// `data-object-id`s of elements closed by an *explicit* end tag (mirror
+    /// Tree-builder element `uid`s closed by an *explicit* end tag (mirror
     /// `TreeMutationRelay`'s matched-vs-auto-inserted end-tag distinction).
+    /// Keyed by `uid` (not the shared `data-object-id`) so that reconstructed
+    /// formatting-element clones — which copy the original's `data-object-id` —
+    /// are tracked independently.
     explicitly_ended: std::collections::HashSet<usize>,
     /// Maps a tree-builder element `uid` to its stashed `data-object-id`, so an
     /// explicit end tag can mark the *correct* stash entry as explicitly ended
@@ -477,9 +480,11 @@ impl Html5TreeBuilder {
         let Some(data_id) = data_id else {
             return;
         };
-        // Record that this element was ended by an explicit end tag (so it does
-        // NOT get `autoInsertedEnd` in finalize).
-        self.explicitly_ended.insert(data_id);
+        // Record that this *element* was ended by an explicit end tag (so it
+        // does NOT get `autoInsertedEnd`). Keyed by `uid` so reconstructed
+        // formatting-element clones are tracked independently of the shared
+        // `data-object-id`.
+        self.explicitly_ended.insert(uid);
         let Some(stashed) = self.stash.get_mut(&data_id) else {
             return;
         };
@@ -568,19 +573,15 @@ impl Html5TreeBuilder {
     /// [`post_pwrap_transforms`], so p-wrapping runs before encapsulation
     /// (mirrors PHP's `NESTED_PIPELINE_DOM_TRANSFORMS` order).
     pub fn finalize(mut self) -> Node {
-        // Mark `autoInsertedEnd` on stashed elements that were NOT closed by an
-        // explicit end tag (mirrors `TreeMutationRelay::endTag`: an element ended
-        // implicitly at a block boundary / EOF gets `autoInsertedEnd`).
-        for (id, data) in self.stash.iter_mut() {
-            if self.explicitly_ended.contains(id) {
-                continue;
-            }
-            if let Some(dp) = data.dp.as_mut() {
-                dp.auto_inserted_end = true;
-                dp.tmp.end_tsr = None;
-                data.data_parsoid = dp.to_data_parsoid_json();
-            }
-        }
+        // Mark `autoInsertedEnd` on each markable element that was closed
+        // *implicitly* (its `uid` is not in `explicitly_ended`). Mirrors
+        // `TreeMutationRelay::endTag`. Done per-element (rather than per
+        // `data-object-id`) so reconstructed formatting-element clones each
+        // get the correct flag.
+        let explicitly_ended = std::mem::take(&mut self.explicitly_ended);
+        self.builder
+            .handler
+            .mark_implicit_auto_inserted_end(&explicitly_ended);
 
         let mut doc = self.builder.handler.finish();
         resolve_data_ids(&mut doc, &self.stash, &mut std::collections::HashSet::new());
@@ -788,6 +789,19 @@ fn resolve_data_ids(
         }
     }
     node.attrs.retain(|a| a.key != DATA_OBJECT_ATTR_NAME);
+    // Preserve `autoInsertedEnd`/`autoInsertedStart` computed per-element by the
+    // handler (see `mark_implicit_auto_inserted_end`) before we overwrite `dp`
+    // with the stashed data.
+    let pre_auto_inserted_end = node
+        .dp
+        .as_ref()
+        .map(|d| d.auto_inserted_end)
+        .unwrap_or(false);
+    let pre_auto_inserted_start = node
+        .dp
+        .as_ref()
+        .map(|d| d.auto_inserted_start)
+        .unwrap_or(false);
     if let Some(id) = data_id
         && let Some(data) = stash.get(&id)
     {
@@ -810,6 +824,20 @@ fn resolve_data_ids(
             node.dp = Some(dp);
             node.data_mw = data.data_mw.clone();
         }
+    }
+    // Re-apply the per-element auto-inserted flags computed by the handler.
+    if let Some(dp) = node.dp.as_mut() {
+        if pre_auto_inserted_end {
+            dp.auto_inserted_end = true;
+        }
+        if pre_auto_inserted_start {
+            dp.auto_inserted_start = true;
+        }
+    }
+    // Keep the `data-parsoid` JSON in sync with the re-applied flags (consumers
+    // such as `remove_auto_inserted_empty_tags` read the JSON string).
+    if pre_auto_inserted_end || pre_auto_inserted_start {
+        sync_auto_inserted_flags(node);
     }
     for child in &mut node.children {
         resolve_data_ids(child, stash, seen);
@@ -977,6 +1005,31 @@ pub fn post_pwrap_transforms(
     // Strip internal marker metas (e.g. `<meta typeof="mw:IndentPreWS">`),
     // mirroring PHP's `CleanUp::stripMarkerMetas()`.
     strip_marker_metas(node);
+}
+
+/// Sync the structured `dp.autoInsertedStart`/`autoInsertedEnd` flags into the
+/// `data-parsoid` JSON string (used by `remove_auto_inserted_empty_tags`).
+fn sync_auto_inserted_flags(node: &mut Node) {
+    let Some(dp) = node.dp.as_ref() else {
+        return;
+    };
+    let start = dp.auto_inserted_start;
+    let end = dp.auto_inserted_end;
+    if let (true, Some(s)) = (node.data_parsoid.is_some(), node.data_parsoid.as_deref())
+        && let Ok(mut json) = serde_json::from_str::<serde_json::Value>(s)
+        && let Some(obj) = json.as_object_mut()
+    {
+        if start {
+            obj.insert(
+                "autoInsertedStart".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if end {
+            obj.insert("autoInsertedEnd".to_string(), serde_json::Value::Bool(true));
+        }
+        node.data_parsoid = Some(json.to_string());
+    }
 }
 
 /// Promote the transient `autoInsertedStartToken`/`autoInsertedEndToken` flags
