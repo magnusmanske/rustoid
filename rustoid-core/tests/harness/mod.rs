@@ -771,7 +771,7 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
         return run_html2wt_test(test, test_file);
     }
 
-    if supports_wt2html && (test.html_parsoid.is_some() || test.html_php.is_some()) {
+    if supports_wt2html && test.html_parsoid.is_some() {
         return run_wt2html_test(test, test_file);
     }
 
@@ -791,10 +791,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
 
     let expected_html = match test.html_parsoid.as_ref() {
         Some(h) => h.clone(),
-        None => match test.html_php.as_ref() {
-            Some(h) => h.clone(),
-            None => return TestResult::Skip("no expected HTML".to_string()),
-        },
+        None => return TestResult::Skip("no html/parsoid expected output".to_string()),
     };
 
     // Build mock data source with test file articles.
