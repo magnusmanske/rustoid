@@ -16,6 +16,7 @@ pub mod external_link_handler;
 pub mod frame;
 pub mod gallery;
 pub mod headings;
+pub mod language_variant_handler;
 pub mod list_handler;
 pub mod mark_fostered_content;
 pub mod media_options;

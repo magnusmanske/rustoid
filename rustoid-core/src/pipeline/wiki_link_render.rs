@@ -549,6 +549,7 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
         },
         ext_tags: config.extension_tags().to_vec(),
         protocols: config.protocols().iter().map(|s| s.to_string()).collect(),
+        lang_conv_enabled: config.lang_converter_enabled(),
         ..TokenizerOptions::default()
     };
     let mut tokenizer = PegTokenizer::new(caption, &options);

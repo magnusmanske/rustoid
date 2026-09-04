@@ -609,7 +609,7 @@ fn parse_options(raw: &str) -> HashMap<String, String> {
         return opts;
     }
 
-    // Try JSON format
+    // Try JSON format (the whole options blob is a single JSON object).
     if raw.starts_with('{') {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(raw)
             && let Some(obj) = json.as_object()
@@ -621,9 +621,12 @@ fn parse_options(raw: &str) -> HashMap<String, String> {
         return opts;
     }
 
-    // Key=value format (comma or newline separated)
-    for part in raw.split([',', '\n']) {
-        let part = part.trim();
+    // Key=value format. PHP's parser-test options are *whitespace*-separated
+    // `key=value` pairs (e.g. `language=zh htmlVariantLanguage=zh-Hans-CN`). A
+    // value that starts with `{` is a multi-line JSON object/array consumed as a
+    // single value. Split on whitespace (space/tab/newline) and comma.
+    let mut rest = raw;
+    while let Some(part) = next_option(&mut rest) {
         if let Some((key, value)) = part.split_once('=') {
             opts.insert(key.trim().to_string(), value.trim().to_string());
         } else if !part.is_empty() {
@@ -632,6 +635,68 @@ fn parse_options(raw: &str) -> HashMap<String, String> {
     }
 
     opts
+}
+
+/// Extract the next whitespace/comma-delimited option token from `rest`,
+/// consuming a balanced `{ … }` JSON value as a single token. Mirrors PHP's
+/// whitespace-separated option parsing with JSON-valued options.
+fn next_option(rest: &mut &str) -> Option<String> {
+    // Skip leading whitespace and commas.
+    let trimmed = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+    *rest = trimmed;
+    if rest.is_empty() {
+        return None;
+    }
+
+    // A JSON object/array value: consume until the matching close brace/bracket.
+    if rest.starts_with('{') || rest.starts_with('[') {
+        let bytes = rest.as_bytes();
+        let open = bytes[0];
+        let close = if open == b'{' { b'}' } else { b']' };
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut i = 0usize;
+        let mut end = 0usize;
+        for &b in bytes {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        if end > 0 {
+            let token = rest[..end].to_string();
+            *rest = &rest[end..];
+            return Some(token);
+        }
+    }
+
+    // A plain token: consume until the next whitespace or comma.
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ',')
+        .unwrap_or(rest.len());
+    let token = rest[..end].to_string();
+    *rest = &rest[end..];
+    Some(token)
 }
 
 // ---------------------------------------------------------------------------

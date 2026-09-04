@@ -193,6 +193,8 @@ pub struct DataParsoid {
     /// Image rendering options, attached to the image container. Mirrors
     /// `DataParsoid->optList`.
     pub opt_list: Option<Vec<OptListEntry>>,
+    /// Language-variant flags (serialized as `fl`). Mirrors `DataParsoid->fl`.
+    pub fl: Option<Vec<String>>,
     /// Whether an annotation meta was moved. Mirrors `DataParsoid->wasMoved`.
     pub was_moved: Option<bool>,
     /// Whether the element had an explicit `id` (suppressing auto-id). Mirrors
@@ -422,6 +424,18 @@ impl DataParsoid {
                 .collect();
             obj.insert("optList".to_string(), serde_json::Value::Array(arr));
         }
+        if let Some(fl) = &self.fl
+            && !fl.is_empty()
+        {
+            obj.insert(
+                "fl".to_string(),
+                serde_json::Value::Array(
+                    fl.iter()
+                        .map(|f| serde_json::Value::String(f.clone()))
+                        .collect(),
+                ),
+            );
+        }
 
         if obj.is_empty() {
             None
@@ -540,6 +554,48 @@ pub struct TempData {
     /// Set by `MarkFosteredContent` on the transclusion start meta of a fostered
     /// transclusion (mirrors `TempData::FROM_FOSTER`).
     pub from_foster: bool,
+    /// Parsed `-{ … }-` language-variant info (flags, variants, texts),
+    /// carried by a `language-variant` token (mirrors `TempData::variantInfo`).
+    pub variant_info: Option<VariantInfo>,
+}
+
+/// The parsed structure of a `-{ … }-` language-variant construct (mirrors PHP's
+/// `Tokens\VariantInfo`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VariantInfo {
+    /// Sorted flag keys (e.g. `["R"]`); an empty list plus non-empty `variants`
+    /// means "restrict possible variants to a limited set".
+    pub flags: Vec<String>,
+    /// Sorted variant-name keys (from a flag block).
+    pub variants: Vec<String>,
+    /// The original (source-order) flag/spacing items.
+    pub original: Vec<String>,
+    /// Whitespace source around each flag/variant (mirrors `flagSp`).
+    pub flag_sp: Vec<String>,
+    /// The parsed variant texts (each a `VariantOption`).
+    pub texts: Vec<VariantOption>,
+}
+
+/// One variant text within a `-{ … }-` construct (mirrors PHP's `VariantOption`).
+/// At most one of the language/link forms is populated:
+/// - two-way: `lang` + `text`
+/// - one-way: `lang` + `from` + `to`
+/// - plain: `text` only
+/// - trailing semicolon spacer: `semi`
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VariantOption {
+    /// For a two-way option, the language code.
+    pub lang: Option<String>,
+    /// Two-way source text (raw wikitext).
+    pub text: Option<String>,
+    /// One-way source text (raw wikitext).
+    pub from: Option<String>,
+    /// One-way target text (raw wikitext).
+    pub to: Option<String>,
+    /// Whether this option is a trailing-semicolon spacer.
+    pub semi: bool,
+    /// Whitespace around the option (mirrors `sp`).
+    pub sp: Vec<String>,
 }
 
 /// A single Parsoid token — mirrors the PHP token hierarchy.

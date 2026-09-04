@@ -53,6 +53,10 @@ pub struct TokenizerOptions {
     /// `http:`, `https:`, `irc:`, `//`). Mirrors PHP's
     /// `SiteConfig::getProtocols`. Empty relies on a built-in fallback set.
     pub protocols: Vec<String>,
+    /// Whether the language converter is enabled for the page language (so
+    /// `-{ … }-` parses into a `language-variant` token instead of plain text).
+    /// Mirrors PHP's `Env::langConverterEnabled`.
+    pub lang_conv_enabled: bool,
 }
 
 impl Default for TokenizerOptions {
@@ -68,6 +72,7 @@ impl Default for TokenizerOptions {
             redirect_words: vec!["#redirect".to_string()],
             ext_tags: Vec::new(),
             protocols: default_protocols(),
+            lang_conv_enabled: false,
         }
     }
 }
@@ -114,6 +119,9 @@ pub struct PegTokenizer<'a> {
     redirect_words: Vec<String>,
     /// URL protocol schemes recognized for extlinks/autolinks.
     protocols: Vec<String>,
+    /// Whether the language converter is enabled (produces `language-variant`
+    /// tokens for `-{ … }-`).
+    lang_conv_enabled: bool,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -136,6 +144,7 @@ impl<'a> PegTokenizer<'a> {
                 .collect(),
             ext_tags: options.ext_tags.iter().map(|s| s.to_lowercase()).collect(),
             protocols: options.protocols.clone(),
+            lang_conv_enabled: options.lang_conv_enabled,
         }
     }
 
@@ -1037,7 +1046,7 @@ impl<'a> PegTokenizer<'a> {
         let mut redirect = SelfclosingTagTk::new("mw:redirect", vec![], dp);
         redirect.attribs.push(KV {
             key: KeyValue::Str("href".to_string()),
-            value: tokenize_link_target(target),
+            value: tokenize_link_target(target, self.lang_conv_enabled),
             src_offsets: None,
             ksrc: None,
             vsrc: None,
@@ -2052,6 +2061,36 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
+    /// Parse a `-{ ... }-` language-variant construct *without* emitting it,
+    /// returning the `language-variant` self-closing token. Mirrors
+    /// `try_lang_variant_or_tpl` but returns instead of emitting, so it can be
+    /// used by the manual `tokenize_directives` walk (which assembles its own
+    /// item list).
+    fn parse_lang_variant(&mut self) -> Option<SelfclosingTagTk> {
+        if !self.starts_with("-{") || !self.lang_conv_enabled {
+            return None;
+        }
+
+        let saved = self.pos;
+        self.advance(2);
+
+        let Some(end) = find_lang_variant_close(self.remaining()) else {
+            self.pos = saved;
+            return None;
+        };
+        let body = self.remaining()[..end].to_string();
+        self.advance(end + 2);
+
+        let info = parse_lang_variant_body(&body)?;
+
+        let src = self.input[saved..self.pos].to_string();
+        let dp = self.make_dp(saved, self.pos);
+        let mut stt = SelfclosingTagTk::new("language-variant", vec![], dp);
+        stt.data_parsoid.src = Some(src);
+        stt.data_parsoid.tmp.variant_info = Some(info);
+        Some(stt)
+    }
+
     /// Parse a `templatearg` token (`{{{ ... }}}`) without emitting it.
     fn parse_templatearg_token(&mut self) -> Option<SelfclosingTagTk> {
         if !self.starts_with("{{{") {
@@ -2199,23 +2238,42 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
 
+        // With the language converter disabled, `-{ … }-` is re-emitted as plain
+        // text (PHP's `lang_variant_preproc` disabled-`langConverterEnabled` branch).
+        if !self.lang_conv_enabled {
+            return false;
+        }
+
         let saved = self.pos;
         self.advance(2);
 
-        // Find closing `}-`.
-        if let Some(end) = self.remaining().find("}-") {
-            self.advance(end + 2);
+        // Find the closing `}-`, accounting for nested `-{ … }-` constructs
+        // (rightmost-wins precedence: nested variants close before the outer).
+        let Some(end) = find_lang_variant_close(self.remaining()) else {
+            self.pos = saved;
+            return false;
+        };
+        let body = self.remaining()[..end].to_string();
+        self.advance(end + 2);
 
-            // Language conversion is not supported (always disabled), so faithful
-            // to PHP's `lang_variant_preproc` disabled-langconv branch: `-{ … }-` is
-            // re-emitted as plain text rather than a `language-variant` self-closing
-            // tag (which would drop the body). Emit the whole construct verbatim.
+        // Parse the body into a `VariantInfo` (flags, variants, and texts),
+        // following PHP's `lang_variant_preproc` + `opt_lang_variant_flags` +
+        // `lang_variant_option_list` productions.
+        let Some(info) = parse_lang_variant_body(&body) else {
+            // Unparseable: re-emit verbatim (mirrors `broken_lang_variant`).
             self.emit_text(self.input[saved..self.pos].to_string());
             return true;
-        }
+        };
 
-        self.pos = saved;
-        false
+        let src = self.input[saved..self.pos].to_string();
+        let dp = self.make_dp(saved, self.pos);
+        let mut stt = SelfclosingTagTk::new("language-variant", vec![], dp);
+        stt.data_parsoid.src = Some(src);
+        if stt.data_parsoid.tmp.variant_info.is_none() {
+            stt.data_parsoid.tmp.variant_info = Some(info);
+        }
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
     }
 
     /// Try wikilink (`[[...]]`) or extlink (`[...]`).
@@ -2268,7 +2326,7 @@ impl<'a> PegTokenizer<'a> {
             // can be expanded by the AttributeExpander.
             stt.attribs.push(KV {
                 key: KeyValue::Str("href".to_string()),
-                value: tokenize_link_target(target.trim()),
+                value: tokenize_link_target(target.trim(), self.lang_conv_enabled),
                 src_offsets: None,
                 ksrc: None,
                 vsrc: None,
@@ -2279,7 +2337,7 @@ impl<'a> PegTokenizer<'a> {
             for part in parts.iter().skip(1) {
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:maybeContent".to_string()),
-                    value: tokenize_link_content(part),
+                    value: tokenize_link_content(part, self.lang_conv_enabled),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
@@ -2344,7 +2402,7 @@ impl<'a> PegTokenizer<'a> {
                     ));
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:content".to_string()),
-                    value: tokenize_link_content(t),
+                    value: tokenize_link_content(t, self.lang_conv_enabled),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
@@ -3263,8 +3321,8 @@ fn kv_str(key: &str, value: &str) -> KV {
 ///
 /// Returns `Str` for a pure-text target and `Tokens` (a mixed string/token
 /// array) when a directive is present.
-fn tokenize_link_target(target: &str) -> KeyValue {
-    tokenize_directives(target)
+fn tokenize_link_target(target: &str, lang_conv_enabled: bool) -> KeyValue {
+    tokenize_directives(target, lang_conv_enabled)
 }
 
 /// Tokenize inline link *content* (e.g. wikilink text, extlink text) into a
@@ -3272,15 +3330,21 @@ fn tokenize_link_target(target: &str) -> KeyValue {
 /// when the content contains `{{...}}`/`{{{...}}}`. Mirrors the PHP tokenizer's
 /// `inlineline`/`link_text` productions, which tokenize templates in link text
 /// so the AttributeExpander can expand them.
-fn tokenize_link_content(content: &str) -> KeyValue {
-    tokenize_directives(content)
+fn tokenize_link_content(content: &str, lang_conv_enabled: bool) -> KeyValue {
+    tokenize_directives(content, lang_conv_enabled)
 }
 
 /// Shared directive-tokenization used for both link targets and link content.
 /// Walks the string, emitting `{{...}}`/`{{{...}}}` as `template`/`templatearg`
-/// self-closing tokens and accumulating the surrounding text.
-fn tokenize_directives(input: &str) -> KeyValue {
-    let options = TokenizerOptions::default();
+/// self-closing tokens and accumulating the surrounding text. When
+/// `lang_conv_enabled`, a `-{ … }-` construct is also emitted as a
+/// `language-variant` self-closing token (mirrors the PHP tokenizer's
+/// `url_directive` → `lang_variant_or_tpl` inside `wikilink_preprocessor_text`).
+fn tokenize_directives(input: &str, lang_conv_enabled: bool) -> KeyValue {
+    let options = TokenizerOptions {
+        lang_conv_enabled,
+        ..TokenizerOptions::default()
+    };
     let mut tk = PegTokenizer::new(input, &options);
     let mut items: Vec<Item> = Vec::new();
     let mut buf = String::new();
@@ -3288,6 +3352,16 @@ fn tokenize_directives(input: &str) -> KeyValue {
     while !tk.eof() {
         if tk.starts_with("{{")
             && let Some(tok) = tk.parse_directive()
+        {
+            if !buf.is_empty() {
+                items.push(Item::Str(std::mem::take(&mut buf)));
+            }
+            items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+            continue;
+        }
+        if tk.starts_with("-{")
+            && lang_conv_enabled
+            && let Some(tok) = tk.parse_lang_variant()
         {
             if !buf.is_empty() {
                 items.push(Item::Str(std::mem::take(&mut buf)));
@@ -3376,6 +3450,7 @@ fn split_template_args(inner: &str) -> Vec<String> {
     let mut bracket: i32 = 0;
     let mut extlink: i32 = 0;
     let mut table: i32 = 0;
+    let mut dash_brace: i32 = 0;
     let chars: Vec<char> = inner.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -3406,6 +3481,20 @@ fn split_template_args(inner: &str) -> Vec<String> {
                 }
                 continue;
             }
+        }
+        // A `-{ … }-` language-variant construct is balanced: its internal `|`
+        // (e.g. `-{R|caption:}-`) must not split the option/argument list.
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            dash_brace += 1;
+            current.push_str("-{");
+            i += 2;
+            continue;
+        }
+        if c == '}' && i + 1 < chars.len() && chars[i + 1] == '-' && dash_brace > 0 {
+            dash_brace -= 1;
+            current.push_str("}-");
+            i += 2;
+            continue;
         }
         // Track nesting of `{{{`, `{{`, and `[[`.
         if c == '{' && i + 2 < chars.len() && chars[i + 1] == '{' && chars[i + 2] == '{' {
@@ -3485,6 +3574,7 @@ fn split_template_args(inner: &str) -> Vec<String> {
             && bracket == 0
             && table == 0
             && extlink == 0
+            && dash_brace == 0
         {
             parts.push(std::mem::take(&mut current));
         } else {
@@ -3494,6 +3584,309 @@ fn split_template_args(inner: &str) -> Vec<String> {
     }
     parts.push(current);
     parts
+}
+
+/// Find the byte offset of the closing `}-` of a `-{ … }-` construct, accounting
+/// for nested `-{ … }-` blocks (rightmost-wins). Returns the offset of `}-`
+/// relative to `input` (which starts just after the opening `-{`).
+fn find_lang_variant_close(input: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    while i + 1 < input.len() {
+        if input[i..].starts_with("-{") {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if input[i..].starts_with("}-") {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            i += 2;
+            continue;
+        }
+        let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        i += ch_len;
+    }
+    None
+}
+
+/// Parse the body of a `-{ … }-` construct into a `VariantInfo`. Returns `None`
+/// if the body cannot be parsed (caller re-emits verbatim). Mirrors PHP's
+/// `lang_variant_preproc` + `opt_lang_variant_flags` + `lang_variant_option_list`.
+fn parse_lang_variant_body(body: &str) -> Option<crate::wikitext::tokens_v2::VariantInfo> {
+    use crate::wikitext::tokens_v2::{VariantInfo, VariantOption};
+
+    // The optional flag block (`opt_lang_variant_flags = lang_variant_flags "|"?`)
+    // is a `;`-separated sequence of *single* flag chars (`-`, `+`, `A`..`Z`) or
+    // language-variant names, terminated by a top-level `|`. Any other character
+    // (e.g. `:` starting a two-way option) means there is *no* flag block — the
+    // whole body is the text (parsed as an option list or raw).
+    let (flags_part, texts_part) = split_flag_block(body);
+
+    // Parse flags/variants from the flag block. Mirrors `opt_lang_variant_flags`,
+    // which (a) collects flags and variants into ordered lists plus whitespace,
+    // (b) applies ConverterRule::parseFlags-style normalization, and (c) decides
+    // whether the text that follows should be treated as *raw* (flags contain
+    // `R` or `N`, or there are variants) or parsed as a variant option list.
+    let mut variants: Vec<String> = Vec::new();
+    let mut original: Vec<String> = Vec::new();
+    let mut flag_sp: Vec<String> = Vec::new();
+    let (normalized_flags, use_variants) =
+        parse_lang_variant_flags(flags_part, &mut original, &mut flag_sp);
+
+    // Rebuild the ordered `variants` list for `data-parsoid.fl` fidelity.
+    if !flags_part.is_empty() {
+        for piece in flags_part.split(';') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            if is_lang_variant_name(piece) {
+                variants.push(piece.to_string());
+            }
+        }
+    }
+
+    // `raw` mirrors `lang_variant_preproc`: when the normalized flags contain
+    // `R` or `N` (or variants restrict the set), the following text is NOT split
+    // into `;`/`:` options — it is a single raw conversion string.
+    let raw = use_variants || normalized_flags.iter().any(|f| f == "R" || f == "N");
+
+    // Parse the texts. When raw, the whole `texts_part` is one plain text option
+    // (mirrors `lang_variant_text`). Otherwise split into `;`-separated options
+    // (mirrors `lang_variant_option_list`).
+    let mut texts: Vec<VariantOption> = Vec::new();
+    if raw {
+        texts.push(VariantOption {
+            text: Some(texts_part.to_string()),
+            ..Default::default()
+        });
+    } else if !texts_part.is_empty() {
+        for opt in texts_part.split(';') {
+            if opt.is_empty() {
+                texts.push(VariantOption {
+                    semi: true,
+                    ..Default::default()
+                });
+                continue;
+            }
+            let opt = opt.trim_matches([' ', '\t']);
+            if let Some(v) = parse_variant_option(opt) {
+                texts.push(v);
+            } else {
+                texts.push(VariantOption {
+                    text: Some(opt.to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    } else {
+        // A bare `-{…}-` with empty text.
+        texts.push(VariantOption::default());
+    }
+
+    // The handler reads a *normalized* flag list (mirrors the sorted normalized
+    // flags stored in `VariantInfo::flags`). Keep source-order flags/variants for
+    // `data-parsoid.fl` but publish the normalized set as `flags`.
+    let mut normalized_flags = normalized_flags;
+    normalized_flags.sort();
+    variants.sort();
+    Some(VariantInfo {
+        flags: normalized_flags,
+        variants,
+        original,
+        flag_sp,
+        texts,
+    })
+}
+
+/// Split the body into a leading flag block and the remaining text. Mirrors the
+/// `opt_lang_variant_flags` `lang_variant_flags "|"` production: a flag block is
+/// present only when the segment before the first *top-level* `|` is a valid
+/// `;`-separated sequence of single flag chars or variant names.
+fn split_flag_block(body: &str) -> (&str, &str) {
+    // Find the first top-level `|` (not inside a nested `-{ … }-`).
+    let mut depth = 0usize;
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'{' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'}' && bytes[i + 1] == b'-' {
+            depth = depth.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'|' && depth == 0 {
+            let left = &body[..i];
+            if is_flag_block(left) {
+                return (left, &body[i + 1..]);
+            }
+            // Not a valid flag block: this `|` is part of the text.
+            return ("", body);
+        }
+        i += 1;
+    }
+    ("", body)
+}
+
+/// Whether `left` is a valid `lang_variant_flags` sequence: empty, or a
+/// `;`-separated list where each piece is a single flag char or a variant name.
+fn is_flag_block(left: &str) -> bool {
+    let trimmed = left.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    for piece in trimmed.split(';') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        // A single flag char (`-`, `+`, `A`..`Z`).
+        let mut chars = piece.chars();
+        let first = chars.next();
+        let ok = match first {
+            Some(c) if c.is_ascii_uppercase() || c == '-' || c == '+' => chars.next().is_none(),
+            Some(c) if c.is_ascii_lowercase() => is_lang_variant_name(piece),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply PHP's `opt_lang_variant_flags` flag/variant collection and the
+/// `ConverterRule::parseFlags` normalization to the flag block. Returns the
+/// normalized flag keys and whether the variant-set is restricted (`useVariants`).
+/// `original`/`flag_sp` are populated with source-order items (for `fl`/`flSp`).
+fn parse_lang_variant_flags(
+    flags_part: &str,
+    original: &mut Vec<String>,
+    _flag_sp: &mut Vec<String>,
+) -> (Vec<String>, bool) {
+    // Collect raw flags and variant names from the flag block (before the first
+    // `|`). Each `;`-separated piece is either a language name (variant) or a
+    // flag character (`-`, `+`, `A`..`Z`).
+    let mut raw_flags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut raw_variants: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for piece in flags_part.split(';') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if is_lang_variant_name(piece) {
+            raw_variants.insert(piece.to_string());
+        } else {
+            raw_flags.insert(piece.to_string());
+        }
+        original.push(piece.to_string());
+    }
+
+    // `parseFlags()` normalization (from core/languages/ConverterRule.php),
+    // faithfully reproduced. `$S`/`$+`/`$E` are internal flags (prefixed `$`).
+    let has = |set: &std::collections::BTreeSet<String>, f: &str| set.contains(f);
+
+    let (flags, use_variants): (Vec<String>, bool) =
+        if raw_flags.is_empty() && raw_variants.is_empty() {
+            (vec!["$S".to_string()], false)
+        } else if has(&raw_flags, "R") {
+            (vec!["R".to_string()], false)
+        } else if has(&raw_flags, "N") {
+            (vec!["N".to_string()], false)
+        } else if has(&raw_flags, "-") {
+            (vec!["-".to_string()], false)
+        } else if has(&raw_flags, "T") && raw_flags.len() == 1 {
+            (vec!["H".to_string()], false)
+        } else if has(&raw_flags, "H") {
+            let mut nf = vec!["$+".to_string(), "H".to_string()];
+            if has(&raw_flags, "T") {
+                nf.push("T".to_string());
+            }
+            if has(&raw_flags, "D") {
+                nf.push("D".to_string());
+            }
+            (nf, false)
+        } else if !raw_variants.is_empty() {
+            (vec![], true)
+        } else {
+            let mut nf: Vec<String> = Vec::new();
+            if has(&raw_flags, "A") {
+                nf.push("$+".to_string());
+                nf.push("$S".to_string());
+            }
+            if has(&raw_flags, "D") {
+                // remove $S (describe does not show); leaves $+ if A was present.
+                nf.retain(|f| f != "$S");
+            }
+            (nf, false)
+        };
+
+    (flags, use_variants)
+}
+
+/// Whether a flag-block piece is a language variant name (`[a-z][-a-zA-Z]+`),
+/// e.g. `zh`, `zh-cn`. Returns `false` for single flags like `R`, `A`, `D`.
+fn is_lang_variant_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    let rest: Vec<char> = chars.collect();
+    !rest.is_empty()
+        && rest
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || *c == '-' || c.is_ascii_alphabetic())
+}
+
+/// Parse a single variant option text into a `VariantOption`.
+/// - two-way: `lang:text`
+/// - one-way: `from=>lang:to`
+/// - plain: `text`
+fn parse_variant_option(opt: &str) -> Option<crate::wikitext::tokens_v2::VariantOption> {
+    use crate::wikitext::tokens_v2::VariantOption;
+
+    // One-way: `from => lang : to`.
+    if let Some(arrow) = opt.find("=>") {
+        let from = opt[..arrow].trim();
+        let rest = &opt[arrow + 2..];
+        if let Some(colon) = rest.find(':') {
+            let lang = rest[..colon].trim();
+            let to = rest[colon + 1..].trim();
+            return Some(VariantOption {
+                lang: Some(lang.to_string()),
+                from: Some(from.to_string()),
+                to: Some(to.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Two-way: `lang:text` where `lang` is a lowercase language name.
+    if let Some(colon) = opt.find(':') {
+        let lang = opt[..colon].trim();
+        if is_lang_variant_name(lang) {
+            let text = opt[colon + 1..].trim();
+            return Some(VariantOption {
+                lang: Some(lang.to_string()),
+                text: Some(text.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Plain text.
+    Some(VariantOption {
+        text: Some(opt.to_string()),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -3564,6 +3957,31 @@ mod tests {
             })
             .collect();
         assert!(text.contains("-{foo|bar}-"), "body lost: {tokens:?}");
+    }
+
+    #[test]
+    fn test_lang_variant_flag_normalization() {
+        // `R` is flagged exclusive and marks the following text as *raw* (so a
+        // `:`/`;` inside is NOT split into options) and classifies as `disabled`.
+        let body = "R|caption:";
+        let info = parse_lang_variant_body(body).expect("parse");
+        assert_eq!(info.flags, vec!["R"]);
+        assert!(info.variants.is_empty());
+        assert_eq!(info.texts.len(), 1);
+        assert_eq!(info.texts[0].lang, None);
+        assert_eq!(info.texts[0].text.as_deref(), Some("caption:"));
+
+        // A nested `-{ … }-` inside a two-way option line has no top-level `|`,
+        // so it is the *whole* body (no flag block) parsed as a two-way option.
+        let nested = "zh-cn:blog (hk: -{zh-hans|WEBJOURNAL}-, tw: -{zh-hans|WEBLOG}-)";
+        let info = parse_lang_variant_body(nested).expect("parse nested");
+        assert_eq!(info.flags, vec!["$S"]);
+        assert_eq!(info.texts.len(), 1);
+        assert_eq!(info.texts[0].lang.as_deref(), Some("zh-cn"));
+        assert_eq!(
+            info.texts[0].text.as_deref(),
+            Some("blog (hk: -{zh-hans|WEBJOURNAL}-, tw: -{zh-hans|WEBLOG}-)")
+        );
     }
 
     #[test]

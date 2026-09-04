@@ -97,6 +97,16 @@ pub trait SiteConfig: Send + Sync {
     /// The wiki's content language code (e.g. `"en"`).
     fn language_code(&self) -> &str;
 
+    /// Whether the language converter is enabled for the content language (i.e.
+    /// the language has variant support, like `sr`/`zh`). Mirrors PHP's
+    /// `Env::langConverterEnabled`. Default: false (no variants).
+    fn lang_converter_enabled(&self) -> bool {
+        matches!(
+            self.language_code(),
+            "sr" | "sh" | "zh" | "zh-cn" | "zh-hans" | "zh-hant"
+        )
+    }
+
     /// The wiki's script path (e.g. `"/w"`).
     fn script_path(&self) -> &str {
         "/w"

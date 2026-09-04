@@ -299,6 +299,12 @@ pub fn render_inline_fragment(
     // Step 3: behavior switches → `mw:PageProp` metas.
     tokens = crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens);
 
+    // Step 3b: `language-variant` → `mw:LanguageVariant` elements (mirrors the
+    // TT2 `LanguageVariantHandler`, which runs in the token pipeline before tree
+    // building). Captions can carry language-converter markup (`-{R|…}-`), so the
+    // inline fragment path must render them too.
+    tokens = crate::pipeline::language_variant_handler::LanguageVariantHandler.run(config, tokens);
+
     // Step 4: flush pending quotes with a synthetic EOF, build the inline tree,
     // and apply the pwrap transforms (transclusion encapsulation).
     tokens.push(Item::Tok(ParsoidToken::Eof(
@@ -421,6 +427,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 pmid: self.config.magic_link_enabled("PMID"),
                 isbn: self.config.magic_link_enabled("ISBN"),
             },
+            lang_conv_enabled: self.config.lang_converter_enabled(),
             ..TokenizerOptions::default()
         };
         // Localized synonyms for the `redirect` magic word (each including the
@@ -670,6 +677,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// TT2 `BehaviorSwitchHandler`).
     fn render_behavior_switches(&self, tokens: Vec<Item>) -> Vec<Item> {
         crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens)
+    }
+
+    /// Expand `language-variant` tokens into `mw:LanguageVariant` elements
+    /// (mirrors the TT2 `LanguageVariantHandler`).
+    fn render_language_variants(&self, tokens: Vec<Item>) -> Vec<Item> {
+        crate::pipeline::language_variant_handler::LanguageVariantHandler.run(self.config, tokens)
     }
 
     /// Run an inline sub-pipeline over an extension-tag body and return the
@@ -1075,6 +1088,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
+        let tokens = self.render_language_variants(tokens);
         let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens);
         fragments.extend(pre_fragments);
         let tokens = self.expand_gallery_sync(tokens, &mut fragments, &mut next_id);
@@ -1152,6 +1166,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_external_links(tokens);
         let tokens = self.render_behavior_switches(tokens);
+        let tokens = self.render_language_variants(tokens);
         // Route `format="wikitext"` extension bodies through the inline
         // sub-pipeline, producing `mw:dom-fragment-token` placeholders + their
         // pre-built sub-fragments.

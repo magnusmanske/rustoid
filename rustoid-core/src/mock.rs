@@ -553,6 +553,14 @@ impl MockSiteConfig {
                 self.add_magic_word("img_right", &["dekstra", "right"]);
                 self.add_magic_word("img_center", &["centre", "center"]);
             }
+            "sr" => {
+                ns.insert(6, "Датотека".to_string()); // File (Serbian)
+                if let Some(info) = self.namespaces.get_mut(&6) {
+                    info.aliases.push("Датотека".to_string());
+                    info.aliases.push("датотека".to_string());
+                }
+                self.add_magic_word("img_thumbnail", &["мини", "thumbnail", "thumb"]);
+            }
             _ => {}
         }
         if !ns.is_empty() {
