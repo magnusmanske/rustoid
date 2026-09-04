@@ -481,14 +481,16 @@ impl<'a> SerializerState<'a> {
         self.single_line_context.disable();
         self.reset_curr_line(None);
 
-        // Serialize the children (with the optional escaping handler) and flush
-        // the buffered line into `out`.
+        // Serialize the children (with the optional escaping handler), emit the
+        // node's own pending separator (faithful to `kickOffSerialize`'s
+        // `emitSepForNode`), and flush the buffered line into `out`.
         self.update_sep(node);
         if let Some(escaper) = wt_escaper {
             self.serialize_children_with_escaper(tree, node, escaper);
         } else {
             self.serialize_children(tree, node);
         }
+        self.emit_sep_for_node(tree, node);
         self.flush_line();
 
         let bits = std::mem::take(&mut self.out);

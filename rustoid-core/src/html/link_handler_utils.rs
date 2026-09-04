@@ -831,12 +831,31 @@ struct Nopt {
 
 /// `figureToConstrainedText` — assemble the `[[File:resource|…]]` wikitext for a
 /// media element. Faithful port of `LinkHandlerUtils::figureToConstrainedText`.
+///
+/// `force_default_size` makes the element behave as if it carried the
+/// `mw-default-size` class, suppressing the (synthetic) width/height options. This
+/// is set by the gallery serializer, which strips the fake dimensions `pLine`
+/// injected when rendering each gallery line (PHP adds `mw-default-size` to the
+/// container before calling `serializeMedia`).
 pub fn figure_to_constrained_text(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    node: NodeId,
+    ms: &crate::html::media_structure::MediaStructure,
+) -> crate::html::constrained_text::ConstrainedText {
+    figure_to_constrained_text_inner(state, tree, env, node, ms, false)
+}
+
+/// The shared body of [`figure_to_constrained_text`], with `force_default_size`
+/// controlling whether the synthetic width/height options are suppressed.
+fn figure_to_constrained_text_inner(
     state: &mut SerializerState,
     tree: &DomTree,
     env: &SerializerEnv,
     _node: NodeId,
     ms: &crate::html::media_structure::MediaStructure,
+    force_default_size: bool,
 ) -> crate::html::constrained_text::ConstrainedText {
     let outer_elt = ms.container_elt;
     let link_elt = ms.link_elt;
@@ -1113,7 +1132,7 @@ pub fn figure_to_constrained_text(
     );
 
     let size_unmodified = ww.from_data_mw || (!ww.modified && !wh.modified);
-    let has_default_size = classes.iter().any(|c| c == "mw-default-size");
+    let has_default_size = force_default_size || classes.iter().any(|c| c == "mw-default-size");
     let is_audio = crate::html::dom_utils::node_name(tree.node(media_elt)) == "audio";
     let has_default_audio_height = classes.iter().any(|c| c == "mw-default-audio-height");
 
@@ -1201,8 +1220,45 @@ pub fn figure_to_constrained_text(
     )
 }
 
+/// Serialize a gallery media structure to `(title, options)` — the converse of
+/// `ParsoidExtensionAPI::serializeMedia`. Faithful to PHP:
+///
+/// ```php
+/// $ct = LinkHandlerUtils::figureToConstrainedText( $state, $ms );
+/// if ( $ct instanceof WikiLinkText ) {
+///     $text = substr( $ct->text, 2, -2 );       // strip [[ and ]]
+///     return array_pad( explode( '|', $text, 2 ), 2, '' );
+/// }
+/// return [ '', '' ];
+/// ```
+///
+/// The gallery pipeline forces `mw-default-size` (suppressing the synthetic
+/// width/height) before serializing; `caption_elt` is expected to already point
+/// at the `.gallerytext` div.
+pub fn serialize_gallery_media(
+    state: &mut SerializerState,
+    tree: &DomTree,
+    env: &SerializerEnv,
+    ms: &crate::html::media_structure::MediaStructure,
+) -> (String, String) {
+    let ct = figure_to_constrained_text_inner(state, tree, env, ms.container_elt, ms, true);
+    if matches!(
+        ct.kind,
+        crate::html::constrained_text::ConstrainedTextKind::WikiLink { .. }
+    ) && ct.text.len() >= 4
+    {
+        let inner = &ct.text[2..ct.text.len() - 2];
+        match inner.split_once('|') {
+            Some((line, options)) => (line.to_string(), options.to_string()),
+            None => (inner.to_string(), String::new()),
+        }
+    } else {
+        (String::new(), String::new())
+    }
+}
+
 /// Strip the `./`/`../` relative-prefix segments from a title string, faithful
-/// to `preg_replace('#^(\\.\\.?/)+#', '', $value, 1)`.
+/// to `preg_replace('#^(\.\.?/)+#', '', $value, 1)`.
 fn strip_dot_prefix(s: &str) -> String {
     let mut rest = s;
     loop {

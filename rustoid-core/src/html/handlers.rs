@@ -1877,6 +1877,218 @@ impl EncapsulatedContentHandler {
         }
         out
     }
+
+    /// Serialize a `<gallery>` extension, faithfully mirroring PHP's
+    /// `Gallery::domToWikitext` + `contentHandler` + `serializeMedia`. Reconstructs
+    /// the start tag from `data-mw.attrs`, recovers the caption from the
+    /// `li.gallerycaption`, and rebuilds each `li.gallerybox` into a `File:…|…`
+    /// line (using `MediaStructure` → `figureToConstrainedText`, with the
+    /// synthetic gallery dimensions suppressed as `mw-default-size`).
+    fn gallery_dom_to_wikitext(
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> Option<String> {
+        let n = tree.node(node);
+        let data_mw = n
+            .data_mw
+            .as_deref()
+            .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok());
+        let ext_name = data_mw
+            .as_ref()
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .or_else(|| crate::html::wts_utils::get_ext_tag_name(n))
+            .unwrap_or_else(|| "gallery".to_string());
+
+        // Rebuild the start tag's attribute list (preserving `data-mw.attrs`
+        // order), then append the recovered caption last.
+        let mut attrs: Vec<(String, String)> = data_mw
+            .as_ref()
+            .and_then(|v| v.get("attrs").and_then(|a| a.as_object()))
+            .map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Recover the `caption` from `li.gallerycaption` (and remember to skip it
+        // when iterating gallery lines below). Faithful to `domToWikitext`.
+        let mut gallerycaption_id: Option<NodeId> = None;
+        let mut child = tree.first_child(node);
+        while let Some(c) = child {
+            if dom_utils::node_name(tree.node(c)) == "li"
+                && has_class(tree.node(c), "gallerycaption")
+            {
+                let caption = state.serialize_caption_children_to_string(
+                    tree,
+                    c,
+                    Some(Box::new(move |_s, text, _o, _t| {
+                        crate::html::wikitext_escape_handlers::media_option_handler(text)
+                    })),
+                );
+                attrs.push(("caption".to_string(), caption));
+                gallerycaption_id = Some(c);
+                break;
+            }
+            child = tree.next_sibling(c);
+        }
+
+        // Serialize each `li.gallerybox` into a `File:…|…` line.
+        let mut lines: Vec<String> = Vec::new();
+        let mut child = tree.first_child(node);
+        while let Some(c) = child {
+            if Some(c) == gallerycaption_id {
+                child = tree.next_sibling(c);
+                continue;
+            }
+            if dom_utils::node_name(tree.node(c)) == "li" && has_class(tree.node(c), "gallerybox") {
+                let line = Self::serialize_gallery_line(tree, c, state);
+                lines.push(line);
+            }
+            child = tree.next_sibling(c);
+        }
+
+        // Assemble the start tag, then the body lines, then the close tag.
+        let mut out = String::new();
+        out.push('<');
+        out.push_str(&ext_name);
+        for (k, v) in &attrs {
+            out.push(' ');
+            out.push_str(k);
+            out.push_str("=\"");
+            out.push_str(v);
+            out.push('\"');
+        }
+
+        if lines.is_empty() {
+            out.push_str(" />");
+        } else {
+            out.push('>');
+            for line in &lines {
+                out.push('\n');
+                out.push_str(line);
+            }
+            out.push('\n');
+            out.push_str("</");
+            out.push_str(&ext_name);
+            out.push('>');
+        }
+        Some(out)
+    }
+
+    /// Serialize a single `li.gallerybox` into a `File:…|…` (or `File:…`) line.
+    /// Mirrors PHP `Gallery::contentHandler`'s per-`li` branch.
+    fn serialize_gallery_line(tree: &DomTree, li: NodeId, state: &mut SerializerState) -> String {
+        use crate::dom::node::ElementKind;
+
+        // Locate the `.thumb` and `.gallerytext` div children.
+        let mut thumb: Option<NodeId> = None;
+        let mut gallerytext: Option<NodeId> = None;
+        let mut child = tree.first_child(li);
+        while let Some(c) = child {
+            if matches!(
+                tree.node(c).kind,
+                crate::dom::node::NodeKind::Element(ElementKind::Div)
+            ) {
+                if has_class(tree.node(c), "thumb") {
+                    thumb = Some(c);
+                } else if has_class(tree.node(c), "gallerytext") {
+                    gallerytext = Some(c);
+                }
+            }
+            child = tree.next_sibling(c);
+        }
+
+        // Parse the media structure from the `.thumb`'s first non-separator child.
+        let Some(thumb_div) = thumb else {
+            return String::new();
+        };
+        let Some(media_node) = crate::html::dom_tree::first_non_sep_child(tree, thumb_div) else {
+            return String::new();
+        };
+
+        let Some(env) = state.env else {
+            return String::new();
+        };
+
+        if let Some(mut ms) = crate::html::media_structure::MediaStructure::parse(tree, media_node)
+        {
+            // Override the caption with the `.gallerytext` div, then serialize.
+            ms.caption_elt = gallerytext;
+            let (line, options) =
+                crate::html::link_handler_utils::serialize_gallery_media(state, tree, &env, &ms);
+            let mut line = if options.is_empty() {
+                line
+            } else {
+                format!("{line}|{options}")
+            };
+            // Gallery content is split by line, so collapse any newlines in the
+            // caption into spaces (faithful to `str_replace( "\n", ' ', $line )`
+            // in PHP's `Gallery::contentHandler`).
+            line = line.replace('\n', " ");
+            line
+        } else {
+            // A `mw:Error` media (e.g. a missing file) falls back to the
+            // `.thumb`'s text content plus an optional caption (mirrors the
+            // legacy `<=1.5.0` behavior PHP keeps for compatibility).
+            let line = crate::html::handlers::text_content(tree, thumb_div);
+            if let Some(gt) = gallerytext {
+                let caption = state.serialize_caption_children_to_string(
+                    tree,
+                    gt,
+                    Some(Box::new(move |_s, text, _o, _t| {
+                        crate::html::wikitext_escape_handlers::wikilink_handler(text)
+                    })),
+                );
+                if !caption.trim().is_empty() {
+                    return format!("{line}|{caption}");
+                }
+            }
+            line
+        }
+    }
+
+    /// Serialize a `<gallery>` extension (or fall back to the default handler).
+    fn extension_handler_with_state(
+        tree: &DomTree,
+        node: NodeId,
+        state: &mut SerializerState,
+    ) -> String {
+        let ext_name = crate::html::wts_utils::get_ext_tag_name(tree.node(node));
+        if ext_name.as_deref() == Some("gallery")
+            && let Some(src) = Self::gallery_dom_to_wikitext(tree, node, state)
+        {
+            return src;
+        }
+        Self::default_extension_handler(tree, node)
+    }
+}
+
+/// A `li`/`div` element has the given `class` token (faithful to
+/// `WTUtils::hasClass`/`DOMUtils::hasClass`).
+fn has_class(node: &crate::dom::node::Node, class: &str) -> bool {
+    node.get_attr("class")
+        .is_some_and(|c| c.split_whitespace().any(|t| t == class))
+}
+
+/// Concatenate the descendant text of `node` (a faithful `Node::textContent`).
+fn text_content(tree: &DomTree, node: NodeId) -> String {
+    let mut out = String::new();
+    fn collect(tree: &DomTree, node: NodeId, out: &mut String) {
+        match &tree.node(node).kind {
+            crate::dom::node::NodeKind::Text(t) => out.push_str(t),
+            _ => {
+                let mut child = tree.first_child(node);
+                while let Some(c) = child {
+                    collect(tree, c, out);
+                    child = tree.next_sibling(c);
+                }
+            }
+        }
+    }
+    collect(tree, node, &mut out);
+    out
 }
 
 impl DomHandler for EncapsulatedContentHandler {
@@ -1906,8 +2118,9 @@ impl DomHandler for EncapsulatedContentHandler {
                 None => dp.as_ref().and_then(|d| d.src.clone()).unwrap_or_default(),
             }
         } else if ext_tag_name.is_some() {
-            // Extension tag: reconstruct from data-mw.
-            Self::default_extension_handler(tree, node)
+            // Extension tag: reconstruct from data-mw (gallery gets its own
+            // DOM-reconstructing serializer).
+            Self::extension_handler_with_state(tree, node, state)
         } else if Self::is_language_variant(tree, node) {
             // Language variant: not yet ported; skip (faithful no-op until the
             // variant serializer lands).
@@ -3020,13 +3233,10 @@ mod tests {
 
     #[test]
     fn test_pre_handler_trailing_newline_preserved() {
-        // `<pre>foo\n</pre>`: `serialize_text` strips the trailing newline
-        // (faithful to `WikitextSerializer::serializeText`'s unconditional
-        // `SEPARATOR_SUFFIX_WITH_NLS_RE` split) into the indent-pre
-        // sub-serialization's discarded separator, so the `<pre>` body is
-        // `foo` and the trailing newline does not leak into the outer
-        // separator. The PreHandler's own `append_sep(trailing_nl)` is
-        // therefore a no-op (mirroring PHP's dead `str_ends_with` check).
+        // `<pre>foo\n</pre>`: `serialize_indent_pre_children_to_string` emits the
+        // trailing newline (via `kickOffSerialize`'s `emitSepForNode`), then
+        // `PreHandler` strips it and re-appends it as separator source — faithful
+        // to PHP's `str_ends_with` strip + `appendSep($trailingNL)`.
         let mut doc = Node::document();
         let mut pre = Node::element(ElementKind::Preformatted);
         pre.push_child(Node::text("foo\n"));
@@ -3038,9 +3248,8 @@ mod tests {
         let mut state = SerializerState::new();
         let mut handler = PreHandler;
         handler.handle(&tree, pre_id, &mut state);
-        // The trailing newline is consumed by the indent-pre sub-serialization,
-        // not moved into the outer separator.
-        assert_eq!(state.separator.src.as_deref(), None);
+        // The trailing newline is re-appended as the outer separator.
+        assert_eq!(state.separator.src.as_deref(), Some("\n"));
         state.flush_line();
         assert_eq!(state.out, " foo");
     }

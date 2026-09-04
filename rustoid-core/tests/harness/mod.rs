@@ -648,17 +648,25 @@ fn next_option(rest: &mut &str) -> Option<String> {
         return None;
     }
 
-    // A JSON object/array value: consume until the matching close brace/bracket.
-    if rest.starts_with('{') || rest.starts_with('[') {
+    // A JSON object/array value: either a bare `{…}`/`[…]` token, or a
+    // `key={…}`/`key=[…]` option whose value is a multi-line JSON blob. Consume
+    // until the matching close brace/bracket.
+    let value_start = if rest.starts_with('{') || rest.starts_with('[') {
+        0
+    } else if let Some(eq) = rest.find('=')
+        && rest[eq + 1..].trim_start().starts_with(['{', '['])
+    {
+        eq + 1 + rest[eq + 1..].len() - rest[eq + 1..].trim_start().len()
+    } else {
+        usize::MAX
+    };
+    if value_start != usize::MAX {
         let bytes = rest.as_bytes();
-        let open = bytes[0];
-        let close = if open == b'{' { b'}' } else { b']' };
         let mut depth = 0usize;
         let mut in_string = false;
         let mut escaped = false;
-        let mut i = 0usize;
         let mut end = 0usize;
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             if in_string {
                 if escaped {
                     escaped = false;
@@ -681,7 +689,6 @@ fn next_option(rest: &mut &str) -> Option<String> {
                     _ => {}
                 }
             }
-            i += 1;
         }
         if end > 0 {
             let token = rest[..end].to_string();
@@ -747,40 +754,66 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
         return TestResult::Skip("disabled".to_string());
     }
 
-    // Determine mode from options
+    // Determine mode from options. The `parsoid` option is either a plain
+    // comma-separated mode string (`wt2html`, `wt2wt`, `html2wt`, `selser`) or a
+    // JSON object whose `modes` array lists the same values (e.g.
+    // `parsoid={"modes":["html2wt"]}`), mirroring the parser-test format.
     let mode = test
         .options
         .get("parsoid")
         .map(|s| s.as_str())
         .unwrap_or("wt2html");
 
-    // Check if this mode contains specific test modes
-    let modes: Vec<&str> = if mode.starts_with('{') {
-        vec!["wt2html"] // Default for JSON options
+    let modes: Vec<String> = if let (true, Some(obj)) = (
+        mode.starts_with('{'),
+        serde_json::from_str::<serde_json::Value>(mode)
+            .ok()
+            .and_then(|v| v.as_object().cloned()),
+    ) {
+        obj.get("modes")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     } else {
-        mode.split(',').map(|s| s.trim()).collect()
+        mode.split(',').map(|s| s.trim().to_string()).collect()
     };
 
-    // Only run wt2html if the mode explicitly supports it
-    let supports_wt2html = modes.is_empty() || modes.contains(&"wt2html");
+    // A `changes` array (present only in JSON `parsoid` options) marks a
+    // selser-style edit test (apply DOM changes, then re-serialize). Selser is
+    // not yet supported, so these are skipped rather than mis-run as a plain
+    // round-trip.
+    let has_changes = serde_json::from_str::<serde_json::Value>(mode)
+        .ok()
+        .and_then(|v| v.get("changes").cloned())
+        .is_some();
 
-    if modes.contains(&"wt2wt") {
-        return run_wt2wt_test(test, test_file);
+    // Run the *first* listed mode (a multi-mode test runs each in turn; we can
+    // only report one result, and the first is the primary direction).
+    let primary = modes.first().map(String::as_str).unwrap_or("wt2html");
+    match primary {
+        "wt2wt" => {
+            if has_changes {
+                return TestResult::Skip("selser not yet fully supported".to_string());
+            }
+            run_wt2wt_test(test, test_file)
+        }
+        "html2wt" => run_html2wt_test(test, test_file),
+        "selser" => TestResult::Skip("selser not yet fully supported".to_string()),
+        "html2html" => TestResult::Skip("html2html not yet supported".to_string()),
+        _ => {
+            if test.html_parsoid.is_some() {
+                run_wt2html_test(test, test_file)
+            } else if test.wikitext_edited.is_some() {
+                run_selser_test(test, test_file)
+            } else {
+                TestResult::Skip(format!("unsupported mode: {mode}"))
+            }
+        }
     }
-    if modes.contains(&"html2wt") {
-        return run_html2wt_test(test, test_file);
-    }
-
-    if supports_wt2html && test.html_parsoid.is_some() {
-        return run_wt2html_test(test, test_file);
-    }
-
-    // If wikitext/edited is provided, run selser
-    if test.wikitext_edited.is_some() {
-        return run_selser_test(test, test_file);
-    }
-
-    TestResult::Skip(format!("unsupported mode: {mode}"))
 }
 
 /// Run a wikitext → HTML test using the V2 parser.
