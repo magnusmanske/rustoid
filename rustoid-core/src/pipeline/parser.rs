@@ -270,9 +270,7 @@ pub fn render_inline_fragment(
                     // Re-render link content (nested `[[…]]`) inline and wrap the
                     // result in a DOM-fragment token (mirrors PHP's
                     // `getDOMFragmentToken`).
-                    let mut f = std::collections::HashMap::new();
-                    let mut id = 0usize;
-                    let frag = render_inline_fragment(config, items, &mut f, &mut id);
+                    let frag = render_inline_fragment(config, items, fragments, next_id);
                     crate::pipeline::wiki_link_render::dom_fragment_token(
                         frag, &token, fragments, next_id,
                     )
