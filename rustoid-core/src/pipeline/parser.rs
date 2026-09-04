@@ -87,6 +87,34 @@ fn gallery_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosin
     }
 }
 
+/// If `item` is a `divtag`/`spantag` extension token, return the self-closing
+/// token, the extension tag name, and the wrapper tag name (`div`/`span`).
+/// Mirrors the `ParserHook` transparent-wrapper extensions.
+fn wrapper_tag_target(
+    item: &Item,
+) -> Option<(
+    &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    &'static str,
+    &'static str,
+)> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    if stt.name != "extension" {
+        return None;
+    }
+    match stt
+        .attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str())
+    {
+        Some("divtag") => Some((stt, "divtag", "div")),
+        Some("spantag") => Some((stt, "spantag", "span")),
+        _ => None,
+    }
+}
+
 /// Reconstruct the full wikilink source (`[[href|content0|content1…]]`) from a
 /// `wikilink` token's `href` and `mw:maybeContent` KVs. Used by the media-in-link
 /// bail to re-tokenize the source without the leading `[` (mirrors PHP's
@@ -137,19 +165,48 @@ fn emit_pre_placeholder(
     id: usize,
     out: &mut Vec<Item>,
 ) {
+    emit_wrapper_placeholder(stt, "pre", "mw:Extension/pre", id, out);
+}
+
+/// Emit the `<div typeof="mw:Extension/divtag">`/`<span …/spantag>` +
+/// `mw:dom-fragment-token` + closing placeholder sequence for a `divtag`/`spantag`
+/// extension, referencing the sub-fragment by `id` (mirrors `getWrapperTokens` +
+/// `tunnelDOMThroughTokens`, which emit only the shallow wrapper tags around a
+/// tunnelled DOM fragment). `ext_name` is the extension tag name (`divtag`/
+/// `spantag`), distinct from the HTML wrapper tag (`div`/`span`).
+fn emit_wrapper_extension_placeholder(
+    stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    ext_name: &str,
+    wrapper: &str,
+    id: usize,
+    out: &mut Vec<Item>,
+) {
+    let typeof_ = format!("mw:Extension/{ext_name}");
+    emit_wrapper_placeholder(stt, wrapper, &typeof_, id, out);
+}
+
+/// The common placeholder emitter: `<tag typeof=…>` + `mw:dom-fragment-token` +
+/// `</tag>`, with the start-tag attributes sanitized as for the wrapper tag.
+fn emit_wrapper_placeholder(
+    stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    tag: &str,
+    typeof_: &str,
+    id: usize,
+    out: &mut Vec<Item>,
+) {
     use crate::wikitext::tokens_v2::{EndTagTk, KeyValue, SelfclosingTagTk, TagTk};
 
     let attrs: Vec<crate::wikitext::tokens_v2::KV> =
         crate::pipeline::extension_handler::extension_kv_attrs(stt);
-    let sanitized = crate::sanitizer::sanitize_tag_attrs("pre", attrs, |_proto| true);
+    let sanitized = crate::sanitizer::sanitize_tag_attrs(tag, attrs, |_proto| true);
     let mut dp = stt.data_parsoid.clone();
     dp.src = None;
     dp.src_content = None;
     dp.ext_tag_offsets = None;
     dp.stx = Some("html".to_string());
-    let mut pre = TagTk::new("pre", sanitized, dp);
-    pre.data_mw = None;
-    pre.add_attribute_str("typeof", "mw:Extension/pre");
+    let mut open = TagTk::new(tag, sanitized, dp);
+    open.data_mw = None;
+    open.add_attribute_str("typeof", typeof_);
 
     let mut frag = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], stt.data_parsoid.clone());
     frag.attribs.push(crate::wikitext::tokens_v2::KV {
@@ -160,10 +217,10 @@ fn emit_pre_placeholder(
         vsrc: None,
     });
 
-    out.push(Item::Tok(ParsoidToken::Tag(pre)));
+    out.push(Item::Tok(ParsoidToken::Tag(open)));
     out.push(Item::Tok(ParsoidToken::SelfclosingTag(frag)));
     out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
-        "pre",
+        tag,
         vec![],
         crate::wikitext::tokens_v2::DataParsoid::default(),
     ))));
@@ -876,6 +933,132 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         (out, fragments)
     }
 
+    /// Expand `<divtag>`/`<spantag>` extension tokens in place: parse the body as
+    /// wikitext in *block* context (so `<p>` wrapping applies) and tunnel it
+    /// through a `mw:dom-fragment-token` placeholder wrapped in the `<div>`/`<span>`
+    /// `mw:Extension/*` container. Mirrors `ParserHook::sourceToDom`'s
+    /// `divtag`/`spantag` transparent-wrapper case (via `extTagToDOM` in block
+    /// context).
+    async fn expand_wrapper_tag(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let mut out: Vec<Item> = Vec::new();
+
+        for item in tokens {
+            let Some((stt, ext_name, wrapper)) = wrapper_tag_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let body = extension_body(stt);
+            let sub = if source.is_some() {
+                self.process_block_fragment_body(&body, source, frame, about_counter)
+                    .await
+            } else {
+                self.block_fragment_from_body(&body)
+            };
+            let id = next_id;
+            next_id += 1;
+            fragments.insert(id, sub);
+            emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
+        }
+
+        (out, fragments)
+    }
+
+    /// Synchronous [`expand_wrapper_tag`] for the `wikitext_to_ast` path.
+    fn expand_wrapper_tag_sync(
+        &self,
+        tokens: Vec<Item>,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let mut out: Vec<Item> = Vec::new();
+
+        for item in tokens {
+            let Some((stt, ext_name, wrapper)) = wrapper_tag_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let body = extension_body(stt);
+            let sub = self.block_fragment_from_body(&body);
+            let id = next_id;
+            next_id += 1;
+            fragments.insert(id, sub);
+            emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
+        }
+
+        (out, fragments)
+    }
+
+    /// Build a *block*-context fragment document from raw body wikitext, without
+    /// template expansion (used by the synchronous `wikitext_to_ast` path). Unlike
+    /// [`fragment_from_body`] (inline), p-wrapping is enabled so bare text becomes
+    /// `<p>…</p>`.
+    fn block_fragment_from_body(&self, body: &str) -> Node {
+        let mut tokens = match self.tokenize(body) {
+            Ok(t) => t,
+            Err(_) => return crate::dom::node::Node::document(),
+        };
+        tokens.push(Item::Tok(ParsoidToken::Eof(
+            crate::wikitext::tokens_v2::EOFTk,
+        )));
+        self.block_fragment_from_tokens(tokens)
+    }
+
+    /// Process a `divtag`/`spantag` body (wikitext) into a block-context fragment,
+    /// expanding nested templates/parser functions when a data source is present.
+    async fn process_block_fragment_body(
+        &self,
+        body: &str,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Node {
+        let mut tokens = match self.tokenize(body) {
+            Ok(t) => t,
+            Err(_) => return crate::dom::node::Node::document(),
+        };
+        if source.is_some() {
+            tokens = self
+                .expand_templates(frame, tokens, source, about_counter, true)
+                .await;
+            tokens = self
+                .expand_attributes(frame, tokens, source, about_counter, None)
+                .await;
+        }
+        tokens.push(Item::Tok(ParsoidToken::Eof(
+            crate::wikitext::tokens_v2::EOFTk,
+        )));
+        self.block_fragment_from_tokens(tokens)
+    }
+
+    /// Build a block-context fragment document from an already-tokenized token
+    /// stream (with p-wrapping, unlike the inline [`fragment_from_tokens`]).
+    fn block_fragment_from_tokens(&self, tokens: Vec<Item>) -> Node {
+        // Render links, external links, behavior switches, and language variants
+        // (the token-level stages that run before tree building on the main page).
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_behavior_switches(tokens);
+        let tokens = self.render_language_variants(tokens);
+
+        let stage = TreeBuilderStage::new(false);
+        let mut ast = stage.to_ast_with_fragments(tokens, None, self.config, fragments);
+        let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
+        crate::pipeline::p_wrap::run(&mut ast);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None);
+        crate::pipeline::cleanup::run(&mut ast);
+        extract_fragment_children(&ast)
+    }
+
     /// Shared driver for [`expand_wikitext_pre`] / [`expand_wikitext_pre_sync`]:
     /// route `format="wikitext"` `<pre>` extension bodies through the inline
     /// sub-pipeline, emitting `<pre>` + `mw:dom-fragment-token` placeholders.
@@ -1141,6 +1324,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_language_variants(tokens);
         let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens);
         fragments.extend(pre_fragments);
+        let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens);
+        fragments.extend(wrapper_fragments);
         let tokens = self.expand_gallery_sync(tokens, &mut fragments, &mut next_id);
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
@@ -1234,6 +1419,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .expand_wikitext_pre(tokens, source, &frame, about_counter)
             .await;
         fragments.extend(pre_fragments);
+        let (tokens, wrapper_fragments) = self
+            .expand_wrapper_tag(tokens, source, &frame, about_counter)
+            .await;
+        fragments.extend(wrapper_fragments);
         let tokens = self
             .expand_gallery(
                 tokens,
@@ -2344,5 +2533,40 @@ mod tests {
             .unwrap();
         assert!(html.contains("data-mw-section-id=\"1\""), "got: {html}");
         assert!(html.contains("data-mw-section-id=\"2\""), "got: {html}");
+    }
+
+    #[test]
+    fn test_wrapper_tag_target() {
+        use crate::wikitext::tokens_v2::SelfclosingTagTk;
+
+        let mut stt = SelfclosingTagTk::new(
+            "extension",
+            vec![],
+            crate::wikitext::tokens_v2::DataParsoid::default(),
+        );
+        stt.add_attribute_str("name", "divtag");
+        let item = Item::Tok(ParsoidToken::SelfclosingTag(stt));
+        let (_, ext_name, wrapper) = wrapper_tag_target(&item).expect("divtag recognized");
+        assert_eq!(ext_name, "divtag");
+        assert_eq!(wrapper, "div");
+
+        let mut stt = SelfclosingTagTk::new(
+            "extension",
+            vec![],
+            crate::wikitext::tokens_v2::DataParsoid::default(),
+        );
+        stt.add_attribute_str("name", "spantag");
+        let item = Item::Tok(ParsoidToken::SelfclosingTag(stt));
+        let (_, ext_name, wrapper) = wrapper_tag_target(&item).expect("spantag recognized");
+        assert_eq!(ext_name, "spantag");
+        assert_eq!(wrapper, "span");
+
+        let stt = SelfclosingTagTk::new(
+            "extension",
+            vec![],
+            crate::wikitext::tokens_v2::DataParsoid::default(),
+        );
+        let item = Item::Tok(ParsoidToken::SelfclosingTag(stt));
+        assert!(wrapper_tag_target(&item).is_none());
     }
 }
