@@ -127,6 +127,66 @@ pub fn run(node: &mut Node) {
 /// whose parent is an `<a>`. Must run after `AddMediaInfo`.
 pub fn fix_bad_nesting(node: &mut Node) {
     fix_nested_anchors(node);
+    // Fostering a block media container (`<figure>`) out of an `<a>` leaves it
+    // (incorrectly) as a direct child of a wrapping `<p>`; a block cannot live
+    // inside a `<p>`, so hoist it out (mirroring HTML5's block-in-`<p>` split,
+    // which the token stage couldn't see while the fragment was still opaque).
+    split_paragraphs_on_block(node);
+}
+
+/// Whether a node is a block-level element (`<figure>`/`<div>`/`<table>`/…).
+fn is_block_node(node: &Node) -> bool {
+    is_block_container(&node_name(node))
+}
+
+/// Whether a run of sibling nodes has no visible text content (only empty
+/// inline elements like a fostered-out `<a>`, whitespace, and comments). Used to
+/// decide whether the leading run of a `<p>` should be hoisted wholesale when a
+/// following block is hoisted (mirroring HTML5, where an `<a>` whose content was
+/// fostered out leaves nothing p-worth-wrapping).
+fn is_trivially_empty(run: &[Node]) -> bool {
+    run.iter().all(|n| match &n.kind {
+        NodeKind::Text(t) => t.trim().is_empty(),
+        NodeKind::Comment(_) => true,
+        NodeKind::Element(_) => is_trivially_empty(&n.children),
+        NodeKind::Document => false,
+    })
+}
+
+/// Top-down: split every `<p>` containing a direct block-level child into the
+/// `<p>` (holding the leading inline run) followed by its block (and trailing)
+/// siblings at the parent level. When the leading inline run is itself
+/// trivially empty (e.g. an `<a>` left empty by the misnest foster), the `<p>`
+/// is dropped entirely. Mirrors the tree builder's block-in-`<p>` split.
+fn split_paragraphs_on_block(node: &mut Node) {
+    // Recurse first.
+    for child in &mut node.children {
+        split_paragraphs_on_block(child);
+    }
+
+    // Rebuild this level, expanding `<p>`s that contain a direct block child.
+    let mut rebuilt: Vec<Node> = Vec::with_capacity(node.children.len());
+    for child in std::mem::take(&mut node.children) {
+        if node_name(&child) == "p"
+            && let Some(i) = child.children.iter().position(is_block_node)
+        {
+            let mut p = child;
+            let hoisted: Vec<Node> = p.children.drain(i..).collect();
+            // Drop the `<p>` if its leading run is trivially empty (only the
+            // emptied `<a>` + whitespace); otherwise keep it.
+            if !is_trivially_empty(&p.children) {
+                rebuilt.push(p);
+                rebuilt.extend(hoisted);
+            } else {
+                // Hoist the leading (empty) run too, dropping the `<p>`.
+                rebuilt.extend(p.children);
+                rebuilt.extend(hoisted);
+            }
+        } else {
+            rebuilt.push(child);
+        }
+    }
+    node.children = rebuilt;
 }
 
 /// Bottom-up splice of fragment content. Bad nesting is repaired afterward by
@@ -444,5 +504,55 @@ mod tests {
             doc.children[1].children[0].kind,
             NodeKind::Text("Foo".into())
         );
+    }
+
+    #[test]
+    fn test_block_split_out_of_paragraph() {
+        // A `<p>` whose only content is an emptied `<a>` and a fostered block
+        // `<figure>` is dropped, hoisting both to the parent.
+        // `<p><a></a><figure><figcaption>x</figcaption></figure></p>`
+        //   → `<a></a><figure><figcaption>x</figcaption></figure>`.
+        let mut a = Node::element(ElementKind::ExtLink);
+        a.set_attr("rel", "mw:ExtLink");
+        let mut fig = Node::element(ElementKind::Figure);
+        let mut cap = Node::element(ElementKind::FigCaption);
+        cap.push_child(Node::text("x"));
+        fig.push_child(cap);
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(a);
+        p.push_child(fig);
+
+        let mut doc = Node::document();
+        doc.push_child(p);
+        fix_bad_nesting(&mut doc);
+
+        // The `<p>` is dropped; its children surface at the top level.
+        assert_eq!(doc.children.len(), 2);
+        assert_eq!(node_name(&doc.children[0]), "a");
+        assert_eq!(node_name(&doc.children[1]), "figure");
+    }
+
+    #[test]
+    fn test_paragraph_kept_for_leading_inline_text() {
+        // A `<p>` with real leading text before a block keeps the `<p>` (holding
+        // the text) and hoists only the block.
+        // `<p>hi<figure>x</figure></p>` → `<p>hi</p><figure>x</figure>`.
+        let mut fig = Node::element(ElementKind::Figure);
+        fig.push_child(Node::text("x"));
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("hi"));
+        p.push_child(fig);
+
+        let mut doc = Node::document();
+        doc.push_child(p);
+        fix_bad_nesting(&mut doc);
+
+        assert_eq!(doc.children.len(), 2);
+        assert_eq!(node_name(&doc.children[0]), "p");
+        assert_eq!(
+            doc.children[0].children[0].kind,
+            NodeKind::Text("hi".into())
+        );
+        assert_eq!(node_name(&doc.children[1]), "figure");
     }
 }
