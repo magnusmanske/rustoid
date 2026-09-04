@@ -143,9 +143,13 @@ impl SanitizerHandler {
         let name = tok.get_name();
         let attribs = tok.get_attribs().to_vec();
 
-        // Unknown/disallowed HTML tag → convert to plain text.
+        // Unknown/disallowed HTML tag → convert to plain text, mirroring PHP's
+        // `sanitizeToken`: disallow if the name isn't an allowed literal tag,
+        // an end tag has no valid end form, or `escapeLiteralHTMLTag` (which
+        // requires `<meta>`/`<link>` to carry `itemprop`, etc.) rejects it.
         let disallowed = !is_allowed_literal_tag(name)
-            || (matches!(tok, ParsoidToken::EndTag(_)) && no_end_tag_set(name));
+            || (matches!(tok, ParsoidToken::EndTag(_)) && no_end_tag_set(name))
+            || crate::sanitizer::escape_literal_html_tag(tok);
 
         if disallowed {
             // Prefer the original source (preserves the author's original tag
