@@ -634,7 +634,9 @@ impl TemplateHandler {
                     ksrc: None,
                     vsrc: None,
                 };
-                let result = Self::call_parser_function(config, &name, &pf_params);
+                let token_src = token.data_parsoid().and_then(|dp| dp.src.clone());
+                let result =
+                    Self::call_parser_function(config, &name, &pf_params, token_src.as_deref());
                 let mut encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 if !colon.is_empty() {
                     encap.set_colon(Some(colon));
@@ -703,7 +705,19 @@ impl TemplateHandler {
     }
 
     /// Dispatch a parser function name to the `ParserFunctions` implementation.
-    fn call_parser_function(config: &dyn SiteConfig, name: &str, params: &Params) -> Vec<Item> {
+    ///
+    /// `token_src` is the original `{{#name:...}}` source. For an unknown
+    /// ("broken") parser function the transclusion content is the verbatim
+    /// source, mirroring the integrated-mode path where MediaWiki's preprocessor
+    /// leaves an unrecognized `{{#…}}` invocation unexpanded (the standalone
+    /// "Parser function implementation … missing" message is a native-only
+    /// branch not exercised by the integrated fixtures).
+    fn call_parser_function(
+        config: &dyn SiteConfig,
+        name: &str,
+        params: &Params,
+        token_src: Option<&str>,
+    ) -> Vec<Item> {
         match name {
             "if" => ParserFunctions::pf_if(params),
             "ifeq" => ParserFunctions::pf_ifeq(params),
@@ -719,8 +733,8 @@ impl TemplateHandler {
             "padright" => ParserFunctions::pf_padright(params),
             "tag" => ParserFunctions::pf_tag(config, params),
             "urlencode" => ParserFunctions::pf_urlencode(params),
-            // Unknown parser function: return its name in braces.
-            _ => vec![Item::Str(format!("{{{{{{#{name}|...}}}}}}"))],
+            // Unknown parser function: preserve the original source verbatim.
+            _ => vec![Item::Str(token_src.unwrap_or("").to_string())],
         }
     }
 

@@ -365,8 +365,19 @@ impl WikitextSerializer {
         let body = body_content_node(&tree, root_id);
         crate::html::serializer::walk_children(&tree, body, &mut state);
         state.flush_line();
-        if let Some(redirect) = state.redirect_text.clone() {
-            format!("{redirect}\n{}", state.out)
+        // Prepend the buffered redirect at the start of the file, unless it was
+        // already emitted inline (`unbuffered` sentinel). Faithful to
+        // `serializeDOM`'s trailing redirect prepend.
+        if let Some(redirect) = state.redirect_text.as_deref()
+            && redirect != "unbuffered"
+        {
+            let first_line = state.out.split('\n').next().unwrap_or("");
+            let nl = if first_line.chars().next().is_none_or(|c| c.is_whitespace()) {
+                ""
+            } else {
+                "\n"
+            };
+            format!("{redirect}{nl}{}", state.out)
         } else {
             state.out
         }
