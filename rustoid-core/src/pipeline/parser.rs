@@ -321,7 +321,7 @@ pub fn render_inline_fragment(
         tokens,
         None,
         config,
-        std::mem::take(fragments),
+        fragments.clone(),
     ));
     let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
     crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
