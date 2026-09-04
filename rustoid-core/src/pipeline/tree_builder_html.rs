@@ -696,6 +696,39 @@ fn build_compound_data_mw(
     Some(data_mw)
 }
 
+/// Merge a transclusion's `data-mw` (its `parts` envelope) with a target's own
+/// `data-mw` (e.g. a media container's `attribs`/`errors`). The transclusion
+/// object is the base; the target's non-`parts` keys (and any `attribs`) are
+/// carried over so the compound object retains both the transclusion metadata
+/// and the media options. Mirrors PHP's `DOMRangeBuilder` encapsulation, which
+/// attaches the transclusion `parts` onto the target without discarding the
+/// target's existing `data-mw` fields.
+fn merge_encap_data_mw(encap: Option<String>, target: Option<String>) -> Option<String> {
+    let encap: serde_json::Value = serde_json::from_str(encap.as_deref()?).ok()?;
+    let target: serde_json::Value = match target {
+        Some(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+            Ok(v) => v,
+            Err(_) => return Some(encap.to_string()),
+        },
+        None => return Some(encap.to_string()),
+    };
+
+    let Some(mut obj) = encap.as_object().cloned() else {
+        return Some(encap.to_string());
+    };
+    if let Some(tobj) = target.as_object() {
+        for (k, v) in tobj {
+            // `parts` is the transclusion's own envelope; every other key
+            // (attribs, errors, caption, …) belongs to the target and must be
+            // preserved.
+            if k != "parts" {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Some(serde_json::Value::Object(obj).to_string())
+}
+
 /// Walk the AST, resolving `data-object-id` attributes into stashed
 /// `data-parsoid`/`data-mw`.
 ///
@@ -1199,7 +1232,22 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
                 let existing = new_content[et].get_attr("typeof").map(str::to_string);
                 let merged = match existing {
                     Some(existing) if !existing.split_whitespace().any(|t| t == typeof_) => {
-                        format!("{existing} {typeof_}")
+                        // The `mw:Transclusion` type is *prepended* when the
+                        // encapsulation target is a media container (`mw:File`),
+                        // yielding `mw:Transclusion mw:File` (mirrors PHP's
+                        // `AddMediaInfo`, which adds `mw:File` after the
+                        // transclusion marker). For all other targets
+                        // (extensions, `mw:Nowiki`, parser functions, …) the
+                        // transclusion type is *appended* (`mw:Extension/pre
+                        // mw:Transclusion`, etc.).
+                        let is_media = existing
+                            .split_whitespace()
+                            .any(|t| t == "mw:File" || t.starts_with("mw:File/"));
+                        if is_media {
+                            format!("{typeof_} {existing}")
+                        } else {
+                            format!("{existing} {typeof_}")
+                        }
                     }
                     Some(existing) => existing,
                     None => typeof_.clone(),
@@ -1222,7 +1270,17 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
                 new_content[et].set_attr("typeof", merged);
             }
             new_content[et].data_parsoid = start_meta.data_parsoid.clone();
-            new_content[et].data_mw = build_compound_data_mw(&start_meta, source, None);
+            // Merge the transclusion's `data-mw` (its `parts` envelope) with any
+            // `data-mw` already on the encapsulation target (e.g. a media
+            // container's `attribs`/`errors`), rather than overwriting it. This
+            // mirrors PHP, where `DOMDataUtils::setDataMw` on the encapsulation
+            // target preserves the target's own `attribs` while attaching the
+            // transclusion `parts`. Losing the target's `data-mw` here would
+            // drop e.g. a `link=` option and break `AddMediaInfo`.
+            new_content[et].data_mw = merge_encap_data_mw(
+                build_compound_data_mw(&start_meta, source, None),
+                new_content[et].data_mw.clone(),
+            );
             apply_encap_dp_fields(&mut new_content[et], &start_meta);
         } else {
             // Empty transclusion: the start and end markers are adjacent (no
