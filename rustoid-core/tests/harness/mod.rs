@@ -740,6 +740,13 @@ pub fn run_single_test_public(test: &ParserTestCase, test_file: &ParserTestFile)
 
 /// Run a single test case.
 fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
+    // A `disabled` test option (the parser-test convention for marking a test as
+    // not currently run, mirroring PHP's parserTestFiles 'disabled' flag) skips
+    // the test entirely.
+    if test.options.contains_key("disabled") {
+        return TestResult::Skip("disabled".to_string());
+    }
+
     // Determine mode from options
     let mode = test
         .options
@@ -1843,6 +1850,28 @@ fn compute_diff_hint(expected: &str, actual: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_options_disabled() {
+        // The `disabled` parser-test option is captured as a key; `run_single_test`
+        // uses its presence (regardless of value) to skip the test.
+        let opts = parse_options("parsoid=html2wt\nlanguage=ar\ndisabled");
+        assert!(opts.contains_key("disabled"));
+        assert_eq!(opts.get("parsoid").map(|s| s.as_str()), Some("html2wt"));
+        assert_eq!(opts.get("language").map(|s| s.as_str()), Some("ar"));
+    }
+
+    #[test]
+    fn test_parse_options_space_separated() {
+        // Options are whitespace-separated `k=v` pairs (the PHP parser-test
+        // format), not comma/newline only.
+        let opts = parse_options("language=zh htmlVariantLanguage=zh-Hans-CN");
+        assert_eq!(opts.get("language").map(|s| s.as_str()), Some("zh"));
+        assert_eq!(
+            opts.get("htmlVariantLanguage").map(|s| s.as_str()),
+            Some("zh-Hans-CN")
+        );
+    }
 
     #[test]
     fn test_decode_xml_entities_predefines() {
