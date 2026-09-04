@@ -520,6 +520,7 @@ mod tests {
                 end: Some(22),
                 open_width: Some(8),
                 close_width: Some(9),
+                ..Default::default()
             }),
             ..DataParsoid::default()
         };
@@ -554,6 +555,7 @@ mod tests {
                 end: Some(full.len()),
                 open_width: Some("<nowiki>".len()),
                 close_width: Some("</nowiki>".len()),
+                ..Default::default()
             }),
             ..DataParsoid::default()
         };
@@ -613,6 +615,7 @@ mod tests {
                 end: Some(full.len()),
                 open_width: Some(format!("<{name}>").len()),
                 close_width: Some(format!("</{name}>").len()),
+                ..Default::default()
             }),
             ..DataParsoid::default()
         };

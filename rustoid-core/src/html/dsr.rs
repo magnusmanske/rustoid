@@ -215,17 +215,20 @@ impl DomSourceRange {
 /// Faithful port of PHP's `Core\SelectiveUpdateData`. This is always the
 /// revision (current or previous) wikitext & html.
 ///
-/// Only `rev_text` is modeled for now: it is the sole field the selser
-/// serializer reads (`getOrigSrc`/`isValidDSR`). `rev_html`/`rev_dom`/
-/// `template_title`/`mode` are carried through when provided, but the
-/// `revDOM` document graph is a type this codebase does not yet materialize
-/// for the selective-update path (see `selser.rs` porting note).
+/// Only `rev_text` and `rev_dom` are modeled for now: `rev_text` is the sole
+/// text field the selser serializer reads directly (`getOrigSrc`/`isValidDSR`),
+/// and `rev_dom` carries the parsed revision DOM (the "old body" that the
+/// `DOMDiff` compares the edited body against). `rev_html`/`template_title`/
+/// `mode` are carried through when provided.
 #[derive(Debug, Clone, Default)]
 pub struct SelectiveUpdateData {
     /// The revision wikitext source.
     pub rev_text: String,
     /// The revision HTML (when available).
     pub rev_html: Option<String>,
+    /// The parsed revision DOM (mirrors PHP's non-null `SelectiveUpdateData::$revDOM`).
+    /// `None` until a `revHTML` is parsed.
+    pub rev_dom: Option<Box<crate::dom::node::Node>>,
     /// If doing a selective update for a template edit, the edited template's
     /// title string.
     pub template_title: Option<String>,
@@ -238,6 +241,7 @@ impl SelectiveUpdateData {
         Self {
             rev_text: rev_text.into(),
             rev_html: None,
+            rev_dom: None,
             template_title: None,
             mode: None,
         }
@@ -266,9 +270,10 @@ pub fn is_valid_dsr(dsr: Option<&DomSourceRange>, all: bool) -> bool {
 }
 
 impl From<crate::wikitext::tokens_v2::DomSourceRange> for DomSourceRange {
-    /// Lift the tokenizer-side DSR into the serializer-facing DSR, defaulting
-    /// the html2wt-only fields that the tokenizer does not model (trimmed-WS
-    /// widths, and the `source` text — which `getOrigSrc` supplies at call time).
+    /// Lift the tokenizer-side DSR into the serializer-facing DSR, carrying the
+    /// trimmed-WS widths (faithful to PHP, where a single `DomSourceRange` type
+    /// serves both) but defaulting the `source` text (which `getOrigSrc`
+    /// supplies at call time).
     fn from(tsr: crate::wikitext::tokens_v2::DomSourceRange) -> Self {
         DomSourceRange {
             start: tsr.start,
@@ -276,8 +281,8 @@ impl From<crate::wikitext::tokens_v2::DomSourceRange> for DomSourceRange {
             source: None,
             open_width: tsr.open_width,
             close_width: tsr.close_width,
-            leading_ws: 0,
-            trailing_ws: 0,
+            leading_ws: tsr.leading_ws,
+            trailing_ws: tsr.trailing_ws,
         }
     }
 }

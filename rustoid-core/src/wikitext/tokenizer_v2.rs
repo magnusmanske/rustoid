@@ -1619,6 +1619,7 @@ impl<'a> PegTokenizer<'a> {
                 end: Some(end),
                 open_width: Some(self.pos - saved),
                 close_width: Some(close_width),
+                ..Default::default()
             });
             self.pos = end;
         } else {

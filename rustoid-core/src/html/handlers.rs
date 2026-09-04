@@ -3194,6 +3194,7 @@ mod tests {
                 end: Some(7),
                 open_width: Some(2),
                 close_width: Some(2),
+                ..Default::default()
             }),
             ..Default::default()
         });

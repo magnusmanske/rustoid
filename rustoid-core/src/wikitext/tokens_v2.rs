@@ -355,15 +355,20 @@ impl DataParsoid {
             );
         }
         if let Some(dsr) = &self.dsr {
-            obj.insert(
-                "dsr".to_string(),
-                serde_json::Value::Array(vec![
-                    serde_json::Value::from(dsr.start.map(|v| v as u64)),
-                    serde_json::Value::from(dsr.end.map(|v| v as u64)),
-                    serde_json::Value::from(dsr.open_width.map(|v| v as u64)),
-                    serde_json::Value::from(dsr.close_width.map(|v| v as u64)),
-                ]),
-            );
+            // Faithful to PHP's `DomSourceRange::toJsonArray`: a 4-element
+            // array, extended to 6 elements only when trimmed-WS info is
+            // recorded (leadingWS/trailingWS non-zero).
+            let mut arr = vec![
+                serde_json::Value::from(dsr.start.map(|v| v as u64)),
+                serde_json::Value::from(dsr.end.map(|v| v as u64)),
+                serde_json::Value::from(dsr.open_width.map(|v| v as u64)),
+                serde_json::Value::from(dsr.close_width.map(|v| v as u64)),
+            ];
+            if dsr.leading_ws != 0 || dsr.trailing_ws != 0 {
+                arr.push(serde_json::Value::from(dsr.leading_ws));
+                arr.push(serde_json::Value::from(dsr.trailing_ws));
+            }
+            obj.insert("dsr".to_string(), serde_json::Value::Array(arr));
         }
         if let Some(tail) = &self.tail {
             obj.insert("tail".to_string(), serde_json::Value::String(tail.clone()));
@@ -452,6 +457,12 @@ pub struct DomSourceRange {
     pub end: Option<usize>,
     pub open_width: Option<usize>,
     pub close_width: Option<usize>,
+    /// Width of trimmed whitespace between opening tag & first child
+    /// (`-1` invalid; faithful to PHP's `DomSourceRange::$leadingWS`).
+    pub leading_ws: isize,
+    /// Width of trimmed whitespace between last child & closing tag
+    /// (`-1` invalid; faithful to PHP's `DomSourceRange::$trailingWS`).
+    pub trailing_ws: isize,
 }
 
 impl DomSourceRange {

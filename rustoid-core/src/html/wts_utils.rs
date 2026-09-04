@@ -267,6 +267,17 @@ pub fn comment_wt(comment: &str) -> String {
     format!("<!--{}-->", decode_comment(comment))
 }
 
+/// The wikitext length in bytes of an HTML DOM comment, including the 7
+/// chars for the `<!--`/`-->` delimiters (or 4 for an unclosed comment).
+/// Faithful to `WTUtils::decodedCommentLength` for the `Comment` branch.
+///
+/// `unclosed` mirrors the `mw:Placeholder/UnclosedComment` previous-sibling
+/// check that flips `$syntaxLen` from 7 to 4.
+pub fn decoded_comment_length(comment: &str, unclosed: bool) -> usize {
+    let syntax_len = if unclosed { 4 } else { 7 };
+    decode_comment(comment).len() + syntax_len
+}
+
 /// Map an HTML DOM-escaped comment to a wikitext-escaped comment, so `-->`
 /// never appears literally. Mirrors `WTUtils::decodeComment`.
 pub fn decode_comment(comment: &str) -> String {
@@ -823,6 +834,7 @@ mod tests {
                 end: Some(30),
                 open_width: Some(2),
                 close_width: Some(3),
+                ..Default::default()
             }),
             ..Default::default()
         };

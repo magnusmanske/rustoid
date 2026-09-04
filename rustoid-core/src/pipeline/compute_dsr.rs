@@ -371,6 +371,7 @@ fn compute_node_dsr(
                             end: Some(o),
                             open_width: None,
                             close_width: None,
+                            ..Default::default()
                         }
                     } else {
                         DomSourceRange {
@@ -378,6 +379,7 @@ fn compute_node_dsr(
                             end: ce,
                             open_width: st_width,
                             close_width: et_width,
+                            ..Default::default()
                         }
                     };
                     child.dp.get_or_insert_with(DataParsoid::default).dsr = Some(dsr);
@@ -474,6 +476,7 @@ pub fn run(root: &mut Node, source: &str) {
             end: Some(end),
             open_width: Some(0),
             close_width: Some(0),
+            ..Default::default()
         };
         root.dp.get_or_insert_with(DataParsoid::default).dsr = Some(dsr);
     }

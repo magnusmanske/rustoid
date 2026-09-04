@@ -1806,6 +1806,7 @@ mod tests {
             end: Some(38),
             open_width: None,
             close_width: None,
+            ..Default::default()
         });
         start.dp = Some(dp);
 
@@ -2307,6 +2308,7 @@ mod tests {
                 end: Some(38),
                 open_width: None,
                 close_width: None,
+                ..Default::default()
             }),
             ..DataParsoid::default()
         });
@@ -2328,6 +2330,7 @@ mod tests {
                 end: Some(41),
                 open_width: None,
                 close_width: None,
+                ..Default::default()
             }),
             ..DataParsoid::default()
         });

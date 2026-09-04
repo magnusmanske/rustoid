@@ -98,6 +98,7 @@ fn mark_misnested(node: &mut Node) {
             end: None,
             open_width: None,
             close_width: None,
+            ..Default::default()
         });
         if let Some(json) = &mut node.data_parsoid
             && let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(json)

@@ -1,476 +1,388 @@
 //! Selective serialization (selser).
 //!
-//! Given original wikitext, original HTML, and modified HTML,
-//! produce modified wikitext with minimal changes by preserving
-//! unmodified portions via DSR (DOM Source Range) information.
+//! Faithful port of PHP Parsoid's `Html2Wt\SelectiveSerializer`. Given the
+//! edited DOM and the *original* (revision) DOM — with the revision wikitext —
+//! it reuses the original wikitext source for unmodified regions of the DOM,
+//! re-serializing only what a `DOMDiff` marks as changed.
 //!
-//! This is the foundation for the VisualEditor editing pipeline.
+//! The entry point is [`selective_serialize_dom`], which mirrors
+//! `SelectiveSerializer::serializeDOM`:
+//!
+//! 1. Wrap the direct text children of `<li>`/`<dd>` elements (in *both* DOMs)
+//!    in `<span data-mw-selser-wrapper>` markers carrying a computed DSR, so
+//!    `DOMDiff` can mark content changes at a finer granularity.
+//! 2. Diff the old body against the new body via [`DomDiff`], annotating the new
+//!    DOM in place.
+//! 3. If nothing changed, return the revision wikitext verbatim; otherwise
+//!    hand the annotated document to the selser-mode serializer.
 
-use crate::dom::node::{Node, NodeKind};
+use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::error::Result;
+use crate::html::dom_diff::DomDiff;
+use crate::html::dsr::{SelectiveUpdateData, is_valid_dsr};
 use crate::html::parse::parse_html;
-use crate::html::serialize_wt::ast_to_wikitext;
 
-/// A change detected between original and modified DOM.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-enum DomChange {
-    /// A node was inserted at the given position.
-    Inserted {
-        parent_path: Vec<usize>,
-        index: usize,
-        node: Box<Node>,
-    },
-    /// A node was deleted from the given position.
-    Deleted {
-        parent_path: Vec<usize>,
-        index: usize,
-    },
-    /// A text node's content was modified.
-    TextModified {
-        parent_path: Vec<usize>,
-        index: usize,
-        old_text: String,
-        new_text: String,
-    },
-    /// An element's attributes were modified.
-    AttrsModified {
-        parent_path: Vec<usize>,
-        index: usize,
-    },
-    /// An element's children were modified (recursive).
-    ChildrenModified {
-        parent_path: Vec<usize>,
-        index: usize,
-    },
+/// Wrap the direct text-node children of every descendant element named
+/// `node_name` (used for `li` and `dd`) in `<span data-mw-selser-wrapper>`
+/// markers, computing a (speculative) DSR for each. Faithful to
+/// `SelectiveSerializer::wrapTextChildrenOfNode`.
+///
+/// The DSR relies on trimmed-whitespace metadata (`leadingWS`/`trailingWS`) from
+/// the wt→html direction; on the original DOM these are accurate, on the edited
+/// DOM they are speculative and are discarded by `DOMDiff` when the
+/// `data-parsoid` attribute diverges.
+fn wrap_text_children_of_node(body: &mut Node, node_name: &str) {
+    let in_list_item = crate::html::dom_utils::is_list_item_name(node_name);
+    collect_and_wrap(body, node_name, in_list_item);
 }
 
-/// A contiguous region of wikitext to preserve.
-#[derive(Debug, Clone)]
-struct UnmodifiedRegion {
-    /// Byte offset in the original wikitext.
-    start: usize,
-    /// Byte offset of the end (exclusive).
-    end: usize,
+/// Recursively walk the owned tree, wrapping the text children of every element
+/// named `node_name`. This mirrors `querySelectorAll($body, $nodeName)` — all
+/// descendants match, not just direct children — while avoiding aliasing `body`
+/// (the list item is mutated only through its own `children` `&mut`).
+fn collect_and_wrap(node: &mut Node, node_name: &str, in_list_item: bool) {
+    if matches!(node.kind, NodeKind::Element(_))
+        && crate::html::wts_utils::node_name(node) == node_name
+    {
+        wrap_one_list_item(node, in_list_item);
+    }
+    for child in &mut node.children {
+        collect_and_wrap(child, node_name, in_list_item);
+    }
 }
 
-/// DSR (DOM Source Range) data extracted from data-parsoid.
-#[derive(Debug, Clone, Default)]
-struct DsrData {
-    /// [start, end, open_width, close_width] as in Parsoid's dsr field.
-    dsr: Option<[usize; 4]>,
-}
+/// Wrap the text-node children of a single `<li>`/`<dd>` element. Faithful to the
+/// per-element body of `wrapTextChildrenOfNode`.
+fn wrap_one_list_item(elt: &mut Node, in_list_item: bool) {
+    // Skip items with `about` (template/extension content) and literal-HTML nodes.
+    if crate::html::wts_utils::is_literal_html_node(elt) || elt.get_attr("about").is_some() {
+        return;
+    }
 
-impl DsrData {
-    fn from_parsoid(attr: &str) -> Self {
-        // Try parsing {"dsr":[s,e,ow,cw]} from data-parsoid JSON
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(attr)
-            && let Some(dsr_arr) = json.get("dsr").and_then(|v| v.as_array())
-            && dsr_arr.len() == 4
-        {
-            let arr: Vec<usize> = dsr_arr
-                .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .collect();
-            if arr.len() == 4 {
-                return DsrData {
-                    dsr: Some([arr[0], arr[1], arr[2], arr[3]]),
+    // No point wrapping if there is no usable DSR on the list item itself.
+    let Some(elt_dsr) = crate::html::wts_utils::get_dsr(elt) else {
+        return;
+    };
+    if !is_valid_dsr(Some(&elt_dsr), false) {
+        return;
+    }
+
+    // `$start = $eltDSR->innerStart()`: skip the leading (open) tag width.
+    let mut start = elt_dsr.inner_start();
+
+    let mut c = 0;
+    while c < elt.children.len() {
+        if c == 0 && !elt_dsr.has_valid_leading_ws() {
+            // No accurate leading-WS width: cannot wrap the first text node.
+            break;
+        }
+        if c == 0 {
+            start += elt_dsr.leading_ws.max(0) as usize;
+        }
+
+        // The next sibling index, skipping over any encapsulated forest rooted at
+        // this child (`WTUtils::skipOverEncapsulatedContent`), plus an extra step
+        // when a trailing newline was split off (a `<span>` was inserted before the
+        // current node, shifting subsequent indices by one).
+        let next = skip_over_encapsulated_content(&elt.children, c).unwrap_or(elt.children.len());
+        let next_opt = (next < elt.children.len()).then_some(next);
+        let child = &elt.children[c];
+
+        // The trailing-newline split inserts a node before index `c`, shifting
+        // everything at/after `c` by one, so advance past it.
+        let mut next_c = next;
+
+        match &child.kind {
+            NodeKind::Text(text) => {
+                let text = text.clone();
+                let mut len = text.len();
+                // Don't wrap trailing newlines: single-line-context handling would
+                // convert them into spaces and introduce dirty-diffs. Leave them
+                // outside the wrapper to be handled as separator text.
+                //
+                // `$nl` is `null` when no trailing newline was split off.
+                let (text, nls): (String, Option<String>) =
+                    if len > 0 && text.as_bytes()[len - 1] == b'\n' {
+                        let trimmed = text.trim_end_matches('\n').to_string();
+                        let count = len - trimmed.len();
+                        len = trimmed.len();
+                        (trimmed, Some("\n".repeat(count)))
+                    } else {
+                        // Last child of the "original" item (or the item now ends
+                        // in a nested inserted list): tack on the trailing-WS width.
+                        if is_last_child_with_nested_list(&elt.children, next_opt, in_list_item) {
+                            if !elt_dsr.has_valid_trailing_ws() {
+                                break;
+                            }
+                            len += elt_dsr.trailing_ws.max(0) as usize;
+                        }
+                        (text, None)
+                    };
+
+                // Build `<span data-mw-selser-wrapper>` with DSR
+                // `[start, start + len, 0, 0]`.
+                let mut span = Node::element(ElementKind::Span);
+                span.set_attr("data-mw-selser-wrapper", "");
+                let dp = span.dp.get_or_insert_with(Default::default);
+                // Faithful to
+                // `$dp->dsr = new DomSourceRange($start, $start + $len, 0, 0)` and
+                // `$dp->setTempFlag(TempData::IS_NEW, false)` — a non-null DSR makes
+                // this node "not new" (see `is_new_elt`, which checks `dsr.is_none()`).
+                dp.dsr = Some(crate::wikitext::tokens_v2::DomSourceRange {
+                    start: Some(start),
+                    end: Some(start + len),
+                    open_width: Some(0),
+                    close_width: Some(0),
+                    leading_ws: 0,
+                    trailing_ws: 0,
+                });
+                span.push_child(Node::text(text));
+
+                // Faithful to PHP's three-way mutation:
+                //   non-nl: `$elt->replaceChild($span, $c);`
+                //       nl: `$elt->insertBefore($span, $c);` +
+                //           `$c->nodeValue = $nl;` (the *same* text node keeps its
+                //           position and becomes the newline run, so the captured
+                //           `next` index stays correct).
+                let nls_len = match nls {
+                    None => {
+                        elt.children[c] = span;
+                        0
+                    }
+                    Some(nls) => {
+                        let count = nls.len();
+                        elt.children[c] = Node::text(nls);
+                        elt.children.insert(c, span);
+                        next_c += 1;
+                        count
+                    }
                 };
+
+                // `$start += $len;` then, in the `$nl` branch, `$start += $numOfNls;`.
+                start += len + nls_len;
             }
-        }
-        DsrData { dsr: None }
-    }
-
-    /// The content range in the original wikitext (between opening and closing).
-    #[allow(dead_code)]
-    fn content_range(&self) -> Option<(usize, usize)> {
-        self.dsr.map(|[s, e, ow, cw]| (s + ow, e - cw))
-    }
-
-    /// The full range including opening/closing delimiters.
-    fn full_range(&self) -> Option<(usize, usize)> {
-        self.dsr.map(|[s, e, ..]| (s, e))
-    }
-}
-
-/// Extract DSR data from a node's data-parsoid attribute.
-#[allow(dead_code)]
-fn get_dsr(node: &Node) -> DsrData {
-    node.data_parsoid
-        .as_ref()
-        .map(|dp| DsrData::from_parsoid(dp))
-        .unwrap_or_default()
-}
-
-/// Run the selser algorithm.
-///
-/// 1. Parse original and modified HTML into ASTs.
-/// 2. Diff the ASTs to find changes.
-/// 3. Map changes to wikitext regions using DSR offsets.
-/// 4. Serialize only the changed regions, preserving unmodified wikitext verbatim.
-pub fn selser(original_wikitext: &str, original_html: &str, modified_html: &str) -> Result<String> {
-    let original_ast = parse_html(original_html)?;
-    let modified_ast = parse_html(modified_html)?;
-
-    // Diff the ASTs
-    let changes = diff_asts(&original_ast, &modified_ast, &[])?;
-
-    // Map changes to wikitext regions and produce output
-    apply_changes(original_wikitext, &original_ast, &changes)
-}
-
-/// Diff two ASTs and return a list of changes.
-fn diff_asts(original: &Node, modified: &Node, parent_path: &[usize]) -> Result<Vec<DomChange>> {
-    let mut changes = Vec::new();
-
-    match (&original.kind, &modified.kind) {
-        (NodeKind::Document, NodeKind::Document) => {
-            // Compare children
-            let max_len = original.children.len().max(modified.children.len());
-            for i in 0..max_len {
-                let orig_child = original.children.get(i);
-                let mod_child = modified.children.get(i);
-
-                match (orig_child, mod_child) {
-                    (Some(o), Some(m)) => {
-                        let mut child_path = parent_path.to_vec();
-                        child_path.push(i);
-                        changes.extend(diff_asts(o, m, &child_path)?);
-                    }
-                    (Some(_o), None) => {
-                        let mut child_path = parent_path.to_vec();
-                        child_path.push(i);
-                        changes.push(DomChange::Deleted {
-                            parent_path: child_path,
-                            index: i,
-                        });
-                    }
-                    (None, Some(node)) => {
-                        let mut child_path = parent_path.to_vec();
-                        child_path.push(i);
-                        changes.push(DomChange::Inserted {
-                            parent_path: child_path,
-                            index: i,
-                            node: Box::new(node.clone()),
-                        });
-                    }
-                    (None, None) => {}
+            NodeKind::Comment(value) => {
+                let unclosed = has_unclosed_comment_prev(&elt.children, c);
+                start += crate::html::wts_utils::decoded_comment_length(value, unclosed);
+            }
+            NodeKind::Element(_) => {
+                // No point wrapping following text if this child has no usable DSR.
+                let Some(c_dsr) = crate::html::wts_utils::get_dsr(child) else {
+                    break;
+                };
+                if !is_valid_dsr(Some(&c_dsr), false) {
+                    break;
                 }
+                start = c_dsr.end.unwrap_or(start);
             }
+            NodeKind::Document => {}
         }
 
-        (NodeKind::Element(orig_kind), NodeKind::Element(mod_kind)) => {
-            if orig_kind != mod_kind {
-                // Element type changed — replace entirely
-                let mut child_path = parent_path.to_vec();
-                child_path.push(0);
-                changes.push(DomChange::ChildrenModified {
-                    parent_path: child_path.clone(),
-                    index: 0,
-                });
-                return Ok(changes);
-            }
-
-            // Check attributes
-            if original.attrs != modified.attrs {
-                let mut child_path = parent_path.to_vec();
-                child_path.push(0);
-                changes.push(DomChange::AttrsModified {
-                    parent_path: child_path,
-                    index: 0,
-                });
-            }
-
-            // Check children
-            let max_len = original.children.len().max(modified.children.len());
-            for i in 0..max_len {
-                let orig_child = original.children.get(i);
-                let mod_child = modified.children.get(i);
-
-                match (orig_child, mod_child) {
-                    (Some(o), Some(m)) => {
-                        let mut child_path = parent_path.to_vec();
-                        child_path.push(i);
-                        changes.extend(diff_asts(o, m, &child_path)?);
-                    }
-                    (Some(_o), None) => {
-                        let mut child_path = parent_path.to_vec();
-                        child_path.push(i);
-                        changes.push(DomChange::Deleted {
-                            parent_path: child_path,
-                            index: i,
-                        });
-                    }
-                    (None, Some(node)) => {
-                        let mut child_path = parent_path.to_vec();
-                        child_path.push(i);
-                        changes.push(DomChange::Inserted {
-                            parent_path: child_path,
-                            index: i,
-                            node: Box::new(node.clone()),
-                        });
-                    }
-                    (None, None) => {}
-                }
-            }
-        }
-
-        (NodeKind::Text(orig_text), NodeKind::Text(mod_text)) => {
-            if orig_text != mod_text {
-                let mut child_path = parent_path.to_vec();
-                child_path.push(0);
-                changes.push(DomChange::TextModified {
-                    parent_path: child_path,
-                    index: 0,
-                    old_text: orig_text.clone(),
-                    new_text: mod_text.clone(),
-                });
-            }
-        }
-
-        _ => {
-            // Nodes differ in type — full replacement
-            let mut child_path = parent_path.to_vec();
-            child_path.push(0);
-            changes.push(DomChange::ChildrenModified {
-                parent_path: child_path,
-                index: 0,
-            });
-        }
+        c = next_c;
     }
-
-    Ok(changes)
 }
 
-/// Apply changes to produce the modified wikitext.
+/// Decide whether the text node is the last child of the "original" item, or
+/// the item now ends in a nested inserted list — either way, tack on the
+/// trailing-WS width. Faithful to the `!$next || ($inListItem && isList($next)
+/// && isNewElt($next))` test in `wrapTextChildrenOfNode`.
+fn is_last_child_with_nested_list(
+    children: &[Node],
+    next_opt: Option<usize>,
+    in_list_item: bool,
+) -> bool {
+    match next_opt {
+        None => true,
+        Some(next) => {
+            let next_node = &children[next];
+            in_list_item
+                && crate::html::dom_utils::is_list(next_node)
+                && next_node.dp.as_ref().is_none_or(|d| d.dsr.is_none())
+        }
+    }
+}
+
+/// `WTUtils::skipOverEncapsulatedContent` — return the index just past the
+/// encapsulated forest (siblings sharing `about`), or `None` at end of list.
+fn skip_over_encapsulated_content(children: &[Node], from: usize) -> Option<usize> {
+    let about = children
+        .get(from)
+        .and_then(|n| n.get_attr("about"))
+        .map(str::to_string);
+    let Some(about) = about else {
+        return (from + 1 < children.len()).then_some(from + 1);
+    };
+    let mut i = from + 1;
+    while i < children.len() {
+        let same = children[i]
+            .get_attr("about")
+            .map(|a| a == about)
+            .unwrap_or(false);
+        if !same {
+            break;
+        }
+        i += 1;
+    }
+    (i < children.len()).then_some(i)
+}
+
+/// Whether the comment at `index` is immediately preceded by a
+/// `mw:Placeholder/UnclosedComment` meta (which shortens the wikitext delimiter
+/// from `<!--…-->` to just `<!--…`). Faithful to `decodedCommentLength`'s
+/// `previousSibling` check.
+fn has_unclosed_comment_prev(children: &[Node], index: usize) -> bool {
+    if index == 0 {
+        return false;
+    }
+    if !matches!(children[index - 1].kind, NodeKind::Element(_)) {
+        return false;
+    }
+    crate::html::dom_utils::has_type_of(&children[index - 1], "mw:Placeholder/UnclosedComment")
+}
+
+/// Pre-process a DOM for selser by wrapping the text children of `<li>` and
+/// `<dd>` elements. Faithful to `SelectiveSerializer::preprocessDOMForSelser`.
+fn preprocess_dom_for_selser(body: &mut Node) {
+    wrap_text_children_of_node(body, "li");
+    wrap_text_children_of_node(body, "dd");
+}
+
+/// Selectively serialize an edited document, reusing the revision wikitext for
+/// unmodified content. Faithful to `SelectiveSerializer::serializeDOM`.
 ///
-/// Strategy:
-/// 1. Collect all DSR regions from the original AST.
-/// 2. Mark regions that are affected by changes.
-/// 3. Output the original wikitext, replacing only changed regions with
-///    freshly-serialized wikitext from the modified AST.
-fn apply_changes(
-    original_wikitext: &str,
-    original_ast: &Node,
-    changes: &[DomChange],
+/// * `doc` — the (edited) DOM to serialize (its `<body>` content is used).
+/// * `selser_data` — carries the revision wikitext and the revision DOM (the
+///   "old body" the diff compares against); the DOM is recovered from `rev_html`
+///   if needed.
+/// * `env` — the serializer environment (optional; `None` falls back to literal
+///   HTML for links/media).
+pub fn selective_serialize_dom(
+    doc: &mut Node,
+    selser_data: &mut SelectiveUpdateData,
+    env: Option<crate::html::env::SerializerEnv>,
 ) -> Result<String> {
-    // Collect unmodified regions from the original AST
-    let unmodified = collect_unmodified_regions(original_wikitext, original_ast, changes)?;
-
-    // If there are no changes, return the original wikitext unchanged
-    if changes.is_empty() {
-        return Ok(original_wikitext.to_string());
+    // Populate the revision DOM from `rev_html` when it isn't already present.
+    if selser_data.rev_dom.is_none()
+        && let Some(rev_html) = selser_data.rev_html.as_deref()
+    {
+        selser_data.rev_dom = Some(Box::new(parse_html(rev_html)?));
     }
 
-    let bytes = original_wikitext.as_bytes();
-    let mut result = String::with_capacity(original_wikitext.len());
-
-    // Process unmodified regions interspersed with change regions
-    let mut pos = 0;
-    for region in &unmodified {
-        // Copy unmodified text up to the region start
-        if region.start > pos {
-            result.push_str(&original_wikitext[pos..region.start.min(bytes.len())]);
+    // `$oldBody = DOMCompat::getBody($this->selserData->revDOM);`
+    let old_body = match selser_data.rev_dom.take() {
+        Some(old) => old,
+        None => {
+            // No revision DOM: nothing to diff against, so fall through to the
+            // selser serializer (nothing can be reused).
+            return Ok(
+                crate::html::serializer::WikitextSerializer::serialize_dom_selser(
+                    doc.clone(),
+                    env,
+                    &selser_data.rev_text,
+                ),
+            );
         }
-        // Copy the unmodified region
-        if region.start < bytes.len() && region.end <= bytes.len() {
-            result.push_str(&original_wikitext[region.start..region.end]);
-        }
-        pos = region.end;
-    }
+    };
+    let mut old_body = *old_body;
 
-    // Copy any trailing text
-    if pos < bytes.len() {
-        result.push_str(&original_wikitext[pos..]);
-    }
+    // Pre-process both DOMs (selser-specific wrapping).
+    preprocess_dom_for_selser(&mut old_body);
+    preprocess_dom_for_selser(doc);
 
-    // For text modifications, do a simple search-and-replace
-    // This is a fallback for cases where DSR isn't available
-    for change in changes {
-        if let DomChange::TextModified {
-            old_text, new_text, ..
-        } = change
-        {
-            // Only replace if the old text appears in the result and isn't already replaced
-            if result.contains(old_text.as_str()) && old_text != new_text {
-                result = result.replacen(old_text.as_str(), new_text.as_str(), 1);
-            }
-        }
-    }
+    // `$diff = (new DOMDiff($this->env))->diff($oldBody, $body);`
+    let mut dom_diff = DomDiff::default();
+    let changed = dom_diff.diff(&old_body, doc);
 
-    // For inserted content, serialize the new nodes and append
-    let mut insertions: Vec<(String, usize)> = Vec::new();
-    for change in changes {
-        if let DomChange::Inserted { node, .. } = change {
-            // Serialize the inserted node to wikitext
-            if let Ok(wt) = ast_to_wikitext(node) {
-                insertions.push((wt, usize::MAX)); // append for now
-            }
-        }
-    }
-    // Append all insertions
-    for (wt, _) in &insertions {
-        result.push_str(wt);
-    }
+    let result = if !changed {
+        // Nothing was modified: reuse the original source verbatim.
+        selser_data.rev_text.clone()
+    } else {
+        // `$r = $this->wts->serializeDOM($doc, true);`
+        crate::html::serializer::WikitextSerializer::serialize_dom_selser(
+            doc.clone(),
+            env,
+            &selser_data.rev_text,
+        )
+    };
 
-    Ok(result.trim().to_string())
-}
-
-/// Collect regions of the original wikitext that are NOT affected by changes.
-///
-/// Walks the original AST, checking each node's DSR, and collects ranges
-/// that should be preserved as-is.
-fn collect_unmodified_regions(
-    original_wikitext: &str,
-    ast: &Node,
-    _changes: &[DomChange],
-) -> Result<Vec<UnmodifiedRegion>> {
-    let mut regions = Vec::new();
-    let bytes = original_wikitext;
-
-    // Walk the AST and collect DSR ranges from nodes that haven't changed.
-    // We track the last position to detect gaps.
-    let mut ranges = Vec::<(usize, usize)>::new();
-    collect_dsr_ranges(ast, &mut ranges);
-
-    // Sort by start position
-    ranges.sort_by_key(|(s, _)| *s);
-
-    // Merge overlapping ranges and create unmodified regions
-    // For now, just include all ranges as unmodified
-    for (start, end) in &ranges {
-        if *start < bytes.len() && *end <= bytes.len() && start < end {
-            regions.push(UnmodifiedRegion {
-                start: *start,
-                end: *end,
-            });
-        }
-    }
-
-    // If no ranges found, treat the entire document as one region
-    if regions.is_empty() {
-        regions.push(UnmodifiedRegion {
-            start: 0,
-            end: bytes.len(),
-        });
-    }
-
-    Ok(regions)
-}
-
-/// Recursively collect DSR ranges from AST nodes.
-fn collect_dsr_ranges(node: &Node, ranges: &mut Vec<(usize, usize)>) {
-    if let Some(ref dp) = node.data_parsoid {
-        let dsr = DsrData::from_parsoid(dp);
-        if let Some((start, end)) = dsr.full_range() {
-            ranges.push((start, end));
-        }
-    }
-
-    for child in &node.children {
-        collect_dsr_ranges(child, ranges);
-    }
-}
-
-/// Find the wikitext range covering a specific node (by its DSR).
-#[allow(dead_code)]
-fn find_node_range(node: &Node) -> Option<(usize, usize)> {
-    get_dsr(node).full_range()
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dom::node::{ElementKind, Node};
+    use crate::wikitext::tokens_v2::DataParsoid;
 
-    #[test]
-    fn test_selser_no_changes() {
-        let wikitext = "'''bold''' text";
-        let html = "<p><b>bold</b> text</p>";
-
-        let result = selser(wikitext, html, html).unwrap();
-        assert_eq!(result, wikitext);
+    fn li_with_dsr(start: usize, end: usize) -> Node {
+        let mut li = Node::element(ElementKind::ListItem);
+        li.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(start),
+                end: Some(end),
+                open_width: Some(1),
+                close_width: Some(0),
+                leading_ws: 0,
+                trailing_ws: 0,
+            }),
+            ..Default::default()
+        });
+        li
     }
 
     #[test]
-    fn test_selser_text_change() {
-        let wikitext = "Hello world";
-        let original_html = "<p>Hello world</p>";
-        let modified_html = "<p>Hello rustoid</p>";
+    fn test_wrap_text_children_wraps_text() {
+        let mut li = li_with_dsr(0, 5); // "*foo" -> open width 1, content "foo"
+        li.push_child(Node::text("foo"));
+        wrap_text_children_of_node(&mut li, "li");
 
-        let result = selser(wikitext, original_html, modified_html).unwrap();
-        // Should preserve "Hello " prefix and replace "world" with "rustoid"
-        assert!(result.contains("Hello"));
-        assert!(result.contains("rustoid"));
+        assert_eq!(li.children.len(), 1);
+        let span = &li.children[0];
+        assert!(span.get_attr("data-mw-selser-wrapper").is_some());
+        // Span DSR: [1, 4, 0, 0] (innerStart=1, content "foo"=3 bytes).
+        let dsr = span.dp.as_ref().and_then(|d| d.dsr.clone()).unwrap();
+        assert_eq!(dsr.start, Some(1));
+        assert_eq!(dsr.end, Some(4));
+        assert_eq!(dsr.open_width, Some(0));
+        assert_eq!(dsr.close_width, Some(0));
     }
 
     #[test]
-    fn test_diff_identical() {
-        let a = Node::text("hello");
-        let b = Node::text("hello");
-        let changes = diff_asts(&a, &b, &[]).unwrap();
-        assert!(changes.is_empty());
+    fn test_wrap_skips_about_items() {
+        let mut li = li_with_dsr(0, 5);
+        li.set_attr("about", "#mwt1");
+        li.push_child(Node::text("foo"));
+        wrap_text_children_of_node(&mut li, "li");
+        // Not wrapped (still a bare text child).
+        assert!(matches!(li.children[0].kind, NodeKind::Text(_)));
     }
 
     #[test]
-    fn test_diff_text_change() {
-        let a = Node::text("hello");
-        let b = Node::text("world");
-        let changes = diff_asts(&a, &b, &[]).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(changes[0], DomChange::TextModified { .. }));
+    fn test_wrap_skips_literal_html() {
+        let mut li = li_with_dsr(0, 5);
+        li.dp.as_mut().unwrap().stx = Some("html".to_string());
+        li.push_child(Node::text("foo"));
+        wrap_text_children_of_node(&mut li, "li");
+        assert!(matches!(li.children[0].kind, NodeKind::Text(_)));
     }
 
     #[test]
-    fn test_diff_element_inserted() {
-        let mut doc_a = Node::document();
-        doc_a.push_child(Node::text("a"));
-        let mut doc_b = Node::document();
-        doc_b.push_child(Node::text("a"));
-        doc_b.push_child(Node::text("b"));
+    fn test_wrap_trailing_newline_split() {
+        let mut li = li_with_dsr(0, 8); // "*foo\n" -> "foo\n" content
+        li.push_child(Node::text("foo\n"));
+        wrap_text_children_of_node(&mut li, "li");
 
-        let changes = diff_asts(&doc_a, &doc_b, &[]).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(changes[0], DomChange::Inserted { .. }));
+        // "foo" wrapped in a span, "\n" left as a trailing text node.
+        assert_eq!(li.children.len(), 2);
+        assert!(li.children[0].get_attr("data-mw-selser-wrapper").is_some());
+        assert!(matches!(&li.children[1].kind, NodeKind::Text(t) if t == "\n"));
     }
 
     #[test]
-    fn test_diff_element_deleted() {
-        let mut doc_a = Node::document();
-        doc_a.push_child(Node::text("a"));
-        doc_a.push_child(Node::text("b"));
-        let mut doc_b = Node::document();
-        doc_b.push_child(Node::text("a"));
-
-        let changes = diff_asts(&doc_a, &doc_b, &[]).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(changes[0], DomChange::Deleted { .. }));
-    }
-
-    #[test]
-    fn test_diff_attrs_changed() {
-        let mut a = Node::element(ElementKind::Paragraph);
-        a.set_attr("class", "old");
-        let mut b = Node::element(ElementKind::Paragraph);
-        b.set_attr("class", "new");
-
-        let changes = diff_asts(&a, &b, &[]).unwrap();
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(changes[0], DomChange::AttrsModified { .. }));
-    }
-
-    #[test]
-    fn test_selser_preserves_unmodified() {
-        // A document with DSR annotations should preserve unchanged parts
-        let wikitext = "first paragraph\n\nsecond paragraph";
-        let html = r#"<p data-parsoid='{"dsr":[0,16,0,0]}'>first paragraph</p>
-<p data-parsoid='{"dsr":[18,34,0,0]}'>second paragraph</p>"#;
-        let modified_html = r#"<p data-parsoid='{"dsr":[0,16,0,0]}'>first paragraph</p>
-<p data-parsoid='{"dsr":[18,34,0,0]}'>modified second</p>"#;
-
-        let result = selser(wikitext, html, modified_html).unwrap();
-        assert!(result.contains("first paragraph"));
-        // The modified text should appear somewhere
-        assert!(result.contains("modified second"));
+    fn test_no_dsr_no_wrap() {
+        let mut li = Node::element(ElementKind::ListItem);
+        li.push_child(Node::text("foo"));
+        wrap_text_children_of_node(&mut li, "li");
+        // No DSR => skipped entirely.
+        assert!(matches!(li.children[0].kind, NodeKind::Text(_)));
     }
 }

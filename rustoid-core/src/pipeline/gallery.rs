@@ -772,6 +772,7 @@ mod tests {
             end: Some(source.len()),
             open_width: Some("<gallery>".len()),
             close_width: Some("</gallery>".len()),
+            ..Default::default()
         });
         tk
     }

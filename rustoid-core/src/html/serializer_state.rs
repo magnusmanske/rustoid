@@ -907,6 +907,7 @@ mod tests {
                 end: Some(6),
                 open_width: Some(1),
                 close_width: Some(0),
+                ..Default::default()
             }),
             ..Default::default()
         });

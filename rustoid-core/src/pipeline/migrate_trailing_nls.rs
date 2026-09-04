@@ -100,8 +100,7 @@ fn has_zero_width_wt(node: &Node) -> bool {
 /// `<!--` / `-->` delimiters (`7`), or `<!--` alone (`4`) for an unclosed
 /// comment. Mirrors `WTUtils::decodedCommentLength`.
 fn decoded_comment_length(value: &str, unclosed: bool) -> usize {
-    let syntax_len = if unclosed { 4 } else { 7 };
-    crate::html::wts_utils::decode_comment(value).len() + syntax_len
+    crate::html::wts_utils::decoded_comment_length(value, unclosed)
 }
 
 /// Whether the comment immediately preceding (in document order) is an unclosed

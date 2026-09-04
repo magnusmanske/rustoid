@@ -494,6 +494,7 @@ impl ParserFunctions {
                 end: Some(source.len()),
                 open_width: Some(open_tag.len()),
                 close_width: Some(close_tag.len()),
+                ..Default::default()
             }),
             ..Default::default()
         };
