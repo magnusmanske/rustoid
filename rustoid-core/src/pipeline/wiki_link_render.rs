@@ -569,16 +569,52 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
 /// `expandAttributes`) and re-tokenizes only the text chunks, passing through
 /// the `mw:Transclusion` meta markers untouched (so templates in captions render
 /// as `mw:Transclusion` spans rather than flattening to text).
+///
+/// A caption may carry `language-variant` tokens (`-{…}-`) interleaved with text;
+/// because `tokenize_link_content` only recognizes `{{…}}`/`-{…}-` directives, a
+/// nested `[[…]]` wikilink surrounding a `-{…}-` is split across several items
+/// (e.g. `[[File:…|alt=`, `language-variant`, `|`, `language-variant`, `]]`). To
+/// re-assemble such a wikilink, we reconstruct the full caption source (using
+/// each directive's `data-parsoid.src`) and re-tokenize it as one span, rather
+/// than tokenizing each text chunk in isolation.
 fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> {
-    let mut out = Vec::with_capacity(items.len());
+    // Only reconstruct when a `language-variant` token is present (the sole case
+    // where `tokenize_link_content` fragments a surrounding wikilink); otherwise
+    // keep the existing per-chunk path to preserve transclusion markers.
+    let needs_reconstruction = items.iter().any(|item| {
+        matches!(
+            item,
+            Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant"
+        )
+    });
+    if !needs_reconstruction {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if let Item::Str(s) = item {
+                out.extend(tokenize_caption(s, config));
+            } else {
+                out.push(item.clone());
+            }
+        }
+        return out;
+    }
+
+    // Reconstruct the full caption source, then tokenize it whole. `language-
+    // variant`/`template`/meta tokens carry their exact wikitext in `src`; text
+    // chunks are already literal.
+    let mut src = String::new();
     for item in items {
-        if let Item::Str(s) = item {
-            out.extend(tokenize_caption(s, config));
-        } else {
-            out.push(item.clone());
+        match item {
+            Item::Str(s) => src.push_str(s),
+            Item::Tok(tok) => {
+                let dp_src = tok.data_parsoid().and_then(|d| d.src.clone());
+                if let Some(s) = dp_src {
+                    src.push_str(&s);
+                }
+            }
         }
     }
-    out
+    tokenize_caption(&src, config)
 }
 
 /// Split a media option string on *top-level* pipes, respecting nested
