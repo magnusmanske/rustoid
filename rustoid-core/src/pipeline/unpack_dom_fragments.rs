@@ -6,8 +6,18 @@
 //! replaced by their content children during finalize. Typeof/about/data-mw
 //! metadata on the placeholder is transferred to the fragment's first
 //! (span-wrapped) child.
+//!
+//! When the placeholder's parent is an `<a>` and the fragment itself contains an
+//! `<a>` (a `[[…]]`/`[[File:…]]` link inside an external link), the two anchors
+//! would nest illegally. PHP (`UnpackDOMFragments::hasBadNesting`) repairs this
+//! by serializing the parent and re-parsing it through the HTML parser, which
+//! runs the adoption-agency algorithm: the inner `<a>` is hoisted out of the
+//! outer `<a>` as a following sibling, and every hoisted element is marked
+//! `misnested` (with a zero-width DSR). We reproduce that well-defined result
+//! directly on the DOM (see [`fix_nested_anchors`]), preserving the node data a
+//! serialize/reparse round-trip would otherwise lose.
 
-use crate::dom::node::Node;
+use crate::dom::node::{Node, NodeKind};
 
 /// Whether a node's `typeof` contains the `mw:DOMFragment` token.
 fn has_dom_fragment_type(node: &Node) -> bool {
@@ -35,18 +45,111 @@ fn add_typeof(node: &mut Node, token: &str) {
     node.set_attr("typeof", tokens.join(" "));
 }
 
+/// The HTML tag name of a node (`""` for non-elements).
+fn node_name(node: &Node) -> String {
+    crate::html::wts_utils::node_name(node)
+}
+
+/// Whether `node` or any descendant is an `<a>` element. Mirrors
+/// `DOMUtils::treeHasElement($fragment, 'a')`.
+fn tree_has_element(node: &Node, name: &str) -> bool {
+    if node_name(node) == name {
+        return true;
+    }
+    node.children.iter().any(|c| tree_has_element(c, name))
+}
+
+/// Whether an element is a "block" container. A block container holding the
+/// nested `<a>` is hoisted *as a unit* (mirroring HTML5's `figure`/`div`/etc.
+/// handling, which reconstructs the active formatting elements — the outer
+/// `<a>` — inside the block before inserting it), whereas an inline `<span>`
+/// shell stays inside the outer anchor while only the nested `<a>` is hoisted.
+fn is_block_container(name: &str) -> bool {
+    matches!(
+        name,
+        "figure"
+            | "div"
+            | "p"
+            | "table"
+            | "ul"
+            | "ol"
+            | "dl"
+            | "section"
+            | "blockquote"
+            | "pre"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+    )
+}
+
+/// Mark `node` and every element in its subtree as misnested. Mirrors
+/// `UnpackDOMFragments::markMisnested`, which sets `dp->misnested = true` (and a
+/// zero-width DSR, absorbed at serialization) on each hoisted element.
+fn mark_misnested(node: &mut Node) {
+    if matches!(node.kind, NodeKind::Element(_)) {
+        let dp = node.dp.get_or_insert_with(Default::default);
+        dp.misnested = Some(true);
+        dp.dsr = Some(crate::wikitext::tokens_v2::DomSourceRange {
+            start: None,
+            end: None,
+            open_width: None,
+            close_width: None,
+        });
+        if let Some(json) = &mut node.data_parsoid
+            && let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(json)
+            && let Some(map) = obj.as_object_mut()
+        {
+            map.insert("misnested".to_string(), serde_json::Value::Bool(true));
+            *json = obj.to_string();
+        }
+    }
+    for child in &mut node.children {
+        mark_misnested(child);
+    }
+}
+
 /// Unpack every `mw:DOMFragment` placeholder in the subtree, replacing it in
-/// place with its stashed fragment children (mirrors
-/// `UnpackDOMFragments::handler` for the well-formed, non-fostered, non-badly-
-/// nested cases).
+/// place with its stashed fragment children (the well-formed case).
+///
+/// The bad-nesting repair (`<a>` inside `<a>`) is deferred to
+/// [`fix_bad_nesting`], which must run *after* `AddMediaInfo` (mirroring PHP's
+/// `media` … `linkneighbours+dom-unpack` order) so the foster-out operates on
+/// already-resolved media rather than detaching a broken-media anchor first.
 pub fn run(node: &mut Node) {
-    // Recurse into children first (the placeholder's own children are its
-    // shallow wrapper plus stashed fragment, so recurse before unpacking).
+    run_inner(node);
+}
+
+/// Repair illegal `<a>`-inside-`<a>` nesting created by unpacking a DOM fragment
+/// whose parent is an `<a>`. Must run after `AddMediaInfo`.
+pub fn fix_bad_nesting(node: &mut Node) {
+    fix_nested_anchors(node);
+}
+
+/// Bottom-up splice of fragment content. Bad nesting is repaired afterward by
+/// [`fix_nested_anchors`], which needs the full (post-splice) tree.
+fn run_inner(node: &mut Node) {
     let mut new_children: Vec<Node> = Vec::with_capacity(node.children.len());
     for mut child in std::mem::take(&mut node.children) {
-        run(&mut child);
+        run_inner(&mut child);
         if has_dom_fragment_type(&child) {
-            unpack_placeholder(node, &mut new_children, child);
+            let mut fragment = child
+                .fragment
+                .take()
+                .map(|f| *f)
+                .unwrap_or_else(Node::document);
+            let mut kids = std::mem::take(&mut fragment.children);
+            if kids.is_empty() {
+                // A leaf fragment (e.g. a bare text node) is itself the content.
+                transfer_metadata(&child, std::slice::from_mut(&mut fragment));
+                new_children.push(fragment);
+            } else {
+                transfer_metadata(&child, &mut kids);
+                new_children.extend(kids);
+            }
         } else {
             new_children.push(child);
         }
@@ -54,28 +157,15 @@ pub fn run(node: &mut Node) {
     node.children = new_children;
 }
 
-/// Replace a single `mw:DOMFragment` placeholder `placeholder` with its
-/// fragment children, transferring metadata. `parent` is used only for span
-/// wrapping of bare text children; `out` receives the replacement nodes.
-fn unpack_placeholder(_parent: &Node, out: &mut Vec<Node>, mut placeholder: Node) {
-    let Some(fragment) = placeholder.fragment.take() else {
-        // No stashed fragment (should not happen for a real placeholder).
-        return;
-    };
-    let mut fragment = *fragment;
-
-    // First child receives the placeholder's `typeof`, `data-mw`, and (for a
-    // transclusion) `data-parsoid` pi info. Mirrors the transclusion transfer
-    // in PHP, which span-wraps bare text children first.
-    let is_transclusion = has_transclusion_type(&placeholder);
+/// Transfer `typeof`/`data-mw`/`about` metadata from a `mw:DOMFragment`
+/// placeholder onto its (span-wrapped) first fragment child. Mirrors the
+/// transclusion/fostered transfer in PHP's `UnpackDOMFragments::handler`.
+fn transfer_metadata(placeholder: &Node, kids: &mut [Node]) {
+    let is_transclusion = has_transclusion_type(placeholder);
     let about = placeholder.get_attr("about").map(str::to_string);
-    let dmw = placeholder.data_mw.take();
-
-    // Children of a fragment are already span-wrapped (or are lone elements).
-    let mut kids = std::mem::take(&mut fragment.children);
+    let dmw = placeholder.data_mw.clone();
     for (i, child) in kids.iter_mut().enumerate() {
         if i == 0 {
-            // Transfer metadata from the placeholder onto the first child.
             if is_transclusion {
                 add_typeof(child, "mw:Transclusion");
             }
@@ -87,12 +177,111 @@ fn unpack_placeholder(_parent: &Node, out: &mut Vec<Node>, mut placeholder: Node
             child.set_attr("about", ab.clone());
         }
     }
+}
 
-    if kids.is_empty() {
-        out.push(fragment);
-    } else {
-        out.extend(kids);
+/// Top-down repair of `<a>` elements whose subtree contains a nested `<a>`. Runs
+/// after fragments are unpacked so the nested media/link anchor is a real
+/// element. Reproduces the adoption-agency result:
+///
+/// * Inline (`<span>`) media container: the nested `<a>` (and following
+///   siblings) are hoisted out after the outer `<a>`; the `<span>` shell stays
+///   (empty) inside it.
+/// * Block (`<figure>`) media container: the whole container is hoisted out, the
+///   outer `<a>` is emptied, and a copy of the outer `<a>` is reconstructed as
+///   the container's first child.
+///
+/// Every hoisted element is marked `misnested`.
+fn fix_nested_anchors(node: &mut Node) {
+    // Recurse into children first so deeper nesting is repaired before we
+    // inspect this level.
+    for child in &mut node.children {
+        fix_nested_anchors(child);
     }
+
+    // Rebuild this level's children, expanding each `<a>`-containing-`<a>` into
+    // the (possibly emptied) `<a>` followed by its hoisted siblings.
+    let mut rebuilt: Vec<Node> = Vec::with_capacity(node.children.len());
+    for child in std::mem::take(&mut node.children) {
+        if node_name(&child) == "a" && child.children.iter().any(|c| tree_has_element(c, "a")) {
+            let mut outer = child; // the `<a>` itself
+            let kids = std::mem::take(&mut outer.children);
+            let hoisted = foster_anchors(&mut outer, kids);
+            rebuilt.push(outer);
+            rebuilt.extend(hoisted);
+        } else {
+            rebuilt.push(child);
+        }
+    }
+    node.children = rebuilt;
+}
+
+/// Foster the nested `<a>`(s) out of the outer anchor `parent`, returning the
+/// nodes to place immediately after it. `parent` is left holding any content
+/// that stays inside (the empty inline shell, or nothing for a hoisted block).
+fn foster_anchors(parent: &mut Node, fragment_kids: Vec<Node>) -> Vec<Node> {
+    let mut kept: Vec<Node> = Vec::new();
+    let mut hoisted: Vec<Node> = Vec::new();
+
+    // A copy of the outer `<a>` (attributes only) used to reconstruct the anchor
+    // inside a hoisted block container (HTML5 formatting-element reconstruction).
+    let anchor_copy = || {
+        let mut copy = Node::element(match &parent.kind {
+            NodeKind::Element(k) => k.clone(),
+            _ => crate::dom::node::ElementKind::Span,
+        });
+        copy.attrs.clone_from(&parent.attrs);
+        copy.data_parsoid.clone_from(&parent.data_parsoid);
+        copy.data_mw.clone_from(&parent.data_mw);
+        copy.dp.clone_from(&parent.dp);
+        copy
+    };
+
+    for child in fragment_kids {
+        let child_is_anchor = node_name(&child) == "a";
+        if child_is_anchor {
+            // A bare nested `<a>` is hoisted out directly.
+            let mut child = child;
+            mark_misnested(&mut child);
+            hoisted.push(child);
+        } else if tree_has_element(&child, "a") {
+            if is_block_container(&node_name(&child)) {
+                let mut container = child;
+                let mut copy = anchor_copy();
+                mark_misnested(&mut copy);
+                container.children.insert(0, copy);
+                mark_misnested(&mut container);
+                hoisted.push(container);
+            } else {
+                // Inline container: keep the shell inside the outer `<a>`, hoist
+                // the nested `<a>` (and following siblings) out.
+                split_inline_anchor(child, &mut kept, &mut hoisted);
+            }
+        } else {
+            kept.push(child);
+        }
+    }
+
+    parent.children = kept;
+    hoisted
+}
+
+/// Split an inline `<span>` media container: the nested `<a>` (and everything
+/// after it) is hoisted out and marked misnested; the (now empty) shell stays.
+fn split_inline_anchor(mut container: Node, kept: &mut Vec<Node>, hoisted: &mut Vec<Node>) {
+    let Some(i) = container
+        .children
+        .iter()
+        .position(|c| tree_has_element(c, "a"))
+    else {
+        kept.push(container);
+        return;
+    };
+    let drained = container.children.drain(i..).collect::<Vec<_>>();
+    for mut child in drained {
+        mark_misnested(&mut child);
+        hoisted.push(child);
+    }
+    kept.push(container);
 }
 
 #[cfg(test)]
@@ -110,7 +299,6 @@ mod tests {
     fn test_unpacks_simple_fragment() {
         let mut frag = Node::document();
         frag.push_child(Node::text("hello"));
-        // A placeholder carrying a text child via its fragment field.
         let mut ph = fragment_placeholder(ElementKind::Other("span".into()));
         ph.fragment = Some(Box::new(frag));
 
@@ -157,5 +345,104 @@ mod tests {
         run(&mut doc);
         assert_eq!(doc.children.len(), 1);
         assert_eq!(doc.children[0].kind, NodeKind::Text("plain".into()));
+    }
+
+    #[test]
+    fn test_inline_media_fostered_out_of_anchor() {
+        // The inline case: `<a extlink><span><a file><img></a></span></a>` →
+        // `<a extlink><span></span></a><a file><img></a>`.
+        let mut img = Node::element(ElementKind::Image);
+        img.set_attr("src", "x");
+        let mut file_a = Node::element(ElementKind::Wikilink);
+        file_a.set_attr("href", "./File:F.jpg");
+        file_a.push_child(img);
+        let mut span = Node::element(ElementKind::Span);
+        span.push_child(file_a);
+        let mut ext = Node::element(ElementKind::ExtLink);
+        ext.set_attr("rel", "mw:ExtLink");
+        ext.push_child(span);
+
+        let mut doc = Node::document();
+        doc.push_child(ext);
+        run(&mut doc);
+        fix_bad_nesting(&mut doc);
+
+        // doc.children = [<a extlink><span></span></a>, <a file><img></a>]
+        assert_eq!(doc.children.len(), 2);
+        assert_eq!(node_name(&doc.children[0]), "a");
+        assert_eq!(node_name(&doc.children[1]), "a");
+        // The outer `<a>` holds the empty span; the hoisted `<a>` holds the img.
+        assert_eq!(doc.children[0].children.len(), 1);
+        assert_eq!(node_name(&doc.children[0].children[0]), "span");
+        assert!(doc.children[0].children[0].children.is_empty());
+        assert_eq!(doc.children[1].children.len(), 1);
+        assert_eq!(node_name(&doc.children[1].children[0]), "img");
+        // The hoisted `<a>` and its `<img>` are marked misnested.
+        assert!(doc.children[1].dp.as_ref().unwrap().misnested == Some(true));
+    }
+
+    #[test]
+    fn test_thumb_media_fostered_out_of_anchor() {
+        // The block case: `<a extlink><figure><a file><img></a><figcaption/></figure></a>`
+        // → `<a extlink></a><figure><a extlink></a><a file><img></a><figcaption/></figure>`.
+        let mut img = Node::element(ElementKind::Image);
+        img.set_attr("src", "x");
+        let mut file_a = Node::element(ElementKind::Wikilink);
+        file_a.set_attr("href", "./File:F.jpg");
+        file_a.push_child(img);
+        let mut fig = Node::element(ElementKind::Figure);
+        fig.push_child(file_a);
+        let mut cap = Node::element(ElementKind::FigCaption);
+        cap.push_child(Node::text("123"));
+        fig.push_child(cap);
+        let mut ext = Node::element(ElementKind::ExtLink);
+        ext.set_attr("rel", "mw:ExtLink");
+        ext.push_child(fig);
+
+        let mut doc = Node::document();
+        doc.push_child(ext);
+        run(&mut doc);
+        fix_bad_nesting(&mut doc);
+
+        // doc.children = [<a extlink></a>, <figure>…</figure>]
+        assert_eq!(doc.children.len(), 2);
+        assert_eq!(node_name(&doc.children[0]), "a");
+        assert!(doc.children[0].children.is_empty());
+        assert_eq!(node_name(&doc.children[1]), "figure");
+        // The figure holds: a reconstructed empty `<a>`, the file `<a>` + img,
+        // and the figcaption.
+        let fig_children = &doc.children[1].children;
+        assert_eq!(fig_children.len(), 3);
+        assert_eq!(node_name(&fig_children[0]), "a");
+        assert!(fig_children[0].children.is_empty());
+        assert_eq!(node_name(&fig_children[1]), "a");
+        assert_eq!(node_name(&fig_children[1].children[0]), "img");
+        assert_eq!(node_name(&fig_children[2]), "figcaption");
+    }
+
+    #[test]
+    fn test_bare_nested_anchor_fostered_out() {
+        // A bare nested `<a>` (link text, not media) is hoisted out directly:
+        // `<a extlink><a wikilink>Foo</a></a>` → `<a extlink></a><a wikilink>Foo</a>`.
+        let mut inner = Node::element(ElementKind::Wikilink);
+        inner.set_attr("href", "./Foo");
+        inner.push_child(Node::text("Foo"));
+        let mut ext = Node::element(ElementKind::ExtLink);
+        ext.set_attr("rel", "mw:ExtLink");
+        ext.push_child(inner);
+
+        let mut doc = Node::document();
+        doc.push_child(ext);
+        run(&mut doc);
+        fix_bad_nesting(&mut doc);
+
+        assert_eq!(doc.children.len(), 2);
+        assert_eq!(node_name(&doc.children[0]), "a");
+        assert!(doc.children[0].children.is_empty());
+        assert_eq!(node_name(&doc.children[1]), "a");
+        assert_eq!(
+            doc.children[1].children[0].kind,
+            NodeKind::Text("Foo".into())
+        );
     }
 }

@@ -1141,6 +1141,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::compute_dsr::run(&mut ast, wikitext);
         crate::pipeline::p_wrap::run(&mut ast);
+        // AddLinkAttributes runs *before* `dom-unpack` (mirrors PHP's
+        // `NESTED_PIPELINE_DOM_TRANSFORMS`, where `linkclasses` precedes
+        // `linkneighbours+dom-unpack`). The `<a>` still holds its
+        // `mw:DOMFragment` placeholder child at this point, so an extlink whose
+        // content is a nested link/media gets `external text` (reflecting
+        // wikitext intent) rather than `external autonumber` (empty DOM).
+        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         crate::pipeline::tree_builder_html::post_pwrap_transforms(
             &mut ast,
             &depths,
@@ -1148,7 +1155,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         );
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
-        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
+        // Repair `<a>`-inside-`<a>` bad nesting created by DOM-fragment unpack.
+        // (The sync path has no media resolution, so this runs after the other
+        // DOM transforms here; the async `build_ast` runs it after `AddMediaInfo`.)
+        crate::pipeline::unpack_dom_fragments::fix_bad_nesting(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);
         Ok(ast)
     }
@@ -1240,6 +1250,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // DOM-level p-wrapping runs before transclusion encapsulation (mirrors
         // PHP's `pwrap` … `tplwrap` order).
         crate::pipeline::p_wrap::run(&mut ast);
+        // AddLinkAttributes precedes `dom-unpack` (see `wikitext_to_ast`).
+        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         crate::pipeline::tree_builder_html::post_pwrap_transforms(
             &mut ast,
             &depths,
@@ -1247,7 +1259,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         );
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
-        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
         // AddRedLinks: resolve which wikilink targets exist, marking missing
         // ones as red links. Gather the relevant page titles, batch-check their
         // existence via the data source, then apply the pass.
@@ -1273,6 +1284,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         if let Some(source) = source {
             crate::pipeline::add_media_info::run(&mut ast, source, self.config).await;
         }
+        // After media resolution, repair bad-nesting (`<a>` inside `<a>`) that the
+        // DOM-fragment unpack created. This must follow `AddMediaInfo` (mirroring
+        // PHP's `media` … `linkneighbours+dom-unpack` order) so the foster-out
+        // operates on resolved media rather than a broken-media anchor.
+        crate::pipeline::unpack_dom_fragments::fix_bad_nesting(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);
         ast
     }
