@@ -86,6 +86,10 @@ struct ContainerJob {
     /// The `data-upright` factor on the broken span (only present for
     /// `thumb`/`frameless` + `upright`), if any.
     upright: Option<f64>,
+    /// The original wikitext source of the `resource` (e.g. `Image:Foobar.jpg`),
+    /// recovered from the broken span's `data-parsoid.sa.resource`, used to
+    /// round-trip a non-canonical namespace alias through html2wt.
+    href_src: Option<String>,
 }
 
 /// Resolve the `<a>` anchor inside a media container, descending through any
@@ -236,6 +240,13 @@ fn title_from_container(container: &Node, config: &dyn SiteConfig) -> Title {
     }
 }
 
+/// The original wikitext `resource` source on a container's broken span (e.g.
+/// `Image:Foobar.jpg`), recovered from the span's `data-parsoid.sa.resource`.
+fn href_src_from_container(container: &Node) -> Option<String> {
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
+    span.and_then(|s| s.dp.as_ref()?.sa.as_ref()?.get("resource").cloned())
+}
+
 /// The `data-width` attribute on a container's broken span, if present.
 fn data_width_from_container(container: &Node) -> Option<String> {
     let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
@@ -349,6 +360,7 @@ fn collect_containers(
             data_height: data_height_from_container(node),
             manualthumb: data_mw_txt(node, "manualthumb"),
             upright: upright_from_container(node),
+            href_src: href_src_from_container(node),
         });
     }
 }
@@ -491,7 +503,17 @@ fn apply_media_info(
     // Build the `<img>` replacement.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
     // resource copied from the broken span's title (the file DB key).
-    img.set_attr("resource", crate::title::make_link(&job.title, config));
+    let canonical_resource = crate::title::make_link(&job.title, config);
+    img.set_attr("resource", &canonical_resource);
+    // Preserve the normalized/source shadow info so html2wt can round-trip a
+    // non-canonical namespace alias (`Image:Foobar.jpg` → `[[Image:…]]`),
+    // mirroring PHP's `addNormalizedAttribute` on the `<img>` resource.
+    if let Some(href_src) = &job.href_src {
+        let mut dp = crate::wikitext::tokens_v2::DataParsoid::default();
+        dp.set_a("resource", &canonical_resource);
+        dp.set_sa("resource", href_src);
+        img.dp = Some(dp);
+    }
     // alt from the explicit option/caption (when present), before the fixed
     // attrs (mirrors PHP's `thumbattribs` ordering: `src`, `decoding`,
     // `loading`, then `data-file-*`, then `width`/`height`).

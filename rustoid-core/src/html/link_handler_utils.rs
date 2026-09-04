@@ -846,8 +846,23 @@ pub fn figure_to_constrained_text(
     let is_img = crate::html::dom_utils::node_name(tree.node(media_elt)) == "img";
 
     // Try to identify the local title for this image (from `resource`, else
-    // reconstruct from `src`, stripping the `.`/`..` relative prefix).
-    let mut resource: Shadow = attribute_shadow(tree, media_elt, "resource");
+    // reconstruct from `src`, stripping the `.`/`..` relative prefix). Use the
+    // real shadow info (`a`/`sa`) so a non-canonical source namespace alias
+    // (`Image:Foobar.jpg`) round-trips instead of normalizing to `File:`.
+    let mut resource: Shadow = {
+        let media_node = tree.node(media_elt);
+        let si = crate::html::wts_utils::get_attribute_shadow_info(media_node, "resource");
+        Shadow {
+            value: if si.value.is_empty() {
+                None
+            } else {
+                Some(si.value)
+            },
+            modified: si.modified,
+            fromsrc: si.fromsrc,
+            from_data_mw: false,
+        }
+    };
     if resource.value.is_none() {
         let src = tree.node(media_elt).get_attr("src").unwrap_or("");
         if src.is_empty() {
@@ -1103,9 +1118,30 @@ pub fn figure_to_constrained_text(
     let has_default_audio_height = classes.iter().any(|c| c == "mw-default-audio-height");
 
     if !has_default_size && effective_format != "Frame" && !has_manualthumb {
-        let size_string = String::new(); // no data-mw optList to recover from
+        // Recover the original width/height option string from `data-parsoid
+        // optList` (the last `width` entry), mirroring PHP's `$getLastOpt('width')`.
+        // When the size is unmodified, emit that original string verbatim
+        // (`[[…|50px]]` stays `50px`, not `50x50px`).
+        let size_string: String = tree
+            .node(outer_elt)
+            .dp
+            .as_ref()
+            .and_then(|dp| dp.opt_list.as_ref())
+            .and_then(|opts| {
+                opts.iter()
+                    .rev()
+                    .find(|o| o.ck.as_deref() == Some("width"))
+                    .and_then(|o| o.ak.clone())
+            })
+            .unwrap_or_default();
         if size_unmodified && !size_string.is_empty() {
-            // preserve original width/height string (n/a in basic HTML)
+            // Preserve the original width/height string without re-deriving a
+            // square bounding box (`ak` is `$1` so the value is emitted as-is).
+            nopts.push(Nopt {
+                ck: "width".to_string(),
+                ak: "$1".to_string(),
+                v: Some(size_string),
+            });
         } else {
             let mut bbox: Option<i64> = None;
             if let Some(v) = &ww.value
