@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
+use crate::html5::active_formatting_elements::AfeEntry;
 use crate::html5::dispatcher::{Dispatcher, ModeId};
 use crate::html5::element::Attributes;
 use crate::html5::modes;
@@ -261,9 +262,46 @@ impl Html5TreeBuilder {
 
     /// Process a chunk of tokens.
     pub fn process_chunk(&mut self, tokens: &[Item]) {
-        for token in tokens {
-            self.process_token(token);
+        let n = tokens.len();
+        let mut i = 0;
+        while i < n {
+            let token = &tokens[i];
+            // If there are exactly two newlines directly after a `</p>`, and we
+            // have active formatting elements, process one of the newlines
+            // *inside* the paragraph (before the `</p>`) rather than after
+            // (T368720). Mirrors `TreeBuilderStage::processChunk`.
+            let mut nl_index = i + 1;
+            if matches!(token, Item::Tok(ParsoidToken::EndTag(t)) if t.name == "p")
+                && self.has_afe()
+            {
+                while nl_index < n && matches!(tokens[nl_index], Item::Tok(ParsoidToken::Nl(_))) {
+                    nl_index += 1;
+                }
+            }
+            if nl_index == i + 3 {
+                self.process_token(&tokens[i + 1]);
+                self.process_token(&tokens[i + 2]);
+                self.process_token(token);
+                i += 3;
+            } else {
+                self.process_token(token);
+                i += 1;
+            }
         }
+    }
+
+    /// Whether there is an active formatting element (an `Element` entry in the
+    /// AFE list; scope markers and bookmarks do not count). Mirrors
+    /// `TreeBuilderStage::hasAfe` (which walks from the tail, skipping `Marker`).
+    fn has_afe(&self) -> bool {
+        let mut node = self.builder.afe.tail_node();
+        while let Some(ci) = node {
+            if let AfeEntry::Element(_) = self.builder.afe.entry(ci) {
+                return true;
+            }
+            node = self.builder.afe.prev_node(ci);
+        }
+        false
     }
 
     /// Feed a single token.

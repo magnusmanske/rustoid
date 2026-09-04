@@ -236,17 +236,34 @@ impl<H: TreeHandler> TreeBuilder<H> {
         uid
     }
 
-    /// Reparent the children of `from_uid` onto `to_uid` (mirrors
-    /// `TreeHandler::reparentChildren`).
-    pub fn reparent_children(&mut self, from_uid: usize, to_uid: usize, source_start: usize) {
-        let (Some(from), Some(to)) = (
-            self.stack.item_by_uid(from_uid),
-            self.stack.item_by_uid(to_uid),
-        ) else {
+    /// Reparent the children of `from_uid` onto `new_parent` (mirrors
+    /// `TreeBuilder::reparentChildren` + `TreeHandler::reparentChildren`).
+    /// `new_parent` is a freshly-created element not yet on the stack; its DOM
+    /// node is created here (via the handler) and inserted under `from`, then
+    /// `from`'s existing children are moved into it.
+    pub fn reparent_children(
+        &mut self,
+        from_uid: usize,
+        new_parent: &mut Element,
+        source_start: usize,
+    ) {
+        let Some(from) = self.stack.item_by_uid(from_uid).cloned() else {
             return;
         };
-        let (from, to) = (from.clone(), to.clone());
-        self.handler.reparent_children(&from, &to, source_start);
+        // Insert the new parent node under `from` (creating its DOM node and
+        // registering it as the last child of `from`).
+        self.handler.insert_element(
+            Preposition::Under,
+            Some(from_uid),
+            new_parent,
+            false,
+            source_start,
+            0,
+        );
+        // Move `from`'s children (all but the just-inserted new parent) into
+        // the new parent.
+        self.handler
+            .reparent_children(&from, new_parent, source_start);
     }
 
     /// Pop the current node from the stack and notify the handler.
@@ -719,14 +736,13 @@ impl<H: TreeHandler> TreeBuilder<H> {
             }
 
             // Steps 15-17: new formatting element, move furthest block children.
-            let new_fmt = Element::new(
+            let mut new_fmt = Element::new(
                 &fmt_elt.namespace,
                 &fmt_elt.name,
                 fmt_elt.attrs.clone(),
                 self.next_uid(),
             );
-            let new_fmt_uid = new_fmt.uid;
-            self.reparent_children(furthest_block_uid, new_fmt_uid, source_start);
+            self.reparent_children(furthest_block_uid, &mut new_fmt, source_start);
 
             // Step 18: remove fmt from AFE, replace bookmark with new fmt.
             self.afe.remove(fmt_uid);
@@ -734,16 +750,21 @@ impl<H: TreeHandler> TreeBuilder<H> {
 
             // Step 19: rebuild the stack.
             let mut temp_stack: Vec<Element> = Vec::new();
-            let mut index = self.stack.length();
+            let mut index = self.stack.length().saturating_sub(1);
+            // Stash elements above the furthest block.
             while index > furthest_block_index {
-                index -= 1;
                 if let Some(elt) = self.stack.pop() {
                     temp_stack.push(elt);
                 }
-            }
-            temp_stack.push(new_fmt.clone());
-            while index > fmt_idx {
+                if index == 0 {
+                    break;
+                }
                 index -= 1;
+            }
+            // Add the new formatting element.
+            temp_stack.push(new_fmt.clone());
+            // Stash elements above the formatting element.
+            while index > fmt_idx {
                 let elt = self.stack.pop();
                 let Some(elt) = elt else {
                     break;
@@ -753,7 +774,12 @@ impl<H: TreeHandler> TreeBuilder<H> {
                 } else {
                     temp_stack.push(elt);
                 }
+                if index == 0 {
+                    break;
+                }
+                index -= 1;
             }
+            // Remove the formatting element itself.
             let elt = self.stack.pop();
             if let Some(elt) = elt {
                 self.handler.end_tag(&elt, source_start, 0);

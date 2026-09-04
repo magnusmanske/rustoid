@@ -71,8 +71,9 @@ pub struct Element {
     pub is_virtual: bool,
     /// Current stack slot index, or `None` if not in the stack.
     pub stack_index: Option<usize>,
-    /// User data attached by the handler (the DOM node id).
-    pub user_data: usize,
+    /// User data attached by the handler (the DOM node id). `None` until the
+    /// handler creates a node for this element (mirrors PHP's `null` `userData`).
+    pub user_data: Option<usize>,
     /// Unique id.
     pub uid: usize,
 }
@@ -95,7 +96,7 @@ impl Element {
             attrs,
             is_virtual: false,
             stack_index: None,
-            user_data: 0,
+            user_data: None,
             uid,
         }
     }

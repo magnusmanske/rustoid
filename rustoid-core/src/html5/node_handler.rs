@@ -96,9 +96,12 @@ impl NodeTreeHandler {
     }
 
     /// Attach a child (arena index or text) under a parent arena index.
+    /// If the child is a node that already has a parent, it is first removed
+    /// from that parent (mirrors DOM `insertBefore`, which re-parents).
     fn attach_under(&mut self, parent_idx: usize, child: Child) {
         match child {
             Child::Node(idx) => {
+                self.detach(idx);
                 self.children[parent_idx].push(idx);
                 self.parents[idx] = Some(parent_idx);
             }
@@ -121,6 +124,14 @@ impl NodeTreeHandler {
         }
     }
 
+    /// Detach a node from its current parent (if any), collapsing the parent's
+    /// child list. Used when re-inserting an existing node (a move).
+    fn detach(&mut self, idx: usize) {
+        if let Some(old_parent) = self.parents[idx] {
+            self.children[old_parent].retain(|&c| c != idx);
+        }
+    }
+
     /// Insert a child (arena index or text) immediately before the reference
     /// arena index (i.e. as its previous sibling). Falls back to attaching under
     /// the reference's parent if the reference is not yet linked into a children
@@ -136,6 +147,7 @@ impl NodeTreeHandler {
         };
         match child {
             Child::Node(idx) => {
+                self.detach(idx);
                 self.children[parent_idx].insert(pos, idx);
                 self.parents[idx] = Some(parent_idx);
             }
@@ -283,26 +295,35 @@ impl TreeHandler for NodeTreeHandler {
         _source_start: usize,
         _source_length: usize,
     ) {
-        let kind = Self::kind_for(&element.name);
-        let kind = if element.name == "a" {
-            Self::a_kind(element)
+        // If the element already has a DOM node (it was inserted before, e.g.
+        // by the adoption-agency algorithm re-inserting a formatting element
+        // clone), reuse that node and move it to the new location (mirrors
+        // `DOMBuilder::insertElement`'s `$element->userData` check).
+        let idx = if let Some(idx) = element.user_data {
+            idx
         } else {
-            kind
+            let kind = Self::kind_for(&element.name);
+            let kind = if element.name == "a" {
+                Self::a_kind(element)
+            } else {
+                kind
+            };
+            let mut node = Node::element(kind);
+            for (k, v) in element.attrs.get_values() {
+                // HTML5 tree-construction attribute-value normalization
+                // ("create an element for a token"): replace LF/FF/CR/TAB with
+                // U+0020 SPACE, so `<pre class="one\ntwo">` yields `one two`.
+                node.set_attr(k.clone(), normalize_attr_value(v));
+            }
+            let dom = Rc::new(RefCell::new(node));
+            let idx = self.arena.len();
+            self.arena.push(dom);
+            self.children.push(Vec::new());
+            self.parents.push(None);
+            element.user_data = Some(idx);
+            self.uids.insert(element.uid, idx);
+            idx
         };
-        let mut node = Node::element(kind);
-        for (k, v) in element.attrs.get_values() {
-            // HTML5 tree-construction attribute-value normalization
-            // ("create an element for a token"): replace LF/FF/CR/TAB with
-            // U+0020 SPACE, so `<pre class="one\ntwo">` yields `one two`.
-            node.set_attr(k.clone(), normalize_attr_value(v));
-        }
-        let dom = Rc::new(RefCell::new(node));
-        let idx = self.arena.len();
-        self.arena.push(dom);
-        self.children.push(Vec::new());
-        self.parents.push(None);
-        element.user_data = idx;
-        self.uids.insert(element.uid, idx);
         self.place(preposition, reference, Child::Node(idx));
     }
 
@@ -351,15 +372,32 @@ impl TreeHandler for NodeTreeHandler {
     fn remove_node(&mut self, _element: &Element, _source_start: usize) {}
 
     fn reparent_children(&mut self, element: &Element, new_parent: &Element, _source_start: usize) {
-        if let (Some(&from), Some(&to)) =
+        // PHP `DOMBuilder::reparentChildren`:
+        //   1. `insertElement(UNDER, element, newParent)` — already done by the
+        //      caller (`TreeBuilder::reparent_children`), which created the
+        //      new parent's node as the last child of `element`.
+        //   2. Move each of `element`'s children into `newParent`, skipping
+        //      `newParent` itself (the loop stops when `firstChild` is the
+        //      new parent node).
+        let (Some(&from), Some(&to)) =
             (self.uids.get(&element.uid), self.uids.get(&new_parent.uid))
-        {
-            let children = std::mem::take(&mut self.children[from]);
-            for &c in &children {
-                self.parents[c] = Some(to);
-            }
-            self.children[to].extend(children);
+        else {
+            return;
+        };
+        // Move all of `from`'s children that come before `to` (the new parent,
+        // which was appended last) into `to`, preserving order.
+        let pos = self.children[from]
+            .iter()
+            .position(|&c| c == to)
+            .unwrap_or(self.children[from].len());
+        let moved = self.children[from].drain(..pos).collect::<Vec<_>>();
+        for &c in &moved {
+            self.parents[c] = Some(to);
         }
+        let mut kept = std::mem::take(&mut self.children[to]);
+        let mut combined = moved;
+        combined.append(&mut kept);
+        self.children[to] = combined;
     }
 }
 
