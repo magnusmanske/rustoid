@@ -19,7 +19,7 @@ enum DomChange {
     Inserted {
         parent_path: Vec<usize>,
         index: usize,
-        node: Node,
+        node: Box<Node>,
     },
     /// A node was deleted from the given position.
     Deleted {
@@ -151,7 +151,7 @@ fn diff_asts(original: &Node, modified: &Node, parent_path: &[usize]) -> Result<
                         changes.push(DomChange::Inserted {
                             parent_path: child_path,
                             index: i,
-                            node: node.clone(),
+                            node: Box::new(node.clone()),
                         });
                     }
                     (None, None) => {}
@@ -207,7 +207,7 @@ fn diff_asts(original: &Node, modified: &Node, parent_path: &[usize]) -> Result<
                         changes.push(DomChange::Inserted {
                             parent_path: child_path,
                             index: i,
-                            node: node.clone(),
+                            node: Box::new(node.clone()),
                         });
                     }
                     (None, None) => {}
