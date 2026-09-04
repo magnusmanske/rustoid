@@ -325,6 +325,12 @@ pub fn render_inline_fragment(
     ));
     let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
     crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
+    // AddLinkAttributes also runs in the nested fragment pipeline (mirrors PHP's
+    // `NESTED_PIPELINE_DOM_TRANSFORMS`, where `linkclasses` precedes
+    // `linkneighbours+dom-unpack`): it assigns `class`/`rel` to links inside
+    // media/gallery captions, which would otherwise only get the bare `rel`
+    // set by the token handler.
+    crate::pipeline::add_link_attributes::run(&mut frag, config);
     frag
 }
 
