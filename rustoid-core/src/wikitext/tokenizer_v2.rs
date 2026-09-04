@@ -2370,9 +2370,13 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
 
-        // Find the closing `]`.
-        if let Some(end) = self.remaining().find(']') {
-            let content = &self.remaining()[..end];
+        // Find the closing `]`, skipping any nested `[[…]]` (a wikilink inside the
+        // link text must not terminate the outer extlink). Track bracket depth so
+        // the extlink closes at the first depth-0 `]`.
+        let rem = self.remaining();
+        let end = find_extlink_close(rem);
+        if let Some(end) = end {
+            let content = &rem[..end];
             let (url, text) = if let Some(space) = content.find([' ', '\t']) {
                 (
                     content[..space].to_string(),
@@ -2980,6 +2984,38 @@ fn is_space_or_nbsp(c: char) -> bool {
         ' ' | '\t' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
             ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
+}
+
+/// Find the byte offset of the closing `]` of an external link, skipping nested
+/// `[[…]]` wikilinks (which must not terminate the outer extlink). Mirrors the
+/// PHP `extlink_preprocessor_text` which tracks balanced brackets.
+fn find_extlink_close(input: &str) -> Option<usize> {
+    let mut i = 0;
+    let mut bracket_depth: i32 = 0;
+    while i < input.len() {
+        if input[i..].starts_with("[[") {
+            bracket_depth += 1;
+            i += 2;
+            continue;
+        }
+        if input[i..].starts_with("]]") {
+            if bracket_depth > 0 {
+                bracket_depth -= 1;
+            }
+            i += 2;
+            continue;
+        }
+        if input[i..].starts_with(']') {
+            if bracket_depth == 0 {
+                return Some(i);
+            }
+            i += 1;
+            continue;
+        }
+        let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        i += ch_len;
+    }
+    None
 }
 
 /// Find the byte offset of the first `]]` that is not inside a `<nowiki>` element.
@@ -4049,6 +4085,31 @@ mod tests {
         let tokens = tokenize("[http://example.com link]");
         let has_extlink = tokens.iter().any(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink"));
         assert!(has_extlink, "Expected extlink, got: {:?}", tokens);
+    }
+
+    #[test]
+    fn test_extlink_nested_wikilink_content() {
+        // A nested `[[…]]` inside the extlink text must not terminate the
+        // outer `]`; the full `[[File:Foobar.jpg|123]]` is captured as
+        // `mw:content` (mirrors PHP's `extlink_preprocessor_text`).
+        let tokens = tokenize("[http://www.google.com [[File:Foobar.jpg|123]]]");
+        let extlink = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink" => Some(tk),
+                _ => None,
+            })
+            .expect("expected an extlink token");
+        let content = extlink
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:content"))
+            .and_then(|kv| kv.value.as_str())
+            .expect("expected mw:content");
+        assert_eq!(
+            content, "[[File:Foobar.jpg|123]]",
+            "nested wikilink content must be captured in full"
+        );
     }
 
     #[test]

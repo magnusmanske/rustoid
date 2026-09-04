@@ -1268,7 +1268,9 @@ pub(crate) fn resolve_wikilink_option(value: &str, is_link: bool) -> String {
 /// Register a pre-built inline caption fragment in `fragments` and return the
 /// `mw:dom-fragment-token` placeholder that the tree builder splices in its
 /// place (mirrors `PipelineUtils::getDOMFragmentToken` + `tunnelDOMThroughTokens`).
-fn dom_fragment_token(
+/// Wrap a fragment into an `mw:dom-fragment-token` self-closing token.
+/// Mirrors PHP's `PipelineUtils::getDOMFragmentToken`.
+pub(crate) fn dom_fragment_token(
     frag: crate::dom::node::Node,
     token: &ParsoidToken,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,

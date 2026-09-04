@@ -265,11 +265,19 @@ pub fn render_inline_fragment(
         };
         match stt.name.as_str() {
             "extlink" => {
-                match on_ext_link(
-                    &ParsoidToken::SelfclosingTag(stt.clone()),
-                    clean,
-                    config.relative_link_prefix(),
-                ) {
+                let token = ParsoidToken::SelfclosingTag(stt.clone());
+                let render_content = |items: Vec<Item>| {
+                    // Re-render link content (nested `[[…]]`) inline and wrap the
+                    // result in a DOM-fragment token (mirrors PHP's
+                    // `getDOMFragmentToken`).
+                    let mut f = std::collections::HashMap::new();
+                    let mut id = 0usize;
+                    let frag = render_inline_fragment(config, items, &mut f, &mut id);
+                    crate::pipeline::wiki_link_render::dom_fragment_token(
+                        frag, &token, fragments, next_id,
+                    )
+                };
+                match on_ext_link(&token, clean, config.relative_link_prefix(), render_content) {
                     Some(rendered) => out.extend(rendered),
                     None => out.push(item),
                 }
@@ -621,7 +629,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
     /// Expand `extlink`/`urllink` self-closing tokens into `<a>`/`<img>` tag
     /// sequences (mirrors the TT2 `ExternalLinkHandler`).
-    fn render_external_links(&self, tokens: Vec<Item>) -> Vec<Item> {
+    fn render_external_links(
+        &self,
+        tokens: Vec<Item>,
+        fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+        next_id: &mut usize,
+    ) -> Vec<Item> {
         use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
 
         let mut out: Vec<Item> = Vec::new();
@@ -639,10 +652,43 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             match stt.name.as_str() {
                 "extlink" => {
+                    let token = ParsoidToken::SelfclosingTag(stt.clone());
+                    let render_content = |items: Vec<Item>| {
+                        // Re-tokenize and render the link content so nested
+                        // `[[…]]` (media/links) are expanded, then wrap in a
+                        // DOM-fragment token (mirrors PHP's `getDOMFragmentToken`).
+                        let mut src_items = items;
+                        // Render any nested wikilinks, then external links.
+                        let rendered = if src_items
+                            .iter()
+                            .any(|it| matches!(it, Item::Str(s) if s.contains("[[")))
+                        {
+                            // Re-tokenize each string token that contains `[[`.
+                            let mut expanded: Vec<Item> = Vec::new();
+                            for it in src_items.drain(..) {
+                                match it {
+                                    Item::Str(s) if s.contains("[[") => {
+                                        let sub = self.tokenize_inline(&s).unwrap_or_default();
+                                        let sub = self.render_links(sub, fragments, next_id);
+                                        expanded.extend(sub);
+                                    }
+                                    other => expanded.push(other),
+                                }
+                            }
+                            expanded
+                        } else {
+                            src_items
+                        };
+                        let frag = self.build_inline_fragment(rendered, fragments, next_id);
+                        crate::pipeline::wiki_link_render::dom_fragment_token(
+                            frag, &token, fragments, next_id,
+                        )
+                    };
                     let Some(rendered) = on_ext_link(
-                        &ParsoidToken::SelfclosingTag(stt.clone()),
+                        &token,
                         clean,
                         self.config.relative_link_prefix(),
+                        render_content,
                     ) else {
                         out.push(item);
                         continue;
@@ -974,7 +1020,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 )
             })
             .collect();
-        let tokens = self.render_external_links(tokens);
+        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let mut tokens = self.render_behavior_switches(tokens);
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
@@ -1086,7 +1132,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             std::collections::HashMap::new();
         let mut next_id = 0usize;
         let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
-        let tokens = self.render_external_links(tokens);
+        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
         let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens);
@@ -1164,7 +1210,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             std::collections::HashMap::new();
         let mut next_id = 0usize;
         let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
-        let tokens = self.render_external_links(tokens);
+        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
         // Route `format="wikitext"` extension bodies through the inline

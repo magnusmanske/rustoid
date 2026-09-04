@@ -100,10 +100,17 @@ fn has_image_link_generic(href: &str) -> bool {
 
 /// Handler for an `extlink` token (a bracketed `[url ...]`). Mirrors
 /// `ExternalLinkHandler::onExtLink` for the non-templated case.
+///
+/// `render_content` turns the link's content items into a single DOM-fragment
+/// token (mirrors PHP's `PipelineUtils::getDOMFragmentToken` with
+/// `inlineContext => true`), so that nested wikilinks/media in the link text are
+/// rendered by a sub-pipeline and then fostered out of the `<a>` by tree
+/// building.
 pub fn on_ext_link(
     token: &ParsoidToken,
     clean: impl Fn(&str) -> Option<String>,
     relative_link_prefix: &str,
+    mut render_content: impl FnMut(Vec<Item>) -> Item,
 ) -> Option<Vec<Item>> {
     let orig_href = token.get_attribute_v("href")?.to_string();
     // `mw:content` may be a plain string, or (after the AttributeExpander has
@@ -161,6 +168,9 @@ pub fn on_ext_link(
     let href = clean(&orig_href)?;
 
     // If the content is a single plain-text URL (and an image), render `<img>`.
+    let has_nested_wikilink = content_items
+        .iter()
+        .any(|it| matches!(it, Item::Str(s) if s.contains("[[")));
     let rendered_content: Vec<Item> = if let [Item::Str(s)] = content_items.as_slice()
         && has_image_link(s, &[])
     {
@@ -172,6 +182,12 @@ pub fn on_ext_link(
         );
         img.data_parsoid.stx = Some("url".to_string());
         vec![Item::Tok(ParsoidToken::SelfclosingTag(img))]
+    } else if has_nested_wikilink {
+        // Content containing a nested `[[…]]` (media/link) is rendered through a
+        // sub-pipeline and wrapped in a DOM-fragment token (`getDOMFragmentToken`),
+        // so the media is rendered and then fostered out of the `<a>` by tree
+        // building.
+        vec![render_content(content_items)]
     } else {
         content_items
     };
@@ -247,7 +263,10 @@ mod tests {
     #[test]
     fn test_extlink_renders_a_tag() {
         let token = extlink_token("http://example.com", "link");
-        let out = on_ext_link(&token, id_clean, "./").unwrap();
+        let out = on_ext_link(&token, id_clean, "./", |_items| {
+            Item::Str("link".to_string())
+        })
+        .unwrap();
 
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "a"));
         assert!(matches!(out.last(), Some(Item::Tok(ParsoidToken::EndTag(t))) if t.name == "a"));
