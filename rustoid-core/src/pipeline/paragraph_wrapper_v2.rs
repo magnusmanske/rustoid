@@ -251,8 +251,15 @@ impl ParagraphWrapper {
             }
         }
 
-        // 2. SOL-transparent link tags, metas, style.
-        if self.is_sol_transparent_tag(&token, &token_name) {
+        // 2. SOL-transparent link tags, metas, and (T186965) `<style>`, which
+        // doesn't open/close paragraphs but also doesn't induce one by itself.
+        // `style` is handled here (newline-swallowing) but is deliberately NOT in
+        // `is_sol_transparent_tag`, which `open_p_tag`/`close_open_p_tag` use to
+        // hoist SOL-transparent tokens out of a paragraph — a `<style>` must stay
+        // *inside* the surrounding paragraph.
+        let is_style_tag = token_name == "style"
+            || matches!(token, Item::Tok(ParsoidToken::EndTag(ref t)) if t.name == "style");
+        if self.is_sol_transparent_tag(&token, &token_name) || is_style_tag {
             if self.new_line_count == 0 {
                 return self.flush_buffers(token);
             } else if self.new_line_count == 1 {
@@ -335,12 +342,6 @@ impl ParagraphWrapper {
     /// `isSolTransparentLinkTag` (a `<link>` with `rel` matching
     /// `mw:PageProp/(?:Category|redirect|Language)`).
     fn is_sol_transparent_tag(&self, token: &Item, token_name: &str) -> bool {
-        if matches!(token, Item::Tok(ParsoidToken::EndTag(t)) if t.name == "style") {
-            return true;
-        }
-        if token_name == "style" {
-            return true;
-        }
         if token_name == "meta" && matches!(token, Item::Tok(ParsoidToken::SelfclosingTag(_))) {
             // PHP's `TokenUtils::isSolTransparent` excludes `meta` tokens that
             // carry a literal-HTML marker (`stx === 'html'`, i.e. an explicit

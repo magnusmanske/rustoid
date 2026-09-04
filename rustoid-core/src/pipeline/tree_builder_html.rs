@@ -161,6 +161,7 @@ impl Html5TreeBuilder {
                 && k != "data-parsoid"
                 && k != "data-mw"
                 && k != DATA_OBJECT_ATTR_NAME
+                && k != "data-fragment-id"
                 && !templated.contains(k)
             {
                 pairs.push((k.to_string(), v.to_string()));
@@ -402,6 +403,22 @@ impl Html5TreeBuilder {
     fn process_start_tag(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
         let data_mw = Self::extract_data_mw(attribs);
         let (attrs, data_id) = self.stash_data_attribs(attribs, dp, data_mw);
+
+        // A start tag carrying a `data-fragment-id` tunnels a pre-built DOM
+        // fragment (mirrors `tunnelDOMThroughTokens`, which stores the fragment
+        // on the wrapper token). Stash it into the same `data-object-id` entry so
+        // `resolve_data_ids` attaches it to the element for `UnpackDOMFragments`.
+        let fragment_id = attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+            .and_then(|kv| kv.value.as_str())
+            .and_then(|s| s.parse::<usize>().ok());
+        if let Some(fragment_id) = fragment_id
+            && let Some(fragment) = self.fragments.remove(&fragment_id)
+            && let Some(stashed) = self.stash.get_mut(&data_id)
+        {
+            stashed.fragment = Some(fragment);
+        }
 
         // Mirrors `insertExplicitStartTag`: if the tag produced no element
         // (stripped/ignored), handle it as a deleted start tag.

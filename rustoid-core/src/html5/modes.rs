@@ -399,6 +399,18 @@ mod in_head {
             }
             // Raw-text / RCDATA elements: NOT void; switch to text mode to
             // consume the following characters as raw text until the end tag.
+            // A `mw:DOMFragment`-typed tunnel (e.g. `<style typeof="mw:DOMFragment">`)
+            // is a transparent placeholder, not raw text: its children are stashed
+            // in a fragment, so it must stay inline instead of switching to text
+            // mode (which would swallow following content as raw text).
+            "title" | "noframes" | "style" | "script"
+                if attrs
+                    .get("typeof")
+                    .map(|t| t.contains("mw:DOMFragment"))
+                    .unwrap_or(false) =>
+            {
+                Some(b.insert_element(name, attrs, false, ss, sl))
+            }
             "title" | "noframes" | "style" | "script" => {
                 let uid = b.insert_element(name, attrs, false, ss, sl);
                 d.switch_and_save(ModeId::Text);

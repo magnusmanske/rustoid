@@ -303,24 +303,27 @@ fn pre_items(token: &SelfclosingTagTk, _config: &dyn crate::traits::SiteConfig) 
 }
 
 /// Build the token sequence for a `<style>` extension. Faithful port of
-/// `ParserTests\StyleTag::sourceToDom`: a `<style>` element whose `innerHTML` is
-/// the raw body source (a raw-text element, so it is *not* entity-decoded), with
-/// `typeof="mw:Extension/style"`. Like `pwraptest`, the whole thing is tunneled
-/// through a `mw:dom-fragment-token` placeholder so its raw-text content bypasses
-/// token-level p-wrapping (mirrors `ExtensionHandler::onDocumentFragment`).
+/// `ParserTests\StyleTag::sourceToDom` combined with `tunnelDOMThroughTokens`:
+/// the extension produces a `<style typeof="mw:Extension/style">` element whose
+/// `innerHTML` is the raw body source, but the body is then *tunnelled* into a
+/// stashed DOM fragment while the token stream only sees an empty
+/// `<style typeof="mw:DOMFragment">` + `</style>` pair (mirrors `getWrapperTokens`,
+/// which shallow-clones the `<style>` so only the tags — not the raw text — reach
+/// the token stage). This keeps the raw-text body out of p-wrapping and lets the
+/// ParagraphWrapper see a `style`-named token rather than a `meta` marker, so it
+/// participates in the surrounding paragraph (T186965).
 fn style_items(
     token: &SelfclosingTagTk,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
     next_id: &mut usize,
 ) -> Vec<Item> {
     use crate::dom::node::{ElementKind, Node};
-    use crate::wikitext::tokens_v2::KeyValue;
 
     let source = attr_str(token, "source").unwrap_or_default().to_string();
     let body = extract_ext_body(token, &source);
 
     // Build the `<style typeof="mw:Extension/style">` element with the raw
-    // body as its single text node.
+    // body as its single text node, as the stashed fragment.
     let mut style = Node::element(ElementKind::Other("style".to_string()));
     style.set_attr("typeof", "mw:Extension/style");
     style.push_child(Node::text(&body));
@@ -332,21 +335,24 @@ fn style_items(
     *next_id += 1;
     fragments.insert(id, frag);
 
-    // Emit a `mw:dom-fragment-token` placeholder carrying the fragment id.
+    // Emit an empty `<style typeof="mw:DOMFragment">` + `</style>` pair carrying
+    // the fragment id; the tree builder stashes the fragment (keyed by the id)
+    // and `unpack_dom_fragments` restores the real `<style>` later.
     let mut dp = token.data_parsoid.clone();
     dp.src = None;
     dp.src_content = None;
     dp.ext_tag_offsets = None;
-    let mut frag_tok = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
-    frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
-        key: KeyValue::Str("data-fragment-id".to_string()),
-        value: KeyValue::Str(id.to_string()),
-        src_offsets: None,
-        ksrc: None,
-        vsrc: None,
-    });
 
-    vec![Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))]
+    let mut open = TagTk::new("style", vec![], dp);
+    open.add_attribute_str("typeof", "mw:DOMFragment");
+    open.add_attribute_str("data-fragment-id", id.to_string().as_str());
+
+    let close = EndTagTk::new("style", vec![], DataParsoid::default());
+
+    vec![
+        Item::Tok(ParsoidToken::Tag(open)),
+        Item::Tok(ParsoidToken::EndTag(close)),
+    ]
 }
 
 /// Recover the parsed start-tag attributes from an extension token's `data-mw`
