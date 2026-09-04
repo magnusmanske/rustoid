@@ -87,6 +87,17 @@ fn default_protocols() -> Vec<String> {
     .collect()
 }
 
+/// The result of parsing a possible extension tag at the current position.
+enum ExtensionParse {
+    /// Not an extension tag.
+    NotExtension,
+    /// An unmatched extension tag shadowing an HTML tag (fall through to HTML).
+    ShadowedHtml(TagTk),
+    /// A recognized `<nowiki>`/`<pre>`/… extension, collapsed to an `extension`
+    /// self-closing token.
+    Extension(SelfclosingTagTk),
+}
+
 /// The PEG tokenizer state.
 pub struct PegTokenizer<'a> {
     /// Input wikitext.
@@ -1046,7 +1057,7 @@ impl<'a> PegTokenizer<'a> {
         let mut redirect = SelfclosingTagTk::new("mw:redirect", vec![], dp);
         redirect.attribs.push(KV {
             key: KeyValue::Str("href".to_string()),
-            value: tokenize_link_target(target, self.lang_conv_enabled),
+            value: tokenize_link_target(target, self.lang_conv_enabled, &self.ext_tags),
             src_offsets: None,
             ksrc: None,
             vsrc: None,
@@ -1504,8 +1515,30 @@ impl<'a> PegTokenizer<'a> {
     /// `extension_handler`); other extension tags fall through to the HTML path
     /// until their handlers are implemented.
     fn try_extension_tag(&mut self) -> bool {
+        match self.parse_extension_tag() {
+            ExtensionParse::NotExtension => false,
+            ExtensionParse::ShadowedHtml(tk) => {
+                self.emit_token(ParsoidToken::Tag(tk));
+                true
+            }
+            ExtensionParse::Extension(stt) => {
+                self.emit_token(ParsoidToken::SelfclosingTag(stt));
+                true
+            }
+        }
+    }
+
+    /// Parse an extension tag at the current position without emitting it.
+    /// Faithful port of the `maybe_extension_tag` grammar rule, returning one of:
+    ///   - [`ExtensionParse::Extension`]: a `extension` self-closing token
+    ///     (`<nowiki>`/`<pre>`/…) whose `source` carries the whole tag region;
+    ///   - [`ExtensionParse::ShadowedHtml`]: an *unmatched* extension tag that
+    ///     shadows an HTML tag (e.g. `<pre </table>`), which must fall through to
+    ///     its HTML equivalent (`stx: "html"`); or
+    ///   - [`ExtensionParse::NotExtension`]: no extension tag here.
+    fn parse_extension_tag(&mut self) -> ExtensionParse {
         if self.starts_with("</") || !self.starts_with("<") {
-            return false;
+            return ExtensionParse::NotExtension;
         }
 
         let saved = self.pos;
@@ -1513,7 +1546,7 @@ impl<'a> PegTokenizer<'a> {
         let name = self.parse_tag_name();
         if name.is_empty() {
             self.pos = saved;
-            return false;
+            return ExtensionParse::NotExtension;
         }
         let lc_name = name.to_lowercase();
         if !matches!(
@@ -1522,7 +1555,7 @@ impl<'a> PegTokenizer<'a> {
         ) || !self.ext_tags.contains(&lc_name)
         {
             self.pos = saved;
-            return false;
+            return ExtensionParse::NotExtension;
         }
 
         // Parse the start-tag attributes (the `pre` extension sanitizes them).
@@ -1539,7 +1572,7 @@ impl<'a> PegTokenizer<'a> {
             self.advance(1);
         } else {
             self.pos = saved;
-            return false;
+            return ExtensionParse::NotExtension;
         }
 
         // Locate the matching end tag (`</name ...>`), if any, in the remaining
@@ -1569,12 +1602,7 @@ impl<'a> PegTokenizer<'a> {
             let mut html_dp = self.make_dp(saved, self.pos);
             html_dp.stx = Some("html".to_string());
             html_dp.src = Some(self.input[saved..self.pos].to_string());
-            self.emit_token(ParsoidToken::Tag(TagTk::new(
-                name.to_lowercase(),
-                attrs,
-                html_dp,
-            )));
-            return true;
+            return ExtensionParse::ShadowedHtml(TagTk::new(name.to_lowercase(), attrs, html_dp));
         }
 
         let mut dp = self.make_dp(saved, self.pos);
@@ -1609,8 +1637,7 @@ impl<'a> PegTokenizer<'a> {
         // `pre` extension handler can sanitize them faithfully (mirrors PHP's
         // `maybe_extension_tag`, which stores `$t->attribs` as the `options` KV).
         stt.data_mw = Some(extension_data_mw(&attrs));
-        self.emit_token(ParsoidToken::SelfclosingTag(stt));
-        true
+        ExtensionParse::Extension(stt)
     }
 
     /// Try an HTML comment: `<!-- ... -->`
@@ -2326,7 +2353,7 @@ impl<'a> PegTokenizer<'a> {
             // can be expanded by the AttributeExpander.
             stt.attribs.push(KV {
                 key: KeyValue::Str("href".to_string()),
-                value: tokenize_link_target(target.trim(), self.lang_conv_enabled),
+                value: tokenize_link_target(target.trim(), self.lang_conv_enabled, &self.ext_tags),
                 src_offsets: None,
                 ksrc: None,
                 vsrc: None,
@@ -2337,7 +2364,7 @@ impl<'a> PegTokenizer<'a> {
             for part in parts.iter().skip(1) {
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:maybeContent".to_string()),
-                    value: tokenize_link_content(part, self.lang_conv_enabled),
+                    value: tokenize_link_content(part, self.lang_conv_enabled, &self.ext_tags),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
@@ -2406,7 +2433,7 @@ impl<'a> PegTokenizer<'a> {
                     ));
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:content".to_string()),
-                    value: tokenize_link_content(t, self.lang_conv_enabled),
+                    value: tokenize_link_content(t, self.lang_conv_enabled, &self.ext_tags),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: None,
@@ -3018,29 +3045,49 @@ fn find_extlink_close(input: &str) -> Option<usize> {
     None
 }
 
-/// Find the byte offset of the first `]]` that is not inside a `<nowiki>` element.
+/// Find the byte offset of the first `]]` that closes the wikilink.
 ///
-/// The PHP wikilink/redirect grammar parses `<nowiki>` as a directive, so a `]]`
-/// inside `<nowiki>…</nowiki>` does *not* terminate the enclosing `[[…]]`.
+/// Faithfully mirrors PHP's `wikilink_preproc_internal`, whose content is
+/// `wikilink_preprocessor_text? (pipe link_text?)*` followed by a literal `]]`.
+/// Each pipe-separated `link_text` segment is scanned per
+/// `link_text_parameterized`:
+///   - a `<nowiki>` element is opaque (its `]]`/`|` are not structural);
+///   - a nested `[[…]]` is a balanced atom, closed recursively;
+///   - `{{…}}`/`{{{…}}}` templates and `-{…}-` language variants are balanced
+///     atoms (their `]]`/`|`/`[` are not structural);
+///   - the `]` alternative: a lone `]` (`!']'`) is always content, and the
+///     first `]` of a `]]…]` run is *also* content when a `[` has appeared
+///     earlier in this segment (`strpos($text,'[')`) and the run has an odd
+///     length, so `[[A|[x]]]` keeps `[x]` as its whole link text and closes at
+///     the `]]` that follows that `]` (the legacy `handleInternalLinks2` oddity
+///     PEP reproduces).
 fn find_wikilink_close(input: &str) -> Option<usize> {
+    find_wikilink_close_at(input)
+}
+
+/// Recursive worker for [`find_wikilink_close`].
+fn find_wikilink_close_at(input: &str) -> Option<usize> {
     let lower = input.to_ascii_lowercase();
     let mut i = 0;
-    let mut bracket_depth: i32 = 0;
-    while i + 1 < input.len() {
+    // Whether a `[` has appeared in the raw source of the current pipe-separated
+    // `link_text` segment (mirrors `strpos($text, '[')` in `link_text_parameterized`,
+    // where `$text` is the segment source from its start to the current `]`).
+    let mut seg_has_open_bracket = false;
+    while i < input.len() {
+        // `<nowiki>` is opaque: its `]]`, `|`, and `[` are not structural, though
+        // a `[` inside still counts for `strpos($text,'[')` (raw source).
         if lower[i..].starts_with("<nowiki") {
             let rest = &input[i + 7..];
-            // A real `<nowiki>` tag is followed by `>`, `/`, or whitespace.
             let is_tag = rest.starts_with('>')
                 || rest.starts_with('/')
                 || rest.starts_with(|c: char| c.is_whitespace());
             if is_tag && let Some((tag_end, self_closing)) = nowiki_start_tag_end(input, i) {
                 if self_closing {
-                    // `<nowiki … />`: skip the whole self-closing tag; its `|`
-                    // (if any, inside an attribute) is not a pipe separator.
+                    seg_has_open_bracket |= input[i..tag_end].contains('[');
                     i = tag_end;
                 } else {
                     // Paired `<nowiki>…</nowiki>`: skip to just past the close tag.
-                    // Unclosed `<nowiki>` (no close tag) has no `]]` terminator.
+                    // Unclosed `<nowiki>` has no `]]` terminator.
                     let close_rel = lower[tag_end..].find("</nowiki")?;
                     let close_start = tag_end + close_rel;
                     let after_close = &input[close_start + 8..];
@@ -3048,29 +3095,125 @@ fn find_wikilink_close(input: &str) -> Option<usize> {
                         .find('>')
                         .map(|g| g + 1)
                         .unwrap_or(after_close.len());
-                    i = close_start + 8 + gt;
+                    let end = close_start + 8 + gt;
+                    seg_has_open_bracket |= input[tag_end..end].contains('[');
+                    i = end;
                 }
                 continue;
             }
         }
-        // A nested `[[…]]` (e.g. a link inside a caption) must not terminate
-        // the surrounding wikilink. Track bracket depth so the first
-        // depth-0 `]]` is the real close.
+        // A nested `[[…]]` (e.g. a link inside a caption) is a balanced atom: find
+        // its close recursively instead of letting its `]]` terminate this link.
         if input[i..].starts_with("[[") {
-            bracket_depth += 1;
-            i += 2;
+            seg_has_open_bracket = true;
+            if let Some(rel_end) = find_wikilink_close_at(&input[i + 2..]) {
+                i += 2 + rel_end + 2;
+            } else {
+                // Broken nested link: treat the `[[` as literal content.
+                i += 2;
+            }
             continue;
         }
-        if input[i..].starts_with("]]") {
-            if bracket_depth == 0 {
-                return Some(i);
+        // `{{…}}` / `{{{…}}}` transclusion atoms (their `]]`/`|`/`[` are internal).
+        if input[i..].starts_with("{{{") || input[i..].starts_with("{{") {
+            if let Some((end, had_bracket)) = skip_template(input, i) {
+                seg_has_open_bracket |= had_bracket;
+                i = end;
+                continue;
             }
-            bracket_depth -= 1;
-            i += 2;
+            // Unclosed template: `{` is literal content.
+            seg_has_open_bracket |= input[i..].starts_with('[');
+            let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            i += ch_len;
+            continue;
+        }
+        // `-{…}-` language-variant atom.
+        if input[i..].starts_with("-{") {
+            let rest = &input[i + 2..];
+            if let Some(rel_end) = find_lang_variant_close(rest) {
+                seg_has_open_bracket |= input[i..i + 2 + rel_end].contains('[');
+                i += 2 + rel_end + 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // A run of `]` decides between link content and the closing `]]`.
+        if input[i..].starts_with(']') {
+            let mut run = 0;
+            while input[i + run..].starts_with(']') {
+                run += 1;
+            }
+            if run == 1 {
+                // A lone `]` (`!']'`) is always link text.
+                i += 1;
+                continue;
+            }
+            // `]]…]` run: the close `]]` is at `i`, unless a `[` earlier in the
+            // segment absorbs the first `]` (odd-length run) and closes at `i+1`.
+            if run % 2 == 1 && seg_has_open_bracket {
+                return Some(i + 1);
+            }
+            return Some(i);
+        }
+        // A lone `[` (not `[[`, not a template) is link text; it enables the
+        // odd-`]`-run absorption above.
+        if input[i..].starts_with('[') {
+            seg_has_open_bracket = true;
+            i += 1;
+            continue;
+        }
+        // A top-level `|` starts a new `link_text` segment (its `strpos($text,'[')`
+        // window resets). Templates/nested links were already skipped above, so
+        // a `|` reaching here is a genuine `wikilink_content` pipe.
+        if input[i..].starts_with('|') {
+            seg_has_open_bracket = false;
+            i += 1;
             continue;
         }
         let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         i += ch_len;
+    }
+    None
+}
+
+/// If `input[i..]` starts a `{{…}}`/`{{{…}}}` transclusion, skip it, returning
+/// `(end, had_open_bracket)` where `end` is the byte offset just past the closing
+/// `}}`/`}}}` and `had_open_bracket` reports whether any `[` appeared in the
+/// skipped source (for `strpos($text,'[')` fidelity). Returns `None` if unclosed.
+fn skip_template(input: &str, i: usize) -> Option<(usize, bool)> {
+    let bytes = input.as_bytes();
+    let triple = input[i..].starts_with("{{{");
+    let open_len = if triple { 3 } else { 2 };
+    let close = if triple { "}}}" } else { "}}" };
+    let mut had_bracket = false;
+    let mut depth = 1usize;
+    let mut j = i + open_len;
+    while j + 1 < bytes.len() {
+        // Closes first (rightmost-wins nesting for `{{{`/`}}}` overlaps).
+        if input[j..].starts_with(close) {
+            depth -= 1;
+            j += close.len();
+            if depth == 0 {
+                return Some((j, had_bracket));
+            }
+            continue;
+        }
+        if input[j..].starts_with("{{{") {
+            depth += 1;
+            j += 3;
+            continue;
+        }
+        if input[j..].starts_with("{{") {
+            depth += 1;
+            j += 2;
+            continue;
+        }
+        if input[j..].starts_with('[') {
+            had_bracket = true;
+        }
+        let ch_len = input[j..].chars().next().map(char::len_utf8).unwrap_or(1);
+        j += ch_len;
     }
     None
 }
@@ -3080,7 +3223,7 @@ fn find_wikilink_close(input: &str) -> Option<usize> {
 /// `self_closing` is whether that `>` closed a `/>` self-closing tag. The scan
 /// honors quoted attribute values, so a `>` inside `bogus="a>b"` (or a `|`
 /// inside `bogus="a|b"`) is not mistaken for the tag terminator.
-fn nowiki_start_tag_end(input: &str, i: usize) -> Option<(usize, bool)> {
+pub(crate) fn nowiki_start_tag_end(input: &str, i: usize) -> Option<(usize, bool)> {
     let bytes = input.as_bytes();
     if !input[i..].to_ascii_lowercase().starts_with("<nowiki") {
         return None;
@@ -3357,28 +3500,31 @@ fn kv_str(key: &str, value: &str) -> KV {
 ///
 /// Returns `Str` for a pure-text target and `Tokens` (a mixed string/token
 /// array) when a directive is present.
-fn tokenize_link_target(target: &str, lang_conv_enabled: bool) -> KeyValue {
-    tokenize_directives(target, lang_conv_enabled)
+fn tokenize_link_target(target: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
+    tokenize_directives(target, lang_conv_enabled, ext_tags)
 }
 
 /// Tokenize inline link *content* (e.g. wikilink text, extlink text) into a
 /// `KeyValue`: plain text when no directives are present, or a `Tokens` array
-/// when the content contains `{{...}}`/`{{{...}}}`. Mirrors the PHP tokenizer's
-/// `inlineline`/`link_text` productions, which tokenize templates in link text
-/// so the AttributeExpander can expand them.
-fn tokenize_link_content(content: &str, lang_conv_enabled: bool) -> KeyValue {
-    tokenize_directives(content, lang_conv_enabled)
+/// when the content contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`. Mirrors the
+/// PHP tokenizer's `inlineline`/`link_text` productions, which tokenize templates
+/// and angle-bracket markup in link text so the AttributeExpander/extension
+/// handler can expand them.
+fn tokenize_link_content(content: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
+    tokenize_directives(content, lang_conv_enabled, ext_tags)
 }
 
 /// Shared directive-tokenization used for both link targets and link content.
 /// Walks the string, emitting `{{...}}`/`{{{...}}}` as `template`/`templatearg`
-/// self-closing tokens and accumulating the surrounding text. When
+/// self-closing tokens, `<nowiki>`/`<pre>`/… extension tags as `extension`
+/// self-closing tokens, and accumulating the surrounding text. When
 /// `lang_conv_enabled`, a `-{ … }-` construct is also emitted as a
 /// `language-variant` self-closing token (mirrors the PHP tokenizer's
 /// `url_directive` → `lang_variant_or_tpl` inside `wikilink_preprocessor_text`).
-fn tokenize_directives(input: &str, lang_conv_enabled: bool) -> KeyValue {
+fn tokenize_directives(input: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
     let options = TokenizerOptions {
         lang_conv_enabled,
+        ext_tags: ext_tags.to_vec(),
         ..TokenizerOptions::default()
     };
     let mut tk = PegTokenizer::new(input, &options);
@@ -3398,6 +3544,19 @@ fn tokenize_directives(input: &str, lang_conv_enabled: bool) -> KeyValue {
         if tk.starts_with("-{")
             && lang_conv_enabled
             && let Some(tok) = tk.parse_lang_variant()
+        {
+            if !buf.is_empty() {
+                items.push(Item::Str(std::mem::take(&mut buf)));
+            }
+            items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+            continue;
+        }
+        // Angle-bracket markup (`<nowiki>…</nowiki>`, etc.): recognized via the
+        // same `maybe_extension_tag` rule the inline tokenizer uses, so a nowiki
+        // inside link text becomes an `extension` token (later expanded to
+        // `mw:Nowiki`) instead of literal escaped text.
+        if tk.starts_with("<")
+            && let ExtensionParse::Extension(tok) = tk.parse_extension_tag()
         {
             if !buf.is_empty() {
                 items.push(Item::Str(std::mem::take(&mut buf)));
@@ -4469,6 +4628,20 @@ mod tests {
         assert_eq!(find_wikilink_close("<nowiki>[[Bar]]</nowiki>]]"), Some(24));
         // No closing brackets: None.
         assert_eq!(find_wikilink_close("Foo"), None);
+        // A lone `[` and a matching lone `]` in the caption do not defer the
+        // close: `[[A|[x]]]` has link text `[x]` and closes at the `]]` *after*
+        // that `]` (the `link_text_parameterized` `]`-run absorption).
+        assert_eq!(find_wikilink_close("A|[x]]]"), Some(5));
+        // A lone `[` not matched by a lone `]` (odd `]` run) means the first `]]`
+        // starts the link text's trailing run: `[[A|[x]]` keeps `[x` and closes at
+        // the first `]]` (run length even → no absorption).
+        assert_eq!(find_wikilink_close("A|[x]]"), Some(4));
+        // A nested `[[…]]` caption is closed recursively, so the outer close is
+        // found after the nested link's own link text (`[meh]`) resolves.
+        assert_eq!(
+            find_wikilink_close("File:Foobar.jpg|thumb|[[Link1|[meh]]]]]"),
+            Some(37)
+        );
     }
 
     #[test]

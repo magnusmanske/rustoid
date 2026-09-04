@@ -146,6 +146,15 @@ pub fn tokens_to_string(tokens: &[Item]) -> String {
                         out.push_str(bullets);
                     }
                 }
+                // Reconstruct an `extension` token (e.g. `<nowiki>`) back to its
+                // source wikitext (mirrors `tokensToString` reconstructing the
+                // token's `src`), so a nowiki inside an option/caption survives
+                // stringification instead of collapsing to nothing.
+                ParsoidToken::SelfclosingTag(tk) if tk.name == "extension" => {
+                    if let Some(src) = tk.data_parsoid.src.as_deref() {
+                        out.push_str(src);
+                    }
+                }
                 _ => {}
             },
         }

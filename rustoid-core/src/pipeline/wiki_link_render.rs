@@ -578,13 +578,17 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
 /// each directive's `data-parsoid.src`) and re-tokenize it as one span, rather
 /// than tokenizing each text chunk in isolation.
 fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> {
-    // Only reconstruct when a `language-variant` token is present (the sole case
-    // where `tokenize_link_content` fragments a surrounding wikilink); otherwise
-    // keep the existing per-chunk path to preserve transclusion markers.
+    // Only reconstruct when a directive token is present that may have split a
+    // surrounding wikilink across several items (`tokenize_link_content` only
+    // recognizes `{{…}}`/`-{…}-`/`<nowiki>` directives, so `[[A|…directive…]]` is
+    // fragmented); otherwise keep the per-chunk path to preserve transclusion
+    // markers. `extension` (nowiki) and `language-variant` tokens carry their exact
+    // wikitext in `data-parsoid.src`, so the full caption source can be re-assembled.
     let needs_reconstruction = items.iter().any(|item| {
         matches!(
             item,
-            Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant"
+            Item::Tok(ParsoidToken::SelfclosingTag(tk))
+                if tk.name == "language-variant" || tk.name == "extension"
         )
     });
     if !needs_reconstruction {
@@ -599,9 +603,9 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
         return out;
     }
 
-    // Reconstruct the full caption source, then tokenize it whole. `language-
-    // variant`/`template`/meta tokens carry their exact wikitext in `src`; text
-    // chunks are already literal.
+    // Reconstruct the full caption source, then tokenize it whole. `extension`/
+    // `language-variant`/`template`/meta tokens carry their exact wikitext in `src`;
+    // text chunks are already literal.
     let mut src = String::new();
     for item in items {
         match item {
@@ -621,36 +625,62 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
 /// `[[…]]`/`{{…}}` (so a `|` inside a piped link or template does not split the
 /// options). Mirrors `wikilink_content`'s balanced-bracket pipe handling,
 /// including the `{| … |}` table block, whose internal pipes are cell/row
-/// markers (not option separators) and must stay glued to the caption.
+/// markers (not option separators) and must stay glued to the caption. A
+/// `<nowiki>` (self-closing or paired) is likewise opaque: a `|` inside it (e.g.
+/// a bogus attribute `bogus="attri|bute"`) is literal, not a separator.
 pub(crate) fn split_media_options(content: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut bracket = 0i32;
     let mut braces = 0i32;
     let mut table = 0i32;
-    let chars: Vec<char> = content.chars().collect();
+    let bytes = content.as_bytes();
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '[' && i + 1 < chars.len() && chars[i + 1] == '[' {
+    while i < bytes.len() {
+        let c = bytes[i];
+        // A `<nowiki>` (self-closing or paired) is opaque to pipe splitting.
+        if c == b'<'
+            && content[i..].to_ascii_lowercase().starts_with("<nowiki")
+            && content[i + 7..].starts_with(|c: char| c == '>' || c == '/' || c.is_whitespace())
+            && let Some((tag_end, self_closing)) =
+                crate::wikitext::tokenizer_v2::nowiki_start_tag_end(content, i)
+        {
+            current.push_str(&content[i..tag_end]);
+            i = tag_end;
+            if !self_closing {
+                // Paired `<nowiki>…</nowiki>`: consume to just past the close tag.
+                if let Some(close_rel) = content[i..].to_ascii_lowercase().find("</nowiki") {
+                    let close_end = i + close_rel + "</nowiki>".len();
+                    let gt = content[close_end..].find('>').map(|g| g + 1).unwrap_or(0);
+                    current.push_str(&content[i..close_end + gt]);
+                    i = close_end + gt;
+                } else {
+                    // Unclosed nowiki: the rest is literal.
+                    current.push_str(&content[i..]);
+                    i = bytes.len();
+                }
+            }
+            continue;
+        }
+        if c == b'[' && bytes.get(i + 1) == Some(&b'[') {
             bracket += 1;
             current.push_str("[[");
             i += 2;
             continue;
         }
-        if c == ']' && i + 1 < chars.len() && chars[i + 1] == ']' {
+        if c == b']' && bytes.get(i + 1) == Some(&b']') {
             bracket = bracket.saturating_sub(1);
             current.push_str("]]");
             i += 2;
             continue;
         }
-        if c == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+        if c == b'{' && bytes.get(i + 1) == Some(&b'{') {
             braces += 1;
             current.push_str("{{");
             i += 2;
             continue;
         }
-        if c == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
+        if c == b'}' && bytes.get(i + 1) == Some(&b'}') {
             braces = braces.saturating_sub(1);
             current.push_str("}}");
             i += 2;
@@ -658,25 +688,28 @@ pub(crate) fn split_media_options(content: &str) -> Vec<String> {
         }
         // A `{| … |}` table block is a single balanced atom: its internal `|`
         // (cell/row markers) must not split the option/caption list.
-        if c == '{' && i + 1 < chars.len() && chars[i + 1] == '|' && bracket == 0 && braces == 0 {
+        if c == b'{' && bytes.get(i + 1) == Some(&b'|') && bracket == 0 && braces == 0 {
             table += 1;
             current.push_str("{|");
             i += 2;
             continue;
         }
-        if c == '|' && i + 1 < chars.len() && chars[i + 1] == '}' && table > 0 {
+        if c == b'|' && bytes.get(i + 1) == Some(&b'}') && table > 0 {
             table -= 1;
             current.push_str("|}");
             i += 2;
             continue;
         }
-        if c == '|' && bracket == 0 && braces == 0 && table == 0 {
+        if c == b'|' && bracket == 0 && braces == 0 && table == 0 {
             parts.push(std::mem::take(&mut current));
             i += 1;
             continue;
         }
-        current.push(c);
-        i += 1;
+        // Advance one UTF-8 code point (structural delimiters `|`/`[`/`{` are
+        // single-byte ASCII, so the structural branches above are byte-safe).
+        let ch_len = content[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        current.push_str(&content[i..i + ch_len]);
+        i += ch_len;
     }
     if !current.is_empty() || parts.is_empty() {
         parts.push(current);
@@ -1778,5 +1811,17 @@ mod tests {
     fn test_split_media_options_simple() {
         let parts = split_media_options("right|Caption text");
         assert_eq!(parts, vec!["right", "Caption text"]);
+    }
+
+    #[test]
+    fn test_split_media_options_skips_nowiki_pipe() {
+        // A `|` inside a `<nowiki>` attribute or body is literal, not a separator.
+        let parts = split_media_options("thumb|Test <nowiki bogus=\"attri|bute\"/> 123");
+        assert_eq!(
+            parts,
+            vec!["thumb", "Test <nowiki bogus=\"attri|bute\"/> 123"]
+        );
+        let parts = split_media_options("thumb|caption <nowiki>a|b</nowiki> tail");
+        assert_eq!(parts, vec!["thumb", "caption <nowiki>a|b</nowiki> tail"]);
     }
 }
