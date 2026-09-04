@@ -358,6 +358,10 @@ impl MockSiteConfig {
         config.add_magic_word("numberofusers", &["NUMBEROFUSERS"]);
         config.add_magic_word("numberofedits", &["NUMBEROFEDITS"]);
         config.add_magic_word("namespace", &["NAMESPACE", "NAMESPACENUMBER"]);
+        // `{{ns:index}}` / `{{nse:index}}` map a namespace index (or localized
+        // name) to its canonical name (`nse` returns the empty-form variant).
+        config.add_magic_word("ns", &["ns"]);
+        config.add_magic_word("nse", &["nse"]);
         config.add_magic_word("revisionid", &["REVISIONID"]);
         config.add_magic_word("revisionday", &["REVISIONDAY", "REVISIONDAY2"]);
         config.add_magic_word("revisionyear", &["REVISIONYEAR"]);

@@ -602,6 +602,7 @@ impl TemplateHandler {
             Some(ResolvedTarget::Variable {
                 name,
                 magic_word_type,
+                pf_arg,
                 ..
             }) => {
                 // The `{{!}}` magic word expands to a literal `|` (table-pipe).
@@ -611,7 +612,7 @@ impl TemplateHandler {
                 if magic_word_type.as_deref() == Some("!") {
                     return vec![Item::Str("|".to_string())];
                 }
-                let value = Self::variable_value(config, &name);
+                let value = Self::variable_value(config, &name, &pf_arg);
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 let mut info = template_info_from(Some(&name), None, vec![]);
                 info.target_wt = Some(target_str.clone());
@@ -667,8 +668,9 @@ impl TemplateHandler {
 
     /// Resolve a magic variable to its string value. Mirrors the common
     /// variable cases (full page-name variables require the page context,
-    /// which isn't yet wired).
-    fn variable_value(config: &dyn SiteConfig, name: &str) -> String {
+    /// which isn't yet wired). `pf_arg` carries the colon argument for
+    /// parameterized magic words like `{{ns:…}}`/`{{nse:…}}`.
+    fn variable_value(config: &dyn SiteConfig, name: &str, pf_arg: &str) -> String {
         match name {
             "sitename" => "MediaWiki".to_string(),
             "server" => config.server_url().to_string(),
@@ -680,6 +682,21 @@ impl TemplateHandler {
                 .to_string(),
             "contentlanguage" | "contentlang" => config.language_code().to_string(),
             "scriptpath" => config.script_path().to_string(),
+            "ns" | "nse" => {
+                // `{{ns:index}}` maps a namespace index (or localized name) to its
+                // canonical name. A non-numeric arg is looked up as a namespace
+                // alias; an unknown index echoes the raw argument (mirrors
+                // `Language::getNsText` returning `false` → the arg is passed
+                // through unchanged).
+                let arg = pf_arg.trim();
+                if let Ok(index) = arg.parse::<i32>() {
+                    config
+                        .namespace_name(index)
+                        .unwrap_or_else(|| arg.to_string())
+                } else {
+                    arg.to_string()
+                }
+            }
             // Any other variable: empty for now (requires page context).
             _ => String::new(),
         }
