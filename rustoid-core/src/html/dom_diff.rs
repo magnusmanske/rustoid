@@ -313,8 +313,13 @@ impl DomDiff {
 
     /// Mark the node at `index` within `new_parent.children` with `mark`,
     /// prepending a `mw:DiffMarker/*` meta when the mark requires it (faithful
-    /// to `DiffUtils::addDiffMark` + `markNode`). Returns the index of the
-    /// *next sibling after* the marked node (accounting for any inserted meta).
+    /// to `DiffUtils::addDiffMark` + `DOMDiff::markNode`). Returns the index of
+    /// the *next sibling after* the marked node (accounting for any inserted
+    /// meta).
+    ///
+    /// Faithful to `DOMDiff::markNode`: marking `deleted`/`inserted` also marks
+    /// the parent `children-changed`; marking a `data-mw-selser-wrapper` span
+    /// clears its speculatively-computed DSR.
     fn mark_node(&mut self, new_parent: &mut Node, index: usize, mark: DiffMarkers) -> usize {
         let node_is_element = matches!(new_parent.children[index].kind, NodeKind::Element(_));
 
@@ -328,10 +333,43 @@ impl DomDiff {
             let ty = format!("mw:DiffMarker/{}", mark.value());
             let meta = diff_marker_meta(&ty);
             new_parent.children.insert(index, meta);
-            // The marked node is now at index+1; its next sibling is at index+2.
-            index + 2
+            // The marked node is now at index+1.
+            let node_index = index + 1;
+
+            // `data-mw-selser-wrapper` spans carry speculative DSRs that are now
+            // invalid; clear them (PHP `markNode`).
+            if new_parent.children[node_index]
+                .get_attr("data-mw-selser-wrapper")
+                .is_some()
+                && let Some(dp) = new_parent.children[node_index].dp.as_mut()
+            {
+                dp.dsr = None;
+            }
+
+            // deleted/inserted marks imply the parent's direct children changed.
+            if matches!(mark, DiffMarkers::Deleted | DiffMarkers::Inserted) {
+                DiffUtils::set_diff_mark(new_parent, DiffMarkers::ChildrenChanged);
+            }
+
+            // The marked node's next sibling is at index+2.
+            node_index + 1
         } else {
-            DiffUtils::set_diff_mark(&mut new_parent.children[index], mark);
+            let node = &mut new_parent.children[index];
+            DiffUtils::set_diff_mark(node, mark);
+
+            // `data-mw-selser-wrapper` spans carry speculative DSRs that are now
+            // invalid; clear them (PHP `markNode`).
+            if node.get_attr("data-mw-selser-wrapper").is_some()
+                && let Some(dp) = node.dp.as_mut()
+            {
+                dp.dsr = None;
+            }
+
+            // deleted/inserted marks imply the parent's direct children changed.
+            if matches!(mark, DiffMarkers::Deleted | DiffMarkers::Inserted) {
+                DiffUtils::set_diff_mark(new_parent, DiffMarkers::ChildrenChanged);
+            }
+
             index + 1
         }
     }
@@ -368,9 +406,10 @@ mod tests {
 
     #[test]
     fn test_diff_insertion() {
-        let mut a = Node::document();
+        // PHP diffs two *Elements* (the `<body>`s), not Documents, so model that.
+        let mut a = Node::element(ElementKind::Other("body".to_string()));
         a.push_child(p("x"));
-        let mut b = Node::document();
+        let mut b = Node::element(ElementKind::Other("body".to_string()));
         b.push_child(p("x"));
         b.push_child(p("y"));
 
@@ -382,6 +421,13 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(inserted);
+        // Inserting a child marks the parent (body) `children-changed`
+        // (faithful to `DOMDiff::markNode`'s DELETED/INSERTED recursion).
+        let parent_marked = b
+            .get_attr("data-parsoid-diff")
+            .map(|s| s.contains("children-changed"))
+            .unwrap_or(false);
+        assert!(parent_marked, "parent should be marked children-changed");
     }
 
     #[test]
