@@ -664,6 +664,10 @@ fn next_option(rest: &mut &str) -> Option<String> {
     let value_start = if rest.starts_with('{') || rest.starts_with('[') {
         0
     } else if let Some(eq) = rest.find('=')
+        // The `=` must belong to the *current* leading token, not a later
+        // `key={…}` after a preceding bare option (e.g. `djvu` on its own
+        // line before `parsoid={…}`).
+        && !rest[..eq].chars().any(char::is_whitespace)
         && rest[eq + 1..].trim_start().starts_with(['{', '['])
     {
         eq + 1 + rest[eq + 1..].len() - rest[eq + 1..].trim_start().len()
@@ -793,26 +797,24 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
     };
 
     // A `changes` array (present only in JSON `parsoid` options) marks a
-    // selser-style edit test (apply DOM changes, then re-serialize). Selser is
-    // not yet supported, so these are skipped rather than mis-run as a plain
-    // round-trip.
-    let has_changes = serde_json::from_str::<serde_json::Value>(mode)
+    // manual-edit test: apply jQuery-style DOM changes, then re-serialize
+    // (mirrors PHP's `Test::applyManualChanges`).
+    let changes: Option<serde_json::Value> = serde_json::from_str::<serde_json::Value>(mode)
         .ok()
-        .and_then(|v| v.get("changes").cloned())
-        .is_some();
+        .and_then(|v| v.get("changes").cloned());
 
     // Run the *first* listed mode (a multi-mode test runs each in turn; we can
     // only report one result, and the first is the primary direction).
     let primary = modes.first().map(String::as_str).unwrap_or("wt2html");
     match primary {
         "wt2wt" => {
-            if has_changes {
-                return TestResult::Skip("selser not yet fully supported".to_string());
+            if changes.is_some() {
+                return run_wt2wt_with_changes_test(test, test_file);
             }
             run_wt2wt_test(test, test_file)
         }
         "html2wt" => run_html2wt_test(test, test_file),
-        "selser" => TestResult::Skip("selser not yet fully supported".to_string()),
+        "selser" => run_selser_test(test, test_file),
         "html2html" => TestResult::Skip("html2html not yet supported".to_string()),
         _ => {
             if test.html_parsoid.is_some() {
@@ -1094,7 +1096,7 @@ fn run_html2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestR
     }
 }
 
-fn run_selser_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
+fn run_selser_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
     if test.wikitext.is_empty() {
         return TestResult::Skip("no wikitext input".to_string());
     }
@@ -1103,10 +1105,190 @@ fn run_selser_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestRe
         Some(w) => w.clone(),
         None => return TestResult::Skip("no expected edited wikitext".to_string()),
     };
-    let _ = expected_edited;
 
-    // For now, selser tests are skipped — they need the full VE pipeline.
-    TestResult::Skip("selser not yet fully supported".to_string())
+    let changes = parse_changes(test);
+    let Some(changes) = changes else {
+        return TestResult::Skip("selser auto-changetree not yet supported".to_string());
+    };
+
+    let (original_body, mut edited_body, config, page_title) =
+        match build_edited_dom(test, test_file, &changes) {
+            Ok(t) => t,
+            Err(e) => return TestResult::Error(format!("build/apply changes: {e}")),
+        };
+
+    let title = rustoid_core::title::Title::new_main(&page_title);
+    let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
+
+    let mut selser_data = rustoid_core::html::dsr::SelectiveUpdateData::new(test.wikitext.clone());
+    selser_data.rev_dom = Some(Box::new(original_body));
+    let actual = match rustoid_core::html::selser::selective_serialize_dom(
+        &mut edited_body,
+        &mut selser_data,
+        Some(env),
+    ) {
+        Ok(w) => w,
+        Err(e) => return TestResult::Error(format!("selser serialize: {e}")),
+    };
+
+    compare_wikitext(&actual, &expected_edited)
+}
+
+/// Run a `wt2wt` test with a manual `changes` array: apply the changes, then
+/// serialize the edited DOM to wikitext as a plain round-trip (not selser).
+fn run_wt2wt_with_changes_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
+    let expected_edited = match test.wikitext_edited.as_ref() {
+        Some(w) => w.clone(),
+        None => return TestResult::Skip("no expected edited wikitext".to_string()),
+    };
+    let changes = match parse_changes(test) {
+        Some(c) => c,
+        None => return TestResult::Skip("no changes".to_string()),
+    };
+    let (_original, edited, config, page_title) = match build_edited_dom(test, test_file, &changes)
+    {
+        Ok(t) => t,
+        Err(e) => return TestResult::Error(format!("build/apply changes: {e}")),
+    };
+
+    let title = rustoid_core::title::Title::new_main(&page_title);
+    let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
+    let actual =
+        rustoid_core::html::serializer::WikitextSerializer::serialize_dom_with_env(edited, env);
+    compare_wikitext(&actual, &expected_edited)
+}
+
+fn compare_wikitext(actual: &str, expected: &str) -> TestResult {
+    if actual == expected {
+        TestResult::Pass
+    } else {
+        TestResult::Fail {
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+            diff_hint: String::new(),
+        }
+    }
+}
+
+/// Recover the `changes` array from the raw `parsoid` option JSON.
+fn parse_changes(test: &ParserTestCase) -> Option<serde_json::Value> {
+    test.options
+        .get("parsoid")
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v.get("changes").cloned())
+}
+
+/// Build the (expanded) original DOM body for a test and the edited body after
+/// applying `changes`. Returns `(original_body, edited_body, config, page_title)`.
+fn build_edited_dom(
+    test: &ParserTestCase,
+    test_file: &ParserTestFile,
+    changes: &serde_json::Value,
+) -> Result<(
+    rustoid_core::dom::node::Node,
+    rustoid_core::dom::node::Node,
+    MockSiteConfig,
+    String,
+)> {
+    // Build the (expanded) AST from the original wikitext, carrying DSR
+    // metadata, using the same mock source/config as `run_wt2html_test`.
+    let source = MockDataSource::new();
+    seed_media_files(&source);
+    for (name, text) in &test_file.articles {
+        if name.starts_with("Template:") {
+            source.add_template(name, text);
+        } else if let Some(target) = redirect_target(text) {
+            source.add_page(name, text);
+            source.add_redirect(name, &target);
+        } else {
+            source.add_page(name, text);
+            if !name.contains(':') {
+                source.add_template(&format!("Template:{name}"), text);
+            }
+        }
+    }
+    let page_title = test
+        .options
+        .get("title")
+        .cloned()
+        .unwrap_or_else(|| "TestPage".to_string());
+    source.add_page(&page_title, &test.wikitext);
+
+    let mut config = MockSiteConfig::new();
+    if let Some(lang) = test.options.get("language") {
+        config.set_language(lang);
+    }
+    for line in test.config_raw.lines() {
+        let line = line.trim();
+        if line == "wgParsoidExperimentalParserFunctionOutput=true" {
+            config.set_parsoid_experimental_parser_function_output(true);
+        } else if let Some(v) = line.strip_prefix("wgExternalLinkTarget=") {
+            config.set_external_link_target(v.trim_matches('"'));
+        } else if let Some(v) = line.strip_prefix("wgNoFollowLinks=") {
+            config.set_no_follow_links(v.trim_matches('"') == "true");
+        } else if let Some(v) = line.strip_prefix("wgNoFollowDomainExceptions=") {
+            let v = v.trim();
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(v) {
+                for domain in arr {
+                    config.add_no_follow_domain_exception(&domain);
+                }
+            } else {
+                for domain in v.split(',') {
+                    config.add_no_follow_domain_exception(domain.trim().trim_matches('"'));
+                }
+            }
+        }
+    }
+    let parser = Parser::new(&config);
+
+    let wrap_sections = test.options_raw.contains("wrapSections\": true")
+        || test.options_raw.contains("wrapSections\":true");
+    let options = ParserOptions {
+        page_title: page_title.clone(),
+        language: test
+            .options
+            .get("language")
+            .cloned()
+            .unwrap_or_else(|| "en".to_string()),
+        body_only: true,
+        wrap_sections,
+        ..ParserOptions::default()
+    };
+
+    let original_ast = if let Ok(rt) = tokio::runtime::Runtime::new() {
+        rt.block_on(parser.wikitext_to_ast_expanded(&test.wikitext, &source, &options))?
+    } else {
+        return Err(RustoidError::DataSource(
+            "failed to build tokio runtime".to_string(),
+        ));
+    };
+
+    let original_body = extract_ast_body(original_ast);
+    let mut edited = original_body.clone();
+    rustoid_core::html::apply_changes::apply_manual_changes(&mut edited, changes)?;
+
+    Ok((original_body, edited, config, page_title))
+}
+
+/// Extract the body content from a (possibly synthetic-wrapper) AST, mirroring
+/// `DOMCompat::getBody`. Our fragment-mode tree builder may emit a synthetic
+/// `<html>`/`<body>` wrapper; strip it to get the content the selser serializer
+/// expects.
+fn extract_ast_body(mut ast: rustoid_core::dom::node::Node) -> rustoid_core::dom::node::Node {
+    use rustoid_core::dom::node::{ElementKind, NodeKind};
+    while ast.children.len() == 1
+        && matches!(
+            &ast.children[0].kind,
+            NodeKind::Element(ElementKind::Other(t)) if t == "html" || t == "body"
+        )
+    {
+        let child = std::mem::replace(
+            &mut ast.children[0],
+            rustoid_core::dom::node::Node::document(),
+        );
+        ast = child;
+    }
+    ast
 }
 
 /// Strip newlines in paragraph context (PHP format difference).

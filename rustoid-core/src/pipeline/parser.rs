@@ -1368,9 +1368,26 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: &dyn DataSource,
         options: &ParserOptions,
     ) -> Result<String> {
+        let ast = self
+            .wikitext_to_ast_expanded(wikitext, source, options)
+            .await?;
+        let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
+        serializer.serialize(&ast)
+    }
+
+    /// Convert wikitext to an AST (with `data-parsoid` DSR metadata) using the
+    /// native (async) template expansion path. This is the AST counterpart of
+    /// [`wikitext_to_html_expanded`], returning the expanded DOM so downstream
+    /// stages (e.g. selective serialization / selser) can operate on it.
+    pub async fn wikitext_to_ast_expanded(
+        &self,
+        wikitext: &str,
+        source: &dyn DataSource,
+        options: &ParserOptions,
+    ) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let about_counter = std::cell::Cell::new(0usize);
-        let ast = self
+        Ok(self
             .build_ast(
                 tokens,
                 Some(source),
@@ -1379,9 +1396,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 wikitext,
                 options.wrap_sections,
             )
-            .await;
-        let serializer = crate::html::serialize::HtmlSerializer::new(options.clone());
-        serializer.serialize(&ast)
+            .await)
     }
 
     /// Run the TT2 stage (template/parser-function/magic-variable expansion)

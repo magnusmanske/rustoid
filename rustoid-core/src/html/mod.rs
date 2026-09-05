@@ -4,6 +4,7 @@
 //! - `parse` — HTML → AST (for round-tripping, via `html5ever`).
 //! - `selser` — selective serialization for VE editing.
 
+pub mod apply_changes;
 pub mod constrained_text;
 pub mod diff_utils;
 pub mod dom_diff;
