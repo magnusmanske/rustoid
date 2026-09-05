@@ -557,7 +557,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     // Assemble collected lines
     test.options_raw = options_lines.join("\n");
     test.config_raw = config_lines.join("\n");
-    test.wikitext = wikitext_lines.join("\n").trim().to_string();
+    test.wikitext = wikitext_lines.join("\n");
 
     if seen_html_section {
         let html = html_parsoid_lines.join("\n").trim().to_string();
