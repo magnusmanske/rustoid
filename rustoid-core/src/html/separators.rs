@@ -141,36 +141,301 @@ impl Separators {
     }
 
     /// Build the separator to emit before `node`, based on the buffered
-    /// constraints and source. Faithful to the *non-selser* path of
-    /// `Separators::buildSep` (the DSR-based source recovery is selser-only and
-    /// not yet wired in).
-    pub fn build_sep(state: &mut SerializerState, tree: &DomTree, _node: NodeId) -> Option<String> {
-        // In selser mode, recover the separator from source via DSR; for now,
-        // fall back to the constraint-based construction.
+    /// constraints and source. Faithful to `Separators::buildSep`: in selser
+    /// mode it first attempts to recover the exact separator from original
+    /// source via DSR offsets, falling back to trimmed-whitespace recovery and
+    /// then to constraint-based construction.
+    pub fn build_sep(state: &mut SerializerState, tree: &DomTree, node: NodeId) -> Option<String> {
         let constraints = state.separator.constraints.clone();
         let constraint_info = state.separator.constraint_info.clone();
+
+        // In selser mode, first attempt to recover the exact separator from
+        // original source; this also mutates `state.separator.src` (recovered
+        // text is stashed there for the trimmed-whitespace fallback below).
+        let recovered = if state.selser_mode {
+            Self::build_sep_selser(state, tree, node)
+        } else {
+            None
+        };
+
         let src = state.separator.src.clone().unwrap_or_default();
         state.separator.src = None;
 
-        let sep = match constraints {
-            Some(c) => Some(Self::make_separator(
-                tree,
-                &src,
-                &c,
-                state.at_start_of_output,
-                &constraint_info,
-            )),
-            None => {
-                if src.is_empty() {
-                    None
-                } else {
-                    Some(src)
-                }
+        let mut sep = recovered;
+
+        // If the selser recovery didn't produce a separator but left buffered
+        // source, reconstruct via constraints (mirrors the `makeSeparator`
+        // fallback at the end of PHP's `buildSep`).
+        if sep.is_none() && (constraints.is_some() || !src.is_empty()) {
+            if let Some(c) = constraints {
+                sep = Some(Self::make_separator(
+                    tree,
+                    &src,
+                    &c,
+                    state.at_start_of_output,
+                    &constraint_info,
+                ));
+            } else {
+                sep = Some(src);
             }
-        };
+        }
 
         // Wrap leading whitespace that would otherwise trigger indent-pre.
         sep.map(|s| Self::make_sep_indent_pre_safe(state, tree, &s, &constraint_info))
+    }
+
+    /// The selser DSR-recovery branch of `Separators::buildSep`. Recovers the
+    /// exact separator between `prev_node` and `node` from the revision source
+    /// using their DSR offsets, or via trimmed-whitespace heuristics. Returns
+    /// `Some(sep)` when recovered, or `None` to fall through to the constraint
+    /// path (leaving any recovered text in `state.separator.src`).
+    fn build_sep_selser(
+        state: &mut SerializerState,
+        tree: &DomTree,
+        node: NodeId,
+    ) -> Option<String> {
+        let prev_node = state.separator.last_source_node?;
+        if node == prev_node {
+            return None;
+        }
+
+        // `$origSepNeededAndUsable` — only recover from source when the edited
+        // context has valid DSR on both sides and neither node is adjacent to a
+        // deleted block node.
+        let orig_sep_usable = !state.in_inserted_content
+            && !crate::html::wts_utils::next_to_deleted_block_node_in_wt(tree, prev_node, true)
+            && !crate::html::wts_utils::next_to_deleted_block_node_in_wt(tree, node, false)
+            && crate::html::wts_utils::orig_src_valid_in_edited_context(state, tree, prev_node)
+            && crate::html::wts_utils::orig_src_valid_in_edited_context(state, tree, node);
+
+        let mut recovered: Option<String> = None;
+
+        if orig_sep_usable {
+            let dsr_a = Self::dsr_for_source_node(tree, prev_node, node, false);
+            let dsr_b = Self::dsr_for_source_node(tree, node, prev_node, true);
+
+            if let (Some(a), Some(b)) = (dsr_a, dsr_b)
+                && state.is_valid_dsr(Some(&a), false) && state.is_valid_dsr(Some(&b), false) {
+                    recovered = Self::sep_from_dsr(state, &a, &b);
+                }
+        }
+
+        // Trimmed-whitespace fallback (mirrors the `$sep === null` block at the
+        // end of PHP `buildSep`), stashing recovered text in `state.separator.src`.
+        let sep_type = state.separator.constraint_info.sep_type;
+        match sep_type {
+            Some(SepType::ParentChild) => {
+                let ws = state.recover_trimmed_whitespace(tree, node, true);
+                if let Some(ws) = ws {
+                    state.separator.src = Some(format!(
+                        "{ws}{}",
+                        state.separator.src.as_deref().unwrap_or("")
+                    ));
+                }
+            }
+            Some(SepType::ChildParent) => {
+                let ws = state.recover_trimmed_whitespace(tree, node, false);
+                if let Some(ws) = ws {
+                    match &mut state.separator.src {
+                        Some(s) => s.push_str(&ws),
+                        None => state.separator.src = Some(ws),
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        recovered
+    }
+
+    /// Resolve the DSR (with auto-inserted tag widths nulled) of the node on one
+    /// side of a separator. `is_node_b` selects the `$node` (B) side vs the
+    /// `$prevNode` (A) side. Faithful to the `$dsrA`/`$dsrB` computation in
+    /// PHP `buildSep`.
+    fn dsr_for_source_node(
+        tree: &DomTree,
+        id: NodeId,
+        other: NodeId,
+        is_node_b: bool,
+    ) -> Option<crate::html::dsr::DomSourceRange> {
+        let n = tree.node(id);
+        match &n.kind {
+            crate::dom::node::NodeKind::Element(_) => {
+                // A vs B: the parent/child relationship matters for the walking.
+                if is_node_b && tree.parent(other) == Some(id) {
+                    // `$node` is parent of `$prevNode`: walk up while it has no
+                    // usable DSR and is a last child.
+                    let mut cur = id;
+                    loop {
+                        if tree.next_sibling(cur).is_some()
+                            || crate::html::dom_utils::at_the_top(tree, cur)
+                        {
+                            break;
+                        }
+                        let dsr = crate::html::wts_utils::get_dsr(tree.node(cur));
+                        if dsr.is_some()
+                            && dsr
+                                .as_ref()
+                                .is_some_and(|d| d.start.is_some() && d.end.is_some())
+                        {
+                            break;
+                        }
+                        let Some(parent) = tree.parent(cur) else {
+                            break;
+                        };
+                        cur = parent;
+                    }
+                    Self::handle_auto_inserted(tree.node(cur))
+                } else {
+                    Self::handle_auto_inserted(n)
+                }
+            }
+            crate::dom::node::NodeKind::Text(_) | crate::dom::node::NodeKind::Comment(_) => {
+                // Text/comment: extrapolate DSR from the previous element sibling
+                // (or the parent, for the last-child case).
+                Self::extrapolate_dsr_for_text(tree, id, n, is_node_b, other)
+            }
+            crate::dom::node::NodeKind::Document => None,
+        }
+    }
+
+    /// `Separators::handleAutoInserted` — clone the node's DSR, nulling the
+    /// open/close width when the corresponding tag was auto-inserted.
+    fn handle_auto_inserted(
+        node: &crate::dom::node::Node,
+    ) -> Option<crate::html::dsr::DomSourceRange> {
+        let dp = node.dp.as_ref()?;
+        let mut dsr = crate::html::wts_utils::get_dsr(node)?;
+        // Note: `auto_inserted_start`/`auto_inserted_end` live on the
+        // serializer-side DSR model via `tokens_v2`; null the widths to match.
+        if dp.auto_inserted_start {
+            dsr.open_width = None;
+        }
+        if dp.auto_inserted_end {
+            dsr.close_width = None;
+        }
+        Some(dsr)
+    }
+
+    /// Extrapolate a DSR for a text/comment node from its previous element
+    /// sibling (or parent), faithful to the `$dsrA` text/comment branch of PHP
+    /// `buildSep`.
+    fn extrapolate_dsr_for_text(
+        tree: &DomTree,
+        id: NodeId,
+        n: &crate::dom::node::Node,
+        _is_node_b: bool,
+        _other: NodeId,
+    ) -> Option<crate::html::dsr::DomSourceRange> {
+        // Check if `id` is the last child of a zero-width element and use that
+        // parent's DSR instead (typical case: text in p).
+        if tree.next_sibling(id).is_none()
+            && let Some(parent) = tree.parent(id) {
+                let parent_node = tree.node(parent);
+                if matches!(parent_node.kind, crate::dom::node::NodeKind::Element(_))
+                    && crate::html::wts_utils::get_dsr(parent_node)
+                        .as_ref()
+                        .and_then(|d| d.close_width)
+                        == Some(0)
+                {
+                    return Self::handle_auto_inserted(parent_node);
+                }
+            }
+
+        // Can we extrapolate DSR from the previous element sibling? Yes, if the
+        // parent didn't have its children edited.
+        if let Some(prev) = tree.prev_sibling(id)
+            && matches!(tree.node(prev).kind, crate::dom::node::NodeKind::Element(_))
+            && let Some(parent) = tree.parent(id)
+            && !crate::html::diff_utils::DiffUtils::direct_children_changed(tree.node(parent))
+        {
+            let end_dsr = crate::html::wts_utils::get_dsr(tree.node(prev)).and_then(|d| d.end);
+            if let Some(end) = end_dsr {
+                let correction = match &n.kind {
+                    crate::dom::node::NodeKind::Comment(c) => {
+                        let unclosed = Self::has_unclosed_comment_prev(tree, id);
+                        crate::html::wts_utils::decoded_comment_length(c, unclosed)
+                    }
+                    crate::dom::node::NodeKind::Text(t) => t.len(),
+                    _ => 0,
+                };
+                return Some(crate::html::dsr::DomSourceRange {
+                    start: Some(end),
+                    end: Some(end + correction),
+                    source: None,
+                    open_width: Some(0),
+                    close_width: Some(0),
+                    leading_ws: 0,
+                    trailing_ws: 0,
+                });
+            }
+        }
+        None
+    }
+
+    /// Whether the comment at `id` is preceded by an `mw:Placeholder/UnclosedComment`
+    /// meta (which shortens the comment delimiter length). Reused from
+    /// `selser.rs`.
+    fn has_unclosed_comment_prev(tree: &DomTree, id: NodeId) -> bool {
+        let Some(prev) = tree.prev_sibling(id) else {
+            return false;
+        };
+        crate::html::dom_utils::has_type_of(tree.node(prev), "mw:Placeholder/UnclosedComment")
+    }
+
+    /// Extract the separator between two DSR ranges, faithful to the
+    /// containment-relationship switch in PHP `buildSep` + `isValidSep`.
+    fn sep_from_dsr(
+        state: &SerializerState,
+        dsr_a: &crate::html::dsr::DomSourceRange,
+        dsr_b: &crate::html::dsr::DomSourceRange,
+    ) -> Option<String> {
+        use crate::html::dsr::SourceRange;
+        let a_start = dsr_a.start.unwrap_or(0);
+        let a_end = dsr_a.end.unwrap_or(0);
+        let b_start = dsr_b.start.unwrap_or(0);
+        let b_end = dsr_b.end.unwrap_or(0);
+        // The plain source-range views (start/end) that PHP treats DomSourceRange
+        // as via `SourceRange::to`/`openRange`/`closeRange`.
+        let a = SourceRange::with_source(dsr_a.start, dsr_a.end, dsr_a.source.clone());
+        let b = SourceRange::with_source(dsr_b.start, dsr_b.end, dsr_b.source.clone());
+
+        let sep = if a_start <= b_start {
+            if b_end <= a_end {
+                if a_start == b_start && a_end == b_end {
+                    // Same range: no separator between them.
+                    Some(String::new())
+                } else if dsr_a.open_width.is_some() && state.is_valid_dsr(Some(dsr_a), true) {
+                    // B in A, parent→child.
+                    state.get_orig_src(&dsr_a.open_range().to(&b))
+                } else {
+                    None
+                }
+            } else if a_end <= b_start {
+                // B following A (siblings).
+                state.get_orig_src(&a.to(&b))
+            } else if dsr_b.close_width.is_some() && state.is_valid_dsr(Some(dsr_b), true) {
+                // A in B, child→parent.
+                state.get_orig_src(&a.to(&dsr_b.close_range()))
+            } else {
+                None
+            }
+        } else if a_end <= b_end {
+            if dsr_b.close_width.is_some() && state.is_valid_dsr(Some(dsr_b), true) {
+                // A in B, child→parent.
+                state.get_orig_src(&a.to(&dsr_b.close_range()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Reset if the recovered separator is not valid wikitext separator text.
+        match sep {
+            Some(s) if crate::html::wts_utils::is_valid_sep(&s) => Some(s),
+            _ => None,
+        }
     }
 
     /// Merges two constraint sets (`Separators::mergeConstraints`).
