@@ -446,6 +446,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
 
     let mut section = Section::None;
     let mut parsoid_only = false;
+    let mut seen_html_section = false;
 
     while *i < lines.len() {
         let line = lines[*i];
@@ -475,6 +476,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
             "!! html/parsoid" | "!! html/parsoid here" => {
                 section = Section::Html;
                 parsoid_only = true;
+                seen_html_section = true;
                 *i += 1;
             }
             "!! html" | "!! html/*" => {
@@ -482,6 +484,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 // and legacy expected output (the two parsers agree here),
                 // mirroring Parsoid's PARSOID_HTML_KEYS / LEGACY_HTML_KEYS.
                 section = Section::HtmlBoth;
+                seen_html_section = true;
                 *i += 1;
             }
             "!! html/php" => {
@@ -498,6 +501,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 // extension tags (so #tag:pre → mw:Extension/pre).
                 section = Section::HtmlIntegrated;
                 parsoid_only = true;
+                seen_html_section = true;
                 *i += 1;
             }
             "!! html/parsoid+standalone" => {
@@ -555,7 +559,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     test.config_raw = config_lines.join("\n");
     test.wikitext = wikitext_lines.join("\n").trim().to_string();
 
-    if !html_parsoid_lines.is_empty() {
+    if seen_html_section {
         let html = html_parsoid_lines.join("\n").trim().to_string();
         if html != "NOT NEEDED" {
             test.html_parsoid = Some(html);
@@ -824,10 +828,6 @@ fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRes
 
 /// Run a wikitext → HTML test using the V2 parser.
 fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
-    if test.wikitext.is_empty() {
-        return TestResult::Skip("no wikitext input".to_string());
-    }
-
     let expected_html = match test.html_parsoid.as_ref() {
         Some(h) => h.clone(),
         None => return TestResult::Skip("no html/parsoid expected output".to_string()),
