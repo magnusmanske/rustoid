@@ -1163,10 +1163,14 @@ fn record_media_option(
     // and stashes its `html` in `data-mw.attribs`). Mirrors PHP `renderFile`:
     //   for `link`, `$expOpt = is_array($origOptSrc) && hasTransclusion(...)`
     //   otherwise, `$expOpt = is_array($origOptSrc)`
-    // (the stricter `link` test avoids treating a mere autourl/entity in the link
-    // target as an editable expansion).
+    // The stricter `link` test excludes a *mere autourl*: in PHP a template that
+    // appears inside a bare URL is tokenized as an `urllink` (autourl), so it
+    // expands to plain text rather than a top-level `mw:Transclusion` marker and
+    // must NOT mark the option `mw:ExpandedAttrs` (e.g.
+    // `link=http://test{{1x|345}}`). We detect that case from the resolved value:
+    // when it is itself a URL, the transclusion was inside a URL, not standalone.
     let exp_opt = if info.ck == "link" {
-        is_token_array && has_transclusion
+        is_token_array && has_transclusion && !ctx.config.has_valid_protocol(&info.v)
     } else {
         is_token_array
     };
