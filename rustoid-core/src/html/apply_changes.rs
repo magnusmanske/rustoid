@@ -206,11 +206,20 @@ fn find_matches(body: &Node, selector: &str) -> Vec<Path> {
 }
 
 fn walk(node: &Node, selector: &str, path: &mut Vec<usize>, out: &mut Vec<Path>) {
+    // Compute the element-sibling position (0-based) for each child, matching
+    // Zest's `:nth-child`, which counts *element* siblings via
+    // `previousElementSibling` (a historical quirk of `qsa`-derived selector
+    // engines) rather than all siblings including whitespace text nodes.
+    let mut element_index = 0usize;
     for (i, child) in node.children.iter().enumerate() {
-        if matches_selector(child, selector, i) {
-            let mut p = path.clone();
-            p.push(i);
-            out.push(p);
+        let is_element = matches!(child.kind, NodeKind::Element(_));
+        if is_element {
+            if matches_selector(child, selector, element_index) {
+                let mut p = path.clone();
+                p.push(i);
+                out.push(p);
+            }
+            element_index += 1;
         }
         path.push(i);
         walk(child, selector, path, out);
@@ -219,7 +228,9 @@ fn walk(node: &Node, selector: &str, path: &mut Vec<usize>, out: &mut Vec<Path>)
 }
 
 /// Match a single node against `selector`. `sibling_index` is the node's
-/// 0-based index among its siblings (needed for `:nth-child`).
+/// 0-based index among its *element* siblings (not counting whitespace text/
+/// comment siblings), matching Zest's `:nth-child` (which counts
+/// `previousElementSibling`).
 pub fn matches_selector(node: &Node, selector: &str, sibling_index: usize) -> bool {
     if !matches!(node.kind, NodeKind::Element(_)) {
         return false;
