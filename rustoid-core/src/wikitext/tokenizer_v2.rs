@@ -482,6 +482,20 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
+    /// Consume the leading whitespace/newlines permitted before a redirect
+    /// word: `[ \t\n\r\0\x0b]` (space, tab, LF, CR, NUL, vertical tab — but
+    /// *not* form feed `\x0c`, which PHP's `redirect_word` excludes).
+    fn consume_redirect_leading_ws(&mut self) {
+        while self.pos < self.input_len {
+            let ch = self.input.as_bytes()[self.pos];
+            if ch == b' ' || ch == b'\t' || ch == b'\n' || ch == b'\r' || ch == 0x00 || ch == 0x0b {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Consume `space_or_newline_or_solidus`: whitespace, or a `/` that is not
     /// followed by `>` (so a `/>` self-close is left for the caller to detect).
     /// Mirrors PHP's `space_or_newline_or_solidus = space_or_newline / (@"/" !">")`,
@@ -995,17 +1009,28 @@ impl<'a> PegTokenizer<'a> {
 
         let saved = self.pos;
 
+        // The `redirect` magic word may be preceded by leading whitespace /
+        // newlines, mirroring PHP's `redirect_word = $([ \t\n\r\0\x0b]* …)`
+        // (the leading whitespace is permitted by PHP's `trim()` and is absorbed
+        // into the redirect token's `src`, not emitted as text).
+        self.consume_redirect_leading_ws();
+
         // Match redirect word (case-insensitive). Mirrors PHP's `redirect_word`,
         // which matches `[ \t\n\r\0\x0b]*` then a run of
         // `[^ \t\n\r\x0c:\[]+` and checks it against the localized `redirect`
         // magic word synonyms (each including the leading `#`).
         let remaining = self.remaining();
         let lower = remaining.to_lowercase();
-        let rw = self
+        let Some(rw) = self
             .redirect_words
             .iter()
             .find(|w| lower.starts_with(w.as_str()))
-            .cloned()?;
+            .cloned()
+        else {
+            // Backtrack: the leading whitespace we consumed is not a redirect.
+            self.pos = saved;
+            return None;
+        };
         // The redirect word must be followed by a terminator (whitespace,
         // colon, or the wikilink opener), mirroring PHP's `[^ \t\n\r\x0c:\[]+`
         // (the word cannot contain `:`, `[`, or whitespace).
@@ -1015,6 +1040,7 @@ impl<'a> PegTokenizer<'a> {
             && c != ':'
             && c != '['
         {
+            self.pos = saved;
             return None;
         }
         self.advance(rw.len());
@@ -4581,6 +4607,25 @@ mod tests {
         assert!(
             has_redirect,
             "expected mw:redirect for #TILVÍSUN, got {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_redirect_with_leading_whitespace_and_colon() {
+        // PHP's `redirect_word` permits `[ \t\n\r\0\x0b]*` before the word AND
+        // an optional `:` (`# REDIRECT : [[Target]]` archaic syntax). The
+        // leading whitespace/newlines are absorbed into the redirect token,
+        // not emitted as text, and the redirect must still be recognized.
+        let options = TokenizerOptions::default();
+        let mut tokenizer = PegTokenizer::new("\n #REDIRECT \n: \n[[Main Page]]", &options);
+        let tokens = tokenizer.tokenize().unwrap();
+        let has_redirect = tokens.iter().any(|t| {
+            matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw:redirect")
+        });
+        assert!(
+            has_redirect,
+            "expected mw:redirect with leading whitespace/colon, got {:?}",
             tokens
         );
     }
