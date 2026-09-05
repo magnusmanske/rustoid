@@ -388,38 +388,44 @@ pub fn parse_test_file(path: &Path) -> Result<ParserTestFile> {
 /// `!! html` expectation. We honor those so the harness reflects Parsoid's own
 /// pass/fail accounting rather than treating a faithful divergence as a bug.
 fn load_known_failures(path: &Path) -> KnownFailures {
-    // `foo.txt` → `foo-standalone-knownFailures.json` (and `.txt` is stripped
-    // so `php/foo.txt` maps to `php/foo-standalone-knownFailures.json`).
     let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().to_string()) else {
         return KnownFailures::default();
     };
-    let sidecar = path.with_file_name(format!("{stem}-standalone-knownFailures.json"));
-    let Ok(text) = std::fs::read_to_string(&sidecar) else {
-        return KnownFailures::default();
-    };
 
-    // Tolerate a missing/empty file; only parse well-formed JSON.
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return KnownFailures::default();
-    };
-    let Some(obj) = json.as_object() else {
-        return KnownFailures::default();
-    };
-
-    let mut entries = HashMap::new();
-    for (name, value) in obj {
-        let Some(modes) = value.as_object() else {
+    // Parsoid records known divergences in two sibling files, both of which we
+    // honor:
+    //   - `foo-standalone-knownFailures.json` — divergences specific to
+    //     standalone (non-integrated) mode.
+    //   - `foo-knownFailures.json` — divergences in integrated/legacy mode.
+    // Each maps a test description to `mode -> Parsoid's actual output`, which
+    // is the value we aim to reproduce faithfully.
+    let mut merged = KnownFailures::default();
+    for suffix in ["-standalone-knownFailures.json", "-knownFailures.json"] {
+        let sidecar = path.with_file_name(format!("{stem}{suffix}"));
+        let Ok(text) = std::fs::read_to_string(&sidecar) else {
             continue;
         };
-        let mut map = HashMap::new();
-        for (mode, output) in modes {
-            if let Some(s) = output.as_str() {
-                map.insert(mode.clone(), s.to_string());
+        // Tolerate a missing/empty file; only parse well-formed JSON.
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(obj) = json.as_object() else {
+            continue;
+        };
+
+        for (name, value) in obj {
+            let Some(modes) = value.as_object() else {
+                continue;
+            };
+            let entry = merged.entries.entry(name.clone()).or_default();
+            for (mode, output) in modes {
+                if let Some(s) = output.as_str() {
+                    entry.insert(mode.clone(), s.to_string());
+                }
             }
         }
-        entries.insert(name.clone(), map);
     }
-    KnownFailures { entries }
+    merged
 }
 
 /// Parse a single test case starting after the !! test line.
