@@ -2350,13 +2350,15 @@ impl<'a> PegTokenizer<'a> {
             let mut stt = SelfclosingTagTk::new("wikilink", vec![], dp);
             // The target is tokenized (templates become `template` tokens),
             // matching PHP's `wikilink_preprocessor_text`, so templated targets
-            // can be expanded by the AttributeExpander.
+            // can be expanded by the AttributeExpander. The `vsrc` preserves the
+            // raw source string so `renderFile` can round-trip option source
+            // (mirrors PHP's `$oContent->vsrc`).
             stt.attribs.push(KV {
                 key: KeyValue::Str("href".to_string()),
                 value: tokenize_link_target(target.trim(), self.lang_conv_enabled, &self.ext_tags),
                 src_offsets: None,
                 ksrc: None,
-                vsrc: None,
+                vsrc: Some(target.trim().to_string()),
             });
             // Emit one `mw:maybeContent` KV per pipe-separated content part
             // (mirrors PHP's `wikilink_content`, whose `(pipe link_text?)*`
@@ -2367,7 +2369,7 @@ impl<'a> PegTokenizer<'a> {
                     value: tokenize_link_content(part, self.lang_conv_enabled, &self.ext_tags),
                     src_offsets: None,
                     ksrc: None,
-                    vsrc: None,
+                    vsrc: Some(part.to_string()),
                 });
             }
 
