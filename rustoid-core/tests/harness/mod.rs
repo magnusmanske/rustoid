@@ -1263,32 +1263,12 @@ fn build_edited_dom(
         ));
     };
 
-    let original_body = extract_ast_body(original_ast);
-    let mut edited = original_body.clone();
+    // Pass the full AST to the selser serializer, whose internal
+    // `body_content_node` resolves the synthetic html/body wrapper.
+    let mut edited = original_ast.clone();
     rustoid_core::html::apply_changes::apply_manual_changes(&mut edited, changes)?;
 
-    Ok((original_body, edited, config, page_title))
-}
-
-/// Extract the body content from a (possibly synthetic-wrapper) AST, mirroring
-/// `DOMCompat::getBody`. Our fragment-mode tree builder may emit a synthetic
-/// `<html>`/`<body>` wrapper; strip it to get the content the selser serializer
-/// expects.
-fn extract_ast_body(mut ast: rustoid_core::dom::node::Node) -> rustoid_core::dom::node::Node {
-    use rustoid_core::dom::node::{ElementKind, NodeKind};
-    while ast.children.len() == 1
-        && matches!(
-            &ast.children[0].kind,
-            NodeKind::Element(ElementKind::Other(t)) if t == "html" || t == "body"
-        )
-    {
-        let child = std::mem::replace(
-            &mut ast.children[0],
-            rustoid_core::dom::node::Node::document(),
-        );
-        ast = child;
-    }
-    ast
+    Ok((original_ast, edited, config, page_title))
 }
 
 /// Strip newlines in paragraph context (PHP format difference).
