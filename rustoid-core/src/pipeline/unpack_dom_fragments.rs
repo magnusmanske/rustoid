@@ -87,15 +87,17 @@ fn is_block_container(name: &str) -> bool {
 }
 
 /// Mark `node` and every element in its subtree as misnested. Mirrors
-/// `UnpackDOMFragments::markMisnested`, which sets `dp->misnested = true` (and a
-/// zero-width DSR, absorbed at serialization) on each hoisted element.
-fn mark_misnested(node: &mut Node) {
+/// `UnpackDOMFragments::markMisnested`, which sets `dp->misnested = true` and a
+/// zero-width DSR (`[offset, offset]`) on each hoisted element, so the selser
+/// serializer can reuse the (empty) source via the `misnested` flag rather than
+/// re-serializing it as a redlink.
+fn mark_misnested(node: &mut Node, offset: Option<usize>) {
     if matches!(node.kind, NodeKind::Element(_)) {
         let dp = node.dp.get_or_insert_with(Default::default);
         dp.misnested = Some(true);
         dp.dsr = Some(crate::wikitext::tokens_v2::DomSourceRange {
-            start: None,
-            end: None,
+            start: offset,
+            end: offset,
             open_width: None,
             close_width: None,
             ..Default::default()
@@ -109,7 +111,7 @@ fn mark_misnested(node: &mut Node) {
         }
     }
     for child in &mut node.children {
-        mark_misnested(child);
+        mark_misnested(child, offset);
     }
 }
 
@@ -283,6 +285,14 @@ fn foster_anchors(parent: &mut Node, fragment_kids: Vec<Node>) -> Vec<Node> {
     let mut kept: Vec<Node> = Vec::new();
     let mut hoisted: Vec<Node> = Vec::new();
 
+    // The zero-width DSR offset for hoisted (misnested) nodes is the outer
+    // anchor's source end (PHP `markMisnested`'s `$newOffset = $linkNode->dsr->end`).
+    let offset = parent
+        .dp
+        .as_ref()
+        .and_then(|d| d.dsr.as_ref())
+        .and_then(|d| d.end);
+
     // A copy of the outer `<a>` (attributes only) used to reconstruct the anchor
     // inside a hoisted block container (HTML5 formatting-element reconstruction).
     let anchor_copy = || {
@@ -302,20 +312,20 @@ fn foster_anchors(parent: &mut Node, fragment_kids: Vec<Node>) -> Vec<Node> {
         if child_is_anchor {
             // A bare nested `<a>` is hoisted out directly.
             let mut child = child;
-            mark_misnested(&mut child);
+            mark_misnested(&mut child, offset);
             hoisted.push(child);
         } else if tree_has_element(&child, "a") {
             if is_block_container(&node_name(&child)) {
                 let mut container = child;
                 let mut copy = anchor_copy();
-                mark_misnested(&mut copy);
+                mark_misnested(&mut copy, offset);
                 container.children.insert(0, copy);
-                mark_misnested(&mut container);
+                mark_misnested(&mut container, offset);
                 hoisted.push(container);
             } else {
                 // Inline container: keep the shell inside the outer `<a>`, hoist
                 // the nested `<a>` (and following siblings) out.
-                split_inline_anchor(child, &mut kept, &mut hoisted);
+                split_inline_anchor(child, offset, &mut kept, &mut hoisted);
             }
         } else {
             kept.push(child);
@@ -328,7 +338,12 @@ fn foster_anchors(parent: &mut Node, fragment_kids: Vec<Node>) -> Vec<Node> {
 
 /// Split an inline `<span>` media container: the nested `<a>` (and everything
 /// after it) is hoisted out and marked misnested; the (now empty) shell stays.
-fn split_inline_anchor(mut container: Node, kept: &mut Vec<Node>, hoisted: &mut Vec<Node>) {
+fn split_inline_anchor(
+    mut container: Node,
+    offset: Option<usize>,
+    kept: &mut Vec<Node>,
+    hoisted: &mut Vec<Node>,
+) {
     let Some(i) = container
         .children
         .iter()
@@ -339,7 +354,7 @@ fn split_inline_anchor(mut container: Node, kept: &mut Vec<Node>, hoisted: &mut 
     };
     let drained = container.children.drain(i..).collect::<Vec<_>>();
     for mut child in drained {
-        mark_misnested(&mut child);
+        mark_misnested(&mut child, offset);
         hoisted.push(child);
     }
     kept.push(container);
@@ -439,6 +454,46 @@ mod tests {
         assert_eq!(doc.children[1].children.len(), 1);
         assert_eq!(node_name(&doc.children[1].children[0]), "img");
         // The hoisted `<a>` and its `<img>` are marked misnested.
+        assert!(doc.children[1].dp.as_ref().unwrap().misnested == Some(true));
+    }
+
+    #[test]
+    fn test_misnested_dsr_is_zero_width_at_outer_end() {
+        // The outer `<a>`'s `dsr.end` becomes the zero-width DSR of the hoisted
+        // (misnested) `<a>`, so the selser serializer can reuse-empty via the
+        // `misnested` flag (PHP `markMisnested` sets `dsr = [end, end]`).
+        let mut img = Node::element(ElementKind::Image);
+        img.set_attr("src", "x");
+        let mut file_a = Node::element(ElementKind::Wikilink);
+        file_a.set_attr("href", "./File:F.jpg");
+        file_a.push_child(img);
+        let mut span = Node::element(ElementKind::Span);
+        span.push_child(file_a);
+        let mut ext = Node::element(ElementKind::ExtLink);
+        ext.set_attr("rel", "mw:ExtLink");
+        // The outer anchor source ends at 56.
+        ext.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(2),
+                end: Some(56),
+                open_width: Some(20),
+                close_width: None,
+                leading_ws: 0,
+                trailing_ws: 0,
+            }),
+            ..Default::default()
+        });
+        ext.push_child(span);
+
+        let mut doc = Node::document();
+        doc.push_child(ext);
+        run(&mut doc);
+        fix_bad_nesting(&mut doc);
+
+        // The hoisted `<a>` gets a zero-width DSR [56, 56].
+        let hoisted_dsr = doc.children[1].dp.as_ref().and_then(|d| d.dsr.as_ref());
+        assert_eq!(hoisted_dsr.map(|d| d.start), Some(Some(56)));
+        assert_eq!(hoisted_dsr.map(|d| d.end), Some(Some(56)));
         assert!(doc.children[1].dp.as_ref().unwrap().misnested == Some(true));
     }
 
