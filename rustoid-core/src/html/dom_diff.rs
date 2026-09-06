@@ -186,13 +186,22 @@ impl DomDiff {
                         {
                             // Mark skipped-over nodes (ni .. la) as inserted, going
                             // right-to-left so preceding meta insertions don't shift
-                            // indices still to be processed.
+                            // indices still to be processed. Track how many
+                            // `mw:DiffMarker` metas were prepended so we can correct
+                            // `la` (the matched node shifted right by exactly that
+                            // count).
+                            let mut meta_shift = 0usize;
                             let mut mark = la;
                             while mark > ni {
                                 mark -= 1;
-                                let _ = self.mark_node(new_parent, mark, DiffMarkers::Inserted);
+                                let next = self.mark_node(new_parent, mark, DiffMarkers::Inserted);
+                                // `mark_node` returns `mark + 2` when it prepends a
+                                // meta (text/comment) vs `mark + 1` (element).
+                                if next == mark + 2 {
+                                    meta_shift += 1;
+                                }
                             }
-                            ni = la;
+                            ni = la + meta_shift;
                             found_diff = true;
                             break;
                         }

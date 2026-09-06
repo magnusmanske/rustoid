@@ -77,7 +77,9 @@ impl Separators {
     /// newline that lives inside a comment does not count toward the separator's
     /// line count and is never stripped.
     pub fn make_separator(
+        state: &SerializerState,
         tree: &DomTree,
+        node: NodeId,
         sep: &str,
         constraints: &Constraints,
         at_start_of_output: bool,
@@ -128,16 +130,36 @@ impl Separators {
             } else {
                 out.push_str(&nl_buf);
             }
-        } else if let Some(max) = constraints.max {
+        } else if let Some(max) = constraints.max
+            && sep_nl_count > max
+            && !Self::skip_newline_strip_selser(state, tree, node, constraint_info.sep_type)
+        {
             // Strip excess newlines *outside* comments only (comment-only lines
             // and the newlines inside comments are preserved verbatim).
-            let excess = sep_nl_count.saturating_sub(max);
+            let excess = sep_nl_count - max;
             if excess > 0 {
                 out = strip_nls_outside_comments(&out, excess);
             }
         }
 
         out
+    }
+
+    /// The selser-only newline-preservation guard from `Separators::makeSeparator`:
+    /// when in selser mode and the current node is an *unmodified*
+    /// rendering-transparent node of a sibling pair, leave the separator's
+    /// excess newlines alone (stripping them would only dirty the diff without
+    /// changing how the node parses in wt→html).
+    fn skip_newline_strip_selser(
+        state: &SerializerState,
+        tree: &DomTree,
+        node: NodeId,
+        sep_type: Option<SepType>,
+    ) -> bool {
+        state.selser_mode
+            && sep_type == Some(SepType::Sibling)
+            && state.curr_node_unmodified
+            && crate::html::wts_utils::is_rendering_transparent_node(tree.node(node))
     }
 
     /// Build the separator to emit before `node`, based on the buffered
@@ -169,7 +191,9 @@ impl Separators {
         if sep.is_none() && (constraints.is_some() || !src.is_empty()) {
             if let Some(c) = constraints {
                 sep = Some(Self::make_separator(
+                    state,
                     tree,
+                    node,
                     &src,
                     &c,
                     state.at_start_of_output,
@@ -970,7 +994,16 @@ mod tests {
     }
 
     fn msep(tree: &DomTree, sep: &str, c: &Constraints, at_start: bool) -> String {
-        Separators::make_separator(tree, sep, c, at_start, &ConstraintInfo::default())
+        let state = crate::html::serializer_state::SerializerState::new();
+        Separators::make_separator(
+            &state,
+            tree,
+            tree.root(),
+            sep,
+            c,
+            at_start,
+            &ConstraintInfo::default(),
+        )
     }
 
     #[test]
@@ -1059,6 +1092,56 @@ mod tests {
         };
         // The first newline is skipped at start-of-output.
         assert_eq!(msep(&tree, "", &c, true), "\n");
+    }
+
+    #[test]
+    fn test_make_separator_selser_preserves_newlines_before_transparent_sibling() {
+        // In selser mode, an unmodified rendering-transparent sibling separator
+        // keeps its excess newlines (they don't change wt->html parsing, but
+        // stripping them would dirty the diff). Faithful to the
+        // `selserMode && sibling && unmodified && transparent` guard.
+        let mut st = SerializerState::new();
+        st.selser_mode = true;
+        st.curr_node_unmodified = true;
+
+        // Root is a Document, not rendering-transparent, so the guard is false:
+        // the 1 excess newline is stripped (max=1).
+        let tree = mk_tree();
+        let c = Constraints {
+            min: Some(1),
+            max: Some(1),
+        };
+        let info = ConstraintInfo {
+            sep_type: Some(SepType::Sibling),
+            node_a: None,
+            node_b: None,
+            on_sol: false,
+            force_sol: false,
+        };
+        assert!(!Separators::skip_newline_strip_selser(
+            &st,
+            &tree,
+            tree.root(),
+            Some(SepType::Sibling)
+        ));
+
+        // A rendering-transparent comment node is preserved by the guard.
+        // Rebuild a tree with a comment child (rendering-transparent).
+        let mut doc = Node::document();
+        doc.push_child(Node::comment("bar"));
+        let ctree = DomTree::new(doc);
+        let comment_id = ctree.first_child(ctree.root()).unwrap();
+        assert!(Separators::skip_newline_strip_selser(
+            &st,
+            &ctree,
+            comment_id,
+            Some(SepType::Sibling)
+        ));
+
+        // The comment tree separator keeps its excess newlines.
+        let sep = "\n\n<!--bar-->\n\n";
+        let result = Separators::make_separator(&st, &ctree, comment_id, sep, &c, false, &info);
+        assert_eq!(result, "\n\n<!--bar-->\n\n", "newlines preserved");
     }
 
     #[test]
@@ -1161,8 +1244,9 @@ mod tests {
         };
         // With no node_b in the info (no literal-HTML check possible), newlines
         // are appended, matching the else branch.
+        let state = SerializerState::new();
         assert_eq!(
-            Separators::make_separator(&tree, "", &c, false, &info),
+            Separators::make_separator(&state, &tree, tree.root(), "", &c, false, &info),
             "\n"
         );
     }
