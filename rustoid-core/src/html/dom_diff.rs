@@ -162,6 +162,13 @@ impl DomDiff {
 
         while bi < base_children.len() && ni < new_parent.children.len() {
             let mut dont_advance_new = false;
+            // When a `mark_node` call prepends a `mw:DiffMarker/*` meta *before*
+            // the current new node, the node shifts to `ni + 1` and the index
+            // space after it shifts accordingly. PHP tracks `$newNode` by stable
+            // node pointer (immune to this), so we capture the post-mark index
+            // here and use it to advance `ni` correctly instead of the stale
+            // `next_analyzable_sibling` step.
+            let mut ni_after_mark: Option<usize> = None;
             let base_node = &base_children[bi];
             let new_node = new_parent.children[ni].clone();
 
@@ -199,7 +206,8 @@ impl DomDiff {
                     while let Some(la) = lookahead {
                         let la_node = &base_children[la];
                         if is_content_node(la_node) && self.tree_equals(la_node, &new_node, true) {
-                            self.mark_node(new_parent, ni, DiffMarkers::Deleted);
+                            ni_after_mark =
+                                Some(self.mark_node(new_parent, ni, DiffMarkers::Deleted));
                             bi = la;
                             found_diff = true;
                             break;
@@ -212,7 +220,8 @@ impl DomDiff {
                     let saved_is_element = matches!(saved_new_node.kind, NodeKind::Element(_));
                     if !saved_is_element {
                         // Modified text/comment → mark deleted.
-                        self.mark_node(new_parent, saved_new_index, DiffMarkers::Deleted);
+                        ni_after_mark =
+                            Some(self.mark_node(new_parent, saved_new_index, DiffMarkers::Deleted));
                     } else if matches!(base_node.kind, NodeKind::Element(_))
                         && crate::html::wts_utils::node_name(&saved_new_node)
                             == crate::html::wts_utils::node_name(base_node)
@@ -225,7 +234,8 @@ impl DomDiff {
                         self.subtree_differs_at(base_node, new_parent, saved_new_index);
                     } else {
                         dont_advance_new = true;
-                        self.mark_node(new_parent, saved_new_index, DiffMarkers::Deleted);
+                        ni_after_mark =
+                            Some(self.mark_node(new_parent, saved_new_index, DiffMarkers::Deleted));
                     }
                 }
 
@@ -241,10 +251,19 @@ impl DomDiff {
                 bi = self
                     .next_analyzable_sibling(&base_children, bi)
                     .unwrap_or(base_children.len());
-                if !dont_advance_new {
-                    ni = self
-                        .next_analyzable_sibling(&new_parent.children, ni)
-                        .unwrap_or(new_parent.children.len());
+                match ni_after_mark {
+                    // A `mark_node` that may have prepended a meta before the
+                    // current new node: `mark_node` returns the index just past
+                    // the marked node (and meta), so `- 1` re-points at the node
+                    // itself (correct whether or not a meta was inserted).
+                    Some(past) if dont_advance_new => ni = past - 1,
+                    Some(past) => ni = past,
+                    None if !dont_advance_new => {
+                        ni = self
+                            .next_analyzable_sibling(&new_parent.children, ni)
+                            .unwrap_or(new_parent.children.len());
+                    }
+                    None => {}
                 }
             }
         }
@@ -450,5 +469,42 @@ mod tests {
                     .unwrap_or(false)
             });
         assert!(changed);
+    }
+
+    #[test]
+    fn test_diff_iew_insertion_does_not_mark_following_nodes() {
+        // An inserted sublist preceded by a newline (IEW) must not cascade into
+        // marking the trailing comment as inserted. This exercises the
+        // corrected index tracking when `markNode` prepends `mw:DiffMarker`
+        // metas (which shift sibling indices).
+        let mut base = Node::element(ElementKind::Other("body".to_string()));
+        base.push_child(p("foo"));
+        base.push_child(Node::text("\n\n"));
+        base.push_child(Node::comment("bar"));
+
+        let mut new = Node::element(ElementKind::Other("body".to_string()));
+        new.push_child(p("foo"));
+        new.push_child(Node::text("\n"));
+        let mut ul = Node::element(ElementKind::UnorderedList);
+        let mut li = Node::element(ElementKind::ListItem);
+        li.push_child(Node::text("x"));
+        ul.push_child(li);
+        new.push_child(ul);
+        new.push_child(Node::text("\n\n"));
+        new.push_child(Node::comment("bar"));
+
+        let mut d = DomDiff::default();
+        assert!(d.diff(&base, &mut new));
+
+        // The trailing comment must remain unmarked (not `inserted`).
+        let comment = new
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::Comment(_)))
+            .expect("comment present");
+        assert!(
+            comment.get_attr("data-parsoid-diff").is_none(),
+            "trailing comment should not be marked: {comment:?}"
+        );
     }
 }
