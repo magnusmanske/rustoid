@@ -12,6 +12,13 @@
 
 use crate::dom::node::{Node, NodeKind};
 use crate::html::wts_utils::element_tag;
+use crate::wikitext::tokens_v2::DataParsoid;
+
+/// Whether `dp` carries a literal-HTML (`stx: html`) marker. Faithful to
+/// `WTUtils::hasLiteralHTMLMarker`.
+fn has_literal_html_marker(dp: Option<&DataParsoid>) -> bool {
+    dp.is_some_and(|dp| dp.stx.as_deref() == Some("html"))
+}
 
 /// The "flagged empty elements" the cleanup pass inspects (`Consts::$Output['FlaggedEmptyElts']`).
 fn flagged_empty_elts() -> &'static [&'static str] {
@@ -177,8 +184,137 @@ fn handle_empty_element(node: &mut Node) {
 /// Run the `CleanUp` empty-element pass over the document.
 pub fn run(root: &mut Node) {
     handle_empty_element(root);
+    trim_whitespace(root);
     for child in &mut root.children {
         run(child);
+    }
+}
+
+/// Trim leading/trailing `[ \t]` whitespace from a trimmable-WS element, removing
+/// pure-whitespace text children and `mw:DisplaySpace` elements, and recording the
+/// trimmed widths in `dp.dsr.leading_ws`/`trailing_ws` (or `-1` when the widths
+/// cannot be reliably tracked). Faithful to `CleanUp::trimWhiteSpace`.
+fn trim_whitespace(node: &mut Node) {
+    let tag = match &node.kind {
+        NodeKind::Element(kind) => element_tag(kind),
+        _ => return,
+    };
+
+    // Faithful to the guard in `finalCleanup`: only wikitext markup (not literal
+    // HTML) with trimmable whitespace is trimmed.
+    if !crate::wikitext::consts::wikitext_tags_with_trimmable_ws().contains(&tag)
+        || has_literal_html_marker(node.dp.as_ref())
+    {
+        return;
+    }
+
+    // We need a DSR to record the trimmed widths on.
+    if node.dp.as_ref().and_then(|d| d.dsr.as_ref()).is_none() {
+        return;
+    }
+
+    // --- Trim leading whitespace (first line) ---
+    let mut trimmed_len = 0usize;
+    let mut update_dsr = true;
+    let mut skipped = false;
+
+    let mut break_index = node.children.len();
+    let mut i = 0usize;
+    while i < node.children.len() {
+        let pure_ws_text = matches!(&node.children[i].kind, NodeKind::Text(t) if !t.is_empty() && t.bytes().all(|b| matches!(b, b' ' | b'\t')));
+        let display_space = matches!(&node.children[i].kind, NodeKind::Element(_))
+            && crate::html::dom_utils::has_type_of(&node.children[i], "mw:DisplaySpace");
+
+        if pure_ws_text {
+            let len = match &node.children[i].kind {
+                NodeKind::Text(t) => t.len(),
+                _ => 0,
+            };
+            trimmed_len += len;
+            update_dsr = !skipped;
+            node.children.remove(i);
+        } else if display_space {
+            trimmed_len += 1;
+            update_dsr = !skipped;
+            node.children.remove(i);
+        } else if !crate::html::wts_utils::is_rendering_transparent_node(&node.children[i]) {
+            break_index = i;
+            break;
+        } else {
+            skipped = true;
+            i += 1;
+        }
+    }
+
+    if break_index < node.children.len() {
+        let child = &mut node.children[break_index];
+        if let NodeKind::Text(t) = &mut child.kind {
+            let byte_len = t.bytes().take_while(|b| matches!(b, b' ' | b'\t')).count();
+            if byte_len > 0 {
+                update_dsr = !skipped;
+                trimmed_len += byte_len;
+                *t = t[byte_len..].to_string();
+            }
+        }
+    }
+
+    let leading_ws = if update_dsr { trimmed_len as isize } else { -1 };
+
+    // --- Trim trailing whitespace (last line) ---
+    let mut trimmed_len = 0usize;
+    let mut update_dsr = true;
+    let mut skipped = false;
+
+    let mut break_index = node.children.len();
+    let mut i = node.children.len();
+    while i > 0 {
+        i -= 1;
+        let pure_ws_text = matches!(&node.children[i].kind, NodeKind::Text(t) if !t.is_empty() && t.bytes().all(|b| matches!(b, b' ' | b'\t')));
+        if pure_ws_text {
+            let len = match &node.children[i].kind {
+                NodeKind::Text(t) => t.len(),
+                _ => 0,
+            };
+            trimmed_len += len;
+            update_dsr = !skipped;
+            node.children.remove(i);
+            break_index = i;
+        } else if !crate::html::wts_utils::is_rendering_transparent_node(&node.children[i]) {
+            break_index = i;
+            break;
+        } else {
+            skipped = true;
+        }
+    }
+
+    if break_index < node.children.len() {
+        let child = &mut node.children[break_index];
+        if let NodeKind::Text(t) = &mut child.kind {
+            // Faithful to `/^([\s\S]*\S)([ \t]+)$/D`: strip a trailing `[ \t]+`
+            // run only when the character *immediately before* that run is
+            // non-whitespace (`\S`). An intervening `\n` (or other whitespace)
+            // means the run is not trimmed (it is separator text, not content).
+            let trailing_count = t.len() - t.trim_end_matches([' ', '\t']).len();
+            if trailing_count > 0 {
+                let prefix = &t[..t.len() - trailing_count];
+                if let Some(last) = prefix.chars().next_back()
+                    && !last.is_whitespace()
+                {
+                    update_dsr = !skipped;
+                    trimmed_len += trailing_count;
+                    *t = prefix.to_string();
+                }
+            }
+        }
+    }
+
+    let trailing_ws = if update_dsr { trimmed_len as isize } else { -1 };
+
+    if let Some(dp) = node.dp.as_mut()
+        && let Some(dsr) = dp.dsr.as_mut()
+    {
+        dsr.leading_ws = leading_ws;
+        dsr.trailing_ws = trailing_ws;
     }
 }
 
@@ -228,5 +364,67 @@ mod tests {
         run(&mut root);
 
         assert_eq!(root.children[0].get_attr("class"), Some("mw-empty-elt"));
+    }
+
+    fn li_with_dsr(children: Vec<Node>, start: usize, end: usize) -> Node {
+        let mut li = Node::element(ElementKind::ListItem);
+        for c in children {
+            li.push_child(c);
+        }
+        li.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(start),
+                end: Some(end),
+                open_width: Some(1),
+                close_width: Some(0),
+                leading_ws: 0,
+                trailing_ws: 0,
+            }),
+            ..Default::default()
+        });
+        li
+    }
+
+    /// Trim trailing `[ \t]` from "foo " → "foo", `trailing_ws = 1`.
+    #[test]
+    fn test_trim_trailing_space() {
+        let mut li = li_with_dsr(vec![Node::text("foo ")], 0, 5);
+        trim_whitespace(&mut li);
+        let dsr = li.dp.as_ref().unwrap().dsr.as_ref().unwrap();
+        assert_eq!(dsr.trailing_ws, 1);
+        assert_eq!(dsr.leading_ws, 0);
+        assert!(matches!(&li.children[0].kind, NodeKind::Text(t) if t == "foo"));
+    }
+
+    /// A trailing `[ \t]` run preceded by a `\n` is *not* trimmed (faithful to
+    /// `/^([\s\S]*\S)([ \t]+)$/D` — the `\n` separates the non-ws char from the
+    /// trailing run). This preserves the separator space between table cells.
+    /// (The *leading* space is still trimmed, per the leading regex.)
+    #[test]
+    fn test_trim_trailing_space_after_newline_is_untouched() {
+        let mut li = li_with_dsr(vec![Node::text(" [1]\n ")], 0, 6);
+        trim_whitespace(&mut li);
+        let dsr = li.dp.as_ref().unwrap().dsr.as_ref().unwrap();
+        assert_eq!(dsr.leading_ws, 1); // leading space before `[` trimmed
+        assert_eq!(dsr.trailing_ws, 0); // trailing space after `\n` NOT trimmed
+        assert!(matches!(&li.children[0].kind, NodeKind::Text(t) if t == "[1]\n "));
+    }
+
+    /// A rendering-transparent node (comment) in the middle makes the trimmed
+    /// widths unreliable → `-1` (faithful to the `$skipped` flag).
+    #[test]
+    fn test_trim_trailing_with_comment_is_invalid() {
+        let mut li = li_with_dsr(
+            vec![Node::text("c "), Node::comment("c2"), Node::text(" ")],
+            0,
+            14,
+        );
+        trim_whitespace(&mut li);
+        let dsr = li.dp.as_ref().unwrap().dsr.as_ref().unwrap();
+        assert_eq!(dsr.trailing_ws, -1);
+        // "c " trailing space stripped → "c"; the trailing " " text node removed.
+        assert_eq!(li.children.len(), 2);
+        assert!(matches!(&li.children[0].kind, NodeKind::Text(t) if t == "c"));
+        assert!(matches!(&li.children[1].kind, NodeKind::Comment(c) if c == "c2"));
     }
 }
