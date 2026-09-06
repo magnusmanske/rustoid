@@ -215,9 +215,23 @@ impl Separators {
             let dsr_b = Self::dsr_for_source_node(tree, node, prev_node, true);
 
             if let (Some(a), Some(b)) = (dsr_a, dsr_b)
-                && state.is_valid_dsr(Some(&a), false) && state.is_valid_dsr(Some(&b), false) {
-                    recovered = Self::sep_from_dsr(state, &a, &b);
-                }
+                && state.is_valid_dsr(Some(&a), false)
+                && state.is_valid_dsr(Some(&b), false)
+            {
+                recovered = Self::sep_from_dsr(state, &a, &b);
+            }
+        } else if !crate::html::diff_utils::DiffUtils::has_diff_markers(tree.node(prev_node)) {
+            // Faithful to the `$origSepNeeded && !hasDiffMarkers($prevNode)` branch
+            // of PHP `buildSep`: `prevNode` is unmodified but its next non-sep
+            // sibling was *inserted*. Recover the original separator that existed
+            // between `prevNode` and its original next sibling (or its parent, if
+            // it was the last non-sep child), minimizing dirty diffs around the
+            // insertion. The recovered text is stashed in `state.separator.src`
+            // (overwriting any buffered separator) and the branch reports no
+            // DSR-recovered `sep` (so the constraint path re-emits it).
+            if let Some(sep) = Self::recover_inserted_prev_sep(state, tree, prev_node, node) {
+                state.separator.src = Some(sep);
+            }
         }
 
         // Trimmed-whitespace fallback (mirrors the `$sep === null` block at the
@@ -246,6 +260,81 @@ impl Separators {
         }
 
         recovered
+    }
+
+    /// The `$origSepNeeded && !hasDiffMarkers($prevNode)` branch of
+    /// `Separators::buildSep`: recover the separator that originally followed an
+    /// unmodified `prev_node` whose next non-separator sibling was inserted.
+    /// Faithful to the `$origSepUsable`/`$origNext` logic, returning the
+    /// recovered source text (or `None` when unrecoverable).
+    fn recover_inserted_prev_sep(
+        state: &SerializerState,
+        tree: &DomTree,
+        prev_node: NodeId,
+        node: NodeId,
+    ) -> Option<String> {
+        use crate::html::diff_utils::DiffUtils;
+        use crate::html::dsr::SourceRange;
+        use crate::html::wts_utils;
+
+        // `$next = nextNonSepSibling($prevNode)` must exist AND be inserted.
+        let next = crate::html::dom_tree::next_non_sep_sibling(tree, prev_node)?;
+        if !DiffUtils::has_inserted_diff_mark(tree.node(next)) {
+            return None;
+        }
+
+        // `$origSepUsable` must hold: `$next` is either `$node` itself, or an
+        // ancestor of `$node` via zero-width wikitext elements only.
+        if node != next {
+            let mut n = tree.parent(node);
+            while let Some(cur) = n {
+                if cur == next {
+                    break;
+                }
+                if !wts_utils::is_zero_width_wikitext_elt(tree.node(cur)) {
+                    return None;
+                }
+                n = tree.parent(cur);
+            }
+            // `$n !== null` after the loop: `$next` was found among ancestors.
+            n?;
+        }
+
+        // `$o1 = getDataParsoid($prevNode)->dsr ?? null` (Element only).
+        if !matches!(
+            tree.node(prev_node).kind,
+            crate::dom::node::NodeKind::Element(_)
+        ) {
+            return None;
+        }
+        let o1 = wts_utils::get_dsr(tree.node(prev_node))?;
+        let o1_sr = SourceRange::with_source(o1.start, o1.end, o1.source.clone());
+
+        let orig_next = crate::html::dom_tree::next_non_sep_sibling(tree, next);
+        match orig_next {
+            None => {
+                // `$prevNode` was the last non-sep child: recover up to the
+                // parent's close range.
+                let dsr2 = wts_utils::get_dsr(tree.node(tree.parent(prev_node)?))?;
+                state.get_orig_src(&o1_sr.to(&dsr2.close_range()))
+            }
+            Some(orig_next) => {
+                // Recover from `o1` up to `orig_next` (which must be unmodified
+                // and have a DSR).
+                if DiffUtils::has_diff_markers(tree.node(orig_next)) {
+                    return None;
+                }
+                if !matches!(
+                    tree.node(orig_next).kind,
+                    crate::dom::node::NodeKind::Element(_)
+                ) {
+                    return None;
+                }
+                let o2 = wts_utils::get_dsr(tree.node(orig_next))?;
+                let o2_sr = SourceRange::with_source(o2.start, o2.end, o2.source.clone());
+                state.get_orig_src(&o1_sr.to(&o2_sr))
+            }
+        }
     }
 
     /// Resolve the DSR (with auto-inserted tag widths nulled) of the node on one
@@ -330,17 +419,18 @@ impl Separators {
         // Check if `id` is the last child of a zero-width element and use that
         // parent's DSR instead (typical case: text in p).
         if tree.next_sibling(id).is_none()
-            && let Some(parent) = tree.parent(id) {
-                let parent_node = tree.node(parent);
-                if matches!(parent_node.kind, crate::dom::node::NodeKind::Element(_))
-                    && crate::html::wts_utils::get_dsr(parent_node)
-                        .as_ref()
-                        .and_then(|d| d.close_width)
-                        == Some(0)
-                {
-                    return Self::handle_auto_inserted(parent_node);
-                }
+            && let Some(parent) = tree.parent(id)
+        {
+            let parent_node = tree.node(parent);
+            if matches!(parent_node.kind, crate::dom::node::NodeKind::Element(_))
+                && crate::html::wts_utils::get_dsr(parent_node)
+                    .as_ref()
+                    .and_then(|d| d.close_width)
+                    == Some(0)
+            {
+                return Self::handle_auto_inserted(parent_node);
             }
+        }
 
         // Can we extrapolate DSR from the previous element sibling? Yes, if the
         // parent didn't have its children edited.
@@ -881,6 +971,72 @@ mod tests {
 
     fn msep(tree: &DomTree, sep: &str, c: &Constraints, at_start: bool) -> String {
         Separators::make_separator(tree, sep, c, at_start, &ConstraintInfo::default())
+    }
+
+    #[test]
+    fn test_recover_inserted_prev_sep() {
+        use crate::dom::node::{ElementKind, Node};
+        use crate::html::dsr::SelectiveUpdateData;
+        use crate::html::serializer_state::SerializerState;
+        use crate::wikitext::tokens_v2::DataParsoid;
+
+        // Source: `* c <!--c2--> ` — the `<li>` covers 19..33, bullet `*` at 19
+        // (open width 1), `c` at 21 (wrapped in a selser span [21..22]), then a
+        // space + `<!--c2-->` + trailing space, then an inserted nested list.
+        let mut li = Node::element(ElementKind::ListItem);
+        li.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(19),
+                end: Some(33),
+                open_width: Some(1),
+                close_width: Some(0),
+                leading_ws: 1,
+                trailing_ws: -1,
+            }),
+            ..DataParsoid::default()
+        });
+
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("data-mw-selser-wrapper", "");
+        span.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(21),
+                end: Some(22),
+                open_width: Some(0),
+                close_width: Some(0),
+                leading_ws: 0,
+                trailing_ws: 0,
+            }),
+            ..DataParsoid::default()
+        });
+        span.push_child(Node::text("c"));
+
+        let mut inserted_ul = Node::element(ElementKind::UnorderedList);
+        inserted_ul.set_attr("data-parsoid-diff", "{\"diff\":[\"inserted\"]}");
+
+        li.push_child(span);
+        li.push_child(Node::comment("c2"));
+        li.push_child(inserted_ul);
+
+        let mut ul = Node::element(ElementKind::UnorderedList);
+        ul.push_child(li);
+
+        let tree = DomTree::new(ul);
+        let li_id = tree.first_child(tree.root()).unwrap();
+        let span_id = tree.first_child(li_id).unwrap();
+        let comment_id = tree.next_sibling(span_id).unwrap();
+        let inserted_id = tree.next_sibling(comment_id).unwrap();
+
+        let mut state = SerializerState::new();
+        state.init_mode(true);
+        // Full page source so offsets 19..33 are in-bounds.
+        let source = "* a \n* b<!--c1--> \n* c <!--c2--> \n* d <!--c3--> \n";
+        state.selser_data = Some(SelectiveUpdateData::new(source));
+
+        // `prev_node` is the span, `node` is the inserted `<ul>`; the recovered
+        // separator is source[22..33] = ` <!--c2--> ` (space + comment + space).
+        let sep = Separators::recover_inserted_prev_sep(&state, &tree, span_id, inserted_id);
+        assert_eq!(sep.as_deref(), Some(" <!--c2--> "));
     }
 
     #[test]

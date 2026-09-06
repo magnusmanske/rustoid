@@ -899,9 +899,11 @@ impl<'a> PegTokenizer<'a> {
             dp,
         )));
 
-        // Parse inline content after the bullets. The single space separator
-        // between the bullets and the content is not part of the item text.
-        self.consume_spaces();
+        // Parse inline content after the bullets. Faithful to PHP's
+        // `li = bullets:list_char+ c:inlineline?` — the leading space after the
+        // bullet is *kept* as the first content character (it is NOT consumed
+        // here), so `CleanUp::trimWhiteSpace` can later trim it and record
+        // `leading_ws` for selser whitespace recovery.
         self.try_parse_inlineline_stop_at_nl();
         // The trailing newline is left unconsumed so the parent `sol`/`block_lines`
         // rule emits its `Nl` token and can then consume following SOL-transparent
@@ -4570,6 +4572,33 @@ mod tests {
             .filter(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote"))
             .count();
         assert_eq!(quote_count, 4, "expected 4 quote tokens in {tokens:?}");
+    }
+
+    #[test]
+    fn test_list_item_keeps_leading_space() {
+        // The space after a bullet is *kept* as the first content character of
+        // the `<li>` (faithful to `li = bullets:list_char+ c:inlineline?`), so
+        // `CleanUp::trimWhiteSpace` can trim it and record `leading_ws` for
+        // selser whitespace recovery.
+        let tokens = tokenize("* a\n* b");
+        let list_items: Vec<_> = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "listItem"))
+            .collect();
+        assert_eq!(list_items.len(), 2, "expected 2 list items in {tokens:?}");
+        // The first `<li>`'s inline content must be " a" (leading space kept),
+        // not "a" (space dropped by the removed `consume_spaces`).
+        let text: String = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Either::Left(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains(" a") && text.contains(" b"),
+            "leading space after bullet dropped: {tokens:?}"
+        );
     }
 
     #[test]

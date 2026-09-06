@@ -204,6 +204,10 @@ pub trait DomHandler {
             ("dd", ':'),
         ];
 
+        // For new elements, for prettier wikitext serialization, emit a space
+        // after the last bullet (faithful to `getListBullets`).
+        let space = self.get_leading_space(tree, node, " ");
+
         let mut res = String::new();
         let mut cur = Some(node);
         while let Some(c) = cur {
@@ -246,6 +250,10 @@ pub trait DomHandler {
             cur = tree.parent(c);
         }
 
+        // Don't emit a space if we aren't returning any bullets.
+        if !res.is_empty() {
+            res.push_str(&space);
+        }
         res
     }
 

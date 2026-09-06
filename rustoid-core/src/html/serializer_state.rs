@@ -188,7 +188,12 @@ impl<'a> SerializerState<'a> {
             prev_node: None,
             open_annotations: std::collections::HashMap::new(),
             log_prefix: "OUT:".to_string(),
-            have_trimmed_ws_dsr: false,
+            // `SerializerState::__construct` computes this as
+            // `Semver::satisfies(env->getInputContentVersion(), '>=2.1.1')`.
+            // The default content version is `2.8.0`, which always satisfies
+            // the constraint, so trimmed-ws DSR recovery is enabled by default
+            // (the non-trimmed-ws fallback below would otherwise mask it).
+            have_trimmed_ws_dsr: true,
         }
     }
 
