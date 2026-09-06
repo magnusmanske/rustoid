@@ -1378,6 +1378,18 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
                 new_content[et].set_attr("typeof", merged);
             }
             new_content[et].data_parsoid = start_meta.data_parsoid.clone();
+            // The encapsulation target (e.g. a `<div>`/`<pre>` block produced by a
+            // template argument) carries a *fragment-relative* `tsr`/`dsr` (offsets
+            // into the template's own substituted source, e.g. `[0, 5]` for
+            // `<div>`). The `mw:Transclusion` start meta carries the page-relative
+            // `tsr`/`dsr` of the whole `{{…}}`; sync those onto the target (while
+            // preserving the target's own fragment `src`/`dom_fragment_src`, which
+            // are used to reconstruct the argument's tag) so ComputeDSR anchors the
+            // transclusion at the correct page offset.
+            if let (Some(mdp), Some(tdp)) = (start_meta.dp.as_ref(), new_content[et].dp.as_mut()) {
+                tdp.tsr = mdp.tsr.clone();
+                tdp.dsr = mdp.dsr.clone();
+            }
             // Merge the transclusion's `data-mw` (its `parts` envelope) with any
             // `data-mw` already on the encapsulation target (e.g. a media
             // container's `attribs`/`errors`), rather than overwriting it. This

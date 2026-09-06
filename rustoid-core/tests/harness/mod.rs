@@ -578,7 +578,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
         }
     }
     if !wikitext_edited_lines.is_empty() {
-        test.wikitext_edited = Some(wikitext_edited_lines.join("\n").trim().to_string());
+        // Preserve leading whitespace (a leading space before the first
+        // content node is significant wikitext, e.g. a body separator);
+        // only trim the trailing newline introduced by the section parse.
+        test.wikitext_edited = Some(wikitext_edited_lines.join("\n").trim_end().to_string());
     }
 
     // Parse options
