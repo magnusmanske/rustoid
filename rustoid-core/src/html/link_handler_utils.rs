@@ -369,9 +369,7 @@ pub fn serialize_as_ext_link(
 
     if is_url_link(env, tree, node, link_data) {
         let ct = crate::html::constrained_text::ConstrainedText::auto_url_link(url_str, node);
-        state.push_to_curr_line(ct);
-        state.on_sol = false;
-        state.at_start_of_output = false;
+        state.emit_ct(ct, node, tree);
         return;
     }
 
@@ -419,7 +417,7 @@ pub fn serialize_as_ext_link(
     } else {
         crate::html::constrained_text::ConstrainedText::ext_link(link_text, node)
     };
-    state.push_to_curr_line(ct);
+    state.emit_ct(ct, node, tree);
 }
 
 /// `isSimpleWikiLink` — can the link be serialized as a pipeless `[[Foo]]` (i.e.
@@ -523,9 +521,7 @@ pub fn serialize_as_wiki_link(
             target.value.clone(),
             node,
         );
-        state.push_to_curr_line(ct);
-        state.on_sol = false;
-        state.at_start_of_output = false;
+        state.emit_ct(ct, node, tree);
         return;
     } else {
         // Emit piped wikilink syntax.
@@ -634,7 +630,7 @@ pub fn serialize_as_wiki_link(
         let ct = crate::html::constrained_text::ConstrainedText::wiki_link(
             wt, node, greedy, None, trail,
         );
-        state.push_to_curr_line(ct);
+        state.emit_ct(ct, node, tree);
 
         if is_piped {
             state.single_line_context.pop();
@@ -681,7 +677,7 @@ pub fn link_handler(
             if !serialized.starts_with('[') {
                 let ct =
                     crate::html::constrained_text::ConstrainedText::magic_link(serialized, node);
-                state.push_to_curr_line(ct);
+                state.emit_ct(ct, node, tree);
                 return;
             }
         }
@@ -736,7 +732,7 @@ pub fn link_handler(
         format!("[{href_str} {content_str}]")
     };
     let ct = crate::html::constrained_text::ConstrainedText::ext_link(chunk, node);
-    state.push_to_curr_line(ct);
+    state.emit_ct(ct, node, tree);
 }
 
 /// `figureHandler` — serialize a `<figure>`/media node. Faithful to
