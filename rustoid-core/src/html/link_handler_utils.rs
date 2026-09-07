@@ -996,17 +996,27 @@ fn figure_to_constrained_text_inner(
     }
     let resource_value = resource.value.clone().unwrap_or_default();
 
-    // Reconstruct the caption.
-    let caption = caption_elt.map(|c| {
-        crate::html::serializer_state::SerializerState::serialize_caption_children_to_string(
-            state,
-            tree,
-            c,
-            Some(Box::new(move |_s, text, _o, _t| {
-                crate::html::wikitext_escape_handlers::media_option_handler(text)
-            })),
-        )
-    });
+    // Reconstruct the caption. For block media this comes from the `<figcaption>`;
+    // for inline media (no caption element) it is recovered from `data-mw.caption`
+    // (a serialized caption string), escaping any wikitext-significant characters
+    // (mirrors PHP's `dataMw->caption` fragment → `$captionElt` reconstruction).
+    let caption = match caption_elt {
+        Some(c) => Some(
+            crate::html::serializer_state::SerializerState::serialize_caption_children_to_string(
+                state,
+                tree,
+                c,
+                Some(Box::new(move |_s, text, _o, _t| {
+                    crate::html::wikitext_escape_handlers::media_option_handler(text)
+                })),
+            ),
+        ),
+        None => data_mw_prop(tree, outer_elt, "caption").map(|cap| {
+            crate::html::wikitext_escape_handlers::escape_link_content(
+                state, tree, &cap, false, outer_elt, true,
+            )
+        }),
+    };
 
     // Identify the link target.
     let mut link: Option<Shadow> = None;
