@@ -34,20 +34,22 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
     let mut jobs: Vec<ContainerJob> = Vec::new();
     collect_containers(root, &mut Vec::new(), &mut jobs, config);
 
-    // Resolve redirects (a redirect-to-file title yields its target's media
-    // info; mirrors the API's `redirects=1` following) and batch-fetch file info
-    // (PHP issues a single getFileInfo API call). Deduplicate by title so each
-    // distinct file is fetched once.
+    // Fetch file info, following any redirect to retrieve the *target's* media
+    // info (its `src`/dimensions) while keeping `job.title` as the original
+    // title. Mirrors PHP `AddMediaInfo::run`, where `getFileInfo` resolves
+    // redirects internally (`redirects=1`) so the returned info describes the
+    // target, but `$attrs['title']` — and therefore `resource`/`href`/the
+    // description link — stay the original title.
     let mut infos: HashMap<String, Option<FileInfo>> = HashMap::new();
     for job in jobs.iter_mut() {
-        if let Ok(Some(target)) = source.resolve_redirect(&job.title).await {
-            // Re-target: the description link and `resource` use the resolved
-            // title, not the redirect title.
-            job.title = target;
-        }
+        // Only the info lookup follows the redirect; the job's title is unchanged.
+        let fetch_title = match source.resolve_redirect(&job.title).await {
+            Ok(Some(target)) => target,
+            _ => job.title.clone(),
+        };
         let key = job.title.full_text();
         if let Entry::Vacant(entry) = infos.entry(key) {
-            let info = source.get_file_info(&job.title).await.unwrap_or(None);
+            let info = source.get_file_info(&fetch_title).await.unwrap_or(None);
             entry.insert(info);
         }
 

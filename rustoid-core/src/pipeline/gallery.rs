@@ -576,7 +576,9 @@ fn figure_to_span(figure: &mut Node) -> Node {
 /// The `<a class="galleryfilename galleryfilename-truncate">` link prepended by
 /// the `showfilename` option (mirrors `Gallery::pLine`).
 fn showfilename_anchor(title: &Title, config: &dyn SiteConfig) -> Node {
-    let file = title.get_prefixed_text();
+    // `getPrefixedDBKey()` — underscores, not spaces — for both the `title`
+    // attribute and the visible text.
+    let file = title.get_full_db_key();
     let mut a = Node::element(ElementKind::Other("a".to_string()));
     a.set_attr("href", crate::title::make_link(title, config));
     a.set_attr("class", "galleryfilename galleryfilename-truncate");
