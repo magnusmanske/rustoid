@@ -834,9 +834,20 @@ impl<'a> PegTokenizer<'a> {
                 colons += 1;
                 self.advance(1);
             }
+            // `space_or_comment*` may separate the colons from the table start
+            // (mirrors PHP's `hacky_dl_uses = ":"+ space_or_comment* !inline_breaks
+            // table_start_tag`).
+            loop {
+                let before = self.pos;
+                self.consume_spaces();
+                self.try_comment();
+                if self.pos == before {
+                    break;
+                }
+            }
             // Check if followed by table start.
             if self.starts_with("{|") {
-                // This is hacky_dl_uses: colons before a table.
+                // This is hacky_dl_uses: colons (+ leading space/comments) before a table.
                 let tsr_start = saved;
                 let dp = self.make_dp(tsr_start, tsr_start + colons);
                 // The `bullets` are just the colon string (mirrors the standard
@@ -854,9 +865,9 @@ impl<'a> PegTokenizer<'a> {
                     vec![bullet_kv],
                     dp,
                 )));
-                // Emit spaces/comments, then parse the table.
-                self.consume_spaces();
-                self.try_comment();
+                // The leading spaces/comments (if any) are already emitted into the
+                // output by `consume_spaces`/`try_comment` above (they become `sc`,
+                // mirrored into the token stream before the table, as PHP does).
                 self.try_table_start_tag();
                 self.at_sol = false;
                 return true;
