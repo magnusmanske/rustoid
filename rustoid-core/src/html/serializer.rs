@@ -654,7 +654,10 @@ fn data_mw_value_html(v: &serde_json::Value) -> Option<String> {
 
 /// Serialize a template-generated attribute key/value `html` fragment back to
 /// wikitext (`domToWikitext` with `onSOL => false` + `inAttribute => true`).
-fn dom_to_wikitext_from_html(html: String, env: Option<crate::html::env::SerializerEnv>) -> String {
+pub(crate) fn dom_to_wikitext_from_html(
+    html: String,
+    env: Option<crate::html::env::SerializerEnv>,
+) -> String {
     let Ok(root) = crate::html::parse::parse_html(&html) else {
         return String::new();
     };

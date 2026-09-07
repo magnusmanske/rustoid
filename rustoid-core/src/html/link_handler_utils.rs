@@ -817,26 +817,49 @@ fn attribute_shadow(
     }
 }
 
-/// `WikitextSerializer::getAttributeValue` — the generated value of
-/// `data-mw.attribs[i]` whose key matches `key` (only when it carries a `.html`
-/// form), serialized back to wikitext.
-fn data_mw_attr_html(node: &crate::dom::node::Node, key: &str) -> Option<String> {
+/// `WTSUtils::getAttrFromDataMw` — the `data-mw.attribs[i]` entry whose key
+/// (`.txt`) matches `key`, returning its `txt`/`html` value forms.
+struct DataMwAttrVal {
+    txt: Option<String>,
+    html: Option<String>,
+}
+
+fn get_attr_from_data_mw(node: &crate::dom::node::Node, key: &str) -> Option<DataMwAttrVal> {
     let dm = node.data_mw.as_deref()?;
     let json: serde_json::Value = serde_json::from_str(dm).ok()?;
     for entry in json.get("attribs")?.as_array()? {
         let kv = entry.as_array()?;
         let key_obj = kv.first()?;
-        let k_str = key_obj.get("txt")?.as_str()?;
+        // The key is either a plain string (`"page"`) or an object with a
+        // `.txt` (a templated attribute key). Mirrors `DataMwAttrib::getKeyString`.
+        let k_str = match key_obj {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Object(_) => key_obj.get("txt")?.as_str()?,
+            _ => return None,
+        };
         if k_str != key {
             continue;
         }
         let value_obj = kv.get(1)?;
-        // Only the generated (`.html`) form is authoritative here.
-        if let Some(html) = value_obj.get("html").and_then(|h| h.as_str()) {
-            return Some(html.to_string());
-        }
+        return Some(DataMwAttrVal {
+            txt: value_obj
+                .get("txt")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            html: value_obj
+                .get("html")
+                .and_then(|h| h.as_str())
+                .map(str::to_string),
+        });
     }
     None
+}
+
+/// `WikitextSerializer::getAttributeValue` — the generated value of
+/// `data-mw.attribs[i]` whose key matches `key` (only when it carries a `.html`
+/// form), serialized back to wikitext.
+fn data_mw_attr_html(node: &crate::dom::node::Node, key: &str) -> Option<String> {
+    get_attr_from_data_mw(node, key).and_then(|v| v.html)
 }
 
 /// Read a string property from the node's `data-mw` JSON object (e.g.
@@ -893,11 +916,11 @@ fn mw_aliases<'a>(
 
 /// A single assembled media option (`[[File:resource|opt…]]` argument) in the
 /// internal `$nopts` order, before alias/ordering resolution. `ak` holds the
-/// alias(es) (string form, possibly multi-alias preserved from data-mw);
-/// `v` is the substituted `$1` value, `ck` the canonical key.
+/// candidate wikitext alias(es) (e.g. `["page=$1", "page $1"]`); `v` is the
+/// substituted `$1` value, `ck` the canonical key.
 struct Nopt {
     ck: String,
-    ak: String,
+    ak: Vec<String>,
     v: Option<String>,
 }
 
@@ -1056,12 +1079,12 @@ fn figure_to_constrained_text_inner(
             if !cond {
                 return;
             }
-            let ak = aliases_first(env, alias);
+            let ak = aliases_all(env, alias);
             if shadow.fromsrc {
                 let v = shadow.value.clone().unwrap_or_default();
                 nopts.push(Nopt {
                     ck: ck.to_string(),
-                    ak: v,
+                    ak: vec![v],
                     v: None,
                 });
             } else {
@@ -1104,7 +1127,7 @@ fn figure_to_constrained_text_inner(
                 let ak = aliases_first(env, &format!("img_{val}"));
                 nopts.push(Nopt {
                     ck: val.to_string(),
-                    ak,
+                    ak: vec![ak],
                     v: None,
                 });
             }
@@ -1120,7 +1143,7 @@ fn figure_to_constrained_text_inner(
                 let ak = aliases_first(env, &format!("img_{val}"));
                 nopts.push(Nopt {
                     ck: val,
-                    ak,
+                    ak: vec![ak],
                     v: None,
                 });
             }
@@ -1128,7 +1151,7 @@ fn figure_to_constrained_text_inner(
                 let ak = aliases_first(env, "img_border");
                 nopts.push(Nopt {
                     ck: "border".to_string(),
-                    ak,
+                    ak: vec![ak],
                     v: None,
                 });
             }
@@ -1137,7 +1160,7 @@ fn figure_to_constrained_text_inner(
         }
     }
     if !extra.is_empty() {
-        let ak = aliases_first(env, "img_class");
+        let ak = aliases_all(env, "img_class");
         nopts.push(Nopt {
             ck: "class".to_string(),
             ak,
@@ -1147,24 +1170,49 @@ fn figure_to_constrained_text_inner(
 
     // Reconstruct options that only live in `data-mw` (manualthumb, page,
     // timedmedia start/end/thumb time). Faithful to the `$mwParams` loop in
-    // `figureToConstrainedText` (basic `data-mw` property access; template
-    // attributed (`value.html`) forms are deferred).
+    // `figureToConstrainedText`: each `prop` is first tried as a top-level
+    // `data-mw` property, then looked up in `data-mw.attribs` (a template-
+    // attributed `.html` form serializes back to wikitext, else the `.txt`
+    // value is used with the option's localized alias).
     let mut has_manualthumb = false;
     let mut effective_format = format.clone();
     {
+        let outer_node = tree.node(outer_elt);
         let mut push_mw = |prop: &str, ck: &str, alias: &str| {
-            let Some(v) = data_mw_prop(tree, outer_elt, prop) else {
-                return;
-            };
-            let ak = aliases_first(env, alias);
-            nopts.push(Nopt {
-                ck: ck.to_string(),
-                ak,
-                v: Some(v),
-            });
-            if prop == "thumb" {
-                has_manualthumb = true;
-                effective_format.clear();
+            let mut v = data_mw_prop(tree, outer_elt, prop);
+            if v.is_none()
+                && let Some(av) = get_attr_from_data_mw(outer_node, ck)
+            {
+                if let Some(html) = av.html {
+                    // Template-generated: serialize the `.html` back to wikitext
+                    // (mirrors `getAttributeValue`'s `domToWikitext` with
+                    // `inAttribute => true`).
+                    let value =
+                        crate::html::serializer::dom_to_wikitext_from_html(html, Some(*env));
+                    nopts.push(Nopt {
+                        ck: ck.to_string(),
+                        ak: vec![value],
+                        v: None,
+                    });
+                    if prop == "thumb" {
+                        has_manualthumb = true;
+                        effective_format.clear();
+                    }
+                    return;
+                }
+                v = av.txt;
+            }
+            if let Some(v) = v {
+                let ak = aliases_all(env, alias);
+                nopts.push(Nopt {
+                    ck: ck.to_string(),
+                    ak,
+                    v: Some(v),
+                });
+                if prop == "thumb" {
+                    has_manualthumb = true;
+                    effective_format.clear();
+                }
             }
         };
         // `thumb` (manualthumb) first, so it lands before the format option.
@@ -1179,7 +1227,7 @@ fn figure_to_constrained_text_inner(
     // present (the `thumbnail=…` option already encodes the format).
     match effective_format.as_str() {
         "Thumb" => {
-            let ak = aliases_first(env, "img_thumbnail");
+            let ak = aliases_all(env, "img_thumbnail");
             nopts.push(Nopt {
                 ck: "thumbnail".to_string(),
                 ak,
@@ -1190,7 +1238,7 @@ fn figure_to_constrained_text_inner(
             let ak = aliases_first(env, "img_framed");
             nopts.push(Nopt {
                 ck: "framed".to_string(),
-                ak,
+                ak: vec![ak],
                 v: None,
             });
         }
@@ -1198,7 +1246,7 @@ fn figure_to_constrained_text_inner(
             let ak = aliases_first(env, "img_frameless");
             nopts.push(Nopt {
                 ck: "frameless".to_string(),
-                ak,
+                ak: vec![ak],
                 v: None,
             });
         }
@@ -1247,7 +1295,7 @@ fn figure_to_constrained_text_inner(
             // square bounding box (`ak` is `$1` so the value is emitted as-is).
             nopts.push(Nopt {
                 ck: "width".to_string(),
-                ak: "$1".to_string(),
+                ak: vec!["$1".to_string()],
                 v: Some(size_string),
             });
         } else {
@@ -1265,7 +1313,7 @@ fn figure_to_constrained_text_inner(
                 bbox = Some(h);
             }
             if let Some(bbox) = bbox {
-                let ak = aliases_first(env, "img_width");
+                let ak = aliases_all(env, "img_width");
                 nopts.push(Nopt {
                     ck: "width".to_string(),
                     ak,
@@ -1281,7 +1329,7 @@ fn figure_to_constrained_text_inner(
     {
         nopts.push(Nopt {
             ck: "caption".to_string(),
-            ak: caption.clone(),
+            ak: vec![caption.clone()],
             v: None,
         });
     }
@@ -1299,7 +1347,7 @@ fn figure_to_constrained_text_inner(
         if o.ck.as_deref() == Some("bogus") {
             nopts.push(Nopt {
                 ck: "bogus".to_string(),
-                ak: o.ak.clone().unwrap_or_default(),
+                ak: vec![o.ak.clone().unwrap_or_default()],
                 v: None,
             });
         }
@@ -1317,21 +1365,86 @@ fn figure_to_constrained_text_inner(
             .iter()
             .position(|o| {
                 o.ck.as_deref() == Some(no.ck.as_str())
-                    && (no.ck != "bogus" || o.ak.as_deref() == Some(no.ak.as_str()))
+                    && (no.ck != "bogus" || o.ak.as_deref() == no.ak.first().map(String::as_str))
             })
             .unwrap_or(opt_list.len())
     };
-    let mut nopts: Vec<Nopt> = nopts;
+
+    // Match aliases against the original `optList` source and finalize the `ak`
+    // for each option (faithful to PHP's `$changed`/alias-matching loop before
+    // the final `usort`). For an option whose canonical key matches an original
+    // option, try each candidate alias (substituting `$1`); when one reproduces
+    // the original source, reuse that source verbatim (preserving whitespace).
+    let opt_list_for_match = opt_list.clone();
+    let mut changed = false;
+    let mut nopts: Vec<Nopt> = nopts
+        .into_iter()
+        .map(|mut no| {
+            // Find the original option entry matching this canonical key (a bogus
+            // option also matches on its source).
+            let idx = opt_list_for_match.iter().position(|o| {
+                o.ck.as_deref() == Some(no.ck.as_str())
+                    && (no.ck != "bogus" || o.ak.as_deref() == no.ak.first().map(String::as_str))
+            });
+            let Some(idx) = idx else {
+                // New option: prefer the first alias.
+                if let Some(first) = no.ak.first() {
+                    no.ak = vec![first.clone()];
+                }
+                changed = true;
+                return no;
+            };
+            let orig_ak = opt_list_for_match[idx]
+                .ak
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // Try each candidate alias; substitute $1 with the value.
+            let matched = no.ak.iter().any(|b| {
+                let b2 = match &no.v {
+                    Some(v) => b.replace("$1", v),
+                    None => b.clone(),
+                };
+                b2 == orig_ak
+            });
+            if matched {
+                if no.ck != "caption" {
+                    // Reuse the original source verbatim (incl. whitespace).
+                    no.ak = opt_list_for_match[idx].ak.clone().into_iter().collect();
+                    no.v = None;
+                }
+            } else {
+                // No alias matched: use the last (English default) alias.
+                if let Some(last) = no.ak.last().cloned() {
+                    no.ak = vec![last];
+                }
+                if no.ck != "caption" {
+                    changed = true;
+                }
+            }
+            no
+        })
+        .collect();
+
+    // Filter bogus options if any option changed, and drop empty captions
+    // (T64264).
+    if changed {
+        nopts.retain(|no| no.ck != "bogus");
+        nopts.retain(|no| !(no.ck == "caption" && no.ak.is_empty()));
+    }
+
     nopts.sort_by_key(|no| sort_id(no));
 
     // Emit all the options in order.
     let mut wikitext = format!("[[{resource_value}");
     for o in &nopts {
         wikitext.push('|');
+        let ak = o.ak.first().map(String::as_str).unwrap_or("");
         if let Some(v) = &o.v {
-            wikitext.push_str(&o.ak.replace("$1", v));
+            wikitext.push_str(&ak.replace("$1", v));
         } else {
-            wikitext.push_str(&o.ak);
+            wikitext.push_str(ak);
         }
     }
     wikitext.push_str("]]");
@@ -1423,6 +1536,16 @@ fn strip_page_lang(href: &str) -> String {
         }
     }
     href.to_string()
+}
+
+/// All locallized aliases for a canonical magic-word key, or the single
+/// fallback (see [`aliases_first`]) when the key is not configured. Faithful to
+/// `$mwAliases[$alias]`.
+fn aliases_all(env: &SerializerEnv, alias: &str) -> Vec<String> {
+    if let Some(entry) = mw_aliases(env, alias) {
+        return entry.aliases.clone();
+    }
+    vec![aliases_first(env, alias)]
 }
 
 /// The first alias for a canonical magic-word key (the preferred English form),
