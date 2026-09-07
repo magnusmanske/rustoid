@@ -200,12 +200,24 @@ fn child_nodes_at<'a>(body: &'a Node, path: &[usize]) -> &'a [Node] {
 /// Find every element matching `selector` under `body`, returning their paths.
 /// Excludes the root itself (mirrors `querySelectorAll` scope) unless it matches.
 fn find_matches(body: &Node, selector: &str) -> Vec<Path> {
+    // Pre-split the selector into its compound parts (descendant combinator).
+    let compounds: Vec<&str> = selector.split_whitespace().collect();
     let mut out = Vec::new();
-    walk(body, selector, &mut Vec::new(), &mut out);
+    walk(body, &compounds, &mut Vec::new(), &mut Vec::new(), &mut out);
     out
 }
 
-fn walk(node: &Node, selector: &str, path: &mut Vec<usize>, out: &mut Vec<Path>) {
+/// Recursively walk the tree, matching the selector's compound parts against
+/// each element: the rightmost compound against the element itself, preceding
+/// compounds against its ancestors (descendant combinator), mirroring Zest's
+/// `qsa`. `ancestors` is the stack of enclosing element nodes.
+fn walk<'a>(
+    node: &'a Node,
+    compounds: &[&str],
+    ancestors: &mut Vec<&'a Node>,
+    path: &mut Vec<usize>,
+    out: &mut Vec<Path>,
+) {
     // Compute the element-sibling position (0-based) for each child, matching
     // Zest's `:nth-child`, which counts *element* siblings via
     // `previousElementSibling` (a historical quirk of `qsa`-derived selector
@@ -214,72 +226,173 @@ fn walk(node: &Node, selector: &str, path: &mut Vec<usize>, out: &mut Vec<Path>)
     for (i, child) in node.children.iter().enumerate() {
         let is_element = matches!(child.kind, NodeKind::Element(_));
         if is_element {
-            if matches_selector(child, selector, element_index) {
+            if matches_full_selector(child, compounds, element_index, ancestors) {
                 let mut p = path.clone();
                 p.push(i);
                 out.push(p);
             }
             element_index += 1;
+            ancestors.push(child);
+            path.push(i);
+            walk(child, compounds, ancestors, path, out);
+            path.pop();
+            ancestors.pop();
+        } else {
+            path.push(i);
+            walk(child, compounds, ancestors, path, out);
+            path.pop();
         }
-        path.push(i);
-        walk(child, selector, path, out);
-        path.pop();
     }
 }
 
-/// Match a single node against `selector`. `sibling_index` is the node's
-/// 0-based index among its *element* siblings (not counting whitespace text/
-/// comment siblings), matching Zest's `:nth-child` (which counts
-/// `previousElementSibling`).
+/// Match a fully-split selector against `node`. `sibling_index` is the node's
+/// element-sibling position for its own pseudo-class; `ancestors[0]` is the
+/// immediate parent element, `ancestors[1]` the grandparent, etc.
+fn matches_full_selector(
+    node: &Node,
+    compounds: &[&str],
+    sibling_index: usize,
+    ancestors: &[&Node],
+) -> bool {
+    // The rightmost compound matches the node itself.
+    let (last, rest) = compounds.split_last().expect("non-empty selector");
+    if !matches_compound(node, last, sibling_index) {
+        return false;
+    }
+    // Preceding compounds match *some* ancestor (descendant combinator), in
+    // right-to-left order: the rightmost remaining compound matches the nearest
+    // matching ancestor, the next matches an ancestor *above* that, and so on.
+    // Walk the ancestor stack (nearest-first) matching each compound in turn.
+    let mut comp_iter = rest.iter().rev();
+    let mut comp = comp_iter.next();
+    for ancestor in ancestors.iter().rev() {
+        let Some(part) = comp else {
+            break;
+        };
+        if matches_compound(ancestor, part, 0) {
+            comp = comp_iter.next();
+        }
+    }
+    comp.is_none()
+}
+
+/// Public helper matching a node against a (possibly descendant) selector,
+/// given its element-sibling index. Used by unit tests; production matching goes
+/// through [`walk`]/[`matches_full_selector`].
 pub fn matches_selector(node: &Node, selector: &str, sibling_index: usize) -> bool {
+    let compounds: Vec<&str> = selector.split_whitespace().collect();
+    matches_full_selector(node, &compounds, sibling_index, &[])
+}
+
+/// Match a single compound selector (e.g. `figcaption`, `.mw-default-size`,
+/// `*[typeof="mw:File"]`, `li:nth-child(3)`) against a node. `sibling_index` is
+/// the element-sibling index for pseudo-class evaluation.
+fn matches_compound(node: &Node, compound: &str, sibling_index: usize) -> bool {
     if !matches!(node.kind, NodeKind::Element(_)) {
         return false;
     }
 
-    let (simple, pseudo) = match selector.find(':') {
-        Some(i) => (&selector[..i], Some(&selector[i + 1..])),
-        None => (selector, None),
-    };
+    // Split off a trailing pseudo-class (`:first-child`, `:nth-child(...)`).
+    let (simple, pseudo) = split_pseudo(compound);
 
-    let (tag, attr_sel) = split_simple_selector(simple);
-    if let Some(tag) = tag
-        && crate::html::wts_utils::node_name(node) != tag
-    {
+    // A compound is a sequence of simple selectors: `*`/tag, `.class`,
+    // `[attr]`, `#id` (id unsupported).
+    if !matches_simple_selector(node, simple) {
         return false;
     }
-    if let Some(attr_sel) = attr_sel
-        && !matches_attribute_selector(node, attr_sel)
-    {
-        return false;
-    }
+
     if let Some(pseudo) = pseudo {
         return matches_pseudo(pseudo, sibling_index);
     }
     true
 }
 
-/// Split a simple selector (e.g. `li`, `[typeof~='mw:File']`, `a[href]`) into an
-/// optional tag name and an optional attribute selector.
-fn split_simple_selector(sel: &str) -> (Option<&str>, Option<&str>) {
-    if let Some(i) = sel.find('[') {
-        (
-            if sel[..i].is_empty() {
-                None
-            } else {
-                Some(&sel[..i])
-            },
-            Some(&sel[i..]),
-        )
-    } else {
-        (if sel.is_empty() { None } else { Some(sel) }, None)
+/// Split a compound selector into its non-pseudo part and an optional trailing
+/// `:pseudo(...)` (only the first colon *outside* an attribute selector is
+/// honored, so `[typeof="mw:File"]` is not split).
+fn split_pseudo(compound: &str) -> (&str, Option<&str>) {
+    let bytes = compound.as_bytes();
+    let mut in_attr = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => in_attr = true,
+            b']' => in_attr = false,
+            b':' if !in_attr => {
+                return (&compound[..i], Some(&compound[i + 1..]));
+            }
+            _ => {}
+        }
     }
+    (compound, None)
+}
+
+/// Match a pseudo-free simple selector sequence against a node. Handles the
+/// tag (or `*`), any `.class`, and any `[attr]` qualifiers.
+fn matches_simple_selector(node: &Node, simple: &str) -> bool {
+    let simple = simple.trim();
+    if simple.is_empty() || simple == "*" {
+        return true;
+    }
+
+    // Walk the selector left-to-right, consuming one qualifier at a time.
+    let mut rest = simple;
+    // Optional leading tag name (a run of word chars, not preceded by `.`/`[`).
+    let name = crate::html::wts_utils::node_name(node);
+    if !rest.is_empty() && !rest.starts_with(['.', '[']) {
+        // Consume a bare tag name.
+        let tag_end = rest.find(['.', '[', ':']).unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if tag != "*" && name != tag {
+            return false;
+        }
+        rest = &rest[tag_end..];
+    }
+
+    // Consume `.class` and `[attr...]` qualifiers in order.
+    while !rest.is_empty() {
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            let class_end = after_dot.find(['.', '[', ':']).unwrap_or(after_dot.len());
+            let class = &after_dot[..class_end];
+            let Some(cls_attr) = node.get_attr("class") else {
+                return false;
+            };
+            if !cls_attr.split_whitespace().any(|c| c == class) {
+                return false;
+            }
+            rest = &after_dot[class_end..];
+        } else if rest.starts_with('[') {
+            let (attr_sel, remainder) = take_attr_selector(rest);
+            if !matches_attribute_selector(node, attr_sel) {
+                return false;
+            }
+            rest = remainder;
+        } else {
+            // Unrecognized qualifier — fail conservatively.
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract a balanced `[...]` attribute selector from the start of `rest`,
+/// returning it plus the remaining selector text.
+fn take_attr_selector(rest: &str) -> (&str, &str) {
+    let start = rest.find('[').expect("starts with [");
+    let bytes = rest.as_bytes();
+    let mut end = rest.len();
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if b == b']' {
+            end = i + 1;
+            break;
+        }
+    }
+    (&rest[start..end], &rest[end..])
 }
 
 /// Match `:nth-child(An+B)` / `:odd` / `:even` / `:first-child` / `:last-child`.
 /// Faithful to CSS for the simple integer cases used by the parser tests. The
 /// `1-based` index is derived from `sibling_index`; `last` is the total number
-/// of element siblings (not tracked here, so `:last-child` is approximated by
-/// checking the caller-supplied index in a separate pass).
+/// of element siblings (not tracked here, so `:last-child` is approximated).
 fn matches_pseudo(pseudo: &str, sibling_index: usize) -> bool {
     let one_based = sibling_index + 1;
     if let Some(inner) = pseudo.trim().strip_prefix("nth-child(")
@@ -527,34 +640,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_split_simple_selector() {
-        assert_eq!(split_simple_selector("li"), (Some("li"), None));
-        assert_eq!(split_simple_selector("[href]"), (None, Some("[href]")));
-        assert_eq!(
-            split_simple_selector("a[href]"),
-            (Some("a"), Some("[href]"))
-        );
-    }
-
-    #[test]
-    fn test_matches_attribute_selector() {
-        use crate::dom::node::ElementKind;
-        let mut a = Node::element(ElementKind::Wikilink);
-        a.set_attr("href", "./Foo");
-        assert!(matches_attribute_selector(&a, "[href]"));
-        assert!(matches_attribute_selector(&a, "[href='./Foo']"));
-        assert!(matches_attribute_selector(&a, "[href^='./']"));
-        assert!(!matches_attribute_selector(&a, "[href='./Bar']"));
-    }
-
-    #[test]
-    fn test_match_tag_and_nth_child() {
+    fn test_matches_compound_selector() {
         use crate::dom::node::ElementKind;
         let li = Node::element(ElementKind::ListItem);
-        assert!(matches_selector(&li, "li", 0));
-        assert!(!matches_selector(&li, "p", 0));
-        assert!(matches_selector(&li, "li:nth-child(3)", 2));
-        assert!(!matches_selector(&li, "li:nth-child(3)", 1));
+        assert!(matches_compound(&li, "li", 0));
+        assert!(!matches_compound(&li, "p", 0));
+        assert!(matches_compound(&li, "li:nth-child(3)", 2));
+        assert!(!matches_compound(&li, "li:nth-child(3)", 1));
+        // Class + universal + attribute.
+        let mut fig = Node::element(ElementKind::Other("figcaption".into()));
+        fig.set_attr("class", "mw-default-size foo");
+        assert!(matches_compound(&fig, "figcaption.mw-default-size", 0));
+        assert!(!matches_compound(&fig, "figcaption.mw-bogus", 0));
+        assert!(matches_compound(&fig, "*.mw-default-size", 0));
+        assert!(matches_compound(&fig, "*", 0));
+    }
+
+    #[test]
+    fn test_universal_attr_selector() {
+        use crate::dom::node::ElementKind;
+        let mut span = Node::element(ElementKind::Other("span".into()));
+        span.set_attr("typeof", "mw:File");
+        assert!(matches_compound(&span, "*[typeof=\"mw:File\"]", 0));
+        assert!(!matches_compound(&span, "*[typeof=\"mw:File/Thumb\"]", 0));
+    }
+
+    #[test]
+    fn test_descendant_selector() {
+        use crate::dom::node::ElementKind;
+        let mut body = Node::document();
+        let mut figure = Node::element(ElementKind::Other("figure".into()));
+        let mut img = Node::element(ElementKind::Other("img".into()));
+        img.set_attr("width", "170");
+        figure.push_child(img);
+        body.push_child(figure);
+        let matches = find_matches(&body, "figure img");
+        assert_eq!(matches.len(), 1);
     }
 
     #[test]
