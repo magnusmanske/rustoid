@@ -1577,6 +1577,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 source,
                                 frame,
                                 &name,
+                                &target_str,
                                 &title,
                                 &params,
                                 about_id,
@@ -1707,6 +1708,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         name: &str,
+        target_str: &str,
         title: &crate::title::Title,
         params: &crate::pipeline::parser_functions::Params,
         about_id: String,
@@ -1821,6 +1823,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         let mut info = template_info_from(None, Some(name), vec![]);
+        info.target_wt = Some(target_str.to_string());
+        info.href = Some(crate::title::make_link(title, self.config));
         info.param_infos = crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params);
         encap.encap_tokens(expanded, &info)
     }

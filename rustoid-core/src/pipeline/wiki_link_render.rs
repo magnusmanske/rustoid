@@ -850,7 +850,16 @@ pub fn render_file(
                 // a `|`-separated option string), so each is a *non*-array option
                 // source: no `mw:ExpandedAttrs` for them (mirrors PHP, where the
                 // `explode('|', $oText)` path `continue`s before `$expOpt`).
-                if !record_media_option(ctx, &mut opts, &mut opt_list, &sub, &sub, false, false) {
+                if !record_media_option(
+                    ctx,
+                    &mut opts,
+                    &mut opt_list,
+                    &sub,
+                    &sub,
+                    false,
+                    false,
+                    &[],
+                ) {
                     // Unrecognized sub-part ⇒ caption (last one wins). A previous
                     // caption becomes a `bogus` optList entry at its position
                     // (mirrors PHP's `array_splice` bogus-marker for displaced captions).
@@ -880,6 +889,7 @@ pub fn render_file(
             vsrc.as_deref().unwrap_or(&part),
             is_token_array,
             has_transclusion,
+            &raw_items,
         ) {
             // Unrecognized ⇒ caption (last one wins). Keep the raw tokens.
             if caption.is_some() {
@@ -973,7 +983,7 @@ pub fn render_file(
                 DataMwValue::Str(key.to_string()),
                 DataMwValue::Object {
                     txt: Some(v.clone()),
-                    html: None,
+                    html: opts.expanded_html.get(key).cloned(),
                     uneditable: false,
                 },
             )
@@ -1135,6 +1145,67 @@ fn contains_transclusion(items: &[Item]) -> bool {
     })
 }
 
+/// Serialize an expanded option's token array to the HTML attribute fragment
+/// PHP's `expandAttrValueToDOM` produces (the `data-mw.attribs[i].value.html`).
+/// The `mw:Transclusion` marker metas become `<span typeof="mw:Transclusion"
+/// data-mw='…'>…</span>` (the `about` id is dropped, as PHP does in attribute
+/// expansion), text is HTML-text-escaped, and other tokens fall back to their
+/// stored source.
+fn tokens_to_attribute_html(items: &[Item]) -> String {
+    fn attr_html(tok: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> Option<String> {
+        let type_of = tok
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str())?;
+        (type_of == "mw:Transclusion" || type_of == "mw:Param").then(|| {
+            let data_mw = tok
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("data-mw"))
+                .and_then(|kv| kv.value.as_str())
+                .unwrap_or("{}");
+            // Single-quote the `data-mw` value (it carries JSON double quotes).
+            let escaped = data_mw.replace('&', "&amp;");
+            format!("<span typeof=\"{type_of}\" data-mw='{escaped}'>")
+        })
+    }
+
+    let mut out = String::new();
+    for item in items {
+        match item {
+            Item::Str(s) => {
+                out.push_str(&s.replace('&', "&amp;").replace('<', "&lt;"));
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(tk)) => {
+                let type_of = tk
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("typeof"))
+                    .and_then(|kv| kv.value.as_str());
+                match type_of {
+                    Some("mw:Transclusion/End") | Some("mw:Param/End") => {
+                        out.push_str("</span>");
+                    }
+                    Some("mw:Transclusion") | Some("mw:Param") => {
+                        if let Some(html) = attr_html(tk) {
+                            out.push_str(&html);
+                        }
+                    }
+                    _ => {
+                        // Fall back to the stored source wikitext.
+                        if let Some(src) = tk.data_parsoid.src.clone() {
+                            out.push_str(&src.replace('&', "&amp;").replace('<', "&lt;"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Resolve a single option string, apply it to `opts`, and record its
 /// round-trip entry in `opt_list` (the `data-parsoid.optList`). Returns `true`
 /// when the string is a recognized option (so the caller treats `false` as a
@@ -1143,6 +1214,7 @@ fn contains_transclusion(items: &[Item]) -> bool {
 /// `vsrc` is the raw source wikitext for the option (`$oContent->vsrc`), used
 /// as the `ak` (aliased key) so whitespace/entities round-trip; `part` is the
 /// stringified option text used for recognition.
+#[allow(clippy::too_many_arguments)]
 fn record_media_option(
     ctx: &WikiLinkContext,
     opts: &mut super::media_options::MediaOpts,
@@ -1151,6 +1223,7 @@ fn record_media_option(
     vsrc: &str,
     is_token_array: bool,
     has_transclusion: bool,
+    raw_items: &[Item],
 ) -> bool {
     use super::media_options::{
         get_option_info, has_wikitext_markup, is_valid_internal_lang, strip_quote_markers,
@@ -1176,6 +1249,16 @@ fn record_media_option(
     };
     if exp_opt {
         opts.expanded_attrs = true;
+        // For `data-mw.attribs` options, stash the serialized (HTML) expanded
+        // attribute source so it round-trips a template (e.g. `page {{1x|2}}`).
+        // Only the options that `renderFile` stores in `data-mw.attribs` need it.
+        if matches!(
+            info.ck.as_str(),
+            "page" | "link" | "alt" | "manualthumb" | "class"
+        ) {
+            let html = tokens_to_attribute_html(raw_items);
+            opts.expanded_html.insert(info.ck.clone(), html);
+        }
     }
 
     // The optList `ck` is the short canonical name for simple options and the

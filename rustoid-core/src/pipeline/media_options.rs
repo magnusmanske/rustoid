@@ -352,6 +352,10 @@ pub struct MediaOpts {
     /// Whether an `alt=` (or similarly rich) option value carries wikitext
     /// markup, marking the container `mw:ExpandedAttrs`.
     pub expanded_attrs: bool,
+    /// For `data-mw.attribs` options with a template-generated value, the
+    /// serialized (HTML) expanded attribute source, keyed by option canonical
+    /// key (e.g. `"page"`). Mirrors `dataMw->attribs[i]->value->html`.
+    pub expanded_html: std::collections::HashMap<String, String>,
     /// Whether a template expanded to a `|`-separated option string (no editing
     /// support), marking the container `mw:Placeholder`.
     pub placeholder: bool,

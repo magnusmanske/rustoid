@@ -114,6 +114,15 @@ pub fn get_dom_handler(tree: &DomTree, node: NodeId) -> Box<dyn DomHandler> {
         return Box::new(EncapsulatedContentHandler);
     }
 
+    // An `mw:Transclusion`/`mw:Param` element (even one without an `about`, as
+    // produced when parsing a `data-mw.attribs` `.html` fragment) is still a
+    // transclusion and must serialize back to `{{…}}` via the content handler
+    // rather than as a literal `<meta>` marker.
+    if crate::html::dom_utils::match_type_of(tree.node(node), "^mw:(Transclusion|Param)$").is_some()
+    {
+        return Box::new(EncapsulatedContentHandler);
+    }
+
     // Specialized handler for `nodeName_stx` (e.g. `dd_row`, `pre_html`).
     let tag = dom_utils::node_name(tree.node(node));
     let specialized = stx.as_ref().map(|s| format!("{tag}_{s}"));
