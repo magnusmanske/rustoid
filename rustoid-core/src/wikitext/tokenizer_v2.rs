@@ -1809,18 +1809,24 @@ impl<'a> PegTokenizer<'a> {
         // original case (mirrors PHP's `getWTSource` fallback).
         dp.src = Some(self.input[saved..self.pos].to_string());
 
-        if self_closing {
+        // Void elements without an explicit `/>` are still self-closing (HTML5):
+        // `<br>` emits a SelfclosingTag with `noClose=true` (and `selfClose`
+        // unset), mirroring PHP's `buildXMLTag(…, !!$selfclose || $isVoidElt)` +
+        // the `noClose` override for unselfclosed void elements.
+        let name_lc = name.to_lowercase();
+        let is_void = !self_closing && crate::html5::html_data::is_void_tag(&name_lc);
+        if is_void {
+            dp.no_close = true;
+        }
+
+        if self_closing || is_void {
             self.emit_token(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
-                name.to_lowercase(),
+                name_lc.clone(),
                 attrs,
                 dp,
             )));
         } else {
-            self.emit_token(ParsoidToken::Tag(TagTk::new(
-                name.to_lowercase(),
-                attrs,
-                dp,
-            )));
+            self.emit_token(ParsoidToken::Tag(TagTk::new(name_lc, attrs, dp)));
         }
 
         true
