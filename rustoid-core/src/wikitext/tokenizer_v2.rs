@@ -983,15 +983,32 @@ impl<'a> PegTokenizer<'a> {
         true
     }
 
-    /// Inline line that breaks on colon.
+    /// Inline line that breaks on a top-level colon (a `:` not inside any
+    /// inline construct). Faithful to PHP's `inlineline_break_on_colon`, which
+    /// is `inlineline` with a `stopChar` flag: the term of a `;term:definition`
+    /// is parsed as full inline wikitext (wikilinks, URLs, templates, tags,
+    /// entities, …), stopping only at a colon at the inline-parse top level. This
+    /// lets `;[[Help:FAQ]]:def` treat the `:` inside the wikilink as content,
+    /// splitting the term/definition only at the `:` after `]]`.
     fn try_parse_inlineline_break_on_colon(&mut self) -> bool {
         let start = self.pos;
-        while self.pos < self.input_len {
+        loop {
+            if self.pos >= self.input_len {
+                break;
+            }
+            // A top-level `:` ends the term (it is not consumed here; the
+            // caller treats it as the term/definition separator). A newline also
+            // ends the term (a `;term` with no colon on the line).
             if self.starts_with(":") || self.starts_with("\n") || self.starts_with("\r\n") {
                 break;
             }
-            // Consume one char.
-            if let Some(ch) = self.peek_char() {
+            let saved = self.pos;
+            if self.try_inline_element() {
+                continue;
+            }
+            // No inline construct matched: consume a single character as text.
+            if self.pos == saved {
+                let ch = self.remaining().chars().next().unwrap();
                 let ch_len = ch.len_utf8();
                 let text = self.input[self.pos..self.pos + ch_len].to_string();
                 self.pos += ch_len;
