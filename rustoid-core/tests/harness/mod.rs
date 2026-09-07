@@ -1838,6 +1838,7 @@ fn normalize_html(html: &str, parsoid_only: bool) -> String {
         stripped = strip_legacy_attrs(&stripped);
     }
     let mut nodes = parse_fragment(&stripped);
+    wrap_table_rows_in_tbody(&mut nodes);
     normalize_nodes(
         &mut nodes,
         NOpts {
@@ -1850,6 +1851,75 @@ fn normalize_html(html: &str, parsoid_only: bool) -> String {
     let mut out = String::new();
     serialize_iew(&nodes, &mut out);
     out
+}
+
+/// Replicate the HTML5 tree-construction rule that implicitly wraps `<tr>` (and
+/// stray row-group content) direct children of a `<table>` in a `<tbody>`.
+/// Parsoid's test normalization round-trips through `DOMUtils::parseHTML`, which
+/// inserts the implicit `<tbody>` into a golden like `<table><tr>…</tr></table>`
+/// so it matches Parsoid's own output (which *does* contain `<tbody>`). The
+/// string-based normalization here must reproduce that, otherwise a fixture
+/// hand-authored without `<tbody>` fails against the tree-builder output.
+fn wrap_table_rows_in_tbody(nodes: &mut [MNode]) {
+    for node in nodes.iter_mut() {
+        let MNode::Elem {
+            name,
+            children,
+            self_closing,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        // Descend first (a nested table's own children normalize independently).
+        wrap_table_rows_in_tbody(children);
+        if *self_closing {
+            continue;
+        }
+        let lc = name.to_lowercase();
+        // Only a `<table>` directly wrapping `<tr>`/row-group content (in the
+        // position HTML5 allows a `<tbody>`) is affected.
+        let is_table = lc == "table";
+        let has_bare_row = is_table
+            && children
+                .iter()
+                .any(|c| matches!(c, MNode::Elem { name, .. } if name == "tr"));
+        if !has_bare_row {
+            continue;
+        }
+        // Wrap the run(s) of `<tr>` (and any stray `<td>`/`<th>`) — the only
+        // children HTML5 groups into `<tbody>` — in a synthetic `<tbody>`.
+        let mut new_children: Vec<MNode> = Vec::with_capacity(children.len() + 1);
+        let mut body_kids: Vec<MNode> = Vec::new();
+        let mut grouped = false;
+        for child in std::mem::take(children) {
+            let is_row = matches!(&child, MNode::Elem { name, .. } if name == "tr" || name == "td" || name == "th");
+            if is_row {
+                body_kids.push(child);
+                grouped = true;
+            } else {
+                if grouped {
+                    new_children.push(MNode::Elem {
+                        name: "tbody".to_string(),
+                        open_tag: "<tbody>".to_string(),
+                        self_closing: false,
+                        children: std::mem::take(&mut body_kids),
+                    });
+                    grouped = false;
+                }
+                new_children.push(child);
+            }
+        }
+        if grouped {
+            new_children.push(MNode::Elem {
+                name: "tbody".to_string(),
+                open_tag: "<tbody>".to_string(),
+                self_closing: false,
+                children: body_kids,
+            });
+        }
+        *children = new_children;
+    }
 }
 
 /// Strip only the round-trip metadata (`data-parsoid`, `data-mw`) and HTML
