@@ -821,9 +821,12 @@ impl<'a> PegTokenizer<'a> {
             _ => return false,
         };
 
-        // Handle `;term:definition` (dtdd) specially.
-        if first == ';' {
-            return self.try_dtdd();
+        // Try `;term:definition` (dtdd) first. It captures any leading
+        // `bullets:list_char*` run followed by a term `;`, and backtracks
+        // cleanly when no term separator is present (mirrors PHP's
+        // `list_item = dtdd / hacky_dl_uses / li`).
+        if self.try_dtdd() {
+            return true;
         }
 
         // Handle `:` followed by table (hacky_dl_uses).
@@ -925,29 +928,62 @@ impl<'a> PegTokenizer<'a> {
     }
 
     /// Try to match a definition term/description pair: `;term:definition`.
-    /// Emits a `listItem` token for the `;` (term) and one `listItem` token per
-    /// top-level `:` (definition), so the ListHandler produces
-    /// `<dl><dt>…</dt><dd>…</dd></dl>`. Faithful to PHP's
+    /// Emits a `listItem` token for the leading `bullets` + `;` (term) and one
+    /// `listItem` token per top-level `:` (definition), so the ListHandler
+    /// produces `<dl><dt>…</dt><dd>…</dd></dl>`. Faithful to PHP's
     /// `dtdd = bullets:list_char* ";" colons:dtdd_colon* d:inlineline? &eolf`,
-    /// where each `dtdd_colon = inlineline_break_on_colon? ":"` is a definition
-    /// separator, and the final `d:inlineline?` is the last definition's content.
+    /// where `bullets` is a run of leading `*#:;` list chars terminated by the
+    /// definition `;` (a `;` not immediately followed by another list char), each
+    /// `dtdd_colon = inlineline_break_on_colon? ":"` is a definition separator,
+    /// and the final `d:inlineline?` is the last definition's content.
     fn try_dtdd(&mut self) -> bool {
-        if !self.at_sol || !self.starts_with(";") {
+        if !self.at_sol {
             return false;
         }
 
         let start = self.pos;
-        self.advance(1); // consume ';'
 
-        // First list item: the definition term.
+        // Capture the leading `bullets:list_char*` run (a `;` is a bullet when it
+        // is immediately followed by another list char, mirroring PHP's
+        // `(!(";" !list_char) @list_char)*` guard which stops a `;` from being
+        // consumed as a bullet only when it is the term separator).
+        let mut leading = String::new();
+        while self.pos < self.input_len {
+            let ch = self.remaining().chars().next().unwrap();
+            if !matches!(ch, '*' | '#' | ';' | ':') {
+                break;
+            }
+            if ch == ';' {
+                let next = self.remaining()[ch.len_utf8()..].chars().next();
+                if !matches!(next, Some('*' | '#' | ';' | ':')) {
+                    // This `;` is the term separator, not a bullet.
+                    break;
+                }
+            }
+            leading.push(ch);
+            self.advance(ch.len_utf8());
+        }
+
+        // The term separator `;`.
+        if !self.starts_with(";") {
+            self.pos = start;
+            return false;
+        }
+        self.advance(1); // consume the term-separator ';'
+
+        // The term's bullets are the leading run plus the `;` (mirrors PHP's
+        // `$li1Bullets = $bullets; $li1Bullets[] = ';'`).
+        let term_bullets = format!("{leading};");
+
+        // First list item: the definition term (bullets + ';').
         let bullets_1 = KV {
             key: KeyValue::Str("bullets".to_string()),
-            value: KeyValue::Str(";".to_string()),
+            value: KeyValue::Str(term_bullets.clone()),
             src_offsets: None,
             ksrc: None,
             vsrc: None,
         };
-        let dp_1 = self.make_dp(start, start + 1);
+        let dp_1 = self.make_dp(start, start + term_bullets.len());
         self.emit_token(ParsoidToken::Tag(TagTk::new(
             "listItem",
             vec![bullets_1],
@@ -956,7 +992,8 @@ impl<'a> PegTokenizer<'a> {
 
         // One or more `:` form the term/definition separators. Each `:` is
         // preceded by inline content that stops at a *top-level* colon, and is
-        // followed by a `listItem(:)` (mirrors `colons:dtdd_colon*`).
+        // followed by a `listItem` whose bullets are the leading run + `:`
+        // (mirrors PHP's `$li2Bullets = $bullets; $li2Bullets[] = ':'`).
         loop {
             self.try_parse_inlineline_break_on_colon();
             if !self.starts_with(":") {
@@ -970,7 +1007,7 @@ impl<'a> PegTokenizer<'a> {
             dp.stx = Some("row".to_string());
             let bullets = KV {
                 key: KeyValue::Str("bullets".to_string()),
-                value: KeyValue::Str(":".to_string()),
+                value: KeyValue::Str(format!("{leading}:")),
                 src_offsets: None,
                 ksrc: None,
                 vsrc: None,
