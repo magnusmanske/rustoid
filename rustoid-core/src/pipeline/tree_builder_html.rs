@@ -122,15 +122,16 @@ impl Html5TreeBuilder {
         id
     }
 
-    /// Stash a pre-built sub-fragment node and return its id.
-    fn stash_fragment(&mut self, fragment: Node) -> usize {
+    /// Stash a pre-built sub-fragment node (and the placeholder token's `dp`, so
+    /// its `tsr`/`extTagOffsets` survive into `ComputeDSR`) and return its id.
+    fn stash_fragment(&mut self, fragment: Node, dp: &TDataParsoid) -> usize {
         let id = self.next_data_id;
         self.next_data_id += 1;
         self.stash.insert(
             id,
             StashedNodeData {
-                data_parsoid: None,
-                dp: None,
+                data_parsoid: dp.to_data_parsoid_json(),
+                dp: Some(dp.clone()),
                 data_mw: None,
                 fragment: Some(fragment),
             },
@@ -536,7 +537,7 @@ impl Html5TreeBuilder {
                 .and_then(|kv| kv.value.as_str())
                 .and_then(|s| s.parse::<usize>().ok());
             let fragment = fragment_id.and_then(|id| self.fragments.remove(&id));
-            let id = self.stash_fragment(fragment.unwrap_or_else(Node::document));
+            let id = self.stash_fragment(fragment.unwrap_or_else(Node::document), dp);
             let attrs = Attributes::from_pairs(vec![
                 ("typeof".to_string(), "mw:DOMFragment".to_string()),
                 (DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()),

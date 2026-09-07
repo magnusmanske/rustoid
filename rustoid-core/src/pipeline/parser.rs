@@ -145,7 +145,11 @@ fn emit_gallery_placeholder(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, 
     let mut dp = stt.data_parsoid.clone();
     dp.src = None;
     dp.src_content = None;
-    dp.ext_tag_offsets = None;
+    // Keep `ext_tag_offsets` (the `<gallery …>` open/close widths) so the
+    // `mw:DOMFragment` placeholder carries them into ComputeDSR, which stamps
+    // the DSR open/close widths. `UnpackDOMFragments::transfer_metadata` then
+    // forwards that DSR (`tsr`/`extTagOffsets`) onto the unpacked `<ul>`, so the
+    // selser serializer can recover the original body via `getOrigSrc`.
     let mut frag_tok = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
     frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
         key: KeyValue::Str("data-fragment-id".to_string()),

@@ -1934,46 +1934,75 @@ impl EncapsulatedContentHandler {
             child = tree.next_sibling(c);
         }
 
+        // Rebuild the start tag (without the trailing `>`/`/>`, decided below).
+        let mut start_tag_src = String::new();
+        start_tag_src.push('<');
+        start_tag_src.push_str(&ext_name);
+        for (k, v) in &attrs {
+            start_tag_src.push(' ');
+            start_tag_src.push_str(k);
+            start_tag_src.push_str("=\"");
+            start_tag_src.push_str(v);
+            start_tag_src.push('\"');
+        }
+
         // Serialize each `li.gallerybox` into a `File:…|…` line.
         let mut lines: Vec<String> = Vec::new();
+        let mut body_modified = false;
         let mut child = tree.first_child(node);
         while let Some(c) = child {
             if Some(c) == gallerycaption_id {
                 child = tree.next_sibling(c);
                 continue;
             }
-            if dom_utils::node_name(tree.node(c)) == "li" && has_class(tree.node(c), "gallerybox") {
+            let n = tree.node(c);
+            if dom_utils::node_name(n) == "li" && has_class(n, "gallerybox") {
+                if crate::html::diff_utils::DiffUtils::has_diff_markers(n) {
+                    body_modified = true;
+                }
                 let line = Self::serialize_gallery_line(tree, c, state);
                 lines.push(line);
             }
             child = tree.next_sibling(c);
         }
 
-        // Assemble the start tag, then the body lines, then the close tag.
-        let mut out = String::new();
-        out.push('<');
-        out.push_str(&ext_name);
-        for (k, v) in &attrs {
-            out.push(' ');
-            out.push_str(k);
-            out.push_str("=\"");
-            out.push_str(v);
-            out.push('\"');
+        if lines.is_empty() {
+            // Self-closed gallery.
+            start_tag_src.push_str(" />");
+            return Some(start_tag_src);
         }
 
-        if lines.is_empty() {
-            out.push_str(" />");
-        } else {
-            out.push('>');
-            for line in &lines {
-                out.push('\n');
-                out.push_str(line);
-            }
-            out.push('\n');
-            out.push_str("</");
-            out.push_str(&ext_name);
-            out.push('>');
+        // Recover the original body source in selser mode when the body is
+        // unmodified (mirrors `Gallery::domToWikitext`'s `getOrigSrc($node, true,
+        // $checkIfOrigSrcReusable)`), preserving blank lines between entries.
+        let mut content = None;
+        if state.selser_mode
+            && !state.in_inserted_content
+            && !body_modified
+            && let Some(dsr) = crate::html::wts_utils::get_dsr(tree.node(node))
+            && dsr.open_width.is_some()
+            && dsr.close_width.is_some()
+            && let Some(body) = state.get_orig_src(&dsr.inner_range())
+        {
+            content = Some(body);
         }
+
+        // Assemble the start tag + body + close tag.
+        let mut out = start_tag_src;
+        out.push('>');
+        match content {
+            Some(body) => out.push_str(&body),
+            None => {
+                for line in &lines {
+                    out.push('\n');
+                    out.push_str(line);
+                }
+                out.push('\n');
+            }
+        }
+        out.push_str("</");
+        out.push_str(&ext_name);
+        out.push('>');
         Some(out)
     }
 

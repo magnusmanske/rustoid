@@ -220,13 +220,18 @@ fn run_inner(node: &mut Node) {
     node.children = new_children;
 }
 
-/// Transfer `typeof`/`data-mw`/`about` metadata from a `mw:DOMFragment`
-/// placeholder onto its (span-wrapped) first fragment child. Mirrors the
-/// transclusion/fostered transfer in PHP's `UnpackDOMFragments::handler`.
+/// Transfer `typeof`/`data-mw`/`about`/`data-parsoid` metadata from a
+/// `mw:DOMFragment` placeholder onto its (span-wrapped) first fragment child.
+/// Mirrors the transclusion/fostered transfer in PHP's `UnpackDOMFragments::handler`.
 fn transfer_metadata(placeholder: &Node, kids: &mut [Node]) {
     let is_transclusion = has_transclusion_type(placeholder);
     let about = placeholder.get_attr("about").map(str::to_string);
     let dmw = placeholder.data_mw.clone();
+    // The placeholder's computed DSR (`open_width`/`close_width` come from the
+    // extension token's `extTagOffsets`) transfers to the first fragment child
+    // (e.g. the gallery `<ul>`), so selser's `getOrigSrc(innerRange)` can recover
+    // the original body (preserving blank lines).
+    let dp = placeholder.dp.clone();
     for (i, child) in kids.iter_mut().enumerate() {
         if i == 0 {
             if is_transclusion {
@@ -234,6 +239,19 @@ fn transfer_metadata(placeholder: &Node, kids: &mut [Node]) {
             }
             if let Some(d) = &dmw {
                 child.data_mw = Some(d.clone());
+            }
+            if let Some(d) = &dp {
+                // Merge the placeholder's DSR (the computed range over the
+                // `<gallery>…</gallery>` source) into the child's `dp`.
+                let child_dp = child.dp.get_or_insert_with(Default::default);
+                if let Some(dsr) = &d.dsr {
+                    child_dp.dsr = Some(dsr.clone());
+                }
+                child_dp.tsr = d.tsr.clone();
+                child_dp.ext_tag_offsets = d.ext_tag_offsets.clone();
+                if child_dp.src.is_none() {
+                    child_dp.src = d.src.clone();
+                }
             }
         }
         if let Some(ab) = &about {

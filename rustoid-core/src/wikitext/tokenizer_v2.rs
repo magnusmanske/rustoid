@@ -1649,6 +1649,10 @@ impl<'a> PegTokenizer<'a> {
                 close_width: Some(close_width),
                 ..Default::default()
             });
+            // The token TSR spans the full extension (start..end), not just the
+            // open tag (mirrors PHP, whose extension token `tsr` covers the whole
+            // `<gallery>…</gallery>` so ComputeDSR stamps a correct DSR).
+            dp.tsr = Some(SourceRange::new(saved, end));
             self.pos = end;
         } else {
             // Unmatched start tag (no end tag) or self-closed: the sanitizer falls
