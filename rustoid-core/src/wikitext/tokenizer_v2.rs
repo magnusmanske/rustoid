@@ -914,8 +914,12 @@ impl<'a> PegTokenizer<'a> {
     }
 
     /// Try to match a definition term/description pair: `;term:definition`.
-    /// Emits two `listItem` tokens (a `dt` for the term and a `dd` for the
-    /// definition), so the ListHandler produces `<dl><dt>…</dt><dd>…</dd></dl>`.
+    /// Emits a `listItem` token for the `;` (term) and one `listItem` token per
+    /// top-level `:` (definition), so the ListHandler produces
+    /// `<dl><dt>…</dt><dd>…</dd></dl>`. Faithful to PHP's
+    /// `dtdd = bullets:list_char* ";" colons:dtdd_colon* d:inlineline? &eolf`,
+    /// where each `dtdd_colon = inlineline_break_on_colon? ":"` is a definition
+    /// separator, and the final `d:inlineline?` is the last definition's content.
     fn try_dtdd(&mut self) -> bool {
         if !self.at_sol || !self.starts_with(";") {
             return false;
@@ -939,46 +943,38 @@ impl<'a> PegTokenizer<'a> {
             dp_1,
         )));
 
-        // The term content runs up to the colon (or end of line).
-        self.try_parse_inlineline_break_on_colon();
-
-        if !self.starts_with(":") {
-            // No colon on this line: a `;term` definition term followed by a
-            // newline. Consume the newline so a following `:definition` is
-            // recognized as its own list item on the next line.
-            if self.starts_with("\r\n") {
-                let nl_start = self.pos;
-                self.advance(2);
-                self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(nl_start, self.pos))));
-            } else if self.starts_with("\n") {
-                let nl_start = self.pos;
-                self.advance(1);
-                self.emit_token(ParsoidToken::Nl(NlTk::new(self.tsr(nl_start, self.pos))));
+        // One or more `:` form the term/definition separators. Each `:` is
+        // preceded by inline content that stops at a *top-level* colon, and is
+        // followed by a `listItem(:)` (mirrors `colons:dtdd_colon*`).
+        loop {
+            self.try_parse_inlineline_break_on_colon();
+            if !self.starts_with(":") {
+                break;
             }
-            self.at_sol = true;
-            return true;
+
+            // Consume the colon and emit the definition list item.
+            let colon_pos = self.pos;
+            self.advance(1); // consume ':'
+            let mut dp = self.make_dp(colon_pos, colon_pos + 1);
+            dp.stx = Some("row".to_string());
+            let bullets = KV {
+                key: KeyValue::Str("bullets".to_string()),
+                value: KeyValue::Str(":".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            };
+            self.emit_token(ParsoidToken::Tag(TagTk::new("listItem", vec![bullets], dp)));
         }
-        self.advance(1); // consume ':'
 
-        // Second list item: the definition description.
-        let colon_pos = self.pos - 1;
-        let mut dp_2 = self.make_dp(colon_pos, colon_pos + 1);
-        dp_2.stx = Some("row".to_string());
-        let bullets_2 = KV {
-            key: KeyValue::Str("bullets".to_string()),
-            value: KeyValue::Str(":".to_string()),
-            src_offsets: None,
-            ksrc: None,
-            vsrc: None,
-        };
-        self.emit_token(ParsoidToken::Tag(TagTk::new(
-            "listItem",
-            vec![bullets_2],
-            dp_2,
-        )));
+        if !self.starts_with("\n") && !self.starts_with("\r\n") && self.pos < self.input_len {
+            // The final definition content runs to the end of the line (mirrors
+            // `d:inlineline?` — parsed after the last `:`).
+            self.try_parse_inlineline();
+        }
 
-        // The definition content runs to the end of the line.
-        self.try_parse_inlineline();
+        // A trailing newline (a `;term`/`;term:` with no definition content) is
+        // left for the parent `sol`/`block_lines` to consume.
         self.at_sol = true;
         true
     }
