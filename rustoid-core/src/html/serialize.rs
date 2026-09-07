@@ -89,12 +89,16 @@ impl HtmlSerializer {
                         buf.push_str(&format!("</{h}>"));
                     }
                     ElementKind::Bold => {
-                        buf.push_str("<b>");
+                        buf.push_str("<b");
+                        self.serialize_plain_attrs(node, buf);
+                        buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</b>");
                     }
                     ElementKind::Italic => {
-                        buf.push_str("<i>");
+                        buf.push_str("<i");
+                        self.serialize_plain_attrs(node, buf);
+                        buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</i>");
                     }
@@ -290,6 +294,16 @@ impl HtmlSerializer {
 
     fn serialize_attrs(&self, node: &Node, buf: &mut String) {
         self.serialize_attrs_impl(node, buf, false);
+    }
+
+    /// Serialize only the plain `node.attrs` (e.g. a literal HTML `<b style=…>`
+    /// attribute), without the `data-parsoid`/`data-mw` round-trip metadata.
+    /// Used for tag elements whose `data-parsoid` is purely positional (`tsr`)
+    /// and is not part of the rendered HTML (the quote-generated `<b>`/`<i>`).
+    fn serialize_plain_attrs(&self, node: &Node, buf: &mut String) {
+        for attr in &node.attrs {
+            serialize_attr(attr, buf);
+        }
     }
 
     /// Serialize a `<a>` element's remaining attributes, skipping `rel`/`href`/`src`
