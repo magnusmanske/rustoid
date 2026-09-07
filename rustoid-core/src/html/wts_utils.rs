@@ -438,8 +438,12 @@ pub fn get_data_mw_src(node: &Node) -> Option<String> {
 
 /// Whether a node is genuinely new (no `dsr`), mirroring `WTUtils::isNewElt` for
 /// the `getShadowInfo` fast path. Operates directly on `node.dp` (no tree).
-fn node_is_new(node: &Node) -> bool {
-    node.dp.as_ref().is_none_or(|dp| dp.dsr.is_none())
+/// Whether a node is a *new* element (editor-inserted, no original DSR). The
+/// `IS_NEW` temp flag PHP's `WTUtils::isNewElt` reads is only set during selser
+/// for editor-inserted content; the media path exercises wt2wt/html2wt where it
+/// is never set, so a node is not "new" here (mirrors PHP returning `false`).
+fn node_is_new(_node: &Node) -> bool {
+    false
 }
 
 /// `WTSUtils::getShadowInfo` — resolve an attribute's shadowed value. Faithful
@@ -742,13 +746,13 @@ mod tests {
 
     #[test]
     fn test_get_shadow_info_falls_back_to_attr() {
-        // No `a` shadow entry → plain round-trip, `modified` = isNewElt.
+        // No `a` shadow entry → plain round-trip. A node without data-parsoid is
+        // not editor-inserted (`IS_NEW` is unset), so `modified` is false.
         let mut node = Node::element(ElementKind::Other("span".to_string()));
         node.set_attr("title", "current");
-        // No dp → isNewElt true → modified.
         let si = get_shadow_info(&node, "title", Some("current"));
         assert_eq!(si.value, "current");
-        assert!(si.modified);
+        assert!(!si.modified);
         assert!(!si.fromsrc);
     }
 

@@ -506,13 +506,17 @@ fn apply_media_info(
     let canonical_resource = crate::title::make_link(&job.title, config);
     img.set_attr("resource", &canonical_resource);
     // Preserve the normalized/source shadow info so html2wt can round-trip a
-    // non-canonical namespace alias (`Image:Foobar.jpg` → `[[Image:…]]`),
-    // mirroring PHP's `addNormalizedAttribute` on the `<img>` resource.
-    if let Some(href_src) = &job.href_src {
-        let mut dp = crate::wikitext::tokens_v2::DataParsoid::default();
+    // non-canonical namespace alias (`Image:Foobar.jpg` → `[[Image:…]]`) and
+    // detect editor modifications to `width`/`height`, mirroring PHP's
+    // `addNormalizedAttribute` calls on the `<img>` resource/width/height.
+    {
+        let dp = img.dp.get_or_insert_with(Default::default);
         dp.set_a("resource", &canonical_resource);
-        dp.set_sa("resource", href_src);
-        img.dp = Some(dp);
+        dp.set_a("width", &width.to_string());
+        dp.set_a("height", &height.to_string());
+        if let Some(href_src) = &job.href_src {
+            dp.set_sa("resource", href_src);
+        }
     }
     // alt from the explicit option/caption (when present), before the fixed
     // attrs (mirrors PHP's `thumbattribs` ordering: `src`, `decoding`,

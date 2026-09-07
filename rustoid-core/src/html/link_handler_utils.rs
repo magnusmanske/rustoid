@@ -775,25 +775,68 @@ fn media_child_of_link(tree: &DomTree, node: NodeId) -> Option<NodeId> {
 
 /// Shadow info for a media attribute — the `{ value, modified, fromsrc,
 /// fromDataMW }` tuple PHP's `serializedImageAttrVal`/`serializedAttrVal` produce.
-/// For basic (non-data-parsoid/html import) HTML all flags are `false` and
-/// `value` is the raw attribute value (or `None` when absent).
 #[derive(Debug, Clone, Default)]
 struct Shadow {
     value: Option<String>,
-    #[allow(dead_code)]
     modified: bool,
     fromsrc: bool,
-    #[allow(dead_code)]
     from_data_mw: bool,
 }
 
-/// Read an attribute as shadow info (basic-HTML semantics: no data-parsoid, so
-/// `value` is the attribute value and everything else is `false`).
-fn attribute_shadow(tree: &DomTree, node: NodeId, key: &str) -> Shadow {
-    Shadow {
-        value: tree.node(node).get_attr(key).map(str::to_string),
-        ..Default::default()
+/// Read an attribute as shadow info, mirroring
+/// `WikitextSerializer::serializedImageAttrVal($dataMWnode, $htmlAttrNode, $key)`:
+/// first look up a template-generated value in `data-mw.attribs` (returning
+/// `from_data_mw = true`), else fall back to full `data-parsoid` shadow info on
+/// the HTML-attribute node (which detects editor modifications via `a`/`sa`).
+fn attribute_shadow(
+    tree: &DomTree,
+    data_mw_node: NodeId,
+    html_attr_node: NodeId,
+    key: &str,
+) -> Shadow {
+    // `getAttributeValueAsShadowInfo`: a template-generated `data-mw.attribs[k].html`.
+    if let Some(v) = data_mw_attr_html(tree.node(data_mw_node), key) {
+        return Shadow {
+            value: Some(v),
+            modified: false,
+            fromsrc: true,
+            from_data_mw: true,
+        };
     }
+    // Fallback: full shadow info on the HTML attribute node.
+    let si = crate::html::wts_utils::get_attribute_shadow_info(tree.node(html_attr_node), key);
+    Shadow {
+        value: if si.value.is_empty() {
+            None
+        } else {
+            Some(si.value)
+        },
+        modified: si.modified,
+        fromsrc: si.fromsrc,
+        from_data_mw: false,
+    }
+}
+
+/// `WikitextSerializer::getAttributeValue` — the generated value of
+/// `data-mw.attribs[i]` whose key matches `key` (only when it carries a `.html`
+/// form), serialized back to wikitext.
+fn data_mw_attr_html(node: &crate::dom::node::Node, key: &str) -> Option<String> {
+    let dm = node.data_mw.as_deref()?;
+    let json: serde_json::Value = serde_json::from_str(dm).ok()?;
+    for entry in json.get("attribs")?.as_array()? {
+        let kv = entry.as_array()?;
+        let key_obj = kv.first()?;
+        let k_str = key_obj.get("txt")?.as_str()?;
+        if k_str != key {
+            continue;
+        }
+        let value_obj = kv.get(1)?;
+        // Only the generated (`.html`) form is authoritative here.
+        if let Some(html) = value_obj.get("html").and_then(|h| h.as_str()) {
+            return Some(html.to_string());
+        }
+    }
+    None
 }
 
 /// Read a string property from the node's `data-mw` JSON object (e.g.
@@ -819,7 +862,6 @@ fn mw_aliases<'a>(
 /// alias(es) (string form, possibly multi-alias preserved from data-mw);
 /// `v` is the substituted `$1` value, `ck` the canonical key.
 struct Nopt {
-    #[allow(dead_code)]
     ck: String,
     ak: String,
     v: Option<String>,
@@ -914,7 +956,7 @@ fn figure_to_constrained_text_inner(
     if let Some(l) = link_elt
         && tree.node(l).get_attr("href").is_some()
     {
-        let mut lk = attribute_shadow(tree, l, "href");
+        let mut lk = attribute_shadow(tree, outer_elt, l, "href");
         if !lk.fromsrc {
             // Strip page/lang parameters from the href.
             let stripped = strip_page_lang(tree.node(l).get_attr("href").unwrap_or(""));
@@ -930,17 +972,17 @@ fn figure_to_constrained_text_inner(
     }
     if link.is_none() {
         // Otherwise, just try and get it from `href` on the outer elt.
-        let h = attribute_shadow(tree, outer_elt, "href");
+        let h = attribute_shadow(tree, outer_elt, outer_elt, "href");
         if h.value.is_some() {
             link = Some(h);
         }
     }
 
     // Fetch the alt / lang / muted / loop.
-    let alt = attribute_shadow(tree, media_elt, "alt");
-    let lang = attribute_shadow(tree, media_elt, "lang");
-    let muted = attribute_shadow(tree, media_elt, "muted");
-    let loop_attr = attribute_shadow(tree, media_elt, "loop");
+    let alt = attribute_shadow(tree, outer_elt, media_elt, "alt");
+    let lang = attribute_shadow(tree, outer_elt, media_elt, "lang");
+    let muted = attribute_shadow(tree, outer_elt, media_elt, "muted");
+    let loop_attr = attribute_shadow(tree, outer_elt, media_elt, "loop");
 
     // Determine whether an explicit `link=` is needed.
     let mut link_cond = is_img;
@@ -1118,11 +1160,13 @@ fn figure_to_constrained_text_inner(
     let is_redlink = ms.is_red_link(tree);
     let wh = attribute_shadow(
         tree,
+        outer_elt,
         media_elt,
         if is_redlink { "data-height" } else { "height" },
     );
     let ww = attribute_shadow(
         tree,
+        outer_elt,
         media_elt,
         if is_redlink { "data-width" } else { "width" },
     );
@@ -1192,6 +1236,26 @@ fn figure_to_constrained_text_inner(
             v: None,
         });
     }
+
+    // Sort the new options to match the order given in the original `optList`,
+    // mirroring PHP's `usort` by `sortId`. Each option's `sortId` is the index
+    // of the matching canonical key in the original wikitext option list (or the
+    // end of the list for new options), so a modified alignment (`right`→`left`)
+    // keeps its original position rather than being reordered.
+    let opt_list = tree
+        .node(outer_elt)
+        .dp
+        .as_ref()
+        .and_then(|dp| dp.opt_list.clone())
+        .unwrap_or_default();
+    let sort_id = |no: &Nopt| -> usize {
+        opt_list
+            .iter()
+            .position(|o| o.ck.as_deref() == Some(no.ck.as_str()))
+            .unwrap_or(opt_list.len())
+    };
+    let mut nopts: Vec<Nopt> = nopts;
+    nopts.sort_by_key(|no| sort_id(no));
 
     // Emit all the options in order.
     let mut wikitext = format!("[[{resource_value}");
