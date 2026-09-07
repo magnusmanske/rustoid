@@ -1252,7 +1252,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             };
-            let ul = crate::pipeline::gallery::build_with(
+            let mut ul = crate::pipeline::gallery::build_with(
                 stt,
                 self.config,
                 |caption: &str| {
@@ -1272,6 +1272,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 },
             )
             .await;
+            // The gallery `<ul>` is an extension encapsulation wrapper; it must
+            // carry an `about` id (mirrors PHP's `ExtensionHandler` adding
+            // `about` to extension top-level nodes) so the html2wt serializer
+            // recognizes it as `mw:Extension/gallery` rather than a plain list.
+            if let crate::dom::node::NodeKind::Element(_) = ul.kind {
+                ul.set_attr("about", self.new_about_id(about_counter));
+            }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
             let id = *next_id;
@@ -1288,6 +1295,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn expand_gallery_sync(
         &self,
         tokens: Vec<Item>,
+        about_counter: &std::cell::Cell<usize>,
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &mut usize,
     ) -> Vec<Item> {
@@ -1297,7 +1305,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             };
-            let ul = crate::pipeline::gallery::build_with_sync(stt, self.config);
+            let mut ul = crate::pipeline::gallery::build_with_sync(stt, self.config);
+            if let crate::dom::node::NodeKind::Element(_) = ul.kind {
+                ul.set_attr("about", self.new_about_id(about_counter));
+            }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
             let id = *next_id;
@@ -1326,7 +1337,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments.extend(pre_fragments);
         let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens);
         fragments.extend(wrapper_fragments);
-        let tokens = self.expand_gallery_sync(tokens, &mut fragments, &mut next_id);
+        let tokens = self.expand_gallery_sync(
+            tokens,
+            &std::cell::Cell::new(0usize),
+            &mut fragments,
+            &mut next_id,
+        );
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);

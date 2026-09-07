@@ -83,7 +83,17 @@ pub fn apply_manual_changes(body: &mut Node, changes: &serde_json::Value) -> Res
                 let t = arg_str(change, method_idx + 1, "text value")?;
                 for p in &targets {
                     if let Some(el) = node_at_mut(body, p) {
-                        el.children = vec![Node::text(t)];
+                        // jQuery `.text(t)` sets `textContent`: for a *text* node
+                        // (`contents()` yield) this replaces the node's data in
+                        // place (the element keeps its identity); for an element
+                        // (direct `text` without `contents()`) it replaces the
+                        // children with a single text node.
+                        match &mut el.kind {
+                            NodeKind::Text(s) => *s = t.to_string(),
+                            _ => {
+                                el.children = vec![Node::text(t)];
+                            }
+                        }
                     }
                 }
             }
@@ -210,11 +220,12 @@ fn find_matches(body: &Node, selector: &str) -> Vec<Path> {
 /// Recursively walk the tree, matching the selector's compound parts against
 /// each element: the rightmost compound against the element itself, preceding
 /// compounds against its ancestors (descendant combinator), mirroring Zest's
-/// `qsa`. `ancestors` is the stack of enclosing element nodes.
+/// `qsa`. `ancestors` is the stack of `(enclosing element, its element-sibling
+/// index)` pairs.
 fn walk<'a>(
     node: &'a Node,
     compounds: &[&str],
-    ancestors: &mut Vec<&'a Node>,
+    ancestors: &mut Vec<(&'a Node, usize)>,
     path: &mut Vec<usize>,
     out: &mut Vec<Path>,
 ) {
@@ -232,7 +243,7 @@ fn walk<'a>(
                 out.push(p);
             }
             element_index += 1;
-            ancestors.push(child);
+            ancestors.push((child, element_index - 1));
             path.push(i);
             walk(child, compounds, ancestors, path, out);
             path.pop();
@@ -246,13 +257,13 @@ fn walk<'a>(
 }
 
 /// Match a fully-split selector against `node`. `sibling_index` is the node's
-/// element-sibling position for its own pseudo-class; `ancestors[0]` is the
-/// immediate parent element, `ancestors[1]` the grandparent, etc.
+/// element-sibling position for its own pseudo-class; `ancestors` holds
+/// `(ancestor element, its sibling index)` pairs (nearest last).
 fn matches_full_selector(
     node: &Node,
     compounds: &[&str],
     sibling_index: usize,
-    ancestors: &[&Node],
+    ancestors: &[(&Node, usize)],
 ) -> bool {
     // The rightmost compound matches the node itself.
     let (last, rest) = compounds.split_last().expect("non-empty selector");
@@ -265,11 +276,11 @@ fn matches_full_selector(
     // Walk the ancestor stack (nearest-first) matching each compound in turn.
     let mut comp_iter = rest.iter().rev();
     let mut comp = comp_iter.next();
-    for ancestor in ancestors.iter().rev() {
+    for (ancestor, ancestor_idx) in ancestors.iter().rev() {
         let Some(part) = comp else {
             break;
         };
-        if matches_compound(ancestor, part, 0) {
+        if matches_compound(ancestor, part, *ancestor_idx) {
             comp = comp_iter.next();
         }
     }

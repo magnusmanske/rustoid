@@ -847,6 +847,40 @@ fn data_mw_prop(tree: &DomTree, node: NodeId, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
+/// `WTUtils::hasVisibleCaption` — the media has a *rendered* caption (only
+/// Thumb/Frame; Manualthumb is deliberately excluded, see T305759).
+fn has_visible_caption(format: &str) -> bool {
+    matches!(format, "Thumb" | "Frame")
+}
+
+/// `WTUtils::textContentFromCaption` — the plain text of a caption subtree,
+/// skipping metadata and `mw:Extension/ref` linkbacks (which are not part of the
+/// rendered alt).
+fn text_content_from_caption(tree: &DomTree, node: NodeId) -> String {
+    let n = tree.node(node);
+    let mut out = String::new();
+    match &n.kind {
+        crate::dom::node::NodeKind::Text(t) => out.push_str(t),
+        crate::dom::node::NodeKind::Element(_) => {
+            let name = crate::html::dom_utils::node_name(n);
+            if matches!(
+                name.as_str(),
+                "link" | "meta" | "style" | "script" | "base" | "title"
+            ) || crate::html::dom_utils::has_type_of(n, "mw:Extension/ref")
+            {
+                return String::new();
+            }
+            let mut child = tree.first_child(node);
+            while let Some(c) = child {
+                out.push_str(&text_content_from_caption(tree, c));
+                child = tree.next_sibling(c);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// The wikitext aliases for a canonical magic-word key (e.g. `img_link`),
 /// preferring the suggested alias when present. Faithful to
 /// `$mwAliases[$alias]` in `figureToConstrainedText`.
@@ -979,7 +1013,22 @@ fn figure_to_constrained_text_inner(
     }
 
     // Fetch the alt / lang / muted / loop.
-    let alt = attribute_shadow(tree, outer_elt, media_elt, "alt");
+    let mut alt = attribute_shadow(tree, outer_elt, media_elt, "alt");
+    // "Alt stuff" (PHP `figureToConstrainedText`): when the media has no visible
+    // caption (not Thumb/Frame) and an `alt` whose value equals the caption text,
+    // the `alt` is dropped (it is redundant with the caption).
+    if !has_visible_caption(&format)
+        && let Some(alt_val) = alt.value.as_deref()
+        && !alt_val.trim().is_empty()
+        && let Some(caption_elt) = caption_elt
+    {
+        let caption_text = text_content_from_caption(tree, caption_elt)
+            .trim()
+            .to_string();
+        if alt_val.trim() == caption_text && !caption_text.is_empty() {
+            alt.value = None;
+        }
+    }
     let lang = attribute_shadow(tree, outer_elt, media_elt, "lang");
     let muted = attribute_shadow(tree, outer_elt, media_elt, "muted");
     let loop_attr = attribute_shadow(tree, outer_elt, media_elt, "loop");
@@ -1237,21 +1286,39 @@ fn figure_to_constrained_text_inner(
         });
     }
 
-    // Sort the new options to match the order given in the original `optList`,
-    // mirroring PHP's `usort` by `sortId`. Each option's `sortId` is the index
-    // of the matching canonical key in the original wikitext option list (or the
-    // end of the list for new options), so a modified alignment (`right`→`left`)
-    // keeps its original position rather than being reordered.
+    // Add bogus options from the original `optList` so they round-trip cleanly
+    // (T64500). A suppressed format (`thumb`/`frame` in gallery context) is
+    // recorded as a `bogus` optList entry and must be re-emitted verbatim.
     let opt_list = tree
         .node(outer_elt)
         .dp
         .as_ref()
         .and_then(|dp| dp.opt_list.clone())
         .unwrap_or_default();
+    for o in &opt_list {
+        if o.ck.as_deref() == Some("bogus") {
+            nopts.push(Nopt {
+                ck: "bogus".to_string(),
+                ak: o.ak.clone().unwrap_or_default(),
+                v: None,
+            });
+        }
+    }
+
+    // Sort the new options to match the order given in the original `optList`,
+    // mirroring PHP's `usort` by `sortId`. Each option's `sortId` is the index
+    // of the matching canonical key in the original wikitext option list (or the
+    // end of the list for new options), so a modified alignment (`right`→`left`)
+    // keeps its original position rather than being reordered. A `bogus` option
+    // also matches on its source (`ak`) so a displaced caption/format keeps its
+    // exact slot.
     let sort_id = |no: &Nopt| -> usize {
         opt_list
             .iter()
-            .position(|o| o.ck.as_deref() == Some(no.ck.as_str()))
+            .position(|o| {
+                o.ck.as_deref() == Some(no.ck.as_str())
+                    && (no.ck != "bogus" || o.ak.as_deref() == Some(no.ak.as_str()))
+            })
             .unwrap_or(opt_list.len())
     };
     let mut nopts: Vec<Nopt> = nopts;

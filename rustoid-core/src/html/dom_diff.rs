@@ -61,6 +61,12 @@ fn is_encapsulation_wrapper(node: &Node) -> bool {
     crate::html::wts_utils::is_first_encapsulation_wrapper_node(node)
 }
 
+/// Whether a first-encapsulation-wrapper node is a `<gallery>` extension
+/// (mirrors `WTUtils::getExtTagName($node) === 'gallery'`).
+fn is_gallery(node: &Node) -> bool {
+    crate::html::wts_utils::get_ext_tag_name(node).as_deref() == Some("gallery")
+}
+
 /// Build a `<meta typeof="...">` diff-marker node (faithful to
 /// `prependTypedMeta`'s meta creation).
 fn diff_marker_meta(ty: &str) -> Node {
@@ -314,7 +320,8 @@ impl DomDiff {
         new_index: usize,
     ) -> bool {
         let base_encapsulated = is_encapsulation_wrapper(base_node);
-        let new_encapsulated = is_encapsulation_wrapper(&new_parent.children[new_index]);
+        let new_child = &new_parent.children[new_index];
+        let new_encapsulated = is_encapsulation_wrapper(new_child);
 
         let subtree_differs = if !base_encapsulated && !new_encapsulated {
             // Recurse into the (owned) new child.
@@ -323,9 +330,24 @@ impl DomDiff {
             new_parent.children[new_index] = new_child;
             changed
         } else if base_encapsulated && new_encapsulated {
-            // Encapsulated content: we don't know about the subtree when
-            // skipping encapsulated content.
-            !self.skip_encapsulated_content
+            // Encapsulated content: some extensions implement a `diffHandler`
+            // that diffs their content directly. The gallery handler's
+            // `diffHandler` is `$domDiff($origNode, $editedNode)` (a full
+            // recursion), so caption/line edits inside a gallery are detected;
+            // everything else is skipped when `skip_encapsulated_content`.
+            if is_gallery(base_node) && is_gallery(new_child) {
+                let mut new_child = new_parent.children[new_index].clone();
+                let changed = self.do_dom_diff(base_node, &mut new_child);
+                new_parent.children[new_index] = new_child;
+                changed
+            } else if self.skip_encapsulated_content {
+                false
+            } else {
+                let mut new_child = new_parent.children[new_index].clone();
+                let changed = self.do_dom_diff(base_node, &mut new_child);
+                new_parent.children[new_index] = new_child;
+                changed
+            }
         } else {
             true
         };
