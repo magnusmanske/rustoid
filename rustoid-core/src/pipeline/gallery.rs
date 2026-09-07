@@ -391,16 +391,6 @@ where
         .get_attr("typeof")
         .is_some_and(|ty| ty.split_whitespace().any(|tok| tok == "mw:Error"));
 
-    // The `showfilename` anchor uses the title *after* redirect resolution.
-    // `add_media_info` re-targets the `<img resource=…>` to the redirect target
-    // (e.g. `File:Redirect to foobar.jpg` → `./File:Foobar.jpg`), so recover that
-    // resolved title from the rendered media rather than the pre-render `title`.
-    let showfilename_title = if opts.showfilename {
-        resolved_media_title(&figure, config)
-    } else {
-        None
-    };
-
     // Detach the `<figcaption>` (becomes `.gallerytext`) from the figure.
     let caption_nodes = take_figcaption(&mut figure);
 
@@ -452,8 +442,8 @@ where
     // content, plus the optional `showfilename` filename link.
     let mut gallerytext = Node::element(ElementKind::Div);
     gallerytext.set_attr("class", "gallerytext");
-    if let Some(show_title) = showfilename_title.as_ref() {
-        gallerytext.push_child(showfilename_anchor(show_title, config));
+    if opts.showfilename {
+        gallerytext.push_child(showfilename_anchor(&title, config));
     }
     for node in caption_nodes {
         gallerytext.push_child(node);
@@ -593,26 +583,6 @@ fn showfilename_anchor(title: &Title, config: &dyn SiteConfig) -> Node {
     a.set_attr("title", file.as_str());
     a.push_child(Node::text(file));
     a
-}
-
-/// Recover the *resolved* file title from a rendered media `<figure>`: read the
-/// media element's (`<img>`/`<span>`) `resource` attribute (stamped by
-/// `add_media_info`, which already followed any redirect), strip the relative
-/// `./` link prefix, and re-parse it. Returns `None` when no media/resource is
-/// present (e.g. an error/item without a recognizable file), in which case the
-/// `showfilename` anchor is omitted (mirrors `Gallery::pLine` using the title
-/// only after `renderMedia` ran `AddMediaInfo`, which re-targeted the resource).
-fn resolved_media_title(figure: &Node, config: &dyn SiteConfig) -> Option<Title> {
-    // The media element sits at `figure > a > <img|span>`.
-    let media = figure.children.first()?.children.first()?;
-    let resource = media.get_attr("resource")?;
-    let resource = resource
-        .strip_prefix(crate::title::relative_link_prefix(config))
-        .unwrap_or(resource);
-    Some(TitleParser::parse(
-        &crate::util::decode_uri_component(resource),
-        config,
-    ))
 }
 
 /// Parse the `<gallery …>` start-tag attributes into options.
