@@ -1593,9 +1593,11 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
         };
         while *pos < bytes.len() {
             if bytes[*pos] != b'<' {
-                // Accumulate text (assume ASCII in the test fixtures).
-                text.push(bytes[*pos] as char);
-                *pos += 1;
+                // Accumulate a full UTF-8 character (not a single byte), so
+                // non-ASCII text (e.g. NBSP in a link caption) round-trips.
+                let ch = html[*pos..].chars().next().unwrap();
+                text.push(ch);
+                *pos += ch.len_utf8();
                 continue;
             }
             if html[*pos..].starts_with("</") {

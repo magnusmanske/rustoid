@@ -287,7 +287,7 @@ impl TitleParser {
                     return Title {
                         interwiki: Some(prefix.clone()),
                         namespace_id: 0,
-                        text: after.to_string(),
+                        text: collapse_title_whitespace(after),
                         fragment,
                         namespace_name: None,
                     };
@@ -352,9 +352,9 @@ impl TitleParser {
         config: &dyn SiteConfig,
     ) -> Title {
         let text = if case_sensitive {
-            text.to_string()
+            collapse_title_whitespace(text)
         } else {
-            ucfirst(text, config.language_code())
+            ucfirst(&collapse_title_whitespace(text), config.language_code())
         };
         let namespace_name = config.namespace_name(namespace_id);
         Title {
@@ -388,6 +388,29 @@ fn split_fragment(input: &str) -> (&str, Option<String>) {
     } else {
         (input, None)
     }
+}
+
+/// Normalize a page title's whitespace: map every Unicode whitespace character
+/// (including NBSP U+00A0, thin spaces U+2000–U+200A, etc.) to a regular ASCII
+/// space, collapse runs to a single space, and trim. Mirrors the title-space
+/// normalization MediaWiki's `Language::normalize` applies to `Title` text
+/// (NBSP in a wikilink target becomes a plain space, and `Foo  bar   baz`
+/// collapses to `Foo bar baz`).
+fn collapse_title_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 #[cfg(test)]
