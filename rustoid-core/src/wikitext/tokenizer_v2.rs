@@ -1629,7 +1629,26 @@ impl<'a> PegTokenizer<'a> {
             if let Some(attr) = self.parse_table_attribute(cell_arg) {
                 attrs.push(attr);
             } else {
-                break;
+                // PHP `table_attributes = (table_attribute /
+                // optional_spaces @broken_table_attribute_name_char)*`: a
+                // `\0`/`/`/`=`/`>` that can't start an attribute is digested as a
+                // discarded valueless `KV(c, '')` (not a terminator), so broken
+                // table syntax like `{| || |} ++` yields empty cells rather than
+                // leaking the stray chars as content.
+                let ch = self.remaining().chars().next().unwrap();
+                if matches!(ch, '\0' | '/' | '=' | '>') {
+                    let kv = KV {
+                        key: KeyValue::Str(ch.to_string()),
+                        value: KeyValue::Str(String::new()),
+                        src_offsets: None,
+                        ksrc: None,
+                        vsrc: None,
+                    };
+                    self.advance(ch.len_utf8());
+                    attrs.push(kv);
+                } else {
+                    break;
+                }
             }
         }
         attrs
