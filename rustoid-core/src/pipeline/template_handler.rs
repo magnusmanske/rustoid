@@ -272,7 +272,11 @@ pub enum ResolvedTarget {
 
 /// Classify a resolved (string) template target. Mirrors the tail of PHP's
 /// `resolveTemplateTarget` once `$target` has been stringified.
-fn resolve_target_string(config: &dyn SiteConfig, target_toks: &str) -> Option<ResolvedTarget> {
+fn resolve_target_string(
+    config: &dyn SiteConfig,
+    context_title: Option<&crate::title::Title>,
+    target_toks: &str,
+) -> Option<ResolvedTarget> {
     let mut target = target_toks.trim().to_string();
 
     // Split on ASCII ':' or fullwidth '：'.
@@ -342,8 +346,22 @@ fn resolve_target_string(config: &dyn SiteConfig, target_toks: &str) -> Option<R
         }
     }
 
-    // Resolve as a template title.
-    let namespace_id = if target.starts_with([':', '#', '/']) || target.starts_with("../") {
+    // Resolve a possibly-relative link (/Subpage, ../foo) against the context
+    // title before template processing, mirroring PHP's `$env->resolveTitle($target)`
+    // (a template target in a subpage-supporting namespace picks up the
+    // namespace/fragment prefix). This runs only *after* magic-variable and
+    // parser-function detection, so `#tag:pre` and `{{PAGENAME}}` aren't
+    // fragment-resolved. `orig_target` (pre-resolution) drives the
+    // Template-namespace default decision, matching PHP's `$namespaceId`.
+    let orig_target = target.clone();
+    let target = crate::title::resolve_subpage(config, context_title, &target);
+
+    // Resolve as a template title. The Template-namespace default is omitted
+    // for a relative target (leading ':', '#', '/', or '../'), which resolves in
+    // the current namespace instead (mirrors PHP's `$namespaceId = strspn($target,
+    // ':#/') > 0 || str_starts_with($target, "../") ? null : template_ns`).
+    let namespace_id = if orig_target.starts_with([':', '#', '/']) || orig_target.starts_with("../")
+    {
         None
     } else {
         config.canonical_namespace_id("Template")
@@ -365,8 +383,14 @@ fn resolve_target_string(config: &dyn SiteConfig, target_toks: &str) -> Option<R
 
 /// Resolve a template target from a plain string. Convenience wrapper around
 /// `resolve_target_string` (the common case where the target is already text).
-pub fn resolve_template_target(config: &dyn SiteConfig, target: &str) -> Option<ResolvedTarget> {
-    resolve_target_string(config, target)
+/// `context_title` is the current page title (for relative `/Subpage`/`../foo`
+/// resolution).
+pub fn resolve_template_target(
+    config: &dyn SiteConfig,
+    context_title: Option<&crate::title::Title>,
+    target: &str,
+) -> Option<ResolvedTarget> {
+    resolve_target_string(config, context_title, target)
 }
 
 /// Resolve a template target from a token chunk, mirroring PHP's
@@ -375,6 +399,7 @@ pub fn resolve_template_target(config: &dyn SiteConfig, target: &str) -> Option<
 /// `in_template` mirrors `$this->options['inTemplate']`.
 pub fn resolve_template_target_tokens(
     config: &dyn SiteConfig,
+    context_title: Option<&crate::title::Title>,
     target_toks: &[Item],
     in_template: bool,
 ) -> Option<ResolvedTarget> {
@@ -391,7 +416,7 @@ pub fn resolve_template_target_tokens(
         }
     }
 
-    resolve_target_string(config, &processed.target)
+    resolve_target_string(config, context_title, &processed.target)
 }
 
 /// Is `name` the `safesubst` magic word? Mirrors the essential safesubst check.
@@ -580,6 +605,7 @@ impl TemplateHandler {
     pub fn handle_template(
         &self,
         config: &dyn SiteConfig,
+        context_title: Option<&crate::title::Title>,
         params: &Params,
         about_id: String,
         token: &crate::wikitext::tokens_v2::ParsoidToken,
@@ -598,7 +624,7 @@ impl TemplateHandler {
             })
             .unwrap_or_default();
 
-        match resolve_template_target(config, &target_str) {
+        match resolve_template_target(config, context_title, &target_str) {
             Some(ResolvedTarget::Variable {
                 name,
                 magic_word_type,
@@ -801,7 +827,9 @@ impl TemplateHandler {
                 };
                 // Build a `Params` from the token's attribs.
                 let params = Params::new(stt.attribs.clone());
-                let expanded = self.handle_template(config, &params, about_id, tok);
+                let context_title = frame.title();
+                let expanded =
+                    self.handle_template(config, Some(context_title), &params, about_id, tok);
                 out.extend(expanded);
                 continue;
             }
@@ -999,7 +1027,7 @@ mod tests {
     #[test]
     fn test_resolve_magic_variable() {
         let config = MockSiteConfig::new();
-        let target = resolve_template_target(&config, "PAGENAME").unwrap();
+        let target = resolve_template_target(&config, None, "PAGENAME").unwrap();
         match target {
             ResolvedTarget::Variable { name, .. } => {
                 assert_eq!(name, "pagename");
@@ -1011,7 +1039,7 @@ mod tests {
     #[test]
     fn test_resolve_parser_function() {
         let config = MockSiteConfig::new();
-        let target = resolve_template_target(&config, "#if:a|b|c").unwrap();
+        let target = resolve_template_target(&config, None, "#if:a|b|c").unwrap();
         match target {
             ResolvedTarget::ParserFunction { name, broken, .. } => {
                 assert_eq!(name, "if");
@@ -1025,7 +1053,7 @@ mod tests {
     fn test_resolve_template_title() {
         let config = MockSiteConfig::new();
         // Plain template name defaults to the Template namespace.
-        let target = resolve_template_target(&config, "Foo").unwrap();
+        let target = resolve_template_target(&config, None, "Foo").unwrap();
         match target {
             ResolvedTarget::Template { name, title } => {
                 assert_eq!(name, "Template:Foo");
@@ -1092,7 +1120,7 @@ mod tests {
                 crate::wikitext::tokens_v2::DataParsoid::default(),
             ));
 
-        let out = handler.handle_template(&config, &params, "#mwt1".to_string(), &token);
+        let out = handler.handle_template(&config, None, &params, "#mwt1".to_string(), &token);
 
         // Should be wrapped with mw:Transclusion markers and contain "yes".
         assert!(
@@ -1135,7 +1163,7 @@ mod tests {
         assert!(result.rest.is_some());
 
         // Colon present -> still resolvable as a parser function.
-        assert!(resolve_template_target_tokens(&config, &tokens, false).is_some());
+        assert!(resolve_template_target_tokens(&config, None, &tokens, false).is_some());
 
         // No colon -> additional tokens make this an invalid template target.
         let tokens_no_colon = vec![
@@ -1148,7 +1176,7 @@ mod tests {
                 ),
             )),
         ];
-        assert!(resolve_template_target_tokens(&config, &tokens_no_colon, false).is_none());
+        assert!(resolve_template_target_tokens(&config, None, &tokens_no_colon, false).is_none());
     }
 
     #[test]

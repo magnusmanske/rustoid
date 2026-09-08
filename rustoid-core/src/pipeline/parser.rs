@@ -1595,7 +1595,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .map(|t| t.contains("<!--"))
                     .unwrap_or(false);
 
-                match resolve_template_target(self.config, &target_str) {
+                match resolve_template_target(self.config, Some(frame.title()), &target_str) {
                     Some(ResolvedTarget::Template { name, title }) => {
                         let expanded = self
                             .expand_one_template(
