@@ -1495,18 +1495,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut titles = Vec::new();
         crate::pipeline::add_red_links::collect_wikilink_titles(&ast, &mut titles);
         if !titles.is_empty() {
-            let mut known = std::collections::HashSet::new();
-            if let Some(source) = source {
-                for t in &titles {
-                    if let Ok(Some(_)) = source
-                        .get_page_content(&crate::title::Title::new_main(t.clone()))
-                        .await
-                    {
-                        known.insert(t.clone());
-                    }
-                }
-            }
-            crate::pipeline::add_red_links::run(&mut ast, &known, &page_title_prefixed);
+            let page_info = match source {
+                Some(source) => source.get_page_info(&titles).await.unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            };
+            crate::pipeline::add_red_links::run(&mut ast, &page_info, &page_title_prefixed);
         }
         // AddMediaInfo: resolve file metadata for `mw:File` containers and
         // replace broken-media placeholders with real `<img>` elements (or mark

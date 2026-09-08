@@ -41,6 +41,47 @@ pub trait DataSource: Send + Sync {
     /// Fetch an i18n message from the MediaWiki namespace.
     /// Returns `None` if the message does not exist.
     async fn get_message(&self, lang: &str, key: &str) -> Result<Option<String>>;
+
+    /// Fetch page metadata used to resolve links to existing vs. missing
+    /// (red-link) targets. Faithful to PHP `DataAccess::getPageInfo`, returning
+    /// per-title `{ missing, known, redirect, linkclasses }`.
+    ///
+    /// The default derives existence from `get_page_content`: a title with
+    /// content is `known` (not `missing`). Mock/data-source implementations may
+    /// override this to reflect a richer page-info model (e.g. special pages,
+    /// redirects, disambiguation pages, known-but-contentless files).
+    async fn get_page_info(&self, titles: &[String]) -> Result<HashMap<String, PageInfo>> {
+        let mut ret = HashMap::new();
+        for title in titles {
+            let t = crate::title::Title::new_main(title.clone());
+            let has_content = self.get_page_content(&t).await?.is_some();
+            ret.insert(
+                title.clone(),
+                PageInfo {
+                    missing: !has_content,
+                    known: has_content,
+                    redirect: false,
+                    linkclasses: Vec::new(),
+                },
+            );
+        }
+        Ok(ret)
+    }
+}
+
+/// Page metadata used for link resolution (mirrors the per-title map returned
+/// by PHP `DataAccess::getPageInfo`).
+#[derive(Debug, Clone, Default)]
+pub struct PageInfo {
+    /// The target does not exist (a red link).
+    pub missing: bool,
+    /// The target is "known" (e.g. a file known through a repo even when its
+    /// local description page is absent), suppressing the red-link marker.
+    pub known: bool,
+    /// The target is a redirect page (adds `mw-redirect` to the link classes).
+    pub redirect: bool,
+    /// Extra link classes to apply (e.g. `mw-disambig`, `mw-userlink`).
+    pub linkclasses: Vec<String>,
 }
 
 /// Metadata for a file (image, audio, video).

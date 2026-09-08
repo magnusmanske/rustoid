@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::title::Title;
 use crate::traits::{
-    DataSource, FileInfo, InterwikiInfo, MagicWordEntry, MagicWordMap, NamespaceInfo, SiteConfig,
+    DataSource, FileInfo, InterwikiInfo, MagicWordEntry, MagicWordMap, NamespaceInfo, PageInfo,
+    SiteConfig,
 };
 
 /// Look up a canonical title key in a map, falling back to a first-letter
@@ -46,6 +47,13 @@ fn case_insensitive_get<T: Clone>(map: &RwLock<HashMap<String, T>>, key: &str) -
     map.read().unwrap().get(&alternate).cloned()
 }
 
+/// Normalize a title for page-info lookups by joining namespace + title with
+/// underscores (mirrors PHP `MockDataAccess::normTitle` for the string title
+/// form, and `MockApiHelper`'s normalization of `' '` → `'_'`).
+fn norm_title_key(title: &str) -> String {
+    title.replace(' ', "_")
+}
+
 // ---------------------------------------------------------------------------
 // MockDataSource
 // ---------------------------------------------------------------------------
@@ -60,6 +68,11 @@ pub struct MockDataSource {
     files: RwLock<HashMap<String, FileInfo>>,
     redirects: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<(String, String), String>>,
+    /// Explicit page-info overrides (special pages, redirects, disambiguation
+    /// pages, known-but-contentless files), keyed by prefixed title. Faithful
+    /// to PHP `MockApiHelper::getPageInfo`'s per-title `missing`/`known`/
+    /// `redirect`/`linkclasses` model.
+    page_info: RwLock<HashMap<String, PageInfo>>,
 }
 
 impl MockDataSource {
@@ -72,6 +85,7 @@ impl MockDataSource {
             files: RwLock::new(HashMap::new()),
             redirects: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
+            page_info: RwLock::new(HashMap::new()),
         }
     }
 
@@ -118,6 +132,16 @@ impl MockDataSource {
             .write()
             .unwrap()
             .insert((lang.to_string(), key.to_string()), value.to_string());
+    }
+
+    /// Register an explicit page-info override for a prefixed title, mirroring
+    /// the hardcoded `SPECIAL_TITLES`/`REDIRECT_TITLES`/`DISAMBIG_TITLES` lists
+    /// in PHP's `MockApiHelper`. Such titles are `known` (not `missing`).
+    pub fn set_page_info(&self, title: &str, info: PageInfo) {
+        self.page_info
+            .write()
+            .unwrap()
+            .insert(title.to_string(), info);
     }
 }
 
@@ -199,6 +223,40 @@ impl DataSource for MockDataSource {
             .unwrap()
             .get(&(lang.to_string(), key.to_string()))
             .cloned())
+    }
+
+    async fn get_page_info(&self, titles: &[String]) -> Result<HashMap<String, PageInfo>> {
+        let mut ret = HashMap::new();
+        for title in titles {
+            // Explicit overrides (special/redirect/disambiguation titles, and
+            // known-but-contentless files) win outright. Copy the value out and
+            // drop the guard before the awaits below.
+            let override_info = {
+                let root = self.page_info.read().unwrap();
+                root.get(title)
+                    .or_else(|| root.get(&norm_title_key(title)))
+                    .cloned()
+            };
+            if let Some(info) = override_info {
+                ret.insert(title.clone(), info);
+                continue;
+            }
+
+            let t = crate::title::Title::new_main(title.clone());
+            let has_content = self.get_page_content(&t).await?.is_some();
+            // A file can be "known" even without a local description page.
+            let known_file = self.get_file_info(&t).await?.is_some();
+            ret.insert(
+                title.clone(),
+                PageInfo {
+                    missing: !has_content && !known_file,
+                    known: has_content || known_file,
+                    redirect: false,
+                    linkclasses: Vec::new(),
+                },
+            );
+        }
+        Ok(ret)
     }
 }
 

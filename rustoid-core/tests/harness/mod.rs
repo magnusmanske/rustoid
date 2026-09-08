@@ -136,6 +136,50 @@ fn seed_media_files(source: &MockDataSource) {
     }
 }
 
+/// Seed the page-info overrides for the standard "known" (non-red-link) titles
+/// Parsoid's test runner hardcodes in `MockApiHelper` (`SPECIAL_TITLES`,
+/// `REDIRECT_TITLES`, `DISAMBIG_TITLES`). Without these, links to e.g.
+/// `[[Special:Version]]` or `[[Redirected]]` would be wrongly marked as red
+/// links. Faithful to `MockApiHelper::getPageInfo`'s `prop=info` handling.
+fn seed_page_info(source: &MockDataSource) {
+    use rustoid_core::traits::PageInfo;
+
+    for title in [
+        "Special:Version",
+        "Special:BookSources",
+        "Special:BookSources/isbn=4-00-026157-6",
+        "Special:BookSources/0978739256",
+    ] {
+        source.set_page_info(
+            title,
+            PageInfo {
+                missing: false,
+                known: true,
+                redirect: false,
+                linkclasses: Vec::new(),
+            },
+        );
+    }
+    source.set_page_info(
+        "Redirected",
+        PageInfo {
+            missing: false,
+            known: true,
+            redirect: true,
+            linkclasses: Vec::new(),
+        },
+    );
+    source.set_page_info(
+        "Disambiguation",
+        PageInfo {
+            missing: false,
+            known: true,
+            redirect: false,
+            linkclasses: vec!["mw-disambig".to_string()],
+        },
+    );
+}
+
 /// Extract the target of a `#REDIRECT [[Target]]` article, if `text` is a
 /// redirect. Mirrors the redirect-detection used by the MediaWiki API when it
 /// reports redirects.
@@ -853,6 +897,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     // Build mock data source with test file articles.
     let source = MockDataSource::new();
     seed_media_files(&source);
+    seed_page_info(&source);
     for (name, text) in &test_file.articles {
         if name.starts_with("Template:") {
             source.add_template(name, text);
@@ -975,7 +1020,11 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         // recorded value, the parser is faithful — accept it as an expected
         // divergence instead of failing.
         if let Some(recorded) = test_file.known_failures.get(&test.description, "wt2html") {
-            let recorded_norm = normalize_html(&extract_body(recorded), test.parsoid_only);
+            let recorded_norm = normalize_html(
+                &extract_body(recorded),
+                test.parsoid_only,
+                NormSide::Expected,
+            );
             if actual.trim() == recorded_norm.trim() {
                 return TestResult::Skip("known Parsoid divergence (standalone)".to_string());
             }
@@ -993,8 +1042,8 @@ fn compare_html(actual_html: &str, expected_html: &str, parsoid_only: bool) -> T
         expected_html.to_string()
     };
 
-    let actual_norm = normalize_html(&actual_body, parsoid_only);
-    let expected_norm = normalize_html(&expected_body, parsoid_only);
+    let actual_norm = normalize_html(&actual_body, parsoid_only, NormSide::Actual);
+    let expected_norm = normalize_html(&expected_body, parsoid_only, NormSide::Expected);
 
     if actual_norm.trim() == expected_norm.trim() {
         TestResult::Pass
@@ -1209,6 +1258,7 @@ fn build_edited_dom(
     // metadata, using the same mock source/config as `run_wt2html_test`.
     let source = MockDataSource::new();
     seed_media_files(&source);
+    seed_page_info(&source);
     for (name, text) in &test_file.articles {
         if name.starts_with("Template:") {
             source.add_template(name, text);
@@ -1841,13 +1891,30 @@ fn serialize_iew(nodes: &[MNode], out: &mut String) {
     }
 }
 
+/// Which side of a fixture comparison we are normalizing, mirroring PHP's two
+/// distinct normalization entry points: `TestUtils::normalizeOut` (applied to
+/// *Parsoid* output, i.e. our own `actual`) and `TestUtils::normalizeHTML`
+/// (applied to the hand-authored legacy golden). The two pipelines are NOT
+/// symmetric: `normalizeOut` strips the relative `./`/`../` href prefix and
+/// Parsoid ids, while `normalizeHTML` strips the legacy `/wiki/` prefix, red-link
+/// markup, etc. Faithful replication requires keeping them separate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NormSide {
+    /// The parser's own output (`normalizeOut`).
+    Actual,
+    /// The fixture's expected HTML (`normalizeHTML`).
+    Expected,
+}
+
 /// Full IEW normalization: strip metadata/comments (and, for legacy
 /// comparisons, the Parsoid-inserted attributes), collapse inter-element
 /// whitespace, and place newlines around blocks.
-fn normalize_html(html: &str, parsoid_only: bool) -> String {
+fn normalize_html(html: &str, parsoid_only: bool, side: NormSide) -> String {
     let mut stripped = strip_data_attrs(html);
     if !parsoid_only {
         stripped = strip_legacy_attrs(&stripped);
+        // The legacy href normalization differs by which side we normalize.
+        stripped = normalize_legacy_href(&stripped, side);
     }
     let mut nodes = parse_fragment(&stripped);
     wrap_table_rows_in_tbody(&mut nodes);
@@ -2042,6 +2109,223 @@ fn strip_legacy_attrs(html: &str) -> String {
     }
 
     s
+}
+
+/// Apply the legacy-path `href`/URL normalization for the given side. Mirrors
+/// the asymmetric PHP logic:
+///
+/// - `normalizeOut` (actual/Parsoid output): strips the relative `./`/`../`
+///   prefix Parsoid emits on wiki links (`#(href=")(?:\\.?\\./)+#u`), then
+///   percent-decodes the href (replacing "unnecessary URL escaping").
+/// - `normalizeHTML` (expected/legacy golden): rewrites red-link markup back to
+///   a wiki URL (`/index.php?title=…&action=edit&redlink=1` → `/wiki/$1`),
+///   strips the `/wiki/` prefix, expands a bare `#` fragment to `Main Page#`,
+///   then percent-decodes the href.
+///
+/// Both converge on a bare `href="Page"` / `href="Page?action=..."` form so a
+/// Parsoid wiki link and a legacy wiki link compare equal.
+fn normalize_legacy_href(html: &str, side: NormSide) -> String {
+    let mut s = html.to_string();
+
+    if side == NormSide::Actual {
+        // (href=")(?:\.?\./)+  →  $1   (strip leading ./ and ../ runs)
+        // PHP: `#(href=")(?:\.?\./)+#u` → `'$1'`.
+        s = strip_href_relative_prefix(&s);
+    } else {
+        // strip red link markup, we do not check if a page exists yet
+        // PHP: "#/index.php\?title=([^']+?)&amp;action=edit&amp;redlink=1#u"
+        //      → "/wiki/$1"
+        s = rewrite_red_links(&s);
+
+        // the expected html has some extra space in tags, strip it
+        // PHP: `/<a +href/` → `<a href`
+        while s.contains("<a  href") {
+            s = s.replace("<a  href", "<a href");
+        }
+
+        // href="/wiki/  →  href="
+        // PHP: `#href="/wiki/#u` → `'href="'`
+        while let Some(pos) = s.find("href=\"/wiki/") {
+            s.replace_range(pos..pos + "href=\"/wiki/".len(), "href=\"");
+        }
+
+        // parsoid always add a page name to lonely fragments
+        // PHP: `/href="#/u` → `'href="Main Page#'`
+        s = s.replace("href=\"#", "href=\"Main Page#");
+    }
+
+    // replace unnecessary URL escaping (applied by BOTH normalizers)
+    // PHP: preg_replace_callback('/ href="[^"]*"/u', decodeURI) over each href.
+    s = decode_uri_in_hrefs(&s);
+
+    s
+}
+
+/// Strip the leading run of `./` and `../` from every quoted href value,
+/// faithfully replicating PHP `normalizeOut`'s `#(href=")(?:\.?\./)+#u`.
+fn strip_href_relative_prefix(s: &str) -> String {
+    let mut out = s.to_string();
+    while let Some(rel) = out.find("href=\"./").or_else(|| out.find("href=\"../")) {
+        // `rel` points at `href="`, value starts after the quote.
+        let val_start = rel + "href=\"".len();
+        let mut i = val_start;
+        // Consume the run of `./` and `../` prefixes.
+        while out[i..].starts_with("./") || out[i..].starts_with("../") {
+            i += if out[i..].starts_with("../") { 3 } else { 2 };
+        }
+        out.replace_range(val_start..i, "");
+    }
+    out
+}
+
+/// Rewrite legacy red-link markup back to a `/wiki/` URL.
+/// PHP: `#/index.php\?title=([^']+?)&amp;action=edit&amp;redlink=1#u` → `"/wiki/$1"`.
+fn rewrite_red_links(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    let prefix = "/index.php?title=";
+    let suffix = "&amp;action=edit&amp;redlink=1";
+    while let Some(pos) = rest.find(prefix) {
+        let title_start = pos + prefix.len();
+        let Some(rel_end) = rest[title_start..].find(suffix) else {
+            out.push_str(rest);
+            return out;
+        };
+        let title = &rest[title_start..title_start + rel_end];
+        out.push_str(&rest[..pos]);
+        out.push_str("/wiki/");
+        out.push_str(title);
+        rest = &rest[title_start + rel_end + suffix.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Apply JS `decodeURI` semantics to each `href="..."` value, faithfully
+/// replicating PHP `Utils::decodeURI`. Reserved-character sequences are escaped
+/// first (`/%(?=2[346bcfBCF]|3[abdfABDF]|40)/` → `%25`), then the whole value is
+/// percent-decoded; only valid UTF-8 byte sequences are decoded.
+fn decode_uri_in_hrefs(s: &str) -> String {
+    let mut out = s.to_string();
+    let mut search_from = 0usize;
+    while let Some(rel) = out[search_from..].find("href=\"") {
+        let start = search_from + rel;
+        let val_start = start + "href=\"".len();
+        let Some(end) = out[val_start..].find('"') else {
+            break;
+        };
+        let val_end = val_start + end;
+        let decoded = decode_uri(&out[val_start..val_end]);
+        out.replace_range(val_start..val_end, &decoded);
+        search_from = val_start + decoded.len();
+    }
+    out
+}
+
+/// Percent-decode a URI value using ECMA `decodeURI` semantics (reserved chars
+/// preserved, only valid UTF-8 multibyte sequences decoded).
+fn decode_uri(s: &str) -> String {
+    // First, escape `%` in reserved-character sequences (they must survive).
+    let mut expanded = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() && is_decodeuri_reserved(&bytes[i + 1..i + 3]) {
+            expanded.push_str("%25");
+            i += 1;
+        } else {
+            // Copy one full char (multi-byte safe).
+            let ch = s[i..].chars().next().unwrap();
+            expanded.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    percent_decode_utf8(&expanded)
+}
+
+/// Is `%XX` a reserved-character sequence that `decodeURI` must NOT decode?
+/// Mirrors JS `decodeURI`'s reserved set `; / ? : @ & = + $ , #` (and PHP's
+/// equivalent regex `%(?=2[346bcfBCF]|3[abdfABDF]|40)`).
+fn is_decodeuri_reserved(pair: &[u8]) -> bool {
+    matches!(
+        pair,
+        b"23"
+            | b"24"
+            | b"26"
+            | b"2B"
+            | b"2b"
+            | b"2C"
+            | b"2c"
+            | b"2F"
+            | b"2f"
+            | b"3A"
+            | b"3a"
+            | b"3B"
+            | b"3b"
+            | b"3D"
+            | b"3d"
+            | b"3F"
+            | b"3f"
+            | b"40"
+    )
+}
+
+/// Percent-decode a string, decoding only valid UTF-8 byte sequences (leaving
+/// other `%XX` intact), mirroring PHP `Utils::decodeURIComponent`.
+fn percent_decode_utf8(s: &str) -> String {
+    // PHP does a wholesale rawurldecode, then validates UTF-8; if invalid it
+    // re-decodes one percent-sequence at a time. We implement the equivalent by
+    // decoding on char boundaries with UTF-8 validation.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut pending: Vec<u8> = Vec::new(); // collected percent-decoded bytes
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = hex_val(bytes[i + 1]);
+            let lo = hex_val(bytes[i + 2]);
+            pending.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            // Flush pending bytes if they form valid UTF-8, then emit literal.
+            flush_utf8(&mut out, &mut pending);
+            // Copy one full char.
+            let ch = s[i..].chars().next().unwrap();
+            out.extend_from_slice(ch.to_string().as_bytes());
+            i += ch.len_utf8();
+        }
+    }
+    flush_utf8(&mut out, &mut pending);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+fn flush_utf8(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    if pending.is_empty() {
+        return;
+    }
+    if std::str::from_utf8(pending).is_ok() {
+        out.extend_from_slice(pending);
+    } else {
+        // Re-encode the invalid bytes escapes so they survive.
+        for b in pending.drain(..) {
+            out.extend_from_slice(format!("%{b:02X}").as_bytes());
+        }
+        return;
+    }
+    pending.clear();
 }
 
 /// Unwrap `<span>` elements whose `typeof` is `mw:Nowiki` or `mw:Entity`, for
