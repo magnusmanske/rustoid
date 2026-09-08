@@ -2649,11 +2649,14 @@ impl<'a> PegTokenizer<'a> {
 
             self.advance(end + 2);
 
-            // An empty target (`[[]]`, or the `[[|…]]` pipe trick) is not a link:
-            // it is re-emitted as literal `[[…]]` text (mirrors PHP's
+            // An empty target (`[[]]`, or the `[[|…]]` trick) is not a link, and
+            // neither is the *pipe trick* (`[[X|]]` — one pipe with empty link
+            // text): both are re-emitted as literal `[[…]]` text (mirrors PHP's
             // `wikilink_preproc_internal`, which bails to `$textTokens` when
-            // `$target === null` or the pipe trick is detected).
-            if target.trim().is_empty() {
+            // `$target === null || $pipeTrick` where `$pipeTrick` is a single
+            // `mw:maybeContent` with an empty value).
+            let is_pipe_trick = parts.len() == 2 && parts[1].is_empty();
+            if target.trim().is_empty() || is_pipe_trick {
                 self.emit_text(self.input[saved..self.pos].to_string());
                 return true;
             }
