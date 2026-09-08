@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **804/891 fixtures pass** (90%). Lib tests: 614 pass. Clippy: clean.
+Current baseline: **805/891 fixtures pass** (90%). Lib tests: 614 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
@@ -11,14 +11,20 @@ are the authority; port their logic bit-for-bit.
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
 - Table attribute values stop at cell separators in cell position (commit `bbbdd54`).
 - Lone `|`/`!` are literal table-cell content; leading `||` empty-cell syntax (commit `9c1f01f`).
+- Table row tags consume the full dash run (`{{!}}----`, `|----`) (commit `ddafda5`).
 
 ## Buckets (roughly ordered by priority / tractability)
 
 ### 1. Lookalike `||` / `!!` table edge cases (tokenizer, no template expansion)
 - "! and || in td attributes should not be parsed as `<th>`/`<td>`"
 - "Spec syntactic differences in parsing of `!!` compared to `||`"
-- "Simple table but with multiple dashes for row wikitext"
-- "Table td-cell syntax variations"
+- ~~"Simple table but with multiple dashes for row wikitext"~~ (done, `ddafda5`)
+- "Table td-cell syntax variations" — needs **TreeBuilder `TableFixups`**
+  (dangling valueless attributes in cell position → content), NOT a tokenizer fix.
+  In cell position, `row_syntax_table_args = table_attributes<tableCellArg>`; a bare
+  word parses as a *discarded* valueless `KV(name, '')`, and `TableFixups` converts
+  dangling attributes → content. rustoid lacks `TableFixups` (see `Wt2Html/DOM/Handlers/TableFixups.php`;
+  `TABLE_CELL_WITH_NO_ATTRIBUTE_SYNTAX` / `NON_MERGEABLE_TABLE_CELL` flags are consumed there).
 - "Pipe within attribute without quotes"
 - "A table with stray table end tags on start tag line (wt2html)"
 - "Tables: Digest broken attributes on table and tr tag"
@@ -74,6 +80,9 @@ The biggest remaining cluster. Needs `about`/`typeof="mw:Transclusion mw:Expande
   "T179544: {{anchorencode:}} output should be always usable in links"
 
 ## Key pitfalls (do not repeat)
+- If `/tmp/parsoid-src/src/Wt2Html/Grammar.pegphp` looks truncated/empty, restore it:
+  `cd /tmp/parsoid-src && git checkout -- src/Wt2Html/Grammar.pegphp` (the working tree
+  sometimes loses it). Re-check `wc -l` ≈ 3249.
 - `format!("{{{pipe}}}")` yields `"{|}"` (stray `}`); build `{|`/`{{{!}}` via `String::from("{")` + `push_str`.
 - Attribute-name `{{` directive must be gated on `!table`, and `{`/`}` added to the table `is_stop` set, else `{{!}}` is absorbed as a cell attribute name.
 - `parse_row_syntax_table_args` requires `pipe !pipe` and backtracks fully, so a bare word is not a valueless cell attribute.
