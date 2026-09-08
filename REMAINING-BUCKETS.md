@@ -45,8 +45,18 @@ The biggest remaining cluster. Needs `about`/`typeof="mw:Transclusion mw:Expande
 - "Templated table cell with untemplated attributes: Cell combination tests"
 
 ### 3. Wikilink edge cases
-- "Piped link with no link text" (apostrophe pipe-trick; `wikilink_preprocessor_text` stops at `'`)
-- "T45661: Piped links with identical prefixes", "T4095: link with pipe and three closing brackets, version 2"
+- ~~"Piped link with no link text"~~ (done, `eeb2eb9`: `[[X|]]` pipe trick is literal text)
+- "T45661: Piped links with identical prefixes" — **red-link mock/harness default**: the PHP mock
+  marks undefined titles `missing` (confirmed via `MockApiHelper::processQuery`), so Parsoid
+  *correctly* produces a red link for `Prefixed article`; the legacy `!! html` golden shows blue.
+  This is a harness data-seeding asymmetry, NOT a parser bug (needs a harness knownFailure/data
+  decision, not a tokenizer change).
+- "T4095: link with pipe and three closing brackets, version 2" and
+  "T2002: [[page|http://url/]] should link to page, not http://url/" — **link-text extlink
+  suppression**: inside a wikilink's link text (`link_text = link_text_parameterized<linkdesc=true>`),
+  `[http://…]` must stay literal (not form an extlink). rustoid's `TokenizerOptions` lacks a
+  `linkdesc` flag, so `render_wiki_link`'s caption re-tokenization (`tokenize_caption_sol`) wrongly
+  forms an extlink. Fix: add `linkdesc` and gate `try_extlink` on it during link-text re-tokenization.
 - "Link containing % as a single hex sequence interpreted to char"
 - "Link containing double-single-quotes '' in text embedded in italics (T6598 check)"
 - "T2002: [[page|http://url/]] should link to page, not http://url/"
