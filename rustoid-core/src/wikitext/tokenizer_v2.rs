@@ -621,6 +621,9 @@ impl<'a> PegTokenizer<'a> {
         if self.starts_with("-{") && self.try_lang_variant_or_tpl() {
             return true;
         }
+        if ch == '[' && self.try_odd_bracket_run() {
+            return true;
+        }
         if ch == '[' && self.try_wikilink_or_extlink() {
             return true;
         }
@@ -2414,6 +2417,25 @@ impl<'a> PegTokenizer<'a> {
         }
         self.emit_token(ParsoidToken::SelfclosingTag(stt));
         true
+    }
+
+    /// Match the `$('[[' &'[')+` rule: greedily consume `[[` runs where each
+    /// `[[` is *immediately followed* by another `[`, emitting them as literal
+    /// text. This reproduces the legacy parser's odd/even bracket splitting: an
+    /// odd number of `[` before a title stays literal (`[[[Main Page]]]`), while
+    /// an even number leaves an inner `[[…]]` to parse as a wikilink
+    /// (`[[[[Main Page]]]]` → `[[` + wikilink + `]]`).
+    fn try_odd_bracket_run(&mut self) -> bool {
+        let mut count = 0usize;
+        while self.starts_with("[[") && self.remaining()[2..].starts_with('[') {
+            count += 1;
+            self.advance(2);
+        }
+        if count > 0 {
+            self.emit_text("[[".repeat(count));
+            return true;
+        }
+        false
     }
 
     /// Try wikilink (`[[...]]`) or extlink (`[...]`).
