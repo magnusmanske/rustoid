@@ -503,6 +503,15 @@ pub fn render_wiki_link(
 ) -> Vec<Item> {
     let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
 
+    // A piped caption is re-tokenized as full wikitext (entities/comments/
+    // quotes) so `[[X|&nbsp;]]` renders an `mw:Entity` span and a comment in the
+    // caption is stripped (mirrors `link_text` → `inlineline`).
+    let content = if dp.stx.as_deref() == Some("piped") && !content.is_empty() {
+        tokenize_caption_items(&content, ctx.config)
+    } else {
+        content
+    };
+
     let mut a_tag = TagTk::new("a", attribs, dp);
 
     // href = makeLink(title), title = getPrefixedText().
@@ -760,13 +769,30 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
         )
     });
     if !needs_reconstruction {
+        // Join the `|`-separator fragments back into a single caption source and
+        // tokenize it whole: tokenizing each `Item::Str` in isolation would turn a
+        // lone `|` (a table-cell marker at SOL) into a `<td>`, whereas the caption
+        // `[[X|a|b]]` must keep the `|` literal (`link_text` breaks on `|`).
         let mut out = Vec::with_capacity(items.len());
+        let mut pending_text: Option<String> = None;
         for item in items {
-            if let Item::Str(s) = item {
-                out.extend(tokenize_caption(s, config));
-            } else {
-                out.push(item.clone());
+            match item {
+                Item::Str(s) => {
+                    // Accumulate consecutive text runs (including the `|` separators
+                    // inserted by `add_link_attributes_and_get_content`) so a `|` is
+                    // never tokenized in isolation.
+                    *pending_text.get_or_insert_with(String::new) += s;
+                }
+                Item::Tok(_) => {
+                    if let Some(t) = pending_text.take() {
+                        out.extend(tokenize_caption(&t, config));
+                    }
+                    out.push(item.clone());
+                }
             }
+        }
+        if let Some(t) = pending_text.take() {
+            out.extend(tokenize_caption(&t, config));
         }
         return out;
     }
