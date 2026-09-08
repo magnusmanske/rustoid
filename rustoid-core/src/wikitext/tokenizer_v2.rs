@@ -57,6 +57,13 @@ pub struct TokenizerOptions {
     /// `-{ … }-` parses into a `language-variant` token instead of plain text).
     /// Mirrors PHP's `Env::langConverterEnabled`.
     pub lang_conv_enabled: bool,
+    /// Whether tokenization happens in *link description* context (the
+    /// `linkdesc=true` PEG flag used by `link_text`). When set, `[url]` is not
+    /// parsed as an extlink (nested links are not allowed), so `[http://…]`
+    /// stays literal text — matching PHP, where link text re-tokens with
+    /// `linkdesc=true` and `addLinkAttributesAndGetContent` renders an
+    /// autonumbered extlink `<a>` back to literal `[href]`.
+    pub linkdesc: bool,
 }
 
 impl Default for TokenizerOptions {
@@ -73,6 +80,7 @@ impl Default for TokenizerOptions {
             ext_tags: Vec::new(),
             protocols: default_protocols(),
             lang_conv_enabled: false,
+            linkdesc: false,
         }
     }
 }
@@ -133,6 +141,8 @@ pub struct PegTokenizer<'a> {
     /// Whether the language converter is enabled (produces `language-variant`
     /// tokens for `-{ … }-`).
     lang_conv_enabled: bool,
+    /// Link-description context (see `TokenizerOptions::linkdesc`).
+    linkdesc: bool,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -156,6 +166,7 @@ impl<'a> PegTokenizer<'a> {
             ext_tags: options.ext_tags.iter().map(|s| s.to_lowercase()).collect(),
             protocols: options.protocols.clone(),
             lang_conv_enabled: options.lang_conv_enabled,
+            linkdesc: options.linkdesc,
         }
     }
 
@@ -633,7 +644,11 @@ impl<'a> PegTokenizer<'a> {
         if self.try_magic_link() {
             return true;
         }
-        if self.try_urltext() {
+        // Bare-URL autolinks are suppressed in link-description context (nested
+        // links are not allowed); PHP's `link_text` conversely re-tokens with
+        // `linkdesc=true` and `addLinkAttributesAndGetContent` renders the lone
+        // `<a>` back to its literal source.
+        if !self.linkdesc && self.try_urltext() {
             return true;
         }
         if self.starts_with("__") && self.try_behavior_switch() {
@@ -2620,7 +2635,11 @@ impl<'a> PegTokenizer<'a> {
         if self.starts_with("[[") {
             return self.try_wikilink();
         }
-        if self.starts_with("[") {
+        // In link-description context a `[url]` is plain text (nested links are
+        // not allowed); PHP's `link_text` tokens with `linkdesc=true` and
+        // `addLinkAttributesAndGetContent` renders a lone extlink back to its
+        // literal `[href]` source.
+        if self.starts_with("[") && !self.linkdesc {
             return self.try_extlink();
         }
         false
