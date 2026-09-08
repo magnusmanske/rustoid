@@ -503,11 +503,12 @@ pub fn render_wiki_link(
 ) -> Vec<Item> {
     let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
 
-    // A piped caption is re-tokenized as full wikitext (entities/comments/
-    // quotes) so `[[X|&nbsp;]]` renders an `mw:Entity` span and a comment in the
-    // caption is stripped (mirrors `link_text` → `inlineline`).
+    // A piped caption is re-tokenized as inline wikitext (entities/comments/quotes)
+    // so `[[X|&nbsp;]]` renders an `mw:Entity` span and a comment in the caption is
+    // stripped (mirrors `link_text`). `sol` is false here: unlike a media caption,
+    // wikilink link-text keeps a `|` literal (`linkdesc=true`), never a table cell.
     let content = if dp.stx.as_deref() == Some("piped") && !content.is_empty() {
-        tokenize_caption_items(&content, ctx.config)
+        tokenize_caption_items_sol(&content, ctx.config, false)
     } else {
         content
     };
@@ -715,10 +716,16 @@ fn token_utils_tokens_to_string(items: &[Item]) -> String {
 /// (which re-parses the caption with the inline grammar). The main pipeline's
 /// TT3 handlers (QuoteTransformer, etc.) then turn `mw-quote`/`mw:Entity` into
 /// `<i>`/`mw:Entity` spans during tree-building.
-fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
+///
+/// `sol` controls whether the caption may start a block (a `{| … |}` table,
+/// per `full_table_in_link_caption`). Media captions allow tables (`sol: true`),
+/// while wikilink link-text keeps `|` literal (`sol: false`, mirroring
+/// `linkdesc=true`).
+fn tokenize_caption_sol(caption: &str, config: &dyn SiteConfig, sol: bool) -> Vec<Item> {
     use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
 
     let options = TokenizerOptions {
+        sol,
         magic_links: crate::wikitext::tokenizer_v2::MagicLinkConfig {
             rfc: config.magic_link_enabled("RFC"),
             pmid: config.magic_link_enabled("PMID"),
@@ -741,6 +748,11 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
         .collect()
 }
 
+#[cfg(test)]
+fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
+    tokenize_caption_sol(caption, config, true)
+}
+
 /// Re-tokenize caption *items* as full wikitext. Unlike `tokenize_caption`, this
 /// walks a mixed token array (text chunks + transclusion markers produced by
 /// `expandAttributes`) and re-tokenizes only the text chunks, passing through
@@ -755,6 +767,10 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
 /// each directive's `data-parsoid.src`) and re-tokenize it as one span, rather
 /// than tokenizing each text chunk in isolation.
 fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> {
+    tokenize_caption_items_sol(items, config, true)
+}
+
+fn tokenize_caption_items_sol(items: &[Item], config: &dyn SiteConfig, sol: bool) -> Vec<Item> {
     // Only reconstruct when a directive token is present that may have split a
     // surrounding wikilink across several items (`tokenize_link_content` only
     // recognizes `{{…}}`/`-{…}-`/`<nowiki>` directives, so `[[A|…directive…]]` is
@@ -769,30 +785,13 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
         )
     });
     if !needs_reconstruction {
-        // Join the `|`-separator fragments back into a single caption source and
-        // tokenize it whole: tokenizing each `Item::Str` in isolation would turn a
-        // lone `|` (a table-cell marker at SOL) into a `<td>`, whereas the caption
-        // `[[X|a|b]]` must keep the `|` literal (`link_text` breaks on `|`).
         let mut out = Vec::with_capacity(items.len());
-        let mut pending_text: Option<String> = None;
         for item in items {
-            match item {
-                Item::Str(s) => {
-                    // Accumulate consecutive text runs (including the `|` separators
-                    // inserted by `add_link_attributes_and_get_content`) so a `|` is
-                    // never tokenized in isolation.
-                    *pending_text.get_or_insert_with(String::new) += s;
-                }
-                Item::Tok(_) => {
-                    if let Some(t) = pending_text.take() {
-                        out.extend(tokenize_caption(&t, config));
-                    }
-                    out.push(item.clone());
-                }
+            if let Item::Str(s) = item {
+                out.extend(tokenize_caption_sol(s, config, sol));
+            } else {
+                out.push(item.clone());
             }
-        }
-        if let Some(t) = pending_text.take() {
-            out.extend(tokenize_caption(&t, config));
         }
         return out;
     }
@@ -812,7 +811,7 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
             }
         }
     }
-    tokenize_caption(&src, config)
+    tokenize_caption_sol(&src, config, sol)
 }
 
 /// Split a media option string on *top-level* pipes, respecting nested
