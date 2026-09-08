@@ -932,7 +932,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         .get("title")
         .cloned()
         .map(|t| strip_link_target_brackets(&t))
-        .unwrap_or_else(|| "TestPage".to_string());
+        .unwrap_or_else(|| "Parser test".to_string());
     source.add_page(&page_title, &test.wikitext);
 
     let mut config = MockSiteConfig::new();
@@ -1118,7 +1118,7 @@ fn run_wt2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestRes
         .options
         .get("title")
         .cloned()
-        .unwrap_or_else(|| "TestPage".to_string());
+        .unwrap_or_else(|| "Parser test".to_string());
     let title = rustoid_core::title::Title::new_main(&page_title);
     let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
     let actual =
@@ -1162,7 +1162,7 @@ fn run_html2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestR
         .options
         .get("title")
         .cloned()
-        .unwrap_or_else(|| "TestPage".to_string());
+        .unwrap_or_else(|| "Parser test".to_string());
     let title = rustoid_core::title::Title::new_main(&page_title);
     let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
     let actual =
@@ -1295,7 +1295,7 @@ fn build_edited_dom(
         .get("title")
         .cloned()
         .map(|t| strip_link_target_brackets(&t))
-        .unwrap_or_else(|| "TestPage".to_string());
+        .unwrap_or_else(|| "Parser test".to_string());
     source.add_page(&page_title, &test.wikitext);
 
     let mut config = MockSiteConfig::new();
