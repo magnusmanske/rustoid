@@ -2490,10 +2490,10 @@ impl<'a> PegTokenizer<'a> {
             // (mirrors PHP's `$oContent->vsrc`).
             stt.attribs.push(KV {
                 key: KeyValue::Str("href".to_string()),
-                value: tokenize_link_target(target.trim(), self.lang_conv_enabled, &self.ext_tags),
+                value: tokenize_link_target(target, self.lang_conv_enabled, &self.ext_tags),
                 src_offsets: None,
                 ksrc: None,
-                vsrc: Some(target.trim().to_string()),
+                vsrc: Some(target.to_string()),
             });
             // Emit one `mw:maybeContent` KV per pipe-separated content part
             // (mirrors PHP's `wikilink_content`, whose `(pipe link_text?)*`
