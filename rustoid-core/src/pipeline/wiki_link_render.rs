@@ -347,7 +347,10 @@ pub fn get_wiki_link_target_info(
     {
         return Err("Invalid characters in title.".to_string());
     }
-    if interwiki.is_some() && crate::title::has_invalid_chars(&href) {
+    if interwiki.is_some()
+        && (crate::title::has_invalid_chars(&href)
+            || crate::title::has_invalid_path_component(&href))
+    {
         return Err("Invalid characters in title.".to_string());
     }
 
