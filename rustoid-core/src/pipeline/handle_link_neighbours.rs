@@ -32,7 +32,10 @@ fn recurse_before_merge(node: &mut Node, config: &dyn SiteConfig) {
 }
 
 /// For each wikilink `<a>` among `parent`'s children, consume an adjacent text
-/// trail/prefix into the link.
+/// trail/prefix into the link, recording the moved source in `DataParsoid->tail`
+/// / `DataParsoid->prefix` and (when the link sits inside a transclusion
+/// encapsulation) migrating the moved source into `data-mw.parts` and correcting
+/// DSR offsets.
 fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
     let trail = config
         .link_trail_regex()
@@ -41,110 +44,249 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
         .link_prefix_regex()
         .and_then(|r| regex::Regex::new(r).ok());
 
-    let children = &mut parent.children;
     let mut i = 0usize;
-    while i < children.len() {
-        if !(matches!(children[i].kind, NodeKind::Element(ElementKind::Wikilink))
-            && is_wikilink_rel(&children[i]))
-        {
+    while i < parent.children.len() {
+        let is_link = matches!(
+            parent.children[i].kind,
+            NodeKind::Element(ElementKind::Wikilink)
+        ) && is_wikilink_rel(&parent.children[i]);
+        if !is_link {
             i += 1;
             continue;
         }
 
-        // Link prefix: text immediately *before* this link.
-        if let Some(re) = &prefix
-            && i > 0
-            && matches!(children[i - 1].kind, NodeKind::Text(_))
-        {
-            let (keep, moved) = split_prefix_match(text_of(&children[i - 1]), re);
-            if !moved.is_empty() {
-                // Move the matched suffix of the previous text into the link.
-                prepend_text_to_node(&mut children[i], &moved);
-                set_dp_prefix(&mut children[i], &moved);
-                if keep.is_empty() {
-                    children.remove(i - 1);
-                    i -= 1;
-                } else {
-                    set_text(&mut children[i - 1], &keep);
-                }
-            }
-        }
+        // Port of PHP `HandleLinkNeighbours::handler`, operating on one link.
+        let about = about_of(&parent.children[i]);
+        let mut consumed_following = false;
 
-        // Link trail: text immediately *after* this link.
-        if let Some(re) = &trail
-            && i + 1 < children.len()
-            && matches!(children[i + 1].kind, NodeKind::Text(_))
-        {
-            let (moved, keep) = split_trail_match(text_of(&children[i + 1]), re);
-            if !moved.is_empty() {
-                append_text_to_node(&mut children[i], &moved);
-                set_dp_tail(&mut children[i], &moved);
-                if keep.is_empty() {
-                    children.remove(i + 1);
-                    // `i` is not advanced past the link; the next sibling
-                    // (if any) is handled on the *next* iteration after the
-                    // loop's `i += 1` below — but we must not skip it. Re-scan
-                    // this index by not advancing. We handle that by
-                    // continuing the loop below without `i += 1`.
-                } else {
-                    set_text(&mut children[i + 1], &keep);
-                    // Advance past the (now-trailing) text sibling.
+        // --- Link prefix (text immediately before this link) ---
+        if let Some(re) = &prefix {
+            let nbrs = find_and_handle_neighbour(parent, i, false, re, about.as_deref());
+            if !nbrs.is_empty() {
+                let mut prefix_text = String::new();
+                let mut data_mw_correction = String::new();
+                let mut dsr_correction = 0usize;
+                for nbr in &nbrs {
+                    // Insert the moved text at the front of the link's children.
+                    prepend_text_to_node(&mut parent.children[i], &nbr.content);
+                    prefix_text = format!("{}{}", nbr.content, prefix_text);
+                    if !nbr.from_tpl {
+                        data_mw_correction = format!("{}{}", nbr.content, data_mw_correction);
+                        dsr_correction += nbr.content.len();
+                    }
+                }
+                if !prefix_text.is_empty() {
+                    set_dp_prefix(&mut parent.children[i], &prefix_text);
+                }
+                apply_dsr_correction_for_tpl(&mut parent.children[i], true, dsr_correction);
+                if !data_mw_correction.is_empty() {
+                    migrate_data_mw_parts(&mut parent.children[i], &data_mw_correction, true);
+                }
+                // The prefix neighbours were removed from `parent.children`; `i`
+                // must be re-pointed at the link (which may have shifted left).
+                i = 0;
+                while i < parent.children.len()
+                    && !(matches!(
+                        parent.children[i].kind,
+                        NodeKind::Element(ElementKind::Wikilink)
+                    ) && is_wikilink_rel(&parent.children[i]))
+                {
                     i += 1;
                 }
-                continue;
             }
         }
 
+        // Re-locate the link index after any prefix removal.
+        let mut link_idx = i;
+        while link_idx < parent.children.len() {
+            if matches!(
+                parent.children[link_idx].kind,
+                NodeKind::Element(ElementKind::Wikilink)
+            ) && is_wikilink_rel(&parent.children[link_idx])
+            {
+                break;
+            }
+            link_idx += 1;
+        }
+        if link_idx >= parent.children.len() {
+            i += 1;
+            continue;
+        }
+        i = link_idx;
+
+        // --- Link trail (text immediately after this link) ---
+        if let Some(re) = &trail {
+            let nbrs = find_and_handle_neighbour(parent, link_idx, true, re, about.as_deref());
+            if !nbrs.is_empty() {
+                let mut trail_text = String::new();
+                let mut data_mw_correction = String::new();
+                let mut dsr_correction = 0usize;
+                for nbr in &nbrs {
+                    append_text_to_node(&mut parent.children[link_idx], &nbr.content);
+                    trail_text.push_str(&nbr.content);
+                    if !nbr.from_tpl {
+                        data_mw_correction.push_str(&nbr.content);
+                        dsr_correction += nbr.content.len();
+                    }
+                }
+                if !trail_text.is_empty() {
+                    set_dp_tail(&mut parent.children[link_idx], &trail_text);
+                }
+                apply_dsr_correction_for_tpl(&mut parent.children[link_idx], false, dsr_correction);
+                if !data_mw_correction.is_empty() {
+                    migrate_data_mw_parts(
+                        &mut parent.children[link_idx],
+                        &data_mw_correction,
+                        false,
+                    );
+                }
+                consumed_following = true;
+            }
+        }
+
+        if consumed_following {
+            // Trail siblings were consumed; don't advance past them twice, but
+            // do advance past the (now-augmented) link.
+        }
         i += 1;
     }
 }
 
-/// Split a text string into `(matched_lead, remaining)` where `matched_lead` is
-/// the longest leading portion matched by the trail regex. Returns
-/// `("", original)` when there is no match.
-fn split_trail_match(text: &str, re: &regex::Regex) -> (String, String) {
-    let Some(m) = re.find(text) else {
-        return (String::new(), text.to_string());
-    };
-    // PHP matches `$matches[0]` at the *start* of the sibling; only a leading
-    // match is a trail.
-    if m.start() != 0 {
-        return (String::new(), text.to_string());
-    }
-    (m.as_str().to_string(), text[m.end()..].to_string())
+/// The `about` value of a link node when it is itself a transclusion
+/// encapsulation forest root (mirrors `WTUtils::isEncapsulatedDOMForestRoot` +
+/// `getAttribute($aNode, 'about')` in `getLinkTrail`/`getLinkPrefix`).
+fn about_of(node: &Node) -> Option<String> {
+    let about = node.get_attr("about")?;
+    about
+        .strip_prefix("#mwt")
+        .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))?;
+    Some(about.to_string())
 }
 
-/// Split a text string into `(remaining, matched_tail)` where `matched_tail` is
-/// the trailing portion matched by the prefix regex (applied to the reversed
-/// text, matching PHP's "content will be reversed"). For simplicity we match
-/// the regex against the suffix. Returns `(original, "")` when no match.
-fn split_prefix_match(text: &str, re: &regex::Regex) -> (String, String) {
-    // PHP reverses the neighbour text and matches the (reversed) prefix regex,
-    // then un-reverses the captured source. A prefix is a *suffix* of the text
-    // sibling; find the longest suffix matching by anchoring the regex at the
-    // end of the reversed string (i.e. the start of our reversed copy).
-    let rev: String = text.chars().rev().collect();
-    let Some(m) = re.find(&rev) else {
-        return (text.to_string(), String::new());
-    };
-    if m.start() != 0 {
-        return (text.to_string(), String::new());
-    }
-    let matched_rev = &rev[..m.end()];
-    let matched: String = matched_rev.chars().rev().collect();
-    let remaining_len = text.len() - matched.len();
-    (text[..remaining_len].to_string(), matched)
+/// A single matched neighbour: the text to move into the link, whether it came
+/// from a template (transclusion) wrapper, and the source.
+struct Neighbour {
+    content: String,
+    from_tpl: bool,
 }
 
-fn text_of(node: &Node) -> &str {
-    match &node.kind {
-        NodeKind::Text(t) => t,
-        _ => "",
-    }
-}
+/// Port of `HandleLinkNeighbours::findAndHandleNeighbour`: walk the link's
+/// previous (`go_forward == false`) or next (`go_forward == true`) siblings in
+/// `parent.children`, unwrapping a same-`about` single-child `<span>` that came
+/// from the same transclusion, and collecting the leading/trailing text matched
+/// by `re`. The matched text nodes are removed from `parent.children` (or their
+/// matched portion split off).
+///
+/// `link_idx` is the index of the link within `parent.children`.
+fn find_and_handle_neighbour(
+    parent: &mut Node,
+    link_idx: usize,
+    go_forward: bool,
+    re: &regex::Regex,
+    base_about: Option<&str>,
+) -> Vec<Neighbour> {
+    let mut nbrs: Vec<Neighbour> = Vec::new();
+    let mut removed_indices: Vec<usize> = Vec::new();
+    let child_count = parent.children.len();
 
-fn set_text(node: &mut Node, text: &str) {
-    node.kind = NodeKind::Text(text.to_string());
+    // First pass: identify and inspect neighbours, collecting matched text.
+    // We work from the sibling adjacent to the link outward.
+    let shift: i64 = if go_forward { 1 } else { -1 };
+    let mut cur: i64 = link_idx as i64;
+    loop {
+        cur += shift;
+        if cur < 0 || cur >= child_count as i64 {
+            break;
+        }
+        let idx = cur as usize;
+        let neighbour = &parent.children[idx];
+
+        // `fromTpl`: is this sibling itself an encapsulation forest root?
+        let from_tpl = neighbour.get_attr("about").is_some();
+
+        // `unwrappedSpan`: a `<span>` from the same transclusion (same `about`),
+        // not literal HTML, single child, that wraps the actual text.
+        let mut unwrap_to_text = false;
+        if matches!(neighbour.kind, NodeKind::Element(ElementKind::Span))
+            && !crate::html::dom_utils::is_literal_html_node(neighbour)
+            && from_tpl
+            && base_about.is_some()
+            && neighbour.get_attr("about") == base_about
+            && neighbour.children.len() == 1
+            && matches!(neighbour.children[0].kind, NodeKind::Text(_))
+        {
+            // Has no `typeof`, or (for a prefix) the link itself has no `typeof`.
+            let no_typeof = neighbour.get_attr("typeof").is_none();
+            let link_no_typeof = parent.children[link_idx].get_attr("typeof").is_none();
+            if no_typeof || (!go_forward && link_no_typeof) {
+                unwrap_to_text = true;
+            }
+        }
+
+        // The text to match is either the sibling's text (if it's a text node)
+        // or the unwrapped span's single text child.
+        let text_src: Option<String> = if unwrap_to_text {
+            match &neighbour.children[0].kind {
+                NodeKind::Text(t) => Some(t.clone()),
+                _ => None,
+            }
+        } else {
+            match &neighbour.kind {
+                NodeKind::Text(t) => Some(t.clone()),
+                _ => None,
+            }
+        };
+
+        let Some(text) = text_src else {
+            // Not text and not unwrappable → stop walking.
+            break;
+        };
+
+        let Some(m) = re.find(&text) else {
+            break;
+        };
+        if m.start() != 0 || m.as_str().is_empty() {
+            break;
+        }
+        let src = m.as_str().to_string();
+
+        if src == text {
+            // Entire node matches: remove it (and the unwrapped span).
+            removed_indices.push(idx);
+            nbrs.push(Neighbour {
+                content: src,
+                from_tpl,
+            });
+            // If we unwrapped a span, we've consumed its single child entirely;
+            // there's nothing left to merge beyond this span's content.
+        } else {
+            // Partial match: replace the text node with the remainder.
+            let remaining = text[m.end()..].to_string();
+            if unwrap_to_text {
+                parent.children[idx].children[0].kind = NodeKind::Text(remaining);
+            } else {
+                parent.children[idx].kind = NodeKind::Text(remaining);
+            }
+            nbrs.push(Neighbour {
+                content: src,
+                from_tpl,
+            });
+            break;
+        }
+    }
+
+    if nbrs.is_empty() {
+        return nbrs;
+    }
+
+    // Remove the consumed sibling nodes (in reverse index order to keep the
+    // earlier indices valid).
+    removed_indices.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in removed_indices {
+        parent.children.remove(idx);
+    }
+
+    nbrs
 }
 
 /// Prepend `text` to the link's first child (or add a leading text child).
@@ -182,6 +324,68 @@ fn set_dp_prefix(link: &mut Node, prefix: &str) {
     link.dp = Some(dp);
 }
 
+/// Correct the DSR offsets of the transclusion wrapper around `link` after moving
+/// `dsr_correction` bytes of trail (`end` direction) or prefix (`start` direction)
+/// into it. Mirrors PHP `HandleLinkNeighbours::handler`, which swaps `$dp` for the
+/// first encapsulation wrapper node's data-parsoid when the link is inside a
+/// transclusion, then adjusts `dsr.start`/`openWidth` (prefix) or
+/// `dsr.end`/`closeWidth` (trail).
+fn apply_dsr_correction_for_tpl(link: &mut Node, is_prefix: bool, dsr_correction: usize) {
+    if dsr_correction == 0 {
+        return;
+    }
+    // The link may itself be the encapsulation root; otherwise the correction is
+    // recorded on the first encapsulation wrapper ancestor, but with this flat
+    // children model we only carry DSR on the link's own data-parsoid unless the
+    // link *is* the wrapper. PHP applies the correction to `$firstTplNode` (the
+    // wrapper's) data-parsoid; here the wrapper is the link node itself when it
+    // is a forest root, so we correct `link.dp` directly.
+    let mut dp = link.dp.clone().unwrap_or_default();
+    if let Some(dsr) = dp.dsr.as_mut() {
+        if is_prefix {
+            if let Some(start) = dsr.start.as_mut() {
+                *start = start.saturating_sub(dsr_correction);
+            }
+            if let Some(ow) = dsr.open_width.as_mut() {
+                *ow += dsr_correction;
+            }
+        } else {
+            if let Some(end) = dsr.end.as_mut() {
+                *end += dsr_correction;
+            }
+            if let Some(cw) = dsr.close_width.as_mut() {
+                *cw += dsr_correction;
+            }
+        }
+    }
+    link.data_parsoid = dp.to_data_parsoid_json();
+    link.dp = Some(dp);
+}
+
+/// Append (`is_prefix == false`) or prepend (true) `text` to the link's
+/// `data-mw.parts` array, mirroring PHP's `$dataMW->parts[]`/`array_unshift`. The
+/// migration only happens when the link is inside a `mw:Transclusion`
+/// encapsulation (its own `data-mw.parts` or that of the wrapper).
+fn migrate_data_mw_parts(link: &mut Node, text: &str, is_prefix: bool) {
+    let Some(data_mw) = link.data_mw.as_deref() else {
+        return;
+    };
+    let mut json: serde_json::Value =
+        serde_json::from_str(data_mw).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let Some(parts) = json.get_mut("parts").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    let value = serde_json::Value::String(text.to_string());
+    if is_prefix {
+        if !parts.first().is_some_and(|f| *f == value) {
+            parts.insert(0, value);
+        }
+    } else if !parts.last().is_some_and(|f| *f == value) {
+        parts.push(value);
+    }
+    link.data_mw = Some(json.to_string());
+}
+
 fn is_wikilink_rel(node: &Node) -> bool {
     node.get_attr("rel")
         .map(|r| {
@@ -206,6 +410,23 @@ mod tests {
         a.set_attr("title", "Foo");
         a.push_child(Node::text("Foo"));
         a
+    }
+
+    fn split_trail_match(text: &str, re: &regex::Regex) -> (String, String) {
+        let Some(m) = re.find(text) else {
+            return (String::new(), text.to_string());
+        };
+        if m.start() != 0 {
+            return (String::new(), text.to_string());
+        }
+        (m.as_str().to_string(), text[m.end()..].to_string())
+    }
+
+    fn text_of(node: &Node) -> &str {
+        match &node.kind {
+            NodeKind::Text(t) => t,
+            _ => "",
+        }
     }
 
     #[test]
@@ -248,5 +469,79 @@ mod tests {
         assert_eq!(link.dp.as_ref().unwrap().tail.as_deref(), Some("xxx"));
         assert_eq!(text_of(&children[1]), " rest");
         assert_eq!(text_of(&children[2]), "!!!");
+    }
+
+    #[test]
+    fn test_link_trail_merges_plain_after_forest_root() {
+        // `{{1x|[[Foo]]}}l`: the link is a forest root (`about` + `typeof`), the
+        // trailing `l` is a plain text sibling *outside* the transclusion. The
+        // trail merges into the link and is appended to `data-mw.parts`.
+        let config = MockSiteConfig::new();
+
+        let mut a = link();
+        a.set_attr("about", "#mwt1");
+        a.set_attr("typeof", "mw:Transclusion");
+        a.data_mw = Some(
+            r#"{"parts":[{"template":{"target":{"wt":"1x","href":"./Template:1x"},"params":{"1":{"wt":"[[Foo]]"}},"i":0}}]}"#
+                .to_string(),
+        );
+
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(a);
+        p.push_child(Node::text("l"));
+
+        run(&mut p, &config);
+
+        assert_eq!(p.children.len(), 1);
+        let link = &p.children[0];
+        assert_eq!(
+            link.children.last().unwrap().kind,
+            NodeKind::Text("l".to_string())
+        );
+        assert_eq!(link.dp.as_ref().unwrap().tail.as_deref(), Some("l"));
+        let json: serde_json::Value =
+            serde_json::from_str(link.data_mw.as_deref().unwrap()).unwrap();
+        let parts = json["parts"].as_array().unwrap();
+        assert_eq!(parts.last().unwrap().as_str(), Some("l"));
+    }
+
+    #[test]
+    fn test_link_trail_unwraps_same_about_span() {
+        // `{{1x|[[Foo]]l}}`: the trailing `l` is *inside* the transclusion, so it
+        // is wrapped in a same-`about` single-child span. The trail must merge
+        // into the link through that span (fromTpl=true) *without* migrating
+        // `data-mw.parts`.
+        let config = MockSiteConfig::new();
+
+        let mut a = link();
+        a.set_attr("about", "#mwt1");
+        a.set_attr("typeof", "mw:Transclusion");
+        a.data_mw = Some(
+            r#"{"parts":[{"template":{"target":{"wt":"1x","href":"./Template:1x"},"params":{"1":{"wt":"[[Foo]]l"}},"i":0}}]}"#
+                .to_string(),
+        );
+
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("about", "#mwt1");
+        span.push_child(Node::text("l"));
+
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(a);
+        p.push_child(span);
+
+        run(&mut p, &config);
+
+        assert_eq!(p.children.len(), 1);
+        let link = &p.children[0];
+        assert_eq!(
+            link.children.last().unwrap().kind,
+            NodeKind::Text("l".to_string())
+        );
+        assert_eq!(link.dp.as_ref().unwrap().tail.as_deref(), Some("l"));
+        // No parts migration: the trail came from inside the template.
+        let json: serde_json::Value =
+            serde_json::from_str(link.data_mw.as_deref().unwrap()).unwrap();
+        let parts = json["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
     }
 }

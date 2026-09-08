@@ -1505,15 +1505,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::p_wrap::run(&mut ast);
         // AddLinkAttributes precedes `dom-unpack` (see `wikitext_to_ast`).
         crate::pipeline::add_link_attributes::run(&mut ast, self.config);
-        // HandleLinkNeighbours runs between `linkclasses` and `redlinks` in the
-        // main pipeline: move link trail/prefix text into `mw:WikiLink` anchors
-        // (setting `dp->tail`/`dp->prefix`).
-        crate::pipeline::handle_link_neighbours::run(&mut ast, self.config);
         crate::pipeline::tree_builder_html::post_pwrap_transforms(
             &mut ast,
             &depths,
             Some(page_source),
         );
+        // HandleLinkNeighbours (`linkneighbours`) runs after `tplwrap` so it can
+        // merge link trail/prefix text that straddles a transclusion
+        // encapsulation boundary (setting `dp->tail`/`dp->prefix` + migrating
+        // `data-mw.parts`).
+        crate::pipeline::handle_link_neighbours::run(&mut ast, self.config);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         // AddRedLinks: resolve which wikilink targets exist, marking missing
