@@ -342,7 +342,8 @@ pub fn get_wiki_link_target_info(
     // `getTitleInvalidRegex`, which `makeTitleFromURLDecodedStr` enforces). The
     // caller bails the link to plain text.
     if let Some(t) = &title
-        && crate::title::has_invalid_chars(&t.text)
+        && (crate::title::has_invalid_chars(&t.text)
+            || crate::title::has_invalid_path_component(&t.text))
     {
         return Err("Invalid characters in title.".to_string());
     }
@@ -383,7 +384,7 @@ fn namespace_id(config: &dyn SiteConfig, name: &str) -> Option<i32> {
 /// `WikiLinkHandler::addLinkAttributesAndGetContent` for the simple/simple-piped
 /// cases.
 pub fn add_link_attributes_and_get_content(
-    _ctx: &mut WikiLinkContext,
+    ctx: &mut WikiLinkContext,
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
 ) -> (Vec<KV>, Vec<Item>, DataParsoid) {
@@ -431,10 +432,61 @@ pub fn add_link_attributes_and_get_content(
             morecontent = format!("{lp}:{morecontent}");
         }
 
+        // Match core's labeling: a subpage link with a trailing slash gets the
+        // trailing slashes stripped, and a relative `../` link's caption is the
+        // resolved title (see PHP `addLinkAttributesAndGetContent`).
+        if !target.from_colon_escaped_text
+            && ctx
+                .context_title()
+                .is_some_and(|t| ctx.config.namespace_has_subpages(t.namespace_id))
+        {
+            morecontent = strip_subpage_caption_slashes(&morecontent, target);
+        }
+
         let mut dp = data_parsoid.clone();
         dp.src = None;
         dp.stx = Some("simple".to_string());
         (new_attr_data.attribs, vec![Item::Str(morecontent)], dp)
+    }
+}
+
+/// Strip trailing slashes from a simple-caption subpage link, and resolve a
+/// bare `../`-relative caption to the resolved title. Mirrors PHP's
+/// `addLinkAttributesAndGetContent` core-labeling-matching block.
+fn strip_subpage_caption_slashes(morecontent: &str, target: &WikiLinkTargetInfo) -> String {
+    // `#^((\.\./)+|/)(?!\.\./)(.*?[^/])/+$#D` — a `../`/`/` prefix, then a
+    // non-empty inner part, then one-or-more trailing slashes.
+    if let Some((_prefix, rest)) = split_subpage_prefix(morecontent)
+        && rest.ends_with('/')
+        && rest.len() > 1
+        && let trimmed = rest.trim_end_matches('/')
+        && !trimmed.is_empty()
+    {
+        return trimmed.to_string();
+    }
+    if morecontent.starts_with("../")
+        && let Some(title) = &target.title
+    {
+        return title.get_full_db_key().replace('_', " ");
+    }
+    morecontent.to_string()
+}
+
+/// Split a subpage caption into `(leading ../+ or /, rest)` when it starts with
+/// a `../`/`/` run, mirroring the `(?:(\.\./)+|/)` alternation.
+fn split_subpage_prefix(s: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = s.strip_prefix('/') {
+        return Some((&s[..1], rest));
+    }
+    let bytes = s.as_bytes();
+    let mut n = 0;
+    while bytes[n..].starts_with(b"../") {
+        n += 3;
+    }
+    if n > 0 {
+        Some((&s[..n], &s[n..]))
+    } else {
+        None
     }
 }
 

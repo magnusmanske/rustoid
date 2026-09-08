@@ -182,6 +182,25 @@ pub fn has_invalid_chars(text: &str) -> bool {
     false
 }
 
+/// Whether the title contains an invalid path component (`.`, `..`, or an empty
+/// segment from a `//`), making it an invalid `Title`. Mirrors MediaWiki
+/// `Title::checkTitleValidity`'s rejection of `.`/`..`/`//` components (e.g.
+/// resolving `[[../..]]` against `A/B/C` yields `A/B/..`, which is invalid and
+/// forces the link to bail to literal text). A *leading* `/` (an empty first
+/// segment) is allowed: `[[/subpage]]` with subpages disabled is a valid title
+/// named `/subpage`.
+pub fn has_invalid_path_component(text: &str) -> bool {
+    for (i, seg) in text.split('/').enumerate() {
+        if i == 0 && seg.is_empty() {
+            continue; // leading slash is a literal title character
+        }
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return true;
+        }
+    }
+    false
+}
+
 impl fmt::Display for Title {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = String::new();
