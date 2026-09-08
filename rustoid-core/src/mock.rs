@@ -697,15 +697,27 @@ impl SiteConfig for MockSiteConfig {
     fn link_trail_regex(&self) -> Option<&'static str> {
         // Catalan and Kara-Kalpak (and a few other languages) absorb a lone
         // apostrophe into the link trail (T29473): `[[fou|foo]]'x` includes the
-        // `'` in the link. Mirrors the MediaWiki `linktrail` message for these
-        // languages: `/^((?:[a-z…]|'(?!'))+)(.*)$/sDu`. The `'(?!')` negative
-        // lookahead guards against a doubled apostrophe (quote markup) starting a
-        // trail, but a doubled apostrophe is always consumed as `mw-quote` markup
-        // during tokenization, so it never reaches the trail matcher as text.
+        // `'` in the link. Icelandic extends the trail to accented letters and a
+        // hyphen/dash. Mirrors the MediaWiki `linktrail` message for each
+        // language; the `'(?!')` negative lookahead in `ca`/`kaa` guards against
+        // a doubled apostrophe (quote markup) starting a trail, but a doubled
+        // apostrophe is always consumed as `mw-quote` markup during
+        // tokenization, so it never reaches the trail matcher as text.
         match self.language_code.as_str() {
             "ca" => Some("^[a-zàèéíòóúç·ïü']+"),
             "kaa" => Some("^[a-zıÁáǴǵŃńÓóÚúÍıİʼ’“»']+"),
+            "is" => Some("^[áðéíóúýþæöa-z-–]+"),
             _ => Some("^[a-z]+"),
+        }
+    }
+
+    fn link_prefix_regex(&self) -> Option<&'static str> {
+        // Icelandic has a link-prefix charset (matched against the reversed
+        // neighbour text). Mirrors the MediaWiki `linkprefixcharset` message and
+        // `ApiSiteConfig::linkPrefixRegex` (`/[charset]+$/Du`).
+        match self.language_code.as_str() {
+            "is" => Some("[áÁðÐéÉíÍóÓúÚýÝþÞæÆöÖA-Za-z–-]+"),
+            _ => None,
         }
     }
 
