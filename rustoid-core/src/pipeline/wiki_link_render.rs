@@ -249,7 +249,7 @@ pub fn get_wiki_link_target_info(
     let mut prefix: Option<String> = None;
 
     // Capture the (decoded) title before handling colon escape.
-    let mut title_decoded = decode_uri_component(&href);
+    let title_decoded = decode_uri_component(&href);
 
     if href.trim_start().starts_with(':') {
         from_colon_escaped_text = true;
@@ -260,14 +260,14 @@ pub fn get_wiki_link_target_info(
         return Err("Multiple colons prefixing href.".to_string());
     }
 
-    // The decoded title used for (re-)parsing must not carry the leading colon
-    // escape, or `TitleParser` would treat it as force-mainspace.
-    if from_colon_escaped_text {
-        title_decoded = title_decoded
-            .strip_prefix(':')
-            .unwrap_or(&title_decoded)
-            .to_string();
-    }
+    // The decoded title used for (re-)parsing keeps the leading colon escape
+    // (`[[:/subpage]]` → `:/subpage`). `resolveTitle` only resolves `/`/`../`
+    // *relative* links, so a leading `:` skips subpage resolution, and
+    // `TitleParser::parse` then treats the `:` as force-mainspace (so the
+    // colon-escaped title stays a plain mainspace `/subpage` rather than
+    // resolving to a context-title subpage). Mirrors PHP, where
+    // `makeTitleFromURLDecodedStr($title)` receives the *untrimmed*, still-
+    // colon-prefixed `$title`.
 
     let href_bits = crate::pipeline::wiki_link_handler::href_parts(&href);
 

@@ -196,23 +196,23 @@ pub fn has_invalid_chars(text: &str) -> bool {
     false
 }
 
-/// Whether the title contains an invalid path component (`.`, `..`, or an empty
-/// segment from a `//`), making it an invalid `Title`. Mirrors MediaWiki
-/// `Title::checkTitleValidity`'s rejection of `.`/`..`/`//` components (e.g.
-/// resolving `[[../..]]` against `A/B/C` yields `A/B/..`, which is invalid and
-/// forces the link to bail to literal text). A *leading* `/` (an empty first
-/// segment) is allowed: `[[/subpage]]` with subpages disabled is a valid title
-/// named `/subpage`.
+/// Whether the title contains a forbidden dot-segment path component (`.`, `..`,
+/// `./`, `../`, `/./`, `/../`, `/.`, or `/..`), making it an invalid `Title`.
+/// Mirrors Parsoid's `Title::newFromText` relative-path check (`title-invalid-
+/// relative`), which bails the link to literal text. A leading/trailing `/` and
+/// interior `//` are *not* rejected here (only `.`/`..` components are).
 pub fn has_invalid_path_component(text: &str) -> bool {
-    for (i, seg) in text.split('/').enumerate() {
-        if i == 0 && seg.is_empty() {
-            continue; // leading slash is a literal title character
-        }
-        if seg.is_empty() || seg == "." || seg == ".." {
-            return true;
-        }
+    if !text.contains('.') {
+        return false;
     }
-    false
+    text == "."
+        || text == ".."
+        || text.starts_with("./")
+        || text.starts_with("../")
+        || text.contains("/./")
+        || text.contains("/../")
+        || text.ends_with("/.")
+        || text.ends_with("/..")
 }
 
 impl fmt::Display for Title {
