@@ -346,8 +346,8 @@ impl MockSiteConfig {
         config.add_namespace(1, "Talk", &[], false, "wikitext");
         config.add_namespace(2, "User", &[], false, "wikitext");
         config.add_namespace(3, "User talk", &[], false, "wikitext");
-        config.add_namespace(4, "Project", &["Wikipedia"], false, "wikitext");
-        config.add_namespace(5, "Project talk", &["Wikipedia talk"], false, "wikitext");
+        config.add_namespace(4, "Project", &[], false, "wikitext");
+        config.add_namespace(5, "Project talk", &[], false, "wikitext");
         config.add_namespace(6, "File", &["Image"], false, "wikitext");
         config.add_namespace(7, "File talk", &["Image talk"], false, "wikitext");
         config.add_namespace(8, "MediaWiki", &[], true, "wikitext");

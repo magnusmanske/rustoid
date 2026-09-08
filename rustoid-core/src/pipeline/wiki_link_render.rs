@@ -369,10 +369,14 @@ pub fn get_wiki_link_target_info(
 /// not collide with a namespace alias like `Wikipedia`.
 fn namespace_id(config: &dyn SiteConfig, name: &str) -> Option<i32> {
     for (&id, ns) in config.namespaces() {
-        if ns.canonical == name {
+        if ns.canonical.to_lowercase() == name.to_lowercase() {
             return Some(id);
         }
-        if ns.aliases.iter().any(|a| a == name) {
+        if ns
+            .aliases
+            .iter()
+            .any(|a| a.to_lowercase() == name.to_lowercase())
+        {
             return Some(id);
         }
     }

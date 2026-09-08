@@ -92,7 +92,10 @@ impl Title {
         let text = self.text.replace(' ', "_");
         let prefix = self.prefix_for_display();
         if self.namespace_id != 0 && !prefix.is_empty() {
-            format!("{prefix}:{text}")
+            // The DB-key form uses underscores in the namespace name too
+            // (e.g. `User_talk:Foo_bar`, not `User talk:Foo_bar`).
+            let prefix_key = prefix.replace(' ', "_");
+            format!("{prefix_key}:{text}")
         } else {
             text
         }
@@ -293,29 +296,10 @@ impl TitleParser {
         };
 
         if !force_main {
-            // Try to match interwiki prefix first (case-insensitive, mirroring
-            // PHP's `$pLower = mb_strtolower($p)` lookup).
-            for prefix in config.interwiki_map().keys() {
-                let Some(colon) = rest.find(':') else {
-                    continue;
-                };
-                if rest[..colon].to_lowercase() == prefix.to_lowercase() {
-                    let after = &rest[colon + 1..];
-                    // Interwiki titles are NOT first-letter capitalized (the
-                    // remote wiki may be case-sensitive).
-                    return Title {
-                        interwiki: Some(prefix.clone()),
-                        namespace_id: 0,
-                        text: collapse_title_whitespace(after),
-                        fragment,
-                        namespace_name: None,
-                    };
-                }
-            }
-
-            // Try to match namespace prefix by canonical name or alias.
-            // The prefix is matched case-insensitively (PHP lowercases the
-            // prefix with `mb_strtolower` before looking it up).
+            // Try to match a namespace prefix first (case-insensitive). A local
+            // namespace shadows an interwiki prefix of the same name (e.g. the
+            // `MemoryAlpha` namespace shadows the `memoryalpha` interwiki),
+            // mirroring MediaWiki `Title::newFromText`'s namespace precedence.
             for (&ns_id, ns_info) in config.namespaces() {
                 let match_prefix = |name: &str| -> Option<&str> {
                     let lower_name = name.to_lowercase();
@@ -345,6 +329,26 @@ impl TitleParser {
                             config,
                         );
                     }
+                }
+            }
+
+            // Try to match an interwiki prefix (case-insensitive, mirroring
+            // PHP's `$pLower = mb_strtolower($p)` lookup).
+            for prefix in config.interwiki_map().keys() {
+                let Some(colon) = rest.find(':') else {
+                    continue;
+                };
+                if rest[..colon].to_lowercase() == prefix.to_lowercase() {
+                    let after = &rest[colon + 1..];
+                    // Interwiki titles are NOT first-letter capitalized (the
+                    // remote wiki may be case-sensitive).
+                    return Title {
+                        interwiki: Some(prefix.clone()),
+                        namespace_id: 0,
+                        text: collapse_title_whitespace(after),
+                        fragment,
+                        namespace_name: None,
+                    };
                 }
             }
         }

@@ -65,28 +65,17 @@ fn hex_val(b: u8) -> Option<u8> {
 /// `Utils::normalizeNamespaceName`.
 pub fn normalize_namespace_name(name: &str) -> String {
     let trimmed = name.trim();
-    // Replace runs of whitespace with a single space.
+    // PHP's `normalizeNamespaceName`: full lowercase (`mb_strtolower`) then
+    // spaces → underscores (`strtr(…, ' ', '_')`).
     let mut result = String::with_capacity(trimmed.len());
-    let mut last_was_space = false;
-    for c in trimmed.chars() {
-        if c.is_whitespace() {
-            if !last_was_space {
-                result.push(' ');
-                last_was_space = true;
-            }
+    for c in trimmed.chars().flat_map(char::to_lowercase) {
+        if c == ' ' {
+            result.push('_');
         } else {
             result.push(c);
-            last_was_space = false;
         }
     }
-
-    // Lowercase the first character (MediaWiki namespace names are
-    // case-insensitive in the first letter).
-    let mut chars: Vec<char> = result.chars().collect();
-    if let Some(first) = chars.first_mut() {
-        *first = first.to_lowercase().next().unwrap_or(*first);
-    }
-    chars.into_iter().collect()
+    result
 }
 
 /// Entity-escape anything that would decode to a valid wikitext entity: escape
@@ -168,7 +157,10 @@ mod tests {
     #[test]
     fn test_normalize_namespace_name() {
         assert_eq!(normalize_namespace_name("Template"), "template");
-        assert_eq!(normalize_namespace_name("  User talk  "), "user talk");
+        // Full lowercase + spaces → underscores (mirrors PHP's `mb_strtolower`
+        // then `strtr(…, ' ', '_')`).
+        assert_eq!(normalize_namespace_name("  User talk  "), "user_talk");
+        assert_eq!(normalize_namespace_name("MemoryAlpha"), "memoryalpha");
     }
 
     #[test]
