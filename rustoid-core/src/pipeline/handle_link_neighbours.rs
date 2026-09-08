@@ -46,109 +46,191 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
 
     let mut i = 0usize;
     while i < parent.children.len() {
-        let is_link = matches!(
+        if !(matches!(
             parent.children[i].kind,
             NodeKind::Element(ElementKind::Wikilink)
-        ) && is_wikilink_rel(&parent.children[i]);
-        if !is_link {
+        ) && is_wikilink_rel(&parent.children[i]))
+        {
             i += 1;
             continue;
         }
 
-        // Port of PHP `HandleLinkNeighbours::handler`, operating on one link.
         let about = about_of(&parent.children[i]);
-        let mut consumed_following = false;
+        let link_no_typeof = parent.children[i].get_attr("typeof").is_none();
 
-        // --- Link prefix (text immediately before this link) ---
+        // --- Link prefix (adjacent text before the link) ---
         if let Some(re) = &prefix {
-            let nbrs = find_and_handle_neighbour(parent, i, false, re, about.as_deref());
-            if !nbrs.is_empty() {
-                let mut prefix_text = String::new();
-                let mut data_mw_correction = String::new();
-                let mut dsr_correction = 0usize;
-                for nbr in &nbrs {
-                    // Insert the moved text at the front of the link's children.
-                    prepend_text_to_node(&mut parent.children[i], &nbr.content);
-                    prefix_text = format!("{}{}", nbr.content, prefix_text);
-                    if !nbr.from_tpl {
-                        data_mw_correction = format!("{}{}", nbr.content, data_mw_correction);
-                        dsr_correction += nbr.content.len();
-                    }
+            let mut prefix_text = String::new();
+            let mut data_mw_correction = String::new();
+            let mut dsr_correction = 0usize;
+            loop {
+                if i == 0 {
+                    break;
                 }
-                if !prefix_text.is_empty() {
-                    set_dp_prefix(&mut parent.children[i], &prefix_text);
+                let (content, from_tpl, remove) = match match_neighbour(
+                    parent,
+                    i - 1,
+                    re,
+                    about.as_deref(),
+                    link_no_typeof,
+                    false,
+                ) {
+                    Some(n) => n,
+                    None => break,
+                };
+                if content.is_empty() {
+                    break;
                 }
+                if remove {
+                    parent.children.remove(i - 1);
+                    i -= 1;
+                }
+                prefix_text = format!("{content}{prefix_text}");
+                if !from_tpl {
+                    data_mw_correction = format!("{content}{data_mw_correction}");
+                    dsr_correction += content.len();
+                }
+            }
+            if !prefix_text.is_empty() {
+                prepend_text_to_node(&mut parent.children[i], &prefix_text);
+                set_dp_prefix(&mut parent.children[i], &prefix_text);
                 apply_dsr_correction_for_tpl(&mut parent.children[i], true, dsr_correction);
                 if !data_mw_correction.is_empty() {
                     migrate_data_mw_parts(&mut parent.children[i], &data_mw_correction, true);
                 }
-                // The prefix neighbours were removed from `parent.children`; `i`
-                // must be re-pointed at the link (which may have shifted left).
-                i = 0;
-                while i < parent.children.len()
-                    && !(matches!(
-                        parent.children[i].kind,
-                        NodeKind::Element(ElementKind::Wikilink)
-                    ) && is_wikilink_rel(&parent.children[i]))
-                {
-                    i += 1;
-                }
             }
         }
 
-        // Re-locate the link index after any prefix removal.
-        let mut link_idx = i;
-        while link_idx < parent.children.len() {
-            if matches!(
-                parent.children[link_idx].kind,
-                NodeKind::Element(ElementKind::Wikilink)
-            ) && is_wikilink_rel(&parent.children[link_idx])
-            {
-                break;
-            }
-            link_idx += 1;
-        }
-        if link_idx >= parent.children.len() {
-            i += 1;
-            continue;
-        }
-        i = link_idx;
-
-        // --- Link trail (text immediately after this link) ---
+        // --- Link trail (adjacent text after the link) ---
         if let Some(re) = &trail {
-            let nbrs = find_and_handle_neighbour(parent, link_idx, true, re, about.as_deref());
-            if !nbrs.is_empty() {
-                let mut trail_text = String::new();
-                let mut data_mw_correction = String::new();
-                let mut dsr_correction = 0usize;
-                for nbr in &nbrs {
-                    append_text_to_node(&mut parent.children[link_idx], &nbr.content);
-                    trail_text.push_str(&nbr.content);
-                    if !nbr.from_tpl {
-                        data_mw_correction.push_str(&nbr.content);
-                        dsr_correction += nbr.content.len();
-                    }
+            let mut trail_text = String::new();
+            let mut data_mw_correction = String::new();
+            let mut dsr_correction = 0usize;
+            loop {
+                if i + 1 >= parent.children.len() {
+                    break;
                 }
-                if !trail_text.is_empty() {
-                    set_dp_tail(&mut parent.children[link_idx], &trail_text);
+                let (content, from_tpl, remove) = match match_neighbour(
+                    parent,
+                    i + 1,
+                    re,
+                    about.as_deref(),
+                    link_no_typeof,
+                    true,
+                ) {
+                    Some(n) => n,
+                    None => break,
+                };
+                if content.is_empty() {
+                    break;
                 }
-                apply_dsr_correction_for_tpl(&mut parent.children[link_idx], false, dsr_correction);
+                if remove {
+                    parent.children.remove(i + 1);
+                }
+                trail_text.push_str(&content);
+                if !from_tpl {
+                    data_mw_correction.push_str(&content);
+                    dsr_correction += content.len();
+                }
+            }
+            if !trail_text.is_empty() {
+                append_text_to_node(&mut parent.children[i], &trail_text);
+                set_dp_tail(&mut parent.children[i], &trail_text);
+                apply_dsr_correction_for_tpl(&mut parent.children[i], false, dsr_correction);
                 if !data_mw_correction.is_empty() {
-                    migrate_data_mw_parts(
-                        &mut parent.children[link_idx],
-                        &data_mw_correction,
-                        false,
-                    );
+                    migrate_data_mw_parts(&mut parent.children[i], &data_mw_correction, false);
                 }
-                consumed_following = true;
             }
         }
 
-        if consumed_following {
-            // Trail siblings were consumed; don't advance past them twice, but
-            // do advance past the (now-augmented) link.
-        }
         i += 1;
+    }
+}
+
+/// Inspect the single sibling at `idx` (relative to the link) and, when it is a
+/// matching trail/prefix text (possibly a same-`about` single-child `<span>` to
+/// unwrap), return `(matched_content, from_tpl, remove)`. A partial match (only
+/// the leading/trailing portion matches) returns the matched portion and leaves
+/// the remainder written back into the sibling (`remove == false`). A full match
+/// returns `remove == true` so the caller drops the sibling. `None` means the
+/// sibling is not a mergeable text neighbour.
+///
+/// `is_forward` selects trail (next sibling) vs prefix (previous sibling);
+/// `link_no_typeof` and `base_about` feed the `unwrappedSpan` decision.
+fn match_neighbour(
+    parent: &mut Node,
+    idx: usize,
+    re: &regex::Regex,
+    base_about: Option<&str>,
+    link_no_typeof: bool,
+    is_forward: bool,
+) -> Option<(String, bool, bool)> {
+    let neighbour = &parent.children[idx];
+    let from_tpl = neighbour.get_attr("about").is_some();
+
+    // `unwrappedSpan`: a `<span>` from the same transclusion (same `about`),
+    // not literal HTML, single text child that wraps the actual text.
+    let unwrap = matches!(neighbour.kind, NodeKind::Element(ElementKind::Span))
+        && !crate::html::dom_utils::is_literal_html_node(neighbour)
+        && from_tpl
+        && base_about.is_some()
+        && neighbour.get_attr("about") == base_about
+        && neighbour.children.len() == 1
+        && matches!(neighbour.children[0].kind, NodeKind::Text(_))
+        && (neighbour.get_attr("typeof").is_none() || (!is_forward && link_no_typeof));
+
+    // The text to test is the unwrapped span's child, else the sibling itself.
+    let text: Option<&str> = if unwrap {
+        match &neighbour.children[0].kind {
+            NodeKind::Text(t) => Some(t),
+            _ => None,
+        }
+    } else {
+        match &neighbour.kind {
+            NodeKind::Text(t) => Some(t),
+            _ => None,
+        }
+    };
+    let text = text?;
+
+    let m: Option<(usize, String)> = if is_forward {
+        // Trail: `^`-anchored leading match.
+        re.find(text)
+            .filter(|m| m.start() == 0)
+            .map(|m| (m.start(), m.as_str().to_string()))
+    } else {
+        // Prefix: `$`-anchored trailing match — match the regex against the
+        // reversed text (equivalent to `/[charset]+$/Du`), then reverse back.
+        let rev: String = text.chars().rev().collect();
+        re.find(&rev).filter(|m| m.start() == 0).map(|m| {
+            let matched_rev = &rev[..m.end()];
+            let matched: String = matched_rev.chars().rev().collect();
+            (text.len() - matched.len(), matched)
+        })
+    };
+    let (start, matched) = m?;
+    if matched.is_empty() {
+        return None;
+    }
+
+    if matched == text {
+        // Entire node matches → remove it (and, implicitly, any unwrapped span).
+        Some((matched, from_tpl, true))
+    } else {
+        // Partial match: the remainder stays in the (unwrapped) sibling.
+        let remaining = if is_forward {
+            text[matched.len()..].to_string()
+        } else {
+            text[..start].to_string()
+        };
+        if unwrap {
+            let child = &mut parent.children[idx].children[0];
+            child.kind = NodeKind::Text(remaining);
+        } else {
+            let sibling = &mut parent.children[idx];
+            sibling.kind = NodeKind::Text(remaining);
+        }
+        Some((matched, from_tpl, false))
     }
 }
 
@@ -161,132 +243,6 @@ fn about_of(node: &Node) -> Option<String> {
         .strip_prefix("#mwt")
         .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))?;
     Some(about.to_string())
-}
-
-/// A single matched neighbour: the text to move into the link, whether it came
-/// from a template (transclusion) wrapper, and the source.
-struct Neighbour {
-    content: String,
-    from_tpl: bool,
-}
-
-/// Port of `HandleLinkNeighbours::findAndHandleNeighbour`: walk the link's
-/// previous (`go_forward == false`) or next (`go_forward == true`) siblings in
-/// `parent.children`, unwrapping a same-`about` single-child `<span>` that came
-/// from the same transclusion, and collecting the leading/trailing text matched
-/// by `re`. The matched text nodes are removed from `parent.children` (or their
-/// matched portion split off).
-///
-/// `link_idx` is the index of the link within `parent.children`.
-fn find_and_handle_neighbour(
-    parent: &mut Node,
-    link_idx: usize,
-    go_forward: bool,
-    re: &regex::Regex,
-    base_about: Option<&str>,
-) -> Vec<Neighbour> {
-    let mut nbrs: Vec<Neighbour> = Vec::new();
-    let mut removed_indices: Vec<usize> = Vec::new();
-    let child_count = parent.children.len();
-
-    // First pass: identify and inspect neighbours, collecting matched text.
-    // We work from the sibling adjacent to the link outward.
-    let shift: i64 = if go_forward { 1 } else { -1 };
-    let mut cur: i64 = link_idx as i64;
-    loop {
-        cur += shift;
-        if cur < 0 || cur >= child_count as i64 {
-            break;
-        }
-        let idx = cur as usize;
-        let neighbour = &parent.children[idx];
-
-        // `fromTpl`: is this sibling itself an encapsulation forest root?
-        let from_tpl = neighbour.get_attr("about").is_some();
-
-        // `unwrappedSpan`: a `<span>` from the same transclusion (same `about`),
-        // not literal HTML, single child, that wraps the actual text.
-        let mut unwrap_to_text = false;
-        if matches!(neighbour.kind, NodeKind::Element(ElementKind::Span))
-            && !crate::html::dom_utils::is_literal_html_node(neighbour)
-            && from_tpl
-            && base_about.is_some()
-            && neighbour.get_attr("about") == base_about
-            && neighbour.children.len() == 1
-            && matches!(neighbour.children[0].kind, NodeKind::Text(_))
-        {
-            // Has no `typeof`, or (for a prefix) the link itself has no `typeof`.
-            let no_typeof = neighbour.get_attr("typeof").is_none();
-            let link_no_typeof = parent.children[link_idx].get_attr("typeof").is_none();
-            if no_typeof || (!go_forward && link_no_typeof) {
-                unwrap_to_text = true;
-            }
-        }
-
-        // The text to match is either the sibling's text (if it's a text node)
-        // or the unwrapped span's single text child.
-        let text_src: Option<String> = if unwrap_to_text {
-            match &neighbour.children[0].kind {
-                NodeKind::Text(t) => Some(t.clone()),
-                _ => None,
-            }
-        } else {
-            match &neighbour.kind {
-                NodeKind::Text(t) => Some(t.clone()),
-                _ => None,
-            }
-        };
-
-        let Some(text) = text_src else {
-            // Not text and not unwrappable → stop walking.
-            break;
-        };
-
-        let Some(m) = re.find(&text) else {
-            break;
-        };
-        if m.start() != 0 || m.as_str().is_empty() {
-            break;
-        }
-        let src = m.as_str().to_string();
-
-        if src == text {
-            // Entire node matches: remove it (and the unwrapped span).
-            removed_indices.push(idx);
-            nbrs.push(Neighbour {
-                content: src,
-                from_tpl,
-            });
-            // If we unwrapped a span, we've consumed its single child entirely;
-            // there's nothing left to merge beyond this span's content.
-        } else {
-            // Partial match: replace the text node with the remainder.
-            let remaining = text[m.end()..].to_string();
-            if unwrap_to_text {
-                parent.children[idx].children[0].kind = NodeKind::Text(remaining);
-            } else {
-                parent.children[idx].kind = NodeKind::Text(remaining);
-            }
-            nbrs.push(Neighbour {
-                content: src,
-                from_tpl,
-            });
-            break;
-        }
-    }
-
-    if nbrs.is_empty() {
-        return nbrs;
-    }
-
-    // Remove the consumed sibling nodes (in reverse index order to keep the
-    // earlier indices valid).
-    removed_indices.sort_unstable_by(|a, b| b.cmp(a));
-    for idx in removed_indices {
-        parent.children.remove(idx);
-    }
-
-    nbrs
 }
 
 /// Prepend `text` to the link's first child (or add a leading text child).
