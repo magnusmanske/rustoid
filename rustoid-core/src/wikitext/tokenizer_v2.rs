@@ -1436,14 +1436,15 @@ impl<'a> PegTokenizer<'a> {
     fn try_table_data_tags(&mut self) -> bool {
         let saved = self.pos;
 
-        // Leading single pipe, not followed by `-`, `}`, `+`, or another pipe.
-        // Mirror PHP's `table_data_tags = p:pipe ![+\-}] td:table_data_tag tds:tds`.
+        // Leading pipe, not followed by `-`, `}`, or `+`. Mirror PHP's
+        // `table_data_tags = p:pipe ![+\-}] td:table_data_tag tds:tds`. A
+        // leading `||` (empty-cell syntax) is deliberately allowed: the second
+        // pipe is consumed by `row_syntax_table_args` (`pipe !pipe`) as the cell
+        // separator, or (for `|||`) `row_syntax_table_args` backtracks and
+        // `parse_tds` consumes the `||` `pipe_pipe`.
         let pipe = match self.try_pipe() {
             Some(p)
-                if !self.starts_with("-")
-                    && !self.starts_with("}")
-                    && !self.starts_with("+")
-                    && !self.at_pipe() =>
+                if !self.starts_with("-") && !self.starts_with("}") && !self.starts_with("+") =>
             {
                 p
             }
@@ -1536,14 +1537,25 @@ impl<'a> PegTokenizer<'a> {
     /// `!`-family separators terminate a header (`th`) cell (the `ths` rule
     /// accepts `"!!" / pipe_pipe`), but only the `|`-family terminates a data
     /// (`td`) cell (`tds = pipe_pipe` only) — a `!!` in a data cell is literal.
-    /// Mirrors PHP's `inlineBreaks`, where `!` only breaks when `$stops['th']`.
+    /// Mirrors PHP's `inlineBreaks` (table context): a lone `|` (or, for
+    /// heading cells, a lone `!`) is literal content; only the separator forms
+    /// — `||` / `|{{!}}` / `{{!}}|` / `{{!}}{{!}}` (pipe_pipe), `|}` (table end),
+    /// and `!!` (heading one) — terminate. A newline terminates unconditionally
+    /// (the tree builder reassembles any multi-line cell from the flat stream).
     fn at_cell_terminator(&self, th: bool) -> bool {
-        self.starts_with("{{!}}")
-            || self.starts_with("\n")
-            || self.starts_with("\r\n")
-            || self.starts_with("||")
-            || self.starts_with("|")
-            || (th && (self.starts_with("!!") || self.starts_with("!")))
+        let rem = self.remaining();
+        match rem.as_bytes().first() {
+            // `|` breaks only when part of `|}`, `||`, or `|{{!}}`.
+            Some(&b'|') => {
+                rem.starts_with("|}") || rem.starts_with("||") || rem.starts_with("|{{!}}")
+            }
+            // `{` breaks only for the pipe_pipe forms `{{!}}{{!}}` and `{{!}}|`.
+            Some(&b'{') => rem.starts_with("{{!}}{{!}}") || rem.starts_with("{{!}}|"),
+            // `!` (heading cells only) breaks only for `!!`.
+            Some(&b'!') => th && rem.starts_with("!!"),
+            Some(&b'\n') | Some(&b'\r') => true,
+            _ => false,
+        }
     }
 
     /// `|+` table caption (the `pipe` may be `{{!}}`, yielding `{{!}}+`).
