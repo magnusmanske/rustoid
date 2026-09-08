@@ -2043,8 +2043,10 @@ fn flatten_nowiki_spans(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'<' || !s[i..].starts_with("<span") {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Copy one full character (not one byte) to stay on char boundaries.
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
             continue;
         }
         let Some(gt) = s[i..].find('>') else {
@@ -2086,7 +2088,8 @@ fn flatten_nowiki_spans(s: &str) -> String {
                 }
                 break;
             }
-            j += 1;
+            // Advance one full character (multi-byte safe).
+            j += s[j..].chars().next().unwrap().len_utf8();
         }
         match content_end {
             Some(end) => {
