@@ -1237,7 +1237,7 @@ impl<'a> PegTokenizer<'a> {
         };
 
         let _attr_start = self.pos;
-        let attrs = self.parse_table_attributes();
+        let attrs = self.parse_table_attributes(false);
         let ts_end = self.pos;
 
         self.consume_spaces();
@@ -1412,7 +1412,7 @@ impl<'a> PegTokenizer<'a> {
         self.advance(1);
 
         let _attr_start = self.pos;
-        let attrs = self.parse_table_attributes();
+        let attrs = self.parse_table_attributes(false);
         let tag_end = self.pos;
 
         self.consume_spaces();
@@ -1578,8 +1578,9 @@ impl<'a> PegTokenizer<'a> {
         true
     }
 
-    /// Parse table attributes (space-separated key=value pairs).
-    fn parse_table_attributes(&mut self) -> Vec<KV> {
+    /// Parse table attributes (space-separated key=value pairs). `cell_arg`
+    /// mirrors PHP's `tableCellArg` flag (see `parse_table_att_value`).
+    fn parse_table_attributes(&mut self, cell_arg: bool) -> Vec<KV> {
         let mut attrs = Vec::new();
         loop {
             self.consume_spaces();
@@ -1596,7 +1597,7 @@ impl<'a> PegTokenizer<'a> {
 
             // Try to parse a table attribute. A bare word is not an attribute
             // (it is content), so stop short and let the caller parse it.
-            if let Some(attr) = self.parse_table_attribute() {
+            if let Some(attr) = self.parse_table_attribute(cell_arg) {
                 attrs.push(attr);
             } else {
                 break;
@@ -1608,8 +1609,9 @@ impl<'a> PegTokenizer<'a> {
     /// Parse a single table attribute (`name[=value]`). A valueless name is a
     /// valid ("discarded") table attribute with an empty value, mirroring PHP's
     /// `table_attribute` rule (whose `vd:(optional_spaces "=" value?)?` is
-    /// optional and defaults the value to `''`).
-    fn parse_table_attribute(&mut self) -> Option<KV> {
+    /// optional and defaults the value to `''`). `cell_arg` is as in
+    /// `parse_table_attributes`.
+    fn parse_table_attribute(&mut self, cell_arg: bool) -> Option<KV> {
         let name_start = self.pos;
         let name = self.parse_table_attribute_name()?;
         let name_end = self.pos;
@@ -1618,7 +1620,7 @@ impl<'a> PegTokenizer<'a> {
 
         if self.starts_with("=") {
             self.advance(1);
-            let val = self.parse_table_att_value();
+            let val = self.parse_table_att_value(cell_arg);
             Some(KV {
                 key: name,
                 value: KeyValue::Str(val.unwrap_or_default()),
@@ -1652,34 +1654,75 @@ impl<'a> PegTokenizer<'a> {
         if name.is_empty() { None } else { Some(name) }
     }
 
-    fn parse_table_att_value(&mut self) -> Option<String> {
+    /// `cell_arg` mirrors PHP's `tableCellArg` flag: when true (cell/caption
+    /// attribute position) a `|` or `{{!}}` is a cell separator and terminates
+    /// the value; when false (start/row tag, `table=false`) they are literal
+    /// value content. See PHP `inlineBreaks` (`'|'` breaks only for `table` /
+    /// `tableCellArg`; `'{'` breaks only for `tableCellArg` + `{{!}}`).
+    fn parse_table_att_value(&mut self, cell_arg: bool) -> Option<String> {
         self.consume_spaces();
 
-        let rem = self.remaining();
-        // Quoted value: the closing delimiter ends it; the quotes themselves are
-        // stripped (mirrors PHP's `TokenizerUtils::getAttrVal`, which trims the
-        // surrounding quote characters from the value source).
-        for quote in ['"', '\''] {
-            let Some(stripped) = rem.strip_prefix(quote) else {
+        // Quoted value (`'`/`"`). Mirrors PHP's `table_att_value` quoted
+        // alternatives: the value text stops at its matching quote, a newline,
+        // or (in cell position) a `{{!}}`/`|` separator, which — via the `q`
+        // lookahead — is left in place for the surrounding `row_syntax_table_args`
+        // to match as a pipe. The closing quote is consumed only when it (not a
+        // separator) terminates the value.
+        for quote in ['\'', '\"'] {
+            if !self.starts_with(&quote.to_string()) {
                 continue;
-            };
-            if let Some(quote_end) = stripped.find(quote) {
-                let val = &rem[1..1 + quote_end];
-                self.advance(1 + quote_end + 1);
-                return Some(val.to_string());
             }
+            self.advance(1);
+            let start = self.pos;
+            let end = self.scan_quoted_table_value_end(quote, cell_arg);
+            let val = self.input[start..end].to_string();
+            self.pos = end;
+            if self.starts_with(&quote.to_string()) {
+                self.advance(1);
+            }
+            return Some(val);
         }
 
-        // Unquoted: stop at space, pipe, newline.
-        let end = rem
-            .find([' ', '\t', '|', '\n', '\r', '!'])
-            .unwrap_or(rem.len());
-        if end == 0 {
+        // Unquoted: stop at whitespace or `|`; in cell position also at `{{!}}`.
+        let start = self.pos;
+        let end = self.scan_unquoted_table_value_end(cell_arg);
+        if end == start {
             return None;
         }
-        let val = rem[..end].to_string();
-        self.advance(end);
+        let val = self.input[start..end].to_string();
+        self.pos = end;
         Some(val)
+    }
+
+    /// End byte index of a quoted table value: the first newline, matching
+    /// quote, or (in cell position) `{{!}}`/`|` separator. All such delimiters
+    /// are single-byte ASCII (or the ASCII `{{!}}`), so a byte scan is safe.
+    fn scan_quoted_table_value_end(&self, quote: char, cell_arg: bool) -> usize {
+        let bytes = self.remaining().as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == quote as u8 || b == b'\r' || b == b'\n' {
+                return self.pos + i;
+            }
+            if cell_arg && (bytes[i..].starts_with(b"{{!}}") || b == b'|') {
+                return self.pos + i;
+            }
+        }
+        self.pos + bytes.len()
+    }
+
+    /// End byte index of an unquoted table value: the first whitespace or `|`;
+    /// in cell position also `{{!}}`. All delimiters are single-byte ASCII.
+    fn scan_unquoted_table_value_end(&self, cell_arg: bool) -> usize {
+        let bytes = self.remaining().as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | b'|') {
+                return self.pos + i;
+            }
+            if cell_arg && bytes[i..].starts_with(b"{{!}}") {
+                return self.pos + i;
+            }
+        }
+        self.pos + bytes.len()
     }
 
     /// Parse row syntax table args (attributes followed by *required* single
@@ -1689,7 +1732,7 @@ impl<'a> PegTokenizer<'a> {
     /// (a bare word is NOT treated as a valueless attribute in cell position).
     fn parse_row_syntax_table_args(&mut self) -> (Vec<KV>, String) {
         let saved = self.pos;
-        let attrs = self.parse_table_attributes();
+        let attrs = self.parse_table_attributes(true);
 
         self.consume_spaces();
 
