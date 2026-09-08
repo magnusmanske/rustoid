@@ -1409,7 +1409,9 @@ impl<'a> PegTokenizer<'a> {
             self.pos = saved;
             return false;
         }
-        self.advance(1);
+        // `dashes:$\"-\"+` — consume the full run of dashes (at least one).
+        let dash_run = self.remaining().bytes().take_while(|&b| b == b'-').count();
+        self.advance(dash_run);
 
         let _attr_start = self.pos;
         let attrs = self.parse_table_attributes(false);
@@ -1421,9 +1423,9 @@ impl<'a> PegTokenizer<'a> {
         self.consume_empty_cell_pipe();
 
         let mut dp = self.make_dp(saved, tag_end);
-        // `start_tag_src` = pipe + `-` (`|-` or `{{!}}-`).
+        // `start_tag_src` = pipe + all dashes (`|-`/`|--`/`{{!}}-`/…).
         let mut start_tag_src = pipe.clone();
-        start_tag_src.push('-');
+        start_tag_src.push_str(&"-".repeat(dash_run));
         dp.start_tag_src = Some(start_tag_src);
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("tr", attrs, dp)));
