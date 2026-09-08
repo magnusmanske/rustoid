@@ -364,16 +364,23 @@ impl MockSiteConfig {
         // Register some interwiki prefixes.
         // NOTE: the upstream Parsoid parser-test site config uses `http://`
         // (not `https://`) as its canonical protocol, and the fixtures embed
-        // these URLs verbatim (e.g. `http://en.wikipedia.org/wiki/Foo`).
+        // these URLs verbatim (e.g. `http://en.wikipedia.org/wiki/Foo`). The
+        // prefix set mirrors the parser-test runner's `PARSER_TESTS_IWPS`;
+        // notably `meta`/`mw`/`commons` are NOT interwikis here, so
+        // `[[Meta:Disclaimers]]` resolves as a local (mainspace) title.
         config.add_interwiki("wikipedia", "http://en.wikipedia.org/wiki/$1", true);
-        config.add_interwiki("wiktionary", "http://en.wiktionary.org/wiki/$1", true);
-        config.add_interwiki("wikibooks", "http://en.wikibooks.org/wiki/$1", true);
-        config.add_interwiki("wikiquote", "http://en.wikiquote.org/wiki/$1", true);
-        config.add_interwiki("commons", "http://commons.wikimedia.org/wiki/$1", true);
-        config.add_interwiki("meta", "http://meta.wikimedia.org/wiki/$1", true);
-        config.add_interwiki("mw", "http://www.mediawiki.org/wiki/$1", true);
-        // Interwiki prefixes used by the upstream parser fixtures.
         config.add_interwiki("meatball", "http://www.usemod.com/cgi-bin/mb.pl?$1", false);
+        config.add_interwiki(
+            "memoryalpha",
+            "http://www.memory-alpha.org/en/index.php/$1",
+            false,
+        );
+        config.add_interwiki("gerrit", "https://gerrit.wikimedia.org/$1", true);
+        config.add_interwiki("stats", "https://stats.wikimedia.org/$1", true);
+
+        // The `MemoryAlpha` namespace (T53680) shadows the `memoryalpha`
+        // interwiki prefix.
+        config.add_namespace(100, "MemoryAlpha", &[], false, "wikitext");
 
         // Register language prefixes (language links, not plain interwikis).
         config.add_language_interwiki("en", "http://en.wikipedia.org/wiki/$1");
@@ -762,6 +769,6 @@ mod tests {
     fn test_mock_config_interwiki() {
         let config = MockSiteConfig::new();
         assert!(config.interwiki_map().contains_key("wikipedia"));
-        assert!(config.interwiki_map().contains_key("commons"));
+        assert!(config.interwiki_map().contains_key("meatball"));
     }
 }

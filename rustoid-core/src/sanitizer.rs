@@ -1160,7 +1160,7 @@ fn attr_url_pattern(lower: &str) -> bool {
 ///
 /// Percent-encodes characters in the set `[%? \[\]#|<>\\]`, and (if a fragment
 /// is present) escapes it as an HTML5 id fragment.
-pub fn sanitize_title_uri(title: &str, _is_interwiki: bool) -> String {
+pub fn sanitize_title_uri(title: &str, is_interwiki: bool) -> String {
     let idx = title.find('#');
     let (main_part, anchor) = match idx {
         Some(pos) => (&title[..pos], Some(&title[pos + 1..])),
@@ -1185,7 +1185,12 @@ pub fn sanitize_title_uri(title: &str, _is_interwiki: bool) -> String {
         .collect();
 
     if let Some(anchor) = anchor {
-        format!("{encoded}#{}", escape_id_for_link(anchor))
+        let escaped = if is_interwiki {
+            escape_id_for_external_interwiki(anchor)
+        } else {
+            escape_id_for_link(anchor)
+        };
+        format!("{encoded}#{escaped}")
     } else {
         encoded
     }
@@ -1224,6 +1229,13 @@ fn escape_id_for_link(id: &str) -> String {
     let id: String = escape_id_internal(id, "html5");
     // Do percent encoding of percent signs for href (but not id) attrs.
     id.replace('%', "%25")
+}
+
+/// Escape a fragment string for an external interwiki link. Mirrors PHP's
+/// `escapeIdForExternalInterwiki` (assumes `$wgExternalInterwikiFragmentMode =
+/// 'legacy'`): URL-encode with spaces → `_`, then `%3A` → `:` and `%` → `.`.
+fn escape_id_for_external_interwiki(id: &str) -> String {
+    escape_id_internal(id, "legacy")
 }
 
 /// Escape a string into an HTML5/legacy id. Mirrors `escapeIdInternal`.

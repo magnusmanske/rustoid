@@ -494,8 +494,8 @@ mod tests {
     #[test]
     fn test_interwiki() {
         let config = test_config();
-        let t = TitleParser::parse("commons:File:Example.jpg", &config);
-        assert_eq!(t.interwiki, Some("commons".to_string()));
+        let t = TitleParser::parse("wikipedia:File:Example.jpg", &config);
+        assert_eq!(t.interwiki, Some("wikipedia".to_string()));
         assert_eq!(t.namespace_id, 0);
         assert_eq!(t.text, "File:Example.jpg");
     }

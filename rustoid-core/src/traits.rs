@@ -670,9 +670,9 @@ mod tests {
     #[test]
     fn test_interwiki_matcher() {
         let c = crate::mock::MockSiteConfig::new();
-        // `commons` → `http://commons.wikimedia.org/wiki/$1`.
-        let m = c.interwiki_matcher("http://commons.wikimedia.org/wiki/Foo");
-        assert_eq!(m, Some(("commons".to_string(), "Foo".to_string())));
+        // `meatball` → `http://www.usemod.com/cgi-bin/mb.pl?$1`.
+        let m = c.interwiki_matcher("http://www.usemod.com/cgi-bin/mb.pl?Foo");
+        assert_eq!(m, Some(("meatball".to_string(), "Foo".to_string())));
         // No match for an unrelated URL.
         assert_eq!(c.interwiki_matcher("https://example.com/x"), None);
     }
