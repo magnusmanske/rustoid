@@ -34,6 +34,9 @@ pub struct WikiLinkContext<'a> {
     pub config: &'a dyn SiteConfig,
     about_id_counter: usize,
     metadata: MetadataCollector,
+    /// The context title (the page being parsed), used for subpage/relative link
+    /// resolution. `None` disables subpage resolution (fragment/nested contexts).
+    context_title: Option<&'a crate::title::Title>,
     /// Suppress media format options (`thumb`/`frame`/`framed`/`frameless`/
     /// `manualthumb`), treating them as `bogus` so the media renders as a bare
     /// `mw:File` rather than `mw:File/Thumb` etc. Set in gallery context (mirrors
@@ -74,8 +77,19 @@ impl<'a> WikiLinkContext<'a> {
             config,
             about_id_counter: 0,
             metadata: MetadataCollector::new(),
+            context_title: None,
             suppress_media_formats: false,
         }
+    }
+
+    /// Set the context title (enable subpage/relative link resolution).
+    pub fn set_context_title(&mut self, title: &'a crate::title::Title) {
+        self.context_title = Some(title);
+    }
+
+    /// The context title, if set.
+    pub fn context_title(&self) -> Option<&'a crate::title::Title> {
+        self.context_title
     }
 
     /// Enable suppression of media format options (gallery context).
@@ -123,6 +137,97 @@ pub struct WikiLinkTargetInfo {
     pub local_prefix: Option<String>,
     pub from_colon_escaped_text: bool,
     pub prefix: Option<String>,
+}
+
+/// Resolve a URL-decoded link target string against the context title for
+/// subpage/relative references. Mirrors PHP `Env::resolveTitle` (which
+/// `makeTitleFromURLDecodedStr` → `makeTitle` calls before `Title::newFromText`).
+/// `orig_name` is the untrimmed input; returns the resolved title string.
+fn resolve_title(ctx: &WikiLinkContext, str_in: &str) -> String {
+    let orig_name = str_in.to_string();
+    let s = str_in.trim();
+
+    let Some(title) = ctx.context_title() else {
+        return orig_name;
+    };
+
+    // Resolve lonely fragments (important if the current page is a subpage).
+    if !s.is_empty() && s.starts_with('#') {
+        return format!("{}{s}", title.get_prefixed_text());
+    }
+
+    let mut title_key = s.to_string();
+    if ctx.config.namespace_has_subpages(title.namespace_id) {
+        // Resolve `(../)+` relative subpage references.
+        if let Some(rel_up_len) = count_leading_dotdot_slashes(s) {
+            let levels = rel_up_len / 3;
+            let title_prefixed = title.get_prefixed_text();
+            let title_bits: Vec<&str> = title_prefixed.split('/').collect();
+            if title_bits.first().is_some_and(|b| b.is_empty()) {
+                // Punt on subpages of titles starting with "/" for now.
+                return orig_name;
+            }
+            if title_bits.len() <= levels {
+                // Too many levels -- invalid relative link.
+                return orig_name;
+            }
+            let mut new_bits: Vec<String> = title_bits[..title_bits.len() - levels]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            if s.len() > rel_up_len {
+                let last_bit = &s[rel_up_len..];
+                if last_bit.starts_with('#') {
+                    // Fragments should not get appended after a trailing "/".
+                    let n = new_bits.len();
+                    new_bits[n - 1].push_str(last_bit);
+                } else {
+                    new_bits.push(last_bit.to_string());
+                }
+            }
+            title_key = new_bits.join("/");
+            title_key = normalize_resolved(&title_key);
+        } else if !s.is_empty() && s.starts_with('/') {
+            // Resolve absolute subpage links.
+            let mut resolved = format!("{}{s}", title.get_prefixed_text());
+            // Remove trailing slashes, then normalize.
+            resolved = resolved.trim_end_matches('/').to_string();
+            title_key = resolved;
+        }
+    }
+
+    // Strip leading ':'.
+    if let Some(stripped) = title_key.strip_prefix(':') {
+        title_key = stripped.to_string();
+    }
+    title_key
+}
+
+/// Count the leading run of `../` (returns the byte length of the run), or
+/// `None` if the string does not start with `../`.
+fn count_leading_dotdot_slashes(s: &str) -> Option<usize> {
+    if !s.starts_with("../") {
+        return None;
+    }
+    let mut n = 0;
+    let bytes = s.as_bytes();
+    while bytes[n..].starts_with(b"../") {
+        n += 3;
+    }
+    Some(n)
+}
+
+/// Normalize a resolved subpage string: strip trailing slashes (mirrors the
+/// `rtrim( $str, '/' )` + `normalizedTitleKey` in PHP).
+fn normalize_resolved(s: &str) -> String {
+    s.trim_end_matches('/').to_string()
+}
+
+/// `Env::makeTitleFromURLDecodedStr`: resolve relative/subpage references, then
+/// parse to a Title.
+fn make_title_from_url_decoded_str(ctx: &WikiLinkContext, text: &str) -> crate::title::Title {
+    let resolved = resolve_title(ctx, text);
+    crate::title::TitleParser::parse(&resolved, ctx.config)
 }
 
 /// Normalize and analyze a wikilink target. Mirrors PHP's
@@ -183,7 +288,7 @@ pub fn get_wiki_link_target_info(
             // (rather than `Title::new`) so first-letter capitalization is
             // applied for case-insensitive namespaces (mirrors
             // `makeTitleFromURLDecodedStr`).
-            title = Some(TitleParser::parse(&title_decoded, ctx.config));
+            title = Some(make_title_from_url_decoded_str(ctx, &title_decoded));
         } else if let Some(info) = &interwiki_info {
             if info.localinterwiki == Some(true) {
                 // Local interwiki: empty title means main page (T66167).
@@ -217,18 +322,18 @@ pub fn get_wiki_link_target_info(
                 }
             } else {
                 // Unrecognized prefix → treat whole string as title.
-                title = Some(TitleParser::parse(&title_decoded, ctx.config));
+                title = Some(make_title_from_url_decoded_str(ctx, &title_decoded));
             }
         } else {
             // No namespace or interwiki prefix → plain title.
-            title = Some(TitleParser::parse(&title_decoded, ctx.config));
+            title = Some(make_title_from_url_decoded_str(ctx, &title_decoded));
         }
     } else {
-        // No colon → plain mainspace title. Use `TitleParser::parse` (rather
-        // than `Title::new_main`) so the URL fragment is split off and
-        // first-letter capitalization is applied (mirrors
-        // `makeTitleFromURLDecodedStr`).
-        title = Some(TitleParser::parse(&title_decoded, ctx.config));
+        // No colon → plain mainspace title. Use `make_title_from_url_decoded_str`
+        // (rather than `Title::new_main`) so the URL fragment is split off,
+        // first-letter capitalization is applied, and relative/subpage references
+        // are resolved (mirrors `makeTitleFromURLDecodedStr`).
+        title = Some(make_title_from_url_decoded_str(ctx, &title_decoded));
     }
 
     // A title that (after URL-decoding) still carries a percent-encoding

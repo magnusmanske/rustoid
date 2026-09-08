@@ -283,6 +283,9 @@ pub struct MockSiteConfig {
     /// Localized namespace names per language (language code → namespace ID →
     /// localized name), mirroring PHP's `SiteConfig::namespaceName`.
     localized_namespace_names: HashMap<String, HashMap<i32, String>>,
+    /// Namespace IDs for which subpages are enabled (mirrors PHP's
+    /// `$wgNamespacesWithSubpages` / `enableSubpagesForNS`).
+    subpages_ns: std::collections::HashSet<i32>,
 }
 
 impl MockSiteConfig {
@@ -329,6 +332,7 @@ impl MockSiteConfig {
             no_follow_links: true,
             no_follow_domain_exceptions: Vec::new(),
             localized_namespace_names: HashMap::new(),
+            subpages_ns: std::collections::HashSet::new(),
         };
 
         // Register standard MediaWiki namespaces. `case_sensitive` reflects
@@ -534,6 +538,12 @@ impl MockSiteConfig {
         self.no_follow_domain_exceptions.push(domain.to_string());
     }
 
+    /// Enable subpages for a namespace (mirrors PHP's `enableSubpagesForNS`,
+    /// which the parser-test `subpage` option toggles).
+    pub fn enable_subpages_for_ns(&mut self, ns: i32) {
+        self.subpages_ns.insert(ns);
+    }
+
     /// Set the content language and register localized namespace names + media
     /// option aliases for it (mirrors PHP's `SiteConfig` localization used by
     /// the parser-test `language=` option). Covers the languages the media
@@ -667,6 +677,10 @@ impl SiteConfig for MockSiteConfig {
 
     fn language_code(&self) -> &str {
         &self.language_code
+    }
+
+    fn namespace_has_subpages(&self, ns: i32) -> bool {
+        self.subpages_ns.contains(&ns)
     }
 
     fn get_upload_url(&self, title: &str) -> String {

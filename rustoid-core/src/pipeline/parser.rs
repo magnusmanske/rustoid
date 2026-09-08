@@ -541,6 +541,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens: Vec<Item>,
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
         next_id: &mut usize,
+        context_title: Option<&crate::title::Title>,
     ) -> Vec<Item> {
         use crate::pipeline::wiki_link_render::{
             WikiLinkContext, get_wiki_link_target_info, render_redirect,
@@ -549,6 +550,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         use crate::wikitext::token_utils::key_value_to_string;
 
         let mut ctx = WikiLinkContext::new(self.config);
+        if let Some(title) = context_title {
+            ctx.set_context_title(title);
+        }
         let mut out: Vec<Item> = Vec::new();
 
         for item in tokens {
@@ -603,7 +607,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     let src = reconstruct_link_src(stt, &href);
                     out.push(Item::Str("[".to_string()));
                     let sub = self.tokenize(&src[1..]).unwrap_or_default();
-                    let sub = self.render_links(sub, fragments, next_id);
+                    let sub = self.render_links(sub, fragments, next_id, context_title);
                     out.extend(sub);
                     continue;
                 }
@@ -629,7 +633,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
                 let sub = self.tokenize(&src[1..]).unwrap_or_default();
-                let sub = self.render_links(sub, fragments, next_id);
+                let sub = self.render_links(sub, fragments, next_id, context_title);
                 out.extend(sub);
                 continue;
             }
@@ -739,7 +743,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 match it {
                                     Item::Str(s) if s.contains("[[") => {
                                         let sub = self.tokenize_inline(&s).unwrap_or_default();
-                                        let sub = self.render_links(sub, fragments, next_id);
+                                        let sub = self.render_links(sub, fragments, next_id, None);
                                         expanded.extend(sub);
                                     }
                                     other => expanded.push(other),
@@ -1054,7 +1058,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // (the token-level stages that run before tree building on the main page).
         let mut fragments = std::collections::HashMap::new();
         let mut next_id = 0usize;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, None);
         let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
@@ -1338,7 +1342,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
         let mut next_id = 0usize;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, None);
         let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
@@ -1437,7 +1441,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     ) -> Node {
         let title = TitleParser::parse(page_title, self.config);
         let page_title_prefixed = title.get_prefixed_text();
-        let frame = Frame::new(title, vec![]);
+        let frame = Frame::new(title.clone(), vec![]);
 
         let tokens = self
             .expand_templates(&frame, tokens, source, about_counter, false)
@@ -1448,7 +1452,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
         let mut next_id = 0usize;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, Some(&title));
         let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);

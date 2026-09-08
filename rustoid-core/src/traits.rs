@@ -153,6 +153,14 @@ pub trait SiteConfig: Send + Sync {
         "/w"
     }
 
+    /// Whether pages in namespace `ns` support subpages (relative `[[./…]]` /
+    /// `[[../…]]` / `[[/…]]` link targets resolve against the context title).
+    /// Mirrors PHP's `SiteConfig::namespaceHasSubpages`. Default: false (the
+    /// parser-test harness enables it per-namespace via the `subpage` option).
+    fn namespace_has_subpages(&self, _ns: i32) -> bool {
+        false
+    }
+
     /// Resolve a canonical namespace name (e.g. "Media", "File", "Category")
     /// to its namespace ID. Mirrors PHP's `SiteConfig::canonicalNamespaceId`,
     /// which takes an all-lowercase name and matches case-insensitively.

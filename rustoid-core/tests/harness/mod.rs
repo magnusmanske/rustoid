@@ -200,6 +200,18 @@ fn redirect_target(text: &str) -> Option<String> {
     }
 }
 
+/// Strip a `[[…]]` link-target value in a parser-test option down to its inner
+/// title (mirrors the PHP option grammar's `link_target_value` rule, which
+/// unwraps `[[Subpage test]]` → `Subpage test`).
+fn strip_link_target_brackets(value: &str) -> String {
+    let v = value.trim();
+    if v.starts_with("[[") && v.ends_with("]]") {
+        v[2..v.len() - 2].trim().to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test case representation
 // ---------------------------------------------------------------------------
@@ -919,10 +931,16 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
         .options
         .get("title")
         .cloned()
+        .map(|t| strip_link_target_brackets(&t))
         .unwrap_or_else(|| "TestPage".to_string());
     source.add_page(&page_title, &test.wikitext);
 
     let mut config = MockSiteConfig::new();
+    // The `subpage` option enables subpage support for the content namespace
+    // (mirrors PHP's `enableSubpagesForNS(0)`).
+    if test.options.contains_key("subpage") {
+        config.enable_subpages_for_ns(0);
+    }
     // The `language=` option sets the content language, localizing namespace
     // names and media option aliases (mirrors PHP's `SiteConfig` language).
     if let Some(lang) = test.options.get("language") {
@@ -1276,10 +1294,14 @@ fn build_edited_dom(
         .options
         .get("title")
         .cloned()
+        .map(|t| strip_link_target_brackets(&t))
         .unwrap_or_else(|| "TestPage".to_string());
     source.add_page(&page_title, &test.wikitext);
 
     let mut config = MockSiteConfig::new();
+    if test.options.contains_key("subpage") {
+        config.enable_subpages_for_ns(0);
+    }
     if let Some(lang) = test.options.get("language") {
         config.set_language(lang);
     }
