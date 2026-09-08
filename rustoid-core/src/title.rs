@@ -385,10 +385,18 @@ impl TitleParser {
         fragment: Option<String>,
         config: &dyn SiteConfig,
     ) -> Title {
+        let collapsed = collapse_title_whitespace(text);
+        // NFC-normalize the title (mirrors `Title::newFromText`'s
+        // `UtfNormalValidator::toNFC`), so a composed ligature like U+FB2E
+        // (אַ) resolves to its canonical decomposition (א‍ + ‍ַ). Applied to
+        // local titles only (interwiki titles skip it, since the remote wiki
+        // may be case-sensitive).
+        let normalized = unicode_normalization::UnicodeNormalization::nfc(collapsed.as_str())
+            .collect::<String>();
         let text = if case_sensitive {
-            collapse_title_whitespace(text)
+            normalized
         } else {
-            ucfirst(&collapse_title_whitespace(text), config.language_code())
+            ucfirst(&normalized, config.language_code())
         };
         let namespace_name = config.namespace_name(namespace_id);
         Title {

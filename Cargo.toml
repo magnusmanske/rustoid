@@ -31,3 +31,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ruwex = "0.1"
 log = "0.4"
+unicode-normalization = "0.1"
