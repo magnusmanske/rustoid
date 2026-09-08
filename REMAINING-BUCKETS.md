@@ -19,12 +19,14 @@ are the authority; port their logic bit-for-bit.
 - "! and || in td attributes should not be parsed as `<th>`/`<td>`"
 - "Spec syntactic differences in parsing of `!!` compared to `||`"
 - ~~"Simple table but with multiple dashes for row wikitext"~~ (done, `ddafda5`)
-- "Table td-cell syntax variations" — needs **TreeBuilder `TableFixups`**
-  (dangling valueless attributes in cell position → content), NOT a tokenizer fix.
-  In cell position, `row_syntax_table_args = table_attributes<tableCellArg>`; a bare
-  word parses as a *discarded* valueless `KV(name, '')`, and `TableFixups` converts
-  dangling attributes → content. rustoid lacks `TableFixups` (see `Wt2Html/DOM/Handlers/TableFixups.php`;
-  `TABLE_CELL_WITH_NO_ATTRIBUTE_SYNTAX` / `NON_MERGEABLE_TABLE_CELL` flags are consumed there).
+- "Table td-cell syntax variations" — **shadow/discarded attribute handling**, NOT TableFixups.
+  Verified empirically (PHP `MockSiteConfig`+`MockDataAccess`+wt2html, see `/tmp/pt_single.php`):
+  `|foo bar foo|baz` → `<td data-parsoid='{"a":{"foo":null,"bar":null},"sa":{"foo":"","bar":""}}'>baz</td>`.
+  Valueless table attributes become `data-parsoid` **shadow** attrs (`a`/`sa`) and are *not* emitted
+  as real HTML attributes. rustoid's HTML5 tree builder instead renders them as `foo=""`/`bar=""`
+  (real attrs). Fix: in the tree builder / attribute-sanitizer, keep valueless attrs only in `a`/`sa`
+  shadow and drop them from the literal HTML attribute list (mirrors `Sanitizer`/`KV(name,'')` discard).
+  (Note: the second cell `foo bar foo` comes from line 2's `||` empty-cell syntax — already handled.)
 - "Pipe within attribute without quotes"
 - "A table with stray table end tags on start tag line (wt2html)"
 - "Tables: Digest broken attributes on table and tr tag"
@@ -107,4 +109,12 @@ cargo test -p rustoid-core --lib
 cargo clippy -p rustoid-core --all-targets
 cargo test -p rustoid-core --test integration_test test_all_parsoid_fixtures -- --nocapture 2>&1 | grep -a "Parsoid test results"
 cargo test -p rustoid-core --test debug_failures -- --nocapture 2>&1 | grep -a "FAIL:"
+```
+
+### Empirical PHP reference
+PHP 8.5 + vendor are present in `/tmp/parsoid-src`; `git sparse-checkout add baseconfig` restores the
+`baseconfig/*.json` files the mock needs. `/tmp/pt_single.php` runs a single wikitext string through the
+`MockSiteConfig`+`MockDataAccess`+wt2html pipeline:
+```bash
+php /tmp/pt_single.php "$'some wikitext'"
 ```
