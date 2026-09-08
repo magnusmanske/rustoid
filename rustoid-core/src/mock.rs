@@ -361,6 +361,14 @@ impl MockSiteConfig {
         config.add_namespace(828, "Module", &[], false, "Scribunto");
         config.add_namespace(829, "Module talk", &[], false, "wikitext");
 
+        // Enable subpages for the standard non-main namespaces, mirroring enwiki's
+        // `$wgNamespacesWithSubpages` default (Talk, User, User talk, Project, …).
+        // The parser-test `subpage` option additionally enables ns 0 (main), which
+        // is off by default.
+        for ns in [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 828, 829] {
+            config.subpages_ns.insert(ns);
+        }
+
         // Register some interwiki prefixes.
         // NOTE: the upstream Parsoid parser-test site config uses `http://`
         // (not `https://`) as its canonical protocol, and the fixtures embed
