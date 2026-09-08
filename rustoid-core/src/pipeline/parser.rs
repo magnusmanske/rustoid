@@ -597,9 +597,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let target = match get_wiki_link_target_info(&ctx, &href, &href_src) {
                 Ok(t) => t,
                 Err(_) => {
-                    // Invalid title: bail to literal `[[…]]` text (mirrors PHP's
-                    // `bailTokens`).
-                    out.push(Item::Str(format!("[[{href}]]")));
+                    // Invalid title: bail to literal `[[…]]` text, re-tokenizing the
+                    // source so entities render as `mw:Entity` spans (mirrors PHP's
+                    // `bailTokens` re-processing the link source).
+                    let src = reconstruct_link_src(stt, &href);
+                    out.push(Item::Str("[".to_string()));
+                    let sub = self.tokenize(&src[1..]).unwrap_or_default();
+                    let sub = self.render_links(sub, fragments, next_id);
+                    out.extend(sub);
                     continue;
                 }
             };

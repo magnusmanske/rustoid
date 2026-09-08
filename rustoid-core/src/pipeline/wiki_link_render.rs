@@ -348,14 +348,20 @@ pub fn render_wiki_link(
     // `addNormalizedAttribute('href', normalized, src)` records the source href
     // as `sa.href` and the normalized href as `a.href` (for ComputeDSR).
     if let Some(title) = &target.title {
-        let mut href = make_link(title, ctx.config);
-        // `makeLink(title)` omits the fragment; append it so `[[Main Page#section]]`
-        // renders `./Main_Page#section` (mirrors PHP, where the anchor href
-        // carries the title's fragment).
+        // href = makeLink(title), title = getPrefixedText(). The fragment is
+        // part of the title: whitespace (incl. NBSP) collapses to `_`, and `#`
+        // is escaped (mirrors `Env::makeLink` → `Sanitizer::sanitizeTitleURI` on
+        // the full DB key including the fragment).
+        let mut dbkey = title.get_full_db_key();
         if let Some(fragment) = &title.fragment {
-            href.push('#');
-            href.push_str(fragment);
+            dbkey.push('#');
+            dbkey.push_str(&crate::title::collapse_title_whitespace(fragment));
         }
+        let href = format!(
+            "{}{}",
+            crate::title::relative_link_prefix(ctx.config),
+            crate::sanitizer::sanitize_title_uri(&dbkey, false)
+        );
         let prefixed = title.get_prefixed_text();
         a_tag.add_attribute_str("href", &href);
         a_tag.add_attribute_str("title", &prefixed);

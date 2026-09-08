@@ -396,7 +396,7 @@ fn split_fragment(input: &str) -> (&str, Option<String>) {
 /// normalization MediaWiki's `Language::normalize` applies to `Title` text
 /// (NBSP in a wikilink target becomes a plain space, and `Foo  bar   baz`
 /// collapses to `Foo bar baz`).
-fn collapse_title_whitespace(text: &str) -> String {
+pub(crate) fn collapse_title_whitespace(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
     for c in text.chars() {
