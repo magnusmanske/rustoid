@@ -1193,14 +1193,48 @@ impl<'a> PegTokenizer<'a> {
         false
     }
 
-    /// Try `{|` table start tag.
+    /// Match a `pipe` token (`"|" / "{{!}}"`) and return its source string
+    /// (used to record `startTagSrc`/`endTagSrc`/`attrSepSrc` variations).
+    fn try_pipe(&mut self) -> Option<String> {
+        if self.starts_with("{{!}}") {
+            self.advance(5);
+            Some("{{!}}".to_string())
+        } else if self.starts_with("|") {
+            self.advance(1);
+            Some("|".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Whether the input begins with a `pipe` token (without consuming).
+    fn at_pipe(&self) -> bool {
+        self.starts_with("{{!}}") || self.starts_with("|")
+    }
+
+    /// Match a `pipe_pipe` token (`pipe pipe`) and return its source string
+    /// (`||`, `{{!}}{{!}}`, `|{{!}}`, `{{!}}|`), or `None` (position restored).
+    fn try_pipe_pipe(&mut self) -> Option<String> {
+        let saved = self.pos;
+        let a = self.try_pipe()?;
+        let Some(b) = self.try_pipe() else {
+            self.pos = saved;
+            return None;
+        };
+        Some(format!("{a}{b}"))
+    }
+
+    /// Try `{|` table start tag (the `pipe` may be `{{!}}`, yielding `{{{!}}`).
     fn try_table_start_tag(&mut self) -> bool {
-        if !self.starts_with("{|") {
+        if !self.starts_with("{") {
             return false;
         }
-
         let start = self.pos;
-        self.advance(2);
+        self.advance(1);
+        let Some(pipe) = self.try_pipe() else {
+            self.pos = start;
+            return false;
+        };
 
         let _attr_start = self.pos;
         let attrs = self.parse_table_attributes();
@@ -1214,7 +1248,10 @@ impl<'a> PegTokenizer<'a> {
         self.consume_empty_cell_pipe();
 
         let mut dp = self.make_dp(start, ts_end);
-        dp.start_tag_src = Some("{|".to_string());
+        // `start_tag_src` = `{` + pipe (`{|` or `{{{!}}`).
+        let mut start_tag_src = String::from("{");
+        start_tag_src.push_str(&pipe);
+        dp.start_tag_src = Some(start_tag_src);
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("table", attrs, dp)));
 
@@ -1222,10 +1259,17 @@ impl<'a> PegTokenizer<'a> {
         // common `{| … |}` where the `|}` immediately follows) closes the table
         // (mirrors PHP's "ok to normalize away stray |} on rt", T59360). This is
         // a valueless end tag, distinct from a bare `|` valueless cell.
-        if self.starts_with("|}") {
+        let end_width = if self.starts_with("{{!}}}") {
+            6
+        } else if self.starts_with("|}") {
+            2
+        } else {
+            0
+        };
+        if end_width > 0 {
             let end_start = self.pos;
-            self.advance(2);
-            let end_dp = self.make_dp(end_start, end_start + 2);
+            self.advance(end_width);
+            let end_dp = self.make_dp(end_start, end_start + end_width);
             self.emit_token(ParsoidToken::EndTag(EndTagTk::new("table", vec![], end_dp)));
         }
 
@@ -1248,16 +1292,28 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
-    /// Try `|}` table end tag.
+    /// Try `|}` table end tag (the `pipe` may be `{{!}}`, yielding `{{!}}}`).
     fn try_table_end_tag(&mut self) -> bool {
-        if !self.starts_with("|}") {
+        if !self.at_pipe() {
             return false;
         }
+        let saved = self.pos;
+        let Some(pipe) = self.try_pipe() else {
+            return false;
+        };
+        if !self.starts_with("}") {
+            self.pos = saved;
+            return false;
+        }
+        self.advance(1);
 
-        let start = self.pos;
-        self.advance(2);
-
-        let dp = self.make_dp(start, self.pos);
+        let mut dp = self.make_dp(saved, self.pos);
+        if pipe != "|" {
+            // `end_tag_src` = pipe + `}` (`{{!}}}`).
+            let mut src = pipe.clone();
+            src.push('}');
+            dp.end_tag_src = Some(src);
+        }
         self.emit_token(ParsoidToken::EndTag(EndTagTk::new("table", vec![], dp)));
 
         self.at_sol = true;
@@ -1290,18 +1346,21 @@ impl<'a> PegTokenizer<'a> {
         let start = self.pos;
         self.advance(1); // consume '!'
 
-        let attrs = self.parse_row_syntax_table_args();
+        let (attrs, sep) = self.parse_row_syntax_table_args();
         let tag_end = self.pos;
 
         let tsr = self.tsr(start, tag_end);
-        let dp = self.make_dp_tsr(tsr);
+        let mut dp = self.make_dp_tsr(tsr);
+        if !sep.is_empty() && sep != "|" {
+            dp.attr_sep_src = Some(sep);
+        }
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
 
         // The cell content precedes any `!!` separator on the same line.
         self.parse_table_cell_inline(true);
 
-        // Process additional heading cells: `!!`.
+        // Process additional heading cells: `!!` / `pipe_pipe`.
         self.parse_ths();
 
         self.at_sol = false;
@@ -1309,30 +1368,48 @@ impl<'a> PegTokenizer<'a> {
     }
 
     fn parse_ths(&mut self) {
-        while self.starts_with("!!") || self.starts_with("||") {
-            let pp_start = self.pos;
-            let pp_len = 2;
-            self.advance(pp_len);
-
-            let attrs = self.parse_row_syntax_table_args();
+        loop {
+            let saved = self.pos;
+            // `pp:("!!" / pipe_pipe)`.
+            let pp = if self.starts_with("!!") {
+                self.advance(2);
+                "!!".to_string()
+            } else if let Some(pp) = self.try_pipe_pipe() {
+                pp
+            } else {
+                self.pos = saved;
+                break;
+            };
+            let (attrs, sep) = self.parse_row_syntax_table_args();
             let tag_end = self.pos;
 
-            let tsr = self.tsr(pp_start - pp_len, tag_end);
-            let dp = self.make_dp_tsr(tsr);
+            let tsr = self.tsr(saved, tag_end);
+            let mut dp = self.make_dp_tsr(tsr);
+            dp.stx = Some("row".to_string());
+            if pp != "!!" {
+                // Variation from default (`!!` is the default `ths` separator).
+                dp.start_tag_src = Some(pp);
+            }
+            if !sep.is_empty() && sep != "|" {
+                dp.attr_sep_src = Some(sep);
+            }
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
             self.parse_table_cell_inline(true);
         }
     }
 
-    /// `|-` table row tag.
+    /// `|-` table row tag (the `pipe` may be `{{!}}`, yielding `{{!}}-`).
     fn try_table_row_tag(&mut self) -> bool {
-        if !self.starts_with("|-") {
+        let saved = self.pos;
+        let Some(pipe) = self.try_pipe() else {
+            return false;
+        };
+        if !self.starts_with("-") {
+            self.pos = saved;
             return false;
         }
-
-        let start = self.pos;
-        self.advance(2);
+        self.advance(1);
 
         let _attr_start = self.pos;
         let attrs = self.parse_table_attributes();
@@ -1343,8 +1420,11 @@ impl<'a> PegTokenizer<'a> {
         // dropped by the tree builder (see `try_table_start_tag`).
         self.consume_empty_cell_pipe();
 
-        let mut dp = self.make_dp(start, tag_end);
-        dp.start_tag_src = Some("|-".to_string());
+        let mut dp = self.make_dp(saved, tag_end);
+        // `start_tag_src` = pipe + `-` (`|-` or `{{!}}-`).
+        let mut start_tag_src = pipe.clone();
+        start_tag_src.push('-');
+        dp.start_tag_src = Some(start_tag_src);
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("tr", attrs, dp)));
 
@@ -1352,27 +1432,39 @@ impl<'a> PegTokenizer<'a> {
         true
     }
 
-    /// `|` or `||` data cell.
+    /// `|` or `{{!}}` (and `pipe_pipe`) data cells.
     fn try_table_data_tags(&mut self) -> bool {
         let saved = self.pos;
 
-        // Single pipe.
-        if self.starts_with("|")
-            && !self.starts_with("|-")
-            && !self.starts_with("|}")
-            && !self.starts_with("|+")
-            && !self.starts_with("||")
-        {
-            self.advance(1);
-        } else {
-            return false;
-        }
+        // Leading single pipe, not followed by `-`, `}`, `+`, or another pipe.
+        // Mirror PHP's `table_data_tags = p:pipe ![+\-}] td:table_data_tag tds:tds`.
+        let pipe = match self.try_pipe() {
+            Some(p)
+                if !self.starts_with("-")
+                    && !self.starts_with("}")
+                    && !self.starts_with("+")
+                    && !self.at_pipe() =>
+            {
+                p
+            }
+            _ => {
+                self.pos = saved;
+                return false;
+            }
+        };
 
-        let attrs = self.parse_row_syntax_table_args();
+        let (attrs, sep) = self.parse_row_syntax_table_args();
         let tag_end = self.pos;
 
         let tsr = self.tsr(saved, tag_end);
-        let dp = self.make_dp_tsr(tsr);
+        let mut dp = self.make_dp_tsr(tsr);
+        // Variation from the default `|` separator.
+        if pipe != "|" {
+            dp.start_tag_src = Some(pipe.clone());
+        }
+        if !sep.is_empty() && sep != "|" {
+            dp.attr_sep_src = Some(sep);
+        }
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
 
@@ -1387,16 +1479,24 @@ impl<'a> PegTokenizer<'a> {
     }
 
     fn parse_tds(&mut self) {
-        while self.starts_with("||") {
-            let pp_start = self.pos;
-            self.advance(2);
-
-            let attrs = self.parse_row_syntax_table_args();
+        loop {
+            let saved = self.pos;
+            let Some(pp) = self.try_pipe_pipe() else {
+                break;
+            };
+            let (attrs, sep) = self.parse_row_syntax_table_args();
             let tag_end = self.pos;
 
-            let tsr = self.tsr(pp_start - 2, tag_end);
+            let tsr = self.tsr(saved, tag_end);
             let mut dp = self.make_dp_tsr(tsr);
             dp.stx = Some("row".to_string());
+            // Variation from the default `||` row separator.
+            if pp != "||" {
+                dp.start_tag_src = Some(pp);
+            }
+            if !sep.is_empty() && sep != "|" {
+                dp.attr_sep_src = Some(sep);
+            }
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
             self.parse_table_cell_inline(false);
@@ -1446,20 +1546,31 @@ impl<'a> PegTokenizer<'a> {
             || (th && (self.starts_with("!!") || self.starts_with("!")))
     }
 
-    /// `|+` table caption.
+    /// `|+` table caption (the `pipe` may be `{{!}}`, yielding `{{!}}+`).
     fn try_table_caption_tag(&mut self) -> bool {
-        if !self.starts_with("|+") {
+        let saved = self.pos;
+        let Some(pipe) = self.try_pipe() else {
+            return false;
+        };
+        if !self.starts_with("+") {
+            self.pos = saved;
             return false;
         }
+        self.advance(1);
 
-        let start = self.pos;
-        self.advance(2);
-
-        let attrs = self.parse_row_syntax_table_args();
+        let (attrs, sep) = self.parse_row_syntax_table_args();
         let tag_end = self.pos;
 
-        let tsr = self.tsr(start, tag_end);
-        let dp = self.make_dp_tsr(tsr);
+        let tsr = self.tsr(saved, tag_end);
+        let mut dp = self.make_dp_tsr(tsr);
+        if pipe != "|" {
+            let mut src = pipe.clone();
+            src.push('+');
+            dp.start_tag_src = Some(src);
+        }
+        if !sep.is_empty() && sep != "|" {
+            dp.attr_sep_src = Some(sep);
+        }
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("caption", attrs, dp)));
 
@@ -1477,8 +1588,9 @@ impl<'a> PegTokenizer<'a> {
             }
 
             let ch = self.remaining().chars().next().unwrap();
-            // Stop at pipe, exclamation (unless part of value), newline.
-            if ch == '|' || ch == '\n' || ch == '\r' {
+            // Stop at a pipe (`|`/`{{!}}`), exclamation, or newline (mirrors
+            // `table_attributes`/`generic_newline_attributes` termination).
+            if ch == '|' || ch == '!' || ch == '\n' || ch == '\r' || self.starts_with("{{!}}") {
                 break;
             }
 
@@ -1575,7 +1687,7 @@ impl<'a> PegTokenizer<'a> {
     /// optional_spaces pipe !pipe`. The trailing `|` is required: when absent the
     /// whole match backtracks so the consumed input is re-parsed as cell content
     /// (a bare word is NOT treated as a valueless attribute in cell position).
-    fn parse_row_syntax_table_args(&mut self) -> Vec<KV> {
+    fn parse_row_syntax_table_args(&mut self) -> (Vec<KV>, String) {
         let saved = self.pos;
         let attrs = self.parse_table_attributes();
 
@@ -1583,12 +1695,16 @@ impl<'a> PegTokenizer<'a> {
 
         // Required single pipe (not followed by another pipe), mirroring
         // PHP's `pipe !pipe`. Backtrack fully if absent.
-        if self.starts_with("|") && !self.starts_with("||") {
-            self.advance(1);
-            attrs
+        if let Some(pipe) = self.try_pipe() {
+            if self.at_pipe() {
+                // `pipe` immediately followed by another `pipe` → backtrack.
+                self.pos = saved;
+                return (Vec::new(), String::new());
+            }
+            (attrs, pipe)
         } else {
             self.pos = saved;
-            Vec::new()
+            (Vec::new(), String::new())
         }
     }
 
@@ -2011,7 +2127,12 @@ impl<'a> PegTokenizer<'a> {
         let mut buf = String::new();
 
         loop {
-            if self.starts_with("{{")
+            // In table attribute-name position, `{` is a stop character (the
+            // `{{!}}` cell separator must not be absorbed as a directive token
+            // in a cell-attribute name), so only parse `{{…}}` directives for
+            // non-table (HTML/extension) attribute names.
+            if !table
+                && self.starts_with("{{")
                 && let Some(tok) = self.parse_directive()
             {
                 if !buf.is_empty() {
@@ -2020,7 +2141,6 @@ impl<'a> PegTokenizer<'a> {
                 tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
                 continue;
             }
-            // Unparseable `{{` falls through to single-char handling.
 
             // `table_attribute_name` additionally accepts wikilinks and HTML
             // tags in attribute-name position (PHP's `table_attribute_name_piece`:
@@ -2078,7 +2198,7 @@ impl<'a> PegTokenizer<'a> {
                 || ch == '='
                 || ch == '>'
                 || ch == '<'
-                || (table && (ch == '[' || ch == '|' || ch == '!'));
+                || (table && (ch == '[' || ch == '|' || ch == '!' || ch == '{' || ch == '}'));
             if is_stop {
                 break;
             }
