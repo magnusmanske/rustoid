@@ -2445,7 +2445,7 @@ impl<'a> PegTokenizer<'a> {
             // part becomes its own `mw:maybeContent` KV (with its own token
             // array), so `renderFile` can distinguish options from the caption
             // without flattening the caption's transclusion/table structure.
-            let parts = split_template_args(content);
+            let parts = split_wikilink_content(content);
             let target = parts.first().map(|s| s.as_str()).unwrap_or("");
 
             self.advance(end + 2);
@@ -3757,6 +3757,16 @@ fn extension_data_mw(attrs: &[KV]) -> DataMw {
 /// Split a template invocation's inner content on top-level `|` characters,
 /// respecting nested `{{...}}`, `[[...]]`, and `{{{...}}}` constructs.
 fn split_template_args(inner: &str) -> Vec<String> {
+    split_template_args_impl(inner, false)
+}
+
+/// Variant that also treats `{{!}}` as a pipe separator (for wikilink content,
+/// where the PEG `pipe = "|" / "{{!}}"` rule applies).
+fn split_wikilink_content(inner: &str) -> Vec<String> {
+    split_template_args_impl(inner, true)
+}
+
+fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut double_brace: i32 = 0;
@@ -3815,6 +3825,30 @@ fn split_template_args(inner: &str) -> Vec<String> {
             triple_brace += 1;
             current.push_str("{{{");
             i += 3;
+            continue;
+        }
+        // The `{{!}}` magic word is a *pipe* separator at the top level of
+        // wikilink content (mirrors the PEG `pipe = "|" / "{{!}}"`), so
+        // `[[Main Page{{!}}Something else]]` splits on it just like `|`. Only in
+        // wikilink content (not template args, where `{{!}}` is a nested magic
+        // word).
+        if magic_pipe
+            && c == '{'
+            && i + 3 < chars.len()
+            && chars[i + 1] == '{'
+            && chars[i + 2] == '!'
+            && chars[i + 3] == '}'
+            && i + 4 < chars.len()
+            && chars[i + 4] == '}'
+            && double_brace == 0
+            && triple_brace == 0
+            && bracket == 0
+            && table == 0
+            && extlink == 0
+            && dash_brace == 0
+        {
+            parts.push(std::mem::take(&mut current));
+            i += 5;
             continue;
         }
         if c == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
