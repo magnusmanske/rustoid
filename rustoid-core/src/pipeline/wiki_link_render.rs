@@ -474,7 +474,8 @@ fn strip_subpage_caption_slashes(morecontent: &str, target: &WikiLinkTargetInfo)
     if morecontent.starts_with("../")
         && let Some(title) = &target.title
     {
-        return title.get_full_db_key().replace('_', " ");
+        // PHP uses `$target->title->getFullText()` (prefixed text + fragment).
+        return title.get_full_text();
     }
     morecontent.to_string()
 }

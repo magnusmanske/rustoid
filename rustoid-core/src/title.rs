@@ -114,6 +114,17 @@ impl Title {
     pub fn get_dbkey(&self) -> String {
         self.text.replace(' ', "_")
     }
+
+    /// The prefixed title with spaces, plus any `#fragment` (mirrors PHP's
+    /// `Title::getFullText()`).
+    pub fn get_full_text(&self) -> String {
+        let mut text = self.get_prefixed_text();
+        if let Some(fragment) = &self.fragment {
+            text.push('#');
+            text.push_str(fragment);
+        }
+        text
+    }
 }
 
 /// Map a namespace ID to its canonical English prefix (fallback without SiteConfig).
