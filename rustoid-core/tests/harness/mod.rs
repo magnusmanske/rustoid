@@ -440,6 +440,10 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     let mut config_lines = Vec::new();
     let mut wikitext_lines = Vec::new();
     let mut html_parsoid_lines = Vec::new();
+    // The generic `!! html` section (canonical output for both parsers) is kept
+    // separate from the dedicated `!! html/parsoid*` sections, which take
+    // precedence for the Parsoid comparison when both are present.
+    let mut html_both_lines = Vec::new();
     let mut html_php_lines = Vec::new();
     let mut html_parsoid_lang_lines = Vec::new();
     let mut wikitext_edited_lines = Vec::new();
@@ -540,7 +544,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                         }
                         Section::HtmlPhp => html_php_lines.push(line.to_string()),
                         Section::HtmlBoth => {
-                            html_parsoid_lines.push(line.to_string());
+                            html_both_lines.push(line.to_string());
                             html_php_lines.push(line.to_string());
                         }
                         Section::HtmlLang => html_parsoid_lang_lines.push(line.to_string()),
@@ -560,7 +564,15 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     test.wikitext = wikitext_lines.join("\n");
 
     if seen_html_section {
-        let html = html_parsoid_lines.join("\n").trim().to_string();
+        // A dedicated `!! html/parsoid*` section takes precedence over the
+        // generic `!! html` for the Parsoid comparison; the latter is a
+        // fallback only.
+        let parsoid_lines = if html_parsoid_lines.is_empty() {
+            &html_both_lines
+        } else {
+            &html_parsoid_lines
+        };
+        let html = parsoid_lines.join("\n").trim().to_string();
         if html != "NOT NEEDED" {
             test.html_parsoid = Some(html);
         }

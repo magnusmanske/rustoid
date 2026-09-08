@@ -1215,6 +1215,17 @@ impl<'a> PegTokenizer<'a> {
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("table", attrs, dp)));
 
+        // A stray table end tag on the same line as the start (`{||}`, or the
+        // common `{| … |}` where the `|}` immediately follows) closes the table
+        // (mirrors PHP's "ok to normalize away stray |} on rt", T59360). This is
+        // a valueless end tag, distinct from a bare `|` valueless cell.
+        if self.starts_with("|}") {
+            let end_start = self.pos;
+            self.advance(2);
+            let end_dp = self.make_dp(end_start, end_start + 2);
+            self.emit_token(ParsoidToken::EndTag(EndTagTk::new("table", vec![], end_dp)));
+        }
+
         self.at_sol = false;
         true
     }
@@ -1285,7 +1296,7 @@ impl<'a> PegTokenizer<'a> {
         self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
 
         // The cell content precedes any `!!` separator on the same line.
-        self.parse_table_cell_inline();
+        self.parse_table_cell_inline(true);
 
         // Process additional heading cells: `!!`.
         self.parse_ths();
@@ -1307,7 +1318,7 @@ impl<'a> PegTokenizer<'a> {
             let dp = self.make_dp_tsr(tsr);
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
-            self.parse_table_cell_inline();
+            self.parse_table_cell_inline(true);
         }
     }
 
@@ -1363,7 +1374,7 @@ impl<'a> PegTokenizer<'a> {
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
 
         // The cell content precedes any `||` separator on the same line.
-        self.parse_table_cell_inline();
+        self.parse_table_cell_inline(false);
 
         // Parse additional `||` data cells.
         self.parse_tds();
@@ -1385,7 +1396,7 @@ impl<'a> PegTokenizer<'a> {
             dp.stx = Some("row".to_string());
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
-            self.parse_table_cell_inline();
+            self.parse_table_cell_inline(false);
         }
     }
 
@@ -1394,9 +1405,9 @@ impl<'a> PegTokenizer<'a> {
     /// tokenizes quotes, wikilinks, templates, entities, and other inline
     /// elements exactly as a top-level inline line does (mirrors PHP's
     /// `nested_block_in_table` / `inlineline` cell body).
-    fn parse_table_cell_inline(&mut self) {
+    fn parse_table_cell_inline(&mut self, th: bool) {
         loop {
-            if self.eof() || self.at_cell_terminator() {
+            if self.eof() || self.at_cell_terminator(th) {
                 return;
             }
             let saved = self.pos;
@@ -1405,7 +1416,7 @@ impl<'a> PegTokenizer<'a> {
             }
             // No inline element: consume one character as text (but do not
             // cross a cell terminator).
-            if self.at_cell_terminator() {
+            if self.at_cell_terminator(th) {
                 self.pos = saved;
                 return;
             }
@@ -1418,15 +1429,18 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
-    /// Whether the current position is at a table-cell terminator.
-    fn at_cell_terminator(&self) -> bool {
-        self.starts_with("||")
-            || self.starts_with("!!")
-            || self.starts_with("{{!}}")
-            || self.starts_with("|")
-            || self.starts_with("!")
+    /// Whether the current position is at a table-cell terminator. Both `|` and
+    /// `!`-family separators terminate a header (`th`) cell (the `ths` rule
+    /// accepts `"!!" / pipe_pipe`), but only the `|`-family terminates a data
+    /// (`td`) cell (`tds = pipe_pipe` only) — a `!!` in a data cell is literal.
+    /// Mirrors PHP's `inlineBreaks`, where `!` only breaks when `$stops['th']`.
+    fn at_cell_terminator(&self, th: bool) -> bool {
+        self.starts_with("{{!}}")
             || self.starts_with("\n")
             || self.starts_with("\r\n")
+            || self.starts_with("||")
+            || self.starts_with("|")
+            || (th && (self.starts_with("!!") || self.starts_with("!")))
     }
 
     /// `|+` table caption.
