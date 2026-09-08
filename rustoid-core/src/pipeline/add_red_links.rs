@@ -47,8 +47,13 @@ pub fn run(node: &mut Node, page_info: &HashMap<String, PageInfo>, page_title: &
     if missing && title != page_title {
         add_class(node, "new");
         // Red-link title i18n: `data-mw-i18n` + `typeof="mw:LocalizedAttrs"`.
+        // The params array is JSON-encoded so backslashes/quotes in the title
+        // round-trip (mirrors I18nInfo::toJsonArray + JSON serialization). The
+        // literal object keeps the `lang`/`key`/`params` key order PHP emits
+        // (`serde_json`'s `json!` would sort the keys).
+        let title_json = serde_json::to_string(&title).unwrap_or_else(|_| "\"\"".to_string());
         let i18n = format!(
-            "{{\"title\":{{\"lang\":\"x-page\",\"key\":\"red-link-title\",\"params\":[\"{title}\"]}}}}"
+            "{{\"title\":{{\"lang\":\"x-page\",\"key\":\"red-link-title\",\"params\":[{title_json}]}}}}"
         );
         node.set_attr("data-mw-i18n", i18n);
         add_typeof(node, "mw:LocalizedAttrs");
