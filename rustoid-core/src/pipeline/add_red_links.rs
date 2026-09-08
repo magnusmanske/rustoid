@@ -68,16 +68,17 @@ pub fn run(node: &mut Node, page_info: &HashMap<String, PageInfo>, page_title: &
             );
         }
     } else if title == page_title {
-        // Self-link: `mw-selflink` + `selflink`, or `mw-selflink-fragment` when
-        // the href carries a fragment. The `title` is removed.
-        add_class(node, "mw-selflink");
-        add_class(node, "selflink");
+        // Self-link: `mw-selflink-fragment` when the href carries a fragment,
+        // otherwise `mw-selflink selflink`. The `title` is removed either way.
         let has_fragment = node
             .get_attr("href")
             .map(|h| h.contains('#'))
             .unwrap_or(false);
         if has_fragment {
             add_class(node, "mw-selflink-fragment");
+        } else {
+            add_class(node, "mw-selflink");
+            add_class(node, "selflink");
         }
         node.attrs.retain(|a| a.key != "title");
     }

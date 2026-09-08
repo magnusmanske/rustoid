@@ -598,6 +598,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .map(|kv| key_value_to_string(&kv.value))
                 .unwrap_or_default();
             let href_src = href.clone();
+
+            // Don't allow internal links to pages containing a PROTO (scheme).
+            // `[[http://…]]` is really a (bracketed) external/autonumber link;
+            // bail to plain text and let the external-link pass re-render it
+            // (mirrors `onWikiLink` → `bailTokens` on `hasValidProtocol`).
+            if !href.is_empty() && self.config.has_valid_protocol(&href) {
+                let src = reconstruct_link_src(stt, &href);
+                out.push(Item::Str("[".to_string()));
+                let sub = self.tokenize(&src[1..]).unwrap_or_default();
+                let sub = self.render_links(sub, fragments, next_id, context_title);
+                out.extend(sub);
+                continue;
+            }
+
             let target = match get_wiki_link_target_info(&ctx, &href, &href_src) {
                 Ok(t) => t,
                 Err(_) => {

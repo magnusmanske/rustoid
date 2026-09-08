@@ -3143,9 +3143,13 @@ fn find_extlink_close(input: &str) -> Option<usize> {
         if input[i..].starts_with("]]") {
             if bracket_depth > 0 {
                 bracket_depth -= 1;
+                i += 2;
+                continue;
             }
-            i += 2;
-            continue;
+            // A `]]` at depth 0 is the extlink's closing `]` followed by a
+            // leftover `]` (from a `[[…]]` that bailed to a bare extlink); the
+            // first `]` closes the extlink.
+            return Some(i);
         }
         if input[i..].starts_with(']') {
             if bracket_depth == 0 {
