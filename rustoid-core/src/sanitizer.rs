@@ -1006,6 +1006,20 @@ fn is_reserved_data_attribute(attr: &str) -> bool {
         || lower.starts_with("data-ooui")
 }
 
+/// Whether an attribute is a Parsoid-inserted attribute (bypasses the allowed
+/// list). Mirrors PHP's `Sanitizer::isParsoidAttr`.
+fn is_parsoid_attr(key_lower: &str, value: &str) -> bool {
+    if matches!(key_lower, "typeof" | "property" | "rel")
+        && value
+            .split_whitespace()
+            .any(|tok| tok == "mw:" || tok.starts_with("mw:"))
+    {
+        return true;
+    }
+    // `about` transclusion ids (`#mwt…`).
+    key_lower == "about" && value.starts_with("#mwt")
+}
+
 /// Sanitize the attributes of an HTML tag, keeping only the allowed subset.
 ///
 /// A faithful port of `Sanitizer::sanitizeTagAttrs`. Returns the sanitized
@@ -1047,7 +1061,10 @@ pub fn sanitize_tag_attrs(
                 c != '=' && c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '/' && c != '>'
             });
         let allowed_by_list = allowed.contains(&key_lower.as_str());
-        if !(is_data_attr && !is_reserved_data_attribute(&key_lower)) && !allowed_by_list {
+        if !is_parsoid_attr(&key_lower, &value)
+            && !(is_data_attr && !is_reserved_data_attribute(&key_lower))
+            && !allowed_by_list
+        {
             continue; // drop
         }
         if is_reserved_data_attribute(&key_lower) {

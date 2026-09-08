@@ -402,8 +402,22 @@ impl Html5TreeBuilder {
     }
 
     fn process_start_tag(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
-        let data_mw = Self::extract_data_mw(attribs);
-        let (attrs, data_id) = self.stash_data_attribs(attribs, dp, data_mw);
+        // Wikitext-syntax table cells run their attributes through the sanitizer
+        // allowlist here, discarding disallowed attributes (e.g. a valueless
+        // `|foo|` marker) so they don't leak into the DOM as `foo=""` — PHP
+        // applies `SanitizerHandler`/`sanitizeTagAttrs` to every `td`/`th` before
+        // tree building. HTML-syntax tags are sanitized by the SanitizerHandler
+        // stage; media/link attributes are resolved before this point and must be
+        // left intact, so limit this pass to table cells only.
+        let attribs = if matches!(name, "table" | "tr" | "td" | "th" | "caption")
+            && dp.stx.as_deref() != Some("html")
+        {
+            crate::sanitizer::sanitize_tag_attrs(name, attribs.to_vec(), |_p| true)
+        } else {
+            attribs.to_vec()
+        };
+        let data_mw = Self::extract_data_mw(&attribs);
+        let (attrs, data_id) = self.stash_data_attribs(&attribs, dp, data_mw);
 
         // A start tag carrying a `data-fragment-id` tunnels a pre-built DOM
         // fragment (mirrors `tunnelDOMThroughTokens`, which stores the fragment
