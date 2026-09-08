@@ -686,6 +686,21 @@ impl SiteConfig for MockSiteConfig {
         &self.language_code
     }
 
+    fn link_trail_regex(&self) -> Option<&'static str> {
+        // Catalan and Kara-Kalpak (and a few other languages) absorb a lone
+        // apostrophe into the link trail (T29473): `[[fou|foo]]'x` includes the
+        // `'` in the link. Mirrors the MediaWiki `linktrail` message for these
+        // languages: `/^((?:[a-z…]|'(?!'))+)(.*)$/sDu`. The `'(?!')` negative
+        // lookahead guards against a doubled apostrophe (quote markup) starting a
+        // trail, but a doubled apostrophe is always consumed as `mw-quote` markup
+        // during tokenization, so it never reaches the trail matcher as text.
+        match self.language_code.as_str() {
+            "ca" => Some("^[a-zàèéíòóúç·ïü']+"),
+            "kaa" => Some("^[a-zıÁáǴǵŃńÓóÚúÍıİʼ’“»']+"),
+            _ => Some("^[a-z]+"),
+        }
+    }
+
     fn namespace_has_subpages(&self, ns: i32) -> bool {
         self.subpages_ns.contains(&ns)
     }
