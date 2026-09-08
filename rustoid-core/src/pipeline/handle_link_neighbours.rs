@@ -67,7 +67,7 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
                 if i == 0 {
                     break;
                 }
-                let (content, from_tpl, remove) = match match_neighbour(
+                let nbr = match match_neighbour(
                     parent,
                     i - 1,
                     re,
@@ -78,17 +78,25 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
                     Some(n) => n,
                     None => break,
                 };
-                if content.is_empty() {
+                if nbr.content.is_empty() {
                     break;
                 }
-                if remove {
+                if nbr.remove {
                     parent.children.remove(i - 1);
                     i -= 1;
                 }
-                prefix_text = format!("{content}{prefix_text}");
-                if !from_tpl {
-                    data_mw_correction = format!("{content}{data_mw_correction}");
-                    dsr_correction += content.len();
+                prefix_text = format!("{}{prefix_text}", nbr.content);
+                if !nbr.from_tpl {
+                    data_mw_correction = format!("{}{data_mw_correction}", nbr.content);
+                    dsr_correction += nbr.content.len();
+                }
+                // Migrate transclusion metadata off an unwrapped `typeof`-bearing
+                // span onto the link (mirrors PHP `addTypeOf`/`setDataMw`).
+                if let Some(ty) = nbr.span_typeof {
+                    transfer_typeof(&mut parent.children[i], &ty);
+                    if let Some(dmw) = nbr.span_data_mw {
+                        parent.children[i].data_mw = Some(dmw);
+                    }
                 }
             }
             if !prefix_text.is_empty() {
@@ -110,7 +118,7 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
                 if i + 1 >= parent.children.len() {
                     break;
                 }
-                let (content, from_tpl, remove) = match match_neighbour(
+                let nbr = match match_neighbour(
                     parent,
                     i + 1,
                     re,
@@ -121,16 +129,24 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
                     Some(n) => n,
                     None => break,
                 };
-                if content.is_empty() {
+                if nbr.content.is_empty() {
                     break;
                 }
-                if remove {
+                if nbr.remove {
                     parent.children.remove(i + 1);
                 }
-                trail_text.push_str(&content);
-                if !from_tpl {
-                    data_mw_correction.push_str(&content);
-                    dsr_correction += content.len();
+                trail_text.push_str(&nbr.content);
+                if !nbr.from_tpl {
+                    data_mw_correction.push_str(&nbr.content);
+                    dsr_correction += nbr.content.len();
+                }
+                // Migrate transclusion metadata off an unwrapped `typeof`-bearing
+                // span onto the link.
+                if let Some(ty) = nbr.span_typeof {
+                    transfer_typeof(&mut parent.children[i], &ty);
+                    if let Some(dmw) = nbr.span_data_mw {
+                        parent.children[i].data_mw = Some(dmw);
+                    }
                 }
             }
             if !trail_text.is_empty() {
@@ -147,11 +163,24 @@ fn handle_children_siblings(parent: &mut Node, config: &dyn SiteConfig) {
     }
 }
 
+/// A single matched neighbour: the text to move into the link, whether it came
+/// from a template (transclusion) wrapper, and whether to drop the sibling after
+/// the merge. When the matched text lives in a `typeof`-bearing span (an
+/// encapsulation wrapper whose `mw:Transclusion`/etc. must migrate onto the
+/// link), `span_typeof`/`span_data_mw` carry that span's metadata.
+struct NeighbourMatch {
+    content: String,
+    from_tpl: bool,
+    remove: bool,
+    span_typeof: Option<String>,
+    span_data_mw: Option<String>,
+}
+
 /// Inspect the single sibling at `idx` (relative to the link) and, when it is a
 /// matching trail/prefix text (possibly a same-`about` single-child `<span>` to
-/// unwrap), return `(matched_content, from_tpl, remove)`. A partial match (only
-/// the leading/trailing portion matches) returns the matched portion and leaves
-/// the remainder written back into the sibling (`remove == false`). A full match
+/// unwrap), return the matched content. A partial match (only the
+/// leading/trailing portion matches) returns the matched portion and leaves the
+/// remainder written back into the sibling (`remove == false`). A full match
 /// returns `remove == true` so the caller drops the sibling. `None` means the
 /// sibling is not a mergeable text neighbour.
 ///
@@ -164,7 +193,7 @@ fn match_neighbour(
     base_about: Option<&str>,
     link_no_typeof: bool,
     is_forward: bool,
-) -> Option<(String, bool, bool)> {
+) -> Option<NeighbourMatch> {
     let neighbour = &parent.children[idx];
     let from_tpl = neighbour.get_attr("about").is_some();
 
@@ -178,6 +207,20 @@ fn match_neighbour(
         && neighbour.children.len() == 1
         && matches!(neighbour.children[0].kind, NodeKind::Text(_))
         && (neighbour.get_attr("typeof").is_none() || (!is_forward && link_no_typeof));
+
+    // When the unwrapped span itself carries transclusion metadata (it was the
+    // encapsulation target), that metadata migrates onto the link (mirrors
+    // PHP's `if ($unwrappedSpan->hasAttribute('typeof')) addTypeOf + setDataMw`).
+    let span_typeof = if unwrap {
+        neighbour.get_attr("typeof").map(str::to_string)
+    } else {
+        None
+    };
+    let span_data_mw = if unwrap && span_typeof.is_some() {
+        neighbour.data_mw.clone()
+    } else {
+        None
+    };
 
     // The text to test is the unwrapped span's child, else the sibling itself.
     let text: Option<&str> = if unwrap {
@@ -215,7 +258,13 @@ fn match_neighbour(
 
     if matched == text {
         // Entire node matches → remove it (and, implicitly, any unwrapped span).
-        Some((matched, from_tpl, true))
+        Some(NeighbourMatch {
+            content: matched,
+            from_tpl,
+            remove: true,
+            span_typeof,
+            span_data_mw,
+        })
     } else {
         // Partial match: the remainder stays in the (unwrapped) sibling.
         let remaining = if is_forward {
@@ -230,7 +279,13 @@ fn match_neighbour(
             let sibling = &mut parent.children[idx];
             sibling.kind = NodeKind::Text(remaining);
         }
-        Some((matched, from_tpl, false))
+        Some(NeighbourMatch {
+            content: matched,
+            from_tpl,
+            remove: false,
+            span_typeof,
+            span_data_mw,
+        })
     }
 }
 
@@ -340,6 +395,24 @@ fn migrate_data_mw_parts(link: &mut Node, text: &str, is_prefix: bool) {
         parts.push(value);
     }
     link.data_mw = Some(json.to_string());
+}
+
+/// Add a `typeof` token to the link's `typeof` attribute (space-separated, de-
+/// duplicated), mirroring PHP's `DOMUtils::addTypeOf`. Used to migrate a
+/// transclusion `typeof` from an unwrapped encapsulation span onto the link.
+fn transfer_typeof(link: &mut Node, ty: &str) {
+    let existing = link.get_attr("typeof").map(str::to_string);
+    let merged = match existing {
+        Some(mut existing) => {
+            if !existing.split_whitespace().any(|t| t == ty) {
+                existing.push(' ');
+                existing.push_str(ty);
+            }
+            existing
+        }
+        None => ty.to_string(),
+    };
+    link.set_attr("typeof", merged);
 }
 
 fn is_wikilink_rel(node: &Node) -> bool {
