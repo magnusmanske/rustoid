@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **821/891 fixtures pass** (92%). Lib tests: 620 pass. Clippy: clean.
+Current baseline: **821/891 fixtures pass** (92%). Lib tests: 621 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
@@ -54,13 +54,29 @@ Authoritative PHP output (confirm via `nativeTemplateExpansion:true` + `$env->pa
 **Done this session:**
 - `table_body_content_target` now targets `<td>` (mixed content) vs `<tbody>` (well-balanced), matching
   PHP's `findEncapTarget`; dropped the earlier incorrect `<tr>`/`<tbody>`-only targets.
+- commit — `substitute_args` now unwraps `{{!}}` → `|` in *resolved argument values* (a magic pipe in a
+  template argument always escapes to a literal pipe), while leaving source-level `{{!}}` intact for
+  token handling. Fixes the `{{1x|1={{!}}title="fail"{{!}}bar}}` → `|title="fail"|bar` content before
+  the next layer of the table-cell cluster.
 - commit `6fccfbe` — "Accept `!!` in templates" + "Spec syntactic differences (`!!` vs `||`)".
 - commit `3f240df` — ported `reparseWithPreviousCell` + `convertAttribsToContent` + `mergeCells` +
   `transferSourceBetweenCells` + `stripTrailingPipe`, wired `MAYBE_COMBINE_WITH_PREV_CELL` into
   `getReparseType`, and set `AT_SRC_START` (SOL cells) + `th`-leading-`!` non-mergeable in the tokenizer.
 
-**Next step:** "Templated table cell with untemplated attributes" variants (the cell-combination cluster)
-and the merge path's DSR/data-mw byte-exactness.
+**Next step / root cause for "Templated table cell with untemplated attributes":**
+`|class="foo"{{1x|1={{!}}title="fail"{{!}}bar}}` — the cell has *literal* attribute `class="foo"`
+(no trailing `|`, so the tokenizer emits it as cell content; `row_syntax_table_args` backtracks), then a
+template that expands to `|title="fail"|bar` (its leading `|` is the attr-content separator). The
+*expected* output is `<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",
+{template}]` — the literal `|class="foo"` is the transclusion's *leading wikitext* (recorded by
+`DOMRangeBuilder::encapsulateTemplates`'s leading-wikitext gap, not by `TableFixups`), and `class="foo"`
+becomes the attribute via `reparseTemplatedAttributes`. Two missing pieces remain:
+1. **AttributeExpander + DOMRangeBuilder leading-wikitext**: the transclusion range must extend *backward*
+   over the literal `|class="foo"` prefix (its `dsr.start` < the template's) and record it as a leading
+   `data-mw.parts` string, then `reparseTemplatedAttributes` re-interprets `class="foo"|` as the cell attr.
+   (Currently `data-mw.parts` is `["", {template}, "\n"]` — the leading gap is empty.)
+2. The `reparseTemplatedAttributes` path then hoists `typeof`/`about`/`data-mw` onto the `<td>` (already
+   ported) and drops the consumed `class="foo"|` prefix.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
