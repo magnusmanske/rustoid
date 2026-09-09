@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **812/891 fixtures pass** (91%). Lib tests: 614 pass. Clippy: clean.
+Current baseline: **815/891 fixtures pass** (91%). Lib tests: 614 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
@@ -18,25 +18,27 @@ are the authority; port their logic bit-for-bit.
   to wiki-syntax `table/tr/td/th/caption`; fixed "Table td-cell syntax variations", "! and || in td",
   "Invalid attributes in table cell T3830").
 - Digest broken table-attr name chars `\0 / = >` as discarded KVs (commit `d05e221`).
+- Context-dependent table attribute-name parsing (commit `ffc4b82`): start/row-tag attribute names
+  are permissive (broken `||`/`|}`/`++` digested as valueless names); cell positions still terminate
+  at `|`/`{{!}}`. Fixed "Digest broken attributes", "stray table end tags on start tag line".
+- `|` stays literal in start/row-tag unquoted attribute values (commit `b012219`; "Pipe within attribute
+  without quotes").
 
 ## Buckets (roughly ordered by priority / tractability)
 
 ### 1. Lookalike `||` / `!!` table edge cases (tokenizer, no template expansion)
 - ~~"! and || in td attributes should not be parsed as `<th>`/`<td>`"~~ (done, `28eb673`)
-- "Spec syntactic differences in parsing of `!!` compared to `||`"
+- "Spec syntactic differences in parsing of `!!` compared to `||`" (template encapsulation)
 - ~~"Simple table but with multiple dashes for row wikitext"~~ (done, `ddafda5`)
-- ~~"Table td-cell syntax variations"~~ (done, `28eb673`: shadow/discard via sanitizer allowlist)
-- "Pipe within attribute without quotes"
-- "A table with stray table end tags on start tag line (wt2html)" — **same-line table content**:
-  `try_table_line` returns right after `try_table_start_tag`, so table content on the *same line* as
-  `{|` (e.g. `{| || |} ++`, `{| |data|}`) is NOT parsed as cells — it leaks as a `<p>`. Need to keep
-  parsing `try_table_content_line`/`try_table_end_tag` (and digest stray `id="foo"` after `|}`) on the
-  start-tag line before falling through to `try_parse_inlineline`.
-- "Tables: Digest broken attributes on table and tr tag" — same same-line-content issue as above,
-  plus `broken_table_attribute_name_char` (now performed at `d05e221`).
+- ~~"Table td-cell syntax variations"~~ (done, `28eb673`)
+- ~~"Pipe within attribute without quotes"~~ (done, `b012219`)
+- ~~"A table with stray table end tags on start tag line (wt2html)"~~ (done, `ffc4b82`)
+- ~~"Tables: Digest broken attributes on table and tr tag"~~ (done, `ffc4b82`)
 - ~~"Invalid attributes in table cell (T3830)"~~ (done, `28eb673`)
-- "Parsoid: Default to a newline after tables in new content (T53219)"
+- "Parsoid: Default to a newline after tables in new content (T53219)" (serializer)
 - "Parsoid: Row-syntax table headings followed by comment & table cells"
+- "Table security: embedded pipes", "Hacky use to indent tables, with comments (T65979)",
+  "Wikitext tables can be nested inside HTML tables"
 
 ### 2. Template-generated table cells + encapsulation (AttributeExpander + TemplateHandler)
 The biggest remaining cluster. Needs `about`/`typeof="mw:Transclusion mw:ExpandedAttrs mw:LocalizedAttrs"`,
