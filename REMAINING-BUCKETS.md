@@ -90,6 +90,15 @@ for the *inner-`<td>`-marker* case (not just the plain `k=v|` text case). PHP's 
 `TableFixups::handleTableCellTemplates` do exactly this (`{{!}}` → `<td attrSrc='' AT_SRC_START>` → the
 cell-template handler sees the `<td>` and reparses).
 
+**Tree-builder split confirmed working** (this turn): the `{{!}}`-produced `<td attr_src='' at_src_start>`
+markers *do* reach the tree builder in `InCell` mode (`[TBD] … mode=InCell`), and `modes::in_cell::start_tag`
+for `td` fires `close_the_cell` + `in_row` reinsert (`td_in_scope=true`), so the cell splits into three `<td>`s
+(`class="foo"` / `title="fail"` / `bar`). The remaining deficiency is **in `TableFixups`'s merge**, not the
+split: `reparse_with_previous_cell` / `reparse_templated_attributes` must merge those three cells into the single
+`<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"", {template}]` — currently
+`class="foo"` is not recovered as an attribute and the trailing `bar` cell is lost. This is the DSR/source-recovery
++ `data-mw.parts` bookkeeping refinement already flagged in the "Still failing" list above.
+
 The blocker is **token-level (not string-level) template-argument expansion** — the current async path
 (`Parser::expand_one_template` → `substitute_args` → re-tokenize the whole string) cannot preserve the
 distinction between `{{!}}` → `|` as *literal inline text* vs. *table-cell syntax*.
