@@ -1373,7 +1373,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let stage = TreeBuilderStage::new(false);
         let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
-        crate::pipeline::compute_dsr::run(&mut ast, wikitext);
         crate::pipeline::p_wrap::run(&mut ast);
         // AddLinkAttributes runs *before* `dom-unpack` (mirrors PHP's
         // `NESTED_PIPELINE_DOM_TRANSFORMS`, where `linkclasses` precedes
@@ -1499,7 +1498,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // (before p-wrapping restructures it), mirroring PHP's
         // `transclusionMetaTagDepthMap` recorded at tree-build time.
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
-        crate::pipeline::compute_dsr::run(&mut ast, page_source);
         // DOM-level p-wrapping runs before transclusion encapsulation (mirrors
         // PHP's `pwrap` … `tplwrap` order).
         crate::pipeline::p_wrap::run(&mut ast);

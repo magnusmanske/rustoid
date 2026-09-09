@@ -1021,6 +1021,14 @@ pub fn post_pwrap_transforms(
     // Hoist trailing newlines out of line-ending / auto-closed elements before
     // template encapsulation (mirrors PHP's `migrate-nls` … `tplwrap` order).
     crate::pipeline::migrate_trailing_nls::run(node);
+    // ComputeDSR runs *after* `migrate-metas`/`migrate-nls` (which canonicalize
+    // the DOM, e.g. merging the `{{!}}`-split table cells back toward a single
+    // cell) and *before* `tplwrap` (mirrors PHP's NESTED_PIPELINE_DOM_TRANSFORMS
+    // order `… migrate-metas … migrate-nls … dsr … tplwrap …`), so each node's
+    // `dsr` is anchored against the post-migration DOM.
+    if let Some(source) = source {
+        crate::pipeline::compute_dsr::run(node, source);
+    }
     // Encapsulate transclusion meta markers into wrapping `<span>` elements.
     encapsulate_transclusions(node, source);
     // Unpack `mw:DOMFragment` placeholders (extension/template sub-content)
