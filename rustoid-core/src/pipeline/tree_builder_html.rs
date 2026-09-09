@@ -1613,13 +1613,16 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
         // Table fostering (PHP `getDOMRange`'s `getStartConsideringFosteredContent` +
         // `MAP_TBODY_TR` migration): when the encapsulation target is a `<table>`, the
         // transclusion content was fostered out of the table, so the encap data goes on
-        // the table *body* (`<tbody>`/`<thead>`/`<tfoot>`/`<tr>`), not the `<table>`.
+        // the table *body* (`<tbody>`/`<thead>`/`<tfoot>`) for a well-balanced
+        // (single-template) transclusion, or on the first content *cell* (`<td>`/`<th>`)
+        // when the range extends beyond the template (mixed template + wikitext content).
         //
         // Drop the end marker (a `<table>` child, sibling of the `<tbody>`) *before*
         // transferring onto the nested body, so the two `&mut` borrows don't alias.
+        let well_balanced = tpl_end.is_none_or(|te| range_end.is_some_and(|re| re <= te));
         remove_end_meta(&mut children[t], about.as_deref());
         {
-            let encap_node = table_body_content_target(&mut children[et]);
+            let encap_node = table_body_content_target(&mut children[et], well_balanced);
             transfer_transclusion_to_element(encap_node, &start_meta, source, range_end);
         }
         // Remove the start marker meta.
@@ -1633,10 +1636,13 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
 ///
 /// When the range start is a `<table>` whose content was fostered (PHP
 /// `getStartConsideringFosteredContent` + `MAP_TBODY_TR`), the transclusion
-/// encapsulation goes on the table *body* (`<tbody>`/`<thead>`/`<tfoot>`/`<tr>`)
-/// rather than the `<table>` element itself. The body is the table's first
-/// element child whose tag is a table-body/row tag.
-fn table_body_content_target(table: &mut Node) -> &mut Node {
+/// encapsulation goes on the table *body* (`<tbody>`/`<thead>`/`<tfoot>`) when
+/// the transclusion is well-balanced (a single template produced the whole
+/// table body — mirrors `DataMw::fromWellBalancedTemplate`), and on the first
+/// content *cell* (`<td>`/`<th>`) when the range extends beyond the template
+/// (mixed template + wikitext, e.g. `{{table_attribs_4}} ||a||b`). The sibling
+/// cells receive the same `about` id via the range's `about` chain.
+fn table_body_content_target(table: &mut Node, well_balanced: bool) -> &mut Node {
     if !matches!(table.kind, NodeKind::Element(ElementKind::Table)) {
         return table;
     }
@@ -1647,7 +1653,37 @@ fn table_body_content_target(table: &mut Node) -> &mut Node {
     }) else {
         return table;
     };
-    &mut table.children[body_idx]
+    let body = &mut table.children[body_idx];
+    if well_balanced || !is_table_body_element(body) {
+        // A well-balanced (whole-body) transclusion target is the body/row
+        // itself; a direct `<tr>` child (no implicit `<tbody>`) is also the
+        // body-level target.
+        return body;
+    }
+    // Mixed content: descend `<tbody>`/`<thead>`/`<tfoot>` → `<tr>` → first cell.
+    let Some(row_idx) = body
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::Element(ElementKind::TableRow)))
+    else {
+        return body;
+    };
+    let row = &mut body.children[row_idx];
+    let Some(cell_idx) = row.children.iter().position(|c| {
+        matches!(
+            c.kind,
+            NodeKind::Element(ElementKind::TableCell | ElementKind::TableHeader)
+        )
+    }) else {
+        return row;
+    };
+    &mut row.children[cell_idx]
+}
+
+/// Is this node a table *body* wrapper element (`<tbody>`/`<thead>`/`<tfoot>`)?
+fn is_table_body_element(node: &Node) -> bool {
+    matches!(&node.kind, NodeKind::Element(ElementKind::Other(name))
+        if matches!(name.as_str(), "tbody" | "thead" | "tfoot"))
 }
 
 /// Does this subtree contain a transclusion *end* marker with the given `about`?
@@ -1859,6 +1895,34 @@ mod tests {
         );
         assert!(parts[1].get("template").is_some());
         assert_eq!(parts[2], serde_json::Value::String("\n|}".into()));
+    }
+
+    #[test]
+    fn test_table_body_content_target() {
+        // A well-balanced (single-template) transclusion targets the `<tbody>`.
+        let mut table = Node::element(ElementKind::Table);
+        let mut tbody = Node::element(ElementKind::Other("tbody".to_string()));
+        let mut tr = Node::element(ElementKind::TableRow);
+        tr.push_child(Node::element(ElementKind::TableCell));
+        tbody.push_child(tr);
+        table.push_child(tbody);
+        assert_eq!(
+            table_body_content_target(&mut table, true).kind,
+            NodeKind::Element(ElementKind::Other("tbody".to_string()))
+        );
+
+        // A mixed-content transclusion targets the first `<td>`.
+        let mut table = Node::element(ElementKind::Table);
+        let mut tbody = Node::element(ElementKind::Other("tbody".to_string()));
+        let mut tr = Node::element(ElementKind::TableRow);
+        tr.push_child(Node::element(ElementKind::TableCell));
+        tr.push_child(Node::element(ElementKind::TableCell));
+        tbody.push_child(tr);
+        table.push_child(tbody);
+        assert_eq!(
+            table_body_content_target(&mut table, false).kind,
+            NodeKind::Element(ElementKind::TableCell)
+        );
     }
 
     #[test]

@@ -1,13 +1,13 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **820/891 fixtures pass** (92%). Lib tests: 619 pass. Clippy: clean.
+Current baseline: **821/891 fixtures pass** (92%). Lib tests: 620 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
 The PHP grammar (`src/Wt2Html/Grammar.pegphp`) and `TokenizerUtils.php` (esp. `inlineBreaks`)
 are the authority; port their logic bit-for-bit.
 
-## TableFixups status (this session, commits `d4fe5cd`, `eaa5d38`)
+## TableFixups status (this session)
 
 A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fixups.rs` (runs after
 `handle_link_neighbours`, before `cleanup`). Ported so far:
@@ -22,45 +22,45 @@ A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fi
 - The WRAPPER temp flag is now also stamped on `dp` (not just the `data-parsoid` string) for text-wrap
   encapsulation spans in `tree_builder_html.rs`, so `hoist_transclusion_info` can unwrap them.
 
-**Fixed this session: "1.", "2a.", "3. Template-generated table cell attributes and cell content"**
-(818/891, up from 815).
+**Fixed this session: the fostered-table encapsulation target** (`table_body_content_target` in
+`tree_builder_html.rs`). The PHP `DOMRangeBuilder` (`findEncapTarget` + `MAP_TBODY_TR` migration) puts the
+transclusion `about`/`typeof`/`data-mw` on the first *cell* (`<td>`/`<th>`) when the range extends past
+the template (mixed template + wikitext, e.g. `{{table_attribs_4}} ||a||b` → `typeof` + `about` on the
+first `<td>`, `about` on the sibling cells), and on the table *body* (`<tbody>`/`<thead>`/`<tfoot>`) when
+the transclusion is well-balanced (single template produced the whole body, e.g.
+`{{1x|{{!}} hi}}` → `typeof`/`about` on `<tbody>`). Rust now mirrors both by keying
+`table_body_content_target` on whether the range extends beyond the template's DSR (`range_end > tpl_end`
+⇔ not well-balanced). Net: **821/891** (up from 820); fixed "Template generated table cell with
+attributes" without regressing "Image with table with rows from templates in caption".
 
-**Still failing** — two layers, both needed:
-1. **The fostered-table encapsulation target** (`table_body_content_target` in `tree_builder_html.rs`): for
-   `{{table_attribs_4}} ||a||b` the start marker is fostered before the `<table>`, so `wrap_flipped_children`
-   resolves the encap target to `<tbody>` (via `table_body_content_target`) — but PHP's `MAP_TBODY_TR`/
-   `findEncapTarget` target the `<tr>` (the actual content row), not `<tbody>`. `typeof` must land on `<tr>`,
-   then `hoistTransclusionInfo` moves it to the `<td>`. **Fix `table_body_content_target` to target `<tr>`/body
-   row, not `<tbody>`.**
-2. The merge-cell path (ported in commit `3f240df`, currently harmless/no-regression) then needs its
-   DSR/source-recovery and data-mw bookkeeping refined so the merged cell's `typeof`/`about`/`data-mw` match
-   PHP byte-for-byte.
-
-Authoritative PHP output (via `/tmp/pt_tbl.php` template-mock subclass) for `{{table_attribs_4}} ||a||b`:
+Authoritative PHP output (confirm via `nativeTemplateExpansion:true` + `$env->pageCache`) for
+`{{table_attribs_4}} ||a||b`:
 ```html
 <td style="background-color:#DC241f;" width="10px" about="#mwt1" typeof="mw:Transclusion" …></td>
 <td about="#mwt1">a</td><td about="#mwt1">b</td>
 ```
 `about` on all three `<td>`s and `typeof="mw:Transclusion"` on the first (see line 1373 of tables.txt).
+
+**Still failing** — table-cell template cluster:
 - "4. Template-generated table cell attributes and cell content inside a templated table"
   (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; needs `typeof` on `<table>`, not an empty span)
-- "Template generated table cell with attributes" (`{{table_attribs_4}} ||a||b`)
 - "Templated table cell with untemplated attributes" (all variants: "Cell combination tests",
   "Integrated mode only", T343874)
 - "Multiple transclusions in discarded table attribute position should be handled properly"
+- The merge-cell path (ported in commit `3f240df`, currently harmless/no-regression) still needs its
+  DSR/source-recovery and data-mw bookkeeping refined so the merged cell's `typeof`/`about`/`data-mw`
+  match PHP byte-for-byte.
 
 **Done this session:**
-- commit `6fccfbe` — "Accept `!!` in templates" + "Spec syntactic differences (`!!` vs `||`)": the
-  `split_hidden_cells` span-split now records transclusions during the walk (so `hoistTransclusionInfo`
-  lifts `typeof` onto the cell), and the `<th>` leading-`!` strip is gated behind PHP's
-  `previousSibling instanceof Element && !putsNextSiblingInSOLState`.
+- `table_body_content_target` now targets `<td>` (mixed content) vs `<tbody>` (well-balanced), matching
+  PHP's `findEncapTarget`; dropped the earlier incorrect `<tr>`/`<tbody>`-only targets.
+- commit `6fccfbe` — "Accept `!!` in templates" + "Spec syntactic differences (`!!` vs `||`)".
 - commit `3f240df` — ported `reparseWithPreviousCell` + `convertAttribsToContent` + `mergeCells` +
   `transferSourceBetweenCells` + `stripTrailingPipe`, wired `MAYBE_COMBINE_WITH_PREV_CELL` into
   `getReparseType`, and set `AT_SRC_START` (SOL cells) + `th`-leading-`!` non-mergeable in the tokenizer.
-  No regression (820/891).
 
-**Next step:** fix `table_body_content_target` to target `<tr>` (not `<tbody>`); then refine the merge
-path's DSR/data-mw bookkeeping for byte-exact output.
+**Next step:** "Templated table cell with untemplated attributes" variants (the cell-combination cluster)
+and the merge path's DSR/data-mw byte-exactness.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
