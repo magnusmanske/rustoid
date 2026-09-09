@@ -107,15 +107,31 @@ run at fresh `sol=true`) regressed `!!`/`||` cell continuation (`3. Template-gen
 be **SOL-aware** (the TT2 `TokenStreamPatcher::reprocessTokens` port), not a fresh-SOL re-tokenize.
 
 ### Correct next increment (small, isolated commits)
-1. Port the TT2 `TokenStreamPatcher::reprocessTokens`/`onNewline` SOL-tracking string reprocessing (a second
-   `run` role alongside the existing TT3 handler), tracking `$sol` across the stream.
-2. Wire token-level arg values: `parse_template_token` already stores `Tokens`; make `expand_one_template`
-   splice `templatearg` via `Frame::expand` + expand `{{!}}` via `process_special_magic_word`, then run the
-   new SOL-aware reprocessing.
-3. `{{!}}` magic word at token level (`expand_templates` must emit `|`/`<td>` by `in_template`, setting
-   `attr_src=''` + `at_src_start` on the `<td>`); `handle_template` currently hardcodes `|`.
-4. Re-run `reparseTemplatedAttributes` (already ported) so the leading `|class="foo"` becomes the attribute
-   and `title="fail"|bar` the content.
+1. ~~Port the TT2 `TokenStreamPatcher::reprocessTokens`/`onNewline` SOL-tracking string reprocessing~~
+   **DONE** (`a7a904b`): added `sol`/`tplInfo['atStart']`/`inIndependentParse` state + the
+   `T2529hack` string branch (a bare list/table-syntax string after a transclusion start meta
+   re-tokenizes into a `listItem`/`table`), with unit tests. Net-neutral on the 821 baseline.
+2. **Port `template_param_text` (inline tokenization of arg values).** `tokenize_directives` is too
+   narrow — it only recognizes `{{…}}`/`{{{…}}}`/`-{…}-`/extensions and leaves wikilinks/quotes/entities
+   as raw strings. PHP's `template_param_text` uses `nested_block<table=false, extlink=false,
+   templateArg=true, tableCellArg=false>`, which in the (usual) mid-line position is `inlineline`:
+   it tokenizes `[[Foo|bar]]` → `wikilink`, `'''b'''` → quote tags, entities, and nested templates,
+   but NOT lists/tables (those form only at SOL after a newline). Verified empirically:
+   `{{1x|[[Foo|bar]]}}` arg value → `wikilink` token; `{{1x|*bar}}` → string `"*bar"`; `{{1x|{{!}}…}}`
+   → `[template(!), …]`. The Rust tokenizer already has `try_parse_inlineline`; add a
+   `tokenize_template_arg_value` entry that reuses it with `templateArg=true, table=false`.
+3. Wire `expand_one_template` to splice `templatearg` via `child_frame.expand` (NOT string
+   `substitute_args`), and `{{!}}` → `|`/`<td>` via `process_special_magic_word` at the token level
+   (`expand_templates` must emit `|`/`<td>` by `in_template`, setting `attr_src=''`+`at_src_start`;
+   `handle_template` currently hardcodes `|`). Reeds `AttributeTransformManager::process` on template
+   tokens for `{{{…}}}` in argument **keys/values** (fixes `{{#tag:pre|{{{1}}}|…}}`).
+
+   ⚠️ A partial attempt (steps 2-3 without the faithful `template_param_text`, using
+   `tokenize_directives`) regressed 821→800: arg values containing `[[…]]` stayed strings (breaking
+   the linktrail/wikilink/pwrap/redirect clusters) because `tokenize_directives` doesn't inline-tokenize.
+   The `{{!}}`/`3.`/`4.`/`Template pre: Table` cases stayed broken for the same reason. Do step 2 first.
+4. Re-run `reparseTemplatedAttributes` (already ported) so the leading `|class="foo"` becomes the
+   attribute and `title="fail"|bar` the content.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
