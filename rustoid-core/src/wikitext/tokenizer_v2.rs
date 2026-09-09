@@ -3975,6 +3975,18 @@ pub fn tokenize_as_attributes(wikitext: &str) -> Vec<KV> {
     tokenizer.parse_generic_newline_attributes()
 }
 
+/// Retokenize a table-cell attribute prefix as `row_syntax_table_args`, returning
+/// `(attributes, separator)` (mirrors PHP's `PegTokenizer::tokenizeTableCellAttributes`,
+/// which runs the `row_syntax_table_args` rule and returns `[attributes, spaces, pipe]`).
+/// Used by the `TableFixups::reparseTemplatedAttributes` DOM pass to reinterpret a
+/// template-generated `k=v|` prefix as cell attributes. When the input is a bare
+/// word (no trailing `pipe !pipe`), the rule backtracks and returns no attributes.
+pub fn tokenize_table_cell_attributes(wikitext: &str) -> (Vec<KV>, String) {
+    let options = TokenizerOptions::default();
+    let mut tokenizer = PegTokenizer::new(wikitext, &options);
+    tokenizer.parse_row_syntax_table_args()
+}
+
 /// Tokenize `wikitext` with the `start` rule and a caller-specified start-of-line
 /// flag, returning the token stream. Mirrors PHP's
 /// `PegTokenizer::tokenizeSync( $text, [ 'sol' => $sol ] )` (the `start` rule),
@@ -5125,6 +5137,22 @@ mod tests {
             find_wikilink_close("File:Foobar.jpg|thumb|[[Link1|[meh]]]]]"),
             Some(37)
         );
+    }
+
+    #[test]
+    fn test_tokenize_table_cell_attributes() {
+        // A `k=v|` prefix reparses as `row_syntax_table_args`: the attribute(s)
+        // plus the trailing pipe separator (mirrors `tokenizeTableCellAttributes`).
+        let (attrs, sep) = tokenize_table_cell_attributes("style='color:red;'|");
+        assert_eq!(sep, "|");
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0].key.as_str(), Some("style"));
+        assert_eq!(attrs[0].value.as_str(), Some("color:red;"));
+
+        // A bare word (no trailing `pipe !pipe`) backtracks to no attributes.
+        let (attrs, sep) = tokenize_table_cell_attributes("Foo");
+        assert_eq!(sep, "");
+        assert!(attrs.is_empty());
     }
 
     #[test]

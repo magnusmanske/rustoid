@@ -40,17 +40,37 @@ are the authority; port their logic bit-for-bit.
 - "Table security: embedded pipes", "Hacky use to indent tables, with comments (T65979)",
   "Wikitext tables can be nested inside HTML tables"
 
-### 2. Template-generated table cells + encapsulation (AttributeExpander + TemplateHandler)
+### 2. Template-generated table cells + encapsulation (AttributeExpander + TableFixups)
 The biggest remaining cluster. Needs `about`/`typeof="mw:Transclusion mw:ExpandedAttrs mw:LocalizedAttrs"`,
-`data-mw` parts, `pi` arrays, `firstPipeSrc`, etc.
-- "1./2a./3./4. Template-generated table cell attributes and cell content …"
-- "Template generated table cell with attributes"
-- "Templated table cell with untemplated attributes" (+ "Cell combination tests", "Integrated mode only")
-- "T343874: Templated table that has a templated cell with untemplated attributes"
-- "Multiple transclusions in discarded table attribute position should be handled properly"
-- "2b: Delete whitespace/comments if found in fosterable position while template-wrapping"
-- "Accept `!!` in templates"
-- "Templated table cell with untemplated attributes: Cell combination tests"
+`data-mw` parts, `pi` arrays, `firstPipeSrc`, etc. **Root cause: a missing `TableFixups` DOM pass**
+(`src/Wt2Html/DOM/Handlers/TableFixups.php`, ~1110 lines). rustoid already has `build_expanded_attrs`
++ `DataMwAttrib` (in `pipeline/attribute_expander.rs`) wired via `Parser::expand_attributes`; what's
+missing is the *DOM post-processing* that re-interprets templated cell content as attributes.
+
+#### Implementation plan (port `TableFixups::handleTableCellTemplates` + `reparseTemplatedAttributes`)
+1. `collectAttributishContent(env, cell, templateWrapper)` — walk the cell's children accumulating
+   text/`mw:Entity`/`mw:Transclusion` (hoisted `transclusions` list) / `mw:DOMFragment` (`<frag-marker>`),
+   short-circuit on `shouldAbortAttr` (wikilink/figure). Returns `{txt, frags, transclusions}`.
+2. `reparseTemplatedAttributes`:
+   - regex `/(^[^|]+\|)([^|]|$)/D` on `txt` → `attributishPrefix` (splice `<frag-marker>` → fragment text).
+   - **`tokenizeTableCellAttributes(prefix, false)`** — a NEW tokenizer entry using
+     `row_syntax_table_args` (= `table_attributes<tableCellArg>`); returns `[attributes, spaces, pipe]`.
+     (rustoid has `parse_row_syntax_table_args` already; add a public `tokenize_table_cell_attributes`).
+   - `Sanitizer::applySanitizedArgs` → `sanitize_tag_attrs(name, attrs)` and `setAttribute` each kept attr.
+   - set `MERGED_TABLE_CELL`, clear `TABLE_CELL_WITH_NO_ATTRIBUTE_SYNTAX`.
+   - `hoistTransclusionInfo(dtState, transclusions, cell)` — lift the first transclusion's
+     `about`/`typeof`/`data-mw` onto the `<td>` (and drop the inner `mw:Transclusion` span's about).
+   - `setInnerHTML(cell, preg_replace('/^[^|]*\|/', '', innerHTML))` — drop consumed attr content.
+3. `handleTableCellTemplates` driver — DOM traverse `td`/`th`, skip HTML cells/templated well-balanced
+   tables, call `getReparseType` → `pipeStatusInContent` (for `MAYBE_REPARSE_ATTRS` when
+   `TABLE_CELL_WITH_NO_ATTRIBUTE_SYNTAX`), recurse into any new split cells.
+4. Wire a `table_fixups` pass into `Parser::build_ast` (after `tplwrap`, before `cleanup`/`redlinks`).
+
+Tests: "1./2a./3./4. Template-generated table cell attributes…", "Template generated table cell with
+attributes", "Templated table cell with untemplated attributes", "T343874", "Multi-line
+extension/transclusion tags in a row", "Accept `!!` in templates", "Spec syntactic differences
+(`!!` vs `||`)".
+extension/transclusion tags in a row", "A table with …
 
 ### 3. Wikilink edge cases
 - ~~"Piped link with no link text"~~ (done, `eeb2eb9`: `[[X|]]` pipe trick is literal text)
