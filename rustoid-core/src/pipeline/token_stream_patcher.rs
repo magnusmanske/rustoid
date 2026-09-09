@@ -47,6 +47,29 @@ fn is_whitespace_string(item: &Item) -> bool {
     matches!(item, Item::Str(s) if !s.is_empty() && s.chars().all(|c| c == ' ' || c == '\t'))
 }
 
+/// Whether a string begins with list/table syntax that triggers the T2529
+/// reparse: `{|` (table start) or a list character `*`/`#`/`;`/`:`. Mirrors
+/// PHP's `preg_match( '/^(?:{\\|[:;#*])/', $token )`.
+fn starts_table_or_list_syntax(s: &str) -> bool {
+    s.starts_with("{|") || s.starts_with(['*', '#', ';', ':'])
+}
+
+/// Re-tokenize a fresh SOL string as a list item or table start (mirrors PHP's
+/// `reprocessTokens` for the `T2529hack` cases, which re-parse the string with
+/// `startRule = 'list_item'` / `'table_start_tag'`).
+///
+/// Since the string came from a spliced template argument and contains no
+/// further templates to expand, a plain `PegTokenizer::tokenize` at SOL is the
+/// faithful equivalent (the nested `wikitext-to-expanded-tokens` pipeline only
+/// re-expands templates, which are absent here).
+fn reprocess_tokens(s: &str) -> Vec<Item> {
+    crate::pipeline::template_handler::tokenize_wikitext_to_items(
+        s,
+        /* in_template */ true,
+        &[],
+    )
+}
+
 /// The TokenStreamPatcher handler.
 pub struct TokenStreamPatcher {
     /// Buffered newline/whitespace/metas awaiting a SOL-transparent link (or
@@ -57,6 +80,16 @@ pub struct TokenStreamPatcher {
     /// used to decide whether a bare `<td>`/`<th>`/`<tr>`/`<caption>` is outside
     /// a table and must be converted back to pipe wikitext.
     wiki_table_nesting: usize,
+    /// Whether we are currently at start-of-line. Mirrors PHP's `$sol`.
+    sol: bool,
+    /// Whether the previous token was a transclusion *start* meta (so a
+    /// following list/table-syntax string triggers the T2529 reparse). Mirrors
+    /// PHP's `$tplInfo['atStart']`.
+    tpl_info_at_start: bool,
+    /// Whether the pipeline is processing independent (top-level / attribute /
+    /// ext-tag) content, where list/table reparse is enabled. Mirrors PHP's
+    /// `$inIndependentParse`.
+    in_independent_parse: bool,
 }
 
 impl TokenStreamPatcher {
@@ -64,12 +97,17 @@ impl TokenStreamPatcher {
         Self {
             nl_ws_meta_token_buf: Vec::new(),
             wiki_table_nesting: 0,
+            sol: true,
+            tpl_info_at_start: false,
+            in_independent_parse: true,
         }
     }
 
     fn reset(&mut self) {
         self.nl_ws_meta_token_buf.clear();
         self.wiki_table_nesting = 0;
+        self.sol = true;
+        self.tpl_info_at_start = false;
     }
 
     /// Emit buffered newlines/whitespace/metas before `ret`. Mirrors PHP
@@ -93,6 +131,7 @@ impl TokenStreamPatcher {
                 Item::Tok(ParsoidToken::Nl(_)) => {
                     // onNewline: buffer the newline, stay at SOL.
                     self.nl_ws_meta_token_buf.push(token);
+                    self.sol = true;
                 }
                 Item::Tok(ParsoidToken::Eof(_)) => {
                     // onEnd: flush buffered newlines/metas, then emit EOF.
@@ -115,13 +154,54 @@ impl TokenStreamPatcher {
     /// table-row reparse path).
     fn on_any(&mut self, token: Item) -> Option<Vec<Item>> {
         match &token {
-            Item::Str(_) => {
-                // Whitespace-only strings are buffered with pending newlines;
-                // otherwise flush the buffer first.
+            Item::Str(s) => {
+                // While buffering newlines (awaiting a SOL-transparent link),
+                // buffer intervening whitespace-only strings too.
                 if is_whitespace_string(&token) && !self.nl_ws_meta_token_buf.is_empty() {
                     self.nl_ws_meta_token_buf.push(token);
                     return Some(Vec::new());
                 }
+
+                // T2529 hack: a fresh string right after a transclusion start
+                // meta that begins with list/table syntax is re-tokenized as a
+                // list item / table start. This is how `{{1x|*bar}}` — whose
+                // `{{{1}}}` spliced to the bare string `*bar` — becomes a
+                // `<ul><li>` (the tokenizer never saw `*bar`). When we are not
+                // already at SOL, a newline is inserted first to force SOL
+                // (mirrors PHP's `T2529hack` newline insertion).
+                let t2529hack = self.tpl_info_at_start && starts_table_or_list_syntax(s);
+                if t2529hack && !self.sol {
+                    self.nl_ws_meta_token_buf.push(Item::Tok(ParsoidToken::Nl(
+                        crate::wikitext::tokens_v2::NlTk::new(
+                            crate::wikitext::tokens_v2::SourceRange::new(0, 0),
+                        ),
+                    )));
+                    self.sol = true;
+                }
+
+                if self.sol && self.in_independent_parse && t2529hack {
+                    if s.starts_with("{|") {
+                        self.wiki_table_nesting += 1;
+                    }
+                    let reprocessed = reprocess_tokens(s);
+                    // The re-tokenized content is fully expanded (end of TT2);
+                    // leaves us not-at-SOL for subsequent content.
+                    self.sol = false;
+                    self.tpl_info_at_start = false;
+                    return Some(self.get_result_tokens(reprocessed));
+                }
+
+                if self.sol {
+                    // Plain text at SOL: stays SOL only if whitespace, else clears.
+                    if is_whitespace_string(&token) {
+                        // stays at SOL; falls through to emit below.
+                    } else {
+                        self.sol = false;
+                    }
+                } else {
+                    self.sol = false;
+                }
+                self.tpl_info_at_start = false;
                 Some(self.get_result_tokens(vec![token]))
             }
             Item::Tok(ParsoidToken::Comment(_)) | Item::Tok(ParsoidToken::EmptyLine(_)) => {
@@ -244,15 +324,20 @@ impl TokenStreamPatcher {
         // any pending newlines so an empty transclusion doesn't disturb a
         // following SOL-transparent link.
         if stt.name == "meta" && stt.data_parsoid.stx.as_deref() != Some("html") {
-            let is_transclusion = stt
+            let ty = stt
                 .attribs
                 .iter()
                 .find(|kv| kv.key.as_str() == Some("typeof"))
-                .and_then(|kv| kv.value.as_str())
-                .is_some_and(|ty| {
-                    ty.split_whitespace()
-                        .any(|x| x == "mw:Transclusion" || x == "mw:Param")
-                });
+                .and_then(|kv| kv.value.as_str());
+            let has_type = |x: &str| ty.is_some_and(|t| t.split_whitespace().any(|c| c == x));
+            // Track whether we are right after a transclusion *start* meta
+            // (so a following list/table-syntax string re-tokenizes).
+            if has_type("mw:Transclusion") {
+                self.tpl_info_at_start = true;
+            } else if has_type("mw:Transclusion/End") {
+                self.tpl_info_at_start = false;
+            }
+            let is_transclusion = has_type("mw:Transclusion") || has_type("mw:Param");
             if is_transclusion && !self.nl_ws_meta_token_buf.is_empty() {
                 self.nl_ws_meta_token_buf.push(token);
                 return Some(Vec::new());
@@ -434,6 +519,36 @@ mod tests {
         // Expect: "a", newline, "|" text, "b".
         assert_eq!(out.len(), 4, "{out:?}");
         assert!(matches!(&out[2], Item::Str(s) if s == "|"), "{out:?}");
+    }
+
+    #[test]
+    fn test_t2529_list_reparse_after_transclusion() {
+        // A transclusion start meta immediately followed by a bare `*bar` string
+        // (as produced by `{{1x|*bar}}` token-level arg splicing) re-tokenizes
+        // `*bar` into a listItem.
+        let mut tsp = TokenStreamPatcher::new();
+        let out = tsp.run(vec![meta("mw:Transclusion"), Item::Str("*bar".to_string())]);
+        assert!(
+            out.iter().any(|it| {
+                matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem")
+            }),
+            "expected a listItem token, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_t2529_no_reparse_without_transclusion() {
+        // Without a preceding transclusion start meta, `*bar` at SOL is just text
+        // (well, in a full pipeline it would be tokenized upstream; here the
+        // patcher must leave an untagged string alone).
+        let mut tsp = TokenStreamPatcher::new();
+        let out = tsp.run(vec![Item::Str("*bar".to_string())]);
+        assert!(
+            !out.iter().any(|it| {
+                matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem")
+            }),
+            "did not expect a listItem token, got {out:?}"
+        );
     }
 
     #[test]
