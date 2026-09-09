@@ -646,10 +646,11 @@ fn transfer_source_between_cells(
 
     let row_syntax_char = if name(to) == "td" { "|" } else { "!" };
     if let Some(from_dp) = from.dp.as_mut()
-        && row_syntax_char == "|" {
-            from_dp.start_tag_src = None;
-            from_dp.attr_sep_src = None;
-        }
+        && row_syntax_char == "|"
+    {
+        from_dp.start_tag_src = None;
+        from_dp.attr_sep_src = None;
+    }
 
     let has_row_syntax = src.ends_with(row_syntax_char);
     if has_row_syntax && let Some(to_dp) = to.dp.as_mut() {
@@ -709,9 +710,10 @@ fn merge_cells(from_src: &str, from: &mut Node, to: &mut Node) {
             to.data_mw = Some(dmw);
         }
         if from.dp.as_ref().and_then(|d| d.pi.clone()).is_some()
-            && let Some(dp) = to.dp.as_mut() {
-                dp.pi = from.dp.as_ref().and_then(|d| d.pi.clone());
-            }
+            && let Some(dp) = to.dp.as_mut()
+        {
+            dp.pi = from.dp.as_ref().and_then(|d| d.pi.clone());
+        }
     }
 
     // Migrate `from`'s children into `to` (at the front for identical types,
@@ -845,10 +847,7 @@ fn reparse_with_previous_cell(
         && cell_tmp_flag(prev, |t| t.non_mergeable_table_cell)
         && prev.dp.as_ref().and_then(|d| d.stx.as_deref()) != Some("row")
     {
-        if prev_cell_content
-            .as_deref()
-            .is_some_and(|c| !c.is_empty())
-        {
+        if prev_cell_content.as_deref().is_some_and(|c| !c.is_empty()) {
             // `$prev` is `||..` in SOL position with content.
             convert_attribs_to_content(cell, true, true);
             merge_cells(prev_cell_src.as_deref().unwrap_or(""), prev, cell);
@@ -867,10 +866,7 @@ fn reparse_with_previous_cell(
         if !cell_is_td && !cell_has_attrs {
             // `<th>` without attributes: its `!` becomes content.
             cell.children.insert(0, Node::text("!"));
-        } else if prev_cell_content
-            .as_deref()
-            .is_some_and(|c| !c.is_empty())
-        {
+        } else if prev_cell_content.as_deref().is_some_and(|c| !c.is_empty()) {
             // `$prev`'s content becomes `$cell`'s attributes.
             let reparse_src = prev_cell_content.as_deref().unwrap_or("").to_string() + "|";
             let (attrs, _sep) =
@@ -1060,13 +1056,17 @@ fn process_children(
     let mut i = 0;
     while i < children.len() {
         let child = children[i].clone();
-        // The immediate previous sibling (may be a text/comment node), mirroring
-        // PHP's `$cell->previousSibling`.
-        let prev_sibling: Option<Node> = if i > 0 {
-            Some(children[i - 1].clone())
-        } else {
-            None
-        };
+        // The immediate previous sibling. Use the last *emitted* node in `out`
+        // (which reflects merges), mirroring PHP's live-DOM `$cell->previousSibling`:
+        // when the previous cell was merged into the cell before it, the previous
+        // sibling is the merged result, not the absorbed cell.
+        let prev_sibling: Option<Node> = out.last().cloned().or_else(|| {
+            if i > 0 {
+                Some(children[i - 1].clone())
+            } else {
+                None
+            }
+        });
         match &child.kind {
             NodeKind::Element(ElementKind::Table) => {
                 // A well-balanced templated table is skipped wholesale.
