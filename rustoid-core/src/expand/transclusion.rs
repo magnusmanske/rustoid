@@ -139,6 +139,15 @@ pub fn substitute_args(wikitext: &str, args: &TemplateArgs, max_depth: u32) -> R
                     resolved
                 };
 
+                // A `{{!}}` magic pipe in the *resolved argument value* expands
+                // to a literal `|` (its purpose is to escape a pipe that would
+                // otherwise be consumed as an argument separator). This differs
+                // from `{{!}}` written directly in the template source, which is
+                // left intact for token-level handling (`processSpecialMagicWord`
+                // → `<td>`/`|`); only the substituted value's `{{!}}` is unwrapped
+                // here, after the argument has already been split.
+                let expanded = tpl_args::replace_magic_pipe(&expanded);
+
                 result.push_str(&expanded);
                 i = last_brace + 1; // skip past }}}
             } else {
@@ -339,6 +348,23 @@ mod tests {
         args.add_positional("a|b");
         let result = substitute_args("Value: {{{1}}}", &args, 5).unwrap();
         assert_eq!(result, "Value: a|b");
+    }
+
+    #[test]
+    fn test_magic_pipe_word_expands_in_resolved_arg() {
+        // A `{{!}}` magic pipe in an argument *value* expands to `|` when that
+        // argument is substituted (its purpose is to escape a pipe in the arg),
+        // e.g. `{{1x|1={{!}}title="fail"{{!}}bar}}` → `|title="fail"|bar`.
+        let mut args = TemplateArgs::new();
+        args.add_named("1", "{{!}}title=\"fail\"{{!}}bar");
+        let result = substitute_args("{{{1}}}", &args, 5).unwrap();
+        assert_eq!(result, "|title=\"fail\"|bar");
+
+        // Positional value too.
+        let mut args = TemplateArgs::new();
+        args.add_positional("Main Page{{!}}Something else");
+        let result = substitute_args("{{{1}}}", &args, 5).unwrap();
+        assert_eq!(result, "Main Page|Something else");
     }
 
     #[test]
