@@ -423,7 +423,7 @@ impl ParserFunctions {
         let mut tag_attribs: Vec<KV> = Vec::new();
         for kv in &args[1..] {
             if key_value_to_string(&kv.key).is_empty() {
-                content.push(key_value_to_item(&kv.value));
+                content.extend(key_value_to_items(&kv.value));
             } else {
                 let mut kv = kv.clone();
                 kv.value = KeyValue::Str(strip_attr_value_quotes(&key_value_to_string(&kv.value)));
@@ -477,7 +477,7 @@ impl ParserFunctions {
                 .iter()
                 .map(|it| match it {
                     Item::Str(s) => s.clone(),
-                    Item::Tok(t) => t.to_string(),
+                    Item::Tok(t) => token_to_source(t),
                 })
                 .collect::<String>(),
         );
@@ -547,17 +547,38 @@ impl ParserFunctions {
     }
 }
 
-/// Convert a KeyValue to an Item.
-fn key_value_to_item(v: &KeyValue) -> Item {
+/// Convert a `KeyValue` into a flat token chunk, splicing every token (a whole
+/// `Tokens` list expands to multiple `Item`s). Mirrors PHP's `tag_worker` which
+/// does `PHPUtils::pushArray($toks, $kv->v)` for a non-string argument value,
+/// so `mw-quote`/`wikilink`/etc. tokens flow into the tag body instead of being
+/// collapsed to a string via `tokensToString`.
+fn key_value_to_items(v: &KeyValue) -> Vec<Item> {
     match v {
-        KeyValue::Str(s) => Item::Str(s.clone()),
-        KeyValue::Tokens(t) => {
-            if t.len() == 1 {
-                t[0].clone()
-            } else {
-                Item::Str(tokens_to_string(t))
-            }
-        }
+        KeyValue::Str(s) => vec![Item::Str(s.clone())],
+        KeyValue::Tokens(t) => t.clone(),
+    }
+}
+
+/// Reconstruct a single token's *wikitext source*, mirroring how PHP's token
+/// stream round-trips inline tokens (bash from `data_parsoid->src`, or the
+/// `value` attribute for `mw-quote`, etc.). Used when an extension body must be
+/// re-serialized for `format="wikitext"` re-tokenization. Returns empty for
+/// tokens with no recoverable source.
+fn token_to_source(t: &ParsoidToken) -> String {
+    let dp_src = t.data_parsoid().and_then(|dp| dp.src.clone());
+    if let Some(src) = dp_src {
+        return src;
+    }
+    match t {
+        // `mw-quote` carries its source in the `value` attribute (e.g. `'''`).
+        ParsoidToken::SelfclosingTag(tk) if tk.name == "mw-quote" => tk
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("value"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
     }
 }
 

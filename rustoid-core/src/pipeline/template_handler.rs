@@ -469,7 +469,14 @@ pub fn process_special_magic_word(magic_word_type: &str, in_template: bool) -> V
 
     if magic_word_type == "!" {
         if in_template {
-            let td = TagTk::new("td", vec![], DataParsoid::default());
+            // Inside a template, `{{!}}` produces a `<td>` so the token can be
+            // recognized as a cell in the enclosing table; the empty `attrSrc`
+            // plus the `AT_SRC_START` flag tell `TableFixups` to reinterpret it as
+            // a literal `|` content separator (mirrors PHP's `processSpecialMagicWord`).
+            let mut dp = DataParsoid::default();
+            dp.tmp.attr_src = Some(String::new());
+            dp.tmp.at_src_start = true;
+            let td = TagTk::new("td", vec![], dp);
             vec![Item::Tok(ParsoidToken::Tag(td))]
         } else {
             vec![Item::Str("|".to_string())]

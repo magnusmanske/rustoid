@@ -1571,10 +1571,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             if stt.name == "template" || stt.name == "template3" {
                 let about_id = self.new_about_id(about_counter);
-                let params = crate::pipeline::parser_functions::Params::new(stt.attribs.clone());
+                // Expand `{{{…}}}` template-argument references in the token's
+                // argument keys/values against the current frame (mirrors PHP's
+                // `expandTemplateNatively` → `AttributeTransformManager::process`, so
+                // `{{#tag:pre|{{{1}}}|…}}` sees the argument's *value*).
+                let attribs = crate::pipeline::attribute_transform_manager::process(
+                    frame,
+                    false,
+                    in_template,
+                    &stt.attribs,
+                )
+                .unwrap_or_else(|| stt.attribs.clone());
+                let params = crate::pipeline::parser_functions::Params::new(attribs.clone());
 
-                let target_str = stt
-                    .attribs
+                let target_str = attribs
                     .first()
                     .and_then(|kv| kv.key.as_str())
                     .unwrap_or("")
@@ -1615,9 +1625,36 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             .await;
                         out.extend(expanded);
                     }
+                    Some(ResolvedTarget::Variable {
+                        magic_word_type: Some(magic),
+                        ..
+                    }) => {
+                        // The `{{!}}` magic word expands to a literal `|` at the
+                        // top level, or a `<td>` inside a template (so TableFixups
+                        // can reinterpret it as a cell separator). PHP's
+                        // `expandTemplate` → `processSpecialMagicWord` does this at
+                        // the token level; it must not be string-substituted and
+                        // re-tokenized into a table delimiter.
+                        out.extend(
+                            crate::pipeline::template_handler::process_special_magic_word(
+                                &magic,
+                                in_template,
+                            ),
+                        );
+                    }
                     _ => {
-                        let expanded =
-                            TemplateHandler.process(self.config, frame, about_counter, vec![item]);
+                        // Rebuild the token with expanded argument references so
+                        // parser-function / `mw:Param` / variable paths see the arg
+                        // *values* (e.g. `{{#tag:pre|{{{1}}}|…}}`).
+                        let mut expanded_tok = stt.clone();
+                        expanded_tok.attribs = attribs;
+                        let expanded_item = Item::Tok(ParsoidToken::SelfclosingTag(expanded_tok));
+                        let expanded = TemplateHandler.process(
+                            self.config,
+                            frame,
+                            about_counter,
+                            vec![expanded_item],
+                        );
                         out.extend(expanded);
                     }
                 }
@@ -1803,42 +1840,26 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let template_src = crate::expand::transclusion::extract_includeonly_sections(&template_src);
         let template_src = crate::expand::transclusion::extract_onlyinclude_sections(&template_src);
 
-        // Substitute the template's arguments into its source.
-        use crate::expand::transclusion::TemplateInvocation;
-        use crate::wikitext::token_utils::key_value_to_string;
-        let mut positional_args = Vec::new();
-        let mut named_args = std::collections::HashMap::new();
-        for kv in params.args.iter().skip(1) {
-            let k = key_value_to_string(&kv.key);
-            let v = key_value_to_string(&kv.value);
-            if k.trim().is_empty() {
-                positional_args.push(v);
-            } else {
-                named_args.insert(k.trim().to_string(), v);
-            }
-        }
-        let invocation = TemplateInvocation {
-            name: name.to_string(),
-            positional_args,
-            named_args,
-        };
-        let substituted = crate::expand::transclusion::substitute_args(
-            &template_src,
-            &invocation.to_template_args(),
-            40,
-        )
-        .unwrap_or(template_src);
-
-        // Re-tokenize and recursively expand the substituted source with the
-        // child frame. Extension tags must be registered so their bodies are
-        // captured as `extension` tokens (not expanded as templates/list/etc.).
+        // Tokenize the template source *without* string substitution (mirrors PHP's
+        // `processTemplateSource`, which tokenizes with `inTemplate=true` and defers
+        // argument substitution to `Frame::expand`). Extension tags must be
+        // registered so their bodies are captured as `extension` tokens.
         let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
-            &substituted,
+            &template_src,
             /* in_template */ true,
             self.config.extension_tags(),
         );
+
+        // Splice `{{{…}}}` template-argument references at the token level using
+        // the child frame (mirrors `Frame::expand`). Argument values were already
+        // tokenized by the tokenizer (`template_param_text`), so a `{{!}}` stays a
+        // `template` token and a `[[…]]` a `wikilink` rather than being flattened
+        // and re-tokenized (which would mis-read a leading `|` as table-cell syntax).
+        // Then recursively expand remaining `template` tokens (`{{!}}` → `|`/`<td>`,
+        // nested templates, parser functions).
+        let spliced = child_frame.expand(&items);
         let expanded =
-            Box::pin(self.expand_templates(&child_frame, items, Some(src), about_counter, true))
+            Box::pin(self.expand_templates(&child_frame, spliced, Some(src), about_counter, true))
                 .await;
 
         if in_template || target_has_comment {

@@ -388,10 +388,12 @@ fn convert_non_html_token_to_string(token: &ParsoidToken) -> Vec<Item> {
 
     // Append the cell-attribute source (if any), then the attribute separator
     // for cells (`|`/`!`), mirroring `TableFixups::convertAttribsToContent`'s
-    // re-join. Reparsing (when the attribute source contains `'[{<`) is not yet
-    // wired; the bare-pipe reconstruction covers the common stripped-cell case.
-    if let Some(cell_attr_src) = dp.tmp.attr_src.as_deref() {
-        buf.push_str(cell_attr_src);
+    // re-join. An *empty* `attrSrc` (the `{{!}}` magic-word `<td>` has
+    // `attrSrc=''`) is falsy in PHP, so it takes the `else` branch (no extra
+    // separator) — matching PHP's `if ($cellAttrSrc)` truthiness.
+    let cell_attr_src = dp.tmp.attr_src.as_deref().filter(|s| !s.is_empty());
+    if let Some(src) = cell_attr_src {
+        buf.push_str(src);
         if matches!(name, "caption" | "td" | "th") {
             buf.push_str(dp.attr_sep_src.as_deref().unwrap_or("|"));
         }
