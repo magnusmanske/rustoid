@@ -559,17 +559,392 @@ fn cell_tmp_flag(cell: &Node, f: impl Fn(&crate::wikitext::tokens_v2::TempData) 
     cell.dp.as_ref().map(|d| f(&d.tmp)).unwrap_or(false)
 }
 
+/// `WTUtils::hasLiteralHTMLMarker` — the cell's `stx` is `"html"`.
+fn has_literal_html_marker(cell: &Node) -> bool {
+    cell.dp
+        .as_ref()
+        .is_some_and(|d| d.stx.as_deref() == Some("html"))
+}
+
+/// `Utils::isValidDSR($dsr, true)` — start, end, openWidth and closeWidth are
+/// all non-null.
+fn valid_dsr_with_ws(dsr: Option<&DomSourceRange>) -> bool {
+    dsr.is_some_and(|d| {
+        d.start.is_some() && d.end.is_some() && d.open_width.is_some() && d.close_width.is_some()
+    })
+}
+
+/// Extract the cell's source wikitext via `$dsr->substr($source)` (PHP
+/// `DomSourceRange::substr`). Returns `None` when the DSR is invalid or the
+/// source is unavailable.
+fn dsr_substr(dsr: &DomSourceRange, source: Option<&str>) -> Option<String> {
+    let (Some(start), Some(end)) = (dsr.start, dsr.end) else {
+        return None;
+    };
+    source.and_then(|s| s.get(start..end).map(str::to_string))
+}
+
+/// `DomSourceRange::innerSubstr` — the cell's content, between the open/close
+/// tag widths.
+fn dsr_inner_substr(dsr: &DomSourceRange, source: Option<&str>) -> Option<String> {
+    let (Some(start), Some(end)) = (dsr.start, dsr.end) else {
+        return None;
+    };
+    let inner_start = start + dsr.open_width.unwrap_or(0);
+    let inner_end = end.saturating_sub(dsr.close_width.unwrap_or(0));
+    source.and_then(|s| s.get(inner_start..inner_end).map(str::to_string))
+}
+
+/// `stripTrailingPipe` — remove the trailing `|` (td) / `!` (th) from the last
+/// text descendant of `cell`, returning the stripped char (or `None`).
+fn strip_trailing_pipe(cell: &mut Node) -> Option<String> {
+    // Find the last text descendant.
+    fn last_text_mut(node: &mut Node) -> Option<&mut Node> {
+        let mut cur = node;
+        loop {
+            if matches!(cur.kind, NodeKind::Text(_)) {
+                return Some(cur);
+            }
+            let last_child_idx = cur.children.len().checked_sub(1)?;
+            cur = &mut cur.children[last_child_idx];
+        }
+    }
+    let last = last_text_mut(cell)?;
+    let NodeKind::Text(t) = &mut last.kind else {
+        return None;
+    };
+    let stripped = t.pop()?.to_string();
+    Some(stripped)
+}
+
+const PARSOID_ATTRIBUTES: [&str; 5] = [
+    "data-object-id",
+    "typeof",
+    "about",
+    "data-parsoid",
+    "data-mw",
+];
+
+/// `transferSourceBetweenCells` — move a leading source substring (a pipe/`!`)
+/// from `from` to `to`, adjusting DSRs and data-mw (mirrors PHP).
+fn transfer_source_between_cells(
+    src: &str,
+    from: &mut Node,
+    to: &mut Node,
+    empty_from_content: bool,
+) {
+    // If `to` is a transclusion wrapper, prepend `src` to its data-mw parts.
+    if has_type_of(to, "mw:Transclusion")
+        && let Some(dmw_json) = to.data_mw.as_deref()
+        && let Ok(mut dmw) = serde_json::from_str::<serde_json::Value>(dmw_json)
+    {
+        if let Some(parts) = dmw.get_mut("parts").and_then(|p| p.as_array_mut()) {
+            parts.insert(0, serde_json::Value::String(src.to_string()));
+        }
+        to.data_mw = Some(dmw.to_string());
+    }
+
+    let row_syntax_char = if name(to) == "td" { "|" } else { "!" };
+    if let Some(from_dp) = from.dp.as_mut()
+        && row_syntax_char == "|" {
+            from_dp.start_tag_src = None;
+            from_dp.attr_sep_src = None;
+        }
+
+    let has_row_syntax = src.ends_with(row_syntax_char);
+    if has_row_syntax && let Some(to_dp) = to.dp.as_mut() {
+        to_dp.stx = Some("row".to_string());
+    }
+
+    let src_len = src.chars().count();
+    if let Some(to_dp) = to.dp.as_mut()
+        && let Some(to_dsr) = to_dp.dsr.as_mut()
+    {
+        if let Some(start) = to_dsr.start.as_mut() {
+            *start = start.saturating_sub(src_len);
+        }
+        if has_row_syntax && let Some(ow) = to_dsr.open_width.as_mut() {
+            *ow += 1;
+        }
+    }
+    if let Some(from_dp) = from.dp.as_mut()
+        && let Some(from_dsr) = from_dp.dsr.as_mut()
+    {
+        if let Some(end) = from_dsr.end.as_mut() {
+            *end = end.saturating_sub(src_len);
+        }
+        if has_row_syntax
+            && empty_from_content
+            && let Some(ow) = from_dsr.open_width.as_mut()
+        {
+            *ow = ow.saturating_sub(1);
+        }
+    }
+}
+
+/// `mergeCells` — merge `from` into `to`: copy attributes (except the parsoid
+/// set for identical cell types), migrate `from`'s children, and drop `from`.
+/// Mirrors PHP's `mergeCells($fromSrc, $from, $to)`, which always moves `from`'s
+/// attributes+children onto `to` (for non-identical types, `from` is the
+/// authoritative cell and its transclusion attributes are copied onto `to` too).
+fn merge_cells(from_src: &str, from: &mut Node, to: &mut Node) {
+    transfer_source_between_cells(from_src, from, to, false);
+
+    let identical_cell_types = name(from) == name(to);
+    let ignore_parsoid = identical_cell_types;
+
+    // For identical cell types, `from`'s plain attributes migrate to `to`
+    // (skipping the parsoid metadata set). For non-identical types (td/th),
+    // `from` is authoritative, so also copy its parsoid metadata (about/typeof/
+    // data-mw) across — those live on `from` and must move to `to`.
+    for attr in from.attrs.clone() {
+        if !ignore_parsoid || !PARSOID_ATTRIBUTES.contains(&attr.key.as_str()) {
+            to.set_attr(attr.key.clone(), attr.value.clone());
+        }
+    }
+    // Transclusion metadata that is not in the exported `attrs` list (data-mw
+    // is a dedicated field) transfers when `from` holds it.
+    if !identical_cell_types || to.data_mw.is_none() {
+        if let Some(dmw) = from.data_mw.clone() {
+            to.data_mw = Some(dmw);
+        }
+        if from.dp.as_ref().and_then(|d| d.pi.clone()).is_some()
+            && let Some(dp) = to.dp.as_mut() {
+                dp.pi = from.dp.as_ref().and_then(|d| d.pi.clone());
+            }
+    }
+
+    // Migrate `from`'s children into `to` (at the front for identical types,
+    // since `from` precedes `to` in source order).
+    let from_children = std::mem::take(&mut from.children);
+    let insert_at = if identical_cell_types {
+        0
+    } else {
+        to.children.len()
+    };
+    for child in from_children.into_iter().rev() {
+        to.children.insert(insert_at, child);
+    }
+
+    // The merged cell can't merge further.
+    if let Some(dp) = to.dp.as_mut() {
+        dp.tmp.merged_table_cell = true;
+        dp.tmp.table_cell_with_no_attribute_syntax = false;
+    }
+}
+
+/// `convertAttribsToContent` — reinterpret a cell's attribute wikitext as cell
+/// content, moving it into the cell as leading text and dropping the literal
+/// attributes. Mirrors the `!preg_match("#['[{<]#")` optimized (plain string)
+/// branch; the reparse-through-nested-pipeline branch for richer source is not
+/// wired (rare in our fixtures).
+fn convert_attribs_to_content(cell: &mut Node, leading_pipe: bool, trailing_pipe: bool) {
+    let cell_attr_src = cell
+        .dp
+        .as_ref()
+        .and_then(|d| d.tmp.attr_src.clone())
+        .unwrap_or_default();
+
+    if has_type_of(cell, "mw:ExpandedAttrs") {
+        remove_type_of(cell, "mw:ExpandedAttrs");
+        if let Some(dmw_json) = cell.data_mw.as_deref()
+            && let Ok(mut dmw) = serde_json::from_str::<serde_json::Value>(dmw_json)
+        {
+            if let Some(obj) = dmw.as_object_mut() {
+                obj.remove("attribs");
+            }
+            cell.data_mw = Some(dmw.to_string());
+        }
+    }
+
+    let leading_pipe_char = if name(cell) == "td" { "|" } else { "!" };
+    // Plain-string optimization (no `'[{<` constructs).
+    let mut text = String::new();
+    if leading_pipe {
+        text.push_str(leading_pipe_char);
+    }
+    text.push_str(&cell_attr_src);
+    if !cell_attr_src.is_empty() && trailing_pipe {
+        text.push('|');
+    }
+    if !text.is_empty() {
+        cell.children.insert(0, Node::text(text));
+    }
+
+    // Remove the (now-content) literal attributes, keeping parsoid attrs.
+    cell.attrs
+        .retain(|a| PARSOID_ATTRIBUTES.contains(&a.key.as_str()));
+
+    // Drop shadow attributes to suppress them from wt2wt output.
+    if let Some(dp) = cell.dp.as_mut() {
+        dp.a = None;
+        dp.sa = None;
+        dp.tmp.table_cell_with_no_attribute_syntax = true;
+    }
+}
+
+/// `reparseWithPreviousCell` — the merge-cell driver. Given the previous cell
+/// and the current cell, examine their combined source syntax and either merge
+/// or transfer a leading pipe/`!` between them. Returns the number of original
+/// cells (in document order) consumed by the operation: `1` when the current
+/// cell remains (no full merge), or `2` when the current cell was merged into
+/// the previous one.
+fn reparse_with_previous_cell(
+    prev: &mut Node,
+    cell: &mut Node,
+    config: &dyn SiteConfig,
+    source: Option<&str>,
+) -> usize {
+    let prev_is_td = name(prev) == "td";
+    let prev_has_attrs = !cell_tmp_flag(prev, |t| t.table_cell_with_no_attribute_syntax);
+
+    let cell_is_td = name(cell) == "td";
+    let cell_has_attrs = !cell_tmp_flag(cell, |t| t.table_cell_with_no_attribute_syntax);
+
+    // Recover the previous cell's source, using `tsr` start (DSR may have been
+    // expanded to include fostered content).
+    let prev_dsr = prev.dp.as_ref().and_then(|d| d.dsr.clone());
+    let prev_tsr_start = prev
+        .dp
+        .as_ref()
+        .and_then(|d| d.tsr.as_ref())
+        .and_then(|t| t.start);
+    let prev_cell_src = match (&prev_dsr, prev_tsr_start) {
+        (Some(dsr), Some(_tsr)) => dsr_substr(dsr, source),
+        _ => None,
+    };
+    let prev_cell_content = match (&prev_dsr, prev_tsr_start) {
+        (Some(dsr), Some(tsr)) => {
+            // Use tsr->start (mirrors PHP `$prevDsr->start = $prevDp->tsr->start`).
+            let adjusted = DomSourceRange {
+                start: Some(tsr),
+                ..dsr.clone()
+            };
+            dsr_inner_substr(&adjusted, source)
+        }
+        _ => None,
+    };
+
+    let prev_has_trailing_pipe = match &prev_cell_content {
+        Some(c) => {
+            (cell_is_td && c.ends_with('|')) || (!cell_is_td && !prev_is_td && c.ends_with('!'))
+        }
+        None => false,
+    };
+
+    if prev_has_trailing_pipe {
+        // `$prev` is `..|` → no merge; strip the `|` and migrate it to `$cell`.
+        let Some(stripped) = strip_trailing_pipe(prev) else {
+            return 1;
+        };
+        transfer_source_between_cells(&stripped, prev, cell, false);
+        return 1;
+    }
+
+    if prev_is_td
+        && cell_tmp_flag(prev, |t| t.non_mergeable_table_cell)
+        && prev.dp.as_ref().and_then(|d| d.stx.as_deref()) != Some("row")
+    {
+        if prev_cell_content
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+        {
+            // `$prev` is `||..` in SOL position with content.
+            convert_attribs_to_content(cell, true, true);
+            merge_cells(prev_cell_src.as_deref().unwrap_or(""), prev, cell);
+            2
+        } else {
+            // `$prev` is `||` in SOL position, no content → just migrate `|`.
+            transfer_source_between_cells("|", prev, cell, true);
+            1
+        }
+    } else if !prev_has_attrs {
+        // `$prev` has no attributes → merge `$prev` into `$cell`.
+        if cell_is_td && cell_has_attrs {
+            convert_attribs_to_content(cell, false, true);
+        }
+
+        if !cell_is_td && !cell_has_attrs {
+            // `<th>` without attributes: its `!` becomes content.
+            cell.children.insert(0, Node::text("!"));
+        } else if prev_cell_content
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+        {
+            // `$prev`'s content becomes `$cell`'s attributes.
+            let reparse_src = prev_cell_content.as_deref().unwrap_or("").to_string() + "|";
+            let (attrs, _sep) =
+                crate::wikitext::tokenizer_v2::tokenize_table_cell_attributes(&reparse_src);
+            if !attrs.is_empty() {
+                let tag = name(cell);
+                let sanitized = crate::sanitizer::sanitize_tag_attrs(&tag, attrs, |proto| {
+                    config.has_valid_protocol(proto)
+                });
+                for kv in &sanitized {
+                    cell.set_attr(kv.key.to_string(), kv.value.to_string());
+                }
+                prev.children.clear();
+            } else {
+                if cell_is_td {
+                    cell.children.insert(0, Node::text("|"));
+                } else if cell_has_attrs {
+                    convert_attribs_to_content(cell, true, true);
+                }
+            }
+        }
+
+        merge_cells(prev_cell_src.as_deref().unwrap_or(""), prev, cell);
+        2
+    } else if prev_cell_content.as_deref().is_none_or(|c| c.is_empty()) {
+        // `$prev` has attributes and empty content → attrs become content.
+        convert_attribs_to_content(prev, false, false);
+        transfer_source_between_cells("|", prev, cell, true);
+        1
+    } else {
+        // `$prev` has attributes and content → `$cell` merges into `$prev`.
+        // (Faithful to PHP: convert `$cell`'s attrs to content, then
+        // `mergeCells($prevCellSrc, $prev, $cell)` absorbs `$prev` into `$cell`.)
+        convert_attribs_to_content(cell, true, true);
+        merge_cells(prev_cell_src.as_deref().unwrap_or(""), prev, cell);
+        2
+    }
+}
+
 /// `getReparseType` — decide whether to merge/reparse/split.
 ///
-/// The merge-with-previous-cell path is not yet wired (it requires DSR recovery
-/// of preceding cells and `convertAttribsToContent`); we only handle the
-/// reparse/split decisions here.
-fn get_reparse_type(cell: &Node, in_tpl_content: bool) -> ReparseScenario {
+/// The merge decision (PHP Conditions 1–6) precedes the `pipeStatusInContent`
+/// reparse/split check; it needs the previous *element* sibling and valid DSR on
+/// both cells.
+fn get_reparse_type(cell: &Node, in_tpl_content: bool, prev: Option<&Node>) -> ReparseScenario {
     let cell_is_td = name(cell) == "td";
+    let cell_dp = cell.dp.as_ref();
+
+    // The merge-with-previous-cell decision (`maybeCombineWithPrevCell`).
+    if let (Some(prev), Some(prev_dp)) = (prev, prev.and_then(|p| p.dp.as_ref())) {
+        let prev_is_element = matches!(prev.kind, NodeKind::Element(_));
+        if prev_is_element
+            // Condition 3: cell came from the start of a template source.
+            && cell_tmp_flag(cell, |t| t.at_src_start)
+            // Condition 4: not already merged / not failed.
+            && !cell_tmp_flag(cell, |t| t.merged_table_cell)
+            && !cell_tmp_flag(cell, |t| t.failed_reparse)
+            // Conditions 1 & 2: prev is a non-HTML cell with valid DSR.
+            && !has_literal_html_marker(prev)
+            && valid_dsr_with_ws(prev_dp.dsr.as_ref())
+            // Condition 5: not unmergeable (unless td→th).
+            && (!cell_tmp_flag(cell, |t| t.non_mergeable_table_cell)
+                || (name(prev) == "td" && !cell_is_td))
+            // Condition 6: prev doesn't put cell in SOL state.
+            && !puts_next_sibling_in_sol_state(prev)
+        {
+            return ReparseScenario::MaybeCombineWithPrevCell;
+        }
+    }
+
     let test_re = if cell_is_td { "|" } else { "!|" };
     let no_attr_reparsing = !cell_tmp_flag(cell, |t| t.table_cell_with_no_attribute_syntax)
         || (cell_tmp_flag(cell, |t| t.non_mergeable_table_cell)
-            && cell.dp.as_ref().and_then(|d| d.stx.as_deref()) != Some("row"));
+            && cell_dp.and_then(|d| d.stx.as_deref()) != Some("row"));
     pipe_status_in_content(cell, test_re, in_tpl_content, no_attr_reparsing)
 }
 
@@ -684,7 +1059,7 @@ fn process_children(
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
     while i < children.len() {
-        let mut child = children[i].clone();
+        let child = children[i].clone();
         // The immediate previous sibling (may be a text/comment node), mirroring
         // PHP's `$cell->previousSibling`.
         let prev_sibling: Option<Node> = if i > 0 {
@@ -700,16 +1075,63 @@ fn process_children(
                     i += 1;
                     continue;
                 }
+                let mut child = child;
                 let children = std::mem::take(&mut child.children);
                 child.children = process_children(children, config, source);
                 out.push(child);
             }
             NodeKind::Element(ElementKind::TableCell | ElementKind::TableHeader) => {
+                // The merge-with-previous-cell path: when this cell should
+                // combine with its *immediate* previous sibling, mutate both the
+                // previous cell (already emitted to `out`) and this one in place.
+                // Mirror PHP's `$cell->previousSibling`: the merge only fires when
+                // the immediate previous sibling is an Element (a text/comment
+                // separator between cells — e.g. across rows — prevents merging).
+                if get_reparse_type(&child, false, prev_sibling.as_ref())
+                    == ReparseScenario::MaybeCombineWithPrevCell
+                {
+                    // Find and mutate the previous cell in `out`.
+                    if let Some(prev_out) = out.iter_mut().rev().find(|c| {
+                        matches!(
+                            c.kind,
+                            NodeKind::Element(ElementKind::TableCell | ElementKind::TableHeader)
+                        )
+                    }) {
+                        let mut cur = child.clone();
+                        let consumed =
+                            reparse_with_previous_cell(prev_out, &mut cur, config, source);
+                        if consumed == 2 {
+                            // `cur` is the merged result (prev was absorbed).
+                            // Replace the previous cell in `out` with `cur`.
+                            if let Some(pos) = out.iter().rposition(|c| {
+                                matches!(
+                                    c.kind,
+                                    NodeKind::Element(
+                                        ElementKind::TableCell | ElementKind::TableHeader
+                                    )
+                                )
+                            }) {
+                                out[pos] = cur;
+                            }
+                            i += 1;
+                            continue;
+                        }
+                        // consumed == 1: `cur` remains a distinct cell; process it
+                        // normally (reparse/split).
+                        let mut processed =
+                            process_cell(cur, config, source, false, prev_sibling.as_ref());
+                        out.append(&mut processed);
+                        i += 1;
+                        continue;
+                    }
+                }
+
                 let mut processed =
                     process_cell(child, config, source, false, prev_sibling.as_ref());
                 out.append(&mut processed);
             }
             NodeKind::Element(_) | NodeKind::Document => {
+                let mut child = child;
                 let children = std::mem::take(&mut child.children);
                 child.children = process_children(children, config, source);
                 out.push(child);
@@ -738,7 +1160,9 @@ fn process_cell(
 ) -> Vec<Node> {
     let is_templated = has_type_of(&cell, "mw:Transclusion");
     let cell_name = name(&cell);
-    let reparse_type = get_reparse_type(&cell, in_tpl || is_templated);
+    // The merge-with-previous decision is handled by the caller (`process_children`);
+    // here `prev` is irrelevant, so pass `None` (no merge path reached).
+    let reparse_type = get_reparse_type(&cell, in_tpl || is_templated, None);
 
     // Special `<th>` "!! foo" case: strip a leading `!` from a templated `<th>`
     // when its previous sibling is an element that does not put this cell in SOL

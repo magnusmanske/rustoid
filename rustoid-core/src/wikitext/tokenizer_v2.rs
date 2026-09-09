@@ -1375,6 +1375,17 @@ impl<'a> PegTokenizer<'a> {
         if no_attr_syntax {
             dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
+        // `buildTableTokens` sets `AT_SRC_START` when the cell's source is at the
+        // start of its line (preceded only by whitespace + the pipe);
+        // `try_table_heading_tags` only runs at SOL.
+        dp.tmp.at_src_start = true;
+
+        // `buildTableTokens` th branch: a `<th>` with no attribute box whose
+        // content begins with `!` (the `"!!foo"` SOL form parsed as `<th>!foo</th>`)
+        // is non-mergeable.
+        if no_attr_syntax && self.starts_with("!") {
+            dp.tmp.non_mergeable_table_cell = true;
+        }
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
 
@@ -1503,6 +1514,10 @@ impl<'a> PegTokenizer<'a> {
         if no_attr_syntax {
             dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
+        // `buildTableTokens` sets `AT_SRC_START` on a cell at the start of its
+        // source line (preceded only by whitespace + the pipe);
+        // `try_table_data_tags` only runs at SOL.
+        dp.tmp.at_src_start = true;
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
 
