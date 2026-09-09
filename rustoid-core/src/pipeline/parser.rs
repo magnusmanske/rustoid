@@ -1858,6 +1858,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // Then recursively expand remaining `template` tokens (`{{!}}` → `|`/`<td>`,
         // nested templates, parser functions).
         let spliced = child_frame.expand(&items);
+
+        // When the spliced result is *all plain text* (no tokens to preserve, i.e.
+        // the template produced pure wikitext like `{{1x|!!foo}}` → `!!foo`), the
+        // sole string must be re-tokenized at SOL so leading list/table syntax forms
+        // (`!!foo` → `th`, `*bar` → list). Mirrors the now-removed string
+        // `substitute_args` path's whole-source re-tokenize, but only when there is
+        // nothing token-level to preserve (a mixed token+string result, e.g. a nested
+        // template before cell continuation, is left as-is for the tree builder).
+        let spliced = if spliced.iter().all(|it| matches!(it, Item::Str(_))) {
+            let text: String = spliced
+                .iter()
+                .map(|it| match it {
+                    Item::Str(s) => s.as_str(),
+                    _ => "",
+                })
+                .collect();
+            crate::pipeline::template_handler::tokenize_wikitext_to_items(
+                &text,
+                /* in_template */ true,
+                self.config.extension_tags(),
+            )
+        } else {
+            spliced
+        };
+
         let expanded =
             Box::pin(self.expand_templates(&child_frame, spliced, Some(src), about_counter, true))
                 .await;
