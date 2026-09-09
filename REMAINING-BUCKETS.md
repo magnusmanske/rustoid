@@ -133,6 +133,27 @@ be **SOL-aware** (the TT2 `TokenStreamPatcher::reprocessTokens` port), not a fre
 4. Re-run `reparseTemplatedAttributes` (already ported) so the leading `|class="foo"` becomes the
    attribute and `title="fail"|bar` the content.
 
+### Progress update (this turn: steps 2+3 attempted, reverted — 821→812, still -9)
+Step 2 was implemented as `tokenize_template_arg_value` (full *inline* tokenization via
+`try_inline_element`: `[[…]]`→wikilink, `'''…'''`→`mw-quote`, entities, `{{…}}`/`{{{…}}}`; newlines stay
+text so multi-line values round-trip) and verified against PHP (`{{1x|[[Foo|bar]]}}`→wikilink,
+`{{pre|'''123'''}}`→`[mw-quote,''',…]`, `{{1x|*bar}}`→string all match). Steps 2+3 together got **821→812**
+(net -9): the `Template pre: Simple/Indent/Pwrap/List/Heading/Nowiki` cluster *fixed*, but six
+`Template pre: Quotes/Link/Table` and two others *regressed*.
+
+**Root cause of the remaining regression (the real blocker): token→source re-serialization at the
+`{{#tag:…}}` parser-function boundary.** PHP's `ParserFunctions::tag_worker` (line ~434) **splices the arg
+value tokens directly into the tag body** (`if (is_array($kv->v)) pushArray($toks,$kv->v)`), so a
+`mw-quote`/`wikilink` token flows straight to TT3 (QuoteTransformer → `<b>`, etc.). Rust's
+`pf_tag`/`tag_extension_token` instead *serialize* the content via `Item::Tok(t) => t.to_string()`
+(`ParsoidToken::Display` → `<mw-quote/>`), irreversibly losing the quote/wikilink. So the remaining work is
+**make `pf_tag`/`tag_extension_token` splice tokens (or re-serialize faithfully via `value`/`src`/`tsr`)
+rather than `t.to_string()`** — exactly like PHP's `tag_worker` for the non-string arg case.
+
+Also note: PHP's non-strict `TokenUtils::tokensToString` does **not** reconstruct `mw-quote`/`wikilink`
+either (it only handles entities/listItem/urllink/DOMFragment), so the `#tag` path deliberately avoids
+`tokensToString` and splices tokens; Rust's `tag_extension_token` must do the same.
+
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
 - Table attribute values stop at cell separators in cell position (commit `bbbdd54`).
