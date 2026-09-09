@@ -67,19 +67,55 @@ Authoritative PHP output (confirm via `nativeTemplateExpansion:true` + `$env->pa
 `|class="foo"{{1x|1={{!}}title="fail"{{!}}bar}}` — the cell has *literal* attribute `class="foo"`
 (no trailing `|`, so the tokenizer emits it as cell content; `row_syntax_table_args` backtracks), then a
 template that expands to `|title="fail"|bar` (its leading `|` is the attr-content separator). Expected output
-`<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",{template}]`. The blocker is
-**token-level (not string-level) template-argument expansion** — the current async path
-(`TemplateHandler::expand_template_natively` → `substitute_args` → re-tokenize the whole string) cannot
-preserve the distinction between `{{!}}` → `|` as *literal inline text* vs. *table-cell syntax*:
-re-tokenizing `|title="fail"|bar` (with `in_template`) unconditionally parses it as a `<td>` with attr
-`title`, losing both `title="fail"` and the attr-content separator. Confirmed empirically:
-`tokenize_wikitext_to_items("|title=\"fail\"|bar", /*in_template*/ true|false)` → `<td title>bar</td>` in
-both. PHP avoids this because `{{{1}}}` substitution splices the *argument tokens* (a `{{!}}` template
-token + text) directly; the `{{!}}` token then expands to a literal `|` text token via
-`processSpecialMagicWord` without re-tokenizing as cell syntax. The fix is the `AttributeTransformManager`
-(token-level argument expansion) + running `build_expanded_attrs`/`split_tokens` (which already compute
-`unwrappedWT`) on `<td>`/`<th>` cell tokens, so the leading `|class="foo"` is recorded as the leading
-`data-mw.parts` string and `reparseTemplatedAttributes` (already ported) turns it into the attribute.
+`<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",{template}]`. Current actual:
+`<td typeof="mw:Transclusion">class="foo"bar</td>` (the `{{!}}title="fail"{{!}}` collapses to `bar`, and
+`class="foo"` isn't reparsed as an attribute).
+
+The blocker is **token-level (not string-level) template-argument expansion** — the current async path
+(`Parser::expand_one_template` → `substitute_args` → re-tokenize the whole string) cannot preserve the
+distinction between `{{!}}` → `|` as *literal inline text* vs. *table-cell syntax*.
+
+### Verified this session (against `/tmp/parsoid-src`, PHP 8.5)
+PHP's `template_param_text` (Grammar.pegphp) tokenizes argument *values* with `nested_block<table=false,
+extlink=false, templateArg=true, tableCellArg=false>` and `flattenIfArray`'s single-string back to a string.
+Empirically (PegTokenizer dump):
+- `{{1x|*bar}}` arg value → string `"*bar"` (lists are NOT formed at arg-tokenize time; they form when the
+  spliced source is re-tokenized at SOL).
+- `{{1x|1={{!}}title="fail"{{!}}bar}}` arg value → `[template(!), 'title="fail"', template(!), 'bar']` (the
+  `{{!}}` stays a `template` token, NOT table syntax, because of `table=false`).
+- Rust's `tokenize_directives` already matches this: `{{!}}`/`{{{x}}}` → `template`/`templatearg` tokens,
+  bare text stays a string. **This is the correct primitive for argument values.**
+
+The faithful token-level flow (PHP `expandTemplate` → `expandTemplateNatively`):
+1. `AttributeTransformManager::process($frame, ['expandTemplates'=>false,'inTemplate'=>true], $attribs)`
+   expands `{{{…}}}` in argument keys/values via `Frame::expand` *before* target re-resolution.
+2. `processTemplateSource` → `wikitext-to-expanded-tokens` (`Tokenizer` + `TokenTransform2`) tokenizes the
+   fetched source with `inTemplate=true`, `sol=true`; `Frame::expand` splices `templatearg` tokens.
+3. `TokenStreamPatcher` (TT2 stage) re-tokenizes the spliced *string* runs with **SOL tracking**
+   (`reprocessTokens($srcOffsets,$str,$sol)`), so `*bar` → listItem but `!!`/`||`/`{{!}}` cell continuation
+   is preserved. This TT2 role of TokenStreamPatcher is **NOT yet ported** — the existing
+   `pipeline/token_stream_patcher.rs` only covers the TT3 (tree-builder) role.
+4. `{{!}}` magic word → `processSpecialMagicWord` → `'|'` (top level) or `<td attrSrc='' AT_SRC_START>`
+   (`inTemplate`), which `TableFixups` then re-interprets.
+
+### What was tried & reverted this session (no net win yet)
+A coherent token-level attempt (`tokenize_directives` arg-values + `child_frame.expand` splice in
+`expand_one_template` + `AttributeTransformManager` in `expand_templates` for parser-fn args) fixed the
+`{{pre|123}}` family and `{{!}}` direction, but a naive `re_tokenize_string_runs` (re-tokenizing each string
+run at fresh `sol=true`) regressed `!!`/`||` cell continuation (`3. Template-generated table cell…`) and
+`{{!}}`-in-`format=wikitext` (`Template pre: Table`). Net 821→817. Root cause: string-run re-tokenization must
+be **SOL-aware** (the TT2 `TokenStreamPatcher::reprocessTokens` port), not a fresh-SOL re-tokenize.
+
+### Correct next increment (small, isolated commits)
+1. Port the TT2 `TokenStreamPatcher::reprocessTokens`/`onNewline` SOL-tracking string reprocessing (a second
+   `run` role alongside the existing TT3 handler), tracking `$sol` across the stream.
+2. Wire token-level arg values: `parse_template_token` already stores `Tokens`; make `expand_one_template`
+   splice `templatearg` via `Frame::expand` + expand `{{!}}` via `process_special_magic_word`, then run the
+   new SOL-aware reprocessing.
+3. `{{!}}` magic word at token level (`expand_templates` must emit `|`/`<td>` by `in_template`, setting
+   `attr_src=''` + `at_src_start` on the `<td>`); `handle_template` currently hardcodes `|`.
+4. Re-run `reparseTemplatedAttributes` (already ported) so the leading `|class="foo"` becomes the attribute
+   and `title="fail"|bar` the content.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
