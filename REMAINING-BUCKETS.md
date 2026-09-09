@@ -356,22 +356,14 @@ and this exact two-cell output is recorded in `tables-standalone-knownFailures.j
 section (`<td …>title="fail"|bar</td>`, single cell) is thus the **integrated-mode ideal** — unreachable
 in the standalone path that rustoid re-implements.
 
-**Consequence for rustoid:**
-- The "inverted source-cell DSR" (`dsr=[6,5]`) documented below is **not** a bug to fix toward a
-  single-cell result. It is the standalone tree-builder splitting `{{!}} → <td>` markers into sibling
-  cells (2 in PHP, 3 in rustoid before `TableFixups` merges one pair), exactly the shape that ends at
-  PHP's two-cell known-failure output.
-- The genuine, reachable target is PHP's **standalone two-cell** output. The remaining gap is narrower
-  than the notes below imply:
-  1. recover `class="foo"` as an **attribute** on the first cell (rustoid currently leaves it as text
-     content) — this needs a valid `dsr`/`tsr` on the source cell so `reparseWithPreviousCell`'s
-     `prevCellContent` is `Some("class=\"foo\"")` and the `reparse_src = prev + '|'` path fires;
-  2. hoist `typeof`/`about`/`data-mw`/`pi` onto the first cell (and `about` onto the second) — the
-     `hoistTransclusionInfo` port.
-- These four fixtures **cannot** reach the single-cell `html/parsoid` expectation in standalone mode;
-  they are effectively "known failures" for rustoid too (matching PHP). Worth confirming whether the
-  harness treats `html/parsoid` as standalone (then these are expected failures) or confuses it with
-  `+integrated`.
+**Consequence for rustoid (updated after the `6cb9370` ordering fix):**
+- The base "Templated table cell with untemplated attributes" fixture now **matches PHP's standalone
+  two-cell output exactly** — `class="foo"` is recovered as an attribute, the transclusion metadata is
+  hoisted onto the first cell — and the harness marks it SKIP (faithful divergence) rather than FAIL.
+- "Cell combination tests", "Integrated mode only" (its `&nbsp;{{!}}` second row), and "T343874" still
+  FAIL (50 remaining failures). See the "Root cause … FIXED" section below for the exact remaining gap.
+- These fixtures still cannot reach the single-cell `html/parsoid` ideal (PHP standalone can't either —
+  it's a recorded known-failure); matching PHP's standalone output is the correct, faithful target.
 
 ### Re-derived this turn (why no `processSpecialMagicWord` fired in standalone probes)
 `{{!}}` is a magic-word **variable** (ID `!`, canonical `!`; `baseconfig/enwiki.json` `variables[0]`).
@@ -382,39 +374,31 @@ probes that "got `|`" were using `MockSiteConfig` incl. no `!` variable, so `{{!
 redlink/`convertToString` path.) The `pipe = "|" / "{{!}}"` tokenizer rule handles `{{!}}` only in
 table *position* (as `attrSepSrc`), not inside argument values (tokenized with `table=false`).
 
-### Root cause of the rustoid divergence (pinned down this turn via PHP's own `computeDSR`/`tsp` traces)
-PHP's `computeDSR` sees a **single** `<td>` at tree-build time for
-`|class="foo"{{1x|1={{!}}title="fail"{{!}}bar}}`:
+### Root cause of the rustoid divergence — **FOUND & FIXED** (pipeline ordering)
+The divergence was **not** the tree builder (as the prior note guessed). PHP's `dom:post-builder` dump
+confirmed its tree builder *also* splits `{{!}}` into **three** `<td>` cells (source `class="foo"` +
+meta, `title="fail"`, `bar`), exactly like rustoid. The difference is **`ComputeDSR` runs too early in
+rustoid**: PHP's `NESTED_PIPELINE_DOM_TRANSFORMS` order is `… pwrap … migrate-metas … migrate-nls …
+dsr … tplwrap …`, but rustoid's `build_ast`/`wikitext_to_ast` ran `compute_dsr` *immediately after tree
+building* (before `p-wrap` and `migrate-metas`). Running `dsr` against the un-canonicalized DOM stamped
+the source cell with `dsr=(6,53,1,0)` (its `end` leaked out to the table end) instead of PHP's
+`(6,18,1,0)` (bounded at the transclusion START marker's `tsr->start == 18`, i.e. exactly
+`|class="foo"`).
 
-```
-meta [None,52] cs=NULL ce=52          (/End marker)
-meta [18,52]   cs=18  ce=52           (START marker, tsr spans {{1x…}})
-td   [6,7]     cs=6   ce=18           (source cell → dsr=(6,18,1,0))
-```
+**FIXED** (`6cb9370`): moved `compute_dsr` into `post_pwrap_transforms`, between `migrate-nls` and
+`encapsulate_transclusions` (tplwrap), matching PHP's order. The base "Templated table cell with
+untemplated attributes" fixture now produces PHP's standalone 2-cell output exactly — `class="foo"` is
+recovered as an attribute via `reparseWithPreviousCell` (`prevCellContent="class=\"foo\""`) — and the
+harness recognizes it as a faithful divergence (SKIP) rather than a bug.
 
-The two `{{!}}`-produced `<td attr_src='' AT_SRC_START>` markers (`$tsp` trace shows them as
-`TagTk td` with **empty** `data-parsoid`, no `tsr`) are **absorbed back into the single cell** by the
-HTML5 tree builder — Parsoid's `TreeBuilderStage` does not split on them, so the source cell's DSR stays
-bounded at the transclusion START marker's `tsr->start == 18` (exactly `|class="foo"`, offsets 6..18).
-`reparseWithPreviousCell` then reads `prevDsr=(6,18,1,0)` → `prevCellContent="class=\"foo\""` →
-reparses it as an attribute, leaving the 2-cell known-failure output.
+Remaining in this cluster: "Cell combination tests", "Integrated mode only" (its `&nbsp;{{!}}` second
+row), and "T343874" still FAIL (50 remaining failures, down from 51). The "Integrated mode only" first
+row (`|class="foo"{{1x|1= {{!}}bar}}`) is now correct; its second row uses `&nbsp;{{!}}` which breaks the
+merge (the `mw:Entity` `&nbsp;` child isn't folded into `prevCellContent`).
 
-rustoid's tree builder instead **splits** those markers into three sibling `<td>` cells and stamps the
-source cell with `dsr=(6,53,1,0)` (its `end` leaks out to the table end). That wider `end` makes
-`prevCellContent = "class=\"foo\"{{1x…}}"` (not `"class=\"foo\""`), so `reparseWithPreviousCell`'s
-attribute-reparse fails and `class="foo"` stays text. **Fixing this isn't a `ComputeDSR` change** — the
-tree builder must stop splitting `{{!}}`-marker `<td>`s (absorb them as the PHP tree builder does), most
-likely in `tree_builder_html.rs` (the `mw:Transclusion`-in-`InCell` foster/absorb path) or by matching
-Parsoid's `handleDeletedStartTag`/`insertUnfosteredMeta` behavior around transclusion metas. Once the
-marker `<td>`s become a single cell, `ComputeDSR` naturally yields `end=18` and the existing
-`reparseWithPreviousCell`/`hoistTransclusionInfo` ports should produce the 2-cell known-failure output.
-
-Also landed this turn (net-neutral, faithful): `compute_dsr` now gates the `cs = s` fallback on
-`i == 0` (the leftmost child), matching PHP's `elseif ($s && $child->previousSibling === null)`. A
-unit test (`test_tsr_less_later_sibling_does_not_inherit_s`) locks this in. This alone does not fix the
-cluster (the tree-builder split is the real blocker), but it corrects a genuine divergence and stops the
-marker cells from collapsing the source cell's `end` to `5` (it previously produced the inverted
-`dsr=[6,5]` documented elsewhere).
+Also landed this turn (faithful): `compute_dsr` now gates the `cs = s` fallback on `i == 0` (leftmost
+child), matching PHP's `elseif ($s && $child->previousSibling === null)`; unit test
+`test_tsr_less_later_sibling_does_not_inherit_s` locks it in.
 
 ## Key pitfalls (do not repeat)
 - If `/tmp/parsoid-src/src/Wt2Html/Grammar.pegphp` looks truncated/empty, restore it:
