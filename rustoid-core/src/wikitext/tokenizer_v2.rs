@@ -1366,8 +1366,14 @@ impl<'a> PegTokenizer<'a> {
 
         let tsr = self.tsr(start, tag_end);
         let mut dp = self.make_dp_tsr(tsr);
+        let no_attr_syntax = sep.is_empty();
         if !sep.is_empty() && sep != "|" {
             dp.attr_sep_src = Some(sep);
+        }
+        // `buildTableTokens`: a `<th>` with no `!…|` attribute box gets the
+        // no-attribute-syntax flag (read by `TableFixups`).
+        if no_attr_syntax {
+            dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
@@ -1401,12 +1407,20 @@ impl<'a> PegTokenizer<'a> {
             let tsr = self.tsr(saved, tag_end);
             let mut dp = self.make_dp_tsr(tsr);
             dp.stx = Some("row".to_string());
+            // Row-syntax (`!!`/`||`) cells are non-mergeable (buildTableTokens +
+            // the `ths` rule). A row cell with no attribute box also gets the
+            // no-attribute-syntax flag.
+            dp.tmp.non_mergeable_table_cell = true;
+            let no_attr_syntax = sep.is_empty();
             if pp != "!!" {
                 // Variation from default (`!!` is the default `ths` separator).
                 dp.start_tag_src = Some(pp);
             }
             if !sep.is_empty() && sep != "|" {
                 dp.attr_sep_src = Some(sep);
+            }
+            if no_attr_syntax {
+                dp.tmp.table_cell_with_no_attribute_syntax = true;
             }
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("th", attrs, dp)));
@@ -1476,12 +1490,18 @@ impl<'a> PegTokenizer<'a> {
 
         let tsr = self.tsr(saved, tag_end);
         let mut dp = self.make_dp_tsr(tsr);
+        let no_attr_syntax = sep.is_empty();
         // Variation from the default `|` separator.
         if pipe != "|" {
             dp.start_tag_src = Some(pipe.clone());
         }
         if !sep.is_empty() && sep != "|" {
             dp.attr_sep_src = Some(sep);
+        }
+        // `buildTableTokens`: a `<td>` with no `|…|` attribute box gets the
+        // no-attribute-syntax flag.
+        if no_attr_syntax {
+            dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
@@ -1508,12 +1528,20 @@ impl<'a> PegTokenizer<'a> {
             let tsr = self.tsr(saved, tag_end);
             let mut dp = self.make_dp_tsr(tsr);
             dp.stx = Some("row".to_string());
+            // Row-syntax (`||`) cells are non-mergeable (buildTableTokens +
+            // the `tds` rule). A row cell with no attribute box also gets the
+            // no-attribute-syntax flag.
+            dp.tmp.non_mergeable_table_cell = true;
+            let no_attr_syntax = sep.is_empty();
             // Variation from the default `||` row separator.
             if pp != "||" {
                 dp.start_tag_src = Some(pp);
             }
             if !sep.is_empty() && sep != "|" {
                 dp.attr_sep_src = Some(sep);
+            }
+            if no_attr_syntax {
+                dp.tmp.table_cell_with_no_attribute_syntax = true;
             }
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));

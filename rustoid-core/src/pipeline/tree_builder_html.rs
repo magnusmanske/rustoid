@@ -1308,13 +1308,23 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
                     }
                     // Wrap non-whitespace text in an `about` span so the range
                     // is a contiguous chain of elements. The span becomes the
-                    // encapsulation target if no earlier element exists.
+                    // encapsulation target if no earlier element exists. Mark it
+                    // with the WRAPPER temp flag (mirrors PHP `addSpanWrappers`),
+                    // on the structured `dp` so it survives the `data_parsoid`
+                    // transfer onto the encapsulation target below.
                     let mut span = Node::element(ElementKind::Span);
                     if let Some(about) = &about {
                         span.set_attr("about", about.clone());
                     }
                     span.push_child(Node::text(s.clone()));
                     span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+                    span.dp = Some(TDataParsoid {
+                        tmp: crate::wikitext::tokens_v2::TempData {
+                            wrapper: true,
+                            ..Default::default()
+                        },
+                        ..TDataParsoid::default()
+                    });
                     if encap_target.is_none() {
                         encap_target = Some(new_content.len());
                     }

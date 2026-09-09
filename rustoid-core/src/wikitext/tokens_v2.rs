@@ -568,6 +568,25 @@ pub struct TempData {
     /// Parsed `-{ … }-` language-variant info (flags, variants, texts),
     /// carried by a `language-variant` token (mirrors `TempData::variantInfo`).
     pub variant_info: Option<VariantInfo>,
+    /// Table cell originating from wikitext syntax with no `|…|` attribute box
+    /// (mirrors `TempData::TABLE_CELL_WITH_NO_ATTRIBUTE_SYNTAX`, 1 << 1).
+    /// Set by the tokenizer; read by `TableFixups` to decide reparse/merge.
+    pub table_cell_with_no_attribute_syntax: bool,
+    /// Table cell using `||`/`!!` row syntax that cannot merge with a previous
+    /// cell (mirrors `TempData::NON_MERGEABLE_TABLE_CELL`, 1 << 2).
+    pub non_mergeable_table_cell: bool,
+    /// A cell that failed to combine with the previous cell (private to
+    /// `TableFixups`; mirrors `TempData::FAILED_REPARSE`, 1 << 3).
+    pub failed_reparse: bool,
+    /// A cell that is a merge of two cells in `TableFixups` (mirrors
+    /// `TempData::MERGED_TABLE_CELL`, 1 << 4).
+    pub merged_table_cell: bool,
+    /// Cell is from the start of a template source (mirrors
+    /// `TempData::AT_SRC_START`, 1 << 5).
+    pub at_src_start: bool,
+    /// A span tag created by `PipelineUtils::addSpanWrappers` (mirrors
+    /// `TempData::WRAPPER`, 1 << 6).
+    pub wrapper: bool,
 }
 
 /// The parsed structure of a `-{ … }-` language-variant construct (mirrors PHP's

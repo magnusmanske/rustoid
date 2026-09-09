@@ -31,6 +31,7 @@ pub mod pre_handler;
 pub mod quote_transformer_v2;
 pub mod sanitizer_handler;
 pub mod section_wrapper;
+pub mod table_fixups;
 pub mod template_encapsulator;
 pub mod template_handler;
 pub mod token_handler_pipeline;

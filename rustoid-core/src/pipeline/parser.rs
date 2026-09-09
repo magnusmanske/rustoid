@@ -1515,6 +1515,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // encapsulation boundary (setting `dp->tail`/`dp->prefix` + migrating
         // `data-mw.parts`).
         crate::pipeline::handle_link_neighbours::run(&mut ast, self.config);
+        crate::pipeline::table_fixups::run(&mut ast, self.config, Some(page_source));
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         // AddRedLinks: resolve which wikilink targets exist, marking missing
