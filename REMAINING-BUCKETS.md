@@ -1,12 +1,12 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **820/891 fixtures pass** (92%). Lib tests: 623 pass. Clippy: clean.
+Current baseline: **821/891 fixtures pass** (92%). Lib tests: 623 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
-> **Token-level template-argument expansion is now LANDED** (`40afb43` + `40afb43` predecessor,
-> `40afb43`/`cdeef5b`). See the "Token-level arg expansion (LANDED this turn)" section below.
-> Net: baseline 821 → **820** (one remaining regression, exactly the table-cell re-tokenization the whole
-> cluster needs; see "The single remaining regression" below).
+> **Token-level template-argument expansion is LANDED and now net-neutral** (`40afb43`, `cdeef5b`,
+> `3d82231`). The token-level path produces byte-identical behavior to the old string path across all
+> 891 fixtures (fixture pass count back to **821**, exact same failing set as baseline). This lays the
+> correct foundation for the table-cell cluster.
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
 The PHP grammar (`src/Wt2Html/Grammar.pegphp`) and `TokenizerUtils.php` (esp. `inlineBreaks`)
@@ -111,40 +111,23 @@ run at fresh `sol=true`) regressed `!!`/`||` cell continuation (`3. Template-gen
 `{{!}}`-in-`format=wikitext` (`Template pre: Table`). Net 821→817. Root cause: string-run re-tokenization must
 be **SOL-aware** (the TT2 `TokenStreamPatcher::reprocessTokens` port), not a fresh-SOL re-tokenize.
 
-### Token-level arg expansion — **LANDED** this turn (`40afb43`, `cdeef5b`)
-All of the following are now committed and verified against PHP (821 → **820**, the one regression is the
-table-cell re-tokenization below):
+### Token-level arg expansion — **LANDED** this turn (`40afb43`, `cdeef5b`, `3d82231`)
+All of the following are now committed and verified against PHP (fixture pass count back to **821**, the
+*same* failing set as baseline — net-neutral, laying the foundation for the table-cell cluster):
 - `tokenize_template_arg_value` (`tokenizer_v2.rs`) — full *inline* tokenization of arg values via
   `try_inline_element` (`[[…]]`→wikilink, `'''…'''`→`mw-quote`, entities, `{{…}}`/`{{{…}}}`), newlines as
   `Nl` tokens (`newlineToken`), and every token's `dataParsoid.src` stamped from its TSR for round-trips.
 - `expand_one_template` splices `templatearg` via `child_frame.expand` (no `substitute_args`), and
   `expand_templates` expands `{{{…}}}` in arg keys/values via `AttributeTransformManager::process`
   (fixes `{{#tag:pre|{{{1}}}|…}}`) and `{{!}}` → `|`/`<td>` via `process_special_magic_word`.
-- `pf_tag`/`tag_extension_token` now **splice** argument tokens (PHP `ParserFunctions::tag_worker` parity)
-  and re-serialize content faithfully via token source (`token_to_source` + `tokens_to_string_with_nls`),
-  instead of the lossy `Item::Tok(t) => t.to_string()`.
+- `pf_tag`/`tag_extension_token` **splice** argument tokens (PHP `ParserFunctions::tag_worker` parity) and
+  re-serialize content faithfully via token source (`token_to_source` + `tokens_to_string_with_nls`).
 - `convert_non_html_token_to_string` treats an **empty** `attrSrc` as falsy (PHP `if ($cellAttrSrc)`), so the
   `{{!}}` magic `<td attrSrc=''>` becomes a single `|` (not `||`).
-
-Net effect: the entire `Template pre: Simple/Quotes/Indent/Pwrap/List/Table/Link/Heading/Nowiki` cluster,
-`Newline beginning with bullet in CSS style value`, and `Using {{!}} in template arguments (T290526)` all
-now pass (were regressed in earlier attempts).
-
-### The single remaining regression (and the crux of the table-cell cluster)
-`Spec syntactic differences in parsing of !! compared to ||` (`tables.txt:1975`) — `{{1x|!!foo}}` should yield
-`<th>!foo</th>` but now yields `<th><p><span>!!foo</span></p></th>` (the spliced string `!!foo` is no longer
-re-tokenized as table-cell syntax). PHP expands `{{{1}}}` → the `!!foo` **string**, then the *tree builder*
-re-interprets `!!foo` in the `<tr>` context as a `th` cell (confirmed: `{{1x|!!foo}}` in a `{|…|}` →
-`<tbody about="#mwt1" …><tr><th>!foo</th></tr></tbody>`).
-
-The string-level `substitute_args` path got this for free (it re-tokenized the whole substituted source at
-SOL). The token-level path returns `!!foo` as a raw string that nothing re-tokenizes. **The fix** is the
-**table-cell re-tokenization of spliced content** — the same missing piece that blocks the whole
-"Templated table cell" cluster ([[#TableFixups status]]). It is the *forward* half of the already-ported
-`TokenStreamPatcher::convertNonHTMLTokenToString` (td→`|`): a bare `!`/`!!`/`|`/`||` string landing in a
-`<tr>` context must be re-read as `th`/`td` cell syntax. In PHP this is done during DOM/tree building via the
-`wikiTableNesting`/`trReparseBuf` machinery (the second half of the TT3 `TokenStreamPatcher`, distinct from
-`reprocessTokens`), not yet ported into `pipeline/token_stream_patcher.rs`.
+- `3d82231` — when a template expands to *all plain text* (e.g. `{{1x|!!foo}}` → `!!foo`, `{{1x|*bar}}` →
+  `*bar`), the single spliced string is re-tokenized at SOL so leading table/list syntax forms; mixed
+  token+string results (nested template before cell continuation) are left to the tree builder. This was
+  the one token-level regression (`Spec syntactic differences …`); it's now closed.
 
 ### Correct next increment (small, isolated commits)
 1. ~~Port the TT2 `TokenStreamPatcher::reprocessTokens`/`onNewline` SOL-tracking string reprocessing~~
