@@ -25,18 +25,24 @@ A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fi
 **Fixed this session: "1.", "2a.", "3. Template-generated table cell attributes and cell content"**
 (818/891, up from 815).
 
-**Still failing** — two distinct root causes:
-1. **The fostered-table encapsulation target** (`table_body_content_target`): when a templated
-   `<td>`/`<th>` is fostered out of a `<table>` (e.g. `{{table_attribs_4}} ||a||b`), `wrap_flipped_children`
-   resolves the encap target to `<tbody>` instead of the `<td>`, so `typeof`/`about` land on `<tbody>`.
-   PHP's `findEnclosingRange` computes `range->start` as the child-of-common-ancestor (the `<td>`/`<p>`),
-   and `MAP_TBODY_TR` only migrates *whitespace* into `tbody`/`tr`, never selecting `<tbody>` as the
-   encap target for inline-cell transclusions.
-2. The whole-table templated-table case (`{{tbl-start}}…{{tbl-end}}`) needs `typeof` on `<table>`, not an
-   empty span.
+**Still failing** — root cause confirmed this session: it is the **unimplemented `reparseWithPreviousCell`
+/ `convertAttribsToContent` merge-cell path**, *not* `table_body_content_target`.
+
+Authoritative PHP output (verified via `/tmp/pt_tbl.php` with a template-mock subclass) for
+`{{table_attribs_4}} ||a||b` is:
+```html
+<td style="background-color:#DC241f;" width="10px" about="#mwt1" typeof="mw:Transclusion" …></td>
+<td about="#mwt1">a</td><td about="#mwt1">b</td>
+```
+I.e. `about` on all three `<td>`s and `typeof="mw:Transclusion"` on the first. In rustoid, the top-level
+tokenizer does not split `||a||b` into cells at encapsulation time (the templated `<td style>` absorbs
+`||a||b` as content and the start meta is fostered before the `<table>`), so the encapsulation lands `typeof`
+on `<tbody>`. The real fix is `TableFixups::reparseWithPreviousCell` (the `MAYBE_COMBINE_WITH_PREV_CELL`
+branch) + `convertAttribsToContent`/`mergeCells`/`transferSourceBetweenCells`/`stripTrailingPipe`, plus the
+`cellAttrTerminatorSeen` → `convertAttribsToContent` early branch of `handleTableCellTemplates`.
 - "4. Template-generated table cell attributes and cell content inside a templated table"
-  (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; gets an empty span + `typeof` on `<tbody>`)
-- "Template generated table cell with attributes" (`{{table_attribs_4}} ||a||b`; `typeof` lands on `<tbody>`)
+  (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; needs `typeof` on `<table>`, not an empty span)
+- "Template generated table cell with attributes" (`{{table_attribs_4}} ||a||b`)
 - "Templated table cell with untemplated attributes" (all variants: "Cell combination tests",
   "Integrated mode only", T343874)
 - "Multiple transclusions in discarded table attribute position should be handled properly"
@@ -46,10 +52,9 @@ A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fi
 could lift `typeof` onto the cell), and the `<th>` leading-`!` strip is gated behind PHP's
 `previousSibling instanceof Element && !putsNextSiblingInSOLState`.
 
-Next step: fix `wrap_flipped_children`/`table_body_content_target` in `tree_builder_html.rs` so inline
-cell transclusion ranges target the `<td>`/`<th>` (not the table body), and templated-table ranges target
-the `<table>` element. The merge-cell path (`reparseWithPreviousCell`/`convertAttribsToContent`) remains
-entirely unimplemented.
+Next step: port `reparseWithPreviousCell` + `convertAttribsToContent` + `mergeCells` +
+`transferSourceBetweenCells` + `stripTrailingPipe` into `table_fixups.rs` (the `MaybeCombineWithPrevCell`
+branch, currently stubbed), and consume `cell_attr_terminator_seen` at the top of `process_cell`.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
