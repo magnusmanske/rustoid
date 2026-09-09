@@ -317,7 +317,13 @@ fn compute_node_dsr(
                                     st_width = Some(tsr.end.saturating_sub(tsr.start.unwrap_or(0)));
                                 }
                             }
-                        } else if s.is_some() {
+                        } else if s.is_some() && i == 0 {
+                            // `$s && $child->previousSibling === null`: only the
+                            // first (leftmost) child inherits `s` when it has no
+                            // TSR of its own. (A tsr-less *later* sibling must not
+                            // snap `cs` back to `s`, which would collapse the RTL
+                            // `ce` and produce an inverted DSR for its leftward
+                            // siblings.)
                             cs = s;
                         }
 
@@ -564,5 +570,35 @@ mod tests {
         let dsr = meta.dp.as_ref().unwrap().dsr.as_ref().unwrap();
         assert_eq!(dsr.start, Some(0));
         assert_eq!(dsr.end, Some(0));
+    }
+
+    #[test]
+    fn test_tsr_less_later_sibling_does_not_inherit_s() {
+        // A tsr-less child that is *not* the leftmost sibling must not snap its
+        // `cs` back to the parent's `s` (mirrors PHP's
+        // `$s && $child->previousSibling === null` gate). Doing so would collapse
+        // the RTL `ce` and give the leftward TSR-bearing sibling an inverted DSR.
+        //
+        // Here: a document with two children — a tsr-bearing `<p>` (offset 0..5)
+        // followed by a tsr-less `<div>` with text "xyz" (offset 5..8). The
+        // tsr-less `<div>` must extend rightward to the document end (8), not
+        // collapse back to `s` (0).
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.dp = Some(dtp_with_tsr(0, 5));
+        p.children.push(Node::text("hello"));
+        let mut div = Node::element(ElementKind::Other("div".to_string()));
+        div.children.push(Node::text("xyz"));
+        doc.children.push(p);
+        doc.children.push(div);
+
+        run(&mut doc, "helloxyz");
+
+        // The tsr-less `<div>` (rightmost, no `s` inheritance) resolves its `end`
+        // from the document end, not `s = 0`.
+        let div = &doc.children[1];
+        let dsr = div.dp.as_ref().unwrap().dsr.as_ref().unwrap();
+        assert_eq!(dsr.end, Some(8));
+        assert!(dsr.start.unwrap() <= dsr.end.unwrap());
     }
 }
