@@ -66,17 +66,20 @@ Authoritative PHP output (confirm via `nativeTemplateExpansion:true` + `$env->pa
 **Next step / root cause for "Templated table cell with untemplated attributes":**
 `|class="foo"{{1x|1={{!}}title="fail"{{!}}bar}}` — the cell has *literal* attribute `class="foo"`
 (no trailing `|`, so the tokenizer emits it as cell content; `row_syntax_table_args` backtracks), then a
-template that expands to `|title="fail"|bar` (its leading `|` is the attr-content separator). The
-*expected* output is `<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",
-{template}]` — the literal `|class="foo"` is the transclusion's *leading wikitext* (recorded by
-`DOMRangeBuilder::encapsulateTemplates`'s leading-wikitext gap, not by `TableFixups`), and `class="foo"`
-becomes the attribute via `reparseTemplatedAttributes`. Two missing pieces remain:
-1. **AttributeExpander + DOMRangeBuilder leading-wikitext**: the transclusion range must extend *backward*
-   over the literal `|class="foo"` prefix (its `dsr.start` < the template's) and record it as a leading
-   `data-mw.parts` string, then `reparseTemplatedAttributes` re-interprets `class="foo"|` as the cell attr.
-   (Currently `data-mw.parts` is `["", {template}, "\n"]` — the leading gap is empty.)
-2. The `reparseTemplatedAttributes` path then hoists `typeof`/`about`/`data-mw` onto the `<td>` (already
-   ported) and drops the consumed `class="foo"|` prefix.
+template that expands to `|title="fail"|bar` (its leading `|` is the attr-content separator). Expected output
+`<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",{template}]`. The blocker is
+**token-level (not string-level) template-argument expansion** — the current async path
+(`TemplateHandler::expand_template_natively` → `substitute_args` → re-tokenize the whole string) cannot
+preserve the distinction between `{{!}}` → `|` as *literal inline text* vs. *table-cell syntax*:
+re-tokenizing `|title="fail"|bar` (with `in_template`) unconditionally parses it as a `<td>` with attr
+`title`, losing both `title="fail"` and the attr-content separator. Confirmed empirically:
+`tokenize_wikitext_to_items("|title=\"fail\"|bar", /*in_template*/ true|false)` → `<td title>bar</td>` in
+both. PHP avoids this because `{{{1}}}` substitution splices the *argument tokens* (a `{{!}}` template
+token + text) directly; the `{{!}}` token then expands to a literal `|` text token via
+`processSpecialMagicWord` without re-tokenizing as cell syntax. The fix is the `AttributeTransformManager`
+(token-level argument expansion) + running `build_expanded_attrs`/`split_tokens` (which already compute
+`unwrappedWT`) on `<td>`/`<th>` cell tokens, so the leading `|class="foo"` is recorded as the leading
+`data-mw.parts` string and `reparseTemplatedAttributes` (already ported) turns it into the attribute.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
