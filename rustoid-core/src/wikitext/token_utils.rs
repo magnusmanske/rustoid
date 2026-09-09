@@ -170,6 +170,40 @@ pub fn key_value_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// Like [`tokens_to_string`], but retains newlines: a `Nl` token is emitted as
+/// its source (a single `\n`), rather than stripped. Mirrors `tokensToString`
+/// with `['retainNLs' => true]`, used where a `format="wikitext"` body must
+/// round-trip its newlines.
+pub fn tokens_to_string_with_nls(tokens: &[Item]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            Item::Str(s) => out.push_str(s),
+            Item::Tok(t) => match t {
+                ParsoidToken::Comment(_) => {}
+                ParsoidToken::Nl(_) => out.push('\n'),
+                ParsoidToken::Tag(tk) if tk.name == "listItem" => {
+                    if let Some(bullets) = tk
+                        .attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("bullets"))
+                        .and_then(|kv| kv.value.as_str())
+                    {
+                        out.push_str(bullets);
+                    }
+                }
+                ParsoidToken::SelfclosingTag(tk) if tk.name == "extension" => {
+                    if let Some(src) = tk.data_parsoid.src.as_deref() {
+                        out.push_str(src);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    out
+}
+
 /// Create an `mw:IndentPreWS` meta token (used by PreHandler).
 pub fn new_indent_pre_ws() -> ParsoidToken {
     let mut tk = SelfclosingTagTk::new("meta", vec![], Default::default());

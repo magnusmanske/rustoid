@@ -2641,14 +2641,37 @@ impl<'a> PegTokenizer<'a> {
         // `inline_breaks` can see the `=`, so it is consumed as content and no
         // split occurs. (This mirrors `template_param_name` +
         // `TokenizerUtils::inlineBreaks` in the PHP grammar.)
+        //
+        // The argument *value* is inline-tokenized (mirrors PHP's
+        // `template_param_text` with `templateArg=true, table=false`), so a
+        // `{{!}}`/`{{{x}}}` becomes a `template`/`templatearg` token, a `[[…]]` a
+        // `wikilink`, `'''…'''` a quote token — rather than raw strings. This lets
+        // the frame splice argument *tokens* directly.
         for part in parts.iter().skip(1) {
             match find_arg_separator_eq(part) {
                 Some(eq) => {
                     let k = part[..eq].trim().to_string();
                     let v = part[eq + 1..].to_string();
-                    stt.attribs.push(kv_str(&k, &v));
+                    let v = tokenize_template_arg_value(&v, self.lang_conv_enabled, &self.ext_tags);
+                    stt.attribs.push(KV {
+                        key: KeyValue::Str(k),
+                        value: v,
+                        src_offsets: None,
+                        ksrc: None,
+                        vsrc: None,
+                    });
                 }
-                None => stt.attribs.push(kv_str("", part)),
+                None => {
+                    let v =
+                        tokenize_template_arg_value(part, self.lang_conv_enabled, &self.ext_tags);
+                    stt.attribs.push(KV {
+                        key: KeyValue::Str(String::new()),
+                        value: v,
+                        src_offsets: None,
+                        ksrc: None,
+                        vsrc: None,
+                    });
+                }
             }
         }
 
@@ -3921,6 +3944,96 @@ fn kv_str(key: &str, value: &str) -> KV {
     }
 }
 
+/// Tokenize a template *argument value* into a `KeyValue`, faithful to PHP's
+/// `template_param_value` → `template_param_text` (which runs
+/// `nested_block<table=false, extlink=false, templateArg=true, tableCellArg=false>`).
+///
+/// The value is in an inline (mid-line) position immediately after `{{target|`,
+/// so — like PHP's `block` → `inlineline` in a non-SOL position — it tokenizes
+/// wikilinks, quotes, entities, templates (`{{…}}`) and template-args (`{{{…}}}`)
+/// but **not** lists/tables/headings (those form only at start-of-line). A bare
+/// text run collapses back to a plain `Str`, mirroring PHP's `flattenIfArray`
+/// single-string case. Newlines stay as text so multi-line values round-trip.
+fn tokenize_template_arg_value(
+    input: &str,
+    lang_conv_enabled: bool,
+    ext_tags: &[String],
+) -> KeyValue {
+    let options = TokenizerOptions {
+        in_template: true,
+        lang_conv_enabled,
+        ext_tags: ext_tags.to_vec(),
+        sol: false,
+        ..TokenizerOptions::default()
+    };
+    let mut tk = PegTokenizer::new(input, &options);
+
+    // Inline-tokenize the whole value. Newlines are emitted as `Nl` tokens
+    // (mirrors PHP's `newlineToken`), carrying their source offset so a
+    // serializer that retains newlines (e.g. the `format="wikitext"` `<pre>`
+    // body) can recover `\n`, while `tokensToString` strips them in attribute
+    // context.
+    while !tk.eof() {
+        let ch = tk.peek_char().unwrap();
+        if ch == '\n' || ch == '\r' {
+            let p = tk.pos;
+            if ch == '\r' && tk.remaining().starts_with("\r\n") {
+                tk.advance(2);
+            } else {
+                tk.advance(1);
+            }
+            tk.emit_token(ParsoidToken::Nl(NlTk::new(tk.tsr(p, tk.pos))));
+            continue;
+        }
+        let saved = tk.pos;
+        if !tk.try_inline_element() && tk.pos == saved {
+            let ch_len = ch.len_utf8();
+            let text = tk.input[tk.pos..tk.pos + ch_len].to_string();
+            tk.pos += ch_len;
+            tk.emit_text(text);
+        }
+    }
+
+    // Collapse the emitted chunks into a `KeyValue`: a single bare string stays a
+    // `Str`; otherwise a `Tokens` list (text runs + tokens interleaved).
+    let chunks = std::mem::take(&mut tk.output);
+    let mut items: Vec<Item> = Vec::new();
+    let mut has_token = false;
+    let mut buf = String::new();
+    for chunk in chunks {
+        match chunk {
+            Either::Left(s) => buf.push_str(&s),
+            Either::Right(mut t) => {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                has_token = true;
+                // Stamp every token with its source wikitext (recovered from the
+                // TSR), so downstream token→source round-trips (e.g. a
+                // `format="wikitext"` extension body) can reconstruct
+                // `[[…]]`/`[url]`/`'''` without knowing which token kind it is.
+                if let Some(dp) = t.data_parsoid_mut()
+                    && dp.src.is_none()
+                    && let Some(tsr) = dp.tsr.as_ref()
+                    && let Some(s) = tsr.start
+                    && s <= tsr.end
+                    && tsr.end <= input.len()
+                {
+                    dp.src = Some(input[s..tsr.end].to_string());
+                }
+                items.push(Item::Tok(t));
+            }
+        }
+    }
+    if !has_token {
+        return KeyValue::Str(buf);
+    }
+    if !buf.is_empty() {
+        items.push(Item::Str(buf));
+    }
+    KeyValue::Tokens(items)
+}
+
 /// Tokenize a wikilink/redirect target into a `KeyValue`, recognizing template
 /// directives (`{{...}}` / `{{{...}}}`) as `template`/`templatearg` tokens.
 /// Mirrors PHP's `wikilink_preprocessor_text` (which runs the `directive` rule
@@ -4804,7 +4917,9 @@ mod tests {
     #[test]
     fn test_template_arg_heading_not_split() {
         // A `===` heading inside a template argument must not be read as a
-        // `name=value` separator; the whole line is positional content.
+        // `name=value` separator; the whole line is positional content. The
+        // multi-line value tokenizes to text runs + `Nl` tokens (mirrors PHP's
+        // `template_param_text` → `newlineToken = NlTk`).
         let tokens = tokenize("{{#tag:pre|new\n=== test ===\nline|format=\"wikitext\"}}");
         let template = tokens
             .iter()
@@ -4820,10 +4935,15 @@ mod tests {
         assert_eq!(template.attribs[0].key.as_str(), Some("#tag:pre"));
         // Second arg is positional (empty key), not named `new`.
         assert_eq!(template.attribs[1].key.as_str(), Some(""));
-        assert_eq!(
-            template.attribs[1].value.as_str(),
-            Some("new\n=== test ===\nline")
-        );
+        // The value is `Tokens` (text runs interleaved with `Nl` tokens). The
+        // content still contains `=== test ===` (never split as `name=value`).
+        match &template.attribs[1].value {
+            KeyValue::Tokens(items) => {
+                let s = crate::wikitext::token_utils::tokens_to_string_with_nls(items);
+                assert_eq!(s, "new\n=== test ===\nline");
+            }
+            other => panic!("expected Tokens value, got {other:?}"),
+        }
         // Third arg is named `format`.
         assert_eq!(template.attribs[2].key.as_str(), Some("format"));
         assert_eq!(template.attribs[2].value.as_str(), Some("\"wikitext\""));
@@ -4831,7 +4951,9 @@ mod tests {
 
     #[test]
     fn test_template_nested_pipe() {
-        // Pipes inside a nested template should not split the outer args.
+        // Pipes inside a nested template should not split the outer args. The
+        // nested `{{bar|x}}` argument value is tokenized as a `template` token
+        // (mirrors PHP's `template_param_text`, which tokenizes nested templates).
         let tokens = tokenize("{{foo|{{bar|x}}|baz}}");
         let template = tokens
             .iter()
@@ -4846,7 +4968,21 @@ mod tests {
         assert_eq!(template.attribs.len(), 3);
         assert_eq!(template.attribs[0].key.as_str(), Some("foo"));
         assert_eq!(template.attribs[1].key.as_str(), Some(""));
-        assert_eq!(template.attribs[1].value.as_str(), Some("{{bar|x}}"));
+        // The `{{bar|x}}` value is a `Tokens` array holding a `template` token.
+        let KeyValue::Tokens(items) = &template.attribs[1].value else {
+            panic!(
+                "expected tokenized arg value, got {:?}",
+                template.attribs[1].value
+            );
+        };
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            Item::Tok(ParsoidToken::SelfclosingTag(tk)) => {
+                assert_eq!(tk.name, "template");
+                assert_eq!(tk.attribs[0].key.as_str(), Some("bar"));
+            }
+            other => panic!("expected a nested template token, got {other:?}"),
+        }
     }
 
     #[test]
