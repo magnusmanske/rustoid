@@ -1,11 +1,42 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **815/891 fixtures pass** (91%). Lib tests: 614 pass. Clippy: clean.
+Current baseline: **816/891 fixtures pass** (92%). Lib tests: 618 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
 The PHP grammar (`src/Wt2Html/Grammar.pegphp`) and `TokenizerUtils.php` (esp. `inlineBreaks`)
 are the authority; port their logic bit-for-bit.
+
+## TableFixups status (this session, commit `d4fe5cd`)
+
+A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fixups.rs` (runs after
+`handle_link_neighbours`, before `cleanup`). Ported so far:
+- Tokenizer-side table-cell temp flags (`TABLE_CELL_WITH_NO_ATTRIBUTE_SYNTAX`, `NON_MERGEABLE_TABLE_CELL`,
+  `AT_SRC_START` — the last slot added, not yet set) on `TempData`, set in `tokenizer_v2.rs`
+  (`try_table_data_tags`/`try_table_heading_tags`/`parse_tds`/`parse_ths`).
+- `collect_attributish_content`, `attributish_prefix`, `reparse_templated_attributes` (the `k=v|` reparse),
+  `hoist_transclusion_info` (partial), `drop_consumed_prefix`, `get_reparse_type` → `pipe_status_in_content`,
+  and a `split_hidden_cells` driver.
+- The WRAPPER temp flag is now also stamped on `dp` (not just the `data-parsoid` string) for text-wrap
+  encapsulation spans in `tree_builder_html.rs`, so `hoist_transclusion_info` can unwrap them.
+
+**Fixed: "1. Template-generated table cell attributes and cell content"** (single-template `k=v|` reparse).
+
+**Still failing** (split/hoist over *multi-segment* template output — template expands to text containing a
+newline, so the transclusion encapsulates as multiple spans/newline text and the start `.meta` marker is not
+fully consumed):
+- "2a./3./4. Template-generated table cell attributes and cell content…"
+- "Template generated table cell with attributes"
+- "Templated table cell with untemplated attributes" (all variants, incl. "Cell combination tests",
+  "Integrated mode only", T343874)
+- "Accept `!!` in templates", "Spec syntactic differences (`!!` vs `||`)"
+- "Multiple transclusions in discarded table attribute position should be handled properly"
+
+Next step for bucket #2: make `hoist_transclusion_info` + `split_hidden_cells` handle the multi-span case
+(the `data-mw.parts` leading/trailing DSR-gap strings, e.g. `"|"` / `"!align=center "`, plus the leftover
+start/end `.meta` markers), i.e. faithfully port `hoistTransclusionInfo`'s source-gap filling and the
+`setInnerHTML`-style prefix drop across the transclusion span boundary. The merge cell path
+(`reparseWithPreviousCell`/`convertAttribsToContent`) is still entirely unimplemented.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
