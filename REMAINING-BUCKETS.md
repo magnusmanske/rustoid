@@ -96,8 +96,23 @@ for `td` fires `close_the_cell` + `in_row` reinsert (`td_in_scope=true`), so the
 (`class="foo"` / `title="fail"` / `bar`). The remaining deficiency is **in `TableFixups`'s merge**, not the
 split: `reparse_with_previous_cell` / `reparse_templated_attributes` must merge those three cells into the single
 `<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"", {template}]` — currently
-`class="foo"` is not recovered as an attribute and the trailing `bar` cell is lost. This is the DSR/source-recovery
-+ `data-mw.parts` bookkeeping refinement already flagged in the "Still failing" list above.
+`class="foo"` is not recovered as an attribute and the trailing `bar` cell is lost.
+
+**Diagnosed turn-by-turn (precise root cause):**
+1. The tree-builder split works (3 cells).
+2. The *first* merge (marker cell 2 into cell 1) fires — `get_reparse_type` → `MaybeCombineWithPrevCell` —
+   because cell 1 (`|class="foo"`, a real syntax cell) has a (barely) valid DSR (`open_width=Some(..)`).
+3. The *second* merge (marker cell 3 `bar` into the merged cell) **fails** because the merged cell carries the
+   `{{!}}`-marker cell's **degenerate DSR** (`open_width=None`, `start==end`), so
+   `valid_dsr_with_ws` (Condition 2) is false. The marker `<td>`s are produced by `process_special_magic_word`
+   with `DataParsoid::default()` (no `tsr`), so `compute_dsr` cannot assign them a real DSR, and `merge_cells`/
+   `transfer_source_between_cells` does not propagate the *source* cell's (`|class="foo"`) valid `tsr`/`dsr` onto
+   the merged result — unlike PHP `reparseWithPreviousCell`, which recomputes `$prevDsr->start = $prev->tsr->start`
+   from the (tsr-bearing) previous cell. Also committed a fix for the stale `prev_sibling` in `process_children`
+   (now takes `out.last()` = the merged cell, matching PHP's live-DOM `previousSibling`) — `1c2958b`, net-neutral.
+   **Remaining: make `merge_cells`/the marker cells inherit the source cell's `tsr`/`dsr` so the second merge's
+   `valid_dsr_with_ws` passes, and recover `class="foo"` as the attribute (the `reparse_src = prev_cell_content + '|'`
+   path in `reparse_with_previous_cell`, already ported, then applies).**
 
 The blocker is **token-level (not string-level) template-argument expansion** — the current async path
 (`Parser::expand_one_template` → `substitute_args` → re-tokenize the whole string) cannot preserve the
