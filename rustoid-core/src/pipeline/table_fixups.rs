@@ -470,6 +470,18 @@ fn strip_inner_encapsulation(cell: &mut Node, about_ids: &[Option<String>]) {
             continue;
         }
 
+        // A transclusion marker meta (`mw:Transclusion` / `…/End`) that has been
+        // absorbed into the cell is removed entirely (its data-mw was already
+        // hoisted).
+        let is_marker_meta = matches!(&cell.children[i].kind, NodeKind::Element(ElementKind::Other(name)) if name == "meta")
+            && cell.children[i]
+                .get_attr("typeof")
+                .is_some_and(|t| t == "mw:Transclusion" || t.ends_with("/End"));
+        if is_marker_meta {
+            cell.children.remove(i);
+            continue;
+        }
+
         // A `span` wrapper (marked via `dp.tmp.wrapper` or the serialized
         // `data-parsoid` `tmp.wrapper` flag) is unwrapped: its children migrate
         // into the cell and the span is removed.
@@ -552,24 +564,29 @@ fn cell_tmp_flag(cell: &Node, f: impl Fn(&crate::wikitext::tokens_v2::TempData) 
 /// The merge-with-previous-cell path is not yet wired (it requires DSR recovery
 /// of preceding cells and `convertAttribsToContent`); we only handle the
 /// reparse/split decisions here.
-fn get_reparse_type(cell: &Node) -> ReparseScenario {
+fn get_reparse_type(cell: &Node, in_tpl_content: bool) -> ReparseScenario {
     let cell_is_td = name(cell) == "td";
     let test_re = if cell_is_td { "|" } else { "!|" };
     let no_attr_reparsing = !cell_tmp_flag(cell, |t| t.table_cell_with_no_attribute_syntax)
         || (cell_tmp_flag(cell, |t| t.non_mergeable_table_cell)
             && cell.dp.as_ref().and_then(|d| d.stx.as_deref()) != Some("row"));
-    pipe_status_in_content(cell, test_re, false, no_attr_reparsing)
+    pipe_status_in_content(cell, test_re, in_tpl_content, no_attr_reparsing)
 }
 
 /// `pipeStatusInContent` — search the cell content for a `|` (or `!` for `<th>`)
-/// in templated content, deciding reparse vs. split.
+/// in templated content, deciding reparse vs. split. Faithful port of PHP's
+/// `TableFixups::pipeStatusInContent`, carrying `in_tpl_content`/`about` state
+/// across siblings (a text node following a transclusion is still "in-template").
 fn pipe_status_in_content(
     node: &Node,
     test_re: &str,
     in_tpl_content: bool,
     no_attr_reparsing: bool,
 ) -> ReparseScenario {
+    let mut in_tpl_content = in_tpl_content;
+    let mut no_attr_reparsing = no_attr_reparsing;
     let mut about: Option<String> = None;
+
     for child in &node.children {
         if in_tpl_content && matches!(child.kind, NodeKind::Text(_)) && text_matches(child, test_re)
         {
@@ -583,15 +600,22 @@ fn pipe_status_in_content(
         if matches!(child.kind, NodeKind::Element(_)) {
             let child_about = child.get_attr("about").map(str::to_string);
             if about.is_some() && child_about != about {
+                in_tpl_content = false;
                 about = None;
             }
-            if about.is_none() && has_type_of(child, "mw:Transclusion") {
+            if !in_tpl_content && has_type_of(child, "mw:Transclusion") {
+                in_tpl_content = true;
                 about = child_about;
             }
 
             if !has_type_of(child, "mw:DOMFragment") {
+                // `|`/`!` chars in extension/language-variant content don't
+                // trigger cell parsing (higher tokenization precedence).
+                if should_abort_attr(child) {
+                    no_attr_reparsing = true;
+                }
                 let status =
-                    pipe_status_in_content(child, test_re, about.is_some(), no_attr_reparsing);
+                    pipe_status_in_content(child, test_re, in_tpl_content, no_attr_reparsing);
                 if status != ReparseScenario::NotNeeded {
                     return status;
                 }
@@ -624,6 +648,34 @@ fn puts_next_sibling_in_sol_state(cell: &Node) -> bool {
 pub fn run(root: &mut Node, config: &dyn SiteConfig, source: Option<&str>) {
     let children = std::mem::take(&mut root.children);
     root.children = process_children(children, config, source);
+    // Transclusion marker metas (`mw:Transclusion` / `mw:Transclusion/End`) that
+    // lost their data-mw to the `hoistTransclusionInfo` lift are stray: tplwrap
+    // had already consumed the matched pair in the well-balanced case, so any
+    // leftover marker without data-mw is an artifact of the cross-cell split and
+    // is dropped (mirrors the `stripMetaTags` net effect).
+    remove_stray_marker_metas(root);
+}
+
+/// Remove transclusion marker metas (`mw:Transclusion` / `mw:Transclusion/End`)
+/// that no longer carry `data-mw` (their info was hoisted).
+fn remove_stray_marker_metas(node: &mut Node) {
+    node.children.retain(|c| {
+        if matches!(&c.kind, NodeKind::Element(ElementKind::Other(name)) if name == "meta")
+            && c.data_mw.is_none()
+            && c.get_attr("typeof").is_some_and(|t| {
+                t == "mw:Transclusion"
+                    || t == "mw:Transclusion/End"
+                    || t == "mw:Param"
+                    || t == "mw:Param/End"
+            })
+        {
+            return false;
+        }
+        true
+    });
+    for child in &mut node.children {
+        remove_stray_marker_metas(child);
+    }
 }
 
 fn process_children(
@@ -645,46 +697,8 @@ fn process_children(
                 out.push(child);
             }
             NodeKind::Element(ElementKind::TableCell | ElementKind::TableHeader) => {
-                let is_templated = has_type_of(&child, "mw:Transclusion");
-                let cell_name = name(&child);
-                let reparse_type = get_reparse_type(&child);
-
-                // Special `<th>` "!! foo" case.
-                if cell_name == "th"
-                    && is_templated
-                    && reparse_type != ReparseScenario::MaybeCombineWithPrevCell
-                    && cell_tmp_flag(&child, |t| t.table_cell_with_no_attribute_syntax)
-                    && let Some(first) = child.children.iter_mut().find(|c| {
-                        matches!(c.kind, NodeKind::Text(_))
-                            || matches!(c.kind, NodeKind::Element(_))
-                    })
-                    && let NodeKind::Text(t) = &mut first.kind
-                    && let Some(rest) = t.strip_prefix('!')
-                {
-                    *t = rest.to_string();
-                    if let Some(dp) = child.dp.as_mut() {
-                        dp.stx = Some("row".to_string());
-                        dp.tmp.non_mergeable_table_cell = true;
-                    }
-                }
-
-                if reparse_type == ReparseScenario::MaybeReparseAttrs
-                    && cell_tmp_flag(&child, |t| t.table_cell_with_no_attribute_syntax)
-                {
-                    let template_wrapper = if is_templated {
-                        Some(child.clone())
-                    } else {
-                        None
-                    };
-                    reparse_templated_attributes(&mut child, template_wrapper, config, source);
-                }
-
-                // Split hidden cells on `||`/`!!`, recursing into the remainder.
-                let split = split_hidden_cells(&mut child, &cell_name, source);
-                let children = std::mem::take(&mut child.children);
-                child.children = process_children(children, config, source);
-                out.push(child);
-                out.extend(split);
+                let mut processed = process_cell(child, config, source, false);
+                out.append(&mut processed);
             }
             NodeKind::Element(_) | NodeKind::Document => {
                 let children = std::mem::take(&mut child.children);
@@ -699,28 +713,102 @@ fn process_children(
     out
 }
 
+/// Process a single `<td>`/`<th>` cell: apply the `<th>` `!! foo` special case,
+/// reparse any templated `k=v|` attribute prefix, then split on hidden
+/// `||`/`!!` separators. Return the resulting cells in document order — the
+/// original cell first, then each newly split cell. `in_tpl` is true when this
+/// cell was created by a split (so it inherits the enclosing transclusion
+/// context, mirroring `dtState->tplInfo` in PHP).
+fn process_cell(
+    mut cell: Node,
+    config: &dyn SiteConfig,
+    source: Option<&str>,
+    in_tpl: bool,
+) -> Vec<Node> {
+    let is_templated = has_type_of(&cell, "mw:Transclusion");
+    let cell_name = name(&cell);
+    let reparse_type = get_reparse_type(&cell, in_tpl || is_templated);
+
+    // Special `<th>` "!! foo" case.
+    if cell_name == "th"
+        && is_templated
+        && reparse_type != ReparseScenario::MaybeCombineWithPrevCell
+        && cell_tmp_flag(&cell, |t| t.table_cell_with_no_attribute_syntax)
+        && let Some(first) = cell
+            .children
+            .iter_mut()
+            .find(|c| matches!(c.kind, NodeKind::Text(_)) || matches!(c.kind, NodeKind::Element(_)))
+        && let NodeKind::Text(t) = &mut first.kind
+        && let Some(rest) = t.strip_prefix('!')
+    {
+        *t = rest.to_string();
+        if let Some(dp) = cell.dp.as_mut() {
+            dp.stx = Some("row".to_string());
+            dp.tmp.non_mergeable_table_cell = true;
+        }
+    }
+
+    if reparse_type == ReparseScenario::MaybeReparseAttrs
+        && cell_tmp_flag(&cell, |t| t.table_cell_with_no_attribute_syntax)
+    {
+        let template_wrapper = if is_templated {
+            Some(cell.clone())
+        } else {
+            None
+        };
+        reparse_templated_attributes(&mut cell, template_wrapper, config, source);
+    }
+
+    // Recurse into the cell's own children first (nested tables/cells).
+    let children = std::mem::take(&mut cell.children);
+    cell.children = process_children(children, config, source);
+
+    // Split hidden cells on `||`/`!!`. Each new cell is a fresh `stx:row` cell
+    // whose own `k=v|` prefix must also be reparsed, so recurse into each of them
+    // (mirrors the DOMTraverser re-invoking `handleTableCellTemplates`).
+    let mut split = split_hidden_cells(&mut cell, &cell_name, source);
+
+    let mut out = Vec::with_capacity(1 + split.len());
+    out.push(cell);
+    for s in split.drain(..) {
+        out.extend(process_cell(s, config, source, true));
+    }
+    out
+}
+
 /// `split_hidden_cells` — split a `<td>`/`<th>` on an embedded `||`/`!!`,
 /// returning the newly created sibling cells (inserted after the cell).
+///
+/// Faithful to the tail of PHP `handleTableCellTemplates`: walk the children;
+/// once a separator (`||` for `<td>`, or the shortest of `||`/`!!` for `<th>`)
+/// is found in a text (or simple-templated-span) child, the child keeps the
+/// prefix, a new `<td>`/`<th>` (`stx:row`, non-mergeable, no-attribute-syntax)
+/// receives the suffix as its leading text, and every subsequent child is moved
+/// into the new cell (where further separators split again).
 fn split_hidden_cells(cell: &mut Node, cell_name: &str, source: Option<&str>) -> Vec<Node> {
     let is_td = cell_name == "td";
-    let orig_about = cell.get_attr("about").map(str::to_string);
 
-    let mut new_cells: Vec<Node> = Vec::new();
+    let mut cell_children = std::mem::take(&mut cell.children);
+    // Content bins: the first is the original cell's, subsequent bins are the
+    // newly split cells' contents. `bin_abouts[i]` is the `about` id a split
+    // cell (index `i - 1` in `bins`) inherited.
+    let mut bins: Vec<Vec<Node>> = vec![Vec::new()];
+    let mut new_abouts: Vec<Option<String>> = Vec::new();
+    let orig_about = cell.get_attr("about").map(str::to_string);
     let mut needs_tpl_hoist = false;
 
-    let mut i = 0usize;
-    while i < cell.children.len() {
-        let child_is_text = matches!(cell.children[i].kind, NodeKind::Text(_));
-        let child_is_simple_span = is_simple_templated_span(&cell.children[i]);
+    for mut child in cell_children.drain(..) {
+        let child_is_text = matches!(child.kind, NodeKind::Text(_));
+        let child_is_simple_span = is_simple_templated_span(&child);
 
         if !child_is_text && !child_is_simple_span {
-            i += 1;
+            bins.last_mut().expect("bin exists").push(child);
             continue;
         }
 
-        let child_text = match &cell.children[i].kind {
+        let child_text = match &child.kind {
             NodeKind::Text(t) => t.clone(),
-            _ => text_content(&cell.children[i]),
+            _ => text_content(&child),
         };
 
         let found = if is_td {
@@ -730,38 +818,54 @@ fn split_hidden_cells(cell: &mut Node, cell_name: &str, source: Option<&str>) ->
         };
 
         let Some((prefix, suffix)) = found else {
-            i += 1;
+            bins.last_mut().expect("bin exists").push(child);
             continue;
         };
 
-        // Adjust the child's content to the prefix.
-        let has_span_wrapper = child_is_simple_span;
-        let span_about = if has_span_wrapper {
-            cell.children[i].get_attr("about").map(str::to_string)
+        // The child keeps the prefix in the current bin.
+        let span_about = if child_is_simple_span {
+            child.get_attr("about").map(str::to_string)
         } else {
             None
         };
-        match &mut cell.children[i].kind {
-            NodeKind::Text(t) => *t = prefix.clone(),
-            _ => {
-                if has_span_wrapper {
-                    // Replace the span with the prefix text (its encapsulation is
-                    // hoisted below).
-                    cell.children[i] = Node::text(prefix.clone());
-                }
-            }
+        if child_is_simple_span {
+            child = Node::text(prefix.clone());
+        } else {
+            child.kind = NodeKind::Text(prefix.clone());
         }
+        bins.last_mut().expect("bin exists").push(child);
 
-        // Build the new cell.
+        // A new cell gets the suffix as its leading text.
+        let mut new_bin: Vec<Node> = Vec::new();
+        if !suffix.is_empty() {
+            new_bin.push(Node::text(suffix));
+        }
+        bins.push(new_bin);
+
+        let new_about = if child_is_simple_span {
+            span_about
+        } else {
+            orig_about.clone()
+        };
+        if new_about.is_some() {
+            needs_tpl_hoist = true;
+        }
+        new_abouts.push(new_about);
+    }
+
+    // Rebuild the original cell's children from bin[0].
+    cell.children = bins.remove(0);
+
+    // Build the new sibling cells from the remaining bins.
+    let mut new_cells: Vec<Node> = Vec::with_capacity(bins.len());
+    for (bin, about) in bins.into_iter().zip(new_abouts) {
         let mut new_cell = Node::element(if is_td {
             ElementKind::TableCell
         } else {
             ElementKind::TableHeader
         });
-        if !suffix.is_empty() {
-            new_cell.push_child(Node::text(suffix));
-        }
-        let new_dp = DataParsoid {
+        new_cell.children = bin;
+        new_cell.dp = Some(DataParsoid {
             stx: Some("row".to_string()),
             tmp: crate::wikitext::tokens_v2::TempData {
                 table_cell_with_no_attribute_syntax: true,
@@ -769,28 +873,14 @@ fn split_hidden_cells(cell: &mut Node, cell_name: &str, source: Option<&str>) ->
                 ..Default::default()
             },
             ..Default::default()
-        };
-        new_cell.dp = Some(new_dp);
-
-        let about = if has_span_wrapper {
-            span_about
-        } else {
-            orig_about.clone()
-        };
-        if let Some(a) = &about {
-            new_cell.set_attr("about", a.clone());
-            needs_tpl_hoist = true;
+        });
+        if let Some(a) = about {
+            new_cell.set_attr("about", a);
         }
-
         new_cells.push(new_cell);
-        // Continue scanning from the same index; children after the split were
-        // already relocated into the new cell.
     }
 
     if needs_tpl_hoist {
-        // The `about` is now on multiple cells; hoist the transclusion info to
-        // the original cell (which keeps the data-mw). This mirrors the
-        // `hoistTransclusionInfo` call + `tplInfo->last` update.
         let transclusions = collect_transclusions(cell);
         if !transclusions.is_empty() {
             hoist_transclusion_info(cell, &transclusions, source);
