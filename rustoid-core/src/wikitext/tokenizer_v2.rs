@@ -1618,9 +1618,14 @@ impl<'a> PegTokenizer<'a> {
             }
 
             let ch = self.remaining().chars().next().unwrap();
-            // Stop at a pipe (`|`/`{{!}}`), exclamation, or newline (mirrors
-            // `table_attributes`/`generic_newline_attributes` termination).
-            if ch == '|' || ch == '!' || ch == '\n' || ch == '\r' || self.starts_with("{{!}}") {
+            // Stop at a pipe/exclamation/newline in *cell-argument* position only
+            // (mirrors `inlineBreaks`: `|`/`!` terminate the attribute block for
+            // `tableCellArg`, but in start/row-tag position they are permissive
+            // broken-name characters digested below). A newline always terminates.
+            if ch == '\n'
+                || ch == '\r'
+                || (cell_arg && (ch == '|' || ch == '!' || self.starts_with("{{!}}")))
+            {
                 break;
             }
 
@@ -1661,7 +1666,7 @@ impl<'a> PegTokenizer<'a> {
     /// `parse_table_attributes`.
     fn parse_table_attribute(&mut self, cell_arg: bool) -> Option<KV> {
         let name_start = self.pos;
-        let name = self.parse_table_attribute_name()?;
+        let name = self.parse_table_attribute_name(cell_arg)?;
         let name_end = self.pos;
 
         self.consume_spaces();
@@ -1697,8 +1702,8 @@ impl<'a> PegTokenizer<'a> {
         }
     }
 
-    fn parse_table_attribute_name(&mut self) -> Option<KeyValue> {
-        let name = self.parse_attr_name_impl(true, false);
+    fn parse_table_attribute_name(&mut self, cell_arg: bool) -> Option<KeyValue> {
+        let name = self.parse_attr_name_impl(true, cell_arg, false);
         if name.is_empty() { None } else { Some(name) }
     }
 
@@ -2203,7 +2208,7 @@ impl<'a> PegTokenizer<'a> {
     /// Parse a generic HTML tag attribute name, recognizing template
     /// directives. Mirrors `generic_attribute_name`.
     fn parse_attr_name(&mut self, allow_less_than: bool) -> KeyValue {
-        self.parse_attr_name_impl(false, allow_less_than)
+        self.parse_attr_name_impl(false, false, allow_less_than)
     }
 
     /// Parse an attribute name into a `KeyValue`. A name that contains a
@@ -2213,7 +2218,15 @@ impl<'a> PegTokenizer<'a> {
     ///
     /// `allow_less_than` mirrors PHP's `less_than` guard: a literal `<` is only
     /// accepted in attribute-name position for extension tags (`tagType=ext`).
-    fn parse_attr_name_impl(&mut self, table: bool, allow_less_than: bool) -> KeyValue {
+    /// `cell_arg` mirrors `tableCellArg`: when true (cell/caption attribute
+    /// position) `|`/`{{!}}` terminate the name; when false (start/row tag) they
+    /// are permissive (broken) name characters.
+    fn parse_attr_name_impl(
+        &mut self,
+        table: bool,
+        cell_arg: bool,
+        allow_less_than: bool,
+    ) -> KeyValue {
         let mut tokens: Vec<Item> = Vec::new();
         let mut buf = String::new();
 
@@ -2280,6 +2293,15 @@ impl<'a> PegTokenizer<'a> {
             let Some(ch) = self.peek_char() else {
                 break;
             };
+            // The stop set mirrors `table_attribute_name_piece`'s two alternatives:
+            // the first (`$[^ \t\r\n\0/=><&{}\-!|\[]+`) excludes one set, and the
+            // fallback (`$( !(space_or_newline / [\0/=>]) . )`) re-matches any other
+            // single char. The net effect is that a table attribute *name* only
+            // truly stops at `space/tab/\r/\n/\0//=/|<`; `|`/`!`/`{`/`}`/`[` are only
+            // terminators in cell-argument position (`tableCellArg`), where
+            // `inlineBreaks` would otherwise break on `|`/`{{!}}`. This lets broken
+            // start/row-tag syntax (`{| || |} ++`) digest `||`/`|}`/`++` as discarded
+            // (valueless) attribute names rather than leaking them as content.
             let is_stop = ch == ' '
                 || ch == '\t'
                 || ch == '\r'
@@ -2289,7 +2311,9 @@ impl<'a> PegTokenizer<'a> {
                 || ch == '='
                 || ch == '>'
                 || ch == '<'
-                || (table && (ch == '[' || ch == '|' || ch == '!' || ch == '{' || ch == '}'));
+                || (table
+                    && cell_arg
+                    && (ch == '[' || ch == '|' || ch == '!' || ch == '{' || ch == '}'));
             if is_stop {
                 break;
             }
