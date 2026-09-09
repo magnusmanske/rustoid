@@ -72,9 +72,23 @@ Authoritative PHP output (confirm via `nativeTemplateExpansion:true` + `$env->pa
 `|class="foo"{{1x|1={{!}}title="fail"{{!}}bar}}` — the cell has *literal* attribute `class="foo"`
 (no trailing `|`, so the tokenizer emits it as cell content; `row_syntax_table_args` backtracks), then a
 template that expands to `|title="fail"|bar` (its leading `|` is the attr-content separator). Expected output
-`<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",{template}]`. Current actual:
-`<td typeof="mw:Transclusion">class="foo"bar</td>` (the `{{!}}title="fail"{{!}}` collapses to `bar`, and
-`class="foo"` isn't reparsed as an attribute).
+`<td class="foo">title="fail"|bar</td>` with `data-mw.parts=["|class=\"foo\"",{template}]`.
+
+**Foundation now LANDED** (token-level arg expansion, net-neutral): `{{1x|1={{!}}title="fail"{{!}}bar}}`
+now expands `{{{1}}}` → `[template(!), 'title="fail"', template(!), 'bar']`, and `{{!}}` →
+`<td attr_src='' at_src_start>` (via `process_special_magic_word`, `inTemplate=true`), so the cell content
+is now `<td>class="foo"title="fail"</td>` (current) — `title="fail"` is *preserved* (it was dropped before),
+but the inner `<td>` markers from `{{!}}` are not yet re-interpreted as cell separators, and `class="foo"`
+is not yet reparsed as an attribute.
+
+**Remaining piece (precisely):** the two `{{!}}`-produced `<td attr_src='' at_src_start>` markers land as
+*inner* `<td>` elements inside the outer cell, and `TableFixups` must re-interpret each as a cell separator —
+collect the `class="foo"title="fail"` text + inner-`<td>` markers, re-tokenize the leading `class="foo"` as
+`row_syntax_table_args` attributes, hoist `typeof`/`about`/`data-mw`, and drop the consumed prefix — the same
+`collect_attributish_content`/`reparse_templated_attributes` machinery already ported, but it must be driven
+for the *inner-`<td>`-marker* case (not just the plain `k=v|` text case). PHP's `processSpecialMagicWord` +
+`TableFixups::handleTableCellTemplates` do exactly this (`{{!}}` → `<td attrSrc='' AT_SRC_START>` → the
+cell-template handler sees the `<td>` and reparses).
 
 The blocker is **token-level (not string-level) template-argument expansion** — the current async path
 (`Parser::expand_one_template` → `substitute_args` → re-tokenize the whole string) cannot preserve the
