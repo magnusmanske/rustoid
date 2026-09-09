@@ -7,7 +7,7 @@ Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2
 The PHP grammar (`src/Wt2Html/Grammar.pegphp`) and `TokenizerUtils.php` (esp. `inlineBreaks`)
 are the authority; port their logic bit-for-bit.
 
-## TableFixups status (this session, commit `d4fe5cd`)
+## TableFixups status (this session, commits `d4fe5cd`, `eaa5d38`)
 
 A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fixups.rs` (runs after
 `handle_link_neighbours`, before `cleanup`). Ported so far:
@@ -15,28 +15,32 @@ A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fi
   `AT_SRC_START` — the last slot added, not yet set) on `TempData`, set in `tokenizer_v2.rs`
   (`try_table_data_tags`/`try_table_heading_tags`/`parse_tds`/`parse_ths`).
 - `collect_attributish_content`, `attributish_prefix`, `reparse_templated_attributes` (the `k=v|` reparse),
-  `hoist_transclusion_info` (partial), `drop_consumed_prefix`, `get_reparse_type` → `pipe_status_in_content`,
-  and a `split_hidden_cells` driver.
+  `hoist_transclusion_info` (partial), `drop_consumed_prefix`, `get_reparse_type` → `pipe_status_in_content`
+  (now faithful: carries `in_tpl_content`/`about` across siblings, honors `shouldAbortAttr`), and a
+  `split_hidden_cells` driver that moves subsequent children into each split cell and recurses so each
+  split cell's own `k=v|` prefix reparses.
 - The WRAPPER temp flag is now also stamped on `dp` (not just the `data-parsoid` string) for text-wrap
   encapsulation spans in `tree_builder_html.rs`, so `hoist_transclusion_info` can unwrap them.
 
-**Fixed: "1. Template-generated table cell attributes and cell content"** (single-template `k=v|` reparse).
+**Fixed this session: "1.", "2a.", "3. Template-generated table cell attributes and cell content"**
+(818/891, up from 815).
 
-**Still failing** (split/hoist over *multi-segment* template output — template expands to text containing a
-newline, so the transclusion encapsulates as multiple spans/newline text and the start `.meta` marker is not
-fully consumed):
-- "2a./3./4. Template-generated table cell attributes and cell content…"
-- "Template generated table cell with attributes"
-- "Templated table cell with untemplated attributes" (all variants, incl. "Cell combination tests",
+**Still failing** — a *shared* root cause in the **encapsulation layer**, not table_fixups:
+`wrap_flipped_children`'s `table_body_content_target` puts the transclusion `typeof`/`about` on `<tbody>`
+(or leaves an empty `<span typeof="mw:Transclusion">`), instead of the `<td>`/`<th>`/`<table>` that PHP's
+`DOMRangeBuilder` selects for inline table-cell transclusion ranges and templated tables.
+- "4. Template-generated table cell attributes and cell content inside a templated table"
+  (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; gets an empty span + `typeof` on `<tbody>`)
+- "Template generated table cell with attributes" (`{{table_attribs_4}} ||a||b`; `typeof` lands on `<tbody>`)
+- "Templated table cell with untemplated attributes" (all variants: "Cell combination tests",
   "Integrated mode only", T343874)
-- "Accept `!!` in templates", "Spec syntactic differences (`!!` vs `||`)"
-- "Multiple transclusions in discarded table attribute position should be handled properly"
+- "Accept `!!` in templates", "Spec syntactic differences (`!!` vs `||`)",
+  "Multiple transclusions in discarded table attribute position should be handled properly"
 
-Next step for bucket #2: make `hoist_transclusion_info` + `split_hidden_cells` handle the multi-span case
-(the `data-mw.parts` leading/trailing DSR-gap strings, e.g. `"|"` / `"!align=center "`, plus the leftover
-start/end `.meta` markers), i.e. faithfully port `hoistTransclusionInfo`'s source-gap filling and the
-`setInnerHTML`-style prefix drop across the transclusion span boundary. The merge cell path
-(`reparseWithPreviousCell`/`convertAttribsToContent`) is still entirely unimplemented.
+Next step: fix `wrap_flipped_children`/`table_body_content_target` in `tree_builder_html.rs` so inline
+cell transclusion ranges target the `<td>`/`<th>` (not the table body), and templated-table ranges target
+the `<table>` element. The merge-cell path (`reparseWithPreviousCell`/`convertAttribsToContent`) remains
+entirely unimplemented.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
