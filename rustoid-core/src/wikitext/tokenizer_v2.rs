@@ -1763,15 +1763,17 @@ impl<'a> PegTokenizer<'a> {
         self.pos + bytes.len()
     }
 
-    /// End byte index of an unquoted table value: the first whitespace or `|`;
-    /// in cell position also `{{!}}`. All delimiters are single-byte ASCII.
+    /// End byte index of an unquoted table value: the first whitespace; in cell
+    /// position also `|`/`{{!}}` (in start/row-tag position a `|` is literal
+    /// value content, mirroring `inlineBreaks` where `|` only breaks for
+    /// `tableCellArg`/`table`). All delimiters are single-byte ASCII.
     fn scan_unquoted_table_value_end(&self, cell_arg: bool) -> usize {
         let bytes = self.remaining().as_bytes();
         for (i, &b) in bytes.iter().enumerate() {
-            if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | b'|') {
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
                 return self.pos + i;
             }
-            if cell_arg && bytes[i..].starts_with(b"{{!}}") {
+            if cell_arg && (b == b'|' || bytes[i..].starts_with(b"{{!}}")) {
                 return self.pos + i;
             }
         }
