@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **816/891 fixtures pass** (92%). Lib tests: 618 pass. Clippy: clean.
+Current baseline: **820/891 fixtures pass** (92%). Lib tests: 619 pass. Clippy: clean.
 Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
 
 Reference PHP Parsoid is pinned at `/tmp/parsoid-src` (HEAD `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`).
@@ -25,17 +25,26 @@ A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fi
 **Fixed this session: "1.", "2a.", "3. Template-generated table cell attributes and cell content"**
 (818/891, up from 815).
 
-**Still failing** — a *shared* root cause in the **encapsulation layer**, not table_fixups:
-`wrap_flipped_children`'s `table_body_content_target` puts the transclusion `typeof`/`about` on `<tbody>`
-(or leaves an empty `<span typeof="mw:Transclusion">`), instead of the `<td>`/`<th>`/`<table>` that PHP's
-`DOMRangeBuilder` selects for inline table-cell transclusion ranges and templated tables.
+**Still failing** — two distinct root causes:
+1. **The fostered-table encapsulation target** (`table_body_content_target`): when a templated
+   `<td>`/`<th>` is fostered out of a `<table>` (e.g. `{{table_attribs_4}} ||a||b`), `wrap_flipped_children`
+   resolves the encap target to `<tbody>` instead of the `<td>`, so `typeof`/`about` land on `<tbody>`.
+   PHP's `findEnclosingRange` computes `range->start` as the child-of-common-ancestor (the `<td>`/`<p>`),
+   and `MAP_TBODY_TR` only migrates *whitespace* into `tbody`/`tr`, never selecting `<tbody>` as the
+   encap target for inline-cell transclusions.
+2. The whole-table templated-table case (`{{tbl-start}}…{{tbl-end}}`) needs `typeof` on `<table>`, not an
+   empty span.
 - "4. Template-generated table cell attributes and cell content inside a templated table"
   (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; gets an empty span + `typeof` on `<tbody>`)
 - "Template generated table cell with attributes" (`{{table_attribs_4}} ||a||b`; `typeof` lands on `<tbody>`)
 - "Templated table cell with untemplated attributes" (all variants: "Cell combination tests",
   "Integrated mode only", T343874)
-- "Accept `!!` in templates", "Spec syntactic differences (`!!` vs `||`)",
-  "Multiple transclusions in discarded table attribute position should be handled properly"
+- "Multiple transclusions in discarded table attribute position should be handled properly"
+
+**Fixed this session (commit `6fccfbe`): "Accept `!!` in templates", "Spec syntactic differences (`!!` vs `||`)"**
+— the `split_hidden_cells` span-split now records transclusions during the walk (so `hoistTransclusionInfo`
+could lift `typeof` onto the cell), and the `<th>` leading-`!` strip is gated behind PHP's
+`previousSibling instanceof Element && !putsNextSiblingInSOLState`.
 
 Next step: fix `wrap_flipped_children`/`table_body_content_target` in `tree_builder_html.rs` so inline
 cell transclusion ranges target the `<td>`/`<th>` (not the table body), and templated-table ranges target
