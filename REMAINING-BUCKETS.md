@@ -114,6 +114,15 @@ split: `reparse_with_previous_cell` / `reparse_templated_attributes` must merge 
    `valid_dsr_with_ws` passes, and recover `class="foo"` as the attribute (the `reparse_src = prev_cell_content + '|'`
    path in `reparse_with_previous_cell`, already ported, then applies).**
 
+   ⚠️ Tried (reverted): a `merge_cells` change that copies `from.dp.tsr` + `open_width`/`close_width` onto `to`
+   when `to` lacks a `tsr`. The source cell *does* carry `tsr = Some({start:6, end:7})` and `open_width=Some(1)`
+   (confirmed `[MERGE] copying…`), so the merged cell ends up with `open_width=Some(1)`/`tsr=Some(…)` — yet the
+   **second merge still does not fire**. So the remaining blocker is *not* just missing `open_width` on the merged
+   cell; there is a second, still-unidentified condition (likely `reparse_with_previous_cell` returning `1` vs `2`,
+   or the merged cell not being the `prev` for the third cell, or `puts_next_sibling_in_sol_state`). Next session:
+   instrument `reparse_with_previous_cell`'s return code and the third cell's `get_reparse_type` condition
+   breakdown to isolate which branch short-circuits the second merge.
+
 The blocker is **token-level (not string-level) template-argument expansion** — the current async path
 (`Parser::expand_one_template` → `substitute_args` → re-tokenize the whole string) cannot preserve the
 distinction between `{{!}}` → `|` as *literal inline text* vs. *table-cell syntax*.
