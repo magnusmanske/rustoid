@@ -25,21 +25,23 @@ A first cut of `TableFixups` is now wired in `rustoid-core/src/pipeline/table_fi
 **Fixed this session: "1.", "2a.", "3. Template-generated table cell attributes and cell content"**
 (818/891, up from 815).
 
-**Still failing** — root cause confirmed this session: it is the **unimplemented `reparseWithPreviousCell`
-/ `convertAttribsToContent` merge-cell path**, *not* `table_body_content_target`.
+**Still failing** — two layers, both needed:
+1. **The fostered-table encapsulation target** (`table_body_content_target` in `tree_builder_html.rs`): for
+   `{{table_attribs_4}} ||a||b` the start marker is fostered before the `<table>`, so `wrap_flipped_children`
+   resolves the encap target to `<tbody>` (via `table_body_content_target`) — but PHP's `MAP_TBODY_TR`/
+   `findEncapTarget` target the `<tr>` (the actual content row), not `<tbody>`. `typeof` must land on `<tr>`,
+   then `hoistTransclusionInfo` moves it to the `<td>`. **Fix `table_body_content_target` to target `<tr>`/body
+   row, not `<tbody>`.**
+2. The merge-cell path (ported in commit `3f240df`, currently harmless/no-regression) then needs its
+   DSR/source-recovery and data-mw bookkeeping refined so the merged cell's `typeof`/`about`/`data-mw` match
+   PHP byte-for-byte.
 
-Authoritative PHP output (verified via `/tmp/pt_tbl.php` with a template-mock subclass) for
-`{{table_attribs_4}} ||a||b` is:
+Authoritative PHP output (via `/tmp/pt_tbl.php` template-mock subclass) for `{{table_attribs_4}} ||a||b`:
 ```html
 <td style="background-color:#DC241f;" width="10px" about="#mwt1" typeof="mw:Transclusion" …></td>
 <td about="#mwt1">a</td><td about="#mwt1">b</td>
 ```
-I.e. `about` on all three `<td>`s and `typeof="mw:Transclusion"` on the first. In rustoid, the top-level
-tokenizer does not split `||a||b` into cells at encapsulation time (the templated `<td style>` absorbs
-`||a||b` as content and the start meta is fostered before the `<table>`), so the encapsulation lands `typeof`
-on `<tbody>`. The real fix is `TableFixups::reparseWithPreviousCell` (the `MAYBE_COMBINE_WITH_PREV_CELL`
-branch) + `convertAttribsToContent`/`mergeCells`/`transferSourceBetweenCells`/`stripTrailingPipe`, plus the
-`cellAttrTerminatorSeen` → `convertAttribsToContent` early branch of `handleTableCellTemplates`.
+`about` on all three `<td>`s and `typeof="mw:Transclusion"` on the first (see line 1373 of tables.txt).
 - "4. Template-generated table cell attributes and cell content inside a templated table"
   (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; needs `typeof` on `<table>`, not an empty span)
 - "Template generated table cell with attributes" (`{{table_attribs_4}} ||a||b`)
@@ -47,14 +49,18 @@ branch) + `convertAttribsToContent`/`mergeCells`/`transferSourceBetweenCells`/`s
   "Integrated mode only", T343874)
 - "Multiple transclusions in discarded table attribute position should be handled properly"
 
-**Fixed this session (commit `6fccfbe`): "Accept `!!` in templates", "Spec syntactic differences (`!!` vs `||`)"**
-— the `split_hidden_cells` span-split now records transclusions during the walk (so `hoistTransclusionInfo`
-could lift `typeof` onto the cell), and the `<th>` leading-`!` strip is gated behind PHP's
-`previousSibling instanceof Element && !putsNextSiblingInSOLState`.
+**Done this session:**
+- commit `6fccfbe` — "Accept `!!` in templates" + "Spec syntactic differences (`!!` vs `||`)": the
+  `split_hidden_cells` span-split now records transclusions during the walk (so `hoistTransclusionInfo`
+  lifts `typeof` onto the cell), and the `<th>` leading-`!` strip is gated behind PHP's
+  `previousSibling instanceof Element && !putsNextSiblingInSOLState`.
+- commit `3f240df` — ported `reparseWithPreviousCell` + `convertAttribsToContent` + `mergeCells` +
+  `transferSourceBetweenCells` + `stripTrailingPipe`, wired `MAYBE_COMBINE_WITH_PREV_CELL` into
+  `getReparseType`, and set `AT_SRC_START` (SOL cells) + `th`-leading-`!` non-mergeable in the tokenizer.
+  No regression (820/891).
 
-Next step: port `reparseWithPreviousCell` + `convertAttribsToContent` + `mergeCells` +
-`transferSourceBetweenCells` + `stripTrailingPipe` into `table_fixups.rs` (the `MaybeCombineWithPrevCell`
-branch, currently stubbed), and consume `cell_attr_terminator_seen` at the top of `process_cell`.
+**Next step:** fix `table_body_content_target` to target `<tr>` (not `<tbody>`); then refine the merge
+path's DSR/data-mw bookkeeping for byte-exact output.
 
 ## Already resolved this session
 - `{{!}}` as table-syntax pipe (commit `13265e8`).
