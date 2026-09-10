@@ -146,6 +146,7 @@ impl ListHandler {
         let mut output = Vec::new();
         let mut saw_eof = false;
 
+
         for token in tokens {
             if matches!(token, Item::Tok(ParsoidToken::Eof(_))) {
                 saw_eof = true;

@@ -313,21 +313,15 @@ impl<'a> PegTokenizer<'a> {
             }
 
             // 2. Block lines (headings, lists, hr, table lines).
-            let block_saved = self.pos;
-            let output_saved = self.output.len();
             if self.try_parse_block_lines() {
                 return true;
             }
-            // Backtrack if block_lines didn't consume anything meaningful.
-            self.pos = block_saved;
-            self.output.truncate(output_saved);
 
-            // 2a. At SOL with no preceding newline, a run of comment-only lines
-            // (each `space* comment space_or_comment* newline`) is consumed as a
-            // single `EmptyLineTk`, mirroring PHP's `empty_lines_with_comments`.
-            // This is reachable because `inlineline` already consumed the
-            // preceding newline that put us at SOL.
-            if self.try_empty_lines_with_comments() {
+            // 2a. At SOL, a run of comment-only lines (each `space* comment
+            // space_or_comment* newline`) is consumed as a single `EmptyLineTk`,
+            // mirroring PHP's `empty_lines_with_comments` (which only runs inside
+            // the `sol` rule, i.e. immediately after a line start).
+            if self.at_sol && self.try_empty_lines_with_comments() {
                 return true;
             }
 
@@ -1346,7 +1340,10 @@ impl<'a> PegTokenizer<'a> {
         }
         self.emit_token(ParsoidToken::EndTag(EndTagTk::new("table", vec![], dp)));
 
-        self.at_sol = true;
+        // The `|}` consumes no newline, so the position after it is *not* at
+        // the start of a line (PHP's `table_line` is itself reached only via
+        // `sol block_line`, which has already consumed the leading newline).
+        self.at_sol = false;
         true
     }
 

@@ -1,12 +1,33 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **840/891 fixtures pass** (94%). Lib tests: 644 pass. Clippy: clean.
+Current baseline: **841/891 fixtures pass** (94%). Lib tests: 644 pass. Clippy: clean.
 
-## Landed this session: the selser `T319143` cluster (834 → 840)
+## Landed: the list/SOL cluster (840 → 841)
+
+### `table_end_tag` is not at SOL
+
+`try_table_end_tag` set `at_sol = true` after emitting the `</table>`
+end tag. But `|}` consumes no newline, so the position after it is *not* a line
+start — PHP reaches `table_line` only through `sol block_line`, which has already
+consumed the leading newline. Because of that stale `at_sol`, the following
+`<!-- bar -->` was greedily wrapped into an `EmptyLineTk` (rustoid's step "2a"
+`empty_lines_with_comments` call), whereas PHP emits a plain `CommentTk` +
+`NlTk`.
+
+The `NlTk` matters: in the ListHandler it sets `at_eol`, so the next
+non-SOL-transparent token (`this text`) triggers `closeLists`. With the comment
+swallowed into an `EmptyLineTk` that never happened, and the paragraph was
+absorbed into the `<dd>`.
+
+- `try_table_end_tag` now leaves `at_sol = false`.
+- The step-2a `empty_lines_with_comments` call is now gated on `self.at_sol`,
+  matching PHP's grammar (the rule only runs inside `sol`).
+
+Fixed: "Hacky use to indent tables, with comments (T65979)".
+
+## Landed: the selser `T319143` cluster (834 → 840)
 
 The whole 8-fixture "T319143 - copy-pasting of cells" group shared **one** root
-cause plus two smaller serialization bugs. All are now fixed.
-
 ### 1. `Test::applyManualChanges` — the `before`/`after`/`append` fragment context
 
 PHP's `$jquery['before'|'after']` closures do **not** parse the inserted HTML
