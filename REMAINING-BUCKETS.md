@@ -25,25 +25,62 @@ character" (T280115). Two faithful-port fixes, both prerequisite to the rest:
    `extension` token instead of being flattened to text. Values with no
    directives still come back as `KeyValue::Str`, so the fast path is unchanged.
 
-**Still open for this fixture:** the `mw:ExpandedAttrs` marker. PHP's
-`AttributeTransformManager::process` calls `$frame->expand()` with
-`attrExpansion => true`, which runs the value tokens through the *whole*
-propagation pipeline — including the ExtensionHandler. That is what turns the
-`extension` token into a `mw:DOMFragment`-carrying token, which
-`hasDOMFragmentType` in `stripMetaTags` then sees, setting `hasGeneratedContent`
-and so marking the attribute. (Note `mw:Extension` is **not** in PHP's
-`META_TYPE_MATCHER` = `mw:(LanguageVariant|Transclusion|Param|Includes|Annotation/)`,
-so the `wrapTemplates` branch does not fire — it really is the DOM-fragment
-signal.)
+**Still open for this fixture:** the `mw:ExpandedAttrs` marker — root cause now
+definitively identified, with a concrete plan below.
 
-Running `extension_handler::run` inside `expand_attributes` to close that gap was
-tried and **reverted**: it fixed the target cell (`title="foo|"` became correct)
-but regressed 6 fixtures (`<nowiki> inside a link`, `<pre> inside a link`,
-"Nowiki markup in link attribute (T206940)", "T107474: Frameless image caption
-with nowiki", "T374445: Non extlink in media caption", "3. Other redirect
-variants"), because it also re-expands attribute values that are already
-rendered (`href`, captions). The right fix needs the extension step to apply
-only where `$frame->expand` would have run, not to every `Tokens` value.
+`ExtensionHandler::onExtension` (PHP) **always** ends with
+`PipelineUtils::tunnelDOMThroughTokens` — including for `<nowiki>`, which is only
+special-cased in the block *before* it (skipping the `about`/`data-mw`/
+`mw:Extension/<name>` wrapper; the comment says "Parsoid has treated <nowiki>s as
+core functionality with lean markup"). The wrapper token that
+`tunnelDOMThroughTokens` builds always carries `typeof="mw:DOMFragment"`.
+
+rustoid deliberately skips that indirection — `nowiki_items` builds the
+`<span typeof="mw:Nowiki">` tokens directly ("without the DOM indirection").
+That is invisible on the page path, but inside an attribute value it loses the
+signal `stripMetaTags` reads via `hasDOMFragmentType` to set
+`hasGeneratedContent`, so the attribute is never marked `mw:ExpandedAttrs`.
+Verified by instrumenting `strip_meta_tags`, which sees
+`[Str("foo"), Tag(span, typeof=mw:Nowiki), Str("|"), EndTag(span)]` where PHP's
+token pipeline sees a `mw:DOMFragment` wrapper.
+Note `mw:Extension` is **not** in PHP's `META_TYPE_MATCHER`
+(`mw:(LanguageVariant|Transclusion|Param|Includes|Annotation/)`), so the
+`wrapTemplates` branch does not fire either — it really is the DOM-fragment path.
+
+### Why this was not forced through
+
+Two narrower attempts were tried and **reverted**, each fixing the target cell
+(`title="foo|"` became correct) while regressing 6 fixtures:
+
+- running `extension_handler::run` over every `Tokens` attribute value inside
+  `expand_attributes`;
+- the same, scoped to values containing an unexpanded `extension` token.
+
+The regressions were `<nowiki> inside a link`, `<pre> inside a link`, "Nowiki
+markup in link attribute (T206940)", "T107474: Frameless image caption with
+nowiki", "T374445: Non extlink in media caption", "3. Other redirect variants" —
+all cases where the value is *already rendered* and must not be re-expanded.
+
+### Correct next step (a real design change, not an incremental patch)
+
+Make rustoid tunnel **all** extensions through a DOM fragment, as PHP does:
+
+1. Have `expand_extension` return a `mw:dom-fragment-token` placeholder for
+   `nowiki` too (building the `<span typeof="mw:Nowiki">` sub-`Node` into
+   `fragments`, exactly like the existing `pwraptest`/`style` paths at
+   `extension_handler.rs:182`/`:310`).
+2. Delete the `nowiki` special case, since the only difference is the pre-wrapper
+   block (no `about`/`data-mw`/`mw:Extension/<name>`) — keep that, drop the
+   "no indirection" shortcut.
+3. Let the existing `tree_builder_html` placeholder unpacking
+   (`tree_builder_html.rs:552`, `:2180`) splice it back, and check
+   `p_wrap`/`cleanup` still treat `mw:Nowiki` as before (they already test for
+   both types at `p_wrap.rs:117`, `cleanup.rs:67`).
+
+This touches the shared path all 847 passing fixtures use, so it needs running
+the full suite at each step. The payoff is not just this fixture: the same
+DOM-fragment signal is what several other `AttributeExpander`/`TableFixups`
+failures depend on.
 
 ## Landed: html2wt link target handling (846 → 847)
 
