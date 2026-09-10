@@ -3589,6 +3589,18 @@ fn find_wikilink_close_at(input: &str) -> Option<usize> {
             }
             continue;
         }
+        // A recognized HTML tag is an atom: its quoted attribute values may
+        // contain a `|` that must not split the wikilink content (`link_text`
+        // tokenizes `inline_element`, and `html_tag`'s `html_tag_attributes`
+        // consume quoted values wholesale). Unrecognized tags are not markup,
+        // so their `|` stays structural.
+        if input[i..].starts_with('<')
+            && let Some(end) = skip_recognized_html_tag(&lower, input, i)
+        {
+            seg_has_open_bracket |= input[i..end].contains('[');
+            i = end;
+            continue;
+        }
         // A run of `]` decides between link content and the closing `]]`.
         if input[i..].starts_with(']') {
             let mut run = 0;
@@ -3665,6 +3677,62 @@ fn skip_template(input: &str, i: usize) -> Option<(usize, bool)> {
         }
         let ch_len = input[j..].chars().next().map(char::len_utf8).unwrap_or(1);
         j += ch_len;
+    }
+    None
+}
+
+/// If `input[at..]` starts a *recognized* HTML tag (`<tag …>`, `</tag>`, or
+/// `<tag …/>`), return the byte index just past its closing `>`. Quoted
+/// attribute values are skipped, so a `|`, `]`, or `>` inside them is not
+/// structural. Returns `None` for a non-tag `<` or an unrecognized tag name
+/// (which PHP treats as plain text, not markup).
+///
+/// `lower` must be `input.to_ascii_lowercase()`; `at` is an index into `input`.
+fn skip_recognized_html_tag(lower: &str, input: &str, at: usize) -> Option<usize> {
+    debug_assert_eq!(lower.len(), input.len());
+    let bytes = input.as_bytes();
+    if bytes.get(at) != Some(&b'<') {
+        return None;
+    }
+
+    let mut j = at + 1;
+    let closing = bytes.get(j) == Some(&b'/');
+    if closing {
+        j += 1;
+    }
+
+    // Tag name: ASCII letters/digits, starting with a letter.
+    let name_start = j;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric()) {
+        j += 1;
+    }
+    if j == name_start {
+        return None;
+    }
+    let name = &lower[name_start..j];
+    if !crate::wikitext::consts::html5_tags().contains(name)
+        && !crate::wikitext::consts::older_html_tags().contains(name)
+    {
+        return None;
+    }
+
+    // Skip to the tag's `>`, honoring quoted attribute values.
+    let mut in_quote: Option<u8> = None;
+    while j < bytes.len() {
+        let b = bytes[j];
+        match in_quote {
+            Some(q) => {
+                if b == q {
+                    in_quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => in_quote = Some(b),
+                b'>' => return Some(j + 1),
+                _ => {}
+            },
+        }
+        j += 1;
     }
     None
 }
@@ -4209,13 +4277,36 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
     let mut extlink: i32 = 0;
     let mut table: i32 = 0;
     let mut dash_brace: i32 = 0;
-    let chars: Vec<char> = inner.chars().collect();
+    let lower = inner.to_ascii_lowercase();
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    while i < inner.len() {
+        // A `-{ … }-` language-variant construct is balanced: its internal `|`
+        // (e.g. `-{R|caption:}-`) must not split the option/argument list.
+        if inner[i..].starts_with("-{") {
+            dash_brace += 1;
+            current.push_str("-{");
+            i += 2;
+            continue;
+        }
+        if inner[i..].starts_with("}-") && dash_brace > 0 {
+            dash_brace -= 1;
+            current.push_str("}-");
+            i += 2;
+            continue;
+        }
+        // A recognized HTML tag is an atom: a `|` inside a quoted attribute
+        // value (`<span class="a|b">`) must not split the list, since PHP's
+        // `inline_element`/`html_tag` consume the whole tag (attributes and all).
+        if inner[i..].starts_with('<')
+            && let Some(end) = skip_recognized_html_tag(&lower, inner, i)
+        {
+            current.push_str(&inner[i..end]);
+            i = end;
+            continue;
+        }
         // A `<nowiki>` (self-closing or paired) is opaque: its content — including
         // any `|` — is literal and must not split the option/argument list.
-        if c == '<' && inner[i..].to_ascii_lowercase().starts_with("<nowiki") {
+        if lower[i..].starts_with("<nowiki") {
             let rest = &inner[i + 7..];
             let is_tag = rest.starts_with('>')
                 || rest.starts_with('/')
@@ -4226,7 +4317,7 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
                 if !self_closing {
                     // Paired `<nowiki>…</nowiki>`: consume up to (and incl.) the
                     // close tag.
-                    if let Some(close_rel) = inner[i..].to_ascii_lowercase().find("</nowiki") {
+                    if let Some(close_rel) = lower[i..].find("</nowiki") {
                         let close_end = i + close_rel + "</nowiki>".len();
                         let gt = inner[close_end..].find('>').map(|g| g + 1).unwrap_or(0);
                         current.push_str(&inner[i..close_end + gt]);
@@ -4240,22 +4331,8 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
                 continue;
             }
         }
-        // A `-{ … }-` language-variant construct is balanced: its internal `|`
-        // (e.g. `-{R|caption:}-`) must not split the option/argument list.
-        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '{' {
-            dash_brace += 1;
-            current.push_str("-{");
-            i += 2;
-            continue;
-        }
-        if c == '}' && i + 1 < chars.len() && chars[i + 1] == '-' && dash_brace > 0 {
-            dash_brace -= 1;
-            current.push_str("}-");
-            i += 2;
-            continue;
-        }
         // Track nesting of `{{{`, `{{`, and `[[`.
-        if c == '{' && i + 2 < chars.len() && chars[i + 1] == '{' && chars[i + 2] == '{' {
+        if inner[i..].starts_with("{{{") {
             triple_brace += 1;
             current.push_str("{{{");
             i += 3;
@@ -4267,13 +4344,7 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
         // wikilink content (not template args, where `{{!}}` is a nested magic
         // word).
         if magic_pipe
-            && c == '{'
-            && i + 3 < chars.len()
-            && chars[i + 1] == '{'
-            && chars[i + 2] == '!'
-            && chars[i + 3] == '}'
-            && i + 4 < chars.len()
-            && chars[i + 4] == '}'
+            && lower[i..].starts_with("{{!}}")
             && double_brace == 0
             && triple_brace == 0
             && bracket == 0
@@ -4285,36 +4356,37 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
             i += 5;
             continue;
         }
-        if c == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+        if inner[i..].starts_with("{{") {
             double_brace += 1;
             current.push_str("{{");
             i += 2;
             continue;
         }
-        if c == '}' && i + 2 < chars.len() && chars[i + 1] == '}' && chars[i + 2] == '}' {
+        if inner[i..].starts_with("}}}") {
             triple_brace = triple_brace.saturating_sub(1);
             current.push_str("}}}");
             i += 3;
             continue;
         }
-        if c == '}' && i + 1 < chars.len() && chars[i + 1] == '}' {
+        if inner[i..].starts_with("}}") {
             double_brace = double_brace.saturating_sub(1);
             current.push_str("}}");
             i += 2;
             continue;
         }
-        if c == '[' && i + 1 < chars.len() && chars[i + 1] == '[' {
+        if inner[i..].starts_with("[[") {
             bracket += 1;
             current.push_str("[[");
             i += 2;
             continue;
         }
-        if c == ']' && i + 1 < chars.len() && chars[i + 1] == ']' {
+        if inner[i..].starts_with("]]") {
             bracket = bracket.saturating_sub(1);
             current.push_str("]]");
             i += 2;
             continue;
         }
+        let c = inner[i..].chars().next().unwrap();
         // A single-bracket `[...]` external link is a balanced atom: pipes in the
         // URL must not split the option/argument list (mirrors the PEG `url`/
         // `bracket` productions, which keep `|` inside an extlink intact).
@@ -4332,19 +4404,13 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
         }
         // A `{| … |}` table block is balanced: its internal `|` cell/row markers
         // must not split the enclosing option/argument list.
-        if c == '{'
-            && i + 1 < chars.len()
-            && chars[i + 1] == '|'
-            && double_brace == 0
-            && triple_brace == 0
-            && bracket == 0
-        {
+        if inner[i..].starts_with("{|") && double_brace == 0 && triple_brace == 0 && bracket == 0 {
             table += 1;
             current.push_str("{|");
             i += 2;
             continue;
         }
-        if c == '|' && i + 1 < chars.len() && chars[i + 1] == '}' && table > 0 {
+        if inner[i..].starts_with("|}") && table > 0 {
             table -= 1;
             current.push_str("|}");
             i += 2;
@@ -4362,7 +4428,7 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
         } else {
             current.push(c);
         }
-        i += 1;
+        i += c.len_utf8();
     }
     parts.push(current);
     parts
@@ -5346,6 +5412,42 @@ mod tests {
         // A paired nowiki protects its whole body, pipes included.
         let parts = split_template_args("thumb|caption <nowiki>a|b</nowiki> tail");
         assert_eq!(parts, vec!["thumb", "caption <nowiki>a|b</nowiki> tail"]);
+    }
+
+    #[test]
+    fn test_split_template_args_skips_html_attr_pipe() {
+        // A `|` inside a quoted HTML attribute value is part of the tag, not a
+        // separator (`inline_element` / `html_tag` consume the whole tag).
+        let parts = split_wikilink_content("Test|<span class=\"a|b\">c</span>");
+        assert_eq!(parts, vec!["Test", "<span class=\"a|b\">c</span>"]);
+
+        // An unrecognized tag is plain text, so its `|` still splits.
+        let parts = split_wikilink_content("Test|<foo class=\"a|b\">");
+        assert_eq!(parts, vec!["Test", "<foo class=\"a", "b\">"]);
+    }
+
+    #[test]
+    fn test_wikilink_close_ignores_html_attr_pipe() {
+        // The `[[…]]` close scan must not let a `|` inside an HTML attribute
+        // start a new link-text segment.
+        let tokens = tokenize("[[Test|<span class=\"a|b\">c</span>]]");
+        let link = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "wikilink" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("wikilink token");
+        // One `mw:maybeContent` KV (a single pipe), with the tag intact.
+        let content: Vec<&str> = link
+            .attribs
+            .iter()
+            .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+            .filter_map(|kv| kv.value.as_str())
+            .collect();
+        assert_eq!(content, vec!["<span class=\"a|b\">c</span>"]);
     }
 
     #[test]
