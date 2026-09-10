@@ -796,17 +796,14 @@ pub fn serialize_as_wiki_link(
             "{}[[{}{}]]{}",
             link_data.prefix, link_target, piped_text, link_data.tail
         );
-        let trail = env
-            .get_site_config()
-            .link_trail_regex()
-            .and_then(|t| regex::Regex::new(t).ok());
-        let no_trails = link_data
-            .link_type
-            .as_deref()
-            .is_some_and(|t| t.starts_with("mw:PageProp/") || t == "mw:MediaLink");
-        let greedy = !no_trails && !wt.ends_with(']');
-        let ct = crate::html::constrained_text::ConstrainedText::wiki_link(
-            wt, node, greedy, None, trail,
+        // Faithful port of the `WikiLinkText` constructor: category/external/
+        // image links use neither link trails nor prefixes, and the bad-prefix
+        // guard is the wiki's link-prefix regex OR the default bracket guard.
+        let ct = crate::html::constrained_text::wiki_link_with_config(
+            wt,
+            node,
+            env.get_site_config(),
+            link_data.link_type.as_deref().unwrap_or(""),
         );
         state.emit_ct(ct, node, tree);
 

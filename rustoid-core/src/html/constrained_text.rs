@@ -457,23 +457,28 @@ fn from_sel_ser_impl_kind(
     Some(vec![ct])
 }
 
-/// Construct the `WikiLinkText` chunk, faithfully replicating its constructor's
+/// Build a `WikiLinkText` chunk from a link `type` (the `rel` attribute value),
+/// faithfully replicating the `WikiLinkText` constructor's
 /// `noTrails`/`badPrefix`/`badSuffix`/`greedy` logic.
-fn from_wiki_link_chunk(
-    tree: &DomTree,
-    id: NodeId,
-    text: &str,
-    env: Option<SerializerEnv>,
+///
+/// The non-selser `serializeAsWikiLink` path always wraps its output in this
+/// chunk, which is what inserts `<nowiki/>` before/after a link whose neighbour
+/// text would be swallowed by a link prefix/trail.
+pub fn wiki_link_with_config(
+    text: impl Into<String>,
+    node: NodeId,
+    site_config: &dyn crate::traits::SiteConfig,
+    link_type: &str,
 ) -> ConstrainedText {
-    let node = tree.node(id);
-    let rel = node.get_attr("rel").unwrap_or("");
-    // category links/external links/images don't use link trails or prefixes
-    let no_trails = rel
+    // category links/external links/images don't use link trails or prefixes.
+    // `#^mw:WikiLink(/Interwiki)?$#D`. Note `link_type` may be a multi-token
+    // value, so match on whitespace-separated tokens.
+    let no_trails = !link_type
         .split_whitespace()
-        .all(|t| t != "mw:WikiLink" && t != "mw:WikiLink/Interwiki");
+        .any(|t| t == "mw:WikiLink" || t == "mw:WikiLink/Interwiki");
 
-    let link_prefix_regex = env.and_then(|e| e.get_site_config().link_prefix_regex());
-    let link_trail_regex = env.and_then(|e| e.get_site_config().link_trail_regex());
+    let link_prefix_regex = site_config.link_prefix_regex();
+    let link_trail_regex = site_config.link_trail_regex();
 
     // Default bad prefix: `(^|[^\[])(\[\[)*\[$`.
     let default_bad_prefix = r"(^|[^\[])(\[\[)*\[$";
@@ -489,11 +494,12 @@ fn from_wiki_link_chunk(
     } else {
         link_trail_regex.and_then(|lt| regex::Regex::new(lt).ok())
     };
+    let text = text.into();
     let greedy = !(no_trails || text.ends_with(']'));
 
     ConstrainedText {
-        text: text.to_string(),
-        node: id,
+        text,
+        node,
         prefix: None,
         suffix: None,
         kind: ConstrainedTextKind::WikiLink {
@@ -501,9 +507,43 @@ fn from_wiki_link_chunk(
             bad_prefix: Some(bad_prefix),
             bad_suffix,
         },
-        selser: true,
+        selser: false,
         no_sep: false,
     }
+}
+
+/// Construct the `WikiLinkText` chunk for a DOM node (the selser path).
+fn from_wiki_link_chunk(
+    tree: &DomTree,
+    id: NodeId,
+    text: &str,
+    env: Option<SerializerEnv>,
+) -> ConstrainedText {
+    let rel = tree.node(id).get_attr("rel").unwrap_or("");
+    let mut ct = match env {
+        Some(e) => wiki_link_with_config(text, id, e.get_site_config(), rel),
+        None => {
+            // No env: fall back to the default bracket guard only.
+            let bad_prefix = regex::Regex::new(r"(^|[^\[])(\[\[)*\[$").unwrap();
+            let greedy = !text.ends_with(']');
+            ConstrainedText {
+                text: text.to_string(),
+                node: id,
+                prefix: None,
+                suffix: None,
+                kind: ConstrainedTextKind::WikiLink {
+                    greedy,
+                    bad_prefix: Some(bad_prefix),
+                    bad_suffix: None,
+                },
+                selser: false,
+                no_sep: false,
+            }
+        }
+    };
+    // Chunks built on the selser path are tagged as such.
+    ct.selser = true;
+    ct
 }
 
 /// The base-case `fromSelSerImpl`: partition the text around the leftmost/
@@ -729,6 +769,43 @@ mod tests {
         a.prefix = Some("<nowiki>".to_string());
         let line = vec![a, ConstrainedText::cast("cd", 2)];
         assert_eq!(ConstrainedText::escape_line(&line), "<nowiki>abcd");
+    }
+
+    #[test]
+    fn test_wiki_link_with_config_prefix_escape() {
+        // The non-selser path always builds a `WikiLinkText` chunk, and that
+        // chunk's bad-prefix guard includes the wiki's link-prefix regex.
+        let mut cfg = crate::mock::MockSiteConfig::new();
+        cfg.set_language("is");
+        let ct = wiki_link_with_config("[[söfnuður]]", 1, &cfg, "mw:WikiLink");
+        let state = State {
+            left_context: "Aðrir mótmælenda".to_string(),
+            right_context: "".to_string(),
+            pos: 0,
+        };
+        assert_eq!(ct.escape(&state).prefix.as_deref(), Some("<nowiki/>"));
+
+        // enwiki has no link prefix, so the default bracket guard applies.
+        let cfg = crate::mock::MockSiteConfig::new();
+        let ct = wiki_link_with_config("[[Foo]]", 1, &cfg, "mw:WikiLink");
+        let state = State {
+            left_context: "abc".to_string(),
+            right_context: "".to_string(),
+            pos: 0,
+        };
+        assert!(ct.escape(&state).prefix.is_none());
+
+        // A category link uses neither prefix nor trail guards.
+        let cfg = crate::mock::MockSiteConfig::new();
+        let ct = wiki_link_with_config("[[Category:Foo]]", 1, &cfg, "mw:PageProp/Category");
+        let state = State {
+            left_context: "abc".to_string(),
+            right_context: "def".to_string(),
+            pos: 0,
+        };
+        let r = ct.escape(&state);
+        assert!(r.prefix.is_none());
+        assert!(r.suffix.is_none());
     }
 
     #[test]
