@@ -256,6 +256,71 @@ impl DataParsoid {
             .insert(key.to_string(), value.to_string());
     }
 
+    /// Parse a `data-parsoid` JSON object back into a `DataParsoid`.
+    ///
+    /// This is the inverse of [`DataParsoid::to_data_parsoid_json`] for the
+    /// round-trip-critical fields the html2wt handlers read: the `a`/`sa`
+    /// attribute shadow maps, `stx`, `dsr`/`tsr`, `src`, `srcContent`, `prefix`,
+    /// `tail`, `isIW`, and `type`. Unknown keys are ignored, mirroring PHP's
+    /// lenient JSON deserialization.
+    pub fn from_data_parsoid_json(json: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let obj = value.as_object()?;
+        let mut dp = Self::default();
+
+        let str_of = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let bool_of = |k: &str| obj.get(k).and_then(|v| v.as_bool());
+
+        // Attribute shadow maps: `{ "name": "value" }`.
+        let shadow = |k: &str| {
+            obj.get(k).and_then(|v| v.as_object()).map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<std::collections::HashMap<String, String>>()
+            })
+        };
+        dp.a = shadow("a");
+        dp.sa = shadow("sa");
+
+        dp.stx = str_of("stx");
+        dp.src = str_of("src");
+        dp.src_content = str_of("srcContent");
+        dp.prefix = str_of("prefix");
+        dp.tail = str_of("tail");
+        dp.colon = str_of("colon");
+        dp.name = str_of("name");
+        dp.link_type = str_of("type");
+        dp.is_iw = bool_of("isIW");
+        dp.auto_inserted_start_token = bool_of("autoInsertedStartToken").unwrap_or(false);
+        dp.auto_inserted_end_token = bool_of("autoInsertedEndToken").unwrap_or(false);
+        dp.auto_inserted_start = bool_of("autoInsertedStart").unwrap_or(false);
+        dp.auto_inserted_end = bool_of("autoInsertedEnd").unwrap_or(false);
+
+        // `tsr`: `[start|null, end]`.
+        dp.tsr = obj.get("tsr").and_then(|v| v.as_array()).and_then(|a| {
+            let start = a.first().and_then(|v| v.as_u64()).map(|n| n as usize);
+            let end = a.get(1).and_then(|v| v.as_u64()).map(|n| n as usize)?;
+            Some(SourceRange { start, end })
+        });
+
+        // `dsr`: `[start, end, openWidth|null, closeWidth|null]`.
+        dp.dsr = obj.get("dsr").and_then(|v| v.as_array()).map(|a| {
+            let start = a.first().and_then(|v| v.as_u64()).map(|n| n as usize);
+            let end = a.get(1).and_then(|v| v.as_u64()).map(|n| n as usize);
+            let open_width = a.get(2).and_then(|v| v.as_u64()).map(|n| n as usize);
+            let close_width = a.get(3).and_then(|v| v.as_u64()).map(|n| n as usize);
+            DomSourceRange {
+                start,
+                end,
+                open_width,
+                close_width,
+                ..Default::default()
+            }
+        });
+
+        Some(dp)
+    }
+
     /// Serialize this `DataParsoid` to the `data-parsoid` JSON object that
     /// Parsoid emits on DOM elements (mirrors PHP's `DataParsoid::toJsonArray`).
     ///

@@ -158,6 +158,17 @@ fn convert_node(handle: &Handle) -> Result<Option<Node>> {
             let kind = html_tag_to_element_kind(&tag_name, &html_attrs);
             let mut node = Node::element(kind);
             node.attrs = html_attrs;
+            // Decode `data-parsoid` into the structured metadata, mirroring
+            // PHP's `DOMDataUtils::loadDataAttribs` (run by `prepareAndLoadDoc`).
+            // The html2wt handlers read `dp.a`/`dp.sa` (attribute shadow info),
+            // `dp.stx` (link syntax), and `dp.dsr` from here; leaving it as an
+            // undecoded string made every shadow lookup look "new".
+            if let Some(json) = &data_parsoid
+                && let Some(parsed) =
+                    crate::wikitext::tokens_v2::DataParsoid::from_data_parsoid_json(json)
+            {
+                node.dp = Some(parsed);
+            }
             node.data_parsoid = data_parsoid;
             node.data_mw = data_mw;
 

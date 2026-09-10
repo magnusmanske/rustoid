@@ -1373,11 +1373,23 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// elements (matching PHP's `WrapSections` DOM post-processor in document
     /// mode). Fragment rendering leaves it false.
     pub fn wikitext_to_ast(&self, wikitext: &str, wrap_sections: bool) -> Result<Node> {
+        self.wikitext_to_ast_with_title(wikitext, wrap_sections, None)
+    }
+
+    /// [`Parser::wikitext_to_ast`] with an explicit context title, so relative
+    /// links (`[[../sibling]]`, `[[/subpage]]`) and lone fragments resolve
+    /// against the page being parsed, as PHP's `Env::getContextTitle()` provides.
+    pub fn wikitext_to_ast_with_title(
+        &self,
+        wikitext: &str,
+        wrap_sections: bool,
+        context_title: Option<&crate::title::Title>,
+    ) -> Result<Node> {
         let tokens = self.tokenize(wikitext)?;
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
         let mut next_id = 0usize;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, None);
+        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, context_title);
         let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);

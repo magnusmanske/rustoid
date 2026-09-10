@@ -830,6 +830,23 @@ pub fn run_single_test_public(test: &ParserTestCase, test_file: &ParserTestFile)
     run_single_test(test, test_file)
 }
 
+/// Diagnostic helper: serialize a raw HTML fragment to wikitext.
+/// `subpage` enables subpage support for the content namespace (the `subpage`
+/// test option); `lang` sets the content language.
+pub fn probe_html2wt(html: &str, page_title: &str, subpage: Option<&str>, lang: &str) -> String {
+    let mut config = MockSiteConfig::new();
+    if subpage.is_some() {
+        config.enable_subpages_for_ns(0);
+    }
+    if lang != "en" {
+        config.set_language(lang);
+    }
+    let ast = rustoid_core::html::parse::parse_html(html).expect("html parse");
+    let title = rustoid_core::title::Title::new_main(page_title);
+    let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
+    rustoid_core::html::serializer::WikitextSerializer::serialize_dom_with_env(ast, env)
+}
+
 /// Run a single test case.
 fn run_single_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestResult {
     // A `disabled` test option (the parser-test convention for marking a test as
@@ -948,28 +965,7 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
     }
     // Apply `!! config` MediaWiki config values (e.g.
     // `wgParsoidExperimentalParserFunctionOutput=true`).
-    for line in test.config_raw.lines() {
-        let line = line.trim();
-        if line == "wgParsoidExperimentalParserFunctionOutput=true" {
-            config.set_parsoid_experimental_parser_function_output(true);
-        } else if let Some(v) = line.strip_prefix("wgExternalLinkTarget=") {
-            config.set_external_link_target(v.trim_matches('"'));
-        } else if let Some(v) = line.strip_prefix("wgNoFollowLinks=") {
-            config.set_no_follow_links(v.trim_matches('"') == "true");
-        } else if let Some(v) = line.strip_prefix("wgNoFollowDomainExceptions=") {
-            // The config value is a JSON array (`["example.com", ...]`).
-            let v = v.trim();
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(v) {
-                for domain in arr {
-                    config.add_no_follow_domain_exception(&domain);
-                }
-            } else {
-                for domain in v.split(',') {
-                    config.add_no_follow_domain_exception(domain.trim().trim_matches('"'));
-                }
-            }
-        }
-    }
+    apply_config_raw(&mut config, &test.config_raw);
     // The `i18next` option registers the `i18ntag`/`i18nattr` extension tags
     // (mirrors `SiteConfig::registerParserTestExtension(I18nTag::class)`).
     if test
@@ -1097,29 +1093,68 @@ fn extract_body(html: &str) -> String {
     html.to_string()
 }
 
+/// Apply the test's `!! config` MediaWiki config values to a mock site config.
+fn apply_config_raw(config: &mut MockSiteConfig, config_raw: &str) {
+    for line in config_raw.lines() {
+        let line = line.trim();
+        if line == "wgParsoidExperimentalParserFunctionOutput=true" {
+            config.set_parsoid_experimental_parser_function_output(true);
+        } else if let Some(v) = line.strip_prefix("wgExternalLinkTarget=") {
+            config.set_external_link_target(v.trim_matches('"'));
+        } else if let Some(v) = line.strip_prefix("wgNoFollowLinks=") {
+            config.set_no_follow_links(v.trim_matches('"') == "true");
+        } else if let Some(v) = line.strip_prefix("wgNoFollowDomainExceptions=") {
+            // The config value is a JSON array (`["example.com", ...]`).
+            let v = v.trim();
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(v) {
+                for domain in arr {
+                    config.add_no_follow_domain_exception(&domain);
+                }
+            } else {
+                for domain in v.split(',') {
+                    config.add_no_follow_domain_exception(domain.trim().trim_matches('"'));
+                }
+            }
+        }
+    }
+}
+
 /// Run a wikitext → wikitext (wt2wt) round-trip test: parse to AST, then
 /// serialize back, comparing against the input wikitext.
+///
+/// The `subpage`, `language`, and `!! config` options apply, exactly as in
+/// `run_wt2html_test` — PHP's wt2wt runs the same wt2html pipeline (with the
+/// test's options) and then re-serializes, so ignoring them diverged.
 fn run_wt2wt_test(test: &ParserTestCase, _test_file: &ParserTestFile) -> TestResult {
     if test.wikitext.is_empty() {
         return TestResult::Skip("no wikitext input".to_string());
     }
-    let config = MockSiteConfig::new();
+    let mut config = MockSiteConfig::new();
+    if test.options.contains_key("subpage") {
+        config.enable_subpages_for_ns(0);
+    }
+    if let Some(lang) = test.options.get("language") {
+        config.set_language(lang);
+    }
+    apply_config_raw(&mut config, &test.config_raw);
     let parser = Parser::new(&config);
 
     let wrap_sections = test.options_raw.contains("wrapSections\": true")
         || test.options_raw.contains("wrapSections\":true");
 
-    let ast = match parser.wikitext_to_ast(&test.wikitext, wrap_sections) {
-        Ok(ast) => ast,
-        Err(e) => return TestResult::Error(format!("parse error: {e}")),
-    };
-
     let page_title = test
         .options
         .get("title")
         .cloned()
+        .map(|t| strip_link_target_brackets(&t))
         .unwrap_or_else(|| "Parser test".to_string());
     let title = rustoid_core::title::Title::new_main(&page_title);
+
+    let ast = match parser.wikitext_to_ast_with_title(&test.wikitext, wrap_sections, Some(&title)) {
+        Ok(ast) => ast,
+        Err(e) => return TestResult::Error(format!("parse error: {e}")),
+    };
+
     let env = rustoid_core::html::env::SerializerEnv::new(&config, &title);
     let actual =
         rustoid_core::html::serializer::WikitextSerializer::serialize_dom_with_env(ast, env);
