@@ -469,12 +469,8 @@ fn render_wiki_link_with_fragment(
         // href = makeLink(title), title = getPrefixedText(). The fragment is
         // part of the title: whitespace (incl. NBSP) collapses to `_`, and `#`
         // is escaped (mirrors `Env::makeLink` → `Sanitizer::sanitizeTitleURI` on
-        // the full DB key including the fragment).
-        let mut dbkey = title.get_full_db_key();
-        if let Some(fragment) = &title.fragment {
-            dbkey.push('#');
-            dbkey.push_str(&crate::title::collapse_title_whitespace(fragment));
-        }
+        // `Title::getFullDBKey()`, which appends the fragment).
+        let dbkey = title.get_full_db_key();
         let href = format!(
             "{}{}",
             crate::title::relative_link_prefix(ctx.config),

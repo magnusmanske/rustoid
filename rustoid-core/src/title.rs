@@ -86,9 +86,9 @@ impl Title {
         }
     }
 
-    /// The prefixed title with underscores (DB key). Mirrors PHP's
-    /// `Title::getPrefixedDBKey()` / `getFullDBKey()`.
-    pub fn get_full_db_key(&self) -> String {
+    /// The prefixed title with underscores, no fragment. Mirrors PHP's
+    /// `Title::getPrefixedDBKey()`.
+    pub fn get_prefixed_db_key(&self) -> String {
         let text = self.text.replace(' ', "_");
         let prefix = self.prefix_for_display();
         if self.namespace_id != 0 && !prefix.is_empty() {
@@ -99,6 +99,17 @@ impl Title {
         } else {
             text
         }
+    }
+
+    /// The prefixed DB key plus any `#fragment`. Mirrors PHP's
+    /// `Title::getFullDBKey()`.
+    pub fn get_full_db_key(&self) -> String {
+        let mut key = self.get_prefixed_db_key();
+        if let Some(fragment) = &self.fragment {
+            key.push('#');
+            key.push_str(fragment);
+        }
+        key
     }
 
     /// The namespace prefix used for display/links: the localized name when
@@ -406,6 +417,14 @@ impl TitleParser {
 
         let (rest, fragment) = split_fragment(trimmed);
         let rest = if rest.is_empty() { trimmed } else { rest };
+
+        // MediaWiki's `TitleParser::splitTitleString` runs the fragment through
+        // the same whitespace normalization as the title text (its
+        // `$wgLegalTitleChars`-adjacent "clean up whitespace" step uses
+        // `[ _\x{00A0}\x{1680}…]+` over the whole input), so `[[Foo#a&#160;b]]`
+        // yields the fragment `a b`, and `getFullDBKey()` then gives `Foo#a_b`
+        // once `Sanitizer::sanitizeTitleURI` maps the space to `_`.
+        let fragment = fragment.map(|f| collapse_title_whitespace(&f));
 
         // Leading colon forces main namespace
         let (rest, force_main) = if let Some(stripped) = rest.strip_prefix(':') {

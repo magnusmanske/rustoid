@@ -44,13 +44,17 @@ impl<'a> SerializerEnv<'a> {
     /// `Env::normalizedTitleKey` (with `ignoreFragment` defaulting to `false`) —
     /// the normalized DB key of a url-decoded title string. Returns `None` for
     /// titles that resolve to an empty key.
+    ///
+    /// `ignoreFragment = true` returns `getPrefixedDBKey()` (underscores in both
+    /// the namespace and the title), the default `false` returns the
+    /// `getFullDBKey()` (which appends the fragment).
     pub fn normalized_title_key(&self, str_: &str, ignore_fragment: bool) -> Option<String> {
         let title = self.make_title_from_text(str_);
         if title.text.is_empty() && title.namespace_id == 0 && title.interwiki.is_none() {
             return None;
         }
         if ignore_fragment {
-            Some(title.get_prefixed_text())
+            Some(title.get_prefixed_db_key())
         } else {
             Some(title.get_full_db_key())
         }
@@ -112,14 +116,23 @@ mod tests {
         let config = MockSiteConfig::new();
         let title = Title::new_main("Test Page");
         let env = SerializerEnv::new(&config, &title);
-        // `ignoreFragment` yields the prefixed (space) form; otherwise the DB key.
+        // `ignoreFragment` yields the prefixed DB key (underscores); otherwise
+        // the full DB key, which appends the fragment.
         assert_eq!(
             env.normalized_title_key("Foo Bar", true).as_deref(),
-            Some("Foo Bar")
+            Some("Foo_Bar")
         );
         assert_eq!(
             env.normalized_title_key("Foo Bar", false).as_deref(),
             Some("Foo_Bar")
+        );
+        assert_eq!(
+            env.normalized_title_key("Foo Bar#Sec", true).as_deref(),
+            Some("Foo_Bar")
+        );
+        assert_eq!(
+            env.normalized_title_key("Foo Bar#Sec", false).as_deref(),
+            Some("Foo_Bar#Sec")
         );
         assert_eq!(
             env.normalized_title_key("Template:Foo", false).as_deref(),

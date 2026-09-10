@@ -1136,11 +1136,9 @@ fn rewrite_structure(
                         }
                     }
                 } else {
-                    let mut href = crate::title::make_link(&link_title, config);
-                    if let Some(fragment) = &link_title.fragment {
-                        href.push('#');
-                        href.push_str(fragment);
-                    }
+                    // `make_link` uses `getFullDBKey()`, which already appends
+                    // the fragment.
+                    let href = crate::title::make_link(&link_title, config);
                     anchor.set_attr("href", href);
                     anchor.set_attr("title", link_title.get_prefixed_text());
                 }

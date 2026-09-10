@@ -425,8 +425,40 @@ pub fn serialize_as_ext_link(
 /// `LinkHandlerUtils::isSimpleWikiLink` (the `normalizedTitleKey`/
 /// `resolveTitle` comparisons are approximated with exact/underscore-normalized
 /// string equality).
+/// Normalize title whitespace the way MediaWiki does, for the
+/// `MW_TITLE_WHITESPACE_RE` comparison in `isSimpleWikiLink`:
+/// `/[ _\xA0\x{1680}\x{180E}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]+/u`.
+/// Each maximal run of those characters becomes a single `_`.
+fn mw_title_whitespace_to_underscore(s: &str) -> String {
+    let is_mw_ws = |c: char| {
+        matches!(
+            c,
+            ' ' | '_' | '\u{00a0}' | '\u{1680}' | '\u{180e}' | '\u{2000}'
+                ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+        )
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut in_run = false;
+    for c in s.chars() {
+        if is_mw_ws(c) {
+            if !in_run {
+                out.push('_');
+                in_run = true;
+            }
+        } else {
+            out.push(c);
+            in_run = false;
+        }
+    }
+    out
+}
+
+/// Whether a wiki link can be serialized without an explicit caption
+/// (`[[Foo]]` rather than `[[Foo|Foo]]`).
+///
+/// Faithful port of `LinkHandlerUtils::isSimpleWikiLink`.
 pub fn is_simple_wiki_link(
-    _env: &SerializerEnv,
+    env: &SerializerEnv,
     dp: &crate::wikitext::tokens_v2::DataParsoid,
     target: &ShadowInfo,
     link_data: &LinkData,
@@ -435,31 +467,144 @@ pub fn is_simple_wiki_link(
         return false;
     };
 
-    // Would need to pipe for any modified/non-preserved/minimal-piped content.
-    if (target.modified || (dp.stx.as_deref() != Some("piped")))
-        && !content_string.starts_with("./")
+    // Would need to pipe for any non-string content.
+    // Preserve unmodified or non-minimal piped links.
+    if !(target.modified || (dp.stx.as_deref() != Some("piped")))
+        || content_string.starts_with("./")
     {
-        // Strip colon-escapes and leading `./`/(spaces before) from the target.
-        let mut stripped = target.value.trim_start();
-        stripped = stripped.strip_prefix(':').unwrap_or(stripped);
-        stripped = stripped.strip_prefix("./").unwrap_or(stripped);
-        // rtrim spaces (moved out of links by DOMNormalizer).
-        let stripped = stripped.trim_end();
+        return false;
+    }
 
-        let decoded_target = crate::html::wts_utils::decode_wt_entities_all(stripped);
+    // Strip colon escapes from the original target as that is stripped when
+    // deriving the content string. Strip `./` prefixes (the relative-link prefix
+    // added to all titles) too, including any spaces before the prefix. Finally
+    // remove trailing spaces, which `DOMNormalizer::moveTrailingSpacesOut`
+    // removes for `<a>` links.
+    //
+    // `preg_replace( '#^\s*(:|\./)#', '', $target['value'], 1 )` strips *one*
+    // occurrence of the alternatives (colon first, else `./`) after leading
+    // whitespace.
+    let stripped_target_value = {
+        let v = target.value.as_str();
+        let lead = v.len() - v.trim_start_matches(|c: char| c.is_whitespace()).len();
+        let after_lead = &v[lead..];
+        let rest = if let Some(r) = after_lead.strip_prefix(':') {
+            r
+        } else if let Some(r) = after_lead.strip_prefix("./") {
+            r
+        } else {
+            after_lead
+        };
+        let stripped = format!("{}{rest}", &v[..lead]);
+        stripped.trim_end().to_string()
+    };
 
-        // Normalize content string and decoded target before comparison.
-        let content_norm = content_string.replace('_', " ");
-        let decoded_norm = decoded_target.replace('_', " ");
+    // Strip the colon escape after an interwiki prefix (`#^(\w+:):#` → `$1`).
+    let stripped_target_value = if link_data.is_interwiki {
+        strip_interwiki_colon_escape(&stripped_target_value)
+    } else {
+        stripped_target_value
+    };
 
-        // See if the (normalized) content matches the target, either directly
-        // or wrapped in forward slashes (relative-link stripping).
-        return content_norm == decoded_norm
-            || format!("/{content_norm}/") == decoded_norm
-            || content_norm == crate::util::decode_uri_component(&link_data.href);
+    let decoded_target = crate::wikitext::tokenizer_v2::decode_wt_entities(&stripped_target_value);
+    // Protocol-relative link scenario (`#^(\w+:)?//#`).
+    let href_has_proto = {
+        let h = link_data.href.as_str();
+        let scheme_len = h.find("://").or_else(|| {
+            // `//` at the start, or after `scheme:`.
+            if h.starts_with("//") {
+                Some(0)
+            } else {
+                h.find(':').filter(|&i| h[i + 1..].starts_with("//"))
+            }
+        });
+        match scheme_len {
+            Some(0) => true,
+            Some(i) => h[..i]
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '+' || c == '.' || c == '-'),
+            None => false,
+        }
+    };
+
+    // Normalize content string and decoded target before comparison.
+    // Piped links don't reach here, so it is safe to normalize both.
+    let content_norm = content_string.replace('_', " ");
+    let decoded_norm = decoded_target.replace('_', " ");
+
+    // See if the (normalized) content matches the target, either shadowed or
+    // actual.
+    if content_norm == decoded_norm {
+        return true;
+    }
+    // Try wrapped in forward slashes in case they were stripped.
+    if format!("/{content_norm}/") == decoded_norm {
+        return true;
+    }
+    // Normalize as titles and compare.
+    if let Some(key) = env.normalized_title_key(content_string, true)
+        && key == mw_title_whitespace_to_underscore(&decoded_target)
+    {
+        return true;
+    }
+    // Relative link.
+    let relative_ok = (env
+        .get_site_config()
+        .namespace_has_subpages(env.context_title().namespace_id)
+        && stripped_target_value.starts_with("../")
+        && !stripped_target_value.ends_with('/')
+        && content_string == &env.resolve_title(&stripped_target_value))
+        || (stripped_target_value.starts_with("../")
+            && stripped_target_value.ends_with('/')
+            && content_string == &strip_leading_dotdot_slashes(&stripped_target_value));
+    if relative_ok {
+        return true;
+    }
+    // If content == href this could be a simple link... eg [[Foo]].
+    // But if href is an absolute url with protocol, this won't work:
+    // [[http://example.com]] is not a valid simple link!
+    if !href_has_proto {
+        let decoded_href = crate::util::decode_uri_component(&link_data.href);
+        if content_string == &decoded_href {
+            return true;
+        }
+        if let Some(key) = env.normalized_title_key(content_string, true)
+            && key == decoded_href
+        {
+            return true;
+        }
     }
 
     false
+}
+
+/// Apply PHP's `preg_replace( '#^(\w+:):#', '$1', $s, 1 )` — remove a colon
+/// following a `\w+:` prefix (the interwiki colon escape).
+fn strip_interwiki_colon_escape(s: &str) -> String {
+    let Some(colon) = s.find(':') else {
+        return s.to_string();
+    };
+    // The prefix must be one-or-more word characters (ASCII alnum or `_`).
+    if colon == 0 || !s[..colon].chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return s.to_string();
+    }
+    // `$1` keeps the `\w+:` prefix, dropping only the following colon.
+    let after = &s[colon + 1..];
+    if let Some(rest) = after.strip_prefix(':') {
+        format!("{}{rest}", &s[..=colon])
+    } else {
+        s.to_string()
+    }
+}
+
+/// Apply PHP's `preg_replace( '#^(?:\.\./)+(.*?)/$#D', '$1', $s, 1 )` — drop a
+/// leading `../` run and one trailing slash.
+fn strip_leading_dotdot_slashes(s: &str) -> String {
+    let mut rest = s;
+    while let Some(r) = rest.strip_prefix("../") {
+        rest = r;
+    }
+    rest.strip_suffix('/').unwrap_or(rest).to_string()
 }
 
 /// `serializeAsWikiLink` — serialize a node as a wikilink (`[[…]]`), handling
