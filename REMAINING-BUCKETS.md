@@ -2,6 +2,63 @@
 
 Current baseline: **849/891 fixtures pass** (95%). Lib tests: 651 pass. Clippy: clean.
 
+Note: the harness now compares against `!! html/parsoid+standalone` when there is no
+`+integrated` section (mirroring PHP `Test::normalizeHTML`); previously that section
+was discarded and the legacy `!! html/php` was used instead. Two divergences that the
+old fallback hid are therefore now visible and listed as work items:
+
+- `AttributeExpander regression test: Class attributes should be properly applied`
+- `Number of images should be limited`
+
+Both pass under PHP in standalone mode.
+
+## Landed: templated table-cell attributes (no count change; unblocks the cluster)
+
+The `Templated table cell with untemplated attributes` cluster needed three faithful
+fixes. All are verified against PHP's own `--dump=dom:post-tplwrap` output and
+`PegTokenizer::tokenizeTableCellAttributes`:
+
+1. **`{{{name|default}}}` must honour the default.** `Frame::expandTemplateArg`
+   works off the token's *attribs* (`attribs[0].k` = name, `attribs[1]` = default);
+   rustoid rebuilt the source as `{{{name}}}` at the call site, dropping the default,
+   so a bare `{{{cmt|}}}` rendered as literal `{{cmt}}`. New
+   `Frame::expand_template_arg_token` mirrors PHP exactly.
+2. **A template body is tokenized once, at the body position.** rustoid re-tokenized
+   the whole argument-spliced result at SOL, so `{{{attr|}}}{{{cmt|}}}| foo` had its
+   `|` promoted to a cell separator and split one cell into `<th>`+`<td>`. Only a
+   body made up *solely* of argument references needs the re-tokenize (there the
+   substituted text really does land at the body start, which is what makes
+   `{{1x|!!foo}}` a `<th>`).
+3. **A lone `!` is not a table-attribute-name terminator.** `TokenizerUtils::
+   inlineBreaks` breaks on `!` only as part of `!!`;
+   `table_attribute_name_piece`'s fallback (`$( !(space_or_newline / [\0/=>]) . )`)
+   accepts it as a one-character valueless attribute name. rustoid stopped on it, so
+   `class="test"! align=left|` reparsed to nothing instead of `class`/`!`/`align`.
+
+After these, all six cells of `Cell combination tests` reparse to the correct kinds
+and attributes; what remains there is the `data-mw.parts`/`dsr` metadata detail
+(the fixture's `html/php` section is the legacy parser's malformed output, so the
+standalone/`+standalone` section is the one that matters).
+
+`T343874` additionally needs transclusion wrapping of a table whose `{|`/`|}` come
+from separate templates (`{{tbl-start}}`/`{{tbl-end}}`): rustoid currently emits an
+orphaned empty `<span typeof="mw:Transclusion"></span>` before the table. PHP
+attaches the transclusion to the `<table>` with a multi-part `data-mw`.
+
+`Templated table cell with untemplated attributes: Integrated mode only` is one
+merge away. Rows 1/2 are `|class="foo"{{1x|1= {{!}}bar}}` and
+`|class="foo"{{1x|1=&nbsp;{{!}}bar}}`. The `{{!}}` inside the template argument is
+expanded by `process_special_magic_word` to a `<td>` token (faithful: PHP does the
+same, with empty `attrSrc` + `AT_SRC_START` so `TableFixups` reinterprets it as a
+literal `|`). The HTML5 tree builder therefore sees a `td` start tag while a `td` is
+open and closes the outer cell, leaving two sibling cells plus a fostered
+`mw:Transclusion` meta. rustoid's `TableFixups` does not merge them back; PHP's
+`maybeCombineWithPrevCell` path (Conditions 1–6 in `getReparseType`) does. Row 1 is
+already correct, so the merge works when the argument has a leading space but not
+when it starts with `&nbsp;` — likely `puts_next_sibling_in_sol_state` or the
+`in_tpl_content` tracking across the entity span (`pipe_status_in_content` reported
+`in_tpl=false` for row 2).
+
 ## Landed: autolink URL scanning stops at table pipes; `cleanUrl` wikilink mode (848 → 849)
 
 Closed "Table security: embedded pipes" (T3830-adjacent). Three faithful-port fixes in
