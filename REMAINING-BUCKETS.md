@@ -77,9 +77,21 @@ Four focused, PHP-verified fixes (821 → 826). See the commits below.
   "Wikilinks with embedded newlines are not broken".
 
 ### Next wikilink candidates
-- "<pre> inside a link": a multi-line extension tag inside link text.
-- "T179544: {{anchorencode:}} output should be always usable in links"
-  (`[[#{{anchorencode:[foo]}}]]`: templated wikilink fragment).
+- "<pre> inside a link" — **diagnosed this session, needs a pipeline change**.
+  `[[Main Page|the main page <pre>[it's not very good]</pre>]]`: the tokenizer is
+  correct (`<pre>` becomes a single `extension` self-closing token when `ext_tags`
+  includes `pre`, which `MockSiteConfig` does), but the *tree builder* promotes the
+  expanded `<pre>` out of the `<a>` and out of the `<p>`:
+  ```
+  now:   <p>]] <a …>the main page </a></p>\n<a …><pre …>…</pre></a>
+  PHP:   <p>]] <a …>the main page <pre …>…</pre></a></p>
+  ```
+  The extension expansion runs with the link-text fragment's `inlineContext`, so
+  the fix is to keep the expanded extension inline when the surrounding fragment is
+  inline (PHP's `extractExtBody`/`ExtensionHandler` respects the inline context).
+- "T179544: {{anchorencode:}} output should be always usable in links" — needs the
+  `anchorencode` parser function plus `mw:ExpandedAttrs` on a templated wikilink
+  fragment (AttributeExpander cluster).
 - "Plain link in template argument" (template-arg splitting vs extlink).
 - "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved".
 
