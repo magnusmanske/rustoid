@@ -31,7 +31,7 @@ fn expand_extension(
     }
     let name = attr_str(token, "name")?;
     match name {
-        "nowiki" => Some(nowiki_items(token)),
+        "nowiki" => nowiki_fragment_items(token, fragments, next_id),
         "pre" => Some(pre_items(token, config)),
         "style" => Some(style_items(token, fragments, next_id)),
         "i18ntag" | "i18nattr" => Some(i18n_items(token)),
@@ -52,10 +52,114 @@ fn attr_str<'t>(token: &'t SelfclosingTagTk, name: &str) -> Option<&'t str> {
         .and_then(|kv| kv.value.as_str())
 }
 
-/// Build the token sequence for a `<nowiki>` extension. Faithful port of
-/// `Nowiki::sourceToDom` (without the DOM indirection): the raw body text is
-/// split on entity references, with decodable entities wrapped in
+/// Build the token sequence for a `<nowiki>` extension.
+///
+/// Faithful port of `Nowiki::sourceToDom` **plus** the DOM-fragment tunnelling
+/// that `ExtensionHandler::onExtension` performs for *every* extension. `<nowiki>`
+/// is special-cased only in the block *before* `tunnelDOMThroughTokens` (it skips
+/// the `about`/`data-mw`/`mw:Extension/<name>` wrapper — "lean markup", per the
+/// comment in PHP); it still goes through the tunnel.
+///
+/// The tunnel matters: the wrapper token carries `typeof="mw:DOMFragment"`,
+/// which is the signal `AttributeExpander::stripMetaTags` reads via
+/// `hasDOMFragmentType` to set `hasGeneratedContent` and so mark an attribute
+/// `mw:ExpandedAttrs` (T280115). Emitting the `<span typeof="mw:Nowiki">`
+/// tokens directly (as this function used to) lost that signal inside attribute
+/// values while being invisible on the page path.
+///
+/// The stashed fragment is the real `<span typeof="mw:Nowiki">…</span>` subtree;
+/// the token stream sees a **`<span typeof="mw:DOMFragment" data-fragment-id=…>`
+/// tag token** — a shallow clone of the fragment's own first node, which is what
+/// `getWrapperTokens` builds (its `wrapperName` for a lone inline element is that
+/// element's own name, and the clone keeps the original attributes while gaining
+/// `typeof="mw:DOMFragment"`).
+///
+/// Emitting the real `span` tag (rather than an opaque `mw:dom-fragment-token`
+/// meta) is what keeps the ParagraphWrapper treating the content as inline, so
+/// `<nowiki>…</nowiki>` on its own line is still p-wrapped.
+fn nowiki_fragment_items(
+    token: &SelfclosingTagTk,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Option<Vec<Item>> {
+    let items = nowiki_items(token);
+    let frag = nowiki_items_to_fragment(&items);
+
+    let id = *next_id;
+    *next_id += 1;
+    fragments.insert(id, frag);
+
+    let mut dp = token.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+
+    let mut open = TagTk::new("span", vec![], dp);
+    open.add_attribute_str("typeof", "mw:DOMFragment");
+    open.add_attribute_str("data-fragment-id", id.to_string());
+
+    Some(vec![
+        Item::Tok(ParsoidToken::Tag(open)),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
+    ])
+}
+
+/// Convert the token sequence produced by [`nowiki_items`] into a sub-`Node`
+/// document: the `<span typeof="mw:Nowiki">` wrapper with its text and
+/// `mw:Entity` children.
+fn nowiki_items_to_fragment(items: &[Item]) -> crate::dom::node::Node {
+    use crate::dom::node::{ElementKind, Node};
+
+    let mut frag = Node::document();
+    // Open elements, innermost last; each item is appended to the innermost one.
+    let mut stack: Vec<Node> = Vec::new();
+
+    for item in items {
+        match item {
+            Item::Tok(ParsoidToken::Tag(t)) => {
+                let mut el = Node::element(if t.name == "span" {
+                    ElementKind::Span
+                } else {
+                    ElementKind::Other(t.name.clone())
+                });
+                for kv in &t.attribs {
+                    if let (Some(k), Some(v)) = (kv.key.as_str(), kv.value.as_str()) {
+                        el.set_attr(k, v);
+                    }
+                }
+                el.dp = Some(t.data_parsoid.clone());
+                stack.push(el);
+            }
+            Item::Tok(ParsoidToken::EndTag(_)) => {
+                if let Some(done) = stack.pop() {
+                    match stack.last_mut() {
+                        Some(parent) => parent.push_child(done),
+                        None => frag.push_child(done),
+                    }
+                }
+            }
+            Item::Str(s) => {
+                let text = Node::text(s);
+                match stack.last_mut() {
+                    Some(parent) => parent.push_child(text),
+                    None => frag.push_child(text),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    frag
+}
+
+/// Build the token sequence for a `<nowiki>` body: the raw text is split on
+/// entity references, with decodable entities wrapped in
 /// `<span typeof="mw:Entity">`, all inside a `<span typeof="mw:Nowiki">`.
+/// Faithful port of `Nowiki::sourceToDom`.
 fn nowiki_items(token: &SelfclosingTagTk) -> Vec<Item> {
     let source = attr_str(token, "source").unwrap_or_default().to_string();
     let body = extract_ext_body(token, &source);
@@ -498,6 +602,86 @@ pub fn run(
         }
     }
     out
+}
+
+/// Expand extension tokens *inside* tag attribute values.
+///
+/// PHP's `AttributeExpander` expands an attribute value with
+/// `Frame::expand`, which routes the value's tokens through the full
+/// `peg-tokens-to-expanded-tokens` pipeline (`TokenTransform2`). That chain runs
+/// the `ExtensionHandler` **before** the `AttributeExpander`, so a `<nowiki>` in
+/// a table-cell attribute is already a `mw:DOMFragment` wrapper by the time
+/// `stripMetaTags` inspects it — which is what sets `hasGeneratedContent` and
+/// thus `typeof="mw:ExpandedAttrs"` (T280115).
+///
+/// rustoid's pipeline splits those stages across separate passes, so this step
+/// reproduces the TT2 order by running the extension handler over the attribute
+/// values *before* `expand_attributes`. Only values that actually contain an
+/// unexpanded `extension` token are rewritten, so ordinary attributes keep their
+/// existing representation.
+pub fn expand_in_attributes(
+    tokens: Vec<Item>,
+    config: &dyn crate::traits::SiteConfig,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> Vec<Item> {
+    use crate::wikitext::tokens_v2::KV;
+
+    tokens
+        .into_iter()
+        .map(|item| {
+            let Item::Tok(ParsoidToken::Tag(t)) = &item else {
+                return item;
+            };
+            if !t
+                .attribs
+                .iter()
+                .any(|kv| value_has_extension_token(&kv.value))
+            {
+                return item;
+            }
+            let Item::Tok(ParsoidToken::Tag(mut t)) = item else {
+                unreachable!()
+            };
+            t.attribs = t
+                .attribs
+                .iter()
+                .map(|kv| KV {
+                    key: kv.key.clone(),
+                    value: expand_key_value(&kv.value, config, fragments, next_id),
+                    src_offsets: kv.src_offsets.clone(),
+                    ksrc: kv.ksrc.clone(),
+                    vsrc: kv.vsrc.clone(),
+                })
+                .collect();
+            Item::Tok(ParsoidToken::Tag(t))
+        })
+        .collect()
+}
+
+/// Does this attribute value hold an unexpanded `extension` self-closing token?
+fn value_has_extension_token(value: &crate::wikitext::tokens_v2::KeyValue) -> bool {
+    use crate::wikitext::tokens_v2::KeyValue;
+    let KeyValue::Tokens(items) = value else {
+        return false;
+    };
+    items
+        .iter()
+        .any(|i| matches!(i, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension"))
+}
+
+/// Run the extension handler over a `KeyValue` that holds tokens.
+fn expand_key_value(
+    value: &crate::wikitext::tokens_v2::KeyValue,
+    config: &dyn crate::traits::SiteConfig,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &mut usize,
+) -> crate::wikitext::tokens_v2::KeyValue {
+    use crate::wikitext::tokens_v2::KeyValue;
+    let KeyValue::Tokens(items) = value else {
+        return value.clone();
+    };
+    KeyValue::Tokens(run(items.clone(), config, fragments, next_id))
 }
 
 #[cfg(test)]

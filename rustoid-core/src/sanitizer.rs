@@ -1031,6 +1031,27 @@ pub fn sanitize_tag_attrs(
     attrs: Vec<crate::wikitext::tokens_v2::KV>,
     has_valid_protocol: impl Fn(&str) -> bool,
 ) -> Vec<crate::wikitext::tokens_v2::KV> {
+    sanitize_tag_attrs_with_fragments(
+        tag_name,
+        attrs,
+        has_valid_protocol,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// [`sanitize_tag_attrs`] with the stashed DOM fragments available, so a
+/// token-valued attribute can resolve an `mw:DOMFragment` placeholder.
+///
+/// PHP's `sanitizeTagAttrs` does this via `$token->fetchExpandedAttrValue($k)`
+/// and then takes the fragment's `textContent` (see the `unpackDOMFragments`
+/// note in `TokenUtils::tokensToString`), so a `<nowiki>` in a table-cell
+/// attribute flattens to its literal text (T280115).
+pub fn sanitize_tag_attrs_with_fragments(
+    tag_name: &str,
+    attrs: Vec<crate::wikitext::tokens_v2::KV>,
+    has_valid_protocol: impl Fn(&str) -> bool,
+    fragments: &std::collections::HashMap<usize, crate::dom::node::Node>,
+) -> Vec<crate::wikitext::tokens_v2::KV> {
     let allowed = attributes_allowed(tag_name);
     let mut new_attrs: Vec<crate::wikitext::tokens_v2::KV> = Vec::new();
 
@@ -1050,8 +1071,20 @@ pub fn sanitize_tag_attrs(
         // value containing an HTML comment) is stringified; comments and
         // newlines are dropped. Mirrors PHP `sanitizeTagAttrs`, which calls
         // `TokenUtils::tokensToString($a->v)` for array values, mutating
-        // `$a->v` in place.
-        let value = crate::wikitext::token_utils::key_value_to_string(&a.value);
+        // `$a->v` in place. A `mw:DOMFragment` placeholder resolves to its
+        // fragment's text content (PHP's `fetchExpandedAttrValue`).
+        let value = match &a.value {
+            crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
+            crate::wikitext::tokens_v2::KeyValue::Tokens(items) => {
+                crate::wikitext::token_utils::tokens_to_string_with_opts(
+                    items,
+                    crate::wikitext::token_utils::TokensToStringOpts {
+                        unpack_dom_fragments: true,
+                        fragments: Some(fragments),
+                    },
+                )
+            }
+        };
         a.value = crate::wikitext::tokens_v2::KeyValue::Str(value.clone());
 
         // Allow any `data-*` attribute except reserved ones and namespaced.

@@ -1,6 +1,58 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **847/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+Current baseline: **848/891 fixtures pass** (95%). Lib tests: 651 pass. Clippy: clean.
+
+## Landed: extensions tunnelled through DOM fragments + TT2 attribute order (847 → 848)
+
+Closed "Table cell attributes: Pipes protected by nowikis should be treated as a
+plain character" (T280115) by making two structural fixes that PHP already has:
+
+1. **`nowiki` now tunnels through a DOM fragment**, as PHP's
+   `ExtensionHandler::onExtension` does for *every* extension via
+   `PipelineUtils::tunnelDOMThroughTokens`. The token stream sees a real
+   `<span typeof="mw:DOMFragment" data-fragment-id=…>` start-tag token — a
+   shallow clone of the fragment's own first node, which is what
+   `getWrapperTokens` builds (`wrapperName` for a lone inline element is that
+   element's own name). Emitting an opaque `mw:dom-fragment-token` meta instead
+   is **wrong**: `paragraph_wrapper_v2.rs` treats that name as SOL-transparent
+   and swallows it, so `<nowiki>…</nowiki>` on its own line stopped being
+   p-wrapped (7 regressions; the real span tag fixed 6 of them).
+2. **The ExtensionHandler now runs inside attribute values, before the
+   AttributeExpander.** PHP's `AttributeExpander` expands a value with
+   `Frame::expand`, which routes it through the full TT2 chain
+   (`TemplateHandler → ExtensionHandler → AttributeExpander`); rustoid had the
+   ExtensionHandler only in `TreeBuilderStage::process`, i.e. after attribute
+   expansion. New `extension_handler::expand_in_attributes` reproduces the TT2
+   order, so `stripMetaTags` sees the `mw:DOMFragment` type and sets
+   `hasGeneratedContent` → `typeof="mw:ExpandedAttrs"`.
+
+Supporting faithful ports needed to make the value survive to the DOM:
+
+- **`tokensToString`'s `unpackDOMFragments` option** (`TokensToStringOpts`): a
+  `mw:DOMFragment` placeholder resolves to its fragment's *text content*, not its
+  HTML. PHP's comment explains why: the correct thing would be
+  `innerHTML`, but `<translate>`/`<nowiki>` are the expected contents and
+  `textContent` will do. This is what turns `foo` + fragment(`|`) into `foo|`.
+- **`Sanitizer::sanitizeTagAttrs` uses `fetchExpandedAttrValue($k)->textContent`**
+  for token-array values, rather than stringifying them. rustoid's cell
+  sanitization was flattening the `Tokens` value (dropping the fragment) before
+  the DOM saw it.
+- **`data-mw` is node data, not an attribute.** PHP keeps it on the token's
+  `DataMw` object; rustoid models it as a string attribute, so it must be pulled
+  out *before* the cell sanitizer runs (which would drop it as a reserved
+  `data-` attribute).
+- **Templated attribute keys are no longer dropped** from the element's plain
+  attributes. PHP's `TreeBuilder/Attributes.php` keeps every token attribute on
+  the element; `data-mw.attribs` is metadata about how they were produced, not a
+  replacement for them. The old `templated_attrib_keys` filter was removing the
+  flat `title="foo|"`.
+- **`nowiki_items_to_fragment`** builds the stashed sub-`Node`
+  (`<span typeof="mw:Nowiki">` + `mw:Entity` children) from the token sequence,
+  mirroring `Nowiki::sourceToDom` + `convertDOMtoTokens`.
+
+Also fixed en route: `bail_dirty_redirect` registered its fragments in a **local**
+map, so the emitted `mw:DOMFragment` placeholder had a dangling id and the
+`<nowiki>` content vanished (`REDIRECT [[]]`). It now uses the caller's map.
 
 ## Landed: table-cell attribute values keep their tokens (847, no count change)
 
@@ -47,10 +99,10 @@ Note `mw:Extension` is **not** in PHP's `META_TYPE_MATCHER`
 (`mw:(LanguageVariant|Transclusion|Param|Includes|Annotation/)`), so the
 `wrapTemplates` branch does not fire either — it really is the DOM-fragment path.
 
-### Why this was not forced through
+### Two narrower attempts failed (kept for the record)
 
-Two narrower attempts were tried and **reverted**, each fixing the target cell
-(`title="foo|"` became correct) while regressing 6 fixtures:
+Each fixed the target cell while regressing 6 fixtures, because the value was
+*already rendered* and must not be re-expanded:
 
 - running `extension_handler::run` over every `Tokens` attribute value inside
   `expand_attributes`;
@@ -58,29 +110,12 @@ Two narrower attempts were tried and **reverted**, each fixing the target cell
 
 The regressions were `<nowiki> inside a link`, `<pre> inside a link`, "Nowiki
 markup in link attribute (T206940)", "T107474: Frameless image caption with
-nowiki", "T374445: Non extlink in media caption", "3. Other redirect variants" —
-all cases where the value is *already rendered* and must not be re-expanded.
+nowiki", "T374445: Non extlink in media caption", "3. Other redirect variants".
 
-### Correct next step (a real design change, not an incremental patch)
-
-Make rustoid tunnel **all** extensions through a DOM fragment, as PHP does:
-
-1. Have `expand_extension` return a `mw:dom-fragment-token` placeholder for
-   `nowiki` too (building the `<span typeof="mw:Nowiki">` sub-`Node` into
-   `fragments`, exactly like the existing `pwraptest`/`style` paths at
-   `extension_handler.rs:182`/`:310`).
-2. Delete the `nowiki` special case, since the only difference is the pre-wrapper
-   block (no `about`/`data-mw`/`mw:Extension/<name>`) — keep that, drop the
-   "no indirection" shortcut.
-3. Let the existing `tree_builder_html` placeholder unpacking
-   (`tree_builder_html.rs:552`, `:2180`) splice it back, and check
-   `p_wrap`/`cleanup` still treat `mw:Nowiki` as before (they already test for
-   both types at `p_wrap.rs:117`, `cleanup.rs:67`).
-
-This touches the shared path all 847 passing fixtures use, so it needs running
-the full suite at each step. The payoff is not just this fixture: the same
-DOM-fragment signal is what several other `AttributeExpander`/`TableFixups`
-failures depend on.
+**Resolved by the landed change above** (see the top section): the fix was not to
+re-expand values but to run the ExtensionHandler in the correct TT2 position, and
+resolve the fragment only at the points PHP does (`tokensToString` with
+`unpackDOMFragments`, and `sanitizeTagAttrs`'s `fetchExpandedAttrValue`).
 
 ## Landed: html2wt link target handling (846 → 847)
 

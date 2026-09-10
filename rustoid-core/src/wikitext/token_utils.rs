@@ -125,11 +125,33 @@ pub fn is_entity_span_token(token: &ParsoidToken) -> bool {
     matches!(token, ParsoidToken::Tag(t) if t.name == "span" && has_type_of(token, "mw:Entity"))
 }
 
+/// Options for [`tokens_to_string`]. Mirrors the `$opts` array of PHP's
+/// `TokenUtils::tokensToString`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokensToStringOpts<'a> {
+    /// Resolve `mw:DOMFragment` placeholder tokens to their fragment's text
+    /// content (mirrors the `unpackDOMFragments` option). PHP notes the correct
+    /// thing would be the fragment's *innerHTML*, but `<translate>`/`<nowiki>`
+    /// are the expected contents and `textContent` suffices for them — which is
+    /// exactly why a `<nowiki>` in an attribute value flattens to its literal
+    /// text (T280115).
+    pub unpack_dom_fragments: bool,
+    /// The stashed DOM fragments, keyed by fragment id.
+    pub fragments: Option<&'a std::collections::HashMap<usize, crate::dom::node::Node>>,
+}
+
 /// Flatten/convert a token array into a string.
 /// Mirrors `TokenUtils::tokensToString` (non-strict mode without opts).
 pub fn tokens_to_string(tokens: &[Item]) -> String {
+    tokens_to_string_with_opts(tokens, TokensToStringOpts::default())
+}
+
+/// [`tokens_to_string`] with explicit options.
+pub fn tokens_to_string_with_opts(tokens: &[Item], opts: TokensToStringOpts<'_>) -> String {
     let mut out = String::new();
-    for token in tokens {
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
         match token {
             Item::Str(s) => out.push_str(s),
             Item::Tok(t) => match t {
@@ -155,9 +177,67 @@ pub fn tokens_to_string(tokens: &[Item]) -> String {
                         out.push_str(src);
                     }
                 }
+                // Resolve a DOM-fragment placeholder to its fragment's text
+                // content. A `TagTk` is followed by its `EndTagTk`, which is
+                // skipped (mirrors PHP's `$i += 1` + the "tag should be followed
+                // by endtag" invariant).
+                ParsoidToken::Tag(tk)
+                    if opts.unpack_dom_fragments
+                        && has_dom_fragment_attr(&tk.attribs)
+                        && opts.fragments.is_some() =>
+                {
+                    if let Some(fid) = fragment_id(&tk.attribs) {
+                        let frag = opts.fragments.and_then(|m| m.get(&fid));
+                        out.push_str(&dom_fragment_text(frag));
+                    }
+                    i += 1;
+                }
                 _ => {}
             },
         }
+        i += 1;
+    }
+    out
+}
+
+/// Does an attribute list carry a `typeof` beginning `mw:DOMFragment`?
+fn has_dom_fragment_attr(attribs: &[crate::wikitext::tokens_v2::KV]) -> bool {
+    attribs.iter().any(|kv| {
+        kv.key.as_str() == Some("typeof")
+            && kv
+                .value
+                .as_str()
+                .is_some_and(|ty| ty.starts_with("mw:DOMFragment"))
+    })
+}
+
+/// The `data-fragment-id` of a DOM-fragment placeholder token.
+fn fragment_id(attribs: &[crate::wikitext::tokens_v2::KV]) -> Option<usize> {
+    attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+        .and_then(|kv| kv.value.as_str())
+        .and_then(|s| s.parse().ok())
+}
+
+/// The text content of a stashed DOM fragment (`Node::textContent`).
+fn dom_fragment_text(fragment: Option<&crate::dom::node::Node>) -> String {
+    fn collect(node: &crate::dom::node::Node, out: &mut String) {
+        match &node.kind {
+            crate::dom::node::NodeKind::Text(t) => out.push_str(t),
+            _ => {
+                for child in &node.children {
+                    collect(child, out);
+                }
+            }
+        }
+    }
+    let Some(frag) = fragment else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for child in &frag.children {
+        collect(child, &mut out);
     }
     out
 }

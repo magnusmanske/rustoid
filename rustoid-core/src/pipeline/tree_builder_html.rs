@@ -22,7 +22,7 @@ use crate::html5::element::Attributes;
 use crate::html5::modes;
 use crate::html5::node_handler::NodeTreeHandler;
 use crate::html5::tree_builder::TreeBuilder;
-use crate::wikitext::tokens_v2::{DataParsoid as TDataParsoid, Item, KV, ParsoidToken};
+use crate::wikitext::tokens_v2::{DataParsoid as TDataParsoid, Item, KV, KeyValue, ParsoidToken};
 
 /// The attribute name used to smuggle the stashed node-data id through the tree
 /// builder (mirrors `DOMDataUtils::DATA_OBJECT_ATTR_NAME`).
@@ -152,21 +152,36 @@ impl Html5TreeBuilder {
         dp: &TDataParsoid,
         data_mw: Option<String>,
     ) -> (Attributes, usize) {
-        let templated = data_mw
-            .as_deref()
-            .map(templated_attrib_keys)
-            .unwrap_or_default();
         let mut pairs: Vec<(String, String)> = Vec::new();
         for kv in attribs {
-            if let (Some(k), Some(v)) = (kv.key.as_str(), kv.value.as_str())
-                && k != "data-parsoid"
-                && k != "data-mw"
-                && k != DATA_OBJECT_ATTR_NAME
-                && k != "data-fragment-id"
-                && !templated.contains(k)
+            let Some(k) = kv.key.as_str() else { continue };
+            if k == "data-parsoid"
+                || k == "data-mw"
+                || k == DATA_OBJECT_ATTR_NAME
+                || k == "data-fragment-id"
             {
-                pairs.push((k.to_string(), v.to_string()));
+                continue;
             }
+            // A token-valued attribute (a templated/extension value that never
+            // collapsed to a plain string) is flattened here. With
+            // `unpack_dom_fragments` this resolves an `mw:DOMFragment`
+            // placeholder to its text content, mirroring PHP's
+            // `tokensToString( …, [ 'unpackDOMFragments' => true ] )` — which is
+            // how a `<nowiki>` cell attribute flattens to its literal text
+            // (T280115).
+            let v = match &kv.value {
+                KeyValue::Str(s) => s.clone(),
+                KeyValue::Tokens(items) => {
+                    crate::wikitext::token_utils::tokens_to_string_with_opts(
+                        items,
+                        crate::wikitext::token_utils::TokensToStringOpts {
+                            unpack_dom_fragments: true,
+                            fragments: Some(&self.fragments),
+                        },
+                    )
+                }
+            };
+            pairs.push((k.to_string(), v));
         }
         let id = self.stash(dp, data_mw);
         pairs.push((DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()));
@@ -402,6 +417,17 @@ impl Html5TreeBuilder {
     }
 
     fn process_start_tag(&mut self, name: &str, attribs: &[KV], dp: &TDataParsoid) {
+        // `data-mw` is node data, not a real attribute (PHP stores it on the
+        // token's `DataMw` object). rustoid models it as a string attribute, so
+        // take it out before sanitizing: `Sanitizer::sanitizeTagAttrs` would
+        // drop it as a reserved `data-` attribute.
+        let data_mw = Self::extract_data_mw(attribs);
+        let attribs: Vec<KV> = attribs
+            .iter()
+            .filter(|kv| kv.key.as_str() != Some("data-mw"))
+            .cloned()
+            .collect();
+
         // Wikitext-syntax table cells run their attributes through the sanitizer
         // allowlist here, discarding disallowed attributes (e.g. a valueless
         // `|foo|` marker) so they don't leak into the DOM as `foo=""` — PHP
@@ -412,11 +438,15 @@ impl Html5TreeBuilder {
         let attribs = if matches!(name, "table" | "tr" | "td" | "th" | "caption")
             && dp.stx.as_deref() != Some("html")
         {
-            crate::sanitizer::sanitize_tag_attrs(name, attribs.to_vec(), |_p| true)
+            crate::sanitizer::sanitize_tag_attrs_with_fragments(
+                name,
+                attribs,
+                |_p| true,
+                &self.fragments,
+            )
         } else {
-            attribs.to_vec()
+            attribs
         };
-        let data_mw = Self::extract_data_mw(&attribs);
         let (attrs, data_id) = self.stash_data_attribs(&attribs, dp, data_mw);
 
         // A start tag carrying a `data-fragment-id` tunnels a pre-built DOM
@@ -673,39 +703,6 @@ fn match_transclusion(attribs: &[KV]) -> Option<String> {
     v.split_whitespace()
         .find(|ty| ty.starts_with("mw:Transclusion"))
         .map(String::from)
-}
-
-/// Collect the plain-text attribute keys recorded in a `data-mw.attribs`
-/// envelope, so [`Html5TreeBuilder::stash_data_attribs`] can drop those
-/// templated attributes from the rendered element. Mirrors PHP's
-/// `TreeBuilderStage` (which keeps only non-templated attributes on the DOM
-/// node once `data-mw.attribs` captures the templated ones).
-///
-/// `data-mw.attribs` is a flat `[k, v]` pair list; each `k` is a plain string
-/// or a `{ txt, html, uneditable }` object whose `txt` names the attribute.
-fn templated_attrib_keys(data_mw: &str) -> std::collections::HashSet<String> {
-    let mut keys = std::collections::HashSet::new();
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(data_mw) else {
-        return keys;
-    };
-    let Some(attribs) = json.get("attribs").and_then(|a| a.as_array()) else {
-        return keys;
-    };
-    for pair in attribs {
-        let Some(k) = pair.get(0) else { continue };
-        match k {
-            serde_json::Value::String(s) => {
-                keys.insert(s.clone());
-            }
-            serde_json::Value::Object(obj) => {
-                if let Some(txt) = obj.get("txt").and_then(|t| t.as_str()) {
-                    keys.insert(txt.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    keys
 }
 
 /// Prepend a leading-wikitext string (a `recordTemplateInfo` `unwrappedWT`) to
@@ -1844,23 +1841,6 @@ mod tests {
     }
     fn txt(s: &str) -> Item {
         Item::Str(s.to_string())
-    }
-
-    #[test]
-    fn test_templated_attrib_keys() {
-        // A `data-mw.attribs` envelope names the templated attributes (both as
-        // plain strings and as `{ txt, html, uneditable }` objects) that must be
-        // dropped from the rendered element's plain attributes.
-        let data_mw = r#"{"attribs":[[{"txt":"a","html":"<span>x</span>"},{"html":""}],[{"txt":"k","html":"k","uneditable":true},""]]}"#;
-        let keys = templated_attrib_keys(data_mw);
-        assert!(keys.contains("a"), "{keys:?}");
-        assert!(keys.contains("k"), "{keys:?}");
-        assert!(!keys.contains("style"), "{keys:?}");
-
-        // Plain-string keys are also collected.
-        let data_mw = r#"{"attribs":[["style","color:red"],["title","hi"]]}"#;
-        let keys = templated_attrib_keys(data_mw);
-        assert!(keys.contains("style") && keys.contains("title"), "{keys:?}");
     }
 
     #[test]

@@ -595,7 +595,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // by the time we get here any remaining `{{` indicates a failure
                 // to expand and must bail.
                 if href.contains("<nowiki") {
-                    out.extend(self.bail_dirty_redirect(stt, &href));
+                    out.extend(self.bail_dirty_redirect(stt, &href, fragments, next_id));
                 } else {
                     out.extend(render_redirect(
                         &mut ctx,
@@ -702,6 +702,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
         href: &str,
+        fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+        next_id: &mut usize,
     ) -> Vec<Item> {
         // The redirect word source (e.g. `#REDIRECT `).
         let src = stt.data_parsoid.src.clone().unwrap_or_default();
@@ -709,16 +711,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         // Re-tokenize the wikilink inner (`[{href}]]`, mirroring PHP's
         // `bailTokens` which strips the first `[`) and expand `<nowiki>`.
+        //
+        // The fragments registered here must live in the caller's map: an
+        // emitted `mw:DOMFragment` wrapper is resolved by `unpack_dom_fragments`
+        // against that map, so a local map would leave a dangling fragment id.
         let re_src = format!("[{href}]]");
         let tokens = self.tokenize(&re_src).unwrap_or_default();
-        let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        let expanded = crate::pipeline::extension_handler::run(
-            tokens,
-            self.config,
-            &mut fragments,
-            &mut next_id,
-        );
+        let expanded =
+            crate::pipeline::extension_handler::run(tokens, self.config, fragments, next_id);
 
         let mut li = crate::wikitext::tokens_v2::TagTk::new(
             "listItem",
@@ -861,12 +861,30 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         // Expand nested templates/parser functions when a data source is
         // available (the synchronous `wikitext_to_ast` path has none).
+        let mut fragments: std::collections::HashMap<usize, Node> =
+            std::collections::HashMap::new();
+        let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
                 .expand_templates(frame, tokens, source, about_counter, true)
                 .await;
+            // TT2 order: ExtensionHandler precedes the AttributeExpander.
+            tokens = crate::pipeline::extension_handler::expand_in_attributes(
+                tokens,
+                self.config,
+                &mut fragments,
+                &mut next_id,
+            );
             tokens = self
-                .expand_attributes(frame, tokens, source, about_counter, None)
+                .expand_attributes(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    None,
+                    &mut fragments,
+                    &mut next_id,
+                )
                 .await;
         }
         // The quote transformer flushes pending quotes only on a newline or EOF
@@ -874,7 +892,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        let mut frag = self.fragment_from_tokens(tokens);
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &mut next_id);
         flatten_nowiki_spans(&mut frag);
         frag
     }
@@ -911,11 +929,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// The result carries `data-parsoid`/`data-mw`/`about`/`typeof` intact
     /// (matching Parsoid's round-trippable attribute fragments); the caller
     /// HTML-escapes it when embedding in the `data-mw` JSON envelope.
-    fn value_to_dom_html(&self, kv: &crate::wikitext::tokens_v2::KeyValue) -> String {
+    ///
+    /// `fragments`/`next_id` are threaded through because an attribute value can
+    /// carry a `mw:DOMFragment` placeholder (e.g. the `<nowiki>` in T280115's
+    /// `title="foo<nowiki>|</nowiki>"`): the placeholder must resolve against
+    /// the same map the extension handler registered it in.
+    fn value_to_dom_html(
+        &self,
+        kv: &crate::wikitext::tokens_v2::KeyValue,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &mut usize,
+    ) -> String {
         use crate::pipeline::attribute_transform_manager::key_value_to_items;
 
         let items = key_value_to_items(kv);
-        let frag = self.fragment_from_tokens(items);
+        let mut frag = self.build_inline_fragment(items, fragments, next_id);
+        crate::pipeline::unpack_dom_fragments::run(&mut frag);
         let serializer =
             crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions {
                 body_only: true,
@@ -1085,18 +1114,49 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Ok(t) => t,
             Err(_) => return crate::dom::node::Node::document(),
         };
+        let mut fragments: std::collections::HashMap<usize, Node> =
+            std::collections::HashMap::new();
+        let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
                 .expand_templates(frame, tokens, source, about_counter, true)
                 .await;
+            // TT2 order: ExtensionHandler precedes the AttributeExpander.
+            tokens = crate::pipeline::extension_handler::expand_in_attributes(
+                tokens,
+                self.config,
+                &mut fragments,
+                &mut next_id,
+            );
             tokens = self
-                .expand_attributes(frame, tokens, source, about_counter, None)
+                .expand_attributes(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    None,
+                    &mut fragments,
+                    &mut next_id,
+                )
                 .await;
         }
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        self.fragment_from_tokens_with_context(tokens, inline)
+        let mut ast = if inline {
+            self.build_inline_fragment(tokens, &mut fragments, &mut next_id)
+        } else {
+            let stage = TreeBuilderStage::new(false);
+            let mut ast = stage.to_ast_with_fragments(tokens, None, self.config, fragments.clone());
+            let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
+            crate::pipeline::p_wrap::run(&mut ast);
+            crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None);
+            crate::pipeline::cleanup::run(&mut ast);
+            crate::pipeline::unpack_dom_fragments::run(&mut ast);
+            extract_fragment_children(&ast)
+        };
+        let _ = &mut ast;
+        ast
     }
 
     /// Build a block-context fragment document from an already-tokenized token
@@ -1190,15 +1250,32 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
+        let mut fragments: std::collections::HashMap<usize, Node> =
+            std::collections::HashMap::new();
+        let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
                 .expand_templates(frame, tokens, source, about_counter, false)
                 .await;
+            tokens = crate::pipeline::extension_handler::expand_in_attributes(
+                tokens,
+                self.config,
+                &mut fragments,
+                &mut next_id,
+            );
             tokens = self
-                .expand_attributes(frame, tokens, source, about_counter, None)
+                .expand_attributes(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    None,
+                    &mut fragments,
+                    &mut next_id,
+                )
                 .await;
         }
-        let mut frag = self.fragment_from_tokens(tokens);
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &mut next_id);
         std::mem::take(&mut frag.children)
     }
 
@@ -1228,20 +1305,34 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // forces the block figure, per `renderMedia`'s `$pieces[] = '|none'`).
         let wikitext = format!("[[{title_str}|{opts_str}|none]]");
         let mut tokens = self.tokenize(&wikitext).ok()?;
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
                 .expand_templates(frame, tokens, source, about_counter, false)
                 .await;
+            tokens = crate::pipeline::extension_handler::expand_in_attributes(
+                tokens,
+                self.config,
+                &mut fragments,
+                &mut next_id,
+            );
             tokens = self
-                .expand_attributes(frame, tokens, source, about_counter, None)
+                .expand_attributes(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    None,
+                    &mut fragments,
+                    &mut next_id,
+                )
                 .await;
         }
 
         // Render the wikilink (→ `renderFile`) with media formats suppressed.
         let mut link_ctx = WikiLinkContext::new(self.config);
         link_ctx.set_suppress_media_formats();
-        let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
         let tokens: Vec<Item> = tokens
             .into_iter()
             .flat_map(|item| {
@@ -1514,12 +1605,30 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self
             .expand_templates(&frame, tokens, source, about_counter, false)
             .await;
-        let tokens = self
-            .expand_attributes(&frame, tokens, source, about_counter, Some(page_source))
-            .await;
+        // TT2 order: ExtensionHandler runs after TemplateHandler and before
+        // AttributeExpander (PHP `ParserPipelineFactory::STAGES`). Attribute
+        // values are sub-pipelines, so the extension handler must reach inside
+        // them before attributes are expanded.
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
         let mut next_id = 0usize;
+        let tokens = crate::pipeline::extension_handler::expand_in_attributes(
+            tokens,
+            self.config,
+            &mut fragments,
+            &mut next_id,
+        );
+        let tokens = self
+            .expand_attributes(
+                &frame,
+                tokens,
+                source,
+                about_counter,
+                Some(page_source),
+                &mut fragments,
+                &mut next_id,
+            )
+            .await;
         let tokens = self.render_links(tokens, &mut fragments, &mut next_id, Some(&title));
         let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
@@ -1740,6 +1849,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// then run `buildExpandedAttrs` to finalize the attributes (reparse-KV,
     /// `mw:ExpandedAttrs` marking). Mirrors the TT2 `AttributeExpander` handler
     /// (`onAny` → `processComplexAttributes`).
+    #[allow(clippy::too_many_arguments)]
     async fn expand_attributes(
         &self,
         frame: &Frame,
@@ -1747,6 +1857,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         page_source: Option<&str>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &mut usize,
     ) -> Vec<Item> {
         use crate::wikitext::tokens_v2::{KV, KeyValue};
 
@@ -1775,6 +1887,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
 
             // Expand each templated key/value (template args and templates).
+            let outer_fragments = &mut *fragments;
+            let outer_next_id = &mut *next_id;
+            let fragments = std::cell::RefCell::new(std::mem::take(outer_fragments));
+            let next_id = std::cell::Cell::new(*outer_next_id);
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
@@ -1808,10 +1924,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 expanded_attrs,
                 about_counter,
                 false,
-                &|kv| self.value_to_dom_html(kv),
+                &|kv| {
+                    let mut id = next_id.get();
+                    let html = self.value_to_dom_html(kv, &mut fragments.borrow_mut(), &mut id);
+                    next_id.set(id);
+                    html
+                },
                 page_source,
             );
             out.extend(result);
+            *outer_fragments = fragments.into_inner();
+            *outer_next_id = next_id.get();
         }
         out
     }
@@ -2097,7 +2220,9 @@ mod tests {
         // A plain string value serializes as itself (no <p> wrapper in inline
         // context).
         let kv = crate::wikitext::tokens_v2::KeyValue::Str("color:red".to_string());
-        let html = parser.value_to_dom_html(&kv);
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+        let html = parser.value_to_dom_html(&kv, &mut fragments, &mut next_id);
         assert_eq!(html, "color:red", "got: {html:?}");
     }
 
