@@ -41,6 +41,10 @@ pub struct LinkData {
     pub is_local: bool,
     /// Is this a redirect?
     pub is_redirect: bool,
+    /// Was the link's content modified (selser)? Mirrors
+    /// `$rtData->contentModified`, set when serializing inserted content or a
+    /// node carrying a `SUBTREE_CHANGED` diff mark.
+    pub content_modified: bool,
 }
 
 /// Split a link content string into its content/prefix/tail parts, using the
@@ -175,6 +179,10 @@ pub fn add_colon_escape(env: &SerializerEnv, link_target: &str, link_data: &Link
 /// (the `mw:MediaLink` resource branch, the interwiki conversion block, and the
 /// `isURLLink`/magic-link content checks are ported; the localized magic-link
 /// ISBN branch is deferred).
+///
+/// `contentModified` (set by PHP when serializing inserted content or a
+/// `SUBTREE_CHANGED` node) stays `false`: it only matters under selser, where the
+/// caller can set it on the returned `LinkData`.
 pub fn get_link_round_trip_data(env: &SerializerEnv, tree: &DomTree, node: NodeId) -> LinkData {
     let dp = tree.node(node).dp.clone().unwrap_or_default();
 
@@ -578,6 +586,12 @@ pub fn is_simple_wiki_link(
     false
 }
 
+/// Whether the target contains a `../` relative path segment, i.e. matches
+/// PHP's `#(^|/)\.\./#`.
+fn has_dotdot_path_segment(value: &str) -> bool {
+    value.starts_with("../") || value.contains("/../")
+}
+
 /// Apply PHP's `preg_replace( '#^(\w+:):#', '$1', $s, 1 )` — remove a colon
 /// following a `\w+:` prefix (the interwiki colon escape).
 fn strip_interwiki_colon_escape(s: &str) -> String {
@@ -659,8 +673,27 @@ pub fn serialize_as_wiki_link(
             link_target = Some(target.value.clone());
         }
     } else if is_simple_wiki_link(env, &dp, &target, link_data) {
-        // Simple case: `[[Foo]]`.
-        link_target = Some(target.value.trim_start_matches("./").to_string());
+        // Simple case.
+        if !target.modified && !link_data.content_modified {
+            link_target = Some(target.value.trim_start_matches("./").to_string());
+        } else if crate::html::wts_utils::has_expanded_attrs_type(tree.node(node))
+            || has_dotdot_path_segment(&target.value)
+        {
+            // Templated attrs or a subpage: the content string would differ
+            // drastically, so use the target value.
+            link_target = Some(target.value.trim_start_matches("./").to_string());
+        } else {
+            // Use the source content (which preserves the original case, e.g.
+            // `[[apple]]` stays lowercase even though the normalized title key
+            // is `Apple`).
+            let content = link_data.content_string.clone().unwrap_or_default();
+            let escaped = crate::html::wikitext_escape_handlers::escape_link_target(env, &content);
+            link_target = Some(if escaped.invalid_link {
+                escaped.link_target.clone()
+            } else {
+                add_colon_escape(env, &escaped.link_target, link_data)
+            });
+        }
     } else if is_url_link(env, tree, node, link_data) {
         let ct = crate::html::constrained_text::ConstrainedText::auto_url_link(
             target.value.clone(),

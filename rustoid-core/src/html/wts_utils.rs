@@ -436,14 +436,20 @@ pub fn get_data_mw_src(node: &Node) -> Option<String> {
 // Shadow attributes: `WTSUtils::getShadowInfo` / `getAttributeShadowInfo`.
 // ---------------------------------------------------------------------------
 
-/// Whether a node is genuinely new (no `dsr`), mirroring `WTUtils::isNewElt` for
-/// the `getShadowInfo` fast path. Operates directly on `node.dp` (no tree).
-/// Whether a node is a *new* element (editor-inserted, no original DSR). The
-/// `IS_NEW` temp flag PHP's `WTUtils::isNewElt` reads is only set during selser
-/// for editor-inserted content; the media path exercises wt2wt/html2wt where it
-/// is never set, so a node is not "new" here (mirrors PHP returning `false`).
-fn node_is_new(_node: &Node) -> bool {
-    false
+/// Whether a node is a *new* element that has no source wikitext to round-trip
+/// to. Mirrors the `IS_NEW` temp flag that `WTUtils::isNewElt` reads.
+///
+/// PHP's `DataParsoid::defaultValue()` — the value `DataParsoid::getDataParsoid()`
+/// falls back to for a node with no `data-parsoid` attribute — sets
+/// `IS_NEW = true`. So a node that came from bare HTML (a fresh `html2wt` parse,
+/// or editor-inserted content) counts as new, while one carrying an explicit
+/// `data-parsoid` blob does not.
+fn node_is_new(node: &Node) -> bool {
+    // Newness is only defined for elements; text/comment nodes are never new.
+    if !matches!(node.kind, NodeKind::Element(_)) {
+        return false;
+    }
+    node.dp.is_none()
 }
 
 /// `WTSUtils::getShadowInfo` — resolve an attribute's shadowed value. Faithful
@@ -500,6 +506,12 @@ pub fn get_shadow_info(node: &Node, name: &str, cur_val: Option<&str>) -> Shadow
 /// current attribute value.
 pub fn get_attribute_shadow_info(node: &Node, name: &str) -> ShadowInfo {
     get_shadow_info(node, name, node.get_attr(name))
+}
+
+/// `WTUtils::hasExpandedAttrsType` — the `typeof` attribute matches
+/// `/^mw:ExpandedAttrs(\/\S+)*$/`.
+pub fn has_expanded_attrs_type(node: &Node) -> bool {
+    crate::html::dom_utils::match_type_of(node, r"^mw:ExpandedAttrs(\/\S+)*$").is_some()
 }
 
 /// `WTUtils::isRedirectLink` — a `<link>` element whose `rel` matches
@@ -746,10 +758,21 @@ mod tests {
 
     #[test]
     fn test_get_shadow_info_falls_back_to_attr() {
-        // No `a` shadow entry → plain round-trip. A node without data-parsoid is
-        // not editor-inserted (`IS_NEW` is unset), so `modified` is false.
+        // No `a` shadow entry → plain round-trip. A node with no `data-parsoid`
+        // gets `DataParsoid::defaultValue()`, which sets `IS_NEW`, so `modified`
+        // is true and `fromsrc` false (mirrors PHP).
         let mut node = Node::element(ElementKind::Other("span".to_string()));
         node.set_attr("title", "current");
+        let si = get_shadow_info(&node, "title", Some("current"));
+        assert_eq!(si.value, "current");
+        assert!(si.modified);
+        assert!(!si.fromsrc);
+
+        // With an explicit `data-parsoid` (even an empty one) the node is not
+        // new, so the attribute round-trips unmodified.
+        let mut node = Node::element(ElementKind::Other("span".to_string()));
+        node.set_attr("title", "current");
+        node.dp = Some(crate::wikitext::tokens_v2::DataParsoid::default());
         let si = get_shadow_info(&node, "title", Some("current"));
         assert_eq!(si.value, "current");
         assert!(!si.modified);
