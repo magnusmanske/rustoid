@@ -289,6 +289,15 @@ pub fn selective_serialize_dom(
     preprocess_dom_for_selser(&mut old_body);
     preprocess_dom_for_selser(doc);
 
+    // `ContentModelHandler::canonicalizeDOM(..., $isSelectiveUpdate = false)`
+    // runs `RemoveRedLinks` over the body before diffing: MediaWiki's
+    // `?action=edit&redlink=1` red-link query is not part of the source, so it
+    // must be stripped or every red link would compare as modified. PHP applies
+    // this to *both* the edited top-level doc (`fromDOM`) and the revision DOM
+    // (`setupSelser`), so strip both sides here.
+    crate::html::remove_red_links::remove_red_links(doc);
+    crate::html::remove_red_links::remove_red_links(&mut old_body);
+
     // `$diff = (new DOMDiff($this->env))->diff($oldBody, $body);`
     let mut dom_diff = DomDiff::default();
     let changed = dom_diff.diff(&old_body, doc);

@@ -90,16 +90,22 @@ pub fn get_content_string(tree: &DomTree, node: NodeId) -> Option<String> {
         match &tree.node(child).kind {
             crate::dom::node::NodeKind::Text(t) => out.push_str(t),
             crate::dom::node::NodeKind::Element(_) => {
-                // `mw:DisplaySpace` → ' '; anything else is not plain text.
+                // `mw:DisplaySpace` → ' '; diff markers are skipped; anything
+                // else is not plain text. Faithful to PHP:
+                //   `elseif ( DOMUtils::hasTypeOf( $child, 'mw:DisplaySpace' ) )`
+                //   `elseif ( DiffUtils::isDiffMarker( $child ) ) { }`
+                //   `else { return null; }`
                 if crate::html::dom_utils::has_type_of(tree.node(child), "mw:DisplaySpace") {
                     out.push(' ');
-                } else {
+                } else if !crate::html::diff_utils::DiffUtils::is_diff_marker(
+                    tree.node(child),
+                    None,
+                ) {
                     return None;
                 }
             }
             crate::dom::node::NodeKind::Comment(_) => {
-                // Diff markers are ignored (selser; `is_diff_marker` is stubbed
-                // false, so comments here are ordinary comments → not plain text).
+                // Non-element non-text nodes are not plain text.
                 return None;
             }
             _ => return None,
@@ -183,9 +189,13 @@ pub fn add_colon_escape(env: &SerializerEnv, link_target: &str, link_data: &Link
 /// `contentModified` (set by PHP when serializing inserted content or a
 /// `SUBTREE_CHANGED` node) stays `false`: it only matters under selser, where the
 /// caller can set it on the returned `LinkData`.
-pub fn get_link_round_trip_data(env: &SerializerEnv, tree: &DomTree, node: NodeId) -> LinkData {
+pub fn get_link_round_trip_data(
+    env: &SerializerEnv,
+    tree: &DomTree,
+    node: NodeId,
+    in_inserted_content: bool,
+) -> LinkData {
     let dp = tree.node(node).dp.clone().unwrap_or_default();
-
     let mut data = LinkData {
         tail: dp.tail.clone().unwrap_or_default(),
         prefix: dp.prefix.clone().unwrap_or_default(),
@@ -220,6 +230,18 @@ pub fn get_link_round_trip_data(env: &SerializerEnv, tree: &DomTree, node: NodeI
 
     // The serialized target (shadow info) for `href`.
     data.target = crate::html::wts_utils::get_attribute_shadow_info(tree.node(node), "href");
+
+    // Check if the link content has been modified or is newly inserted content.
+    // Mirrors PHP: `$state->inInsertedContent ||
+    // DiffUtils::hasDiffMark( $node, DiffMarks::SUBTREE_CHANGED )`.
+    data.content_modified = in_inserted_content || {
+        let n = tree.node(node);
+        crate::html::diff_utils::DiffUtils::has_diff_mark(
+            n,
+            None,
+            crate::html::diff_utils::DiffMarkers::SubtreeChanged,
+        )
+    };
 
     // Get the content string or (when not plain text) the content node.
     data.content_string = get_content_string(tree, node);
@@ -477,7 +499,11 @@ pub fn is_simple_wiki_link(
 
     // Would need to pipe for any non-string content.
     // Preserve unmodified or non-minimal piped links.
-    if !(target.modified || (dp.stx.as_deref() != Some("piped")))
+    // NB: PHP's guard is `!empty( $target['modified'] ) ||
+    // !empty( $linkData->contentModified ) || ( $dp->stx ?? null ) !== 'piped'`
+    // — the `contentModified` disjunct is required for inserted links (whose
+    // `dp` carries no `stx` but whose content was freshly serialized).
+    if !(target.modified || link_data.content_modified || dp.stx.as_deref() != Some("piped"))
         || content_string.starts_with("./")
     {
         return false;
@@ -823,7 +849,7 @@ pub fn link_handler(
     env: &SerializerEnv,
     node: NodeId,
 ) {
-    let link_data = get_link_round_trip_data(env, tree, node);
+    let link_data = get_link_round_trip_data(env, tree, node, state.in_inserted_content);
     let link_type = link_data.link_type.clone();
 
     // Magic-link detection (RFC/PMID/ISBN).
@@ -1838,7 +1864,7 @@ mod tests {
         let tree = DomTree::new(a);
         let a_id = tree.root();
 
-        let data = get_link_round_trip_data(&env, &tree, a_id);
+        let data = get_link_round_trip_data(&env, &tree, a_id, false);
         assert_eq!(data.link_type.as_deref(), Some("mw:WikiLink"));
         assert_eq!(data.href, "Foo_Bar");
         assert_eq!(data.content_string.as_deref(), Some("Foo Bar"));
@@ -1858,7 +1884,7 @@ mod tests {
         let tree = DomTree::new(a);
         let a_id = tree.root();
 
-        let data = get_link_round_trip_data(&env, &tree, a_id);
+        let data = get_link_round_trip_data(&env, &tree, a_id, false);
         let mut state = SerializerState::new();
         serialize_as_ext_link(&mut state, &tree, &env, a_id, &data);
         state.flush_line();
@@ -1877,7 +1903,7 @@ mod tests {
         a.push_child(Node::text("https://example.com"));
         let tree = DomTree::new(a);
         let a_id = tree.root();
-        let data = get_link_round_trip_data(&env, &tree, a_id);
+        let data = get_link_round_trip_data(&env, &tree, a_id, false);
         assert!(is_url_link(&env, &tree, a_id, &data));
     }
 
@@ -1894,7 +1920,7 @@ mod tests {
         a.push_child(Node::text("Foo"));
         let tree = DomTree::new(a);
         let a_id = tree.root();
-        let data = get_link_round_trip_data(&env, &tree, a_id);
+        let data = get_link_round_trip_data(&env, &tree, a_id, false);
 
         let mut state = SerializerState::new();
         serialize_as_wiki_link(&mut state, &tree, &env, a_id, &data);

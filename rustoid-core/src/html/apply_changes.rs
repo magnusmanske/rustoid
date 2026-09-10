@@ -18,7 +18,7 @@
 
 use crate::dom::node::{Node, NodeKind};
 use crate::error::{Result, RustoidError};
-use crate::html::parse::parse_html;
+use crate::html::parse::{parse_fragment_in_context, parse_html};
 
 /// A path into the tree: each element is a child index (0-based) from the root.
 type Path = Vec<usize>;
@@ -99,24 +99,30 @@ pub fn apply_manual_changes(body: &mut Node, changes: &serde_json::Value) -> Res
             }
             "html" => {
                 let h = arg_str(change, method_idx + 1, "html value")?;
-                let frag = parse_html(h)?;
-                let new_children = frag.children;
                 for p in &targets {
+                    // `$node->setAttribute`-style replacement; the fragment
+                    // context is the target's own tag name.
+                    let ctx = node_at_mut(body, p).map(|el| crate::html::wts_utils::node_name(el));
+                    let Some(context) = ctx else { continue };
+                    let new_children = parse_fragment_in_context(h, &context)?.children;
                     if let Some(el) = node_at_mut(body, p) {
-                        el.children = new_children.clone();
+                        el.children = new_children;
                     }
                 }
             }
             "append" | "before" | "after" => {
                 let h = arg_str(change, method_idx + 1, "insert html")?;
-                let frag = parse_html(h)?;
-                apply_insertion(body, &targets, method, frag)?;
+                apply_insertion(body, &targets, method, h)?;
             }
             "remove" => {
-                // Remove each matched node from its parent.
+                // Optional selector restricting the removed set (PHP's
+                // `remove( Node $node, ?string $optSelector )`).
+                let opt_selector = change.get(method_idx + 1).and_then(|v| v.as_str());
+                // Remove each matched node from its parent (deepest-first so
+                // removal doesn't invalidate earlier indices).
                 let mut paths = targets.clone();
                 paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
-                remove_paths(body, &paths);
+                remove_paths(body, &paths, opt_selector);
             }
             "empty" => {
                 for p in &targets {
@@ -208,11 +214,18 @@ fn child_nodes_at<'a>(body: &'a Node, path: &[usize]) -> &'a [Node] {
 }
 
 /// Find every element matching `selector` under `body`, returning their paths.
-/// Excludes the root itself (mirrors `querySelectorAll` scope) unless it matches.
+///
+/// PHP uses `DOMCompat::querySelectorAll( $body, $selector )`, which (unlike
+/// the JS `Element.querySelectorAll`) **includes the root element itself** when
+/// it matches the rightmost compound. Only `body`'s own path is `[]`, so a
+/// match on the root yields the empty path.
 fn find_matches(body: &Node, selector: &str) -> Vec<Path> {
     // Pre-split the selector into its compound parts (descendant combinator).
     let compounds: Vec<&str> = selector.split_whitespace().collect();
     let mut out = Vec::new();
+    if matches_full_selector(body, &compounds, 0, &[]) {
+        out.push(Vec::new());
+    }
     walk(body, &compounds, &mut Vec::new(), &mut Vec::new(), &mut out);
     out
 }
@@ -513,9 +526,11 @@ fn matches_attribute_selector(node: &Node, sel: &str) -> bool {
 }
 
 /// Apply `append`/`before`/`after` by splicing parsed nodes relative to each
-/// target. Faithful to jQuery plus the `tbody`/`tr` special-casing in PHP's
-/// `applyManualChanges` (matching the relevant DOM-construction quirks).
-fn apply_insertion(body: &mut Node, targets: &[Path], method: &str, frag: Node) -> Result<()> {
+/// target. Faithful to the `$jquery[]` closures in PHP's `applyManualChanges`,
+/// which wrap the fragment HTML in a `<div>` — or, inside a table, in a
+/// `<table>`/`<tr>` so that `<td>`/`<tr>` children survive HTML5 fragment
+/// parsing (whose "in body" mode drops them).
+fn apply_insertion(body: &mut Node, targets: &[Path], method: &str, html: &str) -> Result<()> {
     // Process targets in reverse order so earlier indices stay valid as we
     // splice; each target is resolved fresh.
     let mut ordered = targets.to_vec();
@@ -526,23 +541,50 @@ fn apply_insertion(body: &mut Node, targets: &[Path], method: &str, frag: Node) 
         }
         let parent_path = &path[..path.len() - 1];
         let idx = path[path.len() - 1];
+        // The fragment context depends on the parent element's tag name:
+        //   'tbody' → parse `html` in a `<table>` and take that table's children
+        //   'tr'    → parse `html` inside `<tbody><tr>…</tr></tbody>` and take
+        //             the inner row's children
+        //   else    → parse `html` in a plain `<div>`
+        let parent_name =
+            node_at_mut(body, parent_path).map(|n| crate::html::wts_utils::node_name(n));
+        let new_nodes: Vec<Node> = match (method, parent_name.as_deref()) {
+            ("before" | "after", Some("tbody")) => {
+                // `setInnerHTML($tbl, $html)` on a fresh `<table>`; HTML5
+                // synthesizes the `<tbody>`, so its children are the result.
+                let tbl = parse_fragment_in_context(html, "table")?;
+                tbl.children
+                    .first()
+                    .map(|tbody| tbody.children.clone())
+                    .unwrap_or_default()
+            }
+            ("before" | "after", Some("tr")) => {
+                // `setInnerHTML($tr, $html)` where `$tr` is an empty row of a
+                // scratch table; the row's children are the result.
+                parse_fragment_in_context(html, "tr")?.children
+            }
+            ("append", Some("tr")) => {
+                // `setInnerHTML($tbl, $html)` then migrate `$tbl->firstChild`'s
+                // children (the `<tbody>` HTML5 synthesizes) onto the row.
+                let tbl = parse_fragment_in_context(html, "table")?;
+                tbl.children
+                    .first()
+                    .map(|tbody| tbody.children.clone())
+                    .unwrap_or_default()
+            }
+            _ => parse_fragment_in_context(html, "div")?.children,
+        };
         let Some(parent) = node_at_mut(body, parent_path) else {
             continue;
         };
-        let new_nodes = frag.children.clone();
         match method {
             "append" => {
-                let target_children = parent.children.get_mut(idx).map(|t| &mut t.children);
-                if let Some(children) = target_children {
-                    children.extend(new_nodes);
+                if let Some(target) = parent.children.get_mut(idx) {
+                    target.children.extend(new_nodes);
                 }
             }
-            "before" => {
-                splice_at(parent, idx, new_nodes);
-            }
-            "after" => {
-                splice_at(parent, idx + 1, new_nodes);
-            }
+            "before" => splice_at(parent, idx, new_nodes),
+            "after" => splice_at(parent, idx + 1, new_nodes),
             _ => unreachable!(),
         }
     }
@@ -558,10 +600,27 @@ fn splice_at(parent: &mut Node, idx: usize, new_nodes: Vec<Node>) {
 
 /// Remove the nodes at `paths` (each a child path). Paths must be sorted
 /// deepest-first so removal doesn't invalidate earlier indices.
-fn remove_paths(body: &mut Node, paths: &[Path]) {
+///
+/// `opt_selector` mirrors PHP's optional `$optSelector`: when present, an
+/// additional `querySelectorAll` runs on the matched node, and — because text
+/// nodes have no `querySelectorAll` in PHP — **any non-element node is kept**
+/// unconditionally (the "text node hack!" in `Test::applyManualChanges`).
+fn remove_paths(body: &mut Node, paths: &[Path], opt_selector: Option<&str>) {
     for path in paths {
         if path.is_empty() {
             continue;
+        }
+        if let Some(sel) = opt_selector {
+            // Only elements are subject to the nested selector; text/comment
+            // nodes sail through the hack and are removed unconditionally.
+            let is_element =
+                node_at_mut(body, path).is_some_and(|n| matches!(n.kind, NodeKind::Element(_)));
+            if is_element
+                && let Some(node) = node_at_mut(body, path)
+                && find_matches(node, sel).is_empty()
+            {
+                continue;
+            }
         }
         let parent_path = &path[..path.len() - 1];
         let idx = path[path.len() - 1];

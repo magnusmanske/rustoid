@@ -183,6 +183,15 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
             // Non-selser (or modified) path.
             state.curr_node_unmodified = false;
 
+            // Track `inInsertedContent` for the subtree of an inserted node
+            // (mirrors the save/set/restore around `$domHandler->handle(...)`).
+            let current_inserted_state = state.in_inserted_content;
+            if state.selser_mode
+                && crate::html::diff_utils::DiffUtils::has_inserted_diff_mark(tree.node(node))
+            {
+                state.in_inserted_content = true;
+            }
+
             // Before-constraints: prev non-sep sibling, or parent.
             let prev = crate::html::dom_tree::previous_non_sep_sibling(tree, node)
                 .or_else(|| tree.parent(node));
@@ -201,6 +210,8 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
 
             let mut handler = get_dom_handler(tree, node);
             handler.handle(tree, node, state);
+
+            state.in_inserted_content = current_inserted_state;
 
             // After-constraints: next non-sep sibling, else parent.
             let next = crate::html::dom_tree::next_non_sep_sibling(tree, node)

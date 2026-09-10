@@ -1,6 +1,72 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **833/891 fixtures pass** (93%). Lib tests: 638 pass. Clippy: clean.
+Current baseline: **840/891 fixtures pass** (94%). Lib tests: 644 pass. Clippy: clean.
+
+## Landed this session: the selser `T319143` cluster (834 → 840)
+
+The whole 8-fixture "T319143 - copy-pasting of cells" group shared **one** root
+cause plus two smaller serialization bugs. All are now fixed.
+
+### 1. `Test::applyManualChanges` — the `before`/`after`/`append` fragment context
+
+PHP's `$jquery['before'|'after']` closures do **not** parse the inserted HTML
+generically. When the target's parent is a `<tr>` they set the inner HTML of a
+scratch `<tr>` of a scratch `<table>`:
+
+```php
+} elseif ( DOMUtils::nodeName( $node->parentNode ) === 'tr' ) {
+    $tbl = $node->ownerDocument->createElement( 'table' );
+    DOMCompat::setInnerHTML( $tbl, '<tbody><tr></tr></tbody>' );
+    $tr = $tbl->firstChild->firstChild;
+    DOMCompat::setInnerHTML( $tr, $html );
+```
+
+That matters because HTML5's "in body" insertion mode **drops** `<td>`/`<tr>`/
+`<tbody>` start tags outright, so parsing `<td>…</td>` in a `<div>` context
+loses the `<td>` (verified against remex: `<a href="./Eau">Eau</a>` alone).
+rustoid previously dropped it too, so the inserted cell vanished.
+
+- Added `html::parse::parse_fragment_in_context(html, context)` — a faithful
+  `DOMCompat::setInnerHTML`, using `html5ever::parse_fragment` with an explicit
+  context element and descending through the synthetic `<html>` wrapper.
+- `apply_insertion` now re-parses per target with the right context: `tbody`
+  parent → `<table>`; `tr` parent → `<tr>`; `append` on a `<tr>` → `<table>`’s
+  `<tbody>` children; otherwise `<div>`. It also honours the `tbody` parent case
+  for `before`/`after`, which was previously unimplemented.
+
+### 2. `ContentModelHandler::canonicalizeDOM` — `RemoveRedLinks`
+
+MediaWiki renders a link to a non-existent page with a `?action=edit&redlink=1`
+query and a `new` class. Parsoid strips those two parameters before diffing, or
+every red link compares as modified. Ported as
+`html::remove_red_links::remove_red_links` (faithful to
+`src/Html2Wt/RemoveRedLinks.php`, including parameter-order preservation and the
+"empty query means no `?`" rule). Applied in `selective_serialize_dom` to **both**
+the edited DOM (PHP `fromDOM`) and the revision DOM (PHP `setupSelser`).
+
+### 3. `LinkHandlerUtils` — two missing gates
+
+- `isSimpleWikiLink`: the guard is
+  `!empty($target['modified']) || !empty($linkData->contentModified) || $dp->stx !== 'piped'`.
+  `contentModified` was missing, so freshly-inserted links always got the piped
+  `[[Eau|Eau]]` form.
+- `linkData.contentModified` was never populated at all. Now set in
+  `getLinkRoundTripData` from `state.inInsertedContent ||
+  DiffUtils::hasDiffMark($node, SUBTREE_CHANGED)`; `in_inserted_content` is now
+  save/set/restore threaded around the handler dispatch in `serializer.rs`
+  (faithful to `WikitextSerializer::serializeDOM`).
+- `getContentString`: diff markers
+  (`<meta typeof="mw:DiffMarker/…">`) must be **skipped**, not treated as
+  non-text. The old code returned `None`, so an inserted `<a>` whose children
+  were `[marker, text, marker]` never produced a content string.
+
+### Also fixed this session (from the previous handoff's diagnosis)
+
+- `Test::applyManualChanges` `remove` with an optional selector: text nodes are
+  removed unconditionally (PHP's "text node hack!"); only elements are filtered
+  by the nested `querySelectorAll`.
+- `find_matches` now includes the **root** when the rightmost compound matches,
+  matching PHP's `DOMCompat::querySelectorAll` (not JS `Element.querySelectorAll`).
 
 ## PHP reference checkout — restored and working
 

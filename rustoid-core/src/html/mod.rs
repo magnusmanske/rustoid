@@ -19,6 +19,7 @@ pub mod handlers;
 pub mod link_handler_utils;
 pub mod media_structure;
 pub mod parse;
+pub mod remove_red_links;
 pub mod selser;
 pub mod separators;
 pub mod serialize;

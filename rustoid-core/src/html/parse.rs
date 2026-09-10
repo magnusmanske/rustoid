@@ -39,6 +39,52 @@ pub fn parse_html(html: &str) -> Result<Node> {
     convert_document(&rc_dom.document)
 }
 
+/// Parse an HTML fragment in the context of a specific enclosing element,
+/// mirroring `DOMCompat::setInnerHTML`.
+///
+/// The fragment context matters: HTML5's "in body" insertion mode drops
+/// `<td>`/`<tr>`/`<tbody>` start tags outright, so `setInnerHTML( $tr, '<td>…' )`
+/// only yields a `<td>` when the parser is told the context is a row. PHP
+/// achieves this by setting the inner HTML of a scratch `<table>`/`<tr>`;
+/// we pass the context name straight to `html5ever`.
+pub fn parse_fragment_in_context(html: &str, context: &str) -> Result<Node> {
+    let opts = ParseOpts::default();
+    let rc_dom = html5ever::parse_fragment(
+        RcDom::default(),
+        opts,
+        html5ever::QualName::new(
+            None,
+            html5ever::Namespace::from("http://www.w3.org/1999/xhtml"),
+            html5ever::LocalName::from(context),
+        ),
+        Vec::new(),
+    )
+    .from_utf8()
+    .read_from(&mut html.as_bytes())
+    .map_err(|e| RustoidError::Parse(format!("HTML fragment parse error: {e}")))?;
+
+    // `parse_fragment` still builds a document wrapper: `document > html > …`.
+    // The fragment's nodes are the `<html>` element's children.
+    let root = rc_dom
+        .document
+        .children
+        .borrow()
+        .iter()
+        .find(
+            |c| matches!(&c.data, NodeData::Element { name, .. } if name.local.as_ref() == "html"),
+        )
+        .cloned()
+        .unwrap_or_else(|| rc_dom.document.clone());
+
+    let mut out = Node::document();
+    for child in root.children.borrow().iter() {
+        if let Some(node) = convert_node(child)? {
+            out.push_child(node);
+        }
+    }
+    Ok(out)
+}
+
 /// Convert an RcDom document handle to our AST Node.
 fn convert_document(handle: &Handle) -> Result<Node> {
     let _doc = Node::document();

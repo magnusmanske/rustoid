@@ -461,32 +461,40 @@ impl Html5TreeBuilder {
     fn handle_deleted_start_tag(&mut self, name: &str, dp: &TDataParsoid) {
         if dp.stx.as_deref() != Some("html") && matches!(name, "td" | "tr" | "th") {
             // A stripped wikitext-syntax table tag outside of a table. Re-insert
-            // the original page source.
-            let orig_txt = if let Some(tsr) = &dp.tsr {
-                tsr.substr(&self.source).to_string()
-            } else {
-                match name {
+            // the original page source. PHP guards the `substr` on a non-empty
+            // tsr with non-null offsets (`!empty( $dp->tsr ) && $dp->tsr->start
+            // !== null && $dp->tsr->end !== null`); otherwise it falls back to
+            // the literal tag character.
+            let orig_txt = match &dp.tsr {
+                Some(tsr) if tsr.start.is_some() => tsr.substr(&self.source).to_string(),
+                _ => match name {
                     "td" => "|",
                     "tr" => "|-",
                     "th" => "!",
                     _ => "",
                 }
-                .to_string()
+                .to_string(),
             };
             if !orig_txt.is_empty() {
-                modes::characters(
-                    &mut self.builder,
-                    &mut self.dispatcher,
-                    &orig_txt,
-                    0,
-                    orig_txt.len(),
-                    0,
-                    0,
-                );
+                self.emit_characters(&orig_txt);
             }
         } else {
             self.insert_placeholder_meta(name, dp, true);
         }
+    }
+
+    /// Flush a run of literal characters through the tree builder (mirrors the
+    /// `$this->remexPipeline->dispatcher->characters( ... )` call).
+    fn emit_characters(&mut self, text: &str) {
+        modes::characters(
+            &mut self.builder,
+            &mut self.dispatcher,
+            text,
+            0,
+            text.len(),
+            0,
+            0,
+        );
     }
 
     /// Copy source data from a matched end tag onto its element's stashed node
