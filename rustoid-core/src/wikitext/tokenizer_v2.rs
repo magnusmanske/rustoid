@@ -1185,13 +1185,28 @@ impl<'a> PegTokenizer<'a> {
         let output_saved = self.output.len();
 
         // PHP's `table_line = sc:space_or_comment* … tl:(…) { array_merge($sc, $tl) }`
-        // captures the leading `sc` (spaces/comments) and merges it *before* the
-        // table tokens. Emit the leading spaces as text so they survive as
-        // separator content (e.g. `\n |[[Bar]]` keeps its leading space).
-        let sc_start = self.pos;
-        self.consume_spaces();
-        self.emit_text(self.input[sc_start..self.pos].to_string());
-        self.try_comment();
+        // captures the leading `sc` (spaces and comments, in any order, repeated)
+        // and merges it *before* the table tokens. Emit the leading spaces as text
+        // so they survive as separator content (e.g. `\n |[[Bar]]` keeps its
+        // leading space).
+        //
+        // The loop matters: `<!-- foo -->  ||baz` is a valid table-content line
+        // because `sc` consumes the comment *and* the spaces after it before the
+        // `||` is tried. Consuming only one of the two would fall back to block
+        // parsing and mis-tokenize the line as indent-pre.
+        loop {
+            let space_start = self.pos;
+            self.consume_spaces();
+            if self.pos > space_start {
+                self.emit_text(self.input[space_start..self.pos].to_string());
+                continue;
+            }
+            let before_comment = self.pos;
+            self.try_comment();
+            if self.pos == before_comment {
+                break;
+            }
+        }
 
         if self.try_table_start_tag() {
             return true;
