@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **830/891 fixtures pass** (93%). Lib tests: 636 pass. Clippy: clean.
+Current baseline: **833/891 fixtures pass** (93%). Lib tests: 638 pass. Clippy: clean.
 
 ## PHP reference checkout — restored and working
 
@@ -26,24 +26,59 @@ cd /tmp/parsoid-src && php /tmp/pt_single.php '[[Foo|bar]]'
 - `/tmp/pt_single.php '<wikitext>'` — bare standalone parse (MockDataAccess,
   no templates).
 - `/tmp/pt_fixture.php '<wikitext>' [--template Name=body]... [--title T]` —
-  standalone parse with **template fetching**, which is what the fixtures use
-  (subclasses `MockDataAccess`, overrides `fetchTemplateSource`). Added this
-  session; this is the primary oracle for wikilink/template work.
+  standalone parse with **template fetching** (the primary wikilink/template
+  oracle).
+- `/tmp/pt_subpage.php '<wikitext>' [title]` — standalone parse with subpages
+  enabled for NS 0 (the `subpage` test option).
+- `/tmp/pt_html2wt.php '<html>'` — html2wt via `WikitextSerializer::serializeDOM`.
+  Good for quick link-serialization checks, but it does **not** run
+  `prepareAndLoadDoc`/`fromDOM`; use `/tmp/pt_h2w3.php` (below) for the full
+  pipeline.
+- `/tmp/pt_h2w3.php '<html>'` (**added this session**) — the faithful html2wt path:
+  `DOMUtils::parseHTML` → `DOMDataUtils::prepareAndLoadDoc` → `env->setupTopLevelDoc`
+  → `ContentModelHandler::fromDOM`. This is what the html2wt fixtures exercise, and
+  it differs from plain `serializeDOM` (e.g. link-prefix `<nowiki/>` escaping only
+  appears here). `PT_LANG=is` selects Icelandic link trail/prefix regexes.
 - Known probe limitation: `MockSiteConfig` registers no magic words, so `{{!}}`
-  does **not** resolve as a variable (it needs `baseconfig/enwiki.json`
-  `query.variables`). Use the fixture runner for `{{!}}` cases.
+  does **not** resolve as a variable. Use the fixture runner for `{{!}}` cases.
 
 ## Landed this session
 
-Eight focused, PHP-verified fixes (821 → 830). See the commits below.
+Eleven focused, PHP-verified fixes (821 → 833). See the commits below.
 
-### 8. `isNewElt`: a node with no `data-parsoid` is new (`fbc73e2`)
-- PHP's `DataParsoid::defaultValue()` — the fallback for a node with no
-  `data-parsoid` attribute — sets the `IS_NEW` temp flag, so `WTUtils::isNewElt`
-  is **true** for HTML parsed without metadata (the html2wt entry point).
-- `wts_utils::node_is_new` was a stub returning `false`, so `getShadowInfo`
-  reported `modified: false` everywhere. That made `serializeAsWikiLink` emit the
-  normalized title (`[[Apple]]`) instead of the source content (`[[apple]]`).
+### 11. `textCanParseAsLink` link-validity walk (`0ec8676`)
+- The trailing-bracket strip used the *first* `]`; PHP's
+  `preg_replace( '/\][^\]]*$/D', ']', $text, 1 )` collapses the *last* `]` plus
+  any following non-`]` characters. `]]` was reduced to `]` and wrongly nowiked.
+- The link-validity walk was missing: PHP walks the tokens backwards, accepts a
+  `wikilink` whose `href` is a valid local target (and not a bare protocol URL),
+  handles `extlink` (including "template expands to a url link"), and otherwise
+  accumulates token source to test whether `text` emerged unscathed.
+- Fixed: "Parsoid link bracket escaping".
+
+### 10. `WikiLinkText` chunks on the non-selser path (`2ba683e`)
+- PHP's `serializeAsWikiLink` always wraps its output in `new WikiLinkText(...)`;
+  the `stx in {simple,piped}` guard lives only in `fromSelSerImpl` (selser).
+  rustoid passed `bad_prefix: None`, so no link-prefix `<nowiki/>` was installed.
+- Added `constrained_text::wiki_link_with_config` (faithful `WikiLinkText`
+  constructor) and refactored `from_wiki_link_chunk` onto it.
+- Fixed: "Parsoid link prefix escaping".
+
+### 9. html2wt metadata + relative titles + test options (`3194f28`)
+- `parse_html` never decoded the `data-parsoid` attribute into `node.dp`, so every
+  `getShadowInfo` lookup saw no `a`/`sa` shadow map. Added
+  `DataParsoid::from_data_parsoid_json` (the inverse of `to_data_parsoid_json` for
+  the html2wt-relevant fields), mirroring `DOMDataUtils::loadDataAttribs`.
+- Ported `Env::resolveTitle` in full (was a lone-fragment stub): `(../)+` relative
+  subpage resolution, absolute `/subpage`, trailing-slash trimming, re-normalization.
+- The wt2wt harness path ignored the test's `subpage`/`language`/`!! config` options
+  and passed no context title; added `Parser::wikitext_to_ast_with_title` and a
+  shared `apply_config_raw` helper.
+- Fixed: "Relative subpage noslash link".
+
+### 8. `isNewElt`: no `data-parsoid` means new (`fbc73e2`)
+- `DataParsoid::defaultValue()` sets `IS_NEW`, so `WTUtils::isNewElt` is true for
+  HTML parsed without metadata. `node_is_new` was a stub returning `false`.
 - Fixed: "Parsoid link trail escaping".
 
 ### 7. `isSimpleWikiLink` + `getFullDBKey` (`74295ce`)
@@ -103,43 +138,34 @@ Eight focused, PHP-verified fixes (821 → 830). See the commits below.
 - Fixed: "Ensure that transclusion titles are not url-decoded",
   "Wikilinks with embedded newlines are not broken".
 
-### Next wikilink candidates
-- "Parsoid link prefix escaping" / "Parsoid link bracket escaping" —
-  **investigated, root cause identified, needs a decision**.
+### Next candidates
+- "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved" —
+  `[http://wp.org ''foo'']` should produce `<i>foo</i>`, but `tokenize_link_content`
+  only tokenizes *directives* (`{{…}}`, extension tags), not quotes/entities, so the
+  content stays a plain string and the QuoteTransformer never sees it. PHP's
+  `extlink` content is `inlineline<extlink>` and does produce `mw-quote`.
 
-  Both fixtures have an `html/parsoid` section with **no `data-parsoid`**
-  (`parsoid=html2wt,html2html`), e.g.:
-  ```html
-  <p>Aðrir mótmælenda<a rel="mw:WikiLink" href="./Söfnuður" title="Söfnuður">söfnuður</a></p>
-  ```
-  PHP's `WikiLinkText::fromSelSerImpl` builds the constrained-text chunk (which
-  is what inserts `<nowiki/>`) only when
-  `matchRel($node, '#^mw:WikiLink(/Interwiki)?$#D') && in_array($stx, ['simple','piped'])`.
-  With no `data-parsoid`, `$stx` is `''`, so PHP declines too.
-
-  Rust's condition (`constrained_text.rs`, `from_wiki_link_chunk` caller) is
-  byte-identical to PHP's. Verified separately that the prefix/trail escaping
-  itself is correct: `test_wikilink_prefix_escape_icelandic` shows the `<nowiki/>`
-  prefix fires for `is` config once `stx` is set. So the gap is *upstream of the
-  chunk*: something in the test pipeline must give `stx` to these nodes.
-
-  Next step: get the real PHP test runner executing this fixture (the ad-hoc
-  probe is blocked — `DOMDataUtils::prepareAndLoadDoc` asserts "Bogus nodeId"
-  because `MockPageConfig` lacks a usable page bundle; the test runner builds its
-  page config via `ParserTests\PageConfig`, not `MockPageConfig`). Mirroring that
-  setup should reveal whether PHP synthesizes `stx` in
-  `canonicalizeDOM`/`prepareAndLoadDoc` or whether the Rust HTML→AST parse is
-  dropping `data-parsoid`.
+  ⚠️ Tried: switching `tokenize_link_content` to a full `try_inline_element` walk with
+  `linkdesc: true`. That regressed 833 → 814 — the tests
+  (`test_extlink_url_stops_at_nested_wikilink`, `test_extlink_nested_wikilink_content`,
+  `test_wikilink_close_ignores_html_attr_pipe`) depend on link content keeping a raw
+  `[[…]]` as literal text, and `linkdesc` alters `[` handling. Reverted. A correct
+  fix must keep the nested-`[[` invariant while still producing quote tokens —
+  likely by tokenizing only quotes/entities inline and leaving brackets alone.
+- "Parsoid T55221: Wikilinks should be properly entity-escaped" —
+  `He&amp;nbsp;llo [[Foo|He&amp;nbsp;llo]]` should keep `&nbsp;` escaped and drop the
+  `./` prefix (`[[Foo|…]]` not `[[./Foo|…]]`).
 - "T179544: {{anchorencode:}} output should be always usable in links" — needs the
   `anchorencode` parser function plus `mw:ExpandedAttrs` on a templated wikilink
   fragment (AttributeExpander cluster).
-- "T45661: Piped links with identical prefixes" — red-link mock/harness default
-  (see the earlier note); PHP's standalone known-failure for `html2wt` shows
-  `[[Prefixed article|prefixed articles with spaces]]`, a *piped* form, so this is
-  a different sub-problem from the simple-link case above.
-- "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved".
+- "T45661: Piped links with identical prefixes" — red-link mock/harness default;
+  PHP's standalone known-failure for `html2wt` shows the piped form.
 - "Plain link in template argument" (template-arg splitting vs extlink).
 - "Broken wikilinks (but not external links) prevent templates from closing".
+
+The table-cell / `TableFixups` cluster (14 fixtures) and the selser `T319143` group
+(8 fixtures) are the largest remaining blocks; both need the AttributeExpander /
+TableFixups work described below.
 
 ## Previous session notes
 
