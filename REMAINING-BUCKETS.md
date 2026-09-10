@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **826/891 fixtures pass** (93%). Lib tests: 634 pass. Clippy: clean.
+Current baseline: **828/891 fixtures pass** (93%). Lib tests: 635 pass. Clippy: clean.
 
 ## PHP reference checkout — restored and working
 
@@ -35,7 +35,16 @@ cd /tmp/parsoid-src && php /tmp/pt_single.php '[[Foo|bar]]'
 
 ## Landed this session
 
-Four focused, PHP-verified fixes (821 → 826). See the commits below.
+Five focused, PHP-verified fixes (821 → 828). See the commits below.
+
+### 5. Wikilink link text tunnelled through a DOM fragment (`83eef20`)
+- `render_wiki_link_dispatched` now passes the caption fragment builder (and the
+  fragment/id maps) to `render_wiki_link_with_fragment`, which registers the
+  built subtree via `dom_fragment_token`. Mirrors PHP's `renderWikiLink` calling
+  `addLinkAttributesAndGetContent(..., $buildDOMFragment = true)`.
+- Without this, block-level content in link text (`<pre>`) was hoisted out of
+  the `<a>` by the tree builder.
+- Fixed: "<pre> inside a link".
 
 ### 4. Extlink URL scan (`cc2424a`)
 - New `scan_extlink_url_len` implements PHP's `extlink_nonipv6url`: stops at
@@ -77,23 +86,14 @@ Four focused, PHP-verified fixes (821 → 826). See the commits below.
   "Wikilinks with embedded newlines are not broken".
 
 ### Next wikilink candidates
-- "<pre> inside a link" — **diagnosed this session, needs a pipeline change**.
-  `[[Main Page|the main page <pre>[it's not very good]</pre>]]`: the tokenizer is
-  correct (`<pre>` becomes a single `extension` self-closing token when `ext_tags`
-  includes `pre`, which `MockSiteConfig` does), but the *tree builder* promotes the
-  expanded `<pre>` out of the `<a>` and out of the `<p>`:
-  ```
-  now:   <p>]] <a …>the main page </a></p>\n<a …><pre …>…</pre></a>
-  PHP:   <p>]] <a …>the main page <pre …>…</pre></a></p>
-  ```
-  The extension expansion runs with the link-text fragment's `inlineContext`, so
-  the fix is to keep the expanded extension inline when the surrounding fragment is
-  inline (PHP's `extractExtBody`/`ExtensionHandler` respects the inline context).
 - "T179544: {{anchorencode:}} output should be always usable in links" — needs the
   `anchorencode` parser function plus `mw:ExpandedAttrs` on a templated wikilink
   fragment (AttributeExpander cluster).
-- "Plain link in template argument" (template-arg splitting vs extlink).
+- "Parsoid link trail / prefix / bracket escaping" — the `handleLinkNeighbours`
+  link-trail regex (`SiteConfig::linkTrail`) and its escaping.
 - "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved".
+- "Plain link in template argument" (template-arg splitting vs extlink).
+- "Broken wikilinks (but not external links) prevent templates from closing".
 
 ## Previous session notes
 
