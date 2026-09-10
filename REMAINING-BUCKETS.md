@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **828/891 fixtures pass** (93%). Lib tests: 635 pass. Clippy: clean.
+Current baseline: **830/891 fixtures pass** (93%). Lib tests: 636 pass. Clippy: clean.
 
 ## PHP reference checkout — restored and working
 
@@ -35,18 +35,36 @@ cd /tmp/parsoid-src && php /tmp/pt_single.php '[[Foo|bar]]'
 
 ## Landed this session
 
-Five focused, PHP-verified fixes (821 → 828). See the commits below.
+Eight focused, PHP-verified fixes (821 → 830). See the commits below.
 
-### 5. Wikilink link text tunnelled through a DOM fragment (`83eef20`)
+### 8. `isNewElt`: a node with no `data-parsoid` is new (`fbc73e2`)
+- PHP's `DataParsoid::defaultValue()` — the fallback for a node with no
+  `data-parsoid` attribute — sets the `IS_NEW` temp flag, so `WTUtils::isNewElt`
+  is **true** for HTML parsed without metadata (the html2wt entry point).
+- `wts_utils::node_is_new` was a stub returning `false`, so `getShadowInfo`
+  reported `modified: false` everywhere. That made `serializeAsWikiLink` emit the
+  normalized title (`[[Apple]]`) instead of the source content (`[[apple]]`).
+- Fixed: "Parsoid link trail escaping".
+
+### 7. `isSimpleWikiLink` + `getFullDBKey` (`74295ce`)
+- Ported PHP's missing `isSimpleWikiLink` branches: the
+  `normalizedTitleKey(...) == preg_replace(MW_TITLE_WHITESPACE_RE, '_', target)`
+  comparison, the relative-link `resolveTitle`/`../`-stripping branches, the
+  protocol-relative `hrefHasProto` guard, and the interwiki colon-escape strip.
+- Split `Title::getPrefixedDBKey` (no fragment) from `getFullDBKey` (appends it).
+  Three call sites were hand-appending the fragment and produced `#section#section`.
+- Normalize the fragment's whitespace at parse time (MediaWiki runs the same
+  whitespace regex over the whole input), so `[[Foo#a&#160;b]]` gives `Foo#a_b`.
+- Fixed: "Link containing % as a single hex sequence interpreted to char".
+
+### 6. Wikilink link text tunnelled through a DOM fragment (`83eef20`)
 - `render_wiki_link_dispatched` now passes the caption fragment builder (and the
   fragment/id maps) to `render_wiki_link_with_fragment`, which registers the
   built subtree via `dom_fragment_token`. Mirrors PHP's `renderWikiLink` calling
   `addLinkAttributesAndGetContent(..., $buildDOMFragment = true)`.
-- Without this, block-level content in link text (`<pre>`) was hoisted out of
-  the `<a>` by the tree builder.
 - Fixed: "<pre> inside a link".
 
-### 4. Extlink URL scan (`cc2424a`)
+### 5. Extlink URL scan (`cc2424a`)
 - New `scan_extlink_url_len` implements PHP's `extlink_nonipv6url`: stops at
   `[`, `<`, `]`, `}`, quotes, whitespace, and directive/entity starts; continues
   through `|`, `&`, `=`, `-`, `!`, `{`.
@@ -86,11 +104,39 @@ Five focused, PHP-verified fixes (821 → 828). See the commits below.
   "Wikilinks with embedded newlines are not broken".
 
 ### Next wikilink candidates
+- "Parsoid link prefix escaping" / "Parsoid link bracket escaping" —
+  **investigated, root cause identified, needs a decision**.
+
+  Both fixtures have an `html/parsoid` section with **no `data-parsoid`**
+  (`parsoid=html2wt,html2html`), e.g.:
+  ```html
+  <p>Aðrir mótmælenda<a rel="mw:WikiLink" href="./Söfnuður" title="Söfnuður">söfnuður</a></p>
+  ```
+  PHP's `WikiLinkText::fromSelSerImpl` builds the constrained-text chunk (which
+  is what inserts `<nowiki/>`) only when
+  `matchRel($node, '#^mw:WikiLink(/Interwiki)?$#D') && in_array($stx, ['simple','piped'])`.
+  With no `data-parsoid`, `$stx` is `''`, so PHP declines too.
+
+  Rust's condition (`constrained_text.rs`, `from_wiki_link_chunk` caller) is
+  byte-identical to PHP's. Verified separately that the prefix/trail escaping
+  itself is correct: `test_wikilink_prefix_escape_icelandic` shows the `<nowiki/>`
+  prefix fires for `is` config once `stx` is set. So the gap is *upstream of the
+  chunk*: something in the test pipeline must give `stx` to these nodes.
+
+  Next step: get the real PHP test runner executing this fixture (the ad-hoc
+  probe is blocked — `DOMDataUtils::prepareAndLoadDoc` asserts "Bogus nodeId"
+  because `MockPageConfig` lacks a usable page bundle; the test runner builds its
+  page config via `ParserTests\PageConfig`, not `MockPageConfig`). Mirroring that
+  setup should reveal whether PHP synthesizes `stx` in
+  `canonicalizeDOM`/`prepareAndLoadDoc` or whether the Rust HTML→AST parse is
+  dropping `data-parsoid`.
 - "T179544: {{anchorencode:}} output should be always usable in links" — needs the
   `anchorencode` parser function plus `mw:ExpandedAttrs` on a templated wikilink
   fragment (AttributeExpander cluster).
-- "Parsoid link trail / prefix / bracket escaping" — the `handleLinkNeighbours`
-  link-trail regex (`SiteConfig::linkTrail`) and its escaping.
+- "T45661: Piped links with identical prefixes" — red-link mock/harness default
+  (see the earlier note); PHP's standalone known-failure for `html2wt` shows
+  `[[Prefixed article|prefixed articles with spaces]]`, a *piped* form, so this is
+  a different sub-problem from the simple-link case above.
 - "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved".
 - "Plain link in template argument" (template-arg splitting vs extlink).
 - "Broken wikilinks (but not external links) prevent templates from closing".
