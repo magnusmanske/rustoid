@@ -500,6 +500,9 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     // separate from the dedicated `!! html/parsoid*` sections, which take
     // precedence for the Parsoid comparison when both are present.
     let mut html_both_lines = Vec::new();
+    // The `!! html/parsoid+standalone` section, used as the Parsoid expectation
+    // when there is no `!! html/parsoid`/`+integrated` section.
+    let mut html_standalone_lines = Vec::new();
     let mut html_php_lines = Vec::new();
     let mut html_parsoid_lang_lines = Vec::new();
     let mut wikitext_edited_lines = Vec::new();
@@ -569,6 +572,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                 // are not registered (so #tag:pre is a plain <pre>).
                 section = Section::HtmlStandalone;
                 parsoid_only = true;
+                seen_html_section = true;
                 *i += 1;
             }
             "!! wikitext/edited" => {
@@ -596,8 +600,7 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
                         Section::Wikitext => wikitext_lines.push(line.to_string()),
                         Section::Html => html_parsoid_lines.push(line.to_string()),
                         Section::HtmlIntegrated => html_parsoid_lines.push(line.to_string()),
-                        Section::HtmlStandalone => { /* standalone: ignore (integrated takes precedence) */
-                        }
+                        Section::HtmlStandalone => html_standalone_lines.push(line.to_string()),
                         Section::HtmlPhp => html_php_lines.push(line.to_string()),
                         Section::HtmlBoth => {
                             html_both_lines.push(line.to_string());
@@ -622,11 +625,16 @@ fn parse_test_case(lines: &[&str], i: &mut usize, description: String) -> Result
     if seen_html_section {
         // A dedicated `!! html/parsoid*` section takes precedence over the
         // generic `!! html` for the Parsoid comparison; the latter is a
-        // fallback only.
-        let parsoid_lines = if html_parsoid_lines.is_empty() {
-            &html_both_lines
-        } else {
+        // fallback only. When both `+integrated` and `+standalone` sections are
+        // present the integrated one wins (mirrors PHP `Test::normalizeHTML`,
+        // which consults `html/parsoid+integrated` first when not in standalone
+        // mode); otherwise the `+standalone` section is used.
+        let parsoid_lines = if !html_parsoid_lines.is_empty() {
             &html_parsoid_lines
+        } else if !html_standalone_lines.is_empty() {
+            &html_standalone_lines
+        } else {
+            &html_both_lines
         };
         let html = parsoid_lines.join("\n").trim().to_string();
         if html != "NOT NEEDED" {
