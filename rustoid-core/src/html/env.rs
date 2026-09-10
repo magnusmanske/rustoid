@@ -48,8 +48,14 @@ impl<'a> SerializerEnv<'a> {
     /// `ignoreFragment = true` returns `getPrefixedDBKey()` (underscores in both
     /// the namespace and the title), the default `false` returns the
     /// `getFullDBKey()` (which appends the fragment).
+    ///
+    /// Mirrors PHP's `makeTitle(..., $noExceptions = true)`: `Title::newFromText`
+    /// throws `TitleException` for illegal characters (`&name;`, `%hh`, …), which
+    /// this surfaces as `None`. The title is resolved (relative `#`/`/`/`../`
+    /// references) *before* parsing, and a relative reference adopts the context
+    /// title's namespace as its default.
     pub fn normalized_title_key(&self, str_: &str, ignore_fragment: bool) -> Option<String> {
-        let title = self.make_title_from_text(str_);
+        let title = self.make_title_from_url_decoded_str(str_, true)?;
         if title.text.is_empty() && title.namespace_id == 0 && title.interwiki.is_none() {
             return None;
         }
@@ -58,6 +64,33 @@ impl<'a> SerializerEnv<'a> {
         } else {
             Some(title.get_full_db_key())
         }
+    }
+
+    /// `Env::makeTitleFromURLDecodedStr( $str, 0, $noExceptions )` — url-decode,
+    /// resolve relative references, then parse. `None` stands for PHP's
+    /// `TitleException` when `noExceptions` is set.
+    pub fn make_title_from_url_decoded_str(
+        &self,
+        str_: &str,
+        no_exceptions: bool,
+    ) -> Option<Title> {
+        let decoded = crate::util::decode_uri_component(str_);
+        self.make_title(&decoded, no_exceptions)
+    }
+
+    /// `Env::makeTitle` — resolve then parse, honoring the relative-reference
+    /// namespace rule.
+    fn make_title(&self, text: &str, no_exceptions: bool) -> Option<Title> {
+        // A relative reference (`#`, `/`, `../`) takes the context namespace.
+        let resolved = self.resolve_title(text);
+        let title = crate::title::TitleParser::try_parse(&resolved, self.config);
+        if title.is_none() && !no_exceptions {
+            // PHP rethrows; callers that pass `noExceptions = false` expect a
+            // hard failure. rustoid has no exception channel, so returning
+            // `None` keeps the signature total (see the `TitleParser` docs).
+            return None;
+        }
+        title
     }
 
     /// `Env::resolveTitle` — resolve a possibly-relative title reference

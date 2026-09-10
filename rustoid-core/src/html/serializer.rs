@@ -61,6 +61,16 @@ pub fn serialize_text(text: &str, node: NodeId, tree: &DomTree, state: &mut Seri
         body = &body[idx..];
     }
 
+    // `if ( $state->needsEscaping ) { $res = Utils::escapeWtEntities( $res ); }`
+    // — escape the ampersand of any *valid* wikitext entity so the text is not
+    // re-interpreted as an entity on the next parse. This runs before
+    // `emitChunk`, so the emitter's own `escapeWikitext` sees the escaped form.
+    let escaped;
+    if state.needs_escaping {
+        escaped = crate::util::escape_wt_entities(body);
+        body = &escaped;
+    }
+
     // Emit the (now separator-stripped) body.
     state.emit_chunk(body, node, tree);
 

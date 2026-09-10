@@ -712,6 +712,10 @@ pub fn serialize_as_wiki_link(
             // Use the source content (which preserves the original case, e.g.
             // `[[apple]]` stays lowercase even though the normalized title key
             // is `Apple`).
+            //
+            // NB: the result must be recorded in `escaped_tgt` as well — PHP
+            // assigns `$escapedTgt` here, and the invalid-link fallback below
+            // keys off it.
             let content = link_data.content_string.clone().unwrap_or_default();
             let escaped = crate::html::wikitext_escape_handlers::escape_link_target(env, &content);
             link_target = Some(if escaped.invalid_link {
@@ -719,6 +723,7 @@ pub fn serialize_as_wiki_link(
             } else {
                 add_colon_escape(env, &escaped.link_target, link_data)
             });
+            escaped_tgt = Some(escaped);
         }
     } else if is_url_link(env, tree, node, link_data) {
         let ct = crate::html::constrained_text::ConstrainedText::auto_url_link(
@@ -756,14 +761,32 @@ pub fn serialize_as_wiki_link(
             needs_escaping = false;
         }
 
+        // PHP: `$linkTarget = $target['value'];` then, when the target is
+        // modified or not from source, strip the relative prefix, normalize
+        // underscores, and escape.
+        let mut lt = target.value.clone();
         if target.modified || !target.fromsrc {
-            let lt = target.value.clone();
+            // Links starting with `./` shouldn't get `_` replaced with ' '.
+            let link_content_is_relative = link_data
+                .content_string
+                .as_deref()
+                .is_some_and(|s| s.starts_with("./"));
+            lt = strip_leading_dot(lt);
+            if !link_data.is_interwiki && !link_content_is_relative {
+                lt = lt.replace('_', " ");
+            }
             let escaped = crate::html::wikitext_escape_handlers::escape_link_target(env, &lt);
+            lt = escaped.link_target.clone();
             escaped_tgt = Some(escaped);
-            link_target = escaped_tgt.as_ref().map(|e| e.link_target.clone());
-        } else {
-            link_target = Some(target.value.clone());
         }
+
+        // If we are reusing the target from source, we don't need to worry
+        // about colon-escaping because it will be in the right form already.
+        if escaped_tgt.as_ref().is_none_or(|e| !e.invalid_link) && !target.fromsrc {
+            lt = add_colon_escape(env, &lt, link_data);
+        }
+
+        link_target = Some(lt);
     }
 
     let link_target = link_target.unwrap_or_default();

@@ -1,6 +1,36 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **846/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+Current baseline: **847/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+
+## Landed: html2wt link target handling (846 → 847)
+
+Fixed "Parsoid T55221: Wikilinks should be properly entity-escaped". Four
+separate faithful-port gaps, all in `Html2Wt/LinkHandlerUtils.php` and
+`WikitextSerializer.php`:
+
+1. **`serializeText` must call `Utils::escapeWtEntities`.** PHP does
+   `if ( $state->needsEscaping ) { $res = Utils::escapeWtEntities( $res ); }`
+   *before* `emitChunk`, so a DOM text node holding the literal characters
+   `He&nbsp;llo` (which is what an HTML5 parse of `He&amp;nbsp;llo` yields — the
+   entity is **not** decoded) serializes back as `He&amp;nbsp;llo`. rustoid's
+   `serialize_text` emitted the raw text.
+2. **`normalizedTitleKey` must surface `TitleException`.** PHP's
+   `makeTitleFromURLDecodedStr` goes through `Title::newFromText`, which throws
+   for illegal title characters; `isValidLinkTarget` passes `noExceptions` and
+   gets `null`. rustoid used the infallible `TitleParser::parse`, so
+   `He&nbsp;llo` (containing `&`) was wrongly considered a valid target. Now uses
+   `TitleParser::try_parse`, and resolves relative `#`/`/`/`../` references first,
+   as PHP's `makeTitle` does.
+3. **The simple-link branch must record `escaped_tgt`.** PHP assigns
+   `$escapedTgt` in that branch too; the invalid-link fallback at the end of
+   `serializeAsWikiLink` keys off it. rustoid assigned it only in the piped
+   branch, so an invalid target was never downgraded to plain text — and PHP logs
+   `Bad title text` and emits just the content.
+4. **The piped branch was missing its target resolution.** PHP strips the
+   relative prefix (`preg_replace( '#^(\.\.?/)*#', '', ... )`), replaces `_`
+   with a space unless the content is relative or the link is interwiki, then
+   escapes and (when valid or not from source) applies `addColonEscape`. rustoid
+   only escaped, so `[[Foo|…]]` came out as `[[./Foo|…]]`.
 
 ## Resolved: `Mixed Lists: Test 11` (T175099) — 845 → 846
 
