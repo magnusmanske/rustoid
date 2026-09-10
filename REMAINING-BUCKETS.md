@@ -1,7 +1,54 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **821/891 fixtures pass** (92%). Lib tests: 623 pass. Clippy: clean.
-Working tree is clean. Commits are local (`main` is ahead of `origin/main`); **do not push** (user pushes).
+Current baseline: **825/891 fixtures pass** (93%). Lib tests: 631 pass. Clippy: clean.
+
+## Landed this session (`0b23b0a`, `9420ccb`, `0d63203`)
+
+Three focused, PHP-verified fixes in the wikilink/title cluster (821 → 825):
+
+### 1. Invalid template targets bail to literal text (`0b23b0a`)
+- `TitleParser::try_parse` mirrors `Title::newFromText`'s `TitleException` checks
+  (illegal chars, `%hh`, `&name;`, relative path components, `~~~`, over-long,
+  empty) and returns `None` where PHP throws. `parse` stays infallible.
+- `resolve_target_string` uses it, matching PHP's
+  `makeTitleFromURLDecodedStr(..., $noExceptions = true)`: an invalid template
+  target now bails the whole template instead of resolving to a bogus title.
+- `TemplateHandler::convert_to_string` re-emits the literal `{{` … `}}` around
+  the re-tokenized inner source (PHP `convertToString`); the old code dropped
+  the braces and kept only the target.
+- Fixed: "Ensure that transclusion titles are not url-decoded",
+  "Wikilinks with embedded newlines are not broken".
+
+### 2. `|` in HTML attribute values is non-structural (`9420ccb`)
+- New `skip_recognized_html_tag`; used in the `[[…]]` close scan and in
+  `split_template_args_impl`, so `<span class="a|b">` does not split link
+  content or close the link. Unrecognized tag names stay plain text.
+- `split_template_args_impl` rewritten to index by byte (it previously mixed
+  `chars[]` lookups with `&str` slices, mis-slicing multibyte input).
+- Fixed: "Pipe in html attribute is link description".
+
+### 3. Entities in HTML attributes + real nested-link detection (`0d63203`)
+- `parse_html_entity` extracted (non-emitting) and called from
+  `parse_attr_value_text` too: PHP's `attribute_preprocessor_text*` route `&`
+  through `directive`, producing an `mw:Entity` span, so the value decodes
+  (T72875's `&#91;&#91;` case).
+- `contains_toplevel_wikilink_open` replaces the raw `contains("[[")` test for
+  the `Link-in-link` bail; it skips `<nowiki>`, recognized HTML tags, templates,
+  and language variants. PHP throws only on a real nested `a rel="mw:WikiLink"`.
+- Fixed: "T72875: Test for brackets in attributes of elements in internal link
+  texts".
+
+### Next wikilink candidates (same cluster)
+- "Nested wikilink syntax in wikilink syntax that parses as wikilink in extlink"
+  (`[[http://example.com|[[Example]]]]`): extlink precedence inside link text.
+- "<pre> inside a link": a multi-line extension tag inside link text.
+- "T179544: {{anchorencode:}} output should be always usable in links"
+  (`[[#{{anchorencode:[foo]}}]]`: templated wikilink fragment).
+- "Plain link in template argument".
+
+## Previous session notes
+
+### Token-level template-argument expansion
 
 > **Token-level template-argument expansion is LANDED and now net-neutral** (`40afb43`, `cdeef5b`,
 > `3d82231`). The token-level path produces byte-identical behavior to the old string path across all
