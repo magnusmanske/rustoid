@@ -1639,8 +1639,12 @@ fn decode_xml_entities(s: &str) -> String {
 }
 
 /// Parse a well-formed HTML fragment into a minimal tree.
+///
+/// Applies HTML5's implied-end-tag rule for `dt`/`dd` (see
+/// [`closes_open_element`]); PHP achieves the same by re-parsing the expected
+/// HTML through `DOMUtils::parseHTML` in `TestUtils::normalizeOut`.
 fn parse_fragment(html: &str) -> Vec<MNode> {
-    fn walk(html: &str, pos: &mut usize, out: &mut Vec<MNode>) {
+    fn walk(html: &str, pos: &mut usize, out: &mut Vec<MNode>, open: &mut Vec<String>) {
         let bytes = html.as_bytes();
         let mut text = String::new();
         let flush = |text: &mut String, out: &mut Vec<MNode>| {
@@ -1681,6 +1685,14 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
             let self_closing = inner.trim_end().ends_with('/') || is_void(&name);
             *pos += gt_rel + 1;
             flush(&mut text, out);
+
+            // HTML5 implied end tags: a start tag that closes its currently-open
+            // element must pop back out of the recursion rather than nest.
+            if !self_closing && closes_open_element(open, &name) {
+                *pos -= gt_rel + 1; // leave the tag for the caller to consume
+                return;
+            }
+
             if self_closing {
                 out.push(MNode::Elem {
                     name,
@@ -1690,7 +1702,9 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
                 });
             } else {
                 let mut children = Vec::new();
-                walk(html, pos, &mut children);
+                open.push(name.clone());
+                walk(html, pos, &mut children, open);
+                open.pop();
                 // Consume the matching end tag `</name>`.
                 if *pos < bytes.len()
                     && bytes[*pos] == b'<'
@@ -1712,8 +1726,32 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
 
     let mut pos = 0;
     let mut out = Vec::new();
-    walk(html, &mut pos, &mut out);
+    let mut open = Vec::new();
+    walk(html, &mut pos, &mut out, &mut open);
     out
+}
+
+/// HTML5 "in body" implied end tags: whether a start tag named `name` closes
+/// the innermost open element named `open.last()`.
+///
+/// Covers the `dt`/`dd` and `li` pairs, which are the ones that occur in
+/// unbalanced hand-authored parser-test HTML.
+fn closes_open_element(open: &[String], name: &str) -> bool {
+    let Some(current) = open.last() else {
+        return false;
+    };
+    let cur = current.as_str();
+    match name {
+        // "A start tag whose tag name is one of: dd, dt" — close an open dd/dt.
+        "dd" | "dt" => matches!(cur, "dd" | "dt"),
+        // "A start tag whose tag name is li" — close an open li.
+        "li" => cur == "li",
+        // "A start tag whose tag name is one of: h1..h6" — close an open heading.
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            matches!(cur, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+        }
+        _ => false,
+    }
 }
 
 fn newline_around(name: &str) -> bool {

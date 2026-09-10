@@ -1,14 +1,14 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **845/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+Current baseline: **846/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
 
-## Open question: `Mixed Lists: Test 11` (T175099)
+## Resolved: `Mixed Lists: Test 11` (T175099) — 845 → 846
 
-Not resolved this session — recorded here so it is not re-investigated from
-scratch.
+The mystery from the previous session is solved, and the earlier analysis was
+wrong in an instructive way.
 
-The fixture has both an `html/php` and an `html/parsoid` section and no
-`!! options`:
+**What was actually happening.** The fixture has both an `html/php` and an
+`html/parsoid` section:
 
 ```
 ;a
@@ -17,26 +17,36 @@ The fixture has both an `html/php` and an `html/parsoid` section and no
 !! html/parsoid  <dl><dt>a\n<dd><ul><li>b</li></ul></dd></dl>
 ```
 
-The surrounding comment explains the intent: "Parsoid is more consistent, and
-recognizes the shared nesting and keeps the still-open tags around until the
-nesting is complete." So the expected `html/parsoid` nests the `<dd>` *inside*
-the still-open `<dt>`, with the `</dt>` closing last.
+Parsoid's parser genuinely produces the **flat** form `<dt>a</dt>\n<dd>…` — the
+same thing rustoid produces. Confirmed two ways:
 
-- `tests/parser/definitionLists-standalone-knownFailures.json` records only an
-  `html2wt` divergence for this test — no `wt2html` entry — so Parsoid's own
-  standalone runner is expected to produce the nested form.
-- But the `/tmp/pt_fixture.php` probe (with and without a trailing newline)
-  consistently produces the **flat** form `<dt>a</dt>\n<dd>…`, which is what
-  rustoid also produces. rustoid's `ListHandler::do_list_item` matches PHP's
-  `doListItem` branch-for-branch here (verified by tracing the two
-  `doListItem` calls: `[';']` then `[':', '*']`, dt/dd transition, `popTags(0)`,
-  `endtags` → `[dl, dd, ul, li]`).
+- `php bin/parserTests.php --mock --wt2html --dump=dom:post-pwrap --filter …`:
+  `<dl…><dt…>a</dt>\n<dd…><ul…><li…>b</li></ul></dd></dl>`.
+- The `/tmp/pt_fixture.php` probe (which the previous session distrusted
+  correctly).
 
-So either the probe does not reproduce the real standalone pipeline for this
-input, or the fixture's `html/parsoid` reflects integrated-mode output. Worth
-re-checking by running Parsoid's own test runner for this one fixture before
-changing any code: the ListHandler logic appears faithful, and forcing the
-nested form would likely require a `DOMNormalizer`/`pqwrap` change elsewhere.
+And the test still passes, because the *expected* side is normalized the same
+way. `Test::normalizeHTML` picks `parsoidOnly = true` (an `html/parsoid` section
+exists), so the expected goes through `TestUtils::normalizeOut`, which re-parses
+the HTML with **`DOMUtils::parseHTML`** — an HTML5 parse. HTML5's "in body"
+implied-end-tag rule closes the `<dt>` when the `<dd>` start tag arrives, so the
+hand-written unbalanced markup normalizes to exactly the flat form.
+
+So both sides converge; the bug was in rustoid's **harness**, not the parser.
+
+### The fix
+
+The harness used a hand-rolled string walker (`parse_fragment`) to build its
+`MNode` tree, and that walker treated `<dl><dt>a` then `<dd>` as *nesting* — the
+`<dd>` became a child of the still-open `<dt>`, with `</dt>` closing last. Added
+`closes_open_element`, implementing the HTML5 implied-end-tag pairs that occur in
+unbalanced hand-authored parser-test HTML: `dd`/`dt` → closes an open `dd`/`dt`,
+`li` → closes `li`, `h1`…`h6` → closes a heading. The walker now pops out of the
+recursion and lets the caller re-consume the tag, mirroring `parseHTML`.
+
+Note this is purely a test-harness fidelity issue: `rustoid_core`'s own
+`html::parse::parse_html` already handled the unbalanced markup correctly (it uses
+`html5ever`).
 
 ## Landed: `:last-child` in the test-harness selector (843 → 845)
 
