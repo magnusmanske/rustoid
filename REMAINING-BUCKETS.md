@@ -1,6 +1,30 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **842/891 fixtures pass** (95%). Lib tests: 644 pass. Clippy: clean.
+Current baseline: **843/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+
+## Landed: `DisplaySpace` (842 → 843)
+
+Ported `src/Wt2Html/DOM/Handlers/DisplaySpace.php` as
+`rustoid-core/src/pipeline/display_space.rs` and wired it into the main DOM
+pipeline after `table_fixups`/`linkneighbours` and before `cleanup` (matching
+`displayspace` in `FULL_PARSE_GLOBAL_DOM_TRANSFORMS`).
+
+It applies French-space armoring: a space before `? : ; ! % » ›` (when not
+followed by a word char), or a space after `« ‹` (when not preceded by one), is
+replaced by a non-breaking `mw:DisplaySpace` span. `<pre>`, `<svg>`, and raw-text
+elements are skipped, matching the `textHandler` early return.
+
+Two harness gaps had to be closed for the fixture to compare equal:
+
+- `TestUtils::unwrapSpansAndNormalizeIEW`'s `stripSpanTypeof` unwrapping was not
+  ported. Marker spans (`mw:DisplaySpace`, `mw:Placeholder`, `mw:Nowiki`,
+  `mw:Transclusion`, `mw:Entity` — or only `mw:Placeholder` for a Parsoid-only
+  test) are now reduced to their inner HTML.
+- That unwrapping must run **before** the attribute-stripping passes, since it
+  keys off `typeof`. It is therefore a string pass over the raw HTML rather than
+  a post-parse tree pass.
+
+Fixed: "Definition lists: ignore colons inside tags".
 
 ## Landed: quotes in link content + `stringifyOptionTokens` (841 → 842)
 

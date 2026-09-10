@@ -1569,6 +1569,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `data-mw.parts`).
         crate::pipeline::handle_link_neighbours::run(&mut ast, self.config);
         crate::pipeline::table_fixups::run(&mut ast, self.config, Some(page_source));
+        // DisplaySpace (`displayspace`): armor French spaces. PHP runs it as a
+        // global DOM pass after extension post-processing and before `cleanup`.
+        crate::pipeline::display_space::run(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
         // AddRedLinks: resolve which wikilink targets exist, marking missing

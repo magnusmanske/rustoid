@@ -1969,7 +1969,23 @@ enum NormSide {
 /// comparisons, the Parsoid-inserted attributes), collapse inter-element
 /// whitespace, and place newlines around blocks.
 fn normalize_html(html: &str, parsoid_only: bool, side: NormSide) -> String {
-    let mut stripped = strip_data_attrs(html);
+    // `unwrapSpansAndNormalizeIEW` runs *before* the attribute stripping in
+    // PHP (it inspects `typeof` to decide what to unwrap), so unwrap the marker
+    // spans first, while `typeof` is still present.
+    let strip_typeof = if parsoid_only {
+        &["mw:Placeholder"][..]
+    } else {
+        &[
+            "mw:DisplaySpace",
+            "mw:Placeholder",
+            "mw:Nowiki",
+            "mw:Transclusion",
+            "mw:Entity",
+        ][..]
+    };
+    let unwrapped = unwrap_marker_spans_str(html, strip_typeof);
+
+    let mut stripped = strip_data_attrs(&unwrapped);
     if !parsoid_only {
         stripped = strip_legacy_attrs(&stripped);
         // The legacy href normalization differs by which side we normalize.
@@ -1989,6 +2005,67 @@ fn normalize_html(html: &str, parsoid_only: bool, side: NormSide) -> String {
     let mut out = String::new();
     serialize_iew(&nodes, &mut out);
     out
+}
+
+/// Replace each `<span typeof="mw:X">…</span>` (for `X` in `strip_typeof`)
+/// with its inner HTML, recursively. Mirrors the `stripSpanTypeof` handling in
+/// `TestUtils::normalizeIEWVisitor`.
+///
+/// Operates on raw HTML (before attribute stripping) because the decision
+/// depends on `typeof`, which later passes remove.
+fn unwrap_marker_spans_str(html: &str, strip_typeof: &[&str]) -> String {
+    let mut out = String::with_capacity(html.len());
+    let bytes = html.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        // Find the next `<span` whose `typeof` is one we strip.
+        let Some(rel) = html[pos..].find("<span") else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let tag_start = pos + rel;
+        out.push_str(&html[pos..tag_start]);
+
+        let Some(gt) = html[tag_start..].find('>') else {
+            out.push_str(&html[tag_start..]);
+            break;
+        };
+        let open_tag = &html[tag_start..tag_start + gt + 1];
+        let is_marker = span_typeof(open_tag).is_some_and(|t| strip_typeof.contains(&t))
+            && !open_tag.trim_end_matches('>').trim_end().ends_with('/');
+        if !is_marker {
+            out.push_str(open_tag);
+            pos = tag_start + gt + 1;
+            continue;
+        }
+
+        // Emit the span's inner HTML, recursively unwrapping nested markers.
+        let inner_start = tag_start + gt + 1;
+        let Some(close_rel) = html[inner_start..].find("</span>") else {
+            out.push_str(&html[inner_start..]);
+            break;
+        };
+        // NB: a nested `<span>` would make `find` mis-locate the close tag. The
+        // marker spans this handles are leaf containers, so a plain search is
+        // sufficient; guard by only unwrapping when no `<span` precedes it.
+        let inner = &html[inner_start..inner_start + close_rel];
+        if inner.contains("<span") {
+            out.push_str(open_tag);
+            pos = inner_start;
+            continue;
+        }
+        out.push_str(&unwrap_marker_spans_str(inner, strip_typeof));
+        pos = inner_start + close_rel + "</span>".len();
+    }
+    out
+}
+
+/// The `typeof` attribute of a raw `<span …>` open tag, if present.
+fn span_typeof(open_tag: &str) -> Option<&str> {
+    let start = open_tag.find("typeof=\"")? + "typeof=\"".len();
+    let rest = &open_tag[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
 }
 
 /// Replicate the HTML5 tree-construction rule that implicitly wraps `<tr>` (and
