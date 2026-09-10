@@ -429,6 +429,25 @@ pub fn render_wiki_link(
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
 ) -> Vec<Item> {
+    render_wiki_link_with_fragment(ctx, token, target, None, None, None)
+}
+
+/// Render a plain wiki link, optionally tunnelling its caption through a pre-built
+/// DOM fragment.
+///
+/// PHP's `renderWikiLink` calls `addLinkAttributesAndGetContent(...,
+/// $buildDOMFragment = true)`, so the link text becomes an opaque
+/// `mw:DOMFragment` whose subtree is built *inside* the `<a>`. That matters for
+/// block-level content in link text (e.g. `<pre>`), which would otherwise be
+/// hoisted out of the anchor by the tree builder.
+fn render_wiki_link_with_fragment(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+    build_fragment: Option<CaptionFragmentBuilder>,
+    fragments: Option<&mut std::collections::HashMap<usize, crate::dom::node::Node>>,
+    next_id: Option<&mut usize>,
+) -> Vec<Item> {
     let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
 
     // A piped caption is re-tokenized as inline wikitext (entities/comments/quotes)
@@ -473,7 +492,19 @@ pub fn render_wiki_link(
     }
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
-    out.extend(content);
+    // PHP tunnels the link text through a DOM fragment
+    // (`addLinkAttributesAndGetContent(..., $buildDOMFragment = true)`), so the
+    // caption subtree is built inside the `<a>` atomically. Without this, a
+    // block-level element in the link text (e.g. `<pre>`) is hoisted out of the
+    // anchor by the tree builder.
+    if let (Some(build), Some(frags), Some(id)) = (build_fragment, fragments, next_id)
+        && !content.is_empty()
+    {
+        let frag = build(content);
+        out.push(dom_fragment_token(frag, token, frags, id));
+    } else {
+        out.extend(content);
+    }
     out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
         "a",
         vec![],
@@ -1580,7 +1611,16 @@ pub fn render_wiki_link_dispatched(
                 return render_category(ctx, token, target);
             }
         }
-        return render_wiki_link(ctx, token, target);
+        // A plain wikilink tunnels its link text through a DOM fragment
+        // (PHP `renderWikiLink` → `addLinkAttributesAndGetContent(..., true)`).
+        return render_wiki_link_with_fragment(
+            ctx,
+            token,
+            target,
+            Some(build_fragment),
+            Some(fragments),
+            Some(next_id),
+        );
     }
 
     if target.interwiki.is_some() {
@@ -1733,6 +1773,47 @@ mod tests {
         static CONFIG: once_cell::sync::Lazy<MockSiteConfig> =
             once_cell::sync::Lazy::new(MockSiteConfig::new);
         &*CONFIG
+    }
+
+    #[test]
+    fn test_piped_link_tunnels_caption_through_fragment() {
+        // PHP's `renderWikiLink` builds the link text as a DOM fragment
+        // (`addLinkAttributesAndGetContent(..., true)`), so block content in the
+        // caption stays inside the `<a>`.
+        let mut ctx = WikiLinkContext::new(config_static());
+        let token = wikilink_token("Main Page", Some("the main page <pre>x</pre>"));
+        let target = get_wiki_link_target_info(&ctx, "Main Page", "Main Page").unwrap();
+        let mut fragments = std::collections::HashMap::new();
+        let mut next_id = 0usize;
+
+        let out = render_wiki_link_dispatched(
+            &mut ctx,
+            &token,
+            &target,
+            false,
+            &mut fragments,
+            &mut next_id,
+            &mut |items| {
+                crate::pipeline::parser::render_inline_fragment(
+                    config_static(),
+                    items,
+                    &mut std::collections::HashMap::new(),
+                    &mut 0usize,
+                )
+            },
+        );
+
+        assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "a"));
+        // The caption is an opaque fragment placeholder, not bare content tokens.
+        assert!(matches!(
+            &out[1],
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw:dom-fragment-token"
+        ));
+        assert!(matches!(
+            out.last(),
+            Some(Item::Tok(ParsoidToken::EndTag(t))) if t.name == "a"
+        ));
+        assert_eq!(fragments.len(), 1);
     }
 
     #[test]
