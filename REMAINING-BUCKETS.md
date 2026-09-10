@@ -1,31 +1,50 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **825/891 fixtures pass** (93%). Lib tests: 631 pass. Clippy: clean.
+Current baseline: **826/891 fixtures pass** (93%). Lib tests: 634 pass. Clippy: clean.
 
-## Landed this session (`0b23b0a`, `9420ccb`, `0d63203`)
+## PHP reference checkout — restored and working
 
-Three focused, PHP-verified fixes in the wikilink/title cluster (821 → 825):
+The reference Parsoid checkout at `/tmp/parsoid-src` (commit
+`d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`) **works again as of this session**. It
+had lost `.git/HEAD`, `.git/config`, and the ref files, so git refused to read
+it and ~83 source files were missing. They were recreated:
 
-### 1. Invalid template targets bail to literal text (`0b23b0a`)
-- `TitleParser::try_parse` mirrors `Title::newFromText`'s `TitleException` checks
-  (illegal chars, `%hh`, `&name;`, relative path components, `~~~`, over-long,
-  empty) and returns `None` where PHP throws. `parse` stays infallible.
-- `resolve_target_string` uses it, matching PHP's
-  `makeTitleFromURLDecodedStr(..., $noExceptions = true)`: an invalid template
-  target now bails the whole template instead of resolving to a bogus title.
-- `TemplateHandler::convert_to_string` re-emits the literal `{{` … `}}` around
-  the re-tokenized inner source (PHP `convertToString`); the old code dropped
-  the braces and kept only the target.
-- Fixed: "Ensure that transclusion titles are not url-decoded",
-  "Wikilinks with embedded newlines are not broken".
+- `.git/HEAD` → `d79c17f03af7423c7c2dcc73d25a6f63a4b805e2`
+- `.git/config` with the `blob:none` partial-clone remote + `extensions.partialClone`
+- `.git/refs/heads/master`, `.git/refs/remotes/origin/{HEAD,master}`
+- then `git checkout -- .` restored the missing files
 
-### 2. `|` in HTML attribute values is non-structural (`9420ccb`)
-- New `skip_recognized_html_tag`; used in the `[[…]]` close scan and in
-  `split_template_args_impl`, so `<span class="a|b">` does not split link
-  content or close the link. Unrecognized tag names stay plain text.
-- `split_template_args_impl` rewritten to index by byte (it previously mixed
-  `chars[]` lookups with `&str` slices, mis-slicing multibyte input).
-- Fixed: "Pipe in html attribute is link description".
+The tree is a **blobless clone**, so `.git/log`/`git log` still fails on missing
+parent commits — that is expected and harmless. Working tree is clean.
+
+Verify it in one command:
+```bash
+cd /tmp/parsoid-src && php /tmp/pt_single.php '[[Foo|bar]]'
+```
+
+### Probes
+- `/tmp/pt_single.php '<wikitext>'` — bare standalone parse (MockDataAccess,
+  no templates).
+- `/tmp/pt_fixture.php '<wikitext>' [--template Name=body]... [--title T]` —
+  standalone parse with **template fetching**, which is what the fixtures use
+  (subclasses `MockDataAccess`, overrides `fetchTemplateSource`). Added this
+  session; this is the primary oracle for wikilink/template work.
+- Known probe limitation: `MockSiteConfig` registers no magic words, so `{{!}}`
+  does **not** resolve as a variable (it needs `baseconfig/enwiki.json`
+  `query.variables`). Use the fixture runner for `{{!}}` cases.
+
+## Landed this session
+
+Four focused, PHP-verified fixes (821 → 826). See the commits below.
+
+### 4. Extlink URL scan (`cc2424a`)
+- New `scan_extlink_url_len` implements PHP's `extlink_nonipv6url`: stops at
+  `[`, `<`, `]`, `}`, quotes, whitespace, and directive/entity starts; continues
+  through `|`, `&`, `=`, `-`, `!`, `{`.
+- Fixed the close-bracket arithmetic (`rem` starts after `[`, so the advance
+  must not re-add it), preserving the trailing `]` of `[http://x]]`.
+- Fixed: "Nested wikilink syntax in wikilink syntax that parses as wikilink in
+  extlink".
 
 ### 3. Entities in HTML attributes + real nested-link detection (`0d63203`)
 - `parse_html_entity` extracted (non-emitting) and called from
@@ -38,13 +57,31 @@ Three focused, PHP-verified fixes in the wikilink/title cluster (821 → 825):
 - Fixed: "T72875: Test for brackets in attributes of elements in internal link
   texts".
 
-### Next wikilink candidates (same cluster)
-- "Nested wikilink syntax in wikilink syntax that parses as wikilink in extlink"
-  (`[[http://example.com|[[Example]]]]`): extlink precedence inside link text.
+### 2. `|` in HTML attribute values is non-structural (`9420ccb`)
+- New `skip_recognized_html_tag`; used in the `[[…]]` close scan and in
+  `split_template_args_impl`, so `<span class="a|b">` does not split link
+  content or close the link. Unrecognized tag names stay plain text.
+- `split_template_args_impl` rewritten to index by byte (it previously mixed
+  `chars[]` lookups with `&str` slices, mis-slicing multibyte input).
+- Fixed: "Pipe in html attribute is link description".
+
+### 1. Invalid template targets bail to literal text (`0b23b0a`)
+- `TitleParser::try_parse` mirrors `Title::newFromText`'s `TitleException` checks
+  (illegal chars, `%hh`, `&name;`, relative path components, `~~~`, over-long,
+  empty) and returns `None` where PHP throws. `parse` stays infallible.
+- `resolve_target_string` uses it, matching PHP's
+  `makeTitleFromURLDecodedStr(..., $noExceptions = true)`.
+- `TemplateHandler::convert_to_string` re-emits the literal `{{` … `}}` around
+  the re-tokenized inner source (PHP `convertToString`).
+- Fixed: "Ensure that transclusion titles are not url-decoded",
+  "Wikilinks with embedded newlines are not broken".
+
+### Next wikilink candidates
 - "<pre> inside a link": a multi-line extension tag inside link text.
 - "T179544: {{anchorencode:}} output should be always usable in links"
   (`[[#{{anchorencode:[foo]}}]]`: templated wikilink fragment).
-- "Plain link in template argument".
+- "Plain link in template argument" (template-arg splitting vs extlink).
+- "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved".
 
 ## Previous session notes
 
