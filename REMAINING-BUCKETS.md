@@ -2,6 +2,49 @@
 
 Current baseline: **847/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
 
+## Landed: table-cell attribute values keep their tokens (847, no count change)
+
+Groundwork for the `TableFixups`/`AttributeExpander` cluster, from
+"Table cell attributes: Pipes protected by nowikis should be treated as a plain
+character" (T280115). Two faithful-port fixes, both prerequisite to the rest:
+
+1. **`scan_quoted_table_value_end` did not skip directives.** PHP builds a
+   quoted table-attribute value with `table_attribute_preprocessor_text_double`,
+   whose alternatives route `{ } & <` through `directive` — so
+   `<nowiki>|</nowiki>` is consumed as **one unit** and the `|` inside it does not
+   terminate the value. rustoid did a raw byte scan, so
+   `title="foo<nowiki>|</nowiki>"` was cut at the inner pipe and the cell fell
+   back to literal text. The scan now walks directives using the non-emitting
+   primitives (`parse_extension_tag`, `parse_html_entity`, `skip_template_or_tplarg`).
+   Note the `|` stop is context-dependent (`cell_arg`): in start/row-tag position
+   a bare `|` is ordinary value content, which is why `style="a|b"` keeps its
+   pipe; `{{!}}` is a stop in both positions.
+2. **`parse_table_att_value` returned a `String`,** discarding the token array
+   that `getAttrVal` preserves in PHP. It now returns a `KeyValue` via the new
+   `tokenize_table_value`, so a `<nowiki>` in a cell attribute survives as an
+   `extension` token instead of being flattened to text. Values with no
+   directives still come back as `KeyValue::Str`, so the fast path is unchanged.
+
+**Still open for this fixture:** the `mw:ExpandedAttrs` marker. PHP's
+`AttributeTransformManager::process` calls `$frame->expand()` with
+`attrExpansion => true`, which runs the value tokens through the *whole*
+propagation pipeline — including the ExtensionHandler. That is what turns the
+`extension` token into a `mw:DOMFragment`-carrying token, which
+`hasDOMFragmentType` in `stripMetaTags` then sees, setting `hasGeneratedContent`
+and so marking the attribute. (Note `mw:Extension` is **not** in PHP's
+`META_TYPE_MATCHER` = `mw:(LanguageVariant|Transclusion|Param|Includes|Annotation/)`,
+so the `wrapTemplates` branch does not fire — it really is the DOM-fragment
+signal.)
+
+Running `extension_handler::run` inside `expand_attributes` to close that gap was
+tried and **reverted**: it fixed the target cell (`title="foo|"` became correct)
+but regressed 6 fixtures (`<nowiki> inside a link`, `<pre> inside a link`,
+"Nowiki markup in link attribute (T206940)", "T107474: Frameless image caption
+with nowiki", "T374445: Non extlink in media caption", "3. Other redirect
+variants"), because it also re-expands attribute values that are already
+rendered (`href`, captions). The right fix needs the extension step to apply
+only where `$frame->expand` would have run, not to every `Tokens` value.
+
 ## Landed: html2wt link target handling (846 → 847)
 
 Fixed "Parsoid T55221: Wikilinks should be properly entity-escaped". Four

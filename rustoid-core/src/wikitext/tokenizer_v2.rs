@@ -1730,6 +1730,21 @@ impl<'a> PegTokenizer<'a> {
     /// `table_attribute` rule (whose `vd:(optional_spaces "=" value?)?` is
     /// optional and defaults the value to `''`). `cell_arg` is as in
     /// `parse_table_attributes`.
+    /// If the cursor is at `{{…}}`/`{{{…}}}`, advance past it and return true.
+    /// Non-emitting (used by the table-value scan).
+    fn skip_template_or_tplarg(&mut self) -> bool {
+        if !self.starts_with("{{") {
+            return false;
+        }
+        match skip_template(self.input, self.pos) {
+            Some((end, _)) => {
+                self.pos = end;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn parse_table_attribute(&mut self, cell_arg: bool) -> Option<KV> {
         let name_start = self.pos;
         let name = self.parse_table_attribute_name(cell_arg)?;
@@ -1739,10 +1754,12 @@ impl<'a> PegTokenizer<'a> {
 
         if self.starts_with("=") {
             self.advance(1);
-            let val = self.parse_table_att_value(cell_arg);
+            let val = self
+                .parse_table_att_value(cell_arg)
+                .unwrap_or(KeyValue::Str(String::new()));
             Some(KV {
                 key: name,
-                value: KeyValue::Str(val.unwrap_or_default()),
+                value: val,
                 src_offsets: Some(KVSourceRange {
                     key_start: name_start,
                     key_end: name_end,
@@ -1773,20 +1790,24 @@ impl<'a> PegTokenizer<'a> {
         if name.is_empty() { None } else { Some(name) }
     }
 
+    /// Parse a table attribute value, returning a `KeyValue` that carries tokens
+    /// when the value contains a directive (template, entity, extension tag).
+    ///
+    /// PHP's `table_att_value` builds its value with
+    /// `table_attribute_preprocessor_text` / `_single` / `_double`, all of which
+    /// route `{`/`}`/`&`/`<` through `directive`. Keeping the token array is what
+    /// lets a `<nowiki>` in a cell attribute become a `mw:DOMFragment` and so
+    /// mark the attribute `mw:ExpandedAttrs` (T280115).
+    ///
     /// `cell_arg` mirrors PHP's `tableCellArg` flag: when true (cell/caption
     /// attribute position) a `|` or `{{!}}` is a cell separator and terminates
-    /// the value; when false (start/row tag, `table=false`) they are literal
+    /// the value; when false (start/row tag, `table=false`) a bare `|` is literal
     /// value content. See PHP `inlineBreaks` (`'|'` breaks only for `table` /
     /// `tableCellArg`; `'{'` breaks only for `tableCellArg` + `{{!}}`).
-    fn parse_table_att_value(&mut self, cell_arg: bool) -> Option<String> {
+    fn parse_table_att_value(&mut self, cell_arg: bool) -> Option<KeyValue> {
         self.consume_spaces();
 
-        // Quoted value (`'`/`"`). Mirrors PHP's `table_att_value` quoted
-        // alternatives: the value text stops at its matching quote, a newline,
-        // or (in cell position) a `{{!}}`/`|` separator, which — via the `q`
-        // lookahead — is left in place for the surrounding `row_syntax_table_args`
-        // to match as a pipe. The closing quote is consumed only when it (not a
-        // separator) terminates the value.
+        // Quoted value (`'`/`"`).
         for quote in ['\'', '\"'] {
             if !self.starts_with(&quote.to_string()) {
                 continue;
@@ -1794,7 +1815,7 @@ impl<'a> PegTokenizer<'a> {
             self.advance(1);
             let start = self.pos;
             let end = self.scan_quoted_table_value_end(quote, cell_arg);
-            let val = self.input[start..end].to_string();
+            let val = self.tokenize_table_value(start, end, cell_arg, Some(quote));
             self.pos = end;
             if self.starts_with(&quote.to_string()) {
                 self.advance(1);
@@ -1808,25 +1829,154 @@ impl<'a> PegTokenizer<'a> {
         if end == start {
             return None;
         }
-        let val = self.input[start..end].to_string();
+        let val = self.tokenize_table_value(start, end, cell_arg, None);
         self.pos = end;
         Some(val)
+    }
+
+    /// Tokenize the attribute-value slice `input[start..end]` as a run of
+    /// `directive` units plus plain text, mirroring PHP's
+    /// `table_attribute_preprocessor_text*`. A value with no directives stays a
+    /// plain `KeyValue::Str`, so unaffected attributes keep their previous
+    /// (cheap, allocation-light) representation.
+    fn tokenize_table_value(
+        &mut self,
+        start: usize,
+        end: usize,
+        cell_arg: bool,
+        quote: Option<char>,
+    ) -> KeyValue {
+        let saved = self.pos;
+        self.pos = start;
+
+        let mut tokens: Vec<Item> = Vec::new();
+        let mut buf = String::new();
+
+        while self.pos < end {
+            // A directive starts here: consume it as one unit. These are the
+            // same arms as `parse_attr_value_text`, minus the stopped forms.
+            let ch = self.remaining().chars().next().unwrap_or('\0');
+            if matches!(ch, '<' | '{' | '&') {
+                let before = self.pos;
+                // `parse_extension_tag` is non-emitting: it returns the token.
+                if let ExtensionParse::Extension(stt) = self.parse_extension_tag() {
+                    if !buf.is_empty() {
+                        tokens.push(Item::Str(std::mem::take(&mut buf)));
+                    }
+                    tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(stt)));
+                    continue;
+                }
+                self.pos = before;
+                if self.pos < end
+                    && let Some(tok) = self.parse_directive()
+                {
+                    if !buf.is_empty() {
+                        tokens.push(Item::Str(std::mem::take(&mut buf)));
+                    }
+                    tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+                    continue;
+                }
+                self.pos = before;
+                if let Some(items) = self.parse_html_entity() {
+                    if !buf.is_empty() {
+                        tokens.push(Item::Str(std::mem::take(&mut buf)));
+                    }
+                    tokens.extend(items);
+                    continue;
+                }
+                self.pos = before;
+            }
+
+            let Some(ch) = self.remaining().chars().next() else {
+                break;
+            };
+            // Stop at the delimiters the scan used.
+            if Some(ch) == quote || ch == '\n' || ch == '\r' {
+                break;
+            }
+            if cell_arg && ch == '|' {
+                break;
+            }
+            if self.starts_with("{{!}}") {
+                break;
+            }
+            self.advance(ch.len_utf8());
+            buf.push(ch);
+        }
+
+        self.pos = saved;
+        if tokens.is_empty() {
+            KeyValue::Str(buf)
+        } else {
+            if !buf.is_empty() {
+                tokens.push(Item::Str(buf));
+            }
+            KeyValue::Tokens(tokens)
+        }
     }
 
     /// End byte index of a quoted table value: the first newline, matching
     /// quote, or (in cell position) `{{!}}`/`|` separator. All such delimiters
     /// are single-byte ASCII (or the ASCII `{{!}}`), so a byte scan is safe.
-    fn scan_quoted_table_value_end(&self, quote: char, cell_arg: bool) -> usize {
-        let bytes = self.remaining().as_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == quote as u8 || b == b'\r' || b == b'\n' {
-                return self.pos + i;
+    /// End byte index of a quoted table value. Mirrors PHP's
+    /// `table_attribute_preprocessor_text_single`/`_double` followed by the
+    /// `q:$("'" / &('!!' / [|\r\n] / '{{!}}'))` terminator.
+    ///
+    /// The value is a run of `directive` units and plain characters. A `|` (or
+    /// `!!`/`{{!}}`) inside a directive — e.g. `<nowiki>|</nowiki>` — belongs to
+    /// that directive and must NOT terminate the value, which is what makes
+    /// `title="foo<nowiki>|</nowiki>"` a single attribute rather than a bare
+    /// word (T280115). PHP's char class stops at the directive-start characters
+    /// `{ } & < - ! [`; we consume a whole directive wherever one starts.
+    ///
+    /// Uses only the non-emitting parse primitives so the caller can slice the
+    /// value afterwards.
+    /// Uses only the non-emitting parse primitives, and restores the cursor
+    /// before returning (the caller assigns `self.pos = end`).
+    ///
+    /// `cell_arg` mirrors `inlineBreaks`: a bare `|` is a stop only in
+    /// cell-argument position (`tableCellArg`). In start/row-tag position a `|`
+    /// is ordinary value content, so `style="a|b"` keeps its pipe.
+    fn scan_quoted_table_value_end(&mut self, quote: char, cell_arg: bool) -> usize {
+        let saved = self.pos;
+        while let Some(ch) = self.remaining().chars().next() {
+            // Stop characters: the quote, a newline, or (in cell position) `|`.
+            // (`!!` is *not* a stop for the quoted double form: PHP's stop set
+            // here is `[|"\r\n]`.)
+            if ch == quote || ch == '\r' || ch == '\n' {
+                break;
             }
-            if cell_arg && (bytes[i..].starts_with(b"{{!}}") || b == b'|') {
-                return self.pos + i;
+            if cell_arg && ch == '|' {
+                break;
             }
+            // `{{!}}` is a stop in *both* positions when it appears at the top
+            // level (the quoted form's lookahead is `&('!!' / [|\r\n] /
+            // '{{!}}')`), so it is never consumed as a template here.
+            if self.starts_with("{{!}}") {
+                break;
+            }
+            // A directive starts here: consume it as one unit so any `|` inside
+            // does not stop the scan.
+            if matches!(ch, '<' | '{' | '&' | '[') {
+                let before = self.pos;
+                if !matches!(self.parse_extension_tag(), ExtensionParse::NotExtension) {
+                    continue;
+                }
+                self.pos = before;
+                if self.parse_html_entity().is_some() {
+                    continue;
+                }
+                self.pos = before;
+                if self.skip_template_or_tplarg() {
+                    continue;
+                }
+                self.pos = before;
+            }
+            self.advance(ch.len_utf8());
         }
-        self.pos + bytes.len()
+        let end = self.pos;
+        self.pos = saved;
+        end
     }
 
     /// End byte index of an unquoted table value: the first whitespace; in cell
@@ -2478,6 +2628,21 @@ impl<'a> PegTokenizer<'a> {
                     tokens.push(Item::Str(std::mem::take(&mut buf)));
                 }
                 tokens.extend(items);
+                continue;
+            }
+
+            // Extension tag (`<nowiki>…</nowiki>`, `<ref/>`, …). PHP's
+            // `directive` includes `wellformed_extension_tag`, so a nowiki inside
+            // an attribute value becomes an `extension` token — which the
+            // AttributeExpander later expands to a `mw:DOMFragment` and thereby
+            // marks the attribute `mw:ExpandedAttrs` (T280115).
+            if self.starts_with("<")
+                && let ExtensionParse::Extension(stt) = self.parse_extension_tag()
+            {
+                if !buf.is_empty() {
+                    tokens.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                tokens.push(Item::Tok(ParsoidToken::SelfclosingTag(stt)));
                 continue;
             }
 
