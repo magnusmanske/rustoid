@@ -2,6 +2,42 @@
 
 Current baseline: **845/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
 
+## Open question: `Mixed Lists: Test 11` (T175099)
+
+Not resolved this session — recorded here so it is not re-investigated from
+scratch.
+
+The fixture has both an `html/php` and an `html/parsoid` section and no
+`!! options`:
+
+```
+;a
+:*b
+!! html/php      <dl><dt>a</dt>\n<dd>\n<ul><li>b</li></ul></dd></dl>
+!! html/parsoid  <dl><dt>a\n<dd><ul><li>b</li></ul></dd></dl>
+```
+
+The surrounding comment explains the intent: "Parsoid is more consistent, and
+recognizes the shared nesting and keeps the still-open tags around until the
+nesting is complete." So the expected `html/parsoid` nests the `<dd>` *inside*
+the still-open `<dt>`, with the `</dt>` closing last.
+
+- `tests/parser/definitionLists-standalone-knownFailures.json` records only an
+  `html2wt` divergence for this test — no `wt2html` entry — so Parsoid's own
+  standalone runner is expected to produce the nested form.
+- But the `/tmp/pt_fixture.php` probe (with and without a trailing newline)
+  consistently produces the **flat** form `<dt>a</dt>\n<dd>…`, which is what
+  rustoid also produces. rustoid's `ListHandler::do_list_item` matches PHP's
+  `doListItem` branch-for-branch here (verified by tracing the two
+  `doListItem` calls: `[';']` then `[':', '*']`, dt/dd transition, `popTags(0)`,
+  `endtags` → `[dl, dd, ul, li]`).
+
+So either the probe does not reproduce the real standalone pipeline for this
+input, or the fixture's `html/parsoid` reflects integrated-mode output. Worth
+re-checking by running Parsoid's own test runner for this one fixture before
+changing any code: the ListHandler logic appears faithful, and forcing the
+nested form would likely require a `DOMNormalizer`/`pqwrap` change elsewhere.
+
 ## Landed: `:last-child` in the test-harness selector (843 → 845)
 
 `matches_pseudo` had `:last-child` stubbed as `one_based == 1` (i.e. identical to
