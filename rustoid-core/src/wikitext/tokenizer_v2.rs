@@ -2444,6 +2444,20 @@ impl<'a> PegTokenizer<'a> {
                 continue;
             }
 
+            // HTML entity (`&#91;`, `&amp;`, …). PHP's `attribute_preprocessor_text*`
+            // route `&` through `directive`, whose `&"&" @htmlentity` arm wraps the
+            // reference in an `mw:Entity` span, so the attribute value becomes a
+            // token array and `getAttributeV` decodes it.
+            if self.starts_with("&")
+                && let Some(items) = self.parse_html_entity()
+            {
+                if !buf.is_empty() {
+                    tokens.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                tokens.extend(items);
+                continue;
+            }
+
             let Some(ch) = self.peek_char() else {
                 break;
             };
@@ -3355,25 +3369,49 @@ impl<'a> PegTokenizer<'a> {
     /// content; anything else (e.g. an unknown named entity) is emitted as
     /// plain text and left unwrapped.
     fn try_html_entity(&mut self) -> bool {
-        if !self.starts_with("&") {
+        let Some(items) = self.parse_html_entity() else {
             return false;
+        };
+        for item in items {
+            match item {
+                Item::Tok(t) => self.emit_token(t),
+                Item::Str(s) => self.emit_text(s),
+            }
+        }
+        true
+    }
+
+    /// Parse an HTML entity without emitting it. Returns the token sequence
+    /// (an `mw:Entity` span plus its decoded text, or a bare text chunk for a
+    /// reference that decodes to more than two codepoints), or `None` when
+    /// `self` is not at a valid entity.
+    ///
+    /// Faithful port of Parsoid's `raw_htmlentity` and `htmlentity` grammar
+    /// productions. A valid entity (one that decodes to one or two codepoints)
+    /// is wrapped in an `mw:Entity` span carrying the raw source and decoded
+    /// content; anything else (e.g. an unknown named entity) is plain text and
+    /// left unwrapped. Shared by the inline tokenizer and the attribute-value
+    /// tokenizer, since PHP's `directive` (used by both) includes `&htmlentity`.
+    fn parse_html_entity(&mut self) -> Option<Vec<Item>> {
+        if !self.starts_with("&") {
+            return None;
         }
 
         let start = self.pos;
         let rem = self.remaining();
 
         // raw_htmlentity matches `&` + charset + `;`.
-        // The charset is `[#0-9a-zA-Zרלמרלמ]` (alphanumerics plus the
+        // The charset is `[#0-9a-zA-Zתלמרלמ]` (alphanumerics plus the
         // Hebrew/Arabic legacy alias characters).
         let body_len = match rem[1..].find(';') {
             Some(n) if n >= 1 => n,
-            _ => return false,
+            _ => return None,
         };
         let body = &rem[1..1 + body_len];
         if !body.chars().all(|c| {
             c.is_ascii_alphanumeric() || c == '#' || matches!(c, 'ר' | 'ל' | 'מ' | 'ر' | 'ل' | 'م')
         }) {
-            return false;
+            return None;
         }
 
         // `entity` includes the leading `&` and trailing `;`. The body starts
@@ -3388,8 +3426,7 @@ impl<'a> PegTokenizer<'a> {
         // grammar returns the raw text unchanged (and without wrapping).
         if decoded.chars().count() > 2 {
             self.advance(total_len);
-            self.emit_text(decoded);
-            return true;
+            return Some(vec![Item::Str(decoded)]);
         }
 
         let end = self.pos + total_len;
@@ -3406,10 +3443,11 @@ impl<'a> PegTokenizer<'a> {
         // End tag: tsr is the zero-width position at `end`.
         let end_dp = self.make_dp(end, end);
 
-        self.emit_token(ParsoidToken::Tag(span));
-        self.emit_text(decoded);
-        self.emit_token(ParsoidToken::EndTag(EndTagTk::new("span", vec![], end_dp)));
-        true
+        Some(vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str(decoded),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new("span", vec![], end_dp))),
+        ])
     }
 
     // ---- Utility ----
@@ -3514,6 +3552,68 @@ fn find_extlink_close(input: &str) -> Option<usize> {
 ///     PEP reproduces).
 fn find_wikilink_close(input: &str) -> Option<usize> {
     find_wikilink_close_at(input)
+}
+
+/// Report whether `input` contains a top-level `[[` — one that is *not* inside a
+/// `<nowiki>` body, a recognized HTML tag's quoted attribute value, a `{{…}}`
+/// template, or a `-{…}-` language variant.
+///
+/// Used to mirror PHP's `Link-in-link` bail: `addLinkAttributesAndGetContent`
+/// throws when the link-text tokens contain an actual nested `wikilink` `a` tag,
+/// and a `[[` that lives inside an HTML attribute is part of the tag, not a
+/// nested link.
+pub fn contains_toplevel_wikilink_open(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    let mut i = 0;
+    while i < input.len() {
+        // `<nowiki>` is opaque.
+        if lower[i..].starts_with("<nowiki") {
+            let rest = &input[i + 7..];
+            let is_tag = rest.starts_with('>')
+                || rest.starts_with('/')
+                || rest.starts_with(|c: char| c.is_whitespace());
+            if is_tag && let Some((tag_end, self_closing)) = nowiki_start_tag_end(input, i) {
+                if self_closing {
+                    i = tag_end;
+                } else if let Some(close_rel) = lower[tag_end..].find("</nowiki") {
+                    let close_start = tag_end + close_rel;
+                    let after = &input[close_start + 8..];
+                    let gt = after.find('>').map(|g| g + 1).unwrap_or(after.len());
+                    i = close_start + 8 + gt;
+                } else {
+                    return false;
+                }
+                continue;
+            }
+        }
+        // A recognized HTML tag: its quoted attribute values may contain `[[`.
+        if input[i..].starts_with('<')
+            && let Some(end) = skip_recognized_html_tag(&lower, input, i)
+        {
+            i = end;
+            continue;
+        }
+        // A `{{…}}`/`{{{…}}}` template is an atom.
+        if input[i..].starts_with("{{")
+            && let Some((end, _)) = skip_template(input, i)
+        {
+            i = end;
+            continue;
+        }
+        // A `-{…}-` language variant is an atom.
+        if input[i..].starts_with("-{")
+            && let Some(rel_end) = find_lang_variant_close(&input[i + 2..])
+        {
+            i += 2 + rel_end + 2;
+            continue;
+        }
+        if input[i..].starts_with("[[") {
+            return true;
+        }
+        let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        i += ch_len;
+    }
+    false
 }
 
 /// Recursive worker for [`find_wikilink_close`].
@@ -5448,6 +5548,57 @@ mod tests {
             .filter_map(|kv| kv.value.as_str())
             .collect();
         assert_eq!(content, vec!["<span class=\"a|b\">c</span>"]);
+    }
+
+    #[test]
+    fn test_html_attr_value_decodes_entities() {
+        // PHP routes `&` in an attribute value through `directive`, so the
+        // reference becomes an `mw:Entity` span and the value decodes to a
+        // token array (mirrors T72875).
+        let tokens = tokenize("<span title=\"a&#91;&#91;b\">c</span>");
+        let span = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::Tag(tk)) if tk.name == "span" => Some(tk),
+                _ => None,
+            })
+            .expect("span start tag");
+        let title = span
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("title"))
+            .expect("title attr");
+        let rendered = crate::wikitext::token_utils::key_value_to_string(&title.value);
+        assert_eq!(rendered, "a[[b");
+
+        // A plain value with no entity stays a bare string.
+        let tokens = tokenize("<span title=\"ab\">c</span>");
+        let span = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::Tag(tk)) if tk.name == "span" => Some(tk),
+                _ => None,
+            })
+            .expect("span start tag");
+        let title = span
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("title"))
+            .expect("title attr");
+        assert_eq!(title.value.as_str(), Some("ab"));
+    }
+
+    #[test]
+    fn test_contains_toplevel_wikilink_open() {
+        assert!(contains_toplevel_wikilink_open("a [[b]] c"));
+        // Inside an HTML attribute: not a nested link.
+        assert!(!contains_toplevel_wikilink_open(
+            "<span title=\"a [[b]]\">c</span>"
+        ));
+        // Inside a template: not a nested link.
+        assert!(!contains_toplevel_wikilink_open("{{1x|[[b]]}}"));
+        // Inside `<nowiki>`: not a nested link.
+        assert!(!contains_toplevel_wikilink_open("<nowiki>[[b]]</nowiki>"));
     }
 
     #[test]

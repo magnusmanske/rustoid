@@ -115,6 +115,25 @@ fn wrapper_tag_target(
     }
 }
 
+/// Report whether a `mw:maybeContent` value contains a nested wikilink that must
+/// trigger PHP's `Link-in-link` bail. A `[[` inside a `<nowiki>` body, a
+/// recognized HTML tag's quoted attribute value, a template, or a language
+/// variant is not a nested link, so those are skipped.
+fn key_value_has_nested_wikilink(value: &crate::wikitext::tokens_v2::KeyValue) -> bool {
+    use crate::wikitext::token_utils::key_value_to_string;
+    use crate::wikitext::tokenizer_v2::contains_toplevel_wikilink_open;
+
+    match value {
+        // A token array already distinguishes a nested `wikilink` token.
+        crate::wikitext::tokens_v2::KeyValue::Tokens(items) => items.iter().any(
+            |it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "wikilink"),
+        ),
+        crate::wikitext::tokens_v2::KeyValue::Str(_) => {
+            contains_toplevel_wikilink_open(&key_value_to_string(value))
+        }
+    }
+}
+
 /// Reconstruct the full wikilink source (`[[href|content0|content1…]]`) from a
 /// `wikilink` token's `href` and `mw:maybeContent` KVs. Used by the media-in-link
 /// bail to re-tokenize the source without the leading `[` (mirrors PHP's
@@ -633,7 +652,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // `addLinkAttributesAndGetContent` throwing `Media-in-link`/`Link-in-link`,
             // caught by `renderWikiLink` → `bailTokens`). Only `renderFile` skips
             // `addLinkAttributesAndGetContent`, so every other dispatch path bails.
-            // Our tokenizer keeps nested `[[…]]` as literal text, so detect that here.
+            // Our tokenizer keeps nested `[[…]]` as literal text, so detect a
+            // *top-level* `[[` here — one inside a `<nowiki>` body, an HTML tag's
+            // quoted attribute, or a template is not a nested link.
             let is_file_path = target.title.as_ref().is_some_and(|t| {
                 !target.from_colon_escaped_text
                     && !target.href.starts_with('#')
@@ -641,7 +662,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             });
             let content_has_nested = stt.attribs.iter().any(|kv| {
                 kv.key.as_str() == Some("mw:maybeContent")
-                    && key_value_to_string(&kv.value).contains("[[")
+                    && key_value_has_nested_wikilink(&kv.value)
             });
             if !is_file_path && content_has_nested {
                 let src = reconstruct_link_src(stt, &href);
