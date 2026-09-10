@@ -1,6 +1,40 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **841/891 fixtures pass** (94%). Lib tests: 644 pass. Clippy: clean.
+Current baseline: **842/891 fixtures pass** (95%). Lib tests: 644 pass. Clippy: clean.
+
+## Landed: quotes in link content + `stringifyOptionTokens` (841 → 842)
+
+### 1. The `quote` rule inside link content
+
+PHP's `extlink` content is `inlineline<extlink>?` and wikilink text is
+`link_text`, so `[http://wp.org ''foo'']` yields an `mw-quote` token that the
+QuoteTransformer turns into `<i>`. rustoid only tokenized *directives*
+(`{{…}}`, `{{{|}}`, extension tags, lang variants) in link content, so the
+apostrophes stayed literal text.
+
+- `tokenize_link_content` now also runs the `quote` rule (`try_quote`).
+- `tokenize_link_target` deliberately does **not**: PHP's
+  `wikilink_preprocessor_text` (the target rule) has no quote production.
+  Applying quotes there broke four media/attribute fixtures, so the flag is
+  split between the two entry points.
+- Added `PegTokenizer::output_len`/`drain_output` so a sub-rule's tokens can be
+  captured without disturbing the surrounding buffer.
+
+### 2. `stringifyOptionTokens`' `mw-quote` bail-out
+
+A quote run contributes no text, so `[[File:Foobar.jpg|'''thumb''']]`
+stringified its caption to `thumb` and the option was misread as the `thumb`
+format — producing a `<figure>`/`<figcaption>` instead of a plain `<span>`.
+
+PHP's `stringifyOptionTokens` returns `null` for an `mw-quote` unless the text
+so far resolves to a `link`/`alt` option (the two options allowed arbitrary
+wikitext); a `null` means "this is a caption". Ported as
+`stringify_option_tokens` and used for the `mw:maybeContent` part in
+`render_file`; a `None` now routes the part to the caption path with its raw
+tokens.
+
+Fixed: "Parsoid-centric test: Whitespace in ext- and wiki-links should be
+preserved", "Media with caption that would stringify to a valid media option".
 
 ## Landed: the list/SOL cluster (840 → 841)
 

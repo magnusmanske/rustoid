@@ -258,6 +258,17 @@ impl<'a> PegTokenizer<'a> {
         self.output.push(Either::Right(token));
     }
 
+    /// The current output length, for callers that want to capture just the
+    /// tokens a sub-rule produces.
+    pub(crate) fn output_len(&self) -> usize {
+        self.output.len()
+    }
+
+    /// Drain and return the output emitted since `from`.
+    pub(crate) fn drain_output(&mut self, from: usize) -> Vec<Either<String, ParsoidToken>> {
+        self.output.drain(from..).collect()
+    }
+
     /// Emit a DataParsoid with a TSR.
     fn make_dp(&self, start: usize, end: usize) -> DataParsoid {
         DataParsoid::with_tsr(start, end)
@@ -4288,12 +4299,11 @@ fn tokenize_link_target(target: &str, lang_conv_enabled: bool, ext_tags: &[Strin
 
 /// Tokenize inline link *content* (e.g. wikilink text, extlink text) into a
 /// `KeyValue`: plain text when no directives are present, or a `Tokens` array
-/// when the content contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`. Mirrors the
-/// PHP tokenizer's `inlineline`/`link_text` productions, which tokenize templates
-/// and angle-bracket markup in link text so the AttributeExpander/extension
-/// handler can expand them.
+/// when the content contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`/quote runs.
+/// Mirrors the PHP tokenizer's `inlineline` production for extlink content and
+/// `link_text` for wikilink text.
 fn tokenize_link_content(content: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
-    tokenize_directives(content, lang_conv_enabled, ext_tags)
+    tokenize_directives_and_quotes(content, lang_conv_enabled, ext_tags, true)
 }
 
 /// Shared directive-tokenization used for both link targets and link content.
@@ -4304,6 +4314,20 @@ fn tokenize_link_content(content: &str, lang_conv_enabled: bool, ext_tags: &[Str
 /// `language-variant` self-closing token (mirrors the PHP tokenizer's
 /// `url_directive` → `lang_variant_or_tpl` inside `wikilink_preprocessor_text`).
 fn tokenize_directives(input: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
+    tokenize_directives_and_quotes(input, lang_conv_enabled, ext_tags, false)
+}
+
+/// Shared walk over a link target/content string.
+///
+/// `quotes` enables the `quote` rule (only valid where PHP's grammar uses
+/// `inlineline`/`link_text`, i.e. link *content* — link *targets* run
+/// `wikilink_preprocessor_text`, which has no quote production).
+fn tokenize_directives_and_quotes(
+    input: &str,
+    lang_conv_enabled: bool,
+    ext_tags: &[String],
+    quotes: bool,
+) -> KeyValue {
     let options = TokenizerOptions {
         lang_conv_enabled,
         ext_tags: ext_tags.to_vec(),
@@ -4332,6 +4356,20 @@ fn tokenize_directives(input: &str, lang_conv_enabled: bool, ext_tags: &[String]
             }
             items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
             continue;
+        }
+        // Quote runs (`''`/`'''`/`'''''`).
+        if quotes && tk.starts_with("''") {
+            let out_len = tk.output_len();
+            if tk.try_quote() {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                items.extend(tk.drain_output(out_len).into_iter().map(|e| match e {
+                    Either::Left(s) => Item::Str(s),
+                    Either::Right(t) => Item::Tok(t),
+                }));
+                continue;
+            }
         }
         // Angle-bracket markup (`<nowiki>…</nowiki>`, etc.): recognized via the
         // same `maybe_extension_tag` rule the inline tokenizer uses, so a nowiki

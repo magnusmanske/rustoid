@@ -989,11 +989,29 @@ pub fn render_file(
         // The raw source wikitext for round-tripping (`$oContent->vsrc` in PHP).
         let vsrc = kv.vsrc.clone();
         let part = match &kv.value {
-            crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
+            crate::wikitext::tokens_v2::KeyValue::Str(s) => Some(s.clone()),
             crate::wikitext::tokens_v2::KeyValue::Tokens(items) => {
                 let stripped = crate::pipeline::attribute_expander::strip_meta_tags(items, true);
-                crate::wikitext::token_utils::tokens_to_string(&stripped.value)
+                // Faithful `stringifyOptionTokens`: `None` means the tokens cannot
+                // be an option value (an `mw-quote` or `<nowiki>` outside a
+                // `link`/`alt` option), i.e. this part is a caption.
+                stringify_option_tokens(ctx, &stripped.value, "")
             }
+        };
+        let Some(part) = part else {
+            // Not a valid option: treat the whole part as a caption (last one
+            // wins), keeping its raw tokens.
+            let src = vsrc.clone().unwrap_or_default();
+            if caption.is_some() {
+                let pos = caption_pos.min(opt_list.len());
+                opt_list.insert(pos, bogus_opt(&src));
+                caption_pos = pos + 1;
+            } else {
+                caption_pos = opt_list.len();
+            }
+            caption_ak = Some(src);
+            caption = Some(raw_items);
+            continue;
         };
         // A template that expanded to a top-level `|`-separated string yields
         // multiple option parts (no editing support). Split and process each;
@@ -1364,6 +1382,54 @@ fn tokens_to_attribute_html(items: &[Item]) -> String {
         }
     }
     out
+}
+
+/// Faithful port of `WikiLinkHandler::stringifyOptionTokens`, limited to the
+/// cases rustoid's token stream can produce at this point.
+///
+/// The important case is `mw-quote`: a quote run contributes no text, so
+/// `'''thumb'''` would otherwise stringify to `thumb` and be mistaken for the
+/// `thumb` option. PHP only recurses into an `mw-quote` when the text so far is
+/// a `link`/`alt` option (the two options allowed to contain arbitrary
+/// wikitext); otherwise it bails out with `null`.
+///
+/// Any other token contributes its text/source. (PHP additionally walks `a`/
+/// `span` markup for `link`/`alt`; that path is not reachable from the tokens
+/// handled here.)
+fn stringify_option_tokens(ctx: &WikiLinkContext, items: &[Item], prefix: &str) -> Option<String> {
+    let mut opt_info: Option<super::media_options::OptionInfo> = None;
+    let mut result = String::new();
+
+    for item in items {
+        match item {
+            Item::Str(s) => result.push_str(s),
+            Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote" => {
+                // `link` and `alt` are allowed to contain arbitrary wikitext.
+                if opt_info.is_none() {
+                    opt_info = super::media_options::get_option_info(
+                        ctx.config,
+                        &format!("{prefix}{result}"),
+                    );
+                }
+                let is_wikitext_opt = opt_info
+                    .as_ref()
+                    .is_some_and(|i| i.ck == "link" || i.ck == "alt");
+                if is_wikitext_opt {
+                    // Just recurse inside.
+                    opt_info = None; // might change the nature of opt
+                    continue;
+                }
+                return None;
+            }
+            Item::Tok(_) => {
+                // Any other token contributes its stringification.
+                let single = std::slice::from_ref(item);
+                result.push_str(&crate::wikitext::token_utils::tokens_to_string(single));
+            }
+        }
+    }
+
+    Some(result)
 }
 
 /// Resolve a single option string, apply it to `opts`, and record its
