@@ -1838,14 +1838,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             if stt.name == "templatearg" {
                 let about_id = self.new_about_id(about_counter);
-                let name = stt
-                    .attribs
-                    .first()
-                    .and_then(|kv| kv.key.as_str())
-                    .unwrap_or("");
-                let src = format!("{{{{{name}}}}}");
                 let expanded =
-                    TemplateHandler.handle_template_arg(frame, &src, about_id, tok, !in_template);
+                    TemplateHandler.handle_template_arg_token(frame, tok, about_id, !in_template);
                 out.extend(expanded);
                 continue;
             }

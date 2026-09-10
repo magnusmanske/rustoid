@@ -831,6 +831,33 @@ impl TemplateHandler {
             toks = vec![Item::Str(default)];
         }
 
+        self.encap_template_arg(toks, about_id, token, wrap)
+    }
+
+    /// Expand a `templatearg` token through `Frame::expandTemplateArg` and
+    /// encapsulate the result. Unlike [`Self::handle_template_arg`], this works
+    /// off the token's attribs, so the `{{{name|default}}}` default is honoured
+    /// (mirrors `TemplateHandler::onTemplateArg`).
+    pub fn handle_template_arg_token(
+        &self,
+        frame: &super::frame::Frame,
+        token: &ParsoidToken,
+        about_id: String,
+        wrap: bool,
+    ) -> Vec<Item> {
+        let toks = frame.expand_template_arg_token(token);
+        self.encap_template_arg(toks, about_id, token, wrap)
+    }
+
+    /// Wrap an expanded template-argument chunk in its `mw:Param`
+    /// encapsulation when `wrap` is set.
+    fn encap_template_arg(
+        &self,
+        toks: Vec<Item>,
+        about_id: String,
+        token: &ParsoidToken,
+        wrap: bool,
+    ) -> Vec<Item> {
         if wrap {
             let encap = TemplateEncapsulator::new("mw:Param", about_id, token);
             let info = TemplateInfo::default();

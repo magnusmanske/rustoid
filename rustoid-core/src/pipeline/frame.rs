@@ -87,6 +87,48 @@ impl Frame {
         None
     }
 
+    /// Expand a `{{{...}}}` template-argument token. Faithful port of
+    /// `Frame::expandTemplateArg`, which works off the token's *attribs* rather
+    /// than a reconstructed source string:
+    ///
+    /// - look the (expanded, trimmed) argument name up in this frame's args;
+    ///   a hit is returned trimmed when it came from a named argument;
+    /// - on a miss with a **default** (more than one attrib) return the default
+    ///   value, expanded — this is the `{{{name|default}}}` case;
+    /// - otherwise (no default) return a literal `{{{name}}}`.
+    ///
+    /// Passing the default through matters: a bare `{{{cmt|}}}` must expand to
+    /// the empty default, not to the literal source `{{cmt}}`.
+    pub fn expand_template_arg_token(&self, token: &ParsoidToken) -> Vec<Item> {
+        let ParsoidToken::SelfclosingTag(stt) = token else {
+            return Vec::new();
+        };
+        let Some(first) = stt.attribs.first() else {
+            return Vec::new();
+        };
+
+        let key_items = self.expand(&key_value_to_items(&first.key));
+        let name = crate::wikitext::token_utils::tokens_to_string(&key_items)
+            .trim()
+            .to_string();
+
+        if let Some(value) = self.args.named().dict.get(&name) {
+            let mut items = key_value_to_items(value);
+            if self.args.named().named_args.contains_key(&name) {
+                trim_items(&mut items);
+            }
+            return items;
+        }
+        if stt.attribs.len() > 1 {
+            return self.expand(&key_value_to_items(&stt.attribs[1].value));
+        }
+        vec![
+            Item::Str("{{{".to_string()),
+            Item::Str(name),
+            Item::Str("}}}".to_string()),
+        ]
+    }
+
     /// Expand a `{{{...}}}` template argument token. Mirrors
     /// `Frame::expandTemplateArg` for the string-valued argument case.
     pub fn expand_template_arg(&self, name: &str) -> Vec<Item> {
@@ -132,15 +174,12 @@ impl Frame {
                     if let ParsoidToken::SelfclosingTag(stt) = t
                         && stt.name == "templatearg"
                     {
-                        // attribs[0].key is the argument name.
-                        if let Some(kv) = stt.attribs.first() {
-                            let name = match &kv.key {
-                                KeyValue::Str(s) => s.clone(),
-                                KeyValue::Tokens(toks) => to_strings(toks),
-                            };
-                            out.extend(self.expand_template_arg(&name));
-                        } else {
+                        // attribs[0].key is the argument name; attribs[1] (when
+                        // present) is the default.
+                        if stt.attribs.is_empty() {
                             out.push(item.clone());
+                        } else {
+                            out.extend(self.expand_template_arg_token(t));
                         }
                     } else {
                         out.push(item.clone());
@@ -159,23 +198,6 @@ fn key_value_to_items(value: &KeyValue) -> Vec<Item> {
         KeyValue::Str(s) => vec![Item::Str(s.clone())],
         KeyValue::Tokens(items) => items.clone(),
     }
-}
-
-/// Convert a token chunk (`Vec<Item>`) to a single concatenated string.
-fn to_strings(items: &[Item]) -> String {
-    items
-        .iter()
-        .map(|it| match it {
-            Item::Str(s) => s.clone(),
-            Item::Tok(t) => match t {
-                ParsoidToken::Comment(_) | ParsoidToken::Nl(_) => String::new(),
-                other => other
-                    .data_parsoid()
-                    .and_then(|d| d.src.clone())
-                    .unwrap_or_default(),
-            },
-        })
-        .collect()
 }
 
 /// Trim leading/trailing whitespace from a token chunk (mirrors
