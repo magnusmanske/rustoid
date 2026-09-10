@@ -949,8 +949,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        next_id: &mut usize,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
-        self.expand_wikitext_pre_with(source, frame, about_counter, tokens)
+        self.expand_wikitext_pre_with(source, frame, about_counter, tokens, next_id)
             .await
     }
 
@@ -960,9 +961,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn expand_wikitext_pre_sync(
         &self,
         tokens: Vec<Item>,
+        next_id: &mut usize,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
         let mut out: Vec<Item> = Vec::new();
 
         for item in tokens {
@@ -972,8 +973,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
             let body = extension_body(pre_stt);
             let sub = self.fragment_from_body(&body);
-            let id = next_id;
-            next_id += 1;
+            let id = *next_id;
+            *next_id += 1;
             fragments.insert(id, sub);
             emit_pre_placeholder(pre_stt, id, &mut out);
         }
@@ -993,9 +994,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        next_id: &mut usize,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
         let mut out: Vec<Item> = Vec::new();
 
         for item in tokens {
@@ -1004,14 +1005,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 continue;
             };
             let body = extension_body(stt);
+            // PHP's `SpanTag`/`DivTag` handler passes
+            // `parseOpts.context = $isDiv ? 'block' : 'inline'`: the body of a
+            // `<spantag>` is parsed in *inline* context, so it gets neither
+            // p-wrapping nor indent-pre (T278565).
+            let inline = wrapper == "span";
             let sub = if source.is_some() {
-                self.process_block_fragment_body(&body, source, frame, about_counter)
+                self.process_block_fragment_body(&body, source, frame, about_counter, inline)
                     .await
+            } else if inline {
+                self.fragment_from_body(&body)
             } else {
                 self.block_fragment_from_body(&body)
             };
-            let id = next_id;
-            next_id += 1;
+            let id = *next_id;
+            *next_id += 1;
             fragments.insert(id, sub);
             emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
         }
@@ -1023,9 +1031,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn expand_wrapper_tag_sync(
         &self,
         tokens: Vec<Item>,
+        next_id: &mut usize,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
         let mut out: Vec<Item> = Vec::new();
 
         for item in tokens {
@@ -1034,9 +1042,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 continue;
             };
             let body = extension_body(stt);
-            let sub = self.block_fragment_from_body(&body);
-            let id = next_id;
-            next_id += 1;
+            let sub = if wrapper == "span" {
+                self.fragment_from_body(&body)
+            } else {
+                self.block_fragment_from_body(&body)
+            };
+            let id = *next_id;
+            *next_id += 1;
             fragments.insert(id, sub);
             emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
         }
@@ -1067,6 +1079,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        inline: bool,
     ) -> Node {
         let mut tokens = match self.tokenize(body) {
             Ok(t) => t,
@@ -1083,12 +1096,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        self.block_fragment_from_tokens(tokens)
+        self.fragment_from_tokens_with_context(tokens, inline)
     }
 
     /// Build a block-context fragment document from an already-tokenized token
     /// stream (with p-wrapping, unlike the inline [`fragment_from_tokens`]).
     fn block_fragment_from_tokens(&self, tokens: Vec<Item>) -> Node {
+        self.fragment_from_tokens_with_context(tokens, false)
+    }
+
+    /// Build a fragment document from an already-tokenized token stream, in
+    /// either block context (p-wrapping + indent-pre enabled) or inline context.
+    /// Mirrors PHP's `parseOpts.context` (`'block'` vs `'inline'`).
+    fn fragment_from_tokens_with_context(&self, tokens: Vec<Item>, inline: bool) -> Node {
         // Render links, external links, behavior switches, and language variants
         // (the token-level stages that run before tree building on the main page).
         let mut fragments = std::collections::HashMap::new();
@@ -1098,10 +1118,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
 
-        let stage = TreeBuilderStage::new(false);
+        let stage = TreeBuilderStage::new(inline);
         let mut ast = stage.to_ast_with_fragments(tokens, None, self.config, fragments);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
-        crate::pipeline::p_wrap::run(&mut ast);
+        if !inline {
+            crate::pipeline::p_wrap::run(&mut ast);
+        }
         crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None);
         crate::pipeline::cleanup::run(&mut ast);
         extract_fragment_children(&ast)
@@ -1116,9 +1138,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
         tokens: Vec<Item>,
+        next_id: &mut usize,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
         let mut out: Vec<Item> = Vec::new();
 
         for item in tokens {
@@ -1130,8 +1152,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let sub = self
                 .process_fragment_body(&body, source, frame, about_counter)
                 .await;
-            let id = next_id;
-            next_id += 1;
+            let id = *next_id;
+            *next_id += 1;
             fragments.insert(id, sub);
             emit_pre_placeholder(pre_stt, id, &mut out);
         }
@@ -1393,9 +1415,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
-        let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens);
+        let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens, &mut next_id);
         fragments.extend(pre_fragments);
-        let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens);
+        let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens, &mut next_id);
         fragments.extend(wrapper_fragments);
         let tokens = self.expand_gallery_sync(
             tokens,
@@ -1506,11 +1528,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // sub-pipeline, producing `mw:dom-fragment-token` placeholders + their
         // pre-built sub-fragments.
         let (tokens, pre_fragments) = self
-            .expand_wikitext_pre(tokens, source, &frame, about_counter)
+            .expand_wikitext_pre(tokens, source, &frame, about_counter, &mut next_id)
             .await;
         fragments.extend(pre_fragments);
         let (tokens, wrapper_fragments) = self
-            .expand_wrapper_tag(tokens, source, &frame, about_counter)
+            .expand_wrapper_tag(tokens, source, &frame, about_counter, &mut next_id)
             .await;
         fragments.extend(wrapper_fragments);
         let tokens = self
