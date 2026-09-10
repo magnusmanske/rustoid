@@ -380,9 +380,28 @@ impl TitleParser {
     /// when the resolved namespace is first-letter case-insensitive and there is
     /// no interwiki prefix, mirroring `Title::newFromText`.
     pub fn parse(input: &str, config: &dyn SiteConfig) -> Title {
+        Self::try_parse(input, config).unwrap_or_else(|| Title::new_main(input.trim().to_string()))
+    }
+
+    /// Strict variant of [`TitleParser::parse`] mirroring PHP's
+    /// `Title::newFromText`, which throws a `TitleException` for invalid titles.
+    ///
+    /// Returns `None` where PHP throws, so callers that mirror a PHP
+    /// `try/catch ( TitleException )` (or a `$noExceptions` argument) can branch
+    /// to their fallback (e.g. bailing a template target to literal text).
+    ///
+    /// The checks, in PHP's order:
+    /// - invalid characters (`has_invalid_chars`: illegal chars, `%hh`, `&name;`);
+    /// - relative path components (`has_invalid_path_component`);
+    /// - `~~~` magic tildes;
+    /// - title length (255, or 512 in the Special namespace);
+    /// - empty title (except mainspace, where an empty title is only rejected
+    ///   when it was *not* the whole input).
+    pub fn try_parse(input: &str, config: &dyn SiteConfig) -> Option<Title> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return Title::new_main(String::new());
+            // PHP `Title::newFromText('')` throws `title-invalid-empty`.
+            return None;
         }
 
         let (rest, fragment) = split_fragment(trimmed);
@@ -394,6 +413,12 @@ impl TitleParser {
         } else {
             (rest, false)
         };
+
+        // `checkBadChars` / `getTitleInvalidRegex` run on the namespace-stripped
+        // title: illegal characters, percent-encoding, and char references.
+        if has_invalid_chars(rest) || has_invalid_path_component(rest) || rest.contains("~~~") {
+            return None;
+        }
 
         if !force_main {
             // Try to match a namespace prefix first (case-insensitive). A local
@@ -411,23 +436,23 @@ impl TitleParser {
                     }
                 };
                 if let Some(title_part) = match_prefix(&ns_info.canonical) {
-                    return Self::with_case(
+                    return Some(Self::with_case(
                         title_part,
                         ns_id,
                         ns_info.case_sensitive,
                         fragment,
                         config,
-                    );
+                    ));
                 }
                 for alias in &ns_info.aliases {
                     if let Some(title_part) = match_prefix(alias) {
-                        return Self::with_case(
+                        return Some(Self::with_case(
                             title_part,
                             ns_id,
                             ns_info.case_sensitive,
                             fragment,
                             config,
-                        );
+                        ));
                     }
                 }
             }
@@ -442,13 +467,13 @@ impl TitleParser {
                     let after = &rest[colon + 1..];
                     // Interwiki titles are NOT first-letter capitalized (the
                     // remote wiki may be case-sensitive).
-                    return Title {
+                    return Some(Title {
                         interwiki: Some(prefix.clone()),
                         namespace_id: 0,
                         text: collapse_title_whitespace(after),
                         fragment,
                         namespace_name: None,
-                    };
+                    });
                 }
             }
         }
@@ -461,7 +486,7 @@ impl TitleParser {
             .get(&ns_id)
             .map(|info| info.case_sensitive)
             .unwrap_or(false);
-        Self::with_case(rest, ns_id, case_sensitive, fragment, config)
+        Self::with_case(rest, ns_id, case_sensitive, fragment, config).into()
     }
 
     /// Build a `Title`, applying first-letter capitalization when the namespace
@@ -695,5 +720,45 @@ mod tests {
             "./Main_Page"
         );
         assert_eq!(make_link(&Title::new(10, "Foo"), &config), "./Template:Foo");
+    }
+
+    #[test]
+    fn test_try_parse_rejects_invalid_titles() {
+        let config = test_config();
+
+        // Valid titles still parse.
+        assert!(TitleParser::try_parse("Main Page", &config).is_some());
+        assert!(TitleParser::try_parse("Template:Foo", &config).is_some());
+
+        // Percent-encoding sequences are illegal (`title-invalid-characters`),
+        // which is what bails `{{Bar%C3%A9}}` to literal text in PHP.
+        assert!(TitleParser::try_parse("Bar%C3%A9", &config).is_none());
+        assert!(TitleParser::try_parse("50%25", &config).is_none());
+
+        // Illegal title characters.
+        for bad in ["a<b", "a>b", "a[b", "a]b", "a{b", "a|b", "a}b"] {
+            assert!(TitleParser::try_parse(bad, &config).is_none(), "{bad}");
+        }
+
+        // Relative path components.
+        assert!(TitleParser::try_parse("../Foo", &config).is_none());
+        assert!(TitleParser::try_parse("Foo/./Bar", &config).is_none());
+
+        // Magic tildes.
+        assert!(TitleParser::try_parse("~~~", &config).is_none());
+
+        // Empty title.
+        assert!(TitleParser::try_parse("", &config).is_none());
+        assert!(TitleParser::try_parse("   ", &config).is_none());
+    }
+
+    #[test]
+    fn test_parse_is_lenient_fallback() {
+        // `parse` keeps its infallible signature: an invalid title falls back to
+        // a mainspace Title built from the raw input rather than panicking.
+        let config = test_config();
+        let t = TitleParser::parse("Bar%C3%A9", &config);
+        assert_eq!(t.namespace_id, 0);
+        assert_eq!(t.text, "Bar%C3%A9");
     }
 }

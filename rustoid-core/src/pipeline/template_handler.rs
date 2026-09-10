@@ -367,8 +367,13 @@ fn resolve_target_string(
         config.canonical_namespace_id("Template")
     };
 
-    // Parse the target; if a Template namespace default applies, force it.
-    let parsed = TitleParser::parse(&target, config);
+    // PHP parses the title with `makeTitleFromURLDecodedStr($title, $namespaceId,
+    // true)`, whose `$noExceptions` flag makes an invalid title (bad characters,
+    // `%hh` sequences, char references, relative path components, `~~~`, an
+    // over-long title, or an empty one) return `null`, bailing the whole
+    // template to literal text ("Entities in transclusions aren't decoded in the
+    // PHP parser"). Mirror that by rejecting here.
+    let parsed = TitleParser::try_parse(&target, config)?;
     let title = if let Some(ns) = namespace_id {
         Title::new(ns, parsed.text)
     } else {
@@ -697,8 +702,39 @@ impl TemplateHandler {
                 info.param_infos = super::template_encapsulator::prepare_tpl_param_infos(params);
                 encap.encap_tokens(vec![template_to_wikilink(&name)], &info)
             }
-            None => vec![Item::Str(target_str)],
+            None => Self::convert_to_string(token, false),
         }
+    }
+
+    /// Bail an unexpandable template back to literal text. Mirrors PHP's
+    /// `TemplateHandler::convertToString`: re-tokenize the token's source with
+    /// the outer `{{`/`}}` stripped (`substr($src, 2, -2)`), then re-emit the
+    /// literal `{{` … `}}` around the re-tokenized content.
+    ///
+    /// `in_template` is the tokenizer's `inTemplate` option (PHP keeps the parent
+    /// pipeline's `inTemplate` for the re-tokenization). PHP additionally threads
+    /// an `expandTemplates` flag (true for the `onTemplateArg`/`onTemplate` bail
+    /// paths); it only matters when template expansion is enabled, which is
+    /// already decided by the caller's pipeline options.
+    fn convert_to_string(
+        token: &crate::wikitext::tokens_v2::ParsoidToken,
+        in_template: bool,
+    ) -> Vec<Item> {
+        let dp = token.data_parsoid();
+        let Some(src) = dp.and_then(|dp| dp.src.as_deref()) else {
+            // No recorded source: fall back to a no-op re-serialization.
+            return vec![Item::Tok(token.clone())];
+        };
+        // `substr( $src, 2, -2 )` — the source always has the `{{`/`}}` delimiters.
+        let inner = src
+            .strip_prefix("{{")
+            .and_then(|s| s.strip_suffix("}}"))
+            .unwrap_or(src);
+
+        let mut out = vec![Item::Str("{{".to_string())];
+        out.extend(tokenize_wikitext_to_items(inner, in_template, &[]));
+        out.push(Item::Str("}}".to_string()));
+        out
     }
 
     /// Resolve a magic variable to its string value. Mirrors the common
@@ -1137,6 +1173,29 @@ mod tests {
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "yes"))
         );
+    }
+
+    #[test]
+    fn test_convert_to_string_keeps_delimiters() {
+        // A template whose target resolves to an invalid title bails to literal
+        // text with the `{{`/`}}` delimiters preserved (PHP `convertToString`).
+        let dp = crate::wikitext::tokens_v2::DataParsoid {
+            src: Some("{{Bar%C3%A9}}".to_string()),
+            ..Default::default()
+        };
+        let token = crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(
+            crate::wikitext::tokens_v2::SelfclosingTagTk::new("template", vec![], dp),
+        );
+
+        let out = TemplateHandler::convert_to_string(&token, false);
+        let s: String = out
+            .iter()
+            .map(|it| match it {
+                Item::Str(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(s, "{{Bar%C3%A9}}");
     }
 
     #[test]
