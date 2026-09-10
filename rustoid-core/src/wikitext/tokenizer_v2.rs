@@ -1684,13 +1684,18 @@ impl<'a> PegTokenizer<'a> {
             }
 
             let ch = self.remaining().chars().next().unwrap();
-            // Stop at a pipe/exclamation/newline in *cell-argument* position only
-            // (mirrors `inlineBreaks`: `|`/`!` terminate the attribute block for
-            // `tableCellArg`, but in start/row-tag position they are permissive
-            // broken-name characters digested below). A newline always terminates.
+            // Stop at a pipe (or `{{!}}`) in *cell-argument* position only
+            // (mirrors `inlineBreaks`: `|` terminates the attribute block for
+            // `tableCellArg`; in start/row-tag position a bare `|` is permissive
+            // broken-name content). A newline always terminates.
+            //
+            // `!` is **not** a terminator: `inlineBreaks` breaks on `!` only when
+            // it is part of `!!` (and only for a `th` stop). A lone `!` is instead
+            // digested below as a valueless attribute, so `class="test"!
+            // align=left|` reparses as `class="test"`, `!`, `align="left"`.
             if ch == '\n'
                 || ch == '\r'
-                || (cell_arg && (ch == '|' || ch == '!' || self.starts_with("{{!}}")))
+                || (cell_arg && (ch == '|' || self.starts_with("{{!}}") || self.starts_with("!!")))
             {
                 break;
             }
@@ -2512,14 +2517,19 @@ impl<'a> PegTokenizer<'a> {
                 break;
             };
             // The stop set mirrors `table_attribute_name_piece`'s two alternatives:
-            // the first (`$[^ \t\r\n\0/=><&{}\-!|\[]+`) excludes one set, and the
+            // the first (`$[^ \t\r\n\0/=><&{}\!|\[]+`) excludes one set, and the
             // fallback (`$( !(space_or_newline / [\0/=>]) . )`) re-matches any other
             // single char. The net effect is that a table attribute *name* only
-            // truly stops at `space/tab/\r/\n/\0//=/|<`; `|`/`!`/`{`/`}`/`[` are only
+            // truly stops at `space/tab/\r/\n/\0///=/|<`; `|`/`{`/`}`/`[` are only
             // terminators in cell-argument position (`tableCellArg`), where
             // `inlineBreaks` would otherwise break on `|`/`{{!}}`. This lets broken
             // start/row-tag syntax (`{| || |} ++`) digest `||`/`|}`/`++` as discarded
             // (valueless) attribute names rather than leaking them as content.
+            //
+            // `!` is deliberately *not* a stop: `inlineBreaks` breaks on `!` only
+            // as part of `!!`, so a lone `!` is a valid (one-character, valueless)
+            // attribute name — which is what makes `class="test"! align=left|`
+            // reparse into `class`, `!`, and `align`.
             let is_stop = ch == ' '
                 || ch == '\t'
                 || ch == '\r'
@@ -2529,9 +2539,7 @@ impl<'a> PegTokenizer<'a> {
                 || ch == '='
                 || ch == '>'
                 || ch == '<'
-                || (table
-                    && cell_arg
-                    && (ch == '[' || ch == '|' || ch == '!' || ch == '{' || ch == '}'));
+                || (table && cell_arg && (ch == '[' || ch == '|' || ch == '{' || ch == '}'));
             if is_stop {
                 break;
             }

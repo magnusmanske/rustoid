@@ -418,6 +418,31 @@ pub fn render_inline_fragment(
     frag
 }
 
+/// Re-tokenize an all-plain-string template expansion at start of line.
+///
+/// A template body consisting solely of argument references (e.g. `1x`'s
+/// `{{{1}}}`) yields its substituted text at the position where the body began,
+/// which is start of line — so leading list/table syntax must be tokenized as
+/// such (`{{1x|!!foo}}` → a `<th>`). A body with any other content before the
+/// trailing text (`{{{attr|}}}{{{cmt|}}}| foo`) is left alone.
+///
+/// Returns the input unchanged when it is not all plain strings.
+fn re_tokenize_sol_prefix(spliced: Vec<Item>, ext_tags: &[String]) -> Vec<Item> {
+    if !spliced.iter().all(|it| matches!(it, Item::Str(_))) {
+        return spliced;
+    }
+    let text: String = spliced
+        .iter()
+        .map(|it| match it {
+            Item::Str(s) => s.as_str(),
+            _ => "",
+        })
+        .collect();
+    crate::pipeline::template_handler::tokenize_wikitext_to_items(
+        &text, /* in_template */ true, ext_tags,
+    )
+}
+
 /// Flatten `mw:Nowiki` spans into their text content (mirrors PHP
 /// `Pre::sourceToDom` + `removeNowikiEscapesFromContent`): inside a
 /// `<pre format="wikitext">` body the `<nowiki>` content has already been
@@ -2033,35 +2058,30 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             self.config.extension_tags(),
         );
 
-        // Splice `{{{…}}}` template-argument references at the token level using
-        // the child frame (mirrors `Frame::expand`). Argument values were already
-        // tokenized by the tokenizer (`template_param_text`), so a `{{!}}` stays a
-        // `template` token and a `[[…]]` a `wikilink` rather than being flattened
-        // and re-tokenized (which would mis-read a leading `|` as table-cell syntax).
-        // Then recursively expand remaining `template` tokens (`{{!}}` → `|`/`<td>`,
-        // nested templates, parser functions).
+        // Argument substitution replaces each `{{{…}}}` with its value's
+        // tokens. A plain-string value (the default `{{{attr|}}}`, or a string
+        // argument) stays a string, exactly as PHP's `Frame::expandArg` returns
+        // `[ $arg ]` for a string.
+        //
+        // The result is normally *not* re-tokenized: PHP tokenizes the template
+        // body source once, so a `|` that follows an argument reference is already
+        // known to be mid-line content (`{{{attr|}}}{{{cmt|}}}| foo`) and must not
+        // be promoted to a table-cell separator.
+        //
+        // The one case that does need re-tokenizing is a body that was *only* an
+        // argument reference (or several back to back), because the substituted
+        // text then lands where the body began — i.e. at start of line. PHP gets
+        // this for free: its `{{1x|!!foo}}` puts `!!foo` at the very start of the
+        // body. Detect it by checking that every item before the text run is
+        // itself a `templatearg` reference at the body start.
         let spliced = child_frame.expand(&items);
-
-        // When the spliced result is *all plain text* (no tokens to preserve, i.e.
-        // the template produced pure wikitext like `{{1x|!!foo}}` → `!!foo`), the
-        // sole string must be re-tokenized at SOL so leading list/table syntax forms
-        // (`!!foo` → `th`, `*bar` → list). Mirrors the now-removed string
-        // `substitute_args` path's whole-source re-tokenize, but only when there is
-        // nothing token-level to preserve (a mixed token+string result, e.g. a nested
-        // template before cell continuation, is left as-is for the tree builder).
-        let spliced = if spliced.iter().all(|it| matches!(it, Item::Str(_))) {
-            let text: String = spliced
-                .iter()
-                .map(|it| match it {
-                    Item::Str(s) => s.as_str(),
-                    _ => "",
-                })
-                .collect();
-            crate::pipeline::template_handler::tokenize_wikitext_to_items(
-                &text,
-                /* in_template */ true,
-                self.config.extension_tags(),
-            )
+        // The substituted text is at start of line only when the body began with a
+        // run of argument references and nothing else preceded the trailing text.
+        let body_was_arg_refs = items.iter().all(|it| {
+            matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "templatearg")
+        });
+        let spliced = if body_was_arg_refs {
+            re_tokenize_sol_prefix(spliced, self.config.extension_tags())
         } else {
             spliced
         };
