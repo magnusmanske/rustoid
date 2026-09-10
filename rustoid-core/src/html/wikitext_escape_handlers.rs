@@ -548,6 +548,17 @@ fn tokenize(text: &str, sol: bool) -> Option<Vec<Either<String, ParsoidToken>>> 
     tokenizer.tokenize().ok()
 }
 
+/// Apply PHP's `preg_replace( '/\][^\]]*$/D', ']', $text, 1 )`: the last `]` and
+/// any non-`]` characters after it collapse to a single `]`.
+fn collapse_trailing_bracket_run(text: &str) -> String {
+    let Some(last_close) = text.rfind(']') else {
+        return text.to_string();
+    };
+    // Everything after the last `]` must be non-`]` (by definition) and lie at
+    // the end of the string, so the match always extends to the end.
+    format!("{}]", &text[..last_close])
+}
+
 /// Does `text` contain an unmatched closing bracket (the `/[^\[]*\]/` test
 /// that gates the `textCanParseAsLink` link-resolution walk)?
 fn contains_closing_bracket(text: &str) -> bool {
@@ -561,16 +572,17 @@ fn contains_closing_bracket(text: &str) -> bool {
 /// (i.e. `text` stayed outside any link token), it is safe.
 fn text_can_parse_as_link(
     state: &SerializerState,
-    _tree: &crate::html::dom_tree::DomTree,
-    _node: Option<crate::html::dom_tree::NodeId>,
+    tree: &crate::html::dom_tree::DomTree,
+    node: Option<crate::html::dom_tree::NodeId>,
     text: &str,
 ) -> bool {
-    // Strip extraneous characters after a `]` (inessential to link detection).
-    // Mirrors `/\][^\]]*$/D` → keep up to (and including) the first close.
-    let text = match text.find(']') {
-        Some(i) => &text[..=i],
-        None => text,
-    };
+    // Strip away extraneous characters after the final `]` run: the regex is
+    // `/\][^\]]*$/D` replaced with `']'` — i.e. the last `]` plus any
+    // following non-`]` characters collapse to a single `]`. Those trailing
+    // characters are inessential to deciding whether the `]]`/`]` parses as a
+    // wikilink and only complicate the logic.
+    let text = collapse_trailing_bracket_run(text);
+    let text = text.as_str();
     if text.contains('\n') {
         return false;
     }
@@ -584,10 +596,103 @@ fn text_can_parse_as_link(
         return false;
     };
 
-    match last {
-        Either::Left(s) => s == text || s.ends_with(text),
-        _ => true,
+    // If `text` remained outside of any non-string tokens, it does not need
+    // nowiking.
+    if matches!(last, Either::Left(s) if s == text || s.ends_with(text)) {
+        return false;
     }
+
+    // Verify that the tokenized links are valid links.
+    let env = state.env;
+    let mut buf = String::new();
+    let mut node = node;
+
+    for t in tokens.iter().rev() {
+        match t {
+            Either::Left(s) => buf = format!("{s}{buf}"),
+            Either::Right(ParsoidToken::Comment(c)) => {
+                buf = format!("{}{buf}", crate::html::wts_utils::comment_wt(&c.value));
+            }
+            Either::Right(tok) => match tok.get_name() {
+                "wikilink" => {
+                    // A templated target could theoretically expand to a link; bail.
+                    if tok.get_attribute("href").is_some_and(|kv| {
+                        !matches!(kv, crate::wikitext::tokens_v2::KeyValue::Str(_))
+                    }) {
+                        return false;
+                    }
+                    let target = tok.get_attribute_v("href").unwrap_or_default().to_string();
+                    if let Some(env) = env
+                        && env.is_valid_link_target(&target)
+                        && !env.get_site_config().has_valid_protocol(&target)
+                    {
+                        return true;
+                    }
+                    // A wikilink whose target is not a valid link does not
+                    // survive re-parsing, so recover its source text.
+                    let src = tok
+                        .data_parsoid()
+                        .and_then(|dp| dp.src.clone())
+                        .unwrap_or_default();
+                    buf = format!("{src}{buf}");
+                }
+                "extlink" => {
+                    let href = tok.get_attribute_v("href").unwrap_or_default().to_string();
+                    let href = if href.is_empty() {
+                        tok.data_parsoid()
+                            .and_then(|dp| dp.src.clone())
+                            .unwrap_or_default()
+                    } else {
+                        href
+                    };
+                    if !href.contains("{{") {
+                        // Not a template and a real href => needs nowiking.
+                        if href.starts_with("http://") || href.starts_with("https://") {
+                            return true;
+                        }
+                    } else {
+                        // Walk back to a preceding encapsulation wrapper.
+                        while let Some(n) = node {
+                            node = crate::html::dom_tree::previous_non_sep_sibling(tree, n);
+                            if let Some(n2) = node
+                                && crate::html::wts_utils::is_first_encapsulation_wrapper_node(
+                                    tree.node(n2),
+                                )
+                            {
+                                break;
+                            }
+                        }
+                        if let Some(n) = node
+                            && crate::html::wts_utils::node_name(tree.node(n)) == "a"
+                            && crate::html::dom_tree::text_content(tree, n)
+                                == tree.node(n).get_attr("href").unwrap_or_default()
+                        {
+                            // The template expands to a url link => needs nowiking.
+                            return true;
+                        }
+                    }
+                    // Not a real extlink: recover its wikitext source.
+                    let src = tok
+                        .data_parsoid()
+                        .and_then(|dp| dp.src.clone())
+                        .unwrap_or_default();
+                    buf = format!("{src}{buf}");
+                }
+                _ => {
+                    // No other smarts => be conservative.
+                    return true;
+                }
+            },
+        }
+
+        if buf.ends_with(text) {
+            // `text` emerged unscathed.
+            return false;
+        }
+    }
+
+    // We couldn't prove safety of skipping nowiki-ing.
+    true
 }
 
 /// `escapedText` — wrap `orig_text` in `<nowiki>…</nowiki>` (or protect minimal
