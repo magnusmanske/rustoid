@@ -1158,6 +1158,19 @@ fn process_cell(
     in_tpl: bool,
     prev_sibling: Option<&Node>,
 ) -> Vec<Node> {
+    // A link/image inside this cell's attribute region terminated attribute
+    // processing, so the attributes must be turned back into cell content
+    // (mirrors PHP's `cellAttrTerminatorSeen` branch, which also clears the flag
+    // and reprocesses the cell for further fixups).
+    if cell_tmp_flag(&cell, |t| t.cell_attr_terminator_seen == Some(true)) {
+        convert_attribs_to_content(&mut cell, false, true);
+        if let Some(dp) = cell.dp.as_mut() {
+            dp.tmp.cell_attr_terminator_seen = None;
+        }
+        // Reprocess in case this round makes the cell suitable for more fixups.
+        return process_cell(cell, config, source, in_tpl, prev_sibling);
+    }
+
     let is_templated = has_type_of(&cell, "mw:Transclusion");
     let cell_name = name(&cell);
     // The merge-with-previous decision is handled by the caller (`process_children`);

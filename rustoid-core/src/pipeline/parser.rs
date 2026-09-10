@@ -337,6 +337,9 @@ pub fn render_inline_fragment(
     let clean = |href: &str| {
         crate::sanitizer::clean_url(href, "external", |proto| config.has_valid_protocol(proto))
     };
+    let clean_link = |href: &str| {
+        crate::sanitizer::clean_url(href, "wikilink", |proto| config.has_valid_protocol(proto))
+    };
     let mut out: Vec<Item> = Vec::with_capacity(tokens.len());
     for item in tokens {
         let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = &item else {
@@ -372,6 +375,7 @@ pub fn render_inline_fragment(
                     &ParsoidToken::SelfclosingTag(stt.clone()),
                     &content_href,
                     clean,
+                    clean_link,
                 ) {
                     Some(rendered) => out.extend(rendered),
                     None => out.push(item),
@@ -758,6 +762,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     self.config.has_valid_protocol(proto)
                 })
             };
+            let clean_link = |href: &str| {
+                crate::sanitizer::clean_url(href, "wikilink", |proto| {
+                    self.config.has_valid_protocol(proto)
+                })
+            };
 
             match stt.name.as_str() {
                 "extlink" => {
@@ -816,6 +825,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         &ParsoidToken::SelfclosingTag(stt.clone()),
                         &content_href,
                         clean,
+                        clean_link,
                     ) else {
                         out.push(item);
                         continue;

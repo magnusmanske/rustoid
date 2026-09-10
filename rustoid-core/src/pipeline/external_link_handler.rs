@@ -50,6 +50,7 @@ pub fn on_url_link(
     token: &ParsoidToken,
     content_href: &str,
     clean: impl Fn(&str) -> Option<String>,
+    clean_wikilink: impl Fn(&str) -> Option<String>,
 ) -> Option<Vec<Item>> {
     let data_parsoid = token.data_parsoid().cloned().unwrap_or_default();
 
@@ -79,8 +80,10 @@ pub fn on_url_link(
 
     let mut a_tag = TagTk::new("a", result.attribs, dp);
     a_tag.add_attribute_str("href", &href);
-    // Auto-link text is the (cleaned) href.
-    let text = href.clone();
+    // The autolink text is the href cleaned in `wikilink` mode, which does *not*
+    // percent-encode the URL (PHP: `Sanitizer::cleanUrl( …, $href, 'wikilink' )`),
+    // so `ftp://|x` keeps its pipe while the `href` attribute escapes it.
+    let text = clean_wikilink(content_href).unwrap_or_else(|| href.clone());
 
     Some(vec![
         Item::Tok(ParsoidToken::Tag(a_tag)),

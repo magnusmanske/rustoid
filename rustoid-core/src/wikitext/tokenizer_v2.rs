@@ -3071,6 +3071,20 @@ impl<'a> PegTokenizer<'a> {
             self.pos = saved;
             return false;
         };
+        // `extlink = "[" url (space)* inlineline<extlink>? "]"`: the content is
+        // `inlineline`, which stops at an `inline_breaks` position. When the very
+        // first content character breaks (a table-context `|` before `|`/`}` in
+        // `[ftp://|x||]`), `inlineline` matches nothing and the required `]` is
+        // not there, so the whole rule fails and the `[` becomes literal text
+        // (the URL is then re-scanned as an autolink).
+        if content_rem[..rel_end]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '|')
+        {
+            self.pos = saved;
+            return false;
+        }
         let text = &content_rem[..rel_end];
         let content_end = content_src_start + rel_end;
 
@@ -3239,6 +3253,24 @@ impl<'a> PegTokenizer<'a> {
         true
     }
 
+    /// The offset (into `rem`) of the first PHP `inlineBreaks`-relevant position.
+    ///
+    /// The `url` grammar production's `path` is a run of
+    /// `!inline_breaks @(no_punctuation_char / …)`, so a position that
+    /// `inline_breaks` reports as a break terminates the URL. In the table
+    /// context the only relevant case is `|` followed by `|` or `}`
+    /// (`TokenizerUtils::inlineBreaks`'s `$stops['table']` branch) — the same
+    /// rule that stops `[ftp://|x||]` at `ftp://|x`.
+    fn inline_break_pos(&self, rem: &str) -> usize {
+        let bytes = rem.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'|' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'|' | b'}') {
+                return i;
+            }
+        }
+        rem.len()
+    }
+
     /// Try URL text (plain text that could contain URLs).
     fn try_urltext(&mut self) -> bool {
         // First check for URL protocols.
@@ -3250,17 +3282,15 @@ impl<'a> PegTokenizer<'a> {
             if rem.starts_with(prefix.as_str()) {
                 let start = self.pos;
                 let end = rem
-                    .find(|c: char| {
-                        c == ' '
-                            || c == '\t'
-                            || c == '\n'
-                            || c == '\r'
-                            || c == ']'
-                            || c == '['
-                            || c == '>'
-                            || c == '<'
-                    })
+                    .find(|c: char| !is_no_punctuation_char(c))
                     .unwrap_or(rem.len());
+
+                // PHP's `url = proto addr path`, where `path` is a run of
+                // `!inline_breaks @(no_punctuation_char / …)`. In a table context a
+                // `|` is a break when followed by `|` or `}` (the `$stops['table']`
+                // branch of `TokenizerUtils::inlineBreaks`), which is what stops
+                // `[ftp://|x||]` at `ftp://|x` instead of swallowing both pipes.
+                let end = end.min(self.inline_break_pos(rem));
 
                 if end > prefix.len() {
                     let url = rem[..end].to_string();
@@ -3678,6 +3708,43 @@ fn validate_codepoint(cp: u32) -> bool {
         || (0x10000..=0x10ffff).contains(&cp)
 }
 
+/// Whether `c` is allowed inside a URL's `path` (negation of PHP's
+/// `no_punctuation_char`, whose excluded set is
+/// `[ \]\[\r\n\"'<>\x00-\x20\x7f&\u00A0\u1680\u180E\u2000-\u200A\u202F\u205F\u3000{]`).
+/// Note that `|` is *not* excluded here: it only terminates a URL via
+/// `inline_breaks` in a table context (see [`Tokenizer::inline_break_pos`]).
+fn is_no_punctuation_char(c: char) -> bool {
+    if matches!(
+        c,
+        ' ' | ']'
+            | '['
+            | '\r'
+            | '\n'
+            | '"'
+            | '\''
+            | '<'
+            | '>'
+            | '&'
+            | '{'
+            | '\u{A0}'
+            | '\u{1680}'
+            | '\u{180E}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    ) {
+        return false;
+    }
+    if (c as u32) <= 0x20 || c as u32 == 0x7f {
+        return false;
+    }
+    // General Punctuation spaces (U+2000..U+200A).
+    if (0x2000..=0x200A).contains(&(c as u32)) {
+        return false;
+    }
+    true
+}
+
 /// Whether `c` is a word character for the auto-link boundary check (mirrors
 /// PHP `Utils::isUniWord`'s `\w` test).
 fn is_word_char(c: char) -> bool {
@@ -3711,6 +3778,12 @@ fn scan_extlink_url_len(input: &str) -> usize {
         if matches!(ch, '<' | '[' | '\n' | '\r' | ']' | '}' | '\t' | '"' | ' ')
             || is_space_or_nbsp(ch)
         {
+            break;
+        }
+        // `inline_breaks` in a table context: a `|` followed by `|` or `}` ends
+        // the URL (`TokenizerUtils::inlineBreaks`, `$stops['table']` branch),
+        // which is what stops `[ftp://|x||]` at `ftp://|x`.
+        if ch == '|' && matches!(input[i + 1..].chars().next(), Some('|') | Some('}')) {
             break;
         }
         // Directives (templates, comments, language variants) end the URL.

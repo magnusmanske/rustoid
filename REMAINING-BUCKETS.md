@@ -1,6 +1,33 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **848/891 fixtures pass** (95%). Lib tests: 651 pass. Clippy: clean.
+Current baseline: **849/891 fixtures pass** (95%). Lib tests: 651 pass. Clippy: clean.
+
+## Landed: autolink URL scanning stops at table pipes; `cleanUrl` wikilink mode (848 → 849)
+
+Closed "Table security: embedded pipes" (T3830-adjacent). Three faithful-port fixes in
+the URL/`urllink` tokenizer path:
+
+1. **`no_punctuation_char`** (`Grammar.pegphp:798`): the `url`/`autourl` `path` is a run
+   of `!inline_breaks @(no_punctuation_char / …)`. rustoid's `try_urltext` used an ad-hoc
+   stop set; the real class is `[ \]\[\r\n\"'<>\x00-\x20\x7f&\u00A0\u1680\u180E
+   \u2000-\u200A\u202F\u205F\u3000{]`. Note `|` is **not** excluded.
+2. **`inline_breaks`'s `$stops['table']` branch**: in a table context a `|` followed by
+   `|` or `}` *does* break, which is what stops `[ftp://|x||]` at `ftp://|x` instead of
+   swallowing both pipes. Applied in both `try_urltext` and `scan_extlink_url_len`.
+3. **`extlink` fails when its content starts with a break character**: the grammar is
+   `"[" url (space)* inlineline<extlink>? "]"`, and `inlineline` stops at an
+   `inline_breaks` position. When the first content char breaks, `inlineline` is empty and
+   the required `]` is not there, so the whole rule fails — the `[` becomes literal text
+   and the URL is re-scanned as an autolink (PHP's token stream confirms: a `urllink`, not
+   an `extlink`).
+4. **Autolink text uses `cleanUrl` in `wikilink` mode** (`ExternalLinkHandler::onUrlLink`
+   ends with `Sanitizer::cleanUrl( …, $href, 'wikilink' )`). Only the `external` mode
+   percent-encodes, so the displayed text keeps `ftp://|x` while the `href` attribute
+   carries `ftp://%7Cx`. `on_url_link` now takes a second cleaner.
+
+Also landed in this commit: the `cellAttrTerminatorSeen` plumbing
+(`AttributeExpander::stripMetaTags` → `dp.tmp` → `TableFixups::handleTableCellTemplates`),
+which is correct but does not by itself fix a fixture yet.
 
 ## Landed: extensions tunnelled through DOM fragments + TT2 attribute order (847 → 848)
 

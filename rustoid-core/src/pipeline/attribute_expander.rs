@@ -82,6 +82,17 @@ pub struct StripMetaTagsResult {
 /// Strip all meta markers introduced by transclusions/params/includes, and
 /// return the content. Mirrors `AttributeExpander::stripMetaTags`.
 pub fn strip_meta_tags(tokens: &[Item], wrap_templates: bool) -> StripMetaTagsResult {
+    strip_meta_tags_in_cell(tokens, wrap_templates, false)
+}
+
+/// [`strip_meta_tags`] with the `inTableCellContext` flag, which additionally
+/// detects an image/link that terminates table-cell attribute processing
+/// (mirrors PHP's `stripMetaTags( …, bool $inTableCellContext = false )`).
+pub fn strip_meta_tags_in_cell(
+    tokens: &[Item],
+    wrap_templates: bool,
+    in_table_cell_context: bool,
+) -> StripMetaTagsResult {
     let mut buf = Vec::new();
     let mut has_generated_content = false;
     let mut cell_attr_terminator_seen = false;
@@ -99,7 +110,7 @@ pub fn strip_meta_tags(tokens: &[Item], wrap_templates: bool) -> StripMetaTagsRe
                 }
 
                 // Images/links terminate table-cell attribute processing.
-                if is_cell_attr_terminator(type_of, rel) {
+                if in_table_cell_context && is_cell_attr_terminator(type_of, rel) {
                     cell_attr_terminator_seen = true;
                 }
 
@@ -422,6 +433,10 @@ pub fn build_expanded_attrs(
     // Accumulated rich-attribute metadata (mirrors PHP's `$tmpDataMW`): keyed
     // by attribute name, in source order.
     let mut tmp_data_mw: Vec<TmpDataMw> = Vec::new();
+    // Set when a link/image inside a `td`/`th` attribute value terminated
+    // attribute processing; `TableFixups` reads it to convert the attribute back
+    // to content (mirrors `$token->dataParsoid->getTemp()->cellAttrTerminatorSeen`).
+    let mut cell_attr_terminator_seen = false;
 
     for (i, old_a) in old_attrs.iter().enumerate() {
         let mut expanded_a = expanded_attrs[i].clone();
@@ -543,8 +558,15 @@ pub fn build_expanded_attrs(
                     expanded_a.vsrc = None;
                 }
             } else {
-                let stripped = strip_meta_tags(&expanded_v_items, wrap_templates);
+                let stripped = strip_meta_tags_in_cell(
+                    &expanded_v_items,
+                    wrap_templates,
+                    token_name == "td" || token_name == "th",
+                );
                 val_generated = stripped.has_generated_content;
+                if stripped.cell_attr_terminator_seen {
+                    cell_attr_terminator_seen = true;
+                }
                 expanded_v_items = stripped.value;
             }
             expanded_a.value = items_to_key_value(expanded_v_items);
@@ -638,6 +660,10 @@ pub fn build_expanded_attrs(
         let data_mw_attribs = serialize_data_mw_attribs(&attribs);
         let data_mw_json = format!("{{\"attribs\":{data_mw_attribs}}}");
         token.set_attribute("data-mw", &data_mw_json);
+    }
+
+    if cell_attr_terminator_seen && let Some(dp) = token.data_parsoid_mut() {
+        dp.tmp.cell_attr_terminator_seen = Some(true);
     }
 
     let mut out = meta_tokens;
