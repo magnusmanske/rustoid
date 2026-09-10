@@ -732,6 +732,35 @@ mod tests {
     }
 
     #[test]
+    fn test_wikilink_prefix_escape_icelandic() {
+        // On iswiki both `linktrail` and `linkprefix` include `a`, so
+        // `mótmælenda[[söfnuður]]` would re-parse with the `a` pulled into the
+        // link prefix; the serializer must emit `<nowiki/>` before the link.
+        let config = crate::mock::MockSiteConfig::new();
+        let mut cfg = config;
+        cfg.set_language("is");
+        let title = crate::title::Title::new_main("Test");
+        let env = crate::html::env::SerializerEnv::new(&cfg, &title);
+        let prefix_re = env
+            .get_site_config()
+            .link_prefix_regex()
+            .map(|p| regex::Regex::new(&format!("({p})|((^|[^\\[])(\\[\\[)*\\[$)")).unwrap());
+        let trail_re = env
+            .get_site_config()
+            .link_trail_regex()
+            .map(|t| regex::Regex::new(t).unwrap());
+        let link = ConstrainedText::wiki_link("[[söfnuður]]", 1, true, prefix_re, trail_re);
+        // The left context ends with `a`, a link-prefix char.
+        let state = State {
+            left_context: "Aðrir mótmælenda".to_string(),
+            right_context: "".to_string(),
+            pos: 0,
+        };
+        let r = link.escape(&state);
+        assert_eq!(r.prefix.as_deref(), Some("<nowiki/>"));
+    }
+
+    #[test]
     fn test_wikilink_trail_suffix() {
         // A wikilink followed by a word char (the enwiki link trail `[a-z]+`)
         // needs a `<nowiki/>` suffix to prevent the word being absorbed.
