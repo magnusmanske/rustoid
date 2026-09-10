@@ -223,22 +223,46 @@ fn find_matches(body: &Node, selector: &str) -> Vec<Path> {
     // Pre-split the selector into its compound parts (descendant combinator).
     let compounds: Vec<&str> = selector.split_whitespace().collect();
     let mut out = Vec::new();
-    if matches_full_selector(body, &compounds, 0, &[]) {
+    let root_total = element_child_count(body);
+    if matches_full_selector(body, &compounds, Sib::new(0, root_total), &[]) {
         out.push(Vec::new());
     }
     walk(body, &compounds, &mut Vec::new(), &mut Vec::new(), &mut out);
     out
 }
 
+/// An element's position among its element siblings: `index` (0-based) and
+/// `total` (the number of element siblings, including itself). Both are needed
+/// for `:first-child`/`:last-child`/`:nth-child`.
+#[derive(Clone, Copy)]
+struct Sib {
+    index: usize,
+    total: usize,
+}
+
+impl Sib {
+    fn new(index: usize, total: usize) -> Self {
+        Self { index, total }
+    }
+}
+
+/// The number of element children of `node`.
+fn element_child_count(node: &Node) -> usize {
+    node.children
+        .iter()
+        .filter(|c| matches!(c.kind, NodeKind::Element(_)))
+        .count()
+}
+
 /// Recursively walk the tree, matching the selector's compound parts against
 /// each element: the rightmost compound against the element itself, preceding
 /// compounds against its ancestors (descendant combinator), mirroring Zest's
-/// `qsa`. `ancestors` is the stack of `(enclosing element, its element-sibling
-/// index)` pairs.
+/// `qsa`. `ancestors` is the stack of `(enclosing element, its sibling info)`
+/// pairs.
 fn walk<'a>(
     node: &'a Node,
     compounds: &[&str],
-    ancestors: &mut Vec<(&'a Node, usize)>,
+    ancestors: &mut Vec<(&'a Node, Sib)>,
     path: &mut Vec<usize>,
     out: &mut Vec<Path>,
 ) {
@@ -246,17 +270,19 @@ fn walk<'a>(
     // Zest's `:nth-child`, which counts *element* siblings via
     // `previousElementSibling` (a historical quirk of `qsa`-derived selector
     // engines) rather than all siblings including whitespace text nodes.
+    let total = element_child_count(node);
     let mut element_index = 0usize;
     for (i, child) in node.children.iter().enumerate() {
         let is_element = matches!(child.kind, NodeKind::Element(_));
         if is_element {
-            if matches_full_selector(child, compounds, element_index, ancestors) {
+            let sib = Sib::new(element_index, total);
+            if matches_full_selector(child, compounds, sib, ancestors) {
                 let mut p = path.clone();
                 p.push(i);
                 out.push(p);
             }
             element_index += 1;
-            ancestors.push((child, element_index - 1));
+            ancestors.push((child, sib));
             path.push(i);
             walk(child, compounds, ancestors, path, out);
             path.pop();
@@ -275,12 +301,12 @@ fn walk<'a>(
 fn matches_full_selector(
     node: &Node,
     compounds: &[&str],
-    sibling_index: usize,
-    ancestors: &[(&Node, usize)],
+    sib: Sib,
+    ancestors: &[(&Node, Sib)],
 ) -> bool {
     // The rightmost compound matches the node itself.
     let (last, rest) = compounds.split_last().expect("non-empty selector");
-    if !matches_compound(node, last, sibling_index) {
+    if !matches_compound(node, last, sib) {
         return false;
     }
     // Preceding compounds match *some* ancestor (descendant combinator), in
@@ -289,11 +315,11 @@ fn matches_full_selector(
     // Walk the ancestor stack (nearest-first) matching each compound in turn.
     let mut comp_iter = rest.iter().rev();
     let mut comp = comp_iter.next();
-    for (ancestor, ancestor_idx) in ancestors.iter().rev() {
+    for (ancestor, ancestor_sib) in ancestors.iter().rev() {
         let Some(part) = comp else {
             break;
         };
-        if matches_compound(ancestor, part, *ancestor_idx) {
+        if matches_compound(ancestor, part, *ancestor_sib) {
             comp = comp_iter.next();
         }
     }
@@ -305,13 +331,20 @@ fn matches_full_selector(
 /// through [`walk`]/[`matches_full_selector`].
 pub fn matches_selector(node: &Node, selector: &str, sibling_index: usize) -> bool {
     let compounds: Vec<&str> = selector.split_whitespace().collect();
-    matches_full_selector(node, &compounds, sibling_index, &[])
+    // A bare index cannot express `:last-child`; treat the node as the only
+    // element sibling, which keeps the historical `matches_compound` behaviour
+    // for the tests that use this helper.
+    matches_full_selector(
+        node,
+        &compounds,
+        Sib::new(sibling_index, sibling_index + 1),
+        &[],
+    )
 }
 
 /// Match a single compound selector (e.g. `figcaption`, `.mw-default-size`,
-/// `*[typeof="mw:File"]`, `li:nth-child(3)`) against a node. `sibling_index` is
-/// the element-sibling index for pseudo-class evaluation.
-fn matches_compound(node: &Node, compound: &str, sibling_index: usize) -> bool {
+/// `*[typeof="mw:File"]`, `li:nth-child(3)`) against a node.
+fn matches_compound(node: &Node, compound: &str, sib: Sib) -> bool {
     if !matches!(node.kind, NodeKind::Element(_)) {
         return false;
     }
@@ -326,7 +359,7 @@ fn matches_compound(node: &Node, compound: &str, sibling_index: usize) -> bool {
     }
 
     if let Some(pseudo) = pseudo {
-        return matches_pseudo(pseudo, sibling_index);
+        return matches_pseudo(pseudo, sib);
     }
     true
 }
@@ -417,8 +450,8 @@ fn take_attr_selector(rest: &str) -> (&str, &str) {
 /// Faithful to CSS for the simple integer cases used by the parser tests. The
 /// `1-based` index is derived from `sibling_index`; `last` is the total number
 /// of element siblings (not tracked here, so `:last-child` is approximated).
-fn matches_pseudo(pseudo: &str, sibling_index: usize) -> bool {
-    let one_based = sibling_index + 1;
+fn matches_pseudo(pseudo: &str, sib: Sib) -> bool {
+    let one_based = sib.index + 1;
     if let Some(inner) = pseudo.trim().strip_prefix("nth-child(")
         && let Some(inner) = inner.strip_suffix(')')
     {
@@ -437,8 +470,8 @@ fn matches_pseudo(pseudo: &str, sibling_index: usize) -> bool {
         return matches_an_plus_b(inner, one_based);
     }
     match pseudo.trim() {
-        "first-child" => one_based == 1,
-        "last-child" => one_based == 1, // approximated; refined via find count when needed
+        "first-child" => sib.index == 0,
+        "last-child" => one_based == sib.total,
         _ => false,
     }
 }
@@ -713,17 +746,25 @@ mod tests {
     fn test_matches_compound_selector() {
         use crate::dom::node::ElementKind;
         let li = Node::element(ElementKind::ListItem);
-        assert!(matches_compound(&li, "li", 0));
-        assert!(!matches_compound(&li, "p", 0));
-        assert!(matches_compound(&li, "li:nth-child(3)", 2));
-        assert!(!matches_compound(&li, "li:nth-child(3)", 1));
+        assert!(matches_compound(&li, "li", Sib::new(0, 8)));
+        assert!(!matches_compound(&li, "p", Sib::new(0, 8)));
+        assert!(matches_compound(&li, "li:nth-child(3)", Sib::new(2, 8)));
+        assert!(!matches_compound(&li, "li:nth-child(3)", Sib::new(1, 8)));
         // Class + universal + attribute.
         let mut fig = Node::element(ElementKind::Other("figcaption".into()));
         fig.set_attr("class", "mw-default-size foo");
-        assert!(matches_compound(&fig, "figcaption.mw-default-size", 0));
-        assert!(!matches_compound(&fig, "figcaption.mw-bogus", 0));
-        assert!(matches_compound(&fig, "*.mw-default-size", 0));
-        assert!(matches_compound(&fig, "*", 0));
+        assert!(matches_compound(
+            &fig,
+            "figcaption.mw-default-size",
+            Sib::new(0, 8)
+        ));
+        assert!(!matches_compound(
+            &fig,
+            "figcaption.mw-bogus",
+            Sib::new(0, 8)
+        ));
+        assert!(matches_compound(&fig, "*.mw-default-size", Sib::new(0, 8)));
+        assert!(matches_compound(&fig, "*", Sib::new(0, 8)));
     }
 
     #[test]
@@ -731,8 +772,16 @@ mod tests {
         use crate::dom::node::ElementKind;
         let mut span = Node::element(ElementKind::Other("span".into()));
         span.set_attr("typeof", "mw:File");
-        assert!(matches_compound(&span, "*[typeof=\"mw:File\"]", 0));
-        assert!(!matches_compound(&span, "*[typeof=\"mw:File/Thumb\"]", 0));
+        assert!(matches_compound(
+            &span,
+            "*[typeof=\"mw:File\"]",
+            Sib::new(0, 8)
+        ));
+        assert!(!matches_compound(
+            &span,
+            "*[typeof=\"mw:File/Thumb\"]",
+            Sib::new(0, 8)
+        ));
     }
 
     #[test]

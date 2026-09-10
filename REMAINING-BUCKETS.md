@@ -1,6 +1,19 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **843/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+Current baseline: **845/891 fixtures pass** (95%). Lib tests: 652 pass. Clippy: clean.
+
+## Landed: `:last-child` in the test-harness selector (843 → 845)
+
+`matches_pseudo` had `:last-child` stubbed as `one_based == 1` (i.e. identical to
+`:first-child`), so `["td:last-child", "after", …]` matched the *first* cell and
+the pasted cell landed at the front of the row.
+
+The sibling index is now a small `Sib { index, total }` carrying both the
+0-based element-sibling position and the total element-sibling count, threaded
+through `walk`/`matches_full_selector`/`matches_compound`/`matches_pseudo`, so
+`:last-child` is `index + 1 == total`.
+
+Fixed: "T319143 - copy-pasting of cells, after multiple cells" (both variants).
 
 ## Landed: `DisplaySpace` (842 → 843)
 
