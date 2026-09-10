@@ -2858,55 +2858,63 @@ impl<'a> PegTokenizer<'a> {
             return false;
         }
 
-        // Find the closing `]`, skipping any nested `[[…]]` (a wikilink inside the
-        // link text must not terminate the outer extlink). Track bracket depth so
-        // the extlink closes at the first depth-0 `]`.
+        // Parse `[url (spaces) content? ]` per PHP's `extlink` rule:
+        //   "[" url (space)* inlineline<extlink>? "]"
+        //
+        // The URL scan stops at the first character that cannot continue a URL
+        // (`[`, `<`, `]`, `}`, whitespace, quotes, …) but *does* continue through
+        // the `[&|{\-!}=]` fallback set, so `|` is part of the URL
+        // (`[http://x|a]` → href `http://x|a`). That is why
+        // `[http://example.com|[[Example]]]` yields href `http://example.com|`
+        // with `[[Example]]` as link *content*, not a longer href.
         let rem = self.remaining();
-        let end = find_extlink_close(rem);
-        if let Some(end) = end {
-            let content = &rem[..end];
-            let (url, text) = if let Some(space) = content.find([' ', '\t']) {
-                (
-                    content[..space].to_string(),
-                    Some(content[space + 1..].to_string()),
-                )
-            } else {
-                (content.to_string(), None)
-            };
+        let url_end = scan_extlink_url_len(rem);
+        let url = &rem[..url_end];
 
-            self.advance(end + 1);
+        // `sp:$( space / unispace )*` — the whitespace run before the content.
+        let after_url = &rem[url_end..];
+        let spaces_len = after_url.len() - after_url.trim_start_matches([' ', '\t']).len();
+        let content_src_start = url_end + spaces_len;
+        let content_rem = &rem[content_src_start..];
 
-            let dp = self.make_dp(saved, self.pos);
-            let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
-            stt.add_attribute_str("href", &url);
+        // Find the closing `]`, skipping any nested `[[…]]` (a wikilink inside the
+        // link text must not terminate the outer extlink).
+        let Some(rel_end) = find_extlink_close(content_rem) else {
+            self.pos = saved;
+            return false;
+        };
+        let text = &content_rem[..rel_end];
+        let content_end = content_src_start + rel_end;
 
-            // Text content spans from just after the URL + separating space to
-            // the closing `]`. `extLinkContentOffsets->start` covers "all spaces
-            // before content", used by `ExternalLinkHandler::onExtLink` and
-            // `ComputeDSR::computeATagWidth` (mirrors the PHP tokenizer).
-            if let Some(t) = &text {
-                let space_offset = 1; // the single separating space
-                let content_start = saved + 1 + url.len() + space_offset;
-                stt.data_parsoid.tmp.ext_link_content_offsets =
-                    Some(crate::wikitext::tokens_v2::SourceRange::new(
-                        content_start,
-                        content_start + t.len(),
-                    ));
-                stt.attribs.push(KV {
-                    key: KeyValue::Str("mw:content".to_string()),
-                    value: tokenize_link_content(t, self.lang_conv_enabled, &self.ext_tags),
-                    src_offsets: None,
-                    ksrc: None,
-                    vsrc: None,
-                });
-            }
+        // `rem` starts just after the opening `[`, so `content_end` is already
+        // relative to the current position; only the closing `]` needs adding.
+        self.advance(content_end + 1);
 
-            self.emit_token(ParsoidToken::SelfclosingTag(stt));
-            return true;
+        let dp = self.make_dp(saved, self.pos);
+        let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
+        stt.add_attribute_str("href", url);
+
+        // Text content spans from just after the URL + separating spaces to the
+        // closing `]`. `extLinkContentOffsets` covers "all spaces before content",
+        // used by `ExternalLinkHandler::onExtLink` and
+        // `ComputeDSR::computeATagWidth` (mirrors the PHP tokenizer).
+        if !text.is_empty() {
+            stt.data_parsoid.tmp.ext_link_content_offsets =
+                Some(crate::wikitext::tokens_v2::SourceRange::new(
+                    saved + 1 + content_src_start,
+                    saved + 1 + content_end,
+                ));
+            stt.attribs.push(KV {
+                key: KeyValue::Str("mw:content".to_string()),
+                value: tokenize_link_content(text, self.lang_conv_enabled, &self.ext_tags),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
         }
 
-        self.pos = saved;
-        false
+        self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        true
     }
 
     /// Try quote: `''`, `'''`, `'''''`
@@ -3498,11 +3506,64 @@ fn is_space_or_nbsp(c: char) -> bool {
     )
 }
 
+/// Length of the URL at the start of `input`, per PHP's `extlink_nonipv6url`
+/// (which delegates to `extlink_nonipv6url_parameterized<linkdesc=false>`).
+///
+/// The fast path accepts everything outside `[^<[{\n\r|!\]}\-\t&="' …]`; the
+/// fallback `[&|{\-!}=]` then permits those characters when they do not start a
+/// `url_directive` or an entity. The net effect: a `|`, `&`, `=`, `{`, `}`(opening),
+/// `-`, or `!` continues the URL, while `[`, `<`, `]`, whitespace, and quotes stop
+/// it. A `{`/`}` that opens a `{{…}}`/`{|` directive stops the URL, and an `&`
+/// that opens an entity stops it (the entity becomes part of the link content).
+fn scan_extlink_url_len(input: &str) -> usize {
+    let mut i = 0usize;
+    while i < input.len() {
+        let ch = input[i..].chars().next().unwrap_or('\0');
+        // Characters that always terminate a non-IPv6 URL.
+        if matches!(ch, '<' | '[' | '\n' | '\r' | ']' | '}' | '\t' | '"' | ' ')
+            || is_space_or_nbsp(ch)
+        {
+            break;
+        }
+        // Directives (templates, comments, language variants) end the URL.
+        if input[i..].starts_with("{{")
+            || input[i..].starts_with("-{")
+            || input[i..].starts_with("<!--")
+        {
+            break;
+        }
+        // An `&` that starts an entity is content, not URL.
+        if ch == '&' && is_entity_at(input, i) {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    i
+}
+
+/// Whether an `&…;` entity (a valid HTML character reference) starts at `i`.
+fn is_entity_at(input: &str, i: usize) -> bool {
+    let rem = &input[i..];
+    if !rem.starts_with('&') {
+        return false;
+    }
+    let Some(rel) = rem[1..].find(';') else {
+        return false;
+    };
+    if rel == 0 {
+        return false;
+    }
+    let body = &rem[1..1 + rel];
+    let len = body.len();
+    body.chars().all(|c| c.is_ascii_alphanumeric() || c == '#')
+        && (len <= 8 || body.starts_with('#'))
+}
+
 /// Find the byte offset of the closing `]` of an external link, skipping nested
 /// `[[…]]` wikilinks (which must not terminate the outer extlink). Mirrors the
 /// PHP `extlink_preprocessor_text` which tracks balanced brackets.
 fn find_extlink_close(input: &str) -> Option<usize> {
-    let mut i = 0;
+    let mut i = 0usize;
     let mut bracket_depth: i32 = 0;
     while i < input.len() {
         if input[i..].starts_with("[[") {
@@ -5524,6 +5585,65 @@ mod tests {
         // An unrecognized tag is plain text, so its `|` still splits.
         let parts = split_wikilink_content("Test|<foo class=\"a|b\">");
         assert_eq!(parts, vec!["Test", "<foo class=\"a", "b\">"]);
+    }
+
+    #[test]
+    fn test_extlink_url_allows_pipe_stops_at_bracket() {
+        // PHP's `extlink_nonipv6url` continues through `|` (and the other
+        // `[&|{\-!}=]` fallback chars) but stops at `[`.
+        assert_eq!(scan_extlink_url_len("http://x|a]"), 10);
+        assert_eq!(scan_extlink_url_len("http://x]"), 8);
+        assert_eq!(scan_extlink_url_len("http://example.com|[[X]]]"), 19);
+
+        // A page URL with query/fragment characters stays intact.
+        assert_eq!(scan_extlink_url_len("//x/y?a=b&c=d]"), 13);
+        // An entity is link content, not URL.
+        assert_eq!(scan_extlink_url_len("http://x&amp;]"), 8);
+    }
+
+    #[test]
+    fn test_extlink_leaves_trailing_bracket() {
+        // `[http://x]]` is an extlink with empty content plus a literal `]`, so
+        // the wikilink `[[http://x]]` can bail to `[` + autonumber + `]`.
+        let tokens = tokenize("[http://www.example.com]]");
+        let ext = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink" => Some(tk),
+                _ => None,
+            })
+            .expect("extlink token");
+        assert_eq!(
+            ext.data_parsoid.tsr.as_ref().map(|r| (r.start, r.end)),
+            Some((Some(0), 24))
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, Either::Left(s) if s == "]"))
+        );
+    }
+
+    #[test]
+    fn test_extlink_url_stops_at_nested_wikilink() {
+        // `[http://example.com|[[Example]]]` → href `http://example.com|` (the
+        // `|` is part of the URL) with `[[Example]]` as link content.
+        let tokens = tokenize("[http://example.com|[[Example]]]");
+        let ext = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink" => Some(tk),
+                _ => None,
+            })
+            .expect("extlink token");
+        let attr = |name: &str| {
+            ext.attribs
+                .iter()
+                .find(|k| k.key.as_str() == Some(name))
+                .map(|k| crate::wikitext::token_utils::key_value_to_string(&k.value))
+        };
+        assert_eq!(attr("href").as_deref(), Some("http://example.com|"));
+        assert_eq!(attr("mw:content").as_deref(), Some("[[Example]]"));
     }
 
     #[test]
