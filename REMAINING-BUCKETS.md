@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **859/891 fixtures pass** (96%). Lib tests: 663 pass. Clippy: clean.
+Current baseline: **860/891 fixtures pass** (97%). Lib tests: 665 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -8,6 +8,89 @@ Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 **skips** in standalone mode, so its expectation is unreachable for rustoid. 36
 fixtures are in that state; most still compare equal, so the fallback is left in
 place (skipping them would hide real divergences rather than surface them).
+
+## Landed: indent-pre nowikis and `hasBlocksOnLine` (859 → 860)
+
+`Parsoid: Default to a newline after tables in new content (T53219)` now
+passes. Two linked gaps in the html2wt serializer:
+
+1. **The indent-pre escape only fired in multiline mode.**
+   PHP's condition is `$indentPreUnsafe && ( !hasBlocksOnLine(
+   $state->currLine->firstNode, true) || !empty($opts['inMultilineMode']) )`;
+   the `hasBlocksOnLine` term was missing, so a space at start of line was
+   returned verbatim and re-read as indent-pre. Ported `hasBlocksOnLine` and
+   `startsOnANewLine`, and `escapedText` now protects *just the space* with
+   `<nowiki> </nowiki>` (PHP splits on `/(^|\n) /`) instead of wrapping the
+   whole text.
+
+2. **`stripUnnecessaryIndentPreNowikis` was never ported.**
+   `has_indent_pre_nowikis` was set but never read, so the protecting nowiki
+   survived into the output. The pass now runs on the assembled output,
+   dropping the nowiki *and* the whitespace it protected unless the content
+   would read as a sol-sensitive construct (`=*#:;`), in which case a
+   self-closing `<nowiki/>` remains.
+
+Verified against Parsoid itself: `</table> bar` → `|}\nbar`, but
+`</table> =bar` → `|}\n<nowiki/>=bar`. PHP's two site-config regexps behind
+this pass have no rustoid equivalent, so the constructs are recognised
+structurally (`sol_transparent_no_ws_len` / `is_sol_transparent_line` over
+comments, category links and behaviour switches).
+
+## Landed: `wrapperUnmodified` and the `+` combinator (no fixture change)
+
+Two faithful fixes that `Invalid text in table attributes should be preserved
+by selective serializer` also needs (it still fails on a third issue, below).
+
+1. **`wrapperUnmodified` was not modelled.** PHP's `DOMHandler::handle` takes
+   it, and `serializeTableTag` returns `getOrigSrc($dsr->openRange())` when
+   set. Without it a table tag whose only change is in a descendant was
+   re-serialized from the DOM, losing non-attribute wikitext inside the tag
+   and normalizing quoting (`{| <span>boo</span> style='border:1px solid
+   black'` came back as `{| style="border:1px solid black"`). The trait, all
+   handlers, and the call site now thread it.
+
+2. **The change-application selector engine only supported the descendant
+   combinator.** The fixture's `td + td` change matched nothing and was
+   *silently* dropped, so cell 2 kept its old text. PHP's
+   `querySelectorAll` would have matched — and its runner errors out when a
+   selector matches nothing, which is why the silence was easy to miss.
+   `parse_selector` now records the combinator between compounds and
+   `matches_steps` walks the previous-element-sibling chain for `+`.
+
+## Next: selser leading-whitespace recovery inside a cell
+
+`Invalid text in table attributes should be preserved by selective serializer`
+is now down to a single difference:
+
+```
+expected: ... style='color:blue'  | abc      got: ... style='color:blue'  |abc
+expected: |<span>boo</span> style='color:blue'| xyz   got: ...|xyz
+```
+
+The extra space comes from `Separators::recoverTrimmedWhitespace($node, true)`
+— the table cell's original content was ` 1`, and `CleanUp::trimWhiteSpace`
+recorded `leadingWS = 1` on the cell's DSR (rustoid records this correctly:
+both cells parse to `leading_ws: 1`, matching PHP exactly).
+
+Reproduced in isolation with the fixture's own changetree:
+
+```
+wt:     {| <span>boo</span> style='border:1px solid black'
+        |  <span>boo</span> style='color:blue'  | 1
+        |<span>boo</span> style='color:blue'| 2
+        |}
+changes: [["td:first-child","text","abc"],["td + td","text","xyz"]]
+both <td> dsr = (start 51/95, open_width 41/37, leading_ws 1, trailing_ws 0)
+got:    ...|abc  ...|xyz      (PHP: ...| abc  ...| xyz)
+```
+
+So the DSR data is right and the recovery code exists
+(`separators.rs:263-272` calls it for `SepType::ParentChild`); the separator
+never reaches the output. Most likely the recovered `" "` is placed on the
+wrong side of the newline in `make_separator` (it appends the newline buffer
+*after* the seed text, giving `" \n"`), or the `|` chunk's
+`last_source_node` short-circuits `emit_sep_for_node`. Instrument
+`Separators::build_sep` for the text child of the first `<td>` to settle it.
 
 ## Landed: token-level argument substitution (858 → 859)
 
