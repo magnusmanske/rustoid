@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::error::Result;
+use crate::resource_limits::Wt2HtmlLimits;
 use crate::title::Title;
 
 // ---------------------------------------------------------------------------
@@ -128,6 +129,13 @@ pub trait SiteConfig: Send + Sync {
 
     /// Recognized extension tag names (e.g. `"ref"`, `"gallery"`, `"poem"`).
     fn extension_tags(&self) -> &[String];
+
+    /// Per-parse wt2html resource limits, keyed by resource name. Mirrors PHP's
+    /// `SiteConfig::getWt2HtmlLimits` / the `wt2htmlLimits` property. A resource
+    /// absent from the map is unlimited.
+    fn wt2html_limits(&self) -> Wt2HtmlLimits {
+        Wt2HtmlLimits::default()
+    }
 
     /// The base URL for constructing full URLs (e.g. `"https://en.wikipedia.org"`).
     fn server_url(&self) -> &str;

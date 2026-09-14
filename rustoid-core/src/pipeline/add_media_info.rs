@@ -9,15 +9,21 @@
 //! `<a class="mw-file-description" href="./File:…">` description link. Missing
 //! or bad-list files keep the broken markup and gain an `mw:Error` type.
 //!
+//! The `image` wt2html resource limit (`wgParsoidMaximumImages`) is enforced
+//! here too: containers are deduplicated by file + requested size, and once the
+//! budget is spent (`SiteConfig::wt2html_limits`) further media is refused and
+//! marked `apierror-imagelimitexceeded` rather than rendered.
+//!
 //! Only the bitmap-image branch of the PHP processor is implemented here;
-//! audio/video (`handleAudio`/`handleVideo`), manual-thumb, pagination, and the
-//! timed-media option surface are deferred until the corresponding file-info
-//! fields are plumbed through.
+//! audio/video (`handleAudio`/`handleVideo`), pagination, and the timed-media
+//! option surface are deferred until the corresponding file-info fields are
+//! plumbed through.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
+use crate::resource_limits::{Bump, ResourceUsage};
 use crate::title::{Title, TitleParser};
 use crate::traits::{DataSource, FileInfo, SiteConfig};
 
@@ -33,6 +39,32 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
     // Collect containers (deepest-first) with their index paths from `root`.
     let mut jobs: Vec<ContainerJob> = Vec::new();
     collect_containers(root, &mut Vec::new(), &mut jobs, config);
+
+    // Apply the `image` resource limit, in the order the containers were
+    // collected. PHP walks `querySelectorAll('[typeof*="mw:File"]')`, i.e.
+    // document order; rustoid's walk is deepest-first, which visits siblings in
+    // the same relative order (nested media are rare and only differ when an
+    // image sits inside another image's caption).
+    //
+    // Mirrors `AddMediaInfo::run`'s `isset($files[$infoKey]) ||
+    // $env->bumpWt2HtmlResourceUse('image')` guard: a container that resolves to
+    // the same file *and* requested size as an earlier one reuses that slot and
+    // does not consume limit budget.
+    let mut usage = ResourceUsage::new(config);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for job in jobs.iter_mut() {
+        let info_key = format!("{}\u{1}{}", job.title.full_text(), job.dims_key);
+        if seen.contains(&info_key) {
+            continue;
+        }
+        seen.insert(info_key);
+        // The guard is `isset($files[$infoKey]) || bump(...)`, so *any* non-`true`
+        // bump result (PHP `false` or `null`) refuses this container. PHP keeps
+        // the two apart only to report the limit once rather than per token.
+        if usage.bump_one("image") != Bump::Within {
+            job.limit_reached = true;
+        }
+    }
 
     // Fetch file info, following any redirect to retrieve the *target's* media
     // info (its `src`/dimensions) while keeping `job.title` as the original
@@ -68,8 +100,28 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
         }
     }
 
+    // Page info for the titles whose media was refused by the limit: PHP looks
+    // these up in one batch (`getPageInfoBatched`) and uses `missing && !known`
+    // to decide whether the container is broken (leaving its red upload anchor).
+    let limit_titles: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        jobs.iter()
+            .filter(|j| j.limit_reached)
+            .map(|j| j.title.full_text())
+            .filter(|t| seen.insert(t.clone()))
+            .collect()
+    };
+    let page_info = if limit_titles.is_empty() {
+        HashMap::new()
+    } else {
+        source
+            .get_page_info(&limit_titles)
+            .await
+            .unwrap_or_default()
+    };
+
     for job in &jobs {
-        apply_media_info(root, job, &infos, config);
+        apply_media_info(root, job, &infos, &page_info, config);
     }
 }
 
@@ -92,6 +144,15 @@ struct ContainerJob {
     /// recovered from the broken span's `data-parsoid.sa.resource`, used to
     /// round-trip a non-canonical namespace alias through html2wt.
     href_src: Option<String>,
+    /// PHP's `$dims` array for this container, rendered into a stable string.
+    /// Together with the file DB key it forms the `$infoKey` dedup key, so two
+    /// containers that resolve to the same file *and* the same requested size
+    /// share one limit slot.
+    dims_key: String,
+    /// Set when the `image` resource limit refused this container (PHP's
+    /// `$infoKey === false`): the media keeps its broken markup and gains
+    /// `mw:Error` plus `apierror-imagelimitexceeded`.
+    limit_reached: bool,
 }
 
 /// Resolve the `<a>` anchor inside a media container, descending through any
@@ -276,6 +337,59 @@ fn lang_from_container(root: &Node, path: &[usize]) -> Option<String> {
     span.and_then(|s| s.get_attr("lang").map(str::to_string))
 }
 
+/// Build PHP's `$dims` array for a container and render it into a stable string
+/// for the `$infoKey` dedup key.
+///
+/// Mirrors the assembly in `AddMediaInfo::run`: `width`/`height` are read as
+/// non-zero integers from the broken span (falsy becomes `null`), then `page`,
+/// `lang`, `seek` (from `thumbtime`/`starttime`) and `isDefault` are added in
+/// that order. Only fields actually present take part, so two containers asking
+/// for the same file at the same size collide (and share one limit slot).
+fn dims_key_from_container(container: &Node) -> String {
+    let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
+    let mut parts: Vec<String> = Vec::new();
+
+    // `'width' => (int)$attr ?: null` — a zero width is dropped.
+    if let Some(w) = span
+        .and_then(|s| s.get_attr("data-width"))
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n != 0)
+    {
+        parts.push(format!("width={w}"));
+    }
+    if let Some(h) = span
+        .and_then(|s| s.get_attr("data-height"))
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n != 0)
+    {
+        parts.push(format!("height={h}"));
+    }
+    if let Some(page) = data_mw_txt(container, "page") {
+        parts.push(format!("page={page}"));
+    }
+    if let Some(lang) = span.and_then(|s| s.get_attr("lang")) {
+        parts.push(format!("lang={lang}"));
+    }
+    // `seek` is derived from `thumbtime`/`starttime` via `parseTimeString`, which
+    // rustoid does not implement; a media container in a parser-test fixture
+    // never carries either, so the key omits it exactly when PHP would too.
+    // `isDefault` marks a width that came from default sizing.
+    if span.is_some_and(|s| s.get_attr("data-width").is_some())
+        && class_list(container).iter().any(|c| c == "mw-default-size")
+    {
+        parts.push("isDefault".to_string());
+    }
+
+    parts.join("\u{1}")
+}
+
+/// The `class` attribute of a node split into whitespace-separated tokens.
+fn class_list(node: &Node) -> Vec<String> {
+    node.get_attr("class")
+        .map(|c| c.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 /// The first element (non-text) child of `node`, if any.
 fn first_element_child(node: &Node) -> Option<&Node> {
     node.children
@@ -355,14 +469,17 @@ fn collect_containers(
         path.pop();
     }
     if is_media_container(node) && has_broken_span(node) && !has_error_type(node) {
+        let title = title_from_container(node, config);
         out.push(ContainerJob {
             path: path.clone(),
-            title: title_from_container(node, config),
+            dims_key: dims_key_from_container(node),
+            title,
             data_width: data_width_from_container(node),
             data_height: data_height_from_container(node),
             manualthumb: data_mw_txt(node, "manualthumb"),
             upright: upright_from_container(node),
             href_src: href_src_from_container(node),
+            limit_reached: false,
         });
     }
 }
@@ -374,6 +491,7 @@ fn apply_media_info(
     root: &mut Node,
     job: &ContainerJob,
     infos: &HashMap<String, Option<FileInfo>>,
+    page_info: &HashMap<String, crate::traits::PageInfo>,
     config: &dyn SiteConfig,
 ) {
     let info = infos.get(&job.title.full_text()).and_then(|i| i.clone());
@@ -405,6 +523,41 @@ fn apply_media_info(
 
     // The final `alt` for the image: explicit `alt=` wins, else the caption.
     let alt = explicit_alt.clone().or_else(|| caption_text.clone());
+
+    // The `image` resource limit refused this container (PHP's `$infoKey ===
+    // false`). The media is not rendered: it keeps its broken markup and gains
+    // `mw:Error` plus `apierror-imagelimitexceeded`.
+    //
+    // PHP additionally decides whether the container is *broken* by looking up
+    // the file's page info (`$limitFallbackInfo[$pageInfoKey]`): a missing page
+    // (and not otherwise known) leaves the anchor as the red upload link and
+    // skips `replaceAnchor` entirely, while a known page still gets rewritten
+    // into a file-description link.
+    if job.limit_reached {
+        let missing = page_info
+            .get(&job.title.full_text())
+            .is_some_and(|i| i.missing && !i.known);
+        if missing {
+            mark_error(
+                root,
+                &job.path,
+                "apierror-imagelimitexceeded",
+                "Image is not rendered due to image limit was exceeded",
+                alt.as_deref(),
+            );
+        } else {
+            mark_error_with_description_link(
+                root,
+                &job.path,
+                &job.title,
+                config,
+                "apierror-imagelimitexceeded",
+                "Image is not rendered due to image limit was exceeded",
+                alt.as_deref(),
+            );
+        }
+        return;
+    }
 
     let Some(info) = info else {
         // Missing file: leave broken, add `mw:Error` (mirrors `handleErrors`).
@@ -938,6 +1091,12 @@ fn mark_error_with_description_link(
             .retain(|a| a.key != "class" && a.key != "title" && a.key != "href");
         anchor.set_attr("href", crate::title::make_link(title, config));
         anchor.set_attr("class", "mw-file-description");
+        // A non-empty caption becomes the anchor `title` (mirrors the
+        // `if ( $captionText ) { $anchor->setAttribute( 'title', $captionText ); }`
+        // step at the end of `replaceAnchor`, which runs for every error case).
+        if let Some(alt) = alt.filter(|a| !a.is_empty()) {
+            anchor.set_attr("title", alt);
+        }
     }
 
     let errors = format!("{{\"errors\":[{{\"key\":\"{key}\",\"message\":\"{message}\"}}]}}");

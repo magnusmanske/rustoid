@@ -1107,6 +1107,11 @@ fn apply_config_raw(config: &mut MockSiteConfig, config_raw: &str) {
         let line = line.trim();
         if line == "wgParsoidExperimentalParserFunctionOutput=true" {
             config.set_parsoid_experimental_parser_function_output(true);
+        } else if let Some(v) = line.strip_prefix("wgParsoidMaximumImages=") {
+            // Mirrors the parser-test runner's `setWt2htmlLimit( 'image', … )`.
+            if let Ok(n) = v.trim().parse::<i64>() {
+                config.set_wt2html_limit("image", n);
+            }
         } else if let Some(v) = line.strip_prefix("wgExternalLinkTarget=") {
             config.set_external_link_target(v.trim_matches('"'));
         } else if let Some(v) = line.strip_prefix("wgNoFollowLinks=") {
@@ -1348,27 +1353,7 @@ fn build_edited_dom(
     if let Some(lang) = test.options.get("language") {
         config.set_language(lang);
     }
-    for line in test.config_raw.lines() {
-        let line = line.trim();
-        if line == "wgParsoidExperimentalParserFunctionOutput=true" {
-            config.set_parsoid_experimental_parser_function_output(true);
-        } else if let Some(v) = line.strip_prefix("wgExternalLinkTarget=") {
-            config.set_external_link_target(v.trim_matches('"'));
-        } else if let Some(v) = line.strip_prefix("wgNoFollowLinks=") {
-            config.set_no_follow_links(v.trim_matches('"') == "true");
-        } else if let Some(v) = line.strip_prefix("wgNoFollowDomainExceptions=") {
-            let v = v.trim();
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(v) {
-                for domain in arr {
-                    config.add_no_follow_domain_exception(&domain);
-                }
-            } else {
-                for domain in v.split(',') {
-                    config.add_no_follow_domain_exception(domain.trim().trim_matches('"'));
-                }
-            }
-        }
-    }
+    apply_config_raw(&mut config, &test.config_raw);
     let parser = Parser::new(&config);
 
     let wrap_sections = test.options_raw.contains("wrapSections\": true")

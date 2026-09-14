@@ -33,6 +33,7 @@
 
 pub mod error;
 pub mod options;
+pub mod resource_limits;
 pub mod title;
 pub mod traits;
 

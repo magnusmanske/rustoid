@@ -286,6 +286,8 @@ pub struct MockSiteConfig {
     /// Namespace IDs for which subpages are enabled (mirrors PHP's
     /// `$wgNamespacesWithSubpages` / `enableSubpagesForNS`).
     subpages_ns: std::collections::HashSet<i32>,
+    /// wt2html resource limits (mirrors PHP's `SiteConfig::$wt2htmlLimits`).
+    wt2html_limits: crate::resource_limits::Wt2HtmlLimits,
 }
 
 impl MockSiteConfig {
@@ -333,6 +335,7 @@ impl MockSiteConfig {
             no_follow_domain_exceptions: Vec::new(),
             localized_namespace_names: HashMap::new(),
             subpages_ns: std::collections::HashSet::new(),
+            wt2html_limits: crate::resource_limits::Wt2HtmlLimits::default(),
         };
 
         // Register standard MediaWiki namespaces. `case_sensitive` reflects
@@ -553,6 +556,12 @@ impl MockSiteConfig {
         self.no_follow_domain_exceptions.push(domain.to_string());
     }
 
+    /// Override a wt2html resource limit (mirrors the parser-test runner's
+    /// `setWt2htmlLimit`, e.g. for `wgParsoidMaximumImages`).
+    pub fn set_wt2html_limit(&mut self, resource: &str, limit: i64) {
+        self.wt2html_limits.set(resource, limit);
+    }
+
     /// Enable subpages for a namespace (mirrors PHP's `enableSubpagesForNS`,
     /// which the parser-test `subpage` option toggles).
     pub fn enable_subpages_for_ns(&mut self, ns: i32) {
@@ -680,6 +689,10 @@ impl SiteConfig for MockSiteConfig {
 
     fn extension_tags(&self) -> &[String] {
         &self.extension_tags
+    }
+
+    fn wt2html_limits(&self) -> crate::resource_limits::Wt2HtmlLimits {
+        self.wt2html_limits.clone()
     }
 
     fn server_url(&self) -> &str {
