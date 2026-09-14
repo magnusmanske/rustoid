@@ -386,6 +386,15 @@ impl WikitextSerializer {
         let body = body_content_node(&tree, root_id);
         crate::html::serializer::walk_children(&tree, body, &mut state);
         state.flush_line();
+        // If the serializer had to `nowiki` leading whitespace to avoid
+        // accidentally triggering indent-pre, revisit every such line: the
+        // nowiki is only needed when the line's content is not sol-transparent
+        // and no block tag on the line suppresses it anyway. Mirrors
+        // `serializeDOM`'s `stripUnnecessaryIndentPreNowikis`, which likewise
+        // runs on the assembled output.
+        if state.has_indent_pre_nowikis {
+            state.out = strip_unnecessary_indent_pre_nowikis(&state.out);
+        }
         // Prepend the buffered redirect at the start of the file, unless it was
         // already emitted inline (`unbuffered` sentinel). Faithful to
         // `serializeDOM`'s trailing redirect prepend.
@@ -403,6 +412,168 @@ impl WikitextSerializer {
             state.out
         }
     }
+}
+
+/// Revisit every line whose leading whitespace was protected with a
+/// `<nowiki>…</nowiki>`, keeping the nowiki only where it is actually needed.
+/// Faithful port of `WikitextSerializer::stripUnnecessaryIndentPreNowikis`.
+///
+/// PHP drives this off two site-config regexps,
+/// `solTransparentWikitextNoWsRegexp` (a run of comments, category links and
+/// behaviour switches) and `solTransparentWikitextRegexp` (the same, plus
+/// surrounding whitespace). rustoid has no exact equivalent of those strings, so
+/// the two are recognised structurally by [`sol_transparent_no_ws_len`] and
+/// [`is_sol_transparent_line`] over the same constructs: comments, category
+/// links, behaviour switches, and the redirect form.
+fn strip_unnecessary_indent_pre_nowikis(out: &str) -> String {
+    let mut result = String::with_capacity(out.len());
+    let mut rest = out;
+    while let Some(prot) = find_indent_pre_nowiki(rest) {
+        // Everything before the nowiki, plus the line's sol-transparent prefix
+        // (comments/category links/behaviour switches), which stays as it is.
+        result.push_str(&rest[..prot.nowiki_start]);
+        // The line content *after* the nowiki tag.
+        let after_nowiki = &rest[prot.nowiki_end..prot.end];
+
+        // `$reqd = !preg_match( solTransparentWikitextRegexp, $rest )` — the
+        // nowiki may go away when the line holds nothing but sol-transparent
+        // wikitext (plus the whitespace it was protecting).
+        let reqd = !is_sol_transparent_line(&format!("{}{after_nowiki}", prot.whitespace));
+
+        if !reqd {
+            // Put the whitespace back; nothing needed protecting.
+            result.push_str(&prot.whitespace);
+            result.push_str(after_nowiki);
+        } else {
+            // Drop both the nowiki and the whitespace it protected, keeping a
+            // self-closing `<nowiki/>` only when the content would otherwise
+            // read as a sol-sensitive construct (`=`, `*`, `#`, `:`, `;`).
+            let content = after_nowiki.trim_start_matches([' ', '\t']);
+            if content.starts_with(['=', '*', '#', ':', ';']) {
+                result.push_str("<nowiki/>");
+            }
+            result.push_str(content);
+        }
+        rest = &rest[prot.end..];
+    }
+    result.push_str(rest);
+    result
+}
+
+/// A leading indent-pre `<nowiki>` found in the assembled output.
+struct IndentPreNowiki {
+    /// Byte offset (into the searched text) of the `<nowiki>` tag itself.
+    nowiki_start: usize,
+    /// Byte offset just past the closing `</nowiki>`.
+    nowiki_end: usize,
+    /// The whitespace the nowiki was protecting.
+    whitespace: String,
+    /// Byte offset just past the line (including its newline, if any).
+    end: usize,
+}
+
+/// Locate the next `<nowiki>WS</nowiki>` that directly follows a sol-transparent
+/// line prefix, mirroring the anchor of PHP's `$noWikiRegexp`:
+/// `^<solTransparentNoWs>((?i:<nowiki>\s+</nowiki>))([^\n]*(?:\n|$))`.
+fn find_indent_pre_nowiki(text: &str) -> Option<IndentPreNowiki> {
+    let mut offset = 0usize;
+    while offset <= text.len() {
+        let line_end = text[offset..]
+            .find('\n')
+            .map_or(text.len(), |n| offset + n + 1);
+        let line = &text[offset..line_end];
+        let prefix_len = sol_transparent_no_ws_len(line);
+        let after_prefix = &line[prefix_len..];
+        if let Some((whitespace, tag_end)) = parse_nowiki_ws(after_prefix) {
+            return Some(IndentPreNowiki {
+                nowiki_start: offset + prefix_len,
+                nowiki_end: offset + prefix_len + tag_end,
+                whitespace,
+                end: line_end,
+            });
+        }
+        if line_end >= text.len() {
+            break;
+        }
+        offset = line_end;
+    }
+    None
+}
+
+/// If `s` starts with `<nowiki>‹whitespace›</nowiki>` (case-insensitive),
+/// return that whitespace and the offset just past the closing tag.
+fn parse_nowiki_ws(s: &str) -> Option<(String, usize)> {
+    let lower = s.get(..10)?.to_ascii_lowercase();
+    if !lower.starts_with("<nowiki>") {
+        return None;
+    }
+    let body_start = 8;
+    let rel_close = s[body_start..].to_ascii_lowercase().find("</nowiki>")?;
+    let ws = &s[body_start..body_start + rel_close];
+    if ws.is_empty() || !ws.chars().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((ws.to_string(), body_start + rel_close + "</nowiki>".len()))
+}
+
+/// Length of the leading `solTransparentWikitextNoWsRegexp` match in `line`: a
+/// run of comments, category links and behaviour switches (optionally preceded
+/// by a redirect).
+fn sol_transparent_no_ws_len(line: &str) -> usize {
+    let mut i = 0usize;
+    while i < line.len() {
+        if let Some(end) = crate::html::handlers::comment_at(line, i) {
+            i = end;
+        } else if let Some(end) = sol_transparent_link_at(line, i) {
+            i = end;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Whether `line` is entirely sol-transparent wikitext (optionally surrounded by
+/// whitespace), mirroring `solTransparentWikitextRegexp`.
+fn is_sol_transparent_line(line: &str) -> bool {
+    let line = line.trim_end_matches('\n');
+    let trimmed = line.trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}']);
+    let prefix_len = sol_transparent_no_ws_len(trimmed);
+    // The regexp allows leading/trailing whitespace and repeated
+    // sol-transparent items, so the prefix must span to the end once the
+    // surrounding whitespace is set aside.
+    trimmed[prefix_len..]
+        .trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
+        .is_empty()
+}
+
+/// Recognise a comment (`<!--…-->`), a category link (`[[Category:…]]`), or a
+/// behaviour switch (`__FOO__`) at `i`, returning the offset just past it.
+/// Mirrors the `$category`, `$bswRegexp` and `$comment` alternatives of
+/// `solTransparentWikitextNoWsRegexp`.
+fn sol_transparent_link_at(line: &str, i: usize) -> Option<usize> {
+    if let Some(end) = crate::html::handlers::comment_at(line, i) {
+        return Some(end);
+    }
+    // Behaviour switch: `__` + word + `__`.
+    if line[i..].starts_with("__")
+        && let Some(rel) = line[i + 2..].find("__")
+        && rel > 0
+        && line[i + 2..i + 2 + rel]
+            .chars()
+            .all(|c| c.is_alphanumeric())
+    {
+        return Some(i + 2 + rel + 2);
+    }
+    // Category link: `[[Category:…]]` (case-insensitive prefix, matching the
+    // localized `categoryRegexp` for the default `Category` namespace).
+    if line[i..].starts_with("[[")
+        && line[i + 2..].to_ascii_lowercase().starts_with("category:")
+        && let Some(rel) = line[i + 2..].find("]]")
+    {
+        return Some(i + 2 + rel + 2);
+    }
+    None
 }
 
 /// Resolve the node whose children are the document body content, mirroring
@@ -778,6 +949,32 @@ fn strip_mw_empty_elt_once(v: &str) -> String {
 mod tests {
     use super::*;
     use crate::dom::node::{ElementKind, Node};
+
+    #[test]
+    fn test_strip_unnecessary_indent_pre_nowikis() {
+        // A nowiki that was only protecting a space in front of plain content is
+        // dropped along with the space (mirrors PHP: the content is neither
+        // sol-transparent nor suppressed by a block tag).
+        assert_eq!(
+            strip_unnecessary_indent_pre_nowikis("|}\n<nowiki> </nowiki>bar"),
+            "|}\nbar"
+        );
+        // ...unless the content would read as a sol-sensitive construct, where a
+        // self-closing `<nowiki/>` keeps the meaning (`=bar` must not become a
+        // heading).
+        assert_eq!(
+            strip_unnecessary_indent_pre_nowikis("|}\n<nowiki> </nowiki>=bar"),
+            "|}\n<nowiki/>=bar"
+        );
+        // A line holding nothing but a comment is sol-transparent, so the
+        // protected whitespace is restored verbatim.
+        assert_eq!(
+            strip_unnecessary_indent_pre_nowikis("<nowiki> </nowiki><!-- c -->"),
+            " <!-- c -->"
+        );
+        // Output without any indent-pre nowiki is untouched.
+        assert_eq!(strip_unnecessary_indent_pre_nowikis("a\n\nb"), "a\n\nb");
+    }
 
     #[test]
     fn test_serialize_html_tag() {

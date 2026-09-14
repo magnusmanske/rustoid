@@ -388,7 +388,12 @@ impl<'a> SerializerState<'a> {
                 is_last_child: self.is_last_child,
                 in_multiline_mode: false,
             };
-            text = crate::html::wikitext_escape_handlers::escape_wikitext(self, tree, &text, opts);
+            let (escaped, added_nowiki) =
+                crate::html::wikitext_escape_handlers::escape_wikitext_tracked(
+                    self, tree, &text, opts,
+                );
+            text = escaped;
+            self.has_indent_pre_nowikis |= added_nowiki;
             self.needs_escaping = false;
         }
         self.push_to_curr_line(ConstrainedText::cast(text, node));

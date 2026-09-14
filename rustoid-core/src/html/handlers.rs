@@ -2358,7 +2358,12 @@ pub struct PreHandler;
 
 /// Match a wikitext comment at `text[i..]`: `<!--` … `-->` (first closing).
 /// Returns the end index (past `-->`) when `text[i..]` begins with a comment.
-/// Mirrors PHP's `COMMENT_REGEXP = /<!--(?>[\s\S]*?-->)/`.
+/// Mirrors PHP's `COMMENT_REGEXP = /<!--(?>[\s\S]*?-->)`.
+/// If a comment starts at `i`, return the offset just past its `-->`.
+pub fn comment_at(text: &str, i: usize) -> Option<usize> {
+    match_comment_at(text, i)
+}
+
 fn match_comment_at(text: &str, i: usize) -> Option<usize> {
     let rest = &text[i..];
     if !rest.starts_with("<!--") {

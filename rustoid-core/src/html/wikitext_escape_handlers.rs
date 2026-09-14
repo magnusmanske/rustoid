@@ -188,6 +188,21 @@ pub fn escape_wikitext(
     text: &str,
     opts: EscapeOpts,
 ) -> String {
+    let (escaped, _) = escape_wikitext_tracked(state, tree, text, opts);
+    escaped
+}
+
+/// As [`escape_wikitext`], additionally reporting whether the result carries a
+/// `<nowiki>` that protects leading whitespace from being read as indent-pre.
+/// The caller records that so the final `stripUnnecessaryIndentPreNowikis` pass
+/// runs (mirrors PHP setting `$state->hasIndentPreNowikis` in `escapeWikitext`).
+pub fn escape_wikitext_tracked(
+    state: &SerializerState,
+    tree: &crate::html::dom_tree::DomTree,
+    text: &str,
+    opts: EscapeOpts,
+) -> (String, bool) {
+    let mut added_indent_pre_nowiki = false;
     let sol = state.on_sol && !(state.in_indent_pre || state.in_php_block);
 
     // $hasMagicWord / $hasAutolink force a full token-walk check.
@@ -199,7 +214,10 @@ pub fn escape_wikitext(
     if let Some(protect) = &state.protect
         && text.contains(protect.as_str())
     {
-        return escaped_text(state, sol, text, false, false);
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     let has_quote_char;
@@ -215,7 +233,10 @@ pub fn escape_wikitext(
         has_non_quote_escapable_chars_ = has_non_quote_escapable_chars(text);
         if has_language_converter(text) {
             // Language-converter markers force the full token-walk.
-            return escaped_text(state, sol, text, false, false);
+            return (
+                escaped_text(state, sol, text, false, false),
+                added_indent_pre_nowiki,
+            );
         }
     }
     let indent_pre_unsafe = indent_pre_unsafe_;
@@ -223,7 +244,7 @@ pub fn escape_wikitext(
 
     // Quick check for the common case: pure text without wt-special characters.
     if !has_quote_char && !indent_pre_unsafe && !has_non_quote_escapable_chars {
-        return text.to_string();
+        return (text.to_string(), false);
     }
 
     // Context-specific escape handler: consult the top of the `wteHandlerStack`
@@ -233,22 +254,34 @@ pub fn escape_wikitext(
     if let Some(wte_handler) = state.wte_handler_stack.last()
         && wte_handler(state, text, &opts, tree)
     {
-        return escaped_text(state, false, text, true, false);
+        return (
+            escaped_text(state, false, text, true, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     // Quote-escape test.
     if text.contains("''") {
         if full_check_needed || indent_pre_unsafe || has_non_quote_escapable_chars {
-            return escaped_text(state, sol, text, false, false);
+            return (
+                escaped_text(state, sol, text, false, false),
+                added_indent_pre_nowiki,
+            );
         }
         // `escaped_ib_sibling_node_text` needs DOM sibling lookups; the
         // full-wrap is a conservative superset of its selective escaping.
-        return escaped_text(state, sol, text, false, false);
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     // Template and template-arg markers are escaped unconditionally.
     if text.contains("{{{") || text.contains("{{") || text.contains("}}}") || text.contains("}}") {
-        return escaped_text(state, false, text, false, false);
+        return (
+            escaped_text(state, false, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     // Multi-line: escape each line separately (faithful split-then-recurse).
@@ -284,7 +317,7 @@ pub fn escape_wikitext(
                 ));
             }
         }
-        return out;
+        return (out, added_indent_pre_nowiki);
     }
 
     let has_tildes = has_tildes(text);
@@ -298,7 +331,7 @@ pub fn escape_wikitext(
             && !text.contains("__")
             && !text.ends_with('=')
         {
-            return text.to_string();
+            return (text.to_string(), false);
         }
         // SOL safe test.
         if sol
@@ -318,47 +351,117 @@ pub fn escape_wikitext(
             && !text.contains("----")
             && !text.contains("__")
         {
-            return text.to_string();
+            return (text.to_string(), false);
         }
     }
 
-    // Indent-pre protection.
-    if indent_pre_unsafe && opts.in_multiline_mode {
-        return escaped_text(state, sol, text, false, false);
+    // Indent-pre protection. The space only needs escaping when the line has no
+    // block content to suppress the indent-pre (or when we are already in
+    // multiline mode). Faithful to PHP's
+    // `$indentPreUnsafe && ( !hasBlocksOnLine($state->currLine->firstNode, true)
+    // || !empty($opts['inMultilineMode']) )`.
+    let blocks_on_line = state
+        .curr_line
+        .first_node
+        .is_some_and(|n| has_blocks_on_line(tree, n, true));
+    if indent_pre_unsafe && (opts.in_multiline_mode || !blocks_on_line) {
+        // Mark that a `<nowiki>` now protects leading whitespace, so
+        // `stripUnnecessaryIndentPreNowikis` revisits the assembled output
+        // (mirrors PHP setting `$state->hasIndentPreNowikis` here).
+        added_indent_pre_nowiki = true;
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     // `hasWikitextTokens` / `textCanParseAsLink` need a real tokenizer walk,
     // which we now have via `tokenizer_v2`. Tildes always wrap (PHP short-
     // circuits before the token walk).
     if has_tildes {
-        return escaped_text(state, sol, text, false, false);
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     if has_wikitext_tokens(state, sol, text) {
-        return escaped_text(state, sol, text, false, false);
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     // An unmatched closing bracket could still parse as a link: verify by
     // re-tokenizing the accumulated line + text.
     if contains_closing_bracket(text) && text_can_parse_as_link(state, tree, opts.node, text) {
-        return escaped_text(state, sol, text, false, false);
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
     // Trailing `=` in a heading context needs protection (heading-escape
     // heuristic, ported conservatively).
     if opts.is_last_child && text.ends_with('=') && !state.curr_line.text.is_empty() {
-        return escaped_text(state, sol, text, false, false);
+        return (
+            escaped_text(state, sol, text, false, false),
+            added_indent_pre_nowiki,
+        );
     }
 
-    text.to_string()
+    (text.to_string(), false)
 }
 
-/// `hasWikitextTokens` — tokenize `text` and report whether it contains any
-/// wikitext markup token (a token that would re-parse as a construct, not as
-/// plain text). Faithful to PHP's `hasWikitextTokens`: only structural tokens
-/// (`TagTk`, `EndTagTk`, `SelfclosingTagTk`) — plus our compound
-/// `IndentPre`/`List` tokens — trigger escaping. `NlTk`, `CommentTk`,
-/// `EmptyLineTk`, `EOFTk`, and plain strings do not (PHP's loop ignores them).
+/// Does this node start on a new line — i.e. does it open a block scope for
+/// wikitext, without being literal HTML? Mirrors
+/// `WikitextEscapeHandlers::startsOnANewLine`.
+fn starts_on_a_new_line(
+    tree: &crate::html::dom_tree::DomTree,
+    node: crate::html::dom_tree::NodeId,
+) -> bool {
+    let name = crate::html::dom_utils::node_name(tree.node(node));
+    crate::wikitext::token_utils::tag_opens_block_scope(&name)
+        && !crate::html::wts_utils::is_literal_html_node(tree.node(node))
+}
+
+/// Look ahead on the current line for block content. Faithful port of
+/// `WikitextEscapeHandlers::hasBlocksOnLine`.
+fn has_blocks_on_line(
+    tree: &crate::html::dom_tree::DomTree,
+    node: crate::html::dom_tree::NodeId,
+    first: bool,
+) -> bool {
+    let mut node = Some(node);
+    if first {
+        // We are at SOL, so ignore a possible `\n` as the first character.
+        let Some(n) = node else { return false };
+        let text = crate::html::dom_tree::text_content(tree, n);
+        let offset = usize::from(!text.is_empty());
+        if text[offset..].contains('\n') {
+            return false;
+        }
+        node = tree.next_sibling(n);
+    }
+
+    while let Some(n) = node {
+        if matches!(tree.node(n).kind, crate::dom::node::NodeKind::Element(_)) {
+            if crate::html::dom_utils::is_wikitext_block_node(tree.node(n)) {
+                return !starts_on_a_new_line(tree, n);
+            }
+            if let Some(child) = tree.first_child(n)
+                && has_blocks_on_line(tree, child, false)
+            {
+                return true;
+            }
+        } else if crate::html::dom_tree::text_content(tree, n).contains('\n') {
+            return false;
+        }
+        node = tree.next_sibling(n);
+    }
+    false
+}
+
 /// `hasWikitextTokens` — tokenize `text` and report whether it contains any
 /// wikitext markup token (a token that would re-parse as a construct, not as
 /// plain text). Faithful port of PHP's `hasWikitextTokens`, including the
@@ -700,6 +803,14 @@ fn text_can_parse_as_link(
 /// the simple-SOL lead-char protection; the token-granular minimal wrapping
 /// (the `nowikiWrap` machinery) is approximated because it depends on
 /// `tokenize_as` and `SourceRange`-based source recovery.
+///
+/// One part of PHP's behaviour *is* ported exactly, because a lot of
+/// serialization depends on it: a space that would land in start-of-line
+/// position (or right after a newline) is protected on its own with
+/// `<nowiki> </nowiki>`, leaving the rest of the text unwrapped. PHP does this
+/// by splitting on `/(^|\n) /`; wrapping the whole text instead would produce
+/// different wikitext, and the trailing
+/// `stripUnnecessaryIndentPreNowikis` pass expects the narrow form.
 pub fn escaped_text(
     _state: &SerializerState,
     sol: bool,
@@ -720,6 +831,16 @@ pub fn escaped_text(
         return format!("<nowiki>{body}</nowiki>{trailing}");
     }
 
+    // A space at start of line would read as indent-pre: protect just that
+    // space, keeping the remainder of the text unwrapped. PHP's `$sol && $t[0]
+    // === ' '` covers the very start, and `\n ` the other line starts.
+    if sol && body.starts_with(' ') {
+        return format!("<nowiki> </nowiki>{}{trailing}", &body[1..]);
+    }
+    if body.contains("\n ") {
+        return format!("{}{trailing}", nowiki_wrap_newline_spaces(body));
+    }
+
     // Protect a single lead SOL-sensitive char with `<nowiki/>`; otherwise
     // full-wrap the body.
     if sol {
@@ -733,6 +854,21 @@ pub fn escaped_text(
     }
 
     format!("<nowiki>{body}</nowiki>{trailing}")
+}
+
+/// Protect each space that immediately follows a newline with its own
+/// `<nowiki> </nowiki>`, mirroring PHP's `preg_split('/(^|\n) /')` +
+/// `nowikiWrap( ' ', … )` loop.
+fn nowiki_wrap_newline_spaces(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(pos) = rest.find("\n ") {
+        out.push_str(&rest[..pos + 1]);
+        out.push_str("<nowiki> </nowiki>");
+        rest = &rest[pos + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `liHandler` — decide whether a `<li>`/`<dt>` text child needs escaping.
