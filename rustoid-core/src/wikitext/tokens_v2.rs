@@ -652,6 +652,12 @@ pub struct TempData {
     /// A span tag created by `PipelineUtils::addSpanWrappers` (mirrors
     /// `TempData::WRAPPER`, 1 << 6).
     pub wrapper: bool,
+    /// A `{{…}}` token spliced in from a template *argument value*. PHP expands
+    /// argument values with a hard-coded `inTemplate => true`, which only matters
+    /// for the `{{!}}` magic word (`processSpecialMagicWord`). rustoid expands the
+    /// values together with the template body, so it marks them here and reads the
+    /// mark back in `expand_templates`.
+    pub in_arg_value: bool,
 }
 
 /// The parsed structure of a `-{ … }-` language-variant construct (mirrors PHP's

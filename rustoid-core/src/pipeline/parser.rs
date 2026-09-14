@@ -418,6 +418,34 @@ pub fn render_inline_fragment(
     frag
 }
 
+/// Mark the `{{…}}` template tokens inside an argument value as "expand in
+/// template context".
+///
+/// PHP expands argument values under a hard-coded `inTemplate => true`
+/// (`AttributeTransformManager::process` → `Frame::expand`), which affects both
+/// `processSpecialMagicWord` (`{{!}}` → `<td>` cell token instead of a literal
+/// `|`) and `wrapTemplates` (a template nested inside an argument value is not
+/// separately encapsulated). The template *body* uses the caller's flag instead
+/// (`processTemplateSource` forwards `$this->options`).
+fn mark_arg_value_tokens(items: &mut [Item]) {
+    for item in items.iter_mut() {
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+            continue;
+        };
+        if t.name != "template" && t.name != "template3" {
+            continue;
+        }
+        t.data_parsoid.tmp.in_arg_value = true;
+        for kv in t.attribs.iter_mut() {
+            for value in [&mut kv.key, &mut kv.value] {
+                if let crate::wikitext::tokens_v2::KeyValue::Tokens(inner) = value {
+                    mark_arg_value_tokens(inner);
+                }
+            }
+        }
+    }
+}
+
 /// Re-tokenize an all-plain-string template expansion at start of line.
 ///
 /// A template body consisting solely of argument references (e.g. `1x`'s
@@ -1771,6 +1799,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             if stt.name == "template" || stt.name == "template3" {
                 let about_id = self.new_about_id(about_counter);
+                // A token spliced in from an *argument value* is expanded in
+                // template context: PHP expands argument values with a hard-coded
+                // `inTemplate => true` (see `mark_arg_value_tokens`).
+                let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
                 // Expand `{{{…}}}` template-argument references in the token's
                 // argument keys/values against the current frame (mirrors PHP's
                 // `expandTemplateNatively` → `AttributeTransformManager::process`, so
@@ -1778,7 +1810,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let attribs = crate::pipeline::attribute_transform_manager::process(
                     frame,
                     false,
-                    in_template,
+                    in_tpl,
                     &stt.attribs,
                 )
                 .unwrap_or_else(|| stt.attribs.clone());
@@ -1819,7 +1851,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 about_id,
                                 tok,
                                 about_counter,
-                                in_template,
+                                in_tpl,
                                 target_has_comment,
                             )
                             .await;
@@ -1835,10 +1867,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         // `expandTemplate` → `processSpecialMagicWord` does this at
                         // the token level; it must not be string-substituted and
                         // re-tokenized into a table delimiter.
+                        //
+                        // A token spliced in from an *argument value* always counts
+                        // as in-template: PHP expands argument values under a
+                        // hard-coded `inTemplate => true` (see
+                        // `mark_arg_value_tokens`).
+                        let arg_value = stt.data_parsoid.tmp.in_arg_value;
                         out.extend(
                             crate::pipeline::template_handler::process_special_magic_word(
                                 &magic,
-                                in_template,
+                                in_template || arg_value,
                             ),
                         );
                     }
@@ -2036,8 +2074,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
 
         // Build a child frame carrying the template's arguments (params[1..]).
-        let child_args: Vec<crate::wikitext::tokens_v2::KV> =
+        //
+        // PHP expands the template token's *attributes* — i.e. the argument keys
+        // and values — with `Frame::expand(...)` under a hard-coded
+        // `[ 'expandTemplates' => false, 'inTemplate' => true ]`
+        // (TemplateHandler.php:988). The `inTemplate => true` matters: a `{{!}}`
+        // *inside an argument value* becomes a `<td>` cell token, which is what
+        // lets `{{1x|1={{!}}bar}}` split its enclosing cell. Templates in the
+        // *template body* are expanded with the caller's flag instead
+        // (`processTemplateSource` forwards `$this->options`).
+        //
+        // The values stay unexpanded here (rustoid expands them together with the
+        // body), so mark their template tokens instead: the body expansion below
+        // reads the mark to pick the right `inTemplate`.
+        let mut child_args: Vec<crate::wikitext::tokens_v2::KV> =
             params.args.iter().skip(1).cloned().collect();
+        for arg in child_args.iter_mut() {
+            let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &mut arg.value else {
+                continue;
+            };
+            mark_arg_value_tokens(items);
+        }
         let child_frame = frame.new_child(title.clone(), child_args);
 
         // Resolve the include directives (`<noinclude>` / `<includeonly>` /
@@ -2086,16 +2143,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             spliced
         };
 
-        // Expand the spliced body's remaining templates. `in_template` stays
-        // `true` here: under the parserTests configuration (the oracle rustoid's
-        // fixtures come from) a `{{!}}` inside a template body expands via
-        // `processSpecialMagicWord`'s `inTemplate` branch, i.e. to a `<td>` token
-        // that `TableFixups` later reinterprets as a cell separator. Passing the
-        // *caller's* flag instead makes `{{1x|1= {{!}}bar}}` produce the literal
-        // `|`, which diverges from those fixtures.
-        let expanded =
-            Box::pin(self.expand_templates(&child_frame, spliced, Some(src), about_counter, true))
-                .await;
+        // Expand the spliced body's remaining templates. PHP's
+        // `processTemplateSource` forwards `$this->options` — the *caller's*
+        // `inTemplate` — into the nested `wikitext-to-expanded-tokens` pipeline
+        // (TemplateHandler.php:621, :648-666), so the flag must be forwarded too:
+        // `{{1x|1= {{!}}bar}}` at the top level expands `{{!}}` to a literal `|`
+        // (the `<td>` form is reserved for argument values, expanded above).
+        let expanded = Box::pin(self.expand_templates(
+            &child_frame,
+            spliced,
+            Some(src),
+            about_counter,
+            in_template,
+        ))
+        .await;
 
         if in_template || target_has_comment {
             // Nested/extension-content context, or a comment in the template

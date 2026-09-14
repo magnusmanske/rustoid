@@ -2454,11 +2454,13 @@ impl<'a> PegTokenizer<'a> {
         let mut buf = String::new();
 
         loop {
-            // In table attribute-name position, `{` is a stop character (the
-            // `{{!}}` cell separator must not be absorbed as a directive token
-            // in a cell-attribute name), so only parse `{{…}}` directives for
-            // non-table (HTML/extension) attribute names.
-            if !table
+            // In table attribute-name position a `{{…}}` directive is a valid
+            // (token-valued) name — PHP's `table_attribute_name_piece` includes
+            // `directive` unconditionally. The *only* `{`-run that `inline_breaks`
+            // stops at is the cell separator `{{!}}`; parse that as a terminator
+            // (handled by the caller's stop set) and let every other directive
+            // through.
+            if !(table && cell_arg && self.starts_with("{{!}}"))
                 && self.starts_with("{{")
                 && let Some(tok) = self.parse_directive()
             {
@@ -4660,12 +4662,20 @@ pub fn tokenize_as_attributes(wikitext: &str) -> Vec<KV> {
 /// `(attributes, separator)` (mirrors PHP's `PegTokenizer::tokenizeTableCellAttributes`,
 /// which runs the `row_syntax_table_args` rule and returns `[attributes, spaces, pipe]`).
 /// Used by the `TableFixups::reparseTemplatedAttributes` DOM pass to reinterpret a
-/// template-generated `k=v|` prefix as cell attributes. When the input is a bare
-/// word (no trailing `pipe !pipe`), the rule backtracks and returns no attributes.
+/// template-generated `k=v|` prefix as cell attributes.
+///
+/// `row_syntax_table_args` is a PEG *start rule*, so PHP's `tokenizeSync` requires
+/// it to consume the entire input; any leftover makes it report `false` (a parse
+/// failure) which the caller treats as "nothing to reparse". A partial match
+/// therefore yields no attributes here too.
 pub fn tokenize_table_cell_attributes(wikitext: &str) -> (Vec<KV>, String) {
     let options = TokenizerOptions::default();
     let mut tokenizer = PegTokenizer::new(wikitext, &options);
-    tokenizer.parse_row_syntax_table_args()
+    let (attrs, sep) = tokenizer.parse_row_syntax_table_args();
+    if tokenizer.pos < tokenizer.input_len {
+        return (Vec::new(), String::new());
+    }
+    (attrs, sep)
 }
 
 /// Tokenize `wikitext` with the `start` rule and a caller-specified start-of-line
@@ -5854,6 +5864,32 @@ mod tests {
         // A bare word (no trailing `pipe !pipe`) backtracks to no attributes.
         let (attrs, sep) = tokenize_table_cell_attributes("Foo");
         assert_eq!(sep, "");
+        assert!(attrs.is_empty());
+    }
+
+    #[test]
+    fn test_tokenize_table_cell_attributes_template_name() {
+        // A `{{…}}` directive is a valid (token-valued) table-attribute name:
+        // PHP's `table_attribute_name_piece` includes `directive`, and
+        // `inline_breaks` only stops a `{`-run at the cell separator `{{!}}`.
+        let (attrs, sep) = tokenize_table_cell_attributes("class=\"foo\"{{1x|1=&nbsp;{{!}}bar}}|");
+        assert_eq!(sep, "|");
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].key.as_str(), Some("class"));
+        assert_eq!(attrs[0].value.as_str(), Some("foo"));
+        assert!(
+            matches!(&attrs[1].key, KeyValue::Tokens(toks)
+                if matches!(toks.first(), Some(Item::Tok(ParsoidToken::SelfclosingTag(t))) if t.name == "template")),
+            "expected a template-token attribute name, got {:?}",
+            attrs[1].key
+        );
+
+        // The `{{!}}` cell separator still terminates the attribute block: the
+        // rule consumes it as the `pipe` separator and then fails the `!pipe`
+        // lookahead, so no attributes are recovered (PHP additionally reports a
+        // hard `false` because the start rule must consume the whole input; both
+        // mean "nothing to reparse").
+        let (attrs, _sep) = tokenize_table_cell_attributes("class=\"foo\"{{!}}bar");
         assert!(attrs.is_empty());
     }
 
