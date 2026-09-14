@@ -12,6 +12,34 @@ old fallback hid are therefore now visible and listed as work items:
 
 Both pass under PHP in standalone mode.
 
+## Identified: `Number of images should be limited` needs the wt2html resource limits
+
+This fixture (`media.txt`) sets `wgParsoidMaximumImages=2` via `!! config`. PHP's
+`AddMediaInfo` calls `$env->bumpWt2HtmlResourceUse( 'image' )` per media container and
+dedupes containers by `md5( json_encode( [ dbKey, dims ] ) )`. `Env::bumpWt2HtmlResourceUse`
+is worth porting exactly, because its off-by-one matters:
+
+```php
+$n = $this->wt2htmlUsage[$resource] ?? 0;
+if ( !$this->compareWt2HtmlLimit( $resource, $n ) ) { return null; }  // already over
+$n += $count;
+$this->wt2htmlUsage[$resource] = $n;
+return $this->compareWt2HtmlLimit( $resource, $n );
+// compareWt2HtmlLimit: !( isset($limits[$r]) && $n > $limits[$r] )
+```
+
+With a limit of 2 that is `true`, `true`, `false`, `null`, `null`, … — the **third**
+container is the first to be refused, and the fifth image in the fixture renders
+normally only because it repeats the first `title+dims` (so the `isset($files[$infoKey])`
+fast path short-circuits the bump). A refused container gets `mw:Error mw:File` plus
+`apierror-imagelimitexceeded`, keeps its broken-media markup, and sets the
+`media-limit-reached` tracking category and the `prevent-selective-update` output flag.
+
+rustoid has no resource-limit machinery at all (no `getWt2HtmlLimits` site-config hook,
+no per-parse usage counters, no tracking categories / output flags), and no media
+container dedup key. This is a real feature rather than a quick fix, but the PHP logic
+is self-contained and fully specified above.
+
 ## Landed: templated table-cell attributes (no count change; unblocks the cluster)
 
 The `Templated table cell with untemplated attributes` cluster needed three faithful
