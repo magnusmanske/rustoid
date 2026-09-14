@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **858/891 fixtures pass** (96%). Lib tests: 660 pass. Clippy: clean.
+Current baseline: **859/891 fixtures pass** (96%). Lib tests: 663 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -8,6 +8,71 @@ Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 **skips** in standalone mode, so its expectation is unreachable for rustoid. 36
 fixtures are in that state; most still compare equal, so the fallback is left in
 place (skipping them would hide real divergences rather than surface them).
+
+## Landed: token-level argument substitution (858 → 859)
+
+`Plain link in template argument` now passes, via three fixes.
+
+The premise in the previous session's note was wrong in an instructive way:
+the live expansion path (`Parser::expand_one_template`) **already** substituted
+token-level. `TemplateHandler::expand_template_natively` — the string-level
+`substitute_args` implementation the note was aimed at — turned out to be
+**dead code referenced only by its own test**, long since superseded. The real
+gaps were narrower:
+
+1. **`ParamInfo` wikitext from the source span.**
+   `TemplateEncapsulator::prepareTplParamInfos` takes each argument's `kWt`/
+   `vWt` from the KV's `srcOffsets` (`$srcOffsets->value->substr($src)`), not
+   from stringifying its tokens — because `TokenUtils::tokensToString` has no
+   arm for a `wikilink`/`extlink`, so a link argument stringifies to `""` and
+   `data-mw` records `"1":{"wt":null}`. rustoid set no spans on template-token
+   arguments at all. The tokenizer now records them; `KVSourceRange` carries
+   its own `source` (mirroring `SourceRange::fromSource`/`substr`), so a token
+   tokenized from a template body still recovers its own wikitext.
+
+   Note the positional/named decision turns on `key.end === value.start`, so it
+   *requires* `srcOffsets`. With `None`, PHP treats a blank key as **named**;
+   the old rustoid test asserting positional encoded rustoid behaviour, not
+   PHP's, and was corrected.
+
+2. **A `|` inside an external link separates template arguments.**
+   `inlineBreaks` breaks on `|` when the `templateArg` stop is set and never
+   consults `extlink` (which only guards `]`). The `extlink` guard is retained
+   for wikilink content, where `link_text_parameterized` treats `[...]` as an
+   extlink atom — the `Images with the "|" character in the comment` case.
+
+3. **Two bounds on the template-close scan.**
+   * A `}}` reached while a `[[` is still open fails the scan *immediately*
+     rather than skipping ahead. Without this, `{{1x|[[http://x |y]}}` (a lone
+     `]`, then `}}`) swallowed the *next line's* `]]` and expanded across both
+     — PHP backtracks the whole `template` production at that point, so rows 3
+     and 4 of the fixture must parse independently. Verified against PHP's own
+     tokenizer: it yields `"{{1x|["` + `extlink(|123)` + `"}}"` then a
+     separate `template` token.
+   * `try_extlink` treats a leading `|` in the link content as a break only
+     inside a table cell (`tableCellArg`); PHP's `|` stop is context-dependent.
+     Outside a cell `[http://x |123]` is an extlink whose text is `|123`, which
+     is what makes the invalid-title bail (`bailTokens`) re-tokenize
+     `[[http://x |123]]` to PHP's `[` + extlink + `]` shape.
+
+## Next: the remaining 14
+
+The table cluster is still the biggest group:
+
+- `4. Template-generated table cell attributes…` and `T343874` — compound
+  `data-mw` fusion (`DOMRangeBuilder::recordTemplateInfo`). The range extent
+  must come from the marker *elements*, not the start meta's DSR (which is
+  narrow, `[0,13]` for a `{{tbl-start}}`); that is why the earlier
+  DSR-containment attempt found nothing.
+- `Wikitext tables can be nested inside HTML tables`,
+  `Second colon on line: Templates involved and T2959 kicks in`,
+  `Parser function inside dl-dt list should be tokenized correctly` —
+  line-splitting heuristics in `AttributeExpander`.
+- `T179544: {{anchorencode:}} output should be always usable in links` and the
+  T290526 `{{!}}` family — link handling.
+- `Parsoid: Default to a newline after tables in new content (T53219)` and
+  `Invalid text in table attributes should be preserved by selective serializer`
+  — serializer-only, so lower risk and independently verifiable.
 
 ## Landed: the tokenizer's `preproc` stack (857 → 858)
 
@@ -29,36 +94,8 @@ wikilink closes first) stay correct. Fixed
 The same pass confirmed that `inlineBreaks` never consults the `extlink` stop
 for `|`, so a pipe inside a single-bracket external link still separates
 template arguments (`{{1x|[http://e.com |x]}}` passes `[http://e.com ` and
-`x]`). That is what `Plain link in template argument` row 1 needs; the fixture
-as a whole still fails on its other rows (see below).
-
-## Next: token-level template-argument substitution
-
-`Plain link in template argument` is blocked on an architectural gap.
-`TemplateHandler::expand_template_natively` flattens each argument to a
-**string** (`key_value_to_string`), string-substitutes it into the template
-body, and re-tokenizes. `token_utils::tokens_to_string` has no arm for a
-`wikilink`/`extlink` token — PHP's `TokenUtils::tokensToString` has none
-either — so a link argument collapses to the empty string and the link is
-lost.
-
-PHP never stringifies there: `processTemplateSource` splices the argument's
-**token array** into the template body. Row 2 of the fixture
-(`{{1x|[[http://www.example.com |123]]}}`) is the visible symptom: rustoid
-emits a literal `[[` plus a free extlink where PHP renders the wikilink
-(`<a class="external text" href="http://www.example.com">|123</a>`).
-
-Verified with a direct probe of PHP's tokenizer:
-
-```
-{{1x|[[http://www.example.com |123]]}}  -> template arg value = wikilink token
-{{1x|[[http://www.example.com |123]}}   -> template fails; "{{1x|[" + extlink + "}}"
-{{1x|[http://www.example.com |123]}}   -> template with urllink + 2 params
-```
-
-Converting `expand_template_natively` to token-level substitution is the next
-architectural step for this fixture (and for `Template interaction` and the
-T290526 family).
+`x]`). That was the first of the three fixes that made
+`Plain link in template argument` pass (see above).
 
 ## Landed: marker pairing across sibling subtrees (856 → 857)
 
@@ -835,8 +872,6 @@ Eleven focused, PHP-verified fixes (821 → 833). See the commits below.
   fragment (AttributeExpander cluster).
 - "T45661: Piped links with identical prefixes" — red-link mock/harness default;
   PHP's standalone known-failure for `html2wt` shows the piped form.
-- "Plain link in template argument" (template-arg splitting vs extlink).
-- "Broken wikilinks (but not external links) prevent templates from closing".
 
 The table-cell / `TableFixups` cluster (14 fixtures) and the selser `T319143` group
 (8 fixtures) are the largest remaining blocks; both need the AttributeExpander /
@@ -1151,7 +1186,7 @@ extension/transclusion tags in a row", "A table with …
 - "Link containing double-single-quotes '' in text embedded in italics (T6598 check)"
 - "T2002: [[page|http://url/]] should link to page, not http://url/"
 - "Relative subpage noslash link"
-- "Plain link in template argument", "Ensure that transclusion titles are not url-decoded"
+- "Ensure that transclusion titles are not url-decoded"
 - "Parsoid link trail/prefix/bracket escaping", "Parsoid T55221: entity-escaped wikilinks"
 - "Parsoid-centric test: Whitespace in ext- and wiki-links should be preserved"
 - "Wikilink extlink precedence", "Wikilinks with embedded newlines are not broken",
