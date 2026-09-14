@@ -1,44 +1,83 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **849/891 fixtures pass** (95%). Lib tests: 651 pass. Clippy: clean.
+Current baseline: **852/891 fixtures pass** (96%). Lib tests: 657 pass. Clippy: clean.
 
-Note: the harness now compares against `!! html/parsoid+standalone` when there is no
-`+integrated` section (mirroring PHP `Test::normalizeHTML`); previously that section
-was discarded and the legacy `!! html/php` was used instead. Two divergences that the
-old fallback hid are therefore now visible and listed as work items:
+Note: the harness compares against `!! html/parsoid+standalone`, falling back to
+`!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
+`Test::normalizeHTML`). A `+integrated`-only fixture is one PHP's own runner
+**skips** in standalone mode, so its expectation is unreachable for rustoid. 36
+fixtures are in that state; most still compare equal, so the fallback is left in
+place (skipping them would hide real divergences rather than surface them).
 
-- `AttributeExpander regression test: Class attributes should be properly applied`
-- `Number of images should be limited`
+## Categorically unreachable: the `+integrated`-only table fixtures
 
-Both pass under PHP in standalone mode.
+`Templated table cell with untemplated attributes: Integrated mode only` and
+`T343874` (plus the `Templated table cell with untemplated attributes` base
+fixture, already recorded as a known failure) have **no `html/parsoid` or
+`html/parsoid+standalone` section**. Their expected output is the
+integrated-mode (production) single-cell / table-level-encapsulation form, which
+PHP in standalone mode does not produce either — verified by running PHP's own
+runner on a patched copy of `tables.txt`:
 
-## Identified: `Number of images should be limited` needs the wt2html resource limits
-
-This fixture (`media.txt`) sets `wgParsoidMaximumImages=2` via `!! config`. PHP's
-`AddMediaInfo` calls `$env->bumpWt2HtmlResourceUse( 'image' )` per media container and
-dedupes containers by `md5( json_encode( [ dbKey, dims ] ) )`. `Env::bumpWt2HtmlResourceUse`
-is worth porting exactly, because its off-by-one matters:
-
-```php
-$n = $this->wt2htmlUsage[$resource] ?? 0;
-if ( !$this->compareWt2HtmlLimit( $resource, $n ) ) { return null; }  // already over
-$n += $count;
-$this->wt2htmlUsage[$resource] = $n;
-return $this->compareWt2HtmlLimit( $resource, $n );
-// compareWt2HtmlLimit: !( isset($limits[$r]) && $n > $limits[$r] )
+```
+# row 1 of "Integrated mode only"
+<td about="#mwt1" typeof="mw:Transclusion" class="foo">bar</td>
+# row 2 (the `&nbsp;{{!}}` row) — note: NO typeof
+<td about="#mwt3" class="foo">bar</td>
 ```
 
-With a limit of 2 that is `true`, `true`, `false`, `null`, `null`, … — the **third**
-container is the first to be refused, and the fifth image in the fixture renders
-normally only because it repeats the first `title+dims` (so the `isset($files[$infoKey])`
-fast path short-circuits the bump). A refused container gets `mw:Error mw:File` plus
-`apierror-imagelimitexceeded`, keeps its broken-media markup, and sets the
-`media-limit-reached` tracking category and the `prevent-selective-update` output flag.
+The fixture asks for `typeof="mw:Transclusion"` on row 2 as well. rustoid now
+reaches PHP's standalone output for row 1 exactly; row 2 still drops
+`about="#mwt3"` but is otherwise identical, i.e. it is one `about` attribute
+short of *PHP*, and one `typeof` short of the *fixture*. Chasing the fixture
+would be chasing an unreachable target; the faithful goal is PHP's standalone
+output, and `about` on row 2 is the remaining gap.
 
-rustoid has no resource-limit machinery at all (no `getWt2HtmlLimits` site-config hook,
-no per-parse usage counters, no tracking categories / output flags), and no media
-container dedup key. This is a real feature rather than a quick fix, but the PHP logic
-is self-contained and fully specified above.
+The cause of the missing `about`: `mergeCells` sets `ignoreParsoidAttributes`
+when the two cells have identical names (`td`→`td`), so `$from`'s `about` is not
+copied onto `$to`. PHP's standalone `$to` (the second cell) already carried
+`about="#mwt3"` from `tplwrap`, which is why PHP keeps it and rustoid does not:
+rustoid's `tplwrap` does not encapsulate the inner split cell's transclusion
+range. That is the same root cause as the `T343874` orphaned
+`<span typeof="mw:Transclusion"></span>`: rustoid's `findEncapTarget` handling
+for a table whose opening tag came from a template does not extend the
+encapsulation over the `{{tbl-start}}`/`{{tbl-end}}` pair.
+
+## Landed: argument-value expansion context (850 → 852)
+
+`processTemplateSource` forwards the *caller's* `inTemplate` into the nested
+expansion pipeline, while `AttributeTransformManager::process` expands the
+template token's argument keys/values under a hard-coded
+`[ 'expandTemplates' => false, 'inTemplate' => true ]` (TemplateHandler.php:988).
+`{{!}}` therefore becomes a `<td>` cell token **only inside an argument value**,
+and a literal `|` in the template body. rustoid expanded the whole spliced body
+with a hard-coded `true`, which made `{{1x|1={{!}}bar}}` work but
+`{{1x|1= {{!}}bar}}` diverge from `{{1x|{{T290526}}}}`. The template tokens
+spliced in from an argument value are now marked
+(`TempData::in_arg_value`) and `expand_templates` reads the mark back, so the
+body expansion uses the caller's flag.
+
+This **supersedes** the earlier "tempting fix that is wrong" note: the reason a
+flat switch to the caller's flag regressed fixtures was that rustoid had no way
+to distinguish argument-value tokens from body tokens. With the mark in place
+the caller's flag is correct for the body *and* `inTemplate=true` still applies
+where PHP applies it.
+
+Also landed (both verified against `PegTokenizer::tokenizeTableCellAttributes`):
+
+- `tokenize_table_cell_attributes` now requires the whole input to be consumed.
+  `row_syntax_table_args` is a PEG *start rule*, so PHP's `tokenizeSync` reports a
+  hard `false` on a partial match, and `TableFixups::reparseWithPreviousCell`
+  treats that as "nothing to reparse".
+- `{{…}}` is a valid table attribute *name* in cell-argument position. PHP's
+  `table_attribute_name_piece` includes `directive`, and `inline_breaks` only
+  stops a `{`-run at the cell separator `{{!}}`. This is what recovers
+  `class="foo"` from `class="foo"{{1x|1=&nbsp;{{!}}bar}}|` — the piece that
+  made `Integrated mode only` row 2 merge at all.
+
+Fixed: `AttributeExpander regression test: Class attributes should be properly
+applied`, `Multiple transclusions in discarded table attribute position should be
+handled properly`.
 
 ## Landed: templated table-cell attributes (no count change; unblocks the cluster)
 
@@ -71,28 +110,29 @@ standalone/`+standalone` section is the one that matters).
 `T343874` additionally needs transclusion wrapping of a table whose `{|`/`|}` come
 from separate templates (`{{tbl-start}}`/`{{tbl-end}}`): rustoid currently emits an
 orphaned empty `<span typeof="mw:Transclusion"></span>` before the table. PHP
-attaches the transclusion to the `<table>` with a multi-part `data-mw`.
+attaches the transclusion to the `<table>` with a multi-part `data-mw`. (Note that
+this fixture, like `Integrated mode only`, is `+integrated`-only — see the section
+at the top of this file.)
 
-`Templated table cell with untemplated attributes: Integrated mode only` is one
-merge away. Rows 1/2 are `|class="foo"{{1x|1= {{!}}bar}}` and
-`|class="foo"{{1x|1=&nbsp;{{!}}bar}}`. The `{{!}}` inside the template argument is
-expanded by `process_special_magic_word` to a `<td>` token (faithful: PHP does the
-same, with empty `attrSrc` + `AT_SRC_START` so `TableFixups` reinterprets it as a
-literal `|`). The HTML5 tree builder therefore sees a `td` start tag while a `td` is
-open and closes the outer cell, leaving two sibling cells. rustoid's `TableFixups`
-does not merge them back; PHP's `maybeCombineWithPrevCell` path does.
+### Superseded note (kept for the record)
 
-All six of PHP's `getReparseType` conditions for the merge evaluate **true** in
-rustoid for both rows, and the branch taken is `!prev_has_attrs`
-("`$prev`'s content becomes `$cell`'s attributes"). The merge then fails inside
-`reparse_with_previous_cell`: it derives `$prevCellContent` from the previous cell's
-DSR, and for row 2 rustoid's cell-1 DSR is `[40,75]` — the whole row — so
-`prev_cell_content` is `class="foo"{{1x|1=&nbsp;{{!}}bar}}` instead of
-`class="foo"\u{a0}`. Re-tokenizing that as attributes yields zero attrs
-(`{{!}}`'s `|` is read as the separator), so nothing merges. Row 1's cell-1 DSR is a
-tight `[6,18]`, which is why it works. Next step is to find why the tree builder
-extends cell 1's DSR across the whole row when the argument begins with an entity
-span.
+An earlier session recorded that hardcoding `in_template: true` in
+`expand_one_template`'s recursive `expand_templates` call was "suspicious" and that
+switching it to the *caller's* `in_template` regressed two fixtures. That reading was
+too coarse: the caller's flag **is** right for the template body, but argument values
+need `inTemplate => true`. Marking the argument-value tokens
+(`TempData::in_arg_value`) satisfies both, and `expand_one_template` now forwards the
+caller's flag. See "Landed: argument-value expansion context" above.
+
+## Superseded: "a tempting fix that is wrong"
+
+**This section is obsolete.** Hardcoding `in_template: true` in
+`expand_one_template`'s recursive `expand_templates` call was indeed wrong, and
+switching to the caller's flag alone also regressed fixtures — but only because
+rustoid could not tell argument-value tokens from body tokens. The
+`TempData::in_arg_value` mark (commit `94782e7`) resolves that, and the caller's
+flag is now forwarded. The text below is kept only to explain why the naive
+version failed.
 
 ### A tempting fix that is wrong (recorded so it is not retried)
 
@@ -708,15 +748,17 @@ Authoritative PHP output (confirm via `nativeTemplateExpansion:true` + `$env->pa
 ```
 `about` on all three `<td>`s and `typeof="mw:Transclusion"` on the first (see line 1373 of tables.txt).
 
-**Still failing** — table-cell template cluster:
+**Still failing** — table-cell template cluster (updated):
 - "4. Template-generated table cell attributes and cell content inside a templated table"
   (`{{tbl-start}}…{{tbl-end}}` wraps the whole `<table>`; needs `typeof` on `<table>`, not an empty span)
-- "Templated table cell with untemplated attributes" (all variants: "Cell combination tests",
-  "Integrated mode only", T343874)
-- "Multiple transclusions in discarded table attribute position should be handled properly"
-- The merge-cell path (ported in commit `3f240df`, currently harmless/no-regression) still needs its
-  DSR/source-recovery and data-mw bookkeeping refined so the merged cell's `typeof`/`about`/`data-mw`
-  match PHP byte-for-byte.
+- "Templated table cell with untemplated attributes" ("Cell combination tests") and its
+  `+integrated`-only variants ("Integrated mode only", T343874 — see the note at the top of this file
+  for why those expectations are unreachable)
+- ~~"Multiple transclusions in discarded table attribute position should be handled properly"~~
+  **fixed** by the argument-value expansion-context change (`{{…}}` as a table attribute name).
+- The merge-cell path's DSR/source-recovery and data-mw bookkeeping still needs refinement so a
+  merged cell's `about`/`typeof`/`data-mw` match PHP byte-for-byte (the remaining gap for the
+  `&nbsp;` row).
 
 **Done this session:**
 - `table_body_content_target` now targets `<td>` (mixed content) vs `<tbody>` (well-balanced), matching
@@ -1022,19 +1064,22 @@ in the standalone path that rustoid re-implements.
 - The base "Templated table cell with untemplated attributes" fixture now **matches PHP's standalone
   two-cell output exactly** — `class="foo"` is recovered as an attribute, the transclusion metadata is
   hoisted onto the first cell — and the harness marks it SKIP (faithful divergence) rather than FAIL.
-- "Cell combination tests", "Integrated mode only" (its `&nbsp;{{!}}` second row), and "T343874" still
-  FAIL (50 remaining failures). See the "Root cause … FIXED" section below for the exact remaining gap.
+- "Cell combination tests", "Integrated mode only" and "T343874" still FAIL. The last two are
+  `+integrated`-only fixtures (no `html/parsoid`/`+standalone` section), so PHP standalone cannot reach
+  their expectations either — see the note at the top of this file.
 - These fixtures still cannot reach the single-cell `html/parsoid` ideal (PHP standalone can't either —
   it's a recorded known-failure); matching PHP's standalone output is the correct, faithful target.
 
 ### Re-derived this turn (why no `processSpecialMagicWord` fired in standalone probes)
 `{{!}}` is a magic-word **variable** (ID `!`, canonical `!`; `baseconfig/enwiki.json` `variables[0]`).
-`resolveTemplateTarget("!")` returns `magicWordType === '!'`, so `processSpecialMagicWord` *does* run at
-`inTemplate=true` inside the `processTemplateSource` nested pipeline and returns `<td attr_src=''`
-`AT_SRC_START>` — producing the sibling-cell split that ends at the two-cell known-failure. (Earlier
-probes that "got `|`" were using `MockSiteConfig` incl. no `!` variable, so `{{!}}` fell through to a
-redlink/`convertToString` path.) The `pipe = "|" / "{{!}}"` tokenizer rule handles `{{!}}` only in
-table *position* (as `attrSepSrc`), not inside argument values (tokenized with `table=false`).
+`resolveTemplateTarget("!")` returns `magicWordType === '!'`, so `processSpecialMagicWord` *does* run and
+returns `<td attr_src=''` `AT_SRC_START>` — producing the sibling-cell split that ends at the two-cell
+known-failure. Which of its two branches is taken depends on `inTemplate`: it is `true` for an
+**argument value** (PHP expands argument keys/values under a hard-coded `inTemplate => true`) and the
+*caller's* flag for the **template body**. (Earlier probes that "got `|`" were using `MockSiteConfig`
+including no `!` variable, so `{{!}}` fell through to a redlink/`convertToString` path.) The
+`pipe = "|" / "{{!}}"` tokenizer rule handles `{{!}}` only in table *position* (as `attrSepSrc`), not
+inside argument values (tokenized with `table=false`).
 
 ### Root cause of the rustoid divergence — **FOUND & FIXED** (pipeline ordering)
 The divergence was **not** the tree builder (as the prior note guessed). PHP's `dom:post-builder` dump
@@ -1054,9 +1099,12 @@ recovered as an attribute via `reparseWithPreviousCell` (`prevCellContent="class
 harness recognizes it as a faithful divergence (SKIP) rather than a bug.
 
 Remaining in this cluster: "Cell combination tests", "Integrated mode only" (its `&nbsp;{{!}}` second
-row), and "T343874" still FAIL (50 remaining failures, down from 51). The "Integrated mode only" first
-row (`|class="foo"{{1x|1= {{!}}bar}}`) is now correct; its second row uses `&nbsp;{{!}}` which breaks the
-merge (the `mw:Entity` `&nbsp;` child isn't folded into `prevCellContent`).
+row), and "T343874" still FAIL. **Updated** (`94782e7`): the `&nbsp;` row now merges and recovers
+`class="foo"` — the `mw:Entity` child was *not* the blocker. (The real blocker was that `{{…}}` was
+rejected as a table attribute name in cell-argument position, so the `k=v|` reparse of
+`class="foo"{{1x|1=&nbsp;{{!}}bar}}|` recovered nothing.) What remains for that row is the missing
+`about` on the merged cell, and both `Integrated mode only` and `T343874` are `+integrated`-only
+fixtures whose expectations PHP standalone cannot reach — see the note at the top of this file.
 
 Also landed this turn (faithful): `compute_dsr` now gates the `cs = s` fallback on `i == 0` (leftmost
 child), matching PHP's `elseif ($s && $child->previousSibling === null)`; unit test
