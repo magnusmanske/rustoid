@@ -1724,16 +1724,22 @@ fn parse_fragment(html: &str) -> Vec<MNode> {
     out
 }
 
-/// HTML5 "in body" implied end tags: whether a start tag named `name` closes
+/// HTML5 implied end tags: whether a start tag named `name` closes
 /// the innermost open element named `open.last()`.
 ///
-/// Covers the `dt`/`dd` and `li` pairs, which are the ones that occur in
-/// unbalanced hand-authored parser-test HTML.
+/// Parser-test HTML is hand-authored and sometimes leaves a cell or row
+/// unclosed (see the `Cell combination tests` fixture, whose expected row 4 ends
+/// `</td>\n<tr>` with no `</tr>`). PHP normalizes both sides by parsing them into
+/// a real DOM (`TestUtils::normalizeHTML` → `DOMUtils::parseHTML`), so an HTML
+/// parser resolves the missing tags. This mini-parser must do the same, or the
+/// expected side nests a row inside a row and the two trees differ.
 fn closes_open_element(open: &[String], name: &str) -> bool {
     let Some(current) = open.last() else {
         return false;
     };
     let cur = current.as_str();
+    let cur_is_cell = matches!(cur, "td" | "th");
+    let cur_is_section = matches!(cur, "tbody" | "thead" | "tfoot" | "caption");
     match name {
         // "A start tag whose tag name is one of: dd, dt" — close an open dd/dt.
         "dd" | "dt" => matches!(cur, "dd" | "dt"),
@@ -1743,6 +1749,11 @@ fn closes_open_element(open: &[String], name: &str) -> bool {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             matches!(cur, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
         }
+        // Table mode: a cell/section start tag closes an open cell, and a section
+        // start tag also closes an open row.
+        "td" | "th" | "caption" => cur_is_cell,
+        "tr" => cur_is_cell || cur == "tr",
+        "tbody" | "thead" | "tfoot" => cur_is_cell || cur == "tr" || cur_is_section,
         _ => false,
     }
 }
