@@ -17,13 +17,23 @@
 
 use std::fmt;
 
-/// A source range (analogous to PHP's SourceRange).
+/// A source range (analogous to PHP's `SourceRange`).
+///
+/// `source` is the text this range's offsets index into. It is usually absent
+/// (offsets then refer to the page source passed down to `substr`), but parsoid
+/// sets it when a token was produced by tokenizing *different* text — most
+/// importantly a template body, whose offsets index the template source rather
+/// than the page. `substr` prefers it, exactly like PHP's
+/// `SourceRange::substr` (`SourceRange::$source`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRange {
     /// Starting offset; `None` mirrors PHP's `SourceRange` `start === null`
     /// (an *unknown* start, which is distinct from a known `0`).
     pub start: Option<usize>,
     pub end: usize,
+    /// The text `start`/`end` index into, when it is not the ambient page
+    /// source. Shared so cloning a token stays cheap.
+    pub source: Option<std::sync::Arc<str>>,
 }
 
 impl SourceRange {
@@ -31,24 +41,60 @@ impl SourceRange {
         Self {
             start: Some(start),
             end,
+            source: None,
+        }
+    }
+
+    /// A range over `source` (offsets 0..`source.len()`), mirroring PHP's
+    /// `SourceRange::fromSource`.
+    pub fn from_source(source: &str) -> Self {
+        Self {
+            start: Some(0),
+            end: source.len(),
+            source: Some(std::sync::Arc::from(source)),
         }
     }
 
     /// A range with an unknown (`null`) start, mirroring PHP's
     /// `new SourceRange( null, $end )` (e.g. a template end marker meta).
     pub fn with_null_start(end: usize) -> Self {
-        Self { start: None, end }
+        Self {
+            start: None,
+            end,
+            source: None,
+        }
     }
 
     pub fn length(&self) -> usize {
         self.end.saturating_sub(self.start.unwrap_or(self.end))
     }
 
-    /// Extract the substring from the source input.
-    pub fn substr<'a>(&self, input: &'a str) -> &'a str {
+    /// The source text this range indexes into, if it carries its own.
+    pub fn src_text(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Extract the substring for this range. Prefers the range's own `source`
+    /// over the caller-supplied text, mirroring PHP's `getSourceString`. Returns
+    /// an owned string because the result may borrow from `self`.
+    pub fn substr(&self, input: &str) -> String {
+        match self.source.as_deref() {
+            Some(src) => self.substr_in(src).to_string(),
+            None => self.substr_in(input).to_string(),
+        }
+    }
+
+    /// Extract the substring from an explicit text, ignoring `self.source`.
+    pub fn substr_in<'a>(&self, input: &'a str) -> &'a str {
         let end = self.end.min(input.len());
         let start = self.start.unwrap_or(end).min(end);
-        &input[start..end]
+        // `start` may index into the middle of a UTF-8 sequence when the range
+        // was built by hand; fall back to the end offset rather than panicking.
+        if input.is_char_boundary(start) && input.is_char_boundary(end) {
+            &input[start..end]
+        } else {
+            ""
+        }
     }
 }
 
@@ -300,7 +346,11 @@ impl DataParsoid {
         dp.tsr = obj.get("tsr").and_then(|v| v.as_array()).and_then(|a| {
             let start = a.first().and_then(|v| v.as_u64()).map(|n| n as usize);
             let end = a.get(1).and_then(|v| v.as_u64()).map(|n| n as usize)?;
-            Some(SourceRange { start, end })
+            Some(SourceRange {
+                start,
+                end,
+                source: None,
+            })
         });
 
         // `dsr`: `[start, end, openWidth|null, closeWidth|null]`.

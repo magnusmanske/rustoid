@@ -1103,7 +1103,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // p-wrapping nor indent-pre (T278565).
             let inline = wrapper == "span";
             let sub = if source.is_some() {
-                self.process_block_fragment_body(&body, source, frame, about_counter, inline)
+                // `ParsoidExtensionAPI::wikitextToDOM` parses the body with
+                // `inTemplate => $this->inTemplate()` — false unless the extension
+                // was reached from inside a template (`expand_wrapper_tag` runs on
+                // the top-level stream, so false here).
+                self.process_block_fragment_body(&body, source, frame, about_counter, inline, false)
                     .await
             } else if inline {
                 self.fragment_from_body(&body)
@@ -1172,6 +1176,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
         inline: bool,
+        in_template: bool,
     ) -> Node {
         let mut tokens = match self.tokenize(body) {
             Ok(t) => t,
@@ -1182,7 +1187,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, true)
+                .expand_templates(frame, tokens, source, about_counter, in_template)
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
             tokens = crate::pipeline::extension_handler::expand_in_attributes(

@@ -227,9 +227,8 @@ impl TokenStreamPatcher {
                     self.wiki_table_nesting += 1;
                 }
                 "td" | "th" | "tr" | "caption" if self.wiki_table_nesting == 0 => {
-                    return Some(self.get_result_tokens(convert_non_html_token_to_string(
-                        &ParsoidToken::Tag(t),
-                    )));
+                    let converted = self.convert_non_html_token_to_string(&ParsoidToken::Tag(t));
+                    return Some(self.get_result_tokens(converted));
                 }
                 _ => {}
             }
@@ -252,9 +251,8 @@ impl TokenStreamPatcher {
                     self.wiki_table_nesting -= 1;
                 }
             } else if t.name == "table" || t.name == "caption" {
-                return Some(self.get_result_tokens(convert_non_html_token_to_string(
-                    &ParsoidToken::EndTag(t),
-                )));
+                let converted = self.convert_non_html_token_to_string(&ParsoidToken::EndTag(t));
+                return Some(self.get_result_tokens(converted));
             }
         }
         Some(self.get_result_tokens(vec![token]))
@@ -347,6 +345,52 @@ impl TokenStreamPatcher {
         // Fall through: flush the buffer, then emit the token.
         Some(self.get_result_tokens(vec![token]))
     }
+
+    /// `convertNonHTMLTokenToString` — turn a wikitext-syntax table tag sitting
+    /// outside any table back into its source wikitext.
+    ///
+    /// PHP's primary branch re-reads the token's whole `tsr` from the source and
+    /// re-tokenizes it with `sol = false`. That is what preserves the *entire*
+    /// cell marker: a `<td>` whose `tsr` covers `|  |` comes back as `|  |`, not
+    /// as the bare `|` the marker-reconstruction fallback would produce. The text
+    /// is indexed by the range's own source (the tokenizer stamps it), so this
+    /// works for a cell produced inside a template body just as for a top-level
+    /// one. Only when there is no usable range/source do we reconstruct the
+    /// marker instead.
+    fn convert_non_html_token_to_string(&mut self, token: &ParsoidToken) -> Vec<Item> {
+        if let Some(tsr) = token.data_parsoid().and_then(|dp| dp.tsr.clone())
+            && let Some(src) = tsr.src_text()
+            && let Some(start) = tsr.start
+            && tsr.end > start
+        {
+            // `sol = false` ensures the pipe is not parsed as a `<td>` again.
+            let text = tsr.substr_in(src);
+            let items = crate::pipeline::template_handler::tokenize_wikitext_to_items_with_sol(
+                text,
+                /* in_template */ true,
+                &[],
+                /* sol */ false,
+            );
+            return self.reprocess(items);
+        }
+        convert_non_html_token_to_string(token)
+    }
+
+    /// Re-run this patcher over a nested token chunk, so table tags recovered
+    /// from source are themselves fixed up (mirrors `reprocessTokens` handing its
+    /// output back to `onAnyInternal`).
+    fn reprocess(&mut self, items: Vec<Item>) -> Vec<Item> {
+        let saved_buf = std::mem::take(&mut self.nl_ws_meta_token_buf);
+        let mut out = Vec::new();
+        for item in items {
+            if let Some(mut emitted) = self.on_any(item) {
+                out.append(&mut emitted);
+            }
+        }
+        out.extend(self.get_result_tokens(Vec::new()));
+        self.nl_ws_meta_token_buf = saved_buf;
+        out
+    }
 }
 
 impl Default for TokenStreamPatcher {
@@ -357,7 +401,7 @@ impl Default for TokenStreamPatcher {
 
 /// Convert a non-HTML table-cell/table token back to its pipe wikitext. Faithful
 /// port of PHP `TokenStreamPatcher::convertNonHTMLTokenToString` for the
-/// reconstructible cases (no `tsr`/source reparse): a bare `<td>`/`<th>`/`<tr>`/
+/// reconstructible cases (no usable `tsr`): a bare `<td>`/`<th>`/`<tr>`/
 /// `<caption>`/`<table>` outside a table is re-emitted as `|`/`!`/`|-`/`|+`/`{|`
 /// (or `||`/`!!` for `stx === 'row'` cells), appending any cell-attribute source.
 fn convert_non_html_token_to_string(token: &ParsoidToken) -> Vec<Item> {

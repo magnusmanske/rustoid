@@ -110,6 +110,9 @@ enum ExtensionParse {
 pub struct PegTokenizer<'a> {
     /// Input wikitext.
     input: &'a str,
+    /// The input as a shared string, stamped onto every `tsr` this tokenizer
+    /// produces (mirrors the peg grammar's `$this->source`).
+    source: std::sync::Arc<str>,
     /// Current byte position.
     pos: usize,
     /// Input length.
@@ -149,6 +152,7 @@ impl<'a> PegTokenizer<'a> {
     pub fn new(input: &'a str, options: &TokenizerOptions) -> Self {
         Self {
             input,
+            source: std::sync::Arc::from(input),
             pos: 0,
             input_len: input.len(),
             at_sol: options.sol,
@@ -235,13 +239,22 @@ impl<'a> PegTokenizer<'a> {
         self.pos
     }
 
+    /// A source range over this tokenizer's input. Mirrors the peg grammar, where
+    /// every `SourceRange` is built with `$this->source` — so a token produced by
+    /// tokenizing a *template body* carries that body's text, and
+    /// `SourceRange::substr` recovers the right characters no matter which source
+    /// the downstream reader happens to be holding.
     fn tsr(&self, start: usize, end: usize) -> SourceRange {
-        SourceRange::new(start, end)
+        SourceRange {
+            start: Some(start),
+            end,
+            source: Some(std::sync::Arc::clone(&self.source)),
+        }
     }
 
     #[allow(dead_code)]
     fn tsr_current(&self, start: usize) -> SourceRange {
-        SourceRange::new(start, self.pos)
+        self.tsr(start, self.pos)
     }
 
     // ---- Text accumulation helpers ----
@@ -1390,14 +1403,12 @@ impl<'a> PegTokenizer<'a> {
         let tsr = self.tsr(start, tag_end);
         let mut dp = self.make_dp_tsr(tsr);
         let no_attr_syntax = sep.is_empty();
-        if !sep.is_empty() && sep != "|" {
-            dp.attr_sep_src = Some(sep);
-        }
         // `buildTableTokens`: a `<th>` with no `!…|` attribute box gets the
         // no-attribute-syntax flag (read by `TableFixups`).
         if no_attr_syntax {
             dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
+        self.apply_build_table_tokens_attrs(&mut dp, &attrs, &sep, "!", start, tag_end);
         // `buildTableTokens` sets `AT_SRC_START` when the cell's source is at the
         // start of its line (preceded only by whitespace + the pipe);
         // `try_table_heading_tags` only runs at SOL.
@@ -1476,7 +1487,7 @@ impl<'a> PegTokenizer<'a> {
         let dash_run = self.remaining().bytes().take_while(|&b| b == b'-').count();
         self.advance(dash_run);
 
-        let _attr_start = self.pos;
+        let attr_start = self.pos;
         let attrs = self.parse_table_attributes(false);
         let tag_end = self.pos;
 
@@ -1486,6 +1497,15 @@ impl<'a> PegTokenizer<'a> {
         self.consume_empty_cell_pipe();
 
         let mut dp = self.make_dp(saved, tag_end);
+        // `table_row_tag`: `attrSrc` is everything after the dashes up to the end
+        // of the attribute box (a broken `|` on a row line is a valueless
+        // attribute name, so it lands inside `tagEndPos`).
+        dp.tmp.attr_src = Some(
+            self.input
+                .get(attr_start..tag_end)
+                .unwrap_or_default()
+                .to_string(),
+        );
         // `start_tag_src` = pipe + all dashes (`|-`/`|--`/`{{!}}-`/…).
         let mut start_tag_src = pipe.clone();
         start_tag_src.push_str(&"-".repeat(dash_run));
@@ -1529,14 +1549,12 @@ impl<'a> PegTokenizer<'a> {
         if pipe != "|" {
             dp.start_tag_src = Some(pipe.clone());
         }
-        if !sep.is_empty() && sep != "|" {
-            dp.attr_sep_src = Some(sep);
-        }
         // `buildTableTokens`: a `<td>` with no `|…|` attribute box gets the
         // no-attribute-syntax flag.
         if no_attr_syntax {
             dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
+        self.apply_build_table_tokens_attrs(&mut dp, &attrs, &sep, &pipe, saved, tag_end);
         // `buildTableTokens` sets `AT_SRC_START` on a cell at the start of its
         // source line (preceded only by whitespace + the pipe);
         // `try_table_data_tags` only runs at SOL.
@@ -1573,14 +1591,12 @@ impl<'a> PegTokenizer<'a> {
             let no_attr_syntax = sep.is_empty();
             // Variation from the default `||` row separator.
             if pp != "||" {
-                dp.start_tag_src = Some(pp);
-            }
-            if !sep.is_empty() && sep != "|" {
-                dp.attr_sep_src = Some(sep);
+                dp.start_tag_src = Some(pp.clone());
             }
             if no_attr_syntax {
                 dp.tmp.table_cell_with_no_attribute_syntax = true;
             }
+            self.apply_build_table_tokens_attrs(&mut dp, &attrs, &sep, &pp, saved, tag_end);
 
             self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
             self.parse_table_cell_inline(false);
@@ -1999,6 +2015,63 @@ impl<'a> PegTokenizer<'a> {
             }
         }
         self.pos + bytes.len()
+    }
+
+    /// The attribute-source bookkeeping shared by every table cell/row/caption
+    /// token, mirroring PHP `TokenizerUtils::buildTableTokens`:
+    ///
+    /// ```php
+    /// $dp->getTemp()->attrSrc = substr(
+    ///     $pegSource, $tsr->start, $tsr->end - $tsr->start - strlen( $attrInfo[2] )
+    /// );
+    /// $attrs = $attrInfo[0];
+    /// if ( !$attrs ) {
+    ///     $dp->startTagSrc = $wtChar . $attrInfo[1];
+    ///     $dp->getTemp()->attrSrc = '';
+    /// }
+    /// if ( ( !$attrs && $attrInfo[2] ) || $attrInfo[2] !== '|' ) {
+    ///     $dp->attrSepSrc = $attrInfo[2];
+    /// }
+    /// ```
+    ///
+    /// `attrs` is the valueless case when the attribute box parsed to nothing, in
+    /// which case the whitespace between the pipe and the separator moves into
+    /// `startTagSrc` and the separator (if any) into `attrSepSrc`. Getting this
+    /// right is what lets a cell be re-serialized *exactly* as written — e.g. a
+    /// stray row `|--|` is `startTagSrc = "|--"` plus `attrSrc = "|"`.
+    fn apply_build_table_tokens_attrs(
+        &self,
+        dp: &mut DataParsoid,
+        attrs: &[KV],
+        sep: &str,
+        wt_char: &str,
+        tsr_start: usize,
+        tag_end: usize,
+    ) {
+        // The box's leading whitespace is everything between the tag char and the
+        // separator that isn't a parsed attribute.
+        let attr_end = tag_end.saturating_sub(sep.len());
+        let raw_attr_src = self
+            .input
+            .get(tsr_start..attr_end)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let leading_ws_len = raw_attr_src.len() - raw_attr_src.trim_start().len();
+        let ws = raw_attr_src
+            .get(..leading_ws_len)
+            .unwrap_or_default()
+            .to_string();
+
+        dp.tmp.attr_src = Some(raw_attr_src);
+        if attrs.is_empty() {
+            // No usable attribute box: the tag char plus the box's whitespace is
+            // the visible start-tag source, and the box content is dropped.
+            dp.start_tag_src = Some(format!("{wt_char}{ws}"));
+            dp.tmp.attr_src = Some(String::new());
+        }
+        if (!attrs.is_empty() && sep != "|") || (attrs.is_empty() && !sep.is_empty()) {
+            dp.attr_sep_src = Some(sep.to_string());
+        }
     }
 
     /// Parse row syntax table args (attributes followed by *required* single

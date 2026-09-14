@@ -990,9 +990,21 @@ pub fn tokenize_wikitext_to_items(
     in_template: bool,
     ext_tags: &[String],
 ) -> Vec<Item> {
+    tokenize_wikitext_to_items_with_sol(wikitext, in_template, ext_tags, true)
+}
+
+/// As [`tokenize_wikitext_to_items`], with an explicit start-of-line flag
+/// (mirrors the `sol` option of PHP's `PegTokenizer::tokenizeSync`).
+pub fn tokenize_wikitext_to_items_with_sol(
+    wikitext: &str,
+    in_template: bool,
+    ext_tags: &[String],
+    sol: bool,
+) -> Vec<Item> {
     let options = TokenizerOptions {
         in_template,
         ext_tags: ext_tags.to_vec(),
+        sol,
         ..Default::default()
     };
     let mut tokenizer = PegTokenizer::new(wikitext, &options);
