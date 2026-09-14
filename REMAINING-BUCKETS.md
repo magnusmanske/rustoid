@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **857/891 fixtures pass** (96%). Lib tests: 657 pass. Clippy: clean.
+Current baseline: **858/891 fixtures pass** (96%). Lib tests: 660 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -8,6 +8,57 @@ Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 **skips** in standalone mode, so its expectation is unreachable for rustoid. 36
 fixtures are in that state; most still compare equal, so the fallback is left in
 place (skipping them would hide real divergences rather than surface them).
+
+## Landed: the tokenizer's `preproc` stack (857 → 858)
+
+PHP's grammar keeps a stack of pending closers, and
+`TokenizerUtils::inlineBreaks` consults its top: `}}` breaks only while the
+pending closer is `}}`, `]]` only while it is `]]`. A `[[` inside a template
+argument therefore becomes the pending closer and *hides* the following `}}`,
+which is the behaviour `Grammar.pegphp` documents at `broken_template`: once an
+opener fails to close, the whole chain degrades to literal text, so
+`{{1x|[[Foo}}` does not expand.
+
+rustoid scanned for the closing braces with a plain brace counter, so it
+expanded the template. `find_template_closing` now walks the pending-closer
+stack the way `inlineBreaks` does. `{{1x|[http://example.com x}}` (a single
+bracket opens an external link, not a wikilink) and `{{1x|[[a]]}}` (the
+wikilink closes first) stay correct. Fixed
+`Broken wikilinks (but not external links) prevent templates from closing`.
+
+The same pass confirmed that `inlineBreaks` never consults the `extlink` stop
+for `|`, so a pipe inside a single-bracket external link still separates
+template arguments (`{{1x|[http://e.com |x]}}` passes `[http://e.com ` and
+`x]`). That is what `Plain link in template argument` row 1 needs; the fixture
+as a whole still fails on its other rows (see below).
+
+## Next: token-level template-argument substitution
+
+`Plain link in template argument` is blocked on an architectural gap.
+`TemplateHandler::expand_template_natively` flattens each argument to a
+**string** (`key_value_to_string`), string-substitutes it into the template
+body, and re-tokenizes. `token_utils::tokens_to_string` has no arm for a
+`wikilink`/`extlink` token — PHP's `TokenUtils::tokensToString` has none
+either — so a link argument collapses to the empty string and the link is
+lost.
+
+PHP never stringifies there: `processTemplateSource` splices the argument's
+**token array** into the template body. Row 2 of the fixture
+(`{{1x|[[http://www.example.com |123]]}}`) is the visible symptom: rustoid
+emits a literal `[[` plus a free extlink where PHP renders the wikilink
+(`<a class="external text" href="http://www.example.com">|123</a>`).
+
+Verified with a direct probe of PHP's tokenizer:
+
+```
+{{1x|[[http://www.example.com |123]]}}  -> template arg value = wikilink token
+{{1x|[[http://www.example.com |123]}}   -> template fails; "{{1x|[" + extlink + "}}"
+{{1x|[http://www.example.com |123]}}   -> template with urllink + 2 params
+```
+
+Converting `expand_template_natively` to token-level substitution is the next
+architectural step for this fixture (and for `Template interaction` and the
+T290526 family).
 
 ## Landed: marker pairing across sibling subtrees (856 → 857)
 
