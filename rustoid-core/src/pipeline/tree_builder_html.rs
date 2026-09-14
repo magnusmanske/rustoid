@@ -197,11 +197,16 @@ impl Html5TreeBuilder {
             .map(str::to_string)
     }
 
-    /// Insert a `<meta>` tag *unfostered* (mirrors `insertUnfosteredMeta` +
-    /// `InHead::startTag`).
+    /// Insert a `<meta>` tag *unfostered* (mirrors `insertUnfosteredMeta`).
+    ///
+    /// Note it calls the **InHead** handler directly rather than dispatching on
+    /// the current insertion mode. That is deliberate and load-bearing: a
+    /// transclusion marker meta emitted while a table row/cell is open must stay
+    /// where it is, whereas a normal `meta` start tag in a table context is
+    /// foster-parented out of the table.
     fn insert_unfostered_meta(&mut self, attrs: Attributes) {
         self.dispatcher.flush_table_text(&mut self.builder);
-        modes::start_tag(
+        modes::in_head::start_tag(
             &mut self.builder,
             &mut self.dispatcher,
             "meta",
@@ -1214,7 +1219,7 @@ fn encapsulate_transclusions(node: &mut Node, source: Option<&str>) {
     }
 
     let children = std::mem::take(&mut node.children);
-    let children = wrap_transclusion_children(children, source);
+    let children = wrap_transclusion_children(children, source, Some(node));
     node.children = wrap_flipped_children(children, source);
 }
 
@@ -1232,7 +1237,11 @@ fn encapsulate_transclusions(node: &mut Node, source: Option<&str>) {
 /// fused innermost-first: an inner range's markers are removed and its
 /// `typeof`/metadata merged onto its target before the enclosing range is
 /// processed, so two nested `mw:Transclusion` markers collapse to one.
-fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<Node> {
+fn wrap_transclusion_children(
+    children: Vec<Node>,
+    source: Option<&str>,
+    parent: Option<&Node>,
+) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
     while i < children.len() {
@@ -1270,7 +1279,7 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
 
         // Fuse any *nested* ranges in the content first (innermost-first).
         let content: Vec<Node> = children[i + 1..end].to_vec();
-        let content = wrap_transclusion_children(content, source);
+        let content = wrap_transclusion_children(content, source, parent);
 
         // Stamp `about` on every element in the range and find the first
         // element (the encapsulation target), dropping deletable text and
@@ -1305,7 +1314,7 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
                         // sits between two sol-transparent links); otherwise
                         // wrap it in a single-space `about` span so the range
                         // stays contiguous and editable.
-                        if is_deletable_in_range(&content, idx) {
+                        if is_deletable_in_range(&content, idx, parent) {
                             continue;
                         }
                         // Span-wrap the newline (single space) to keep the
@@ -1466,14 +1475,23 @@ fn wrap_transclusion_children(children: Vec<Node>, source: Option<&str>) -> Vec<
     out
 }
 
-/// Whether a newline-only text node inside a transclusion range should be
+/// Whether a whitespace-only text node inside a transclusion range should be
 /// deleted (rather than wrapped in a single-space `about` span). Faithful port
-/// of PHP `DOMRangeBuilder::isDeletableNode` (minus the fosterable-position
-/// case, which is handled by `fostered` flags elsewhere): a newline is
-/// deletable when it separates a wikitext block node from a following wikitext
-/// list/table, or when it sits between two sol-transparent links. Otherwise it
-/// must be preserved (span-wrapped) so the range stays contiguous.
-fn is_deletable_in_range(content: &[Node], idx: usize) -> bool {
+/// of PHP `DOMRangeBuilder::isDeletableNode`.
+///
+/// The first check is the important one for tables: a text node in a *fosterable*
+/// position cannot have any rendering-relevant content (the HTML tree builder
+/// would already have fostered it out), and `data-mw` captures the template's
+/// output anyway, so it is always safe to drop. Everything else is the narrowly
+/// targeted newline handling: deletable when it separates a wikitext block node
+/// from a following wikitext list/table, or when it sits between two
+/// sol-transparent links.
+fn is_deletable_in_range(content: &[Node], idx: usize, parent: Option<&Node>) -> bool {
+    // `DOMUtils::isFosterablePosition` keys off the *parent* element name.
+    if parent.is_some_and(crate::html::dom_utils::is_fosterable_position_element) {
+        return true;
+    }
+
     let prev = idx.checked_sub(1).map(|p| &content[p]);
     let next = content.get(idx + 1);
 
@@ -2572,7 +2590,8 @@ mod tests {
                 Node::text("\n"),
                 Node::element(ElementKind::Table),
             ],
-            1
+            1,
+            None
         ));
 
         // A newline between a div and a paragraph is NOT deletable.
@@ -2582,7 +2601,8 @@ mod tests {
                 Node::text("\n"),
                 Node::element(ElementKind::Paragraph),
             ],
-            1
+            1,
+            None
         ));
 
         // A newline between two sol-transparent links is deletable (T407798).
@@ -2590,7 +2610,17 @@ mod tests {
         l1.set_attr("rel", "mw:PageProp/Category");
         let mut l2 = Node::element(ElementKind::Other("link".to_string()));
         l2.set_attr("rel", "mw:PageProp/Category");
-        assert!(is_deletable_in_range(&[l1, Node::text("\n"), l2], 1));
+        assert!(is_deletable_in_range(&[l1, Node::text("\n"), l2], 1, None));
+
+        // Anything in a fosterable position is deletable outright — the tree
+        // builder would already have fostered out any rendering-relevant
+        // content, and `data-mw` captures the template's output.
+        let tr = Node::element(ElementKind::TableRow);
+        assert!(is_deletable_in_range(
+            &[Node::element(ElementKind::Div), Node::text(" ")],
+            1,
+            Some(&tr)
+        ));
     }
 
     #[test]

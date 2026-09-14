@@ -360,7 +360,7 @@ mod before_head {
     }
 }
 
-mod in_head {
+pub(crate) mod in_head {
     use super::*;
     pub fn characters<H: TreeHandler>(
         b: &mut TreeBuilder<H>,

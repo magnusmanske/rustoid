@@ -70,6 +70,13 @@ pub fn is_wikitext_block_node(node: &Node) -> bool {
     consts::wikitext_block_elems().contains(&node_name(node))
 }
 
+/// `DOMUtils::isFosterablePosition` — would a text node/placeholder inside this
+/// element be fostered out by the HTML tree builder?
+/// (PHP: `Consts::$HTML['FosterablePosition'][nodeName( $n->parentNode )]`.)
+pub fn is_fosterable_position_element(node: &Node) -> bool {
+    consts::fosterable_position().contains(&node_name(node))
+}
+
 /// `DOMUtils::isQuoteElt` (`Consts::$WTQuoteTags` = `b`/`i`).
 pub fn is_quote_elt(node: &Node) -> bool {
     crate::html::wts_utils::is_quote_elt(node)
