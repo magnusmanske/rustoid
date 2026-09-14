@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **852/891 fixtures pass** (96%). Lib tests: 657 pass. Clippy: clean.
+Current baseline: **854/891 fixtures pass** (96%). Lib tests: 656 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -8,6 +8,56 @@ Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 **skips** in standalone mode, so its expectation is unreachable for rustoid. 36
 fixtures are in that state; most still compare equal, so the fallback is left in
 place (skipping them would hide real divergences rather than surface them).
+
+## Landed: source tracking on `SourceRange` (850 → 854)
+
+This was the "frame-source plumbing" item. Every `SourceRange` in the peg grammar
+is built with `$this->source`, so a token produced by tokenizing a *template body*
+indexes that body's text — which is why PHP's
+`TokenStreamPatcher::convertNonHTMLTokenToString` can re-read a stray table tag's
+wikitext no matter which source its caller holds (`SourceRange::substr` prefers the
+range's own source over the passed string).
+
+rustoid now models that: `SourceRange` gained an optional shared `source`, the
+tokenizer stamps its input onto every `tsr` it produces, and `substr`/`substr_in`
+prefer it. `substr` returns an owned `String` because the result may borrow from
+the range rather than the caller's text.
+
+With that in place, three faithful fixes landed:
+
+1. **`TokenizerUtils::buildTableTokens`' attribute-source bookkeeping**,
+   factored into `apply_build_table_tokens_attrs`. A cell whose attribute box
+   parsed to nothing takes its `startTagSrc` from the tag character plus the box's
+   whitespace and its `attrSepSrc` from the separator; `table_row_tag` records
+   `attrSrc` from the end of the dashes to the end of the attribute box. A stray
+   `|--|` row is therefore `startTagSrc = "|--"` plus `attrSrc = "|"`, so
+   `|  |` and `|--|` survive as written instead of collapsing to `|` and `|-`.
+   Fixed `Asciiart template should display the right number of spaces`.
+2. **The extension-body sub-pipeline's `inTemplate` context.**
+   `ParsoidExtensionAPI::wikitextToDOM` parses an extension body with
+   `'inTemplate' => $this->inTemplate()` — false unless the extension was reached
+   from inside a template. rustoid hardcoded `true`, which left templates inside a
+   top-level `<spantag>` unencapsulated. Fixed
+   `Multi-line extension tags should not interrupt table-cell parsing in the same
+   row`.
+
+### Still open in this area
+
+- `2b: Delete whitespace/comments if found in fosterable position while
+  template-wrapping` and `T343874` both need `DOMRangeBuilder`'s
+  **fosterable-position range expansion** (`DOMRangeBuilder.php:145-190`). When the
+  transclusion start marker sits in a fosterable position inside a `<tr>`, PHP
+  walks forward over the non-element nodes, then either migrates them into the
+  first element (`newStart`) or, if that element is not `tr`/`tbody` and there was
+  real whitespace, expands the range to the start marker's parent. Only then does
+  `getStartConsideringFosteredContent` + `MAP_TBODY_TR` pick the actual
+  encapsulation target. rustoid currently leaves an orphan
+  `<span typeof="mw:Transclusion"></span>` in front of the table, i.e. it does not
+  take that path at all. This is the last piece for the whole
+  "transclusion straddling an HTML table" family.
+- `Templated table cell with untemplated attributes: Integrated mode only` is one
+  `about` attribute short of PHP's standalone output (see below), and its fixture
+  expectation is `+integrated`-only (unreachable in standalone).
 
 ## Categorically unreachable: the `+integrated`-only table fixtures
 
