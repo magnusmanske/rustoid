@@ -5017,12 +5017,20 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
             i += 2;
             continue;
         }
+        // A `|` separates arguments. PHP's `TokenizerUtils::inlineBreaks`
+        // breaks on `|` whenever the `templateArg` stop is set and never
+        // consults the `extlink` stop (that one only guards `]`), so in a
+        // *template argument* a pipe inside a single-bracket external link
+        // still separates: `{{1x|[http://e.com |x]}}` passes `[http://e.com `
+        // and `x]`, and `{{{1}}}` renders only the first. Wikilink content
+        // (`magic_pipe`) is scanned by `link_text`/`link_text_parameterized`,
+        // where the `[...]` is an `extlink` atom and its pipes stay put.
         if c == '|'
             && double_brace == 0
             && triple_brace == 0
             && bracket == 0
             && table == 0
-            && extlink == 0
+            && (!magic_pipe || extlink == 0)
             && dash_brace == 0
         {
             parts.push(std::mem::take(&mut current));
@@ -6045,6 +6053,37 @@ mod tests {
         // mean "nothing to reparse").
         let (attrs, _sep) = tokenize_table_cell_attributes("class=\"foo\"{{!}}bar");
         assert!(attrs.is_empty());
+    }
+
+    #[test]
+    fn test_split_template_args_pipe_inside_extlink() {
+        // PHP's `inlineBreaks` never consults the `extlink` stop for `|`, so a
+        // pipe inside a single-bracket external link still separates template
+        // arguments: `{{1x|[http://e.com |x]}}` passes `[http://e.com ` and `x]`.
+        let parts = split_template_args("1x|[http://e.com |x]");
+        assert_eq!(parts, vec!["1x", "[http://e.com ", "x]"]);
+
+        // A pipe inside a `[[…]]` wikilink is consumed by the wikilink's own
+        // `pipe` rule, so it does not split the arguments.
+        let parts = split_template_args("1x|[[http://e.com |123]]");
+        assert_eq!(parts, vec!["1x", "[[http://e.com |123]]"]);
+    }
+
+    #[test]
+    fn test_split_wikilink_content_keeps_extlink_pipe() {
+        // Wikilink content is scanned by `link_text_parameterized`, where the
+        // `[...]` is an `extlink` atom and its pipes stay put — the case behind
+        // `Images with the "|" character in the comment`.
+        let parts =
+            split_wikilink_content("File:Foobar.jpg|thumb|An [http://t/?a=|b external] URL");
+        assert_eq!(
+            parts,
+            vec![
+                "File:Foobar.jpg",
+                "thumb",
+                "An [http://t/?a=|b external] URL"
+            ]
+        );
     }
 
     #[test]
