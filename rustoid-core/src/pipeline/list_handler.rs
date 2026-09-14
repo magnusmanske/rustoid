@@ -146,7 +146,6 @@ impl ListHandler {
         let mut output = Vec::new();
         let mut saw_eof = false;
 
-
         for token in tokens {
             if matches!(token, Item::Tok(ParsoidToken::Eof(_))) {
                 saw_eof = true;
@@ -254,9 +253,7 @@ impl ListHandler {
 
         list_frame.bstack = bn.clone();
 
-        let res: Vec<Item>;
-
-        if prefix.len() == bs.len() && bn.len() == bs.len() {
+        let res: Vec<Item> = if prefix.len() == bs.len() && bn.len() == bs.len() {
             // No nesting change.
             let item_name = list_frame
                 .endtags
@@ -287,7 +284,7 @@ impl ListHandler {
             }
             out.push(Item::Tok(item_open));
 
-            res = out;
+            out
         } else {
             let mut prefix_correction = 0usize;
             let mut tokens: Vec<Item> = Vec::new();
@@ -405,8 +402,8 @@ impl ListHandler {
                 tokens.extend(pushed.into_iter().map(Item::Tok));
             }
 
-            res = tokens;
-        }
+            tokens
+        };
 
         // Clear out sol tokens, nl, atEOL.
         list_frame.sol_tokens.clear();

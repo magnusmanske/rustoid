@@ -708,8 +708,7 @@ mod in_body {
         sl: usize,
     ) -> Option<usize> {
         // The full "in body" start-tag switch. Ported faithfully below.
-        let is_new_afe: bool;
-        match name {
+        let is_new_afe: bool = match name {
             "html" => {
                 b.error("merging unexpected html tag", ss);
                 if b.stack.has_template() || b.stack.length() < 1 {
@@ -735,19 +734,19 @@ mod in_body {
             | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
             | "main" | "menu" | "nav" | "ol" | "p" | "section" | "summary" | "ul" => {
                 b.close_p_in_button_scope(ss);
-                is_new_afe = false;
+                false
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 b.close_p_in_button_scope(ss);
                 if is_heading(b.stack.current().map(|e| e.html_name.as_str())) {
                     b.pop(ss, 0);
                 }
-                is_new_afe = false;
+                false
             }
             "pre" | "listing" => {
                 b.close_p_in_button_scope(ss);
                 b.frameset_ok = false;
-                is_new_afe = false;
+                false
             }
             "form" => {
                 if b.form_element.is_some() && !b.stack.has_template() {
@@ -778,11 +777,11 @@ mod in_body {
                     }
                 }
                 b.close_p_in_button_scope(ss);
-                is_new_afe = false;
+                false
             }
             "plaintext" => {
                 b.close_p_in_button_scope(ss);
-                is_new_afe = false;
+                false
             }
             "button" => {
                 if b.stack.is_in_scope("button") {
@@ -791,17 +790,17 @@ mod in_body {
                 }
                 b.reconstruct_afe(ss);
                 b.frameset_ok = false;
-                is_new_afe = false;
+                false
             }
             "a" => {
                 b.afe.find_element_by_name("a");
                 b.reconstruct_afe(ss);
-                is_new_afe = true;
+                true
             }
             "b" | "big" | "code" | "em" | "font" | "i" | "s" | "small" | "strike" | "strong"
             | "tt" | "u" => {
                 b.reconstruct_afe(ss);
-                is_new_afe = true;
+                true
             }
             "nobr" => {
                 b.reconstruct_afe(ss);
@@ -809,13 +808,13 @@ mod in_body {
                     b.adoption_agency("nobr", ss, 0);
                     b.reconstruct_afe(ss);
                 }
-                is_new_afe = true;
+                true
             }
             "applet" | "marquee" | "object" => {
                 b.reconstruct_afe(ss);
                 b.afe.insert_marker();
                 b.frameset_ok = false;
-                is_new_afe = false;
+                false
             }
             "table" => {
                 if b.quirks != TB_QUIRKS {
@@ -823,7 +822,7 @@ mod in_body {
                 }
                 b.frameset_ok = false;
                 d.switch_mode(ModeId::InTable);
-                is_new_afe = false;
+                false
             }
             "area" | "br" | "embed" | "img" | "keygen" | "wbr" => {
                 b.reconstruct_afe(ss);
@@ -848,25 +847,23 @@ mod in_body {
             }
             "textarea" => {
                 b.frameset_ok = false;
-                is_new_afe = false;
+                false
             }
             "xmp" => {
                 b.close_p_in_button_scope(ss);
                 b.reconstruct_afe(ss);
                 b.frameset_ok = false;
-                is_new_afe = false;
+                false
             }
             "iframe" => {
                 b.frameset_ok = false;
-                is_new_afe = false;
+                false
             }
             "noscript" => {
                 b.reconstruct_afe(ss);
-                is_new_afe = false;
+                false
             }
-            "noembed" => {
-                is_new_afe = false;
-            }
+            "noembed" => false,
             "select" => {
                 b.reconstruct_afe(ss);
                 b.frameset_ok = false;
@@ -875,26 +872,26 @@ mod in_body {
                 } else {
                     d.switch_mode(ModeId::InSelect);
                 }
-                is_new_afe = false;
+                false
             }
             "optgroup" | "option" => {
                 if b.stack.current().map(|e| e.html_name.as_str()) == Some("option") {
                     b.pop(ss, 0);
                 }
                 b.reconstruct_afe(ss);
-                is_new_afe = false;
+                false
             }
             "rb" | "rtc" => {
                 if b.stack.is_in_scope("ruby") {
                     b.generate_implied_end_tags(None, ss);
                 }
-                is_new_afe = false;
+                false
             }
             "rp" | "rt" => {
                 if b.stack.is_in_scope("ruby") {
                     b.generate_implied_end_tags(Some("rtc"), ss);
                 }
-                is_new_afe = false;
+                false
             }
             "math" => {
                 b.reconstruct_afe(ss);
@@ -911,9 +908,9 @@ mod in_body {
             }
             _ => {
                 b.reconstruct_afe(ss);
-                is_new_afe = false;
+                false
             }
-        }
+        };
 
         let uid = b.insert_element(name, attrs, false, ss, sl);
         if is_new_afe && let Some(elt) = b.stack.item_by_uid(uid) {
