@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **855/891 fixtures pass** (96%). Lib tests: 656 pass. Clippy: clean.
+Current baseline: **857/891 fixtures pass** (96%). Lib tests: 657 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -8,6 +8,27 @@ Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 **skips** in standalone mode, so its expectation is unreachable for rustoid. 36
 fixtures are in that state; most still compare equal, so the fallback is left in
 place (skipping them would hide real divergences rather than surface them).
+
+## Landed: marker pairing across sibling subtrees (856 → 857)
+
+A template that opens inside one element and closes inside a *sibling* element
+was never encapsulated. `{|
+| {{content and cell}}
+|}` puts the
+`mw:Transclusion` start meta in the first `<td>` and the `mw:Transclusion/End`
+meta in the second; rustoid's range search only ever paired markers that were
+themselves siblings (or reachable as siblings), so the start marker survived as
+a stray `<meta>` inside the cell.
+
+PHP's `DOMRangeBuilder::findWrappableTemplateRangesRecursive` pairs the metas
+wherever they sit in the tree, and `findEnclosingRange` then lifts the range to
+their common ancestor — the first cell becomes the encapsulation target and the
+second only carries the `about` id.
+
+rustoid now models that: `wrap_flipped_children` also recognises a child whose
+*subtree* holds a start marker whose end marker lies outside that subtree, and
+pairs it with the sibling holding the end marker. Fixed
+`Newline constraint after multi-node template`.
 
 ## Landed: transclusion marker metas insert through InHead (854 → 855)
 
@@ -1101,7 +1122,6 @@ extension/transclusion tags in a row", "A table with …
   "Definition lists: ignore colons inside tags", "Mixed Lists: Test 11"
 - "Hacky use to indent tables, with comments (T65979)", "Wikitext tables can be nested inside HTML tables"
 - "Table cell attributes: Pipes protected by nowikis …", "Table security: embedded pipes"
-- "Newline constraint after multi-node template"
 - "Template interaction"
 - T290526 family: "2. Using {{!}} in wikilinks", "Using {{!}} in template arguments, part 2",
   "T72875: brackets in attributes of elements in internal link texts",
