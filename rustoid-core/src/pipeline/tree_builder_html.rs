@@ -1534,12 +1534,26 @@ fn is_deletable_in_range(content: &[Node], idx: usize, parent: Option<&Node>) ->
 fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<Node> {
     let mut i = 0;
     while i < children.len() {
-        if !is_transclusion_start(&children[i]) {
+        // The range start is either the marker meta itself (a direct sibling) or
+        // the deepest element whose subtree holds a start marker whose end marker
+        // lies outside that subtree. PHP's `findWrappableTemplateRangesRecursive`
+        // pairs the two metas wherever they are in the tree, and
+        // `findEnclosingRange` then lifts the range to their common ancestor, so
+        // a template that opens inside one child and closes inside another is
+        // encapsulated on the enclosing element of the opening marker (e.g. the
+        // first of two sibling `<td>`s).
+        let start_meta = if is_transclusion_start(&children[i]) {
+            children[i].clone()
+        } else if matches!(children[i].kind, NodeKind::Element(_))
+            && let Some(found) = find_unmatched_start_meta(&children[i])
+        {
+            found.clone()
+        } else {
             i += 1;
             continue;
-        }
+        };
 
-        let about: Option<String> = children[i].get_attr("about").map(str::to_string);
+        let about: Option<String> = start_meta.get_attr("about").map(str::to_string);
 
         // Find the sibling element (in either direction, nearest first) whose
         // subtree contains the matching end marker.
@@ -1568,7 +1582,10 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
             continue;
         };
 
-        let start_meta = children[i].clone();
+        // Whether the range start is the sibling itself (`start_meta` is
+        // `children[i]`) or a marker nested inside its subtree (PHP's
+        // common-ancestor case).
+        let start_is_sibling = is_transclusion_start(&children[i]);
 
         // Determine the contiguous sibling range [lo, hi] spanned by the
         // transclusion: from the start meta to the element holding the end
@@ -1656,9 +1673,15 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
             let encap_node = table_body_content_target(&mut children[et], well_balanced);
             transfer_transclusion_to_element(encap_node, &start_meta, source, range_end);
         }
-        // Remove the start marker meta.
-        children.remove(i);
-        // Do not advance `i`: the next sibling shifted into this index.
+        // Remove the start marker meta: either the sibling element itself, or
+        // the marker nested in the range-start element's subtree.
+        if start_is_sibling {
+            children.remove(i);
+            // Do not advance `i`: the next sibling shifted into this index.
+        } else {
+            remove_start_meta(&mut children[i], about.as_deref());
+            i += 1;
+        }
     }
     children
 }
@@ -1725,6 +1748,46 @@ fn subtree_contains_end_meta(node: &Node, about: Option<&str>) -> bool {
     node.children
         .iter()
         .any(|c| subtree_contains_end_meta(c, about))
+}
+
+/// Find the first transclusion/param start marker meta in this subtree whose
+/// end marker is *not* also inside the subtree. Used to pair marker metas that
+/// live in different children of a common ancestor (PHP's
+/// `DOMRangeBuilder::findEnclosingRange` common-ancestor case), e.g. a template
+/// that opens in one `<td>` and closes in the next.
+fn find_unmatched_start_meta(node: &Node) -> Option<&Node> {
+    if is_transclusion_start(node) {
+        let about = node.get_attr("about");
+        if !node
+            .children
+            .iter()
+            .any(|c| subtree_contains_end_meta(c, about))
+        {
+            return Some(node);
+        }
+    }
+    node.children.iter().find_map(find_unmatched_start_meta)
+}
+
+/// Remove a transclusion *start* marker with the given `about` from a subtree.
+/// Returns true if one was removed.
+fn remove_start_meta(node: &mut Node, about: Option<&str>) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while i < node.children.len() {
+        if is_transclusion_start(&node.children[i]) && node.children[i].get_attr("about") == about {
+            node.children.remove(i);
+            found = true;
+        } else {
+            i += 1;
+        }
+    }
+    for child in &mut node.children {
+        if remove_start_meta(child, about) {
+            found = true;
+        }
+    }
+    found
 }
 
 /// Remove a transclusion *end* marker with the given `about` from a subtree.
@@ -1936,6 +1999,53 @@ mod tests {
         assert_eq!(
             table_body_content_target(&mut table, false).kind,
             NodeKind::Element(ElementKind::TableCell)
+        );
+    }
+
+    #[test]
+    fn test_wrap_flipped_children_pairs_markers_across_siblings() {
+        // A template that opens inside one `<td>` and closes inside the next
+        // (T343874 / "Newline constraint after multi-node template"). PHP's
+        // `findEnclosingRange` lifts the range to the common ancestor, so the
+        // *first* cell becomes the encapsulation target and the second only
+        // carries the `about` id.
+        fn start_meta() -> Node {
+            let mut m = Node::element(ElementKind::Other("meta".to_string()));
+            m.set_attr("typeof", "mw:Transclusion");
+            m.set_attr("about", "#mwt1");
+            m
+        }
+        fn end_meta() -> Node {
+            let mut m = Node::element(ElementKind::Other("meta".to_string()));
+            m.set_attr("typeof", "mw:Transclusion/End");
+            m.set_attr("about", "#mwt1");
+            m
+        }
+
+        let mut td1 = Node::element(ElementKind::TableCell);
+        td1.push_child(Node::text(" "));
+        td1.push_child(start_meta());
+        td1.push_child(Node::text("test"));
+
+        let mut td2 = Node::element(ElementKind::TableCell);
+        td2.push_child(Node::text(" 123"));
+        td2.push_child(end_meta());
+
+        let out = wrap_flipped_children(vec![td1, td2], None);
+
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].get_attr("about"), Some("#mwt1"));
+        assert_eq!(out[0].get_attr("typeof"), Some("mw:Transclusion"));
+        assert_eq!(out[1].get_attr("about"), Some("#mwt1"));
+        assert_eq!(out[1].get_attr("typeof"), None);
+        // Both marker metas are gone; the first cell keeps its content.
+        assert!(
+            !out[0].children.iter().any(is_transclusion_marker_meta),
+            "{out:?}"
+        );
+        assert!(
+            !out[1].children.iter().any(is_transclusion_marker_meta),
+            "{out:?}"
         );
     }
 
