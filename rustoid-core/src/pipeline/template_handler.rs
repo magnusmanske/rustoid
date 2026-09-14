@@ -699,7 +699,13 @@ impl TemplateHandler {
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 let mut info = template_info_from(None, Some(&name), vec![]);
                 info.target_wt = Some(target_str.clone());
-                info.param_infos = super::template_encapsulator::prepare_tpl_param_infos(params);
+                info.param_infos = super::template_encapsulator::prepare_tpl_param_infos(
+                    params,
+                    token
+                        .data_parsoid()
+                        .and_then(|dp| dp.src.as_deref())
+                        .unwrap_or(""),
+                );
                 encap.encap_tokens(vec![template_to_wikilink(&name)], &info)
             }
             None => Self::convert_to_string(token, false),

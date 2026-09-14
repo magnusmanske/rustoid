@@ -146,6 +146,11 @@ pub struct PegTokenizer<'a> {
     lang_conv_enabled: bool,
     /// Link-description context (see `TokenizerOptions::linkdesc`).
     linkdesc: bool,
+    /// Whether we are tokenizing the body of a table cell. Mirrors the
+    /// `tableCellArg` stop that PHP's `inline_breaks` consults: inside a cell a
+    /// `|` breaks (so `[ftp://|x||]` cannot close its bracket), while in plain
+    /// inline context it does not.
+    in_table_cell: bool,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -171,6 +176,7 @@ impl<'a> PegTokenizer<'a> {
             protocols: options.protocols.clone(),
             lang_conv_enabled: options.lang_conv_enabled,
             linkdesc: options.linkdesc,
+            in_table_cell: false,
         }
     }
 
@@ -1609,6 +1615,13 @@ impl<'a> PegTokenizer<'a> {
     /// elements exactly as a top-level inline line does (mirrors PHP's
     /// `nested_block_in_table` / `inlineline` cell body).
     fn parse_table_cell_inline(&mut self, th: bool) {
+        let saved_cell = self.in_table_cell;
+        self.in_table_cell = true;
+        self.parse_table_cell_inline_inner(th);
+        self.in_table_cell = saved_cell;
+    }
+
+    fn parse_table_cell_inline_inner(&mut self, th: bool) {
         loop {
             if self.eof() || self.at_cell_terminator(th) {
                 return;
@@ -1786,6 +1799,7 @@ impl<'a> PegTokenizer<'a> {
                     key_end: name_end,
                     value_start: name_end + 1,
                     value_end: self.pos,
+                    source: None,
                 }),
                 ksrc: None,
                 vsrc: None,
@@ -1799,6 +1813,7 @@ impl<'a> PegTokenizer<'a> {
                     key_end: name_end,
                     value_start: name_end,
                     value_end: name_end,
+                    source: None,
                 }),
                 ksrc: None,
                 vsrc: None,
@@ -2481,6 +2496,7 @@ impl<'a> PegTokenizer<'a> {
                     key_end: name_end,
                     value_start: name_end + 1,
                     value_end: val_end,
+                    source: None,
                 }),
                 ksrc: None,
                 vsrc,
@@ -2494,6 +2510,7 @@ impl<'a> PegTokenizer<'a> {
                     key_end: name_end,
                     value_start: name_end,
                     value_end: name_end,
+                    source: None,
                 }),
                 ksrc: None,
                 vsrc: None,
@@ -2903,8 +2920,9 @@ impl<'a> PegTokenizer<'a> {
         };
         self.advance(end + 2);
 
-        // Split the inner content on top-level '|' into target + arguments.
-        let parts = split_template_args(&inner);
+        // Split the inner content on top-level '|' into target + arguments,
+        // keeping each part's offset so arguments can carry `srcOffsets`.
+        let parts = split_template_args_with_offsets(&inner);
 
         let mut dp = self.make_dp(saved, self.pos);
         dp.src = Some(self.input[saved..self.pos].to_string());
@@ -2916,7 +2934,7 @@ impl<'a> PegTokenizer<'a> {
         // we strip the comment syntax directly).
         let target = parts
             .first()
-            .map(|s| strip_html_comments(s).trim().to_string())
+            .map(|(_, s)| strip_html_comments(s).trim().to_string())
             .unwrap_or_default();
         stt.attribs.push(kv_str(&target, ""));
 
@@ -2933,16 +2951,34 @@ impl<'a> PegTokenizer<'a> {
         // `{{!}}`/`{{{x}}}` becomes a `template`/`templatearg` token, a `[[…]]` a
         // `wikilink`, `'''…'''` a quote token — rather than raw strings. This lets
         // the frame splice argument *tokens* directly.
-        for part in parts.iter().skip(1) {
+        // `inner` begins two bytes into the `{{`; a part at offset `o` within
+        // `inner` therefore starts at `inner_start + o` in the input.
+        let inner_start = saved + 2;
+        let token_src: std::sync::Arc<str> = self.input.into();
+        for (offset, part) in parts.iter().skip(1) {
+            let part_start = inner_start + offset;
+            let value_end = part_start + part.len();
             match find_arg_separator_eq(part) {
                 Some(eq) => {
                     let k = part[..eq].trim().to_string();
                     let v = part[eq + 1..].to_string();
                     let v = tokenize_template_arg_value(&v, self.lang_conv_enabled, &self.ext_tags);
+                    // `key` spans the part up to `=` (trailing spaces are
+                    // recorded separately by PHP as `spc`), `value` the rest.
+                    let key_start = part_start + part[..eq].trim_end().len()
+                        - part[..eq].trim_end().trim_start().len();
+                    let key_end = part_start + eq;
+                    let value_start = part_start + eq + 1;
                     stt.attribs.push(KV {
                         key: KeyValue::Str(k),
                         value: v,
-                        src_offsets: None,
+                        src_offsets: Some(KVSourceRange {
+                            key_start,
+                            key_end,
+                            value_start,
+                            value_end,
+                            source: Some(token_src.clone()),
+                        }),
                         ksrc: None,
                         vsrc: None,
                     });
@@ -2950,10 +2986,19 @@ impl<'a> PegTokenizer<'a> {
                 None => {
                     let v =
                         tokenize_template_arg_value(part, self.lang_conv_enabled, &self.ext_tags);
+                    // A positional argument: PHP records a key range that ends
+                    // where the value begins, so `key.end === value.start` marks
+                    // it positional in `prepareTplParamInfos`.
                     stt.attribs.push(KV {
                         key: KeyValue::Str(String::new()),
                         value: v,
-                        src_offsets: None,
+                        src_offsets: Some(KVSourceRange {
+                            key_start: part_start,
+                            key_end: part_start,
+                            value_start: part_start,
+                            value_end,
+                            source: Some(token_src.clone()),
+                        }),
                         ksrc: None,
                         vsrc: None,
                     });
@@ -3156,15 +3201,16 @@ impl<'a> PegTokenizer<'a> {
             return false;
         };
         // `extlink = "[" url (space)* inlineline<extlink>? "]"`: the content is
-        // `inlineline`, which stops at an `inline_breaks` position. When the very
-        // first content character breaks (a table-context `|` before `|`/`}` in
-        // `[ftp://|x||]`), `inlineline` matches nothing and the required `]` is
-        // not there, so the whole rule fails and the `[` becomes literal text
-        // (the URL is then re-scanned as an autolink).
-        if content_rem[..rel_end]
-            .chars()
-            .next()
-            .is_some_and(|c| c == '|')
+        // `inlineline`, which stops at an `inline_breaks` position. A `|` breaks
+        // only when the `tableCellArg` stop is set — in plain inline context a
+        // leading `|` is ordinary link text (`[http://x |123]` has the text
+        // `|123`). Only inside a table cell does the break make the rule fail,
+        // leaving `[ftp://|x||]` to re-scan the URL as an autolink.
+        if self.in_table_cell
+            && content_rem[..rel_end]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '|')
         {
             self.pos = saved;
             return false;
@@ -4159,6 +4205,12 @@ fn find_wikilink_close_at(input: &str) -> Option<usize> {
 ///
 /// Only the *unmatched* `[[` matters: `{{1x|[[a]]}}` closes its wikilink first, so
 /// the closer on top is `}}` again by the time the `}}` arrives.
+///
+/// A `}}` seen while `]]` is on top fails the scan *immediately* rather than
+/// skipping ahead for a later `}}`. PHP reaches the same result by backtracking
+/// the whole `template` production at that point, which is what keeps
+/// `{{1x|[[http://x |y]}}` (a lone `]`, then `}}`) from swallowing a following
+/// line's `]]` and expanding across both.
 fn find_template_closing(input: &str) -> Option<usize> {
     // Pending closers, innermost last. The outermost entry is the `{{` this scan
     // is resolving, so a `}}` matching it ends the scan.
@@ -4167,6 +4219,9 @@ fn find_template_closing(input: &str) -> Option<usize> {
     let bytes = input.as_bytes();
     while i < bytes.len() {
         match (stack.last(), bytes[i]) {
+            // A `}}` while a wikilink is still open cannot close this template;
+            // the rule fails here and the `{{` degrades to literal text.
+            (Some(&"]]"), _) if input[i..].starts_with("}}") => return None,
             // `TokenizerUtils::inlineBreaks` breaks on `}}` whenever the pending
             // closer is `}}`, irrespective of any further `}`.
             (Some(&"}}"), _) if input[i..].starts_with("}}") => {
@@ -4863,6 +4918,16 @@ fn split_template_args(inner: &str) -> Vec<String> {
     split_template_args_impl(inner, false)
 }
 
+/// As [`split_template_args`], but each part carries its byte offset within
+/// `inner`. PHP keeps each argument's `srcOffsets` on the KV so the
+/// `ParamInfo` wikitext can be taken from the *source* (`$srcOffsets->value->substr($src)`)
+/// rather than reconstructed from tokens — which matters because
+/// `TokenUtils::tokensToString` has no arm for a `wikilink`/`extlink` token, so
+/// a link argument would otherwise serialize to an empty `wt`.
+fn split_template_args_with_offsets(inner: &str) -> Vec<(usize, String)> {
+    split_template_args_impl_offsets(inner, false)
+}
+
 /// Variant that also treats `{{!}}` as a pipe separator (for wikilink content,
 /// where the PEG `pipe = "|" / "{{!}}"` rule applies).
 fn split_wikilink_content(inner: &str) -> Vec<String> {
@@ -4870,8 +4935,17 @@ fn split_wikilink_content(inner: &str) -> Vec<String> {
 }
 
 fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
-    let mut parts = Vec::new();
+    split_template_args_impl_offsets(inner, magic_pipe)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect()
+}
+
+fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize, String)> {
+    let mut parts: Vec<(usize, String)> = Vec::new();
     let mut current = String::new();
+    // Byte offset of the current part within `inner`.
+    let mut part_start = 0usize;
     let mut double_brace: i32 = 0;
     let mut triple_brace: i32 = 0;
     let mut bracket: i32 = 0;
@@ -4953,7 +5027,8 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
             && extlink == 0
             && dash_brace == 0
         {
-            parts.push(std::mem::take(&mut current));
+            parts.push((part_start, std::mem::take(&mut current)));
+            part_start = i + 5;
             i += 5;
             continue;
         }
@@ -5033,13 +5108,14 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
             && (!magic_pipe || extlink == 0)
             && dash_brace == 0
         {
-            parts.push(std::mem::take(&mut current));
+            parts.push((part_start, std::mem::take(&mut current)));
+            part_start = i + c.len_utf8();
         } else {
             current.push(c);
         }
         i += c.len_utf8();
     }
-    parts.push(current);
+    parts.push((part_start, current));
     parts
 }
 
@@ -6009,6 +6085,12 @@ mod tests {
         // An *unclosed* `[[` hides the `}}`, so the template never closes
         // (`Grammar.pegphp`'s `broken_template`: `{{1x|[[Foo}}` stays literal).
         assert_eq!(find_template_closing("1x|[[Foo}}"), None);
+        // A `}}` reached while the wikilink is open fails the scan immediately
+        // rather than skipping ahead, so a following line's `]]` cannot rescue it.
+        assert_eq!(
+            find_template_closing("1x|[[http://x |y]}}\n\n{{2x|z]]}}"),
+            None
+        );
         // Nothing to close at all.
         assert_eq!(find_template_closing("1x|foo"), None);
     }
@@ -6124,6 +6206,35 @@ mod tests {
         assert_eq!(scan_extlink_url_len("//x/y?a=b&c=d]"), 13);
         // An entity is link content, not URL.
         assert_eq!(scan_extlink_url_len("http://x&amp;]"), 8);
+    }
+
+    #[test]
+    fn test_extlink_pipe_content_in_table_cell() {
+        // In plain inline context a `|` is ordinary link text, so
+        // `[http://x |123]` is an extlink with the text `|123`.
+        let toks = tokenize("[http://www.example.com |123]");
+        let extlink = toks.iter().find_map(|t| match t {
+            Either::Right(ParsoidToken::SelfclosingTag(stt)) if stt.name == "extlink" => Some(stt),
+            _ => None,
+        });
+        let extlink = extlink.expect("expected an extlink");
+        let content = extlink
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:content"))
+            .expect("extlink should carry mw:content");
+        assert_eq!(content.value.as_str(), Some("|123"));
+
+        // Inside a table cell the `|` breaks `inlineline`, so the extlink rule
+        // fails and the URL is re-scanned as an autolink (`[ftp://|x||]`).
+        let toks = tokenize("{|\n| |[ftp://|x||]\n|}");
+        assert!(
+            !toks.iter().any(|t| matches!(
+                t,
+                Either::Right(ParsoidToken::SelfclosingTag(stt)) if stt.name == "extlink"
+            )),
+            "no extlink expected inside a cell: {toks:?}"
+        );
     }
 
     #[test]

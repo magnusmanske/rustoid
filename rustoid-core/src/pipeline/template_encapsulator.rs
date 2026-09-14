@@ -420,10 +420,20 @@ pub fn prepare_pf_param_infos(
     out
 }
 
-/// Prepare `ParamInfo` for a template transclusion. Mirrors
-/// `TemplateEncapsulator::prepareTplParamInfos` for string-valued args.
+/// Prepare `ParamInfo` for a template transclusion. Faithful port of
+/// `TemplateEncapsulator::prepareTplParamInfos`.
+///
+/// The name and value wikitext come from the argument's `srcOffsets` — i.e.
+/// straight out of the source — *not* from stringifying the argument tokens.
+/// That matters: `TokenUtils::tokensToString` has no arm for a
+/// `wikilink`/`extlink` token, so a link argument would otherwise serialize to
+/// an empty `wt` (and an empty `data-mw` parameter).
+///
+/// `source` is the ambient wikitext, used only for arguments whose range carries
+/// no source of its own.
 pub fn prepare_tpl_param_infos(
     params: &crate::pipeline::parser_functions::Params,
+    source: &str,
 ) -> Vec<ParamInfo> {
     use crate::wikitext::token_utils::key_value_to_string;
 
@@ -432,24 +442,51 @@ pub fn prepare_tpl_param_infos(
 
     // Ignore params[0] (the template name).
     for param in params.args.iter().skip(1) {
-        let k = key_value_to_string(&param.key).trim().to_string();
-        let v = key_value_to_string(&param.value);
+        let (k_src, v_src) = match &param.src_offsets {
+            Some(so) => (
+                so.key_substr(source).to_string(),
+                so.value_substr(source).to_string(),
+            ),
+            None => (
+                key_value_to_string(&param.key),
+                key_value_to_string(&param.value),
+            ),
+        };
+        let k_wt = k_src.trim().to_string();
 
-        let mut info = if k.is_empty() {
-            let mut info = ParamInfo::new(arg_index.to_string());
+        // `TokenUtils::tokensToString` returns a string; only when it cannot (the
+        // argument name is a non-string token array) does PHP fall back to the
+        // original source text `$kWt` (which it has already trimmed).
+        let k = match &param.key {
+            KeyValue::Str(s) => s.trim().to_string(),
+            KeyValue::Tokens(_) => k_wt.clone(),
+        };
+        let mut v = v_src.clone();
+
+        // Even an empty `k` stays positional only when the value directly follows
+        // the key; otherwise it is a blank *named* parameter (which is valid).
+        let is_positional = k.is_empty()
+            && param
+                .src_offsets
+                .as_ref()
+                .is_some_and(|so| so.key_end == so.value_start);
+        let mut info = if is_positional {
+            let info = ParamInfo::new(arg_index.to_string());
             arg_index += 1;
-            info.value_wt = v;
             info
         } else {
+            // Named parameters get their value whitespace stripped.
+            v = v.trim().to_string();
             let mut info = ParamInfo::new(k.clone());
             info.named = true;
-            info.value_wt = v.trim().to_string();
             info
         };
+        info.value_wt = v;
 
-        // Preserve original key wikitext when it differs.
-        if info.named && k != info.k {
-            info.key_wt = Some(k);
+        // Only add the original parameter wikitext when named and different from
+        // the actual parameter.
+        if info.named && k_wt != info.k {
+            info.key_wt = Some(k_wt);
         }
         out.push(info);
     }
@@ -557,8 +594,11 @@ mod tests {
 
     #[test]
     fn test_prepare_tpl_param_infos() {
-        use crate::wikitext::tokens_v2::{KV, KeyValue};
+        use crate::wikitext::tokens_v2::{KV, KVSourceRange, KeyValue};
 
+        // `Foo |pos| name = value ` — the second argument is positional (its key
+        // range is empty and abuts the value), the third is named.
+        let src = "Foo|pos| name = value ";
         let params = crate::pipeline::parser_functions::Params::new(vec![
             KV {
                 key: KeyValue::Str("Foo".to_string()),
@@ -570,20 +610,32 @@ mod tests {
             KV {
                 key: KeyValue::Str(String::new()),
                 value: KeyValue::Str("pos".to_string()),
-                src_offsets: None,
+                src_offsets: Some(KVSourceRange {
+                    key_start: 4,
+                    key_end: 4,
+                    value_start: 4,
+                    value_end: 7,
+                    source: None,
+                }),
                 ksrc: None,
                 vsrc: None,
             },
             KV {
                 key: KeyValue::Str(" name ".to_string()),
                 value: KeyValue::Str(" value ".to_string()),
-                src_offsets: None,
+                src_offsets: Some(KVSourceRange {
+                    key_start: 8,
+                    key_end: 14,
+                    value_start: 15,
+                    value_end: 21,
+                    source: None,
+                }),
                 ksrc: None,
                 vsrc: None,
             },
         ]);
 
-        let infos = prepare_tpl_param_infos(&params);
+        let infos = prepare_tpl_param_infos(&params, src);
         assert_eq!(infos.len(), 2);
         assert_eq!(infos[0].k, "1");
         assert_eq!(infos[0].value_wt, "pos");
@@ -591,6 +643,75 @@ mod tests {
         assert_eq!(infos[1].k, "name");
         assert_eq!(infos[1].value_wt, "value");
         assert!(infos[1].named);
+    }
+
+    #[test]
+    fn test_prepare_tpl_param_infos_without_source_offsets() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        // Without `srcOffsets` PHP cannot prove the value abuts the key, so the
+        // argument is *named* (with an empty key) and its value is trimmed.
+        let params = crate::pipeline::parser_functions::Params::new(vec![
+            KV {
+                key: KeyValue::Str("Foo".to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Str(" pos ".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+
+        let infos = prepare_tpl_param_infos(&params, "");
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].k, "");
+        assert_eq!(infos[0].value_wt, "pos");
+        assert!(infos[0].named);
+    }
+
+    #[test]
+    fn test_prepare_tpl_param_infos_uses_source_ranges() {
+        use crate::wikitext::tokens_v2::{KV, KVSourceRange, KeyValue};
+
+        // `{{1x|[[http://e.com |123]]}}`: a single positional argument whose
+        // token array holds a `wikilink`. `tokensToString` has no arm for that,
+        // so the `valueWt` must come from the source span — exactly as PHP's
+        // `prepareTplParamInfos` reads `$srcOffsets->value->substr($src)`.
+        let src = "1x|[[http://e.com |123]]";
+        let params = crate::pipeline::parser_functions::Params::new(vec![
+            KV {
+                key: KeyValue::Str("1x".to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Tokens(vec![]),
+                src_offsets: Some(KVSourceRange {
+                    key_start: 3,
+                    key_end: 3,
+                    value_start: 3,
+                    value_end: 26,
+                    source: None,
+                }),
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+
+        let infos = prepare_tpl_param_infos(&params, src);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].k, "1");
+        assert!(!infos[0].named);
+        assert_eq!(infos[0].value_wt, "[[http://e.com |123]]");
     }
 
     #[test]

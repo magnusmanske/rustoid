@@ -310,11 +310,34 @@ pub fn render_inline_fragment(
             let target = match get_wiki_link_target_info(&link_ctx, &href, &href_src) {
                 Ok(t) => t,
                 Err(_) => {
-                    // Invalid title (bad chars, stray `%hh`, multiple colons):
-                    // bail the link to literal `[[…]]` text (mirrors PHP's
-                    // `bailTokens`, which re-tokenizes the source without a
-                    // leading `[[` so it no longer re-links).
-                    return vec![Item::Str(format!("[[{href}]]"))];
+                    // Invalid title (bad chars, stray `%hh`, multiple colons): bail
+                    // the link back to wikitext. Mirrors PHP's
+                    // `WikiLinkHandler::bailTokens`, which re-runs the link's
+                    // *source* through the token pipeline with the leading `[`
+                    // dropped — so `[[http://x|y]]` becomes `[http://x|y]]`, whose
+                    // `[...]` then re-tokenizes as an external link instead of a
+                    // literal `[[`.
+                    //
+                    // `tsr`/`src` are relative to the source the link was
+                    // tokenized from (a template body, when the link came in as
+                    // an argument), which is exactly what PHP's
+                    // `$tsr->substr($frameSrc)` uses.
+                    let link_src = stt
+                        .data_parsoid
+                        .tsr
+                        .as_ref()
+                        .map(|tsr| tsr.substr(""))
+                        .filter(|s| s.len() > 1)
+                        .or_else(|| stt.data_parsoid.src.clone().filter(|s| s.len() > 1));
+                    let Some(rest) = link_src.as_deref().map(|s| &s[1..]) else {
+                        return vec![Item::Str(format!("[[{href}]]"))];
+                    };
+                    return crate::pipeline::template_handler::tokenize_wikitext_to_items_with_sol(
+                        rest,
+                        false,
+                        config.extension_tags(),
+                        false,
+                    );
                 }
             };
             render_wiki_link_dispatched(
@@ -929,7 +952,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, true)
+                .expand_templates(frame, tokens, source, about_counter, true, body)
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
@@ -1187,7 +1210,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, in_template)
+                .expand_templates(frame, tokens, source, about_counter, in_template, body)
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
@@ -1323,7 +1346,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, false)
+                .expand_templates(frame, tokens, source, about_counter, false, &caption)
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -1377,7 +1400,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, false)
+                .expand_templates(frame, tokens, source, about_counter, false, &wikitext)
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -1671,7 +1694,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let frame = Frame::new(title.clone(), vec![]);
 
         let tokens = self
-            .expand_templates(&frame, tokens, source, about_counter, false)
+            .expand_templates(&frame, tokens, source, about_counter, false, page_source)
             .await;
         // TT2 order: ExtensionHandler runs after TemplateHandler and before
         // AttributeExpander (PHP `ParserPipelineFactory::STAGES`). Attribute
@@ -1783,6 +1806,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `in_template` mirrors PHP's `wrapTemplates = !$options['inTemplate']`:
     /// when true (nested template / extension-content context), expanded
     /// templates are returned *without* `mw:Transclusion` encapsulation.
+    ///
+    /// `src_text` is the wikitext the tokens were tokenized from, used to
+    /// recover argument source spans (`ParamInfo`'s `valueWt`). Tokens whose
+    /// ranges carry their own source ignore it.
     async fn expand_templates(
         &self,
         frame: &Frame,
@@ -1790,6 +1817,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
+        src_text: &str,
     ) -> Vec<Item> {
         let mut out = Vec::new();
         for item in tokens {
@@ -1858,6 +1886,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 about_counter,
                                 in_tpl,
                                 target_has_comment,
+                                src_text,
                             )
                             .await;
                         out.extend(expanded);
@@ -1967,7 +1996,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
                     let expanded = self
-                        .expand_templates(frame, toks.clone(), source, about_counter, false)
+                        .expand_templates(
+                            frame,
+                            toks.clone(),
+                            source,
+                            about_counter,
+                            false,
+                            page_source.unwrap_or(""),
+                        )
                         .await;
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
@@ -1975,7 +2011,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 };
                 let new_value = if let KeyValue::Tokens(toks) = &kv.value {
                     let expanded = self
-                        .expand_templates(frame, toks.clone(), source, about_counter, false)
+                        .expand_templates(
+                            frame,
+                            toks.clone(),
+                            source,
+                            about_counter,
+                            false,
+                            page_source.unwrap_or(""),
+                        )
                         .await;
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
@@ -2030,6 +2073,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
         target_has_comment: bool,
+        page_source: &str,
     ) -> Vec<Item> {
         const MAX_TEMPLATE_DEPTH: usize = 40;
 
@@ -2160,6 +2204,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(src),
             about_counter,
             in_template,
+            &template_src,
         ))
         .await;
 
@@ -2173,7 +2218,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut info = template_info_from(None, Some(name), vec![]);
         info.target_wt = Some(target_str.to_string());
         info.href = Some(crate::title::make_link(title, self.config));
-        info.param_infos = crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params);
+        info.param_infos =
+            crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params, page_source);
         encap.encap_tokens(expanded, &info)
     }
 }

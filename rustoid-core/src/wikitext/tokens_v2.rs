@@ -149,13 +149,55 @@ impl fmt::Display for KeyValue {
     }
 }
 
-/// Source range for a key-value pair (analogous to PHP's KVSourceRange).
+/// Source range for a key-value pair (analogous to PHP's `KVSourceRange`, whose
+/// `key`/`value` are `SourceRange`s over `$this->source`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KVSourceRange {
     pub key_start: usize,
     pub key_end: usize,
     pub value_start: usize,
     pub value_end: usize,
+    /// The text these offsets index into. PHP's `SourceRange` carries its own
+    /// source (`SourceRange::fromSource`), and `substr` prefers it over the
+    /// ambient string, so a token tokenized from a *template body* still
+    /// recovers its own wikitext no matter which source its caller holds.
+    pub source: Option<std::sync::Arc<str>>,
+}
+
+impl KVSourceRange {
+    /// Extract an explicit text's key substring, ignoring `source`.
+    pub fn key_substr_in<'a>(&self, input: &'a str) -> &'a str {
+        slice(input, self.key_start, self.key_end)
+    }
+
+    /// Extract an explicit text's value substring, ignoring `source`.
+    pub fn value_substr_in<'a>(&self, input: &'a str) -> &'a str {
+        slice(input, self.value_start, self.value_end)
+    }
+
+    /// Extract the key substring, preferring the range's own `source` (mirrors
+    /// `SourceRange::substr` / `getSourceString`).
+    pub fn key_substr<'a>(&'a self, input: &'a str) -> &'a str {
+        self.key_substr_in(self.source.as_deref().unwrap_or(input))
+    }
+
+    /// Extract the value substring, preferring the range's own `source`.
+    pub fn value_substr<'a>(&'a self, input: &'a str) -> &'a str {
+        self.value_substr_in(self.source.as_deref().unwrap_or(input))
+    }
+}
+
+/// Slice `input[start..end]`, clamping to the string's bounds and falling back
+/// to the empty string on a non-char-boundary index (which a hand-built range can
+/// produce).
+fn slice(input: &str, start: usize, end: usize) -> &str {
+    let end = end.min(input.len());
+    let start = start.min(end);
+    if input.is_char_boundary(start) && input.is_char_boundary(end) {
+        &input[start..end]
+    } else {
+        ""
+    }
 }
 
 /// DataParsoid — per-token metadata used for round-tripping.
