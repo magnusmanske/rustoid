@@ -2845,7 +2845,8 @@ impl<'a> PegTokenizer<'a> {
 
     /// Find the byte offset (within `remaining`, exclusive) of the closing
     /// delimiter made of `close` repeated `count` times, respecting nested
-    /// open/close pairs (two-level brace counting).
+    /// open/close pairs (two-level brace counting). Used for `{{{…}}}` arguments,
+    /// whose close must be a literal `}}}`.
     fn find_closing(&self, close: char, count: usize) -> Option<usize> {
         let rem = self.remaining();
         let chars: Vec<char> = rem.chars().collect();
@@ -2888,7 +2889,7 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(2);
 
-        let Some(end) = self.find_closing('}', 2) else {
+        let Some(end) = find_template_closing(self.remaining()) else {
             self.pos = saved;
             return None;
         };
@@ -4141,6 +4142,66 @@ fn find_wikilink_close_at(input: &str) -> Option<usize> {
         }
         let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         i += ch_len;
+    }
+    None
+}
+
+/// Find the byte offset (relative to `input`) of the `}}` that closes a
+/// `{{…}}` transclusion, honouring PHP's `preproc` stack.
+///
+/// PHP's grammar keeps a stack of pending closers and `TokenizerUtils::inlineBreaks`
+/// consults its top: a `}}` breaks **only** while the pending closer is `}}`, and a
+/// `]]` breaks only while it is `]]`. So an unclosed `[[` inside a template argument
+/// hides the following `}}` from the template, and — as
+/// `Grammar.pegphp`'s `broken_template` comment spells out — a template whose
+/// argument holds an unclosed `[[` can never close, leaving the whole construct as
+/// literal text (`{{1x|[[Foo}}` does not expand).
+///
+/// Only the *unmatched* `[[` matters: `{{1x|[[a]]}}` closes its wikilink first, so
+/// the closer on top is `}}` again by the time the `}}` arrives.
+fn find_template_closing(input: &str) -> Option<usize> {
+    // Pending closers, innermost last. The outermost entry is the `{{` this scan
+    // is resolving, so a `}}` matching it ends the scan.
+    let mut stack: Vec<&'static str> = vec!["}}"];
+    let mut i = 0;
+    let bytes = input.as_bytes();
+    while i < bytes.len() {
+        match (stack.last(), bytes[i]) {
+            // `TokenizerUtils::inlineBreaks` breaks on `}}` whenever the pending
+            // closer is `}}`, irrespective of any further `}`.
+            (Some(&"}}"), _) if input[i..].starts_with("}}") => {
+                stack.pop();
+                i += 2;
+                if stack.is_empty() {
+                    return Some(i - 2);
+                }
+            }
+            // A nested transclusion pushes its own closer.
+            (Some(&"}}"), _) if input[i..].starts_with("{{{") => {
+                stack.push("}}");
+                i += 3;
+            }
+            (Some(&"}}"), _) if input[i..].starts_with("{{") => {
+                stack.push("}}");
+                i += 2;
+            }
+            // Only a `[[` seen while looking for `}}` becomes the pending closer;
+            // one nested inside an already-open `[[` is ordinary text (PHP tests
+            // the pending `preproc` before pushing).
+            (Some(&"}}"), _) if input[i..].starts_with("[[") => {
+                stack.push("]]");
+                i += 2;
+            }
+            (Some(&"]]"), _) if input[i..].starts_with("]]") => {
+                stack.pop();
+                i += 2;
+            }
+            // Anything else is one character of content. A lone `[` starts an
+            // external link rather than a wikilink, so it pushes nothing.
+            _ => {
+                i += input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+            }
+        }
     }
     None
 }
@@ -5922,6 +5983,26 @@ mod tests {
             find_wikilink_close("File:Foobar.jpg|thumb|[[Link1|[meh]]]]]"),
             Some(37)
         );
+    }
+
+    #[test]
+    fn test_find_template_closing_respects_preproc_stack() {
+        // `}}` closes while the pending closer is `}}`.
+        assert_eq!(find_template_closing("1x|foo}}"), Some(6));
+        // A nested transclusion is skipped as a unit.
+        assert_eq!(find_template_closing("1x|{{2x}}}}"), Some(9));
+        // An external link is not a wikilink, so it does not hide the `}}`.
+        assert_eq!(
+            find_template_closing("1x|[http://example.com x}}"),
+            Some(24)
+        );
+        // A matched `[[…]]` returns the pending closer to `}}` before the `}}`.
+        assert_eq!(find_template_closing("1x|[[a]]}}"), Some(8));
+        // An *unclosed* `[[` hides the `}}`, so the template never closes
+        // (`Grammar.pegphp`'s `broken_template`: `{{1x|[[Foo}}` stays literal).
+        assert_eq!(find_template_closing("1x|[[Foo}}"), None);
+        // Nothing to close at all.
+        assert_eq!(find_template_closing("1x|foo"), None);
     }
 
     #[test]
