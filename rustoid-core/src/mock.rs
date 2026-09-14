@@ -166,13 +166,18 @@ impl DataSource for MockDataSource {
     }
 
     async fn get_template(&self, title: &Title) -> Result<Option<String>> {
+        // Prefer the prefixed *DB* key (`Template:Foo_bar`): fixture articles are
+        // declared with that form, and it is what `Title::getPrefixedDBKey()`
+        // yields. `full_text()` keeps spaces, so a wikitext call written with
+        // spaces (`{{content and cell}}`) would otherwise miss the article.
+        let dbkey = title.get_prefixed_db_key();
         let key = title.full_text();
-        Ok(self
-            .templates
-            .read()
-            .unwrap()
-            .get(&key)
+        let templates = self.templates.read().unwrap();
+        Ok(templates
+            .get(&dbkey)
+            .or_else(|| templates.get(&key))
             .cloned()
+            .or_else(|| case_insensitive_get(&self.templates, &dbkey))
             .or_else(|| case_insensitive_get(&self.templates, &key)))
     }
 
