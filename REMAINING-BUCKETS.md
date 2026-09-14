@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **854/891 fixtures pass** (96%). Lib tests: 656 pass. Clippy: clean.
+Current baseline: **855/891 fixtures pass** (96%). Lib tests: 656 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -8,6 +8,25 @@ Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 **skips** in standalone mode, so its expectation is unreachable for rustoid. 36
 fixtures are in that state; most still compare equal, so the fallback is left in
 place (skipping them would hide real divergences rather than surface them).
+
+## Landed: transclusion marker metas insert through InHead (854 → 855)
+
+`RemexPipeline::insertUnfosteredMeta` calls `$this->dispatcher->inHead->startTag(...)`
+— the InHead handler *directly*, not `dispatcher->startTag`. That distinction is
+load-bearing: a transclusion marker meta emitted while a table row/cell is open
+must stay where it is, whereas a normal `meta` start tag in a table context is
+foster-parented out of the table. rustoid dispatched on the current insertion
+mode, so the markers were hoisted out and ended up as siblings of `<table>`;
+`wrapTransclusionChildren` then saw an adjacent start/end pair, treated the
+transclusion as empty, and left an orphan `<span typeof="mw:Transclusion"></span>`
+in front of the table.
+
+Also ported the first branch of `DOMRangeBuilder::isDeletableNode`: a whitespace
+text node in a *fosterable* position is always deletable, before any newline
+analysis. Fixed
+`2b: Delete whitespace/comments if found in fosterable position while
+template-wrapping`, and moved `T343874` and `Cell combination tests` close to
+passing (see the "Still open" list above).
 
 ## Landed: source tracking on `SourceRange` (850 → 854)
 
@@ -43,21 +62,18 @@ With that in place, three faithful fixes landed:
 
 ### Still open in this area
 
-- `2b: Delete whitespace/comments if found in fosterable position while
-  template-wrapping` and `T343874` both need `DOMRangeBuilder`'s
-  **fosterable-position range expansion** (`DOMRangeBuilder.php:145-190`).
-  Investigated: rustoid's marker metas end up as **siblings of `<table>`** (under
-  `<html>`) rather than between the `<td>`s the template produced, so
-  `wrap_transclusion_children` sees an adjacent start/end pair and treats the
-  transclusion as *empty* (hence the orphan
-  `<span typeof="mw:Transclusion"></span>`). PHP's markers stay inside the table:
-  `TreeBuilderStage` inserts them with `insertUnfosteredMeta` precisely so
-  foster-parenting cannot hoist them. So the first thing to check is rustoid's
-  meta insertion path in `in_table`/`in_row` modes for a transclusion whose
-  content is table *cells* — before reaching for `DOMRangeBuilder`.
-- Once the markers are correctly placed, the range expansion itself
-  (`DOMRangeBuilder.php:145-190` + `getStartConsideringFosteredContent` +
-  `MAP_TBODY_TR`) picks the encapsulation target.
+- `T343874` now reaches `<table typeof="mw:Transclusion">` (the table-level
+  encapsulation works). What remains is the cell-attribute reparse:
+  `<td>class="test"<span typeof="mw:Transclusion">| foo</span></td>` should
+  become `<td class="test">foo</td>` — i.e. the same
+  `TableFixups::reparseTemplatedAttributes` work as "Cell combination tests".
+- `Templated table cell with untemplated attributes: Cell combination tests` now
+  produces all six cells with the correct kinds, attributes, and transclusion
+  metadata. The remaining diff is a **stray `</tr>`**: the fixture's expected HTML
+  has `<td …>…</td>\n<tr …>` where rustoid emits `<td …>…</td>\n</tr>\n<tr …>`.
+  Since the harness normalizes both sides through an HTML parse, this is a real
+  nesting difference, not a whitespace one — worth checking whether PHP's
+  serializer omits an auto-inserted `</tr>` in that position.
 - `Templated table cell with untemplated attributes: Integrated mode only` is one
   `about` attribute short of PHP's standalone output (see below), and its fixture
   expectation is `+integrated`-only (unreachable in standalone).
