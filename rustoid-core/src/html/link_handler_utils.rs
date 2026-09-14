@@ -971,7 +971,7 @@ pub fn figure_handler(
 ) {
     let Some(ms) = ms else {
         let mut fallback = crate::html::handlers::FallbackHTMLHandler;
-        fallback.handle(tree, node, state);
+        fallback.handle(tree, node, state, false);
         return;
     };
     let ct = figure_to_constrained_text(state, tree, env, node, &ms);

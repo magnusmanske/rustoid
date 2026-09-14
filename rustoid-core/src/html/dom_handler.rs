@@ -33,6 +33,7 @@ pub trait DomHandler {
         _tree: &DomTree,
         _node: NodeId,
         _state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         // Mirrors the `LogicException("Not implemented.")` in the PHP base class.
         None
@@ -335,8 +336,13 @@ pub trait DomHandler {
         }
     }
 
-    /// Serialize a table tag, using original source when `wrapper_unmodified`.
-    /// Faithful to `DOMHandler::serializeTableTag` (non-selser branch).
+    /// Serialize a table tag, reusing the original source when only the node's
+    /// subtree changed. Faithful to `DOMHandler::serializeTableTag`.
+    ///
+    /// Reusing the source (rather than re-serializing the attributes) is what
+    /// preserves non-attribute wikitext inside the tag — e.g. an invalid
+    /// `<span>boo</span>` before `style=` in `{| <span>boo</span> style=…` —
+    /// and the original quoting.
     fn serialize_table_tag(
         &self,
         symbol: &str,
@@ -344,7 +350,11 @@ pub trait DomHandler {
         tree: &DomTree,
         node: NodeId,
         state: &SerializerState,
+        wrapper_unmodified: bool,
     ) -> String {
+        if wrapper_unmodified && let Some(dsr) = crate::html::wts_utils::get_dsr(tree.node(node)) {
+            return state.get_orig_src(&dsr.open_range()).unwrap_or_default();
+        }
         self.serialize_table_element(symbol, end_symbol, tree, node, state)
     }
 
@@ -384,7 +394,8 @@ mod tests {
                 .handle(
                     &DomTree::new(Node::document()),
                     0,
-                    &mut SerializerState::new()
+                    &mut SerializerState::new(),
+                    false,
                 )
                 .is_none()
         );

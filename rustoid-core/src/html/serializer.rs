@@ -193,6 +193,17 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
             // Non-selser (or modified) path.
             state.curr_node_unmodified = false;
 
+            // `wrapperUnmodified`: only this node's *subtree* changed, and its tag
+            // widths are valid — so a handler may still reuse the node's own tag
+            // source even though it must re-serialize the children. Faithful to
+            // `$wrapperUnmodified = DiffUtils::onlySubtreeChanged( $node ) &&
+            // WTSUtils::hasValidTagWidths( $dp->dsr ?? null )`.
+            let wrapper_unmodified = state.selser_mode
+                && crate::html::diff_utils::DiffUtils::only_subtree_changed(n)
+                && crate::html::wts_utils::has_valid_tag_widths(
+                    crate::html::wts_utils::get_dsr(n).as_ref(),
+                );
+
             // Track `inInsertedContent` for the subtree of an inserted node
             // (mirrors the save/set/restore around `$domHandler->handle(...)`).
             let current_inserted_state = state.in_inserted_content;
@@ -219,7 +230,7 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
             }
 
             let mut handler = get_dom_handler(tree, node);
-            handler.handle(tree, node, state);
+            handler.handle(tree, node, state, wrapper_unmodified);
 
             state.in_inserted_content = current_inserted_state;
 

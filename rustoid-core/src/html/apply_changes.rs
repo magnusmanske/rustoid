@@ -219,16 +219,147 @@ fn child_nodes_at<'a>(body: &'a Node, path: &[usize]) -> &'a [Node] {
 /// the JS `Element.querySelectorAll`) **includes the root element itself** when
 /// it matches the rightmost compound. Only `body`'s own path is `[]`, so a
 /// match on the root yields the empty path.
+/// Find every element matching `selector` under `body`, returning their paths.
 fn find_matches(body: &Node, selector: &str) -> Vec<Path> {
-    // Pre-split the selector into its compound parts (descendant combinator).
-    let compounds: Vec<&str> = selector.split_whitespace().collect();
+    let steps = parse_selector(selector);
     let mut out = Vec::new();
     let root_total = element_child_count(body);
-    if matches_full_selector(body, &compounds, Sib::new(0, root_total), &[]) {
+    if matches_steps(body, &steps, Sib::new(0, root_total), &[], None) {
         out.push(Vec::new());
     }
-    walk(body, &compounds, &mut Vec::new(), &mut Vec::new(), &mut out);
+    walk_steps(body, &steps, &mut Vec::new(), &mut Vec::new(), &mut out);
     out
+}
+
+/// A selector split into `(combinator, compound)` steps. The first step's
+/// combinator is meaningless (it is always `Descendant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Combinator {
+    /// ` ` — an ancestor anywhere above.
+    Descendant,
+    /// `+` — the immediately preceding element sibling.
+    AdjacentSibling,
+}
+
+/// Split a selector into its compound steps, recording the combinator that
+/// joins each compound to the one before it.
+fn parse_selector(selector: &str) -> Vec<(Combinator, String)> {
+    let mut steps: Vec<(Combinator, String)> = Vec::new();
+    let mut current = String::new();
+    let mut pending = Combinator::Descendant;
+    for c in selector.chars() {
+        if c == '+' {
+            if !current.is_empty() {
+                steps.push((pending, std::mem::take(&mut current)));
+            }
+            pending = Combinator::AdjacentSibling;
+        } else if c.is_whitespace() {
+            if !current.is_empty() {
+                steps.push((pending, std::mem::take(&mut current)));
+                // A following `+` overrides this; otherwise it is a descendant
+                // combinator.
+                pending = Combinator::Descendant;
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        steps.push((pending, current));
+    }
+    steps
+}
+
+/// Match a selector's steps against `node`, walking the ancestor stack and the
+/// previous-element-sibling chain as the combinators require.
+fn matches_steps(
+    node: &Node,
+    steps: &[(Combinator, String)],
+    sib: Sib,
+    ancestors: &[(&Node, Sib)],
+    prev_sibling: Option<(&Node, Sib)>,
+) -> bool {
+    let Some(((_, last), _)) = steps.split_last() else {
+        return false;
+    };
+    if !matches_compound(node, last, sib) {
+        return false;
+    }
+    // Walk the remaining compounds right-to-left, following each step's
+    // combinator.
+    let mut ancestor_iter = ancestors.iter().rev().peekable();
+    let mut sibling_cursor = prev_sibling;
+    // `i` indexes a compound in `steps`, and `steps[i + 1].0` is the combinator
+    // joining it to the compound on its right.
+    let mut i = steps.len().saturating_sub(1);
+    while i > 0 {
+        i -= 1;
+        let combinator = steps[i + 1].0;
+        let (_, compound) = &steps[i];
+        match combinator {
+            Combinator::Descendant => {
+                // The nearest matching ancestor, then any higher one.
+                let mut matched = false;
+                for (anc, anc_sib) in ancestor_iter.by_ref() {
+                    if matches_compound(anc, compound, *anc_sib) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return false;
+                }
+            }
+            Combinator::AdjacentSibling => {
+                // The immediately preceding element sibling must match. It shares
+                // this node's parent, so its ancestor stack is the same.
+                let Some((prev, prev_sib)) = sibling_cursor else {
+                    return false;
+                };
+                if !matches_compound(prev, compound, prev_sib) {
+                    return false;
+                }
+                sibling_cursor = None;
+            }
+        }
+    }
+    true
+}
+
+/// Descendant-combinator-only matching, retained for the compound-first fast
+/// path in [`walk_steps`].
+fn walk_steps<'a>(
+    node: &'a Node,
+    steps: &[(Combinator, String)],
+    ancestors: &mut Vec<(&'a Node, Sib)>,
+    path: &mut Vec<usize>,
+    out: &mut Vec<Path>,
+) {
+    let total = element_child_count(node);
+    let mut element_index = 0usize;
+    let mut prev_element: Option<(&'a Node, Sib)> = None;
+    for (i, child) in node.children.iter().enumerate() {
+        let is_element = matches!(child.kind, NodeKind::Element(_));
+        if is_element {
+            let sib = Sib::new(element_index, total);
+            if matches_steps(child, steps, sib, ancestors, prev_element) {
+                let mut p = path.clone();
+                p.push(i);
+                out.push(p);
+            }
+            element_index += 1;
+            ancestors.push((child, sib));
+            path.push(i);
+            walk_steps(child, steps, ancestors, path, out);
+            path.pop();
+            ancestors.pop();
+            prev_element = Some((child, sib));
+        } else {
+            path.push(i);
+            walk_steps(child, steps, ancestors, path, out);
+            path.pop();
+        }
+    }
 }
 
 /// An element's position among its element siblings: `index` (0-based) and
@@ -252,94 +383,6 @@ fn element_child_count(node: &Node) -> usize {
         .iter()
         .filter(|c| matches!(c.kind, NodeKind::Element(_)))
         .count()
-}
-
-/// Recursively walk the tree, matching the selector's compound parts against
-/// each element: the rightmost compound against the element itself, preceding
-/// compounds against its ancestors (descendant combinator), mirroring Zest's
-/// `qsa`. `ancestors` is the stack of `(enclosing element, its sibling info)`
-/// pairs.
-fn walk<'a>(
-    node: &'a Node,
-    compounds: &[&str],
-    ancestors: &mut Vec<(&'a Node, Sib)>,
-    path: &mut Vec<usize>,
-    out: &mut Vec<Path>,
-) {
-    // Compute the element-sibling position (0-based) for each child, matching
-    // Zest's `:nth-child`, which counts *element* siblings via
-    // `previousElementSibling` (a historical quirk of `qsa`-derived selector
-    // engines) rather than all siblings including whitespace text nodes.
-    let total = element_child_count(node);
-    let mut element_index = 0usize;
-    for (i, child) in node.children.iter().enumerate() {
-        let is_element = matches!(child.kind, NodeKind::Element(_));
-        if is_element {
-            let sib = Sib::new(element_index, total);
-            if matches_full_selector(child, compounds, sib, ancestors) {
-                let mut p = path.clone();
-                p.push(i);
-                out.push(p);
-            }
-            element_index += 1;
-            ancestors.push((child, sib));
-            path.push(i);
-            walk(child, compounds, ancestors, path, out);
-            path.pop();
-            ancestors.pop();
-        } else {
-            path.push(i);
-            walk(child, compounds, ancestors, path, out);
-            path.pop();
-        }
-    }
-}
-
-/// Match a fully-split selector against `node`. `sibling_index` is the node's
-/// element-sibling position for its own pseudo-class; `ancestors` holds
-/// `(ancestor element, its sibling index)` pairs (nearest last).
-fn matches_full_selector(
-    node: &Node,
-    compounds: &[&str],
-    sib: Sib,
-    ancestors: &[(&Node, Sib)],
-) -> bool {
-    // The rightmost compound matches the node itself.
-    let (last, rest) = compounds.split_last().expect("non-empty selector");
-    if !matches_compound(node, last, sib) {
-        return false;
-    }
-    // Preceding compounds match *some* ancestor (descendant combinator), in
-    // right-to-left order: the rightmost remaining compound matches the nearest
-    // matching ancestor, the next matches an ancestor *above* that, and so on.
-    // Walk the ancestor stack (nearest-first) matching each compound in turn.
-    let mut comp_iter = rest.iter().rev();
-    let mut comp = comp_iter.next();
-    for (ancestor, ancestor_sib) in ancestors.iter().rev() {
-        let Some(part) = comp else {
-            break;
-        };
-        if matches_compound(ancestor, part, *ancestor_sib) {
-            comp = comp_iter.next();
-        }
-    }
-    comp.is_none()
-}
-
-/// Public helper matching a node against a (possibly descendant) selector,
-/// given its element-sibling index. Used by unit tests; production matching goes
-/// through [`walk`]/[`matches_full_selector`].
-pub fn matches_selector(node: &Node, selector: &str, sibling_index: usize) -> bool {
-    let compounds: Vec<&str> = selector.split_whitespace().collect();
-    // A bare index cannot express `:last-child`; treat the node as the only
-    // element sibling, which keeps the historical `matches_compound` behaviour
-    // for the tests that use this helper.
-    matches_full_selector(
-        node,
-        &compounds,
-        Sib::new(sibling_index, sibling_index + 1),
-        &[],
-    )
 }
 
 /// Match a single compound selector (e.g. `figcaption`, `.mw-default-size`,
@@ -741,6 +784,40 @@ fn innermost_mut(node: &mut Node) -> &mut Node {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_adjacent_sibling_selector() {
+        use crate::dom::node::ElementKind;
+        // <tr><td>a</td><td>b</td><td>c</td></tr>
+        let mut tr = Node::element(ElementKind::TableRow);
+        for t in ["a", "b", "c"] {
+            let mut td = Node::element(ElementKind::TableCell);
+            td.push_child(Node::text(t));
+            tr.push_child(td);
+        }
+        let mut doc = Node::document();
+        doc.push_child(tr);
+
+        // `td + td` matches every cell but the first.
+        let paths = find_matches(&doc, "td + td");
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        // Each match resolves to the 2nd and 3rd cell respectively.
+        let names: Vec<&str> = paths
+            .iter()
+            .map(|p| {
+                let td = p.iter().fold(&doc, |n, i| &n.children[*i]);
+                match &td.children.first().map(|c| &c.kind) {
+                    Some(NodeKind::Text(t)) => t.as_str(),
+                    _ => "?",
+                }
+            })
+            .collect();
+        assert_eq!(names, vec!["b", "c"]);
+
+        // A non-adjacent pair does not match, and a plain `td` matches all.
+        assert!(find_matches(&doc, "td + p").is_empty());
+        assert_eq!(find_matches(&doc, "td").len(), 3);
+    }
 
     #[test]
     fn test_matches_compound_selector() {

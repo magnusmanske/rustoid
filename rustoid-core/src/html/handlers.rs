@@ -25,6 +25,7 @@ impl DomHandler for BodyHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         walk_children(tree, node, state);
         tree.next_sibling(node)
@@ -68,6 +69,7 @@ impl DomHandler for JustChildrenHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         walk_children(tree, node, state);
         tree.next_sibling(node)
@@ -108,6 +110,7 @@ impl DomHandler for QuoteHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         if self.preceding_quote_elt_requires_escape(tree, node) {
             state.emit_chunk("<nowiki/>", node, tree);
@@ -136,6 +139,7 @@ impl DomHandler for HRHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let extra = tree
             .node(node)
@@ -206,6 +210,7 @@ impl DomHandler for BRHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let html_stx = tree
             .node(node)
@@ -312,6 +317,7 @@ impl DomHandler for HeadingHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let space = self.get_leading_space(tree, node, " ");
         state.emit_chunk(format!("{}{}", self.heading_wt, space), node, tree);
@@ -403,6 +409,7 @@ impl DomHandler for ListHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         state.single_line_context.disable();
         let mut first_child_elt = crate::html::dom_tree::first_non_sep_child(tree, node);
@@ -508,6 +515,7 @@ impl DomHandler for LIHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let first_child_element = crate::html::dom_tree::first_non_sep_child(tree, node);
         let first_is_list = first_child_element.is_some_and(|c| dom_utils::is_list(tree.node(c)));
@@ -754,6 +762,7 @@ impl DomHandler for PHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         crate::html::serializer::walk_children(tree, node, state);
         tree.next_sibling(node)
@@ -899,6 +908,7 @@ impl DomHandler for DTHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let first_child_element = crate::html::dom_tree::first_non_sep_child(tree, node);
         let first_is_list = first_child_element.is_some_and(|c| dom_utils::is_list(tree.node(c)));
@@ -996,6 +1006,7 @@ impl DomHandler for DDHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let first_child_element = crate::html::dom_tree::first_non_sep_child(tree, node);
         let chunk = if self.stx.as_deref() == Some("row") {
@@ -1095,6 +1106,7 @@ impl DomHandler for CaptionHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let symbol = tree
             .node(node)
@@ -1102,7 +1114,8 @@ impl DomHandler for CaptionHandler {
             .as_ref()
             .and_then(|d| d.start_tag_src.clone())
             .unwrap_or_else(|| "|+".to_string());
-        let table_tag = self.serialize_table_tag(&symbol, None, tree, node, state);
+        let table_tag =
+            self.serialize_table_tag(&symbol, None, tree, node, state, wrapper_unmodified);
         state.emit_chunk(table_tag, node, tree);
         crate::html::serializer::walk_children(tree, node, state);
         tree.next_sibling(node)
@@ -1153,6 +1166,7 @@ impl DomHandler for TableHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let wt = tree
             .node(node)
@@ -1167,7 +1181,7 @@ impl DomHandler for TableHandler {
         if indent_table {
             state.single_line_context.disable();
         }
-        let tag = self.serialize_table_tag(&wt, Some(""), tree, node, state);
+        let tag = self.serialize_table_tag(&wt, Some(""), tree, node, state, wrapper_unmodified);
         state.emit_chunk(tag, node, tree);
         if !dom_utils::is_literal_html_node(tree.node(node)) {
             state.wiki_table_nesting += 1;
@@ -1304,6 +1318,7 @@ impl DomHandler for TRHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         if self.tr_wikitext_needed(tree, node) {
             let wt = tree
@@ -1312,7 +1327,8 @@ impl DomHandler for TRHandler {
                 .as_ref()
                 .and_then(|d| d.start_tag_src.clone())
                 .unwrap_or_else(|| "|-".to_string());
-            let tag = self.serialize_table_tag(&wt, Some(""), tree, node, state);
+            let tag =
+                self.serialize_table_tag(&wt, Some(""), tree, node, state, wrapper_unmodified);
             state.emit_chunk(tag, node, tree);
         }
         crate::html::serializer::walk_children(tree, node, state);
@@ -1420,6 +1436,7 @@ impl DomHandler for TDHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let dp = tree.node(node).dp.clone().unwrap_or_default();
         let usable = self.stx_info_valid_for_table_cell(tree, node);
@@ -1450,8 +1467,14 @@ impl DomHandler for TDHandler {
             start_tag_src
         };
 
-        let td_tag =
-            self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node, state);
+        let td_tag = self.serialize_table_tag(
+            &start_tag_src,
+            attr_sep_src.as_deref(),
+            tree,
+            node,
+            state,
+            wrapper_unmodified,
+        );
         // `$inWideTD = (bool)preg_match('/\|\||^{{!}}({{!}}|\|)|^(\||{{!}}){{!}}/', $tdTag)`.
         let in_wide_td = td_tag.contains("||")
             || td_tag.starts_with("{{!}}{{!}}")
@@ -1553,6 +1576,7 @@ impl DomHandler for THHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let dp = tree.node(node).dp.clone().unwrap_or_default();
         let usable = self.stx_info_valid_for_table_cell(tree, node);
@@ -1583,8 +1607,14 @@ impl DomHandler for THHandler {
             start_tag_src
         };
 
-        let th_tag =
-            self.serialize_table_tag(&start_tag_src, attr_sep_src.as_deref(), tree, node, state);
+        let th_tag = self.serialize_table_tag(
+            &start_tag_src,
+            attr_sep_src.as_deref(),
+            tree,
+            node,
+            state,
+            wrapper_unmodified,
+        );
         let leading_space = self.get_leading_space(tree, node, "");
         state.emit_chunk(format!("{th_tag}{leading_space}"), node, tree);
 
@@ -1713,6 +1743,7 @@ impl DomHandler for SpanHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let n = tree.node(node);
         let dp = n.dp.clone();
@@ -1731,7 +1762,7 @@ impl DomHandler for SpanHandler {
                     let ms = crate::html::media_structure::MediaStructure::parse(tree, node);
                     crate::html::link_handler_utils::figure_handler(state, tree, &env, node, ms);
                 } else {
-                    FallbackHTMLHandler.handle(tree, node, state);
+                    FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
                 }
             } else if crate::html::dom_utils::has_type_of(n, "mw:Entity")
                 && crate::html::dom_tree::has_n_children(tree, node, 1)
@@ -1760,7 +1791,7 @@ impl DomHandler for SpanHandler {
                 if dp.as_ref().and_then(|d| d.src.as_ref()).is_some() {
                     Self::emit_placeholder_src(tree, node, state);
                 } else {
-                    FallbackHTMLHandler.handle(tree, node, state);
+                    FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
                 }
             }
         } else if n.get_attr("data-mw-selser-wrapper").is_some() {
@@ -1772,7 +1803,7 @@ impl DomHandler for SpanHandler {
                 // Discard span wrappers added to flag misnested content.
                 state.serialize_children(tree, node);
             } else {
-                FallbackHTMLHandler.handle(tree, node, state);
+                FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
             }
         }
         tree.next_sibling(node)
@@ -2126,6 +2157,7 @@ impl DomHandler for EncapsulatedContentHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let n = tree.node(node);
         let dp = n.dp.clone();
@@ -2157,7 +2189,7 @@ impl DomHandler for EncapsulatedContentHandler {
         } else {
             // Should never reach here (the dispatch only calls us for an
             // encapsulation wrapper). Fall back to literal HTML.
-            FallbackHTMLHandler.handle(tree, node, state);
+            FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
             return tree.next_sibling(node);
         };
 
@@ -2504,6 +2536,7 @@ impl DomHandler for PreHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         // Serialize the children in indent-pre context, then re-indent.
         let content = state.serialize_indent_pre_children_to_string(tree, node);
@@ -2609,9 +2642,10 @@ impl DomHandler for HTMLPreHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         // Delegate to the literal-HTML fallback.
-        FallbackHTMLHandler.handle(tree, node, state);
+        FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
         tree.next_sibling(node)
     }
 
@@ -2652,12 +2686,13 @@ impl DomHandler for AHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         // `SerializerEnv` is `Copy`; extract it before mutably borrowing `state`.
         if let Some(env) = state.env {
             crate::html::link_handler_utils::link_handler(state, tree, &env, node);
         } else {
-            FallbackHTMLHandler.handle(tree, node, state);
+            FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
         }
         tree.next_sibling(node)
     }
@@ -2673,11 +2708,12 @@ impl DomHandler for LinkHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         if let Some(env) = state.env {
             crate::html::link_handler_utils::link_handler(state, tree, &env, node);
         } else {
-            FallbackHTMLHandler.handle(tree, node, state);
+            FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
         }
         tree.next_sibling(node)
     }
@@ -2738,12 +2774,13 @@ impl DomHandler for FigureHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         if let Some(env) = state.env {
             let ms = crate::html::media_structure::MediaStructure::parse(tree, node);
             crate::html::link_handler_utils::figure_handler(state, tree, &env, node, ms);
         } else {
-            FallbackHTMLHandler.handle(tree, node, state);
+            FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
         }
         tree.next_sibling(node)
     }
@@ -2801,6 +2838,7 @@ impl DomHandler for ImgHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         if let Some(env) = state.env {
             if crate::html::dom_utils::has_rel(tree.node(node), "mw:externalImage") {
@@ -2814,7 +2852,7 @@ impl DomHandler for ImgHandler {
                 crate::html::link_handler_utils::figure_handler(state, tree, &env, node, Some(ms));
             }
         } else {
-            FallbackHTMLHandler.handle(tree, node, state);
+            FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
         }
         tree.next_sibling(node)
     }
@@ -2830,6 +2868,7 @@ impl DomHandler for MediaHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         if let Some(env) = state.env {
             // A bare `<audio>`/`<video>` (whose media element is itself) →
@@ -2837,7 +2876,7 @@ impl DomHandler for MediaHandler {
             let ms = crate::html::media_structure::cradle_media_structure(node);
             crate::html::link_handler_utils::figure_handler(state, tree, &env, node, Some(ms));
         } else {
-            FallbackHTMLHandler.handle(tree, node, state);
+            FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
         }
         tree.next_sibling(node)
     }
@@ -2855,6 +2894,7 @@ impl DomHandler for MetaHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let n = tree.node(node);
         let dp_src = n.dp.as_ref().and_then(|d| d.src.clone());
@@ -2883,7 +2923,7 @@ impl DomHandler for MetaHandler {
                 };
                 state.emit_chunk(out, node, tree);
             } else {
-                FallbackHTMLHandler.handle(tree, node, state);
+                FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
             }
             return tree.next_sibling(node);
         }
@@ -2955,7 +2995,7 @@ impl DomHandler for MetaHandler {
                 // Just ignore.
             }
             _ => {
-                FallbackHTMLHandler.handle(tree, node, state);
+                FallbackHTMLHandler.handle(tree, node, state, wrapper_unmodified);
             }
         }
 
@@ -3133,6 +3173,7 @@ impl DomHandler for FallbackHTMLHandler {
         tree: &DomTree,
         node: NodeId,
         state: &mut SerializerState,
+        _wrapper_unmodified: bool,
     ) -> Option<NodeId> {
         let tag = crate::html::serializer::WikitextSerializer::serialize_html_tag(
             tree.node(node),
@@ -3180,7 +3221,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = BodyHandler;
-        handler.handle(&tree, p_id, &mut state);
+        handler.handle(&tree, p_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "hi");
     }
@@ -3197,7 +3238,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = QuoteHandler::new("''");
-        handler.handle(&tree, i_id, &mut state);
+        handler.handle(&tree, i_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "''foo''");
     }
@@ -3211,7 +3252,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = HRHandler;
-        handler.handle(&tree, hr_id, &mut state);
+        handler.handle(&tree, hr_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "----");
     }
@@ -3238,7 +3279,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = HeadingHandler::new("==");
-        handler.handle(&tree, h2_id, &mut state);
+        handler.handle(&tree, h2_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "==foo==");
     }
@@ -3261,7 +3302,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = PreHandler;
-        handler.handle(&tree, pre_id, &mut state);
+        handler.handle(&tree, pre_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, " foo\nbar ");
     }
@@ -3282,7 +3323,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = PreHandler;
-        handler.handle(&tree, pre_id, &mut state);
+        handler.handle(&tree, pre_id, &mut state, false);
         // The trailing newline is re-appended as the outer separator.
         assert_eq!(state.separator.src.as_deref(), Some("\n"));
         state.flush_line();
@@ -3306,7 +3347,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = HTMLPreHandler;
-        handler.handle(&tree, pre_id, &mut state);
+        handler.handle(&tree, pre_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "<pre>foo</pre>");
     }
@@ -3323,7 +3364,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = MetaHandler;
-        handler.handle(&tree, meta_id, &mut state);
+        handler.handle(&tree, meta_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "<noinclude>");
     }
@@ -3340,7 +3381,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = MetaHandler;
-        handler.handle(&tree, meta_id, &mut state);
+        handler.handle(&tree, meta_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "<translate>");
     }
@@ -3357,7 +3398,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = SpanHandler;
-        handler.handle(&tree, span_id, &mut state);
+        handler.handle(&tree, span_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, " ");
     }
@@ -3377,7 +3418,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = SpanHandler;
-        handler.handle(&tree, span_id, &mut state);
+        handler.handle(&tree, span_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "&#x26;");
     }
@@ -3400,7 +3441,7 @@ mod tests {
 
         let mut state = SerializerState::new();
         let mut handler = EncapsulatedContentHandler;
-        handler.handle(&tree, span_id, &mut state);
+        handler.handle(&tree, span_id, &mut state, false);
         state.flush_line();
         assert_eq!(state.out, "{{Foo|bar}}");
     }
