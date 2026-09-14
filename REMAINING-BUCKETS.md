@@ -45,16 +45,19 @@ With that in place, three faithful fixes landed:
 
 - `2b: Delete whitespace/comments if found in fosterable position while
   template-wrapping` and `T343874` both need `DOMRangeBuilder`'s
-  **fosterable-position range expansion** (`DOMRangeBuilder.php:145-190`). When the
-  transclusion start marker sits in a fosterable position inside a `<tr>`, PHP
-  walks forward over the non-element nodes, then either migrates them into the
-  first element (`newStart`) or, if that element is not `tr`/`tbody` and there was
-  real whitespace, expands the range to the start marker's parent. Only then does
-  `getStartConsideringFosteredContent` + `MAP_TBODY_TR` pick the actual
-  encapsulation target. rustoid currently leaves an orphan
-  `<span typeof="mw:Transclusion"></span>` in front of the table, i.e. it does not
-  take that path at all. This is the last piece for the whole
-  "transclusion straddling an HTML table" family.
+  **fosterable-position range expansion** (`DOMRangeBuilder.php:145-190`).
+  Investigated: rustoid's marker metas end up as **siblings of `<table>`** (under
+  `<html>`) rather than between the `<td>`s the template produced, so
+  `wrap_transclusion_children` sees an adjacent start/end pair and treats the
+  transclusion as *empty* (hence the orphan
+  `<span typeof="mw:Transclusion"></span>`). PHP's markers stay inside the table:
+  `TreeBuilderStage` inserts them with `insertUnfosteredMeta` precisely so
+  foster-parenting cannot hoist them. So the first thing to check is rustoid's
+  meta insertion path in `in_table`/`in_row` modes for a transclusion whose
+  content is table *cells* — before reaching for `DOMRangeBuilder`.
+- Once the markers are correctly placed, the range expansion itself
+  (`DOMRangeBuilder.php:145-190` + `getStartConsideringFosteredContent` +
+  `MAP_TBODY_TR`) picks the encapsulation target.
 - `Templated table cell with untemplated attributes: Integrated mode only` is one
   `about` attribute short of PHP's standalone output (see below), and its fixture
   expectation is `+integrated`-only (unreachable in standalone).
