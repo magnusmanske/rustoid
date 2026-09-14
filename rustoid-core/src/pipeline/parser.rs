@@ -2086,6 +2086,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             spliced
         };
 
+        // Expand the spliced body's remaining templates. `in_template` stays
+        // `true` here: under the parserTests configuration (the oracle rustoid's
+        // fixtures come from) a `{{!}}` inside a template body expands via
+        // `processSpecialMagicWord`'s `inTemplate` branch, i.e. to a `<td>` token
+        // that `TableFixups` later reinterprets as a cell separator. Passing the
+        // *caller's* flag instead makes `{{1x|1= {{!}}bar}}` produce the literal
+        // `|`, which diverges from those fixtures.
         let expanded =
             Box::pin(self.expand_templates(&child_frame, spliced, Some(src), about_counter, true))
                 .await;

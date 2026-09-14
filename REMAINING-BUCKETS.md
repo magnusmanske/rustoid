@@ -51,13 +51,46 @@ merge away. Rows 1/2 are `|class="foo"{{1x|1= {{!}}bar}}` and
 expanded by `process_special_magic_word` to a `<td>` token (faithful: PHP does the
 same, with empty `attrSrc` + `AT_SRC_START` so `TableFixups` reinterprets it as a
 literal `|`). The HTML5 tree builder therefore sees a `td` start tag while a `td` is
-open and closes the outer cell, leaving two sibling cells plus a fostered
-`mw:Transclusion` meta. rustoid's `TableFixups` does not merge them back; PHP's
-`maybeCombineWithPrevCell` path (Conditions 1–6 in `getReparseType`) does. Row 1 is
-already correct, so the merge works when the argument has a leading space but not
-when it starts with `&nbsp;` — likely `puts_next_sibling_in_sol_state` or the
-`in_tpl_content` tracking across the entity span (`pipe_status_in_content` reported
-`in_tpl=false` for row 2).
+open and closes the outer cell, leaving two sibling cells. rustoid's `TableFixups`
+does not merge them back; PHP's `maybeCombineWithPrevCell` path does.
+
+All six of PHP's `getReparseType` conditions for the merge evaluate **true** in
+rustoid for both rows, and the branch taken is `!prev_has_attrs`
+("`$prev`'s content becomes `$cell`'s attributes"). The merge then fails inside
+`reparse_with_previous_cell`: it derives `$prevCellContent` from the previous cell's
+DSR, and for row 2 rustoid's cell-1 DSR is `[40,75]` — the whole row — so
+`prev_cell_content` is `class="foo"{{1x|1=&nbsp;{{!}}bar}}` instead of
+`class="foo"\u{a0}`. Re-tokenizing that as attributes yields zero attrs
+(`{{!}}`'s `|` is read as the separator), so nothing merges. Row 1's cell-1 DSR is a
+tight `[6,18]`, which is why it works. Next step is to find why the tree builder
+extends cell 1's DSR across the whole row when the argument begins with an entity
+span.
+
+### A tempting fix that is wrong (recorded so it is not retried)
+
+Hardcoding `in_template: true` in `expand_one_template`'s recursive
+`expand_templates` call is suspicious (the comment on it is a TODO), and switching
+it to the *caller's* `in_template` does fix `Integrated mode only` — `{{!}}` then
+expands to the literal `|` instead of a `<td>`, so no spurious cell appears. It
+regresses two fixtures, though:
+
+- `Templated table cell with untemplated attributes: Regression tests`
+- `Using {{!}} in template arguments (T290526)`
+
+Both are **validated** by PHP's own runner (`php bin/parserTests.php --mock
+--wt2html --filter '...'` passes them), whereas `Integrated mode only` is skipped by
+that runner entirely — it is one of the three tests in its group that report
+`0 of 0 tests matching`, so PHP never checks the fixture's `html/parsoid+integrated`
+section. Matching the production path instead would be defensible in isolation, but
+rustoid's fixture suite is generated from the parserTests configuration, so the
+parserTests behaviour is the one that must hold.
+
+Note when probing: `MockSiteConfig::getMagicWordMatcher` returns `/(?!)/` (never
+matches) except for `toc`, so a standalone probe does **not** treat `{{!}}` as a
+magic word unless the site config registers it (`--template` probes silently treat
+it as a missing template). `bin/parserTests.php --filter` matches on the test name
+as a plain substring and silently reports `0 of 0 tests matching` when the name
+does not start the matched list, which makes a wrong name look like a passing run.
 
 ## Landed: autolink URL scanning stops at table pipes; `cleanUrl` wikilink mode (848 → 849)
 
