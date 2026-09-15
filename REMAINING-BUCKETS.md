@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **861/891 fixtures pass** (97%). Lib tests: 665 pass. Clippy: clean.
+Current baseline: **865/891 fixtures pass** (97%). Lib tests: 669 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -127,24 +127,87 @@ gaps were narrower:
      is what makes the invalid-title bail (`bailTokens`) re-tokenize
      `[[http://x |123]]` to PHP's `[` + extlink + `]` shape.
 
-## Next: the remaining 14
+## Landed: a batch of five, 861 → 865
 
-The table cluster is still the biggest group:
+The previous "remaining 14" note was partly wrong, and the corrections are worth
+recording because they cost time to find:
 
-- `4. Template-generated table cell attributes…` and `T343874` — compound
-  `data-mw` fusion (`DOMRangeBuilder::recordTemplateInfo`). The range extent
-  must come from the marker *elements*, not the start meta's DSR (which is
-  narrow, `[0,13]` for a `{{tbl-start}}`); that is why the earlier
-  DSR-containment attempt found nothing.
-- `Wikitext tables can be nested inside HTML tables`,
-  `Second colon on line: Templates involved and T2959 kicks in`,
-  `Parser function inside dl-dt list should be tokenized correctly` —
-  line-splitting heuristics in `AttributeExpander`.
-- `T179544: {{anchorencode:}} output should be always usable in links` and the
-  T290526 `{{!}}` family — link handling.
-- `Parsoid: Default to a newline after tables in new content (T53219)` and
-  `Invalid text in table attributes should be preserved by selective serializer`
-  — serializer-only, so lower risk and independently verifiable.
+1. **`Wikitext tables can be nested inside HTML tables`** — *not* an
+   `AttributeExpander` problem. `is_table_tag` omitted `tbody`/`thead`/`tfoot`,
+   so `WTUtils::inHTMLTableTag`'s walk up to the `stx='html'` table stopped at
+   the parser-inserted `<tbody>` and `serializeChildTableTagAsHTML` was false.
+
+2. **`Second colon on line: Templates involved and T2959 kicks in`** — *not*
+   `AttributeExpander` either. `ListHandler::onAny` had PHP's `if/elseif`
+   polarity inverted, so `inT2529Mode` was cleared as soon as it was set, and
+   `onListItem` never reset `haveDD`; the stale flag made a `:` serialize as
+   cell content instead of opening a `<dd>`.
+
+3. **`Parser function inside dl-dt list should be tokenized correctly`** — the
+   tokenizer was correct; `#dir` simply was not implemented, and `resolve_target_string`
+   could not have resolved it anyway. See below.
+
+4. **`T45661: Piped links with identical prefixes`** — the note claiming the
+   fixture "is not in the fixture's articles" was **wrong**: `prefixed article`
+   is defined at `wikiLinks.txt:53`. `case_insensitive_get` bailed on any key
+   without a `:`, so mainspace titles never got the first-letter fallback.
+
+5. **`Templated table cell with untemplated attributes: Integrated mode only`**
+   is in the categorically-unreachable group (see below), not a live gap.
+
+### Parser functions: the `functionhooks` set
+
+PHP resolves `{{#…}}` by looking the whole prefix up in the function-synonym
+table, keyed with a `#` unless the name is in `$noHashFunctions`. rustoid sent
+any `#…` straight to `broken: true` without consulting anything, so core's
+no-hash functions could not resolve. `SiteConfig::function_hooks` now models the
+API's `functionhooks` set.
+
+Watch out: `dir` must be registered as a *function hook*, not a magic word.
+Registering it as a magic word made `{{dir}}` resolve as a variable instead of
+falling through to `Template:Dir` (there is a regression test for this).
+
+`#dir` itself is only partly faithful. Core gets direction from
+`Language::getDir()` and its `$rtlLanguages` table; rustoid has no language data,
+and the direction is not decidable from the code alone (`ar` is RTL, `en` LTR).
+Only the `-x-rtl` override is recognised, and an omitted code reports `auto`.
+An earlier draft hardcoded a 24-entry RTL language list with `ar-`/`fa-`/`he-`
+prefix heuristics — **no test exercises it and MediaWiki core is not in the
+`/tmp/parsoid-src` checkout to port from**, so it was guesswork and was removed.
+TODO: add per-language direction to `SiteConfig` (PHP's `languages` block has an
+`rtl` flag per language) and look the code up.
+
+## Next: a nested template in a template target
+
+Five failures now share one root cause, and it is in the **tokenizer**.
+`parse_template_token` takes the target as raw source text:
+
+```rust
+let target = parts.first().map(|(_, s)| strip_html_comments(s).trim()...)
+```
+
+PHP instead tokenizes `template_target` and keeps `{{…}}`/`{{{…}}}` as live
+`template`/`templatearg` tokens, which expand in document order *before* the
+outer target is resolved; `processToString` then flattens the buffer. Because
+rustoid stringifies the target, an inner template is destroyed:
+
+```
+{{ {{T290526}} }}    →  <template T290526=""></template>   (PHP: expands, then {{ … }})
+{{1x<invalid> |{{2x<invalid>y}}| }}  →  <template 2x<invalid>y=""></template>
+```
+
+Affected: `2. Using {{!}} in wikilinks`, `Using {{!}} in template arguments,
+part 2`, and `Don't apply complex line-splitting heuristics in AttributeExpander
+for non-<table> tokens` (the last one's bucket attribution is otherwise a red
+herring — it is the same target bug, not line splitting). Also implicated in the
+`T179544` `{{anchorencode:}}` family.
+
+The fix is to give the target the same inline tokenization the argument values
+already get (`try_wikilink`/template-arg tokens), and to resolve
+`resolve_target_string` from tokens rather than a pre-flattened `String`. Note
+that for `{{ {{T}} }}` the *expected* output keeps literal `{{`/`}}` around the
+expanded `<span>` — the inner expansion is real, but it does not turn the outer
+construct into a transclusion.
 
 ## Landed: the tokenizer's `preproc` stack (857 → 858)
 
