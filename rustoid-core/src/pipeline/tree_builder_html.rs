@@ -1394,7 +1394,7 @@ fn encapsulate_transclusions(node: &mut Node, source: Option<&str>) {
 
     let children = std::mem::take(&mut node.children);
     let children = wrap_transclusion_children(children, source, Some(node));
-    node.children = wrap_flipped_children(children, source);
+    node.children = wrap_flipped_children(children, source, Some(node));
 }
 
 /// Wrap transclusion ranges among a parent's direct children (the sibling case,
@@ -1731,7 +1731,11 @@ fn is_deletable_in_range(content: &[Node], idx: usize, parent: Option<&Node>) ->
 ///     non-fostered case, e.g. `{{1x|*bar}}` → `<meta/> <ul>…</ul>`), and
 ///   - the "flipped" case where the end marker was fostered into a *preceding*
 ///     sibling element.
-fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<Node> {
+fn wrap_flipped_children(
+    mut children: Vec<Node>,
+    source: Option<&str>,
+    parent: Option<&Node>,
+) -> Vec<Node> {
     let mut i = 0;
     while i < children.len() {
         // The range start is either the marker meta itself (a direct sibling) or
@@ -1800,6 +1804,38 @@ fn wrap_flipped_children(mut children: Vec<Node>, source: Option<&str>) -> Vec<N
                     encap_target = Some(j);
                 }
             }
+        }
+
+        // A text node inside the range cannot carry `about`, so it is span-wrapped
+        // (mirrors `ensureElementsInRangeAndAddAboutIds`, which requires every node
+        // in the range to be an Element so the chain stays contiguous and
+        // editable). A newline between two block siblings, e.g. the one between the
+        // `<dd>`s of `one\n::two`, is kept this way rather than dropped: PHP's
+        // `isDeletableNode` only discards it in the two narrow cases mirrored by
+        // `is_deletable_in_range`, and a `dd`/`dd` pair is neither.
+        let range: Vec<Node> = children[lo..=hi].to_vec();
+        let about_id = start_meta.get_attr("about").map(str::to_string);
+        for (offset, node) in range.iter().enumerate() {
+            if !matches!(&node.kind, NodeKind::Text(t) if t.trim().is_empty()) {
+                continue;
+            }
+            if is_deletable_in_range(&range, offset, parent) {
+                continue;
+            }
+            // A whitespace text node in a fosterable position is already dropped
+            // by `is_deletable_in_range`, so this wrapping only ever sees nodes that
+            // belong in the range (a newline between block siblings such as the
+            // `<dd>`s of `one\n::two`).
+            let NodeKind::Text(text) = &node.kind else {
+                continue;
+            };
+            let mut span = Node::element(ElementKind::Span);
+            if let Some(about) = &about_id {
+                span.set_attr("about", about.clone());
+            }
+            span.push_child(Node::text(text.clone()));
+            span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+            children[lo + offset] = span;
         }
 
         // Adoption scenario (PHP `findWrappableTemplateRangesRecursive`): when
@@ -2231,7 +2267,7 @@ mod tests {
         td2.push_child(Node::text(" 123"));
         td2.push_child(end_meta());
 
-        let out = wrap_flipped_children(vec![td1, td2], None);
+        let out = wrap_flipped_children(vec![td1, td2], None, None);
 
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(out[0].get_attr("about"), Some("#mwt1"));
@@ -2247,6 +2283,52 @@ mod tests {
             !out[1].children.iter().any(is_transclusion_marker_meta),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn test_newline_between_block_siblings_gets_about_span() {
+        // `one\n::two` (Template:definition_list): the newline between the two
+        // `<dd>`s cannot carry `about`, so it is span-wrapped to keep the range a
+        // contiguous chain of elements (mirrors
+        // `ensureElementsInRangeAndAddAboutIds`). PHP keeps it — `isDeletableNode`
+        // only drops a newline in two narrow cases, and a `dd`/`dd` pair is
+        // neither.
+        fn meta(typeof_: &str) -> Node {
+            let mut m = Node::element(ElementKind::Other("meta".to_string()));
+            m.set_attr("typeof", typeof_);
+            m.set_attr("about", "#mwt1");
+            m
+        }
+        let dd = |text: &str| {
+            let mut d = Node::element(ElementKind::Other("dd".to_string()));
+            d.push_child(Node::text(text));
+            d
+        };
+        let parent = Node::element(ElementKind::Other("dl".to_string()));
+
+        let out = wrap_flipped_children(
+            vec![meta("mw:Transclusion"), dd("one"), Node::text("\n"), {
+                let mut d = dd("two");
+                d.push_child(meta("mw:Transclusion/End"));
+                d
+            }],
+            None,
+            Some(&parent),
+        );
+
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0].get_attr("about"), Some("#mwt1"));
+        // The middle node is a span wrapping the newline, carrying `about`.
+        assert_eq!(crate::html::wts_utils::node_name(&out[1]), "span");
+        assert_eq!(out[1].get_attr("about"), Some("#mwt1"));
+        assert_eq!(
+            out[1].children.first().map(|c| match &c.kind {
+                NodeKind::Text(t) => t.as_str(),
+                _ => "",
+            }),
+            Some("\n")
+        );
+        assert_eq!(out[2].get_attr("about"), Some("#mwt1"));
     }
 
     #[test]
