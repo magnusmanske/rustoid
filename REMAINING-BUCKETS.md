@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **865/891 fixtures pass** (97%). Lib tests: 669 pass. Clippy: clean.
+Current baseline: **867/891 fixtures pass** (97%). Lib tests: 675 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -177,34 +177,73 @@ prefix heuristics — **no test exercises it and MediaWiki core is not in the
 TODO: add per-language direction to `SiteConfig` (PHP's `languages` block has an
 `rtl` flag per language) and look the code up.
 
-## Next: a nested template in a template target
+## Landed: nested templates in a template target (865 → 867)
 
-Four failures share one root cause. It was in the **tokenizer**, and the first
-half is now fixed (see the "tokenizer: tokenize the template target" commit).
-`parse_template_token` used to take the target as raw source text, which
-destroyed any inner template:
+The target tokenization (previous commit) turned out to be only the first of
+three bugs on this path. `{{ {{T}} }}` also needed:
 
-```
-{{ {{T290526}} }}    →  <template T290526=""></template>   (PHP: expands, then {{ … }})
-{{1x<invalid> |{{2x<invalid>y}}| }}  →  <template 2x<invalid>y=""></template>
-```
+1. **The expansion itself.** `Frame::expand` only substitutes `{{{…}}}`
+   references and passes `template` tokens through, so the nested template was
+   never expanded — it survived until `tokens_to_string`'s catch-all `_ => {}`
+   dropped it, producing a literal `<template T="">`. PHP expands it in
+   `Frame::expand` because that runs the chunk through the full TT2 pipeline.
+   rustoid now does it in `Parser::expand_target_templates`, before the
+   AttributeTransformManager pass, keeping `Frame::expand` synchronous.
 
-The target is now inline-tokenized like an argument value, so `{{ {{T}} }}`
-yields a template token whose key is `Tokens([template T])` — verified with a
-probe. **That alone flips no fixture**: the expanded target is not yet consumed
-by the downstream resolution, which is the next step.
+2. **Only `attribs[0]` may be expanded here.** Expanding templates in *all*
+   keys/values regresses `Using {{!}} in template arguments (T290526)` and
+   `Templated table cell with untemplated attributes`: PHP's
+   `expandFirstAttribute` touches only the target, and an argument *value* is
+   expanded later by the body expansion with `expandTemplates => false`.
 
-Remaining work: `resolve_target_string`/`handle_template` must run the expanded
-target buffer through the `processToString` equivalent (flattening strings and
-`mw-quote` values, *keeping* `{{`/`}}` as literal text for an inner transclusion)
-and then resolve. Note the expected output for `{{ {{T}} }}` keeps literal
-braces around the expanded `<span>` — the inner expansion is real, but it does
-not make the outer construct a transclusion.
+3. **An expanded target may be an illegal title.** `Main Page|Something else`
+   is rejected by `resolve_target_string`, and the bail path was never
+   re-expanded. It now goes through `convert_to_string` and back through
+   `expand_templates`, mirroring `convertToString($token, /* expandTemplates */
+   true)`. Worth knowing: the `{{`/`}}` stay literal *around* the expanded inner
+   transclusion span — the inner expansion is real, but the outer construct does
+   not become a transclusion.
 
-Affected: `2. Using {{!}} in wikilinks`, `Using {{!}} in template arguments,
-part 2`, `T179544: {{anchorencode:}}`, and `Don't apply complex line-splitting
-heuristics in AttributeExpander for non-<table> tokens` (whose bucket
-attribution is a red herring — it is the same target bug, not line splitting).
+`#anchorencode` also landed. It needed a no-hash parser function to resolve with
+a colon (`anchorencode` is a `$noHashFunctions` member, so the synonym table
+holds the bare name), gated on `have_colon` so `{{dir}}` stays a template
+reference, exactly as PHP's `if ((!$hasHash) && (!$haveColon))` does.
+
+### A port bug worth remembering
+
+`Utils::entityEncodeAll` is **codepoint**-wise, not byte-wise:
+`mb_encode_numericentity($s, …, 'utf-8', true)` gives `&#xE9;` for `é`, and the
+`$conventions` map turns U+00A0 into `&nbsp;`. The first implementation encoded
+UTF-8 bytes, which would have emitted `&#xC3;&#xA9;` — invisible to the fixture
+suite, whose only `#anchorencode` input is ASCII. There is now a test pinned
+against PHP's actual output.
+
+### Verified unreachable, not merely hard
+
+`2. Using {{!}} in wikilinks (T290526)` is in PHP's own
+`wikiLinks-standalone-knownFailures.json`: in standalone mode PHP produces
+`href="./Main_PageSomething_else"`, not the fixture's
+`<a href="./Main_Page">Something else</a>`, which is the MediaWiki-preprocessor
+(integrated) result. Confirmed by running PHP's runner directly
+(`bin/parserTests.php --wt2html --filter='2. Using'` → EXPECTED FAIL). It cannot
+flip in native mode.
+
+## Next: the raw-token bail in `convert_to_string`
+
+`Don't apply complex line-splitting heuristics in AttributeExpander for
+non-<table> tokens` shares the `<template 2x<invalid>="">` *symptom* but has a
+different cause: the inner `{{2x<invalid>y}}` bails through the **no-source**
+branch of `convert_to_string`, which returns the raw token, and that token is
+later stringified. It is not a nested target, so the fix above does not touch
+it (byte-identical before/after). Fixing it means expanding/handling the
+no-`src` bail path, not the target path.
+
+The remaining table fixtures are the table-encapsulation cluster.
+`Templated table cell with untemplated attributes: Integrated mode only` and
+`T343874` are in the **categorically unreachable** `+integrated`-only group
+documented below, so they are not work items. `4. Template-generated table cell
+attributes and cell content inside a templated table` is a live gap (the
+`reparseTemplatedAttributes` reparse).
 
 ## Landed: the tokenizer's `preproc` stack (857 → 858)
 
