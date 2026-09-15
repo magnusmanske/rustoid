@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **860/891 fixtures pass** (97%). Lib tests: 665 pass. Clippy: clean.
+Current baseline: **861/891 fixtures pass** (97%). Lib tests: 665 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -57,40 +57,29 @@ by selective serializer` also needs (it still fails on a third issue, below).
    `parse_selector` now records the combinator between compounds and
    `matches_steps` walks the previous-element-sibling chain for `+`.
 
-## Next: selser leading-whitespace recovery inside a cell
+## Landed: separator constraints for text nodes (860 → 861)
 
 `Invalid text in table attributes should be preserved by selective serializer`
-is now down to a single difference:
+now passes. The previous session's note blamed `make_separator` or
+`last_source_node`; both were innocent. The real gap was one step earlier.
 
-```
-expected: ... style='color:blue'  | abc      got: ... style='color:blue'  |abc
-expected: |<span>boo</span> style='color:blue'| xyz   got: ...|xyz
-```
+**`serialize_node`'s text branch never called
+`updateSeparatorConstraints`.** PHP does it for every node, but text nodes get
+`new DOMHandler( false )` — a handler whose `before`/`firstChild` hooks return
+*empty* constraints, so only the *previous* handler's constraints contribute.
+Skipping the call left the text node with no `constraint_info` at all, so
+`buildSep` never learned that the separator is `SepType::ParentChild`. The
+trimmed-whitespace recovery (`separators.rs:263-272`) is guarded on exactly
+that type, so the cell's recorded `leadingWS = 1` was never consulted and
+`| 1` serialized as `|abc` instead of `| abc`.
 
-The extra space comes from `Separators::recoverTrimmedWhitespace($node, true)`
-— the table cell's original content was ` 1`, and `CleanUp::trimWhiteSpace`
-recorded `leadingWS = 1` on the cell's DSR (rustoid records this correctly:
-both cells parse to `leading_ws: 1`, matching PHP exactly).
+The `currNodeUnmodified` flag is now also computed on this path (guarded on
+`selser_mode`), matching the text branch of PHP's `serializeNodeInternal`.
 
-Reproduced in isolation with the fixture's own changetree:
-
-```
-wt:     {| <span>boo</span> style='border:1px solid black'
-        |  <span>boo</span> style='color:blue'  | 1
-        |<span>boo</span> style='color:blue'| 2
-        |}
-changes: [["td:first-child","text","abc"],["td + td","text","xyz"]]
-both <td> dsr = (start 51/95, open_width 41/37, leading_ws 1, trailing_ws 0)
-got:    ...|abc  ...|xyz      (PHP: ...| abc  ...| xyz)
-```
-
-So the DSR data is right and the recovery code exists
-(`separators.rs:263-272` calls it for `SepType::ParentChild`); the separator
-never reaches the output. Most likely the recovered `" "` is placed on the
-wrong side of the newline in `make_separator` (it appends the newline buffer
-*after* the seed text, giving `" \n"`), or the `|` chunk's
-`last_source_node` short-circuits `emit_sep_for_node`. Instrument
-`Separators::build_sep` for the text child of the first `<td>` to settle it.
+Worth noting for the next session: the *DSR* side was already correct — both
+cells parsed to `leading_ws: 1`, byte-identical to PHP. When a selser
+recovery branch looks dead, check that the constraint plumbing that gates it
+actually ran before suspecting the recovery logic itself.
 
 ## Landed: token-level argument substitution (858 → 859)
 
