@@ -442,17 +442,23 @@ impl ListHandler {
 
     /// Handle any other (non-listItem/newline/EOF) token.
     fn on_any(&mut self, token: Item) -> Option<Vec<Item>> {
-        // T2529 detection: transclusion token resets inT2529Mode.
-        if let Item::Tok(ParsoidToken::SelfclosingTag(tk)) = &token {
-            let is_transclusion = tk.attribs.iter().any(|kv| {
-                kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:Transclusion")
-            });
-            if is_transclusion {
-                self.in_t2529_mode = false;
-            }
-        }
-        // Non-SOL-transparent resets T2529 mode.
-        if !Self::is_sol_transparent(&token) {
+        // T2529: an `mw:Transclusion` marker means the *next* list item came out
+        // of a template that was expanded in SOL context (legacy would have
+        // inserted a newline for it), so `onListItem` must first clear `haveDD`.
+        // A transclusion is *not* sol-transparent, so the branches are exclusive —
+        // mirroring PHP's `if ( … matchTypeOf 'mw:Transclusion' ) { … = true; }
+        // elseif ( !isSolTransparent( … ) ) { … = false; }`.
+        let is_transclusion = matches!(
+            &token,
+            Item::Tok(ParsoidToken::SelfclosingTag(tk))
+                if tk.attribs.iter().any(|kv| {
+                    kv.key.as_str() == Some("typeof")
+                        && kv.value.as_str() == Some("mw:Transclusion")
+                })
+        );
+        if is_transclusion {
+            self.in_t2529_mode = true;
+        } else if !Self::is_sol_transparent(&token) {
             self.in_t2529_mode = false;
         }
 
