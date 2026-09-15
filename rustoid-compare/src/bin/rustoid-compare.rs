@@ -126,7 +126,27 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let client = Arc::new(WikiClient::new(wiki)?);
-    let config = rustoid_core::mock::MockSiteConfig::new();
+    let cache = Mutex::new(cache);
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // The wiki's own configuration, not a hardcoded enwiki-shaped mock: a tag
+    // list that omits a wiki's extensions would make them render as plain text.
+    let config = rt.block_on(rustoid_compare::load_site_config(
+        Some(&client),
+        &cache,
+        cli.offline,
+        cli.refresh,
+    ))?;
+    if cli.verbose {
+        println!(
+            "siteinfo: {} extension tags, {} function hooks, {} magic words, {} namespaces, {} interwiki",
+            config.extension_tag_count(),
+            config.function_hook_count(),
+            config.magic_word_count(),
+            config.namespace_count(),
+            config.interwiki_count(),
+        );
+    }
     let req = rustoid_compare::CompareRequest {
         title: page.clone(),
         revid: cli.revision,
@@ -134,8 +154,6 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         offline: cli.offline,
     };
 
-    let cache = Mutex::new(cache);
-    let rt = tokio::runtime::Runtime::new()?;
     let comparison = rt.block_on(rustoid_compare::compare_page(
         &client, &config, &cache, &req,
     ))?;

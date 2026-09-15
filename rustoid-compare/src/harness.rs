@@ -20,6 +20,7 @@ use rustoid_core::traits::DataSource;
 
 use crate::cache::{EntryKind, EntryMeta, WikiCache};
 use crate::error::{CompareError, Result};
+use crate::siteconfig::WikiSiteConfig;
 use crate::wire::WikiClient;
 
 /// How one page's comparison turned out.
@@ -482,6 +483,66 @@ fn now_rfc3339() -> Option<String> {
     Some(format!("epoch:{secs}"))
 }
 
+/// The cache key under which a wiki's `siteinfo` is stored. One entry per wiki,
+/// so it is keyed by a constant rather than a title.
+const SITEINFO_KEY: &str = "siteinfo";
+
+/// Load the wiki's `siteinfo`, through the cache.
+///
+/// `siteinfo` changes rarely but is needed by every page, so it is cached like
+/// anything else. `refresh` forces a re-fetch; `offline` turns a miss into an
+/// error rather than a silent fallback, because comparing against an invented
+/// configuration would produce confidently wrong diffs.
+pub async fn load_site_config(
+    client: Option<&Arc<WikiClient>>,
+    cache: &std::sync::Mutex<WikiCache>,
+    offline: bool,
+    refresh: bool,
+) -> Result<WikiSiteConfig> {
+    let cached = if refresh {
+        None
+    } else {
+        cache
+            .lock()
+            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+            .get(EntryKind::SiteInfo, SITEINFO_KEY)?
+            .map(|c| c.body)
+    };
+
+    if let Some(body) = cached {
+        return WikiSiteConfig::from_siteinfo_json(&body);
+    }
+
+    let Some(client) = client else {
+        return Err(CompareError::Offline(format!(
+            "siteinfo not cached and no client available ({SITEINFO_KEY})"
+        )));
+    };
+    if offline {
+        return Err(CompareError::Offline(
+            "siteinfo not cached and --offline was requested".to_string(),
+        ));
+    }
+
+    let body = client.siteinfo().await?;
+    let config = WikiSiteConfig::from_siteinfo_json(&body)?;
+    cache
+        .lock()
+        .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+        .put(
+            EntryKind::SiteInfo,
+            SITEINFO_KEY,
+            &body,
+            EntryMeta {
+                kind: EntryKind::SiteInfo,
+                title: SITEINFO_KEY.to_string(),
+                revid: None,
+                fetched_at: now_rfc3339(),
+            },
+        )?;
+    Ok(config)
+}
+
 /// Convenience for tests and the binary: the default cache root.
 pub fn default_cache_root() -> std::path::PathBuf {
     std::env::var_os("RUSTOID_CACHE_DIR")
@@ -496,6 +557,8 @@ pub fn default_cache_root() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use rustoid_core::traits::SiteConfig;
+
     use super::*;
 
     #[test]
@@ -610,6 +673,51 @@ mod tests {
             .await
             .unwrap();
         assert!(got.is_none());
+
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// The siteinfo must come from the cache when present, with no client at all.
+    /// This is what makes a `--offline` run reproduce the online one exactly.
+    #[tokio::test]
+    async fn site_config_is_served_from_cache() {
+        let root = std::env::temp_dir().join("rustoid-compare-siteinfo-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cache = WikiCache::open(&root, "example.invalid").unwrap();
+        let body = r#"{"query":{"general":{"lang":"de"},
+            "extensiontags":["<ref>","</ref>"],"functionhooks":["invoke"]}}"#;
+        cache
+            .put(
+                EntryKind::SiteInfo,
+                "siteinfo",
+                body,
+                crate::cache::EntryMeta {
+                    kind: EntryKind::SiteInfo,
+                    title: "siteinfo".to_string(),
+                    revid: None,
+                    fetched_at: None,
+                },
+            )
+            .unwrap();
+        let cache = std::sync::Mutex::new(cache);
+
+        let cfg = load_site_config(None, &cache, true, false).await.unwrap();
+        assert_eq!(cfg.language_code(), "de");
+        assert_eq!(cfg.extension_tags(), &["ref".to_string()]);
+
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A miss while offline is an error, not a silent fallback to an invented
+    /// configuration: a wrong config would produce confidently wrong diffs.
+    #[tokio::test]
+    async fn site_config_miss_offline_is_an_error() {
+        let root = std::env::temp_dir().join("rustoid-compare-siteinfo-miss");
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = std::sync::Mutex::new(WikiCache::open(&root, "example.invalid").unwrap());
+
+        let err = load_site_config(None, &cache, true, false).await;
+        assert!(matches!(err, Err(CompareError::Offline(_))), "{err:?}");
 
         WikiCache::flush_all(&root).unwrap();
     }

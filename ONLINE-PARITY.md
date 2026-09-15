@@ -150,14 +150,27 @@ Still to come in this phase: corpus/batch mode (a list of titles), golden files,
 and recording the run's wall-clock time and site stats for replay (see
 "What exact equality cannot mean").
 
-### Phase 1 — Site config from the wiki
+### Phase 1 — Site config from the wiki — *done*
 
 - Load `SiteConfig` from `siteinfo` (namespaces + aliases, magic words, function
   hooks, extension tags, interwiki map, general) instead of a hardcoded list, and
-  persist it with the cache.
-- Ingest Parsoid's `baseconfig/*.json` too, for offline fixture-grade runs.
+  persist it with the cache. — **done** (`rustoid-compare/src/siteconfig.rs`)
 - **Exit criterion:** the extension-tag list and namespace table used for a run
-  demonstrably come from the wiki, not `mock.rs`.
+  demonstrably come from the wiki, not `mock.rs`. — **met**: `rustoid-compare`
+  no longer references `MockSiteConfig`, and a live enwiki run reports
+  `28 extension tags, 112 function hooks, 285 magic words, 30 namespaces, 781
+  interwiki`, matching a direct `siteinfo` query.
+
+Two non-obvious `siteinfo` wire traps, both now covered by tests:
+
+- The localized namespace name is spelled `*` in formatversion=1 and `name` in
+  formatversion=2, so both must be understood.
+- `serde`'s `rename = "*"` **silently deserializes to `None`** — it does not
+  error. Anything reading a `*` key has to capture the object and index it.
+
+Still to come in this phase: ingesting Parsoid's `baseconfig/*.json` for
+fixture-grade offline runs (the parser's own fixture suite already pins its own
+configuration and is unaffected).
 
 ### Phase 2 — Corpus and scoreboard
 

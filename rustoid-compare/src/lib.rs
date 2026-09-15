@@ -16,14 +16,20 @@
 //! - [`wire`] — thin, revision-pinned client for the MediaWiki REST/Action API.
 //! - [`harness`] — drives the two sides and reports the comparison.
 
+//! - [`siteconfig`] — the wiki's own `SiteConfig`, parsed from its `siteinfo`,
+//!   so an online comparison is not silently capped by a hardcoded mock.
+
 pub mod cache;
 pub mod error;
 pub mod harness;
+pub mod siteconfig;
 pub mod wire;
 
 pub use cache::{CachedBody, EntryKind, EntryMeta, WikiCache};
 pub use error::{CompareError, Result};
 pub use harness::{
     CachedDataSource, CompareRequest, Comparison, Outcome, compare_html, compare_page,
+    load_site_config,
 };
+pub use siteconfig::WikiSiteConfig;
 pub use wire::{Wiki, WikiClient};

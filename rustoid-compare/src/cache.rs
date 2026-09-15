@@ -42,6 +42,9 @@ pub enum EntryKind {
     Module,
     /// A rendered artifact fetched from the wiki (e.g. its Parsoid HTML).
     Rendered,
+    /// Raw `siteinfo` JSON for the wiki: namespaces, magic words, function
+    /// hooks, extension tags, interwiki map.
+    SiteInfo,
 }
 
 impl EntryKind {
@@ -51,6 +54,7 @@ impl EntryKind {
             Self::Template => "tpl",
             Self::Module => "mod",
             Self::Rendered => "html",
+            Self::SiteInfo => "siteinfo",
         }
     }
 }

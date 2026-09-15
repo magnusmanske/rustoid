@@ -24,6 +24,11 @@ pub enum CompareError {
     /// rustoid failed to parse the wikitext.
     #[error("parse error: {0}")]
     Parse(String),
+
+    /// Something was needed that is neither cached nor reachable because the
+    /// run was explicitly offline.
+    #[error("offline: {0}")]
+    Offline(String),
 }
 
 impl CompareError {
