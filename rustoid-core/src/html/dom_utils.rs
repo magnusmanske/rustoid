@@ -96,6 +96,10 @@ pub fn is_table_tag(node: &Node) -> bool {
             | NodeKind::Element(ElementKind::TableCell)
             | NodeKind::Element(ElementKind::TableHeader)
             | NodeKind::Element(ElementKind::TableCaption)
+    ) || matches!(
+        &node.kind,
+        NodeKind::Element(ElementKind::Other(n))
+            if n == "tbody" || n == "thead" || n == "tfoot"
     )
 }
 
