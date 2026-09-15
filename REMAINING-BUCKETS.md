@@ -1,6 +1,6 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **867/891 fixtures pass** (97%). Lib tests: 675 pass. Clippy: clean.
+Current baseline: **867/891 fixtures pass** (97%). Lib tests: 676 pass. Clippy: clean.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -241,9 +241,71 @@ no-`src` bail path, not the target path.
 The remaining table fixtures are the table-encapsulation cluster.
 `Templated table cell with untemplated attributes: Integrated mode only` and
 `T343874` are in the **categorically unreachable** `+integrated`-only group
-documented below, so they are not work items. `4. Template-generated table cell
-attributes and cell content inside a templated table` is a live gap (the
-`reparseTemplatedAttributes` reparse).
+documented below, so they are not work items.
+
+## Next: cross-parent transclusion range merging (the big one)
+
+`4. Template-generated table cell attributes and cell content inside a templated
+table` is a live gap, and the cause is **not** `reparseTemplatedAttributes`
+(an earlier note in this file said so; that was wrong, and two sessions were
+spent on the wrong end of the pipeline).
+
+What actually happens: the table's `data-mw` carries **1** part (`tbl-start`)
+while the fixture expects **7** (4 templates + 3 string gaps).
+`TableFixups::handleTableCellTemplates` opens with
+
+```php
+if ( $isTemplatedNode && DOMDataUtils::getDataMw( $tableOrCell )->fromWellBalancedTemplate() ) {
+    return $tableOrCell->nextSibling;   // skip the entire table
+}
+```
+
+and `fromWellBalancedTemplate()` is `count($parts) === 1` (`NodeData/DataMw.php:77`).
+So the single part makes the table look like a well-balanced single-template
+transclusion and **every cell fixup is skipped before it runs**. rustoid's port
+of both the check and the skip is faithful — the bug is that the `data-mw` never
+gets the other 6 parts.
+
+They are missing because `wrap_transclusion_children` processes each
+transclusion range **independently per parent element**:
+
+```
+#mwt1 parent=html  content=[table]
+#mwt2 parent=th    content=[…]
+#mwt4 parent=td    content=[…]
+```
+
+PHP's `DOMRangeBuilder` instead treats these as *overlapping* ranges and merges
+them (`subsumedRanges` → `findToplevelEnclosingRange` → `recordTemplateInfo`),
+producing one **compound** `data-mw` on the common ancestor (here the table).
+rustoid has no counterpart — `grep -rn 'subsumedRanges|findToplevelEnclosingRange|introducesCycle|recordTemplateInfo'`
+finds nothing, and `build_compound_data_mw` only handles the `unwrappedWT` prefix
+and a trailing-wikitext suffix for a *single* range.
+
+### Why this is not a small fix
+
+A correct port means adding `findWrappableTemplateRanges` →
+`findTopLevelNonOverlappingRanges` → `recordTemplateInfo`/`compoundTpls` →
+`encapsulateTemplates` to `tree_builder_html.rs`. Transclusion encapsulation
+underlies a large fraction of the 891 fixtures, so it should be landed
+incrementally with the full suite run after each step rather than in one shot.
+
+A tempting shortcut is to tighten the skip so it fires only when the table
+genuinely holds no templated cells. **Do not do this**: it changes
+`fromWellBalancedTemplate` from a faithful port of `count($parts) === 1` into
+something PHP does not do, and would likely break the fixtures it currently
+protects.
+
+### A partial fix that did land from this work
+
+`drop_consumed_prefix` in `table_fixups.rs` walked only *direct* children, but
+PHP's `preg_replace('/^[^|]*\|/', '', innerHTML)` runs on the **serialized**
+inner HTML and so crosses element boundaries. For `| align=center {{cells}}` the
+text is a direct child while the consuming `|` sits inside the transclusion
+span, so the old code deleted the text and stopped, leaving the attribute text
+as cell content. It now walks the tree recursively. This is correct in its own
+right (with a unit test) but flips no fixture, because the table is skipped
+before the fixup runs.
 
 ## Landed: the tokenizer's `preproc` stack (857 → 858)
 
