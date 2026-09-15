@@ -1,12 +1,33 @@
 # Rustoid — A Rust implementation of the Parsoid MediaWiki parser
 
+## Current goal: parity with *online* Parsoid
+
+> **The active goal of this codebase is online parity.** See
+> [ONLINE-PARITY.md](ONLINE-PARITY.md) for the full statement and plan.
+
+A test binary that takes a **wiki** and a **page title**, fetches that wiki's own
+(online) Parsoid HTML, fetches the page's wikitext (cached) from the same wiki,
+runs rustoid over it, and **compares** the results — aiming for *exact* equality.
+That requires reimplementing all on-wiki extensions, prominently the
+**Lua/Scribunto** plugin.
+
+Note this is a *different* target from the fixture suite. The 891 fixtures
+exercise Parsoid in **standalone** mode; a live wiki serves **integrated** mode,
+where MediaWiki core runs the preprocessor and the extensions. Standalone
+Parsoid does not implement `#invoke` at all, and ships only a handful of
+built-in extensions — so the fixture suite cannot measure Lua or Cite, and
+online parity is a superset of the current target. The existing parser core is
+reused as-is; this is additive work.
+
+Current baseline for the shared core: **871/891 fixtures, 679 lib tests**.
+
 ## Overview
 
 Rustoid is a from-scratch Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wiki/Parsoid) parser. Parsoid is a bidirectional wikitext↔HTML5 parser used by MediaWiki. The existing canonical implementations are in JavaScript (Node.js) and PHP. This project aims to produce a parser with **identical output** to the PHP Parsoid, but with the performance, safety, and portability of Rust.
 
 ## Goals
 
-1. **Byte-perfect output compatibility** with the PHP Parsoid (the current canonical implementation). Byte-perfect is the desired outcome. The standard is: given the same wikitext, produce HTML that is functionally identical to Parsoid's and matches the `!! html/parsoid` sections in the official test suite.
+1. **Byte-perfect output compatibility** with the PHP Parsoid (the current canonical implementation). Byte-perfect is the desired outcome. The standard is: given the same wikitext, produce HTML that is functionally identical to Parsoid's and matches the `!! html/parsoid` sections in the official test suite. **Superseded in scope by the current goal**, which extends this from the standalone fixture suite to live-wiki (integrated) output.
 2. **Full feature coverage**: wikitext→HTML, HTML→wikitext (round-tripping), selective serialization (selser), and the full VisualEditor editing pipeline (DOM diffing, minimal selser patches).
 3. **Template expansion** (transclusion) via a pluggable data backend.
 4. **Lua/Scribunto** module evaluation via the `mlua` crate.
@@ -289,7 +310,12 @@ pub enum WikitextToken {
 
 ### Phase 4 — Lua / Scribunto engine (est. 3-5 days)
 
-**Status: Partially complete** — core mw table stubs exist but many APIs are missing.
+**Status: engine present but UNWIRED.** The `mw` table and sandbox exist in
+`rustoid-core/src/lua/engine.rs` (8 sub-tables, 17 functions, 16 unit tests),
+but nothing in the parser dispatches `#invoke`, so Lua is currently unreachable
+from wikitext and untested end-to-end. Note the fixture suite *cannot* cover it:
+standalone Parsoid does not implement `#invoke` either. See
+[ONLINE-PARITY.md](ONLINE-PARITY.md) Phases 3-4 for the driving plan.
 
 - [x] Integrate `mlua` and create sandbox.
 - [x] Implement `mw` global table:

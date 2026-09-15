@@ -1,38 +1,57 @@
 # Rustoid
 
-A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wiki/Parsoid) parser — bidirectional wikitext ↔ HTML5 conversion with byte-perfect output compatibility.
+A Rust reimplementation of the Wikimedia [Parsoid](https://www.mediawiki.org/wiki/Parsoid) parser — bidirectional wikitext ↔ HTML5 conversion, targeting **identical output** to Parsoid.
+
+## Current goal: parity with *online* Parsoid
+
+**This is the active goal of the codebase.** See [ONLINE-PARITY.md](ONLINE-PARITY.md).
+
+A test binary that takes a **wiki** and a **page title**, fetches that wiki's own (online) Parsoid HTML, fetches the page's wikitext (cached) from the same wiki, runs rustoid over it, and compares the two — aiming for *exact* equality. This requires reimplementing all on-wiki extensions, prominently the **Lua/Scribunto** plugin.
+
+This is a *different* target from the fixture suite below. The fixtures exercise
+Parsoid in **standalone** mode; a live wiki serves **integrated** mode, where
+MediaWiki core runs the preprocessor and the extensions. Standalone Parsoid does
+not implement `#invoke` at all, and ships only a handful of built-in extensions —
+so the fixture suite cannot measure Lua or Cite.
 
 ## Status
 
-🚧 **All phases have initial implementations** — 130 unit tests pass, 7/144 Parsoid fixture tests pass (5%).
+| Area | Status |
+|------|--------|
+| Parser core (wikitext → HTML) | **871/891 fixtures (98%)**, 679 lib tests |
+| HTML → wikitext (round-trip) | Working |
+| Selective serialization (selser) | Working |
+| Template expansion | Working |
+| Lua/Scribunto | Engine present, **not wired to `#invoke`** |
+| On-wiki extensions (Cite, …) | Not implemented (built-ins only) |
+| Online-parity harness (`rustoid compare`) | Not started |
+| CLI (`rustoid-cli`) | Subcommands are stubs |
 
-Active work: deeper architectural changes for block HTML tags, pre-mode tokenization, bold/italic nesting, and comment handling.
-
-| Phase | Status |
-|-------|--------|
-| 0 — Project setup | ✅ Done |
-| 1 — Core types & traits | ✅ Done |
-| 2 — Wikitext tokenizer | ✅ Done (pre-mode support added) |
-| 3 — Template expander | ✅ Done (iterative work-stack preprocessor) |
-| 4 — Lua/Scribunto engine | ✅ Done |
-| 5 — AST / Tree builder | ✅ Done (block HTML content collection) |
-| 6 — HTML serialization | ✅ Done |
-| 7 — HTML→wikitext round-trip | ✅ Done |
-| 8 — Selective serialization | ✅ Done |
-| 9 — Data source impls | ✅ Done |
-| 10 — Test harness | ✅ Done (11 Parsoid fixture files) |
-| 11 — Test pass | 🔄 7/144 Parsoid fixtures (5%) |
-| 12 — CLI binary | 🔄 In progress |
-| 13 — Polish | ⬜ Pending |
-
-See [PLAN.md](PLAN.md) for the full roadmap.
+The phases in [PLAN.md](PLAN.md) (0–13) are the original, now largely complete
+plan for the standalone parser. Progress on the current goal is tracked in
+[ONLINE-PARITY.md](ONLINE-PARITY.md); per-fixture detail lives in
+[REMAINING-BUCKETS.md](REMAINING-BUCKETS.md).
 
 ## Quick start
 
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -- render --page "Main Page"
+
+# Fixture suite (the standalone-mode score)
+cargo test -p rustoid-core --test integration_test -- --nocapture
+```
+
+## Repository layout
+
+```
+rustoid/
+├── PLAN.md                # roadmap (standalone parser phases)
+├── ONLINE-PARITY.md       # current goal + plan (the active workstream)
+├── REMAINING-BUCKETS.md   # per-fixture notes for the fixture suite
+├── rustoid-core/          # parser, tokenizer, tree builder, serializers, Lua
+├── rustoid-cli/           # command-line binary
+└── enwiki-parser-extensions.md
 ```
 
 ## License
