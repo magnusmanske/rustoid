@@ -234,15 +234,58 @@ against PHP's actual output.
 (`bin/parserTests.php --wt2html --filter='2. Using'` → EXPECTED FAIL). It cannot
 flip in native mode.
 
-## Next: the raw-token bail in `convert_to_string`
+## Next: the PACKRAT `tableDataBlock` argument
 
 `Don't apply complex line-splitting heuristics in AttributeExpander for
-non-<table> tokens` shares the `<template 2x<invalid>="">` *symptom* but has a
-different cause: the inner `{{2x<invalid>y}}` bails through the **no-source**
-branch of `convert_to_string`, which returns the raw token, and that token is
-later stringified. It is not a nested target, so the fix above does not touch
-it (byte-identical before/after). Fixing it means expanding/handling the
-no-`src` bail path, not the target path.
+non-<table> tokens`. An earlier note here blamed the no-`src` bail of
+`convert_to_string`; that is where the symptom surfaces, not the cause. What is
+established now, by running PHP:
+
+**Rustoid's tokenizer reads a start-of-line `|` as a table cell; PHP does not,
+unless a table is genuinely open.**
+
+```
+abc                     ->  <p>abc\n|def</p>          (plain text; no cell)
+|def
+```
+```
+{|                      ->  <table><tbody><tr><td>def</td></tr></tbody></table>
+|def
+|}
+```
+Both verified with `php bin/parserTests.php --mock <file> --dump dom:pre-pwrap`.
+
+That matters for this fixture because the outer `{{1x<invalid>...}}` has an
+invalid title, so `resolve_target_string` returns `None` and the parser bails
+through `TemplateHandler::convert_to_string`, which re-tokenizes the inner source
+`1x<invalid>\n|{{2x<invalid>y}}|\n`. rustoid emits a `td` there; PHP emits pure
+text (its own `dom:post-builder` for the fixture contains no tokens at all). The
+stray `td` is what later renders as `<template 2x<invalid>y="">`.
+
+**A naive "only inside a table" gate does NOT work** — tried and reverted: it
+regressed 869 → 864, breaking `2a. Template-generated table cell attributes`,
+`4. Template-generated table cell attributes…`, `Template generated table cell
+with attributes`, `T343874`, `Spec syntactic differences in parsing of !! compared
+to ||`, and `Newline constraint after multi-node template`. Template-generated
+cells legitimately contain a leading `|` with no `{|` in the same token stream,
+which a depth counter cannot see across a template expansion.
+
+The real rule is PHP's PACKRAT argument. `Grammar.pegphp:379`:
+
+```
+/ ( &<tableCaption> / &<fullTable> / !<tableDataBlock> ) @sol !sof !inline_breaks notempty
+```
+
+so an SOL newline counts as a block boundary only when `tableDataBlock` is false,
+and `tableDataBlock` is threaded as a parameter through `fullTable` /
+`embedded_full_table` / `nested_block_in_table` (lines 393-408, 2564, 2632,
+2645, 2719). Porting that usually means adding a `tableDataBlock` flag to
+rustoid's tokenizer that is set for the duration of a `{|`-initiated table parse
+and consulted where the tokenizer decides whether a newline starts a block.
+
+Also worth keeping: `nested_block_in_table` starts with
+`!(sol (space* sol)? space* (pipe / "!"))`, i.e. cell content stops at a
+start-of-line pipe or `!`.
 
 `Templated table cell with untemplated attributes: Integrated mode only` is in
 the **categorically unreachable** `+integrated`-only group documented below, so
