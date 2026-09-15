@@ -223,6 +223,54 @@ Still to come in this phase: golden Parsoid HTML committed in-repo, so
 regressions are catchable without network. The cache carries the same
 information today, but it is a local artifact rather than a reviewable one.
 
+#### A tokenizer bug the corpus found, and a second one it did not
+
+The first corpus run never finished. `RUSTOID_TRACE_FETCH=1` showed the page
+`Israel` requesting `Template:Def` — a template that **does not exist** and
+appears in no input — thousands of times. Root cause, in `find_template_closing`
+(`rustoid-core/src/wikitext/tokenizer_v2.rs`): a `{{{…}}}` argument reference was
+treated as pushing a `}}` closer, so the enclosing template closed one brace
+early.
+
+```text
+{{y|def={{{def|no}}}}}    inner was "y|def={{{def|no}}", dropping a brace
+                          → the leftover re-read as {{def|no}}
+                          → a bogus transclusion of Template:Def
+```
+
+PHP is explicit that the closer for an argument reference is `}}}`: its
+`preproc_piece` scans tplarg contents with `preproc_stop="}}}"` and admits a `}`
+only when it is not followed by `}}` (`&<preproc_stop=="}}}"> !"}}"`).
+
+The fix has **two** halves, and skipping either one is wrong:
+
+- Treat a `{{{…}}}` as closed by `}}}` — otherwise the enclosing template is
+truncated (above).
+- Reject a `{{{` that is not a well-formed argument reference, falling back to
+  reading the `{` as ordinary content — otherwise `{{{!}}` breaks. `{{{!}}` is
+  not an argument reference at all; it is `{` + `{{!}}`, the idiom that renders
+  `{|` and opens a table, and it has no `}}}`.
+
+Half of the fix alone passes the corpus reproduction but drops the fixture suite
+from 871 to 869 (`Template pre: Table`). Both halves together: 871/891
+unchanged, and `Template:Def` requests go from 1813 to **zero**.
+
+This is also why the fixture suite never caught it. The bogus token lives in an
+argument value, so it only expands if the template actually *uses* that
+parameter. Fixture templates are small and ignore their last argument; a real
+infobox uses every one. `{{T|p={{{x|default}}}}}` and `{{T|p={{{x|}}}}}`
+behaved differently — only the first leaves a well-formed `{{x|default}}`
+behind — which no fixture distinguished.
+
+**Still open.** With that fixed, a warm-cache online run of `Israel` *still* does
+not terminate: ~198000 requests against 9 network fetches. It is not a cycle in
+the `Template:Def` sense — the longest run of identical consecutive requests is
+24 — but a runaway expansion tree, most likely the exponential blowup that
+MediaWiki bounds with its preprocessor node-count limit, which rustoid does not
+implement. `#ifexist` and `#invoke` are both unimplemented, and the offending
+templates (`Template:Country topics`) lean on both, so this probably belongs
+with the Phase 3 `#invoke` work rather than here.
+
 ### Phase 3 — `#invoke` end to end (the biggest single lever)
 
 - Wire `invoke` into the parser-function dispatch and build the module loader

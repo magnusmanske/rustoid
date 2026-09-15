@@ -4279,43 +4279,75 @@ fn find_wikilink_close_at(input: &str) -> Option<usize> {
 /// the whole `template` production at that point, which is what keeps
 /// `{{1x|[[http://x |y]}}` (a lone `]`, then `}}`) from swallowing a following
 /// line's `]]` and expanding across both.
+///
+/// The closer a `{{{` introduces is **`}}}`**, not `}}` — but only when the
+/// `{{{` really does begin an argument reference. PHP decides that by *trying* to
+/// parse one: `preproc_piece` scans a tplarg's contents with
+/// `preproc_stop="}}}"` and admits a `}` piece only when it is not followed by
+/// `}}` (`&<preproc_stop=="}}}"> !"}}"`). A `}}` that is not part of a `}}}`
+/// therefore makes the tplarg production fail, and the caller falls back to
+/// reading the leading `{` as ordinary content.
+///
+/// Both halves matter, and they are why a naive "`{{{` always pushes `}}`"
+/// was wrong:
+///
+/// - Reading `{{{` as pushing `}}` truncated the enclosing template one brace
+///   early for `{{y|def={{{def|no}}}}}` — inner came out
+///   `"y|def={{{def|no}}"`, dropping the argument reference's last brace. The
+///   dropped brace then re-tokenized as a *complete* `{{def|no}}`, i.e. a bogus
+///   transclusion of `Template:Def`. That is what an online corpus run spent
+///   thousands of requests on, and why `{{T|p={{{x|default}}}}}` misbehaved
+///   while `{{T|p={{{x|}}}}}` did not: only the former leaves a well-formed
+///   `{{x|default}}` behind.
+/// - Reading `{{{` as *always* an argument reference broke `{{{!}}`, which is
+///   `{` + `{{!}}` (rendering `{|`, the table-opening escape) and has no `}}}`.
+///   Treating it as an argument reference swallowed everything up to the next
+///   `}}}`, which changed how `<pre>` bodies tokenize.
 fn find_template_closing(input: &str) -> Option<usize> {
+    /// Closer pushed by a nested `{{…}}` (and by the template being scanned).
+    const TPL: &str = "}}";
+    /// Closer pushed by a `[[…]]` wikilink.
+    const LINK: &str = "]]";
+
     // Pending closers, innermost last. The outermost entry is the `{{` this scan
     // is resolving, so a `}}` matching it ends the scan.
-    let mut stack: Vec<&'static str> = vec!["}}"];
+    let mut stack: Vec<&'static str> = vec![TPL];
     let mut i = 0;
     let bytes = input.as_bytes();
     while i < bytes.len() {
         match (stack.last(), bytes[i]) {
             // A `}}` while a wikilink is still open cannot close this template;
             // the rule fails here and the `{{` degrades to literal text.
-            (Some(&"]]"), _) if input[i..].starts_with("}}") => return None,
+            (Some(&LINK), _) if input[i..].starts_with("}}") => return None,
             // `TokenizerUtils::inlineBreaks` breaks on `}}` whenever the pending
             // closer is `}}`, irrespective of any further `}`.
-            (Some(&"}}"), _) if input[i..].starts_with("}}") => {
+            (Some(&TPL), _) if input[i..].starts_with("}}") => {
                 stack.pop();
                 i += 2;
                 if stack.is_empty() {
                     return Some(i - 2);
                 }
             }
-            // A nested transclusion pushes its own closer.
-            (Some(&"}}"), _) if input[i..].starts_with("{{{") => {
-                stack.push("}}");
-                i += 3;
-            }
-            (Some(&"}}"), _) if input[i..].starts_with("{{") => {
-                stack.push("}}");
+            // A well-formed `{{{…}}}` argument reference is skipped whole; one
+            // that PHP would reject leaves the `{` as ordinary content, so the
+            // following `{{…}}` is then read as a template.
+            (Some(&TPL), _) if input[i..].starts_with("{{{") => match skip_tplarg(input, i) {
+                Some(end) => i = end,
+                None => i += 1,
+            },
+            // A nested transclusion pushes its own `}}` closer.
+            (Some(&TPL), _) if input[i..].starts_with("{{") => {
+                stack.push(TPL);
                 i += 2;
             }
             // Only a `[[` seen while looking for `}}` becomes the pending closer;
             // one nested inside an already-open `[[` is ordinary text (PHP tests
             // the pending `preproc` before pushing).
-            (Some(&"}}"), _) if input[i..].starts_with("[[") => {
-                stack.push("]]");
+            (Some(&TPL), _) if input[i..].starts_with("[[") => {
+                stack.push(LINK);
                 i += 2;
             }
-            (Some(&"]]"), _) if input[i..].starts_with("]]") => {
+            (Some(&LINK), _) if input[i..].starts_with(LINK) => {
                 stack.pop();
                 i += 2;
             }
@@ -4325,6 +4357,55 @@ fn find_template_closing(input: &str) -> Option<usize> {
                 i += input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
             }
         }
+    }
+    None
+}
+
+/// Skip a well-formed `{{{…}}}` argument reference starting at `start`,
+/// returning the offset just past its closing `}}}`.
+///
+/// Returns `None` when `input[start..]` is not an argument reference, which is
+/// the signal for the caller to treat the leading `{` as ordinary content.
+/// Contents may hold nested `{{…}}`/`{{{…}}}`/`[[…]]` pieces; a `}}` that is not
+/// part of a `}}}` ends the attempt, matching PHP's `preproc_piece` scan.
+fn skip_tplarg(input: &str, start: usize) -> Option<usize> {
+    let mut i = start + 3;
+    while i < input.len() {
+        // The closer.
+        if input[i..].starts_with("}}}") {
+            return Some(i + 3);
+        }
+        // A `}}` that is not part of a `}}}` is not admissible content, so this
+        // is not an argument reference after all.
+        if input[i..].starts_with("}}") {
+            return None;
+        }
+        // Nested pieces are skipped as units, so their own `}}`/`]]` cannot be
+        // mistaken for this tplarg's boundary.
+        if input[i..].starts_with("{{{") {
+            i = skip_tplarg(input, i)?;
+            continue;
+        }
+        if input[i..].starts_with("{{") {
+            let end = find_template_closing(&input[i + 2..])?;
+            i += 2 + end + 2;
+            continue;
+        }
+        if input[i..].starts_with("[[") {
+            // Inside a wikilink the pending closer is `]]`, so braces are
+            // ordinary content (PHP's `inlineBreaks` keys off the top closer).
+            let rest = &input[i + 2..];
+            let end = rest.find("]]")?;
+            i += 2 + end + 2;
+            continue;
+        }
+        if input[i..].starts_with("<!--") {
+            let rest = &input[i + 4..];
+            let end = rest.find("-->")?;
+            i += 4 + end + 3;
+            continue;
+        }
+        i += input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
     }
     None
 }

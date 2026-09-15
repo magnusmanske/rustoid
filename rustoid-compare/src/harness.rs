@@ -98,6 +98,12 @@ fn classify(detail: &str) -> &'static str {
 
 const CACHE_FLUSH_EVERY: usize = 64;
 
+/// Whether `RUSTOID_TRACE_FETCH` is set, checked once per process.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTOID_TRACE_FETCH").is_some())
+}
+
 /// A `PageInfo` for a title known to exist.
 fn existing() -> rustoid_core::traits::PageInfo {
     rustoid_core::traits::PageInfo {
@@ -166,6 +172,25 @@ impl CachedDataSource {
     /// `kind` distinguishes pages/templates/modules, matching `rustoid-core`'s
     /// split between `get_page_content`/`get_template`/`get_module`.
     async fn fetch(&self, kind: EntryKind, key: &str) -> Result<Option<String>> {
+        // Trace every *request*, before the cache is consulted, so an offline run
+        // reproduces an online one's request sequence exactly. Tracing only the
+        // network path hid the whole sequence offline: the loop this was written
+        // to find was invisible precisely when reproducing it was cheap.
+        if trace_enabled() {
+            eprintln!("req {kind:?} {key}");
+            // A backtrace for a chosen title, to find *who* asked for something
+            // that cannot be a real template (e.g. a main-namespace title).
+            if let Ok(needle) = std::env::var("RUSTOID_TRACE_BT")
+                && !needle.is_empty()
+                && key.contains(&needle)
+            {
+                eprintln!(
+                    "BACKTRACE for {key}:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
+
         if let Some(hit) = self
             .cache
             .lock()
@@ -185,19 +210,11 @@ impl CachedDataSource {
         }
 
         let title = key.to_string();
-        // Trace fetches when asked. Without this, a run that stops making
-        // progress is indistinguishable from one that is merely slow, and the
-        // only way to find the offending title is to inspect the cache
-        // directory afterwards.
-        let trace = std::env::var_os("RUSTOID_TRACE_FETCH").is_some();
-        if trace {
-            eprintln!("fetch {kind:?} {title}");
-        }
         let Some(revid) = client.latest_revid(&title).await? else {
             return Ok(None);
         };
         let body = client.wikitext_at(revid).await?;
-        if trace {
+        if trace_enabled() {
             eprintln!("fetch {kind:?} {title} -> {} bytes", body.len());
         }
         let meta = EntryMeta {
