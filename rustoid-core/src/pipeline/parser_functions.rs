@@ -12,7 +12,7 @@
 
 use crate::error::RustoidError;
 use crate::wikitext::token_utils::tokens_to_string;
-use crate::wikitext::tokens_v2::{Item, KV, KeyValue, ParsoidToken};
+use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, Item, KV, KeyValue, ParsoidToken, TagTk};
 
 /// Parameter wrapper (mirrors PHP's `Params`).
 #[derive(Debug, Clone, Default)]
@@ -530,6 +530,58 @@ impl ParserFunctions {
         ))]
     }
 
+    /// `#anchorencode` — encode a string so it can be used as a link fragment.
+    /// Mirrors `ParserFunctions::pf_anchorencode` (which in turn mirrors
+    /// `Parser::guessSectionNameFromWikiText`):
+    ///
+    /// - collapse runs of spaces/underscores and trim,
+    /// - decode character references,
+    /// - escape as an HTML5 fragment id (`Sanitizer::escapeIdForLink`),
+    /// - then split on the characters that would otherwise be re-interpreted as
+    ///   wikitext (`{}[]|`, `''`, `ISBN`, `RFC`, `PMID`, `__`), wrapping each such
+    ///   delimiter in an `mw:Entity` span so it survives as literal text (T179544).
+    pub fn pf_anchorencode(params: &Params) -> Vec<Item> {
+        let target = params
+            .args
+            .first()
+            .map(|kv| key_value_to_string(&kv.key))
+            .unwrap_or_default();
+
+        let normalized = crate::sanitizer::normalize_section_name_whitespace(&target);
+        let decoded = crate::html::wts_utils::decode_wt_entities_all(&normalized);
+        let escaped = crate::sanitizer::escape_id_for_link(&decoded);
+
+        // Split on the delimiter alternation, keeping the delimiters
+        // (`PREG_SPLIT_DELIM_CAPTURE`): `pieces` holds the literal runs and
+        // `delims[i]` the delimiter that followed `pieces[i]`.
+        let (pieces, delims) = split_keep_delimiters(&escaped);
+
+        let mut out: Vec<Item> = Vec::new();
+        for (i, delim) in delims.iter().enumerate() {
+            if i < pieces.len() {
+                out.push(Item::Str(pieces[i].to_string()));
+            }
+            // `''` is two separate entities; anything else is one entity for the
+            // first char plus the remainder as literal text.
+            let mut chars = delim.chars();
+            if let Some(first) = chars.next() {
+                encode_char_entity(first, &mut out);
+            }
+            if *delim != "''" {
+                let rest: String = chars.collect();
+                if !rest.is_empty() {
+                    out.push(Item::Str(rest));
+                }
+            } else if let Some(second) = chars.next() {
+                encode_char_entity(second, &mut out);
+            }
+        }
+        if let Some(last) = pieces.last() {
+            out.push(Item::Str((*last).to_string()));
+        }
+        out
+    }
+
     /// `#dir` — the directionality of a language code: `ltr`, `rtl`, or `auto`
     /// (the direction of the content language when no code is given).
     /// Mirrors MediaWiki core's `CoreParserFunctions::dir`.
@@ -581,6 +633,78 @@ impl ParserFunctions {
             }
         }
     }
+}
+
+/// Append a single character to `out` wrapped in an `mw:Entity` span, so it
+/// survives as literal text instead of being re-interpreted as wikitext.
+/// Mirrors `ParserFunctions::encodeCharEntity`.
+fn encode_char_entity(c: char, out: &mut Vec<Item>) {
+    let enc = entity_encode_all(c);
+    let dp = DataParsoid {
+        src: Some(enc),
+        src_content: Some(c.to_string()),
+        ..DataParsoid::default()
+    };
+    let mut span = TagTk::new("span", vec![], dp);
+    span.add_attribute_str("typeof", "mw:Entity");
+    out.push(Item::Tok(ParsoidToken::Tag(span)));
+    out.push(Item::Str(c.to_string()));
+    out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+        "span",
+        vec![],
+        DataParsoid::default(),
+    ))));
+}
+
+/// `Utils::entityEncodeAll` — encode `s` as a numeric character reference.
+///
+/// PHP uses `mb_encode_numericentity($s, [0, 0x10ffff, 0, ~0], 'utf-8', true)`
+/// (hex form), which encodes each *codepoint* (not each UTF-8 byte) and pads to
+/// at least two hex digits, then maps a few conventions over the result. The
+/// only convention that matters here is `&nbsp;` for U+00A0.
+fn entity_encode_all(s: char) -> String {
+    if s == '\u{A0}' {
+        return "&nbsp;".to_string();
+    }
+    format!("&#x{:02X};", s as u32)
+}
+
+/// Split `s` on the `#anchorencode` delimiter alternation
+/// `([\{\}\[\]|]|''|ISBN|RFC|PMID|__)`, returning the pieces and the captured
+/// delimiters (mirroring `preg_split` with `PREG_SPLIT_DELIM_CAPTURE`).
+/// `pieces.len() == delims.len() * 2 + 1`.
+fn split_keep_delimiters(s: &str) -> (Vec<&str>, Vec<&str>) {
+    const DELIMS: [&str; 8] = ["{", "}", "[", "]", "|", "''", "ISBN", "RFC"];
+    const DELIMS2: [&str; 2] = ["PMID", "__"];
+
+    let mut pieces = Vec::new();
+    let mut delims = Vec::new();
+    let rest = s;
+    let mut start = 0;
+
+    while start < rest.len() {
+        let at = DELIMS
+            .iter()
+            .chain(DELIMS2.iter())
+            .filter_map(|d| rest[start..].find(d).map(|i| (start + i, *d)))
+            // Prefer the earliest match; on a tie the alternation order decides,
+            // which `min_by_key` on the index alone would not respect, so compare
+            // the delimiter's position in `DELIMS` as a tiebreak.
+            .min_by_key(|(i, d)| {
+                (
+                    *i,
+                    DELIMS.iter().position(|x| x == d).unwrap_or(DELIMS.len()),
+                )
+            });
+        let Some((idx, delim)) = at else {
+            break;
+        };
+        pieces.push(&rest[start..idx]);
+        delims.push(delim);
+        start = idx + delim.len();
+    }
+    pieces.push(&rest[start..]);
+    (pieces, delims)
 }
 
 /// Convert a `KeyValue` into a flat token chunk, splicing every token (a whole
@@ -909,5 +1033,54 @@ mod tests {
         // resolve without a language table, so `auto`.
         let p = params(vec![]);
         assert_eq!(ParserFunctions::pf_dir(&p), vec![Item::Str("auto".into())]);
+    }
+
+    #[test]
+    fn test_pf_anchorencode_wraps_delimiters() {
+        // `[foo]` has no whitespace/entities to normalize, so the brackets are
+        // the only thing that needs `mw:Entity` protection (T179544).
+        let p = params(vec![("[foo]", "")]);
+        let out = ParserFunctions::pf_anchorencode(&p);
+        assert_eq!(tokens_to_string(&out), "[foo]");
+
+        let entities = out
+            .iter()
+            .filter(|it| {
+                matches!(it, Item::Tok(ParsoidToken::Tag(t))
+                    if t.attribs.iter().any(|kv| kv.key.as_str() == Some("typeof")
+                        && kv.value.as_str() == Some("mw:Entity")))
+            })
+            .count();
+        assert_eq!(entities, 2, "expected one entity span per bracket: {out:?}");
+    }
+
+    #[test]
+    fn test_pf_anchorencode_normalizes_whitespace() {
+        // Runs of spaces/underscores collapse to a single `_` (via the html5
+        // id escape) and the result is trimmed-ish.
+        let p = params(vec![("foo  _bar", "")]);
+        let out = ParserFunctions::pf_anchorencode(&p);
+        assert_eq!(tokens_to_string(&out), "foo_bar");
+    }
+
+    #[test]
+    fn test_entity_encode_all_is_codepoint_wise() {
+        // PHP's `mb_encode_numericentity(..., true)` encodes whole codepoints,
+        // not UTF-8 bytes, and zero-pads to at least two hex digits.
+        assert_eq!(entity_encode_all('['), "&#x5B;");
+        assert_eq!(entity_encode_all('\u{9}'), "&#x09;");
+        assert_eq!(entity_encode_all('é'), "&#xE9;");
+        assert_eq!(entity_encode_all('\u{4E2D}'), "&#x4E2D;");
+        // The one `$conventions` entry that matters here.
+        assert_eq!(entity_encode_all('\u{A0}'), "&nbsp;");
+    }
+
+    #[test]
+    fn test_pf_anchorencode_non_ascii() {
+        // A non-ASCII anchor must survive as its own literal text (no delimiter
+        // to protect), not be mangled into per-byte entities.
+        let p = params(vec![("Café", "")]);
+        let out = ParserFunctions::pf_anchorencode(&p);
+        assert_eq!(tokens_to_string(&out), "Café");
     }
 }

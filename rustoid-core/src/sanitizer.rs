@@ -1273,9 +1273,9 @@ pub fn normalize_section_name_whitespace(section: &str) -> String {
     out.trim().to_string()
 }
 
-/// Escape a fragment string as an HTML5 id (used by `sanitize_title_uri`).
-/// Mirrors PHP's `escapeIdForLink` with html5 mode.
-fn escape_id_for_link(id: &str) -> String {
+/// Escape a fragment string as an HTML5 id (used by `sanitize_title_uri` and
+/// `#anchorencode`). Mirrors PHP's `escapeIdForLink` with html5 mode.
+pub fn escape_id_for_link(id: &str) -> String {
     let id: String = escape_id_internal(id, "html5");
     // Do percent encoding of percent signs for href (but not id) attrs.
     id.replace('%', "%25")
