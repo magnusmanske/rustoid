@@ -321,6 +321,62 @@ impl DataSource for CachedDataSource {
     }
 }
 
+/// Counts of wikitext that survived parsing instead of being expanded.
+///
+/// This is the most informative single number at the current stage. Parsoid's
+/// output never contains literal `{{…}}` in its text (only inside `data-mw`,
+/// which sits in an attribute), so a rustoid body that does is one where
+/// expansion was skipped rather than merely different. That distinction matters:
+/// "the infobox rendered differently" and "the infobox was never rendered" are
+/// different bodies of work, and the first difference at byte 1 cannot tell them
+/// apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unexpanded {
+    /// Literal `{{#invoke:` occurrences (Scribunto, still unwired).
+    pub invoke: usize,
+    /// Literal `{{` occurrences outside any tag.
+    pub braces: usize,
+}
+
+impl Unexpanded {
+    /// Count unexpanded wikitext in one rendering.
+    ///
+    /// Only text *outside* `<…>` is examined, because that is where real content
+    /// lives: `data-mw`/`data-parsoid` attributes legitimately carry `{{…}}` as
+    /// wikitext, and counting those would report every page as unexpanded.
+    pub fn count(html: &str) -> Self {
+        let mut out = Unexpanded::default();
+        let mut in_tag = false;
+        let bytes = html.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'<' => in_tag = true,
+                b'>' => in_tag = false,
+                b'{' if !in_tag && html[i..].starts_with("{{") => {
+                    out.braces += 1;
+                    if html[i..].starts_with("{{#invoke:") {
+                        out.invoke += 1;
+                    }
+                    // Skip the run so `{{{` is one construct, not two.
+                    while i < bytes.len() && bytes[i] == b'{' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Whether any literal template syntax survived.
+    pub fn any(&self) -> bool {
+        self.braces > 0
+    }
+}
+
 /// Everything needed for one comparison.
 pub struct CompareRequest {
     /// Page title, as the wiki spells it.
@@ -341,9 +397,29 @@ pub struct Comparison {
     pub title: String,
     pub revid: u64,
     pub wikitext: String,
+    /// Literal unexpanded wikitext in each rendering, for diagnosis.
+    pub unexpanded_rustoid: Unexpanded,
+    pub unexpanded_parsoid: Unexpanded,
     pub parsoid_html: String,
     pub rustoid_html: String,
     pub outcome: Outcome,
+}
+
+impl Comparison {
+    /// A page that could not be compared. Carries no renderings, so the
+    /// unexpanded counts are empty by definition.
+    pub fn skipped(title: String, revid: u64, wikitext: String, reason: String) -> Self {
+        Self {
+            title,
+            revid,
+            wikitext,
+            unexpanded_rustoid: Unexpanded::default(),
+            unexpanded_parsoid: Unexpanded::default(),
+            parsoid_html: String::new(),
+            rustoid_html: String::new(),
+            outcome: Outcome::Skipped { reason },
+        }
+    }
 }
 
 /// Run one comparison.
@@ -385,32 +461,24 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
                 match cached.and_then(|c| c.meta.revid) {
                     Some(r) => r,
                     None => {
-                        return Ok(Comparison {
+                        return Ok(Comparison::skipped(
                             title,
-                            revid: 0,
-                            wikitext: String::new(),
-                            parsoid_html: String::new(),
-                            rustoid_html: String::new(),
-                            outcome: Outcome::Skipped {
-                                reason: "offline, and no cached revision for this page".to_string(),
-                            },
-                        });
+                            0,
+                            String::new(),
+                            "offline, and no cached revision for this page".to_string(),
+                        ));
                     }
                 }
             } else {
                 match client.latest_revid(&title).await? {
                     Some(r) => r,
                     None => {
-                        return Ok(Comparison {
+                        return Ok(Comparison::skipped(
                             title,
-                            revid: 0,
-                            wikitext: String::new(),
-                            parsoid_html: String::new(),
-                            rustoid_html: String::new(),
-                            outcome: Outcome::Skipped {
-                                reason: "page does not exist".to_string(),
-                            },
-                        });
+                            0,
+                            String::new(),
+                            "page does not exist".to_string(),
+                        ));
                     }
                 }
             }
@@ -429,16 +497,12 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
     let wikitext = match cached {
         Some(c) => c.body,
         None if req.offline => {
-            return Ok(Comparison {
+            return Ok(Comparison::skipped(
                 title,
                 revid,
-                wikitext: String::new(),
-                parsoid_html: String::new(),
-                rustoid_html: String::new(),
-                outcome: Outcome::Skipped {
-                    reason: format!("offline, and r{revid} wikitext is not cached"),
-                },
-            });
+                String::new(),
+                format!("offline, and r{revid} wikitext is not cached"),
+            ));
         }
         None => {
             let body = client.wikitext_at(revid).await?;
@@ -471,16 +535,12 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
     let parsoid_html = match cached {
         Some(c) if c.meta.revid == Some(revid) => c.body,
         _ if req.offline => {
-            return Ok(Comparison {
+            return Ok(Comparison::skipped(
                 title,
                 revid,
                 wikitext,
-                parsoid_html: String::new(),
-                rustoid_html: String::new(),
-                outcome: Outcome::Skipped {
-                    reason: format!("offline, and r{revid} Parsoid HTML is not cached"),
-                },
-            });
+                format!("offline, and r{revid} Parsoid HTML is not cached"),
+            ));
         }
         _ => {
             let body = client.parsoid_html_at(&title, revid).await?;
@@ -512,6 +572,8 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
         title,
         revid,
         wikitext,
+        unexpanded_rustoid: Unexpanded::count(&rustoid_html),
+        unexpanded_parsoid: Unexpanded::count(&parsoid_html),
         parsoid_html,
         rustoid_html,
         outcome,

@@ -35,7 +35,7 @@ pub use cache::{CachedBody, EntryKind, EntryMeta, WikiCache};
 pub use corpus::{Corpus, CorpusEntry};
 pub use error::{CompareError, Result};
 pub use harness::{
-    CachedDataSource, CompareRequest, Comparison, Outcome, compare_html, compare_page,
+    CachedDataSource, CompareRequest, Comparison, Outcome, Unexpanded, compare_html, compare_page,
     load_site_config,
 };
 pub use scoreboard::{Row, Scoreboard};

@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
-use rustoid_compare::{Corpus, EntryKind, Outcome, Row, Scoreboard, Wiki, WikiCache, WikiClient};
+use rustoid_compare::{
+    Corpus, EntryKind, Outcome, Row, Scoreboard, Unexpanded, Wiki, WikiCache, WikiClient,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustoid-compare")]
@@ -267,6 +269,8 @@ fn run_corpus<C: rustoid_core::SiteConfig>(
                 revid: Some(c.revid),
                 parsoid_bytes: c.parsoid_html.len(),
                 rustoid_bytes: c.rustoid_html.len(),
+                unexpanded_rustoid: c.unexpanded_rustoid,
+                unexpanded_parsoid: c.unexpanded_parsoid,
                 outcome: c.outcome,
             },
             Err(e) => Row {
@@ -275,6 +279,8 @@ fn run_corpus<C: rustoid_core::SiteConfig>(
                 revid: None,
                 parsoid_bytes: 0,
                 rustoid_bytes: 0,
+                unexpanded_rustoid: Unexpanded::default(),
+                unexpanded_parsoid: Unexpanded::default(),
                 outcome: Outcome::Skipped {
                     reason: e.to_string(),
                 },

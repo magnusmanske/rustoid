@@ -264,12 +264,57 @@ behind — which no fixture distinguished.
 
 **Still open.** With that fixed, a warm-cache online run of `Israel` *still* does
 not terminate: ~198000 requests against 9 network fetches. It is not a cycle in
-the `Template:Def` sense — the longest run of identical consecutive requests is
+`Template:Def`'s sense — the longest run of identical consecutive requests is
 24 — but a runaway expansion tree, most likely the exponential blowup that
 MediaWiki bounds with its preprocessor node-count limit, which rustoid does not
 implement. `#ifexist` and `#invoke` are both unimplemented, and the offending
 templates (`Template:Country topics`) lean on both, so this probably belongs
 with the Phase 3 `#invoke` work rather than here.
+
+#### The first real scoreboard, and what it says to build next
+
+With 44 of the 48 corpus pages cached (the other four, including the stalling
+`Israel`, are recorded as skipped), the offline corpus run reports:
+
+```
+score: 0/44 compared (0.0%)
+output: parsoid 57196568 bytes, rustoid 311357289 bytes (5.44x)
+
+unexpanded wikitext (rustoid side):
+  pages with literal {{...}}         43/44
+  pages with literal {{#invoke:      43/44
+  more literal syntax than parsoid   41/44
+```
+
+The second histogram is the one that matters. Every page but `Module:Math` — a
+module *source* page, which by nature contains no `#invoke` — leaves Scribunto
+calls in its output as literal text:
+
+| page | rustoid `{{#invoke:` | rustoid `{{…}}` | parsoid `{{…}}` |
+|---|---|---|---|
+| COVID-19 pandemic | 16366 | 20942 | 34 |
+| Cristiano Ronaldo | 3337 | 16381 | 51 |
+| Hydrogen | 617 | 83626 | 1 |
+| Quicksilver (film) | 18 | 289 | 2 |
+
+Two conclusions, both measured rather than assumed:
+
+1. **`#invoke` is the blocker, not a feature among many.** No page can match
+   while `{{#invoke:…}}` is emitted as text, because those calls nest: one
+   unexpanded call leaves the whole subtree of wikitext behind it, which is why
+   the counts are enormous (Hydrogen: 83626) and why the output is 5.44x Parsoid's.
+2. **The tag table is not yet a prioritisation tool.** Every tag reads `0/N`
+   because a page carries several tags and contributes a failure to each, so
+   `cite 0/40` does not mean citation handling is broken — it means 40
+   cite-tagged pages fail, for any reason. Attributing by cause needs either
+   single-tag entries or a per-page cause, which is what the `unexpanded`
+   histogram is a first step towards.
+
+The `unexpanded` metric exists because the first-difference classifier could not
+do this job: it reported 41 of 44 pages as `transclusion`, because that marker is
+simply what appears in the first 400 bytes of every article. "The infobox
+rendered differently" and "the infobox was never rendered" need telling apart,
+and only the latter is fixed by working on `#invoke`.
 
 ### Phase 3 — `#invoke` end to end (the biggest single lever)
 

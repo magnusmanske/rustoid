@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::harness::Outcome;
+use crate::harness::{Outcome, Unexpanded};
 
 /// The result of one entry in the run.
 #[derive(Debug, Clone)]
@@ -27,6 +27,9 @@ pub struct Row {
     /// Bytes of parsoid output, for the size-gap summary.
     pub parsoid_bytes: usize,
     pub rustoid_bytes: usize,
+    /// Literal unexpanded wikitext each side emitted.
+    pub unexpanded_rustoid: Unexpanded,
+    pub unexpanded_parsoid: Unexpanded,
 }
 
 impl Row {
@@ -48,6 +51,19 @@ impl Row {
 pub struct Bucket {
     pub name: String,
     pub count: usize,
+}
+
+/// Aggregate diagnosis of unexpanded wikitext across a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnexpandedSummary {
+    /// Comparisons that produced two renderings.
+    pub compared: usize,
+    /// Pages whose rustoid output still contains literal `{{…}}` in its text.
+    pub pages_with_literal_wikitext: usize,
+    /// Pages whose rustoid output still contains a literal `{{#invoke:…}}`.
+    pub pages_with_unexpanded_invoke: usize,
+    /// Pages emitting more literal template syntax than Parsoid does.
+    pub pages_worse_than_parsoid: usize,
 }
 
 /// A finished run.
@@ -154,6 +170,33 @@ impl Scoreboard {
         })
     }
 
+    /// How many compared pages show literal unexpanded wikitext, and how many of
+    /// those involve `#invoke`.
+    ///
+    /// Reported separately from the outcome histogram because it answers a
+    /// different question. "Nothing matches" says the parser is far from parity;
+    /// "N pages still contain `{{…}}` in their output" says *how* far, and it
+    /// separates a rendering that is wrong from one that never happened.
+    pub fn unexpanded_summary(&self) -> UnexpandedSummary {
+        let mut s = UnexpandedSummary::default();
+        for row in &self.rows {
+            if row.is_skipped() {
+                continue;
+            }
+            s.compared += 1;
+            if row.unexpanded_rustoid.any() {
+                s.pages_with_literal_wikitext += 1;
+            }
+            if row.unexpanded_rustoid.invoke > 0 {
+                s.pages_with_unexpanded_invoke += 1;
+            }
+            if row.unexpanded_rustoid.braces > row.unexpanded_parsoid.braces {
+                s.pages_worse_than_parsoid += 1;
+            }
+        }
+        s
+    }
+
     /// Render the report.
     ///
     /// `detailed` adds the first difference for every failure, which is the
@@ -188,6 +231,24 @@ impl Scoreboard {
             out.push_str(&format!("  {:20} {}\n", b.name, b.count));
         }
 
+        // The diagnosis that matters while expansion is incomplete.
+        let un = self.unexpanded_summary();
+        if un.compared > 0 {
+            out.push_str("\nunexpanded wikitext (rustoid side):\n");
+            out.push_str(&format!(
+                "  {:34} {}/{}\n",
+                "pages with literal {{...}}", un.pages_with_literal_wikitext, un.compared
+            ));
+            out.push_str(&format!(
+                "  {:34} {}/{}\n",
+                "pages with literal {{#invoke:", un.pages_with_unexpanded_invoke, un.compared
+            ));
+            out.push_str(&format!(
+                "  {:34} {}/{}\n",
+                "more literal syntax than parsoid", un.pages_worse_than_parsoid, un.compared
+            ));
+        }
+
         let by_tag = self.by_tag();
         if !by_tag.is_empty() {
             out.push_str("\nby tag (worst first):\n");
@@ -218,6 +279,20 @@ impl Scoreboard {
         }
 
         if detailed {
+            out.push_str("\nunexpanded by page (rustoid / parsoid):\n");
+            for row in &self.rows {
+                if row.is_skipped() {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "  {:40} invoke={:<4} braces={:<6} (parsoid braces={})\n",
+                    truncate(&row.title, 40),
+                    row.unexpanded_rustoid.invoke,
+                    row.unexpanded_rustoid.braces,
+                    row.unexpanded_parsoid.braces,
+                ));
+            }
+
             out.push_str("\nfirst differences:\n");
             for row in &failing {
                 if let Outcome::Differ { detail } = &row.outcome {
@@ -266,6 +341,8 @@ mod tests {
             outcome,
             parsoid_bytes: 100,
             rustoid_bytes: 400,
+            unexpanded_rustoid: Unexpanded::default(),
+            unexpanded_parsoid: Unexpanded::default(),
         }
     }
 
@@ -421,5 +498,49 @@ mod tests {
         let (p, r) = board().byte_totals();
         assert_eq!(p, 400);
         assert_eq!(r, 1600);
+    }
+
+    /// The unexpanded summary must distinguish "rendered differently" from
+    /// "never rendered", and must not count skipped pages as compared.
+    #[test]
+    fn unexpanded_summary_counts_only_compared_pages() {
+        let mut with_literal = row("E", &["lua"], differ("x"));
+        with_literal.unexpanded_rustoid = Unexpanded {
+            invoke: 2,
+            braces: 5,
+        };
+        let b = Scoreboard::new(
+            "t",
+            vec![
+                row("A", &["x"], Outcome::Match),
+                with_literal,
+                // A skip must not be counted, and must not be counted as clean.
+                row(
+                    "S",
+                    &["x"],
+                    Outcome::Skipped {
+                        reason: "offline".to_string(),
+                    },
+                ),
+            ],
+        );
+        let un = b.unexpanded_summary();
+        assert_eq!(un.compared, 2);
+        assert_eq!(un.pages_with_literal_wikitext, 1);
+        assert_eq!(un.pages_with_unexpanded_invoke, 1);
+    }
+
+    /// Literal `{{…}}` inside an attribute is wikitext data, not unexpanded
+    /// output, so it must not be counted — otherwise every page looks broken.
+    #[test]
+    fn unexpanded_counting_ignores_attribute_values() {
+        let html = "<span data-mw='{\"wt\":\"{{cite web}}\"}'>text</span>";
+        assert_eq!(Unexpanded::count(html), Unexpanded::default());
+
+        // But the same syntax in the text is counted, and `{{{` counts once.
+        let bad = "<span>{{{x|y}}}</span>{{#invoke:mod|fn}}";
+        let c = Unexpanded::count(bad);
+        assert_eq!(c.braces, 2);
+        assert_eq!(c.invoke, 1);
     }
 }
