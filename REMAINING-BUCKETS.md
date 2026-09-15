@@ -266,9 +266,19 @@ stray `td` is what later renders as `<template 2x<invalid>y="">`.
 regressed 869 → 864, breaking `2a. Template-generated table cell attributes`,
 `4. Template-generated table cell attributes…`, `Template generated table cell
 with attributes`, `T343874`, `Spec syntactic differences in parsing of !! compared
-to ||`, and `Newline constraint after multi-node template`. Template-generated
-cells legitimately contain a leading `|` with no `{|` in the same token stream,
-which a depth counter cannot see across a template expansion.
+to ||`, and `Newline constraint after multi-node template`.
+
+**Nor does gating on an open `table` token in the emitted stream** — also tried and
+reverted, with the *same* regression set. `2a` is the counter-example that kills
+both attempts: its wikitext is `{|\n|{{table_attribs_2}}\n|}` and the template
+expands to text containing further `|` separators. Those cells are tokenized in
+the template's own sub-pipeline, where no `{|` appears in the stream at all, yet
+the `|` must still split cells. So the flag has to be *propagated into* the
+sub-pipeline, not recomputed locally.
+
+Confirming control: PHP creates a `<td>` from `{{start}}\n|a\n{{end}}` (with
+`Template:start` = `{|`), while `|def` alone and `abc\n|def` are plain text. That
+pair is the test case to satisfy.
 
 The real rule is PHP's PACKRAT argument. `Grammar.pegphp:379`:
 
