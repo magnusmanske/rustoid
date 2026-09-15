@@ -115,6 +115,14 @@ fn wrapper_tag_target(
     }
 }
 
+/// Is this item a `template`/`template3` token? Used to decide whether the
+/// template token's target chunk still needs template expansion (see
+/// `Parser::expand_target_templates`).
+fn is_template_item(item: &Item) -> bool {
+    matches!(item, Item::Tok(ParsoidToken::SelfclosingTag(t))
+        if t.name == "template" || t.name == "template3")
+}
+
 /// Report whether a `mw:maybeContent` value contains a nested wikilink that must
 /// trigger PHP's `Link-in-link` bail. A `[[` inside a `<nowiki>` body, a
 /// recognized HTML tag's quoted attribute value, a template, or a language
@@ -1836,17 +1844,35 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // template context: PHP expands argument values with a hard-coded
                 // `inTemplate => true` (see `mark_arg_value_tokens`).
                 let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
+                // The *target* (attribs[0]) may hold a nested template
+                // (`{{ {{T}} }}`): PHP's `expandTemplate` calls
+                // `AttributeExpander::expandFirstAttribute` before resolving the
+                // target, and `Frame::expand` runs the chunk through the TT2
+                // pipeline, expanding that inner template. rustoid's
+                // `Frame::expand` is synchronous, so do that pass here first and
+                // only then hand the (template-free) target to the
+                // AttributeTransformManager for the `{{{...}}}` substitution it
+                // owns. Argument values are deliberately left alone: PHP expands
+                // the template token's *body* arguments later, with
+                // `expandTemplates => false`.
+                let attribs = self
+                    .expand_target_templates(
+                        frame,
+                        stt.attribs.clone(),
+                        source,
+                        about_counter,
+                        in_tpl,
+                        src_text,
+                    )
+                    .await;
                 // Expand `{{{…}}}` template-argument references in the token's
                 // argument keys/values against the current frame (mirrors PHP's
                 // `expandTemplateNatively` → `AttributeTransformManager::process`, so
                 // `{{#tag:pre|{{{1}}}|…}}` sees the argument's *value*).
                 let attribs = crate::pipeline::attribute_transform_manager::process(
-                    frame,
-                    false,
-                    in_tpl,
-                    &stt.attribs,
+                    frame, false, in_tpl, &attribs,
                 )
-                .unwrap_or_else(|| stt.attribs.clone());
+                .unwrap_or(attribs);
                 let params = crate::pipeline::parser_functions::Params::new(attribs.clone());
 
                 // The target may hold a nested template (`{{ {{T}} }}`), in which
@@ -1924,6 +1950,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             ),
                         );
                     }
+                    None => {
+                        // The target is not a template / variable / parser
+                        // function (e.g. an invalid title such as
+                        // `{{ {{T}} }}` → `Main Page|Something else`, whose `|`
+                        // makes it an illegal title). Bail back to literal
+                        // `{{` … `}}` around the re-tokenized source.
+                        let bailed = TemplateHandler::convert_to_string(tok, in_tpl);
+                        // PHP's `convertToString` runs the bailed chunk through
+                        // `wikitext-to-expanded-tokens`, so a nested template in
+                        // the source (the `{{T290526}}` above) still expands.
+                        let expanded = Box::pin(self.expand_templates(
+                            frame,
+                            bailed,
+                            source,
+                            about_counter,
+                            in_tpl,
+                            src_text,
+                        ))
+                        .await;
+                        out.extend(expanded);
+                    }
                     _ => {
                         // Rebuild the token with expanded argument references so
                         // parser-function / `mw:Param` / variable paths see the arg
@@ -1954,6 +2001,51 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             out.push(item);
         }
         out
+    }
+
+    /// Expand nested templates in a template token's **target** (attribs[0]).
+    ///
+    /// PHP's `expandTemplate` calls `AttributeExpander::expandFirstAttribute`
+    /// before resolving the target, and `Frame::expand` runs the chunk through
+    /// the whole TT2 pipeline (`peg-tokens-to-expanded-tokens`), so a `template`
+    /// token in the target — as in `{{ {{T290526}} }}` — is expanded there.
+    /// rustoid's [`Frame::expand`] is synchronous and only handles `{{{...}}}`
+    /// references, so the template half is done here, in the async parser loop,
+    /// before [`attribute_transform_manager::process`] runs.
+    ///
+    /// Only attribs[0] is touched, matching `expandFirstAttribute`: an argument
+    /// *value* holding a template stays unexpanded for the template body
+    /// expansion to handle.
+    async fn expand_target_templates(
+        &self,
+        frame: &Frame,
+        mut attribs: Vec<crate::wikitext::tokens_v2::KV>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+        src_text: &str,
+    ) -> Vec<crate::wikitext::tokens_v2::KV> {
+        let Some(target) = attribs.first_mut() else {
+            return attribs;
+        };
+        let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &target.key else {
+            return attribs;
+        };
+        if !items.iter().any(is_template_item) {
+            return attribs;
+        }
+        let items = items.clone();
+        let expanded = Box::pin(self.expand_templates(
+            frame,
+            items,
+            source,
+            about_counter,
+            in_template,
+            src_text,
+        ))
+        .await;
+        target.key = crate::wikitext::tokens_v2::KeyValue::Tokens(expanded);
+        attribs
     }
 
     /// Expand templated attribute keys/values on `Tag`/`SelfclosingTag` tokens,
@@ -2804,6 +2896,36 @@ mod tests {
             .unwrap();
         // The nested `{{Inner|world}}` should expand to "Hello world!".
         assert!(html.contains("Hello world"), "got: {html}");
+    }
+
+    #[tokio::test]
+    async fn test_wikitext_templated_template_target() {
+        use crate::mock::MockDataSource;
+
+        // `{{ {{T}} }}` — the target is itself a transclusion. The inner template
+        // expands first (in document order) to `Main Page|Something else`, which
+        // is not a valid title, so the outer braces stay literal around the
+        // expanded inner transclusion.
+        let source = MockDataSource::new();
+        source.add_template("Template:T290526", "Main Page{{!}}Something else");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{ {{T290526}} }}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(html.contains("{{ "), "got: {html}");
+        assert!(html.contains("Main Page|Something else"), "got: {html}");
+        assert!(html.contains(" }}</p>"), "got: {html}");
+        // The inner transclusion must survive as a real span, not as a stray
+        // unexpanded `<template …>` token.
+        assert!(html.contains("mw:Transclusion"), "got: {html}");
+        assert!(!html.contains("<template "), "got: {html}");
     }
 
     #[tokio::test]

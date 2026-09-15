@@ -337,13 +337,21 @@ fn resolve_target_string(
     // `{{#dir:en|bcp47}}` is a *valid* invocation, while an unknown `#…` is a
     // "broken" one that `TemplateHandler::resolveTemplateTarget` still treats as
     // a parser function so the `#` is not mistaken for part of a template name.
+    //
+    // The synonym table for a no-hash function holds the bare name, so
+    // `{{anchorencode:x}}` (no `#`) is a parser function too — but only when a
+    // colon follows (PHP nulls `$canonicalFunctionName` for a no-hash, no-colon
+    // invocation, leaving `{{dir}}` a plain template reference).
+    let known_hook = |name: &str| {
+        config
+            .function_hooks()
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    };
     if has_hash {
         let stripped = prefix.trim_start_matches(['#', '＃']);
         if !stripped.is_empty() {
-            let is_known = config
-                .function_hooks()
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(stripped));
+            let is_known = known_hook(stripped);
             let name = if is_known {
                 stripped.to_lowercase()
             } else {
@@ -359,6 +367,16 @@ fn resolve_target_string(
                 broken: !is_known,
             });
         }
+    } else if have_colon && known_hook(&prefix) {
+        let title = TitleParser::parse(&format!("Special:ParserFunction/{prefix}"), config);
+        return Some(ResolvedTarget::ParserFunction {
+            name: prefix.to_lowercase(),
+            local_name: prefix.clone(),
+            title,
+            pf_arg,
+            colon,
+            broken: false,
+        });
     }
 
     // Resolve a possibly-relative link (/Subpage, ../foo) against the context
@@ -737,7 +755,12 @@ impl TemplateHandler {
     /// an `expandTemplates` flag (true for the `onTemplateArg`/`onTemplate` bail
     /// paths); it only matters when template expansion is enabled, which is
     /// already decided by the caller's pipeline options.
-    fn convert_to_string(
+    ///
+    /// PHP runs the re-tokenized content through the full TT2 pipeline
+    /// (`wikitext-to-expanded-tokens`), so nested templates in the bailed
+    /// source are expanded — the caller is responsible for that pass in
+    /// rustoid (see `Parser::expand_templates`).
+    pub(crate) fn convert_to_string(
         token: &crate::wikitext::tokens_v2::ParsoidToken,
         in_template: bool,
     ) -> Vec<Item> {
@@ -823,6 +846,7 @@ impl TemplateHandler {
             "padright" => ParserFunctions::pf_padright(params),
             "tag" => ParserFunctions::pf_tag(config, params),
             "urlencode" => ParserFunctions::pf_urlencode(params),
+            "anchorencode" => ParserFunctions::pf_anchorencode(params),
             // `{{#dir:code}}` — the directionality (`ltr`/`rtl`) of a language.
             // Core `$noHashFunctions` member (invoked with a leading `#`).
             "dir" => ParserFunctions::pf_dir(params),
@@ -1186,6 +1210,41 @@ mod tests {
                 assert!(!broken);
             }
             other => panic!("expected parser function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_hash_function_with_colon_is_a_parser_function() {
+        // `anchorencode` is a registered function hook and is stored in the
+        // synonym table *without* a `#`, so `{{anchorencode:[foo]}}` (no colon
+        // hash) is a parser function — but only because a colon follows.
+        let config = MockSiteConfig::new();
+        match resolve_template_target(&config, None, "anchorencode:[foo]").unwrap() {
+            ResolvedTarget::ParserFunction {
+                name,
+                broken,
+                pf_arg,
+                ..
+            } => {
+                assert_eq!(name, "anchorencode");
+                assert_eq!(pf_arg, "[foo]");
+                assert!(!broken);
+            }
+            other => panic!("expected parser function, got {:?}", other),
+        }
+
+        // Without a colon the same name is an ordinary template reference.
+        match resolve_template_target(&config, None, "anchorencode").unwrap() {
+            ResolvedTarget::Template { name, .. } => {
+                assert_eq!(name, "Template:Anchorencode")
+            }
+            other => panic!("expected template, got {:?}", other),
+        }
+
+        // A name that is not a function hook stays a template even with a colon.
+        match resolve_template_target(&config, None, "NotAFunction:x").unwrap() {
+            ResolvedTarget::Template { name, .. } => assert_eq!(name, "Template:NotAFunction:x"),
+            other => panic!("expected template, got {:?}", other),
         }
     }
 
