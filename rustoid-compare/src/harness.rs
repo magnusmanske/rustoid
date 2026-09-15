@@ -98,6 +98,16 @@ fn classify(detail: &str) -> &'static str {
 
 const CACHE_FLUSH_EVERY: usize = 64;
 
+/// A `PageInfo` for a title known to exist.
+fn existing() -> rustoid_core::traits::PageInfo {
+    rustoid_core::traits::PageInfo {
+        missing: false,
+        known: true,
+        redirect: false,
+        linkclasses: Vec::new(),
+    }
+}
+
 /// A cache-backed `DataSource`, so template and module fetches during expansion
 /// are persisted too — not just the top-level page.
 ///
@@ -175,10 +185,21 @@ impl CachedDataSource {
         }
 
         let title = key.to_string();
+        // Trace fetches when asked. Without this, a run that stops making
+        // progress is indistinguishable from one that is merely slow, and the
+        // only way to find the offending title is to inspect the cache
+        // directory afterwards.
+        let trace = std::env::var_os("RUSTOID_TRACE_FETCH").is_some();
+        if trace {
+            eprintln!("fetch {kind:?} {title}");
+        }
         let Some(revid) = client.latest_revid(&title).await? else {
             return Ok(None);
         };
         let body = client.wikitext_at(revid).await?;
+        if trace {
+            eprintln!("fetch {kind:?} {title} -> {} bytes", body.len());
+        }
         let meta = EntryMeta {
             kind,
             title: title.clone(),
@@ -234,6 +255,26 @@ impl DataSource for CachedDataSource {
             .fetch(EntryKind::Module, &title.full_text())
             .await
             .unwrap_or(None))
+    }
+
+    /// Existence for link resolution, asked of the wiki directly.
+    ///
+    /// The trait's default derives existence from `get_page_content`, which for
+    /// a live wiki means fetching every linked article: `AddRedLinks` asks about
+    /// *all* wikilink titles on the page in one batch, and a single run on
+    /// `Israel` pulled 2558 articles that were never going to be compared. One
+    /// `prop=info` request per 50 links answers the same question.
+    async fn get_page_info(
+        &self,
+        titles: &[String],
+    ) -> rustoid_core::Result<std::collections::HashMap<String, rustoid_core::traits::PageInfo>>
+    {
+        let Some(client) = &self.client else {
+            // Offline: assume everything exists, which marks nothing as a red
+            // link. Recording it would be a claim the run cannot support.
+            return Ok(titles.iter().map(|t| (t.clone(), existing())).collect());
+        };
+        Ok(crate::pageinfo::page_info_soft(client, titles).await)
     }
 
     async fn get_file_info(

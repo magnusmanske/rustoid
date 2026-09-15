@@ -75,7 +75,18 @@ impl WikiClient {
     pub fn new(wiki: Wiki) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(DEFAULT_USER_AGENT)
-            .timeout(std::time::Duration::from_secs(60))
+            // A whole-request cap. Without it, and without a connect cap, a
+            // request can sit on a pooled keep-alive connection that the wiki's
+            // load balancer has silently dropped: the socket stays ESTABLISHED,
+            // nothing is ever sent or received, and the process waits forever.
+            // That wedged an entire corpus run at one page.
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            // A pooled connection is only worth reusing for a short while. The
+            // failure above is far likelier on a connection that has been idle,
+            // and reconnecting is cheap next to hanging.
+            .pool_idle_timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(2)
             .build()
             .map_err(|e| CompareError::Http {
                 url: wiki.api_url(),
@@ -89,6 +100,18 @@ impl WikiClient {
     }
 
     async fn get_text(&self, url: &str) -> Result<String> {
+        // One retry, for transport failures only. A dropped connection is common
+        // enough on a long run that losing a page to it would make corpus scores
+        // noisy, but a retry is safe here because every request is a plain GET of
+        // revision-pinned content.
+        match self.get_text_once(url).await {
+            Ok(body) => Ok(body),
+            Err(CompareError::Http { .. }) => self.get_text_once(url).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn get_text_once(&self, url: &str) -> Result<String> {
         let resp = self
             .http
             .get(url)
@@ -164,6 +187,25 @@ impl WikiClient {
             self.wiki.rest_v1_url(),
             urlencode(title),
             revid
+        );
+        self.get_text(&url).await
+    }
+
+    /// Existence metadata for up to 50 titles, with no wikitext.
+    ///
+    /// `prop=info` answers "does this exist, and is it a redirect?" in one
+    /// request, which is what link resolution needs. Fetching content instead
+    /// would be two requests per link.
+    pub async fn page_info_json(&self, titles: &[String]) -> Result<String> {
+        let joined = titles
+            .iter()
+            .map(|t| urlencode(t))
+            .collect::<Vec<_>>()
+            .join("%7C");
+        let url = format!(
+            "{}?action=query&prop=info&format=json&formatversion=2&titles={}",
+            self.wiki.api_url(),
+            joined
         );
         self.get_text(&url).await
     }

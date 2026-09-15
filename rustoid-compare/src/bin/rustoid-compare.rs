@@ -249,10 +249,11 @@ fn run_corpus<C: rustoid_core::SiteConfig>(
             refresh: cli.refresh,
             offline: cli.offline,
         };
-        let progress = format!("[{}/{}] {}", n + 1, corpus.len(), entry.title);
-        if !cli.quiet {
-            eprintln!("{progress} …");
-        }
+        // Progress always goes to stderr, even under `--quiet`: `--quiet` means
+        // "scoreboard only" for stdout, not "show nothing". A cold corpus run is
+        // network-bound and can take minutes per page, and a run that looks
+        // frozen is indistinguishable from one that has hung.
+        eprint!("[{}/{}] {} … ", n + 1, corpus.len(), entry.title);
 
         let comparison = rt.block_on(rustoid_compare::compare_page(client, config, cache, &req));
 
@@ -279,8 +280,19 @@ fn run_corpus<C: rustoid_core::SiteConfig>(
                 },
             },
         };
-        if !cli.quiet {
-            eprintln!("{progress} — {}", row.category());
+        // The category closes the progress line opened above. Under `--quiet`
+        // that is all that is printed per page; otherwise the title is repeated
+        // so a scrollback reads as a list.
+        if cli.quiet {
+            eprintln!("{}", row.category());
+        } else {
+            eprintln!(
+                "[{}/{}] {} — {}",
+                n + 1,
+                corpus.len(),
+                entry.title,
+                row.category()
+            );
         }
         rows.push(row);
 
