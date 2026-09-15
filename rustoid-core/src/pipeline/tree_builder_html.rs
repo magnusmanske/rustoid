@@ -868,6 +868,89 @@ fn build_compound_data_mw_with_nested(
     Some(root.to_string())
 }
 
+/// Dissolve nested transclusion ranges whose `data-mw` was absorbed into an
+/// enclosing compound transclusion, by unwrapping each absorbed span into its
+/// children.
+///
+/// PHP's `DOMRangeBuilder` never leaves a separate element for such a range: its
+/// post-tplwrap cells hold a bare text node (`align=center style="color:red;"|Foo`)
+/// with no transclusion span, and the cell's DSR is clamped to the template's end.
+/// rustoid encapsulates each inner range eagerly, before the enclosing range is
+/// known, so the equivalent is to splice the absorbed span's children in its place.
+///
+/// The `about`/`typeof`/`data-mw` are dropped with the span: they now belong to
+/// the enclosing compound transclusion, which is what stops `TableFixups`'
+/// `hoistTransclusionInfo` from lifting a second id onto the cell.
+/// Dissolve nested transclusion ranges whose `data-mw` was absorbed into an
+/// enclosing compound transclusion, by unwrapping each absorbed span into its
+/// children.
+///
+/// PHP's `DOMRangeBuilder` never leaves a separate element for such a range: its
+/// post-tplwrap cells hold a bare text node (`align=center style="color:red;"|Foo`)
+/// with no transclusion span, and the cell's DSR is clamped to the template's end.
+/// rustoid encapsulates each inner range eagerly, before the enclosing range is
+/// known, so the equivalent is to splice the absorbed range's children in place.
+///
+/// The `about`/`typeof`/`data-mw` go with the wrapper: they now belong to the
+/// enclosing compound transclusion, which is what stops `TableFixups`'
+/// `hoistTransclusionInfo` from lifting a second id onto the cell.
+fn dissolve_absorbed_ranges(node: &mut Node, outer_about: Option<&str>) {
+    let mut i = 0usize;
+    while i < node.children.len() {
+        let about = node.children[i].get_attr("about").map(str::to_string);
+        let is_absorbed = about.as_deref().is_some()
+            && about.as_deref() != outer_about
+            && node.children[i]
+                .get_attr("typeof")
+                .is_some_and(|t| t.split_whitespace().any(|x| x == "mw:Transclusion"));
+
+        if is_absorbed {
+            let mut head = node.children.remove(i);
+            let children = std::mem::take(&mut head.children);
+            let head_is_span = matches!(&head.kind, NodeKind::Element(ElementKind::Span));
+            let spliced = children.len();
+            for (offset, child) in children.into_iter().enumerate() {
+                node.children.insert(i + offset, child);
+            }
+
+            // The rest of the range follows as siblings carrying the same `about`.
+            // Mirrors `migrateElements`: a `span` is dropped outright (it only kept
+            // the range contiguous — PHP's "drop the newline span"), while any other
+            // element keeps its content with `about` stripped.
+            let mut j = i + spliced;
+            while j < node.children.len() {
+                let sibling_about = node.children[j].get_attr("about").map(str::to_string);
+                if sibling_about.as_deref() != about.as_deref() {
+                    break;
+                }
+                if matches!(&node.children[j].kind, NodeKind::Element(ElementKind::Span)) {
+                    let mut wrapper = node.children.remove(j);
+                    let inner = std::mem::take(&mut wrapper.children);
+                    let inner_len = inner.len();
+                    for (offset, child) in inner.into_iter().enumerate() {
+                        node.children.insert(j + offset, child);
+                    }
+                    j += inner_len;
+                } else {
+                    node.children[j].attrs.retain(|a| a.key != "about");
+                    j += 1;
+                }
+            }
+
+            // A non-span head survives as a visited sibling and still needs its own
+            // children examined; a span was fully unwrapped, so the spliced-in
+            // children are re-examined at the same index instead.
+            if !head_is_span && spliced > 0 {
+                dissolve_absorbed_ranges(&mut node.children[i], outer_about);
+                i += 1;
+            }
+            continue;
+        }
+        dissolve_absorbed_ranges(&mut node.children[i], outer_about);
+        i += 1;
+    }
+}
+
 /// Merge a transclusion's `data-mw` (its `parts` envelope) with a target's own
 /// `data-mw` (e.g. a media container's `attribs`/`errors`). The transclusion
 /// object is the base; the target's non-`parts` keys (and any `attribs`) are
@@ -1555,6 +1638,14 @@ fn wrap_transclusion_children(
                 {
                     new_content[et].data_mw =
                         merge_encap_data_mw(Some(merged), new_content[et].data_mw.clone());
+                    // PHP's merge dissolves an absorbed inner range into plain
+                    // content: its post-tplwrap cells hold a bare text node with
+                    // no transclusion span at all. rustoid encapsulates inner
+                    // ranges eagerly, so undo that here — unwrap each absorbed
+                    // span into its children (keeping the content, dropping the
+                    // now-redundant `about`/`typeof`/`data-mw`).
+                    let outer_about = start_meta.get_attr("about").map(str::to_string);
+                    dissolve_absorbed_ranges(&mut new_content[et], outer_about.as_deref());
                 }
             }
             apply_encap_dp_fields(&mut new_content[et], &start_meta);
