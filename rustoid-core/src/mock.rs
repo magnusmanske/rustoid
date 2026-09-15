@@ -23,15 +23,14 @@ use crate::traits::{
 fn case_insensitive_get<T: Clone>(map: &RwLock<HashMap<String, T>>, key: &str) -> Option<T> {
     // Fast path: the exact key is already handled by the caller; only fall back
     // here when the caller's exact lookup missed. We toggle the case of the
-    // first character of the title part (after the last ':').
+    // first character of the title part (after the last ':'). A key with no
+    // namespace is entirely title, so the toggle applies at index 0.
     let (prefix, rest) = match key.rsplit_once(':') {
-        Some((p, r)) if !p.is_empty() => (p, r),
-        _ => return None,
+        Some((p, r)) if !p.is_empty() => (format!("{p}:"), r),
+        _ => (String::new(), key),
     };
-    let mut alternate = String::with_capacity(key.len());
-    alternate.push_str(prefix);
-    alternate.push(':');
     let mut chars = rest.chars();
+    let mut alternate = prefix;
     match chars.next() {
         Some(c) if c.is_ascii() => {
             if c.is_ascii_uppercase() {
@@ -41,7 +40,7 @@ fn case_insensitive_get<T: Clone>(map: &RwLock<HashMap<String, T>>, key: &str) -
             }
         }
         Some(c) => alternate.push(c),
-        None => {}
+        None => return None,
     }
     alternate.push_str(chars.as_str());
     map.read().unwrap().get(&alternate).cloned()
