@@ -118,6 +118,41 @@ pub fn serialize_node(tree: &DomTree, node: NodeId, state: &mut SerializerState)
             if !state.in_indent_pre && text.chars().all(|c| c.is_whitespace()) {
                 state.append_sep(text);
             } else {
+                // PHP runs `updateSeparatorConstraints` for text nodes too, using
+                // `new DOMHandler( false )` (whose `before`/`firstChild` return
+                // empty constraints), so that the *previous* handler's
+                // constraints still apply. Without this the text node inherited no
+                // constraints at all, so `buildSep`'s `ParentChild`
+                // trimmed-whitespace recovery never ran and a table cell's
+                // leading space (`| 1`) was dropped on serialization.
+                if state.selser_mode {
+                    // `currNodeUnmodified`: unmodified unless a diff marker
+                    // precedes it, or it is a first child below the top level.
+                    state.curr_node_unmodified = !state.in_inserted_content
+                        && match tree.prev_sibling(node) {
+                            Some(p) => !crate::html::diff_utils::DiffUtils::is_diff_marker(
+                                tree.node(p),
+                                None,
+                            ),
+                            None => tree
+                                .parent(node)
+                                .is_some_and(|p| dom_utils::at_the_top(tree, p)),
+                        };
+                }
+                let prev = crate::html::dom_tree::previous_non_sep_sibling(tree, node)
+                    .or_else(|| tree.parent(node));
+                if let Some(prev) = prev {
+                    let mut prev_handler = get_dom_handler(tree, prev);
+                    let mut handler = get_dom_handler(tree, node);
+                    Separators::update_separator_constraints(
+                        state,
+                        tree,
+                        prev,
+                        prev_handler.as_mut(),
+                        node,
+                        handler.as_mut(),
+                    );
+                }
                 state.needs_escaping = true;
                 state.is_last_child =
                     crate::html::dom_tree::next_non_deleted_sibling(tree, node).is_none();
