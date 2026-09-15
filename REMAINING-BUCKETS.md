@@ -1,11 +1,20 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **870/891 fixtures pass** (98%). Lib tests: 678 pass. Clippy: clean.
+Current baseline: **871/891 fixtures pass** (98%). Lib tests: 679 pass. Clippy: clean.
 
-The three remaining failures are the standing tail: `2. Using {{!}} in wikilinks`
-(standalone-unreachable, see below), `Templated table cell with untemplated
-attributes: Integrated mode only` (`+integrated`-only), and
-`Template interaction`.
+Only two failures remain, and both are unreachable in standalone mode:
+
+- `2. Using {{!}} in wikilinks (T290526)` — PHP's own
+  `wikiLinks-standalone-knownFailures.json` lists it; its expected output is the
+  MediaWiki-preprocessor (integrated) form. Confirmed by running
+  `bin/parserTests.php --wt2html --filter='2. Using'` → EXPECTED FAIL.
+- `Templated table cell with untemplated attributes: Integrated mode only` — the
+  fixture has no `html/parsoid` or `html/parsoid+standalone` section, and PHP's
+  own runner matches **0 of 0** tests for it (verified with
+  `--filter "Integrated mode only"`).
+
+So the reachable fixture suite is effectively complete; further work is on the
+unreachable/skip tail and on lib-level fidelity rather than fixture counts.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -232,6 +241,41 @@ against PHP's actual output.
 (integrated) result. Confirmed by running PHP's runner directly
 (`bin/parserTests.php --wt2html --filter='2. Using'` → EXPECTED FAIL). It cannot
 flip in native mode.
+
+## Landed: span-wrapping text inside a flipped range (870 → 871)
+
+`Template interaction` is fixed. The fixture is `::{{definition_list}}` with
+`Template:definition_list` = `one\n::two`, so the range holds two `<dd>`s with a
+newline between them. PHP produces:
+
+```
+<dd about="#mwt1" ...>one</dd><span about="#mwt1">\n</span><dd about="#mwt1">two</dd>
+```
+
+rustoid stamped `about` on Elements only and skipped Text entirely, so the
+newline was dropped:
+
+```
+<dd about="#mwt1" ...>one</dd><dd about="#mwt1" ...>two</dd>
+```
+
+PHP's `ensureElementsInRangeAndAddAboutIds` requires every node in a range to be
+an Element — a text node cannot carry `about`, so it is span-wrapped. And PHP
+*keeps* this newline: `isDeletableNode` only discards one in two narrow cases (a
+wikitext block followed by a `ul`/`ol`/`table`, or between two sol-transparent
+links), and a `dd`/`dd` pair is neither.
+
+Two notes for future work here:
+
+- The wrapping lives in `wrap_flipped_children`, which had no whitespace handling
+  at all (only `wrap_transclusion_children` did). `wrap_flipped_children` now also
+  receives `parent`, which it needs for `is_deletable_in_range`'s fosterable check
+  — it was hard-coded to `None`.
+- No special case for table cells was needed, despite an initial attempt: a
+  whitespace node in a fosterable position (`table`/`thead`/`tbody`/`tfoot`/`tr`)
+  is already dropped by that first rule, which is why `2a. Template-generated
+  table cell attributes` stays correct. That attempt was reverted; the code
+  carries only the general rule.
 
 ## Landed: propagating `tableDataBlock` (869 → 870)
 
