@@ -169,8 +169,18 @@ impl WikiCache {
         }))
     }
 
-    /// Store a body, writing the index afterwards so a crash mid-write leaves a
-    /// consistent (if stale) cache rather than a dangling entry.
+    /// Store a body.
+    ///
+    /// The entry is visible to [`get`](Self::get) immediately, but the manifest
+    /// is **not** written here. A dense article transcludes hundreds of
+    /// templates, and re-serialising the whole manifest on each one is quadratic
+    /// — it dominated a corpus run. Callers persist via
+    /// [`write_index`](Self::write_index), which the harness does periodically
+    /// during expansion and once at the end.
+    ///
+    /// Crash-safety is unchanged: a body is written before the manifest that
+    /// references it, so a crash leaves an unreferenced body (harmless, ignored
+    /// on read) rather than a dangling entry.
     pub fn put(&mut self, kind: EntryKind, title: &str, body: &str, meta: EntryMeta) -> Result<()> {
         let key = Self::key(kind, title);
         let path = self.body_path(&key);
@@ -179,11 +189,7 @@ impl WikiCache {
         }
         std::fs::write(&path, body).map_err(|e| io_err(&path, e))?;
         self.index.entries.insert(key, meta);
-
-        // An index-write failure after a successful body-write is recoverable
-        // (the entry is simply absent next run), so it is reported but does not
-        // need to unwind the body.
-        self.write_index()
+        Ok(())
     }
 
     /// Persist the manifest.
@@ -326,7 +332,17 @@ mod tests {
         assert_eq!(got.body, "hello");
         assert_eq!(got.meta.revid, Some(42));
 
-        // A fresh handle sees the same data, i.e. it really is on disk.
+        // `put` writes the body but not the manifest: a fresh handle does not
+        // see the entry until the manifest is written.
+        let before = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert!(
+            before.get(EntryKind::Page, "Main Page").unwrap().is_none(),
+            "put must not implicitly persist the manifest"
+        );
+
+        cache.write_index().unwrap();
+
+        // Now a fresh handle sees the same data, i.e. it really is on disk.
         let reopened = WikiCache::open(&root, "en.wikipedia.org").unwrap();
         assert_eq!(
             reopened

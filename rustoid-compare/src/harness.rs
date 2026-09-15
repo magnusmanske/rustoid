@@ -41,30 +41,62 @@ impl Outcome {
 
     /// A coarse bucket for the scoreboard histogram, so a run reports *how* the
     /// differences cluster rather than only how many there were.
+    ///
+    /// Classified from `detail`, which [`compare_html`] fills with the *whole*
+    /// differing region plus both sides' surrounding markup — a raw byte offset
+    /// says where a page diverged, not why, and a histogram built from offsets
+    /// would mostly measure document length.
     pub fn category(&self) -> &'static str {
         match self {
             Self::Match => "match",
             Self::Skipped { .. } => "skipped",
-            Self::Differ { detail } => {
-                if detail.contains("<table") || detail.contains("<td") || detail.contains("<tr") {
-                    "differ:table"
-                } else if detail.contains("mw:Transclusion") {
-                    "differ:transclusion"
-                } else if detail.contains("data-parsoid") {
-                    "differ:data-parsoid"
-                } else if detail.contains("mw:Extension") {
-                    "differ:extension"
-                } else if detail.contains("mw:File") || detail.contains("<img") {
-                    "differ:media"
-                } else if detail.contains("id=\"mw") || detail.contains("about=\"#mwt") {
-                    "differ:marker"
-                } else {
-                    "differ:other"
-                }
-            }
+            Self::Differ { detail } => classify(detail),
         }
     }
 }
+
+/// Bucket a difference by the construct that most likely caused it.
+///
+/// Order matters: the first marker that matches wins, so the list runs from the
+/// most specific construct to the least. Markers are looked for across the whole
+/// difference, not just its first bytes.
+fn classify(detail: &str) -> &'static str {
+    // Ordered most-specific first. Each entry is a feature area worth its own
+    // number on the scoreboard, because each is a separate body of work.
+    const CATEGORIES: &[(&str, &str)] = &[
+        ("mw:Extension", "extension"),
+        ("mw:Transclusion", "transclusion"),
+        ("mw:ExpandedAttrs", "expanded-attrs"),
+        ("mw:File", "media"),
+        ("<img", "media"),
+        ("<table", "table"),
+        ("<td", "table"),
+        ("<tr", "table"),
+        ("<section", "section-wrap"),
+        ("data-mw", "data-mw"),
+        ("data-parsoid", "data-parsoid"),
+        ("mw:Nowiki", "nowiki"),
+        ("mw:Entity", "entity"),
+        ("mw:WikiLink", "wikilink"),
+        ("mw:PageProp", "pageprop"),
+        ("<ref", "cite"),
+        ("mw:LanguageVariant", "language-variant"),
+    ];
+    for (marker, name) in CATEGORIES {
+        if detail.contains(marker) {
+            return name;
+        }
+    }
+    // An `id="mwXY"`/`about="#mwtN"` mismatch with no other marker means the
+    // two sides produced structurally similar HTML differing only in generated
+    // attribute values, which is a parity problem in its own right.
+    if detail.contains("id=\"mw") || detail.contains("about=\"#mwt") {
+        return "marker-ids";
+    }
+    "other"
+}
+
+const CACHE_FLUSH_EVERY: usize = 64;
 
 /// A cache-backed `DataSource`, so template and module fetches during expansion
 /// are persisted too — not just the top-level page.
@@ -73,22 +105,50 @@ impl Outcome {
 /// blocking I/O is acceptable here because this is a test harness, and doing it
 /// on the async runtime's thread keeps the type simple. The cache also dedupes:
 /// a template transcluded a hundred times is read from disk once.
+///
+/// The manifest is written every [`CACHE_FLUSH_EVERY`] entries rather than on
+/// each one: `WikiCache::put` does not persist by itself, because a dense
+/// article transcludes hundreds of templates and rewriting the whole manifest
+/// per template is quadratic. [`CachedDataSource::flush`] writes the remainder.
 pub struct CachedDataSource {
     client: Option<Arc<WikiClient>>,
-    cache: std::sync::Mutex<WikiCache>,
+    /// The **shared** cache handle, not a private one.
+    ///
+    /// Expansion fetches templates into this. If the source owned its own
+    /// handle, its manifest would be a separate in-memory copy from the
+    /// harness's, and the two would overwrite each other's `index.json` — which
+    /// silently orphaned hundreds of already-downloaded template bodies.
+    cache: Arc<std::sync::Mutex<WikiCache>>,
     /// When set, a cache miss returns `None` instead of fetching. Template
     /// expansion can trigger many fetches, so this is what keeps an offline run
     /// genuinely offline.
     offline: bool,
+    /// Entries stored since the manifest was last written, so the manifest is
+    /// not re-serialised on every one of hundreds of template fetches.
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 impl CachedDataSource {
-    pub fn new(client: Option<Arc<WikiClient>>, cache: WikiCache, offline: bool) -> Self {
+    pub fn new(
+        client: Option<Arc<WikiClient>>,
+        cache: Arc<std::sync::Mutex<WikiCache>>,
+        offline: bool,
+    ) -> Self {
         Self {
             client,
-            cache: std::sync::Mutex::new(cache),
+            cache,
             offline,
+            pending: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Persist the manifest, covering entries not yet written out.
+    pub fn flush(&self) -> Result<()> {
+        self.pending.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.cache
+            .lock()
+            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+            .write_index()
     }
 
     /// Look up a cached body, or fetch it via the client and store it.
@@ -129,6 +189,14 @@ impl CachedDataSource {
             .lock()
             .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
             .put(kind, &title, &body, meta)?;
+        if self
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+            >= CACHE_FLUSH_EVERY
+        {
+            self.flush()?;
+        }
         Ok(Some(body))
     }
 }
@@ -221,7 +289,7 @@ pub struct Comparison {
 pub async fn compare_page<C: rustoid_core::SiteConfig>(
     client: &WikiClient,
     config: &C,
-    cache: &std::sync::Mutex<WikiCache>,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
     req: &CompareRequest,
 ) -> Result<Comparison> {
     let title = req.title.clone();
@@ -391,28 +459,25 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
 async fn render_rustoid<C: rustoid_core::SiteConfig>(
     client: &WikiClient,
     config: &C,
-    cache: &std::sync::Mutex<WikiCache>,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
     title: &str,
     wikitext: &str,
     offline: bool,
 ) -> Result<String> {
-    // Open a second handle on the same on-disk cache for the data source.
-    // `WikiCache` keeps an in-memory manifest, so handing the parser a fresh
-    // handle would risk losing entries the outer handle wrote later; instead the
-    // source shares the outer handle's state through the mutex-free path below.
-    let cache_handle = {
-        let guard = cache
-            .lock()
-            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
-        WikiCache::open(guard.root(), guard.host())?
-    };
-    let source = CachedDataSource::new(Some(Arc::new(client.clone())), cache_handle, offline);
+    // The data source shares the harness's cache handle. A second handle would
+    // keep its own in-memory manifest, so the two would clobber each other's
+    // `index.json` and orphan every template fetched during expansion.
+    let source = CachedDataSource::new(Some(Arc::new(client.clone())), Arc::clone(cache), offline);
     let parser = rustoid_core::Parser::new(config);
     let options = rustoid_core::ParserOptions::for_page(title);
-    parser
+    let html = parser
         .wikitext_to_html_expanded(wikitext, &source, &options)
         .await
-        .map_err(|e| CompareError::Parse(e.to_string()))
+        .map_err(|e| CompareError::Parse(e.to_string()))?;
+    // Expansion fetched templates into the source's own cache handle; persist any
+    // entries that did not reach a periodic flush.
+    source.flush()?;
+    Ok(html)
 }
 
 /// Compare two HTML strings, returning the first difference.
@@ -448,30 +513,51 @@ fn normalise(html: &str) -> String {
     body.trim().to_string()
 }
 
-/// Describe the first differing position, with a little context.
+/// Describe the first differing position, with enough surrounding markup for
+/// [`classify`] to tell *what* diverged.
+///
+/// The snippet is deliberately large: a 60-byte window around the first differing
+/// byte usually lands several elements before the construct that actually caused
+/// the divergence (a `<td>` mismatch, say, is often first visible inside an
+/// attribute or a marker), which would make the scoreboard's histogram reflect
+/// position rather than cause. Both sides are included, because the *shape* of
+/// the divergence — extra markup on one side, a renamed attribute on the other —
+/// is what identifies the feature area.
 fn first_difference(a: &str, b: &str) -> String {
+    const CONTEXT: usize = 400;
+
     let ab = a.as_bytes();
     let bb = b.as_bytes();
     let mut i = 0;
     while i < ab.len() && i < bb.len() && ab[i] == bb[i] {
         i += 1;
     }
+
     // Walk back to a char boundary so the snippet is valid UTF-8.
-    let mut start = i.saturating_sub(60);
-    while start > 0 && !a.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut end = (i + 60).min(a.len());
-    while end > 0 && !a.is_char_boundary(end) {
-        end -= 1;
-    }
+    let start = floor_char_boundary(a, i.saturating_sub(CONTEXT));
+    let end = floor_char_boundary(a, (i + CONTEXT).min(a.len()));
+    let bend = floor_char_boundary(b, (i + CONTEXT).min(b.len()));
+
     let expected = &a[start..end];
-    let mut bend = (i + 60).min(b.len());
-    while bend > 0 && !b.is_char_boundary(bend) {
-        bend -= 1;
-    }
     let actual = &b[start.min(b.len())..bend];
-    format!("first difference at byte {i}:\n  parsoid: {expected:?}\n  rustoid: {actual:?}")
+    let diverged_at = a.len() == b.len() && i == a.len();
+    if diverged_at {
+        return format!("length-identical but differing at the end: {expected:?}");
+    }
+    format!(
+        "first difference at byte {i} of {} (parsoid) / {} (rustoid):\n  parsoid: {expected:?}\n  rustoid: {actual:?}",
+        a.len(),
+        b.len()
+    )
+}
+
+/// Largest index `<= i` that is a char boundary, without panicking on overshoot.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn now_rfc3339() -> Option<String> {
@@ -495,7 +581,7 @@ const SITEINFO_KEY: &str = "siteinfo";
 /// configuration would produce confidently wrong diffs.
 pub async fn load_site_config(
     client: Option<&Arc<WikiClient>>,
-    cache: &std::sync::Mutex<WikiCache>,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
     offline: bool,
     refresh: bool,
 ) -> Result<WikiSiteConfig> {
@@ -577,6 +663,45 @@ mod tests {
         assert_eq!(compare_html("\n  <p>x</p>  \n", "<p>x</p>"), Outcome::Match);
     }
 
+    /// The snippet must be wide enough to reach the construct that caused the
+    /// diverging byte — here the `<td>` that identifies it as a table problem
+    /// sits well over 100 bytes before the first differing byte.
+    #[test]
+    fn difference_context_reaches_the_causing_construct() {
+        let filler = "x".repeat(200);
+        let a = format!("<table><tr><td>{filler}A</td></tr></table>");
+        let b = format!("<table><tr><td>{filler}B</td></tr></table>");
+        match compare_html(&a, &b) {
+            Outcome::Differ { detail } => {
+                assert_eq!(
+                    Outcome::Differ {
+                        detail: detail.clone()
+                    }
+                    .category(),
+                    "table",
+                    "{detail}"
+                );
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    /// A page whose two renderings are the same length but differ at the very
+    /// end must still be reported, not silently treated as a match.
+    #[test]
+    fn a_difference_at_the_very_end_is_detected() {
+        let out = compare_html("<p>abc</p>", "<p>abd</p>");
+        assert!(matches!(out, Outcome::Differ { .. }), "{out:?}");
+    }
+
+    /// One rendering being a strict prefix of the other is a difference, even
+    /// though the common-prefix scan runs out of bytes rather than mismatching.
+    #[test]
+    fn a_prefix_is_a_difference() {
+        let out = compare_html("<p>abc</p>", "<p>abcdef</p>");
+        assert!(matches!(out, Outcome::Differ { .. }), "{out:?}");
+    }
+
     #[test]
     fn differences_are_reported_with_context() {
         let out = compare_html("<p>abXcd</p>", "<p>abYcd</p>");
@@ -613,22 +738,33 @@ mod tests {
             }
             .category()
         };
-        assert_eq!(cat("first difference at byte 3: <table>"), "differ:table");
-        assert_eq!(
-            cat("first difference: mw:Transclusion"),
-            "differ:transclusion"
-        );
-        assert_eq!(
-            cat("first difference: data-parsoid=…"),
-            "differ:data-parsoid"
-        );
-        assert_eq!(
-            cat("first difference: mw:Extension/ref"),
-            "differ:extension"
-        );
-        assert_eq!(cat("first difference: <img src"), "differ:media");
-        assert_eq!(cat("first difference: about=\"#mwt7\""), "differ:marker");
-        assert_eq!(cat("first difference: hello"), "differ:other");
+        assert_eq!(cat("first difference at byte 3: <table>"), "table");
+        assert_eq!(cat("first difference: mw:Transclusion"), "transclusion");
+        assert_eq!(cat("first difference: data-parsoid=…"), "data-parsoid");
+        assert_eq!(cat("first difference: mw:Extension/ref"), "extension");
+        assert_eq!(cat("first difference: <img src"), "media");
+        assert_eq!(cat("first difference: about=\"#mwt7\""), "marker-ids");
+        assert_eq!(cat("first difference: hello"), "other");
+    }
+
+    /// The buckets must be ordered most-specific-first, or a page whose only
+    /// real problem is Lua would be reported as an extension difference just
+    /// because a `mw:Extension` marker happens to appear inside the snippet.
+    #[test]
+    fn classification_prefers_the_most_specific_marker() {
+        let cat = |d: &str| {
+            Outcome::Differ {
+                detail: d.to_string(),
+            }
+            .category()
+        };
+        // A difference containing both an extension and a transclusion marker is
+        // reported as the extension, which is the narrower diagnosis.
+        assert_eq!(cat("mw:Extension/ref … mw:Transclusion"), "extension");
+        // An `id="mw…"` mismatch alongside a real construct is not a marker-id
+        // problem; the construct wins.
+        assert_eq!(cat("<table id=\"mwAB\""), "table");
+        assert_eq!(cat("mw:ExpandedAttrs about=\"#mwt3\""), "expanded-attrs");
     }
 
     #[test]
@@ -660,7 +796,7 @@ mod tests {
             )
             .unwrap();
 
-        let ds = CachedDataSource::new(None, cache, true);
+        let ds = CachedDataSource::new(None, Arc::new(std::sync::Mutex::new(cache)), true);
         let title = rustoid_core::Title::new_main("Template:Foo");
         let got = rustoid_core::traits::DataSource::get_template(&ds, &title)
             .await
@@ -701,7 +837,9 @@ mod tests {
             .unwrap();
         let cache = std::sync::Mutex::new(cache);
 
-        let cfg = load_site_config(None, &cache, true, false).await.unwrap();
+        let cfg = load_site_config(None, &Arc::new(cache), true, false)
+            .await
+            .unwrap();
         assert_eq!(cfg.language_code(), "de");
         assert_eq!(cfg.extension_tags(), &["ref".to_string()]);
 
@@ -714,10 +852,77 @@ mod tests {
     async fn site_config_miss_offline_is_an_error() {
         let root = std::env::temp_dir().join("rustoid-compare-siteinfo-miss");
         let _ = std::fs::remove_dir_all(&root);
-        let cache = std::sync::Mutex::new(WikiCache::open(&root, "example.invalid").unwrap());
+        let cache = Arc::new(std::sync::Mutex::new(
+            WikiCache::open(&root, "example.invalid").unwrap(),
+        ));
 
         let err = load_site_config(None, &cache, true, false).await;
         assert!(matches!(err, Err(CompareError::Offline(_))), "{err:?}");
+
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A data source must write into the manifest of the handle it was given.
+    ///
+    /// Regression: the source used to open its own handle, so its in-memory
+    /// manifest was a separate copy and the two overwrote each other's
+    /// `index.json`. The effect was silent — bodies land on disk either way — but
+    /// hundreds of already-downloaded templates were orphaned and re-fetched on
+    /// every run, which is what made a corpus run take minutes.
+    #[tokio::test]
+    async fn expansion_entries_reach_the_shared_manifest() {
+        let root = std::env::temp_dir().join("rustoid-compare-shared-manifest");
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = Arc::new(std::sync::Mutex::new(
+            WikiCache::open(&root, "example.invalid").unwrap(),
+        ));
+        let ds = CachedDataSource::new(None, Arc::clone(&cache), true);
+
+        // Store directly through the source's own path, as expansion would.
+        for title in ["Template:A", "Template:B"] {
+            let t = rustoid_core::Title::new_main(title);
+            assert!(
+                rustoid_core::traits::DataSource::get_template(&ds, &t)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "offline with an empty cache should miss"
+            );
+        }
+        // Seed through the *shared* handle and confirm the source reads it back,
+        // which is only possible if there is genuinely one handle.
+        cache
+            .lock()
+            .unwrap()
+            .put(
+                EntryKind::Template,
+                "Template:A",
+                "body a",
+                crate::cache::EntryMeta {
+                    kind: EntryKind::Template,
+                    title: "Template:A".to_string(),
+                    revid: Some(7),
+                    fetched_at: None,
+                },
+            )
+            .unwrap();
+
+        let t = rustoid_core::Title::new_main("Template:A");
+        let got = rustoid_core::traits::DataSource::get_template(&ds, &t)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("body a"));
+
+        // And the manifest reached by the outer handle contains it, i.e. the two
+        // are the same manifest rather than two that clobber each other.
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .index()
+                .entries
+                .contains_key("tpl:Template:A")
+        );
 
         WikiCache::flush_all(&root).unwrap();
     }

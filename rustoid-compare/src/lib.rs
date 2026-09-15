@@ -18,18 +18,25 @@
 
 //! - [`siteconfig`] — the wiki's own `SiteConfig`, parsed from its `siteinfo`,
 //!   so an online comparison is not silently capped by a hardcoded mock.
+//! - [`corpus`] — the set of pages to compare, and the tag vocabulary that lets
+//!   a failure be attributed to a feature area rather than merely counted.
+//! - [`scoreboard`] — tallies a corpus run into a score and two histograms.
 
 pub mod cache;
+pub mod corpus;
 pub mod error;
 pub mod harness;
+pub mod scoreboard;
 pub mod siteconfig;
 pub mod wire;
 
 pub use cache::{CachedBody, EntryKind, EntryMeta, WikiCache};
+pub use corpus::{Corpus, CorpusEntry};
 pub use error::{CompareError, Result};
 pub use harness::{
     CachedDataSource, CompareRequest, Comparison, Outcome, compare_html, compare_page,
     load_site_config,
 };
+pub use scoreboard::{Row, Scoreboard};
 pub use siteconfig::WikiSiteConfig;
 pub use wire::{Wiki, WikiClient};

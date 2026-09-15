@@ -4,6 +4,12 @@
 //! # One page, reporting the first difference:
 //! rustoid-compare --wiki en.wikipedia.org --page "UFC BJJ"
 //!
+//! # The built-in corpus, with a scoreboard:
+//! rustoid-compare --wiki en.wikipedia.org --corpus default
+//!
+//! # A custom corpus, offline, with per-failure detail:
+//! rustoid-compare --wiki en.wikipedia.org --corpus my.txt --offline -v
+//!
 //! # Offline re-run from cache (no network):
 //! rustoid-compare --wiki en.wikipedia.org --page "UFC BJJ" --offline
 //!
@@ -17,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
-use rustoid_compare::{EntryKind, Outcome, Wiki, WikiCache, WikiClient};
+use rustoid_compare::{Corpus, EntryKind, Outcome, Row, Scoreboard, Wiki, WikiCache, WikiClient};
 
 #[derive(Parser, Debug)]
 #[command(name = "rustoid-compare")]
@@ -30,6 +36,20 @@ struct Cli {
     /// Page title to compare.
     #[arg(long)]
     page: Option<String>,
+
+    /// Compare a corpus of pages. `default` uses the built-in corpus; otherwise
+    /// this is a path to a corpus file (one `Title | tag, tag` per line).
+    #[arg(long, value_name = "FILE_OR_DEFAULT")]
+    corpus: Option<String>,
+
+    /// Print the scoreboard only, without the per-page detail lines.
+    #[arg(long)]
+    quiet: bool,
+
+    /// Pause this many milliseconds between page fetches, to stay well inside
+    /// the wiki's rate limits on an uncached run.
+    #[arg(long, default_value_t = 200)]
+    delay_ms: u64,
 
     /// Pin to this revision (default: the wiki's latest).
     #[arg(long)]
@@ -73,6 +93,10 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.page.is_some() && cli.corpus.is_some() {
+        return Err("--page and --corpus are mutually exclusive".into());
+    }
+
     let root = cli
         .cache_dir
         .clone()
@@ -91,23 +115,32 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let Some(page) = cli.page.clone() else {
-        // No page: report what is cached, which is the useful no-argument action.
-        println!(
-            "cache: {} — {} entries for {}",
-            cache.dir().display(),
-            cache.len(),
-            cli.wiki
-        );
-        if cache.is_empty() {
-            eprintln!("nothing cached; pass --page <title> to compare a page");
+    // A page or a corpus is required; with neither, report what is cached, which
+    // is the useful no-argument action. In corpus mode the page stays empty and
+    // is never used, because the corpus branch below returns first.
+    let page = match cli.page.clone() {
+        Some(page) => page,
+        None if cli.corpus.is_some() => String::new(),
+        None => {
+            println!(
+                "cache: {} — {} entries for {}",
+                cache.dir().display(),
+                cache.len(),
+                cli.wiki
+            );
+            if cache.is_empty() {
+                eprintln!("nothing cached; pass --page <title> or --corpus default");
+            }
+            return Ok(());
         }
-        return Ok(());
     };
 
     let wiki = Wiki::new(&cli.wiki);
 
     if cli.show_wikitext {
+        if page.is_empty() {
+            return Err("--show-wikitext needs --page <title>".into());
+        }
         let cached = cache.get(EntryKind::Page, &page)?;
         return match cached {
             Some(c) => {
@@ -126,7 +159,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let client = Arc::new(WikiClient::new(wiki)?);
-    let cache = Mutex::new(cache);
+    let cache = Arc::new(Mutex::new(cache));
     let rt = tokio::runtime::Runtime::new()?;
 
     // The wiki's own configuration, not a hardcoded enwiki-shaped mock: a tag
@@ -147,6 +180,16 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             config.interwiki_count(),
         );
     }
+
+    if let Some(spec) = &cli.corpus {
+        let corpus = if spec == "default" {
+            Corpus::builtin()
+        } else {
+            Corpus::from_file(std::path::Path::new(spec))?
+        };
+        return run_corpus(cli, &client, &config, &cache, &rt, &corpus);
+    }
+
     let req = rustoid_compare::CompareRequest {
         title: page.clone(),
         revid: cli.revision,
@@ -175,6 +218,90 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if !comparison.outcome.is_match() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Compare every entry in a corpus and print the scoreboard.
+///
+/// Pages are compared sequentially, not concurrently. The bottleneck is the
+/// wiki's rate limiter, not the local work, so concurrency would buy little
+/// while making a mid-run failure much harder to attribute.
+fn run_corpus<C: rustoid_core::SiteConfig>(
+    cli: &Cli,
+    client: &Arc<WikiClient>,
+    config: &C,
+    cache: &Arc<Mutex<WikiCache>>,
+    rt: &tokio::runtime::Runtime,
+    corpus: &Corpus,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if corpus.is_empty() {
+        return Err(format!("corpus {} is empty", corpus.name).into());
+    }
+
+    let mut rows = Vec::with_capacity(corpus.len());
+    for (n, entry) in corpus.entries.iter().enumerate() {
+        let req = rustoid_compare::CompareRequest {
+            title: entry.title.clone(),
+            // A pinned revision only makes sense for a single page; in a corpus
+            // each page resolves its own, and the cache pins it thereafter.
+            revid: None,
+            refresh: cli.refresh,
+            offline: cli.offline,
+        };
+        let progress = format!("[{}/{}] {}", n + 1, corpus.len(), entry.title);
+        if !cli.quiet {
+            eprintln!("{progress} …");
+        }
+
+        let comparison = rt.block_on(rustoid_compare::compare_page(client, config, cache, &req));
+
+        // A single failing page must not abort the run: a corpus is exactly the
+        // case where some pages are known-bad, and losing the other 30 results
+        // to one error would defeat the point.
+        let row = match comparison {
+            Ok(c) => Row {
+                title: entry.title.clone(),
+                tags: entry.tags.iter().cloned().collect(),
+                revid: Some(c.revid),
+                parsoid_bytes: c.parsoid_html.len(),
+                rustoid_bytes: c.rustoid_html.len(),
+                outcome: c.outcome,
+            },
+            Err(e) => Row {
+                title: entry.title.clone(),
+                tags: entry.tags.iter().cloned().collect(),
+                revid: None,
+                parsoid_bytes: 0,
+                rustoid_bytes: 0,
+                outcome: Outcome::Skipped {
+                    reason: e.to_string(),
+                },
+            },
+        };
+        if !cli.quiet {
+            eprintln!("{progress} — {}", row.category());
+        }
+        rows.push(row);
+
+        // Only pace the run when we might actually hit the network.
+        if cli.delay_ms > 0 && !cli.offline && n + 1 < corpus.len() {
+            std::thread::sleep(std::time::Duration::from_millis(cli.delay_ms));
+        }
+    }
+
+    let board = Scoreboard::new(corpus.name.clone(), rows);
+    print!("{}", board.render(cli.verbose));
+
+    // The cache is written through on every put, but flushing makes the
+    // manifest on-disk state match what the run reported.
+    cache
+        .lock()
+        .map_err(|_| "cache mutex poisoned")?
+        .write_index()?;
+
+    if board.compared() == 0 {
+        return Err("nothing could be compared (all pages skipped)".into());
     }
     Ok(())
 }

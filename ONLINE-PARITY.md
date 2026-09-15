@@ -172,13 +172,56 @@ Still to come in this phase: ingesting Parsoid's `baseconfig/*.json` for
 fixture-grade offline runs (the parser's own fixture suite already pins its own
 configuration and is unaffected).
 
-### Phase 2 — Corpus and scoreboard
+### Phase 2 — Corpus and scoreboard — *done*
 
 - A curated corpus spanning the failure space: plain prose, tables, infoboxes,
   references, module-heavy, magic-word-heavy, edge cases — plus a random sample
-  for breadth.
-- Golden Parsoid HTML in-repo so regressions are catchable without network.
-- **Exit criterion:** one command prints a score and a diff-category histogram.
+  for breadth. — **done** (`rustoid-compare/corpus/enwiki.txt`, 49 entries,
+  compiled in via `include_str!`; `--corpus <file>` takes a custom one).
+  Entries are tagged with the feature areas they exercise, verified by
+  inspecting each page's wikitext rather than assumed.
+- **Exit criterion:** one command prints a score and a diff-category histogram. —
+  **met**: `--corpus default` prints a score, a by-outcome histogram, a by-tag
+  table, a failure list, and (with `-v`) every first difference.
+
+Two decisions worth recording, both of which changed the numbers' meaning:
+
+- **Two histograms, not one.** By *category* says what the parser did wrong; by
+  *tag* says which body of work that maps onto and whether anything passes at
+  all. Neither alone is enough: a page yields a single category but carries
+  several tags, and a tag whose pages all fail identically is invisible in a
+  category tally.
+- **Skips are excluded** from the score and the tag table. A page that could not
+  be fetched says nothing about parser parity, and counting it as a failure
+  would fill the work list with entries that have nothing wrong with them. This
+  is what makes an `--offline` run comparable to an online one.
+
+The classification also had to change to be worth anything: it previously
+sniffed a 60-byte window around the first differing *byte*, which reflects
+position rather than cause — a `<td>` that identifies a table problem is often
+several hundred bytes before the byte that actually differs. It now sees 400
+bytes on each side, and buckets are ordered most-specific-first so a page whose
+only real problem is Lua is not reported as an extension difference.
+
+Building the corpus immediately exposed a **cache correctness bug** that had
+been invisible until a template-heavy page was tried. The data source handed to
+the parser opened its *own* `WikiCache`, so it held a separate in-memory
+manifest from the harness's; the two overwrote each other's `index.json`. Bodies
+still landed on disk, so nothing failed — but after a full cold fetch of
+`Cristiano Ronaldo` there were **445 template bodies on disk and 3 manifest
+entries**, so nearly every template was re-downloaded on every run. A dense page
+took 7m28s and only 3 entries survived.
+
+The fix is one shared `Arc<Mutex<WikiCache>>`. While fixing it, `put` was also
+decoupled from `write_index`, because re-serialising the whole manifest on each
+of hundreds of fetches is quadratic; the manifest is now written every 64
+entries and at the end of a run. This matters for what comes next: Lua support
+will fetch *more* templates per page, not fewer, so a harness that got slower
+with every capability added would defeat the purpose of having one.
+
+Still to come in this phase: golden Parsoid HTML committed in-repo, so
+regressions are catchable without network. The cache carries the same
+information today, but it is a local artifact rather than a reviewable one.
 
 ### Phase 3 — `#invoke` end to end (the biggest single lever)
 

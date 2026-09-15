@@ -29,6 +29,10 @@ pub enum CompareError {
     /// run was explicitly offline.
     #[error("offline: {0}")]
     Offline(String),
+
+    /// A corpus file could not be read or did not parse.
+    #[error("corpus error: {0}")]
+    Corpus(String),
 }
 
 impl CompareError {

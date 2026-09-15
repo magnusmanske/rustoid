@@ -1,0 +1,76 @@
+# Built-in comparison corpus.
+#
+# One entry per line: `Title | tag, tag`. Blank lines and `#` comments are
+# ignored. Tags name the feature areas an entry is intended to exercise, so a
+# failure can be attributed to a body of work rather than just counted.
+#
+# Entries are chosen to span the failure space, not to be representative of
+# Wikipedia. Sizes and `#invoke` counts below were measured against enwiki; they
+# will drift as pages are edited, which is why the harness pins revisions in its
+# cache. Tags were verified by inspecting each page's wikitext, not assumed.
+#
+# A tag is only worth adding if it names something separately implementable; a
+# taxonomy that mirrors the diff rather than the work would not prioritise
+# anything.
+
+# --- Lua / Scribunto: the largest single lever ---
+# `invoke=164` and `invoke=101`: these two are the densest Lua consumers in the
+# corpus and the best single measure of `#invoke` progress.
+Cristiano Ronaldo | lua, transclusion, table, cite, media
+Lionel Messi | lua, transclusion, table, cite, media
+Taylor Swift | lua, transclusion, cite, media
+Israel | lua, transclusion, table, cite, media
+Python (programming language) | lua, parser-function, table, cite, media, syntaxhighlight
+COVID-19 pandemic | lua, transclusion, table, cite, media
+Template:Weather box | lua, parser-function, template-only
+
+# --- Transclusion and parser functions, minimal Lua ---
+Albert Einstein | transclusion, cite, table, media, sub-sup
+World War II | transclusion, cite, parser-function, media
+United States | transclusion, cite, media, template-bang
+Wikipedia | transclusion, parser-function, cite, media, gallery
+France | transclusion, cite, media, template-bang
+The Beatles | transclusion, parser-function, cite, media, template-bang
+Titanic | transclusion, parser-function, cite, table, media
+
+# --- Tables, in several shapes ---
+Periodic table | table, transclusion, cite, media, math
+List of sovereign states | table, transclusion, cite, media
+Commonwealth of Nations | table, transclusion, cite, media
+ISO 3166-1 alpha-2 | table, parser-function, transclusion, cite
+
+# --- Extensions other than Lua ---
+Zebra | gallery, transclusion, table, cite, media
+Chess | gallery, transclusion, table, cite, media, sub-sup
+Order of the British Empire | gallery, transclusion, table, cite, media
+Berlin | gallery, transclusion, table, cite, media
+Bicycle | gallery, transclusion, cite, media, template-bang
+International Space Station | gallery, transclusion, table, cite, media
+Hydrogen | math, transclusion, table, cite, media, sub-sup
+Earth | math, transclusion, table, cite, media, sub-sup
+Tropical cyclone | math, parser-function, transclusion, table, cite, media
+Sundial | math, transclusion, cite, media
+
+# --- Prose and plain structure: the baseline that must never regress ---
+Canada | transclusion, cite, media, parser-function
+Isaac Newton | transclusion, cite, media
+Unix | transclusion, cite, media
+Nobel Prize | transclusion, cite, media
+Megadeth | transclusion, cite, media
+Nigeria | transclusion, cite, media
+Bitcoin | transclusion, cite, media, sub-sup
+Association football | transclusion, cite, media, parser-function
+Anarchism | transclusion, cite, table, media, template-bang
+Doom (1993 video game) | transclusion, cite, media
+Grand Theft Auto V | transclusion, cite, table, media
+Brat (album) | transclusion, cite, table, media
+Polio vaccine | transclusion, cite, table, media, template-bang
+Chernobyl disaster | transclusion, cite, media
+2024 Summer Olympics | transclusion, cite, table, media
+India | transclusion, cite, table, media, math, gallery
+Quicksilver (film) | transclusion, cite, media, short
+
+# --- Edge cases and non-article namespaces ---
+Help:Introduction | transclusion, nowiki, media, non-article
+Module:Math | lua, module-source, parser-function
+Template:Infobox | transclusion, template-only
