@@ -61,6 +61,12 @@ impl Outcome {
 /// most specific construct to the least. Markers are looked for across the whole
 /// difference, not just its first bytes.
 fn classify(detail: &str) -> &'static str {
+    // A difference that *is* only the section wrappers. Checked first because
+    // the marker text is otherwise a full sentence of prose.
+    if detail.starts_with("sections: ") {
+        return "section-wrap";
+    }
+
     // Ordered most-specific first. Each entry is a feature area worth its own
     // number on the scoreboard, because each is a separate body of work.
     const CATEGORIES: &[(&str, &str)] = &[
@@ -543,15 +549,63 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
 /// Both sides are normalised first: Parsoid serves a full document with
 /// `<html>`/`<head>`/`<body>`, while rustoid's output here is the body. Leading
 /// and trailing whitespace is insignificant for the comparison's purpose.
+///
+/// Parsoid's section wrappers are then removed from *both* sides before the
+/// difference is located. They are not ignored — a page that differs only by
+/// them is still a `Differ`, bucketed as `section-wrap` — but they must not be
+/// allowed to *hide* everything else. Parsoid emits `<section
+/// data-mw-section-id="…">` as the very first thing in the document, so with the
+/// wrappers left in place every single page reported its first difference at
+/// byte 1, which attributed nothing and made the scoreboard unreadable.
 pub fn compare_html(parsoid: &str, rustoid: &str) -> Outcome {
     let a = normalise(parsoid);
     let b = normalise(rustoid);
     if a == b {
         return Outcome::Match;
     }
-    Outcome::Differ {
-        detail: first_difference(&a, &b),
+
+    let (sa, sb) = (strip_sections(&a), strip_sections(&b));
+    if sa == sb {
+        return Outcome::Differ {
+            detail: SECTION_ONLY.to_string(),
+        };
     }
+    Outcome::Differ {
+        detail: first_difference(&sa, &sb),
+    }
+}
+
+/// Marker `detail` for a difference that is *only* section wrappers.
+const SECTION_ONLY: &str =
+    "sections: the renderings agree once Parsoid's mw:section wrappers are removed";
+
+/// Remove `<section …>` / `</section>` wrappers, keeping their contents.
+///
+/// These are Parsoid's `SectionWrapping` output: one wrapper per
+/// heading-delimited chunk, which rustoid does not emit yet. The tags carry
+/// `data-mw-section-id` (and sometimes `id`), and SectionWrapping's output is
+/// flat, so a plain scan for the tags is sufficient.
+fn strip_sections(html: &str) -> String {
+    if !html.contains("<section") {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find("<section") {
+        out.push_str(&rest[..pos]);
+        // Skip to the end of the opening tag. A `<section` with no `>` is not a
+        // tag; keep it as literal text rather than swallowing the remainder.
+        match rest[pos..].find('>') {
+            Some(gt) => rest = &rest[pos + gt + 1..],
+            None => {
+                out.push_str(&rest[pos..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    // Closing tags carry no attributes, so a plain replace is exact.
+    out.replace("</section>", "")
 }
 
 /// Reduce both sides to a comparable form.
@@ -719,6 +773,52 @@ mod tests {
     #[test]
     fn surrounding_whitespace_is_ignored() {
         assert_eq!(compare_html("\n  <p>x</p>  \n", "<p>x</p>"), Outcome::Match);
+    }
+
+    /// Section wrappers must not be allowed to hide a difference in substance.
+    ///
+    /// Parsoid emits `<section …>` as the first thing in the document, so with
+    /// the wrappers left in place every page reported its first difference at
+    /// byte 1 — attributing nothing and making the scoreboard unreadable.
+    #[test]
+    fn section_wrappers_do_not_mask_the_real_difference() {
+        let parsoid = "<section data-mw-section-id=\"0\" id=\"mwAQ\"><table><tr><td>a</td></tr></table></section>";
+        let rustoid = "<table><tr><td>b</td></tr></table>";
+        match compare_html(parsoid, rustoid) {
+            Outcome::Differ { detail } => {
+                assert_eq!(
+                    Outcome::Differ {
+                        detail: detail.clone()
+                    }
+                    .category(),
+                    "table",
+                    "the table difference should be attributed, not the wrapper: {detail}"
+                );
+            }
+            other => panic!("expected a difference, got {other:?}"),
+        }
+    }
+
+    /// A page differing *only* by section wrappers is still a failure, but one
+    /// with its own bucket — it is one identifiable piece of work, not a
+    /// mysterious diff.
+    #[test]
+    fn a_section_wrapper_only_difference_has_its_own_category() {
+        let parsoid = "<section data-mw-section-id=\"0\" id=\"mwAQ\"><p>x</p></section>";
+        assert_eq!(compare_html(parsoid, "<p>x</p>").category(), "section-wrap");
+    }
+
+    /// Stripping must not disturb an already-identical pair, nor eat content.
+    #[test]
+    fn stripping_sections_keeps_the_contents() {
+        assert_eq!(
+            compare_html("<p>a</p><p>b</p>", "<p>a</p><p>b</p>"),
+            Outcome::Match
+        );
+        // A literal `<section` that never closes is left as text, not swallowed.
+        let weird =
+            "<section data-mw-section-id=\"0\"><p>x</p></section><p>literal <section here</p>";
+        assert_eq!(compare_html(weird, weird), Outcome::Match);
     }
 
     /// The snippet must be wide enough to reach the construct that caused the
