@@ -449,8 +449,13 @@ pub fn build_expanded_attrs(
 
         let mut expanded_k = expanded_a.key.clone();
         let expanded_v = expanded_a.value.clone();
-        let orig_k = old_a.key.clone();
-        let orig_v = old_a.value.clone();
+        // `origK`/`origV` are PHP's `$expandedA->k`/`->v` — the values *after*
+        // the AttributeTransformManager expansion, not the raw tokenizer
+        // attributes. They feed the `data-mw` HTML for a templated attribute, so
+        // taking the unexpanded `old_a` here would record the raw `{{…}}` (or a
+        // nested `<template …>`) instead of what actually rendered.
+        let orig_k = expanded_a.key.clone();
+        let orig_v = expanded_a.value.clone();
 
         let mut reparsed_kv = false;
         let mut key_uses_mixed_attr_content_tpl = false;
