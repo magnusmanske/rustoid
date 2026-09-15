@@ -777,6 +777,97 @@ fn build_compound_data_mw(
     Some(data_mw)
 }
 
+/// Nested transclusion ranges found inside a templated node's subtree, in
+/// document order, as `(data-mw parts, dsr)` pairs.
+///
+/// A templated table's range typically *encloses* further transclusion ranges
+/// (one per template-generated cell). PHP's `DOMRangeBuilder` collects them via
+/// `recordTemplateInfo` into `compoundTpls` so the outermost node reports a
+/// compound transclusion; rustoid has no range-merging pass, so the nested
+/// ranges are recovered here from their `about`-stamped encapsulation targets.
+type NestedTplParts = Vec<(
+    Vec<serde_json::Value>,
+    Option<crate::wikitext::tokens_v2::DomSourceRange>,
+)>;
+
+fn collect_nested_transclusion_parts(
+    node: &Node,
+    start_meta: &Node,
+    _source: Option<&str>,
+) -> NestedTplParts {
+    let outer_about = start_meta.get_attr("about").map(str::to_string);
+    let mut found: NestedTplParts = Vec::new();
+
+    fn walk(node: &Node, outer_about: Option<&str>, found: &mut NestedTplParts) {
+        for child in &node.children {
+            let about = child.get_attr("about").map(str::to_string);
+            let is_nested_tpl = !matches!(child.kind, NodeKind::Text(_))
+                && child
+                    .get_attr("typeof")
+                    .is_some_and(|t| t.split_whitespace().any(|x| x == "mw:Transclusion"))
+                && about.as_deref().is_some()
+                && about.as_deref() != outer_about;
+
+            if is_nested_tpl {
+                let parts = child
+                    .data_mw
+                    .as_deref()
+                    .and_then(|dm| serde_json::from_str::<serde_json::Value>(dm).ok())
+                    .and_then(|v| v.get("parts").and_then(|p| p.as_array()).cloned())
+                    .unwrap_or_default();
+                if !parts.is_empty() {
+                    let dsr = child.dp.as_ref().and_then(|d| d.dsr.clone());
+                    found.push((parts, dsr));
+                }
+            }
+            walk(child, outer_about, found);
+        }
+    }
+
+    walk(node, outer_about.as_deref(), &mut found);
+    found
+}
+
+/// Build the compound `data-mw` for a node whose range encloses `nested`
+/// transclusion ranges, mirroring `DOMRangeBuilder::recordTemplateInfo`: each
+/// template's parts are appended, with the intervening source wikitext between
+/// one template's `dsr.end` and the next template's `dsr.start` inserted as a
+/// string part (PHP's `$width = $dsr->start - $prevTplInfo->dsr->end`).
+fn build_compound_data_mw_with_nested(
+    start_meta: &Node,
+    source: Option<&str>,
+    nested: &NestedTplParts,
+) -> Option<String> {
+    let base = build_compound_data_mw(start_meta, source, None)?;
+    let mut root: serde_json::Value = serde_json::from_str(&base).ok()?;
+    let parts = root.get_mut("parts")?.as_array_mut()?;
+
+    // The outermost template's end offset seeds the gap computation.
+    let mut prev_end = start_meta
+        .dp
+        .as_ref()
+        .and_then(|d| d.dsr.as_ref())
+        .and_then(|r| r.end);
+
+    for (nested_parts, dsr) in nested {
+        let Some(dsr) = dsr.as_ref() else { continue };
+        if let (Some(prev), Some(start)) = (prev_end, dsr.start)
+            && prev < start
+            && let Some(src) = source
+            && let Some(gap) = src.get(prev..start)
+            && !gap.is_empty()
+        {
+            parts.push(serde_json::Value::String(gap.to_string()));
+        }
+        for p in nested_parts {
+            parts.push(p.clone());
+        }
+        prev_end = dsr.end;
+    }
+
+    Some(root.to_string())
+}
+
 /// Merge a transclusion's `data-mw` (its `parts` envelope) with a target's own
 /// `data-mw` (e.g. a media container's `attribs`/`errors`). The transclusion
 /// object is the base; the target's non-`parts` keys (and any `attribs`) are
@@ -1448,6 +1539,24 @@ fn wrap_transclusion_children(
                 build_compound_data_mw(&start_meta, source, None),
                 new_content[et].data_mw.clone(),
             );
+            // A templated *table* whose range encloses nested transclusion ranges
+            // gets a compound `data-mw` listing every constituent template plus
+            // the intervening wikitext (mirrors `DOMRangeBuilder::recordTemplateInfo`
+            // collecting into `compoundTpls`). Without this the table reports a
+            // single template, so `fromWellBalancedTemplate` (one part) matches and
+            // `TableFixups` skips the whole table, leaving template-generated cell
+            // attributes unparsed.
+            if matches!(new_content[et].kind, NodeKind::Element(ElementKind::Table)) {
+                let nested =
+                    collect_nested_transclusion_parts(&new_content[et], &start_meta, source);
+                if !nested.is_empty()
+                    && let Some(merged) =
+                        build_compound_data_mw_with_nested(&start_meta, source, &nested)
+                {
+                    new_content[et].data_mw =
+                        merge_encap_data_mw(Some(merged), new_content[et].data_mw.clone());
+                }
+            }
             apply_encap_dp_fields(&mut new_content[et], &start_meta);
         } else {
             // Empty transclusion: the start and end markers are adjacent (no
