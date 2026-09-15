@@ -64,6 +64,22 @@ pub struct TokenizerOptions {
     /// `linkdesc=true` and `addLinkAttributesAndGetContent` renders an
     /// autonumbered extlink `<a>` back to literal `[href]`.
     pub linkdesc: bool,
+    /// Whether tokenization happens inside a table data block (PHP's
+    /// `tableDataBlock` PEG *parameter*, threaded through `fullTable` /
+    /// `embedded_full_table` / `nested_block_in_table`).
+    ///
+    /// Only `table_start_tag`/`table_end_tag` are valid outside a table, so a
+    /// bare `|def` line is ordinary text (`Grammar.pegphp:379` gates the bare
+    /// SOL alternative on `!<tableDataBlock>`). The flag therefore has to be
+    /// *propagated* rather than recomputed: a `{|` may live in a different
+    /// expansion from the cells it governs, as in `{{start}}\n|a\n{{end}}` with
+    /// `Template:start` = `{|`, which does produce a `<td>`.
+    pub table_data_block: bool,
+    /// Whether `table_data_block` should actually gate table-content
+    /// tokenization. Set by callers that are re-tokenizing bailed source, where
+    /// the surrounding table context is known; left false for the page-level
+    /// initial pass (see `PegTokenizer::enforce_table_data_block`).
+    pub enforce_table_data_block: bool,
 }
 
 impl Default for TokenizerOptions {
@@ -81,6 +97,8 @@ impl Default for TokenizerOptions {
             protocols: default_protocols(),
             lang_conv_enabled: false,
             linkdesc: false,
+            table_data_block: false,
+            enforce_table_data_block: false,
         }
     }
 }
@@ -151,6 +169,19 @@ pub struct PegTokenizer<'a> {
     /// `|` breaks (so `[ftp://|x||]` cannot close its bracket), while in plain
     /// inline context it does not.
     in_table_cell: bool,
+    /// PHP's `tableDataBlock` PEG parameter: the nesting depth of `{|` tables
+    /// whose content is currently being tokenized, so row/cell/caption tags are
+    /// recognized. A depth (not a bool) because tables nest, and an inner `|}`
+    /// must not stop the outer table's cells being recognized. Propagated through
+    /// nested tokenizations (template bodies, link descriptions) rather than
+    /// recomputed — see `TokenizerOptions::table_data_block`.
+    table_data_depth: usize,
+    /// Whether `table_data_depth` should gate table-content tokenization.
+    ///
+    /// False for the page-level initial pass, which cannot see a `{|` that a
+    /// template will produce; true wherever a caller supplies the context
+    /// explicitly (PHP's `tableDataBlock` parameter proper).
+    enforce_table_data_block: bool,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -177,6 +208,8 @@ impl<'a> PegTokenizer<'a> {
             lang_conv_enabled: options.lang_conv_enabled,
             linkdesc: options.linkdesc,
             in_table_cell: false,
+            table_data_depth: usize::from(options.table_data_block),
+            enforce_table_data_block: options.enforce_table_data_block,
         }
     }
 
@@ -1238,7 +1271,19 @@ impl<'a> PegTokenizer<'a> {
         if self.try_table_end_tag() {
             return true;
         }
-        if self.try_table_content_line() {
+        // Row/heading/caption/data tags are only recognized inside a table data
+        // block (PHP gates them behind `embedded_full_table`, which begins with a
+        // `table_start_tag`).
+        //
+        // The gate only applies when the flag was *supplied* by a caller
+        // (`enforce_table_data_block`): the page-level initial tokenization
+        // cannot see a `{|` that a template will produce (`{{tbl-start}}`
+        // expands to `{|`), so gating it there would lose the cells entirely.
+        // PHP does not have that problem because it tokenizes *preprocessed*
+        // source, where the template has already been substituted.
+        if (!self.enforce_table_data_block || self.table_data_depth > 0)
+            && self.try_table_content_line()
+        {
             return true;
         }
 
@@ -1308,6 +1353,9 @@ impl<'a> PegTokenizer<'a> {
         dp.start_tag_src = Some(start_tag_src);
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("table", attrs, dp)));
+        // From here on the table's content is a data block, so row/cell/caption
+        // tags on the following lines are recognized (PHP's `tableDataBlock`).
+        self.table_data_depth += 1;
 
         // A stray table end tag on the same line as the start (`{||}`, or the
         // common `{| … |}` where the `|}` immediately follows) closes the table
@@ -1325,6 +1373,7 @@ impl<'a> PegTokenizer<'a> {
             self.advance(end_width);
             let end_dp = self.make_dp(end_start, end_start + end_width);
             self.emit_token(ParsoidToken::EndTag(EndTagTk::new("table", vec![], end_dp)));
+            self.table_data_depth = self.table_data_depth.saturating_sub(1);
         }
 
         self.at_sol = false;
@@ -1369,6 +1418,7 @@ impl<'a> PegTokenizer<'a> {
             dp.end_tag_src = Some(src);
         }
         self.emit_token(ParsoidToken::EndTag(EndTagTk::new("table", vec![], dp)));
+        self.table_data_depth = self.table_data_depth.saturating_sub(1);
 
         // The `|}` consumes no newline, so the position after it is *not* at
         // the start of a line (PHP's `table_line` is itself reached only via
@@ -6360,6 +6410,56 @@ mod tests {
             .find(|kv| kv.key.as_str() == Some("title"))
             .expect("title attr");
         assert_eq!(title.value.as_str(), Some("ab"));
+    }
+
+    #[test]
+    fn test_table_content_line_needs_table_data_block() {
+        // A bare start-of-line `|` is ordinary text outside a table, but a cell
+        // inside one. Both verified against PHP: `|def` alone and `abc\n|def`
+        // render as a single paragraph, while `{|\n|def\n|}` yields a `<td>`.
+        let names = |input: &str, table_data_block: bool, enforce: bool| {
+            let options = TokenizerOptions {
+                table_data_block,
+                enforce_table_data_block: enforce,
+                ..Default::default()
+            };
+            let mut tk = PegTokenizer::new(input, &options);
+            tk.tokenize()
+                .unwrap()
+                .into_iter()
+                .map(|e| match e {
+                    Either::Left(_) => "text".to_string(),
+                    Either::Right(ParsoidToken::Tag(t)) => format!("Tag({})", t.name),
+                    Either::Right(ParsoidToken::EndTag(t)) => format!("EndTag({})", t.name),
+                    Either::Right(ParsoidToken::SelfclosingTag(t)) => {
+                        format!("Self({})", t.name)
+                    }
+                    Either::Right(_) => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // No table context: the `|` stays text even with enforcement on.
+        let bare = names("abc\n|def\n", false, true);
+        assert!(
+            !bare.iter().any(|n| n == "Tag(td)"),
+            "bare |def must not become a cell: {bare:?}"
+        );
+
+        // Explicitly told a table is open: the `|` is a cell.
+        let in_tbl = names("abc\n|def\n", true, true);
+        assert!(
+            in_tbl.iter().any(|n| n == "Tag(td)"),
+            "|def inside a table must be a cell: {in_tbl:?}"
+        );
+
+        // Without enforcement (the page-level initial pass) the gate is off, so
+        // a template-generated `{|` can still yield cells.
+        let ungated = names("abc\n|def\n", false, false);
+        assert!(
+            ungated.iter().any(|n| n == "Tag(td)"),
+            "the unenforced pass must keep recognising cells: {ungated:?}"
+        );
     }
 
     #[test]

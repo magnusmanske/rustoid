@@ -1828,7 +1828,25 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         src_text: &str,
     ) -> Vec<Item> {
         let mut out = Vec::new();
+        // PHP's `tableDataBlock` context for the token being expanded: true while
+        // the walk sits inside an unclosed `table` tag. A template body expanded
+        // here inherits it, which is what lets the body's `|` split cells when the
+        // governing `{|` came from an *earlier* expansion (`{{start}}\n|a\n{{end}}`
+        // with `Template:start` = `{|`).
+        //
+        // Tracked over *both* the input stream and the tokens emitted so far: a
+        // `{|` produced by expanding a previous template (`{{tbl-start}}`) opens
+        // the table for the tokens after it, exactly as a literal `{|` would.
+        let mut table_depth = 0usize;
+        let track_table = |item: &Item, depth: &mut usize| match item {
+            Item::Tok(ParsoidToken::Tag(tk)) if tk.name == "table" => *depth += 1,
+            Item::Tok(ParsoidToken::EndTag(tk)) if tk.name == "table" => {
+                *depth = depth.saturating_sub(1)
+            }
+            _ => {}
+        };
         for item in tokens {
+            track_table(&item, &mut table_depth);
             let Item::Tok(tok) = &item else {
                 out.push(item);
                 continue;
@@ -1923,8 +1941,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 in_tpl,
                                 target_has_comment,
                                 src_text,
+                                table_depth > 0,
                             )
                             .await;
+                        for e in &expanded {
+                            track_table(e, &mut table_depth);
+                        }
                         out.extend(expanded);
                     }
                     Some(ResolvedTarget::Variable {
@@ -1956,7 +1978,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         // `{{ {{T}} }}` → `Main Page|Something else`, whose `|`
                         // makes it an illegal title). Bail back to literal
                         // `{{` … `}}` around the re-tokenized source.
-                        let bailed = TemplateHandler::convert_to_string(tok, in_tpl);
+                        let bailed =
+                            TemplateHandler::convert_to_string(tok, in_tpl, table_depth > 0);
                         // PHP's `convertToString` runs the bailed chunk through
                         // `wikitext-to-expanded-tokens`, so a nested template in
                         // the source (the `{{T290526}}` above) still expands.
@@ -1969,6 +1992,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             src_text,
                         ))
                         .await;
+                        for e in &expanded {
+                            track_table(e, &mut table_depth);
+                        }
                         out.extend(expanded);
                     }
                     _ => {
@@ -1984,6 +2010,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             about_counter,
                             vec![expanded_item],
                         );
+                        for e in &expanded {
+                            track_table(e, &mut table_depth);
+                        }
                         out.extend(expanded);
                     }
                 }
@@ -1994,10 +2023,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let about_id = self.new_about_id(about_counter);
                 let expanded =
                     TemplateHandler.handle_template_arg_token(frame, tok, about_id, !in_template);
+                for e in &expanded {
+                    track_table(e, &mut table_depth);
+                }
                 out.extend(expanded);
                 continue;
             }
 
+            {
+                let mut d = table_depth;
+                track_table(&item, &mut d);
+                table_depth = d;
+            }
             out.push(item);
         }
         out
@@ -2176,6 +2213,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         in_template: bool,
         target_has_comment: bool,
         page_source: &str,
+        // Whether the *call site* was inside an open table (PHP's
+        // `tableDataBlock`). Carried into the body tokenization so a body's `|`
+        // still splits cells when the governing `{|` came from elsewhere.
+        in_table: bool,
     ) -> Vec<Item> {
         const MAX_TEMPLATE_DEPTH: usize = 40;
 
@@ -2260,10 +2301,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `processTemplateSource`, which tokenizes with `inTemplate=true` and defers
         // argument substitution to `Frame::expand`). Extension tags must be
         // registered so their bodies are captured as `extension` tokens.
-        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items_in_table(
             &template_src,
             /* in_template */ true,
             self.config.extension_tags(),
+            in_table,
         );
 
         // Argument substitution replaces each `{{{…}}}` with its value's

@@ -741,7 +741,7 @@ impl TemplateHandler {
                 );
                 encap.encap_tokens(vec![template_to_wikilink(&name)], &info)
             }
-            None => Self::convert_to_string(token, false),
+            None => Self::convert_to_string(token, false, false),
         }
     }
 
@@ -763,6 +763,7 @@ impl TemplateHandler {
     pub(crate) fn convert_to_string(
         token: &crate::wikitext::tokens_v2::ParsoidToken,
         in_template: bool,
+        in_table: bool,
     ) -> Vec<Item> {
         let dp = token.data_parsoid();
         let Some(src) = dp.and_then(|dp| dp.src.as_deref()) else {
@@ -776,7 +777,17 @@ impl TemplateHandler {
             .unwrap_or(src);
 
         let mut out = vec![Item::Str("{{".to_string())];
-        out.extend(tokenize_wikitext_to_items(inner, in_template, &[]));
+        // Re-tokenizing bailed source: the caller knows whether a table was open,
+        // so the flag is enforced here (PHP's `convertToString` re-tokenizes under
+        // the ambient `tableDataBlock` context).
+        out.extend(tokenize_wikitext_to_items_with_sol_and_table(
+            inner,
+            in_template,
+            &[],
+            false,
+            in_table,
+            true,
+        ));
         out.push(Item::Str("}}".to_string()));
         out
     }
@@ -1041,6 +1052,26 @@ pub fn tokenize_wikitext_to_items(
     tokenize_wikitext_to_items_with_sol(wikitext, in_template, ext_tags, true)
 }
 
+/// As [`tokenize_wikitext_to_items`], carrying the caller's table-data-block
+/// context (PHP's `tableDataBlock` parameter). A template body tokenized while a
+/// table is open must still recognize `|` as a cell separator, even though the
+/// `{|` is in a different expansion — see `TokenizerOptions::table_data_block`.
+pub fn tokenize_wikitext_to_items_in_table(
+    wikitext: &str,
+    in_template: bool,
+    ext_tags: &[String],
+    table_data_block: bool,
+) -> Vec<Item> {
+    tokenize_wikitext_to_items_with_sol_and_table(
+        wikitext,
+        in_template,
+        ext_tags,
+        true,
+        table_data_block,
+        false,
+    )
+}
+
 /// As [`tokenize_wikitext_to_items`], with an explicit start-of-line flag
 /// (mirrors the `sol` option of PHP's `PegTokenizer::tokenizeSync`).
 pub fn tokenize_wikitext_to_items_with_sol(
@@ -1049,10 +1080,35 @@ pub fn tokenize_wikitext_to_items_with_sol(
     ext_tags: &[String],
     sol: bool,
 ) -> Vec<Item> {
+    tokenize_wikitext_to_items_with_sol_and_table(
+        wikitext,
+        in_template,
+        ext_tags,
+        sol,
+        false,
+        false,
+    )
+}
+
+/// [`tokenize_wikitext_to_items_with_sol`] with an explicit table-data-block flag.
+///
+/// `enforce_table_data_block` is true for re-tokenization of bailed source, where
+/// the caller knows the surrounding table context, so the flag can meaningfully
+/// decide whether a leading `|` is a cell (PHP's `convertToString`).
+pub fn tokenize_wikitext_to_items_with_sol_and_table(
+    wikitext: &str,
+    in_template: bool,
+    ext_tags: &[String],
+    sol: bool,
+    table_data_block: bool,
+    enforce_table_data_block: bool,
+) -> Vec<Item> {
     let options = TokenizerOptions {
         in_template,
         ext_tags: ext_tags.to_vec(),
         sol,
+        table_data_block,
+        enforce_table_data_block,
         ..Default::default()
     };
     let mut tokenizer = PegTokenizer::new(wikitext, &options);
@@ -1343,7 +1399,7 @@ mod tests {
             crate::wikitext::tokens_v2::SelfclosingTagTk::new("template", vec![], dp),
         );
 
-        let out = TemplateHandler::convert_to_string(&token, false);
+        let out = TemplateHandler::convert_to_string(&token, false, false);
         let s: String = out
             .iter()
             .map(|it| match it {
