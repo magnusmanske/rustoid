@@ -511,35 +511,63 @@ fn strip_inner_encapsulation(cell: &mut Node, about_ids: &[Option<String>]) {
 }
 
 /// `DOMCompat::setInnerHTML(cell, preg_replace('/^[^|]*\|/','', …))` — drop the
-/// leading text (and any nodes) consumed by the reparsed attribute prefix.
+/// leading content consumed by the reparsed attribute prefix.
+///
+/// PHP runs this on the cell's *serialized* inner HTML, so the match crosses
+/// element boundaries: for `|  align=center {{cells}}` the text `align=center `
+/// is a direct child while the `|` sits inside the transclusion span, and the
+/// whole prefix up to the `|` is consumed as one string. Walking only the
+/// direct children instead deleted the leading text and then stopped at the
+/// span, leaving the attribute text behind as cell content.
 fn drop_consumed_prefix(cell: &mut Node) {
-    let mut consumed_pipe = false;
-    let mut i = 0usize;
-    while i < cell.children.len() && !consumed_pipe {
-        match &cell.children[i].kind {
+    // Drop children up to and including the first `|`, descending into elements:
+    // everything before the `|` in document order is consumed.
+    consume_until_pipe(&mut cell.children);
+}
+
+/// Remove leading content up to and including the first `|` in document order.
+/// Returns `true` once the `|` has been consumed (so the caller stops).
+fn consume_until_pipe(children: &mut Vec<Node>) -> bool {
+    let i = 0usize;
+    while i < children.len() {
+        match &children[i].kind {
             NodeKind::Text(t) => {
+                // Text before the first `|` is consumed. What follows the `|` in
+                // the same text node survives; no later sibling does.
                 if let Some(pipe) = t.find('|') {
                     let rest = t[pipe + 1..].to_string();
-                    consumed_pipe = true;
                     if rest.is_empty() {
-                        cell.children.remove(i);
+                        children.remove(i);
                     } else {
-                        cell.children[i].kind = NodeKind::Text(rest);
-                        i += 1;
+                        children[i].kind = NodeKind::Text(rest);
                     }
-                } else {
-                    cell.children.remove(i);
+                    return true;
                 }
+                children.remove(i);
             }
-            NodeKind::Element(_) if has_type_of(&cell.children[i], "mw:Entity") => {
-                cell.children.remove(i);
+            NodeKind::Element(_) if has_type_of(&children[i], "mw:Entity") => {
+                children.remove(i);
             }
             NodeKind::Comment(_) => {
-                cell.children.remove(i);
+                children.remove(i);
             }
-            _ => break,
+            NodeKind::Element(_) => {
+                // Descend: the `|` may be inside this element, in which case only
+                // its leading part is consumed and the element itself survives.
+                if consume_until_pipe(&mut children[i].children) {
+                    if children[i].children.is_empty()
+                        && !has_type_of(&children[i], "mw:Transclusion")
+                    {
+                        children.remove(i);
+                    }
+                    return true;
+                }
+                children.remove(i);
+            }
+            _ => return true,
         }
     }
+    false
 }
 
 /// `fromWellBalancedTemplate` — data-mw has exactly one `parts` entry.
@@ -1451,6 +1479,30 @@ mod tests {
         // The wrapper span was unwrapped; only the `Foo` content remains.
         let text = text_content(&cell);
         assert_eq!(text, "Foo");
+    }
+
+    #[test]
+    fn test_drop_consumed_prefix_crosses_element_boundary() {
+        // `| align=center {{cells}}` puts the literal text `align=center ` as a
+        // direct child while the `|` that consumes it lives inside the
+        // transclusion span. PHP runs `preg_replace('/^[^|]*\|/', …)` on the
+        // *serialized* inner HTML, so the whole prefix is consumed across the
+        // boundary; walking only direct children would delete the text and stop
+        // at the span, leaving the attribute text as cell content.
+        let mut td = Node::element(ElementKind::TableCell);
+        td.push_child(Node::text("align=center "));
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("typeof", "mw:Transclusion");
+        span.push_child(Node::text("style=\"color:red;\"|Foo"));
+        td.push_child(span);
+
+        drop_consumed_prefix(&mut td);
+
+        // The span survives (the `|` was inside it); its leading attribute text
+        // is gone. The outer text node and the `|` itself are consumed.
+        assert_eq!(td.children.len(), 1, "children: {:?}", td.children.len());
+        assert!(has_type_of(&td.children[0], "mw:Transclusion"));
+        assert_eq!(text_content(&td), "Foo");
     }
 
     #[test]
