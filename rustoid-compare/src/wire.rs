@@ -1,0 +1,306 @@
+//! Revision-pinned client for a wiki's REST/Action API.
+//!
+//! Everything here is deliberately explicit about **revision pinning**. The
+//! comparison is only meaningful if the wikitext and the Parsoid HTML come from
+//! the same revision, so the flow is always:
+//!
+//! 1. resolve the latest `revid` for a title (or take one the caller supplied),
+//! 2. fetch both artifacts *at that revid*.
+//!
+//! Verified endpoints (checked live against `en.wikipedia.org`):
+//!
+//! | Purpose | Request |
+//! |---|---|
+//! | latest revid | `api.php?action=query&prop=revisions&titles=…&rvprop=ids` |
+//! | wikitext at a revision | `rest.php/v1/revision/{revid}` → `.source` |
+//! | Parsoid HTML, latest | `rest.php/v1/page/{title}/html` |
+//! | Parsoid HTML, pinned | `api/rest_v1/page/html/{title}/{revision}` |
+//! | site config | `api.php?action=query&meta=siteinfo&siprop=…` |
+//!
+//! Note the HTML endpoints are *not* symmetric: `rest.php/v1/page/{title}/{rev}`
+//! 404s, whereas `rest.php/v1/revision/{rev}` is fine. The pinned HTML endpoint
+//! is the older `api/rest_v1` form.
+//!
+//! Wikimedia rate-limits aggressively — a handful of rapid requests already
+//! returns `You are making too many requests to the API` — so the client sends a
+//! descriptive `User-Agent` and the harness is expected to cache every response.
+
+use serde::Deserialize;
+
+use crate::error::{CompareError, Result};
+
+/// Default `User-Agent`. Wikimedia rejects requests without a descriptive one.
+pub const DEFAULT_USER_AGENT: &str =
+    "rustoid-compare/0.1 (https://github.com/magnusmanske/rustoid; parser parity testing)";
+
+/// A wiki host, e.g. `en.wikipedia.org`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wiki {
+    pub host: String,
+}
+
+impl Wiki {
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn api_url(&self) -> String {
+        format!("https://{}/w/api.php", self.host)
+    }
+
+    pub fn rest_url(&self) -> String {
+        format!("https://{}/w/rest.php/v1", self.host)
+    }
+
+    /// The older REST base, which is where the revision-pinned HTML endpoint
+    /// lives.
+    pub fn rest_v1_url(&self) -> String {
+        format!("https://{}/api/rest_v1", self.host)
+    }
+}
+
+/// Client for one wiki.
+///
+/// Cheap to clone: `reqwest::Client` is an `Arc` internally, so clones share the
+/// connection pool (which matters for the rate limiter).
+#[derive(Clone)]
+pub struct WikiClient {
+    wiki: Wiki,
+    http: reqwest::Client,
+}
+
+impl WikiClient {
+    pub fn new(wiki: Wiki) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .user_agent(DEFAULT_USER_AGENT)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| CompareError::Http {
+                url: wiki.api_url(),
+                message: format!("client build: {e}"),
+            })?;
+        Ok(Self { wiki, http })
+    }
+
+    pub fn wiki(&self) -> &Wiki {
+        &self.wiki
+    }
+
+    async fn get_text(&self, url: &str) -> Result<String> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| CompareError::Http {
+                url: url.to_string(),
+                message: e.to_string(),
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| CompareError::Http {
+            url: url.to_string(),
+            message: e.to_string(),
+        })?;
+        if !status.is_success() {
+            return Err(CompareError::Http {
+                url: url.to_string(),
+                message: format!("HTTP {status}: {}", truncate(&body, 200)),
+            });
+        }
+        Ok(body)
+    }
+
+    /// Resolve the latest revision id for `title`.
+    ///
+    /// Returns `None` when the page does not exist (the API reports a negative
+    /// pageid), which the caller should distinguish from a transport failure.
+    pub async fn latest_revid(&self, title: &str) -> Result<Option<u64>> {
+        let url = format!(
+            "{}?action=query&prop=revisions&rvprop=ids&format=json&formatversion=2&titles={}",
+            self.wiki.api_url(),
+            urlencode(title)
+        );
+        let body = self.get_text(&url).await?;
+        let parsed: QueryRevisions =
+            serde_json::from_str(&body).map_err(|e| CompareError::Response {
+                url: url.clone(),
+                message: format!("query parse: {e}"),
+            })?;
+        let Some(page) = parsed.query.pages.into_iter().next() else {
+            return Ok(None);
+        };
+        if page.missing {
+            return Ok(None);
+        }
+        Ok(page.revisions.and_then(|r| r.first().map(|x| x.revid)))
+    }
+
+    /// Fetch the wikitext of `revid`.
+    pub async fn wikitext_at(&self, revid: u64) -> Result<String> {
+        let url = format!("{}/revision/{}", self.wiki.rest_url(), revid);
+        let body = self.get_text(&url).await?;
+        let parsed: RevisionResponse =
+            serde_json::from_str(&body).map_err(|e| CompareError::Response {
+                url: url.clone(),
+                message: format!("revision parse: {e}"),
+            })?;
+        let Some(source) = parsed.source else {
+            return Err(CompareError::Response {
+                url,
+                message: "revision response had no `source`".to_string(),
+            });
+        };
+        Ok(source)
+    }
+
+    /// Fetch the wiki's own Parsoid HTML for `title` at `revid`.
+    ///
+    /// Uses the pinned endpoint so the HTML cannot drift away from the wikitext.
+    pub async fn parsoid_html_at(&self, title: &str, revid: u64) -> Result<String> {
+        let url = format!(
+            "{}/page/html/{}/{}",
+            self.wiki.rest_v1_url(),
+            urlencode(title),
+            revid
+        );
+        self.get_text(&url).await
+    }
+
+    /// Fetch raw `siteinfo` JSON (namespaces, magic words, function hooks,
+    /// extension tags, interwiki map, general).
+    pub async fn siteinfo(&self) -> Result<String> {
+        let url = format!(
+            "{}?action=query&meta=siteinfo&siprop=general%7Cnamespaces%7Cnamespacealiases%7Cmagicwords%7Cfunctionhooks%7Cextensiontags%7Cinterwikimap&format=json&formatversion=2",
+            self.wiki.api_url()
+        );
+        self.get_text(&url).await
+    }
+}
+
+/// Percent-encode a title for use in a query string or path segment.
+///
+/// `url::form_urlencoded` is not used because it encodes spaces as `+`, which is
+/// wrong in a path segment; `%20` is correct in both positions.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        // Char-boundary safe: find the largest boundary <= n.
+        let mut end = n;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
+}
+
+// ---- wire types ----
+
+#[derive(Debug, Deserialize)]
+struct QueryRevisions {
+    query: QueryPages,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryPages {
+    #[serde(default)]
+    pages: Vec<PageEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageEntry {
+    #[serde(default)]
+    missing: bool,
+    #[serde(default)]
+    revisions: Option<Vec<RevisionEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevisionEntry {
+    revid: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevisionResponse {
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wiki_urls_are_built_from_the_host() {
+        let w = Wiki::new("en.wikipedia.org/");
+        assert_eq!(w.host, "en.wikipedia.org");
+        assert_eq!(w.api_url(), "https://en.wikipedia.org/w/api.php");
+        assert_eq!(w.rest_url(), "https://en.wikipedia.org/w/rest.php/v1");
+        assert_eq!(w.rest_v1_url(), "https://en.wikipedia.org/api/rest_v1");
+    }
+
+    #[test]
+    fn title_encoding_uses_percent_twenty_for_spaces() {
+        assert_eq!(urlencode("Main Page"), "Main%20Page");
+        assert_eq!(urlencode("Template:Foo/bar"), "Template%3AFoo%2Fbar");
+        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+        // Unreserved characters pass through.
+        assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn encoding_is_byte_wise_and_round_trips_utf8() {
+        // Non-ASCII must be percent-encoded per UTF-8 byte.
+        assert_eq!(urlencode("é"), "%C3%A9");
+        assert_eq!(urlencode("日本"), "%E6%97%A5%E6%9C%AC");
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        assert_eq!(truncate("hello", 10), "hello");
+        // Must not panic when the cut lands inside a multi-byte char.
+        let s = "日本語テキスト";
+        let t = truncate(s, 4);
+        assert!(t.ends_with('…'));
+        assert!(s.starts_with(t.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn latest_revid_parses_the_query_shape() {
+        // Shape captured from the live API (formatversion=2).
+        let body = r#"{"batchcomplete":true,"query":{"pages":[{"pageid":1,"ns":0,"title":"UFC BJJ","revisions":[{"revid":1300000000,"parentid":1299999999}]}]}}"#;
+        let parsed: QueryRevisions = serde_json::from_str(body).unwrap();
+        let page = &parsed.query.pages[0];
+        assert!(!page.missing);
+        assert_eq!(page.revisions.as_ref().unwrap()[0].revid, 1300000000);
+    }
+
+    #[test]
+    fn missing_page_is_recognised() {
+        let body = r#"{"query":{"pages":[{"ns":0,"title":"Nope","missing":true}]}}"#;
+        let parsed: QueryRevisions = serde_json::from_str(body).unwrap();
+        assert!(parsed.query.pages[0].missing);
+    }
+
+    #[test]
+    fn revision_response_parses_source() {
+        let body = r#"{"id":1300000000,"source":"{{Short description|x}}"}"#;
+        let parsed: RevisionResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.source.unwrap(), "{{Short description|x}}");
+    }
+}

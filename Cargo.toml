@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "rustoid-core",
     "rustoid-cli",
+    "rustoid-compare",
 ]
 
 [workspace.package]

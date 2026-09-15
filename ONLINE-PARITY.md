@@ -70,14 +70,14 @@ score and tracked separately.
 | Piece | State |
 |---|---|
 | Parser core (wikitext → HTML) | **Working** — 871/891 fixtures, 679 lib tests |
+| **Comparison harness** (`rustoid-compare`) | **Working** — revid-pinned fetch, persistent per-wiki cache, offline replay, first-difference reporting. 24 tests |
 | CLI (`rustoid-cli`) | **Stubs only.** `render`/`roundtrip`/`test`/`serve` all print "not yet implemented" |
 | Lua engine (`lua/engine.rs`, 666 lines) | Present: sandbox, 8 `mw` sub-tables, 17 functions, 16 unit tests. **Not wired into the parser** — no `#invoke` dispatch anywhere |
 | Extension API (`traits.rs::ExtensionHandler`) | Trait exists; **zero implementations**. Returns `String`, which is too coarse for `mw:Extension/<name>` + `data-mw`/`data-parsoid` |
 | Extension tags | Handled *generically*; `nowiki`/`pre`/gallery/i18n special-cased. No Cite, no Scribunto |
 | Site config | **Hardcoded** `MockSiteConfig` (enwiki-shaped). No way to load a wiki's real config |
-| API data source (`mw_api.rs`) | Exists with in-memory TTL cache: page/template/module/file/redirect. Not enabled by the CLI (feature off) |
-| Persistent cache | **None** — in-memory only |
-| Comparison harness | **Does not exist** |
+| API data source (`mw_api.rs`) | Exists with in-memory TTL cache. Superseded for this purpose by the harness's cache-backed `DataSource` |
+| Persistent cache | **Done** — per-wiki, flushable, offline-capable |
 | Corpus / golden files | **Does not exist** |
 
 ## Verified API surface (for the harness)
@@ -108,20 +108,47 @@ Lua work is unverifiable.
 
 ### Phase 0 — The measurement instrument
 
-`rustoid compare` in the CLI, plus a batch mode.
+**Status: landed** as a separate `rustoid-compare` crate (chosen over a
+`rustoid-cli` subcommand so it can be a dev-dependency, stays out of the shipped
+`rustoid` binary, and keeps the network dependencies away from the parser).
 
-- `--wiki <host>` / `--page <title>` / `--revision <id>` (default: latest),
-  `--corpus <file>` for batches, `--cache <dir>`, `--offline`.
-- Fetch revid → wikitext → Parsoid HTML, all pinned; record the timestamp and
-  site stats from the same moment for replay.
-- **Persistent disk cache** keyed by `(wiki, title, revid)`, with a manifest so
-  runs are reproducible offline and re-runs never re-hit the wiki.
-- Normalise both sides the way Parsoid's own `Test::normalizeHTML` does (DOM
-  normalisation; optionally strip `data-parsoid`/`data-mw`), then diff, and
-  report the *first* difference plus a categorised reason.
-- Enable the `mwapi` feature for the CLI (currently off).
-- **Exit criterion:** 10 hand-picked pages produce stable, reproducible results
-  from cache alone, with `--offline`.
+- [x] Separate `rustoid-compare` crate + `rustoid-compare` binary.
+- [x] Revision-pinned client ([`wire`](../rustoid-compare/src/wire.rs)): resolves
+      the latest revid, then fetches the wikitext and the wiki's Parsoid HTML *at
+      that revid*, so an intervening edit cannot invalidate a comparison.
+- [x] **Persistent, flushable, per-wiki wikitext cache**
+      ([`cache`](../rustoid-compare/src/cache.rs)): one directory per wiki host
+      (`<root>/<host>/index.json` + `pages/<key>.txt`). Bodies are separate files
+      so a large cache stays inspectable; the manifest is written write-then-rename
+      so a crash cannot truncate it. Keys are sanitised so a wiki-supplied title
+      cannot escape the directory. `--flush` drops one wiki, `--flush-all`
+      everything.
+- [x] Cache-backed `DataSource`, so template and module fetches *during
+      expansion* are persisted per title too — verified: one page produced 85
+      cached entries.
+- [x] `--offline`: a miss is reported as skipped rather than fetched, so a run is
+      reproducible and rate-limit-free. Verified: an offline replay of the same
+      page returns the identical revid and the identical diff.
+- [x] Outcome categorisation (`match` / `differ:<kind>` / `skipped`) for the
+      scoreboard histogram.
+
+Verified end-to-end against the live wiki:
+
+```
+$ rustoid-compare --wiki en.wikipedia.org --page "UFC BJJ"
+UFC BJJ @ r1371233379 — DIFFER
+first difference at byte 1:
+  parsoid: "<section data-mw-section-id=\"0\" id=\"mwAQ\"><div class=\"shortde"
+  rustoid: "<p about=\"#mwt30\" typeof=\"mw:Transclusion\" data-parsoid='{\"pi"
+  parsoid 239179 bytes, rustoid 1112120 bytes
+```
+
+That size gap is the expected shape of what remains: missing Lua modules and
+on-wiki extensions. The instrument itself is what Phase 0 needed to produce.
+
+Still to come in this phase: corpus/batch mode (a list of titles), golden files,
+and recording the run's wall-clock time and site stats for replay (see
+"What exact equality cannot mean").
 
 ### Phase 1 — Site config from the wiki
 
