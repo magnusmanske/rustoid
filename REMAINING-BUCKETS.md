@@ -1,12 +1,11 @@
 # Remaining fixture buckets (for future sessions)
 
-Current baseline: **869/891 fixtures pass** (98%). Lib tests: 677 pass. Clippy: clean.
+Current baseline: **870/891 fixtures pass** (98%). Lib tests: 678 pass. Clippy: clean.
 
-The four remaining failures are the standing tail: `2. Using {{!}} in wikilinks`
+The three remaining failures are the standing tail: `2. Using {{!}} in wikilinks`
 (standalone-unreachable, see below), `Templated table cell with untemplated
-attributes: Integrated mode only` (`+integrated`-only), `Template interaction`,
-and `Don't apply complex line-splitting heuristics in AttributeExpander for
-non-<table> tokens` (the raw-token bail documented in its own section).
+attributes: Integrated mode only` (`+integrated`-only), and
+`Template interaction`.
 
 Note: the harness compares against `!! html/parsoid+standalone`, falling back to
 `!! html/parsoid+integrated` when there is no standalone section (mirroring PHP
@@ -234,72 +233,49 @@ against PHP's actual output.
 (`bin/parserTests.php --wt2html --filter='2. Using'` → EXPECTED FAIL). It cannot
 flip in native mode.
 
-## Next: the PACKRAT `tableDataBlock` argument
+## Landed: propagating `tableDataBlock` (869 → 870)
 
-`Don't apply complex line-splitting heuristics in AttributeExpander for
-non-<table> tokens`. An earlier note here blamed the no-`src` bail of
-`convert_to_string`; that is where the symptom surfaces, not the cause. What is
-established now, by running PHP:
+Closed. PHP gates the row/heading/caption/data tags behind `embedded_full_table`,
+which begins with a `table_start_tag`, so a bare start-of-line `|` is ordinary
+text. Verified against PHP: `|def` alone and `abc\n|def` both render as a single
+paragraph, while `{|\n|def\n|}` yields a `<td>`.
 
-**Rustoid's tokenizer reads a start-of-line `|` as a table cell; PHP does not,
-unless a table is genuinely open.**
+rustoid recognized cells unconditionally, so re-tokenizing a bailed template
+turned `1x<invalid>\n|{{2x<invalid>y}}|\n` into a stray `td`, which later rendered
+as `<template 2x<invalid>y="">`.
 
-```
-abc                     ->  <p>abc\n|def</p>          (plain text; no cell)
-|def
-```
-```
-{|                      ->  <table><tbody><tr><td>def</td></tr></tbody></table>
-|def
-|}
-```
-Both verified with `php bin/parserTests.php --mock <file> --dump dom:pre-pwrap`.
+Two details decided it, after the naive variants above had failed:
 
-That matters for this fixture because the outer `{{1x<invalid>...}}` has an
-invalid title, so `resolve_target_string` returns `None` and the parser bails
-through `TemplateHandler::convert_to_string`, which re-tokenizes the inner source
-`1x<invalid>\n|{{2x<invalid>y}}|\n`. rustoid emits a `td` there; PHP emits pure
-text (its own `dom:post-builder` for the fixture contains no tokens at all). The
-stray `td` is what later renders as `<template 2x<invalid>y="">`.
+1. **The flag is propagated, not recomputed.** A `{|` may live in a different
+   expansion from the cells it governs, so `expand_templates` tracks the table
+   depth across *both* the input stream and the tokens it emits. That is what
+   makes `{{start}}\n|a\n{{end}}` keep its `<td>`.
+2. **The gate is enforced only where a caller supplies the context.** The
+   page-level initial pass cannot see a `{{tbl-start}}` that will expand to
+   `{|`, and PHP has no such problem because it tokenizes *preprocessed* source.
+   Enforcing it on that pass costs the cells entirely (measured 869 → 864, then
+   863 → 866 with the propagation in place and the gate unconditional). Hence
+   `TokenizerOptions::enforce_table_data_block`, true only on the
+   `convert_to_string` re-tokenization path.
 
-**A naive "only inside a table" gate does NOT work** — tried and reverted: it
-regressed 869 → 864, breaking `2a. Template-generated table cell attributes`,
-`4. Template-generated table cell attributes…`, `Template generated table cell
-with attributes`, `T343874`, `Spec syntactic differences in parsing of !! compared
-to ||`, and `Newline constraint after multi-node template`.
+A **depth** rather than a bool: tables nest, and an inner `|}` must not stop the
+outer table's cells being recognized. That detail fixed `Nested table`, which the
+bool version broke.
 
-**Nor does gating on an open `table` token in the emitted stream** — also tried and
-reverted, with the *same* regression set. `2a` is the counter-example that kills
-both attempts: its wikitext is `{|\n|{{table_attribs_2}}\n|}` and the template
-expands to text containing further `|` separators. Those cells are tokenized in
-the template's own sub-pipeline, where no `{|` appears in the stream at all, yet
-the `|` must still split cells. So the flag has to be *propagated into* the
-sub-pipeline, not recomputed locally.
+Note the underlying architectural difference remains: rustoid tokenizes the raw
+source and expands later, where PHP tokenizes preprocessed text. The propagation
+here bridges the common cases without restructuring that.
 
-Confirming control: PHP creates a `<td>` from `{{start}}\n|a\n{{end}}` (with
-`Template:start` = `{|`), while `|def` alone and `abc\n|def` are plain text. That
-pair is the test case to satisfy.
+## Superseded: the two failed attempts at this fixture
 
-The real rule is PHP's PACKRAT argument. `Grammar.pegphp:379`:
+Kept only so the approaches are not retried. Both regressed 869 → 864 with the
+same six fixtures, and both are now unnecessary:
 
-```
-/ ( &<tableCaption> / &<fullTable> / !<tableDataBlock> ) @sol !sof !inline_breaks notempty
-```
+- a nesting counter set on `{|` in the tokenizer alone;
+- gating on an open `table` token in the emitted stream.
 
-so an SOL newline counts as a block boundary only when `tableDataBlock` is false,
-and `tableDataBlock` is threaded as a parameter through `fullTable` /
-`embedded_full_table` / `nested_block_in_table` (lines 393-408, 2564, 2632,
-2645, 2719). Porting that usually means adding a `tableDataBlock` flag to
-rustoid's tokenizer that is set for the duration of a `{|`-initiated table parse
-and consulted where the tokenizer decides whether a newline starts a block.
-
-Also worth keeping: `nested_block_in_table` starts with
-`!(sol (space* sol)? space* (pipe / "!"))`, i.e. cell content stops at a
-start-of-line pipe or `!`.
-
-`Templated table cell with untemplated attributes: Integrated mode only` is in
-the **categorically unreachable** `+integrated`-only group documented below, so
-it is not a work item.
+What they got right: the divergence is the table-content gate. What they missed:
+the flag must reach the sub-pipeline, and the initial pass must stay ungated.
 
 ## Superseded notes on the table-cell cluster
 
