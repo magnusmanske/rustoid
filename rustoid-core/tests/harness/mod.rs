@@ -945,9 +945,6 @@ fn run_wt2html_test(test: &ParserTestCase, test_file: &ParserTestFile) -> TestRe
             source.add_redirect(name, &target);
         } else {
             source.add_page(name, text);
-            if !name.contains(':') {
-                source.add_template(&format!("Template:{name}"), text);
-            }
         }
     }
 
@@ -1333,9 +1330,6 @@ fn build_edited_dom(
             source.add_redirect(name, &target);
         } else {
             source.add_page(name, text);
-            if !name.contains(':') {
-                source.add_template(&format!("Template:{name}"), text);
-            }
         }
     }
     let page_title = test
