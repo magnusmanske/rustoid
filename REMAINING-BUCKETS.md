@@ -243,15 +243,16 @@ The remaining table fixtures are the table-encapsulation cluster.
 `T343874` are in the **categorically unreachable** `+integrated`-only group
 documented below, so they are not work items.
 
-## Next: cross-parent transclusion range merging (the big one)
+## Next: cross-parent transclusion range merging
 
 `4. Template-generated table cell attributes and cell content inside a templated
-table` is a live gap, and the cause is **not** `reparseTemplatedAttributes`
-(an earlier note in this file said so; that was wrong, and two sessions were
-spent on the wrong end of the pipeline).
+table` is a live gap. This section records what was learned on the way; the
+*corrected*, current analysis is in the next section — read that first.
 
-What actually happens: the table's `data-mw` carries **1** part (`tbl-start`)
-while the fixture expects **7** (4 templates + 3 string gaps).
+The cause is **not** `reparseTemplatedAttributes` (an earlier note said so; that
+was wrong, and two sessions were spent on the wrong end of the pipeline). What
+did hold up: the table's `data-mw` carried **1** part (`tbl-start`) where the
+fixture expects **7** (4 templates + 3 string gaps), and
 `TableFixups::handleTableCellTemplates` opens with
 
 ```php
@@ -260,41 +261,22 @@ if ( $isTemplatedNode && DOMDataUtils::getDataMw( $tableOrCell )->fromWellBalanc
 }
 ```
 
-and `fromWellBalancedTemplate()` is `count($parts) === 1` (`NodeData/DataMw.php:77`).
-So the single part makes the table look like a well-balanced single-template
-transclusion and **every cell fixup is skipped before it runs**. rustoid's port
-of both the check and the skip is faithful — the bug is that the `data-mw` never
-gets the other 6 parts.
+`fromWellBalancedTemplate()` is `count($parts) === 1` (`NodeData/DataMw.php:77`),
+so a single part makes the table look like a well-balanced single-template
+transclusion and **every cell fixup is skipped before it runs**. rustoid's port of
+both the check and the skip is faithful — the bug was that `data-mw` never got the
+other 6 parts. (That is now addressed; see the next section.)
 
-They are missing because `wrap_transclusion_children` processes each
-transclusion range **independently per parent element**:
-
-```
-#mwt1 parent=html  content=[table]
-#mwt2 parent=th    content=[…]
-#mwt4 parent=td    content=[…]
-```
-
-PHP's `DOMRangeBuilder` instead treats these as *overlapping* ranges and merges
-them (`subsumedRanges` → `findToplevelEnclosingRange` → `recordTemplateInfo`),
-producing one **compound** `data-mw` on the common ancestor (here the table).
-rustoid has no counterpart — `grep -rn 'subsumedRanges|findToplevelEnclosingRange|introducesCycle|recordTemplateInfo'`
-finds nothing, and `build_compound_data_mw` only handles the `unwrappedWT` prefix
-and a trailing-wikitext suffix for a *single* range.
-
-### Why this is not a small fix
-
-A correct port means adding `findWrappableTemplateRanges` →
-`findTopLevelNonOverlappingRanges` → `recordTemplateInfo`/`compoundTpls` →
-`encapsulateTemplates` to `tree_builder_html.rs`. Transclusion encapsulation
-underlies a large fraction of the 891 fixtures, so it should be landed
-incrementally with the full suite run after each step rather than in one shot.
+PHP's `DOMRangeBuilder` produces the compound `data-mw` by merging overlapping
+ranges (`subsumedRanges` → `findToplevelEnclosingRange` → `recordTemplateInfo` →
+`encapsulateTemplates`). rustoid has no counterpart:
+`grep -rn 'subsumedRanges|findToplevelEnclosingRange|introducesCycle|recordTemplateInfo'`
+finds nothing.
 
 A tempting shortcut is to tighten the skip so it fires only when the table
 genuinely holds no templated cells. **Do not do this**: it changes
 `fromWellBalancedTemplate` from a faithful port of `count($parts) === 1` into
-something PHP does not do, and would likely break the fixtures it currently
-protects.
+something PHP does not do.
 
 ### A partial fix that did land from this work
 
@@ -303,9 +285,56 @@ PHP's `preg_replace('/^[^|]*\|/', '', innerHTML)` runs on the **serialized**
 inner HTML and so crosses element boundaries. For `| align=center {{cells}}` the
 text is a direct child while the consuming `|` sits inside the transclusion
 span, so the old code deleted the text and stopped, leaving the attribute text
-as cell content. It now walks the tree recursively. This is correct in its own
-right (with a unit test) but flips no fixture, because the table is skipped
-before the fixup runs.
+as cell content. It now walks the tree recursively. Correct in its own right
+(with a unit test), though it flips no fixture on its own.
+
+## Next: the subsumed-range marker
+
+This note has now been wrong twice, so here is what is actually established by
+running PHP (`php bin/parserTests.php --mock tests/parser/tables.txt --filter
+"inside a templated table" --dump dom:pre-pwrap|dom:post-tplwrap`).
+
+**PHP's `dom:pre-pwrap`** (7 passes *before* tplwrap) has all four marker pairs
+`#mwt1/2/4/6` present and correctly nested *as `<meta>` markers*, and the cells
+are plain text. **PHP's `dom:post-tplwrap`** has the table carrying a compound
+`data-mw` (4 templates + 3 string gaps, `pi:[[],[],[],[]]`, `src` spanning
+`[0,95]`) with the cells still plain and no per-cell `about`.
+
+So the earlier claim that "the ranges to merge don't exist" was **wrong**, and
+the claim that this is a foster-parenting problem was **also wrong** (there is no
+`FosterBox` in the pre-pwrap dump). What is true:
+
+- rustoid *does* create all the ranges, but as **`<span about=… typeof="mw:Transclusion">`**
+  wrappers rather than flat `<meta>` markers — it encapsulates each inner range
+  inline, where PHP keeps flat markers until the range builder merges them.
+- rustoid's table therefore reported a **single-part** `data-mw`, which
+  `fromWellBalancedTemplate` (`count($parts) === 1`) matched, so `TableFixups`
+  skipped the entire table. **This part is now fixed** — see the
+  `build_compound_data_mw_with_nested` commit. The reparse then runs and the cell
+  attributes come out right.
+
+### What is still missing
+
+The single remaining diff is one spurious `typeof="mw:Transclusion"` on the
+cell. PHP's merge **subsumes** the inner range (`findTopLevelEnclosingRange` →
+`recordTemplateInfo` → `stripStartMeta` + remove the end meta), leaving the cell
+plain; rustoid keeps the inner marker because `TableFixups` needs it to find the
+attributish content, and `hoistTransclusionInfo` then faithfully lifts
+`about`/`typeof` onto the cell. Both halves are individually correct — what is
+absent is the **range graph** recording that the inner range was subsumed, so the
+lift can be skipped for a cell whose transclusion was already absorbed by an
+enclosing compound range.
+
+Two dead ends, so they are not retried:
+- **Stripping the inner marker before `TableFixups`** (in the tree builder):
+  regresses the fixture from `char 80` back to `char 46`, because `TableFixups`
+  can no longer recognise the cell as templated and never reparses the
+  attributes.
+- **Tightening the `fromWellBalancedTemplate` skip**: changes a faithful port of
+  `count($parts) === 1` into something PHP does not do.
+
+`mark_fostered_content.rs` is still unwired (see its own header) and the tree
+builder never emits `mw:FosterBox`, but that is *not* this fixture's problem.
 
 ## Landed: the tokenizer's `preproc` stack (857 → 858)
 
