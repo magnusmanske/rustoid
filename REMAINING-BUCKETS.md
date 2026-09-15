@@ -179,35 +179,32 @@ TODO: add per-language direction to `SiteConfig` (PHP's `languages` block has an
 
 ## Next: a nested template in a template target
 
-Five failures now share one root cause, and it is in the **tokenizer**.
-`parse_template_token` takes the target as raw source text:
-
-```rust
-let target = parts.first().map(|(_, s)| strip_html_comments(s).trim()...)
-```
-
-PHP instead tokenizes `template_target` and keeps `{{…}}`/`{{{…}}}` as live
-`template`/`templatearg` tokens, which expand in document order *before* the
-outer target is resolved; `processToString` then flattens the buffer. Because
-rustoid stringifies the target, an inner template is destroyed:
+Four failures share one root cause. It was in the **tokenizer**, and the first
+half is now fixed (see the "tokenizer: tokenize the template target" commit).
+`parse_template_token` used to take the target as raw source text, which
+destroyed any inner template:
 
 ```
 {{ {{T290526}} }}    →  <template T290526=""></template>   (PHP: expands, then {{ … }})
 {{1x<invalid> |{{2x<invalid>y}}| }}  →  <template 2x<invalid>y=""></template>
 ```
 
-Affected: `2. Using {{!}} in wikilinks`, `Using {{!}} in template arguments,
-part 2`, and `Don't apply complex line-splitting heuristics in AttributeExpander
-for non-<table> tokens` (the last one's bucket attribution is otherwise a red
-herring — it is the same target bug, not line splitting). Also implicated in the
-`T179544` `{{anchorencode:}}` family.
+The target is now inline-tokenized like an argument value, so `{{ {{T}} }}`
+yields a template token whose key is `Tokens([template T])` — verified with a
+probe. **That alone flips no fixture**: the expanded target is not yet consumed
+by the downstream resolution, which is the next step.
 
-The fix is to give the target the same inline tokenization the argument values
-already get (`try_wikilink`/template-arg tokens), and to resolve
-`resolve_target_string` from tokens rather than a pre-flattened `String`. Note
-that for `{{ {{T}} }}` the *expected* output keeps literal `{{`/`}}` around the
-expanded `<span>` — the inner expansion is real, but it does not turn the outer
-construct into a transclusion.
+Remaining work: `resolve_target_string`/`handle_template` must run the expanded
+target buffer through the `processToString` equivalent (flattening strings and
+`mw-quote` values, *keeping* `{{`/`}}` as literal text for an inner transclusion)
+and then resolve. Note the expected output for `{{ {{T}} }}` keeps literal
+braces around the expanded `<span>` — the inner expansion is real, but it does
+not make the outer construct a transclusion.
+
+Affected: `2. Using {{!}} in wikilinks`, `Using {{!}} in template arguments,
+part 2`, `T179544: {{anchorencode:}}`, and `Don't apply complex line-splitting
+heuristics in AttributeExpander for non-<table> tokens` (whose bucket
+attribution is a red herring — it is the same target bug, not line splitting).
 
 ## Landed: the tokenizer's `preproc` stack (857 → 858)
 
