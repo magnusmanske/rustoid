@@ -84,10 +84,24 @@ pub struct WikiIndex {
 }
 
 /// A per-wiki persistent cache rooted at `<root>/<host>`.
+///
+/// The manifest is written by **merging** with what is on disk rather than
+/// overwriting it. Two `WikiCache` handles — in the same process or, more
+/// commonly, in two concurrent `rustoid-compare` runs — each hold their own
+/// in-memory copy of the manifest, and whichever writes last would otherwise
+/// drop the other's entries. That is not hypothetical: populating the corpus
+/// while a comparison ran left 5863 body files on disk against 3877 manifest
+/// entries, so ~2000 already-downloaded templates and pages were invisible and
+/// had to be fetched again.
+///
+/// `removed` records keys this handle deleted, because a merge would otherwise
+/// resurrect them.
 pub struct WikiCache {
     root: PathBuf,
     host: String,
     index: WikiIndex,
+    /// Keys deleted through this handle, excluded from the merge.
+    removed: std::collections::HashSet<String>,
 }
 
 impl WikiCache {
@@ -114,6 +128,7 @@ impl WikiCache {
             root,
             host: host.to_string(),
             index,
+            removed: std::collections::HashSet::new(),
         })
     }
 
@@ -192,11 +207,33 @@ impl WikiCache {
         Ok(())
     }
 
-    /// Persist the manifest.
+    /// Persist the manifest, merged with whatever is already on disk.
+    ///
+    /// Merging (rather than overwriting) is what keeps a second concurrent
+    /// writer from silently dropping this handle's entries, and vice versa. An
+    /// entry already on disk wins only if this handle has nothing to say about
+    /// it, so this handle's own fetches always take precedence.
     pub fn write_index(&self) -> Result<()> {
         let dir = self.dir();
         let path = dir.join("index.json");
-        let json = serde_json::to_string_pretty(&self.index)
+
+        let mut entries = self.index.entries.clone();
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(on_disk) = serde_json::from_str::<WikiIndex>(&text)
+        {
+            for (key, meta) in on_disk.entries {
+                if self.removed.contains(&key) {
+                    continue;
+                }
+                entries.entry(key).or_insert(meta);
+            }
+        }
+
+        let merged = WikiIndex {
+            host: self.index.host.clone(),
+            entries,
+        };
+        let json = serde_json::to_string_pretty(&merged)
             .map_err(|e| CompareError::cache(&path, format!("serialise: {e}")))?;
         // Write-then-rename so a crash cannot leave a truncated manifest.
         let tmp = dir.join("index.json.tmp");
@@ -212,6 +249,9 @@ impl WikiCache {
     }
 
     /// Remove one entry (body + metadata).
+    ///
+    /// The key is remembered as removed so that a later [`write_index`](Self::write_index)
+    /// merge does not resurrect it from a manifest another handle wrote.
     pub fn remove(&mut self, kind: EntryKind, title: &str) -> Result<()> {
         let key = Self::key(kind, title);
         let path = self.body_path(&key);
@@ -221,6 +261,7 @@ impl WikiCache {
             Err(e) => return Err(io_err(&path, e)),
         }
         self.index.entries.remove(&key);
+        self.removed.insert(key);
         self.write_index()
     }
 
@@ -234,6 +275,9 @@ impl WikiCache {
             Err(e) => return Err(io_err(&dir, e)),
         }
         self.index.entries.clear();
+        // The whole directory is gone, so there is nothing left to resurrect and
+        // no tombstone worth keeping.
+        self.removed.clear();
         std::fs::create_dir_all(dir.join("pages")).map_err(|e| io_err(&dir, e))?;
         Ok(())
     }
@@ -428,6 +472,68 @@ mod tests {
         cache.remove(EntryKind::Page, "A").unwrap();
         assert!(cache.get(EntryKind::Page, "A").unwrap().is_none());
         assert_eq!(cache.get(EntryKind::Page, "B").unwrap().unwrap().body, "b");
+        // A removal must survive reopening, i.e. the tombstone worked.
+        let reopened = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert!(reopened.get(EntryKind::Page, "A").unwrap().is_none());
+        assert!(reopened.get(EntryKind::Page, "B").unwrap().is_some());
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// Two handles writing must not drop each other's entries.
+    ///
+    /// Regression for a real loss: populating the corpus while a comparison ran
+    /// left 5863 body files on disk against 3877 manifest entries, so ~2000
+    /// already-downloaded templates and pages were invisible and had to be
+    /// fetched again.
+    #[test]
+    fn concurrent_handles_do_not_drop_each_others_entries() {
+        let root = temp_root("merge");
+        let mut first = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        let mut second = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+
+        // Each handle fetches a different entry, then writes. `first` writes
+        // last, so a plain overwrite would lose `second`'s entry.
+        first
+            .put(EntryKind::Page, "A", "a", meta(EntryKind::Page, "A"))
+            .unwrap();
+        second
+            .put(EntryKind::Page, "B", "b", meta(EntryKind::Page, "B"))
+            .unwrap();
+        second.write_index().unwrap();
+        first.write_index().unwrap();
+
+        let reopened = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert!(reopened.get(EntryKind::Page, "A").unwrap().is_some());
+        assert!(
+            reopened.get(EntryKind::Page, "B").unwrap().is_some(),
+            "the merge must keep the other handle's entry"
+        );
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A merge must not undo a removal: the tombstone wins over the stale entry
+    /// that is still on disk from the other handle.
+    #[test]
+    fn a_merge_does_not_resurrect_a_removed_entry() {
+        let root = temp_root("merge-remove");
+        let mut holder = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        holder
+            .put(EntryKind::Page, "A", "a", meta(EntryKind::Page, "A"))
+            .unwrap();
+        holder.write_index().unwrap();
+
+        let mut other = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        other.remove(EntryKind::Page, "A").unwrap();
+        assert!(other.get(EntryKind::Page, "A").unwrap().is_none());
+
+        // `holder` still has the entry in memory and writes again; the tombstone
+        // recorded by `other` must win.
+        holder.write_index().unwrap();
+        let reopened = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert!(
+            reopened.get(EntryKind::Page, "A").unwrap().is_none(),
+            "a removed entry must not come back"
+        );
         WikiCache::flush_all(&root).unwrap();
     }
 
