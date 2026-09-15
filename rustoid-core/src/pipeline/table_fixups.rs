@@ -1080,6 +1080,22 @@ fn process_children(
     config: &dyn SiteConfig,
     source: Option<&str>,
 ) -> Vec<Node> {
+    process_children_in_tpl(children, config, source, false)
+}
+
+/// [`process_children`] with the enclosing-transclusion context.
+///
+/// `enclosing_tpl` mirrors PHP's `dtState->tplInfo !== null`: while the walk is
+/// inside a transclusion, `getReparseType` treats the cell's content as templated
+/// (`$inTplContent`) regardless of whether the cell itself carries
+/// `mw:Transclusion`. PHP keeps this in the traversal state, because a merged
+/// range leaves its cells as plain text with no marker of their own.
+fn process_children_in_tpl(
+    children: Vec<Node>,
+    config: &dyn SiteConfig,
+    source: Option<&str>,
+    enclosing_tpl: bool,
+) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
     while i < children.len() {
@@ -1105,7 +1121,12 @@ fn process_children(
                 }
                 let mut child = child;
                 let children = std::mem::take(&mut child.children);
-                child.children = process_children(children, config, source);
+                // A transclusion table scopes its whole subtree into template
+                // content (mirrors `dtState->tplInfo`), which is what lets
+                // `getReparseType` treat its cells as templated even after a
+                // range merge has left them as plain text.
+                let child_in_tpl = enclosing_tpl || has_type_of(&child, "mw:Transclusion");
+                child.children = process_children_in_tpl(children, config, source, child_in_tpl);
                 out.push(child);
             }
             NodeKind::Element(ElementKind::TableCell | ElementKind::TableHeader) => {
@@ -1115,7 +1136,7 @@ fn process_children(
                 // Mirror PHP's `$cell->previousSibling`: the merge only fires when
                 // the immediate previous sibling is an Element (a text/comment
                 // separator between cells — e.g. across rows — prevents merging).
-                if get_reparse_type(&child, false, prev_sibling.as_ref())
+                if get_reparse_type(&child, enclosing_tpl, prev_sibling.as_ref())
                     == ReparseScenario::MaybeCombineWithPrevCell
                 {
                     // Find and mutate the previous cell in `out`.
@@ -1147,7 +1168,7 @@ fn process_children(
                         // consumed == 1: `cur` remains a distinct cell; process it
                         // normally (reparse/split).
                         let mut processed =
-                            process_cell(cur, config, source, false, prev_sibling.as_ref());
+                            process_cell(cur, config, source, enclosing_tpl, prev_sibling.as_ref());
                         out.append(&mut processed);
                         i += 1;
                         continue;
@@ -1155,13 +1176,17 @@ fn process_children(
                 }
 
                 let mut processed =
-                    process_cell(child, config, source, false, prev_sibling.as_ref());
+                    process_cell(child, config, source, enclosing_tpl, prev_sibling.as_ref());
                 out.append(&mut processed);
             }
             NodeKind::Element(_) | NodeKind::Document => {
                 let mut child = child;
                 let children = std::mem::take(&mut child.children);
-                child.children = process_children(children, config, source);
+                // A transclusion node scopes its whole subtree into template
+                // content (mirrors `dtState->tplInfo`, whose `first` is the
+                // encapsulation target tested by `getReparseType`).
+                let child_in_tpl = enclosing_tpl || has_type_of(&child, "mw:Transclusion");
+                child.children = process_children_in_tpl(children, config, source, child_in_tpl);
                 out.push(child);
             }
             NodeKind::Text(_) | NodeKind::Comment(_) => {
@@ -1241,9 +1266,10 @@ fn process_cell(
         reparse_templated_attributes(&mut cell, template_wrapper, config, source);
     }
 
-    // Recurse into the cell's own children first (nested tables/cells).
+    // Recurse into the cell's own children first (nested tables/cells), keeping
+    // the enclosing-transclusion context for the descendants.
     let children = std::mem::take(&mut cell.children);
-    cell.children = process_children(children, config, source);
+    cell.children = process_children_in_tpl(children, config, source, in_tpl);
 
     // Split hidden cells on `||`/`!!`. Each new cell is a fresh `stx:row` cell
     // whose own `k=v|` prefix must also be reparsed, so recurse into each of them
@@ -1479,6 +1505,46 @@ mod tests {
         // The wrapper span was unwrapped; only the `Foo` content remains.
         let text = text_content(&cell);
         assert_eq!(text, "Foo");
+    }
+
+    #[test]
+    fn test_enclosing_transclusion_scopes_cell_content() {
+        // A cell whose *enclosing* node is a transclusion is treated as templated
+        // content even when the cell itself carries no marker. PHP keeps this in
+        // its traversal state (`dtState->tplInfo`), which is what lets a cell that
+        // a range merge left as plain text still be reparsed.
+        //
+        // `|align=center style="color:red;"|Foo` — the attribute prefix is plain
+        // text here, exactly as after a merge.
+        let make_cell = || {
+            let mut td = Node::element(ElementKind::TableCell);
+            td.dp = Some(DataParsoid {
+                tmp: crate::wikitext::tokens_v2::TempData {
+                    table_cell_with_no_attribute_syntax: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            td.push_child(Node::text("align=center style='color:red;'|Foo"));
+            td
+        };
+
+        // Outside a transclusion the content is not treated as templated.
+        let outside =
+            process_children_in_tpl(vec![make_cell()], &MockSiteConfig::new(), None, false);
+        assert_eq!(outside.len(), 1);
+        assert!(
+            outside[0].get_attr("align").is_none(),
+            "must not reparse without an enclosing transclusion: {:?}",
+            outside[0].attrs
+        );
+
+        // Inside a transclusion the prefix is reparsed into real attributes.
+        let inside = process_children_in_tpl(vec![make_cell()], &MockSiteConfig::new(), None, true);
+        assert_eq!(inside.len(), 1);
+        assert_eq!(inside[0].get_attr("align"), Some("center"));
+        assert_eq!(inside[0].get_attr("style"), Some("color:red;"));
+        assert_eq!(text_content(&inside[0]), "Foo");
     }
 
     #[test]
