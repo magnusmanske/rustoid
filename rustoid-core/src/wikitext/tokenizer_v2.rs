@@ -2929,14 +2929,32 @@ impl<'a> PegTokenizer<'a> {
         let mut stt = SelfclosingTagTk::new("template", vec![], dp);
 
         // attribs[0] = KV(target, '') — target is the part before the first '|'.
-        // Comments in the target are stripped (they are `CommentTk` tokens that
-        // `tokensToString` drops in PHP; here the target is raw source text so
-        // we strip the comment syntax directly).
-        let target = parts
+        //
+        // The target is inline-tokenized like an argument value, so a nested
+        // `{{…}}`/`{{{…}}}` stays a live `template`/`templatearg` token that
+        // expands in document order *before* the outer target is resolved
+        // (PHP's `template_target` rule; `processToString` then flattens the
+        // buffer). Taking the target as raw source text instead destroyed any
+        // inner template — `{{ {{T}} }}` became a literal `<template T="">`.
+        //
+        // Comments in the target are dropped: they are `CommentTk` tokens that
+        // PHP's `tokensToString` discards in attribute context.
+        let target_raw = parts
             .first()
             .map(|(_, s)| strip_html_comments(s).trim().to_string())
             .unwrap_or_default();
-        stt.attribs.push(kv_str(&target, ""));
+        let target = if target_raw.contains("{{") {
+            tokenize_template_arg_value(&target_raw, self.lang_conv_enabled, &self.ext_tags)
+        } else {
+            KeyValue::Str(target_raw)
+        };
+        stt.attribs.push(KV {
+            key: target,
+            value: KeyValue::Str(String::new()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
 
         // attribs[1..] are the arguments: `name=value` is named, else positional.
         // A `=` only acts as the name/value separator when it is *not* at

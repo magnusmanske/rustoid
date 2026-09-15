@@ -1849,11 +1849,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .unwrap_or_else(|| stt.attribs.clone());
                 let params = crate::pipeline::parser_functions::Params::new(attribs.clone());
 
+                // The target may hold a nested template (`{{ {{T}} }}`), in which
+                // case the KV's key carries *tokens*, not a string: the
+                // AttributeTransformManager above expands it against the frame,
+                // and a multi-item result stays `Tokens`. Stringify it the way
+                // PHP's `processToString` does — a plain `as_str()` silently
+                // yielded `""`, producing an empty target.
                 let target_str = attribs
                     .first()
-                    .and_then(|kv| kv.key.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .map(|kv| match &kv.key {
+                        crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
+                        crate::wikitext::tokens_v2::KeyValue::Tokens(t) => {
+                            crate::wikitext::token_utils::tokens_to_string(t)
+                        }
+                    })
+                    .unwrap_or_default();
 
                 // A comment in the template *target* (`{{f<!---->oo}}`) is
                 // stripped by the PHP preprocessor before target resolution,
