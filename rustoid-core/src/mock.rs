@@ -274,6 +274,8 @@ pub struct MockSiteConfig {
     namespaces: HashMap<i32, NamespaceInfo>,
     interwiki_map: HashMap<String, InterwikiInfo>,
     magic_words: MagicWordMap,
+    /// Parser-function names registered by the wiki (PHP's `functionhooks`).
+    function_hooks: Vec<String>,
     extension_tags: Vec<String>,
     server_url: String,
     article_path: String,
@@ -302,6 +304,7 @@ impl MockSiteConfig {
             namespaces: HashMap::new(),
             interwiki_map: HashMap::new(),
             magic_words: HashMap::new(),
+            function_hooks: Vec::new(),
             extension_tags: vec![
                 "nowiki".to_string(),
                 "pre".to_string(),
@@ -453,6 +456,22 @@ impl MockSiteConfig {
         config.add_magic_word("revisiontimestamp", &["REVISIONTIMESTAMP"]);
         config.add_magic_word("server", &["SERVER", "SERVERNAME"]);
         config.add_magic_word("sitename", &["SITENAME"]);
+        // Parser functions core registers in `$noHashFunctions`: stored without a
+        // leading hash, yet invoked as `{{#dir:en|bcp47}}`.
+        config.add_function_hook("dir");
+        // The `#`-prefixed parser functions, from the same `functionhooks` list.
+        for f in [
+            "if",
+            "ifeq",
+            "iferror",
+            "ifexpr",
+            "switch",
+            "expr",
+            "tag",
+            "anchorencode",
+        ] {
+            config.add_function_hook(f);
+        }
         config.add_magic_word("img_thumbnail", &["thumb", "thumbnail"]);
         config.add_magic_word("img_manualthumb", &["thumbnail=$1", "thumb=$1"]);
         config.add_magic_word("img_right", &["right"]);
@@ -528,6 +547,13 @@ impl MockSiteConfig {
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
             },
         );
+    }
+
+    /// Register a parser function (PHP's `functionhooks`). Needed for functions
+    /// core lists in `$noHashFunctions`, which are stored without a leading `#`
+    /// but invoked with one (`{{#dir:en}}`).
+    fn add_function_hook(&mut self, name: &str) {
+        self.function_hooks.push(name.to_string());
     }
 
     /// Enable/disable v3 parser-function output (for `!! config` sections in
@@ -690,6 +716,10 @@ impl SiteConfig for MockSiteConfig {
 
     fn magic_words(&self) -> &MagicWordMap {
         &self.magic_words
+    }
+
+    fn function_hooks(&self) -> &[String] {
+        &self.function_hooks
     }
 
     fn extension_tags(&self) -> &[String] {

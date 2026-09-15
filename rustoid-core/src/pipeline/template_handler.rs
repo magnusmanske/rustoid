@@ -330,18 +330,33 @@ fn resolve_target_string(
         });
     }
 
-    // Check for a parser function (starts with '#').
+    // Check for a parser function. PHP's `getMagicWordForParserFunction` looks the
+    // whole prefix (including any leading `#`) up in the function-synonym table,
+    // whose keys carry a `#` unless the function is listed in `$noHashFunctions`.
+    // Core registers several functions that way (`dir`, `ns`, `lc`, …), so
+    // `{{#dir:en|bcp47}}` is a *valid* invocation, while an unknown `#…` is a
+    // "broken" one that `TemplateHandler::resolveTemplateTarget` still treats as
+    // a parser function so the `#` is not mistaken for part of a template name.
     if has_hash {
-        let canonical = prefix.trim_start_matches(['#', '＃']);
-        if !canonical.is_empty() {
-            let title = TitleParser::parse(&format!("Special:ParserFunction/{canonical}"), config);
+        let stripped = prefix.trim_start_matches(['#', '＃']);
+        if !stripped.is_empty() {
+            let is_known = config
+                .function_hooks()
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(stripped));
+            let name = if is_known {
+                stripped.to_lowercase()
+            } else {
+                stripped.to_string()
+            };
+            let title = TitleParser::parse(&format!("Special:ParserFunction/{stripped}"), config);
             return Some(ResolvedTarget::ParserFunction {
-                name: canonical.to_string(),
+                name,
                 local_name: prefix.clone(),
                 title,
                 pf_arg,
                 colon,
-                broken: true,
+                broken: !is_known,
             });
         }
     }
@@ -808,6 +823,9 @@ impl TemplateHandler {
             "padright" => ParserFunctions::pf_padright(params),
             "tag" => ParserFunctions::pf_tag(config, params),
             "urlencode" => ParserFunctions::pf_urlencode(params),
+            // `{{#dir:code}}` — the directionality (`ltr`/`rtl`) of a language.
+            // Core `$noHashFunctions` member (invoked with a leading `#`).
+            "dir" => ParserFunctions::pf_dir(params),
             // Unknown parser function: preserve the original source verbatim.
             _ => vec![Item::Str(token_src.unwrap_or("").to_string())],
         }
@@ -1131,7 +1149,41 @@ mod tests {
         match target {
             ResolvedTarget::ParserFunction { name, broken, .. } => {
                 assert_eq!(name, "if");
+                // `if` is a registered function hook, so the invocation is known.
+                assert!(!broken);
+            }
+            other => panic!("expected parser function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_unknown_hash_prefix_is_broken() {
+        let config = MockSiteConfig::new();
+        let target = resolve_template_target(&config, None, "#nope:a").unwrap();
+        match target {
+            ResolvedTarget::ParserFunction { name, broken, .. } => {
+                assert_eq!(name, "nope");
                 assert!(broken);
+            }
+            other => panic!("expected parser function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_hash_function_is_not_a_variable() {
+        // `dir` is a function hook, not a magic variable: `{{dir}}` (no colon)
+        // must resolve as a *template* named `Dir`, not as a variable, while
+        // `{{#dir:en}}` is a known parser function. Registering it as a magic
+        // word instead would make `{{dir}}` resolve as a variable.
+        let config = MockSiteConfig::new();
+        match resolve_template_target(&config, None, "dir").unwrap() {
+            ResolvedTarget::Template { name, .. } => assert_eq!(name, "Template:Dir"),
+            other => panic!("expected template, got {:?}", other),
+        }
+        match resolve_template_target(&config, None, "#dir:en|bcp47").unwrap() {
+            ResolvedTarget::ParserFunction { name, broken, .. } => {
+                assert_eq!(name, "dir");
+                assert!(!broken);
             }
             other => panic!("expected parser function, got {:?}", other),
         }

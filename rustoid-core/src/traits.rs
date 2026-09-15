@@ -127,6 +127,16 @@ pub trait SiteConfig: Send + Sync {
     /// Magic word aliases for this wiki (localized names like `"ANCHORENCODE"` etc.).
     fn magic_words(&self) -> &MagicWordMap;
 
+    /// Names of the wiki's parser functions (`functionhooks`). Mirrors PHP's
+    /// `SiteConfig::$apiFunctionHooks`, which `updateFunctionSynonym` uses to
+    /// decide whether a synonym is stored with a leading `#`. Core registers
+    /// some functions *without* one (`$noHashFunctions`: `dir`, `ns`, `lc`, …),
+    /// yet invokes them with a `#`, so the hook set is what makes
+    /// `{{#dir:en}}` resolvable while an unregistered `{{#foo:}}` stays broken.
+    /// A function that is also a magic variable (`ns`, `anchorencode`) appears
+    /// here too, so this is a set of *function* names, not a synonym table.
+    fn function_hooks(&self) -> &[String];
+
     /// Recognized extension tag names (e.g. `"ref"`, `"gallery"`, `"poem"`).
     fn extension_tags(&self) -> &[String];
 
@@ -632,6 +642,10 @@ mod tests {
         fn magic_words(&self) -> &MagicWordMap {
             static W: std::sync::OnceLock<MagicWordMap> = std::sync::OnceLock::new();
             W.get_or_init(HashMap::new)
+        }
+        fn function_hooks(&self) -> &[String] {
+            static H: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            H.get_or_init(Vec::new)
         }
         fn extension_tags(&self) -> &[String] {
             static T: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();

@@ -530,6 +530,42 @@ impl ParserFunctions {
         ))]
     }
 
+    /// `#dir` — the directionality of a language code: `ltr`, `rtl`, or `auto`
+    /// (the direction of the content language when no code is given).
+    /// Mirrors MediaWiki core's `CoreParserFunctions::dir`.
+    ///
+    /// Core gets the direction from `Language::getDir()`, which consults the
+    /// site's per-language `rtl` flag. rustoid's `SiteConfig` carries only the
+    /// single content-language code, not a language table, and the direction is
+    /// not decidable from the code alone (`ar` is RTL and `en` LTR; both are
+    /// plain two-letter codes). So only the cases decidable from the input are
+    /// modelled: an explicit `-x-rtl`/`-x-ltr` BCP-47 bidi override, and an
+    /// omitted code. Any other code is assumed LTR, which is the overwhelmingly
+    /// common case and is what the site config would report for its own
+    /// language — but it is an assumption, not a lookup.
+    ///
+    /// TODO: once `SiteConfig` exposes per-language direction data (PHP's
+    /// `languagevariants`/`languages` blocks), look the code up instead of
+    /// assuming.
+    pub fn pf_dir(params: &Params) -> Vec<Item> {
+        let code = params
+            .args
+            .first()
+            .map(|kv| key_value_to_string(&kv.key))
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+
+        let dir = if code.is_empty() {
+            "auto"
+        } else if code.ends_with("-x-rtl") {
+            "rtl"
+        } else {
+            "ltr"
+        };
+        vec![Item::Str(dir.to_string())]
+    }
+
     /// Expand a KV into items (mirrors `expandKV` for string keys/values).
     fn expand_kv(kv: Option<&KV>, default: Option<&str>) -> Vec<Item> {
         match kv {
@@ -855,5 +891,23 @@ mod tests {
         assert_eq!(strip_attr_value_quotes("\"\""), "");
         // Mismatched quotes are left intact.
         assert_eq!(strip_attr_value_quotes("\"oops'"), "\"oops'");
+    }
+
+    #[test]
+    fn test_pf_dir_bcp47_override() {
+        // `{{#dir:en|bcp47}}` → `ltr`; the fixture's `definition_list_template`
+        // form passes the format as the value of the first arg.
+        let p = params(vec![("en", "bcp47")]);
+        assert_eq!(ParserFunctions::pf_dir(&p), vec![Item::Str("ltr".into())]);
+        let p = params(vec![("ar-x-rtl", "bcp47")]);
+        assert_eq!(ParserFunctions::pf_dir(&p), vec![Item::Str("rtl".into())]);
+    }
+
+    #[test]
+    fn test_pf_dir_no_args_is_auto() {
+        // No code: report the content language's direction, which rustoid cannot
+        // resolve without a language table, so `auto`.
+        let p = params(vec![]);
+        assert_eq!(ParserFunctions::pf_dir(&p), vec![Item::Str("auto".into())]);
     }
 }
