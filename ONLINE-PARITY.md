@@ -362,14 +362,22 @@ The failure list keeps flattening, which is the useful signal:
 | first `#invoke` wiring | 114 | 29 | 36 pages |
 | after parent frames and `mw.clone` | 106 | 44 | 9 pages |
 | after title facts and namespace fixes | 95 | 35 | 31 pages |
+| after `mw.title` facts | 93 | 43 | 10 pages |
+| after namespace aliases and `mw.html` chaining | 91 | 39 | 11 pages |
 
-So the fixes so far are real (the `strict`/`libraryUtil`/`mw.html` walls are gone, the
-score of distinct failures sits around 35) but a new largest entry appeared: an
-`attempt to index a nil value` inside `Module:Namespace detect/data`, on 31 pages.
-That is the current top item and it is *not* the `mw.site` namespace tables — those
-iterate correctly with 41 entries, each carrying `id` and `name` (there is a test
-for it). The module's stack frame names the module but not the line, so pinning it
-needs a longer traceback than `script_error` currently keeps.
+The 31-page wall turned out to be `ipairs(ns.aliases)` in
+`Module:Namespace detect/data`: the field did not exist. A missing field *inside a
+for iterator* is the nasty case, because Lua cannot attach a line to it, so it
+appeared as a bare `attempt to index a nil value` against the whole module.
+Reaching it needed a `pcall` around the module's *load*, which revealed the error
+was raised at load time in the module's return table — every attempt to reach it
+through an entry point had missed it entirely.
+
+The other large win was `mw.html:done()` returning the **parent** node rather than
+a string, as Scribunto's manual specifies. Modules chain
+`:tag('li'):attr(..):done():wikitext(..)`, and returning a string broke the chain,
+which made modules re-render whole subtrees. One line, and the corpus output ratio
+fell from **5.55x to 3.50x** (219MB to 138MB).
 
 Two diagnostics were added while chasing this, both of which paid off:
 
@@ -389,6 +397,34 @@ non-existent; recorded as a known gap.
 `mw.ext.data.get` returns an empty table rather than being nil: rustoid does not
 implement the extension, and a nil `mw.ext` failed the whole page with an
 unattributed error instead of just rendering nothing for that part.
+
+#### The next step is architectural: `frame:expandTemplate`
+
+`frame:expandTemplate` is now the largest single item (11 pages) but that
+understates it: **42 of the cached modules** reference it or `frame:preprocess`,
+and it is what citation and taxobox rendering need.
+
+It cannot be done the way everything else was. `require` and
+`mw.title.new(...)` were solvable by *preloading* because the titles involved are
+literals in the module source. `expandTemplate` is different: the title is a
+literal but the **arguments are computed at runtime**, so the result cannot be
+known before the module runs.
+
+Lua calls it synchronously; `Parser::expand_templates` is `async`. The two options:
+
+1. **Suspend and resume.** `expandTemplate` records its request (title + args)
+   and yields; the host expands it outside Lua and re-runs the invocation with the
+   answers available. This is the same defer-and-retry shape the module preload
+   already uses, so the machinery is familiar, but "re-runs the invocation" means
+   a module must be safe to run more than once — cheap for the pure ones, and the
+   corpus suggests the expensive ones are pure.
+2. **A synchronous inner parser.** Give Lua a minimal synchronous expander for the
+   template-only case. Simpler to call, but it duplicates the async pipeline, and
+   a second implementation that can disagree with the first is the kind of thing
+   that makes byte-exact parity harder rather than easier.
+
+Option 1 is the one to take; recorded here because it is a design decision rather
+than a port, and because getting it wrong would be expensive.
 
 Wiring `#invoke` moved the corpus from "43 of 44 pages never expand their Lua
 calls" to "Lua runs and the failures are a ranked list of what modules ask for".
