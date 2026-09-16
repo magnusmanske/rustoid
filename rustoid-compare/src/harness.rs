@@ -687,6 +687,45 @@ fn normalise(html: &str) -> String {
     body.trim().to_string()
 }
 
+/// Extract the distinct Scribunto failures from a rendering.
+///
+/// When `#invoke` runs, the failures stop being "literal `{{#invoke:…}}` in the
+/// output" and become Lua runtime errors. Those name the missing API —
+/// `attempt to call a nil value (global 'gsub')` says which `mw` function to
+/// implement next — so collecting them turns the scoreboard into a work list
+/// instead of a count.
+///
+/// Messages are truncated to keep the report readable and are returned
+/// deduplicated in first-seen order, capped at `limit`.
+pub fn script_errors(html: &str, limit: usize) -> Vec<String> {
+    const MARKER: &str = "Script error:";
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find(MARKER) {
+        rest = &rest[pos + MARKER.len()..];
+        // The message runs to the closing tag of the error element.
+        let end = rest.find('<').unwrap_or(rest.len());
+        // Strip the `lua error:` prefix rustoid adds; MediaWiki's own message
+        // starts at the interesting part.
+        let mut msg = rest[..end].trim();
+        msg = msg.strip_prefix("lua error: ").unwrap_or(msg);
+        msg = msg.strip_prefix("execution error: ").unwrap_or(msg);
+        msg = msg.strip_prefix("runtime error: ").unwrap_or(msg);
+        let msg = if msg.chars().count() > 120 {
+            format!("{}…", msg.chars().take(119).collect::<String>())
+        } else {
+            msg.to_string()
+        };
+        if !out.contains(&msg) {
+            out.push(msg);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Describe the first differing position, with enough surrounding markup for
 /// [`classify`] to tell *what* diverged.
 ///

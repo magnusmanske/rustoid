@@ -40,15 +40,24 @@ pub struct Invoke {
 impl Invoke {
     /// Parse the text after `#invoke:` — `Module|func|arg|name=value`.
     ///
-    /// Returns `None` when the call is malformed (no module, or no function),
-    /// which MediaWiki renders as an error rather than expanding.
+    /// An omitted or *empty* function name resolves to `main`, which is
+    /// Scribunto's documented default. The empty form is not hypothetical:
+    /// `Template:Citation needed` calls `{{#invoke:Unsubst||date=…}}`, and that
+    /// template is on hundreds of thousands of pages, so the empty function has
+    /// to work. `Module:Unsubst` defines only `p.main`, which is the evidence
+    /// for the default.
+    ///
+    /// Returns `None` only when there is no module to invoke at all.
     pub fn parse(pf_arg: &str) -> Option<Self> {
         let mut parts = pf_arg.split('|');
         let module = parts.next()?.trim();
-        let function = parts.next()?.trim();
-        if module.is_empty() || function.is_empty() {
+        if module.is_empty() {
             return None;
         }
+        let function = match parts.next() {
+            Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+            _ => "main".to_string(),
+        };
 
         let mut args = Vec::new();
         for part in parts {
@@ -64,7 +73,7 @@ impl Invoke {
 
         Some(Self {
             module: module.to_string(),
-            function: function.to_string(),
+            function,
             args,
         })
     }
@@ -204,7 +213,38 @@ pub fn run(invoke: &Invoke, registry: Registry, site: LuaSite, page_title: &str)
     engine.execute(&entry, &invoke.function, &args)
 }
 
+/// How many times an `#invoke` may be re-run after discovering a module it
+/// needed but could not be anticipated.
+///
+/// A module graph is small and each round adds at least one module, so a handful
+/// of rounds is plenty; the bound exists so a module that asks for something
+/// impossible cannot loop.
+const MAX_PRELOAD_ROUNDS: usize = 6;
+
+/// Parse `module X was not preloaded` into `X`.
+///
+/// The engine's message is the only place this knowledge lives, so the coupling
+/// is deliberate and asserted by a test rather than left implicit.
+fn missing_module_from(message: &str) -> Option<String> {
+    let start = message.find("module ")? + "module ".len();
+    let rest = &message[start..];
+    let end = rest.find(" was not preloaded")?;
+    let title = rest[..end].trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
+}
+
 /// Parse a `#invoke` call, preload what it needs, and run it.
+///
+/// Runs more than once only when a module asks for something the scan could not
+/// see — a name built at runtime, e.g. `mw.loadData(cfgModule)`. When that
+/// happens the named module is fetched and the call re-runs, which keeps
+/// `require` synchronous inside Lua while still covering the dynamic case.
+/// Without this, `Module:Message box/configuration` (reached that way) stopped
+/// 36 of 39 corpus pages.
 pub async fn invoke<S: DataSource + ?Sized>(
     pf_arg: &str,
     source: &S,
@@ -214,8 +254,34 @@ pub async fn invoke<S: DataSource + ?Sized>(
     let Some(call) = Invoke::parse(pf_arg) else {
         return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
     };
-    let registry = preload(source, &call.module_title()).await;
-    run(&call, registry, site, page_title)
+    let mut registry = preload(source, &call.module_title()).await;
+    let mut last_missing: Option<String> = None;
+
+    for _ in 0..MAX_PRELOAD_ROUNDS {
+        match run(&call, registry.clone(), site.clone(), page_title) {
+            Ok(out) => return Ok(out),
+            Err(RustoidError::Lua(msg)) => {
+                match missing_module_from(&msg) {
+                    Some(title) if !registry.contains_key(&title) => {
+                        // Fetch it, plus anything *it* needs, then try again.
+                        registry.extend(preload(source, &title).await);
+                        last_missing = Some(title);
+                    }
+                    _ => return Err(RustoidError::Lua(msg)),
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    // Name the module that stayed missing: "gave up" alone leaves the reader to
+    // guess, and the usual reason is that it could not be fetched rather than
+    // that the chain was long.
+    Err(RustoidError::Lua(format!(
+        "could not load {} after {MAX_PRELOAD_ROUNDS} rounds (still missing: {})",
+        call.module_title(),
+        last_missing.as_deref().unwrap_or("unknown")
+    )))
 }
 
 #[cfg(test)]
@@ -254,10 +320,28 @@ mod tests {
 
     #[test]
     fn a_malformed_call_is_rejected() {
+        // No module at all: nothing to invoke.
         assert!(Invoke::parse("").is_none());
-        assert!(Invoke::parse("Weather box").is_none());
         assert!(Invoke::parse("|main").is_none());
-        assert!(Invoke::parse("Weather box|").is_none());
+        assert!(Invoke::parse("  ").is_none());
+    }
+
+    /// An omitted or empty function name means `main`.
+    ///
+    /// `Template:Citation needed` calls `{{#invoke:Unsubst||date=…}}` and is on
+    /// hundreds of thousands of pages, so this form has to expand.
+    #[test]
+    fn an_omitted_or_empty_function_defaults_to_main() {
+        let bare = Invoke::parse("Weather box").unwrap();
+        assert_eq!(bare.function, "main");
+
+        let empty = Invoke::parse("Unsubst||date=2024").unwrap();
+        assert_eq!(empty.module, "Unsubst");
+        assert_eq!(empty.function, "main");
+        assert_eq!(
+            empty.args,
+            vec![(Some("date".to_string()), "2024".to_string())]
+        );
     }
 
     #[test]
@@ -303,5 +387,17 @@ mod tests {
             required_modules(src),
             vec!["Module:Weather box/data".to_string()]
         );
+    }
+
+    /// The retry loop reads the module name back out of the engine's message, so
+    /// the two must agree. This test is the contract between them.
+    #[test]
+    fn extracts_the_missing_module_name_from_an_error() {
+        assert_eq!(
+            missing_module_from("module Module:Message box/configuration was not preloaded"),
+            Some("Module:Message box/configuration".to_string())
+        );
+        assert_eq!(missing_module_from("some other failure"), None);
+        assert_eq!(missing_module_from("module  was not preloaded"), None);
     }
 }

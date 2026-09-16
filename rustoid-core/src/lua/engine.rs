@@ -266,6 +266,14 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
             }
 
             let Some(source) = lookup_module(&modules, &title) else {
+                // Scribunto also exposes its *own* libraries through `require` —
+                // `strict`, `libraryUtil`, `ustring` — which are not `Module:` pages.
+                // Rejecting those was the single most common failure in the corpus
+                // (36 pages for `strict`, 26 for `libraryUtil`).
+                if let Some(lib) = builtin_library(lua, &title) {
+                    cache.set(title, lib.clone())?;
+                    return Ok(lib);
+                }
                 return Err(mlua::Error::runtime(format!(
                     "module {title} was not preloaded"
                 )));
@@ -310,6 +318,109 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     lua.globals().set("package", package).map_err(lua_err)?;
 
     Ok(())
+}
+
+/// Scribunto's built-in libraries, as Lua source, loadable by `require`.
+///
+/// These are part of Scribunto rather than of a wiki, so they can never be
+/// fetched and must be supplied. They are Lua source rather than Rust because
+/// they *are* Lua: reimplementing `libraryUtil` in the host language would make
+/// it diverge for no gain.
+///
+/// `strict` is the module's metatable factory; `libraryUtil` is the argument
+/// checker Scribunto's own modules use, which wiki modules also require
+/// directly.
+const BUILTIN_LIBRARIES: &[(&str, &str)] = &[
+    (
+        "strict",
+        r#"
+        local mt = {}
+        mt.__index = function(t, k)
+            error("strict mode: undefined global '" .. tostring(k) .. "'", 2)
+        end
+        mt.__newindex = function(t, k, v)
+            error("strict mode: assignment to undeclared global '" .. tostring(k) .. "'", 2)
+        end
+        return mt
+        "#,
+    ),
+    (
+        "libraryUtil",
+        r#"
+        local libraryUtil = {}
+
+        function libraryUtil.checkType(name, argIdx, arg, expectType, nilOk)
+            if arg == nil and nilOk then return arg end
+            local actual = type(arg)
+            if actual ~= expectType then
+                error(string.format(
+                    "%s: bad argument #%d (type %s expected, got %s)",
+                    name, argIdx, expectType, actual), 3)
+            end
+            return arg
+        end
+
+        function libraryUtil.checkTypeMulti(name, argIdx, arg, expectTypes)
+            if arg == nil then return arg end
+            local actual = type(arg)
+            for _, t in ipairs(expectTypes) do
+                if actual == t then return arg end
+            end
+            error(string.format(
+                "%s: bad argument #%d (type %s expected, got %s)",
+                name, argIdx, table.concat(expectTypes, " or "), actual), 3)
+        end
+
+        function libraryUtil.checkTypeForNamedArg(name, argName, arg, expectType, nilOk)
+            if arg == nil and nilOk then return arg end
+            local actual = type(arg)
+            if actual ~= expectType then
+                error(string.format(
+                    "%s: bad argument '%s' (type %s expected, got %s)",
+                    name, argName, expectType, actual), 3)
+            end
+            return arg
+        end
+
+        function libraryUtil.makeCheckSelfFunction(libraryName, varName, self, method)
+            if type(self) ~= 'table' then
+                error(string.format(
+                    "%s: bad self argument (table expected, got %s)",
+                    libraryName, type(self)), 3)
+            end
+            if method and self[method] == nil then
+                error(string.format(
+                    "%s: '%s' is not a valid method", libraryName, tostring(method)), 3)
+            end
+            return function(self, method)
+                if type(self) ~= 'table' then
+                    error(string.format(
+                        "%s: bad self argument (table expected, got %s)",
+                        libraryName, type(self)), 3)
+                end
+                return self
+            end
+        end
+
+        return libraryUtil
+        "#,
+    ),
+];
+
+/// Resolve `require(name)` for a Scribunto built-in library.
+///
+/// `ustring` is not Lua source: it is the same table `mw.ustring` exposes, so it
+/// is handed back directly.
+fn builtin_library(lua: &Lua, name: &str) -> Option<Value> {
+    if name == "ustring" {
+        let mw: Table = lua.globals().get("mw").ok()?;
+        return mw.get::<Value>("ustring").ok();
+    }
+    let (_, source) = BUILTIN_LIBRARIES.iter().find(|(n, _)| *n == name)?;
+    lua.load(*source)
+        .set_name((*name).to_string())
+        .eval::<Value>()
+        .ok()
 }
 
 /// Look a module up by title, tolerating case and underscore/space differences.
@@ -372,6 +483,10 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     site.set("server", ctx.site.server.clone())?;
     site.set("scriptPath", ctx.site.script_path.clone())?;
     site.set("languageCode", ctx.site.language_code.clone())?;
+    // `mw.site.namespaces` is indexed by id and by name, and modules read
+    // properties off the entries (Hatnote indexes it directly, which is why a
+    // missing table stops the module with "attempt to index a nil value").
+    site.set("namespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
     mw.set("site", site)?;
 
     // mw.uri
@@ -390,21 +505,64 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let lang = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    lang.set("formatNum", lua.create_function(luafn_lang_format_num)?)?;
+    lang.set("formatNum", lua.create_function(luafn_lang_format_num_any)?)?;
     lang.set(
         "getCode",
         lua.create_function(|_, ()| Ok("en".to_string()))?,
     )?;
+    // `mw.language.getContentLanguage()` returns the wiki's content language
+    // object; modules call through it to `formatNum`/`getCode` rather than using
+    // `mw.language` directly.
+    let content_language = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    content_language.set("formatNum", lua.create_function(luafn_lang_format_num_any)?)?;
+    content_language.set(
+        "getCode",
+        lua.create_function(|_, ()| Ok("en".to_string()))?,
+    )?;
+    content_language.set("code", "en")?;
+    lang.set(
+        "getContentLanguage",
+        lua.create_function(move |_, ()| Ok(content_language.clone()))?,
+    )?;
     mw.set("language", lang)?;
 
     // mw.ustring
+    //
+    // Scribunto's `ustring` is a codepoint-aware version of Lua's `string`. The
+    // pattern-matching functions (`match`/`gmatch`/`gsub`/`find`) are the ones
+    // modules actually lean on, and implementing them by hand would be a project
+    // of its own, so they forward to Lua's `string` library. The divergence is
+    // real and worth stating: Lua's indices are *bytes* while Scribunto's are
+    // *codepoints*, so a module matching a pattern against a non-ASCII string
+    // and then slicing by index gets different offsets. `len` is overridden
+    // below, so the common counting case is correct.
     let ustring = lua
         .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    let ustring_mt = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ustring_mt
+        .set(
+            "__index",
+            lua.create_function(|lua, (_t, key): (Table, Value)| {
+                let name = match &key {
+                    Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
+                    _ => return Ok(Value::Nil),
+                };
+                let string: Table = lua.globals().get("string")?;
+                string.get::<Value>(name)
+            })
+            .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     ustring.set("len", lua.create_function(luafn_ustring_len)?)?;
     ustring.set("sub", lua.create_function(luafn_ustring_sub)?)?;
     ustring.set("upper", lua.create_function(luafn_ustring_upper)?)?;
     ustring.set("lower", lua.create_function(luafn_ustring_lower)?)?;
+    ustring.set_metatable(Some(ustring_mt));
     mw.set("ustring", ustring)?;
 
     // mw.message
@@ -525,7 +683,36 @@ fn luafn_uri_anchor_encode(_: &Lua, s: String) -> mlua::Result<String> {
     Ok(s.replace(' ', "_").replace('?', "%3F").replace('#', "%23"))
 }
 
-fn luafn_lang_format_num(_: &Lua, n: f64) -> mlua::Result<String> {
+/// `formatNum` that accepts both call styles.
+///
+/// Scribunto's language objects are used as method tables, so
+/// `lang:formatNum(x)` passes the language as the first argument while
+/// `mw.language.formatNum(x)` does not. Taking `Value`s and using whichever one
+/// is a number covers both, which matters because the colon form is the common
+/// one in modules.
+fn luafn_lang_format_num_any(
+    _: &Lua,
+    (first, second): (Value, Option<Value>),
+) -> mlua::Result<String> {
+    let arg = match (&second, &first) {
+        (Some(v), _) => v,
+        (None, v) => v,
+    };
+    let n = match arg {
+        Value::Number(n) => *n,
+        Value::Integer(i) => *i as f64,
+        Value::String(s) => s
+            .to_str()
+            .ok()
+            .and_then(|s| s.trim().replace(',', "").parse::<f64>().ok())
+            .ok_or_else(|| mlua::Error::runtime("formatNum expects a number"))?,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "formatNum expects a number, got {}",
+                other.type_name()
+            )));
+        }
+    };
     Ok(format_number(n))
 }
 
@@ -718,6 +905,41 @@ fn html_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+/// Build `mw.site.namespaces`, indexed by id and by canonical name.
+///
+/// Modules read properties (`id`, `name`, `canonicalName`, `isContent`, …) off
+/// the entries, so each is a table rather than a bare string.
+fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
+    let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    let namespaces = lua.create_table().map_err(err)?;
+    // The main namespace is id 0 with the empty name, which the snapshot drops
+    // (an empty canonical name carries no information); add it back.
+    let mut all: Vec<(i32, String)> = site.namespaces.clone();
+    if !all.iter().any(|(id, _)| *id == 0) {
+        all.push((0, String::new()));
+    }
+    all.sort_by_key(|(id, _)| *id);
+
+    for (id, canonical) in all {
+        let entry = lua.create_table().map_err(err)?;
+        entry.set("id", id).map_err(err)?;
+        entry.set("name", canonical.clone()).map_err(err)?;
+        entry.set("canonicalName", canonical.clone()).map_err(err)?;
+        entry.set("displayName", canonical.clone()).map_err(err)?;
+        // `isContent` is true for the namespaces that hold articles: the main
+        // namespace plus Module, and false for talk/user/file templates. The
+        // exact set is a site detail, so this is the conservative reading.
+        entry.set("isContent", id == 0 || id == 828).map_err(err)?;
+        entry.set("isTalk", id % 2 == 1).map_err(err)?;
+        entry.set("subject", id - (id % 2)).map_err(err)?;
+        namespaces.set(id, entry.clone()).map_err(err)?;
+        if !canonical.is_empty() {
+            namespaces.set(canonical, entry.clone()).map_err(err)?;
+        }
+    }
+    Ok(namespaces)
 }
 
 fn format_number(n: f64) -> String {
@@ -1087,6 +1309,47 @@ mod tests {
             .execute(src, "main", &[Arg::Named("k".to_string(), "v".to_string())])
             .unwrap();
         assert_eq!(result, "v");
+    }
+
+    /// `require('strict')` and `require('libraryUtil')` are Scribunto's own
+    /// libraries, not wiki modules, so they can never be fetched and must be
+    /// supplied. Rejecting them was the most common corpus failure.
+    #[test]
+    fn test_scribunto_builtin_libraries_are_requirable() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                local libraryUtil = require('libraryUtil')
+                local ok = pcall(libraryUtil.checkType, 'fn', 1, 'x', 'number')
+                local strict = require('strict')
+                return type(libraryUtil) .. '/' .. type(strict) .. '/' .. tostring(ok)
+            end
+            return p
+        "#;
+        assert_eq!(
+            engine.execute(src, "main", &[]).unwrap(),
+            "table/table/false"
+        );
+    }
+
+    /// `require('ustring')` is the same table `mw.ustring` exposes, and the
+    /// pattern functions must be there — modules call `ustring.match`
+    /// constantly and a missing one stops the module dead.
+    #[test]
+    fn test_ustring_require_and_pattern_functions() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                local ustring = require('ustring')
+                local m = ustring.match('abc123', '%d+')
+                local g = mw.ustring.gsub('a-b-c', '-', '+')
+                return m .. '/' .. g .. '/' .. ustring.len('héllo')
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(src, "main", &[]).unwrap(), "123/a+b+c/5");
     }
 
     #[test]

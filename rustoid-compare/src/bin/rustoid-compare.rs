@@ -271,6 +271,7 @@ fn run_corpus<C: rustoid_core::SiteConfig>(
                 rustoid_bytes: c.rustoid_html.len(),
                 unexpanded_rustoid: c.unexpanded_rustoid,
                 unexpanded_parsoid: c.unexpanded_parsoid,
+                script_errors: rustoid_compare::harness::script_errors(&c.rustoid_html, 3),
                 outcome: c.outcome,
             },
             Err(e) => Row {
@@ -281,6 +282,7 @@ fn run_corpus<C: rustoid_core::SiteConfig>(
                 rustoid_bytes: 0,
                 unexpanded_rustoid: Unexpanded::default(),
                 unexpanded_parsoid: Unexpanded::default(),
+                script_errors: Vec::new(),
                 outcome: Outcome::Skipped {
                     reason: e.to_string(),
                 },

@@ -30,6 +30,8 @@ pub struct Row {
     /// Literal unexpanded wikitext each side emitted.
     pub unexpanded_rustoid: Unexpanded,
     pub unexpanded_parsoid: Unexpanded,
+    /// Distinct Scribunto failures rustoid reported (see [`script_errors`]).
+    pub script_errors: Vec<String>,
 }
 
 impl Row {
@@ -64,6 +66,13 @@ pub struct UnexpandedSummary {
     pub pages_with_unexpanded_invoke: usize,
     /// Pages emitting more literal template syntax than Parsoid does.
     pub pages_worse_than_parsoid: usize,
+}
+
+/// One Lua failure and how many pages hit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptErrorBucket {
+    pub message: String,
+    pub pages: usize,
 }
 
 /// A finished run.
@@ -197,6 +206,29 @@ impl Scoreboard {
         s
     }
 
+    /// Lua failures, most widespread first.
+    ///
+    /// This is the work list for the Lua API: each message names what a module
+    /// asked for and did not get.
+    pub fn script_errors_by_frequency(&self) -> Vec<ScriptErrorBucket> {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for row in &self.rows {
+            for msg in &row.script_errors {
+                *counts.entry(msg.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<ScriptErrorBucket> = counts
+            .into_iter()
+            .map(|(message, pages)| ScriptErrorBucket { message, pages })
+            .collect();
+        out.sort_by(|a, b| {
+            b.pages
+                .cmp(&a.pages)
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        out
+    }
+
     /// Render the report.
     ///
     /// `detailed` adds the first difference for every failure, which is the
@@ -247,6 +279,18 @@ impl Scoreboard {
                 "  {:34} {}/{}\n",
                 "more literal syntax than parsoid", un.pages_worse_than_parsoid, un.compared
             ));
+        }
+
+        let errors = self.script_errors_by_frequency();
+        if !errors.is_empty() {
+            let total: usize = errors.iter().map(|e| e.pages).sum();
+            out.push_str(&format!(
+                "\nlua failures ({total} across {} distinct):\n",
+                errors.len()
+            ));
+            for e in errors.iter().take(12) {
+                out.push_str(&format!("  {:4} pages  {}\n", e.pages, e.message));
+            }
         }
 
         let by_tag = self.by_tag();
@@ -343,6 +387,7 @@ mod tests {
             rustoid_bytes: 400,
             unexpanded_rustoid: Unexpanded::default(),
             unexpanded_parsoid: Unexpanded::default(),
+            script_errors: Vec::new(),
         }
     }
 
@@ -498,6 +543,28 @@ mod tests {
         let (p, r) = board().byte_totals();
         assert_eq!(p, 400);
         assert_eq!(r, 1600);
+    }
+
+    /// The failure list must name the missing API, deduplicated per page, or it
+    /// is just another count.
+    #[test]
+    fn script_errors_are_deduplicated_and_ranked() {
+        let mut a = row("A", &["lua"], differ("x"));
+        a.script_errors = vec![
+            "attempt to call a nil value (global 'gsub')".to_string(),
+            "too many expensive function calls".to_string(),
+        ];
+        let mut b = row("B", &["lua"], differ("x"));
+        b.script_errors = vec!["attempt to call a nil value (global 'gsub')".to_string()];
+        let s = Scoreboard::new("t", vec![a, b]);
+        let errs = s.script_errors_by_frequency();
+        assert_eq!(errs.len(), 2);
+        assert_eq!(errs[0].pages, 2, "the shared failure must rank first");
+        assert!(errs[0].message.contains("gsub"), "{:?}", errs[0]);
+        assert_eq!(errs[1].pages, 1);
+        let text = s.render(false);
+        assert!(text.contains("lua failures"), "{text}");
+        assert!(text.contains("gsub"), "{text}");
     }
 
     /// The unexpanded summary must distinguish "rendered differently" from

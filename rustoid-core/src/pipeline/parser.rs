@@ -2491,8 +2491,17 @@ fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Par
 
 /// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`
 /// shows up as an error in the output rather than as silently missing text.
+///
+/// The stack traceback is dropped: MediaWiki shows a short message in the page
+/// and keeps the trace for the debug console, and the trace is long enough to
+/// distort the byte totals the scoreboard reports.
 fn script_error(message: &str) -> String {
-    format!("<strong class=\"error\">Script error: {message}</strong>")
+    let short = message
+        .split("\nstack traceback:")
+        .next()
+        .unwrap_or(message)
+        .trim();
+    format!("<strong class=\"error\">Script error: {short}</strong>")
 }
 
 #[cfg(test)]

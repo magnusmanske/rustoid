@@ -143,6 +143,43 @@ async fn a_missing_function_reports_a_script_error() {
     assert!(html.contains("Script error"), "got: {html}");
 }
 
+/// An empty function name runs `main`.
+///
+/// `Template:Citation needed` calls `{{#invoke:Unsubst||date=…}}` and is on
+/// hundreds of thousands of pages, so the empty form must expand.
+#[tokio::test]
+async fn an_empty_function_name_runs_main() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return "main ran with " .. tostring(frame.args['date'])
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:Unsubst", module)],
+        "{{#invoke:Unsubst||date=2024}}",
+    )
+    .await;
+    assert!(html.contains("main ran with 2024"), "got: {html}");
+}
+
+/// `require` must serve Scribunto's own libraries as well as wiki modules.
+#[tokio::test]
+async fn scribunto_libraries_are_requirable_from_a_module() {
+    let module = r#"
+        local libraryUtil = require('libraryUtil')
+        local p = {}
+        function p.main(frame)
+            libraryUtil.checkType('main', 1, frame.args[1], 'string')
+            return require('ustring').upper(frame.args[1])
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Lib", module)], "{{#invoke:Lib|main|loud}}").await;
+    assert!(html.contains("LOUD"), "got: {html}");
+}
+
 /// Without a data source there is nothing to fetch a module from, so the call
 /// stays as source text — the same behaviour other unimplemented parser
 /// functions have.
@@ -170,4 +207,36 @@ async fn probe_direct_invoke() {
 async fn probe_parser_output() {
     let html = expand(&[("Module:Greet", GREET)], "{{#invoke:Greet|main|world}}").await;
     println!("FULL HTML ({} bytes):\n{html}", html.len());
+}
+
+/// `mw.site.namespaces` must be a real table: Hatnote indexes it directly and
+/// stops dead when it is missing.
+#[tokio::test]
+async fn mw_site_namespaces_is_available() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local ns = mw.site.namespaces
+            return tostring(ns[0].name) .. '|' .. tostring(ns[10].canonicalName)
+                .. '|' .. tostring(ns['Template'].id)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:NS", module)], "{{#invoke:NS|main}}").await;
+    assert!(html.contains("|Template|10"), "got: {html}");
+}
+
+/// `mw.language.getContentLanguage()` must exist and carry `formatNum`.
+#[tokio::test]
+async fn mw_language_content_language_is_available() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local lang = mw.language.getContentLanguage()
+            return lang:getCode() .. '/' .. lang:formatNum(1234567)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Lang", module)], "{{#invoke:Lang|main}}").await;
+    assert!(html.contains("en/"), "got: {html}");
 }
