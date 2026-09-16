@@ -725,21 +725,18 @@ const BUILTIN_LIBRARIES: &[(&str, &str)] = &[
             return arg
         end
 
-        function libraryUtil.makeCheckSelfFunction(libraryName, varName, self, method)
-            if type(self) ~= 'table' then
-                error(string.format(
-                    "%s: bad self argument (table expected, got %s)",
-                    libraryName, type(self)), 3)
-            end
-            if method and self[method] == nil then
-                error(string.format(
-                    "%s: '%s' is not a valid method", libraryName, tostring(method)), 3)
-            end
+        -- Returns a checker that raises when `self` is not the object the
+        -- checker was made for. Scribunto also accepts a method *name* as the
+        -- second argument to the returned function, and reports the object's
+        -- description ("ItalicTitle object") when the identity check fails,
+        -- which is what makes such a mistake readable.
+        function libraryUtil.makeCheckSelfFunction(libraryName, varName, selfObj, selfObjDesc)
+            selfObjDesc = selfObjDesc or (varName and (varName .. ' object') or 'self object')
             return function(self, method)
-                if type(self) ~= 'table' then
+                if self ~= selfObj then
                     error(string.format(
-                        "%s: bad self argument (table expected, got %s)",
-                        libraryName, type(self)), 3)
+                        "%s: '%s' is not a valid method",
+                        libraryName, tostring(method)), 3)
                 end
                 return self
             end
@@ -2815,6 +2812,39 @@ mod tests {
                 .eval("return mw.message.newRawMessage('$1 px', 300):plain()")
                 .unwrap(),
             "300 px"
+        );
+    }
+
+    /// `libraryUtil.makeCheckSelfFunction` must reject a `self` that is not the
+    /// object it was made for. The stub used to accept anything, so a module
+    /// that mixed up its object silently read another object's fields; the real
+    /// check is what makes the mistake a diagnosable error.
+    #[test]
+    fn test_library_util_check_self() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "local u = require('libraryUtil') \
+                     local obj = {} \
+                     local checkSelf = u.makeCheckSelfFunction('MyLib', 'obj', obj, 'MyLib object') \
+                     return tostring(checkSelf(obj, 'method') == obj)"
+                )
+                .unwrap(),
+            "true"
+        );
+        // A different object is rejected, and the message names the library.
+        assert_eq!(
+            engine
+                .eval(
+                    "local u = require('libraryUtil') \
+                     local obj = {} \
+                     local checkSelf = u.makeCheckSelfFunction('MyLib', 'obj', obj, 'MyLib object') \
+                     local ok, err = pcall(checkSelf, {}, 'method') \
+                     return tostring(ok) .. '|' .. tostring(err:match('MyLib:') ~= nil)"
+                )
+                .unwrap(),
+            "false|true"
         );
     }
 
