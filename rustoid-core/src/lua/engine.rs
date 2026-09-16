@@ -1117,6 +1117,52 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     mw.set("ext", ext)
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
+    // `mw.wikibase` is provided by the Wikibase Client extension, which rustoid
+    // does not implement. It exists as a table of "nothing found" answers rather
+    // than as nil, because that is what a wiki *without* Wikidata looks like:
+    // `Module:Coordinates` writes `if mw.wikibase and mw.wikibase.entityExists(qid)`
+    // and so takes its own fallback, whereas indexing nil failed the page
+    // outright (6 for Module:Official website, 2 for Module:Coordinates).
+    //
+    // A stub that invented an entity would be worse: the modules would render
+    // Wikidata values that do not exist.
+    let wikibase = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    for name in [
+        "getEntityIdForCurrentPage",
+        "getEntityObject",
+        "getEntity",
+        "getLabel",
+        "getDescription",
+    ] {
+        wikibase
+            .set(
+                name,
+                lua.create_function(|_, _: mlua::MultiValue| Ok(Value::Nil))
+                    .map_err(|e| RustoidError::Lua(e.to_string()))?,
+            )
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    }
+    for name in ["getAllStatements", "getBestStatements"] {
+        wikibase
+            .set(
+                name,
+                lua.create_function(|lua, _: mlua::MultiValue| lua.create_table())
+                    .map_err(|e| RustoidError::Lua(e.to_string()))?,
+            )
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    }
+    wikibase
+        .set(
+            "entityExists",
+            lua.create_function(|_, _: Value| Ok(false))
+                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    mw.set("wikibase", wikibase)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
     // mw.message — the object methods live in `MESSAGE_LIB`, which is given the
     // message store and the content language as its two arguments.
     let messages = lua
@@ -3601,6 +3647,48 @@ mod tests {
                 .eval("return tostring(mw.site.interwikiMap('local').en.isProtocolRelative)")
                 .unwrap(),
             "true"
+        );
+    }
+
+    /// `mw.wikibase` reports "nothing found" rather than being nil, which is
+    /// what a wiki without Wikidata looks like. `Module:Coordinates` guards on
+    /// the table's existence and on `entityExists`, so both must be present;
+    /// indexing nil failed the page outright.
+    #[test]
+    fn test_mw_wikibase_stub() {
+        let engine = make_engine();
+        // The table exists, so a guard passes.
+        assert_eq!(engine.eval("return type(mw.wikibase)").unwrap(), "table");
+        // ...and every lookup reports a miss, so the module falls back.
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.wikibase.getEntityIdForCurrentPage())")
+                .unwrap(),
+            "nil"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.wikibase.entityExists('Q42'))")
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            engine
+                .eval("return #mw.wikibase.getAllStatements('Q42', 'P625')")
+                .unwrap(),
+            "0"
+        );
+        // The guard `Module:Coordinates` writes now takes its fallback path
+        // instead of erroring.
+        assert_eq!(
+            engine
+                .eval(
+                    "local qid = mw.wikibase.getEntityIdForCurrentPage() \
+                     if mw.wikibase and mw.wikibase.entityExists(qid) then return 'entity' end \
+                     return 'fallback'"
+                )
+                .unwrap(),
+            "fallback"
         );
     }
 
