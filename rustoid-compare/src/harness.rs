@@ -695,8 +695,10 @@ fn normalise(html: &str) -> String {
 /// implement next — so collecting them turns the scoreboard into a work list
 /// instead of a count.
 ///
-/// Messages are truncated to keep the report readable and are returned
-/// deduplicated in first-seen order, capped at `limit`.
+/// The traceback's *first module frame* is included, because a message like
+/// `attempt to index a nil value` is otherwise unattributable: the frame names
+/// the module and line. The rest of the trace is dropped, being long enough to
+/// distort the byte totals.
 pub fn script_errors(html: &str, limit: usize) -> Vec<String> {
     const MARKER: &str = "Script error:";
     let mut out: Vec<String> = Vec::new();
@@ -705,14 +707,19 @@ pub fn script_errors(html: &str, limit: usize) -> Vec<String> {
         rest = &rest[pos + MARKER.len()..];
         // The message runs to the closing tag of the error element.
         let end = rest.find('<').unwrap_or(rest.len());
-        // Strip the `lua error:` prefix rustoid adds; MediaWiki's own message
-        // starts at the interesting part.
+        // Strip the wrappers rustoid adds; MediaWiki's own message starts at the
+        // interesting part.
         let mut msg = rest[..end].trim();
-        msg = msg.strip_prefix("lua error: ").unwrap_or(msg);
-        msg = msg.strip_prefix("execution error: ").unwrap_or(msg);
-        msg = msg.strip_prefix("runtime error: ").unwrap_or(msg);
-        let msg = if msg.chars().count() > 120 {
-            format!("{}…", msg.chars().take(119).collect::<String>())
+        for prefix in [
+            "lua error: ",
+            "execution error: ",
+            "runtime error: ",
+            "module load error in ",
+        ] {
+            msg = msg.strip_prefix(prefix).unwrap_or(msg);
+        }
+        let msg = if msg.chars().count() > 150 {
+            format!("{}…", msg.chars().take(149).collect::<String>())
         } else {
             msg.to_string()
         };

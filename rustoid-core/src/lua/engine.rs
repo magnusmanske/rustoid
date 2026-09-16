@@ -41,12 +41,14 @@ pub struct LuaSite {
     /// Article path with its `$1` placeholder, for `mw.title.fullUrl`.
     pub article_path: String,
     /// `(id, canonical name)` for every namespace, for `mw.title` resolution.
-    pub namespaces: Vec<(i32, String)>,
+    /// `(id, (canonical name, aliases))` for every namespace, for `mw.title` and
+    /// `mw.site`. The main namespace (id 0) is excluded: its name is empty.
+    pub namespaces: Vec<(i32, String, Vec<String>)>,
 }
 
 impl LuaSite {
     pub fn from_config(config: &dyn SiteConfig) -> Self {
-        let mut namespaces: Vec<(i32, String)> = config
+        let mut namespaces: Vec<(i32, String, Vec<String>)> = config
             .namespaces()
             .iter()
             .map(|(id, ns)| {
@@ -58,11 +60,11 @@ impl LuaSite {
                 } else {
                     ns.canonical.clone()
                 };
-                (*id, name)
+                (*id, name, ns.aliases.clone())
             })
-            .filter(|(_, name)| !name.is_empty())
+            .filter(|(_, name, _)| !name.is_empty())
             .collect();
-        namespaces.sort_by_key(|(id, _)| *id);
+        namespaces.sort_by_key(|(id, _, _)| *id);
         Self {
             server: config.server_url().to_string(),
             language_code: config.language_code().to_string(),
@@ -80,8 +82,8 @@ impl LuaSite {
         }
         self.namespaces
             .iter()
-            .find(|(ns_id, _)| *ns_id == id)
-            .map(|(_, name)| name.clone())
+            .find(|(ns_id, _, _)| *ns_id == id)
+            .map(|(_, name, _)| name.clone())
             .unwrap_or_default()
     }
 
@@ -96,12 +98,15 @@ impl LuaSite {
             return Some(0);
         }
         if let Ok(id) = trimmed.parse::<i32>() {
-            return (id == 0 || self.namespaces.iter().any(|(i, _)| *i == id)).then_some(id);
+            return (id == 0 || self.namespaces.iter().any(|(i, _, _)| *i == id)).then_some(id);
         }
         self.namespaces
             .iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(trimmed))
-            .map(|(id, _)| *id)
+            .find(|(_, n, aliases)| {
+                n.eq_ignore_ascii_case(trimmed)
+                    || aliases.iter().any(|a| a.eq_ignore_ascii_case(trimmed))
+            })
+            .map(|(id, _, _)| *id)
     }
 }
 
@@ -671,6 +676,49 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // such as `Module:Unsubst` need in order to take their normal path.
     mw.set("isSubsting", lua.create_function(|_, ()| Ok(false))?)?;
 
+    // `mw.log.*` and `mw.logObject` write to the debug console. rustoid has
+    // none to write to, so these discard; the point is that a module calling them
+    // does not stop, and `Module:Footnotes/anchor_id_list` calls `mw.logObject`
+    // directly.
+    let log = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    for name in ["log", "warn", "info", "error", "debug"] {
+        log.set(
+            name,
+            lua.create_function(|_, _args: mlua::MultiValue| Ok(()))
+                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    }
+    log.set(
+        "logObject",
+        lua.create_function(|_, (_v, _prefix): (Value, Option<Value>)| Ok(()))
+            .map_err(|e| RustoidError::Lua(e.to_string()))?,
+    )
+    .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    mw.set("log", log.clone())
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    // `mw.log` is *also* callable directly (`mw.log('text')`), which is how
+    // `Module:Footnotes` uses it, so the table needs a `__call` metamethod.
+    let log_mt = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    log_mt
+        .set(
+            "__call",
+            lua.create_function(|_, (_t, _args): (Value, mlua::MultiValue)| Ok(()))
+                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    log.set_metatable(Some(log_mt));
+    // `mw.logObject(x)` is the module-level shorthand for `mw.log.logObject(x)`.
+    let log_object: Function = log
+        .get("logObject")
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    mw.set("logObject", log_object)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
     // `mw.clone(value)` — a deep copy, preserving metatables. Modules copy shared
     // configuration tables before modifying them, and a shallow copy would let
     // one invocation corrupt another's data.
@@ -717,6 +765,58 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     content_language.set("formatNum", lua.create_function(luafn_lang_format_num_any)?)?;
+    // `ucfirst`/`lcfirst` change only the first character. `Module:Footnotes`
+    // calls `lang:ucfirst(name)` to canonicalise a template name, and both take
+    // the language as `self` under the colon call, so they take `Value`s.
+    content_language.set(
+        "ucfirst",
+        lua.create_function(|_, (first, second): (Value, Option<Value>)| {
+            let s = coerce_string(pick_self(&first, second.as_ref()), "ucfirst")?;
+            let mut chars = s.chars();
+            Ok(match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            })
+        })?,
+    )?;
+    content_language.set(
+        "lcfirst",
+        lua.create_function(|_, (first, second): (Value, Option<Value>)| {
+            let s = coerce_string(pick_self(&first, second.as_ref()), "lcfirst")?;
+            let mut chars = s.chars();
+            Ok(match chars.next() {
+                Some(c) => c.to_lowercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            })
+        })?,
+    )?;
+    // `formatDate(format, timestamp)` — date formatting. `Module:Citation/CS1`
+    // uses it to get month names, so the common single-letter formats are
+    // supported; anything else returns the input unchanged, which is visible in
+    // the output rather than silently wrong.
+    content_language.set(
+        "formatDate",
+        lua.create_function(
+            |_, (first, second, third): (Value, Option<Value>, Option<Value>)| {
+                // Called both as `lang:formatDate(f, ts)` (language first) and
+                // `mw.language.formatDate(f, ts)`.
+                let (fmt, stamp) = if matches!(first, Value::Table(_)) {
+                    match (second, third) {
+                        (Some(f), ts) => (f, ts.unwrap_or(Value::Nil)),
+                        (None, _) => return Ok(String::new()),
+                    }
+                } else {
+                    (first, second.unwrap_or(Value::Nil))
+                };
+                let fmt = coerce_string(&fmt, "formatDate")?;
+                let stamp = match stamp {
+                    Value::Nil => return Ok(String::new()),
+                    v => coerce_string(&v, "formatDate")?,
+                };
+                Ok(format_date(&fmt, &stamp))
+            },
+        )?,
+    )?;
     content_language.set(
         "getCode",
         lua.create_function(|_, ()| Ok("en".to_string()))?,
@@ -1214,8 +1314,18 @@ end
 
 function Node:tag(tag)
     local child = new_node(tag)
+    child._parent = self
     table.insert(self._children, child)
     return child
+end
+
+-- `node(builder)` inserts an already-built node (or any value) as a child.
+-- Re-parenting matters: the child is rendered once, in its new position.
+function Node:node(child)
+    if child == nil then return self end
+    if type(child) == 'table' then child._parent = self end
+    table.insert(self._children, child)
+    return self
 end
 
 function Node:wikitext(...)
@@ -1250,8 +1360,16 @@ function Node:_render()
     return table.concat(out)
 end
 
-function Node:done() return self:_render() end
-function Node:allDone() return self:_render() end
+function Node:done() return self._parent or self:allDone() end
+function Node:allDone()
+    -- `allDone` finishes the *whole* tree and returns a string.
+    if self._parent then return self._parent:allDone() end
+    return self:_render()
+end
+
+-- `tostring(node)` renders the subtree, which is how a node used as a value
+-- behaves in Scribunto.
+Node.__tostring = function(self) return self:_render() end
 
 function html.create(tag)
     -- The table form is accepted too: `mw.html.create{ 'div', selfClosing = true }`.
@@ -1275,6 +1393,87 @@ if table.clone == nil then
     end
 end
 "#;
+
+/// A small subset of MediaWiki's `Language::sprintfDate`.
+///
+/// Covers the formats modules actually ask for when reading month names out of a
+/// date (`Module:Citation/CS1` iterates `F` and `M` over a year). An unknown
+/// letter is passed through as-is, so unsupported formatting shows up in the
+/// output rather than silently producing an empty string.
+fn format_date(format: &str, stamp: &str) -> String {
+    // Only the date part matters for the supported letters, and MediaWiki accepts
+    // `YYYY-MM-DD` (optionally with a time), which is what callers build.
+    let mut parts = stamp.split(['-', 'T', ' ']);
+    let year = parts.next().and_then(|s| s.parse::<i32>().ok());
+    let month = parts.next().and_then(|s| s.parse::<usize>().ok());
+    let day = parts.next().and_then(|s| s.parse::<u32>().ok());
+
+    const LONG: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const SHORT: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const DAYS: [&str; 7] = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ];
+
+    // Day of week needs a real date calculation, which this does not attempt:
+    // the letters below are the ones the corpus asks for.
+    let mut out = String::new();
+    for c in format.chars() {
+        match c {
+            'Y' => out.push_str(&year.unwrap_or(0).to_string()),
+            'y' => out.push_str(&format!("{:02}", year.unwrap_or(0).rem_euclid(100))),
+            'n' => out.push_str(&month.unwrap_or(0).to_string()),
+            'm' => out.push_str(&format!("{:02}", month.unwrap_or(0))),
+            'F' => out.push_str(
+                month
+                    .and_then(|m| (1..=12).contains(&m).then(|| LONG[m - 1]))
+                    .unwrap_or(""),
+            ),
+            'M' => out.push_str(
+                month
+                    .and_then(|m| (1..=12).contains(&m).then(|| SHORT[m - 1]))
+                    .unwrap_or(""),
+            ),
+            'j' => out.push_str(&day.unwrap_or(0).to_string()),
+            'd' => out.push_str(&format!("{:02}", day.unwrap_or(0))),
+            _ => out.push(c),
+        }
+    }
+    let _ = DAYS;
+    out
+}
+
+/// Pick the argument that is *not* the language object.
+///
+/// Scribunto's language methods are called both ways — `lang:ucfirst(s)` passes
+/// the language first, `mw.language.ucfirst(s)` does not — so the value is
+/// whichever argument is not a table.
+fn pick_self<'a>(first: &'a Value, second: Option<&'a Value>) -> &'a Value {
+    match (first, second) {
+        (Value::Table(_), Some(s)) => s,
+        _ => first,
+    }
+}
 
 /// `mw.clone(value)` — a deep copy that keeps metatables.
 ///
@@ -1567,14 +1766,14 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
     let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let namespaces = lua.create_table().map_err(err)?;
     // The main namespace is id 0 with the empty name, which the snapshot drops
-    // (an empty canonical name carries no information); add it back.
-    let mut all: Vec<(i32, String)> = site.namespaces.clone();
-    if !all.iter().any(|(id, _)| *id == 0) {
-        all.push((0, String::new()));
+    // (an empty name carries no information); add it back.
+    let mut all: Vec<(i32, String, Vec<String>)> = site.namespaces.clone();
+    if !all.iter().any(|(id, _, _)| *id == 0) {
+        all.push((0, String::new(), Vec::new()));
     }
-    all.sort_by_key(|(id, _)| *id);
+    all.sort_by_key(|(id, _, _)| *id);
 
-    for (id, canonical) in all {
+    for (id, canonical, aliases) in all {
         let entry = lua.create_table().map_err(err)?;
         entry.set("id", id).map_err(err)?;
         entry.set("name", canonical.clone()).map_err(err)?;
@@ -1586,6 +1785,15 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
         entry.set("isContent", id == 0 || id == 828).map_err(err)?;
         entry.set("isTalk", id % 2 == 1).map_err(err)?;
         entry.set("subject", id - (id % 2)).map_err(err)?;
+        // The localized names, as a table. It must exist even when empty:
+        // `Module:Namespace detect/data` iterates `ipairs(ns.aliases)` for every
+        // namespace, and a missing field was an unattributed "attempt to index a
+        // nil value" raised inside a for iterator.
+        let alias_table = lua.create_table().map_err(err)?;
+        for (i, alias) in aliases.iter().enumerate() {
+            alias_table.set(i + 1, alias.clone()).map_err(err)?;
+        }
+        entry.set("aliases", alias_table).map_err(err)?;
         namespaces.set(id, entry.clone()).map_err(err)?;
         if !canonical.is_empty() {
             namespaces.set(canonical, entry.clone()).map_err(err)?;

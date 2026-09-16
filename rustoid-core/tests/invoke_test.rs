@@ -619,3 +619,180 @@ async fn site_namespace_tables_support_the_usual_iteration() {
         .unwrap_or(0);
     assert!(count > 10, "namespaces did not iterate: {body}");
 }
+
+/// Every `mw.site` namespace entry must carry `aliases` as a *table*.
+///
+/// `Module:Namespace detect/data` iterates `ipairs(ns.aliases)` for every
+/// namespace in order to build its parameter mappings. A missing field is not a
+/// recoverable nil there: the error surfaces inside a for iterator, which Lua
+/// cannot attribute to a line, so it appeared as a bare "attempt to index a nil
+/// value" against the whole module — 31 corpus pages, unattributable.
+#[tokio::test]
+async fn every_site_namespace_has_an_aliases_table() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local bad, count = 0, 0
+            for _, ns in pairs(mw.site.subjectNamespaces) do
+                count = count + 1
+                -- Iterating is the operation that failed; type() alone would
+                -- not have caught a non-iterable value.
+                for _, alias in ipairs(ns.aliases) do
+                    if type(alias) ~= 'string' then bad = bad + 1 end
+                end
+            end
+            return 'count=' .. count .. ' bad=' .. bad
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:NSAlias", module)], "{{#invoke:NSAlias|main}}").await;
+    let body = text_only(&html);
+    assert!(
+        body.contains("bad=0"),
+        "a namespace alias was not a string: {body}"
+    );
+    assert!(
+        body.contains("count="),
+        "namespaces did not iterate: {body}"
+    );
+}
+
+/// A namespace can be named by its *alias* as well as its canonical name.
+#[tokio::test]
+async fn namespace_alias_resolves_to_its_id() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return tostring(mw.title.new('Foo', 'Template').namespace)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:NsAlias", module)], "{{#invoke:NsAlias|main}}").await;
+    assert!(text_only(&html).contains("10"), "got: {html}");
+}
+
+/// `mw.html`'s `tag()` must return a builder with the same methods.
+#[tokio::test]
+async fn html_nested_tag_supports_wikitext_and_attrs() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local root = mw.html.create('div')
+            local inner = root:tag('span')
+            inner:attr('title', 'T')
+            inner:wikitext('body')
+            return root:done()
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:HN", module)], "{{#invoke:HN|main}}").await;
+    assert!(html.contains("title=\"T\""), "got: {html}");
+    assert!(text_only(&html).contains("body"), "got: {html}");
+}
+
+/// `mw.language` objects need `ucfirst`/`lcfirst`; `Module:Footnotes` calls
+/// `Lang_obj:ucfirst(name)` to canonicalise a template name.
+#[tokio::test]
+async fn language_objects_have_case_functions() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local lang = mw.getContentLanguage()
+            return lang:ucfirst('article') .. '/' .. lang:lcfirst('Article')
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Langcase", module)], "{{#invoke:Langcase|main}}").await;
+    assert!(text_only(&html).contains("Article/article"), "got: {html}");
+}
+
+/// The exact `mw.html` chain `Module:Navbar` builds.
+#[tokio::test]
+async fn html_chained_builder_calls() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local ul = mw.html.create('ul')
+            ul:tag('li')
+                :attr('class', 'nv-view')
+                :cssText('white-space:nowrap;')
+                :wikitext('text')
+                :done()
+                :wikitext('tail')
+                :done()
+            return ul:done()
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Chain", module)], "{{#invoke:Chain|main}}").await;
+    let body = text_only(&html);
+    assert!(body.contains("text"), "got: {html}");
+    assert!(body.contains("tail"), "got: {html}");
+}
+
+/// `mw.log` and `mw.logObject` must exist as no-ops.
+///
+/// rustoid has no debug console to write to, but a module that logs must not
+/// stop: `Module:Footnotes/anchor_id_list` calls `mw.logObject` directly.
+#[tokio::test]
+async fn logging_helpers_are_no_ops() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            mw.log('plain')
+            mw.logObject({ a = 1 }, 'prefix')
+            mw.log.warn('nested')
+            return 'logged'
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Logs", module)], "{{#invoke:Logs|main}}").await;
+    assert!(text_only(&html).contains("logged"), "got: {html}");
+}
+
+/// `mw.html:node()` inserts an existing node; `done()` returns the *parent*.
+///
+/// Scribunto's manual is explicit that `done()` returns the parent instance
+/// rather than a string, which is what makes
+/// `:tag('li'):attr(..):done():wikitext(..)` chain back up. Returning a string
+/// broke every such chain (`Module:Navbar` and `Module:Sidebar` both build one).
+#[tokio::test]
+async fn html_node_inserts_a_child_and_done_goes_up() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local ul = mw.html.create('ul')
+            ul:tag('li'):wikitext('first'):done():wikitext('AFTER')
+            local separate = mw.html.create('li'):wikitext('inserted')
+            ul:node(separate)
+            return ul:done()
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Node", module)], "{{#invoke:Node|main}}").await;
+    let body = text_only(&html);
+    assert!(body.contains("first"), "got: {html}");
+    assert!(
+        body.contains("AFTER"),
+        "done() did not return the parent: {html}"
+    );
+    assert!(body.contains("inserted"), "node() did not insert: {html}");
+}
+
+/// `mw.language:formatDate` must produce month names — `Module:Citation/CS1`
+/// iterates `F` and `M` across a year to build its month tables.
+#[tokio::test]
+async fn language_format_date_supports_month_names() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local lang = mw.getContentLanguage()
+            return lang:formatDate('F', '2022-3-1') .. '/' .. lang:formatDate('M', '2022-12-1')
+                .. '/' .. lang:formatDate('Y-m-d', '2022-3-4')
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:FmtDate", module)], "{{#invoke:FmtDate|main}}").await;
+    let body = text_only(&html);
+    assert!(body.contains("March/Dec"), "got: {body}");
+}
