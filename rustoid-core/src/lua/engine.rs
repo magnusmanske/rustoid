@@ -793,7 +793,10 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     text.set("encode", lua.create_function(luafn_text_encode)?)?;
     text.set("decode", lua.create_function(luafn_text_decode)?)?;
     text.set("trim", lua.create_function(luafn_text_trim)?)?;
-    text.set("split", lua.create_function(luafn_text_split)?)?;
+    // `mw.text.split` and `mw.text.gsplit` are written in `LUA_STDLIB_EXTRAS`,
+    // over the literal-split primitive below, because the pattern form needs
+    // `mw.ustring.find` and the pattern dialect belongs in one place.
+    text.set("__splitPlain", lua.create_function(luafn_text_split_plain)?)?;
     text.set("tag", lua.create_function(luafn_text_tag)?)?;
     text.set("nowiki", lua.create_function(luafn_text_nowiki)?)?;
     text.set("listToText", lua.create_function(luafn_text_list_to_text)?)?;
@@ -1066,6 +1069,11 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
             })
         })?,
     )?;
+    // `gcodepoint` yields both a value and a new control, and mlua keeps only the
+    // first of a closure's tuple return when the closure is used as a `for`
+    // iterator. The codepoints are therefore collected in Rust and the iterator
+    // itself is written in Lua, where a multi-value return is native.
+    ustring.set("codepoints", lua.create_function(luafn_ustring_codepoints)?)?;
     ustring.set_metatable(Some(ustring_mt));
     mw.set("ustring", ustring)?;
 
@@ -1124,10 +1132,18 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .map_err(|e| RustoidError::Lua(format!("mw.html setup: {e}")))?;
     mw.set("html", html)?;
 
-    // Scribunto's standard-library additions.
+    // Scribunto's standard-library additions. The chunk needs the `mw` table it
+    // extends, and the global is not registered until `setup_mw_table` returns,
+    // so the table is bound to a name for the duration of the call.
+    lua.globals()
+        .set("__rustoid_mw", mw.clone())
+        .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
     lua.load(LUA_STDLIB_EXTRAS)
         .set_name("lua stdlib extras")
         .exec()
+        .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
+    lua.globals()
+        .set("__rustoid_mw", Value::Nil)
         .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
 
     Ok(mw)
@@ -1305,9 +1321,20 @@ fn luafn_text_list_to_text(
     })
 }
 
-fn luafn_text_split(_: &Lua, (s, sep): (Value, Value)) -> mlua::Result<Vec<String>> {
+/// `mw.text.split( s, pattern, plain )` — the pieces between separator matches.
+///
+/// Only the `plain` form is implemented in Rust: a literal separator is a
+/// substring split, and the pattern form is handled in `LUA_STDLIB_EXTRAS`,
+/// where the matching is done with `mw.ustring.find` — the same function
+/// Scribunto's own library uses, so the pattern dialect is the Ustring one.
+fn luafn_text_split_plain(_: &Lua, (s, sep): (Value, Value)) -> mlua::Result<Vec<String>> {
     let s = coerce_string(&s, "split")?;
     let sep = coerce_string(&sep, "split")?;
+    if sep.is_empty() {
+        // A separator that matches the empty string splits into characters, as
+        // the manual says for the pattern case.
+        return Ok(s.chars().map(|c| c.to_string()).collect());
+    }
     Ok(s.split(&sep).map(|p| p.to_string()).collect())
 }
 
@@ -1949,6 +1976,8 @@ return html
 /// `table.clone` is Scribunto's, not Lua's, and modules call it freely. Without
 /// it a module stops at the call rather than at something diagnosable.
 const LUA_STDLIB_EXTRAS: &str = r#"
+do
+local mw = __rustoid_mw
 if table.clone == nil then
     function table.clone(t)
         local copy = {}
@@ -1963,6 +1992,67 @@ end
 -- strip markers. Lua 5.4 dropped the alias, so it is restored here.
 if string.gfind == nil then
     string.gfind = string.gmatch
+end
+
+-- `mw.ustring.gcodepoint( s, i, j )` — an iterator over the codepoints. The
+-- codepoints come from `mw.ustring.codepoints` (Rust), but the iterator is
+-- built here: a `for` iterator must return a value *and* the next control, and
+-- a Rust closure's second return value does not survive that call.
+-- `i` and `j` are codepoint offsets and default to the whole string.
+function mw.ustring.gcodepoint(s, i, j)
+    local points = mw.ustring.codepoints(s, i, j)
+    local pos = 0
+    return function()
+        pos = pos + 1
+        return points[pos]
+    end
+end
+
+-- `mw.text.split( s, pattern, plain )` and its iterator form
+-- `mw.text.gsplit`. The Rust side supplies only the literal split; the pattern
+-- form is the reference implementation from the manual, walking the string with
+-- `mw.ustring.find` so the pattern dialect is the Ustring one.
+local function gsplit_pattern(text, pattern, plain)
+    local s, l = 1, mw.ustring.len(text)
+    return function()
+        if not s then return nil end
+        local e, n = mw.ustring.find(text, pattern, s, plain)
+        local ret
+        if not e then
+            ret = mw.ustring.sub(text, s)
+            s = nil
+        elseif n < e then
+            -- Empty separator: emit one character.
+            ret = mw.ustring.sub(text, s, e)
+            s = e < l and e + 1 or nil
+        else
+            ret = e > s and mw.ustring.sub(text, s, e - 1) or ''
+            s = n + 1
+        end
+        return ret
+    end
+end
+
+function mw.text.gsplit(text, pattern, plain)
+    if plain then
+        local parts = mw.text.__splitPlain(text, pattern)
+        local i = 0
+        return function()
+            i = i + 1
+            return parts[i]
+        end
+    end
+    return gsplit_pattern(text, pattern)
+end
+
+function mw.text.split(text, pattern, plain)
+    if plain then return mw.text.__splitPlain(text, pattern) end
+    local out = {}
+    for piece in gsplit_pattern(text, pattern) do
+        out[#out + 1] = piece
+    end
+    return out
+end
 end
 "#;
 
@@ -2391,6 +2481,38 @@ fn luafn_ustring_sub(
 
 fn luafn_ustring_upper(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(coerce_string(&s, "upper")?.to_uppercase())
+}
+
+/// The codepoints of `s[i..=j]`, as a table, for `mw.ustring.gcodepoint`.
+///
+/// The iterator itself is written in Lua (`LUA_STDLIB_EXTRAS`), because a `for`
+/// iterator must return both a value and the next control, and mlua keeps only
+/// the first of a closure's tuple return in that position.
+///
+/// `i` and `j` index codepoints (not bytes) and default to the whole string, as
+/// in `ustring.sub`. The bounds are clamped here, so the Lua side never sees an
+/// out-of-range index and a start past the end simply yields an empty table.
+fn luafn_ustring_codepoints(
+    _: &Lua,
+    (s, i, j): (Value, Option<i64>, Option<i64>),
+) -> mlua::Result<Vec<i64>> {
+    let s = coerce_string(&s, "gcodepoint")?;
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+
+    // Lua's `posrelat`: a negative index counts back from the end.
+    let start = i.unwrap_or(1);
+    let start = if start < 0 { n + start + 1 } else { start }.max(1);
+    let end = j.unwrap_or(-1);
+    let end = (if end < 0 { n + end + 1 } else { end }).min(n);
+
+    if start > end {
+        return Ok(Vec::new());
+    }
+    Ok(chars[(start - 1) as usize..end as usize]
+        .iter()
+        .map(|c| *c as i64)
+        .collect())
 }
 
 fn luafn_ustring_lower(_: &Lua, s: Value) -> mlua::Result<String> {
@@ -3163,6 +3285,34 @@ mod tests {
             .eval("return table.concat(mw.text.split('a,b,c', ','), '|')")
             .unwrap();
         assert_eq!(result, "a|b|c");
+        // The separator is a *pattern*, not a literal, so a character class
+        // works and a run of separators does not produce empty pieces.
+        assert_eq!(
+            engine
+                .eval("return table.concat(mw.text.split('a b  c', '%s+'), '|')")
+                .unwrap(),
+            "a|b|c"
+        );
+        assert_eq!(
+            engine
+                .eval("return table.concat(mw.text.split('a1b22c', '%d+'), '|')")
+                .unwrap(),
+            "a|b|c"
+        );
+        // `plain` turns the separator back into a literal.
+        assert_eq!(
+            engine
+                .eval("return table.concat(mw.text.split('a.s.b', '.', true), '|')")
+                .unwrap(),
+            "a|s|b"
+        );
+        // A pattern matching the empty string splits into characters.
+        assert_eq!(
+            engine
+                .eval("return table.concat(mw.text.split('abc', ''), '|')")
+                .unwrap(),
+            "a|b|c"
+        );
     }
 
     #[test]
@@ -3540,6 +3690,126 @@ mod tests {
         assert_eq!(
             engine.eval("return mw.ustring.upper('hello')").unwrap(),
             "HELLO"
+        );
+    }
+
+    /// `mw.ustring.gcodepoint` iterates codepoints. `Module:Lang` walks a string
+    /// with it, so the values must be numeric codepoints and the iterator must
+    /// terminate.
+    #[test]
+    fn test_mw_ustring_gcodepoint() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = {} \
+                     for cp in mw.ustring.gcodepoint('ab') do t[#t + 1] = cp end \
+                     return table.concat(t, ',')"
+                )
+                .unwrap(),
+            "97,98"
+        );
+        // Multibyte characters count once, as codepoints rather than bytes.
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = 0 \
+                     for _ in mw.ustring.gcodepoint('héllo') do n = n + 1 end \
+                     return n"
+                )
+                .unwrap(),
+            "5"
+        );
+        // The bounds are codepoint offsets, and negatives count from the end.
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = {} \
+                     for cp in mw.ustring.gcodepoint('abc', 2) do t[#t + 1] = cp end \
+                     return table.concat(t, ',')"
+                )
+                .unwrap(),
+            "98,99"
+        );
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = {} \
+                     for cp in mw.ustring.gcodepoint('abc', -2) do t[#t + 1] = cp end \
+                     return table.concat(t, ',')"
+                )
+                .unwrap(),
+            "98,99"
+        );
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = {} \
+                     for cp in mw.ustring.gcodepoint('abc', 1, 2) do t[#t + 1] = cp end \
+                     return table.concat(t, ',')"
+                )
+                .unwrap(),
+            "97,98"
+        );
+        // An out-of-range start yields nothing rather than erroring.
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = 0 \
+                     for _ in mw.ustring.gcodepoint('abc', 9) do n = n + 1 end \
+                     return n"
+                )
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = 0 \
+                     for _ in mw.ustring.gcodepoint('') do n = n + 1 end \
+                     return n"
+                )
+                .unwrap(),
+            "0"
+        );
+    }
+
+    /// `mw.text.gsplit` is the iterator form of `mw.text.split`, which
+    /// `Module:Annotated link` uses to walk a hash-delimited list.
+    #[test]
+    fn test_mw_text_gsplit() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = {} \
+                     for part in mw.text.gsplit('a b  c', '%s+') do t[#t + 1] = part end \
+                     return table.concat(t, '|')"
+                )
+                .unwrap(),
+            "a|b|c"
+        );
+        // A plain separator is a literal, not a pattern.
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = {} \
+                     for part in mw.text.gsplit('a#b#c', '#', true) do t[#t + 1] = part end \
+                     return table.concat(t, '|')"
+                )
+                .unwrap(),
+            "a|b|c"
+        );
+        // The pieces match what `mw.text.split` returns, in order.
+        assert_eq!(
+            engine
+                .eval(
+                    "local a = {} \
+                     for part in mw.text.gsplit('a b c', ' ') do a[#a + 1] = part end \
+                     return table.concat(a, '|') == table.concat(mw.text.split('a b c', ' '), '|')"
+                )
+                .unwrap(),
+            "true"
         );
     }
 
