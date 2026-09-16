@@ -496,6 +496,31 @@ Two things to know about the numbers:
 - Instruction-count and memory limits enforced, with a wall-clock timeout.
 - **Exit criterion:** the score on the module-heavy corpus moves materially.
 
+#### Where the Lua errors stand
+
+The offline corpus at this point holds 32 comparable pages and reports **43 Lua
+failures across 23 distinct messages**, down from 87 when the phase began. The
+remaining ones fall into three groups, which is the useful way to read them:
+
+1. **Cache coverage, not code.** `Module:Sister project links/config` and
+   `Module:IPAc-en/pronunciation` are reached through a `require` whose argument
+   is computed, so the offline cache never fetched them (13 of the 43). A single
+   online run of the affected pages adds them and the failures go away.
+2. **Genuine gaps in the `mw` surface**, each a small, well-specified piece:
+   `frame:preprocess` (3), `mw.text.unstrip` semantics for `Module:Noinclude`,
+   `mw.ext.ParserFunctions` for `Module:Math`, and the `U` sub-tag on
+   `mw.ustring.char`.
+3. **Host features the Lua side cannot supply:** `#tag` (so
+   `frame:callParserFunction('#tag:…')` fails), `mw.wikibase` answering real
+   entities, and `Module:Wikidata`'s own syntax error, which is a Lua 5.1 vs 5.4
+   escaping difference in *that module*, not in the engine.
+
+Two diagnostics earned their keep and are worth keeping in mind when reading
+future failures: a nested load error must be attributed to the **innermost**
+module (see `missing_module_from`), and a `for`-iterator cannot be a Rust
+closure returning a tuple, because mlua drops the second value in that position
+(see `mw.ustring.gcodepoint`).
+
 ### Phase 5 — On-wiki extensions
 
 - **Cite first** (`<ref>`, `<references>`): names and groups, back-links, the
