@@ -353,6 +353,38 @@ observe, and widening it is follow-up work.
 - **Exit criterion:** a page whose infobox is module-driven matches byte-exactly.
   — not yet; see below for where it stands.
 
+#### Where `#invoke` stands, measured
+
+Wiring `#invoke` moved the corpus from "43 of 44 pages never expand their Lua
+calls" to "Lua runs and the failures are a ranked list of what modules ask for".
+Working that list down, in the order the scoreboard ranked it:
+
+| failure | pages | fix |
+|---|---|---|
+| `require('strict')` / `libraryUtil` rejected | 36 + 26 | supplied as Lua source |
+| `mw.ustring.match` and friends missing | many | forwards to Lua's `string` |
+| `mw.site.namespaces` missing | 11 | built from the `LuaSite` snapshot |
+| `mw.language.getContentLanguage` missing | 35 | added, colon-call tolerant |
+| `bad argument #1 … expected string or number` | 37 | coercion, and the error now names the function |
+| `isSubsting`, `listToText`, `subjectNamespaces` | 15 + 5 + 2 | added |
+| `mw.html.create(nil)` rejected | 37 | `mw.html` rewritten as a real builder |
+| `mw.html` `cssText` | 35 | added |
+
+The shape of the remaining list says more than its length: the largest entry is
+now 13 pages, and there are **45 distinct failures across 108 occurrences**,
+where before there were two failures covering 62 pages. There is no longer a
+single wall — what is left is breadth, which is Phase 4's job.
+
+Two things to know about the numbers:
+
+- The score is still 0/38 and the size ratio is 5.57x. Running Lua has not yet
+  made a page *match*; it has replaced one kind of wrong output (literal
+  wikitext) with another (partially rendered pages plus error text).
+- `[string "module"]:13: attempt to index a nil value` and its siblings name no
+  function. Those come from errors *inside* Lua code operating on a table the
+  engine handed back with a missing field, so the message is a line number in a
+  module. Attributing them needs either more `mw` surface or better traces.
+
 ### Phase 4 — Lua API breadth
 
 - `mw.ustring` complete (`gsub`/`gmatch`/`find`/`match`/`sub`/`rep`/…), then

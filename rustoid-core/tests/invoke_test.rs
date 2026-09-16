@@ -240,3 +240,87 @@ async fn mw_language_content_language_is_available() {
     let html = expand(&[("Module:Lang", module)], "{{#invoke:Lang|main}}").await;
     assert!(html.contains("en/"), "got: {html}");
 }
+
+/// Lua's string functions coerce numbers, and modules rely on it: a numeric
+/// argument must not fail, but a missing one must name the function rather than
+/// report a bare conversion error.
+#[tokio::test]
+async fn mw_text_functions_coerce_numbers_and_name_themselves() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local ok, err = pcall(mw.text.trim, nil)
+            return mw.text.trim(42) .. '/' .. tostring(ok) .. '/' .. tostring(err)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Coerce", module)], "{{#invoke:Coerce|main}}").await;
+    assert!(html.contains("42/false"), "got: {html}");
+    assert!(
+        html.contains("trim"),
+        "the error should name the function: {html}"
+    );
+}
+
+/// `mw.isSubsting()`, `mw.text.listToText` and the namespace indexes modules
+/// cross-reference.
+#[tokio::test]
+async fn misc_mw_helpers_needed_by_real_modules() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return tostring(mw.isSubsting())
+                .. '/' .. mw.text.listToText({'a', 'b', 'c'})
+                .. '/' .. tostring(mw.site.subjectNamespaces[0].id)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Misc", module)], "{{#invoke:Misc|main}}").await;
+    assert!(html.contains("false/a, b and c/0"), "got: {html}");
+}
+
+/// Scribunto adds `table.clone`; a module that calls it must not stop there.
+#[tokio::test]
+async fn table_clone_is_available() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local t = { a = 1, b = 2 }
+            local c = table.clone(t)
+            c.a = 9
+            return tostring(t.a) .. tostring(c.a)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Clone", module)], "{{#invoke:Clone|main}}").await;
+    assert!(html.contains("19"), "got: {html}");
+}
+
+/// `mw.html` must build a real tree, and `create(nil)` must give a tagless
+/// builder — the documented form that stopped 37 corpus pages.
+#[tokio::test]
+async fn mw_html_builds_and_accepts_a_tagless_builder() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local tagless = mw.html.create():wikitext('bare'):done()
+            local div = mw.html.create('div'):addClass('a', 'b'):attr('id', 'x')
+                :wikitext('inner'):done()
+            local nested = mw.html.create('span'):tag('b'):wikitext('deep'):allDone()
+            return tagless .. '|' .. div .. '|' .. nested
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Html", module)], "{{#invoke:Html|main}}").await;
+    // `mw.html` builds HTML, which the parser emits as elements, so the
+    // attributes are checked on the raw output rather than on the stripped text.
+    assert!(
+        html.contains("bare"),
+        "tagless builder lost its text: {html}"
+    );
+    assert!(
+        html.contains("class=\"a b\"") && html.contains("id=\"x\""),
+        "attributes: {html}"
+    );
+    assert!(text_only(&html).contains("deep"), "nested tag: {html}");
+}

@@ -455,6 +455,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     text.set("trim", lua.create_function(luafn_text_trim)?)?;
     text.set("split", lua.create_function(luafn_text_split)?)?;
     text.set("tag", lua.create_function(luafn_text_tag)?)?;
+    text.set("listToText", lua.create_function(luafn_text_list_to_text)?)?;
     mw.set("text", text)?;
 
     // mw.title
@@ -464,7 +465,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let ctx2 = ctx.clone();
     title.set(
         "new",
-        lua.create_function(move |lua, (text, ns): (String, Option<i32>)| {
+        lua.create_function(move |lua, (text, ns): (Value, Option<i32>)| {
             luafn_title_new(lua, &ctx2, text, ns)
         })?,
     )?;
@@ -487,7 +488,17 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // properties off the entries (Hatnote indexes it directly, which is why a
     // missing table stops the module with "attempt to index a nil value").
     site.set("namespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
+    // `subjectNamespaces`/`talkNamespaces` are the same entries under a second
+    // index; modules cross-reference them (Namespace detect reads
+    // `subjectNamespaces`).
+    site.set("subjectNamespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
+    site.set("talkNamespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
     mw.set("site", site)?;
+
+    // `mw.isSubsting()` reports whether the current parse is a `subst:`. rustoid
+    // never substitutes, so it is always false — which is the answer modules
+    // such as `Module:Unsubst` need in order to take their normal path.
+    mw.set("isSubsting", lua.create_function(|_, ()| Ok(false))?)?;
 
     // mw.uri
     let uri = lua
@@ -572,31 +583,92 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     message.set("new", lua.create_function(luafn_message_new)?)?;
     mw.set("message", message)?;
 
-    // mw.html (simplified)
-    let html = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    html.set("create", lua.create_function(luafn_html_create)?)?;
+    // mw.html — built from Lua source (see `HTML_LIB`).
+    let html: Table = lua
+        .load(HTML_LIB)
+        .set_name("mw.html")
+        .eval()
+        .map_err(|e| RustoidError::Lua(format!("mw.html setup: {e}")))?;
     mw.set("html", html)?;
+
+    // Scribunto's standard-library additions.
+    lua.load(LUA_STDLIB_EXTRAS)
+        .set_name("lua stdlib extras")
+        .exec()
+        .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
 
     Ok(mw)
 }
 
 // ---- Standalone Lua functions ----
 
-fn luafn_text_encode(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(html_escape(&s))
+/// Coerce a Lua value to a string the way Lua's own string functions do.
+///
+/// Lua's C string library accepts numbers and coerces them, and modules rely on
+/// that (`mw.text.trim(frame.args[1])` where the argument is numeric). It also
+/// means a `nil` — an absent argument — reaches the function, so the error must
+/// *name the function*: mlua's own conversion message
+/// ("expected string or number") left 37 corpus pages unattributable.
+fn coerce_string(value: &Value, function: &str) -> mlua::Result<String> {
+    match value {
+        Value::String(s) => s
+            .to_str()
+            .map(|s| s.to_string())
+            .map_err(mlua::Error::external),
+        Value::Integer(i) => Ok(i.to_string()),
+        Value::Number(n) => Ok(format_number(*n)),
+        other => Err(mlua::Error::runtime(format!(
+            "bad argument #1 to '{function}' (string expected, got {})",
+            other.type_name()
+        ))),
+    }
 }
 
-fn luafn_text_decode(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(html_unescape(&s))
+fn luafn_text_encode(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(html_escape(&coerce_string(&s, "encode")?))
 }
 
-fn luafn_text_trim(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(s.trim().to_string())
+fn luafn_text_decode(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(html_unescape(&coerce_string(&s, "decode")?))
 }
 
-fn luafn_text_split(_: &Lua, (s, sep): (String, String)) -> mlua::Result<Vec<String>> {
+fn luafn_text_trim(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(coerce_string(&s, "trim")?.trim().to_string())
+}
+
+/// `mw.text.listToText` — joins items with `sep` and a `conjunction` before the
+/// last, e.g. `a, b and c`. MediaWiki's default conjunction for English is
+/// "and".
+fn luafn_text_list_to_text(
+    _: &Lua,
+    (items, sep, conj): (Table, Option<Value>, Option<Value>),
+) -> mlua::Result<String> {
+    let sep = match &sep {
+        Some(v) => coerce_string(v, "listToText")?,
+        None => ", ".to_string(),
+    };
+    let conj = match &conj {
+        Some(v) => coerce_string(v, "listToText")?,
+        None => "and".to_string(),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for item in items.sequence_values::<Value>() {
+        let item = item?;
+        parts.push(coerce_string(&item, "listToText")?);
+    }
+    Ok(match parts.len() {
+        0 => String::new(),
+        1 => parts.remove(0),
+        _ => {
+            let last = parts.pop().unwrap_or_default();
+            format!("{} {} {last}", parts.join(&sep), conj)
+        }
+    })
+}
+
+fn luafn_text_split(_: &Lua, (s, sep): (Value, Value)) -> mlua::Result<Vec<String>> {
+    let s = coerce_string(&s, "split")?;
+    let sep = coerce_string(&sep, "split")?;
     Ok(s.split(&sep).map(|p| p.to_string()).collect())
 }
 
@@ -621,9 +693,10 @@ fn luafn_text_tag(
 fn luafn_title_new(
     lua: &Lua,
     ctx: &LuaContext,
-    text: String,
+    text: Value,
     namespace: Option<i32>,
 ) -> mlua::Result<Table> {
+    let text = coerce_string(&text, "title.new")?;
     // Split `Ns:Title#frag` against the namespace snapshot. Full `TitleParser`
     // semantics (interwiki, language variants) are not observable here yet.
     let (prefix, rest) = match text.split_once(':') {
@@ -660,7 +733,69 @@ fn luafn_title_new(
         "rootText",
         title_text.split('/').next().unwrap_or("").to_string(),
     )?;
+
+    // Derived fields are computed on demand rather than eagerly: a module that
+    // never looks at `talkPageTitle` should not pay for building it, and eager
+    // construction would recurse (a title's talk page is itself a title).
+    let site = ctx.site.clone();
+    let mt = lua.create_table()?;
+    mt.set(
+        "__index",
+        lua.create_function(move |lua, (t, key): (Table, Value)| {
+            let key = match &key {
+                Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
+                _ => return Ok(Value::Nil),
+            };
+            let ns_id: i32 = t.get("namespace").unwrap_or(0);
+            let text: String = t.get("text").unwrap_or_default();
+            match key.as_str() {
+                "isTalkPage" => Ok(Value::Boolean(ns_id % 2 == 1)),
+                "isContentPage" => Ok(Value::Boolean(ns_id == 0 || ns_id == 828)),
+                "subjectNsText" => lua_str(lua, site.namespace_name(ns_id - (ns_id % 2))),
+                "nsText" => lua_str(lua, site.namespace_name(ns_id)),
+                "talkPageTitle" => {
+                    let talk = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
+                    lua_str(lua, prefix_title(&site, talk, &text))
+                }
+                "subjectPageTitle" => {
+                    let subject = ns_id - (ns_id % 2);
+                    lua_str(lua, prefix_title(&site, subject, &text))
+                }
+                "baseText" => lua_str(
+                    lua,
+                    text.rsplit_once('/')
+                        .map(|(b, _)| b)
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                "subpageText" => lua_str(
+                    lua,
+                    text.rsplit_once('/')
+                        .map(|(_, s)| s)
+                        .unwrap_or(&text)
+                        .to_string(),
+                ),
+                _ => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+    table.set_metatable(Some(mt));
     Ok(table)
+}
+
+/// A `Value::String` from an owned Rust string.
+fn lua_str(lua: &Lua, s: String) -> mlua::Result<Value> {
+    Ok(Value::String(lua.create_string(&s)?))
+}
+
+/// `Namespace:Text`, or just `Text` for the main namespace.
+fn prefix_title(site: &LuaSite, ns_id: i32, text: &str) -> String {
+    let prefix = site.namespace_name(ns_id);
+    if prefix.is_empty() {
+        text.to_string()
+    } else {
+        format!("{prefix}:{text}")
+    }
 }
 
 fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
@@ -671,15 +806,16 @@ fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
     Ok(table)
 }
 
-fn luafn_uri_encode(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(url_encode(&s))
+fn luafn_uri_encode(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(url_encode(&coerce_string(&s, "encode")?))
 }
 
-fn luafn_uri_decode(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(url_decode(&s))
+fn luafn_uri_decode(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(url_decode(&coerce_string(&s, "decode")?))
 }
 
-fn luafn_uri_anchor_encode(_: &Lua, s: String) -> mlua::Result<String> {
+fn luafn_uri_anchor_encode(_: &Lua, s: Value) -> mlua::Result<String> {
+    let s = coerce_string(&s, "anchorEncode")?;
     Ok(s.replace(' ', "_").replace('?', "%3F").replace('#', "%23"))
 }
 
@@ -690,6 +826,125 @@ fn luafn_uri_anchor_encode(_: &Lua, s: String) -> mlua::Result<String> {
 /// `mw.language.formatNum(x)` does not. Taking `Value`s and using whichever one
 /// is a number covers both, which matters because the colon form is the common
 /// one in modules.
+/// `mw.html`, as Lua source.
+///
+/// Scribunto implements this builder in Lua, and so does rustoid: it is a tree of
+/// nodes with ordered attributes, which is far clearer in Lua than as a pile of
+/// host-language closures. The previous Rust stub ignored its content and rejected
+/// `mw.html.create(nil)` — but a *tagless* builder is documented and common
+/// (`mw.html.create():wikitext(...)`), and wrongly refusing it stopped 37 corpus
+/// pages with a message that did not even say which function was at fault.
+const HTML_LIB: &str = r#"
+local html = {}
+
+local Node = {}
+Node.__index = Node
+
+local function new_node(tag)
+    return setmetatable({ _tag = tag, _attrs = {}, _order = {}, _children = {} }, Node)
+end
+
+function Node:attr(key, value)
+    if key == nil then return self end
+    if self._attrs[key] == nil then table.insert(self._order, key) end
+    self._attrs[key] = value
+    return self
+end
+
+function Node:addClass(...)
+    local list = {}
+    if self._attrs['class'] then table.insert(list, self._attrs['class']) end
+    for _, class in ipairs({ ... }) do
+        if class ~= nil then table.insert(list, tostring(class)) end
+    end
+    return self:attr('class', table.concat(list, ' '))
+end
+
+local function add_style(self, name, value)
+    local existing = self._attrs['style']
+    local prefix = existing and (existing .. ' ') or ''
+    return self:attr('style', prefix .. tostring(name) .. ': ' .. tostring(value) .. ';')
+end
+
+function Node:css(name, value)
+    if type(name) == 'table' then
+        for key, val in pairs(name) do add_style(self, key, val) end
+        return self
+    end
+    return add_style(self, name, value)
+end
+
+function Node:cssText(text)
+    if text == nil then return self end
+    local existing = self._attrs['style']
+    local prefix = existing and (existing .. ' ') or ''
+    return self:attr('style', prefix .. tostring(text))
+end
+
+function Node:tag(tag)
+    local child = new_node(tag)
+    table.insert(self._children, child)
+    return child
+end
+
+function Node:wikitext(...)
+    for _, part in ipairs({ ... }) do
+        if part ~= nil then table.insert(self._children, tostring(part)) end
+    end
+    return self
+end
+
+function Node:newline()
+    table.insert(self._children, '\n')
+    return self
+end
+
+function Node:_render()
+    local out = {}
+    if self._tag ~= nil then
+        table.insert(out, '<' .. self._tag)
+        for _, key in ipairs(self._order) do
+            table.insert(out, ' ' .. key .. '="' .. tostring(self._attrs[key]) .. '"')
+        end
+        table.insert(out, '>')
+    end
+    for _, child in ipairs(self._children) do
+        if type(child) == 'table' then
+            table.insert(out, child:_render())
+        else
+            table.insert(out, child)
+        end
+    end
+    if self._tag ~= nil then table.insert(out, '</' .. self._tag .. '>') end
+    return table.concat(out)
+end
+
+function Node:done() return self:_render() end
+function Node:allDone() return self:_render() end
+
+function html.create(tag)
+    -- The table form is accepted too: `mw.html.create{ 'div', selfClosing = true }`.
+    if type(tag) == 'table' then tag = tag[1] end
+    return new_node(tag)
+end
+
+return html
+"#;
+
+/// Small additions to the standard library that Scribunto provides.
+///
+/// `table.clone` is Scribunto's, not Lua's, and modules call it freely. Without
+/// it a module stops at the call rather than at something diagnosable.
+const LUA_STDLIB_EXTRAS: &str = r#"
+if table.clone == nil then
+    function table.clone(t)
+        local copy = {}
+        for key, value in pairs(t) do copy[key] = value end
+        return copy
+    end
+end
+"#;
+
 fn luafn_lang_format_num_any(
     _: &Lua,
     (first, second): (Value, Option<Value>),
@@ -716,8 +971,8 @@ fn luafn_lang_format_num_any(
     Ok(format_number(n))
 }
 
-fn luafn_ustring_len(_: &Lua, s: String) -> mlua::Result<usize> {
-    Ok(s.chars().count())
+fn luafn_ustring_len(_: &Lua, s: Value) -> mlua::Result<usize> {
+    Ok(coerce_string(&s, "len")?.chars().count())
 }
 
 fn luafn_ustring_sub(
@@ -742,45 +997,21 @@ fn luafn_ustring_sub(
     Ok(chars[start_idx..end_idx].iter().collect())
 }
 
-fn luafn_ustring_upper(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(s.to_uppercase())
+fn luafn_ustring_upper(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(coerce_string(&s, "upper")?.to_uppercase())
 }
 
-fn luafn_ustring_lower(_: &Lua, s: String) -> mlua::Result<String> {
-    Ok(s.to_lowercase())
+fn luafn_ustring_lower(_: &Lua, s: Value) -> mlua::Result<String> {
+    Ok(coerce_string(&s, "lower")?.to_lowercase())
 }
 
-fn luafn_message_new(lua: &Lua, (key, _args): (String, Option<Table>)) -> mlua::Result<Table> {
+fn luafn_message_new(lua: &Lua, (key, _args): (Value, Option<Table>)) -> mlua::Result<Table> {
+    let key = coerce_string(&key, "message.new")?;
     let table = lua.create_table()?;
     let k = key.clone();
     table.set("key", key)?;
     table.set("plain", lua.create_function(move |_, ()| Ok(k.clone()))?)?;
     Ok(table)
-}
-
-fn luafn_html_create(lua: &Lua, (tag_name, _args): (String, Option<Table>)) -> mlua::Result<Table> {
-    let builder = lua.create_table()?;
-    let t1 = tag_name.clone();
-    builder.set(
-        "wikitext",
-        lua.create_function(move |lua, text: String| {
-            let b = lua.create_table()?;
-            b.set("_text", text)?;
-            b.set("_tag", t1.clone())?;
-            Ok(b)
-        })?,
-    )?;
-    let t2 = tag_name.clone();
-    builder.set(
-        "done",
-        lua.create_function(move |_, ()| Ok(format!("<{t2}></{t2}>")))?,
-    )?;
-    let t3 = tag_name;
-    builder.set(
-        "allDone",
-        lua.create_function(move |_, ()| Ok(format!("<{t3}></{t3}>")))?,
-    )?;
-    Ok(builder)
 }
 
 // ---- Frame ----
