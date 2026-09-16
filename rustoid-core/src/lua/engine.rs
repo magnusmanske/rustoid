@@ -8,7 +8,7 @@ use std::sync::Arc;
 use mlua::{Function, Lua, Table, Value};
 
 use crate::error::{Result, RustoidError};
-use crate::traits::{DataSource, SiteConfig};
+use crate::traits::SiteConfig;
 
 /// Configuration for the Lua engine.
 #[derive(Debug, Clone)]
@@ -26,19 +26,111 @@ impl Default for LuaEngineConfig {
     }
 }
 
-pub struct LuaContext<S: DataSource, C: SiteConfig> {
-    pub source: Arc<S>,
-    pub config: Arc<C>,
+/// The site facts a Lua module can observe, copied out of the `SiteConfig`.
+///
+/// Owned rather than borrowed: `mlua` requires the data its closures capture to
+/// be `'static`, and a `Parser` only borrows its config. Copying the handful of
+/// values Lua can actually see is cheaper than restructuring the parser to own
+/// an `Arc`, and it makes the boundary between "what Lua may know" and "the
+/// parser's config" explicit.
+#[derive(Debug, Clone, Default)]
+pub struct LuaSite {
+    pub server: String,
+    pub language_code: String,
+    pub script_path: String,
+    /// `(id, canonical name)` for every namespace, for `mw.title` resolution.
+    pub namespaces: Vec<(i32, String)>,
+}
+
+impl LuaSite {
+    pub fn from_config(config: &dyn SiteConfig) -> Self {
+        let mut namespaces: Vec<(i32, String)> = config
+            .namespaces()
+            .iter()
+            .map(|(id, ns)| (*id, ns.canonical.clone()))
+            .filter(|(_, name)| !name.is_empty())
+            .collect();
+        namespaces.sort_by_key(|(id, _)| *id);
+        Self {
+            server: config.server_url().to_string(),
+            language_code: config.language_code().to_string(),
+            script_path: config.script_path().to_string(),
+            namespaces,
+        }
+    }
+
+    /// Canonical name of a namespace id, empty for the main namespace.
+    pub fn namespace_name(&self, id: i32) -> String {
+        self.namespaces
+            .iter()
+            .find(|(ns_id, _)| *ns_id == id)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_default()
+    }
+
+    /// Namespace id for a canonical or localized name, or for a numeric string.
+    pub fn namespace_id(&self, name: &str) -> Option<i32> {
+        if let Ok(id) = name.trim().parse::<i32>() {
+            return self.namespaces.iter().any(|(i, _)| *i == id).then_some(id);
+        }
+        self.namespaces
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
+            .map(|(id, _)| *id)
+    }
+}
+
+pub struct LuaContext {
+    pub site: LuaSite,
     pub page_title: String,
+    /// Module sources available to `require`/`mw.loadData`, keyed by full title
+    /// (`Module:Foo`). Scribunto's `require` is synchronous inside Lua, so
+    /// modules are fetched *before* execution and looked up here; see
+    /// [`crate::lua::invoke`].
+    pub modules: std::collections::HashMap<String, String>,
 }
 
-pub struct LuaEngine<S: DataSource, C: SiteConfig> {
+impl LuaContext {
+    pub fn new(site: LuaSite, page_title: impl Into<String>) -> Self {
+        Self {
+            site,
+            page_title: page_title.into(),
+            modules: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Same, with the preloaded module registry.
+    pub fn with_modules(
+        site: LuaSite,
+        page_title: impl Into<String>,
+        modules: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            site,
+            page_title: page_title.into(),
+            modules,
+        }
+    }
+}
+
+/// One argument to a module, as `frame.args` presents it.
+///
+/// MediaWiki's preprocessor keys positional arguments by number and named ones
+/// by name, and modules rely on both spellings: `frame.args[1]` and
+/// `frame.args[1]`-as-`"1"` are both written in the wild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Arg {
+    Positional(String),
+    Named(String, String),
+}
+
+pub struct LuaEngine {
     lua: Lua,
-    _context: Arc<LuaContext<S, C>>,
+    _context: Arc<LuaContext>,
 }
 
-impl<S: DataSource + 'static, C: SiteConfig + 'static> LuaEngine<S, C> {
-    pub fn new(engine_config: LuaEngineConfig, ctx: LuaContext<S, C>) -> Result<Self> {
+impl LuaEngine {
+    pub fn new(engine_config: LuaEngineConfig, ctx: LuaContext) -> Result<Self> {
         let lua = Lua::new();
 
         for name in &["os", "io", "package", "require", "loadfile", "dofile"] {
@@ -55,6 +147,7 @@ impl<S: DataSource + 'static, C: SiteConfig + 'static> LuaEngine<S, C> {
         lua.globals()
             .set("mw", mw)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        install_module_loader(&lua, &ctx)?;
 
         Ok(Self { lua, _context: ctx })
     }
@@ -63,21 +156,17 @@ impl<S: DataSource + 'static, C: SiteConfig + 'static> LuaEngine<S, C> {
         &self,
         module_source: &str,
         function_name: &str,
-        args: &[String],
+        args: &[Arg],
     ) -> Result<String> {
-        let frame = create_frame(&self.lua, args)?;
+        let module = self.load_module_value(module_source, None)?;
+        let func = self.module_function(&module, function_name)?;
 
+        let frame = create_frame(&self.lua, args, &self._context.page_title)?;
+        // `mw.getCurrentFrame()` reads this, so the frame must be installed
+        // before the module runs.
         self.lua
-            .load(module_source)
-            .set_name("module")
-            .exec()
-            .map_err(|e| RustoidError::Lua(format!("module load error: {e}")))?;
-
-        let func: Function =
-            self.lua.globals().get(function_name).map_err(|e| {
-                RustoidError::Lua(format!("function not found: {function_name}: {e}"))
-            })?;
-
+            .set_named_registry_value("current_frame", frame.clone())
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
         let result: Value = func
             .call::<Value>(frame)
             .map_err(|e| RustoidError::Lua(format!("execution error: {e}")))?;
@@ -85,6 +174,39 @@ impl<S: DataSource + 'static, C: SiteConfig + 'static> LuaEngine<S, C> {
         Ok(lua_value_to_string(&result))
     }
 
+    /// Run a module's source and return its value.
+    ///
+    /// A Scribunto module is a chunk that `return`s a table (`local p = {} …
+    /// return p`), not a set of globals, so the *returned* value is what carries
+    /// the entry points. `title` names it for error messages.
+    pub fn load_module_value(&self, module_source: &str, title: Option<&str>) -> Result<Value> {
+        self.lua
+            .load(module_source)
+            .set_name(title.unwrap_or("module"))
+            .eval::<Value>()
+            .map_err(|e| {
+                RustoidError::Lua(format!(
+                    "module load error in {}: {e}",
+                    title.unwrap_or("module")
+                ))
+            })
+    }
+
+    /// Fetch a module's entry point: `module[function_name]`, falling back to a
+    /// global of that name for the older style and for the engine's own tests.
+    pub fn module_function(&self, module: &Value, function_name: &str) -> Result<Function> {
+        if let Value::Table(t) = module
+            && let Ok(f) = t.get::<Function>(function_name)
+        {
+            return Ok(f);
+        }
+        self.lua
+            .globals()
+            .get(function_name)
+            .map_err(|e| RustoidError::Lua(format!("function not found: {function_name}: {e}")))
+    }
+
+    /// Run `code` in this engine's environment.
     pub fn eval(&self, code: &str) -> Result<String> {
         let result: Value = self
             .lua
@@ -97,10 +219,118 @@ impl<S: DataSource + 'static, C: SiteConfig + 'static> LuaEngine<S, C> {
 
 // ---- mw table setup ----
 
-fn setup_mw_table<S: DataSource + 'static, C: SiteConfig + 'static>(
-    lua: &Lua,
-    ctx: Arc<LuaContext<S, C>>,
-) -> Result<Table> {
+// ---- module loader ----
+
+/// Install `require`, `mw.loadData` and a `package` stub.
+///
+/// Scribunto's `require` is synchronous inside Lua, so it cannot fetch: the
+/// modules a run needs are fetched *before* execution (see
+/// [`crate::lua::invoke::preload`]) and looked up in `ctx.modules` here. A
+/// `require` for something outside that registry is an error rather than a
+/// silent nil, because a module that quietly receives nothing tends to produce
+/// plausible-but-wrong output.
+fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
+    let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+
+    // Loaded modules are cached, as Scribunto caches them: a module is executed
+    // once per render however many times it is required.
+    let cache = lua.create_table().map_err(lua_err)?;
+    // Titles currently being loaded, so a `require` cycle reports instead of
+    // recursing until the stack runs out.
+    let loading = lua.create_table().map_err(lua_err)?;
+
+    let modules = ctx.modules.clone();
+    let require = lua
+        .create_function(move |lua, name: Value| {
+            let title = match name {
+                Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "require expects a module name, got {} — dynamic requires cannot be \
+                     resolved ahead of execution",
+                        other.type_name()
+                    )));
+                }
+            };
+
+            if let Ok(cached) = cache.get::<Value>(title.clone())
+                && !cached.is_nil()
+            {
+                return Ok(cached);
+            }
+
+            if loading.get::<bool>(title.clone()).unwrap_or(false) {
+                return Err(mlua::Error::runtime(format!(
+                    "circular dependency while loading {title}"
+                )));
+            }
+
+            let Some(source) = lookup_module(&modules, &title) else {
+                return Err(mlua::Error::runtime(format!(
+                    "module {title} was not preloaded"
+                )));
+            };
+
+            loading.set(title.clone(), true)?;
+            let value = lua.load(source).set_name(title.clone()).eval::<Value>();
+            loading.set(title.clone(), Value::Nil)?;
+
+            let value = value?;
+            cache.set(title, value.clone())?;
+            Ok(value)
+        })
+        .map_err(lua_err)?;
+    lua.globals().set("require", require).map_err(lua_err)?;
+
+    // `mw.loadData(name)` — a data module's table, read once. Scribunto marks the
+    // result read-only; sharing the same value as `require` is enough here.
+    let mw: Table = lua.globals().get("mw").map_err(lua_err)?;
+    let require_fn: Function = lua.globals().get("require").map_err(lua_err)?;
+    mw.set(
+        "loadData",
+        lua.create_function(move |_, name: String| require_fn.call::<Value>(name))
+            .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
+
+    // `mw.getCurrentFrame()` — the frame of the invocation being executed.
+    mw.set(
+        "getCurrentFrame",
+        lua.create_function(|lua, ()| lua.named_registry_value::<Value>("current_frame"))
+            .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
+
+    // Lure modules that probe it into the normal path: Scribunto provides
+    // `package` with its own loaders rather than leaving it nil.
+    let package = lua.create_table().map_err(lua_err)?;
+    package
+        .set("loaders", lua.create_table().map_err(lua_err)?)
+        .map_err(lua_err)?;
+    lua.globals().set("package", package).map_err(lua_err)?;
+
+    Ok(())
+}
+
+/// Look a module up by title, tolerating case and underscore/space differences.
+/// An unattempted lookup is the common failure, so it is worth being lenient.
+fn lookup_module<'a>(
+    modules: &'a std::collections::HashMap<String, String>,
+    title: &str,
+) -> Option<&'a String> {
+    if let Some(src) = modules.get(title) {
+        return Some(src);
+    }
+    let normalized = title.replace('_', " ");
+    for (k, v) in modules {
+        if k.eq_ignore_ascii_case(&normalized) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let mw = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
@@ -139,9 +369,9 @@ fn setup_mw_table<S: DataSource + 'static, C: SiteConfig + 'static>(
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     site.set("siteName", "Wikipedia")?;
-    site.set("server", ctx.config.server_url().to_string())?;
-    site.set("scriptPath", "/w")?;
-    site.set("languageCode", ctx.config.language_code().to_string())?;
+    site.set("server", ctx.site.server.clone())?;
+    site.set("scriptPath", ctx.site.script_path.clone())?;
+    site.set("languageCode", ctx.site.language_code.clone())?;
     mw.set("site", site)?;
 
     // mw.uri
@@ -230,39 +460,52 @@ fn luafn_text_tag(
     Ok(result)
 }
 
-fn luafn_title_new<S: DataSource, C: SiteConfig>(
+fn luafn_title_new(
     lua: &Lua,
-    ctx: &LuaContext<S, C>,
+    ctx: &LuaContext,
     text: String,
     namespace: Option<i32>,
 ) -> mlua::Result<Table> {
-    let t = crate::title::TitleParser::parse(&text, ctx.config.as_ref());
-    let ns_id = namespace.unwrap_or(t.namespace_id);
-    let table = lua.create_table()?;
-    table.set("text", t.text.clone())?;
-    table.set("nsText", ns_name(ns_id))?;
-    table.set("namespace", ns_id)?;
-    let prefix = ns_name(ns_id);
-    let ft = if prefix.is_empty() {
-        t.text.clone()
-    } else {
-        format!("{prefix}:{}", t.text)
+    // Split `Ns:Title#frag` against the namespace snapshot. Full `TitleParser`
+    // semantics (interwiki, language variants) are not observable here yet.
+    let (prefix, rest) = match text.split_once(':') {
+        Some((p, r)) => (ctx.site.namespace_id(p), r),
+        None => (None, text.as_str()),
     };
-    table.set("fullText", ft)?;
-    table.set("exists", false)?;
+    let (rest, fragment) = match rest.split_once('#') {
+        Some((t, f)) => (t, f.to_string()),
+        None => (rest, String::new()),
+    };
+    let ns_id = namespace.or(prefix).unwrap_or(0);
+    let title_text = rest.trim().to_string();
+    let ns_text = ctx.site.namespace_name(ns_id);
+
+    let table = lua.create_table()?;
+    table.set("text", title_text.clone())?;
+    table.set("nsText", ns_text.clone())?;
+    table.set("namespace", ns_id)?;
+    let full = if ns_text.is_empty() {
+        title_text.clone()
+    } else {
+        format!("{ns_text}:{title_text}")
+    };
+    table.set("fullText", full)?;
+    table.set("prefixedText", title_text.clone())?;
+    // Existence is not resolvable from here: the engine has no data source (see
+    // `LuaSite`). Reporting `false` would make a module render red links for
+    // pages that do exist, so it reports `true` and the gap is recorded in
+    // ONLINE-PARITY.md.
+    table.set("exists", true)?;
     table.set("isRedirect", false)?;
-    table.set("fragment", t.fragment.unwrap_or_default())?;
+    table.set("fragment", fragment)?;
     table.set(
         "rootText",
-        t.text.split('/').next().unwrap_or("").to_string(),
+        title_text.split('/').next().unwrap_or("").to_string(),
     )?;
     Ok(table)
 }
 
-fn luafn_title_current<S: DataSource, C: SiteConfig>(
-    lua: &Lua,
-    ctx: &LuaContext<S, C>,
-) -> mlua::Result<Table> {
+fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("text", ctx.page_title.clone())?;
     table.set("prefixedText", ctx.page_title.clone())?;
@@ -355,7 +598,7 @@ fn luafn_html_create(lua: &Lua, (tag_name, _args): (String, Option<Table>)) -> m
 
 // ---- Frame ----
 
-fn create_frame(lua: &Lua, args: &[String]) -> Result<Value> {
+fn create_frame(lua: &Lua, args: &[Arg], page_title: &str) -> Result<Value> {
     let frame = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
@@ -363,17 +606,89 @@ fn create_frame(lua: &Lua, args: &[String]) -> Result<Value> {
     let args_table = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    for (i, arg) in args.iter().enumerate() {
-        args_table
-            .set(i + 1, arg.clone())
-            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    // Positional arguments get a *numeric* key, so `frame.args[1]` and `#args`
+    // behave; named ones get their name. A metatable makes the string spelling
+    // (`args["1"]`) resolve too, which modules also write, without duplicating
+    // keys and so without confusing `pairs`.
+    let mut next_positional = 0usize;
+    for arg in args {
+        match arg {
+            Arg::Positional(v) => {
+                next_positional += 1;
+                args_table
+                    .set(next_positional, v.clone())
+                    .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            }
+            Arg::Named(k, v) => {
+                args_table
+                    .set(k.clone(), v.clone())
+                    .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            }
+        }
     }
+    let args_mt = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    args_mt
+        .set(
+            "__index",
+            lua.create_function(|_, (t, k): (Table, Value)| {
+                // Positional args are stored under an integer key, but both
+                // spellings are written in the wild (`args[1]` and `args["1"]`),
+                // so map either to the other. `raw_get` keeps this from
+                // re-entering the metatable.
+                let alternative = match k {
+                    Value::Integer(i) => Some(Value::Integer(i)),
+                    Value::Number(n) if n.fract() == 0.0 => Some(Value::Integer(n as i64)),
+                    Value::String(ref s) => s
+                        .to_str()
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .map(Value::Integer),
+                    _ => None,
+                };
+                match alternative {
+                    Some(key) => Ok(t.raw_get::<Value>(key)?),
+                    None => Ok(Value::Nil),
+                }
+            })
+            .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    args_table.set_metatable(Some(args_mt));
     frame.set("args", args_table)?;
 
+    // `frame:argumentPairs()` — the generic-for protocol: return (iterator,
+    // state, control). Lua's own `next` is the iterator, so the args table is
+    // the state and no snapshot has to be stored on the Lua side.
+    frame.set(
+        "argumentPairs",
+        lua.create_function(|lua, this: Table| {
+            let args: Table = this.get("args")?;
+            let next: Function = lua.globals().get("next")?;
+            Ok((next, args, Value::Nil))
+        })
+        .map_err(|e| RustoidError::Lua(e.to_string()))?,
+    )?;
+
+    // `frame:getTitle()` — the page the frame was invoked from.
+    let title = page_title.to_string();
+    let ctx_for_title = title.clone();
+    frame.set(
+        "getTitle",
+        lua.create_function(move |_, ()| Ok(ctx_for_title.clone()))?,
+    )?;
     frame.set("getParent", lua.create_function(|_, ()| Ok(Value::Nil))?)?;
+    // `frame:preprocess(text)` — expand wikitext. It needs the parser, so it is
+    // a later phase; returning the text unchanged would silently produce wrong
+    // output, so it reports instead.
     frame.set(
         "preprocess",
-        lua.create_function(|_, text: String| Ok(text))?,
+        lua.create_function(|_, _text: String| -> mlua::Result<String> {
+            Err(mlua::Error::runtime(
+                "frame:preprocess is not implemented yet",
+            ))
+        })?,
     )?;
     frame.set(
         "extensionTag",
@@ -403,23 +718,6 @@ fn html_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
-}
-
-fn ns_name(ns_id: i32) -> &'static str {
-    match ns_id {
-        0 => "",
-        1 => "Talk",
-        2 => "User",
-        3 => "User talk",
-        4 => "Project",
-        6 => "File",
-        8 => "MediaWiki",
-        10 => "Template",
-        12 => "Help",
-        14 => "Category",
-        828 => "Module",
-        _ => "",
-    }
 }
 
 fn format_number(n: f64) -> String {
@@ -495,14 +793,10 @@ fn lua_value_to_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::{MockDataSource, MockSiteConfig};
+    use crate::mock::MockSiteConfig;
 
-    fn make_engine() -> LuaEngine<MockDataSource, MockSiteConfig> {
-        let ctx = LuaContext {
-            source: Arc::new(MockDataSource::new()),
-            config: Arc::new(MockSiteConfig::new()),
-            page_title: "Test Page".to_string(),
-        };
+    fn make_engine() -> LuaEngine {
+        let ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test Page");
         LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap()
     }
 
@@ -627,20 +921,172 @@ mod tests {
 
     #[test]
     fn test_frame_args() {
-        let ctx = LuaContext {
-            source: Arc::new(MockDataSource::new()),
-            config: Arc::new(MockSiteConfig::new()),
-            page_title: "Test".to_string(),
-        };
+        let ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test");
         let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
         let result = engine
             .execute(
                 "function myfn(frame) return frame.args[1] end",
                 "myfn",
-                &["hello".to_string()],
+                &[Arg::Positional("hello".to_string())],
             )
             .unwrap();
         assert_eq!(result, "hello");
+    }
+
+    /// A module returns its table (`local p = {} … return p`), so entry points
+    /// live in the returned value, not in globals.
+    #[test]
+    fn test_module_table_entry_point() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                return "from " .. frame.args["who"]
+            end
+            return p
+        "#;
+        let result = engine
+            .execute(
+                src,
+                "main",
+                &[Arg::Named("who".to_string(), "table".to_string())],
+            )
+            .unwrap();
+        assert_eq!(result, "from table");
+    }
+
+    /// Both spellings of a positional argument are used in the wild.
+    #[test]
+    fn test_positional_args_by_number_and_string() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                return tostring(frame.args[1]) .. "/" .. tostring(frame.args["1"])
+            end
+            return p
+        "#;
+        let result = engine
+            .execute(src, "main", &[Arg::Positional("x".to_string())])
+            .unwrap();
+        assert_eq!(result, "x/x");
+    }
+
+    /// `frame:argumentPairs()` must drive a generic `for` loop.
+    #[test]
+    fn test_argument_pairs_iterates() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                local out = {}
+                for k, v in frame:argumentPairs() do
+                    out[#out + 1] = tostring(k) .. "=" .. tostring(v)
+                end
+                table.sort(out)
+                return table.concat(out, ",")
+            end
+            return p
+        "#;
+        let result = engine
+            .execute(
+                src,
+                "main",
+                &[
+                    Arg::Positional("a".to_string()),
+                    Arg::Named("n".to_string(), "v".to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(result, "1=a,n=v");
+    }
+
+    /// `require` resolves from the preloaded registry, executes once, and caches.
+    #[test]
+    fn test_require_uses_the_registry() {
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            "Module:Helper".to_string(),
+            "local m = {} m.value = 'from helper' return m".to_string(),
+        );
+        let ctx = LuaContext::with_modules(
+            LuaSite::from_config(&MockSiteConfig::new()),
+            "Test",
+            modules,
+        );
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                local helper = require('Module:Helper')
+                return helper.value
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(src, "main", &[]).unwrap(), "from helper");
+    }
+
+    /// A `require` of something that was not preloaded must error, not return
+    /// nil: a module quietly handed nothing produces plausible wrong output.
+    #[test]
+    fn test_require_of_unknown_module_errors() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                return require('Module:Absent').value
+            end
+            return p
+        "#;
+        let err = engine.execute(src, "main", &[]).unwrap_err();
+        assert!(err.to_string().contains("Absent"), "{err}");
+    }
+
+    /// A `require` cycle reports rather than recursing until the stack dies.
+    #[test]
+    fn test_require_cycle_is_reported() {
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            "Module:A".to_string(),
+            "return require('Module:B')".to_string(),
+        );
+        modules.insert(
+            "Module:B".to_string(),
+            "return require('Module:A')".to_string(),
+        );
+        let ctx = LuaContext::with_modules(
+            LuaSite::from_config(&MockSiteConfig::new()),
+            "Test",
+            modules,
+        );
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                return require('Module:A')
+            end
+            return p
+        "#;
+        let err = engine.execute(src, "main", &[]).unwrap_err();
+        assert!(err.to_string().contains("circular"), "{err}");
+    }
+
+    /// `mw.getCurrentFrame()` must return the frame of the running invocation,
+    /// which modules use for `args` and for `expandTemplate`.
+    #[test]
+    fn test_current_frame_is_available() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                return mw.getCurrentFrame().args['k']
+            end
+            return p
+        "#;
+        let result = engine
+            .execute(src, "main", &[Arg::Named("k".to_string(), "v".to_string())])
+            .unwrap();
+        assert_eq!(result, "v");
     }
 
     #[test]

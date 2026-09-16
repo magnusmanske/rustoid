@@ -5,3 +5,4 @@
 //! with MediaWiki API stubs.
 
 pub mod engine;
+pub mod invoke;

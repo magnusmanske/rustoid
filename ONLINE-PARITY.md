@@ -316,17 +316,42 @@ simply what appears in the first 400 bytes of every article. "The infobox
 rendered differently" and "the infobox was never rendered" need telling apart,
 and only the latter is fixed by working on `#invoke`.
 
-### Phase 3 — `#invoke` end to end (the biggest single lever)
+### Phase 3 — `#invoke` end to end (the biggest single lever) — *partly done*
 
 - Wire `invoke` into the parser-function dispatch and build the module loader
-  (`Module:` namespace, `require`, `package.loaders`, `mw.loadData`).
+  (`Module:` namespace, `require`, `package.loaders`, `mw.loadData`). — **done**:
+  `#invoke` is intercepted in the async parser (it needs to fetch, and the
+  parser-function path is synchronous), `require`/`mw.loadData` resolve from a
+  preloaded registry, and `mw.getCurrentFrame` returns the live frame.
 - Frame API, in this order: `frame.args`, `getParent`, `getTitle`,
   **`expandTemplate`**, **`callParserFunction`**, `preprocess`, `newChild`,
-  `argumentPairs`.
+  `argumentPairs`. — `args` (both spellings), `argumentPairs`, `getTitle`,
+  `getParent` (nil), `extensionTag` are in; `expandTemplate`,
+  `callParserFunction`, `preprocess` and `newChild` are **not**, and report an
+  error rather than returning something plausible-but-wrong.
+
+#### How modules are fetched, and the trade that was made
+
+Scribunto's `require` is a synchronous Lua call, so the modules a `#invoke` can
+reach are **preloaded** before the module runs: the parser fetches the entry
+module, scans its source for `require`/`mw.loadData` *string literals*, fetches
+those, and repeats (bounded, and cycle-safe). `require` inside Lua is then a
+registry lookup.
+
+The trade, stated plainly: a module that computes a module name at runtime
+(`require('Module:' .. name)`) cannot be anticipated, and its `require` fails
+with a named error. The alternative — rewriting the Lua integration for async —
+is a much larger change, and the literal form is what real modules use. The
+scan also means `mw.title(...).exists` currently reports `true` rather than
+consulting a data source; `LuaSite` is a deliberate snapshot of what Lua may
+observe, and widening it is follow-up work.
+
 - **Strip markers.** Scribunto protects non-wikitext output with `\127'"`UNIQ…`
   markers that must survive the round trip back through the parser. Getting this
   wrong produces subtly mangled output everywhere, so it belongs in this phase.
+  — **not started**.
 - **Exit criterion:** a page whose infobox is module-driven matches byte-exactly.
+  — not yet; see below for where it stands.
 
 ### Phase 4 — Lua API breadth
 

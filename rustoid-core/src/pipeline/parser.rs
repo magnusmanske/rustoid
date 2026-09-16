@@ -1926,6 +1926,38 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .unwrap_or(false);
 
                 match resolve_template_target(self.config, Some(frame.title()), &target_str) {
+                    // `#invoke` is Scribunto, not a parser function: MediaWiki
+                    // hands the call to Lua and feeds the result back through the
+                    // parser. Parsoid implements none of it in standalone mode,
+                    // which is why the fixture suite cannot exercise it.
+                    //
+                    // It is intercepted here, ahead of the synchronous
+                    // parser-function path, because fetching a module is async.
+                    Some(ResolvedTarget::ParserFunction {
+                        name, ref pf_arg, ..
+                    }) if name.eq_ignore_ascii_case("invoke") => {
+                        // Scribunto's `#invoke` is not an ordinary parser
+                        // function: everything after the colon is its argument
+                        // list, and the tokenizer has already split that on `|`,
+                        // so the pieces must be put back together.
+                        let invoke_arg = invoke_arg_text(pf_arg, &params);
+                        let expanded = self
+                            .expand_invoke(
+                                source,
+                                frame,
+                                &invoke_arg,
+                                &target_str,
+                                about_id,
+                                tok,
+                                in_template,
+                                src_text,
+                            )
+                            .await;
+                        for e in &expanded {
+                            track_table(e, &mut table_depth);
+                        }
+                        out.extend(expanded);
+                    }
                     Some(ResolvedTarget::Template { name, title }) => {
                         let expanded = self
                             .expand_one_template(
@@ -2366,6 +2398,101 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params, page_source);
         encap.encap_tokens(expanded, &info)
     }
+
+    /// Expand a `{{#invoke:Module|func|…}}` call.
+    ///
+    /// Scribunto's result is *wikitext*, not HTML: MediaWiki feeds it back
+    /// through the parser, so templates the module returns expand in turn. The
+    /// result is therefore tokenized and expanded like a template body, and
+    /// wrapped in the same `mw:Transclusion` markers a template gets.
+    ///
+    /// A failure (missing module, Lua error) becomes MediaWiki's script-error
+    /// message rather than a panic or a silent empty string: the comparison is
+    /// only meaningful if a broken call looks broken.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_invoke(
+        &self,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        pf_arg: &str,
+        target_str: &str,
+        about_id: String,
+        token: &ParsoidToken,
+        in_template: bool,
+        _page_source: &str,
+    ) -> Vec<Item> {
+        // Without a data source there is nothing to fetch the module from, so
+        // leave the call as source text (the standalone behaviour of every
+        // parser function rustoid cannot implement).
+        let Some(src) = source else {
+            return vec![Item::Str(format!("{{{{{target_str}}}}}"))];
+        };
+
+        let site = crate::lua::engine::LuaSite::from_config(self.config);
+        let output =
+            match crate::lua::invoke::invoke(pf_arg, src, site, &frame.title().full_text()).await {
+                Ok(out) => out,
+                Err(e) => script_error(&e.to_string()),
+            };
+
+        // The module's output is wikitext; tokenize it as template content and
+        // expand whatever it contains.
+        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+            &output,
+            /* in_template */ true,
+            self.config.extension_tags(),
+        );
+        let child = frame.new_child(frame.title().clone(), vec![]);
+        let expanded = Box::pin(self.expand_templates(
+            &child,
+            items,
+            source,
+            &std::cell::Cell::new(0usize),
+            in_template,
+            &output,
+        ))
+        .await;
+
+        if in_template {
+            return expanded;
+        }
+        let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+        let mut info = template_info_from(None, Some(target_str), vec![]);
+        info.ty = Some("parserfunction".to_string());
+        info.target_wt = Some(format!("#invoke{target_str}"));
+        encap.encap_tokens(expanded, &info)
+    }
+}
+
+/// Render a token chunk's `key`/`value` back to source text, for cases where a
+/// construct is re-read as text rather than expanded in place.
+fn kv_to_source_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
+    use crate::wikitext::token_utils::key_value_to_string;
+    let value = key_value_to_string(&kv.value);
+    let key = key_value_to_string(&kv.key);
+    if key.trim().is_empty() {
+        Some(value)
+    } else {
+        Some(format!("{}={value}", key.trim()))
+    }
+}
+
+/// Rebuild the `#invoke:` argument text from the resolved colon argument and the
+/// token's remaining parameters.
+///
+/// `{{#invoke:M|f|a|b=c}}` hands the module the text `M|f|a|b=c`; the tokenizer
+/// has already split that on `|` into the colon argument (`M`) plus parameters
+/// (`f`, `a`, `b=c`), so they are joined back in order.
+fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Params) -> String {
+    let mut parts = vec![pf_arg.trim().to_string()];
+    parts.extend(params.args.iter().skip(1).filter_map(kv_to_source_text));
+    parts.join("|")
+}
+
+/// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`
+/// shows up as an error in the output rather than as silently missing text.
+fn script_error(message: &str) -> String {
+    format!("<strong class=\"error\">Script error: {message}</strong>")
 }
 
 #[cfg(test)]
