@@ -146,6 +146,14 @@ pub fn tokens_to_string(tokens: &[Item]) -> String {
     tokens_to_string_with_opts(tokens, TokensToStringOpts::default())
 }
 
+/// Render a single item to its source text.
+///
+/// The one-item form of [`tokens_to_string`], for callers that already have the
+/// items apart and would otherwise allocate a slice to borrow.
+pub fn item_to_string(item: &Item) -> String {
+    tokens_to_string(std::slice::from_ref(item))
+}
+
 /// [`tokens_to_string`] with explicit options.
 pub fn tokens_to_string_with_opts(tokens: &[Item], opts: TokensToStringOpts<'_>) -> String {
     let mut out = String::new();

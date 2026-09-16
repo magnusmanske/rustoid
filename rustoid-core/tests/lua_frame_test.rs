@@ -1,0 +1,251 @@
+//! `frame:expandTemplate` and `frame:preprocess` end to end.
+//!
+//! These are the frame methods that need the parser itself, so they cannot run
+//! inside Lua: the call is deferred, expanded with the real async pipeline, and
+//! the module re-run with the answer in place. The tests below cover the
+//! interesting consequences of that design — arguments computed at runtime,
+//! several calls in one module, and the module's own output still being parsed.
+//!
+//! `Module:Multiple image` and `Module:ConvertIB` are the corpus modules that
+//! forced this; they call `expandTemplate` with argument values the wikitext
+//! never contained, which is why preloading cannot answer them.
+
+use rustoid_core::mock::{MockDataSource, MockSiteConfig};
+use rustoid_core::{Parser, ParserOptions};
+
+/// Expand `wikitext` with `modules` as `Module:` pages and `templates` as
+/// `Template:` pages.
+async fn expand(modules: &[(&str, &str)], templates: &[(&str, &str)], wikitext: &str) -> String {
+    let mut config = MockSiteConfig::new();
+    // A parser function the mock does not register would resolve as a *broken*
+    // call rather than reaching the implementation, so the ones these tests use
+    // are declared here.
+    config.add_function_hook("uc");
+    let config = config;
+    let source = MockDataSource::new();
+    for (title, body) in modules {
+        source.add_module(title, body);
+    }
+    for (title, body) in templates {
+        source.add_template(title, body);
+    }
+    let parser = Parser::new(&config);
+    parser
+        .wikitext_to_html_expanded(wikitext, &source, &ParserOptions::for_page("Test"))
+        .await
+        .unwrap_or_else(|e| panic!("parse failed: {e}"))
+}
+
+#[tokio::test]
+async fn expand_template_with_a_computed_argument() {
+    // The argument is built by the module, so no preload could have known it.
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local who = "wor" .. "ld"
+            return frame:expandTemplate{ title = "Hello", args = { who } }
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Hello", "hello {{{1}}}")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    assert!(html.contains("hello world"), "got: {html}");
+}
+
+#[tokio::test]
+async fn expand_template_passes_named_arguments() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:expandTemplate{ title = "Pair", args = { a = "1", b = "2" } }
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Pair", "{{{a}}}-{{{b}}}")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    assert!(html.contains("1-2"), "got: {html}");
+}
+
+/// A module may reach `expandTemplate` many times; each call must get its own
+/// answer, which is what the request keying is for.
+#[tokio::test]
+async fn several_expand_template_calls_each_get_their_answer() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local out = {}
+            for i = 1, 3 do
+                out[i] = frame:expandTemplate{ title = "Echo", args = { tostring(i) } }
+            end
+            return table.concat(out, "|")
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Echo", "<b>{{{1}}}</b>")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    // Each call gets its own answer: three bold elements, one per argument.
+    for i in 1..=3 {
+        assert!(html.contains(&format!("<b>{i}</b>")), "missing {i}: {html}");
+    }
+}
+
+/// The same call twice must also work: the second lookup finds the answer the
+/// first one cached.
+#[tokio::test]
+async fn a_repeated_call_reuses_its_answer() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local once = frame:expandTemplate{ title = "Echo", args = { "x" } }
+            local twice = frame:expandTemplate{ title = "Echo", args = { "x" } }
+            return once .. twice
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Echo", "[{{{1}}}]<b>y</b>")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    // The answer is HTML, so the expansion's own `<b>` arrives as markup and
+    // the second, cached answer is identical to the first.
+    let occurrences = html.matches("[x]<b>y</b>").count();
+    assert_eq!(occurrences, 2, "got: {html}");
+}
+
+#[tokio::test]
+async fn preprocess_expands_wikitext() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:preprocess("{{Greet}}")
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Greet", "hi there")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    assert!(html.contains("hi there"), "got: {html}");
+}
+
+/// `preprocess` returns *text*, so a module can test it — the point of the
+/// method, and something a lazily-returned token could not do.
+#[tokio::test]
+async fn preprocess_result_is_readable_by_lua() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local out = frame:preprocess("{{Greet}}")
+            if out:find("hi") then
+                return "matched"
+            end
+            return "no match: " .. out
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Greet", "hi there")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    assert!(html.contains("matched"), "got: {html}");
+}
+
+/// A module that never reads the answer must not pay for expanding it, and must
+/// not break: this is why `expandTemplate` produces a lazily-resolved token.
+#[tokio::test]
+async fn an_unused_expand_template_call_is_harmless() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            frame:expandTemplate{ title = "Never", args = { "x" } }
+            return "done"
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    assert!(html.contains("done"), "got: {html}");
+}
+
+/// An `expandTemplate` answer that is embedded in the module's output must be
+/// parsed as wikitext, exactly as if the template had been written on the page.
+#[tokio::test]
+async fn an_embedded_answer_is_parsed() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return "before " .. frame:expandTemplate{ title = "Bold", args = {} } .. " after"
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Bold", "'''strong'''")],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    assert!(html.contains(">strong</b>"), "got: {html}");
+    assert!(html.contains("before"), "got: {html}");
+    assert!(html.contains("after"), "got: {html}");
+}
+
+/// An error from the expansion must be visible rather than silently dropped.
+#[tokio::test]
+async fn a_missing_template_leaves_a_redlink() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:expandTemplate{ title = "Absent", args = {} }
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    assert!(html.contains("Absent"), "got: {html}");
+}
+
+/// `callParserFunction` is the same problem as `expandTemplate` and must work
+/// the same way.
+#[tokio::test]
+async fn call_parser_function_is_deferred_too() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:callParserFunction{ name = "uc", args = { "shout" } }
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    assert!(html.contains("SHOUT"), "got: {html}");
+}
+
+/// A module returning something other than a string still has to produce
+/// output rather than vanishing or panicking.
+#[tokio::test]
+async fn a_numeric_return_is_stringified() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return 42
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    assert!(html.contains("42"), "got: {html}");
+}

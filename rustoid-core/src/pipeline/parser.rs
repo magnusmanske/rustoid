@@ -578,11 +578,21 @@ fn wrap_sections_in_ast(ast: &mut Node, wrap_sections: bool) {
 /// The wikitext parser, bound to a site configuration.
 pub struct Parser<'a, C: SiteConfig> {
     config: &'a C,
+    /// How deep a Lua frame method's expansion currently is.
+    ///
+    /// Modules reach the parser only through these methods, and the manual is
+    /// explicit that their *output* is not re-parsed for templates — so a
+    /// well-behaved module nests a handful of levels at most. The counter stops
+    /// a pathological one from recursing until the stack runs out.
+    lua_expansion_depth: std::cell::Cell<usize>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
     pub fn new(config: &'a C) -> Self {
-        Self { config }
+        Self {
+            config,
+            lua_expansion_depth: std::cell::Cell::new(0),
+        }
     }
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
@@ -2448,18 +2458,32 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .config
             .canonical_namespace_id("Template")
             .is_some_and(|ns| frame.title().namespace_id == ns);
+        let ctx = crate::lua::engine::FrameContext {
+            parent_args: parent,
+            parent_title: Some(parent_title),
+            has_parent: inside_template,
+            page_source: _page_source.to_string(),
+            ..Default::default()
+        };
+
+        // A module may call back into the parser (`frame:expandTemplate`,
+        // `frame:preprocess`). Those calls cannot happen inside Lua — the
+        // pipeline is async — so each one is deferred and the module re-run
+        // with the answer available; see [`crate::pipeline::lua_deferred`].
+        //
+        // The closure is `Fn`, not `FnOnce`: the answer is expanded once per
+        // distinct request, and `invoke` may call it several times.
+        // The module's output is wikitext, not HTML: templates it returns are
+        // expanded by the caller. A failure (missing module, Lua error) becomes
+        // MediaWiki's script-error markup, so a broken call reads as broken
+        // rather than as silently absent text.
         let output = match crate::lua::invoke::invoke(
             pf_arg,
             src,
             site,
             &frame.title().full_text(),
-            crate::lua::engine::FrameContext {
-                parent_args: parent,
-                parent_title: Some(parent_title),
-                has_parent: inside_template,
-                page_source: _page_source.to_string(),
-                ..Default::default()
-            },
+            ctx,
+            |request| self.expand_lua_request(source, frame, request, about_id.clone(), token),
         )
         .await
         {
@@ -2467,13 +2491,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Err(e) => script_error(&e.to_string()),
         };
 
-        // The module's output is wikitext; tokenize it as template content and
-        // expand whatever it contains.
         let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
             &output,
             /* in_template */ true,
             self.config.extension_tags(),
         );
+
         let child = frame.new_child(frame.title().clone(), vec![]);
         let expanded = Box::pin(self.expand_templates(
             &child,
@@ -2481,7 +2504,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             source,
             &std::cell::Cell::new(0usize),
             in_template,
-            &output,
+            /* src_text */ "",
         ))
         .await;
 
@@ -2493,6 +2516,96 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         info.ty = Some("parserfunction".to_string());
         info.target_wt = Some(format!("#invoke{target_str}"));
         encap.encap_tokens(expanded, &info)
+    }
+
+    /// Expand one deferred frame-call request into the text the module gets.
+    ///
+    /// All three methods **return a string** — Scribunto's manual is explicit
+    /// for each — so the answer is the expanded *wikitext*, which the module may
+    /// concatenate, compare or slice. That is also why all three can share the
+    /// `preprocess` path: once the call has been rendered to wikitext, expanding
+    /// it is the same job.
+    ///
+    /// The difference between them is scope and shape, not mechanism:
+    /// `expandTemplate` is transclusion and carries `mw:Transclusion` markers;
+    /// a parser function expands in place and carries none; `preprocess` gets
+    /// whatever the module wrote. The markers matter for attribution, so the two
+    /// synthesised calls are distinguished here.
+    ///
+    /// The manual also records that this is the only way a module can get
+    /// templates expanded in its output at all: a module returning
+    /// `"Hello {{welcome}}"` has that read literally, because module output is
+    /// not re-parsed for templates.
+    async fn expand_lua_request(
+        &self,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        request: crate::pipeline::lua_deferred::FrameRequest,
+        about_id: String,
+        token: &ParsoidToken,
+    ) -> String {
+        use crate::pipeline::lua_deferred::FrameRequest;
+        // The manual is explicit that module output is not re-parsed for
+        // templates, so a module cannot reach the parser recursively through
+        // its own return value; `expandTemplate`/`preprocess` are the only
+        // doors. A module that calls them from inside an expansion this deep is
+        // already thousands of frames down, which no real module does.
+        if self.lua_expansion_depth.get() >= MAX_LUA_EXPANSION_DEPTH {
+            return String::new();
+        }
+        let Some(source) = source else {
+            // No data source at all: nothing can be fetched, so the call cannot
+            // be answered. The empty string is the safe answer — handing back
+            // the call itself would have the module return `{{#invoke:…}}`,
+            // which the pipeline re-expands and recurses forever.
+            return String::new();
+        };
+
+        let text = crate::pipeline::lua_deferred::render_call(&request);
+        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+            &text,
+            /* in_template */ true,
+            self.config.extension_tags(),
+        );
+        // A call made from inside a module is a call from the module's own
+        // scope, so `{{{1}}}` resolves against the module's frame, not the
+        // caller's — hence a child of *this* frame.
+        //
+        // `in_template: true` is load-bearing: this expansion is nested inside
+        // the `#invoke` that asked for it, so anything it produces must not be
+        // encapsulated again, and the flag carries that into the recursion.
+        let child = frame.new_child(frame.title().clone(), vec![]);
+        self.lua_expansion_depth
+            .set(self.lua_expansion_depth.get() + 1);
+        let expanded = Box::pin(self.expand_templates(
+            &child,
+            items,
+            Some(source),
+            &std::cell::Cell::new(0usize),
+            /* in_template */ true,
+            &text,
+        ))
+        .await;
+        self.lua_expansion_depth
+            .set(self.lua_expansion_depth.get() - 1);
+
+        // A parser function expands in place, with no transclusion wrapper: the
+        // caller wrote `#uc`, not a page name, so there is nothing to attribute
+        // a separate transclusion to.
+        if matches!(request, FrameRequest::CallParserFunction { .. }) {
+            return crate::pipeline::lua_deferred::render_answer(&expanded, self.config)
+                .unwrap_or_default();
+        }
+        // `expandTemplate` is transclusion, so its expansion is wrapped the way
+        // a template's is — but with the *module's* call as the source, not the
+        // `#invoke` that contains it. Reusing the enclosing token made a missing
+        // template render back as the `#invoke` call, which the module returned
+        // and the pipeline expanded again, forever.
+        let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+        let mut info = template_info_from(None, Some("#invoke"), vec![]);
+        info.ty = Some("parserfunction".to_string());
+        let encapped = encap.encap_tokens(expanded, &info);
+        crate::pipeline::lua_deferred::render_answer(&encapped, self.config).unwrap_or_default()
     }
 }
 
@@ -2520,6 +2633,13 @@ fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Par
     parts.extend(params.args.iter().skip(1).filter_map(kv_to_source_text));
     parts.join("|")
 }
+
+/// How many Lua frame methods may nest before the expansion is abandoned.
+///
+/// Each level is one `frame:expandTemplate`/`preprocess` call whose argument
+/// expansion asks for another. Real modules nest a few levels; the bound exists
+/// so a module that asks for itself cannot run until the stack overflows.
+const MAX_LUA_EXPANSION_DEPTH: usize = 16;
 
 /// Convert a frame's raw parameters into Scribunto `Arg`s.
 ///

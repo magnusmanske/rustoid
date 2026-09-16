@@ -195,21 +195,38 @@ fn required_modules(source: &str) -> Vec<String> {
     out
 }
 
-/// Run an `#invoke` call, returning its wikitext output.
+/// The outcome of one `#invoke` attempt: done, or waiting on the host.
+pub enum Outcome {
+    Done(String),
+    Deferred(crate::pipeline::lua_deferred::FrameRequest),
+}
+
+/// How many times one `#invoke` may be re-run for deferred frame calls.
 ///
-/// The output is wikitext, not HTML: Scribunto's result is fed back through the
-/// parser, so templates and parser functions the module returns are still
-/// expanded by the caller.
-pub fn run(
-    invoke: &Invoke,
+/// Each round supplies at least one new answer, so this bounds how many
+/// distinct frame calls a module may make. The corpus's cached modules hold a
+/// combined 129 `expandTemplate`/`preprocess` call sites, so the bound is
+/// generous for real modules while stopping a module that fabricates a fresh
+/// request on every pass.
+const MAX_FRAME_ROUNDS: usize = 64;
+
+/// Run an `#invoke` call once, reporting what it needs from the parser.
+///
+/// `answers` holds everything the host has expanded so far; a frame method not
+/// in it raises a request instead of returning. The engine is created here, so
+/// a caller that re-runs on [`Outcome::Deferred`] starts from scratch — which
+/// is safe because a frame method's result depends only on its arguments.
+pub fn run_once(
+    call: &Invoke,
     registry: Registry,
     site: LuaSite,
     page_title: &str,
     frame: &FrameContext,
-) -> Result<String> {
+    answers: &crate::pipeline::lua_deferred::DeferredAnswers,
+) -> Result<Outcome> {
     // Scribunto's entry module must be present; a `#invoke` of a non-existent
     // module is an error, and the caller turns it into MediaWiki's message.
-    let title = invoke.module_title();
+    let title = call.module_title();
     let Some(entry) = registry.get(&title).cloned() else {
         return Err(RustoidError::Lua(format!("module {title} does not exist")));
     };
@@ -219,8 +236,99 @@ pub fn run(
     let ctx = LuaContext::with_parent(site, page_title.to_string(), frame);
     let engine = LuaEngine::new(LuaEngineConfig::default(), ctx)?;
 
-    let args = invoke.frame_args();
-    engine.execute_in(&entry, &title, &invoke.function, &args)
+    let args = call.frame_args();
+    match engine.execute_in(&entry, &title, &call.function, &args, answers) {
+        Ok(out) => Ok(Outcome::Done(out)),
+        Err(RustoidError::Lua(msg)) => match engine.take_pending() {
+            // The module asked the host to expand something. `take_pending` is
+            // only set by the deferred path, so a genuine script error cannot
+            // be mistaken for a request.
+            Some(request) => Ok(Outcome::Deferred(request)),
+            None => Err(RustoidError::Lua(msg)),
+        },
+        Err(other) => Err(other),
+    }
+}
+
+/// Parse a `#invoke` call, preload what it needs, and run it.
+///
+/// Runs more than once for two reasons: a module that asks for something the
+/// preload scan could not see (a name built at runtime, e.g.
+/// `mw.loadData(cfgModule)` — without this, `Module:Message box/configuration`
+/// stopped 36 of 39 corpus pages), and a module that calls back into the parser
+/// (`frame:expandTemplate` and friends). Both retries look the same from here:
+/// the module failed, what it wants is fetched or expanded, and it runs again.
+pub async fn invoke<F, Fut>(
+    pf_arg: &str,
+    source: &(impl DataSource + ?Sized),
+    site: LuaSite,
+    page_title: &str,
+    // `frame.titles` is filled in here, since only this function knows which
+    // modules were preloaded.
+    frame: FrameContext,
+    expand: F,
+) -> Result<String>
+where
+    F: Fn(crate::pipeline::lua_deferred::FrameRequest) -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    let Some(call) = Invoke::parse(pf_arg) else {
+        return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
+    };
+    let mut registry = preload(source, &call.module_title()).await;
+    let mut frame = FrameContext {
+        titles: preload_titles(source, &registry).await,
+        ..frame
+    };
+    let mut answers = crate::pipeline::lua_deferred::DeferredAnswers::new();
+    let mut asked: Vec<String> = Vec::new();
+
+    for _ in 0..MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS {
+        let outcome = match run_once(
+            &call,
+            registry.clone(),
+            site.clone(),
+            page_title,
+            &frame,
+            &answers,
+        ) {
+            Ok(outcome) => outcome,
+            Err(RustoidError::Lua(msg)) => match missing_module_from(&msg) {
+                Some(title) if !registry.contains_key(&title) => {
+                    // Fetch it, plus anything *it* needs, then try again.
+                    registry.extend(preload(source, &title).await);
+                    // A newly loaded module may reference new titles.
+                    frame.titles.extend(preload_titles(source, &registry).await);
+                    continue;
+                }
+                _ => return Err(RustoidError::Lua(msg)),
+            },
+            Err(other) => return Err(other),
+        };
+
+        match outcome {
+            Outcome::Done(out) => return Ok(out),
+            Outcome::Deferred(request) => {
+                let key = request.key();
+                // Re-running with an answer the module already has would
+                // reproduce the same request forever, so a repeat is a loop.
+                if asked.contains(&key) {
+                    return Err(RustoidError::Lua(format!(
+                        "deferred frame call did not settle: {key}"
+                    )));
+                }
+                let text = expand(request).await;
+                asked.push(key.clone());
+                answers.insert(key, text);
+            }
+        }
+    }
+
+    Err(RustoidError::Lua(format!(
+        "could not run {} after {} rounds",
+        call.module_title(),
+        MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS
+    )))
 }
 
 /// How many times an `#invoke` may be re-run after discovering a module it
@@ -359,62 +467,8 @@ fn referenced_titles(source: &str) -> Vec<String> {
     out
 }
 
-/// Parse a `#invoke` call, preload what it needs, and run it.
-///
-/// Runs more than once only when a module asks for something the scan could not
-/// see — a name built at runtime, e.g. `mw.loadData(cfgModule)`. When that
-/// happens the named module is fetched and the call re-runs, which keeps
-/// `require` synchronous inside Lua while still covering the dynamic case.
-/// Without this, `Module:Message box/configuration` (reached that way) stopped
-/// 36 of 39 corpus pages.
-pub async fn invoke<S: DataSource + ?Sized>(
-    pf_arg: &str,
-    source: &S,
-    site: LuaSite,
-    page_title: &str,
-    // `frame.titles` is filled in here, since only this function knows which
-    // modules were preloaded.
-    frame: FrameContext,
-) -> Result<String> {
-    let Some(call) = Invoke::parse(pf_arg) else {
-        return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
-    };
-    let mut registry = preload(source, &call.module_title()).await;
-    let mut frame = FrameContext {
-        titles: preload_titles(source, &registry).await,
-        ..frame
-    };
-    let mut last_missing: Option<String> = None;
-
-    for _ in 0..MAX_PRELOAD_ROUNDS {
-        match run(&call, registry.clone(), site.clone(), page_title, &frame) {
-            Ok(out) => return Ok(out),
-            Err(RustoidError::Lua(msg)) => {
-                match missing_module_from(&msg) {
-                    Some(title) if !registry.contains_key(&title) => {
-                        // Fetch it, plus anything *it* needs, then try again.
-                        registry.extend(preload(source, &title).await);
-                        // A newly loaded module may reference new titles.
-                        frame.titles.extend(preload_titles(source, &registry).await);
-                        last_missing = Some(title);
-                    }
-                    _ => return Err(RustoidError::Lua(msg)),
-                }
-            }
-            Err(other) => return Err(other),
-        }
-    }
-
-    // Name the module that stayed missing: "gave up" alone leaves the reader to
-    // guess, and the usual reason is that it could not be fetched rather than
-    // that the chain was long.
-    Err(RustoidError::Lua(format!(
-        "could not load {} after {MAX_PRELOAD_ROUNDS} rounds (still missing: {})",
-        call.module_title(),
-        last_missing.as_deref().unwrap_or("unknown")
-    )))
-}
-
+/// How many times an `#invoke` may be re-run after discovering a module it
+/// needed but could not be anticipated.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -326,9 +326,9 @@ and only the latter is fixed by working on `#invoke`.
 - Frame API, in this order: `frame.args`, `getParent`, `getTitle`,
   **`expandTemplate`**, **`callParserFunction`**, `preprocess`, `newChild`,
   `argumentPairs`. — `args` (both spellings), `argumentPairs`, `getTitle`,
-  `getParent` (nil), `extensionTag` are in; `expandTemplate`,
-  `callParserFunction`, `preprocess` and `newChild` are **not**, and report an
-  error rather than returning something plausible-but-wrong.
+  `getParent`, `extensionTag`, **`expandTemplate`**, **`callParserFunction`**
+  and **`preprocess`** are in; `newChild` is not, and reports an error rather
+  than returning something plausible-but-wrong.
 
 #### How modules are fetched, and the trade that was made
 
@@ -398,33 +398,63 @@ non-existent; recorded as a known gap.
 implement the extension, and a nil `mw.ext` failed the whole page with an
 unattributed error instead of just rendering nothing for that part.
 
-#### The next step is architectural: `frame:expandTemplate`
+#### `frame:expandTemplate`, `preprocess`, `callParserFunction` — done
 
-`frame:expandTemplate` is now the largest single item (11 pages) but that
-understates it: **42 of the cached modules** reference it or `frame:preprocess`,
-and it is what citation and taxobox rendering need.
+These were the largest single item (**42 of the cached modules** reference at
+least one, and `Module:Multiple image` alone accounted for 11 pages). They cannot
+be done the way everything else was: `require` and `mw.title.new(...)` were
+solvable by *preloading* because the titles involved are literals in the module
+source, while `expandTemplate`'s **arguments are computed at runtime**, so the
+result cannot be known before the module runs.
 
-It cannot be done the way everything else was. `require` and
-`mw.title.new(...)` were solvable by *preloading* because the titles involved are
-literals in the module source. `expandTemplate` is different: the title is a
-literal but the **arguments are computed at runtime**, so the result cannot be
-known before the module runs.
+Lua calls them synchronously; `Parser::expand_templates` is `async`. Two options
+were considered:
 
-Lua calls it synchronously; `Parser::expand_templates` is `async`. The two options:
+1. **Suspend and resume.** Each call records its request (title + args) and
+yields; the host expands it outside Lua and re-runs the invocation with the
+answers available. The same defer-and-retry shape the module preload already
+uses, at the cost of running a module more than once.
+2. **A synchronous inner parser.** Rejected: it duplicates the async pipeline,
+and two implementations that can disagree make byte-exact parity harder rather
+than easier.
 
-1. **Suspend and resume.** `expandTemplate` records its request (title + args)
-   and yields; the host expands it outside Lua and re-runs the invocation with the
-   answers available. This is the same defer-and-retry shape the module preload
-   already uses, so the machinery is familiar, but "re-runs the invocation" means
-   a module must be safe to run more than once — cheap for the pure ones, and the
-   corpus suggests the expensive ones are pure.
-2. **A synchronous inner parser.** Give Lua a minimal synchronous expander for the
-   template-only case. Simpler to call, but it duplicates the async pipeline, and
-   a second implementation that can disagree with the first is the kind of thing
-   that makes byte-exact parity harder rather than easier.
+**Option 1 is what was built** (`rustoid-core/src/pipeline/lua_deferred.rs`):
 
-Option 1 is the one to take; recorded here because it is a design decision rather
-than a port, and because getting it wrong would be expensive.
+- The engine's frame gets `expandTemplate`/`preprocess`/`callParserFunction`
+  as Rust closures that look the call up in a per-run answer map. A hit returns
+the answer; a miss records the request and raises a marker error.
+- `invoke` loops: run the module, and if it asked for something, expand that one
+  request with the real async pipeline (a `template` token through
+  `expand_templates`), record the answer, and re-run. Bounded, and a request that
+  repeats without settling is reported rather than looped.
+- Requests are keyed by **content** (title + sorted named args + positional
+  args), not by call ordinal, so a re-run that reaches its calls in a different
+  order still matches them up.
+
+Five things had to be right, each found by a test:
+
+- **The answer is HTML, not wikitext.** Scribunto's `mw.lua` binds these to
+  `php.expandTemplate`/`php.preprocess`, whose PHP side runs the result through
+  `recursiveTagParse` — so `'''bold'''` comes back as `<b>bold</b>`. An early
+  version returned wikitext and broke every module that did
+  `"prefix" .. frame:expandTemplate{…}`.
+- **A parser function's first argument is joined by a colon**, not a pipe:
+  `{{#uc:shout}}`, not `{{#uc|shout}}`. Getting this wrong made the call
+  silently resolve to nothing.
+- **The answer must not be the enclosing `#invoke` call.** Reusing the frame
+  token's source made a *missing* template render back as
+  `{{#invoke:T|main}}`; the module returned it, and the pipeline expanded it
+  again, forever.
+- **`mw:Transclusion` markers must be dropped** from the answer, both the
+  opening marker and its `/End` partner — they are bookkeeping, and a module
+  returning one puts it into the page text.
+- **The engine's `pending` collector must be shared**, not recreated per run;
+  a fresh `Rc` per `execute_in` left `take_pending` reading a different one, so
+  no request was ever seen.
+
+A `Cell<usize>` counter bounds nesting, because a module can reach the parser
+only through these methods and the manual is explicit that its *output* is not
+re-parsed for templates.
 
 Wiring `#invoke` moved the corpus from "43 of 44 pages never expand their Lua
 calls" to "Lua runs and the failures are a ranked list of what modules ask for".

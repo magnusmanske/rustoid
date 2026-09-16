@@ -238,6 +238,9 @@ pub enum Arg {
 pub struct LuaEngine {
     lua: Lua,
     _context: Arc<LuaContext>,
+    /// Deferred frame calls raised by the last execution. A `RefCell` because
+    /// the Lua closures that fill it must be `'static` and `Fn`, not `FnMut`.
+    pending: std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
 }
 
 impl LuaEngine {
@@ -259,8 +262,37 @@ impl LuaEngine {
             .set("mw", mw)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
         install_module_loader(&lua, &ctx)?;
+        install_frame_results(&lua)?;
 
-        Ok(Self { lua, _context: ctx })
+        Ok(Self {
+            lua,
+            _context: ctx,
+            pending: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        })
+    }
+
+    /// Pre-fill a deferred frame call's answer, for the host's re-run.
+    ///
+    /// Keyed like [`crate::pipeline::lua_deferred::FrameRequest::key`], so the
+    /// host need not know the call order: it expands whatever
+    /// [`LuaEngine::take_pending`] reported and hands that key back.
+    pub fn set_frame_result(&self, key: &str, text: String) -> Result<()> {
+        let table: Table = self
+            .lua
+            .globals()
+            .get(crate::pipeline::lua_deferred::RESULTS)
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        table
+            .set(key, text)
+            .map_err(|e| RustoidError::Lua(e.to_string()))
+    }
+
+    /// The deferred frame call the last execution raised, if any.
+    ///
+    /// The module is re-run from the start once the host has expanded
+    /// everything it asked for, so at most one request is ever outstanding.
+    pub fn take_pending(&self) -> Option<crate::pipeline::lua_deferred::FrameRequest> {
+        self.pending.borrow_mut().pop()
     }
 
     /// Run `module_source`'s function `function_name`.
@@ -274,6 +306,7 @@ impl LuaEngine {
         title: &str,
         function_name: &str,
         args: &[Arg],
+        answers: &crate::pipeline::lua_deferred::DeferredAnswers,
     ) -> Result<String> {
         let module = self.load_module_value(module_source, Some(title))?;
         let func = self.module_function(&module, function_name)?;
@@ -288,7 +321,12 @@ impl LuaEngine {
                 .has_parent
                 .then_some(self._context.parent_args.as_slice()),
             self._context.parent_title.as_deref(),
+            answers.clone(),
+            // The engine's own collector: `take_pending` reads what this run
+            // asked for, so a fresh one per run would lose it.
+            self.pending.clone(),
         )?;
+        self.pending.replace(Vec::new());
         // `mw.getCurrentFrame()` reads this, so the frame must be installed
         // before the module runs.
         self.lua
@@ -309,7 +347,13 @@ impl LuaEngine {
         function_name: &str,
         args: &[Arg],
     ) -> Result<String> {
-        self.execute_in(module_source, "module", function_name, args)
+        self.execute_in(
+            module_source,
+            "module",
+            function_name,
+            args,
+            &Default::default(),
+        )
     }
 
     /// Run a module's source and return its value.
@@ -356,6 +400,20 @@ impl LuaEngine {
 }
 
 // ---- mw table setup ----
+
+/// Install the table deferred frame-call answers are parked in.
+///
+/// One table on `_G` rather than one registry key per call: the answers are
+/// plain Lua values (strings, or tables carrying parser tokens) and the engine
+/// hands them straight back to the module that asked for them.
+fn install_frame_results(lua: &Lua) -> Result<()> {
+    let table = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    lua.globals()
+        .set(crate::pipeline::lua_deferred::RESULTS, table)
+        .map_err(|e| RustoidError::Lua(e.to_string()))
+}
 
 // ---- module loader ----
 
@@ -1656,6 +1714,8 @@ fn create_frame(
     page_title: &str,
     parent_args: Option<&[Arg]>,
     parent_title: Option<&str>,
+    answers: crate::pipeline::lua_deferred::DeferredAnswers,
+    pending: std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
 ) -> Result<Value> {
     let frame = lua
         .create_table()
@@ -1717,17 +1777,25 @@ fn create_frame(
         "getParent",
         lua.create_function(move |_, ()| Ok(parent_frame.clone()))?,
     )?;
-    // `frame:preprocess(text)` — expand wikitext. It needs the parser, so it is
-    // a later phase; returning the text unchanged would silently produce wrong
-    // output, so it reports instead.
-    frame.set(
-        "preprocess",
-        lua.create_function(|_, _text: String| -> mlua::Result<String> {
-            Err(mlua::Error::runtime(
-                "frame:preprocess is not implemented yet",
-            ))
-        })?,
-    )?;
+    // `frame:preprocess(text)` / `frame:expandTemplate{…}` /
+    // `frame:callParserFunction{…}` — all three need the parser, which only the
+    // host has, so the call is deferred and answered on the re-run. See
+    // [`crate::pipeline::lua_deferred`].
+    for method in [
+        crate::pipeline::lua_deferred::PREPROCESS,
+        crate::pipeline::lua_deferred::EXPAND_TEMPLATE,
+        crate::pipeline::lua_deferred::CALL_PARSER_FUNCTION,
+    ] {
+        frame.set(
+            method,
+            crate::pipeline::lua_deferred::frame_method(
+                lua,
+                method,
+                answers.clone(),
+                pending.clone(),
+            )?,
+        )?;
+    }
     frame.set(
         "extensionTag",
         lua.create_function(|_, opts: Table| {
@@ -1802,7 +1870,7 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
     Ok(namespaces)
 }
 
-fn format_number(n: f64) -> String {
+pub fn format_number(n: f64) -> String {
     if n == n.trunc() && n.abs() < 1e15 {
         let s = (n as i64).to_string();
         let mut result = String::new();

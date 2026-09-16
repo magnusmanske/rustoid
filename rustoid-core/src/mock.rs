@@ -551,7 +551,7 @@ impl MockSiteConfig {
     /// Register a parser function (PHP's `functionhooks`). Needed for functions
     /// core lists in `$noHashFunctions`, which are stored without a leading `#`
     /// but invoked with one (`{{#dir:en}}`).
-    fn add_function_hook(&mut self, name: &str) {
+    pub fn add_function_hook(&mut self, name: &str) {
         self.function_hooks.push(name.to_string());
     }
 

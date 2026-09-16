@@ -20,6 +20,7 @@ pub mod handle_link_neighbours;
 pub mod headings;
 pub mod language_variant_handler;
 pub mod list_handler;
+pub mod lua_deferred;
 pub mod mark_fostered_content;
 pub mod media_options;
 pub mod migrate_template_marker_metas;
