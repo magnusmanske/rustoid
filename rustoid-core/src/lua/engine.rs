@@ -795,7 +795,20 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     text.set("trim", lua.create_function(luafn_text_trim)?)?;
     text.set("split", lua.create_function(luafn_text_split)?)?;
     text.set("tag", lua.create_function(luafn_text_tag)?)?;
+    text.set("nowiki", lua.create_function(luafn_text_nowiki)?)?;
     text.set("listToText", lua.create_function(luafn_text_list_to_text)?)?;
+    // The strip-marker functions operate on MediaWiki's "UNIQ…QINU" markers,
+    // which rustoid has no equivalent of: a `nowiki`/`ref`/`gallery` tag is
+    // parsed into the tree rather than carried through Lua as a marker. There is
+    // therefore nothing to unstrip, and returning the input unchanged is the
+    // correct answer rather than a stub — the text a module sees never held a
+    // marker to begin with.
+    for name in ["unstripNoWiki", "unstrip", "killMarkers"] {
+        text.set(
+            name,
+            lua.create_function(|_, s: Value| coerce_string(&s, "unstrip"))?,
+        )?;
+    }
     mw.set("text", text)?;
 
     // mw.title
@@ -1146,6 +1159,112 @@ pub(crate) fn coerce_string(value: &Value, function: &str) -> mlua::Result<Strin
 
 fn luafn_text_encode(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(html_escape(&coerce_string(&s, "encode")?))
+}
+
+/// `mw.text.nowiki( s )` — escape the characters that would otherwise be read as
+/// wikitext, so the text renders literally.
+///
+/// The manual lists the cases; they are position-dependent, which is why this is
+/// not a simple character map:
+///
+/// - a fixed set of characters is always escaped (`"`, `&`, `'`, `<`, `=`, `>`,
+///   `[`, `]`, `{`, `|`, `}`);
+/// - line-leading characters (`#`, `*`, `:`, `;`, space, tab) are escaped only at
+///   the start of a line;
+/// - a blank line has one of its newline characters escaped, and `----` has its
+///   first `-` escaped;
+/// - `__` loses one underscore, `://` loses its colon, and whitespace after
+///   `ISBN`, `RFC` or `PMID` is escaped (those prefixes would otherwise become
+///   magic links).
+///
+/// `Module:Citation/CS1` escapes an identifier with this so that a value such as
+/// `ISBN 123` cannot turn into a link.
+fn luafn_text_nowiki(_: &Lua, s: Value) -> mlua::Result<String> {
+    let text = coerce_string(&s, "nowiki")?;
+    let mut out = String::with_capacity(text.len());
+    // Whether the next character starts a line, which the position-dependent
+    // rules key off. The string starts at a line start, as MediaWiki treats it.
+    let mut at_line_start = true;
+
+    for (idx, ch) in text.char_indices() {
+        // `ISBN`, `RFC`, `PMID` followed by whitespace become magic links.
+        if ch.is_whitespace() && ends_with_magic_link_prefix(&text[..idx]) {
+            out.push_str("&#");
+            out.push_str(&(ch as u32).to_string());
+            out.push(';');
+            at_line_start = false;
+            continue;
+        }
+
+        let escaped = match ch {
+            '"' | '&' | '\'' | '<' | '=' | '>' | '[' | ']' | '{' | '|' | '}' => {
+                Some(named_or_numeric(ch))
+            }
+            '#' | '*' | ':' | ';' | ' ' | '\t' if at_line_start => Some(named_or_numeric(ch)),
+            _ => None,
+        };
+        if let Some(replacement) = escaped {
+            out.push_str(&replacement);
+            at_line_start = false;
+            continue;
+        }
+
+        match ch {
+            // A blank line: escape its newline so the blank line is preserved.
+            '\n' => {
+                if at_line_start {
+                    out.push_str("&#10;");
+                } else {
+                    out.push('\n');
+                }
+                at_line_start = true;
+                continue;
+            }
+            // `----` at a line start would be a horizontal rule.
+            '-' if at_line_start && text[idx..].starts_with("----") => {
+                out.push_str("&#45;");
+                at_line_start = false;
+                continue;
+            }
+            // `__` is a behavior-switch delimiter.
+            '_' if text[idx..].starts_with("__") => {
+                out.push_str("&#95;");
+                at_line_start = false;
+                continue;
+            }
+            // `://` would make the preceding text a protocol.
+            ':' if text[idx..].starts_with("://") => {
+                out.push_str("&#58;");
+                at_line_start = false;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(ch);
+        at_line_start = false;
+    }
+    Ok(out)
+}
+
+/// Whether `before` ends with one of the prefixes that form a magic link.
+fn ends_with_magic_link_prefix(before: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["ISBN", "RFC", "PMID"];
+    PREFIXES.iter().any(|p| before.ends_with(p))
+}
+
+/// The named entity for the characters the manual names, else a numeric one.
+///
+/// Only the five names the manual lists have short forms; the rest are emitted
+/// numerically, as MediaWiki does.
+fn named_or_numeric(ch: char) -> String {
+    match ch {
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        '&' => "&amp;".to_string(),
+        '"' => "&quot;".to_string(),
+        '\'' => "&#39;".to_string(),
+        other => format!("&#{};", other as u32),
+    }
 }
 
 fn luafn_text_decode(_: &Lua, s: Value) -> mlua::Result<String> {
@@ -2953,6 +3072,82 @@ mod tests {
             engine.eval("return mw.text.trim('  hello  ')").unwrap(),
             "hello"
         );
+    }
+
+    /// `mw.text.nowiki` escapes what would otherwise be read as wikitext.
+    /// `Module:Citation/CS1` escapes an identifier with it so that a value such
+    /// as `ISBN 123` cannot become a magic link.
+    #[test]
+    fn test_mw_text_nowiki() {
+        let engine = make_engine();
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('a&b')").unwrap(),
+            "a&amp;b"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('[[x]]')").unwrap(),
+            "&#91;&#91;x&#93;&#93;"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.nowiki(\"it's\")").unwrap(),
+            "it&#39;s"
+        );
+        // A line-leading marker is escaped; the same character mid-line is not.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('* item')").unwrap(),
+            "&#42; item"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('a * b')").unwrap(),
+            "a * b"
+        );
+        // A magic-link prefix followed by a space is broken up.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('ISBN 123')").unwrap(),
+            "ISBN&#32;123"
+        );
+        // ...but a prefix that is not one of the three is left alone.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('FOO 123')").unwrap(),
+            "FOO 123"
+        );
+        // `----` at a line start would be a horizontal rule.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('----')").unwrap(),
+            "&#45;---"
+        );
+        // `__` is a behavior-switch delimiter, and `://` a protocol.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('__NOTOC__')").unwrap(),
+            "&#95;_NOTOC&#95;_"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('http://x')").unwrap(),
+            "http&#58;//x"
+        );
+        // Text with nothing to escape is returned unchanged.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('plain text')").unwrap(),
+            "plain text"
+        );
+    }
+
+    /// rustoid has no strip markers to remove, so these return their input —
+    /// which is the right answer, not a stub: the text a module sees never
+    /// carried a marker. They must exist so a module that calls them does not
+    /// stop.
+    #[test]
+    fn test_mw_text_strip_markers_are_identity() {
+        let engine = make_engine();
+        for call in ["unstripNoWiki", "unstrip", "killMarkers"] {
+            assert_eq!(
+                engine
+                    .eval(&format!("return mw.text.{call}('plain')"))
+                    .unwrap(),
+                "plain",
+                "mw.text.{call}"
+            );
+        }
     }
 
     #[test]
