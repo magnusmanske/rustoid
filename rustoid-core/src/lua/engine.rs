@@ -2358,12 +2358,18 @@ fn luafn_ustring_len(_: &Lua, s: Value) -> mlua::Result<usize> {
 /// and everything is clamped into range. Clamping independently is *not* enough —
 /// `sub('abc', 5, -1)` clamps to `start > end` and panics on the slice, which is
 /// what `Help:Introduction` triggered. An inverted range is empty.
-fn luafn_ustring_sub(_: &Lua, (s, i, j): (Value, i64, Option<i64>)) -> mlua::Result<String> {
+fn luafn_ustring_sub(
+    _: &Lua,
+    (s, i, j): (Value, Option<i64>, Option<i64>),
+) -> mlua::Result<String> {
     let s = coerce_string(&s, "sub")?;
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len() as i64;
 
-    // Lua's `posrelat`: a negative index counts back from the end.
+    // Lua's `posrelat`: a negative index counts back from the end. An omitted
+    // start is 1, the whole string, as in `string.sub` — `Module:IPA` calls
+    // `mw.ustring.sub(s, nil)` with an uninitialised offset.
+    let i = i.unwrap_or(1);
     let from = if i < 0 { n + i + 1 } else { i };
     let to = match j {
         None | Some(-1) => n,
@@ -3507,6 +3513,10 @@ mod tests {
             ("mw.ustring.sub('héllo', 5, -1)", "o"),
             ("mw.ustring.sub('héllo', 4, 5)", "lo"),
             ("mw.ustring.sub('', 1, 1)", ""),
+            // An omitted or nil start means "from the beginning", which
+            // `Module:IPA` relies on: it passes an uninitialised offset.
+            ("mw.ustring.sub('abc', nil)", "abc"),
+            ("mw.ustring.sub('abc', nil, 2)", "ab"),
         ] {
             assert_eq!(
                 engine.eval(&format!("return {expr}")).unwrap(),
@@ -3514,6 +3524,14 @@ mod tests {
                 "{expr}"
             );
         }
+        // An uninitialised local is nil, which is how `Module:IPA` reaches the
+        // omitted-start case.
+        assert_eq!(
+            engine
+                .eval("local i return mw.ustring.sub('abc', i)")
+                .unwrap(),
+            "abc"
+        );
     }
 
     #[test]
