@@ -235,6 +235,30 @@ async fn call_parser_function_is_deferred_too() {
     assert!(html.contains("SHOUT"), "got: {html}");
 }
 
+/// `callParserFunction` has three documented spellings and modules write all
+/// of them: the named table, `(name, args)`, and `(name, ...)`. Only the first
+/// was accepted, so `frame:callParserFunction('ns', 0)` failed with "expects a
+/// table with a name" — which Module:Italic title and Module:Coordinates both
+/// hit.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn call_parser_function_accepts_every_documented_form() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local named = frame:callParserFunction{ name = 'uc', args = { 'one' } }
+            local table_arg = frame:callParserFunction('uc', { 'two' })
+            local spread = frame:callParserFunction('uc', 'three')
+            return named .. table_arg .. spread
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    assert!(html.contains("ONE"), "named table: {html}");
+    assert!(html.contains("TWO"), "table argument: {html}");
+    assert!(html.contains("THREE"), "spread arguments: {html}");
+}
+
 /// A module returning something other than a string still has to produce
 /// output rather than vanishing or panicking.
 #[tokio::test]

@@ -229,6 +229,15 @@ pub fn pending_key(message: &str) -> Option<&str> {
     Some(rest.lines().next().unwrap_or(rest).trim())
 }
 
+/// Split a `#tag:nowiki`-style function name into the function and its first
+/// argument, per the manual. Any other name is returned unchanged.
+fn split_colon_name(raw: &str) -> (String, Option<String>) {
+    match raw.split_once(':') {
+        Some((head, tail)) if head.starts_with('#') => (head.to_string(), Some(tail.to_string())),
+        _ => (raw.to_string(), None),
+    }
+}
+
 /// Whether a value is the frame table itself — recognised by the members every
 /// frame has, so an ordinary options table is not mistaken for one.
 fn is_frame(value: &Value) -> bool {
@@ -278,25 +287,80 @@ fn build_request(method: &str, args: mlua::MultiValue) -> mlua::Result<FrameRequ
             Ok(FrameRequest::ExpandTemplate { title, args })
         }
         CALL_PARSER_FUNCTION => {
-            let Value::Table(opts) = arg else {
-                return Err(mlua::Error::runtime(
-                    "callParserFunction expects a table with a name",
-                ));
+            // Three documented spellings, all in the corpus:
+            //   frame:callParserFunction( name, args )
+            //   frame:callParserFunction( name, ... )
+            //   frame:callParserFunction{ name = name, args = args }
+            // The named form arrives as the single table; the other two as
+            // positional arguments, which are collected into the same shape.
+            let (name, args) = match arg {
+                Value::Table(opts) if opts.contains_key("name").unwrap_or(false) => {
+                    let name = opts
+                        .get::<Option<String>>("name")?
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let args = match opts.get::<Value>("args")? {
+                        Value::Table(t) => args_from_table(&t)?,
+                        _ => Vec::new(),
+                    };
+                    (name, args)
+                }
+                Value::Table(table) => {
+                    // `frame:callParserFunction( 'ns', { 0 } )` — the first
+                    // positional is the name, an optional table the arguments.
+                    let name = table
+                        .get::<Option<String>>(1)?
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let args = match table.get::<Value>(2)? {
+                        Value::Table(t) => args_from_table(&t)?,
+                        Value::Nil => Vec::new(),
+                        other => vec![FrameArg::positional(stringify(&other)?)],
+                    };
+                    (name, args)
+                }
+                Value::String(s) => {
+                    // `frame:callParserFunction( name, args )` and
+                    // `frame:callParserFunction( name, ... )` — the name is the
+                    // first positional and everything after it is the
+                    // arguments, either as one sequence table or spread out.
+                    let raw = s.to_str().map_err(mlua::Error::external)?.to_string();
+                    let rest: Vec<Value> = args.collect();
+
+                    // A `#tag:nowiki` name carries its first argument in the
+                    // name, which the manual documents: the part after the
+                    // first `:` is prepended to the arguments.
+                    let (name, colon_arg) = split_colon_name(&raw);
+
+                    let mut collected: Vec<FrameArg> = Vec::new();
+                    if let Some(arg) = colon_arg {
+                        collected.push(FrameArg::positional(arg));
+                    }
+                    match rest.as_slice() {
+                        // A lone table is the argument list, not an argument.
+                        [Value::Table(t)] => collected.extend(args_from_table(t)?),
+                        _ => {
+                            for value in rest {
+                                collected.push(FrameArg::positional(stringify(&value)?));
+                            }
+                        }
+                    }
+                    (name, collected)
+                }
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "callParserFunction expects a function name, got a {}",
+                        other.type_name()
+                    )));
+                }
             };
-            let name = opts
-                .get::<Option<String>>("name")?
-                .unwrap_or_default()
-                .trim()
-                .to_string();
             if name.is_empty() {
                 return Err(mlua::Error::runtime(
                     "callParserFunction expects a function name",
                 ));
             }
-            let args = match opts.get::<Value>("args")? {
-                Value::Table(t) => args_from_table(&t)?,
-                _ => Vec::new(),
-            };
             Ok(FrameRequest::CallParserFunction { name, args })
         }
         PREPROCESS => {
@@ -470,6 +534,30 @@ mod tests {
         assert_eq!(
             pending_key(&message),
             Some(request("T", &[("", "x")]).key().as_str())
+        );
+    }
+
+    /// A `#tag:nowiki` name splits into the function and its first argument,
+    /// which the manual documents; any other name is left alone.
+    #[test]
+    fn colon_names_split_into_a_function_and_an_argument() {
+        assert_eq!(
+            split_colon_name("#tag:nowiki"),
+            ("#tag".to_string(), Some("nowiki".to_string()))
+        );
+        assert_eq!(
+            split_colon_name("#tag"),
+            ("#tag".to_string(), None),
+            "a hash name without a colon is a plain function"
+        );
+        assert_eq!(
+            split_colon_name("uc"),
+            ("uc".to_string(), None),
+            "a namespace-like name must not be split"
+        );
+        assert_eq!(
+            split_colon_name("#tag:ref"),
+            ("#tag".to_string(), Some("ref".to_string()))
         );
     }
 }
