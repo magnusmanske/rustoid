@@ -349,11 +349,19 @@ const MAX_PRELOAD_ROUNDS: usize = 6;
 ///
 /// The engine's message is the only place this knowledge lives, so the coupling
 /// is deliberate and asserted by a test rather than left implicit.
+///
+/// The *last* occurrence is taken, because these messages nest: a module that
+/// fails to load becomes part of the error a module above it raises, giving
+/// `load error in Module:A: ... module Module:B was not preloaded`. Taking the
+/// first `module ` would name `A` — the module that already failed — and the
+/// loop would ask the host to fetch a page it had just tried, which is how a
+/// nested load turned into a request for a title built from the message text.
 fn missing_module_from(message: &str) -> Option<String> {
-    let start = message.find("module ")? + "module ".len();
-    let rest = &message[start..];
-    let end = rest.find(" was not preloaded")?;
-    let title = rest[..end].trim();
+    const HEAD: &str = "module ";
+    const TAIL: &str = " was not preloaded";
+    let end = message.find(TAIL)?;
+    let start = message[..end].rfind(HEAD)? + HEAD.len();
+    let title = message[start..end].trim();
     if title.is_empty() {
         None
     } else {
@@ -715,5 +723,22 @@ mod tests {
         );
         assert_eq!(missing_module_from("some other failure"), None);
         assert_eq!(missing_module_from("module  was not preloaded"), None);
+    }
+
+    /// A nested failure puts two `module ` mentions in one message. The inner
+    /// title is the one to fetch: naming the outer module asked the host for a
+    /// page that had already failed, and the request went out titled with the
+    /// message text itself.
+    #[test]
+    fn nested_load_errors_name_the_inner_module() {
+        let nested = "load error in Module:Annotated link: runtime error: \
+                      module Module:Lang/data/iana languages was not preloaded";
+        assert_eq!(
+            missing_module_from(nested),
+            Some("Module:Lang/data/iana languages".to_string())
+        );
+        // Deeper nesting works the same way: the last mention wins.
+        let deep = "module Module:A: module Module:B: module Module:C was not preloaded";
+        assert_eq!(missing_module_from(deep), Some("Module:C".to_string()));
     }
 }
