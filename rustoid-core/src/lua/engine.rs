@@ -835,6 +835,31 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
             })
         })?,
     )?;
+    // `mw.title.makeTitle( ns, text, fragment )` — always applies the given
+    // namespace, unlike `new`, which lets a prefix in the text win. `Module:Listen`
+    // calls `mw.title.makeTitle(-2, filename)`, and with `new` the text would win.
+    let ctx_make = ctx.clone();
+    title.set(
+        "makeTitle",
+        lua.create_function(
+            move |lua, (ns, text, fragment): (Value, Value, Option<Value>)| {
+                let ns = given_namespace_id(&ctx_make.site, &ns)
+                    .ok_or_else(|| mlua::Error::runtime("makeTitle: unknown namespace"))?;
+                let mut text = coerce_string(&text, "makeTitle")?;
+                // A fragment is an argument here rather than part of the text.
+                if let Some(v) = fragment.as_ref().filter(|v| !v.is_nil()) {
+                    text.push('#');
+                    text.push_str(&coerce_string(v, "makeTitle")?);
+                }
+                luafn_title_new(
+                    lua,
+                    &ctx_make,
+                    Value::String(lua.create_string(text)?),
+                    Some(&Value::Integer(ns as i64)),
+                )
+            },
+        )?,
+    )?;
     let ctx3 = ctx.clone();
     title.set(
         "getCurrentTitle",
@@ -1223,15 +1248,24 @@ fn luafn_title_new(
     table.set("text", title_text.clone())?;
     table.set("nsText", ns_text.clone())?;
     table.set("namespace", ns_id)?;
+    // `prefixedText` is the title *including* its namespace, which is what
+    // modules compare and display (`text` is the bare page name).
     let full = if ns_text.is_empty() {
         title_text.clone()
     } else {
         format!("{ns_text}:{title_text}")
     };
-    table.set("fullText", full.clone())?;
-    // `prefixedText` is the title *including* its namespace, which is what
-    // modules compare and display (`text` is the bare page name).
     table.set("prefixedText", full.clone())?;
+    // `fullText` is `prefixedText` *plus* the fragment, which is the one way the
+    // two differ.
+    table.set(
+        "fullText",
+        if fragment.is_empty() {
+            full.clone()
+        } else {
+            format!("{full}#{fragment}")
+        },
+    )?;
     // `exists` and `isRedirect` are *not* set here: they live on the metatable,
     // which consults the preloaded facts. An eager `table.set` would shadow it
     // and silently report every page as existing.
@@ -1805,6 +1839,14 @@ if table.clone == nil then
         for key, value in pairs(t) do copy[key] = value end
         return copy
     end
+end
+
+-- `string.gfind` is Lua 5.0's name for `gmatch`, kept in Lua 5.1 as a
+-- deprecated alias. Scribunto is built on 5.1, so the alias exists there and
+-- published modules call it: Module:Navbox uses it to collect TemplateStyles
+-- strip markers. Lua 5.4 dropped the alias, so it is restored here.
+if string.gfind == nil then
+    string.gfind = string.gmatch
 end
 "#;
 
@@ -2899,6 +2941,53 @@ mod tests {
             .eval("return mw.title.new('Template:Foo').fullText")
             .unwrap();
         assert_eq!(result, "Template:Foo");
+    }
+
+    /// `mw.title.makeTitle` always applies its namespace argument, where `new`
+    /// would find the prefix in the text first. `Module:Listen` builds a Media
+    /// title with it.
+    #[test]
+    fn test_mw_title_make_title() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.title.makeTitle(-2, 'Foo.ogg').fullText")
+                .unwrap(),
+            "Media:Foo.ogg"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.title.makeTitle(-2, 'Foo.ogg').namespace")
+                .unwrap(),
+            "-2"
+        );
+        // The namespace name works as well as the id.
+        assert_eq!(
+            engine
+                .eval("return mw.title.makeTitle('Template', 'Foo').fullText")
+                .unwrap(),
+            "Template:Foo"
+        );
+        // A fragment is a separate argument, and lands on `fragment`.
+        assert_eq!(
+            engine
+                .eval("return mw.title.makeTitle(0, 'Foo', 'Bar').fragment")
+                .unwrap(),
+            "Bar"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.title.makeTitle(0, 'Foo', 'Bar').fullText")
+                .unwrap(),
+            "Foo#Bar"
+        );
+        // `isSubpage` and the subpage fields follow from the text.
+        assert_eq!(
+            engine
+                .eval("return mw.title.makeTitle(0, 'A/B').subpageText")
+                .unwrap(),
+            "B"
+        );
     }
 
     #[test]
