@@ -2453,9 +2453,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             src,
             site,
             &frame.title().full_text(),
-            parent,
-            Some(parent_title),
-            inside_template,
+            crate::lua::engine::FrameContext {
+                parent_args: parent,
+                parent_title: Some(parent_title),
+                has_parent: inside_template,
+                page_source: _page_source.to_string(),
+                ..Default::default()
+            },
         )
         .await
         {
@@ -2542,16 +2546,39 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
 /// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`
 /// shows up as an error in the output rather than as silently missing text.
 ///
-/// The stack traceback is dropped: MediaWiki shows a short message in the page
-/// and keeps the trace for the debug console, and the trace is long enough to
-/// distort the byte totals the scoreboard reports.
+/// The Lua stack traceback is reduced to its first module frame rather than
+/// dropped entirely. Dropping it left messages like `attempt to index a nil
+/// value` with no location at all, which cannot be attributed to anything; the
+/// first frame names the module and line. The full trace is still discarded,
+/// because it is long enough to distort the byte totals the scoreboard reports.
 fn script_error(message: &str) -> String {
     let short = message
         .split("\nstack traceback:")
         .next()
         .unwrap_or(message)
         .trim();
-    format!("<strong class=\"error\">Script error: {short}</strong>")
+    let location = message
+        .split("\nstack traceback:")
+        .nth(1)
+        .and_then(|trace| {
+            trace
+                .lines()
+                .map(str::trim)
+                .find(|line| line.contains("[string \"") && line.contains(':'))
+        })
+        .map(|line| {
+            // `[string "Module:Foo"]:12: in function ...` — keep the source and
+            // line, drop the rest of the frame description.
+            let end = line.rfind(':').unwrap_or(line.len());
+            let cut = line[..end].rfind(':').unwrap_or(end);
+            line[..cut].trim().to_string()
+        });
+    match location {
+        Some(loc) if !short.contains(&loc) => {
+            format!("<strong class=\"error\">Script error: {short} ({loc})</strong>")
+        }
+        _ => format!("<strong class=\"error\">Script error: {short}</strong>"),
+    }
 }
 
 #[cfg(test)]

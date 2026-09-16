@@ -194,30 +194,6 @@ fn without_a_data_source_the_call_is_left_as_source() {
 }
 
 /// Temporary probe: does the Lua path itself produce text?
-#[tokio::test]
-async fn probe_direct_invoke() {
-    let source = MockDataSource::new();
-    source.add_module("Module:Greet", GREET);
-    let site = rustoid_core::lua::engine::LuaSite::from_config(&MockSiteConfig::new());
-    let out = rustoid_core::lua::invoke::invoke(
-        "Greet|main|world",
-        &source,
-        site,
-        "Test",
-        Vec::new(),
-        None,
-        false,
-    )
-    .await;
-    println!("DIRECT RESULT: {out:?}");
-}
-
-#[tokio::test]
-async fn probe_parser_output() {
-    let html = expand(&[("Module:Greet", GREET)], "{{#invoke:Greet|main|world}}").await;
-    println!("FULL HTML ({} bytes):\n{html}", html.len());
-}
-
 /// `mw.site.namespaces` must be a real table: Hatnote indexes it directly and
 /// stops dead when it is missing.
 #[tokio::test]
@@ -514,4 +490,132 @@ async fn content_language_and_named_namespace_arguments() {
     let html = expand(&[("Module:CL", module)], "{{#invoke:CL|main}}").await;
     let body = text_only(&html);
     assert!(body.contains("en/10/Template:Foo"), "got: {body}");
+}
+
+/// `mw.title.getCurrentTitle():getContent()` must return the page being parsed.
+///
+/// This is the dominant use of `getContent` (`Module:Footnotes/anchor_id_list`,
+/// `Module:Engvar detect`), and it needs no fetch: rustoid is parsing it.
+#[tokio::test]
+async fn current_title_content_is_the_page_source() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local content = mw.title.getCurrentTitle():getContent() or 'NIL'
+            return 'len=' .. tostring(#content) .. ' has=' .. tostring(content:find('MAGICWORD') ~= nil)
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Content", module);
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "MAGICWORD here {{#invoke:Content|main}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    let body = text_only(&html);
+    assert!(body.contains("has=true"), "got: {body}");
+}
+
+/// Existence and content of *other* pages come from the preload pass, which
+/// scans the module for `mw.title.new('…')` literals.
+#[tokio::test]
+async fn other_titles_get_preloaded_facts() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local present = mw.title.new('Template:Wrapper')
+            local absent = mw.title.new('Template:NotThere')
+            return tostring(present.exists) .. '/' .. tostring(absent.exists)
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Facts", module);
+    source.add_template("Template:Wrapper", "wrapped");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{#invoke:Facts|main}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    let body = text_only(&html);
+    assert!(body.contains("true/false"), "got: {body}");
+}
+
+/// `mw.addWarning` must exist and accept any stringable argument.
+///
+/// `Module:Labelled list hatnote` and `Module:Clade` call it, and without it the
+/// module stops rather than warning.
+#[tokio::test]
+async fn mw_add_warning_is_available() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            mw.addWarning('something to note')
+            mw.addWarning(42)
+            return 'continued'
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Warn", module)], "{{#invoke:Warn|main}}").await;
+    assert!(text_only(&html).contains("continued"), "got: {html}");
+}
+
+/// `title:fullUrl()` is a method, not a field.
+#[tokio::test]
+async fn title_full_url_is_a_method() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return mw.title.new('Foo'):fullUrl()
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Url", module)], "{{#invoke:Url|main}}").await;
+    assert!(text_only(&html).contains("/wiki/Foo"), "got: {html}");
+}
+
+/// The loop `Module:Namespace detect/data` runs over the namespace tables.
+#[tokio::test]
+async fn site_namespace_tables_support_the_usual_iteration() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local main = mw.site.subjectNamespaces[0].name
+            local count = 0
+            local missing = ''
+            for nsid, ns in pairs(mw.site.subjectNamespaces) do
+                if ns.name == nil or ns.id == nil then missing = missing .. tostring(nsid) end
+                count = count + 1
+            end
+            return 'main=[' .. main .. '] count=' .. count .. ' missing=' .. missing
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:NSI", module)], "{{#invoke:NSI|main}}").await;
+    let body = text_only(&html);
+    // `text_only` strips the brackets (the parser reads `[...]` as a wikilink),
+    // so the checks are on the parts either side.
+    assert!(body.contains("main="), "got: {body}");
+    assert!(body.contains("count="), "got: {body}");
+    assert!(body.contains("missing="), "got: {body}");
+    // A non-zero count means the table iterated, and an empty `missing` means
+    // every entry carried both fields.
+    let count: usize = body
+        .split("count=")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(count > 10, "namespaces did not iterate: {body}");
 }

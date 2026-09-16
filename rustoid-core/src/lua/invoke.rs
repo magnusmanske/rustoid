@@ -23,7 +23,9 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::error::{Result, RustoidError};
-use crate::lua::engine::{Arg, LuaContext, LuaEngine, LuaEngineConfig, LuaSite};
+use crate::lua::engine::{
+    Arg, FrameContext, LuaContext, LuaEngine, LuaEngineConfig, LuaSite, TitleFacts,
+};
 use crate::traits::DataSource;
 
 /// One `{{#invoke:…}}` call.
@@ -203,9 +205,7 @@ pub fn run(
     registry: Registry,
     site: LuaSite,
     page_title: &str,
-    parent_args: Vec<Arg>,
-    parent_title: Option<String>,
-    has_parent: bool,
+    frame: &FrameContext,
 ) -> Result<String> {
     // Scribunto's entry module must be present; a `#invoke` of a non-existent
     // module is an error, and the caller turns it into MediaWiki's message.
@@ -214,14 +214,9 @@ pub fn run(
         return Err(RustoidError::Lua(format!("module {title} does not exist")));
     };
 
-    let ctx = LuaContext::with_parent(
-        site,
-        page_title.to_string(),
-        registry,
-        parent_args,
-        parent_title,
-        has_parent,
-    );
+    let mut frame = frame.clone();
+    frame.modules = registry;
+    let ctx = LuaContext::with_parent(site, page_title.to_string(), frame);
     let engine = LuaEngine::new(LuaEngineConfig::default(), ctx)?;
 
     let args = invoke.frame_args();
@@ -252,6 +247,118 @@ fn missing_module_from(message: &str) -> Option<String> {
     }
 }
 
+/// How many pages one `#invoke` may look up.
+///
+/// A module that asks about hundreds of pages is either doing something this
+/// scan cannot follow or is a bulk-tagging tool; either way the cost is real
+/// network traffic, so it is bounded like the module preload is.
+const MAX_TITLES: usize = 60;
+
+/// Fetch the page facts modules can observe but cannot compute.
+///
+/// `existence`, `redirect` and `content` cannot be answered from inside
+/// synchronous Lua, so the titles a module is likely to ask about are gathered
+/// beforehand — the same trade the module preload makes, and for the same
+/// reason. Titles are discovered by scanning the preloaded sources for
+/// `mw.title.new('…')` string literals.
+///
+/// What this cannot see: a title built at runtime (`mw.title.new(prefix .. name)`).
+/// Those report as non-existent, which is the conservative answer, and the gap is
+/// recorded in ONLINE-PARITY.md.
+pub async fn preload_titles<S: DataSource + ?Sized>(
+    source: &S,
+    registry: &Registry,
+) -> HashMap<String, TitleFacts> {
+    let mut out = HashMap::new();
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+
+    for body in registry.values() {
+        for title in referenced_titles(body) {
+            wanted.insert(title);
+        }
+    }
+
+    for title in wanted.into_iter().take(MAX_TITLES) {
+        let parsed = crate::title::Title::new_main(title.clone());
+        let content = source.get_page_content(&parsed).await.ok().flatten();
+        let exists = content.is_some();
+        // A redirect is a page whose content is `#REDIRECT [[…]]`; fetching it
+        // again to find out would double the traffic for a value most modules do
+        // not read.
+        let is_redirect = content
+            .as_deref()
+            .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"));
+        out.insert(
+            title,
+            TitleFacts {
+                exists,
+                is_redirect,
+                content,
+            },
+        );
+    }
+
+    out
+}
+
+/// Page titles named by `mw.title.new('…')` string literals.
+///
+/// A second argument (a namespace id or name) is appended as a prefix, since
+/// `mw.title.new('Foo', 'Template')` refers to `Template:Foo`.
+fn referenced_titles(source: &str) -> Vec<String> {
+    const CALL: &str = "mw.title.new";
+    let mut out = Vec::new();
+
+    for (idx, _) in source.match_indices(CALL) {
+        let tail = &source[idx + CALL.len()..];
+        let tail = tail.trim_start();
+        let Some(tail) = tail.strip_prefix('(') else {
+            continue;
+        };
+        let tail = tail.trim_start();
+        let Some(quote) = tail.chars().next() else {
+            continue;
+        };
+        if quote != '\'' && quote != '"' {
+            continue;
+        }
+        let Some(end) = tail[1..].find(quote) else {
+            continue;
+        };
+        let literal = tail[1..1 + end].trim();
+        if literal.is_empty() || literal.contains("..") {
+            continue;
+        }
+
+        // An explicit namespace argument, e.g. `mw.title.new('Foo', 'Template')`
+        // or `mw.title.new('Foo', 10)`.
+        let after = tail[1 + end + 1..].trim_start();
+        let after = after.strip_prefix(',').map(str::trim_start);
+        let title = match after {
+            Some(rest) if rest.starts_with(['\'', '"']) => {
+                let q = rest.chars().next().unwrap_or('\'');
+                match rest[1..].find(q) {
+                    Some(e) => {
+                        let ns = rest[1..1 + e].trim();
+                        if ns.is_empty() || literal.contains(':') {
+                            literal.to_string()
+                        } else {
+                            format!("{ns}:{literal}")
+                        }
+                    }
+                    None => literal.to_string(),
+                }
+            }
+            _ => literal.to_string(),
+        };
+        out.push(title.replace('_', " "));
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Parse a `#invoke` call, preload what it needs, and run it.
 ///
 /// Runs more than once only when a module asks for something the scan could not
@@ -265,32 +372,30 @@ pub async fn invoke<S: DataSource + ?Sized>(
     source: &S,
     site: LuaSite,
     page_title: &str,
-    parent_args: Vec<Arg>,
-    parent_title: Option<String>,
-    has_parent: bool,
+    // `frame.titles` is filled in here, since only this function knows which
+    // modules were preloaded.
+    frame: FrameContext,
 ) -> Result<String> {
     let Some(call) = Invoke::parse(pf_arg) else {
         return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
     };
     let mut registry = preload(source, &call.module_title()).await;
+    let mut frame = FrameContext {
+        titles: preload_titles(source, &registry).await,
+        ..frame
+    };
     let mut last_missing: Option<String> = None;
 
     for _ in 0..MAX_PRELOAD_ROUNDS {
-        match run(
-            &call,
-            registry.clone(),
-            site.clone(),
-            page_title,
-            parent_args.clone(),
-            parent_title.clone(),
-            has_parent,
-        ) {
+        match run(&call, registry.clone(), site.clone(), page_title, &frame) {
             Ok(out) => return Ok(out),
             Err(RustoidError::Lua(msg)) => {
                 match missing_module_from(&msg) {
                     Some(title) if !registry.contains_key(&title) => {
                         // Fetch it, plus anything *it* needs, then try again.
                         registry.extend(preload(source, &title).await);
+                        // A newly loaded module may reference new titles.
+                        frame.titles.extend(preload_titles(source, &registry).await);
                         last_missing = Some(title);
                     }
                     _ => return Err(RustoidError::Lua(msg)),
@@ -313,6 +418,26 @@ pub async fn invoke<S: DataSource + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_titles_in_new_literals() {
+        let src = r#"
+            local a = mw.title.new('Template:Wrapper')
+            local b = mw.title.new("Foo_bar")
+            local c = mw.title.new('Baz', 'Template')
+            local d = mw.title.new(prefix .. name)
+        "#;
+        assert_eq!(
+            referenced_titles(src),
+            vec![
+                // Sorted, which is why `Foo bar` precedes `Template:*`; the
+                // explicit namespace argument became a prefix.
+                "Foo bar".to_string(),
+                "Template:Baz".to_string(),
+                "Template:Wrapper".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn parses_a_bare_call() {

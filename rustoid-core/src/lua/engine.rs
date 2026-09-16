@@ -38,6 +38,8 @@ pub struct LuaSite {
     pub server: String,
     pub language_code: String,
     pub script_path: String,
+    /// Article path with its `$1` placeholder, for `mw.title.fullUrl`.
+    pub article_path: String,
     /// `(id, canonical name)` for every namespace, for `mw.title` resolution.
     pub namespaces: Vec<(i32, String)>,
 }
@@ -47,7 +49,17 @@ impl LuaSite {
         let mut namespaces: Vec<(i32, String)> = config
             .namespaces()
             .iter()
-            .map(|(id, ns)| (*id, ns.canonical.clone()))
+            .map(|(id, ns)| {
+                // MediaWiki's main namespace has the *empty* name; a config that
+                // labels it (the mock calls it "Main") must not leak into Lua,
+                // where modules test `nsText == ''` and build titles from it.
+                let name = if *id == 0 {
+                    String::new()
+                } else {
+                    ns.canonical.clone()
+                };
+                (*id, name)
+            })
             .filter(|(_, name)| !name.is_empty())
             .collect();
         namespaces.sort_by_key(|(id, _)| *id);
@@ -55,12 +67,17 @@ impl LuaSite {
             server: config.server_url().to_string(),
             language_code: config.language_code().to_string(),
             script_path: config.script_path().to_string(),
+            article_path: config.article_path().to_string(),
             namespaces,
         }
     }
 
     /// Canonical name of a namespace id, empty for the main namespace.
+    /// Canonical name of a namespace id, empty for the main namespace.
     pub fn namespace_name(&self, id: i32) -> String {
+        if id == 0 {
+            return String::new();
+        }
         self.namespaces
             .iter()
             .find(|(ns_id, _)| *ns_id == id)
@@ -69,15 +86,54 @@ impl LuaSite {
     }
 
     /// Namespace id for a canonical or localized name, or for a numeric string.
+    ///
+    /// The main namespace is id 0 and has the empty name, so it is not in
+    /// `namespaces` (an empty name carries no information there) and is matched
+    /// here instead.
     pub fn namespace_id(&self, name: &str) -> Option<i32> {
-        if let Ok(id) = name.trim().parse::<i32>() {
-            return self.namespaces.iter().any(|(i, _)| *i == id).then_some(id);
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        if let Ok(id) = trimmed.parse::<i32>() {
+            return (id == 0 || self.namespaces.iter().any(|(i, _)| *i == id)).then_some(id);
         }
         self.namespaces
             .iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(name.trim()))
+            .find(|(_, n)| n.eq_ignore_ascii_case(trimmed))
             .map(|(id, _)| *id)
     }
+}
+
+/// Everything the engine needs about the invocation, supplied together.
+#[derive(Debug, Clone, Default)]
+pub struct FrameContext {
+    /// Module sources available to `require`/`mw.loadData`.
+    pub modules: std::collections::HashMap<String, String>,
+    /// Arguments of the invoking template's frame.
+    pub parent_args: Vec<Arg>,
+    /// Its title.
+    pub parent_title: Option<String>,
+    /// Whether a parent frame exists at all. A direct `{{#invoke:…}}` has none,
+    /// while one inside a template does even when that template took no args.
+    pub has_parent: bool,
+    /// Wikitext of the page being parsed.
+    pub page_source: String,
+    /// Preloaded facts for other pages.
+    pub titles: std::collections::HashMap<String, TitleFacts>,
+}
+
+/// What Lua can observe about a page other than the one being parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TitleFacts {
+    /// The page exists.
+    pub exists: bool,
+    /// The page is a redirect.
+    pub is_redirect: bool,
+    /// Wikitext, when it was fetched. `None` means "not fetched", which is
+    /// distinct from "empty": `getContent()` on an unfetched page returns nil,
+    /// while a fetched empty page returns `""`.
+    pub content: Option<String>,
 }
 
 pub struct LuaContext {
@@ -92,6 +148,18 @@ pub struct LuaContext {
     /// arguments": a direct `{{#invoke:…}}` has no parent, while one made from
     /// inside a template does, even when that template took no arguments.
     pub has_parent: bool,
+    /// Wikitext of the page under test, for `mw.title.getCurrentTitle():getContent()`.
+    ///
+    /// This is the one page whose content is always available without a fetch —
+    /// rustoid is parsing it — and it is the dominant use of `getContent` in
+    /// practice (`Module:Footnotes/anchor_id_list`, `Module:Engvar detect`).
+    pub page_source: String,
+    /// Page facts for other titles, fetched before the module runs.
+    ///
+    /// Existence, redirect status and content cannot be answered from inside
+    /// synchronous Lua, so they are gathered beforehand, exactly as module
+    /// sources are. See [`crate::lua::invoke::preload_titles`].
+    pub titles: std::collections::HashMap<String, TitleFacts>,
     /// Module sources available to `require`/`mw.loadData`, keyed by full title
     /// (`Module:Foo`). Scribunto's `require` is synchronous inside Lua, so
     /// modules are fetched *before* execution and looked up here; see
@@ -107,6 +175,8 @@ impl LuaContext {
             parent_args: Vec::new(),
             parent_title: None,
             has_parent: false,
+            page_source: String::new(),
+            titles: std::collections::HashMap::new(),
             modules: std::collections::HashMap::new(),
         }
     }
@@ -123,26 +193,28 @@ impl LuaContext {
             parent_args: Vec::new(),
             parent_title: None,
             has_parent: false,
+            page_source: String::new(),
+            titles: std::collections::HashMap::new(),
             modules,
         }
     }
 
     /// Same, with the invoking frame's arguments available as the parent frame.
-    pub fn with_parent(
-        site: LuaSite,
-        page_title: impl Into<String>,
-        modules: std::collections::HashMap<String, String>,
-        parent_args: Vec<Arg>,
-        parent_title: Option<String>,
-        has_parent: bool,
-    ) -> Self {
+    /// Everything about the invoking frame, supplied together.
+    ///
+    /// Grouped rather than passed as six positional arguments: several are
+    /// `Option`s or collections of the same type, and a struct makes the call
+    /// site say which is which.
+    pub fn with_parent(site: LuaSite, page_title: impl Into<String>, frame: FrameContext) -> Self {
         Self {
             site,
             page_title: page_title.into(),
-            parent_args,
-            parent_title,
-            has_parent,
-            modules,
+            modules: frame.modules,
+            parent_args: frame.parent_args,
+            parent_title: frame.parent_title,
+            has_parent: frame.has_parent,
+            page_source: frame.page_source,
+            titles: frame.titles,
         }
     }
 }
@@ -305,10 +377,13 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
         .create_function(move |lua, name: Value| {
             let title = match name {
                 Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
+                // A non-string name is reported by *type*, not by value: Lua's default
+                // stringification is `table: 0x…`, which named nothing in the
+                // "could not load … still missing: table: 0x78642c180" messages this
+                // used to produce. The call site is then findable from the type.
                 other => {
                     return Err(mlua::Error::runtime(format!(
-                        "require expects a module name, got {} — dynamic requires cannot be \
-                     resolved ahead of execution",
+                        "require expects a module name string, got a {}",
                         other.type_name()
                     )));
                 }
@@ -357,8 +432,20 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     let require_fn: Function = lua.globals().get("require").map_err(lua_err)?;
     mw.set(
         "loadData",
-        lua.create_function(move |_, name: String| require_fn.call::<Value>(name))
-            .map_err(lua_err)?,
+        // A dynamic name (`mw.loadData(cfgModule)`) is not a string, and a
+        // `String` parameter made that a bare "error converting Lua table to
+        // String" naming no function. Reporting the type instead says which call
+        // is at fault.
+        lua.create_function(move |_, name: Value| {
+            if !matches!(name, Value::String(_)) {
+                return Err(mlua::Error::runtime(format!(
+                    "mw.loadData expects a module name string, got a {}",
+                    name.type_name()
+                )));
+            }
+            require_fn.call::<Value>(name)
+        })
+        .map_err(lua_err)?,
     )
     .map_err(lua_err)?;
 
@@ -589,6 +676,19 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // one invocation corrupt another's data.
     mw.set("clone", lua.create_function(luafn_clone)?)?;
 
+    // `mw.addWarning(text)` — adds to the parser's warning list, which MediaWiki
+    // shows above the edit box rather than in the page. Keeping a list nothing
+    // reads is enough: the point is that the module does not stop.
+    let warnings = lua.create_table()?;
+    mw.set(
+        "addWarning",
+        lua.create_function(move |_, text: Value| {
+            let text = coerce_string(&text, "addWarning")?;
+            warnings.set(warnings.raw_len() + 1, text)?;
+            Ok(())
+        })?,
+    )?;
+
     // mw.uri
     let uri = lua
         .create_table()
@@ -673,8 +773,62 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     ustring.set("sub", lua.create_function(luafn_ustring_sub)?)?;
     ustring.set("upper", lua.create_function(luafn_ustring_upper)?)?;
     ustring.set("lower", lua.create_function(luafn_ustring_lower)?)?;
+    // `ucfirst`/`lcfirst` prefer the *first* character's case change, unlike
+    // `upper`/`lower`. Scribunto's versions are codepoint-aware; these are close
+    // enough for the ASCII case, and modules use them for identifiers.
+    ustring.set(
+        "ucfirst",
+        lua.create_function(|_, s: Value| {
+            let s = coerce_string(&s, "ucfirst")?;
+            let mut chars = s.chars();
+            Ok(match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            })
+        })?,
+    )?;
+    ustring.set(
+        "lcfirst",
+        lua.create_function(|_, s: Value| {
+            let s = coerce_string(&s, "lcfirst")?;
+            let mut chars = s.chars();
+            Ok(match chars.next() {
+                Some(c) => c.to_lowercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            })
+        })?,
+    )?;
     ustring.set_metatable(Some(ustring_mt));
     mw.set("ustring", ustring)?;
+
+    // `mw.ext.*` are extension-provided helpers; the one that matters in
+    // practice is `mw.ext.data.get`, which loads a Wikidata tabular-data page.
+    // rustoid does not implement the extension, so it returns an empty table:
+    // a module reading statistics then renders nothing rather than aborting the
+    // whole page. Making it *nil* is what fails, with an unattributed "attempt to
+    // index a nil value (field 'ext')".
+    let ext = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    let ext_data = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext_data
+        .set(
+            "get",
+            lua.create_function(|lua, _name: Value| {
+                let empty = lua.create_table()?;
+                empty.set("schema", lua.create_table()?)?;
+                empty.set("data", lua.create_table()?)?;
+                Ok(empty)
+            })
+            .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext.set("data", ext_data)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    mw.set("ext", ext)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
     // mw.message
     let message = lua
@@ -833,13 +987,10 @@ fn luafn_title_new(
     table.set("fullText", full.clone())?;
     // `prefixedText` is the title *including* its namespace, which is what
     // modules compare and display (`text` is the bare page name).
-    table.set("prefixedText", full)?;
-    // Existence is not resolvable from here: the engine has no data source (see
-    // `LuaSite`). Reporting `false` would make a module render red links for
-    // pages that do exist, so it reports `true` and the gap is recorded in
-    // ONLINE-PARITY.md.
-    table.set("exists", true)?;
-    table.set("isRedirect", false)?;
+    table.set("prefixedText", full.clone())?;
+    // `exists` and `isRedirect` are *not* set here: they live on the metatable,
+    // which consults the preloaded facts. An eager `table.set` would shadow it
+    // and silently report every page as existing.
     table.set("fragment", fragment)?;
     table.set(
         "rootText",
@@ -850,6 +1001,13 @@ fn luafn_title_new(
     // never looks at `talkPageTitle` should not pay for building it, and eager
     // construction would recurse (a title's talk page is itself a title).
     let site = ctx.site.clone();
+    let facts = title_facts_for(ctx, &ns_id, &title_text);
+    let is_current = {
+        let current = ctx.page_title.replace('_', " ");
+        full.eq_ignore_ascii_case(&current) || title_text.eq_ignore_ascii_case(&current)
+    };
+    let current_source = ctx.page_source.clone();
+
     let mt = lua.create_table()?;
     mt.set(
         "__index",
@@ -865,6 +1023,12 @@ fn luafn_title_new(
                 "isContentPage" => Ok(Value::Boolean(ns_id == 0 || ns_id == 828)),
                 "subjectNsText" => lua_str(lua, site.namespace_name(ns_id - (ns_id % 2))),
                 "nsText" => lua_str(lua, site.namespace_name(ns_id)),
+                "exists" => Ok(Value::Boolean(
+                    is_current || facts.as_ref().is_some_and(|f| f.exists),
+                )),
+                "isRedirect" => Ok(Value::Boolean(
+                    facts.as_ref().is_some_and(|f| f.is_redirect),
+                )),
                 "talkPageTitle" => {
                     let talk = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
                     lua_str(lua, prefix_title(&site, talk, &text))
@@ -887,12 +1051,61 @@ fn luafn_title_new(
                         .unwrap_or(&text)
                         .to_string(),
                 ),
+                "fullUrl" => {
+                    // A *method*: modules call `title:fullUrl()`, so this returns a
+                    // function. Returning the URL string made the call fail with
+                    // "attempt to call a string value".
+                    let path = site.article_path.replace("$1", &url_encode(&full));
+                    let url = format!("{}{path}", site.server);
+                    Ok(Value::Function(
+                        lua.create_function(move |_, _this: Value| Ok(url.clone()))?,
+                    ))
+                }
+                // `title:newline()` and friends come from `mw.html`; a title has
+                // no such method, so a miss must stay a miss rather than pretend.
                 _ => Ok(Value::Nil),
             }
         })?,
     )?;
+
+    // `getContent()` — the page's wikitext. Only available for pages that were
+    // fetched (or the page being parsed, whose source rustoid already has);
+    // Scribunto returns nil for a page it has not loaded.
+    //
+    // Registered on the metatable as well as the table, because modules call it
+    // as a method (`title:getContent()`); a `__index` miss would otherwise report
+    // "attempt to call a nil value (method 'getContent')".
+    let facts_for_content = title_facts_for(ctx, &ns_id, &title_text);
+    let has_current = is_current;
+    table.set(
+        "getContent",
+        lua.create_function(move |lua, _this: Value| {
+            if has_current {
+                return Ok(Value::String(lua.create_string(current_source.clone())?));
+            }
+            Ok(
+                match facts_for_content.as_ref().and_then(|f| f.content.as_ref()) {
+                    Some(c) => Value::String(lua.create_string(c)?),
+                    None => Value::Nil,
+                },
+            )
+        })?,
+    )?;
     table.set_metatable(Some(mt));
     Ok(table)
+}
+
+/// Look up the preloaded facts for a title, by full text and by bare text.
+fn title_facts_for(ctx: &LuaContext, ns_id: &i32, title_text: &str) -> Option<TitleFacts> {
+    if let Some(facts) = ctx.titles.get(&prefix_title(&ctx.site, *ns_id, title_text)) {
+        return Some(facts.clone());
+    }
+    // Titles are keyed as written in `mw.title.new`, which may omit the
+    // namespace when the module passed one separately.
+    ctx.titles
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(title_text))
+        .map(|(_, v)| v.clone())
 }
 
 /// A `Value::String` from an owned Rust string.
@@ -910,12 +1123,18 @@ fn prefix_title(site: &LuaSite, ns_id: i32, text: &str) -> String {
     }
 }
 
+/// `mw.title.getCurrentTitle()` — the page being parsed.
+///
+/// Built as a full title object (rather than a bare table) so it carries the
+/// metatable, `getContent()` and the derived fields. The *page frame's* title is
+/// the page itself, which `create_frame` passes in as `page_title`.
 fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
-    table.set("text", ctx.page_title.clone())?;
-    table.set("prefixedText", ctx.page_title.clone())?;
-    table.set("namespace", 0)?;
-    Ok(table)
+    luafn_title_new(
+        lua,
+        ctx,
+        Value::String(lua.create_string(&ctx.page_title)?),
+        None,
+    )
 }
 
 fn luafn_uri_encode(_: &Lua, s: Value) -> mlua::Result<String> {

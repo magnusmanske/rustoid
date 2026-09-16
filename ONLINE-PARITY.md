@@ -353,7 +353,42 @@ observe, and widening it is follow-up work.
 - **Exit criterion:** a page whose infobox is module-driven matches byte-exactly.
   — not yet; see below for where it stands.
 
-#### Where `#invoke` stands, measured
+#### Where `#invoke` stands after the second pass
+
+The failure list keeps flattening, which is the useful signal:
+
+| | occurrences | distinct | largest single entry |
+|---|---|---|---|
+| first `#invoke` wiring | 114 | 29 | 36 pages |
+| after parent frames and `mw.clone` | 106 | 44 | 9 pages |
+| after title facts and namespace fixes | 95 | 35 | 31 pages |
+
+So the fixes so far are real (the `strict`/`libraryUtil`/`mw.html` walls are gone, the
+score of distinct failures sits around 35) but a new largest entry appeared: an
+`attempt to index a nil value` inside `Module:Namespace detect/data`, on 31 pages.
+That is the current top item and it is *not* the `mw.site` namespace tables — those
+iterate correctly with 41 entries, each carrying `id` and `name` (there is a test
+for it). The module's stack frame names the module but not the line, so pinning it
+needs a longer traceback than `script_error` currently keeps.
+
+Two diagnostics were added while chasing this, both of which paid off:
+
+- `script_error` keeps the **first module frame** from Lua's traceback rather than
+  dropping the whole trace. Without it, `attempt to index a nil value` carried no
+  location at all and could not be attributed to anything.
+- `mw.loadData` and `require` report the **type** of a non-string name rather than
+  mlua's bare "error converting Lua table to String". A dynamic
+  `mw.loadData(cfgModule)` previously produced a message naming no function.
+
+`mw.title` now answers `exists`, `isRedirect`, `getContent` and `fullUrl`, using the
+page's own source for `getCurrentTitle()` (free — rustoid is parsing it) and a
+preloaded facts map for everything else. That map is built by scanning modules for
+`mw.title.new('…')` literals, so a title computed at runtime reports as
+non-existent; recorded as a known gap.
+
+`mw.ext.data.get` returns an empty table rather than being nil: rustoid does not
+implement the extension, and a nil `mw.ext` failed the whole page with an
+unattributed error instead of just rendering nothing for that part.
 
 Wiring `#invoke` moved the corpus from "43 of 44 pages never expand their Lua
 calls" to "Lua runs and the failures are a ranked list of what modules ask for".
