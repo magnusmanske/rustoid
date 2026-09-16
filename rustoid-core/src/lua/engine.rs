@@ -83,6 +83,15 @@ impl LuaSite {
 pub struct LuaContext {
     pub site: LuaSite,
     pub page_title: String,
+    /// Arguments of the frame that *invoked* the module — `frame:getParent().args`.
+    /// Empty when there is no parent (a direct `{{#invoke:…}}` from the page).
+    pub parent_args: Vec<Arg>,
+    /// Title of that parent frame, for `frame:getParent():getTitle()`.
+    pub parent_title: Option<String>,
+    /// Whether a parent frame exists at all. Distinct from "the parent had no
+    /// arguments": a direct `{{#invoke:…}}` has no parent, while one made from
+    /// inside a template does, even when that template took no arguments.
+    pub has_parent: bool,
     /// Module sources available to `require`/`mw.loadData`, keyed by full title
     /// (`Module:Foo`). Scribunto's `require` is synchronous inside Lua, so
     /// modules are fetched *before* execution and looked up here; see
@@ -95,6 +104,9 @@ impl LuaContext {
         Self {
             site,
             page_title: page_title.into(),
+            parent_args: Vec::new(),
+            parent_title: None,
+            has_parent: false,
             modules: std::collections::HashMap::new(),
         }
     }
@@ -108,6 +120,28 @@ impl LuaContext {
         Self {
             site,
             page_title: page_title.into(),
+            parent_args: Vec::new(),
+            parent_title: None,
+            has_parent: false,
+            modules,
+        }
+    }
+
+    /// Same, with the invoking frame's arguments available as the parent frame.
+    pub fn with_parent(
+        site: LuaSite,
+        page_title: impl Into<String>,
+        modules: std::collections::HashMap<String, String>,
+        parent_args: Vec<Arg>,
+        parent_title: Option<String>,
+        has_parent: bool,
+    ) -> Self {
+        Self {
+            site,
+            page_title: page_title.into(),
+            parent_args,
+            parent_title,
+            has_parent,
             modules,
         }
     }
@@ -152,16 +186,32 @@ impl LuaEngine {
         Ok(Self { lua, _context: ctx })
     }
 
-    pub fn execute(
+    /// Run `module_source`'s function `function_name`.
+    ///
+    /// `title` names the module in error messages. Without it Lua reports
+    /// `[string "module"]:13`, which says a line number in *something* and made
+    /// several corpus failures impossible to attribute to a module.
+    pub fn execute_in(
         &self,
         module_source: &str,
+        title: &str,
         function_name: &str,
         args: &[Arg],
     ) -> Result<String> {
-        let module = self.load_module_value(module_source, None)?;
+        let module = self.load_module_value(module_source, Some(title))?;
         let func = self.module_function(&module, function_name)?;
 
-        let frame = create_frame(&self.lua, args, &self._context.page_title)?;
+        let frame = create_frame(
+            &self.lua,
+            args,
+            &self._context.page_title,
+            // `Option`: a `#invoke` made outside any template has no parent
+            // frame, and Scribunto returns nil for `getParent()` there.
+            self._context
+                .has_parent
+                .then_some(self._context.parent_args.as_slice()),
+            self._context.parent_title.as_deref(),
+        )?;
         // `mw.getCurrentFrame()` reads this, so the frame must be installed
         // before the module runs.
         self.lua
@@ -172,6 +222,17 @@ impl LuaEngine {
             .map_err(|e| RustoidError::Lua(format!("execution error: {e}")))?;
 
         Ok(lua_value_to_string(&result))
+    }
+
+    /// Run with no module title, for callers that have none (the engine's own
+    /// tests, and `eval`).
+    pub fn execute(
+        &self,
+        module_source: &str,
+        function_name: &str,
+        args: &[Arg],
+    ) -> Result<String> {
+        self.execute_in(module_source, "module", function_name, args)
     }
 
     /// Run a module's source and return its value.
@@ -465,8 +526,31 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let ctx2 = ctx.clone();
     title.set(
         "new",
-        lua.create_function(move |lua, (text, ns): (Value, Option<i32>)| {
-            luafn_title_new(lua, &ctx2, text, ns)
+        lua.create_function(move |lua, (text, ns): (Value, Option<Value>)| {
+            luafn_title_new(lua, &ctx2, text, ns.as_ref())
+        })?,
+    )?;
+    // `mw.title.equals(a, b)` — whether two titles name the same page. Titles are
+    // compared through their `prefixedText`, which is how the objects are built
+    // here; a missing argument is unequal rather than an error, matching what
+    // modules such as `Module:Message box` guard against.
+    title.set(
+        "equals",
+        lua.create_function(|_, (a, b): (Value, Value)| {
+            let key = |v: &Value| -> Option<String> {
+                let t = match v {
+                    Value::Table(t) => t,
+                    _ => return None,
+                };
+                t.get::<Option<String>>("prefixedText")
+                    .ok()
+                    .flatten()
+                    .or_else(|| t.get::<Option<String>>("fullText").ok().flatten())
+            };
+            Ok(match (key(&a), key(&b)) {
+                (Some(x), Some(y)) => x == y,
+                _ => false,
+            })
         })?,
     )?;
     let ctx3 = ctx.clone();
@@ -499,6 +583,11 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // never substitutes, so it is always false — which is the answer modules
     // such as `Module:Unsubst` need in order to take their normal path.
     mw.set("isSubsting", lua.create_function(|_, ()| Ok(false))?)?;
+
+    // `mw.clone(value)` — a deep copy, preserving metatables. Modules copy shared
+    // configuration tables before modifying them, and a shallow copy would let
+    // one invocation corrupt another's data.
+    mw.set("clone", lua.create_function(luafn_clone)?)?;
 
     // mw.uri
     let uri = lua
@@ -538,6 +627,17 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         lua.create_function(move |_, ()| Ok(content_language.clone()))?,
     )?;
     mw.set("language", lang)?;
+
+    // `mw.getContentLanguage()` is the shorthand for
+    // `mw.language.getContentLanguage()`; `Module:Citation/CS1/Configuration`
+    // calls it on its first line, so without it the whole CS1 stack fails.
+    let language_table: Table = mw.get("language")?;
+    let get_content_language: Function = language_table.get("getContentLanguage")?;
+    let content_language: Table = get_content_language.call(())?;
+    mw.set(
+        "getContentLanguage",
+        lua.create_function(move |_, ()| Ok(content_language.clone()))?,
+    )?;
 
     // mw.ustring
     //
@@ -694,7 +794,7 @@ fn luafn_title_new(
     lua: &Lua,
     ctx: &LuaContext,
     text: Value,
-    namespace: Option<i32>,
+    namespace: Option<&Value>,
 ) -> mlua::Result<Table> {
     let text = coerce_string(&text, "title.new")?;
     // Split `Ns:Title#frag` against the namespace snapshot. Full `TitleParser`
@@ -707,7 +807,17 @@ fn luafn_title_new(
         Some((t, f)) => (t, f.to_string()),
         None => (rest, String::new()),
     };
-    let ns_id = namespace.or(prefix).unwrap_or(0);
+    let ns_id = namespace
+        // Scribunto accepts a namespace *name* here as well as an id:
+        // `mw.title.new('Foo', 'Template')` is common in modules.
+        .and_then(|ns| match ns {
+            Value::Integer(i) => Some(*i as i32),
+            Value::Number(n) => Some(*n as i32),
+            Value::String(s) => s.to_str().ok().and_then(|s| ctx.site.namespace_id(&s)),
+            _ => None,
+        })
+        .or(prefix)
+        .unwrap_or(0);
     let title_text = rest.trim().to_string();
     let ns_text = ctx.site.namespace_name(ns_id);
 
@@ -720,8 +830,10 @@ fn luafn_title_new(
     } else {
         format!("{ns_text}:{title_text}")
     };
-    table.set("fullText", full)?;
-    table.set("prefixedText", title_text.clone())?;
+    table.set("fullText", full.clone())?;
+    // `prefixedText` is the title *including* its namespace, which is what
+    // modules compare and display (`text` is the bare page name).
+    table.set("prefixedText", full)?;
     // Existence is not resolvable from here: the engine has no data source (see
     // `LuaSite`). Reporting `false` would make a module render red links for
     // pages that do exist, so it reports `true` and the gap is recorded in
@@ -945,6 +1057,43 @@ if table.clone == nil then
 end
 "#;
 
+/// `mw.clone(value)` — a deep copy that keeps metatables.
+///
+/// Only tables need copying; every other value is immutable in Lua, so it is
+/// returned as-is. Cycles are handled through a memo table, because a module's
+/// configuration often refers to itself.
+fn luafn_clone(lua: &Lua, value: Value) -> mlua::Result<Value> {
+    let memo = lua.create_table()?;
+    clone_into(lua, &memo, &value)
+}
+
+fn clone_into(lua: &Lua, memo: &Table, value: &Value) -> mlua::Result<Value> {
+    let source = match value {
+        Value::Table(t) => t,
+        other => return Ok(other.clone()),
+    };
+    // A value already copied (or being copied) is returned as its copy, which is
+    // what makes a self-referential table terminate.
+    if let Ok(Some(existing)) = memo.raw_get::<Option<Value>>(source.clone()) {
+        return Ok(existing);
+    }
+
+    let copy = lua.create_table()?;
+    memo.raw_set(source.clone(), copy.clone())?;
+    for pair in source.clone().pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        // Keys are copied too: a table used as a key must be the same object
+        // afterwards for lookups to still work.
+        let key = clone_into(lua, memo, &k)?;
+        let val = clone_into(lua, memo, &v)?;
+        copy.raw_set(key, val)?;
+    }
+    if let Some(mt) = source.metatable() {
+        copy.set_metatable(Some(mt));
+    }
+    Ok(Value::Table(copy))
+}
+
 fn luafn_lang_format_num_any(
     _: &Lua,
     (first, second): (Value, Option<Value>),
@@ -975,26 +1124,40 @@ fn luafn_ustring_len(_: &Lua, s: Value) -> mlua::Result<usize> {
     Ok(coerce_string(&s, "len")?.chars().count())
 }
 
-fn luafn_ustring_sub(
-    _: &Lua,
-    (s, start, length): (String, i64, Option<i64>),
-) -> mlua::Result<String> {
+/// `mw.ustring.sub(s, i, j)` — codepoint-indexed, Lua's `string.sub` semantics.
+///
+/// The third argument is the **end index**, not a length. `Module:String` calls
+/// `mw.ustring.sub(s, i, j)` with `j` defaulted to `-1` and range-checked as an
+/// index, which is the evidence; treating it as a length produced `a` where Lua
+/// produces `ab`.
+///
+/// Both indices follow Lua's rules: 1-based, negative counts back from the end,
+/// and everything is clamped into range. Clamping independently is *not* enough —
+/// `sub('abc', 5, -1)` clamps to `start > end` and panics on the slice, which is
+/// what `Help:Introduction` triggered. An inverted range is empty.
+fn luafn_ustring_sub(_: &Lua, (s, i, j): (Value, i64, Option<i64>)) -> mlua::Result<String> {
+    let s = coerce_string(&s, "sub")?;
     let chars: Vec<char> = s.chars().collect();
-    let start_idx = if start > 0 {
-        ((start - 1) as usize).min(chars.len())
-    } else {
-        chars.len().saturating_sub((-start) as usize)
+    let n = chars.len() as i64;
+
+    // Lua's `posrelat`: a negative index counts back from the end.
+    let from = if i < 0 { n + i + 1 } else { i };
+    let to = match j {
+        None | Some(-1) => n,
+        Some(j) if j < 0 => n + j + 1,
+        Some(j) => j,
     };
-    let end_idx = if let Some(len) = length {
-        if len > 0 {
-            (start_idx + len as usize).min(chars.len())
-        } else {
-            chars.len().saturating_sub((-len) as usize)
-        }
-    } else {
-        chars.len()
-    };
-    Ok(chars[start_idx..end_idx].iter().collect())
+
+    // `from` clamps to `n + 1`, not `n`: Lua allows a start one past the end and
+    // then yields the empty string. Clamping to `n` instead made
+    // `sub('abc', 4, -1)` return `c` where Lua returns `""`.
+    let from = from.max(1).min(n + 1);
+    let to = to.min(n);
+    if from > to {
+        return Ok(String::new());
+    }
+    // Both are 1-based; `from <= to <= n` here, so the range is valid.
+    Ok(chars[(from - 1) as usize..to as usize].iter().collect())
 }
 
 fn luafn_ustring_upper(_: &Lua, s: Value) -> mlua::Result<String> {
@@ -1014,47 +1177,37 @@ fn luafn_message_new(lua: &Lua, (key, _args): (Value, Option<Table>)) -> mlua::R
     Ok(table)
 }
 
-// ---- Frame ----
-
-fn create_frame(lua: &Lua, args: &[Arg], page_title: &str) -> Result<Value> {
-    let frame = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-
-    let args_table = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    // Positional arguments get a *numeric* key, so `frame.args[1]` and `#args`
-    // behave; named ones get their name. A metatable makes the string spelling
-    // (`args["1"]`) resolve too, which modules also write, without duplicating
-    // keys and so without confusing `pairs`.
+/// Build a Scribunto `args` table from a frame's arguments.
+///
+/// Positional arguments get a *numeric* key, so `args[1]` and `#args` behave;
+/// named ones get their name. A metatable resolves the string spelling
+/// (`args["1"]`) as well, which modules also write, without duplicating keys and
+/// so without upsetting `pairs`.
+///
+/// Shared with the parent frame, because both are read the same way.
+fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
+    let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    let args_table = lua.create_table().map_err(err)?;
     let mut next_positional = 0usize;
     for arg in args {
         match arg {
             Arg::Positional(v) => {
                 next_positional += 1;
-                args_table
-                    .set(next_positional, v.clone())
-                    .map_err(|e| RustoidError::Lua(e.to_string()))?;
+                args_table.set(next_positional, v.clone()).map_err(err)?;
             }
             Arg::Named(k, v) => {
-                args_table
-                    .set(k.clone(), v.clone())
-                    .map_err(|e| RustoidError::Lua(e.to_string()))?;
+                args_table.set(k.clone(), v.clone()).map_err(err)?;
             }
         }
     }
-    let args_mt = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    let args_mt = lua.create_table().map_err(err)?;
     args_mt
         .set(
             "__index",
             lua.create_function(|_, (t, k): (Table, Value)| {
-                // Positional args are stored under an integer key, but both
-                // spellings are written in the wild (`args[1]` and `args["1"]`),
-                // so map either to the other. `raw_get` keeps this from
-                // re-entering the metatable.
+                // Both spellings are written in the wild (`args[1]` and
+                // `args["1"]`), so map either to the other. `raw_get` keeps this
+                // from re-entering the metatable.
                 let alternative = match k {
                     Value::Integer(i) => Some(Value::Integer(i)),
                     Value::Number(n) if n.fract() == 0.0 => Some(Value::Integer(n as i64)),
@@ -1070,10 +1223,27 @@ fn create_frame(lua: &Lua, args: &[Arg], page_title: &str) -> Result<Value> {
                     None => Ok(Value::Nil),
                 }
             })
-            .map_err(|e| RustoidError::Lua(e.to_string()))?,
+            .map_err(err)?,
         )
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        .map_err(err)?;
     args_table.set_metatable(Some(args_mt));
+    Ok(args_table)
+}
+
+// ---- Frame ----
+
+fn create_frame(
+    lua: &Lua,
+    args: &[Arg],
+    page_title: &str,
+    parent_args: Option<&[Arg]>,
+    parent_title: Option<&str>,
+) -> Result<Value> {
+    let frame = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
+    let args_table = build_args_table(lua, args)?;
     frame.set("args", args_table)?;
 
     // `frame:argumentPairs()` — the generic-for protocol: return (iterator,
@@ -1096,7 +1266,39 @@ fn create_frame(lua: &Lua, args: &[Arg], page_title: &str) -> Result<Value> {
         "getTitle",
         lua.create_function(move |_, ()| Ok(ctx_for_title.clone()))?,
     )?;
-    frame.set("getParent", lua.create_function(|_, ()| Ok(Value::Nil))?)?;
+    // `frame:getParent()` — the calling template's frame. Modules read its
+    // `args` *and* its `getTitle()` constantly: `Module:Infobox` asks for args,
+    // `Module:Labelled list hatnote` and `Module:Arguments` ask for the title,
+    // and returning nil stopped a dozen corpus pages.
+    let parent_frame = match parent_args {
+        // A direct `{{#invoke:…}}` from the page has no *calling template*.
+        // The parser passes the page frame in that case, whose arguments are
+        // empty and whose title is the page itself — so key the decision on
+        // whether a parent was supplied at all, not on whether it had args.
+        Some(parent_args) => {
+            let p = lua
+                .create_table()
+                .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            p.set("args", build_args_table(lua, parent_args)?)
+                .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            let parent_name = parent_title.unwrap_or(page_title).to_string();
+            p.set(
+                "getTitle",
+                lua.create_function(move |_, ()| Ok(parent_name.clone()))?,
+            )
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            // A parent has a parent of its own, but rustoid does not track the
+            // chain past one level; nil is what Scribunto gives for the root.
+            p.set("getParent", lua.create_function(|_, ()| Ok(Value::Nil))?)
+                .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            Value::Table(p)
+        }
+        None => Value::Nil,
+    };
+    frame.set(
+        "getParent",
+        lua.create_function(move |_, ()| Ok(parent_frame.clone()))?,
+    )?;
     // `frame:preprocess(text)` — expand wikitext. It needs the parser, so it is
     // a later phase; returning the text unchanged would silently produce wrong
     // output, so it reports instead.
@@ -1355,12 +1557,45 @@ mod tests {
     #[test]
     fn test_mw_ustring_sub() {
         let engine = make_engine();
-        assert_eq!(
-            engine
-                .eval("return mw.ustring.sub('hello world', 7, 5)")
-                .unwrap(),
-            "world"
-        );
+        // Expected values verified against Lua 5.4's `string.sub`, which
+        // `ustring.sub` mirrors for codepoint-indexed strings. A previous
+        // expectation here was `sub('hello world', 7, 5) == "world"`, which
+        // encoded the bug: the third argument is an *end index*, so an inverted
+        // range is empty, not a length.
+        //
+        // The `héllo` cases deliberately differ from byte-indexed
+        // `string.sub`: `ustring.sub('héllo', 2, 3)` is `él` (two codepoints),
+        // where byte-indexed `string.sub` returns `é` alone because byte 3 is the
+        // second byte of that character.
+        for (expr, want) in [
+            ("mw.ustring.sub('abc', 5, -1)", ""),
+            ("mw.ustring.sub('abc', 2)", "bc"),
+            ("mw.ustring.sub('abc', -2)", "bc"),
+            ("mw.ustring.sub('abc', 1, -2)", "ab"),
+            ("mw.ustring.sub('abc', 2, 1)", ""),
+            ("mw.ustring.sub('abc', 0, 99)", "abc"),
+            ("mw.ustring.sub('abc', -99)", "abc"),
+            ("mw.ustring.sub('abc', 1, -99)", ""),
+            ("mw.ustring.sub('abc', 4, -1)", ""),
+            ("mw.ustring.sub('abc', 3, -1)", "c"),
+            ("mw.ustring.sub('abc', -1, -1)", "c"),
+            ("mw.ustring.sub('abc', 2, -3)", ""),
+            ("mw.ustring.sub('abc', 6, 6)", ""),
+            ("mw.ustring.sub('héllo', 1, 1)", "h"),
+            ("mw.ustring.sub('héllo', -1, -1)", "o"),
+            ("mw.ustring.sub('héllo', 2, 3)", "él"),
+            // `héllo` is 5 codepoints, so index 5 is its last one. (Byte-indexed
+            // `string.sub` gives `lo` here, which is exactly the divergence.)
+            ("mw.ustring.sub('héllo', 5, -1)", "o"),
+            ("mw.ustring.sub('héllo', 4, 5)", "lo"),
+            ("mw.ustring.sub('', 1, 1)", ""),
+        ] {
+            assert_eq!(
+                engine.eval(&format!("return {expr}")).unwrap(),
+                want,
+                "{expr}"
+            );
+        }
     }
 
     #[test]

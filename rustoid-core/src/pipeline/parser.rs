@@ -1941,6 +1941,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         // list, and the tokenizer has already split that on `|`,
                         // so the pieces must be put back together.
                         let invoke_arg = invoke_arg_text(pf_arg, &params);
+                        // Scribunto's `frame:getParent()` is the frame of the
+                        // *calling template*, and modules read its args
+                        // constantly (`Module:Infobox`, `Module:Check for
+                        // conflicting parameters` both do it on their first
+                        // lines). The parent's arguments are this frame's.
+                        let parent_args = frame.args().args.clone();
                         let expanded = self
                             .expand_invoke(
                                 source,
@@ -1951,6 +1957,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 tok,
                                 in_template,
                                 src_text,
+                                parent_args,
                             )
                             .await;
                         for e in &expanded {
@@ -2420,6 +2427,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         token: &ParsoidToken,
         in_template: bool,
         _page_source: &str,
+        parent_args: Vec<crate::wikitext::tokens_v2::KV>,
     ) -> Vec<Item> {
         // Without a data source there is nothing to fetch the module from, so
         // leave the call as source text (the standalone behaviour of every
@@ -2429,11 +2437,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
 
         let site = crate::lua::engine::LuaSite::from_config(self.config);
-        let output =
-            match crate::lua::invoke::invoke(pf_arg, src, site, &frame.title().full_text()).await {
-                Ok(out) => out,
-                Err(e) => script_error(&e.to_string()),
-            };
+        // The parent frame's args and title are the calling template's, which
+        // modules read through `frame:getParent()`. A `#invoke` written directly
+        // on a page has no parent frame at all, which is distinguishable from
+        // one inside a template by the frame's namespace: a template frame is
+        // always in the Template namespace.
+        let parent = frame_args_to_lua(&parent_args);
+        let parent_title = frame.title().full_text();
+        let inside_template = self
+            .config
+            .canonical_namespace_id("Template")
+            .is_some_and(|ns| frame.title().namespace_id == ns);
+        let output = match crate::lua::invoke::invoke(
+            pf_arg,
+            src,
+            site,
+            &frame.title().full_text(),
+            parent,
+            Some(parent_title),
+            inside_template,
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => script_error(&e.to_string()),
+        };
 
         // The module's output is wikitext; tokenize it as template content and
         // expand whatever it contains.
@@ -2487,6 +2515,28 @@ fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Par
     let mut parts = vec![pf_arg.trim().to_string()];
     parts.extend(params.args.iter().skip(1).filter_map(kv_to_source_text));
     parts.join("|")
+}
+
+/// Convert a frame's raw parameters into Scribunto `Arg`s.
+///
+/// A numeric key is positional, anything else named — the same split the
+/// template path makes for arguments.
+fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua::engine::Arg> {
+    use crate::lua::engine::Arg;
+    use crate::wikitext::token_utils::key_value_to_string;
+
+    let mut out = Vec::new();
+    for kv in args {
+        let key = key_value_to_string(&kv.key);
+        let value = key_value_to_string(&kv.value);
+        let trimmed = key.trim();
+        match (trimmed.parse::<usize>(), trimmed.is_empty()) {
+            (Ok(_), false) => out.push(Arg::Positional(value)),
+            (_, true) => out.push(Arg::Positional(value)),
+            _ => out.push(Arg::Named(trimmed.to_string(), value)),
+        }
+    }
+    out
 }
 
 /// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`

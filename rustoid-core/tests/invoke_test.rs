@@ -199,7 +199,16 @@ async fn probe_direct_invoke() {
     let source = MockDataSource::new();
     source.add_module("Module:Greet", GREET);
     let site = rustoid_core::lua::engine::LuaSite::from_config(&MockSiteConfig::new());
-    let out = rustoid_core::lua::invoke::invoke("Greet|main|world", &source, site, "Test").await;
+    let out = rustoid_core::lua::invoke::invoke(
+        "Greet|main|world",
+        &source,
+        site,
+        "Test",
+        Vec::new(),
+        None,
+        false,
+    )
+    .await;
     println!("DIRECT RESULT: {out:?}");
 }
 
@@ -323,4 +332,186 @@ async fn mw_html_builds_and_accepts_a_tagless_builder() {
         "attributes: {html}"
     );
     assert!(text_only(&html).contains("deep"), "nested tag: {html}");
+}
+
+/// `frame:getParent().args` must expose the *calling template's* arguments.
+///
+/// Modules rely on this: `Module:Infobox` and `Module:Check for conflicting
+/// parameters` both read it on their first lines, and returning nil stopped 22
+/// corpus pages.
+#[tokio::test]
+async fn get_parent_exposes_the_calling_templates_args() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local parent = frame:getParent()
+            if parent == nil then return "no parent" end
+            return "parent said " .. tostring(parent.args['name'])
+                .. "/" .. tostring(parent.args[1])
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:UsesParent", module);
+    // The invoke is made *from inside* Template:Wrapper, so its arguments are
+    // the parent frame's.
+    source.add_template("Template:Wrapper", "{{#invoke:UsesParent|main}}");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{Wrapper|first|name=bob}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    let body = text_only(&html);
+    assert!(body.contains("parent said bob/first"), "got: {body}");
+}
+
+/// A direct `{{#invoke:…}}` from the page has no parent frame, and Scribunto
+/// returns nil for `getParent()` there.
+#[tokio::test]
+async fn a_direct_invoke_has_no_parent() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return tostring(frame:getParent())
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:NoParent", module)], "{{#invoke:NoParent|main}}").await;
+    assert!(text_only(&html).contains("nil"), "got: {html}");
+}
+
+/// `ustring.sub` must clamp every index combination without panicking.
+///
+/// This is not hypothetical: an inverted range — `sub(s, 5, -1)` on a short
+/// string, which `Help:Introduction` produced — panicked the whole process,
+/// taking down a corpus run with it.
+///
+/// The expected values are taken from Lua 5.4's own `string.sub`, which
+/// `ustring.sub` mirrors, rather than from reasoning about the formula.
+#[tokio::test]
+async fn ustring_sub_clamps_instead_of_panicking() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local u = mw.ustring
+            return table.concat({
+                '[' .. u.sub('abc', 5, -1) .. ']',   -- start past the end
+                '[' .. u.sub('abc', 2) .. ']',       -- from 2 to the end
+                '[' .. u.sub('abc', -2) .. ']',      -- last two
+                '[' .. u.sub('abc', 1, -2) .. ']',   -- all but the last
+                '[' .. u.sub('abc', 2, 1) .. ']',    -- inverted explicitly
+                '[' .. u.sub('abc', 0, 99) .. ']',   -- clamped both ways
+                '[' .. u.sub('abc', -99) .. ']',     -- start far before
+                '[' .. u.sub('abc', 1, -99) .. ']',  -- end far before
+                '[' .. u.sub('h\xc3\xa9llo', 2, 3) .. ']', -- codepoints, not bytes
+            }, ' ')
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Sub", module)], "{{#invoke:Sub|main}}").await;
+    let body = text_only(&html);
+    // The ASCII cases, verified against Lua 5.4's own `string.sub`. The parser
+    // splits text runs, so only the tail is contiguous.
+    assert!(
+        body.contains("[] [bc] [bc] [ab] [] [abc] [abc] []"),
+        "got: {body}"
+    );
+    // The codepoint case: byte slicing would cut the two-byte `é` in half.
+    // Checked on the raw output, because the parser may split the text run.
+    assert!(
+        html.contains("[él]") || body.contains("[él]"),
+        "got: {html}"
+    );
+}
+
+/// `frame:getParent():getTitle()` must name the calling template.
+///
+/// `Module:Labelled list hatnote` and `Module:Arguments` both read it, and
+/// without it the parent frame was nil and the module stopped.
+#[tokio::test]
+async fn get_parent_exposes_the_calling_templates_title() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return "called from " .. frame:getParent():getTitle()
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Titled", module);
+    source.add_template("Template:Wrapper", "{{#invoke:Titled|main}}");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded("{{Wrapper}}", &source, &ParserOptions::for_page("Test"))
+        .await
+        .unwrap();
+    let body = text_only(&html);
+    assert!(body.contains("called from Template:Wrapper"), "got: {body}");
+}
+
+/// `mw.title.equals` compares two title objects.
+#[tokio::test]
+async fn mw_title_equals_compares_titles() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local a = mw.title.new('Foo')
+            local b = mw.title.new('Foo')
+            local c = mw.title.new('Bar')
+            return tostring(mw.title.equals(a, b)) .. '/' .. tostring(mw.title.equals(a, c))
+                .. '/' .. tostring(mw.title.equals(a, nil))
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Eq", module)], "{{#invoke:Eq|main}}").await;
+    let body = text_only(&html);
+    assert!(body.contains("true/false/false"), "got: {body}");
+}
+
+/// `mw.clone` must deep-copy, keep cycles terminating, and preserve metatables.
+///
+/// Modules copy shared configuration before editing it; a shallow copy would let
+/// one invocation corrupt another's data.
+#[tokio::test]
+async fn mw_clone_deep_copies_and_terminates_on_cycles() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local original = { nested = { value = 1 }, list = { 'a' } }
+            original.self = original  -- a cycle must not hang the clone
+            local copy = mw.clone(original)
+            copy.nested.value = 99
+            copy.list[1] = 'z'
+            return tostring(original.nested.value) .. tostring(copy.nested.value)
+                .. '/' .. original.list[1] .. copy.list[1]
+                .. '/' .. tostring(copy.self == copy)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Clone", module)], "{{#invoke:Clone|main}}").await;
+    let body = text_only(&html);
+    assert!(body.contains("199/az/true"), "got: {body}");
+}
+
+/// `mw.getContentLanguage()` and a namespace *name* in `mw.title.new`.
+#[tokio::test]
+async fn content_language_and_named_namespace_arguments() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local lang = mw.getContentLanguage()
+            local t = mw.title.new('Foo', 'Template')
+            return lang:getCode() .. '/' .. t.namespace .. '/' .. t.prefixedText
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:CL", module)], "{{#invoke:CL|main}}").await;
+    let body = text_only(&html);
+    assert!(body.contains("en/10/Template:Foo"), "got: {body}");
 }

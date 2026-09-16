@@ -198,7 +198,15 @@ fn required_modules(source: &str) -> Vec<String> {
 /// The output is wikitext, not HTML: Scribunto's result is fed back through the
 /// parser, so templates and parser functions the module returns are still
 /// expanded by the caller.
-pub fn run(invoke: &Invoke, registry: Registry, site: LuaSite, page_title: &str) -> Result<String> {
+pub fn run(
+    invoke: &Invoke,
+    registry: Registry,
+    site: LuaSite,
+    page_title: &str,
+    parent_args: Vec<Arg>,
+    parent_title: Option<String>,
+    has_parent: bool,
+) -> Result<String> {
     // Scribunto's entry module must be present; a `#invoke` of a non-existent
     // module is an error, and the caller turns it into MediaWiki's message.
     let title = invoke.module_title();
@@ -206,11 +214,18 @@ pub fn run(invoke: &Invoke, registry: Registry, site: LuaSite, page_title: &str)
         return Err(RustoidError::Lua(format!("module {title} does not exist")));
     };
 
-    let ctx = LuaContext::with_modules(site, page_title.to_string(), registry);
+    let ctx = LuaContext::with_parent(
+        site,
+        page_title.to_string(),
+        registry,
+        parent_args,
+        parent_title,
+        has_parent,
+    );
     let engine = LuaEngine::new(LuaEngineConfig::default(), ctx)?;
 
     let args = invoke.frame_args();
-    engine.execute(&entry, &invoke.function, &args)
+    engine.execute_in(&entry, &title, &invoke.function, &args)
 }
 
 /// How many times an `#invoke` may be re-run after discovering a module it
@@ -250,6 +265,9 @@ pub async fn invoke<S: DataSource + ?Sized>(
     source: &S,
     site: LuaSite,
     page_title: &str,
+    parent_args: Vec<Arg>,
+    parent_title: Option<String>,
+    has_parent: bool,
 ) -> Result<String> {
     let Some(call) = Invoke::parse(pf_arg) else {
         return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
@@ -258,7 +276,15 @@ pub async fn invoke<S: DataSource + ?Sized>(
     let mut last_missing: Option<String> = None;
 
     for _ in 0..MAX_PRELOAD_ROUNDS {
-        match run(&call, registry.clone(), site.clone(), page_title) {
+        match run(
+            &call,
+            registry.clone(),
+            site.clone(),
+            page_title,
+            parent_args.clone(),
+            parent_title.clone(),
+            has_parent,
+        ) {
             Ok(out) => return Ok(out),
             Err(RustoidError::Lua(msg)) => {
                 match missing_module_from(&msg) {
