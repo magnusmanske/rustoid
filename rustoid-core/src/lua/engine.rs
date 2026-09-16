@@ -47,6 +47,15 @@ pub struct LuaSite {
     pub namespaces: Vec<(i32, String, Vec<String>)>,
     /// The interwiki prefixes, for `mw.site.interwikiMap`.
     pub interwikis: Vec<InterwikiFacts>,
+    /// Interface messages (`MediaWiki:` namespace), for `mw.message`. Keyed by
+    /// message name only, since one parse has one content language.
+    ///
+    /// Populated by the host before the engine runs: fetching a message is
+    /// asynchronous and Lua is not, so a module cannot look one up on demand.
+    /// An empty map is the honest representation of "no messages loaded", which
+    /// makes `mw.message`'s existence checks report the message missing rather
+    /// than inventing a value.
+    pub messages: std::collections::HashMap<String, String>,
 }
 
 /// One interwiki prefix as Lua sees it, in `mw.site.interwikiMap`'s terms.
@@ -96,7 +105,18 @@ impl LuaSite {
             article_path: config.article_path().to_string(),
             namespaces,
             interwikis: interwiki_facts(config),
+            // No messages are loaded here: `from_config` has no async access to
+            // the `MediaWiki:` namespace. A caller that needs `mw.message` sets
+            // them with [`LuaSite::with_messages`].
+            messages: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach preloaded interface messages, for `mw.message`.
+    #[must_use]
+    pub fn with_messages(mut self, messages: std::collections::HashMap<String, String>) -> Self {
+        self.messages = messages;
+        self
     }
 
     /// Whether a namespace id exists on this wiki.
@@ -1043,11 +1063,22 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     mw.set("ext", ext)
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
-    // mw.message
-    let message = lua
+    // mw.message — the object methods live in `MESSAGE_LIB`, which is given the
+    // message store and the content language as its two arguments.
+    let messages = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    message.set("new", lua.create_function(luafn_message_new)?)?;
+    for (key, text) in &ctx.site.messages {
+        messages
+            .set(key.as_str(), text.as_str())
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    }
+    let message: Table = lua
+        .load(MESSAGE_LIB)
+        .set_name("mw.message")
+        .eval::<Function>()
+        .and_then(|build| build.call(messages))
+        .map_err(|e| RustoidError::Lua(format!("mw.message setup: {e}")))?;
     mw.set("message", message)?;
 
     // mw.html — built from Lua source (see `HTML_LIB`).
@@ -1777,6 +1808,149 @@ if table.clone == nil then
 end
 "#;
 
+/// Scribunto's `mw.message`, with the message store passed in.
+///
+/// `Message::plain()` is the method modules actually call: it substitutes the
+/// parameters marked `$1`, `$2`, … into the message text and returns the result
+/// as wikitext. `newRawMessage` is the same thing with the text supplied
+/// directly rather than looked up — `Module:Citation/CS1` and `Module:Lang` both
+/// use it as their string-interpolation primitive.
+///
+/// The message store is a plain table of the interface messages the host
+/// preloaded. `exists` and `isBlank` answer from that table, so a message that
+/// was not preloaded reports as missing and a module falls back to its own
+/// built-in copy — which is the behaviour `Module:TemplatePar` depends on.
+const MESSAGE_LIB: &str = r#"
+return function(messages)
+    local object = {}
+
+    -- Substitute `$1`, `$2`, … from `params`. A numbered parameter replaces
+    -- every occurrence, and one that has no value is left standing, which is
+    -- what MediaWiki does (an unfilled `$2` shows up literally rather than
+    -- vanishing).
+    local function substitute(text, params)
+        if not params then return text end
+        return (text:gsub('%$(%d+)', function(n)
+            local i = tonumber(n)
+            -- Parameters are one-based here, but Scribunto follows PHP's
+            -- convention that `$1` is the first parameter, so no shift is
+            -- needed; the raw text is used so a number formats as written.
+            local v = params[i]
+            if v == nil then return '$' .. n end
+            return tostring(v)
+        end))
+    end
+
+    -- `mw.message.newRawMessage( msg, ... )` — the text is used directly, with
+    -- no lookup. This is the common case in the corpus.
+    function object.newRawMessage(msg, ...)
+        return object.new(msg, ...)
+    end
+
+    -- `mw.message.new( key, ... )` — look the key up. A key that is missing
+    -- is kept as the object's raw text, so `plain()` still returns something
+    -- and `exists()` reports the truth. The metatable is installed before
+    -- `:params` is called, since that method is found through it.
+    --
+    -- The stored fields are prefixed with `_` so they cannot shadow the methods
+    -- of the same name (`text`, `params`): an instance field is found first, and
+    -- a nil `text` would otherwise resolve to the `text()` method.
+    function object.new(key, ...)
+        local msg = setmetatable(
+            { _key = key, _text = messages[key], _params = {} },
+            { __index = object }
+        )
+        msg:params(...)
+        return msg
+    end
+
+    -- `mw.message.newFallbackSequence( ... )` — the first key that exists.
+    function object.newFallbackSequence(...)
+        for _, key in ipairs({ ... }) do
+            if messages[key] then return object.new(key) end
+        end
+        return object.new('')
+    end
+
+    -- `mw.message.rawParam` / `numParam` wrap a value so the substitution knows
+    -- not to treat it as wikitext (raw) or to format it (num). Neither affects
+    -- `plain()`, which emits parameters verbatim, so a pair of markers is
+    -- enough to keep the value and record the intent.
+    function object.rawParam(value) return { raw = value } end
+    function object.numParam(value) return { num = value } end
+
+    -- `mw.message.getDefaultLanguage()` needs a language object, which is built
+    -- by `mw.language` — reaching for it here would make the two libraries
+    -- mutually dependent. `mw.message` is a stub for this one accessor.
+
+    -- `msg:params( ... )` and `msg:params( table )`. Kept in the order PHP
+    -- numbers them, so `$1` is the first value either way.
+    --
+    -- A lone table argument is a sequence of parameters to copy — unless it is
+    -- one of the wrapper tables from `rawParam`/`numParam`, which are a single
+    -- parameter that happens to be a table. The wrappers are recognised by
+    -- their marker field, so the distinction is the same one a caller makes.
+    local function is_wrapper(v)
+        return type(v) == 'table' and (v.raw ~= nil or v.num ~= nil)
+    end
+
+    function object:params(...)
+        local args = { ... }
+        local given = args[1]
+        if #args == 1 and type(given) == 'table' and not is_wrapper(given) then
+            args = given
+        end
+        for i, v in ipairs(args) do self._params[i] = v end
+        return self
+    end
+
+    function object:rawParams(...)
+        self:params(...)
+        return self
+    end
+
+    function object:numParams(...)
+        self:params(...)
+        return self
+    end
+
+    function object:inLanguage(_) return self end
+    function object:useDatabase(_) return self end
+
+    -- `msg:plain()` — the message with its parameters substituted, as wikitext.
+    -- A parameter may be one of the wrapper tables above, which yields its
+    -- inner value.
+    function object:plain()
+        local text = self._text or self._key or ''
+        if #self._params == 0 then return text end
+        local values = {}
+        for i, v in ipairs(self._params) do
+            if type(v) == 'table' then values[i] = v.raw or v.num or ''
+            else values[i] = v end
+        end
+        return substitute(text, values)
+    end
+
+    -- `msg:text()` is `plain()`; `msg:parse()` differs only in that MediaWiki
+    -- parses it, which the caller here would do anyway.
+    function object:text() return self:plain() end
+    function object:parse() return self:plain() end
+
+    function object:exists()
+        return self._text ~= nil
+    end
+
+    function object:isBlank()
+        return self._text == nil or self._text == '' or self._text == '-'
+    end
+
+    function object:isDisabled() return self:isBlank() end
+    function object:numParamsEqual(_) return false end
+
+    return object
+end
+"#;
+
 /// Scribunto's `os` library: the four functions that cannot touch the system.
 ///
 /// Lua's full `os` is removed for the same reason Scribunto removes it —
@@ -2057,15 +2231,6 @@ fn luafn_ustring_upper(_: &Lua, s: Value) -> mlua::Result<String> {
 
 fn luafn_ustring_lower(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(coerce_string(&s, "lower")?.to_lowercase())
-}
-
-fn luafn_message_new(lua: &Lua, (key, _args): (Value, Option<Table>)) -> mlua::Result<Table> {
-    let key = coerce_string(&key, "message.new")?;
-    let table = lua.create_table()?;
-    let k = key.clone();
-    table.set("key", key)?;
-    table.set("plain", lua.create_function(move |_, ()| Ok(k.clone()))?)?;
-    Ok(table)
 }
 
 /// Build a Scribunto `args` table from a frame's arguments.
@@ -2412,6 +2577,20 @@ mod tests {
         LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap()
     }
 
+    /// A site with the interface messages `mw.message` looks up loaded.
+    fn engine_site() -> LuaSite {
+        let messages = [
+            ("comma-separator".to_string(), ", ".to_string()),
+            ("word-separator".to_string(), " ".to_string()),
+            ("and".to_string(), " and ".to_string()),
+            // The "disabled" spelling, which `isBlank` must report as blank.
+            ("disabled-message".to_string(), "-".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        LuaSite::from_config(&MockSiteConfig::new()).with_messages(messages)
+    }
+
     /// `(local, non-local, total)` prefix counts, as Lua sees them.
     ///
     /// Counting from inside Lua rather than from the config asserts on the map
@@ -2544,6 +2723,154 @@ mod tests {
         assert_eq!(
             engine.eval("return mw.text.encode('<>&\"')").unwrap(),
             "&lt;&gt;&amp;&quot;"
+        );
+    }
+
+    /// `newRawMessage(text, args):plain()` is the string-interpolation primitive
+    /// `Module:Citation/CS1`, `Module:Lang` and `Module:age` all use, and its
+    /// absence stopped 9 corpus pages at the first call.
+    #[test]
+    fn test_mw_message_new_raw_message() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1 on $2', 'a', 'b'):plain()")
+                .unwrap(),
+            "a on b"
+        );
+        // A parameter used twice is substituted both times.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1/$1', 'x'):plain()")
+                .unwrap(),
+            "x/x"
+        );
+        // With no parameters the text is returned unchanged.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('no params'):plain()")
+                .unwrap(),
+            "no params"
+        );
+        // A parameter with no value is left standing, as MediaWiki leaves it.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1-$3', 'a'):plain()")
+                .unwrap(),
+            "a-$3"
+        );
+        // `Module:Location_map` passes its parameters pre-collected as a table,
+        // which must be numbered from one.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1,$2', {'a', 'b'}):plain()")
+                .unwrap(),
+            "a,b"
+        );
+        // A number substitutes as written, not as a float.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1 px', 300):plain()")
+                .unwrap(),
+            "300 px"
+        );
+    }
+
+    /// A looked-up message answers from the preloaded store, and a key that was
+    /// not preloaded reports as missing — which is how `Module:TemplatePar`
+    /// decides to use its own built-in localisation.
+    #[test]
+    fn test_mw_message_lookup() {
+        let ctx = LuaContext::new(engine_site(), "Test Page");
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+        assert_eq!(
+            engine
+                .eval("return mw.message.new('comma-separator'):plain()")
+                .unwrap(),
+            ", "
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.message.new('comma-separator'):exists())")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.message.new('comma-separator'):isBlank())")
+                .unwrap(),
+            "false"
+        );
+        // A message with parameters substitutes them.
+        assert_eq!(
+            engine
+                .eval("return mw.message.new('word-separator'):plain()")
+                .unwrap(),
+            " "
+        );
+        // An unloaded key reports missing, so a module takes its fallback path.
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.message.new('not-a-real-message'):exists())")
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.message.new('not-a-real-message'):isBlank())")
+                .unwrap(),
+            "true"
+        );
+        // `newFallbackSequence` picks the first key that exists.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newFallbackSequence('nope', 'comma-separator'):plain()")
+                .unwrap(),
+            ", "
+        );
+    }
+
+    /// `Module:Citation/CS1/Utilities`'s `substitute` guards on the args being
+    /// present, and `Module:age` spreads the arguments in — both forms are in
+    /// the corpus and must substitute identically.
+    #[test]
+    fn test_mw_message_params_forms() {
+        let engine = make_engine();
+        // A table is queued with `:params(table)`, then a spread with `:params(...)`.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1'):params('a'):plain()")
+                .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1'):params({'a'}):plain()")
+                .unwrap(),
+            "a"
+        );
+        // `rawParams`/`numParams` queue the values too, and `plain()` emits them.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$2'):numParams(1, 2):plain()")
+                .unwrap(),
+            "2"
+        );
+        // `rawParam` wraps a single value, which `plain()` unwraps.
+        assert_eq!(
+            engine
+                .eval(
+                    "return mw.message.newRawMessage('$1'):params(mw.message.rawParam('[[x]]')):plain()"
+                )
+                .unwrap(),
+            "[[x]]"
+        );
+        // `text()` and `parse()` are the plain text as far as rustoid is concerned.
+        assert_eq!(
+            engine
+                .eval("return mw.message.newRawMessage('$1', 'v'):text()")
+                .unwrap(),
+            "v"
         );
     }
 

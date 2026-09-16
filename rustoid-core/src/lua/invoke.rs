@@ -172,17 +172,9 @@ fn required_modules(source: &str) -> Vec<String> {
         let after_name = idx + keyword.len();
         let tail = source[after_name..].trim_start();
         let tail = tail.strip_prefix('(').unwrap_or(tail);
-        let tail = tail.trim_start();
-        let Some(quote) = tail.chars().next() else {
+        let Some(title) = first_string_literal(tail.trim_start()) else {
             continue;
         };
-        if quote != '\'' && quote != '"' {
-            continue;
-        }
-        let Some(end) = tail[1..].find(quote) else {
-            continue;
-        };
-        let title = &tail[1..1 + end];
         // Only module-space titles are loadable; `require('foo')` refers to a
         // Lua core library, which the sandbox does not expose.
         if title.len() > 7 && title[..7].eq_ignore_ascii_case("Module:") {
@@ -279,6 +271,12 @@ where
     let mut frame = FrameContext {
         titles: preload_titles(source, &registry).await,
         ..frame
+    };
+    // Interface messages are fetched here rather than in the parser for the same
+    // reason modules are: fetching is asynchronous and Lua is not.
+    let site = {
+        let language = site.language_code.clone();
+        site.with_messages(preload_messages(source, &registry, &language).await)
     };
     let mut answers = crate::pipeline::lua_deferred::DeferredAnswers::new();
     let mut asked: Vec<String> = Vec::new();
@@ -423,24 +421,13 @@ fn referenced_titles(source: &str) -> Vec<String> {
         let Some(tail) = tail.strip_prefix('(') else {
             continue;
         };
-        let tail = tail.trim_start();
-        let Some(quote) = tail.chars().next() else {
+        let Some(literal) = first_string_literal(tail.trim_start()) else {
             continue;
         };
-        if quote != '\'' && quote != '"' {
-            continue;
-        }
-        let Some(end) = tail[1..].find(quote) else {
-            continue;
-        };
-        let literal = tail[1..1 + end].trim();
-        if literal.is_empty() || literal.contains("..") {
-            continue;
-        }
 
         // An explicit namespace argument, e.g. `mw.title.new('Foo', 'Template')`
         // or `mw.title.new('Foo', 10)`.
-        let after = tail[1 + end + 1..].trim_start();
+        let after = tail[1 + literal.len() + 1..].trim_start();
         let after = after.strip_prefix(',').map(str::trim_start);
         let title = match after {
             Some(rest) if rest.starts_with(['\'', '"']) => {
@@ -467,6 +454,94 @@ fn referenced_titles(source: &str) -> Vec<String> {
     out
 }
 
+/// How many interface messages one `#invoke` may load.
+///
+/// A module naming hundreds of messages is either doing something this scan
+/// cannot see or is a localisation table; either way each name costs a page
+/// fetch, so it is bounded like the module and title preloads are.
+const MAX_MESSAGES: usize = 40;
+
+/// Interface messages named by `mw.message.new('…')` literals.
+///
+/// `mw.message.new` is how a module asks the wiki for a message it may not have
+/// a local copy of, and `plain()` is what it renders. Only the literal spelling
+/// is visible to a scan; a key built at runtime (`Local.prefix .. say`, which
+/// `Module:TemplatePar` does) is not, and the message then reports as missing —
+/// which is the safe answer, because a module that finds a message absent falls
+/// back to its own copy rather than rendering an empty string.
+///
+/// `newRawMessage` takes its text directly and is deliberately not scanned: its
+/// argument is wikitext, not a message key.
+async fn preload_messages<S: DataSource + ?Sized>(
+    source: &S,
+    registry: &Registry,
+    language: &str,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+
+    for body in registry.values() {
+        for key in message_keys(body) {
+            wanted.insert(key);
+        }
+    }
+
+    for key in wanted.into_iter().take(MAX_MESSAGES) {
+        // A message that does not exist is simply absent, so `exists()` and
+        // `isBlank()` report the truth to the module.
+        if let Ok(Some(text)) = source.get_message(language, &key).await {
+            out.insert(key, text);
+        }
+    }
+
+    out
+}
+
+/// Interface message names named by `mw.message.new('…')` string literals.
+fn message_keys(source: &str) -> Vec<String> {
+    const CALL: &str = "mw.message.new";
+    let mut out = Vec::new();
+    for (idx, _) in source.match_indices(CALL) {
+        // `newRawMessage` also starts with `new`, so a match immediately
+        // followed by an identifier character is a different function and its
+        // argument is wikitext, not a key.
+        let tail = &source[idx + CALL.len()..];
+        let tail = tail.strip_prefix('(').unwrap_or(tail);
+        if tail.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        if let Some(literal) = first_string_literal(tail.trim_start()) {
+            out.push(literal.to_string());
+        }
+    }
+    out
+}
+
+/// The contents of a string literal at the start of `text`, if there is one.
+///
+/// Shared by the preload scans, which all read the argument of a call. A literal
+/// that is part of a concatenation (`'Foo' .. rest`) is rejected: its value is
+/// not knowable here, so treating it as a name would fetch something
+/// nonexistent.
+fn first_string_literal(text: &str) -> Option<&str> {
+    let quote = text.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let end = text[1..].find(quote)?;
+    let literal = text[1..1 + end].trim();
+    if literal.is_empty() || literal.contains("..") {
+        return None;
+    }
+    // The remaining text starts a concatenation when `..` follows the closing
+    // quote, which makes the literal only part of the value.
+    let rest = text[1 + end + 1..].trim_start();
+    if rest.starts_with("..") {
+        return None;
+    }
+    Some(literal)
+}
+
 /// How many times an `#invoke` may be re-run after discovering a module it
 /// needed but could not be anticipated.
 #[cfg(test)]
@@ -491,6 +566,34 @@ mod tests {
                 "Template:Wrapper".to_string(),
             ]
         );
+    }
+
+    /// The message scan must not mistake `newRawMessage` for `new`, or it would
+    /// fetch the module's own wikitext as if it were a message key.
+    #[test]
+    fn finds_message_keys_but_not_raw_message_text() {
+        let src = r#"
+            local a = mw.message.new('comma-separator')
+            local b = mw.message.new("word-separator")
+            local c = mw.message.newRawMessage('$1 on $2', 'a', 'b')
+            local d = mw.message.new(Local.prefix .. say)
+            local e = mw.message.newFallbackSequence('nope', 'and')
+        "#;
+        assert_eq!(
+            message_keys(src),
+            // `newFallbackSequence` is a different function whose arguments are
+            // keys too, but the scan is deliberately literal-only; what matters
+            // is that `$1 on $2` was not taken for a key.
+            vec!["comma-separator".to_string(), "word-separator".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_concatenated_literal_is_not_a_name() {
+        assert_eq!(first_string_literal("'a' .. suffix"), None);
+        assert_eq!(first_string_literal("'a'"), Some("a"));
+        assert_eq!(first_string_literal("\"a\""), Some("a"));
+        assert_eq!(first_string_literal("not_a_literal"), None);
     }
 
     #[test]
