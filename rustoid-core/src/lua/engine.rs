@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, Value};
 
 use crate::error::{Result, RustoidError};
@@ -343,11 +344,19 @@ impl LuaEngine {
     pub fn new(engine_config: LuaEngineConfig, ctx: LuaContext) -> Result<Self> {
         let lua = Lua::new();
 
-        for name in &["os", "io", "package", "require", "loadfile", "dofile"] {
+        for name in &["io", "package", "require", "loadfile", "dofile"] {
             lua.globals()
                 .set(*name, Value::Nil)
                 .map_err(|e| RustoidError::Lua(e.to_string()))?;
         }
+        // `os` is replaced rather than removed: Scribunto keeps the four
+        // functions that cannot touch the filesystem, and modules call
+        // `os.date('%Y')` and `os.date('!*t')` to learn the current time (both
+        // `Module:Date` and `Module:Citation/CS1/Date_validation` do). It is
+        // set here, after the nil-out above, so the order matters.
+        lua.globals()
+            .set("os", luafn_os_table(&lua)?)
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
         lua.set_memory_limit(engine_config.memory_limit)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
@@ -1768,6 +1777,134 @@ if table.clone == nil then
 end
 "#;
 
+/// Scribunto's `os` library: the four functions that cannot touch the system.
+///
+/// Lua's full `os` is removed for the same reason Scribunto removes it —
+/// `os.execute` and `os.remove` are filesystem and shell access. What remains is
+/// `os.time`, `os.date`, `os.difftime` and `os.clock`, which `Module:Date` and
+/// `Module:Citation/CS1/Date_validation` call to learn the current time and to
+/// bound an access date against "tomorrow".
+fn luafn_os_table(lua: &Lua) -> Result<Table> {
+    let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    let os = lua.create_table().map_err(err)?;
+    os.set("time", lua.create_function(luafn_os_time)?)
+        .map_err(err)?;
+    os.set("date", lua.create_function(luafn_os_date)?)
+        .map_err(err)?;
+    os.set("difftime", lua.create_function(luafn_os_difftime)?)
+        .map_err(err)?;
+    // `os.clock` measures CPU time, which a page parse neither has a use for nor
+    // a meaningful value of; the elapsed time is the honest approximation.
+    os.set("clock", lua.create_function(|_, ()| Ok(0.0_f64))?)
+        .map_err(err)?;
+    Ok(os)
+}
+
+/// Now, as a Unix timestamp. This is the only clock the engine reads, so every
+/// time-dependent module sees one consistent instant per call.
+fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// `os.time( table )` — the current time, or the time a field table encodes.
+///
+/// A table is interpreted as local time by C's `mktime`; rustoid has no
+/// timezone database to consult, so UTC is used, which is also the wiki's
+/// reference clock. The fields `year`, `month` and `day` are required, and the
+/// rest default as the manual documents (`hour` 12, `min`/`sec` 0).
+fn luafn_os_time(_: &Lua, table: Option<Table>) -> mlua::Result<i64> {
+    let Some(table) = table else {
+        return Ok(now_unix());
+    };
+    let year: i32 = table
+        .get("year")
+        .map_err(|_| mlua::Error::runtime("os.time: field 'year' missing in date table"))?;
+    let month: u32 = table
+        .get("month")
+        .map_err(|_| mlua::Error::runtime("os.time: field 'month' missing in date table"))?;
+    let day: u32 = table
+        .get("day")
+        .map_err(|_| mlua::Error::runtime("os.time: field 'day' missing in date table"))?;
+    let hour: u32 = table.get("hour").unwrap_or(12);
+    let min: u32 = table.get("min").unwrap_or(0);
+    let sec: u32 = table.get("sec").unwrap_or(0);
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|d| d.and_hms_opt(hour, min, sec))
+        .map(|dt| dt.and_utc().timestamp())
+        .ok_or_else(|| mlua::Error::runtime("os.time: invalid date"))
+}
+
+/// `os.difftime( t2, t1 )` — the number of seconds from `t1` to `t2`.
+fn luafn_os_difftime(_: &Lua, (t2, t1): (i64, i64)) -> mlua::Result<i64> {
+    Ok(t2 - t1)
+}
+
+/// `os.date( format, time )` — `strftime` formatting, or a field table.
+///
+/// The format is C's, not MediaWiki's: `%Y` is the year and `!` selects UTC.
+/// A leading `!` makes the time UTC and is not passed to `strftime`; anything
+/// else is formatted in the wiki's own zone, which for rustoid is UTC too, so
+/// the two agree on every input.
+///
+/// The special format `"*t"` returns a table of fields instead of a string, and
+/// is how `Module:Date` reads the current year, month and day.
+fn luafn_os_date(lua: &Lua, (format, time): (Option<String>, Option<i64>)) -> mlua::Result<Value> {
+    let unix = time.unwrap_or_else(now_unix);
+    let utc = chrono::DateTime::from_timestamp(unix, 0)
+        .ok_or_else(|| mlua::Error::runtime("os.date: time out of range"))?;
+    let format = format.unwrap_or_else(|| "%c".to_string());
+    let spec = format.strip_prefix('!').unwrap_or(&format);
+    if spec == "*t" {
+        // Fields as C's `struct tm` exposes them: `wday` and `yday` are
+        // 1-based, with Sunday as 1. `isdst` is always false under UTC.
+        let table = lua.create_table()?;
+        table.set("year", utc.year() as i64)?;
+        table.set("month", utc.month() as i64)?;
+        table.set("day", utc.day() as i64)?;
+        table.set("hour", utc.hour() as i64)?;
+        table.set("min", utc.minute() as i64)?;
+        table.set("sec", utc.second() as i64)?;
+        table.set("wday", utc.weekday().num_days_from_sunday() as i64 + 1)?;
+        table.set("yday", utc.ordinal() as i64)?;
+        table.set("isdst", false)?;
+        return Ok(Value::Table(table));
+    }
+    Ok(Value::String(
+        lua.create_string(format_strftime(spec, utc))?,
+    ))
+}
+
+/// Apply a C `strftime` format string.
+///
+/// `chrono`'s `format` handles the common conversions, but panics on an unknown
+/// one rather than leaving it alone, so the format is checked first: a specifier
+/// outside the supported set is passed through literally, which is what makes an
+/// unsupported format visible instead of fatal.
+fn format_strftime(spec: &str, utc: chrono::DateTime<chrono::Utc>) -> String {
+    const SUPPORTED: &[char] = &[
+        '%', 'a', 'A', 'b', 'B', 'c', 'C', 'd', 'D', 'e', 'F', 'g', 'G', 'h', 'H', 'I', 'j', 'k',
+        'l', 'm', 'M', 'n', 'p', 'P', 'r', 'R', 's', 'S', 't', 'T', 'u', 'U', 'V', 'w', 'W', 'x',
+        'y', 'Y', 'z', 'Z',
+    ];
+    let mut out = String::with_capacity(spec.len());
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some(next) if SUPPORTED.contains(&next) => {
+                chars.next();
+                out.push_str(&utc.format(&format!("%{next}")).to_string());
+            }
+            // A trailing `%`, or an unknown conversion passes through as-is.
+            _ => out.push('%'),
+        }
+    }
+    out
+}
+
 /// A small subset of MediaWiki's `Language::sprintfDate`.
 ///
 /// Covers the formats modules actually ask for when reading month names out of a
@@ -2306,6 +2443,99 @@ mod tests {
     fn test_basic_lua_execution() {
         let engine = make_engine();
         assert_eq!(engine.eval("return 1 + 1").unwrap(), "2");
+    }
+
+    /// Scribunto keeps the four `os` functions that cannot touch the system.
+    /// `Module:Date` reads the current time through `os.date`, so its absence
+    /// stopped 13 corpus pages with "attempt to index a nil value (global 'os')".
+    #[test]
+    fn test_os_library() {
+        let engine = make_engine();
+        // `%Y` is the year, which `Module:Citation/CS1` uses as a bound.
+        assert_eq!(
+            engine
+                .eval("return #os.date('%Y') == 4 and tonumber(os.date('%Y')) > 2000")
+                .unwrap(),
+            "true"
+        );
+        // `os.date('!*t')` is a field table, the form `Module:Date` reads.
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = os.date('!*t') \
+                     return type(t.year) .. ',' .. type(t.month) .. ',' .. type(t.day) .. ',' \
+                     .. type(t.hour) .. ',' .. type(t.min) .. ',' .. type(t.sec)"
+                )
+                .unwrap(),
+            "number,number,number,number,number,number"
+        );
+        // `wday` is 1-based with Sunday as 1, and `yday` is the day of the year.
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = os.date('!*t', 0) \
+                     return t.year .. '-' .. t.month .. '-' .. t.day .. ',' .. t.wday .. ',' .. t.yday"
+                )
+                .unwrap(),
+            "1970-1-1,5,1"
+        );
+        // A `!` prefix is UTC and is not itself formatted.
+        assert_eq!(engine.eval("return os.date('!%Y', 0)").unwrap(), "1970");
+        // An unsupported conversion passes through rather than raising.
+        assert_eq!(engine.eval("return os.date('100%%', 0)").unwrap(), "100%");
+    }
+
+    /// `os.time` reads the clock, and encodes a field table; `os.difftime` is
+    /// the difference the manual documents.
+    #[test]
+    fn test_os_time_and_difftime() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return tonumber(os.time()) > 1700000000")
+                .unwrap(),
+            "true"
+        );
+        // A field table round-trips through the epoch.
+        assert_eq!(
+            engine
+                .eval("return os.time{year = 1970, month = 1, day = 1, hour = 0}")
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(
+            engine
+                .eval("return os.time{year = 1970, month = 1, day = 2, hour = 0}")
+                .unwrap(),
+            "86400"
+        );
+        assert_eq!(engine.eval("return os.difftime(100, 40)").unwrap(), "60");
+        assert_eq!(engine.eval("return os.difftime(40, 100)").unwrap(), "-60");
+        assert!(engine.eval("return os.clock()").is_ok());
+    }
+
+    /// The `os` functions Scribunto removes must stay removed — this is a
+    /// sandbox, and `os.execute`/`os.remove` are shell and filesystem access.
+    #[test]
+    fn test_os_is_sandboxed() {
+        let engine = make_engine();
+        for gone in [
+            "execute",
+            "remove",
+            "rename",
+            "tmpname",
+            "getenv",
+            "exit",
+            "setlocale",
+        ] {
+            assert_eq!(
+                engine.eval(&format!("return tostring(os.{gone})")).unwrap(),
+                "nil",
+                "os.{gone} must not be exposed"
+            );
+        }
+        // `io` has no safe subset at all and stays removed.
+        assert_eq!(engine.eval("return tostring(io)").unwrap(), "nil");
     }
 
     #[test]
