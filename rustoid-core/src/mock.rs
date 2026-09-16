@@ -521,7 +521,9 @@ impl MockSiteConfig {
         );
     }
 
-    fn add_interwiki(&mut self, prefix: &str, url: &str, local: bool) {
+    /// Add an interwiki prefix, as a `siteinfo` `interwikimap` entry describes
+    /// it: `prefix` is the map key and also the entry's `prefix` field.
+    pub fn add_interwiki(&mut self, prefix: &str, url: &str, local: bool) {
         let mut info = InterwikiInfo::new(url, local);
         info.prefix = Some(prefix.to_string());
         self.interwiki_map.insert(prefix.to_string(), info);

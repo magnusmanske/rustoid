@@ -44,6 +44,29 @@ pub struct LuaSite {
     /// `(id, (canonical name, aliases))` for every namespace, for `mw.title` and
     /// `mw.site`. The main namespace (id 0) is excluded: its name is empty.
     pub namespaces: Vec<(i32, String, Vec<String>)>,
+    /// The interwiki prefixes, for `mw.site.interwikiMap`.
+    pub interwikis: Vec<InterwikiFacts>,
+}
+
+/// One interwiki prefix as Lua sees it, in `mw.site.interwikiMap`'s terms.
+///
+/// The fields are the ones the manual documents; the names match what modules
+/// index, so a module reading `v["prefix"]` or `v.isLocal` works unchanged.
+#[derive(Debug, Clone)]
+pub struct InterwikiFacts {
+    pub prefix: String,
+    pub url: String,
+    pub is_local: bool,
+    /// A local interwiki that resolves to *this* wiki (PHP's `localinterwiki`
+    /// with an empty URL, or a URL matching the wiki's own server).
+    pub is_current_wiki: bool,
+    /// Whether the URL template has no scheme, so links built from it inherit
+    /// the page's own protocol. Mirrors PHP's `protorel`.
+    pub is_protocol_relative: bool,
+    /// Whether transcluding across this prefix is allowed (`scary
+    /// transclusion`), which MediaWiki disables on Wikimedia wikis.
+    pub is_transcludable: bool,
+    pub is_extra_language_link: bool,
 }
 
 impl LuaSite {
@@ -71,10 +94,20 @@ impl LuaSite {
             script_path: config.script_path().to_string(),
             article_path: config.article_path().to_string(),
             namespaces,
+            interwikis: interwiki_facts(config),
         }
     }
 
-    /// Canonical name of a namespace id, empty for the main namespace.
+    /// Whether a namespace id exists on this wiki.
+    ///
+    /// Used for the two namespace facts a title cannot derive from its id: what
+    /// its talk page's namespace is, and whether it can have one at all. The main
+    /// namespace (0) is present even though its name is empty, since
+    /// `namespaces` deliberately drops the empty name.
+    pub fn namespace_id_exists(&self, id: i32) -> bool {
+        id == 0 || self.namespaces.iter().any(|(ns_id, _, _)| *ns_id == id)
+    }
+
     /// Canonical name of a namespace id, empty for the main namespace.
     pub fn namespace_name(&self, id: i32) -> String {
         if id == 0 {
@@ -108,6 +141,69 @@ impl LuaSite {
             })
             .map(|(id, _, _)| *id)
     }
+}
+
+/// Read the wiki's interwiki map into the shape `mw.site.interwikiMap` reports.
+///
+/// Two of the flags MediaWiki computes cannot be read off the map entry alone,
+/// so they are derived here:
+///
+/// - `isCurrentWiki` is true for a *local* interwiki pointing at this very wiki.
+///   MediaWiki decides that by comparing the resolved URL host against
+///   `$wgServer`, so the same comparison is made against the configured server.
+/// - `isProtocolRelative` mirrors PHP's `protorel`, which is also implied by a
+///   URL template that carries no scheme of its own (the usual `//host/$1`
+///   form). Modules use it to decide whether to prepend `https:`.
+fn interwiki_facts(config: &dyn SiteConfig) -> Vec<InterwikiFacts> {
+    let server_host = host_of(config.server_url());
+    let mut out: Vec<InterwikiFacts> = config
+        .interwiki_map()
+        .iter()
+        .map(|(key, iw)| {
+            // The map key is the prefix modules see; the entry's own `prefix` is
+            // a normalized copy and is only a fallback. `Module:Citation/CS1`
+            // keys its result by `v["prefix"]`, and both are the same string in
+            // practice, but the key is the one that always exists.
+            let prefix = iw.prefix.clone().unwrap_or_else(|| key.clone());
+            let host = host_of(&iw.url);
+            InterwikiFacts {
+                is_current_wiki: iw.local
+                    && server_host.is_some()
+                    && host.as_deref() == server_host.as_deref(),
+                is_protocol_relative: iw.protorel.unwrap_or(false) || is_protocol_relative(&iw.url),
+                is_extra_language_link: iw.extralanglink.unwrap_or(false),
+                is_transcludable: iw.transclusion_allowed,
+                is_local: iw.local,
+                url: iw.url.clone(),
+                prefix,
+            }
+        })
+        .collect();
+    // MediaWiki returns the map in its configured order; a stable order here
+    // keeps the comparison harness output reproducible.
+    out.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    out
+}
+
+/// The host of an absolute or protocol-relative URL, lowercased.
+///
+/// A URL template such as `https://de.wikipedia.org/wiki/$1` yields the host;
+/// anything without one (a relative or empty URL, e.g. a `localinterwiki`
+/// shortcut) yields `None`.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("//")
+        .or_else(|| url.split_once("://").map(|(_, rest)| rest))?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    // Drop any userinfo and port, neither of which identifies the wiki.
+    let host = host.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether a URL template has no scheme, so the link inherits the page's.
+fn is_protocol_relative(url: &str) -> bool {
+    url.starts_with("//")
 }
 
 /// Everything the engine needs about the invocation, supplied together.
@@ -308,9 +404,13 @@ impl LuaEngine {
         args: &[Arg],
         answers: &crate::pipeline::lua_deferred::DeferredAnswers,
     ) -> Result<String> {
-        let module = self.load_module_value(module_source, Some(title))?;
-        let func = self.module_function(&module, function_name)?;
-
+        // The frame must exist *before the module body runs*, not merely before
+        // its entry point is called: a module may read `mw.getCurrentFrame()` at
+        // module scope, and `Module:Lang` does exactly that on its line 13
+        // (`mw.getCurrentFrame():getTitle():match('/sandbox')`). Installing it
+        // after the load made that call index nil and failed the whole module,
+        // which took `Module:lang`, `Module:Annotated link` and every page that
+        // transcludes them with it.
         let frame = create_frame(
             &self.lua,
             args,
@@ -327,11 +427,14 @@ impl LuaEngine {
             self.pending.clone(),
         )?;
         self.pending.replace(Vec::new());
-        // `mw.getCurrentFrame()` reads this, so the frame must be installed
-        // before the module runs.
+        // `mw.getCurrentFrame()` reads this.
         self.lua
             .set_named_registry_value("current_frame", frame.clone())
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
+        let module = self.load_module_value(module_source, Some(title))?;
+        let func = self.module_function(&module, function_name)?;
+
         let result: Value = func
             .call::<Value>(frame)
             .map_err(|e| RustoidError::Lua(format!("execution error: {e}")))?;
@@ -727,6 +830,17 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // `subjectNamespaces`).
     site.set("subjectNamespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
     site.set("talkNamespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
+    // `mw.site.interwikiMap(filter)` — `Module:Citation/CS1/Configuration` spins
+    // through the local entries to learn which prefixes are language codes, and
+    // stops with "attempt to call a nil value (field 'interwikiMap')" without it.
+    let iw_site = ctx.site.clone();
+    site.set(
+        "interwikiMap",
+        lua.create_function(move |lua, filter: Option<Value>| {
+            luafn_site_interwiki_map(lua, &iw_site, filter.as_ref())
+                .map_err(|e| mlua::Error::runtime(e.to_string()))
+        })?,
+    )?;
     mw.set("site", site)?;
 
     // `mw.isSubsting()` reports whether the current parse is a `subst:`. rustoid
@@ -807,94 +921,26 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     )?;
     mw.set("uri", uri)?;
 
-    // mw.language
-    let lang = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    lang.set("formatNum", lua.create_function(luafn_lang_format_num_any)?)?;
-    lang.set(
-        "getCode",
-        lua.create_function(|_, ()| Ok("en".to_string()))?,
-    )?;
-    // `mw.language.getContentLanguage()` returns the wiki's content language
-    // object; modules call through it to `formatNum`/`getCode` rather than using
-    // `mw.language` directly.
-    let content_language = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    content_language.set("formatNum", lua.create_function(luafn_lang_format_num_any)?)?;
-    // `ucfirst`/`lcfirst` change only the first character. `Module:Footnotes`
-    // calls `lang:ucfirst(name)` to canonicalise a template name, and both take
-    // the language as `self` under the colon call, so they take `Value`s.
-    content_language.set(
-        "ucfirst",
-        lua.create_function(|_, (first, second): (Value, Option<Value>)| {
-            let s = coerce_string(pick_self(&first, second.as_ref()), "ucfirst")?;
-            let mut chars = s.chars();
-            Ok(match chars.next() {
-                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            })
-        })?,
-    )?;
-    content_language.set(
-        "lcfirst",
-        lua.create_function(|_, (first, second): (Value, Option<Value>)| {
-            let s = coerce_string(pick_self(&first, second.as_ref()), "lcfirst")?;
-            let mut chars = s.chars();
-            Ok(match chars.next() {
-                Some(c) => c.to_lowercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            })
-        })?,
-    )?;
-    // `formatDate(format, timestamp)` — date formatting. `Module:Citation/CS1`
-    // uses it to get month names, so the common single-letter formats are
-    // supported; anything else returns the input unchanged, which is visible in
-    // the output rather than silently wrong.
-    content_language.set(
-        "formatDate",
-        lua.create_function(
-            |_, (first, second, third): (Value, Option<Value>, Option<Value>)| {
-                // Called both as `lang:formatDate(f, ts)` (language first) and
-                // `mw.language.formatDate(f, ts)`.
-                let (fmt, stamp) = if matches!(first, Value::Table(_)) {
-                    match (second, third) {
-                        (Some(f), ts) => (f, ts.unwrap_or(Value::Nil)),
-                        (None, _) => return Ok(String::new()),
-                    }
-                } else {
-                    (first, second.unwrap_or(Value::Nil))
-                };
-                let fmt = coerce_string(&fmt, "formatDate")?;
-                let stamp = match stamp {
-                    Value::Nil => return Ok(String::new()),
-                    v => coerce_string(&v, "formatDate")?,
-                };
-                Ok(format_date(&fmt, &stamp))
-            },
-        )?,
-    )?;
-    content_language.set(
-        "getCode",
-        lua.create_function(|_, ()| Ok("en".to_string()))?,
-    )?;
-    content_language.set("code", "en")?;
-    lang.set(
-        "getContentLanguage",
-        lua.create_function(move |_, ()| Ok(content_language.clone()))?,
-    )?;
+    // mw.language — built by its own module, which also yields the content
+    // language object the `mw.getContentLanguage` shorthand returns.
+    let (lang, content_language) =
+        crate::lua::language::build_language_library(lua, ctx.site.language_code.as_str())
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
     mw.set("language", lang)?;
 
     // `mw.getContentLanguage()` is the shorthand for
     // `mw.language.getContentLanguage()`; `Module:Citation/CS1/Configuration`
     // calls it on its first line, so without it the whole CS1 stack fails.
-    let language_table: Table = mw.get("language")?;
-    let get_content_language: Function = language_table.get("getContentLanguage")?;
-    let content_language: Table = get_content_language.call(())?;
     mw.set(
         "getContentLanguage",
         lua.create_function(move |_, ()| Ok(content_language.clone()))?,
+    )?;
+    // `mw.getLanguage(code)` is the shorthand for `mw.language.new(code)`.
+    let language_table: Table = mw.get("language")?;
+    let language_new: Function = language_table.get("new")?;
+    mw.set(
+        "getLanguage",
+        lua.create_function(move |_, code: Value| language_new.call::<Table>(code))?,
     )?;
 
     // mw.ustring
@@ -1021,7 +1067,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
 /// means a `nil` — an absent argument — reaches the function, so the error must
 /// *name the function*: mlua's own conversion message
 /// ("expected string or number") left 37 corpus pages unattributable.
-fn coerce_string(value: &Value, function: &str) -> mlua::Result<String> {
+pub(crate) fn coerce_string(value: &Value, function: &str) -> mlua::Result<String> {
     match value {
         Value::String(s) => s
             .to_str()
@@ -1150,10 +1196,32 @@ fn luafn_title_new(
     // which consults the preloaded facts. An eager `table.set` would shadow it
     // and silently report every page as existing.
     table.set("fragment", fragment)?;
-    table.set(
-        "rootText",
-        title_text.split('/').next().unwrap_or("").to_string(),
-    )?;
+
+    // Scribunto derives these eagerly in `makeTitleObject`, and sets them on the
+    // data table (so they are *fields*, not `__index` fallbacks). `isSubpage` in
+    // particular is read directly by `Module:Flagg` and by sandbox detection in
+    // a dozen modules.
+    let ns = NamespaceFacts::of(&ctx.site, ns_id);
+    let sub = SubpageFields::of(&title_text);
+    table.set("isSubpage", sub.is_subpage)?;
+    table.set("rootText", sub.root_text.clone())?;
+    table.set("baseText", sub.base_text.clone())?;
+    table.set("subpageText", sub.subpage_text.clone())?;
+    table.set("subjectNsText", ns.subject_name.clone())?;
+    table.set("isContentPage", ns.is_content)?;
+    table.set("isSpecialPage", ns_id == ns.special_id)?;
+    table.set("isTalkPage", ns_id % 2 == 1)?;
+    table.set("isExternal", false)?;
+    table.set("interwiki", String::new())?;
+    // A namespace with no talk space (Special, Media) reports no `talkNsText` and
+    // `canTalk = false`; every other namespace reports both.
+    match &ns.talk_name {
+        Some(talk) => {
+            table.set("canTalk", true)?;
+            table.set("talkNsText", talk.clone())?;
+        }
+        None => table.set("canTalk", false)?,
+    }
 
     // Derived fields are computed on demand rather than eagerly: a module that
     // never looks at `talkPageTitle` should not pay for building it, and eager
@@ -1249,8 +1317,256 @@ fn luafn_title_new(
             )
         })?,
     )?;
+    // `title.subPageTitle(text)` — `mw.title.makeTitle(ns, text .. '/' .. text)`.
+    // `Module:Flagg` builds a sandbox module name with it, and its absence made
+    // the call fail as "attempt to call a nil value (method 'subPageTitle')".
+    let subpage_site = ctx.site.clone();
+    table.set(
+        "subPageTitle",
+        lua.create_function(move |lua, (this, sub): (Table, String)| {
+            let ns: i32 = this.get("namespace").unwrap_or(0);
+            let text: String = this.get("text").unwrap_or_default();
+            let full = prefix_title(&subpage_site, ns, &format!("{text}/{sub}"));
+            title_from_full_text(lua, &subpage_site, &full)
+        })?,
+    )?;
+
+    // `title:isSubpageOf(other)` — same interwiki and namespace, and `other`'s
+    // text followed by a slash is a prefix of this title's.
+    table.set(
+        "isSubpageOf",
+        lua.create_function(|_, (this, other): (Table, Table)| {
+            let interwiki: String = this.get("interwiki").unwrap_or_default();
+            let other_iw: String = other.get("interwiki").unwrap_or_default();
+            let ns: i32 = this.get("namespace").unwrap_or(0);
+            let other_ns: i32 = other.get("namespace").unwrap_or(0);
+            let text: String = this.get("text").unwrap_or_default();
+            let other_text: String = other.get("text").unwrap_or_default();
+            Ok(interwiki == other_iw
+                && ns == other_ns
+                && text.starts_with(&format!("{other_text}/")))
+        })?,
+    )?;
+
+    // `title:inNamespace(ns)` / `inNamespaces(...)` — the namespace checks
+    // modules guard on before formatting a title.
+    let ns_site = ctx.site.clone();
+    let ns_for_in = ns_site.clone();
+    table.set(
+        "inNamespace",
+        lua.create_function(move |_, (this, ns): (Table, Value)| {
+            let this_ns: i32 = this.get("namespace").unwrap_or(0);
+            Ok(given_namespace_id(&ns_for_in, &ns) == Some(this_ns))
+        })?,
+    )?;
+    let ns_for_ins = ns_site.clone();
+    table.set(
+        "inNamespaces",
+        // The frame is passed first (`title:inNamespaces(…)`), so the namespaces
+        // are a *multivalue tail*: taking `(Table, MultiValue)` made mlua bind
+        // only the first, so `inNamespaces(0, 6)` tested just `0`.
+        lua.create_function(move |_, args: mlua::MultiValue| {
+            let mut args = args.into_iter();
+            let Some(Value::Table(this)) = args.next() else {
+                return Ok(false);
+            };
+            let this_ns: i32 = this.get("namespace").unwrap_or(0);
+            Ok(args.any(|ns| given_namespace_id(&ns_for_ins, &ns) == Some(this_ns)))
+        })?,
+    )?;
+    let ns_for_subject = ctx.site.clone();
+    table.set(
+        "hasSubjectNamespace",
+        lua.create_function(move |_, (this, ns): (Table, Value)| {
+            let this_ns: i32 = this.get("namespace").unwrap_or(0);
+            Ok(given_namespace_id(&ns_for_subject, &ns) == Some(this_ns - (this_ns % 2)))
+        })?,
+    )?;
+
+    // `__tostring` is what `require(tostring(mw.title.new('Module:X')))` relies
+    // on: without it, `tostring` yields `table: 0x…`, and `Module:Flagg` asked
+    // for a module of that name — a request that could never be satisfied, so
+    // the preload loop retried it until it gave up.
+    mt.set(
+        "__tostring",
+        lua.create_function(|_, t: Table| t.get::<String>("prefixedText"))?,
+    )?;
+    // `__eq` and `__lt` compare the three identifying fields, in Scribunto's
+    // order (interwiki, namespace, text). Titles are compared with `==` and `<`
+    // in modules constantly, and without these Lua compares table identity.
+    mt.set(
+        "__eq",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            Ok(title_identity(&a) == title_identity(&b))
+        })?,
+    )?;
+    mt.set(
+        "__lt",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            Ok(title_identity(&a) < title_identity(&b))
+        })?,
+    )?;
+
     table.set_metatable(Some(mt));
     Ok(table)
+}
+
+/// The `(interwiki, namespace, text)` triple Scribunto compares titles by.
+fn title_identity(t: &Table) -> (String, i32, String) {
+    (
+        t.get::<String>("interwiki").unwrap_or_default(),
+        t.get::<i32>("namespace").unwrap_or(0),
+        t.get::<String>("text").unwrap_or_default(),
+    )
+}
+
+/// Resolve a namespace argument that may be an id or a name.
+fn given_namespace_id(site: &LuaSite, ns: &Value) -> Option<i32> {
+    match ns {
+        Value::Integer(i) => Some(*i as i32),
+        Value::Number(n) => Some(*n as i32),
+        Value::String(s) => s.to_str().ok().and_then(|s| site.namespace_id(&s)),
+        _ => None,
+    }
+}
+
+/// Build the title object for a full `Ns:Text` string, with no external data.
+///
+/// `subPageTitle` and the `*PageTitle` accessors need to *construct* a title,
+/// not merely describe one, and that construction is the same work
+/// [`luafn_title_new`] does — minus the `LuaContext`, since these titles are
+/// derived rather than looked up, so none of the preloaded page facts apply.
+fn title_from_full_text(lua: &Lua, site: &LuaSite, full: &str) -> mlua::Result<Value> {
+    let (ns_id, title_text) = split_title(site, full);
+    let ns = NamespaceFacts::of(site, ns_id);
+    let sub = SubpageFields::of(&title_text);
+    let table = lua.create_table()?;
+    table.set("text", title_text)?;
+    table.set("nsText", site.namespace_name(ns_id))?;
+    table.set("namespace", ns_id)?;
+    table.set("fullText", full.to_string())?;
+    table.set("prefixedText", full.to_string())?;
+    table.set("fragment", String::new())?;
+    table.set("isSubpage", sub.is_subpage)?;
+    table.set("rootText", sub.root_text)?;
+    table.set("baseText", sub.base_text)?;
+    table.set("subpageText", sub.subpage_text)?;
+    table.set("subjectNsText", ns.subject_name)?;
+    table.set("isContentPage", ns.is_content)?;
+    table.set("isSpecialPage", ns_id == ns.special_id)?;
+    table.set("isTalkPage", ns_id % 2 == 1)?;
+    table.set("isExternal", false)?;
+    table.set("interwiki", String::new())?;
+    match ns.talk_name {
+        Some(talk) => {
+            table.set("canTalk", true)?;
+            table.set("talkNsText", talk)?;
+        }
+        None => table.set("canTalk", false)?,
+    }
+    let mt = lua.create_table()?;
+    mt.set(
+        "__tostring",
+        lua.create_function(|_, t: Table| t.get::<String>("prefixedText"))?,
+    )?;
+    table.set_metatable(Some(mt));
+    Ok(Value::Table(table))
+}
+
+/// Split `Ns:Text#frag` into a namespace id and the bare title text.
+fn split_title(site: &LuaSite, full: &str) -> (i32, String) {
+    let (prefix, rest) = match full.split_once(':') {
+        Some((p, r)) => (site.namespace_id(p), r),
+        None => (None, full),
+    };
+    let rest = rest.split_once('#').map(|(t, _)| t).unwrap_or(rest);
+    (prefix.unwrap_or(0), rest.trim().to_string())
+}
+
+/// The subpage fields of a title, as `mw.title.lua` computes them.
+///
+/// Scribunto matches `'^[^/]*().*()/[^/]*$'` against the title text and uses the
+/// two capture *positions* as boundaries:
+///
+/// - `rootText` is everything before the first slash;
+/// - `baseText` is everything before the last slash;
+/// - `subpageText` is everything after the last slash.
+///
+/// Checked against Lua rather than reasoned about, because the pattern is
+/// subtler than it looks: any slash at all matches, including a leading `/Foo`
+/// (root and base both empty) and a trailing `Foo/` (subpage empty), and the
+/// first and last slash may be the same character. Only a title with no slash is
+/// not a subpage, in which case all three fields are the whole text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubpageFields {
+    is_subpage: bool,
+    root_text: String,
+    base_text: String,
+    subpage_text: String,
+}
+
+impl SubpageFields {
+    fn of(text: &str) -> Self {
+        let (Some(first), Some(last)) = (text.find('/'), text.rfind('/')) else {
+            return Self {
+                is_subpage: false,
+                root_text: text.to_string(),
+                base_text: text.to_string(),
+                subpage_text: text.to_string(),
+            };
+        };
+        Self {
+            is_subpage: true,
+            root_text: text[..first].to_string(),
+            base_text: text[..last].to_string(),
+            subpage_text: text[last + 1..].to_string(),
+        }
+    }
+}
+
+/// What a title needs to know about its namespace.
+///
+/// `mw.title.lua` reads these off `mw.site.namespaces`, and two of them are not
+/// derivable from the id alone:
+///
+/// - `canTalk` is false for the namespaces that have no talk space (Special,
+///   Media), not merely for the odd ones;
+/// - `subjectNsText` is the *subject* namespace's name, which for a subject
+///   namespace is itself.
+///
+/// `isContent` follows MediaWiki's `$wgContentNamespaces`, in which only the
+/// main namespace is content on most wikis; Module (828) is not.
+struct NamespaceFacts {
+    subject_name: String,
+    talk_name: Option<String>,
+    is_content: bool,
+    special_id: i32,
+}
+
+impl NamespaceFacts {
+    fn of(site: &LuaSite, ns_id: i32) -> Self {
+        let special_id = site.namespace_id("Special").unwrap_or(-1);
+        let media_id = site.namespace_id("Media").unwrap_or(-2);
+        // Media and Special have no talk space; a namespace with no canonical
+        // name at all is also treated as having none, which keeps an unknown id
+        // from inventing one.
+        let has_talk = ns_id != special_id && ns_id != media_id && site.namespace_id_exists(ns_id);
+        let talk_id = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
+        let talk_name = if has_talk && site.namespace_id_exists(talk_id) {
+            Some(site.namespace_name(talk_id))
+        } else {
+            None
+        };
+        // The subject namespace of a talk page is the even id below it; of a
+        // subject namespace, itself.
+        let subject_id = ns_id - (ns_id % 2);
+        Self {
+            subject_name: site.namespace_name(subject_id),
+            talk_name,
+            is_content: ns_id == 0,
+            special_id,
+        }
+    }
 }
 
 /// Look up the preloaded facts for a title, by full text and by bare text.
@@ -1458,7 +1774,7 @@ end
 /// date (`Module:Citation/CS1` iterates `F` and `M` over a year). An unknown
 /// letter is passed through as-is, so unsupported formatting shows up in the
 /// output rather than silently producing an empty string.
-fn format_date(format: &str, stamp: &str) -> String {
+pub(crate) fn format_date(format: &str, stamp: &str) -> String {
     // Only the date part matters for the supported letters, and MediaWiki accepts
     // `YYYY-MM-DD` (optionally with a time), which is what callers build.
     let mut parts = stamp.split(['-', 'T', ' ']);
@@ -1521,18 +1837,6 @@ fn format_date(format: &str, stamp: &str) -> String {
     out
 }
 
-/// Pick the argument that is *not* the language object.
-///
-/// Scribunto's language methods are called both ways — `lang:ucfirst(s)` passes
-/// the language first, `mw.language.ucfirst(s)` does not — so the value is
-/// whichever argument is not a table.
-fn pick_self<'a>(first: &'a Value, second: Option<&'a Value>) -> &'a Value {
-    match (first, second) {
-        (Value::Table(_), Some(s)) => s,
-        _ => first,
-    }
-}
-
 /// `mw.clone(value)` — a deep copy that keeps metatables.
 ///
 /// Only tables need copying; every other value is immutable in Lua, so it is
@@ -1568,32 +1872,6 @@ fn clone_into(lua: &Lua, memo: &Table, value: &Value) -> mlua::Result<Value> {
         copy.set_metatable(Some(mt));
     }
     Ok(Value::Table(copy))
-}
-
-fn luafn_lang_format_num_any(
-    _: &Lua,
-    (first, second): (Value, Option<Value>),
-) -> mlua::Result<String> {
-    let arg = match (&second, &first) {
-        (Some(v), _) => v,
-        (None, v) => v,
-    };
-    let n = match arg {
-        Value::Number(n) => *n,
-        Value::Integer(i) => *i as f64,
-        Value::String(s) => s
-            .to_str()
-            .ok()
-            .and_then(|s| s.trim().replace(',', "").parse::<f64>().ok())
-            .ok_or_else(|| mlua::Error::runtime("formatNum expects a number"))?,
-        other => {
-            return Err(mlua::Error::runtime(format!(
-                "formatNum expects a number, got {}",
-                other.type_name()
-            )));
-        }
-    };
-    Ok(format_number(n))
 }
 
 fn luafn_ustring_len(_: &Lua, s: Value) -> mlua::Result<usize> {
@@ -1870,6 +2148,53 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
     Ok(namespaces)
 }
 
+/// `mw.site.interwikiMap( filter )` — the interwiki prefixes, keyed by prefix.
+///
+/// The filter selects by locality: `"local"` keeps the local prefixes, `"!local"`
+/// the rest, and nil keeps everything. Each value is a table whose fields are the
+/// ones the manual documents, so a module reading `v["prefix"]` or `v.isLocal`
+/// works; `displayText` and `tooltip` are omitted, since they only apply to
+/// extra-language links configured with them and rustoid does not read those.
+fn luafn_site_interwiki_map(lua: &Lua, site: &LuaSite, filter: Option<&Value>) -> Result<Table> {
+    let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    // The filter is a tri-state: select local only, select non-local only, or
+    // select everything. An unrecognized filter matches nothing, which is what
+    // MediaWiki does with an unknown string rather than erroring.
+    let keep: Box<dyn Fn(bool) -> bool> = match filter {
+        None | Some(Value::Nil) => Box::new(|_| true),
+        Some(v) => match coerce_string(v, "interwikiMap")?.as_str() {
+            "local" => Box::new(|is_local| is_local),
+            "!local" => Box::new(|is_local| !is_local),
+            _ => Box::new(|_| false),
+        },
+    };
+
+    let map = lua.create_table().map_err(err)?;
+    for iw in &site.interwikis {
+        if !keep(iw.is_local) {
+            continue;
+        }
+        let entry = lua.create_table().map_err(err)?;
+        entry.set("prefix", iw.prefix.clone()).map_err(err)?;
+        entry.set("url", iw.url.clone()).map_err(err)?;
+        entry
+            .set("isProtocolRelative", iw.is_protocol_relative)
+            .map_err(err)?;
+        entry.set("isLocal", iw.is_local).map_err(err)?;
+        entry
+            .set("isCurrentWiki", iw.is_current_wiki)
+            .map_err(err)?;
+        entry
+            .set("isTranscludable", iw.is_transcludable)
+            .map_err(err)?;
+        entry
+            .set("isExtraLanguageLink", iw.is_extra_language_link)
+            .map_err(err)?;
+        map.set(iw.prefix.clone(), entry).map_err(err)?;
+    }
+    Ok(map)
+}
+
 pub fn format_number(n: f64) -> String {
     if n == n.trunc() && n.abs() < 1e15 {
         let s = (n as i64).to_string();
@@ -1928,7 +2253,7 @@ fn url_decode(s: &str) -> String {
     result
 }
 
-fn lua_value_to_string(value: &Value) -> String {
+pub(crate) fn lua_value_to_string(value: &Value) -> String {
     match value {
         Value::Nil => String::new(),
         Value::Boolean(b) => b.to_string(),
@@ -1948,6 +2273,28 @@ mod tests {
     fn make_engine() -> LuaEngine {
         let ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test Page");
         LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap()
+    }
+
+    /// `(local, non-local, total)` prefix counts, as Lua sees them.
+    ///
+    /// Counting from inside Lua rather than from the config asserts on the map
+    /// the engine actually builds, which is the thing modules index.
+    fn interwiki_counts(engine: &LuaEngine) -> (u32, u32, u32) {
+        let counts = engine
+            .eval(
+                "local l, r, n = 0, 0, 0 \
+                 for _ in pairs(mw.site.interwikiMap('local')) do l = l + 1 end \
+                 for _ in pairs(mw.site.interwikiMap('!local')) do r = r + 1 end \
+                 for _ in pairs(mw.site.interwikiMap()) do n = n + 1 end \
+                 return l .. ',' .. r .. ',' .. n",
+            )
+            .unwrap();
+        let mut parts = counts.split(',').map(|p| p.parse().unwrap());
+        let (l, r, n) = (parts.next(), parts.next(), parts.next());
+        match (l, r, n) {
+            (Some(l), Some(r), Some(n)) => (l, r, n),
+            _ => panic!("unexpected count string: {counts}"),
+        }
     }
 
     #[test]
@@ -2012,6 +2359,109 @@ mod tests {
         assert_eq!(engine.eval("return mw.site.siteName").unwrap(), "Wikipedia");
     }
 
+    /// `mw.site.interwikiMap` is called by `Module:Citation/CS1/Configuration`,
+    /// which stops the whole CS1 stack with "attempt to call a nil value (field
+    /// 'interwikiMap')" without it.
+    #[test]
+    fn test_mw_site_interwiki_map() {
+        let engine = make_engine();
+
+        // The entry fields a module reads, keyed by prefix. The mock mirrors the
+        // parser-test runner's interwiki set: `wikipedia` is local and points at
+        // the wiki's own server, `meatball` is a remote wiki, and the language
+        // links are protocol-relative (`//…`, added by `add_language_interwiki`).
+        assert_eq!(
+            engine
+                .eval("return mw.site.interwikiMap('local').wikipedia.prefix")
+                .unwrap(),
+            "wikipedia"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.site.interwikiMap().wikipedia.url")
+                .unwrap(),
+            "http://en.wikipedia.org/wiki/$1"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.site.interwikiMap().wikipedia.isLocal)")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.site.interwikiMap().meatball.isLocal)")
+                .unwrap(),
+            "false"
+        );
+        // Only a local prefix on this wiki's own server is the current wiki.
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.site.interwikiMap().wikipedia.isCurrentWiki)")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.site.interwikiMap().gerrit.isCurrentWiki)")
+                .unwrap(),
+            "false"
+        );
+
+        // The filter splits the map, and `!local` plus `local` covers all of it.
+        // The mock holds 8 prefixes: `wikipedia`, `gerrit` and `stats` are local,
+        // `meatball` and `memoryalpha` are remote, and the three language links
+        // (`en`, `de`, `fr`) count as local — a language link to another
+        // Wikipedia is "the same project".
+        assert_eq!(interwiki_counts(&engine), (6, 2, 8));
+
+        // `nil` and an absent argument select everything; an unknown filter
+        // selects nothing, which is what MediaWiki does rather than erroring.
+        for call in ["mw.site.interwikiMap(nil)", "mw.site.interwikiMap()"] {
+            let count = engine
+                .eval(&format!(
+                    "local n = 0 for _ in pairs({call}) do n = n + 1 end return n"
+                ))
+                .unwrap();
+            assert_eq!(count, "8", "{call}");
+        }
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = 0 \
+                     for _ in pairs(mw.site.interwikiMap('nonsense')) do n = n + 1 end \
+                     return n"
+                )
+                .unwrap(),
+            "0"
+        );
+    }
+
+    /// `Module:Citation/CS1/Configuration` builds its language-prefix set by
+    /// intersecting the interwiki map's prefixes with its own language table, so
+    /// the prefix must be reachable both as the key and as the entry's field.
+    #[test]
+    fn test_mw_site_interwiki_map_prefix_field() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "for k, v in pairs(mw.site.interwikiMap('local')) do \
+                     if k == v.prefix then return 'ok' end end return 'mismatch'"
+                )
+                .unwrap(),
+            "ok"
+        );
+        // The language links are protocol-relative, which is how a module tells
+        // it must supply the scheme itself.
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.site.interwikiMap('local').en.isProtocolRelative)")
+                .unwrap(),
+            "true"
+        );
+    }
+
     #[test]
     fn test_mw_uri_encode() {
         let engine = make_engine();
@@ -2035,11 +2485,113 @@ mod tests {
     #[test]
     fn test_mw_language_format_num() {
         let engine = make_engine();
+        // `formatNum` lives on a language *object*, not on `mw.language` —
+        // Scribunto's `mw.language.lua` installs it per instance. The shorthand
+        // path modules actually use is `mw.getContentLanguage()`.
         assert_eq!(
             engine
-                .eval("return mw.language.formatNum(1234567)")
+                .eval("return mw.getContentLanguage():formatNum(1234567)")
                 .unwrap(),
             "1,234,567"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.language.getContentLanguage():formatNum(1234)")
+                .unwrap(),
+            "1,234"
+        );
+        // And a freshly constructed object for another code.
+        assert_eq!(
+            engine
+                .eval("return mw.language.new('de'):formatNum(1234)")
+                .unwrap(),
+            "1,234"
+        );
+    }
+
+    /// `mw.language` surface the corpus relies on, exercised through the same
+    /// entry points the modules use.
+    #[test]
+    fn test_mw_language_surface() {
+        let engine = make_engine();
+        // The content language reports its code and direction.
+        assert_eq!(
+            engine
+                .eval("return mw.getContentLanguage():getCode()")
+                .unwrap(),
+            "en"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.getContentLanguage():getDir()")
+                .unwrap(),
+            "ltr"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.getContentLanguage():isRTL())")
+                .unwrap(),
+            "false"
+        );
+        // An Arabic object is right-to-left, which is what `Module:Lang` branches on.
+        assert_eq!(
+            engine
+                .eval("return mw.language.new('ar'):getDir()")
+                .unwrap(),
+            "rtl"
+        );
+        // `mw.getLanguage` is the documented shorthand for `new`.
+        assert_eq!(
+            engine
+                .eval("return mw.getLanguage('fr'):getCode()")
+                .unwrap(),
+            "fr"
+        );
+        // The `.code` property is read directly by `Module:Lang`.
+        assert_eq!(
+            engine.eval("return mw.getContentLanguage().code").unwrap(),
+            "en"
+        );
+    }
+
+    /// `getDurationIntervals` feeds `string.format('%02d', …)`, so its values
+    /// must be integers rather than floats.
+    #[test]
+    fn test_mw_language_duration_intervals() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = mw.getContentLanguage():getDurationIntervals(3725, {'hours','minutes','seconds'}) \
+                     return t.hours .. '|' .. t.minutes .. '|' .. t.seconds"
+                )
+                .unwrap(),
+            "1|2|5"
+        );
+    }
+
+    /// `fetchLanguageNames` must return a table whose keys and values are all
+    /// strings, because `Module:Citation/CS1` inverts it with `#k` on the key
+    /// and `mw.ustring.lower` on the value.
+    #[test]
+    fn test_mw_language_fetch_language_names() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.language.fetchLanguageNames('en', 'all').de")
+                .unwrap(),
+            "German"
+        );
+        // The corpus checks `#k`, which a numeric key would break on.
+        assert_eq!(
+            engine
+                .eval(
+                    "for k, v in pairs(mw.language.fetchLanguageNames('en', 'all')) do \
+                     if type(k) ~= 'string' or type(v) ~= 'string' then return 'bad' end end \
+                     return 'ok'"
+                )
+                .unwrap(),
+            "ok"
         );
     }
 
