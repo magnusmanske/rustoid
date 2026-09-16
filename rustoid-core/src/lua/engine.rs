@@ -2334,12 +2334,26 @@ fn format_strftime(spec: &str, utc: chrono::DateTime<chrono::Utc>) -> String {
 /// letter is passed through as-is, so unsupported formatting shows up in the
 /// output rather than silently producing an empty string.
 pub(crate) fn format_date(format: &str, stamp: &str) -> String {
+    // A relative expression (`today + 2 days`, `now`) is a documented `#time`
+    // input, and `Module:Citation/CS1` relies on it: it bounds an access date
+    // against `today + 2 days`. The resulting instant then formats like any
+    // other, so it is resolved to a date here and the rest is unchanged.
+    let resolved = resolve_relative(stamp);
+    let stamp = resolved.as_deref().unwrap_or(stamp);
+
     // Only the date part matters for the supported letters, and MediaWiki accepts
     // `YYYY-MM-DD` (optionally with a time), which is what callers build.
     let mut parts = stamp.split(['-', 'T', ' ']);
     let year = parts.next().and_then(|s| s.parse::<i32>().ok());
     let month = parts.next().and_then(|s| s.parse::<usize>().ok());
     let day = parts.next().and_then(|s| s.parse::<u32>().ok());
+
+    // The time of day, which only `U` and `H`/`i`/`s` need; a date-only stamp
+    // means midnight.
+    let mut time = stamp.split(['T', ' ']).nth(1).unwrap_or("").split(':');
+    let hour = time.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let minute = time.next().and_then(|s| s.trim().parse::<u32>().ok());
+    let second = time.next().and_then(|s| s.trim().parse::<u32>().ok());
 
     const LONG: [&str; 12] = [
         "January",
@@ -2389,11 +2403,98 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> String {
             ),
             'j' => out.push_str(&day.unwrap_or(0).to_string()),
             'd' => out.push_str(&format!("{:02}", day.unwrap_or(0))),
+            // `U` is the Unix timestamp, which is what `Module:Citation/CS1`
+            // compares against when bounding an access date. An unparseable
+            // date yields nothing rather than a misleading epoch.
+            'U' => out.push_str(&unix_timestamp(year, month, day, hour, minute, second)),
             _ => out.push(c),
         }
     }
     let _ = DAYS;
     out
+}
+
+/// The Unix timestamp of a date and time, or an empty string if it is not a
+/// real date.
+///
+/// An unparseable date must not silently become the epoch: `Module:Citation/CS1`
+/// compares the result against a cutoff, and `0` would read as a valid — and
+/// very old — date.
+fn unix_timestamp(
+    year: Option<i32>,
+    month: Option<usize>,
+    day: Option<u32>,
+    hour: Option<u32>,
+    minute: Option<u32>,
+    second: Option<u32>,
+) -> String {
+    let (Some(y), Some(m), Some(d)) = (year, month, day) else {
+        return String::new();
+    };
+    chrono::NaiveDate::from_ymd_opt(y, m as u32, d)
+        .and_then(|date| {
+            date.and_hms_opt(hour.unwrap_or(0), minute.unwrap_or(0), second.unwrap_or(0))
+        })
+        .map(|dt| dt.and_utc().timestamp().to_string())
+        .unwrap_or_default()
+}
+
+/// Resolve the relative date expressions `#time` accepts to an absolute date.
+///
+/// Only the forms the corpus uses are handled — `today`, `now`, `yesterday`,
+/// `tomorrow`, each optionally followed by ` +/- N unit(s)`. Anything else
+/// returns `None`, so the caller falls back to parsing the text as a date.
+///
+/// The result is `YYYY-MM-DD HH:MM:SS` in UTC, which is what the caller's
+/// parser expects.
+fn resolve_relative(stamp: &str) -> Option<String> {
+    const UNITS: [(&str, i64); 6] = [
+        ("second", 1),
+        ("minute", 60),
+        ("hour", 3_600),
+        ("day", 86_400),
+        ("week", 604_800),
+        ("month", 2_592_000),
+    ];
+
+    let trimmed = stamp.trim();
+    let (base, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .map_or((trimmed, ""), |(a, b)| (a, b.trim()));
+
+    let mut when = chrono::Utc::now();
+    match base.to_ascii_lowercase().as_str() {
+        "today" | "now" => {}
+        "yesterday" => when -= chrono::Duration::seconds(86_400),
+        "tomorrow" => when += chrono::Duration::seconds(86_400),
+        _ => return None,
+    }
+    // "today" means midnight, so a bare `today + 2 days` is two whole days on.
+    if matches!(
+        base.to_ascii_lowercase().as_str(),
+        "today" | "yesterday" | "tomorrow"
+    ) {
+        when = when.date_naive().and_hms_opt(0, 0, 0)?.and_utc();
+    }
+
+    if !rest.is_empty() {
+        // `+ N days` / `- N days`, with an optional plural `s`.
+        let rest = rest.trim_start_matches(['+', ' ']);
+        let (sign, rest) = match rest.strip_prefix('-') {
+            Some(r) => (-1, r.trim_start()),
+            None => (1, rest.trim_start()),
+        };
+        let mut fields = rest.split_whitespace();
+        let amount: i64 = fields.next()?.parse().ok()?;
+        let unit = fields.next()?.trim_end_matches('s');
+        let seconds = UNITS
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(unit))
+            .map(|(_, secs)| *secs)?;
+        when += chrono::Duration::seconds(sign * amount * seconds);
+    }
+
+    Some(when.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 /// `mw.clone(value)` — a deep copy that keeps metatables.
@@ -3506,6 +3607,64 @@ mod tests {
                 .eval("return mw.uri.anchorEncode('Hello World?')")
                 .unwrap(),
             "Hello_World%3F"
+        );
+    }
+
+    /// `formatDate('U', …)` yields a Unix timestamp, which
+    /// `Module:Citation/CS1/Date_validation` compares against a cutoff. It also
+    /// passes a *relative* date (`'today + 2 days'`), a documented `#time`
+    /// input, so both the `U` letter and relative resolution are needed.
+    #[test]
+    fn test_mw_language_format_date_unix() {
+        let engine = make_engine();
+        // An absolute date: 2020-01-01T00:00:00Z.
+        assert_eq!(
+            engine
+                .eval("return mw.getContentLanguage():formatDate('U', '2020-01-01')")
+                .unwrap(),
+            "1577836800"
+        );
+        // A relative date resolves to a real timestamp, and `today` means
+        // midnight, so adding two days lands on a whole day.
+        assert_eq!(
+            engine
+                .eval(
+                    "local ts = mw.getContentLanguage():formatDate('U', 'today + 2 days') \
+                     if not tonumber(ts) then return 'not a number' end \
+                     if tonumber(ts) % 86400 ~= 0 then return 'not midnight' end \
+                     return 'ok'"
+                )
+                .unwrap(),
+            "ok"
+        );
+        // Tomorrow is a day later than today.
+        assert_eq!(
+            engine
+                .eval(
+                    "local l = mw.getContentLanguage() \
+                     return tonumber(l:formatDate('U', 'tomorrow')) \
+                          - tonumber(l:formatDate('U', 'today'))"
+                )
+                .unwrap(),
+            "86400"
+        );
+        // An unparseable date yields nothing, so `tonumber` gives nil and the
+        // caller takes its documented failure path rather than comparing
+        // against the epoch.
+        assert_eq!(
+            engine
+                .eval(
+                    "return tostring(tonumber(mw.getContentLanguage():formatDate('U', 'nonsense')))"
+                )
+                .unwrap(),
+            "nil"
+        );
+        // The other supported letters keep working alongside `U`.
+        assert_eq!(
+            engine
+                .eval("return mw.getContentLanguage():formatDate('Y-m-d', '2020-01-02')")
+                .unwrap(),
+            "2020-01-02"
         );
     }
 
