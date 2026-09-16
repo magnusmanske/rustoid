@@ -468,7 +468,18 @@ impl LuaEngine {
             .call::<Value>(frame)
             .map_err(|e| RustoidError::Lua(format!("execution error: {e}")))?;
 
-        Ok(lua_value_to_string(&result))
+        // Scribunto runs the returned value through `tostring` before handing it
+        // to the parser, so a value with a `__tostring` metamethod — an `mw.html`
+        // node, for instance — renders rather than being dropped. Returning a
+        // table used to yield the empty string, which lost a module's whole
+        // output when it returned a builder.
+        let rendered: Value = self
+            .lua
+            .globals()
+            .get::<Function>("tostring")
+            .and_then(|tostring| tostring.call(result))
+            .unwrap_or(Value::Nil);
+        Ok(lua_value_to_string(&rendered))
     }
 
     /// Run with no module title, for callers that have none (the engine's own
@@ -1951,11 +1962,14 @@ function Node:_render()
     return table.concat(out)
 end
 
-function Node:done() return self._parent or self:allDone() end
+function Node:done() return self._parent or self end
 function Node:allDone()
-    -- `allDone` finishes the *whole* tree and returns a string.
+    -- `allDone` traverses to the *root node*, not to its rendered string: the
+    -- manual says it is `done()` all the way up. Returning the render made
+    -- `res:...:done():newline()` call a method on a string, which is how
+    -- Module:Spoken Wikipedia stopped.
     if self._parent then return self._parent:allDone() end
-    return self:_render()
+    return self
 end
 
 -- `tostring(node)` renders the subtree, which is how a node used as a value

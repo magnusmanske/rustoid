@@ -291,8 +291,10 @@ async fn mw_html_builds_and_accepts_a_tagless_builder() {
             local tagless = mw.html.create():wikitext('bare'):done()
             local div = mw.html.create('div'):addClass('a', 'b'):attr('id', 'x')
                 :wikitext('inner'):done()
-            local nested = mw.html.create('span'):tag('b'):wikitext('deep'):allDone()
-            return tagless .. '|' .. div .. '|' .. nested
+            -- `allDone()` returns the root *node*, so it is rendered with
+            -- `tostring` rather than concatenated directly.
+            local nested = tostring(mw.html.create('span'):tag('b'):wikitext('deep'):allDone())
+            return tostring(tagless) .. '|' .. tostring(div) .. '|' .. nested
         end
         return p
     "#;
@@ -308,6 +310,35 @@ async fn mw_html_builds_and_accepts_a_tagless_builder() {
         "attributes: {html}"
     );
     assert!(text_only(&html).contains("deep"), "nested tag: {html}");
+}
+
+/// `done()` and `allDone()` return nodes, not strings, so a chain may keep
+/// calling methods after them. `Module:Spoken Wikipedia` writes
+/// `res:...:done():newline()`, which called a method on a rendered string while
+/// `allDone` returned one — the manual says it walks to the root *node*.
+#[tokio::test]
+async fn mw_html_done_and_all_done_return_nodes() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            -- `done()` on a root returns the root, so this chain works.
+            local chained = mw.html.create('div'):wikitext('a'):done():newline():wikitext('b')
+            -- `allDone()` from a nested tag returns the outermost node, which
+            -- still has the methods.
+            local deep = mw.html.create('div'):tag('b'):wikitext('x'):allDone():newline()
+            return tostring(chained) .. '|' .. tostring(deep)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Html2", module)], "{{#invoke:Html2|main}}").await;
+    assert!(
+        text_only(&html).contains('a') && text_only(&html).contains('b'),
+        "chained after done: {html}"
+    );
+    assert!(
+        text_only(&html).contains('x'),
+        "chained after allDone: {html}"
+    );
 }
 
 /// `frame:getParent().args` must expose the *calling template's* arguments.
