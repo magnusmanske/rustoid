@@ -280,6 +280,11 @@ where
     };
     let mut answers = crate::pipeline::lua_deferred::DeferredAnswers::new();
     let mut asked: Vec<String> = Vec::new();
+    // Modules the loop has already tried to fetch. Without this, a missing
+    // module that `preload` cannot load — a title outside the module namespace,
+    // or one past `MAX_MODULES` — made the loop re-request it every round and
+    // report "could not run X after 70 rounds" instead of the real error.
+    let mut fetched: BTreeSet<String> = BTreeSet::new();
 
     for _ in 0..MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS {
         let outcome = match run_once(
@@ -292,8 +297,11 @@ where
         ) {
             Ok(outcome) => outcome,
             Err(RustoidError::Lua(msg)) => match missing_module_from(&msg) {
-                Some(title) if !registry.contains_key(&title) => {
-                    // Fetch it, plus anything *it* needs, then try again.
+                // Fetch it, plus anything *it* needs, then try again. A module
+                // the loop has already tried to fetch is not retried: the fetch
+                // cannot start succeeding, so the error is the real one and is
+                // reported as-is.
+                Some(title) if !registry.contains_key(&title) && fetched.insert(title.clone()) => {
                     registry.extend(preload(source, &title).await);
                     // A newly loaded module may reference new titles.
                     frame.titles.extend(preload_titles(source, &registry).await);
