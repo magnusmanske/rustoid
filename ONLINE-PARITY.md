@@ -498,36 +498,44 @@ Two things to know about the numbers:
 
 #### Where the Lua errors stand
 
-The offline corpus at this point holds 30 comparable pages and reports **36 Lua
-failures across 21 distinct messages**, down from 87 when the phase began. The
+The offline corpus at this point holds 29 comparable pages and reports **19 Lua
+failures across 18 distinct messages**, down from 87 when the phase began. The
 remaining ones fall into three groups, which is the useful way to read them:
 
-1. **`mw.wikibase`** (14 of the 36) — the largest single item. `Module:Sister
-   project links` and `Module:Wikibase` want `getEntityIdForTitle` and the rest
-   of the entity API, which rustoid does not answer at all.
-2. **Genuine gaps in the `mw` surface**, each a small, well-specified piece:
-   `mw.ext.ParserFunctions` and `mw.loadJsonData` (`Module:Math`,
-   `Module:Music chart`), the `U` sub-tag on `mw.ustring.char`
-   (`Module:Lang`, `Module:Wikt-lang`), and `Module:Piechart` indexing a
-   nil local.
-3. **Engine differences:** `Module:Wikidata` fails to *parse* under Lua 5.4
+1. **`mw` surface gaps**, each small and well-specified: `mw.ext.ParserFunctions`
+   and `mw.loadJsonData` (`Module:Math`, `Module:Music chart`),
+   `mw.ustring.char`'s `U` sub-tag (`Module:Lang`, `Module:Wikt-lang`),
+   `mw.unicode.scripts` returning a boolean instead of a table, and
+   `Module:Piechart` / `Module:OSM Location map` indexing a nil.
+2. **Engine compatibility:** `Module:Wikidata` fails to *parse* under Lua 5.4
    because of `"^\-"`, an escape sequence Lua 5.1 tolerated. That is a module
    written for the older dialect, not a rustoid bug, but it is a real
    compatibility question for the engine.
-
-An earlier reading of this list put the largest group down to "cache coverage,
-not code", on the theory that a computed `require` argument simply was not
-preloaded. That was wrong in the useful direction: the dependency was *always*
-missable, because `required_modules` only looked for a literal directly after the
-call, and `mw.loadData(sandbox('Module:Sister project links/config'))` wraps it.
-Teaching the scanner to find a module title inside a computed argument removed
-every "was not preloaded" failure (42 → 36 offline), with no cache change.
+3. **`Module:Time ago`** subtracting one string from another, which Lua 5.1
+   coerced. Same category as the above.
 
 Two diagnostics earned their keep and are worth keeping in mind when reading
 future failures: a nested load error must be attributed to the **innermost**
 module (see `missing_module_from`), and a `for`-iterator cannot be a Rust
 closure returning a tuple, because mlua drops the second value in that position
 (see `mw.ustring.gcodepoint`).
+
+#### Two wrong readings, and what they cost
+
+Both groups above were, at some point, attributed to something else. Recording
+them because each cost real time:
+
+- The largest group was put down to **cache coverage**, on the theory that a
+  computed `require` argument simply was not preloaded. The dependency was in
+  fact *always* missable: `required_modules` only looked for a literal directly
+  after the call, and `mw.loadData(sandbox('Module:Foo/config'))` wraps it.
+  Teaching the scanner to read a title out of a computed argument removed every
+  "was not preloaded" failure.
+- "The page has no entity" was treated as a cache problem too. It was a *scope*
+  bug: `expand_invoke` passed the invoking frame's title, so a `#invoke` inside a
+  template asked `getEntityIdForCurrentPage` about the template. The fix is one
+  field on `FrameContext`, and it is why exactly one sitelink lookup now runs per
+  page instead of thirty.
 
 ### Phase 5 — On-wiki extensions
 
@@ -541,6 +549,43 @@ closure returning a tuple, because mlua drops the second value in that position
   level so handlers can emit `mw:Extension/<name>` with `data-mw`/`data-parsoid`,
   and so they can be *hybrid* (part wikitext, part HTML) as Parsoid's are.
 - **Exit criterion:** pages with references match.
+
+#### `mw.wikibase` — implemented (the lookup surface)
+
+The entities are read from Wikidata, which is a *different wiki* from the one
+being parsed. `CachedDataSource` therefore holds an optional second wiki with
+its own client and its own cache directory; the layout was already
+`<root>/<host>/`, so nothing had to be restructured. An entity is one request
+to `Special:EntityData/<id>.json`, whose body is the serialisation
+`mw.wikibase` itself consumes; the page's entity is found with
+`wbgetentities&sites=enwiki&titles=…`.
+
+Lua cannot fetch, so entities are gathered before execution the way module
+sources are. Two sources of ids are covered, and the second is the one that
+matters:
+
+- Literals in module source (`mw.wikibase.getLabel('Q42')`).
+- **The page's own entity**, found by a sitelink *search*. A module calling
+  `getEntityIdForCurrentPage()` never names an id, and `Module:Authority control`
+  and `Module:Sister project links` both reach Wikidata this way.
+
+The page title for that search is the **root** page, not the frame that made the
+call: a `#invoke` inside a template asks about the article, while the invoking
+frame is that template. `build_ast` records the real title and passes it through
+`FrameContext::page_title`. Getting this wrong is not a small inefficiency — it
+resolves the wrong entity — and it is worth knowing that the symptom was 30
+sitelink lookups per page instead of one.
+
+An unknown entity stays *absent* rather than becoming an empty table, so
+`entityExists` answers false and the ~19 cached modules that guard on it take
+their own fallback. That is what a wiki without Wikidata does, and it keeps the
+no-entity path honest rather than rendering values that do not exist.
+
+**Still missing, and the reason this is "the lookup surface":** `mw.wikibase.getEntity(id)`
+returns an object, and the object methods beyond label/sitelink/statements
+(`formatPropertyValues`, `formatStatements`) are not implemented.
+`Module:WikidataIB` is 3538 lines and leans on those; it is the next step, not
+this one.
 
 #### Templatestyles — implemented
 
