@@ -178,6 +178,24 @@ impl CachedDataSource {
     /// `kind` distinguishes pages/templates/modules, matching `rustoid-core`'s
     /// split between `get_page_content`/`get_template`/`get_module`.
     async fn fetch(&self, kind: EntryKind, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .fetch_with_revision(kind, key)
+            .await?
+            .map(|(body, _)| body))
+    }
+
+    /// Like [`fetch`](Self::fetch), but also returns the revision the body came
+    /// from.
+    ///
+    /// `<templatestyles>` needs both. The revision is already recorded in the
+    /// cache entry — it is what makes a comparison meaningful — so returning it
+    /// costs nothing, and it is exact whether the body came from the cache or
+    /// from the network.
+    async fn fetch_with_revision(
+        &self,
+        kind: EntryKind,
+        key: &str,
+    ) -> Result<Option<(String, Option<u64>)>> {
         // Trace every *request*, before the cache is consulted, so an offline run
         // reproduces an online one's request sequence exactly. Tracing only the
         // network path hid the whole sequence offline: the loop this was written
@@ -203,7 +221,7 @@ impl CachedDataSource {
             .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
             .get(kind, key)?
         {
-            return Ok(Some(hit.body));
+            return Ok(Some((hit.body, hit.meta.revid)));
         }
 
         let Some(client) = &self.client else {
@@ -241,7 +259,7 @@ impl CachedDataSource {
         {
             self.flush()?;
         }
-        Ok(Some(body))
+        Ok(Some((body, Some(revid))))
     }
 }
 
@@ -256,6 +274,18 @@ impl DataSource for CachedDataSource {
         // a result (a red link) rather than a hard failure.
         Ok(self
             .fetch(EntryKind::Page, &title.full_text())
+            .await
+            .unwrap_or(None))
+    }
+
+    /// Content *and* its revision, which `<templatestyles>` needs: the text is
+    /// inlined and the revision becomes the `data-mw-deduplicate` key.
+    async fn get_page_with_revision(
+        &self,
+        title: &rustoid_core::Title,
+    ) -> rustoid_core::Result<Option<(String, Option<u64>)>> {
+        Ok(self
+            .fetch_with_revision(EntryKind::Page, &title.full_text())
             .await
             .unwrap_or(None))
     }

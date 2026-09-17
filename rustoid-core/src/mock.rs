@@ -72,6 +72,12 @@ pub struct MockDataSource {
     /// to PHP `MockApiHelper::getPageInfo`'s per-title `missing`/`known`/
     /// `redirect`/`linkclasses` model.
     page_info: RwLock<HashMap<String, PageInfo>>,
+    /// Revision ids, for the pages a test wants to pin one on.
+    ///
+    /// Empty by default, which is the honest state for a mock with no revision
+    /// history: a caller that needs a revision sees none rather than a made-up
+    /// number. `<templatestyles>` is the caller that cares.
+    revisions: RwLock<HashMap<String, u64>>,
 }
 
 impl MockDataSource {
@@ -85,7 +91,19 @@ impl MockDataSource {
             redirects: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
             page_info: RwLock::new(HashMap::new()),
+            revisions: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Record a revision id for a page already added.
+    ///
+    /// `<templatestyles>` inlines a stylesheet together with the revision it came
+    /// from, so a test that exercises it supplies one here.
+    pub fn set_revision(&self, title: &str, revid: u64) {
+        self.revisions
+            .write()
+            .unwrap()
+            .insert(title.to_string(), revid);
     }
 
     /// Add a page with the given title and wikitext content.
@@ -162,6 +180,29 @@ impl DataSource for MockDataSource {
             return Ok(Some(content.clone()));
         }
         Ok(self.templates.read().unwrap().get(&key).cloned())
+    }
+
+    /// Content with the revision recorded for it, if any.
+    ///
+    /// A page with no recorded revision reports `None` for it, so a caller that
+    /// requires one (and must not invent one) behaves as it would against a
+    /// source that cannot supply it.
+    async fn get_page_with_revision(&self, title: &Title) -> Result<Option<(String, Option<u64>)>> {
+        let key = title.full_text();
+        let Some(body) = self.get_page_content(title).await? else {
+            return Ok(None);
+        };
+        // A title may be passed with spaces or underscores, so accept either
+        // spelling rather than making the caller match the insertion form.
+        let underscored = key.replace(' ', "_");
+        let revid = {
+            let revisions = self.revisions.read().unwrap();
+            revisions
+                .get(&key)
+                .or_else(|| revisions.get(&underscored))
+                .copied()
+        };
+        Ok(Some((body, revid)))
     }
 
     async fn get_template(&self, title: &Title) -> Result<Option<String>> {

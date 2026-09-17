@@ -43,6 +43,21 @@ pub trait DataSource: Send + Sync {
     /// Returns `None` if the message does not exist.
     async fn get_message(&self, lang: &str, key: &str) -> Result<Option<String>>;
 
+    /// Fetch a page's content *together with* the revision it came from.
+    ///
+    /// `<templatestyles>` needs both: the text is inlined, and the revision
+    /// forms the `data-mw-deduplicate` key that the output is compared on. They
+    /// have to come from one fetch, because a key naming one revision beside the
+    /// text of another is worse than no stylesheet at all.
+    ///
+    /// The default reports no revision, which is the honest answer for a source
+    /// that does not track them (the mock, and the synchronous `wikitext_to_ast`
+    /// path). A caller that needs the revision treats it as unavailable rather
+    /// than inventing one.
+    async fn get_page_with_revision(&self, title: &Title) -> Result<Option<(String, Option<u64>)>> {
+        Ok(self.get_page_content(title).await?.map(|body| (body, None)))
+    }
+
     /// Fetch page metadata used to resolve links to existing vs. missing
     /// (red-link) targets. Faithful to PHP `DataAccess::getPageInfo`, returning
     /// per-title `{ missing, known, redirect, linkclasses }`.

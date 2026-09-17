@@ -56,6 +56,70 @@ fn wikitext_pre_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfc
     }
 }
 
+/// If `item` is a `<templatestyles>` extension token, return the self-closing
+/// token.
+///
+/// Recognised by the extension token's `name` attribute, the same way the
+/// extension handler dispatches.
+fn templatestyles_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    if stt.name != "extension" {
+        return None;
+    }
+    let name = stt
+        .attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str());
+    (name == Some("templatestyles")).then_some(stt)
+}
+
+/// Normalise a `data-mw` attribute value for use as a title or a selector.
+///
+/// Two spellings reach this: a plain `"Z.css"` (from a literal tag, whose
+/// quotes the tokenizer already handled) and a backslash-escaped `\"Z.css\"`
+/// (from `#tag`, where the value travelled through Lua and `pf_tag` could not
+/// unescape it). Both mean `Z.css`.
+fn unquote_attr_value(raw: &str) -> String {
+    let unescaped = raw.replace("\\\"", "\"").replace("\\'", "'");
+    let trimmed = unescaped.trim();
+    let inner = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        });
+    match inner {
+        // A `""` value means empty, not a page named `"`.
+        Some("") => String::new(),
+        Some(inner) => inner.trim().to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Resolve a `<templatestyles src>` value to a title.
+///
+/// A bare name is in the Template namespace (`Hlist/styles.css` is
+/// `Template:Hlist/styles.css`), while an explicit prefix is honoured as written
+/// (`Module:Hatnote/styles.css`). Mirrors `$wgTemplateStylesDefaultNamespace`.
+fn templatestyles_title(config: &dyn crate::traits::SiteConfig, src: &str) -> crate::title::Title {
+    let (namespace, rest) = match src.split_once(':') {
+        Some((head, rest)) if config.namespaces().values().any(|ns| ns.canonical == head) => {
+            (Some(head), rest)
+        }
+        _ => (None, src),
+    };
+    let (ns_id, name) = match namespace {
+        Some(ns) => (config.namespace_id(ns).unwrap_or(10), rest),
+        None => (10, rest),
+    };
+    crate::title::Title::new(ns_id, name.replace('_', " "))
+}
+
 /// Extract the raw body source from a `<pre format="wikitext">` extension token.
 fn extension_body(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String {
     let ext_src = stt
@@ -186,6 +250,36 @@ fn emit_gallery_placeholder(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, 
         vsrc: None,
     });
     Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))
+}
+
+/// The `<style typeof="mw:DOMFragment" data-fragment-id=…>` + `</style>`
+/// placeholder pair for a resolved stylesheet, referencing the sub-fragment by
+/// `id`.
+///
+/// Mirrors the tail of `extension_handler::style_items`: a `<style>` fragment is
+/// reached through a `<style typeof="mw:DOMFragment">` wrapper, so the tree
+/// builder stashes the real element and `unpack_dom_fragments` restores it once
+/// the surrounding structure is known.
+fn emit_style_placeholder(
+    stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    id: usize,
+) -> Vec<Item> {
+    use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, TagTk};
+
+    let mut dp = stt.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+
+    let mut open = TagTk::new("style", vec![], dp);
+    open.add_attribute_str("typeof", "mw:DOMFragment");
+    open.add_attribute_str("data-fragment-id", id.to_string().as_str());
+    let close = EndTagTk::new("style", vec![], DataParsoid::default());
+
+    vec![
+        Item::Tok(ParsoidToken::Tag(open)),
+        Item::Tok(ParsoidToken::EndTag(close)),
+    ]
 }
 
 /// Emit the `<pre typeof="mw:Extension/pre">` + `mw:dom-fragment-token` +
@@ -1560,6 +1654,100 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
+    /// Inline every `<templatestyles>` stylesheet.
+    ///
+    /// Async because the CSS lives on a wiki page, like a template's source; the
+    /// extension handler is synchronous and token-only, so it cannot reach a
+    /// `DataSource` and leaves this tag alone.
+    ///
+    /// Each resolved stylesheet becomes a `<style>` element stashed as a
+    /// sub-fragment, the way `style_items` does it, and reached through a
+    /// `mw:DOMFragment` placeholder. That is what keeps the CSS text from being
+    /// re-parsed as wikitext.
+    ///
+    /// Returns the tokens *and* the fragments they reference: the caller must
+    /// hand those to the tree builder, or the stylesheet is lost. Ids are
+    /// allocated from `next_id` so they cannot collide with the caller's.
+    ///
+    /// A tag is left untouched when its `src` is missing, its page does not
+    /// exist, or the page has no usable revision — all of which keep the
+    /// unexpanded tag visible in the diff instead of silently emitting an empty
+    /// stylesheet. A stylesheet that *does* resolve but sanitises to nothing
+    /// produces an empty `<style>`, which is what Parsoid does.
+    async fn expand_templatestyles(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        next_id: &mut usize,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        let Some(source) = source else {
+            return (tokens, std::collections::HashMap::new());
+        };
+        let mut out: Vec<Item> = Vec::with_capacity(tokens.len());
+        let mut fragments: std::collections::HashMap<usize, Node> =
+            std::collections::HashMap::new();
+
+        for item in tokens {
+            let Some(stt) = templatestyles_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            // `src` and `wrapper` arrive as `data-mw` rich attribs: the tokenizer
+            // stores the parsed start-tag attributes there, not as plain token
+            // attributes.
+            let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
+            // A value that came through Lua reaches here with its quotes
+            // backslash-escaped (`\"Z.css\"`), because Scribunto passes the
+            // string through unchanged and `pf_tag` cannot unescape it the way it
+            // does for a plain tag. Strip both forms before treating it as a
+            // title: an attribute value is not part of the page name.
+            let attr = |key: &str| {
+                attrs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some(key))
+                    .and_then(|kv| kv.value.as_str())
+                    .map(unquote_attr_value)
+                    .filter(|v| !v.is_empty())
+            };
+
+            let resolved = match attr("src") {
+                Some(src) => {
+                    let title = templatestyles_title(self.config, &src);
+                    match source.get_page_with_revision(&title).await {
+                        Ok(Some((body, Some(revid)))) => Some((body, revid, src.to_string())),
+                        // No revision means the source cannot be pinned, and a
+                        // dedup key that names no revision would still have to
+                        // match Parsoid's.
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+
+            let Some((body, revid, src)) = resolved else {
+                out.push(Item::Tok(ParsoidToken::SelfclosingTag(stt.clone())));
+                continue;
+            };
+
+            let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
+            let node = crate::pipeline::templatestyles::style_node(
+                &css,
+                revid,
+                &src,
+                &self.new_about_id(about_counter),
+            );
+            let mut frag = crate::dom::node::Node::document();
+            frag.push_child(node);
+            let id = *next_id;
+            *next_id += 1;
+            fragments.insert(id, frag);
+            out.extend(emit_style_placeholder(stt, id));
+        }
+
+        (out, fragments)
+    }
+
     /// Synchronous [`expand_gallery`] for the `wikitext_to_ast` path (no data
     /// source, so no template expansion).
     fn expand_gallery_sync(
@@ -1763,6 +1951,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &mut next_id,
             )
             .await;
+        // `<templatestyles>` needs a page fetch, so like `gallery` it runs here
+        // rather than in the synchronous extension handler.
+        let (tokens, style_fragments) = self
+            .expand_templatestyles(tokens, source, about_counter, &mut next_id)
+            .await;
+        fragments.extend(style_fragments);
 
         let stage = TreeBuilderStage::new(false);
         let mut ast =
@@ -2507,6 +2701,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             /* src_text */ "",
         ))
         .await;
+
+        // A module that reaches `<templatestyles>` through `frame:extensionTag`
+        // lowers it to `#tag`, whose extension token is built during the
+        // expansion above rather than appearing in the top-level stream the pass
+        // in `build_ast` walks. Resolving it here is not possible without
+        // threading the fragment map through `expand_templates` (13 recursive
+        // call sites), because a created `<style>` fragment *must* reach the tree
+        // builder or it is silently dropped — and silently dropping output is
+        // worse than leaving the call unexpanded. The gap is recorded in
+        // `ONLINE-PARITY.md`.
 
         if in_template {
             return expanded;
