@@ -217,37 +217,63 @@ fn normalise_at_prelude(prelude: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// Tidy a declaration's value: drop spaces after commas and after a closing
-/// parenthesis, and prefer double quotes.
+/// Tidy a declaration's value: drop whitespace around `,`, `/`, `%` and `)`,
+/// and prefer double quotes.
 ///
-/// All three are what Parsoid emits, and none is cosmetic: the comparison is
-/// byte-for-byte. A comma inside a function or a list (`rect(0, 0, 0, 0)`,
-/// `"A", serif`) loses its following space; a space that separates a function
-/// from the function that follows it goes too, so
-/// `invert(1) brightness(55%)` becomes `invert(1)brightness(55%)`; and a
-/// single-quoted string becomes double-quoted.
+/// None of this is cosmetic — the comparison is byte-for-byte — and the rules
+/// were read off Parsoid's own output rather than assumed:
 ///
-/// The space is only dropped when an identifier follows, which is what
-/// distinguishes it from the space in a value such as `0 auto` or `12px/1.5`:
-/// those separate values, not chained functions, and are kept.
+/// ```text
+/// rect(0, 0, 0, 0)         -> rect(0,0,0,0)
+/// invert(1) brightness(…)  -> invert(1)brightness(…)
+/// 0 100% 100% 0 / 50%      -> 0 100%100%0/50%
+/// ```
+///
+/// A space that separates two *values* is meaningful and is kept:
+/// `0.5em 0 1em`, `1px solid #aaa`, `0 auto`. The distinction is that `,`, `/`,
+/// `%` and `)` end or join a component, while a space between two values is the
+/// component separator itself.
+///
+/// `calc()` is the exception, and it is not a special case bolted on: its
+/// arguments are an arithmetic expression in which the spaces *are* the
+/// operators, so `calc(100% - 0.7em)` cannot lose them. It is the only function
+/// with that property, and every space that survives next to a `%` in the
+/// corpus is inside one.
 fn normalise_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
+    // Nesting depth of `calc(`, whose contents are passed through untouched.
+    let mut calc_depth = 0usize;
+
     while let Some(c) = chars.next() {
+        if calc_depth > 0 {
+            match c {
+                '(' => calc_depth += 1,
+                ')' => calc_depth -= 1,
+                _ => {}
+            }
+            out.push(c);
+            continue;
+        }
+
         match c {
             '\'' => out.push('"'),
-            ',' => {
-                out.push(',');
-                // Drop the spaces that follow a comma, in a list or in a
-                // function argument alike: Parsoid normalises both.
-                while chars.peek().is_some_and(|n| n.is_whitespace()) {
+            ',' | '/' | '%' => {
+                // The spaces on either side of a joining punctuation mark go.
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c);
+                while chars.peek().is_some_and(|n| *n == ' ') {
                     chars.next();
                 }
             }
             ')' => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
                 out.push(')');
-                // A function immediately followed by another is written without
-                // the separating space once sanitised.
+                // A function chained to the next one loses the separating space.
                 let mut lookahead = chars.clone();
                 let spaces = lookahead.by_ref().take_while(|n| *n == ' ').count();
                 let next = lookahead.next();
@@ -258,6 +284,12 @@ fn normalise_value(value: &str) -> String {
                 }
             }
             _ => out.push(c),
+        }
+
+        // `calc(` opens a pass-through region. Detected after the character is
+        // emitted so the `(` itself is handled by the branch above.
+        if c == '(' && out.ends_with("calc(") {
+            calc_depth = 1;
         }
     }
     out
@@ -540,6 +572,46 @@ div.hatnote {
         assert_eq!(
             render(".a{filter:invert(1) brightness(55%) contrast(250%)}", None),
             ".mw-parser-output .a{filter:invert(1)brightness(55%)contrast(250%)}"
+        );
+    }
+
+    /// Spaces around `%`, `/` and `)` go; spaces *between values* stay. Both
+    /// spellings occur side by side in a single real stylesheet, which is why the
+    /// distinction has to be made by what the space joins.
+    #[test]
+    fn value_separators_are_kept_but_component_joins_are_not() {
+        // A four-value shorthand: the spaces separate values and survive, while
+        // the ones after `%` do not.
+        assert_eq!(
+            render(".a{border-radius:0 500% 0 0}", None),
+            ".mw-parser-output .a{border-radius:0 500%0 0}"
+        );
+        assert_eq!(
+            render(".a{border-radius:0 100% 100% 0 / 50%}", None),
+            ".mw-parser-output .a{border-radius:0 100%100%0/50%}"
+        );
+        // A value with no `%` keeps every separator.
+        assert_eq!(
+            render(".a{margin:0.5em 0 1em 1em}", None),
+            ".mw-parser-output .a{margin:0.5em 0 1em 1em}"
+        );
+        assert_eq!(
+            render(".a{border:1px solid #aaa}", None),
+            ".mw-parser-output .a{border:1px solid #aaa}"
+        );
+    }
+
+    /// `calc()` keeps its spaces: inside it they are the operators, so dropping
+    /// them changes the value. It is the one place a space next to `%` survives.
+    #[test]
+    fn calc_keeps_its_spaces() {
+        assert_eq!(
+            render(".a{width:calc(100% - 0.7em)}", None),
+            ".mw-parser-output .a{width:calc(100% - 0.7em)}"
+        );
+        assert_eq!(
+            render(".a{width:calc( 1px + 2px )}", None),
+            ".mw-parser-output .a{width:calc( 1px + 2px )}"
         );
     }
 
