@@ -149,8 +149,16 @@ async fn fetch_module<S: DataSource + ?Sized>(source: &S, title: &str) -> Option
 
 /// Module titles named by `require('…')` / `mw.loadData('…')` literals.
 ///
-/// Only string literals immediately after the call are collected; a computed
-/// argument is skipped (see the module docs).
+/// The argument is usually a bare literal, but not always: modules wrap it, as
+/// in `mw.loadData(sandbox('Module:Foo/config'))`, where `sandbox` appends
+/// `/sandbox` when the page is a test copy. Scanning only for a literal directly
+/// after the call misses that dependency entirely, and the module then fails at
+/// runtime with "module … was not preloaded".
+///
+/// So when the immediate argument is not a literal, the argument expression is
+/// scanned for its first `Module:`-prefixed literal. The scan stops at the
+/// closing bracket of the call, or at a newline, so it cannot wander into a
+/// later statement and mis-attribute its module.
 fn required_modules(source: &str) -> Vec<String> {
     let mut out = Vec::new();
 
@@ -172,19 +180,78 @@ fn required_modules(source: &str) -> Vec<String> {
         let after_name = idx + keyword.len();
         let tail = source[after_name..].trim_start();
         let tail = tail.strip_prefix('(').unwrap_or(tail);
-        let Some(title) = first_string_literal(tail.trim_start()) else {
-            continue;
+        let argument = tail.trim_start();
+        // The argument is usually a bare literal; when it is computed, look for
+        // the module title it ultimately names.
+        let name = match first_string_literal(argument) {
+            Some(literal) => module_name(literal),
+            None => module_literal_in(argument),
         };
         // Only module-space titles are loadable; `require('foo')` refers to a
         // Lua core library, which the sandbox does not expose.
-        if title.len() > 7 && title[..7].eq_ignore_ascii_case("Module:") {
-            let name = title[7..].replace('_', " ");
+        if let Some(name) = name {
             out.push(format!("Module:{name}"));
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// The module name in a full `Module:…` title, or `None` if it is not one.
+///
+/// Underscores are normalised to spaces so that the title matches the page name
+/// the data source is asked for.
+fn module_name(title: &str) -> Option<String> {
+    let prefix = title.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("Module:") {
+        return None;
+    }
+    Some(title[7..].replace('_', " "))
+}
+
+/// The module name (without the `Module:` prefix) of the first module-space
+/// string literal in a call's argument expression.
+///
+/// The scan is bounded to the argument expression: it ends at the `)` that closes
+/// the call, at a newline, or after a fixed window, so a computed argument cannot
+/// reach into a later statement.
+fn module_literal_in(expression: &str) -> Option<String> {
+    // A call argument is short in practice; this keeps a malformed or unfamiliar
+    // shape from scanning a whole module.
+    const WINDOW: usize = 400;
+
+    let mut depth = 0usize;
+    let mut rest = &expression[..expression.len().min(WINDOW)];
+    while let Some(c) = rest.chars().next() {
+        match c {
+            '(' => {
+                depth += 1;
+                rest = &rest[1..];
+            }
+            ')' => {
+                if depth == 0 {
+                    // The call closed without naming a module.
+                    return None;
+                }
+                depth -= 1;
+                rest = &rest[1..];
+            }
+            '\n' => return None,
+            '\'' | '"' => match first_string_literal(rest) {
+                Some(literal) => {
+                    if let Some(name) = module_name(literal) {
+                        return Some(name);
+                    }
+                    // Step past this literal and keep looking.
+                    rest = &rest[c.len_utf8() + literal.len() + c.len_utf8()..];
+                }
+                None => rest = &rest[c.len_utf8()..],
+            },
+            _ => rest = &rest[c.len_utf8()..],
+        }
+    }
+    None
 }
 
 /// The outcome of one `#invoke` attempt: done, or waiting on the host.
@@ -701,6 +768,46 @@ mod tests {
     fn ignores_computed_and_non_module_requires() {
         let src = "require('Module:' .. name) require('os') local p = prequired";
         assert!(required_modules(src).is_empty());
+    }
+
+    /// A module named through a wrapper is still reachable, so it must be
+    /// preloaded: `Module:Sister project links` calls
+    /// `mw.loadData(sandbox('Module:Sister project links/config'))`, and missing
+    /// this dependency made the module fail at runtime.
+    #[test]
+    fn finds_a_module_named_through_a_wrapper_call() {
+        let src = r#"
+            local cfg = mw.loadData(sandbox('Module:Sister project links/config'))
+            local logo = require(getOther('Module:Sister project logo'))
+        "#;
+        assert_eq!(
+            required_modules(src),
+            vec![
+                "Module:Sister project links/config".to_string(),
+                "Module:Sister project logo".to_string(),
+            ]
+        );
+    }
+
+    /// The scan for a wrapped module name stops at the end of the argument, so a
+    /// later statement's module is not attributed to the `loadData` call.
+    #[test]
+    fn a_wrapped_scan_does_not_reach_a_later_statement() {
+        // `loadData` names no module here; the `require` finds its own, once.
+        let src = "mw.loadData(name)\nlocal x = require('Module:Unrelated')";
+        assert_eq!(required_modules(src), vec!["Module:Unrelated".to_string()]);
+        // A module on the same line belongs to the `loadData` argument only if
+        // the call actually encloses it; here it follows a closed call.
+        let src = "mw.loadData(name) require('Module:Unrelated')";
+        assert_eq!(required_modules(src), vec!["Module:Unrelated".to_string()]);
+    }
+
+    /// The non-`Module:` literals inside a wrapper are skipped rather than being
+    /// mistaken for a module.
+    #[test]
+    fn a_wrapper_may_contain_other_literals_first() {
+        let src = "mw.loadData(prefix('sandbox') .. suffix('Module:Target'))";
+        assert_eq!(required_modules(src), vec!["Module:Target".to_string()]);
     }
 
     /// Underscores in the literal name normalise to spaces, as titles do.
