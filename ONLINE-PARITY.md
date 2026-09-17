@@ -498,22 +498,30 @@ Two things to know about the numbers:
 
 #### Where the Lua errors stand
 
-The offline corpus at this point holds 32 comparable pages and reports **43 Lua
-failures across 23 distinct messages**, down from 87 when the phase began. The
+The offline corpus at this point holds 30 comparable pages and reports **36 Lua
+failures across 21 distinct messages**, down from 87 when the phase began. The
 remaining ones fall into three groups, which is the useful way to read them:
 
-1. **Cache coverage, not code.** `Module:Sister project links/config` and
-   `Module:IPAc-en/pronunciation` are reached through a `require` whose argument
-   is computed, so the offline cache never fetched them (13 of the 43). A single
-   online run of the affected pages adds them and the failures go away.
+1. **`mw.wikibase`** (14 of the 36) — the largest single item. `Module:Sister
+   project links` and `Module:Wikibase` want `getEntityIdForTitle` and the rest
+   of the entity API, which rustoid does not answer at all.
 2. **Genuine gaps in the `mw` surface**, each a small, well-specified piece:
-   `frame:preprocess` (3), `mw.text.unstrip` semantics for `Module:Noinclude`,
-   `mw.ext.ParserFunctions` for `Module:Math`, and the `U` sub-tag on
-   `mw.ustring.char`.
-3. **Host features the Lua side cannot supply:** `#tag` (so
-   `frame:callParserFunction('#tag:…')` fails), `mw.wikibase` answering real
-   entities, and `Module:Wikidata`'s own syntax error, which is a Lua 5.1 vs 5.4
-   escaping difference in *that module*, not in the engine.
+   `mw.ext.ParserFunctions` and `mw.loadJsonData` (`Module:Math`,
+   `Module:Music chart`), the `U` sub-tag on `mw.ustring.char`
+   (`Module:Lang`, `Module:Wikt-lang`), and `Module:Piechart` indexing a
+   nil local.
+3. **Engine differences:** `Module:Wikidata` fails to *parse* under Lua 5.4
+   because of `"^\-"`, an escape sequence Lua 5.1 tolerated. That is a module
+   written for the older dialect, not a rustoid bug, but it is a real
+   compatibility question for the engine.
+
+An earlier reading of this list put the largest group down to "cache coverage,
+not code", on the theory that a computed `require` argument simply was not
+preloaded. That was wrong in the useful direction: the dependency was *always*
+missable, because `required_modules` only looked for a literal directly after the
+call, and `mw.loadData(sandbox('Module:Sister project links/config'))` wraps it.
+Teaching the scanner to find a module title inside a computed argument removed
+every "was not preloaded" failure (42 → 36 offline), with no cache change.
 
 Two diagnostics earned their keep and are worth keeping in mind when reading
 future failures: a nested load error must be attributed to the **innermost**
@@ -526,35 +534,75 @@ closure returning a tuple, because mlua drops the second value in that position
 - **Cite first** (`<ref>`, `<references>`): names and groups, back-links, the
   `mw:Extension/ref` wrapper with its `data-mw` body, and the `<references>`
   list assembly. This is the most-used extension after Lua.
-- Then Poem, finishing Gallery, SyntaxHighlight/Source, Math, Templatedata,
-  Templatestyles; then the placeholder-semantics ones (Timeline, Graph,
-  Mapframe).
+- Then Poem, finishing Gallery, SyntaxHighlight/Source, Math, Templatedata;
+  then the placeholder-semantics ones (Timeline, Graph, Mapframe).
+  **Templatestyles is done** (see below).
 - This needs the extension API widened from `-> Result<String>` to a token/DOM
   level so handlers can emit `mw:Extension/<name>` with `data-mw`/`data-parsoid`,
   and so they can be *hybrid* (part wikitext, part HTML) as Parsoid's are.
 - **Exit criterion:** pages with references match.
 
-#### Templatestyles is the binding constraint on the Lua work
+#### Templatestyles — implemented
 
 `Module:Citation/CS1` and a dozen others call
-`frame:extensionTag('templatestyles', '', {src = …})`, which is now lowered to
-`{{#tag:templatestyles}}` and reaches the parser correctly. It comes back as an
-`<extension>` placeholder, because `extension_handler::expand_extension` handles
-only `nowiki`, `pre`, `style`, `i18ntag`, `i18nattr` and `pwraptest` — the code
-says so itself, "Other built-in extension tags (poem, …) are not yet handled".
+`frame:extensionTag('templatestyles', '', {src = …})`. That is lowered to
+`{{#tag:templatestyles}}` and reaches the parser as an `<extension>`
+placeholder; `Parser::expand_templatestyles` now expands it, rendering the
+stylesheet with `pipeline::templatestyles`.
 
-Two things this is worth being clear about, because it looks like a Lua bug and
-is not:
+What is emitted, from the cached Parsoid output (the real contract, not a guess):
 
-- A *literal* `<templatestyles>` tag fails identically, so the gap is in the
-  extension handler, not in `#tag`, `extensionTag` or the frame plumbing.
-- Nothing can be fixed by answering the call differently in Lua. The placeholder
-  and its escaping happen after Lua has returned.
+```html
+<style data-mw-deduplicate="TemplateStyles:r1368532237"
+       typeof="mw:Extension/templatestyles" about="#mwt3"
+       data-mw='{"name":"templatestyles","attrs":{"src":"…"},"body":{"extsrc":""}}'>
+  …the sanitised, minified CSS…
+</style>
+```
 
-There is a second, related gap visible in the same probe: Parsoid emits nothing
-for `<templatestyles>` (the stylesheet loads out of band), whereas the current
-placeholder serialises as visible escaped text. Whatever handler is written must
-match Parsoid's empty output, not merely stop leaking.
+The revision id in the dedup key is the stylesheet's `revid`, so the inline text
+and the key come from the same fetch (`DataSource::get_page_with_revision`).
+The CSS **is** stored inline — an earlier note here claimed Parsoid emits nothing,
+which is wrong: the fully scoped, minified stylesheet is the element's text.
+
+A bare `src` such as `Hlist/styles.css` resolves to the Template namespace
+(`$wgTemplateStylesDefaultNamespace`).
+
+`pipeline::templatestyles::render` reproduces the sanitiser's transformations.
+Every rule below was derived by diffing against Parsoid's own output, and
+`rustoid-core/tests/templatestyles_parsoid_test.rs` re-checks all of them
+byte-for-byte against the corpus cache:
+
+- **Scoping.** `.mw-parser-output ` is prefixed onto each selector, except one
+  beginning with `html` or `body` followed by a *descendant* combinator, where the
+  scope is inserted after that prefix (documented in Extension:TemplateStyles —
+  that is how a skin-dependent rule escapes the scope). A bare `body`, or
+  `body > .x`, is scoped normally; qualifiers such as `:not(…)` belong to the
+  prefix.
+- **Declarations.** Whitespace around `:` goes, `! important` becomes
+  `!important`, a trailing `;` before `}` is dropped. Spaces after `,` go
+  (`rect(0, 0, 0, 0)` → `rect(0,0,0,0)`), and so does the space chaining one
+  function to the next (`invert(1) brightness(55%)` →
+  `invert(1)brightness(55%)`). Other internal spacing is meaningful and stays
+  (`0 auto`, `12px/1.5`). Single quotes become double.
+- **At-rule preludes.** A media *type* keeps the space after the at-rule name
+  (`@media print{`, `@media screen and (…)`); a bare condition does not
+  (`@media (max-width: 720px)` → `@media(max-width:720px)`). Within a condition,
+  spaces after `:` and `,` go, and `and` loses the space before it when it
+  follows a `)` — the one place that is special.
+- **Comments** are removed entirely.
+
+Two caveats on the Lua path, both recorded at `expand_invoke`:
+
+- The expansion runs as an async pass in `build_ast`. A top-level `{{#invoke:}}`
+  therefore works, but an `extensionTag` call made *inside* a template expansion
+  cannot reach the fragment map without threading it through
+  `expand_templates`' 13 recursive call sites. A `<style>` fragment that never
+  reaches the tree builder is **silently dropped**, which is worse than leaving
+  the tag unexpanded, so that threading was deliberately not done yet.
+- The feature is inert offline: with no stylesheet pages cached, every corpus
+  run leaves the placeholder alone and the score is unchanged. Populating the
+  cache online is required to see any effect.
 
 ### Phase 6 — Integrated-mode semantics
 
