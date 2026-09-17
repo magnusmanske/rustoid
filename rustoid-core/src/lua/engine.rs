@@ -2735,6 +2735,69 @@ fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
 
 // ---- Frame ----
 
+/// The members every frame has, whichever frame it is: `args`,
+/// `argumentPairs`, the four parser-calling methods, and `extensionTag`.
+///
+/// A `frame:getParent()` result is a *frame*, not a stub with `args` on it, so
+/// both are built from here. Building the parent by hand gave it only `args`,
+/// `getTitle` and `getParent`, and `Module:Noinclude` — which writes
+/// `frame:getParent():preprocess(...)` — stopped with "attempt to call a nil
+/// value (method 'preprocess')".
+fn frame_common(
+    lua: &Lua,
+    args: &[Arg],
+    answers: &crate::pipeline::lua_deferred::DeferredAnswers,
+    pending: &std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
+) -> Result<Table> {
+    let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    let frame = lua.create_table().map_err(err)?;
+    frame
+        .set("args", build_args_table(lua, args)?)
+        .map_err(err)?;
+
+    // `frame:argumentPairs()` — the generic-for protocol: return (iterator,
+    // state, control). Lua's own `next` is the iterator, so the args table is
+    // the state and no snapshot has to be stored on the Lua side.
+    frame
+        .set(
+            "argumentPairs",
+            lua.create_function(|lua, this: Table| {
+                let args: Table = this.get("args")?;
+                let next: Function = lua.globals().get("next")?;
+                Ok((next, args, Value::Nil))
+            })
+            .map_err(err)?,
+        )
+        .map_err(err)?;
+
+    // `frame:preprocess(text)` / `frame:expandTemplate{…}` /
+    // `frame:callParserFunction{…}` / `frame:extensionTag{…}` — all of these
+    // need the parser, which only the host has, so the calls are deferred and
+    // answered on the re-run. See [`crate::pipeline::lua_deferred`].
+    for method in [
+        crate::pipeline::lua_deferred::PREPROCESS,
+        crate::pipeline::lua_deferred::EXPAND_TEMPLATE,
+        crate::pipeline::lua_deferred::CALL_PARSER_FUNCTION,
+        // `frame:extensionTag{ name, content, args }` is the `#tag` parser
+        // function, which is how Scribunto itself lowers it.
+        crate::pipeline::lua_deferred::EXTENSION_TAG,
+    ] {
+        frame
+            .set(
+                method,
+                crate::pipeline::lua_deferred::frame_method(
+                    lua,
+                    method,
+                    answers.clone(),
+                    pending.clone(),
+                )?,
+            )
+            .map_err(err)?;
+    }
+
+    Ok(frame)
+}
+
 fn create_frame(
     lua: &Lua,
     args: &[Arg],
@@ -2744,25 +2807,7 @@ fn create_frame(
     answers: crate::pipeline::lua_deferred::DeferredAnswers,
     pending: std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
 ) -> Result<Value> {
-    let frame = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-
-    let args_table = build_args_table(lua, args)?;
-    frame.set("args", args_table)?;
-
-    // `frame:argumentPairs()` — the generic-for protocol: return (iterator,
-    // state, control). Lua's own `next` is the iterator, so the args table is
-    // the state and no snapshot has to be stored on the Lua side.
-    frame.set(
-        "argumentPairs",
-        lua.create_function(|lua, this: Table| {
-            let args: Table = this.get("args")?;
-            let next: Function = lua.globals().get("next")?;
-            Ok((next, args, Value::Nil))
-        })
-        .map_err(|e| RustoidError::Lua(e.to_string()))?,
-    )?;
+    let frame = frame_common(lua, args, &answers, &pending)?;
 
     // `frame:getTitle()` — the page the frame was invoked from.
     let title = page_title.to_string();
@@ -2781,11 +2826,9 @@ fn create_frame(
         // empty and whose title is the page itself — so key the decision on
         // whether a parent was supplied at all, not on whether it had args.
         Some(parent_args) => {
-            let p = lua
-                .create_table()
-                .map_err(|e| RustoidError::Lua(e.to_string()))?;
-            p.set("args", build_args_table(lua, parent_args)?)
-                .map_err(|e| RustoidError::Lua(e.to_string()))?;
+            // The parent is a frame like any other, so it is built by the same
+            // code; only its title and its own (absent) parent differ.
+            let p = frame_common(lua, parent_args, &answers, &pending)?;
             let parent_name = parent_title.unwrap_or(page_title).to_string();
             p.set(
                 "getTitle",
@@ -2803,33 +2846,6 @@ fn create_frame(
     frame.set(
         "getParent",
         lua.create_function(move |_, ()| Ok(parent_frame.clone()))?,
-    )?;
-    // `frame:preprocess(text)` / `frame:expandTemplate{…}` /
-    // `frame:callParserFunction{…}` — all three need the parser, which only the
-    // host has, so the call is deferred and answered on the re-run. See
-    // [`crate::pipeline::lua_deferred`].
-    for method in [
-        crate::pipeline::lua_deferred::PREPROCESS,
-        crate::pipeline::lua_deferred::EXPAND_TEMPLATE,
-        crate::pipeline::lua_deferred::CALL_PARSER_FUNCTION,
-    ] {
-        frame.set(
-            method,
-            crate::pipeline::lua_deferred::frame_method(
-                lua,
-                method,
-                answers.clone(),
-                pending.clone(),
-            )?,
-        )?;
-    }
-    frame.set(
-        "extensionTag",
-        lua.create_function(|_, opts: Table| {
-            let name: String = opts.get("name").unwrap_or_default();
-            let content: String = opts.get("content").unwrap_or_default();
-            Ok(format!("<{name}>{content}</{name}>"))
-        })?,
     )?;
 
     Ok(Value::Table(frame))

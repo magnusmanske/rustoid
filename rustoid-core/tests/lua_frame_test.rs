@@ -144,6 +144,32 @@ async fn preprocess_expands_wikitext() {
     assert!(html.contains("hi there"), "got: {html}");
 }
 
+/// `frame:extensionTag` is lowered to a `#tag` parser-function call, so both of
+/// its documented spellings must build the same request. Only the named-table
+/// form was accepted, which broke 25 corpus pages when
+/// `Module:Citation/CS1` — which writes `frame:extensionTag('templatestyles', '',
+/// {src = …})` — started using it.
+///
+/// The tag itself cannot be asserted end to end, because rustoid's parser has no
+/// `#tag` yet; what is checked is that the call is well-formed and reaches the
+/// parser instead of failing in the argument parser.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn extension_tag_accepts_both_documented_spellings() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local positional = frame:extensionTag('nowiki', 'raw', { src = 'x' })
+            local named = frame:extensionTag{ name = 'nowiki', content = 'raw', args = { src = 'x' } }
+            return type(positional) .. '|' .. type(named)
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    // Both calls returned a value rather than raising.
+    assert!(html.contains("string|string"), "got: {html}");
+}
+
 /// `preprocess` returns *text*, so a module can test it — the point of the
 /// method, and something a lazily-returned token could not do.
 #[tokio::test]
@@ -166,6 +192,79 @@ async fn preprocess_result_is_readable_by_lua() {
     )
     .await;
     assert!(html.contains("matched"), "got: {html}");
+}
+
+/// `frame:getParent()` returns a *frame*, so it has the parser-calling methods
+/// too. `Module:Noinclude` writes `frame:getParent():preprocess(...)`, and the
+/// parent used to be a bare table of `args`, which made that a call to a nil
+/// method on three corpus pages.
+#[tokio::test]
+async fn the_parent_frame_exposes_preprocess() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:getParent():preprocess("{{Greet}}")
+        end
+        return p
+    "#;
+    // The module is invoked *from* a template, which is what gives it a parent.
+    let html = expand(
+        &[("Module:T", module)],
+        &[
+            ("Template:Greet", "hi there"),
+            ("Template:Wrapper", "{{#invoke:T|main}}"),
+        ],
+        "{{Template:Wrapper}}",
+    )
+    .await;
+    assert!(html.contains("hi there"), "got: {html}");
+}
+
+/// The parent frame's `args` are the *calling template's*, and its parser
+/// methods expand in the parent's scope, which is the whole point of asking for
+/// the parent rather than using `frame`.
+#[tokio::test]
+async fn the_parent_frame_expands_in_its_own_scope() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local parent = frame:getParent()
+            return parent:preprocess("{{{1|none}}}")
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[("Template:Wrapper", "{{#invoke:T|main}}")],
+        "{{Template:Wrapper|from the caller}}",
+    )
+    .await;
+    assert!(html.contains("from the caller"), "got: {html}");
+}
+
+/// The parent frame also has `expandTemplate`, for the same reason: it is a
+/// frame, not a stub. `Module:Noinclude` is the corpus case for `preprocess`;
+/// this pins the general property so a future stub cannot narrow the parent
+/// again.
+#[tokio::test]
+async fn the_parent_frame_exposes_expand_template() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:getParent():expandTemplate{ title = "Greet", args = {} }
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[
+            ("Template:Greet", "hi there"),
+            ("Template:Wrapper", "{{#invoke:T|main}}"),
+        ],
+        "{{Template:Wrapper}}",
+    )
+    .await;
+    assert!(html.contains("hi there"), "got: {html}");
 }
 
 /// A module that never reads the answer must not pay for expanding it, and must

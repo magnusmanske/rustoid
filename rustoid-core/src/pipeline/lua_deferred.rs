@@ -25,6 +25,8 @@ pub const EXPAND_TEMPLATE: &str = "expandTemplate";
 pub const PREPROCESS: &str = "preprocess";
 /// `frame:callParserFunction` — `{ name, args = { … } }`.
 pub const CALL_PARSER_FUNCTION: &str = "callParserFunction";
+/// `frame:extensionTag` — `{ name, content, args }`.
+pub const EXTENSION_TAG: &str = "extensionTag";
 
 /// The out-of-band marker that carries a deferred answer back into Lua.
 ///
@@ -362,6 +364,48 @@ fn build_request(method: &str, args: mlua::MultiValue) -> mlua::Result<FrameRequ
                 ));
             }
             Ok(FrameRequest::CallParserFunction { name, args })
+        }
+        EXTENSION_TAG => {
+            // `frame:extensionTag` is `#tag`, so it is lowered to exactly that.
+            // Two documented spellings, and the corpus uses the positional one:
+            //   frame:extensionTag( name, content, args )
+            //   frame:extensionTag{ name, content, args }
+            // In both, the tag name becomes the first argument and the content
+            // the second, with the rest as named parameters.
+            //
+            // A *positional* call arrives as several values, not as one table,
+            // so the rest of the argument list is collected here rather than
+            // read out of `arg`.
+            let rest: Vec<Value> = args.collect();
+            let (name, content, extra) = match arg {
+                Value::Table(opts) if opts.contains_key("name").unwrap_or(false) => (
+                    opts.get::<Option<String>>("name")?.unwrap_or_default(),
+                    opts.get::<Value>("content")?,
+                    opts.get::<Value>("args")?,
+                ),
+                first => (
+                    stringify(&first)?,
+                    rest.first().cloned().unwrap_or(Value::Nil),
+                    rest.get(1).cloned().unwrap_or(Value::Nil),
+                ),
+            };
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return Err(mlua::Error::runtime("extensionTag expects a tag name"));
+            }
+            let mut args = vec![FrameArg::positional(name)];
+            // The content is optional, and a nil one must not become the string
+            // "nil" — `frame:extensionTag{ name = 'ref' }` is a bare tag.
+            if let Value::String(content) = content {
+                args.push(FrameArg::positional(content.to_str()?.to_string()));
+            }
+            if let Value::Table(extra) = extra {
+                args.extend(args_from_table(&extra)?);
+            }
+            Ok(FrameRequest::CallParserFunction {
+                name: "#tag".to_string(),
+                args,
+            })
         }
         PREPROCESS => {
             let Value::String(s) = arg else {
