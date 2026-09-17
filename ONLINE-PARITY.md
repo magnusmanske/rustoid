@@ -534,6 +534,28 @@ closure returning a tuple, because mlua drops the second value in that position
   and so they can be *hybrid* (part wikitext, part HTML) as Parsoid's are.
 - **Exit criterion:** pages with references match.
 
+#### Templatestyles is the binding constraint on the Lua work
+
+`Module:Citation/CS1` and a dozen others call
+`frame:extensionTag('templatestyles', '', {src = …})`, which is now lowered to
+`{{#tag:templatestyles}}` and reaches the parser correctly. It comes back as an
+`<extension>` placeholder, because `extension_handler::expand_extension` handles
+only `nowiki`, `pre`, `style`, `i18ntag`, `i18nattr` and `pwraptest` — the code
+says so itself, "Other built-in extension tags (poem, …) are not yet handled".
+
+Two things this is worth being clear about, because it looks like a Lua bug and
+is not:
+
+- A *literal* `<templatestyles>` tag fails identically, so the gap is in the
+  extension handler, not in `#tag`, `extensionTag` or the frame plumbing.
+- Nothing can be fixed by answering the call differently in Lua. The placeholder
+  and its escaping happen after Lua has returned.
+
+There is a second, related gap visible in the same probe: Parsoid emits nothing
+for `<templatestyles>` (the stylesheet loads out of band), whereas the current
+placeholder serialises as visible escaped text. Whatever handler is written must
+match Parsoid's empty output, not merely stop leaking.
+
 ### Phase 6 — Integrated-mode semantics
 
 - Close the gap to MW core's preprocessor where it differs from Parsoid
