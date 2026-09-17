@@ -141,6 +141,14 @@ pub struct CachedDataSource {
     /// harness's, and the two would overwrite each other's `index.json` — which
     /// silently orphaned hundreds of already-downloaded template bodies.
     cache: Arc<std::sync::Mutex<WikiCache>>,
+    /// The wiki that holds entities, reached for `mw.wikibase`.
+    ///
+    /// Entities live on their own wiki (`www.wikidata.org`), so they need their
+    /// own client and their own cache directory. Absent when no entity wiki is
+    /// configured, which makes every entity lookup miss rather than fail — the
+    /// modules then take their no-data branch, exactly as they do on a wiki with
+    /// no Wikidata access.
+    entities: Option<SiblingWiki>,
     /// When set, a cache miss returns `None` instead of fetching. Template
     /// expansion can trigger many fetches, so this is what keeps an offline run
     /// genuinely offline.
@@ -148,6 +156,15 @@ pub struct CachedDataSource {
     /// Entries stored since the manifest was last written, so the manifest is
     /// not re-serialised on every one of hundreds of template fetches.
     pending: std::sync::atomic::AtomicUsize,
+}
+
+/// A second wiki whose content the parse can reach, with its own cache.
+///
+/// Cached separately because the layout is per-host: an entity's key must not
+/// collide with an article title on the article wiki.
+pub struct SiblingWiki {
+    pub client: Arc<WikiClient>,
+    pub cache: Arc<std::sync::Mutex<WikiCache>>,
 }
 
 impl CachedDataSource {
@@ -159,9 +176,69 @@ impl CachedDataSource {
         Self {
             client,
             cache,
+            entities: None,
             offline,
             pending: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Same, with a wiki to read `mw.wikibase` entities from.
+    #[must_use]
+    pub fn with_entities(mut self, entities: Option<SiblingWiki>) -> Self {
+        self.entities = entities;
+        self
+    }
+
+    /// Read a body from a specific wiki's cache, fetching it when allowed.
+    ///
+    /// Mirrors [`fetch_with_revision`](Self::fetch_with_revision) but against a
+    /// caller-chosen wiki, so entity lookups do not have to pretend to be
+    /// articles on the wiki under test.
+    async fn fetch_from(
+        &self,
+        wiki: &SiblingWiki,
+        kind: EntryKind,
+        key: &str,
+    ) -> Result<Option<String>> {
+        if trace_enabled() {
+            eprintln!("req {kind:?} {key} (sibling)");
+        }
+        if let Some(hit) = wiki
+            .cache
+            .lock()
+            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+            .get(kind, key)?
+        {
+            return Ok(Some(hit.body));
+        }
+        if self.offline {
+            return Ok(None);
+        }
+
+        // Entities have their own endpoint; every other kind is a wiki page.
+        let body = match kind {
+            EntryKind::Entity => wiki.client.entity_json(key).await?,
+            _ => {
+                let Some(revid) = wiki.client.latest_revid(key).await? else {
+                    return Ok(None);
+                };
+                Some(wiki.client.wikitext_at(revid).await?)
+            }
+        };
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let meta = EntryMeta {
+            kind,
+            title: key.to_string(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        wiki.cache
+            .lock()
+            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+            .put(kind, key, &body, meta)?;
+        Ok(Some(body))
     }
 
     /// Persist the manifest, covering entries not yet written out.
@@ -288,6 +365,71 @@ impl DataSource for CachedDataSource {
             .fetch_with_revision(EntryKind::Page, &title.full_text())
             .await
             .unwrap_or(None))
+    }
+
+    /// A Wikidata entity's JSON, from the entity wiki rather than this one.
+    ///
+    /// The entity id is normalised to upper case: modules pass ids straight
+    /// through from article text, where `q42` and `Q42` both occur.
+    async fn get_entity(&self, id: &str) -> rustoid_core::Result<Option<String>> {
+        let Some(wiki) = &self.entities else {
+            return Ok(None);
+        };
+        let key = id.trim().to_ascii_uppercase();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .fetch_from(wiki, EntryKind::Entity, &key)
+            .await
+            .unwrap_or(None))
+    }
+
+    /// The entity id whose `enwiki` sitelink is `title`.
+    ///
+    /// The search itself is a request, and its answer is cached under a
+    /// `sitelink:` key so an offline re-run does not repeat it. A title with no
+    /// entity caches as an empty body, because a page that has no entity today
+    /// will not have one later and a corpus asks about many such titles.
+    ///
+    /// A failure is reported as "no entity", like every other lookup here: it
+    /// must not abort the parse, and `mw.wikibase` has a defined answer for an
+    /// entity it cannot see.
+    async fn get_entity_id_for_page(&self, title: &str) -> rustoid_core::Result<Option<String>> {
+        let Some(wiki) = &self.entities else {
+            return Ok(None);
+        };
+        let key = format!("sitelink:{}", title.trim().replace('_', " "));
+
+        let cached = wiki
+            .cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(EntryKind::Entity, &key).ok().flatten());
+        if let Some(hit) = cached {
+            return Ok(Some(hit.body).filter(|b| !b.is_empty()));
+        }
+        if self.offline {
+            return Ok(None);
+        }
+
+        let found = wiki
+            .client
+            .entity_id_for_title("enwiki", title)
+            .await
+            .ok()
+            .flatten();
+        let body = found.clone().unwrap_or_default();
+        let meta = EntryMeta {
+            kind: EntryKind::Entity,
+            title: key.clone(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        if let Ok(mut guard) = wiki.cache.lock() {
+            let _ = guard.put(EntryKind::Entity, &key, &body, meta);
+        }
+        Ok(found)
     }
 
     async fn get_template(
@@ -624,6 +766,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     // keep its own in-memory manifest, so the two would clobber each other's
     // `index.json` and orphan every template fetched during expansion.
     let source = CachedDataSource::new(Some(Arc::new(client.clone())), Arc::clone(cache), offline);
+    let source = with_entity_wiki(source, client, cache)?;
     let parser = rustoid_core::Parser::new(config);
     let options = rustoid_core::ParserOptions::for_page(title);
     let html = parser
@@ -635,6 +778,40 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     source.flush()?;
     Ok(html)
 }
+
+/// Attach the entity wiki, so `mw.wikibase` has something to read.
+///
+/// Entities live on Wikidata, which is a different wiki with a different cache
+/// directory, so it gets its own client and cache handle. Both are opened under
+/// the same cache root next to the article wiki, which is what makes an offline
+/// run replayable: once fetched, entity lookups come from disk like any other.
+///
+/// Only Wikipedia wikis have a corresponding entity wiki, so another host gets
+/// none and `mw.wikibase` reports every entity as missing.
+fn with_entity_wiki(
+    source: CachedDataSource,
+    client: &WikiClient,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
+) -> Result<CachedDataSource> {
+    let host = &client.wiki().host;
+    if !host.ends_with("wikipedia.org") {
+        return Ok(source);
+    }
+    let root = cache
+        .lock()
+        .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+        .root()
+        .to_path_buf();
+    let entities_cache = Arc::new(std::sync::Mutex::new(WikiCache::open(&root, ENTITY_WIKI)?));
+    let entities_client = Arc::new(WikiClient::new(crate::wire::Wiki::new(ENTITY_WIKI))?);
+    Ok(source.with_entities(Some(SiblingWiki {
+        client: entities_client,
+        cache: entities_cache,
+    })))
+}
+
+/// The wiki entities are stored on.
+const ENTITY_WIKI: &str = "www.wikidata.org";
 
 /// Compare two HTML strings, returning the first difference.
 ///

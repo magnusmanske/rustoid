@@ -45,6 +45,11 @@ pub enum EntryKind {
     /// Raw `siteinfo` JSON for the wiki: namespaces, magic words, function
     /// hooks, extension tags, interwiki map.
     SiteInfo,
+    /// A Wikidata entity's JSON, for `mw.wikibase`.
+    ///
+    /// Entities live on their own wiki, so this kind is cached under that wiki's
+    /// directory rather than the article wiki's.
+    Entity,
 }
 
 impl EntryKind {
@@ -55,6 +60,7 @@ impl EntryKind {
             Self::Module => "mod",
             Self::Rendered => "html",
             Self::SiteInfo => "siteinfo",
+            Self::Entity => "entity",
         }
     }
 }

@@ -91,6 +91,7 @@ impl WikiClient {
             .map_err(|e| CompareError::Http {
                 url: wiki.api_url(),
                 message: format!("client build: {e}"),
+                status: 0,
             })?;
         Ok(Self { wiki, http })
     }
@@ -104,9 +105,12 @@ impl WikiClient {
         // enough on a long run that losing a page to it would make corpus scores
         // noisy, but a retry is safe here because every request is a plain GET of
         // revision-pinned content.
+        //
+        // A request that got a status is *not* retried: the server answered, and
+        // asking again would only waste a request on a definitive 404.
         match self.get_text_once(url).await {
             Ok(body) => Ok(body),
-            Err(CompareError::Http { .. }) => self.get_text_once(url).await,
+            Err(CompareError::Http { status: 0, .. }) => self.get_text_once(url).await,
             Err(e) => Err(e),
         }
     }
@@ -120,16 +124,19 @@ impl WikiClient {
             .map_err(|e| CompareError::Http {
                 url: url.to_string(),
                 message: e.to_string(),
+                status: 0,
             })?;
         let status = resp.status();
         let body = resp.text().await.map_err(|e| CompareError::Http {
             url: url.to_string(),
             message: e.to_string(),
+            status: 0,
         })?;
         if !status.is_success() {
             return Err(CompareError::Http {
                 url: url.to_string(),
                 message: format!("HTTP {status}: {}", truncate(&body, 200)),
+                status: status.as_u16(),
             });
         }
         Ok(body)
@@ -189,6 +196,70 @@ impl WikiClient {
             revid
         );
         self.get_text(&url).await
+    }
+
+    /// Fetch a Wikidata entity as JSON, or `None` when the id does not exist.
+    ///
+    /// `Special:EntityData/<id>.json` is the canonical way to read one entity:
+    /// a single request, and the body is the serialisation `mw.wikibase` itself
+    /// consumes. Going through the page's wikitext instead would mean parsing
+    /// JSON out of a wiki page, and `wbgetentities` would return a batch
+    /// envelope that has to be unwrapped.
+    ///
+    /// A missing entity answers 404, which is a real answer ("no such id") and
+    /// not an error: `mw.wikibase.entityExists` has to report false.
+    pub async fn entity_json(&self, id: &str) -> Result<Option<String>> {
+        let url = format!(
+            "https://{}/wiki/Special:EntityData/{}.json",
+            self.wiki.host,
+            urlencode(id)
+        );
+        match self.get_text(&url).await {
+            Ok(body) => Ok(Some(body)),
+            Err(CompareError::Http { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The entity id that has `title` as its sitelink on `site`, if any.
+    ///
+    /// This is the query `getEntityIdForCurrentPage` and `getEntityIdForTitle`
+    /// answer from, and it is a *search*: the page title alone determines the
+    /// entity, so a module that never names an id still reaches entity data.
+    ///
+    /// `wbgetentities` with `sites`/`titles` is the direct form; the alternative
+    /// is a sitelink search that would return a page of candidates to filter.
+    /// Returns `None` for a title with no entity, which is normal: most articles
+    /// have one, but a red link or a project page does not.
+    pub async fn entity_id_for_title(&self, site: &str, title: &str) -> Result<Option<String>> {
+        let url = format!(
+            "{}?action=wbgetentities&sites={}&titles={}&props=info&format=json&formatversion=2",
+            self.wiki.api_url(),
+            urlencode(site),
+            urlencode(title)
+        );
+        let body = self.get_text(&url).await?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| CompareError::Response {
+                url: url.clone(),
+                message: e.to_string(),
+            })?;
+        // A missing sitelink comes back as `{"entities":{"-1":{...}}}` rather
+        // than as an error, so the id is read off a real entity only.
+        let Some(entity) = parsed
+            .get("entities")
+            .and_then(|e| e.as_object())
+            .and_then(|o| o.values().next())
+        else {
+            return Ok(None);
+        };
+        if entity.get("missing").is_some() {
+            return Ok(None);
+        }
+        Ok(entity
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(str::to_string))
     }
 
     /// Existence metadata for up to 50 titles, with no wikitext.

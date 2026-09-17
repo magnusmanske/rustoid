@@ -10,8 +10,17 @@ pub enum CompareError {
     Cache { path: PathBuf, message: String },
 
     /// An HTTP request failed, or returned a non-success status.
+    ///
+    /// `status` is the server's status when it answered with one, and `0` when
+    /// the request never completed. A 404 is a real answer for some endpoints
+    /// (a missing Wikidata entity, say), so callers must be able to tell it from
+    /// a transport failure.
     #[error("http error for {url}: {message}")]
-    Http { url: String, message: String },
+    Http {
+        url: String,
+        message: String,
+        status: u16,
+    },
 
     /// The wiki returned a body we could not parse.
     #[error("malformed response from {url}: {message}")]
