@@ -241,8 +241,17 @@ pub struct FrameContext {
     pub has_parent: bool,
     /// Wikitext of the page being parsed.
     pub page_source: String,
+    /// Title of the page being parsed.
+    ///
+    /// The *root* page, not the frame that made the `#invoke` call: a module
+    /// invoked from inside a template asks `getEntityIdForCurrentPage` about the
+    /// article, and the invoking frame's title is that template. `build_ast`
+    /// fills this in, because it is the only place that knows the real title.
+    pub page_title: Option<String>,
     /// Preloaded facts for other pages.
     pub titles: std::collections::HashMap<String, TitleFacts>,
+    /// Preloaded Wikidata entities, for `mw.wikibase`.
+    pub entities: crate::lua::wikibase::Entities,
 }
 
 /// What Lua can observe about a page other than the one being parsed.
@@ -287,6 +296,13 @@ pub struct LuaContext {
     /// modules are fetched *before* execution and looked up here; see
     /// [`crate::lua::invoke`].
     pub modules: std::collections::HashMap<String, String>,
+    /// Wikidata entities available to `mw.wikibase`, keyed by upper-cased id
+    /// (`Q42`), with the page title each id is the sitelink of when known.
+    ///
+    /// Lua cannot fetch, so entities are gathered before execution exactly as
+    /// module sources are; see [`crate::lua::wikibase`]. An id that was not
+    /// fetched is simply absent, which is what makes `entityExists` answer false.
+    pub entities: crate::lua::wikibase::Entities,
 }
 
 impl LuaContext {
@@ -300,6 +316,7 @@ impl LuaContext {
             page_source: String::new(),
             titles: std::collections::HashMap::new(),
             modules: std::collections::HashMap::new(),
+            entities: crate::lua::wikibase::Entities::default(),
         }
     }
 
@@ -318,6 +335,7 @@ impl LuaContext {
             page_source: String::new(),
             titles: std::collections::HashMap::new(),
             modules,
+            entities: crate::lua::wikibase::Entities::default(),
         }
     }
 
@@ -337,6 +355,7 @@ impl LuaContext {
             has_parent: frame.has_parent,
             page_source: frame.page_source,
             titles: frame.titles,
+            entities: frame.entities,
         }
     }
 }
@@ -543,6 +562,296 @@ impl LuaEngine {
 }
 
 // ---- mw table setup ----
+
+/// Build the argument `WIKIBASE_LIB` expects: the parsed entities, keyed by id,
+/// plus the id of the page being parsed.
+///
+/// Parsing happens here rather than in Lua so that malformed JSON is a build
+/// error rather than a runtime one, and so the JSON reader is used exactly once
+/// per entity. An entity that does not parse is skipped: a single bad entity
+/// must not take the page down, and an absent one is already a state the API
+/// handles.
+fn entity_table(lua: &Lua, ctx: &LuaContext) -> Result<Table> {
+    let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    let by_id = lua.create_table().map_err(lua_err)?;
+
+    for (id, json) in ctx.entities.iter() {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+            continue;
+        };
+        // `Special:EntityData/<id>.json` wraps the entity in an `entities` map;
+        // accept a bare entity too.
+        let entity = parsed
+            .get("entities")
+            .and_then(|e| e.as_object())
+            .and_then(|o| o.values().next())
+            .unwrap_or(&parsed)
+            .clone();
+        let value = json_to_lua(lua, &entity)?;
+        by_id.set(id, value).map_err(lua_err)?;
+    }
+
+    let out = lua.create_table().map_err(lua_err)?;
+    out.set("byId", by_id).map_err(lua_err)?;
+    out.set("byTitle", by_title_arg(lua, ctx)?)
+        .map_err(lua_err)?;
+    out.set("current", ctx.entities.current().map(str::to_string))
+        .map_err(lua_err)?;
+    Ok(out)
+}
+
+/// The title→id index as a Lua table.
+fn by_title_arg(lua: &Lua, ctx: &LuaContext) -> Result<Table> {
+    let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    let table = lua.create_table().map_err(lua_err)?;
+    for (id, json) in ctx.entities.iter() {
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+            continue;
+        };
+        let entity = parsed
+            .get("entities")
+            .and_then(|e| e.as_object())
+            .and_then(|o| o.values().next())
+            .unwrap_or(&parsed);
+        if let Some(title) = entity
+            .get("sitelinks")
+            .and_then(|s| s.get("enwiki"))
+            .and_then(|s| s.get("title"))
+            .and_then(|t| t.as_str())
+        {
+            table.set(title.replace('_', " "), id).map_err(lua_err)?;
+        }
+    }
+    Ok(table)
+}
+
+/// Convert a JSON value to its Lua equivalent.
+///
+/// Arrays become 1-based tables so `ipairs` works, which is how modules index
+/// statements (`entity:getBestStatements('P31')[1]`). An empty JSON array
+/// becomes an empty table, which is what `#statements == 0` expects.
+///
+/// This is deliberately a small conversion rather than a general JSON bridge:
+/// only the shapes that appear in entity data are handled, so anything else
+/// stands out rather than being silently coerced.
+fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value> {
+    let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    match value {
+        serde_json::Value::Null => Ok(Value::Nil),
+        serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            // A JSON number that has no fractional part stays an integer, so
+            // `numeric-id` compares equal to a Lua integer literal.
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Integer(i))
+            } else {
+                Ok(Value::Number(n.as_f64().unwrap_or(0.0)))
+            }
+        }
+        serde_json::Value::String(s) => Ok(Value::String(lua.create_string(s).map_err(lua_err)?)),
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table().map_err(lua_err)?;
+            for (i, item) in items.iter().enumerate() {
+                table.set(i + 1, json_to_lua(lua, item)?).map_err(lua_err)?;
+            }
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table().map_err(lua_err)?;
+            for (k, v) in map {
+                table
+                    .set(k.as_str(), json_to_lua(lua, v)?)
+                    .map_err(lua_err)?;
+            }
+            Ok(Value::Table(table))
+        }
+    }
+}
+
+/// `mw.wikibase` — the entity API, over entity JSON parsed by the host.
+///
+/// `args` is `{ byId = { [id] = entity }, byTitle = { [title] = id }, current =
+/// id }`. An entity is the raw JSON shape, so `statements`, `labels`,
+/// `sitelinks` and `claims` are read as they appear in the entity, which is what
+/// `Module:Wikidata` does when it walks a snak.
+///
+/// An unknown id is *absent* rather than a table of empty tables: that is what
+/// `entityExists` reports, and the ~19 cached modules that guard on it then take
+/// their own fallback — the behaviour of a wiki without Wikidata.
+const WIKIBASE_LIB: &str = r#"
+return function(args)
+    local wb = {}
+
+    local byId = args.byId
+    local byTitle = args.byTitle
+
+    -- An entity object. The raw JSON is exposed directly, and the methods below
+    -- are added to it, which is how Wikibase's own object behaves: it answers to
+    -- both `entity.id` and `entity:getId()`.
+    local Entity = {}
+    -- The method table is consulted before the raw data, so `entity.getLabel`
+    -- is the function and `entity.labels` is the JSON field. `rawget` is used
+    -- for both lookups: going through `Entity` itself would re-enter this
+    -- metamethod and recurse.
+    Entity.__index = function(self, key)
+        local method = rawget(Entity, key)
+        if method ~= nil then return method end
+        return rawget(self, '_data')[key]
+    end
+
+    local function wrap(data)
+        return setmetatable({ _data = data }, Entity)
+    end
+
+    -- Statement lists are returned as fresh tables so a caller cannot mutate the
+    -- cached entity by sorting or removing.
+    local function copy_list(list)
+        local out = {}
+        for i = 1, #list do out[i] = list[i] end
+        return out
+    end
+
+    function Entity:getId() return rawget(self, '_data').id end
+    function Entity:getType() return rawget(self, '_data').type end
+
+    -- `entity:getLabel( lang )` — the label is a map of language to `{value=…}`.
+    function Entity:getLabel(lang)
+        local labels = rawget(self, '_data').labels
+        if not labels then return nil end
+        local entry = labels[lang or 'en']
+        return entry and entry.value
+    end
+
+    function Entity:getDescription(lang)
+        local descs = rawget(self, '_data').descriptions
+        if not descs then return nil end
+        local entry = descs[lang or 'en']
+        return entry and entry.value
+    end
+
+    function Entity:getSitelink(site)
+        local links = rawget(self, '_data').sitelinks
+        if not links then return nil end
+        local entry = links[site or 'enwiki']
+        return entry and entry.title
+    end
+
+    function Entity:getAllStatements(property)
+        local claims = rawget(self, '_data').claims
+        if not claims or not property then return {} end
+        local list = claims[property]
+        if not list then return {} end
+        return copy_list(list)
+    end
+
+    -- `getBestStatements` filters to rank `preferred` when any exist, else
+    -- `normal`. Deprecated ranks never win, which is the documented rule and
+    -- what `Module:Sister project links` relies on for its P424 lookup.
+    function Entity:getBestStatements(property)
+        local all = self:getAllStatements(property)
+        if #all == 0 then return {} end
+        local best, normal = {}, {}
+        for _, st in ipairs(all) do
+            -- A statement with no rank defaults to `normal`.
+            local rank = st.rank or 'normal'
+            if rank == 'preferred' then
+                best[#best + 1] = st
+            elseif rank == 'normal' then
+                normal[#normal + 1] = st
+            end
+        end
+        if #best > 0 then return best end
+        return normal
+    end
+
+    -- The id for a title, or for the current page when no title is given.
+    -- Wikibase resolves this by sitelink search; here it is a lookup over the
+    -- entities that were actually fetched.
+    function wb.getEntityIdForTitle(title)
+        if title == nil or title == '' then
+            return args.current
+        end
+        local key = tostring(title):gsub('_', ' ')
+        return byTitle[key]
+    end
+
+    function wb.getEntityIdForCurrentPage()
+        return args.current
+    end
+
+    -- `mw.wikibase.getEntity( id )` — the entity object, or nil when it is not
+    -- available. No argument means the current page, which is how real Wikibase
+    -- behaves and how `Module:Location map` calls it.
+    function wb.getEntity(id)
+        local wanted = id or args.current
+        if wanted == nil or wanted == '' then return nil end
+        local data = byId[tostring(wanted):upper()]
+        if not data then return nil end
+        return wrap(data)
+    end
+
+    wb.getEntityObject = wb.getEntity
+
+    function wb.entityExists(id)
+        if id == nil then return false end
+        return byId[tostring(id):upper()] ~= nil
+    end
+
+    -- An entity id is `Q`/`P` followed by digits, with no leading zero. Checked
+    -- rather than trusted because modules pass arbitrary frame arguments here.
+    function wb.isValidEntityId(id)
+        if type(id) ~= 'string' then return false end
+        return id:match('^[QqPp][1-9]%d*$') ~= nil
+    end
+
+    function wb.getLabel(id, lang)
+        local entity = wb.getEntity(id)
+        if not entity then return nil end
+        return entity:getLabel(lang)
+    end
+
+    function wb.getLabelByLang(id, lang)
+        return wb.getLabel(id, lang)
+    end
+
+    function wb.getDescription(id, lang)
+        local entity = wb.getEntity(id)
+        if not entity then return nil end
+        return entity:getDescription(lang)
+    end
+
+    function wb.getDescriptionWithLang(id, lang)
+        local entity = wb.getEntity(id)
+        if not entity then return nil end
+        local langcode = lang or 'en'
+        return entity:getDescription(langcode), langcode
+    end
+
+    function wb.getSitelink(id, site)
+        local entity = wb.getEntity(id)
+        if not entity then return nil end
+        return entity:getSitelink(site)
+    end
+
+    function wb.getBestStatements(id, property)
+        local entity = wb.getEntity(id)
+        if not entity then return {} end
+        return entity:getBestStatements(property)
+    end
+
+    function wb.getAllStatements(id, property)
+        local entity = wb.getEntity(id)
+        if not entity then return {} end
+        return entity:getAllStatements(property)
+    end
+
+    -- The wiki the entities come from. `getGlobalSiteId` is the *client* wiki's
+    -- language, which is `enwiki` on the wiki under test.
+    function wb.getGlobalSiteId() return 'enwiki' end
+
+    return wb
+end
+"#;
 
 /// Install the table deferred frame-call answers are parked in.
 ///
@@ -1116,53 +1425,6 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     mw.set("ext", ext)
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
-
-    // `mw.wikibase` is provided by the Wikibase Client extension, which rustoid
-    // does not implement. It exists as a table of "nothing found" answers rather
-    // than as nil, because that is what a wiki *without* Wikidata looks like:
-    // `Module:Coordinates` writes `if mw.wikibase and mw.wikibase.entityExists(qid)`
-    // and so takes its own fallback, whereas indexing nil failed the page
-    // outright (6 for Module:Official website, 2 for Module:Coordinates).
-    //
-    // A stub that invented an entity would be worse: the modules would render
-    // Wikidata values that do not exist.
-    let wikibase = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    for name in [
-        "getEntityIdForCurrentPage",
-        "getEntityObject",
-        "getEntity",
-        "getLabel",
-        "getDescription",
-    ] {
-        wikibase
-            .set(
-                name,
-                lua.create_function(|_, _: mlua::MultiValue| Ok(Value::Nil))
-                    .map_err(|e| RustoidError::Lua(e.to_string()))?,
-            )
-            .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    }
-    for name in ["getAllStatements", "getBestStatements"] {
-        wikibase
-            .set(
-                name,
-                lua.create_function(|lua, _: mlua::MultiValue| lua.create_table())
-                    .map_err(|e| RustoidError::Lua(e.to_string()))?,
-            )
-            .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    }
-    wikibase
-        .set(
-            "entityExists",
-            lua.create_function(|_, _: Value| Ok(false))
-                .map_err(|e| RustoidError::Lua(e.to_string()))?,
-        )
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    mw.set("wikibase", wikibase)
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-
     // mw.message — the object methods live in `MESSAGE_LIB`, which is given the
     // message store and the content language as its two arguments.
     let messages = lua
@@ -1180,6 +1442,21 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .and_then(|build| build.call(messages))
         .map_err(|e| RustoidError::Lua(format!("mw.message setup: {e}")))?;
     mw.set("message", message)?;
+
+    // mw.wikibase — the entity JSON is parsed once here and the API is expressed
+    // in Lua (`WIKIBASE_LIB`), because the entity object is a plain data wrapper
+    // and its methods are far clearer as Lua than as a dozen registered
+    // closures.
+    let entities: Table = {
+        let args =
+            entity_table(lua, ctx.as_ref()).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+        lua.load(WIKIBASE_LIB)
+            .set_name("mw.wikibase")
+            .eval::<Function>()
+            .and_then(|build| build.call(args))
+            .map_err(|e| RustoidError::Lua(format!("mw.wikibase setup: {e}")))?
+    };
+    mw.set("wikibase", entities)?;
 
     // mw.html — built from Lua source (see `HTML_LIB`).
     let html: Table = lua
@@ -3666,12 +3943,13 @@ mod tests {
         );
     }
 
-    /// `mw.wikibase` reports "nothing found" rather than being nil, which is
-    /// what a wiki without Wikidata looks like. `Module:Coordinates` guards on
-    /// the table's existence and on `entityExists`, so both must be present;
-    /// indexing nil failed the page outright.
+    /// With no entities loaded, `mw.wikibase` reports "nothing found" rather than
+    /// being nil, which is what a wiki without Wikidata looks like.
+    /// `Module:Coordinates` guards on the table's existence and on
+    /// `entityExists`, so both must be present; indexing nil failed the page
+    /// outright.
     #[test]
-    fn test_mw_wikibase_stub() {
+    fn test_mw_wikibase_without_entities() {
         let engine = make_engine();
         // The table exists, so a guard passes.
         assert_eq!(engine.eval("return type(mw.wikibase)").unwrap(), "table");
@@ -3705,6 +3983,226 @@ mod tests {
                 )
                 .unwrap(),
             "fallback"
+        );
+    }
+
+    /// An engine with one real entity loaded, which is what a wiki with Wikidata
+    /// access looks like. The entity is the shape `Special:EntityData` returns,
+    /// trimmed to the parts the API reads.
+    fn make_engine_with_q42() -> LuaEngine {
+        let mut ctx = LuaContext::new(LuaSite::default(), "Douglas Adams");
+        ctx.entities.insert("Q42", ENTITY_Q42.to_string());
+        ctx.entities.set_current(Some("Q42".to_string()));
+        LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap()
+    }
+
+    const ENTITY_Q42: &str = r#"{
+        "entities": {
+            "Q42": {
+                "id": "Q42",
+                "type": "item",
+                "labels": {"en": {"language": "en", "value": "Douglas Adams"}},
+                "descriptions": {"en": {"language": "en", "value": "English writer"}},
+                "sitelinks": {"enwiki": {"site": "enwiki", "title": "Douglas Adams"}},
+                "claims": {
+                    "P31": [
+                        {"id": "Q42$1", "rank": "normal", "mainsnak": {"snaktype": "value"}},
+                        {"id": "Q42$2", "rank": "deprecated", "mainsnak": {"snaktype": "value"}}
+                    ],
+                    "P856": [
+                        {"id": "Q42$3", "rank": "preferred", "mainsnak": {"snaktype": "value"}},
+                        {"id": "Q42$4", "rank": "normal", "mainsnak": {"snaktype": "value"}}
+                    ]
+                }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn test_mw_wikibase_resolves_the_current_page() {
+        let engine = make_engine_with_q42();
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntityIdForCurrentPage()")
+                .unwrap(),
+            "Q42"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntityIdForTitle('') ")
+                .unwrap(),
+            "Q42"
+        );
+        // The page's own title resolves through its sitelink.
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntityIdForTitle('Douglas_Adams')")
+                .unwrap(),
+            "Q42"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.wikibase.getEntityIdForTitle('Nobody'))")
+                .unwrap(),
+            "nil"
+        );
+    }
+
+    #[test]
+    fn test_mw_wikibase_reads_labels_and_sitelinks() {
+        let engine = make_engine_with_q42();
+        assert_eq!(
+            engine.eval("return mw.wikibase.getLabel('Q42')").unwrap(),
+            "Douglas Adams"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getDescription('Q42')")
+                .unwrap(),
+            "English writer"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getSitelink('Q42')")
+                .unwrap(),
+            "Douglas Adams"
+        );
+        // A lower-case id is the same entity, as modules write both spellings.
+        assert_eq!(
+            engine.eval("return mw.wikibase.getLabel('q42')").unwrap(),
+            "Douglas Adams"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.wikibase.getLabel('Q99'))")
+                .unwrap(),
+            "nil"
+        );
+    }
+
+    #[test]
+    fn test_mw_wikibase_reads_statements() {
+        let engine = make_engine_with_q42();
+        assert!(
+            engine
+                .eval("return mw.wikibase.entityExists('Q42')")
+                .unwrap()
+                == "true"
+        );
+        assert!(
+            engine
+                .eval("return mw.wikibase.entityExists('Q99')")
+                .unwrap()
+                == "false"
+        );
+        // `getAllStatements` returns every rank, including deprecated ones.
+        assert_eq!(
+            engine
+                .eval("return #mw.wikibase.getAllStatements('Q42', 'P31')")
+                .unwrap(),
+            "2"
+        );
+        // `getBestStatements` prefers `preferred` over `normal`, and never
+        // returns a deprecated statement when a better rank exists.
+        assert_eq!(
+            engine
+                .eval("return #mw.wikibase.getBestStatements('Q42', 'P856')")
+                .unwrap(),
+            "1"
+        );
+        // With only `normal` and `deprecated`, the normal one wins.
+        assert_eq!(
+            engine
+                .eval("return #mw.wikibase.getBestStatements('Q42', 'P31')")
+                .unwrap(),
+            "1"
+        );
+        // A statement's fields are readable, which is how a snak is walked.
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getBestStatements('Q42', 'P31')[1].id")
+                .unwrap(),
+            "Q42$1"
+        );
+        assert_eq!(
+            engine
+                .eval("return #mw.wikibase.getAllStatements('Q42', 'P999')")
+                .unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_mw_wikibase_entity_object() {
+        let engine = make_engine_with_q42();
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntity('Q42').id")
+                .unwrap(),
+            "Q42"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntity('Q42'):getLabel()")
+                .unwrap(),
+            "Douglas Adams"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntity('Q42'):getId()")
+                .unwrap(),
+            "Q42"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntity('Q42'):getSitelink('enwiki')")
+                .unwrap(),
+            "Douglas Adams"
+        );
+        // Called with no argument, it is the current page's entity.
+        assert_eq!(
+            engine.eval("return mw.wikibase.getEntity().id").unwrap(),
+            "Q42"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.wikibase.getEntity('Q99'))")
+                .unwrap(),
+            "nil"
+        );
+    }
+
+    #[test]
+    fn test_mw_wikibase_validates_ids() {
+        let engine = make_engine();
+        for good in ["Q42", "q42", "P31", "Q1"] {
+            assert_eq!(
+                engine
+                    .eval(&format!(
+                        "return tostring(mw.wikibase.isValidEntityId('{good}'))"
+                    ))
+                    .unwrap(),
+                "true",
+                "{good}"
+            );
+        }
+        // A leading zero, a bare letter and a non-id are all invalid.
+        for bad in ["Q0", "Q", "Foo", "Q42x"] {
+            assert_eq!(
+                engine
+                    .eval(&format!(
+                        "return tostring(mw.wikibase.isValidEntityId('{bad}'))"
+                    ))
+                    .unwrap(),
+                "false",
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.wikibase.isValidEntityId(nil))")
+                .unwrap(),
+            "false"
         );
     }
 

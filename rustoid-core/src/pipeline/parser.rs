@@ -679,6 +679,14 @@ pub struct Parser<'a, C: SiteConfig> {
     /// well-behaved module nests a handful of levels at most. The counter stops
     /// a pathological one from recursing until the stack runs out.
     lua_expansion_depth: std::cell::Cell<usize>,
+    /// Title of the page being parsed, recorded by `build_ast`.
+    ///
+    /// A `#invoke` inside a template needs the *root* page title — a module
+    /// asking `getEntityIdForCurrentPage` means the article, while the frame it
+    /// was called from is a template. Threading the title through every
+    /// expansion call would touch a dozen signatures to serve one caller, so it
+    /// is recorded once per parse like the expansion depth above.
+    page_title: std::cell::RefCell<String>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
@@ -686,6 +694,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         Self {
             config,
             lua_expansion_depth: std::cell::Cell::new(0),
+            page_title: std::cell::RefCell::new(String::new()),
         }
     }
 
@@ -1897,6 +1906,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     ) -> Node {
         let title = TitleParser::parse(page_title, self.config);
         let page_title_prefixed = title.get_prefixed_text();
+        // Recorded for `expand_invoke`, which needs the root page's title for
+        // `mw.wikibase`; see the field's own comment.
+        *self.page_title.borrow_mut() = title.get_prefixed_text();
         let frame = Frame::new(title.clone(), vec![]);
 
         let tokens = self
@@ -2657,6 +2669,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             parent_title: Some(parent_title),
             has_parent: inside_template,
             page_source: _page_source.to_string(),
+            page_title: Some(self.page_title.borrow().clone()),
             ..Default::default()
         };
 

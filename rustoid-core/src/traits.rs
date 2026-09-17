@@ -58,6 +58,30 @@ pub trait DataSource: Send + Sync {
         Ok(self.get_page_content(title).await?.map(|body| (body, None)))
     }
 
+    /// Fetch a Wikidata entity's JSON, addressed by id (`Q42`, `P31`).
+    ///
+    /// `mw.wikibase` reads entities, and it reads them from a *different* wiki
+    /// than the one being parsed, so this is deliberately not expressed in terms
+    /// of [`get_page_content`](Self::get_page_content).
+    ///
+    /// Returns `None` for an id that does not exist, which is a real answer:
+    /// `mw.wikibase.entityExists` must report false rather than raise. The
+    /// default reports every entity as missing, which is the honest behaviour
+    /// for a source with no entity wiki (a test mock, or a wiki whose
+    /// `wikibase` is not reachable) — modules then take their no-data branch.
+    async fn get_entity(&self, _id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The entity id whose sitelink is this page, for `getEntityIdForCurrentPage`.
+    ///
+    /// A sitelink search, not a lookup: the page's *title* determines the entity,
+    /// which is why a module that never names an id still needs one fetched. The
+    /// default reports no entity, as [`get_entity`](Self::get_entity) does.
+    async fn get_entity_id_for_page(&self, _title: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Fetch page metadata used to resolve links to existing vs. missing
     /// (red-link) targets. Faithful to PHP `DataAccess::getPageInfo`, returning
     /// per-title `{ missing, known, redirect, linkclasses }`.

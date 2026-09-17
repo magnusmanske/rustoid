@@ -335,8 +335,17 @@ where
         return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
     };
     let mut registry = preload(source, &call.module_title()).await;
+    // The page an entity is looked up for is the *root* page, not the frame that
+    // made the call: `frame.page_title` carries the real title, and the
+    // `page_title` parameter is the invoking frame's (a template, when the call
+    // came from inside one).
+    let entity_page = frame
+        .page_title
+        .clone()
+        .unwrap_or_else(|| page_title.to_string());
     let mut frame = FrameContext {
         titles: preload_titles(source, &registry).await,
+        entities: preload_entities(source, &registry, Some(&entity_page)).await,
         ..frame
     };
     // Interface messages are fetched here rather than in the parser for the same
@@ -370,8 +379,20 @@ where
                 // reported as-is.
                 Some(title) if !registry.contains_key(&title) && fetched.insert(title.clone()) => {
                     registry.extend(preload(source, &title).await);
-                    // A newly loaded module may reference new titles.
+                    // A newly loaded module may reference new titles and new
+                    // entities, so both are refreshed from the wider registry.
                     frame.titles.extend(preload_titles(source, &registry).await);
+                    frame.entities = preload_entities(
+                        source,
+                        &registry,
+                        Some(
+                            &frame
+                                .page_title
+                                .clone()
+                                .unwrap_or_else(|| page_title.to_string()),
+                        ),
+                    )
+                    .await;
                     continue;
                 }
                 _ => return Err(RustoidError::Lua(msg)),
@@ -489,6 +510,58 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
 
     out
 }
+
+/// Entity data fetched for `mw.wikibase`, before the module runs.
+///
+/// Lua cannot fetch, so entities are gathered the way module sources and page
+/// facts are. Two sources of ids are covered: literals in the module source
+/// (`mw.wikibase.getLabel('Q42')`), and the page's own entity, which is found by
+/// a sitelink search because a module calling `getEntityIdForCurrentPage()` never
+/// names an id at all.
+///
+/// A computed id cannot be preloaded, so this is best-effort exactly as
+/// [`preload`] is. The difference is that a missing entity is a *supported*
+/// state — `entityExists` answers false and the module falls back — rather than
+/// an error.
+pub async fn preload_entities<S: DataSource + ?Sized>(
+    source: &S,
+    registry: &Registry,
+    page_title: Option<&str>,
+) -> crate::lua::wikibase::Entities {
+    use crate::lua::wikibase::{Entities, referenced_entity_ids};
+
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    for body in registry.values() {
+        for id in referenced_entity_ids(body) {
+            wanted.insert(id);
+        }
+    }
+
+    // The page's own entity is resolved first, so it is stored by id and the loop
+    // below does not fetch it a second time.
+    let current = match page_title {
+        Some(title) => source.get_entity_id_for_page(title).await.ok().flatten(),
+        None => None,
+    };
+    if let Some(id) = &current {
+        wanted.insert(id.clone());
+    }
+
+    let mut entities = Entities::default();
+    for id in wanted.into_iter().take(MAX_ENTITIES) {
+        if let Some(json) = source.get_entity(&id).await.ok().flatten() {
+            entities.insert(&id, json);
+        }
+    }
+    entities.set_current(current);
+    entities
+}
+
+/// How many Wikidata entities one render may fetch.
+///
+/// Entities are only fetched when a module names the id, and a module names a
+/// handful; this bounds a hostile or runaway page without touching real usage.
+const MAX_ENTITIES: usize = 200;
 
 /// Page titles named by `mw.title.new('…')` string literals.
 ///

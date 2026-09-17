@@ -7,3 +7,4 @@
 pub mod engine;
 pub mod invoke;
 pub mod language;
+pub mod wikibase;
