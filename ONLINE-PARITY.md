@@ -734,10 +734,11 @@ Two caveats on the Lua path, both recorded at `expand_invoke`:
 - **Exit criterion:** the previously-"unreachable" fixture family becomes
   reachable and passing.
 
-#### Two parser bugs the corpus found, and one it did not
+#### Two parser bugs the corpus found, and one that turned out not to be one
 
-Comparing `Zebra` against the wiki's own Parsoid turned up three parser bugs, two
-of which are fixed and one of which is recorded here rather than fixed.
+Comparing `Zebra` against the wiki's own Parsoid turned up two real parser bugs.
+A third was suspected in the same area and **investigated to a negative result**;
+that is recorded too, because the negative is worth more than the suspicion was.
 
 **A transcluded redirect was not followed.** Four of `Zebra`'s leading templates
 (`Short description`, `Other uses`, `Featured article`, `Pp-semi`) rendered as a
@@ -760,27 +761,37 @@ body expansion and was later resolved by `expand_attributes` against the **root*
 frame, where the template's arguments do not exist. Both attribute fields had to
 be walked, and the *key* field is the one that is easy to miss: a parser function
 keeps its whole argument list in a single attribute whose key holds the tokens, so
-handling only values left `{{#expr:{{{1}}}*2}}` evaluating the default. Not an
-exotic shape — `Template:Fossil range bar` and `Template:Geological range marker`
-both put references inside `#expr` inside `style`.
+handling only values left `{{#expr:{{{1}}}*2}}` evaluating the default.
 
-**Still open: a `|` inside an attribute splits a parser-function argument.**
-Found while building a test from `Template:Geological range marker`'s real body,
-and deliberately left alone rather than fixed in passing. That template's
-`#ifexpr` branch contains `<div style="…">`, and the `|` characters inside the
-`style` value are treated as argument separators:
+**Not a bug: a `|` inside an attribute does not split a parser-function
+argument.** This was logged as an open bug and it was wrong. `Template:Geological
+range marker`'s `#ifexpr` branch contains `<div style="…">`, and the template
+rendered nothing — so the `|` characters in that style looked like argument
+separators. Tokenizing the attribute value directly shows the truth: the
+`{{#if…}}` arrives as **one** `template` token with both its arguments intact, and
+`split_template_args` never runs on an attribute value at all. The atom rule in
+the tokenizer (a recognized HTML tag is consumed whole) already covers it.
 
-```text
-{{#ifexpr:{{{1}}}-{{{2}}}>5|<div style="…; opacity:1; "><div …></div>|…}}
-                                    ↑ the branch is cut here
-rustoid: #ifexpr receives "590-540>5||nothing"   (branch empty)
-```
+The rendering was explained by two things that are both correct behaviour:
 
-The consequence is that the branch is dropped entirely, so the template renders
-nothing. This needs its own investigation — the tokenizer must not split on a `|`
-that sits inside a quoted attribute value, which is a tokenizer question rather
-than a frame one. It is recorded here so the next session does not have to
-rediscover it.
+- `{{#if:1|B}}` yields `B`. That *is* `#if` — a non-empty condition takes the
+  second argument. Reading `w:Bpx` as "the parser function was not evaluated"
+  was a misreading of the output.
+- `{{Real|5}}` binds `5` to `{{{1}}}`, so `{{{3}}}` is legitimately undefined and
+  its default applies. Anonymous parameters are positional
+  (`help:Templates`: identifying parameters by order "works only with anonymous
+  parameters"), so a template calling `{{{3}}}` that way was never going to see
+  the value.
+
+The tests written while chasing it are kept as `rustoid-core/tests/
+attribute_pipe_test.rs`, including the two behaviours that *look* like bugs and
+are not, because the tokenizer's atom rule is load-bearing for real templates and
+a regression in it would be silent.
+
+The cost of this detour is worth recording: the misdiagnosis came from reading a
+rendered attribute (`w:Bpx`) as evidence about the *tokenizer* rather than first
+checking what the construct is supposed to produce. Tokenizing the input directly
+settled it in one step, and should have been the first step.
 
 ### Phase 7 — Scale and hardening
 
