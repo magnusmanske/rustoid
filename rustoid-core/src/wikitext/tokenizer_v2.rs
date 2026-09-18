@@ -4773,6 +4773,26 @@ fn find_arg_separator_eq(part: &str) -> Option<usize> {
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
+        // An HTML tag is a single atom: `<div class="x">` holds a `=`, but that
+        // separates an attribute, not a template argument name from its value.
+        // Without this, `{{#if:1|<div class="x">hi</div>|no}}` split at
+        // `class=` and the branch value became the nonsense `<div class`.
+        if b == b'<' {
+            match html_tag_len(bytes, i) {
+                Some(len) => {
+                    i += len;
+                    at_sol = false;
+                    continue;
+                }
+                // An extlink is `[http://…]`, which the `extlink` counter owns;
+                // a lone `<` is text.
+                None => {
+                    at_sol = false;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
         // Nested `[[` / `]]` atoms.
         if b == b'[' && bytes.get(i + 1) == Some(&b'[') {
             bracket += 1;
@@ -4836,6 +4856,42 @@ fn find_arg_separator_eq(part: &str) -> Option<usize> {
                 // inside a heading does not re-enable line-start detection.
                 at_sol = false;
             }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Length of an HTML tag starting at `start`, or `None` if this is not a tag.
+///
+/// Mirrors the tokenizer's own tag shape: `<`, an optional `/`, a name starting
+/// with an ASCII letter, then attributes up to the closing `>`. A `>` inside a
+/// quoted attribute value does not close the tag. A `<` that does not begin a
+/// tag (a bare less-than, or a comment, which `template_param_name` treats
+/// separately) yields `None`, so the caller falls back to treating it as text.
+fn html_tag_len(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    if bytes.get(i) == Some(&b'/') {
+        i += 1;
+    }
+    if !bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'>' => return Some(i + 1 - start),
+            b'"' | b'\'' => {
+                // Skip a quoted attribute value; `>` inside it is content.
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None;
+                }
+            }
+            _ => {}
         }
         i += 1;
     }

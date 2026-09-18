@@ -1,0 +1,59 @@
+# A `=` inside an HTML tag in a template argument is not a name separator.
+#
+# `{{#if:1|<div class="x">hi</div>|no}}` used to split at the `=` of
+# `class="x"`, so the second argument's *name* became `<div class` and the
+# branch value was mangled. The block element then had to be p-wrapped, and
+# every page whose first template expands to a `<div>` (Template:Short
+# description is the common one) differed from Parsoid from its first byte.
+#
+# Expectations are the real Parsoid output for the same wikitext.
+!! options
+parsoid-compatible=wt2html
+version=2
+!! end
+
+!! test
+An ifeq branch holding a div is not p-wrapped
+!! wikitext
+{{#ifeq:a|a|<div class="x">hi</div>|no}}
+!! html
+<div class="x">hi</div>
+!! end
+
+!! test
+Text around an ifeq-expanded div is p-wrapped
+!! wikitext
+before
+{{#ifeq:a|a|<div class="x">hi</div>|no}}
+after
+!! html
+<p>before
+</p><div class="x">hi</div>
+<p>after
+</p>
+!! end
+
+!! test
+An if branch holding a div is not p-wrapped
+!! wikitext
+{{#if:1|<div class="x">hi</div>|no}}
+!! html
+<div class="x">hi</div>
+!! end
+
+!! test
+A switch branch holding a div is not p-wrapped
+!! wikitext
+{{#switch:a|a=<div class="x">hi</div>|no}}
+!! html
+<div class="x">hi</div>
+!! end
+
+!! test
+A quoted attribute with an equals sign does not split the argument
+!! wikitext
+{{#if:1|<span title="a=b">hi</span>|no}}
+!! html/parsoid
+<p><span title="a=b" about="#mwt1" typeof="mw:Transclusion">hi</span>
+</p>
+!! end

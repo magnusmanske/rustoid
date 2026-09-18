@@ -175,7 +175,7 @@ impl ParserFunctions {
         if !target.is_empty()
             && let Some(v) = dict.get(&target)
         {
-            return Self::trim_res(&Self::stringify_value(v));
+            return Self::branch_items(v);
         }
 
         // Fallback lookup over positional entries.
@@ -200,7 +200,7 @@ impl ParserFunctions {
             if !k.is_empty() {
                 // Named/equal key: if it matches, return its value.
                 if k.trim() == key {
-                    return Self::trim_res(&Self::stringify_value(&kv.value));
+                    return Self::branch_items(&kv.value);
                 }
             } else {
                 // Value-only entry: this is a fall-through candidate.
@@ -210,7 +210,7 @@ impl ParserFunctions {
                     for next in kvs {
                         let nk = key_value_to_string(&next.key);
                         if !nk.is_empty() {
-                            return Self::trim_res(&Self::stringify_value(&next.value));
+                            return Self::branch_items(&next.value);
                         }
                     }
                     return vec![];
@@ -222,22 +222,34 @@ impl ParserFunctions {
         if let Some(last) = kvs.last()
             && key_value_to_string(&last.key).is_empty()
         {
-            return vec![Item::Str(value_to_string(&last.value))];
+            return Self::branch_items(&last.value);
         }
 
         if let Some(default) = dict.get("#default") {
-            return Self::trim_res(&Self::stringify_value(default));
+            return Self::branch_items(default);
         }
 
         vec![]
     }
 
-    fn stringify_value(v: &KeyValue) -> String {
-        value_to_string(v)
-    }
-
-    fn trim_res(s: &str) -> Vec<Item> {
-        vec![Item::Str(s.trim().to_string())]
+    /// The items a matched `#switch` branch yields, with surrounding whitespace
+    /// trimmed. Mirrors `expandKV`'s token-preserving branch: a value holding an
+    /// HTML tag must stay *tokens*, or `{{#switch:x|x=<div>a</div>}}` renders
+    /// the tag as literal text. Only the outer string items are trimmed, so a
+    /// tag's own tokens pass through untouched.
+    fn branch_items(value: &KeyValue) -> Vec<Item> {
+        let mut items = Self::expand_kv(
+            Some(&KV {
+                key: KeyValue::Str(String::new()),
+                value: value.clone(),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }),
+            None,
+        );
+        trim_item_edges(&mut items);
+        items
     }
 
     /// `#expr` — mirrors `pf_expr`.
@@ -648,9 +660,25 @@ impl ParserFunctions {
     }
 }
 
+/// Trim leading and trailing whitespace from an item list's outer *string*
+/// items, leaving every token in place.
+///
+/// `#switch` trims its matched branch, but a branch may hold markup whose tokens
+/// must survive: `{{#switch:x|x=<div>a</div>}}` keeps the `<div>` and loses only
+/// the surrounding blanks. Trimming the stringified form instead would discard
+/// the tags along with the whitespace.
+fn trim_item_edges(items: &mut Vec<Item>) {
+    if let Some(Item::Str(first)) = items.first_mut() {
+        *first = first.trim_start().to_string();
+    }
+    if let Some(Item::Str(last)) = items.last_mut() {
+        *last = last.trim_end().to_string();
+    }
+    items.retain(|it| !matches!(it, Item::Str(s) if s.is_empty()));
+}
+
 /// Append a single character to `out` wrapped in an `mw:Entity` span, so it
 /// survives as literal text instead of being re-interpreted as wikitext.
-/// Mirrors `ParserFunctions::encodeCharEntity`.
 fn encode_char_entity(c: char, out: &mut Vec<Item>) {
     let enc = entity_encode_all(c);
     let dp = DataParsoid {
