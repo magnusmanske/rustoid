@@ -163,6 +163,22 @@ impl Frame {
     /// re-tokenize the chunk and expand any `templatearg` (`{{{...}}}`)
     /// references against this frame's arguments.
     ///
+    /// Attribute values are walked too, and that is load-bearing rather than a
+    /// detail. An argument reference inside an HTML attribute is not a child of
+    /// the chunk: it sits in a `KeyValue::Tokens` *inside* the `Tag` token. Left
+    /// unvisited it survives this pass and is later expanded by
+    /// `expand_attributes`, which runs against the **root** frame — where a
+    /// template's arguments do not exist — so `{{{small|DEFAULT}}}` took the
+    /// default no matter what the caller passed.
+    ///
+    /// The alternative, expanding attributes inside each template's own frame,
+    /// is not available: `expand_attributes` is a whole-stream pass that runs
+    /// after `expand_templates`, by which point the template boundaries and their
+    /// frames are gone. Substituting here, where the frame is right by
+    /// construction, is both simpler and faithful to PHP — `Frame::expand`
+    /// expands the chunk it is given, and a template body's attributes are part
+    /// of that chunk.
+    ///
     /// Full `template` (`{{...}}`) expansion via the TemplateHandler is wired
     /// separately (see `TemplateHandler::handle_template`); here we only
     /// substitute the parameter references that don't need data access.
@@ -182,13 +198,73 @@ impl Frame {
                             out.extend(self.expand_template_arg_token(t));
                         }
                     } else {
-                        out.push(item.clone());
+                        out.push(self.expand_in_attributes(t));
                     }
                 }
                 Item::Str(_) => out.push(item.clone()),
             }
         }
         out
+    }
+
+    /// Substitute argument references held in a token's attribute values.
+    ///
+    /// Only `KeyValue::Tokens` can hold a reference; a plain string attribute
+    /// carries its text already. A value that expands to a single string is
+    /// folded back to `KeyValue::Str` so downstream code (and the `data-mw`
+    /// `attribs` HTML) sees the same shape a literal attribute would have.
+    /// Substitute argument references held in a token's attribute keys and values,
+    /// and in those of tokens nested *within* them.
+    ///
+    /// Both halves are needed, and the key half is the easy one to miss. A parser
+    /// function packs its whole argument list into a *single* attribute whose key
+    /// holds the tokens — `{{#expr:{{{1}}}*2}}` is
+    /// `key: Tokens(["#expr:", templatearg, "*2"])` with an empty value — so
+    /// rewriting only values leaves the reference untouched, and `#expr` then
+    /// evaluates the `0` default.
+    ///
+    /// The nesting is what makes this recursive rather than a single pass: a
+    /// parser function inside an attribute, `style="left:{{#expr:{{{1}}}*2}}px"`
+    /// (the shape `Template:Fossil range bar` uses), keeps its argument list
+    /// inside the `template` token, which is itself a value of the enclosing tag's
+    /// attribute.
+    ///
+    /// A field that expands to a single string is folded back to `KeyValue::Str`
+    /// so downstream code — including the `data-mw` `attribs` HTML — sees the same
+    /// shape a literal attribute would have.
+    fn expand_in_attributes(&self, token: &ParsoidToken) -> Item {
+        let attribs = token.get_attribs();
+        if !attribs.iter().any(|kv| {
+            matches!(kv.value, KeyValue::Tokens(_)) || matches!(kv.key, KeyValue::Tokens(_))
+        }) {
+            return Item::Tok(token.clone());
+        }
+
+        let expand_field = |field: &KeyValue| match field {
+            KeyValue::Tokens(toks) => {
+                let items = self.expand(toks);
+                match items.as_slice() {
+                    [Item::Str(s)] => KeyValue::Str(s.clone()),
+                    _ => KeyValue::Tokens(items),
+                }
+            }
+            KeyValue::Str(_) => field.clone(),
+        };
+
+        let expanded: Vec<KV> = attribs
+            .iter()
+            .map(|kv| KV {
+                key: expand_field(&kv.key),
+                value: expand_field(&kv.value),
+                src_offsets: kv.src_offsets.clone(),
+                ksrc: kv.ksrc.clone(),
+                vsrc: kv.vsrc.clone(),
+            })
+            .collect();
+
+        let mut new_token = token.clone();
+        new_token.set_attribs(expanded);
+        Item::Tok(new_token)
     }
 }
 
