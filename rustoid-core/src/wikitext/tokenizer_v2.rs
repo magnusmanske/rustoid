@@ -2993,6 +2993,16 @@ impl<'a> PegTokenizer<'a> {
             .first()
             .map(|(_, s)| strip_html_comments(s).trim().to_string())
             .unwrap_or_default();
+        // `{{subst:Name}}`/`{{safesubst:Name}}` is preprocessor syntax: the
+        // prefix is stripped and the rest is the template to expand. Verified
+        // against the live parser, which reports `Template:Country_data_Germany`
+        // as the transclusion for `{{safesubst: Country data Germany|flag}}`.
+        //
+        // Without this the whole `safesubst: Name` string is taken for a title,
+        // which no page matches, so its argument list leaks out as body text. On
+        // a page transcluding `Template:Country data …` that emitted a hundred
+        // lines of raw parameters per call site.
+        let target_raw = strip_subst_prefix(&target_raw).unwrap_or(target_raw);
         let target = if target_raw.contains("{{") {
             tokenize_template_arg_value(&target_raw, self.lang_conv_enabled, &self.ext_tags)
         } else {
@@ -4359,6 +4369,67 @@ fn find_template_closing(input: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// MediaWiki substitution syntax. Recognise a `subst` or `safesubst` prefix and
+/// return the template name it applies to, or `None` if this is not a
+/// substitution.
+///
+/// The preprocessor treats these as directives rather than as part of a title,
+/// so `{{safesubst: Foo}}` transcludes `Template:Foo`. It is how
+/// `Template:Country data X` is written, with a `<noinclude />` between the word
+/// and the colon so that tag stays out of the page when it is viewed directly:
+///
+/// ```text
+/// {{safesubst<noinclude />: {{{1|country showdata}}}
+///  | alias = …
+/// ```
+///
+/// The `<noinclude />` is still present in the token text at this point, because
+/// the target is parsed before tag handling runs, so removing it is part of
+/// recognising the prefix. Case is not significant (`{{Subst:…}}` occurs) and
+/// whitespace may follow the colon.
+fn strip_subst_prefix(target: &str) -> Option<String> {
+    // Drop any `<noinclude />`/`<includeonly />` markers, then look for the
+    // directive. Only those two go: any other tag between the word and the colon
+    // means this is not a substitution but a title that happens to begin with
+    // the word.
+    let mut cleaned = String::with_capacity(target.len());
+    let mut rest = target;
+    while let Some(open) = rest.find('<') {
+        cleaned.push_str(&rest[..open]);
+        let Some(close) = rest[open..].find('>') else {
+            // An unterminated `<`: keep the remainder verbatim.
+            cleaned.push_str(&rest[open..]);
+            return subst_name(&cleaned);
+        };
+        let tag = &rest[open..open + close + 1];
+        let name = tag
+            .trim_start_matches("</")
+            .trim_start_matches('<')
+            .split([' ', '/', '>'])
+            .next()
+            .unwrap_or("");
+        if !name.eq_ignore_ascii_case("noinclude") && !name.eq_ignore_ascii_case("includeonly") {
+            cleaned.push_str(tag);
+        }
+        rest = &rest[open + close + 1..];
+    }
+    cleaned.push_str(rest);
+    subst_name(&cleaned)
+}
+
+/// The name half of [`strip_subst_prefix`], once any tags are gone.
+fn subst_name(text: &str) -> Option<String> {
+    let (word, after) = text.trim_start().split_once(':')?;
+    let word = word.trim();
+    if !word.eq_ignore_ascii_case("subst") && !word.eq_ignore_ascii_case("safesubst") {
+        return None;
+    }
+    let name = after.trim();
+    // `{{subst:}}` names nothing. Leaving it alone keeps the literal text, which
+    // is what the parser does with a directive it cannot resolve.
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Skip a well-formed `{{{…}}}` argument reference starting at `start`,
@@ -6600,5 +6671,50 @@ mod tests {
             "templated wikilink content should be a token array, got {:?}",
             text.value
         );
+    }
+
+    #[test]
+    fn a_subst_prefix_is_stripped() {
+        assert_eq!(strip_subst_prefix("subst:Foo"), Some("Foo".to_string()));
+        assert_eq!(strip_subst_prefix("safesubst:Foo"), Some("Foo".to_string()));
+        // Case and spacing both vary in real wikitext.
+        assert_eq!(strip_subst_prefix("Subst: Foo"), Some("Foo".to_string()));
+        assert_eq!(
+            strip_subst_prefix("SAFESUBST:  Foo"),
+            Some("Foo".to_string())
+        );
+    }
+
+    /// The form `Template:Country data X` is written in, where a `<noinclude />`
+    /// separates the word from the colon.
+    #[test]
+    fn a_noinclude_between_word_and_colon_is_removed() {
+        assert_eq!(
+            strip_subst_prefix("safesubst<noinclude />: Foo"),
+            Some("Foo".to_string())
+        );
+        assert_eq!(
+            strip_subst_prefix("subst<includeonly/>: Foo"),
+            Some("Foo".to_string())
+        );
+    }
+
+    /// A template whose name merely *starts* with the word is not a
+    /// substitution, which matters because `subst` is a common prefix.
+    #[test]
+    fn a_name_that_only_starts_with_the_word_is_left_alone() {
+        assert_eq!(strip_subst_prefix("Foo"), None);
+        assert_eq!(strip_subst_prefix("substitute:Foo"), None);
+        assert_eq!(strip_subst_prefix("Safesubstitute:Foo"), None);
+        // A different tag before the colon belongs to the title.
+        assert_eq!(strip_subst_prefix("subst<nowiki />: Foo"), None);
+    }
+
+    /// A directive naming nothing is left as literal text, matching the parser's
+    /// behaviour for a substitution it cannot resolve.
+    #[test]
+    fn an_empty_name_is_not_a_substitution() {
+        assert_eq!(strip_subst_prefix("subst:"), None);
+        assert_eq!(strip_subst_prefix("safesubst:   "), None);
     }
 }
