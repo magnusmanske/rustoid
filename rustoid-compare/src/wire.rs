@@ -69,7 +69,21 @@ impl Wiki {
 pub struct WikiClient {
     wiki: Wiki,
     http: reqwest::Client,
+    /// Paces requests, shared across every clone.
+    limiter: std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
+
+/// Minimum spacing between two requests to a wiki.
+///
+/// Wikimedia's rate limiter is real and immediate — a handful of rapid requests
+/// already returns `You are making too many requests to the API` — and template
+/// expansion is the case that trips it: one page can transclude hundreds of
+/// templates, each a separate fetch, with no user-visible pacing. The harness's
+/// `--delay-ms` only spaces *pages*, so it cannot cover this.
+///
+/// Zero when `RUSTOID_NO_THROTTLE` is set, which is what a test against a local
+/// file server wants.
+const MIN_REQUEST_SPACING: std::time::Duration = std::time::Duration::from_millis(120);
 
 impl WikiClient {
     pub fn new(wiki: Wiki) -> Result<Self> {
@@ -93,11 +107,38 @@ impl WikiClient {
                 message: format!("client build: {e}"),
                 status: 0,
             })?;
-        Ok(Self { wiki, http })
+        Ok(Self {
+            wiki,
+            http,
+            limiter: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
     pub fn wiki(&self) -> &Wiki {
         &self.wiki
+    }
+
+    /// Sleep until at least [`MIN_REQUEST_SPACING`] has passed since the last
+    /// request.
+    ///
+    /// The spacing is enforced *between* requests rather than per request, so a
+    /// burst of template fetches is spread out instead of queued behind a fixed
+    /// delay each. The mutex is held across the sleep deliberately: two concurrent
+    /// callers must serialise against the same clock, or they would both see the
+    /// same idle moment and fire together.
+    async fn throttle(&self) {
+        if std::env::var_os("RUSTOID_NO_THROTTLE").is_some() {
+            return;
+        }
+        let mut last = self.limiter.lock().await;
+        let now = std::time::Instant::now();
+        if let Some(previous) = *last
+            && let Some(wait) = MIN_REQUEST_SPACING.checked_sub(now.duration_since(previous))
+            && !wait.is_zero()
+        {
+            tokio::time::sleep(wait).await;
+        }
+        *last = Some(std::time::Instant::now());
     }
 
     async fn get_text(&self, url: &str) -> Result<String> {
@@ -116,6 +157,7 @@ impl WikiClient {
     }
 
     async fn get_text_once(&self, url: &str) -> Result<String> {
+        self.throttle().await;
         let resp = self
             .http
             .get(url)
@@ -357,6 +399,48 @@ struct RevisionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two calls in immediate succession must be spaced apart.
+    ///
+    /// The point is not the exact duration but that the second call *waits*: an
+    /// unpaced burst is what earns `You are making too many requests`, and a
+    /// template-heavy page fires these with no other pacing at all.
+    #[tokio::test]
+    async fn requests_are_spaced_apart() {
+        let client = WikiClient::new(Wiki::new("example.invalid")).unwrap();
+        let start = std::time::Instant::now();
+        client.throttle().await;
+        let after_first = start.elapsed();
+        client.throttle().await;
+        let after_second = start.elapsed();
+        assert!(
+            after_first < MIN_REQUEST_SPACING / 2,
+            "the first request should not wait: {after_first:?}"
+        );
+        assert!(
+            after_second >= MIN_REQUEST_SPACING,
+            "the second must wait for the spacing: {after_second:?}"
+        );
+    }
+
+    /// The spacing must be *between* requests, not a fixed delay on each.
+    ///
+    /// With per-request delay, N requests cost N × spacing; with spacing-between,
+    /// they cost (N-1) × spacing plus the call overhead. The latter is what keeps a
+    /// hundreds-of-templates page tractable.
+    #[tokio::test]
+    async fn an_idle_gap_is_not_charged_twice() {
+        let client = WikiClient::new(Wiki::new("example.invalid")).unwrap();
+        client.throttle().await;
+        tokio::time::sleep(MIN_REQUEST_SPACING * 2).await;
+        let start = std::time::Instant::now();
+        client.throttle().await;
+        assert!(
+            start.elapsed() < MIN_REQUEST_SPACING / 2,
+            "an already-idle client must not wait again: {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn wiki_urls_are_built_from_the_host() {

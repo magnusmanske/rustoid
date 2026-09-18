@@ -203,12 +203,21 @@ impl CachedDataSource {
         if trace_enabled() {
             eprintln!("req {kind:?} {key} (sibling)");
         }
-        if let Some(hit) = wiki
-            .cache
-            .lock()
-            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
-            .get(kind, key)?
-        {
+        // The guard is scoped to its own statement, and that is load-bearing rather
+        // than stylistic. Written as `if let Some(hit) = wiki.cache.lock()?.get(..)?`,
+        // the lock guard lives to the end of the `if let` block — so the `await`
+        // further down runs while holding a `std::sync::Mutex`, and a second task
+        // taking the same lock deadlocks the runtime. That is the stall this
+        // function caused: the process sits at 0% CPU because every worker is
+        // parked on a mutex nobody will release.
+        let cached = {
+            let guard = wiki
+                .cache
+                .lock()
+                .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
+            guard.get(kind, key)?
+        };
+        if let Some(hit) = cached {
             return Ok(Some(hit.body));
         }
         if self.offline {
@@ -292,12 +301,19 @@ impl CachedDataSource {
             }
         }
 
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
-            .get(kind, key)?
-        {
+        // Guard scoped to its own statement: written as an `if let` scrutinee, the
+        // temporary lives to the end of the block and the `await`s below would run
+        // holding a `std::sync::Mutex`. This is the busiest function in the harness —
+        // every template and module fetch goes through it — so a lock held here
+        // deadlocks the entire run rather than one lookup.
+        let cached = {
+            let guard = self
+                .cache
+                .lock()
+                .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
+            guard.get(kind, key)?
+        };
+        if let Some(hit) = cached {
             return Ok(Some((hit.body, hit.meta.revid)));
         }
 
@@ -464,7 +480,13 @@ impl DataSource for CachedDataSource {
         titles: &[String],
     ) -> rustoid_core::Result<std::collections::HashMap<String, rustoid_core::traits::PageInfo>>
     {
-        let Some(client) = &self.client else {
+        // `offline` is checked, not just the presence of a client. The client is
+        // always built — it is needed for the entity wiki even in a run that must not
+        // touch the network — so testing `client.is_none()` here sent `--offline`
+        // runs to the network anyway. That is not a small leak: `AddRedLinks` asks
+        // about *every* wikilink title on the page, so one offline run of `Zebra`
+        // fired thousands of paced requests and appeared to hang.
+        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
             // Offline: assume everything exists, which marks nothing as a red
             // link. Recording it would be a claim the run cannot support.
             return Ok(titles.iter().map(|t| (t.clone(), existing())).collect());
