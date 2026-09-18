@@ -322,9 +322,11 @@ pub fn run(
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
     collect(root, &mut state, &mut use_ids);
-    if state.is_empty() {
-        return 0;
-    }
+    // Deliberately **not** skipped when `state` is empty: a `<references>` tag with
+    // no refs still renders its wrapper and an empty `<ol>`, which is what Parsoid
+    // emits (verified against the cached output — the list structure is always
+    // there, and only the `<li>`s vary). Returning early here left the raw
+    // extension element in the output instead.
     render(root, &state, page_title, ids, body_of, &mut use_ids)
 }
 
@@ -348,7 +350,7 @@ fn collect(node: &crate::dom::node::Node, state: &mut CiteState, use_ids: &mut V
 /// interior. So the attributes are recovered from that source rather than read from
 /// the element.
 fn read_ref(node: &crate::dom::node::Node) -> Option<(String, String, String, bool)> {
-    if node.get_attr("typeof") != Some("mw:Extension") || node.get_attr("name") != Some("ref") {
+    if !typeof_contains(node, "mw:Extension") || node.get_attr("name") != Some("ref") {
         return None;
     }
     let source = node.get_attr("source")?;
@@ -516,11 +518,20 @@ fn walk_render(
     }
 }
 
+/// Whether a `typeof` attribute contains `value`.
+///
+/// `typeof` is space-separated and routinely carries several values — a `#tag:`-built
+/// extension is `"mw:Extension mw:Transclusion"` — so an equality check misses the
+/// common case of an extension emitted by a template. The DOM spec says consumers
+/// must treat these like class names (`[typeof~=…]`).
+fn typeof_contains(node: &crate::dom::node::Node, value: &str) -> bool {
+    node.get_attr("typeof")
+        .is_some_and(|t| t.split_whitespace().any(|v| v == value))
+}
+
 /// Read a `<references>` element into `(group, responsive)`.
 fn read_references(node: &crate::dom::node::Node) -> Option<(String, bool)> {
-    if node.get_attr("typeof") != Some("mw:Extension")
-        || node.get_attr("name") != Some("references")
-    {
+    if !typeof_contains(node, "mw:Extension") || node.get_attr("name") != Some("references") {
         return None;
     }
     let source = node.get_attr("source")?;

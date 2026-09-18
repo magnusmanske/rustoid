@@ -242,3 +242,40 @@ async fn a_group_numbers_separately() {
         "the list carries its group: {html}"
     );
 }
+
+/// The real entry point: `{{reflist}}` emits a `<references>` tag.
+///
+/// This is how nearly every article gets its note list, so the `<references>`
+/// element almost always arrives *through* a template rather than as literal
+/// wikitext. A Cite implementation that only found a literal `<references>` would
+/// render markers pointing at a list that never appears.
+///
+/// `Template:Reflist` is a large module-backed template on enwiki; the contract
+/// being tested is the `#tag:references` call it lowers to, which is why a minimal
+/// stand-in is faithful here.
+#[tokio::test]
+async fn a_reflist_template_renders_the_list() {
+    let html = render_with(
+        "A<ref>one</ref>\n{{reflist}}",
+        &[(
+            "Template:Reflist",
+            "<div class=\"reflist\">{{#tag:references}}</div>",
+        )],
+    )
+    .await;
+    assert!(
+        html.contains("mw-references references"),
+        "the list must render from inside the template: {html}"
+    );
+    assert!(html.contains("cite_note--1"), "{html}");
+}
+
+/// An empty `<references>` and a `<references>` with no refs both must not crash.
+#[tokio::test]
+async fn a_references_tag_with_no_refs_renders_an_empty_list() {
+    let html = render("No refs here.\n<references/>").await;
+    assert!(
+        html.contains("mw-references references"),
+        "an empty list is still a list: {html}"
+    );
+}
