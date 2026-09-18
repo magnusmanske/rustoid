@@ -36,6 +36,34 @@ async fn expand(modules: &[(&str, &str)], templates: &[(&str, &str)], wikitext: 
         .unwrap_or_else(|e| panic!("parse failed: {e}"))
 }
 
+/// Strip the page-bundle `id="mw…"` attributes this parser now adds.
+///
+/// Ids are allocated in document order and so are inherently positional: they
+/// encode *how many metadata-bearing elements came before*, not anything about the
+/// element itself. A test asserting on structure therefore cannot also assert on a
+/// literal `<b>` substring, because the id sits between the tag name and the `>`.
+///
+/// Removing them keeps these tests about what they are about — the frame API —
+/// rather than about where an element happened to land in the document. The ids
+/// themselves are covered by `pagebundle_ids_test.rs` against a real page, which is
+/// where they can be checked properly.
+fn without_node_ids(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(pos) = rest.find(" id=\"mw") {
+        // Keep everything up to the attribute, then skip the attribute whole.
+        out.push_str(&rest[..pos]);
+        let after_quote = &rest[pos + " id=\"".len()..];
+        match after_quote.find('"') {
+            // `find` is relative to `after_quote`; step past the closing quote.
+            Some(end) => rest = &after_quote[end + 1..],
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[tokio::test]
 async fn expand_template_with_a_computed_argument() {
     // The argument is built by the module, so no preload could have known it.
@@ -95,6 +123,7 @@ async fn several_expand_template_calls_each_get_their_answer() {
         "{{#invoke:T|main}}",
     )
     .await;
+    let html = without_node_ids(&html);
     // Each call gets its own answer: three bold elements, one per argument.
     for i in 1..=3 {
         assert!(html.contains(&format!("<b>{i}</b>")), "missing {i}: {html}");
@@ -120,6 +149,7 @@ async fn a_repeated_call_reuses_its_answer() {
         "{{#invoke:T|main}}",
     )
     .await;
+    let html = without_node_ids(&html);
     // The answer is HTML, so the expansion's own `<b>` arrives as markup and
     // the second, cached answer is identical to the first.
     let occurrences = html.matches("[x]<b>y</b>").count();

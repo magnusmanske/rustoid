@@ -111,6 +111,17 @@ pub enum NodeKind {
     Comment(String),
 }
 
+impl NodeKind {
+    /// Whether this kind can carry attributes.
+    ///
+    /// Only elements can: attributes on a text or comment node have nowhere to go
+    /// in the serialisation. Passes that walk a tree setting attributes use this to
+    /// skip the rest without matching on `Element(_)` at every call site.
+    pub fn is_element(&self) -> bool {
+        matches!(self, Self::Element(_))
+    }
+}
+
 /// A single node in the AST.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {

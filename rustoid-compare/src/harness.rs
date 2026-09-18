@@ -786,7 +786,14 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     let source = CachedDataSource::new(Some(Arc::new(client.clone())), Arc::clone(cache), offline);
     let source = with_entity_wiki(source, client, cache)?;
     let parser = rustoid_core::Parser::new(config);
-    let options = rustoid_core::ParserOptions::for_page(title);
+    // `node_ids` is on because the target is what a *wiki serves*: MediaWiki's REST
+    // layer page-bundles Parsoid output and assigns each metadata-bearing element an
+    // `id="mw…"`. Parsoid's standalone mode emits none, and the fixture suite (which
+    // compares against standalone output) therefore leaves this off.
+    let options = rustoid_core::ParserOptions {
+        node_ids: true,
+        ..rustoid_core::ParserOptions::for_page(title)
+    };
     let html = parser
         .wikitext_to_html_expanded(wikitext, &source, &options)
         .await

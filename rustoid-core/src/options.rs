@@ -74,6 +74,31 @@ pub struct ParserOptions {
     #[serde(default)]
     pub page_bundle: PageBundleMode,
 
+    /// Assign `id="mw…"` attributes to metadata-bearing elements.
+    ///
+    /// This is a **wiki-serving** feature, not a parsing one. MediaWiki's REST
+    /// layer turns Parsoid output into a page bundle and assigns each element a
+    /// positional id keying it in the bundle's `parsoid`/`mw` maps; Parsoid itself
+    /// in standalone mode emits none. So the two outputs differ by exactly these
+    /// attributes, and which one to produce depends on which question is being
+    /// asked:
+    ///
+    /// - **Standalone** (the fixture suite, round-tripping): no ids. A fixture's
+    ///   expected HTML is Parsoid's standalone output, which has none.
+    /// - **Integrated** (comparing against a live wiki's cached HTML): ids, because
+    ///   that is what the wiki serves.
+    ///
+    /// Off by default, so the fixture suite and every round-trip test keep their
+    /// meaning. `rustoid-compare` turns it on, because its whole purpose is to match
+    /// what a wiki serves.
+    ///
+    /// Note this is orthogonal to [`page_bundle`](Self::page_bundle): that option
+    /// chooses *where the metadata goes* (inline attributes or a JSON envelope),
+    /// while this one chooses whether elements are addressable at all. A wiki
+    /// serves ids with the metadata still inline.
+    #[serde(default)]
+    pub node_ids: bool,
+
     /// Enable lint error reporting.
     #[serde(default)]
     pub linting: bool,
@@ -113,6 +138,7 @@ impl Default for ParserOptions {
             output_content_version: default_content_version(),
             offset_type: OffsetType::default(),
             page_bundle: PageBundleMode::default(),
+            node_ids: false,
             linting: false,
             annotations: false,
             language: default_language(),

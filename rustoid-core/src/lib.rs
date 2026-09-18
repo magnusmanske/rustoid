@@ -51,6 +51,7 @@ pub mod magic;
 pub mod sanitizer;
 
 pub mod mock;
+pub mod pagebundle;
 
 #[cfg(feature = "mwapi")]
 pub mod mw_api;

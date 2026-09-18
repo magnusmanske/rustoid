@@ -1888,13 +1888,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &options.page_title,
                 &about_counter,
                 wikitext,
-                options.wrap_sections,
+                options,
             )
             .await)
     }
 
     /// Run the TT2 stage (template/parser-function/magic-variable expansion)
     /// over a token stream, then the TT3 tree-building stage, producing an AST.
+    ///
+    /// `options` is passed whole rather than field by field: the passes near the end
+    /// of the pipeline each read a different flag, and threading them individually
+    /// invites a new flag reaching one call site and not another.
     async fn build_ast(
         &self,
         tokens: Vec<Item>,
@@ -1902,7 +1906,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         page_title: &str,
         about_counter: &std::cell::Cell<usize>,
         page_source: &str,
-        wrap_sections: bool,
+        options: &ParserOptions,
     ) -> Node {
         let title = TitleParser::parse(page_title, self.config);
         let page_title_prefixed = title.get_prefixed_text();
@@ -2021,7 +2025,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // PHP's `media` … `linkneighbours+dom-unpack` order) so the foster-out
         // operates on resolved media rather than a broken-media anchor.
         crate::pipeline::unpack_dom_fragments::fix_bad_nesting(&mut ast);
-        wrap_sections_in_ast(&mut ast, wrap_sections);
+        wrap_sections_in_ast(&mut ast, options.wrap_sections);
+        // Page-bundle node ids are allocated last, after every pass that can create
+        // or destroy an element. The ids are positional — one element inserted
+        // earlier shifts every id after it — so the assignment cannot run before
+        // the tree is final. `wrap_sections` must come first too, because the
+        // `<section>` wrappers are themselves numbered.
+        //
+        // Gated on `node_ids` because this is what a *wiki* serves, not what
+        // Parsoid's standalone mode produces. The fixture suite compares against
+        // standalone output and so must not see ids; see the option's own comment.
+        if options.node_ids {
+            crate::pagebundle::assign_node_ids(&mut ast);
+        }
         ast
     }
 
