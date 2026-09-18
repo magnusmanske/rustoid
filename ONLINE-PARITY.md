@@ -614,10 +614,24 @@ too. Ground truth came from the live parser, which reports
 `Template:Country_data_Germany` as the transclusion for
 `{{safesubst: Country data Germany|flag}}`.
 
-The remaining inflation is a *different* bug, and worth knowing about because it
-is the next thing to chase: rustoid emits `{{Short description}}` as a paragraph
-where Parsoid emits a `<div class="shortdescription">` plus a `mw-empty-elt`
-span. That is a template-output-to-DOM-shape issue, not a size one.
+The remaining inflation is a *different* bug, and it is **fixed**: rustoid
+stringified a parser function's branch value, so an HTML tag in it was escaped
+and the element itself vanished.
+
+```text
+{{#ifeq:1|0|y|<div>hi</div>}}   rustoid: "hi"      parsoid: <p>y</p><div>hi</div>
+```
+
+Two causes, both fixed. `expand_kv` wrapped the branch in `Item::Str` after
+`tokens_to_string` had flattened it; a token value is now returned as tokens. And
+`prepare_pf_param_infos` built `data-mw` from stringified tokens where the
+template path reads the argument's source range, so a tag disappeared from the
+recorded wikitext as well.
+
+`Template:Short description` is written as
+`{{#ifeq:…|<div class="shortdescription">…</div>}}`, which is how this surfaced.
+The two paths now agree with Parsoid byte-for-byte on a page mixing an inline and
+a block branch.
 
 #### Templatestyles — implemented
 
