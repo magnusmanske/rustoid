@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use rustoid_core::lua::engine::SiteStats;
 use rustoid_core::traits::{
     InterwikiInfo, MagicWordEntry, MagicWordMap, NamespaceInfo, SiteConfig,
 };
@@ -41,6 +42,7 @@ pub struct WikiSiteConfig {
     server_url: String,
     article_path: String,
     language_code: String,
+    stats: SiteStats,
 }
 
 impl WikiSiteConfig {
@@ -171,6 +173,21 @@ impl WikiSiteConfig {
             }
         }
 
+        // `statistics` backs `mw.site.stats`. Without it a module reading the
+        // counters — `Module:Math` seeds its RNG from `edits + pages` — stops on
+        // a nil index.
+        if let Some(s) = q.statistics {
+            cfg.stats = SiteStats {
+                pages: s.pages.unwrap_or(0),
+                articles: s.articles.unwrap_or(0),
+                edits: s.edits.unwrap_or(0),
+                images: s.images.unwrap_or(0),
+                users: s.users.unwrap_or(0),
+                active_users: s.activeusers.unwrap_or(0),
+                admins: s.admins.unwrap_or(0),
+            };
+        }
+
         // `interwikimap` entries carry a prefix and either a url or a local flag.
         if let Some(iw) = q.interwikimap {
             for entry in iw {
@@ -264,6 +281,10 @@ impl SiteConfig for WikiSiteConfig {
             &self.language_code
         }
     }
+
+    fn site_stats(&self) -> SiteStats {
+        self.stats.clone()
+    }
 }
 
 // ---- wire types ----
@@ -289,6 +310,27 @@ struct SiteInfoQuery {
     extensiontags: Option<Vec<String>>,
     #[serde(default)]
     interwikimap: Option<Vec<InterwikiEntry>>,
+    #[serde(default)]
+    statistics: Option<Statistics>,
+}
+
+/// The `statistics` section of `siteinfo`, which is `mw.site.stats`.
+#[derive(Debug, Deserialize, Default)]
+struct Statistics {
+    #[serde(default)]
+    pages: Option<u64>,
+    #[serde(default)]
+    articles: Option<u64>,
+    #[serde(default)]
+    edits: Option<u64>,
+    #[serde(default)]
+    images: Option<u64>,
+    #[serde(default)]
+    users: Option<u64>,
+    #[serde(default)]
+    activeusers: Option<u64>,
+    #[serde(default)]
+    admins: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -56,6 +56,24 @@ pub struct LuaSite {
     /// makes `mw.message`'s existence checks report the message missing rather
     /// than inventing a value.
     pub messages: std::collections::HashMap<String, String>,
+    /// `mw.site.stats` — the wiki-wide counters, for the modules that read them.
+    pub stats: SiteStats,
+}
+
+/// The counters `mw.site.stats` exposes.
+///
+/// A struct rather than a map of Lua values, so a module reading a key that is
+/// not here fails to compile rather than silently answering nil at runtime.
+/// The names are Scribunto's, and match the siteinfo statistics keys.
+#[derive(Debug, Clone, Default)]
+pub struct SiteStats {
+    pub pages: u64,
+    pub articles: u64,
+    pub edits: u64,
+    pub images: u64,
+    pub users: u64,
+    pub active_users: u64,
+    pub admins: u64,
 }
 
 /// One interwiki prefix as Lua sees it, in `mw.site.interwikiMap`'s terms.
@@ -109,6 +127,11 @@ impl LuaSite {
             // the `MediaWiki:` namespace. A caller that needs `mw.message` sets
             // them with [`LuaSite::with_messages`].
             messages: std::collections::HashMap::new(),
+            // Same reasoning as `messages`: the counters come from the siteinfo
+            // API, which a bare config may not carry. Zeroes are the honest
+            // "not loaded" answer, and they keep `mw.site.stats.edits` from
+            // raising `attempt to index a nil value`.
+            stats: config.site_stats(),
         }
     }
 
@@ -116,6 +139,13 @@ impl LuaSite {
     #[must_use]
     pub fn with_messages(mut self, messages: std::collections::HashMap<String, String>) -> Self {
         self.messages = messages;
+        self
+    }
+
+    /// Attach the wiki's statistics, for `mw.site.stats`.
+    #[must_use]
+    pub fn with_stats(mut self, stats: SiteStats) -> Self {
+        self.stats = stats;
         self
     }
 
@@ -1228,6 +1258,20 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
                 .map_err(|e| mlua::Error::runtime(e.to_string()))
         })?,
     )?;
+    // `mw.site.stats` — the wiki-wide counters. `Module:Math` seeds its RNG from
+    // `mw.site.stats.edits + mw.site.stats.pages`, so a missing table stops the
+    // module with "attempt to index a nil value (field 'stats')".
+    let stats = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    stats.set("pages", ctx.site.stats.pages)?;
+    stats.set("articles", ctx.site.stats.articles)?;
+    stats.set("edits", ctx.site.stats.edits)?;
+    stats.set("images", ctx.site.stats.images)?;
+    stats.set("users", ctx.site.stats.users)?;
+    stats.set("activeUsers", ctx.site.stats.active_users)?;
+    stats.set("admins", ctx.site.stats.admins)?;
+    site.set("stats", stats)?;
     mw.set("site", site)?;
 
     // `mw.isSubsting()` reports whether the current parse is a `subst:`. rustoid
@@ -2329,6 +2373,14 @@ end
 -- strip markers. Lua 5.4 dropped the alias, so it is restored here.
 if string.gfind == nil then
     string.gfind = string.gmatch
+end
+
+-- `unpack` is a global in Lua 5.1, which Scribunto runs on; Lua 5.2 moved it
+-- under `table`. Modules call the global spelling — `Module:Pagetype` unpacks
+-- every option row with it — so without the alias the module stops at
+-- "attempt to call a nil value (global 'unpack')".
+if unpack == nil then
+    unpack = table.unpack
 end
 
 -- `mw.ustring.gcodepoint( s, i, j )` — an iterator over the codepoints. The

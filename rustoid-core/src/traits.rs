@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::error::Result;
+use crate::lua::engine::SiteStats;
 use crate::resource_limits::Wt2HtmlLimits;
 use crate::title::Title;
 
@@ -208,6 +209,13 @@ pub trait SiteConfig: Send + Sync {
     /// The wiki's script path (e.g. `"/w"`).
     fn script_path(&self) -> &str {
         "/w"
+    }
+
+    /// The wiki-wide counters, for `mw.site.stats`. Defaults to zeroes: a config
+    /// that carries no statistics is a wiki whose counts are unknown, and zero
+    /// keeps a module that reads them from stopping on a nil index.
+    fn site_stats(&self) -> SiteStats {
+        SiteStats::default()
     }
 
     /// Whether pages in namespace `ns` support subpages (relative `[[./…]]` /
