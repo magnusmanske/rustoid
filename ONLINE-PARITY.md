@@ -572,9 +572,10 @@ them because each cost real time:
 
 - **Cite first** (`<ref>`, `<references>`): names and groups, back-links, the
   `mw:Extension/ref` wrapper with its `data-mw` body, and the `<references>`
-  list assembly. This is the most-used extension after Lua. — **model and
-  renderers done** (`rustoid-core/src/ext/cite.rs`, 14 tests); **not yet wired
-  into the parser**, see "Cite: what is built and what blocks it".
+  list assembly. This is the most-used extension after Lua. — **done**
+  (`rustoid-core/src/ext/cite.rs`; 23 tests). Runs as a DOM pass, which Cite's
+  semantics force: a marker's number depends on refs appearing later in the
+  document, and `<references>` renders the notes from wherever the tag sits.
 - Then Poem, finishing Gallery, SyntaxHighlight/Source, Math, Templatedata;
   then the placeholder-semantics ones (Timeline, Graph, Mapframe).
   **Templatestyles is done** (see below).
@@ -583,24 +584,26 @@ them because each cost real time:
   and so they can be *hybrid* (part wikitext, part HTML) as Parsoid's are.
 - **Exit criterion:** pages with references match.
 
-#### Cite: what is built and what blocks it
+#### Cite, and the node ids it depends on
 
 Cite is the most-used extension after Lua — 28 of the 32 corpus pages carry a
-`<ref>` — and it is the first thing that differs on the very first page examined.
-On `Zebra`, rustoid emits **zero** `<sup>` markers while Parsoid's output has one
-per citation.
+`<ref>` — and it was the first thing to differ on the first page examined. On
+`Zebra`, rustoid emitted **zero** `<sup>` markers against Parsoid's 62, with 46
+raw `<ref>` elements left in the output. It now emits 45 markers and no leftovers.
 
-The model and both renderers are implemented and tested
-(`rustoid-core/src/ext/cite.rs`). The shapes were read off the cached Parsoid
-output, not guessed, which matters because Cite's HTML is dense with derived ids:
+Both halves are implemented (`rustoid-core/src/ext/cite.rs`; 23 tests). The shapes
+were read off the cached Parsoid output, not guessed, which matters because Cite's
+HTML is dense with derived ids:
 
 - Numbers are assigned by **document order of first use**, so the markers and the
   note list cannot be computed independently.
 - A named ref used again does not allocate a number; it appends a back-link to the
-  existing note. The lookup key is the name when present and the content
-  otherwise, which is also why two identical anonymous refs share a note.
+  existing note. The lookup key is the name when present and the content otherwise,
+  which is also why two identical anonymous refs share a note.
+- A note's body renders in the **list**, not at the call site. Rendering it in both
+  places is the obvious wrong version.
 
-Three details a plausible guess gets wrong, all verified against `Zebra`:
+Three output details a plausible guess gets wrong, all verified against `Zebra`:
 
 - The marker and the note use **different separators**:
   `cite_ref-Badenhorst2019_1-0` but `cite_note-Badenhorst2019-1`.
@@ -609,26 +612,53 @@ Three details a plausible guess gets wrong, all verified against `Zebra`:
 - A note used **once** renders its back-link bare with `↑`; used twice or more, the
   links are wrapped in `mw-cite-backlink` and labelled `1`, `2`, …
 
-**What blocks the wiring.** Cite needs two things the current architecture does
-not provide:
+**Cite is a DOM pass, and its semantics force that.** A marker's number depends on
+refs appearing *after* it, and `<references>` renders the notes from wherever the
+tag sits — usually the bottom of the page. So nothing can be decided while walking
+past the refs, and the token pipeline, being a chain of independent passes, has
+nowhere to keep the collection. One walk collects, a second substitutes. That is
+why Cite could not be built the way the other extensions were — and why its
+renderers build `Node`s rather than HTML strings: a string needed a raw-HTML escape
+hatch to get past the serializer, and could not carry per-element ids at all.
 
-1. **Whole-document state.** `TreeBuilderStage` is a chain of stateless token
-   passes, so there is nowhere to accumulate references. The collection has to run
-   over the whole document *before* either half renders, because the number of a
-   marker depends on refs that appear after it.
+#### The node ids, and how they turned out to be base64
 
-2. **Document-wide element ids.** Every `<sup>`, `<a>` and `<span>` in Cite's
-   output carries an `id="mwCg"`-style attribute. These are **not** Cite's
-   `cite_*` ids; Parsoid assigns them in a final `addIds` pass, by element order
-   across the whole document. rustoid emits *zero* such ids today, against a cached
-   `Zebra` that has hundreds.
+Every element carrying `data-parsoid`/`data-mw` gets an `id="mwAQ"`-style
+attribute, keying it in the page bundle a wiki serves. rustoid emitted **none**;
+`Zebra`'s cached HTML has 3124.
 
-The second is the larger problem and is **not** Cite-specific: it affects every
-page, and it is why the renderers take their `mw` ids as a parameter instead of
-generating them. Any attempt to "finish Cite" without it will produce structurally
-right HTML that cannot match byte-for-byte. That pass — a document-order id
-allocator over the built DOM — is the next real piece of work, and it is a
-prerequisite for Cite rather than a detail of it.
+The encoding is not what it looks like, and it cost two wrong attempts. It is
+Parsoid's `Utils\CounterType::counterToId`: the counter written as **big-endian
+bytes and then base64-encoded**, not as base-62 digits. Counter 1 is the byte
+`0x01`, base64 `AQ`, giving `mwAQ`; counter 4 is `0x04` → `BA` → `mwBA`. The visible
+`AQ, Ag, Aw, BA` cycle is base64's alphabet, not a conversion carry.
+
+This is worth recording because base-62 is a *near miss* rather than an obvious
+error: it reproduces the first 63 ids exactly and then diverges. I spent two rounds
+reverse-engineering an alphabet that was never there before reading the source,
+which would have settled it in one step. The lesson is the same one the `|`-in-attribute
+false alarm taught: when a generated-artifact sequence looks arbitrary, find the
+generator rather than infer it.
+
+Three rules from the same source, each of which shifts every later id if wrong:
+
+- Only an element with metadata to key takes a counter.
+- An element that already has an id keeps it, and takes no counter.
+- Pre-order depth-first from the body, starting at counter 1.
+
+A fourth falls out of the allocation loop: a generated id colliding with one already
+in the document is **skipped**, leaving a hole. `Zebra` has exactly two — 434→436 and
+3026→3032 — so an implementation assuming a dense sequence matches 434 ids and then
+drifts for the remaining 2600. All 3031 generated ids are reproduced exactly,
+holes included, by replaying the collisions through the allocator.
+
+**Ids are gated behind `ParserOptions::node_ids`, and that is a real distinction
+rather than a test workaround.** MediaWiki's REST layer page-bundles Parsoid output
+and assigns these ids; Parsoid in **standalone** mode emits none, and the fixture
+suite compares against standalone output. Emitting them unconditionally dropped the
+fixture score from 876 to **172** — the suite correctly reporting that standalone
+output has no ids. `rustoid-compare` turns the option on, because matching what a
+wiki serves is its entire purpose.
 
 #### `mw.wikibase` — implemented (the lookup surface)
 
