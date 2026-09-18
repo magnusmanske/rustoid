@@ -143,8 +143,8 @@ fn normalise_declaration(raw: &str) -> String {
 ///
 /// A media *type* (`all`, `screen`, `print`) keeps the space that follows the
 /// at-rule name; a bare parenthesised condition does not. Within a condition,
-/// spaces after `:` and `,` go, and `and` loses the space before it when it
-/// follows a `)`.
+/// spaces after `:`, after `,` and before `)` go, and `and` loses the space
+/// before it when it follows a `)`.
 ///
 /// The rules are transcribed from every at-rule prelude in the cached Parsoid
 /// output, where all of these appear:
@@ -174,10 +174,11 @@ fn normalise_at_prelude(prelude: &str) -> String {
         out.push(' ');
     }
 
-    // Within what remains, spaces after `:` and `,` go, and `and` loses the
-    // space before it when it follows a `)` so that `…) and (` becomes
-    // `…)and (`. This is the only place `and` is special: after a media type the
-    // space before it is significant, as in `@media screen and (…)`.
+    // Within what remains, spaces after `:` and `,` go, a space before `)`
+    // goes, and `and` loses the space before it when it follows a `)` so that
+    // `…) and (` becomes `…)and (`. The space before `and` is the only place
+    // `and` is special: after a media type it is significant, as in
+    // `@media screen and (…)`.
     let mut after_paren = false;
     let mut chars = rest.chars().peekable();
     while let Some(c) = chars.next() {
@@ -191,6 +192,13 @@ fn normalise_at_prelude(prelude: &str) -> String {
                 }
             }
             ')' => {
+                // A space before `)` goes, mirroring `normalise_value`. Parsoid
+                // closes every condition tightly: the cached output holds
+                // `(max-width:500px)` and `(prefers-color-scheme:dark)`, and not
+                // a single space before a `)` in any at-rule prelude.
+                while out.ends_with(' ') {
+                    out.pop();
+                }
                 out.push(')');
                 after_paren = true;
             }
@@ -671,6 +679,29 @@ div.hatnote {
             let out = render(source, None);
             assert!(out.starts_with("@media screen"), "for {source:?}: {out}");
         }
+    }
+
+    /// A space before `)` goes, as it does in a declaration value. The cached
+    /// Parsoid output closes every condition tightly — `(max-width:500px)`,
+    /// `(prefers-color-scheme:dark)` — and holds no space before a `)` in any
+    /// at-rule prelude. `Template:Col-float/styles.css` and
+    /// `Template:Hidden begin/styles.css` are written `( max-width: 720px )`,
+    /// which is where this showed up.
+    #[test]
+    fn a_space_before_a_closing_paren_goes() {
+        assert_eq!(
+            render("@media all and ( max-width: 720px ) {.a{b:1}}", None),
+            "@media all and (max-width:720px){.mw-parser-output .a{b:1}}"
+        );
+        // A nested condition closes tightly too. This is the real source
+        // spelling of `@media screen and (prefers-color-scheme: dark)`.
+        assert_eq!(
+            render(
+                "@media screen and ( prefers-color-scheme: dark ) {.a{b:1}}",
+                None
+            ),
+            "@media screen and (prefers-color-scheme:dark){.mw-parser-output .a{b:1}}"
+        );
     }
 
     /// `and` after a closing parenthesis loses the space before it, but only in
