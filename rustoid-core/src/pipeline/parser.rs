@@ -2520,6 +2520,45 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             );
         };
 
+        // A transcluded **redirect** is followed to its target, which is what
+        // MediaWiki does: `Template:Pp-semi` is `#REDIRECT [[Template:Protected
+        // page]]`, and rendering that line literally yields a redirect listing
+        // instead of the protected-page icon. Standard on any wiki (`{{db}}`),
+        // and a whole class of the corpus's templates.
+        //
+        // Arguments are carried over untouched: the *caller's* parameters belong
+        // to the target (`{{pp-semi|small=yes}}` reads `{{{small|}}}` there), and
+        // the child frame below is built from `title` only after this, so the
+        // redirect must be resolved before that frame exists.
+        //
+        // `data-mw` still names the *redirect* the page called, not the target —
+        // that is what Parsoid records — so only the body source and the frame
+        // title are replaced here.
+        let (template_src, title) = match follow_template_redirect(src, title).await {
+            Redirected::Followed { body, title } => (body, title),
+            // The page exists and *is* a redirect, but its target could not be
+            // fetched. Treat it as a missing template rather than falling back to
+            // the redirect's own body: the `#REDIRECT [[…]]` line and its
+            // `[[Category:…]]` trailer are bookkeeping, and rendering them as
+            // article text invents content Parsoid never emits.
+            Redirected::Unresolved => {
+                if in_template {
+                    return vec![crate::pipeline::template_handler::template_to_wikilink(
+                        name,
+                    )];
+                }
+                let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+                let info = template_info_from(None, Some(name), vec![]);
+                return encap.encap_tokens(
+                    vec![crate::pipeline::template_handler::template_to_wikilink(
+                        name,
+                    )],
+                    &info,
+                );
+            }
+            Redirected::NotARedirect => (template_src, title.clone()),
+        };
+
         // Build a child frame carrying the template's arguments (params[1..]).
         //
         // PHP expands the template token's *attributes* — i.e. the argument keys
@@ -2616,7 +2655,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         let mut info = template_info_from(None, Some(name), vec![]);
         info.target_wt = Some(target_str.to_string());
-        info.href = Some(crate::title::make_link(title, self.config));
+        info.href = Some(crate::title::make_link(&title, self.config));
         info.param_infos =
             crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params, page_source);
         encap.encap_tokens(expanded, &info)
@@ -2849,6 +2888,95 @@ fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Par
     let mut parts = vec![pf_arg.trim().to_string()];
     parts.extend(params.args.iter().skip(1).filter_map(kv_to_source_text));
     parts.join("|")
+}
+
+/// How many redirect hops may be followed before giving up.
+///
+/// MediaWiki bounds redirect resolution (`$wgMaxRedirects`); a redirect cycle
+/// (`A → B → A`) is otherwise unbounded, and the depth guard for template
+/// transclusion does not catch it, because each hop is a *fetch* rather than a
+/// nested expansion.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// What [`follow_template_redirect`] found.
+///
+/// The three cases are genuinely different for the caller, which is why this is
+/// not an `Option`: "not a redirect" means keep the body already fetched, while
+/// "a redirect whose target is missing" means the template has no content and
+/// must not render its own redirect line.
+enum Redirected {
+    /// A redirect, followed to the page that supplies the content.
+    Followed {
+        body: String,
+        title: crate::title::Title,
+    },
+    /// The body is a redirect, but no target could be fetched.
+    Unresolved,
+    /// The body is ordinary content, so the caller keeps it as-is.
+    NotARedirect,
+}
+
+/// Follow a template's redirect chain, returning the final body and its title.
+///
+/// A redirected template's *own* body is discarded entirely — MediaWiki
+/// transcludes the target, it does not render the redirect line — and the
+/// target's title replaces the redirect's so the child frame, `{{PAGENAME}}` and
+/// any further transclusion resolve against the page that actually supplies the
+/// content.
+///
+async fn follow_template_redirect(src: &dyn DataSource, title: &crate::title::Title) -> Redirected {
+    let mut current = title.clone();
+    let Some(mut body) = src.get_template(&current).await.ok().flatten() else {
+        return Redirected::NotARedirect;
+    };
+    let mut hops = 0;
+
+    while let Some(target) = crate::pipeline::template_handler::redirect_target_of(&body) {
+        if hops >= MAX_REDIRECT_HOPS {
+            // The chain is too long to be a real one. Report it unresolved rather
+            // than rendering a redirect line as content.
+            return Redirected::Unresolved;
+        }
+        hops += 1;
+
+        // The target is resolved as a **full title**: a redirect body names the
+        // page it points at, namespace included. Forcing the redirect's own
+        // namespace onto it would turn `Template:Pp-semi`'s
+        // `#REDIRECT [[Template:Protected page]]` into `Template:Template:…`,
+        // which is why this must not guess.
+        //
+        // `resolve_redirect` is consulted first when the data source implements
+        // it, because a source may know the canonical target (title
+        // normalisation, an interwiki) that parsing the wikitext cannot express.
+        let parsed = crate::title::Title::new_main(target);
+        let next = src
+            .resolve_redirect(&current)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(parsed);
+        if next == current {
+            // A self-redirect: there is no content to be had.
+            return Redirected::Unresolved;
+        }
+        match src.get_template(&next).await.ok().flatten() {
+            Some(next_body) => {
+                body = next_body;
+                current = next;
+            }
+            // The target does not exist, or is not available offline.
+            None => return Redirected::Unresolved,
+        }
+    }
+
+    if hops == 0 {
+        Redirected::NotARedirect
+    } else {
+        Redirected::Followed {
+            body,
+            title: current,
+        }
+    }
 }
 
 /// How many Lua frame methods may nest before the expansion is abandoned.

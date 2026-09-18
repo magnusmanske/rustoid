@@ -462,6 +462,57 @@ fn is_safe_subst(name: &str) -> bool {
     name == "safesubst"
 }
 
+/// The target of a page whose wikitext is a redirect, or `None` if it is not one.
+///
+/// A transcluded redirect is ordinary on a wiki — `{{db}}` → `Template:Delete` —
+/// and MediaWiki follows it, transcluding the *target*. `Template:Pp-semi`
+/// (`#REDIRECT [[Template:Protected page]]`) is the redirect that surfaced this:
+/// rendering its body literally produces a redirect listing instead of the icon.
+///
+/// Detection mirrors MediaWiki's `WikiPage::isRedirect`: the redirect word must
+/// be the first thing in the page, after whitespace and optional comments. A body
+/// that merely mentions `#REDIRECT` inline is **not** a redirect, so this must
+/// anchor at the start rather than search.
+///
+/// `#REDIRECT` is localisable and carries optional aliases (`#REDIRECT`, with
+/// magic-word synonyms), but a wiki's aliases are not guaranteed to be in
+/// `SiteConfig`, so only the canonical spellings are recognised here. The
+/// alternative — treating any leading word as a redirect — would misread ordinary
+/// content, which is much worse than missing a localised redirect.
+pub fn redirect_target_of(body: &str) -> Option<String> {
+    // Strip leading comments, which MediaWiki allows before the redirect word
+    // (`<!--x-->#REDIRECT [[A]]` is a redirect).
+    let mut rest = body.trim_start();
+    while let Some(after) = rest.strip_prefix("<!--") {
+        let end = after.find("-->")?;
+        rest = after[end + 3..].trim_start();
+    }
+
+    let after_word = rest
+        .strip_prefix("#REDIRECT")
+        .or_else(|| rest.strip_prefix("#redirect"))
+        .or_else(|| rest.strip_prefix("#Redirect"))?;
+
+    // The redirect word must be a whole word: `#REDIRECTED` is not a redirect.
+    // A colon is allowed (`#REDIRECT: [[A]]`).
+    let after_word = after_word.strip_prefix(':').unwrap_or(after_word);
+    if !after_word.starts_with(|c: char| c.is_whitespace() || c == '[') {
+        return None;
+    }
+
+    // The target is the first wikilink. A piped target (`[[A|label]]`) redirects
+    // to `A`; the label is ignored, as MediaWiki ignores it too.
+    let after_word = after_word.trim_start();
+    let after_open = after_word.strip_prefix("[[")?;
+    let end = after_open.find("]]")?;
+    let target = &after_open[..end];
+    let target = target.split('|').next()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(target.replace('_', " "))
+}
+
 /// Parse a `{{{...}}}` template-argument source string into its argument name
 /// and optional default. Mirrors the `k` / `v` attribution of PHP's
 /// `templatearg` token.
@@ -1228,6 +1279,53 @@ mod tests {
             }
             other => panic!("expected variable, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn redirect_target_is_read_from_a_redirect_body() {
+        assert_eq!(
+            redirect_target_of("#REDIRECT [[Template:Protected page]]").as_deref(),
+            Some("Template:Protected page")
+        );
+        // MediaWiki's canonical bodies have a trailing newline and a category.
+        assert_eq!(
+            redirect_target_of("#REDIRECT [[Template:B]]\n[[Category:C]]").as_deref(),
+            Some("Template:B")
+        );
+        // A piped target redirects to the page, not the label.
+        assert_eq!(
+            redirect_target_of("#REDIRECT [[Template:B|shown]]").as_deref(),
+            Some("Template:B")
+        );
+        // Underscores are the wire spelling of a space.
+        assert_eq!(
+            redirect_target_of("#REDIRECT [[Template:Protected_page]]").as_deref(),
+            Some("Template:Protected page")
+        );
+        // Leading comments and whitespace are allowed, and the colon is optional.
+        assert_eq!(
+            redirect_target_of("\n<!-- c --> #REDIRECT: [[A]]").as_deref(),
+            Some("A")
+        );
+    }
+
+    /// A body that merely mentions the redirect word is not a redirect.
+    ///
+    /// This is the case that makes anchoring at the start load-bearing: a false
+    /// positive silently replaces a template's real content with another page.
+    #[test]
+    fn a_redirect_word_in_the_middle_is_not_a_redirect() {
+        assert_eq!(redirect_target_of("see #REDIRECT [[A]] for details"), None);
+        assert_eq!(redirect_target_of("{{foo}}\n#REDIRECT [[A]]"), None);
+        // A longer word beginning with the redirect word is not it either.
+        assert_eq!(redirect_target_of("#REDIRECTED [[A]]"), None);
+        // No link, nothing to redirect to.
+        assert_eq!(redirect_target_of("#REDIRECT"), None);
+        assert_eq!(redirect_target_of("#REDIRECT "), None);
+        assert_eq!(redirect_target_of("#REDIRECT [[]]"), None);
+        // Ordinary content.
+        assert_eq!(redirect_target_of("just some text"), None);
+        assert_eq!(redirect_target_of(""), None);
     }
 
     #[test]
