@@ -587,6 +587,38 @@ returns an object, and the object methods beyond label/sitelink/statements
 `Module:WikidataIB` is 3538 lines and leans on those; it is the next step, not
 this one.
 
+#### The `subst` prefix, and what it was costing
+
+Byte inflation was the largest visible symptom for a while: the corpus rendered
+at ~7x Parsoid's size, one page at 10.1MB against 1.46MB. It was **not** a
+serializer problem. `{{subst:Name}}` and `{{safesubst:Name}}` were not
+recognised as preprocessor directives, so the whole `safesubst: Name` string was
+taken for a page title, matched nothing, and the call's own argument list leaked
+out as body text.
+
+`Template:Country data X` is written this way — a `safesubst` call carrying a
+hundred parameter lines — so every transclusion of it dumped those lines. On
+Berlin that happened 117 times and produced 609 bogus "Template loop detected"
+errors, which is why the leak looked like a loop-handling bug at first.
+
+| | before | after |
+|---|---|---|
+| Berlin bytes | 10,115,822 | 2,681,375 |
+| vs Parsoid (1,462,849) | 6.9x | 1.8x |
+| "Template loop detected" | 609 | 0 |
+| corpus output | 7.45x | ~2.0x |
+
+The `<noinclude />` sits between the word and the colon, so it is still in the
+token text when the target is parsed and recognising the directive removes it
+too. Ground truth came from the live parser, which reports
+`Template:Country_data_Germany` as the transclusion for
+`{{safesubst: Country data Germany|flag}}`.
+
+The remaining inflation is a *different* bug, and worth knowing about because it
+is the next thing to chase: rustoid emits `{{Short description}}` as a paragraph
+where Parsoid emits a `<div class="shortdescription">` plus a `mw-empty-elt`
+span. That is a template-output-to-DOM-shape issue, not a size one.
+
 #### Templatestyles — implemented
 
 `Module:Citation/CS1` and a dozen others call
