@@ -18,13 +18,13 @@ so the fixture suite cannot measure Lua or Cite.
 
 | Area | Status |
 |------|--------|
-| Parser core (wikitext → HTML) | **871/891 fixtures (98%)**, 679 lib tests |
+| Parser core (wikitext → HTML) | **876/896 fixtures (98%)**, 769 lib tests |
 | HTML → wikitext (round-trip) | Working |
 | Selective serialization (selser) | Working |
 | Template expansion | Working |
-| Lua/Scribunto | Engine present, **not wired to `#invoke`** |
-| On-wiki extensions (Cite, …) | Not implemented (built-ins only) |
-| Online-parity harness (`rustoid compare`) | Not started |
+| Lua/Scribunto | Engine wired to `#invoke`, with `frame:expandTemplate`/`callParserFunction`/`preprocess`; `mw` surface still incomplete |
+| On-wiki extensions (Cite, …) | Not implemented (built-ins + Templatestyles only) |
+| Online-parity harness (`rustoid-compare`) | Working — revid-pinned fetch, per-wiki cache, offline replay, corpus scoreboard. Online score: **0 pages byte-exact** |
 | CLI (`rustoid-cli`) | Subcommands are stubs |
 
 The phases in [PLAN.md](PLAN.md) (0–13) are the original, now largely complete

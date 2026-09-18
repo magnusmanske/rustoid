@@ -17,6 +17,9 @@
 //! rustoid-compare --wiki en.wikipedia.org
 //! rustoid-compare --wiki en.wikipedia.org --flush
 //! rustoid-compare --flush-all
+//!
+//! # Rebuild a lost manifest from the bodies still on disk:
+//! rustoid-compare --wiki en.wikipedia.org --reindex
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -73,6 +76,14 @@ struct Cli {
     #[arg(long)]
     flush: bool,
 
+    /// Rebuild the manifest from the body files on disk, then exit.
+    ///
+    /// Recovers a cache whose `index.json` was lost while the bodies survived.
+    /// Revisions are not recoverable this way, so a reindexed cache serves
+    /// fetches but cannot satisfy an offline comparison.
+    #[arg(long)]
+    reindex: bool,
+
     /// Delete every wiki's cache, then exit.
     #[arg(long)]
     flush_all: bool,
@@ -114,6 +125,16 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.flush {
         cache.flush()?;
         println!("flushed cache for {}", cli.wiki);
+        return Ok(());
+    }
+
+    if cli.reindex {
+        let added = cache.reindex()?;
+        println!(
+            "reindexed {}: {added} bodies recovered, {} entries now",
+            cli.wiki,
+            cache.len()
+        );
         return Ok(());
     }
 

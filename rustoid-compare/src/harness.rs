@@ -624,13 +624,26 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
                 // Offline with no pinned revision: fall back to whatever the
                 // cached wikitext was fetched at, which is what makes a replay
                 // of a previous run possible without the network.
-                let cached = {
-                    let guard = cache
-                        .lock()
-                        .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
-                    guard.get(EntryKind::Page, &title)?
+                //
+                // A cache recovered by `reindex` has no recorded revision, so the
+                // cached Parsoid HTML's own `Special:Redirect/revision` stamp is
+                // the second source. Without it a reindexed cache serves every
+                // body and still reports every page as skipped, because the
+                // revision — not the content — is what is missing.
+                let guard = cache
+                    .lock()
+                    .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
+                let from_wikitext = guard
+                    .get(EntryKind::Page, &title)?
+                    .and_then(|c| c.meta.revid);
+                let revid = match from_wikitext {
+                    Some(r) => Some(r),
+                    None => guard
+                        .get(EntryKind::Rendered, &title)?
+                        .and_then(|c| c.meta.revid.or_else(|| parsoid_revision(&c.body))),
                 };
-                match cached.and_then(|c| c.meta.revid) {
+                drop(guard);
+                match revid {
                     Some(r) => r,
                     None => {
                         return Ok(Comparison::skipped(
@@ -706,6 +719,11 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
     };
     let parsoid_html = match cached {
         Some(c) if c.meta.revid == Some(revid) => c.body,
+        // A cache recovered by `reindex` has no recorded revision, but the HTML
+        // states its own — so the body can still be matched against the wikitext
+        // instead of being reported as absent. This is what makes a reindexed
+        // cache usable for an offline run at all.
+        Some(c) if c.meta.revid.is_none() && parsoid_revision(&c.body) == Some(revid) => c.body,
         _ if req.offline => {
             return Ok(Comparison::skipped(
                 title,
@@ -875,6 +893,23 @@ fn strip_sections(html: &str) -> String {
     out.push_str(rest);
     // Closing tags carry no attributes, so a plain replace is exact.
     out.replace("</section>", "")
+}
+
+/// Read the revision a Parsoid HTML document was rendered from, if it says.
+///
+/// Parsoid stamps the source revision into the document as a
+/// `Special:Redirect/revision/<id>` about-attribute on the root element, which is
+/// the only place it appears. Extracting it is what lets a reindexed cache —
+/// recovered from body files, so with no recorded revision — still be matched
+/// against a wikitext revision rather than reported as absent.
+///
+/// Returns `None` for a document that does not state one, which is not an error:
+/// the caller then falls back to whatever the manifest held.
+fn parsoid_revision(html: &str) -> Option<u64> {
+    const MARKER: &str = "Special:Redirect/revision/";
+    let rest = &html[html.find(MARKER)? + MARKER.len()..];
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    digits.parse().ok()
 }
 
 /// Reduce both sides to a comparable form.
@@ -1077,6 +1112,28 @@ mod tests {
     #[test]
     fn identical_html_matches() {
         assert_eq!(compare_html("<p>x</p>", "<p>x</p>"), Outcome::Match);
+    }
+
+    /// Parsoid states the source revision in the document, and a reindexed
+    /// cache depends on reading it back — a body recovered from disk has no
+    /// manifest revision, so this is the only way to match it to a wikitext
+    /// revision.
+    #[test]
+    fn the_parsoid_revision_is_read_from_the_document() {
+        let doc = "<!DOCTYPE html>\n<html about=\"//en.wikipedia.org/wiki/Special:Redirect/revision/1375105737\">";
+        assert_eq!(parsoid_revision(doc), Some(1375105737));
+        // The real documents carry a `<link rel="dc:replaces" resource=…>` with a
+        // *different* revision first, so the marker must, not the first number.
+        let with_replaces = "<html about=\"//en.wikipedia.org/wiki/Special:Redirect/revision/1375105737\"><head><link rel=\"dc:replaces\" resource=\"mwr:revision/1375105498\"/>";
+        assert_eq!(parsoid_revision(with_replaces), Some(1375105737));
+    }
+
+    #[test]
+    fn a_document_without_a_revision_yields_none() {
+        assert_eq!(parsoid_revision("<p>no revision here</p>"), None);
+        assert_eq!(parsoid_revision("Special:Redirect/revision/"), None);
+        // Not a number, so it is not a revision.
+        assert_eq!(parsoid_revision("Special:Redirect/revision/abc"), None);
     }
 
     #[test]
@@ -1333,6 +1390,95 @@ mod tests {
         assert!(matches!(err, Err(CompareError::Offline(_))), "{err:?}");
 
         WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A reindexed cache must survive the whole offline comparison, not merely
+    /// be listed.
+    ///
+    /// This is the regression, end to end: a populated cache whose `index.json`
+    /// was lost reported every page as `skipped`, because the manifest is what
+    /// `get` consults and revisions live only there. Reindexing restores the
+    /// bodies, and the Parsoid HTML's own `Special:Redirect/revision` stamp
+    /// restores the revision that `compare_page` matches on.
+    ///
+    /// Real Parsoid HTML is used rather than a stub, because the revision stamp
+    /// is exactly the part a stub would get to invent.
+    #[tokio::test]
+    async fn a_reindexed_cache_still_compares_offline() {
+        let root = std::env::temp_dir().join("rustoid-compare-reindex-offline");
+        let _ = std::fs::remove_dir_all(&root);
+        let host = "example.invalid";
+        let revid = 1375105737u64;
+        let wikitext = "Hello {{World}}";
+        let parsoid = format!(
+            "<!DOCTYPE html>\n<html about=\"//{host}/wiki/Special:Redirect/revision/{revid}\">\n<body><p>Hello <b>World</b></p></body></html>"
+        );
+
+        let mut cache = WikiCache::open(&root, host).unwrap();
+        for (kind, title, body) in [
+            (EntryKind::SiteInfo, "siteinfo", siteinfo_body()),
+            (EntryKind::Page, "Test", wikitext),
+            (EntryKind::Rendered, "Test", &parsoid),
+        ] {
+            cache
+                .put(
+                    kind,
+                    title,
+                    body,
+                    crate::cache::EntryMeta {
+                        kind,
+                        title: title.to_string(),
+                        revid: Some(revid),
+                        fetched_at: None,
+                    },
+                )
+                .unwrap();
+        }
+        cache.write_index().unwrap();
+        // The loss this recovers from.
+        std::fs::remove_file(cache.dir().join("index.json")).unwrap();
+
+        let cache = Arc::new(std::sync::Mutex::new(WikiCache::open(&root, host).unwrap()));
+        let client = WikiClient::new(crate::wire::Wiki::new(host)).unwrap();
+
+        // Before reindexing, the bodies are on disk but invisible — and the
+        // siteinfo they include cannot even be loaded.
+        assert!(
+            load_site_config(None, &cache, true, false).await.is_err(),
+            "an un-reindexed cache cannot serve even the site config"
+        );
+        let req = CompareRequest {
+            title: "Test".to_string(),
+            revid: None,
+            refresh: false,
+            offline: true,
+        };
+
+        assert_eq!(cache.lock().unwrap().reindex().unwrap(), 3);
+
+        let config = load_site_config(None, &cache, true, false).await.unwrap();
+
+        // Now the wikitext, the Parsoid HTML and its revision all resolve, so
+        // the run reaches an actual comparison rather than a skip.
+        let after = compare_page(&client, &config, &cache, &req).await.unwrap();
+        assert_eq!(
+            after.revid, revid,
+            "the revision comes from the HTML itself"
+        );
+        assert_eq!(after.wikitext, wikitext);
+        assert_eq!(after.parsoid_html, parsoid);
+        assert!(
+            !matches!(after.outcome, Outcome::Skipped { .. }),
+            "a recovered cache must produce a comparison: {:?}",
+            after.outcome
+        );
+
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A minimal `siteinfo` body, enough for `WikiSiteConfig`.
+    fn siteinfo_body() -> &'static str {
+        r#"{"query":{"general":{"lang":"en"},"extensiontags":[],"functionhooks":[]}}"#
     }
 
     /// A data source must write into the manifest of the handle it was given.

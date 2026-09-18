@@ -63,6 +63,19 @@ impl EntryKind {
             Self::Entity => "entity",
         }
     }
+
+    /// The inverse of [`as_str`](Self::as_str), for reading a key back.
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "page" => Some(Self::Page),
+            "tpl" => Some(Self::Template),
+            "mod" => Some(Self::Module),
+            "html" => Some(Self::Rendered),
+            "siteinfo" => Some(Self::SiteInfo),
+            "entity" => Some(Self::Entity),
+            _ => None,
+        }
+    }
 }
 
 /// Metadata recorded alongside a cached body.
@@ -169,12 +182,25 @@ impl WikiCache {
 
     /// Look up a cached body. `Ok(None)` on a miss, so callers can fall through
     /// to the network without treating a miss as an error.
+    ///
+    /// A body recovered by [`reindex`](Self::reindex) may sit under a filename
+    /// that neither the current scheme nor a rebuild from `title` produces: a
+    /// body written by the older `__`-escaped scheme is stored that way on disk,
+    /// whatever the index says. Both spellings are therefore tried, canonical
+    /// first, so a normal entry never pays for the second `stat`.
     pub fn get(&self, kind: EntryKind, title: &str) -> Result<Option<CachedBody>> {
         let key = Self::key(kind, title);
         let Some(meta) = self.index.entries.get(&key) else {
             return Ok(None);
         };
-        let path = self.body_path(&key);
+        let canonical = self.body_path(&key);
+        let path = if canonical.exists() {
+            canonical
+        } else {
+            self.dir()
+                .join("pages")
+                .join(format!("{}.txt", Self::legacy_stem(&key)))
+        };
         let body = match std::fs::read_to_string(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -247,11 +273,27 @@ impl WikiCache {
         std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))
     }
 
+    /// Where a key's body lives.
+    ///
+    /// The stem is the key itself, with only `/`, `\` and NUL replaced. Colons
+    /// and spaces survive deliberately: `mod:Module:Foo` and `page:Module:Foo`
+    /// are different keys and must not collapse into one file, and keeping the
+    /// title readable is what makes a populated cache inspectable by hand. The
+    /// key is therefore recoverable from the filename, which
+    /// [`reindex`](Self::reindex) relies on.
     fn body_path(&self, key: &str) -> PathBuf {
-        self.dir().join("pages").join(format!(
-            "{}.txt",
-            sanitize_component(&key.replace(':', "__"))
-        ))
+        self.dir()
+            .join("pages")
+            .join(format!("{}.txt", sanitize_path_separators(key)))
+    }
+
+    /// The filename stem the older cache layout produced for a key.
+    ///
+    /// Every `:` used to become `__`. Bodies written then are still on disk, and
+    /// a corpus cache is hours of rate-limited fetching, so they are worth
+    /// reading rather than re-fetching. See [`key_from_body_stem`].
+    fn legacy_stem(key: &str) -> String {
+        key.replace(':', "__")
     }
 
     /// Remove one entry (body + metadata).
@@ -298,6 +340,71 @@ impl WikiCache {
         }
         Ok(())
     }
+
+    /// Rebuild the manifest from the body files on disk, recovering a cache whose
+    /// `index.json` is missing or was lost mid-run.
+    ///
+    /// Bodies and the manifest are written separately — a body is a plain file,
+    /// the manifest is metadata — so the bodies survive a crash that takes the
+    /// manifest with it. Without this, that state is unrecoverable: `get` consults
+    /// the manifest first, so a cache holding thousands of bodies and no index
+    /// reads as empty, and every offline run reports `skipped`.
+    ///
+    /// The kind is recovered from the key prefix rather than guessed, so the
+    /// result is exactly what the writing run would have produced. What is *not*
+    /// recoverable is `revid`: it was only ever stored in the manifest, and
+    /// inventing one would be worse than useless, because `compare_page` selects
+    /// the cached Parsoid HTML by matching it (`c.meta.revid == Some(revid)`).
+    /// A manifest without revisions therefore makes every offline comparison
+    /// skip, which is why `EntryMeta::revid` is `Option` and why this is a
+    /// recovery tool, not a substitute for the manifest.
+    ///
+    /// A body this handle has already recorded is left alone: a real fetch is
+    /// authoritative, and only the gaps are filled.
+    pub fn reindex(&mut self) -> Result<usize> {
+        let pages = self.dir().join("pages");
+        let dir = match std::fs::read_dir(&pages) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(io_err(&pages, e)),
+        };
+
+        let mut added = 0;
+        for entry in dir {
+            let path = entry.map_err(|e| io_err(&pages, e))?.path();
+            // `index.json.tmp` and any stray file are not bodies; only `.txt` is.
+            if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some((kind, title)) = key_from_body_stem(stem) else {
+                continue;
+            };
+            let key = Self::key(kind, &title);
+            if self.index.entries.contains_key(&key) {
+                continue;
+            }
+            self.removed.remove(&key);
+            self.index.entries.insert(
+                key,
+                EntryMeta {
+                    kind,
+                    // The title as recovered from the *filename*, which for a
+                    // pre-`sanitize_path_separators` body is not the title the
+                    // caller will ask for. `get` resolves the body through this
+                    // field, so recording it is what makes the entry reachable.
+                    title,
+                    revid: None,
+                    fetched_at: None,
+                },
+            );
+            added += 1;
+        }
+        self.write_index()?;
+        Ok(added)
+    }
 }
 
 /// A cached body plus its metadata.
@@ -314,6 +421,10 @@ pub struct CachedBody {
 /// wiki-supplied title and the filesystem, and a title like `../etc/passwd` or
 /// `a/b` must not be able to escape the cache directory. It also collapses runs
 /// and truncates, so long module titles cannot exceed filename limits.
+///
+/// Hosts go through this; cache *keys* go through
+/// [`sanitize_path_separators`] instead, because their colons and spaces carry
+/// meaning.
 fn sanitize_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(96));
     let mut last_underscore = false;
@@ -339,11 +450,56 @@ fn sanitize_component(s: &str) -> String {
     }
 }
 
+/// Escape only what cannot appear in a filename, keeping the rest verbatim.
+///
+/// A cache key is `<kind>:<title>`, and the title is what makes a cache
+/// inspectable — `mod:Module:Hatnote list` should look like itself on disk. Only
+/// `/`, `\` and NUL can actually escape a directory or truncate a path, so only
+/// those are replaced, which also makes the key recoverable from the filename.
+fn sanitize_path_separators(key: &str) -> String {
+    key.replace(['/', '\\', '\0'], "_").replace("..", "__")
+}
+
 fn io_err(path: &Path, e: std::io::Error) -> CompareError {
     CompareError::Cache {
         path: path.to_path_buf(),
         message: e.to_string(),
     }
+}
+
+/// Recover `(kind, title)` from the stem of a body file, or `None` if the file is
+/// not a body.
+///
+/// Two spellings are understood. A key is `<kind>:<title>`, and the title is what
+/// makes a cache inspectable — `mod:Module:Hatnote list` should look like itself
+/// on disk. Two schemes have been used for that:
+///
+/// - current: only `/`, `\` and NUL are replaced, so the key reads through
+///   almost verbatim;
+/// - pre-`sanitize_path_separators`: every `:` became `__`, which is lossy, so a
+///   recovered title cannot be reconstructed exactly.
+///
+/// The old form is still read because a cache outlives the code that wrote it,
+/// and a corpus cache is hours of rate-limited fetching — refusing to read one
+/// would make recovering it pointless. A `__`-escaped title keeps its embedded
+/// colons escaped, and the *recovered* title is what gets recorded, so `get`
+/// looks the body up by the same string rather than by a reconstruction that
+/// cannot be exact.
+///
+/// A stem with no recognised kind is rejected rather than assumed, so a stray
+/// file in `pages/` cannot become a phantom cache entry.
+fn key_from_body_stem(stem: &str) -> Option<(EntryKind, String)> {
+    let (kind, rest) = stem.split_once("__").or_else(|| stem.split_once(':'))?;
+    let kind = EntryKind::from_str(kind)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let title = if stem.contains("__") {
+        rest.replace("__", ":")
+    } else {
+        rest.to_string()
+    };
+    Some((kind, title))
 }
 
 #[cfg(test)]
@@ -603,5 +759,150 @@ mod tests {
             .unwrap();
         WikiCache::flush_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn body_stem_recovers_the_exact_key() {
+        // Keys must survive the trip to a filename and back, colons included:
+        // `mod:Module:Foo` and `page:Module:Foo` are different entries.
+        for (kind, title) in [
+            (EntryKind::Module, "Module:Hatnote list"),
+            (EntryKind::Page, "Template:Foo"),
+            (EntryKind::Template, "Template:Infobox album"),
+            (EntryKind::Rendered, "Brat (album)"),
+            (EntryKind::SiteInfo, "siteinfo"),
+            (EntryKind::Entity, "Q42"),
+        ] {
+            let stem = sanitize_path_separators(&WikiCache::key(kind, title));
+            let (got_kind, got_title) = key_from_body_stem(&stem).expect(&stem);
+            assert_eq!(got_kind, kind);
+            assert_eq!(got_title, title);
+        }
+    }
+
+    /// The earlier filename scheme escaped every colon, and bodies written by it
+    /// are still on disk. The stored form is what is recorded, so the entry
+    /// stays reachable even though the title cannot be reconstructed exactly.
+    #[test]
+    fn body_stem_reads_the_older_colon_escaped_scheme() {
+        assert_eq!(
+            key_from_body_stem("mod__Module__Hatnote_list"),
+            Some((EntryKind::Module, "Module:Hatnote_list".to_string()))
+        );
+        assert_eq!(
+            key_from_body_stem("html__Zebra"),
+            Some((EntryKind::Rendered, "Zebra".to_string()))
+        );
+        assert_eq!(
+            key_from_body_stem("siteinfo__siteinfo"),
+            Some((EntryKind::SiteInfo, "siteinfo".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_body_is_rejected() {
+        assert!(key_from_body_stem("notes").is_none());
+        assert!(key_from_body_stem("bogus:Thing").is_none());
+        assert!(key_from_body_stem("page:").is_none());
+        assert!(key_from_body_stem("page__").is_none());
+    }
+
+    /// The regression this was written for: bodies on disk, manifest gone.
+    ///
+    /// A run that wrote bodies but lost its `index.json` reported the whole
+    /// cache as empty, so an offline corpus run skipped every page. The bodies
+    /// are the expensive part; recovering them is what `reindex` is for.
+    #[test]
+    fn reindex_recovers_a_cache_whose_manifest_was_lost() {
+        let root = temp_root("reindex-lost");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        for (kind, title, body) in [
+            (EntryKind::Page, "Zebra", "wikitext"),
+            (EntryKind::Module, "Module:Hatnote list", "lua"),
+            (EntryKind::Rendered, "Zebra", "<html>"),
+        ] {
+            cache.put(kind, title, body, meta(kind, title)).unwrap();
+        }
+        cache.write_index().unwrap();
+        std::fs::remove_file(cache.dir().join("index.json")).unwrap();
+
+        // The bodies outlive the manifest, but are unreachable without it.
+        let mut lost = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert_eq!(lost.len(), 0);
+        assert!(lost.get(EntryKind::Page, "Zebra").unwrap().is_none());
+
+        assert_eq!(lost.reindex().unwrap(), 3);
+        assert_eq!(
+            lost.get(EntryKind::Page, "Zebra").unwrap().unwrap().body,
+            "wikitext"
+        );
+        assert_eq!(
+            lost.get(EntryKind::Module, "Module:Hatnote list")
+                .unwrap()
+                .unwrap()
+                .body,
+            "lua"
+        );
+        // Kind separation survives: two bodies for one title stay distinct.
+        assert_eq!(
+            lost.get(EntryKind::Rendered, "Zebra")
+                .unwrap()
+                .unwrap()
+                .body,
+            "<html>"
+        );
+
+        // The recovery is recorded, so a reopen does not need to repeat it.
+        let reopened = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert_eq!(reopened.len(), 3);
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reindex_keeps_live_entries_and_fills_only_gaps() {
+        let root = temp_root("reindex-merge");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        // One entry with real metadata, one orphaned body file.
+        cache
+            .put(EntryKind::Page, "A", "a", meta(EntryKind::Page, "A"))
+            .unwrap();
+        std::fs::write(cache.dir().join("pages").join("page:B.txt"), "b").unwrap();
+
+        assert_eq!(cache.reindex().unwrap(), 1);
+        // The recorded entry keeps its revision; only the gap is filled.
+        assert_eq!(
+            cache.get(EntryKind::Page, "A").unwrap().unwrap().meta.revid,
+            Some(42)
+        );
+        assert_eq!(
+            cache.get(EntryKind::Page, "B").unwrap().unwrap().meta.revid,
+            None
+        );
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A removed entry must stay removed: its body file is gone, so there is
+    /// nothing on disk to resurrect, and the tombstone must not be undone.
+    #[test]
+    fn reindex_does_not_resurrect_a_removal() {
+        let root = temp_root("reindex-removed");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        cache
+            .put(EntryKind::Page, "A", "a", meta(EntryKind::Page, "A"))
+            .unwrap();
+        cache.remove(EntryKind::Page, "A").unwrap();
+
+        assert_eq!(cache.reindex().unwrap(), 0);
+        assert!(cache.get(EntryKind::Page, "A").unwrap().is_none());
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reindex_on_an_empty_cache_is_a_no_op() {
+        let root = temp_root("reindex-empty");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert_eq!(cache.reindex().unwrap(), 0);
+        assert_eq!(cache.len(), 0);
+        WikiCache::flush_all(&root).unwrap();
     }
 }

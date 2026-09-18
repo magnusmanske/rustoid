@@ -70,7 +70,7 @@ score and tracked separately.
 | Piece | State |
 |---|---|
 | Parser core (wikitext → HTML) | **Working** — 871/891 fixtures, 679 lib tests |
-| **Comparison harness** (`rustoid-compare`) | **Working** — revid-pinned fetch, persistent per-wiki cache, offline replay, first-difference reporting. 24 tests |
+| **Comparison harness** (`rustoid-compare`) | **Working** — revid-pinned fetch, persistent per-wiki cache, offline replay, manifest recovery (`--reindex`), first-difference reporting. 84 tests |
 | CLI (`rustoid-cli`) | **Stubs only.** `render`/`roundtrip`/`test`/`serve` all print "not yet implemented" |
 | Lua engine (`lua/engine.rs`, 666 lines) | Present: sandbox, 8 `mw` sub-tables, 17 functions, 16 unit tests. **Not wired into the parser** — no `#invoke` dispatch anywhere |
 | Extension API (`traits.rs::ExtensionHandler`) | Trait exists; **zero implementations**. Returns `String`, which is too coarse for `mw:Extension/<name>` + `data-mw`/`data-parsoid` |
@@ -149,6 +149,37 @@ on-wiki extensions. The instrument itself is what Phase 0 needed to produce.
 Still to come in this phase: corpus/batch mode (a list of titles), golden files,
 and recording the run's wall-clock time and site stats for replay (see
 "What exact equality cannot mean").
+
+#### Recovering a cache whose manifest was lost
+
+A run can be interrupted after bodies are written but before `index.json` is. The
+bodies are the expensive, rate-limited part; the manifest is metadata. But `get`
+consults the manifest first, so that state is worse than useless — a cache holding
+thousands of downloaded templates reads as **empty**, and every offline page
+reports `skipped`, which looks like a network or coverage problem rather than a
+lost index. It happened: a populated enwiki cache was left holding 60 bodies and
+no index, and `--offline` failed at the first step with
+`siteinfo not cached and --offline was requested`.
+
+`--reindex` rebuilds the manifest from the body files. Two things make it work:
+
+- **The kind lives in the key**, and the filename carries the key, so
+  `mod:Module:Hatnote list` is recoverable exactly rather than guessed. The old
+  filename scheme escaped every `:` as `__`; those bodies are still readable, and
+  the *recorded* title is what `get` looks the body up by, so a lossy name does
+  not make an entry unreachable.
+- **A revision is not recoverable from a body** — it only ever lived in the
+  manifest. That would still sink an offline run, so a recovered cache falls back
+  to the revision that the cached Parsoid HTML states about itself
+  (`Special:Redirect/revision/<id>` on the root element). This is the second use
+  of that stamp; pinning by it is what makes a reindexed cache comparable at all,
+  rather than merely non-empty.
+
+So `--reindex` + `--offline` reproduces a comparison with no manifest and no
+network. What it cannot restore is `fetched_at`, and it cannot distinguish a
+stale body from a fresh one — it is a recovery tool, not a substitute for the
+manifest. The lesson is that the manifest is the only file whose loss is
+*unrecoverable*, which is what keeps it small and write-then-rename.
 
 ### Phase 1 — Site config from the wiki — *done*
 
