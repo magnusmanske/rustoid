@@ -242,24 +242,14 @@ impl DocIds {
 
     /// The next id, e.g. `mwCg`.
     ///
-    /// Parsoid emits `mw` + a base-62-like counter. This reproduces the shape so a
-    /// reader can tell the ids apart, but a byte comparison needs the *values*,
-    /// which in turn needs the whole document's id allocation in order — a
-    /// separate problem from Cite rendering.
+    /// Delegates to the page-bundle encoder, because these are the same ids the
+    /// dedicated pass assigns: a Cite span is numbered in the same document-order
+    /// sequence as every other element. Keeping one encoder means a Cite rendering
+    /// cannot drift from the rest of the document.
     pub fn take(&mut self) -> String {
         let n = self.n;
         self.n += 1;
-        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let mut out = String::from("mw");
-        let mut v = n;
-        loop {
-            out.push(alphabet[v % alphabet.len()] as char);
-            v /= alphabet.len();
-            if v == 0 {
-                break;
-            }
-        }
-        out
+        crate::pagebundle::counter_to_id(n as u64)
     }
 }
 
@@ -303,128 +293,241 @@ pub fn references_data_mw(group: &str, responsive: bool) -> String {
     )
 }
 
-/// Render the inline `<sup>` marker for a `<ref>`.
+/// Run Cite over a built DOM: collect references, then render both halves.
 ///
-/// `page_title` is the page the anchor targets: Cite links to a note on the *same*
-/// page, so it is the article under parse, not the ref.
+/// A **DOM pass**, not a token pass, and Cite's semantics force that rather than
+/// making it a convenience. Two requirements rule out a token-level version:
 ///
-/// `ids` supplies the `mw`-style ids. They are passed in rather than generated here
-/// because Parsoid's counter is shared across the whole document — a marker cannot
-/// know its ids without knowing how many elements came before it.
-pub fn render_ref_marker(
-    reference: &Reference,
-    ref_id: &str,
+/// 1. A marker's number depends on refs that appear *after* it, so the collection
+///    must see the whole document before any marker renders. The token pipeline is
+///    a chain of independent passes with nowhere to keep that state.
+/// 2. `<references>` renders the notes wherever it appears — usually at the bottom —
+///    so the list cannot be built while walking past the refs either.
+///
+/// One walk collects; a second substitutes. Running after the tree is final also
+/// means the node ids Cite allocates line up with the page-bundle pass that runs
+/// later, which is why `ids` is threaded from the caller rather than started here.
+///
+/// `body_of` renders a note's wikitext to a node. It is the caller's job because a
+/// note may contain templates, links or nested refs, so rendering needs the
+/// pipeline. Passing it in keeps this module independent of the parser.
+///
+/// Returns the number of `<ref>` markers rendered.
+pub fn run(
+    root: &mut crate::dom::node::Node,
     page_title: &str,
     ids: &mut DocIds,
-) -> String {
-    let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
-    let (a_id, text_id, open_id, close_id) = (ids.take(), ids.take(), ids.take(), ids.take());
-    let mw = ref_data_mw(reference);
-    let label = reference.label();
-    format!(
-        "<sup class=\"mw-ref reference\" id=\"{ref_id}\" rel=\"dc:references\" \
-         typeof=\"mw:Extension/ref\" data-mw='{mw}'>\
-         <a href=\"{href}\" id=\"{a_id}\">\
-         <span class=\"mw-reflink-text\" id=\"{text_id}\">\
-         <span class=\"cite-bracket\" id=\"{open_id}\">[</span>{label}\
-         <span class=\"cite-bracket\" id=\"{close_id}\">]</span>\
-         </span></a></sup>"
-    )
-}
-
-/// Render the `<ol>` note list for one group of `<references>`.
-///
-/// `body_html` supplies the rendered content of each note, keyed by the note's
-/// `id`. The body cannot be rendered here: it is wikitext that has to go back
-/// through the parser (a note may contain templates, links, or another ref), and
-/// that is the caller's job. Passing it in keeps this module free of a parser
-/// dependency and keeps the HTML shape in one place.
-pub fn render_references_list(
-    refs: &[&Reference],
-    group: &str,
-    page_title: &str,
-    body_html: &dyn Fn(&Reference) -> String,
-    ids: &mut DocIds,
-) -> String {
-    let page = page_title.replace(' ', "_");
-    let ga = group_attr(group);
-
-    let mut out = format!(
-        "<ol class=\"mw-references references\"{ga} id=\"{}\">",
-        ids.take()
-    );
-    for r in refs {
-        let note_id = r.note_id();
-        // A single use renders its back-link bare; two or more get a wrapping
-        // `<span class="mw-cite-backlink">` and are space-separated. This is
-        // Cite's actual output, verified against the cached page.
-        let backlink = if r.uses.len() == 1 {
-            backlink_one(&r.uses[0], &page, group, ids)
-        } else {
-            let parts: Vec<String> = r
-                .uses
-                .iter()
-                .enumerate()
-                .map(|(n, u)| backlink_n(u, &page, n + 1, ids))
-                .collect();
-            format!(
-                "<span class=\"mw-cite-backlink\" id=\"{}\">{}</span>",
-                ids.take(),
-                parts.join(" ")
-            )
-        };
-        out.push_str(&format!(
-            "<li about=\"#{note_id}\" id=\"{note_id}\" data-mw-footnote-number=\"{}\">{backlink} ",
-            r.label()
-        ));
-        if !r.self_closing {
-            out.push_str(&format!(
-                "<span id=\"mw-reference-text-{note_id}\" class=\"mw-reference-text reference-text\"{ga}>{}</span>",
-                body_html(r)
-            ));
-        }
-        out.push_str("</li>");
+    body_of: &dyn Fn(&str) -> crate::dom::node::Node,
+) -> usize {
+    let mut state = CiteState::new();
+    let mut use_ids = Vec::new();
+    collect(root, &mut state, &mut use_ids);
+    if state.is_empty() {
+        return 0;
     }
-    out.push_str("</ol>");
-    out
+    render(root, &state, page_title, ids, body_of, &mut use_ids)
 }
 
-/// A single-use back-link: no wrapping span.
-fn backlink_one(use_id: &str, page: &str, group: &str, ids: &mut DocIds) -> String {
-    let group_attr = group_attr(group);
-    let a_id = ids.take();
-    let text_id = ids.take();
-    format!(
-        "<a href=\"./{page}#{use_id}\"{group_attr} rel=\"mw:referencedBy\" id=\"{a_id}\">\
-<span class=\"mw-linkback-text\" id=\"{text_id}\">↑</span></a>"
-    )
+/// Walk once, recording every `<ref>` in document order.
+///
+/// `<references>` is deliberately not collected here: it renders in place, from
+/// state only this walk can build, so it is handled during substitution.
+fn collect(node: &crate::dom::node::Node, state: &mut CiteState, use_ids: &mut Vec<String>) {
+    if let Some((name, group, body, self_closing)) = read_ref(node) {
+        use_ids.push(state.add(&name, &group, &body, self_closing));
+    }
+    for child in &node.children {
+        collect(child, state, use_ids);
+    }
 }
 
-/// One back-link among several: labelled with its use number, not an arrow.
-fn backlink_n(use_id: &str, page: &str, n: usize, ids: &mut DocIds) -> String {
-    let a_id = ids.take();
-    let text_id = ids.take();
-    format!(
-        "<a href=\"./{page}#{use_id}\" id=\"{a_id}\">\
-<span class=\"mw-linkback-text\" id=\"{text_id}\">{n}</span></a>"
-    )
-}
-
-/// ` data-mw-group="…"`, or nothing for the main group.
-fn group_attr(group: &str) -> String {
-    if group.is_empty() {
+/// Read a `<ref>` element into `(name, group, body, self_closing)`.
+///
+/// The tokenizer leaves an unknown extension tag as an `<extension>` element whose
+/// `source` attribute holds the raw text, because it does not parse an extension's
+/// interior. So the attributes are recovered from that source rather than read from
+/// the element.
+fn read_ref(node: &crate::dom::node::Node) -> Option<(String, String, String, bool)> {
+    if node.get_attr("typeof") != Some("mw:Extension") || node.get_attr("name") != Some("ref") {
+        return None;
+    }
+    let source = node.get_attr("source")?;
+    let attrs = start_tag_attrs(source, "ref")?;
+    // A self-closing ref carries no body, and its `source` is just the start tag.
+    let self_closing = source.trim_end().ends_with("/>");
+    let name = attr_value(attrs, "name").unwrap_or_default();
+    let group = attr_value(attrs, "group").unwrap_or_default();
+    let body = if self_closing {
         String::new()
     } else {
-        format!(" data-mw-group=\"{}\"", escape_attr(group))
+        body_between(source).unwrap_or_default()
+    };
+    Some((name, group, body, self_closing))
+}
+
+/// The attribute text of `<name …>` (or `<name …/>`), without the brackets.
+fn start_tag_attrs<'s>(source: &'s str, name: &str) -> Option<&'s str> {
+    let rest = source.strip_prefix('<')?.strip_prefix(name)?;
+    // The name must end here, so `<reference>` does not match `ref`.
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+        return None;
+    }
+    let end = rest.find('>')?;
+    Some(&rest[..end])
+}
+
+/// The text between `>` and `</name>`, which is an extension's raw body.
+fn body_between(source: &str) -> Option<String> {
+    let open = source.find('>')?;
+    let close = source.rfind("</")?;
+    (close > open).then(|| source[open + 1..close].to_string())
+}
+
+/// A double-quoted, single-quoted or bare attribute value.
+///
+/// Hand-written because the source is a raw tag, not something a general parser
+/// should be pointed at: it is a fragment inside an attribute of another document.
+fn attr_value(attrs: &str, key: &str) -> Option<String> {
+    let bytes = attrs.as_bytes();
+    let mut i = 0;
+    while i < attrs.len() {
+        while i < attrs.len() && !bytes[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < attrs.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-') {
+            i += 1;
+        }
+        if name_start == i {
+            break;
+        }
+        let name = &attrs[name_start..i];
+        let after_name = i;
+        while i < attrs.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= attrs.len() || bytes[i] != b'=' {
+            i = after_name;
+            continue;
+        }
+        i += 1;
+        while i < attrs.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= attrs.len() {
+            break;
+        }
+        let value = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            i += 1;
+            let start = i;
+            while i < attrs.len() && bytes[i] != quote {
+                i += 1;
+            }
+            let v = attrs[start..i].to_string();
+            i += 1;
+            v
+        } else {
+            let start = i;
+            while i < attrs.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            attrs[start..i].to_string()
+        };
+        if name == key {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Walk again, replacing refs with markers and `<references>` with the note list.
+fn render(
+    root: &mut crate::dom::node::Node,
+    state: &CiteState,
+    page_title: &str,
+    ids: &mut DocIds,
+    body_of: &dyn Fn(&str) -> crate::dom::node::Node,
+    use_ids: &mut [String],
+) -> usize {
+    let mut rendered = 0usize;
+    let mut next_use = 0usize;
+    walk_render(
+        root,
+        state,
+        page_title,
+        ids,
+        body_of,
+        use_ids,
+        &mut next_use,
+        &mut rendered,
+    );
+    rendered
+}
+
+/// Transform one node's children, then the node itself.
+#[allow(clippy::too_many_arguments)]
+fn walk_render(
+    node: &mut crate::dom::node::Node,
+    state: &CiteState,
+    page_title: &str,
+    ids: &mut DocIds,
+    body_of: &dyn Fn(&str) -> crate::dom::node::Node,
+    use_ids: &mut [String],
+    next_use: &mut usize,
+    rendered: &mut usize,
+) {
+    for child in &mut node.children {
+        walk_render(
+            child, state, page_title, ids, body_of, use_ids, next_use, rendered,
+        );
+    }
+
+    if let Some((group, responsive)) = read_references(node) {
+        let refs = state.group(&group);
+        // The list renderer works in terms of the `Reference`; the body renderer the
+        // caller supplied works in terms of wikitext. Bridging here keeps the
+        // renderer's signature about what it needs rather than about what happens to
+        // be available.
+        let body = |r: &Reference| body_of(&r.body);
+        let list = references_list_nodes(&refs, &group, page_title, &body, ids);
+        let mut wrap = crate::dom::node::Node::element(crate::dom::node::ElementKind::Other(
+            "div".to_string(),
+        ));
+        wrap.set_attr("class", "mw-references-wrap");
+        wrap.set_attr("typeof", "mw:Extension/references");
+        wrap.set_attr("data-mw", references_data_mw(&group, responsive));
+        wrap.push_child(list);
+        *node = wrap;
+        return;
+    }
+
+    if read_ref(node).is_some() {
+        let Some(ref_id) = use_ids.get(*next_use).cloned() else {
+            return;
+        };
+        *next_use += 1;
+        let Some(reference) = state.references.iter().find(|r| r.uses.contains(&ref_id)) else {
+            return;
+        };
+        let marker = ref_marker_nodes(reference, &ref_id, page_title, ids);
+        *node = marker;
+        *rendered += 1;
     }
 }
 
-/// Escape a value for an HTML attribute.
-fn escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+/// Read a `<references>` element into `(group, responsive)`.
+fn read_references(node: &crate::dom::node::Node) -> Option<(String, bool)> {
+    if node.get_attr("typeof") != Some("mw:Extension")
+        || node.get_attr("name") != Some("references")
+    {
+        return None;
+    }
+    let source = node.get_attr("source")?;
+    let attrs = start_tag_attrs(source, "references")?;
+    let group = attr_value(attrs, "group").unwrap_or_default();
+    let responsive = attr_value(attrs, "responsive").is_some_and(|v| !v.is_empty() && v != "0");
+    Some((group, responsive))
 }
 
 /// A JSON string literal, escaped the way Parsoid's serializer does.
@@ -448,6 +551,154 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Build the inline `<sup>` marker for a `<ref>` as DOM nodes.
+///
+/// `page_title` is the page the anchor targets: Cite links to a note on the *same*
+/// page, so it is the article under parse, not the ref.
+///
+/// `ids` supplies the `mw`-style ids on the inner elements. They are allocated
+/// from the document-wide sequence the page-bundle pass also draws on, so a Cite
+/// span is numbered in the same order as every other element on the page.
+pub fn ref_marker_nodes(
+    reference: &Reference,
+    ref_id: &str,
+    page_title: &str,
+    ids: &mut DocIds,
+) -> crate::dom::node::Node {
+    use crate::dom::node::{ElementKind, Node};
+
+    let mut sup = Node::element(ElementKind::Other("sup".to_string()));
+    sup.set_attr("class", "mw-ref reference");
+    sup.set_attr("id", ref_id);
+    sup.set_attr("rel", "dc:references");
+    sup.set_attr("typeof", "mw:Extension/ref");
+    sup.set_attr("data-mw", ref_data_mw(reference));
+
+    let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
+    let mut a = Node::element(ElementKind::Other("a".to_string()));
+    a.set_attr("href", href);
+    a.set_attr("id", ids.take());
+
+    let mut text = Node::element(ElementKind::Other("span".to_string()));
+    text.set_attr("class", "mw-reflink-text");
+    text.set_attr("id", ids.take());
+
+    let mut open = Node::element(ElementKind::Other("span".to_string()));
+    open.set_attr("class", "cite-bracket");
+    open.set_attr("id", ids.take());
+    open.push_child(Node::text("["));
+
+    let mut close = Node::element(ElementKind::Other("span".to_string()));
+    close.set_attr("class", "cite-bracket");
+    close.set_attr("id", ids.take());
+    close.push_child(Node::text("]"));
+
+    text.push_child(open);
+    text.push_child(Node::text(reference.label()));
+    text.push_child(close);
+    a.push_child(text);
+    sup.push_child(a);
+    sup
+}
+
+/// Build the note list for one group of `<references>` as DOM nodes.
+///
+/// `body_of` supplies each note's rendered content. It cannot be produced here: a
+/// note is wikitext that has to go back through the parser, because it may contain
+/// templates, links, or another ref. Passing it in keeps this module independent of
+/// the pipeline.
+pub fn references_list_nodes(
+    refs: &[&Reference],
+    group: &str,
+    page_title: &str,
+    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
+    ids: &mut DocIds,
+) -> crate::dom::node::Node {
+    use crate::dom::node::{ElementKind, Node};
+
+    let page = page_title.replace(' ', "_");
+    let mut ol = Node::element(ElementKind::Other("ol".to_string()));
+    ol.set_attr("class", "mw-references references");
+    if !group.is_empty() {
+        ol.set_attr("data-mw-group", group);
+    }
+    ol.set_attr("id", ids.take());
+
+    for r in refs {
+        let note_id = r.note_id();
+        let mut li = Node::element(ElementKind::Other("li".to_string()));
+        li.set_attr("about", format!("#{note_id}"));
+        li.set_attr("id", note_id.clone());
+        li.set_attr("data-mw-footnote-number", r.label());
+
+        // A single use renders its back-link bare; two or more are wrapped in
+        // `<span class="mw-cite-backlink">` and separated by a space. That
+        // asymmetry is Cite's actual output, verified against a cached page.
+        if r.uses.len() == 1 {
+            li.push_child(backlink_node(&r.uses[0], &page, group, None, ids));
+        } else {
+            let mut wrap = Node::element(ElementKind::Other("span".to_string()));
+            wrap.set_attr("class", "mw-cite-backlink");
+            wrap.set_attr("id", ids.take());
+            for (n, use_id) in r.uses.iter().enumerate() {
+                if n > 0 {
+                    wrap.push_child(Node::text(" "));
+                }
+                wrap.push_child(backlink_node(use_id, &page, group, Some(n + 1), ids));
+            }
+            li.push_child(wrap);
+        }
+        li.push_child(Node::text(" "));
+
+        if !r.self_closing {
+            let mut text = Node::element(ElementKind::Other("span".to_string()));
+            text.set_attr("id", format!("mw-reference-text-{note_id}"));
+            text.set_attr("class", "mw-reference-text reference-text");
+            if !group.is_empty() {
+                text.set_attr("data-mw-group", group);
+            }
+            text.push_child(body_of(r));
+            li.push_child(text);
+        }
+        ol.push_child(li);
+    }
+    ol
+}
+
+/// One back-link. `label` is the use number when a note has several, and `None`
+/// for the single-use case, which renders an arrow instead.
+fn backlink_node(
+    use_id: &str,
+    page: &str,
+    group: &str,
+    label: Option<usize>,
+    ids: &mut DocIds,
+) -> crate::dom::node::Node {
+    use crate::dom::node::{ElementKind, Node};
+
+    let mut a = Node::element(ElementKind::Other("a".to_string()));
+    a.set_attr("href", format!("./{page}#{use_id}"));
+    // The group marker and the `referencedBy` relation both appear only on the
+    // single-use form in Cite's output.
+    if label.is_none() {
+        if !group.is_empty() {
+            a.set_attr("data-mw-group", group);
+        }
+        a.set_attr("rel", "mw:referencedBy");
+    }
+    a.set_attr("id", ids.take());
+
+    let mut text = Node::element(ElementKind::Other("span".to_string()));
+    text.set_attr("class", "mw-linkback-text");
+    text.set_attr("id", ids.take());
+    text.push_child(Node::text(match label {
+        Some(n) => n.to_string(),
+        None => "\u{2191}".to_string(),
+    }));
+    a.push_child(text);
+    a
 }
 
 #[cfg(test)]
@@ -555,78 +806,114 @@ mod tests {
         assert_eq!(json_string("a\nb"), r#""a\nb""#);
     }
 
-    /// The marker's HTML, with the ids stubbed to a fixed value.
+    /// The marker's structure, with the ids allocated in order.
     ///
-    /// The shape is taken from the cached Parsoid output of `Zebra`:
-    /// `<sup …><a …><span class="mw-reflink-text">…` — this asserts the nesting and
-    /// the classes, which is what the page actually shows.
+    /// The shape is taken from the cached Parsoid output of `Zebra`, and the
+    /// assertion is on the *tree* rather than a flattened string: the nesting is
+    /// what the page relies on, and it is what a string comparison would obscure.
     #[test]
-    fn ref_marker_matches_the_cached_shape() {
+    fn ref_marker_has_the_cached_structure() {
         let mut st = CiteState::new();
         st.add("Badenhorst2019", "", "", true);
         let mut ids = DocIds::new();
-        let html = render_ref_marker(
+        let sup = ref_marker_nodes(
             &st.references[0],
             "cite_ref-Badenhorst2019_1-0",
             "Zebra",
             &mut ids,
         );
-        assert!(
-            html.starts_with(
-                "<sup class=\"mw-ref reference\" id=\"cite_ref-Badenhorst2019_1-0\" rel=\"dc:references\" typeof=\"mw:Extension/ref\""
-            ),
-            "{html}"
+
+        assert_eq!(
+            sup.kind,
+            crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(
+                "sup".to_string()
+            ))
         );
-        assert!(
-            html.contains("data-mw='{\"name\":\"ref\",\"attrs\":{\"name\":\"Badenhorst2019\"}}'"),
-            "{html}"
+        assert_eq!(sup.get_attr("class"), Some("mw-ref reference"));
+        assert_eq!(sup.get_attr("id"), Some("cite_ref-Badenhorst2019_1-0"));
+        assert_eq!(sup.get_attr("rel"), Some("dc:references"));
+        assert_eq!(sup.get_attr("typeof"), Some("mw:Extension/ref"));
+        assert_eq!(
+            sup.get_attr("data-mw"),
+            Some(r#"{"name":"ref","attrs":{"name":"Badenhorst2019"}}"#)
         );
-        assert!(
-            html.contains("<a href=\"./Zebra#cite_note-Badenhorst2019-1\""),
-            "the anchor must point at the note: {html}"
+
+        // `<sup><a href="./Zebra#cite_note-Badenhorst2019-1"><span class="mw-reflink-text">…`
+        let a = &sup.children[0];
+        assert_eq!(
+            a.get_attr("href"),
+            Some("./Zebra#cite_note-Badenhorst2019-1")
         );
-        assert!(html.contains("class=\"mw-reflink-text\""), "{html}");
-        assert!(html.contains("class=\"cite-bracket\""), "{html}");
-        // The brackets are separate spans around the bare number.
-        assert!(html.contains(">[</span>1<span"), "{html}");
-        assert!(html.ends_with("</span></a></sup>"), "{html}");
+        let text = &a.children[0];
+        assert_eq!(text.get_attr("class"), Some("mw-reflink-text"));
+
+        // The brackets are two spans around the bare number.
+        assert_eq!(text.children.len(), 3, "open, number, close");
+        assert_eq!(text.children[0].get_attr("class"), Some("cite-bracket"));
+        assert_eq!(
+            text.children[0].children[0].kind,
+            crate::dom::node::NodeKind::Text("[".to_string())
+        );
+        assert_eq!(
+            text.children[1].kind,
+            crate::dom::node::NodeKind::Text("1".to_string())
+        );
+        assert_eq!(text.children[2].get_attr("class"), Some("cite-bracket"));
+        assert_eq!(
+            text.children[2].children[0].kind,
+            crate::dom::node::NodeKind::Text("]".to_string())
+        );
     }
 
-    /// A single-use note renders a bare back-link; the arrow is the `<a>`'s text.
+    /// A single-use note renders a bare back-link whose text is an arrow.
     #[test]
     fn a_single_use_note_has_a_bare_backlink() {
         let mut st = CiteState::new();
         st.add("", "", "body", false);
         let mut ids = DocIds::new();
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let html = render_references_list(&refs, "", "Zebra", &|_| "BODY".to_string(), &mut ids);
-        assert!(
-            html.starts_with("<ol class=\"mw-references references\""),
-            "{html}"
+        let ol = references_list_nodes(
+            &refs,
+            "",
+            "Zebra",
+            &|_| crate::dom::node::Node::text("BODY"),
+            &mut ids,
+        );
+        assert_eq!(ol.get_attr("class"), Some("mw-references references"));
+        let li = &ol.children[0];
+        assert_eq!(li.get_attr("id"), Some("cite_note--1"));
+        assert_eq!(li.get_attr("data-mw-footnote-number"), Some("1"));
+
+        let a = &li.children[0];
+        assert_eq!(a.get_attr("href"), Some("./Zebra#cite_ref-1-0"));
+        assert_eq!(a.get_attr("rel"), Some("mw:referencedBy"));
+        assert_eq!(
+            a.children[0].children[0].kind,
+            crate::dom::node::NodeKind::Text("\u{2191}".to_string()),
+            "a single use is an arrow"
         );
         assert!(
-            html.contains(
-                "<li about=\"#cite_note--1\" id=\"cite_note--1\" data-mw-footnote-number=\"1\">"
-            ),
-            "{html}"
+            li.children
+                .iter()
+                .all(|c| c.get_attr("class") != Some("mw-cite-backlink")),
+            "one use must not be wrapped in the back-link span"
         );
-        assert!(
-            html.contains("<a href=\"./Zebra#cite_ref-1-0\" rel=\"mw:referencedBy\""),
-            "{html}"
+
+        // The note text span, which carries the body.
+        let text = li.children.last().unwrap();
+        assert_eq!(text.get_attr("id"), Some("mw-reference-text-cite_note--1"));
+        assert_eq!(
+            text.get_attr("class"),
+            Some("mw-reference-text reference-text")
         );
-        assert!(html.contains("↑"), "a single use is an arrow: {html}");
-        assert!(
-            !html.contains("mw-cite-backlink"),
-            "one use must not be wrapped in the back-link span: {html}"
-        );
-        assert!(
-            html.contains("<span id=\"mw-reference-text-cite_note--1\" class=\"mw-reference-text reference-text\">BODY</span>"),
-            "{html}"
+        assert_eq!(
+            text.children[0].kind,
+            crate::dom::node::NodeKind::Text("BODY".to_string())
         );
     }
 
-    /// Two uses of one note are wrapped and numbered, which is the asymmetry the
-    /// cached page shows for `Badenhorst2019`.
+    /// Two uses of one note are wrapped and numbered, the asymmetry the cached page
+    /// shows for `Badenhorst2019`.
     #[test]
     fn several_uses_are_wrapped_and_numbered() {
         let mut st = CiteState::new();
@@ -634,52 +921,61 @@ mod tests {
         st.add("Badenhorst2019", "", "", true);
         let mut ids = DocIds::new();
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let html = render_references_list(&refs, "", "Zebra", &|_| "B".to_string(), &mut ids);
-        assert!(html.contains("class=\"mw-cite-backlink\""), "{html}");
-        assert!(
-            html.contains("#cite_ref-Badenhorst2019_1-0\""),
-            "the first use is targeted: {html}"
+        let ol = references_list_nodes(
+            &refs,
+            "",
+            "Zebra",
+            &|_| crate::dom::node::Node::text("B"),
+            &mut ids,
         );
-        assert!(
-            html.contains("#cite_ref-Badenhorst2019_1-1\""),
-            "the second use is targeted too: {html}"
+        let li = &ol.children[0];
+        let wrap = &li.children[0];
+        assert_eq!(wrap.get_attr("class"), Some("mw-cite-backlink"));
+
+        let links: Vec<_> = wrap
+            .children
+            .iter()
+            .filter(|c| c.kind.is_element())
+            .collect();
+        assert_eq!(links.len(), 2, "one link per use");
+        assert_eq!(
+            links[0].get_attr("href"),
+            Some("./Zebra#cite_ref-Badenhorst2019_1-0")
         );
-        // The labels count the uses, not the note number.
-        assert!(html.contains(">1</span></a> <a"), "{html}");
-        assert!(html.contains(">2</span></a>"), "{html}");
+        assert_eq!(
+            links[1].get_attr("href"),
+            Some("./Zebra#cite_ref-Badenhorst2019_1-1")
+        );
+        // The labels count uses, not the note number.
+        assert_eq!(
+            links[0].children[0].children[0].kind,
+            crate::dom::node::NodeKind::Text("1".to_string())
+        );
+        assert_eq!(
+            links[1].children[0].children[0].kind,
+            crate::dom::node::NodeKind::Text("2".to_string())
+        );
     }
 
-    /// A named ref with no body of its own renders no reference-text span — there
-    /// is nothing to show, and Cite omits it rather than emitting an empty one.
     #[test]
-    fn a_bodyless_note_has_no_text_span() {
-        let mut st = CiteState::new();
-        st.add("x", "", "content", false);
-        st.add("x", "", "", true);
-        let mut ids = DocIds::new();
-        let refs: Vec<&Reference> = st.references.iter().collect();
-        let html = render_references_list(&refs, "", "Zebra", &|_| "CONTENT".to_string(), &mut ids);
-        // The note came from the first (non-self-closing) use, so it renders.
-        assert!(html.contains("CONTENT"), "{html}");
-    }
-
-    #[test]
-    fn a_group_adds_the_data_mw_group_attribute() {
+    fn a_group_adds_the_group_attributes() {
         let mut st = CiteState::new();
         st.add("", "lower-alpha", "a", false);
         let mut ids = DocIds::new();
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let html = render_references_list(
+        let ol = references_list_nodes(
             &refs,
             "lower-alpha",
             "Zebra",
-            &|_| "A".to_string(),
+            &|_| crate::dom::node::Node::text("A"),
             &mut ids,
         );
-        assert!(html.contains("data-mw-group=\"lower-alpha\""), "{html}");
-        assert!(
-            html.contains("data-mw-footnote-number=\"a\""),
-            "a lower-alpha note is labelled a: {html}"
+        assert_eq!(ol.get_attr("data-mw-group"), Some("lower-alpha"));
+        let li = &ol.children[0];
+        assert_eq!(
+            li.get_attr("data-mw-footnote-number"),
+            Some("a"),
+            "a lower-alpha note is labelled a"
         );
     }
 

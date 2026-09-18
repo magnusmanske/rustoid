@@ -2025,6 +2025,32 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // PHP's `media` … `linkneighbours+dom-unpack` order) so the foster-out
         // operates on resolved media rather than a broken-media anchor.
         crate::pipeline::unpack_dom_fragments::fix_bad_nesting(&mut ast);
+        // Cite runs after the tree is final, because a marker's number depends on
+        // refs that appear later in the document and `<references>` renders the
+        // notes from the bottom of the page. A note's body is wikitext, so it is
+        // rendered through the inline pipeline here rather than inside the Cite
+        // module, which knows nothing about parsing.
+        {
+            let mut ids = crate::ext::cite::DocIds::new();
+            // `RefCell`/`Cell` because the body renderer must be `Fn` rather than
+            // `FnMut`: Cite may call it for several notes, and a `FnMut` would force
+            // the Cite module to hold a mutable borrow of state it does not own.
+            let note_fragments = std::cell::RefCell::new(std::collections::HashMap::new());
+            let next_note_id = std::cell::Cell::new(0usize);
+            let render_body = |body: &str| -> Node {
+                let mut next = next_note_id.get();
+                let mut fragments = note_fragments.borrow_mut();
+                let frag = render_inline_fragment(
+                    self.config,
+                    self.tokenize(body).unwrap_or_default(),
+                    &mut fragments,
+                    &mut next,
+                );
+                next_note_id.set(next);
+                frag
+            };
+            crate::ext::cite::run(&mut ast, &page_title_prefixed, &mut ids, &render_body);
+        }
         wrap_sections_in_ast(&mut ast, options.wrap_sections);
         // Page-bundle node ids are allocated last, after every pass that can create
         // or destroy an element. The ids are positional — one element inserted
