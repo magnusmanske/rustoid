@@ -572,7 +572,9 @@ them because each cost real time:
 
 - **Cite first** (`<ref>`, `<references>`): names and groups, back-links, the
   `mw:Extension/ref` wrapper with its `data-mw` body, and the `<references>`
-  list assembly. This is the most-used extension after Lua.
+  list assembly. This is the most-used extension after Lua. — **model and
+  renderers done** (`rustoid-core/src/ext/cite.rs`, 14 tests); **not yet wired
+  into the parser**, see "Cite: what is built and what blocks it".
 - Then Poem, finishing Gallery, SyntaxHighlight/Source, Math, Templatedata;
   then the placeholder-semantics ones (Timeline, Graph, Mapframe).
   **Templatestyles is done** (see below).
@@ -580,6 +582,53 @@ them because each cost real time:
   level so handlers can emit `mw:Extension/<name>` with `data-mw`/`data-parsoid`,
   and so they can be *hybrid* (part wikitext, part HTML) as Parsoid's are.
 - **Exit criterion:** pages with references match.
+
+#### Cite: what is built and what blocks it
+
+Cite is the most-used extension after Lua — 28 of the 32 corpus pages carry a
+`<ref>` — and it is the first thing that differs on the very first page examined.
+On `Zebra`, rustoid emits **zero** `<sup>` markers while Parsoid's output has one
+per citation.
+
+The model and both renderers are implemented and tested
+(`rustoid-core/src/ext/cite.rs`). The shapes were read off the cached Parsoid
+output, not guessed, which matters because Cite's HTML is dense with derived ids:
+
+- Numbers are assigned by **document order of first use**, so the markers and the
+  note list cannot be computed independently.
+- A named ref used again does not allocate a number; it appends a back-link to the
+  existing note. The lookup key is the name when present and the content
+  otherwise, which is also why two identical anonymous refs share a note.
+
+Three details a plausible guess gets wrong, all verified against `Zebra`:
+
+- The marker and the note use **different separators**:
+  `cite_ref-Badenhorst2019_1-0` but `cite_note-Badenhorst2019-1`.
+- An anonymous ref still emits both separators around an empty name, giving
+  `cite_ref-1-0` and `cite_note--1`.
+- A note used **once** renders its back-link bare with `↑`; used twice or more, the
+  links are wrapped in `mw-cite-backlink` and labelled `1`, `2`, …
+
+**What blocks the wiring.** Cite needs two things the current architecture does
+not provide:
+
+1. **Whole-document state.** `TreeBuilderStage` is a chain of stateless token
+   passes, so there is nowhere to accumulate references. The collection has to run
+   over the whole document *before* either half renders, because the number of a
+   marker depends on refs that appear after it.
+
+2. **Document-wide element ids.** Every `<sup>`, `<a>` and `<span>` in Cite's
+   output carries an `id="mwCg"`-style attribute. These are **not** Cite's
+   `cite_*` ids; Parsoid assigns them in a final `addIds` pass, by element order
+   across the whole document. rustoid emits *zero* such ids today, against a cached
+   `Zebra` that has hundreds.
+
+The second is the larger problem and is **not** Cite-specific: it affects every
+page, and it is why the renderers take their `mw` ids as a parameter instead of
+generating them. Any attempt to "finish Cite" without it will produce structurally
+right HTML that cannot match byte-for-byte. That pass — a document-order id
+allocator over the built DOM — is the next real piece of work, and it is a
+prerequisite for Cite rather than a detail of it.
 
 #### `mw.wikibase` — implemented (the lookup surface)
 
