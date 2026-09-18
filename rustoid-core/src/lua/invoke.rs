@@ -80,9 +80,20 @@ impl Invoke {
         })
     }
 
-    /// Full title of the module page.
-    pub fn module_title(&self) -> String {
-        format!("Module:{}", self.module.replace('_', " "))
+    /// Full title of the module page, with the first letter capitalised.
+    ///
+    /// MediaWiki page names are case-insensitive in their first letter, so
+    /// `{{#invoke:pagetype…}}` and `{{#invoke:Pagetype…}}` are the same module.
+    /// The wiki's own API reports `pagetype` as normalising to `Pagetype`, and
+    /// the cache is keyed by the normalised title, so without this the lookup
+    /// misses and `Module:pagetype does not exist` is reported for a module that
+    /// is present.
+    ///
+    /// `ucfirst` is used rather than a plain ASCII uppercase because the rule is
+    /// language-dependent (Turkish and Azerbaijani dot the `i`).
+    pub fn module_title(&self, language_code: &str) -> String {
+        let name = crate::title::ucfirst(&self.module.replace('_', " "), language_code);
+        format!("Module:{name}")
     }
 
     /// The frame arguments, in Scribunto's shape.
@@ -285,7 +296,7 @@ pub fn run_once(
 ) -> Result<Outcome> {
     // Scribunto's entry module must be present; a `#invoke` of a non-existent
     // module is an error, and the caller turns it into MediaWiki's message.
-    let title = call.module_title();
+    let title = call.module_title(&site.language_code);
     let Some(entry) = registry.get(&title).cloned() else {
         return Err(RustoidError::Lua(format!("module {title} does not exist")));
     };
@@ -334,7 +345,8 @@ where
     let Some(call) = Invoke::parse(pf_arg) else {
         return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
     };
-    let mut registry = preload(source, &call.module_title()).await;
+    let entry_title = call.module_title(&site.language_code);
+    let mut registry = preload(source, &entry_title).await;
     // The page an entity is looked up for is the *root* page, not the frame that
     // made the call: `frame.page_title` carries the real title, and the
     // `page_title` parameter is the invoking frame's (a template, when the call
@@ -419,8 +431,7 @@ where
     }
 
     Err(RustoidError::Lua(format!(
-        "could not run {} after {} rounds",
-        call.module_title(),
+        "could not run {entry_title} after {} rounds",
         MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS
     )))
 }
@@ -758,7 +769,31 @@ mod tests {
         assert_eq!(i.module, "Weather box");
         assert_eq!(i.function, "main");
         assert!(i.args.is_empty());
-        assert_eq!(i.module_title(), "Module:Weather box");
+        assert_eq!(i.module_title("en"), "Module:Weather box");
+    }
+
+    /// A module's first letter is case-insensitive, so `{{#invoke:pagetype}}`
+    /// reaches `Module:Pagetype`. Both the cache and the API key on the
+    /// normalised title, so the lookup has to normalise too.
+    #[test]
+    fn module_title_capitalises_the_first_letter() {
+        assert_eq!(
+            Invoke::parse("pagetype|main").unwrap().module_title("en"),
+            "Module:Pagetype"
+        );
+        // An already-capitalised name is unchanged.
+        assert_eq!(
+            Invoke::parse("Pagetype|main").unwrap().module_title("en"),
+            "Module:Pagetype"
+        );
+        // Underscores are title-equivalent to spaces, and only the first letter
+        // after the prefix is raised.
+        assert_eq!(
+            Invoke::parse("weather_box/data|main")
+                .unwrap()
+                .module_title("en"),
+            "Module:Weather box/data"
+        );
     }
 
     #[test]
