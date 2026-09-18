@@ -734,6 +734,54 @@ Two caveats on the Lua path, both recorded at `expand_invoke`:
 - **Exit criterion:** the previously-"unreachable" fixture family becomes
   reachable and passing.
 
+#### Two parser bugs the corpus found, and one it did not
+
+Comparing `Zebra` against the wiki's own Parsoid turned up three parser bugs, two
+of which are fixed and one of which is recorded here rather than fixed.
+
+**A transcluded redirect was not followed.** Four of `Zebra`'s leading templates
+(`Short description`, `Other uses`, `Featured article`, `Pp-semi`) rendered as a
+link to themselves. `Template:Pp-semi` is `#REDIRECT [[Template:Protected page]]`,
+and the redirect line was being rendered as article text. A template redirect is
+ordinary wikitext (`{{db}}` → `Template:Delete`), so this was dropping a whole
+class of the wiki's most-used templates, not one page. Three details mattered:
+detection anchors at the *start* of the body (a body merely *mentioning*
+`#REDIRECT` is not a redirect, and misreading one silently swaps in another
+page's content); the target is a **full title**, so forcing the redirect's own
+namespace onto it produced `Template:Template:Protected page`; and a redirect
+whose target cannot be fetched is reported *unresolved* rather than falling back
+to its own body, because rendering `#REDIRECT [[…]]` and its `[[Category:…]]`
+trailer as text invents content Parsoid never emits.
+
+**Arguments in HTML attributes took their default.** `Frame::expand` walked only
+the top level of a token chunk, and an attribute value is a `KeyValue::Tokens`
+*inside* the tag token — so `{{{small|no}}}` was never substituted during the
+body expansion and was later resolved by `expand_attributes` against the **root**
+frame, where the template's arguments do not exist. Both attribute fields had to
+be walked, and the *key* field is the one that is easy to miss: a parser function
+keeps its whole argument list in a single attribute whose key holds the tokens, so
+handling only values left `{{#expr:{{{1}}}*2}}` evaluating the default. Not an
+exotic shape — `Template:Fossil range bar` and `Template:Geological range marker`
+both put references inside `#expr` inside `style`.
+
+**Still open: a `|` inside an attribute splits a parser-function argument.**
+Found while building a test from `Template:Geological range marker`'s real body,
+and deliberately left alone rather than fixed in passing. That template's
+`#ifexpr` branch contains `<div style="…">`, and the `|` characters inside the
+`style` value are treated as argument separators:
+
+```text
+{{#ifexpr:{{{1}}}-{{{2}}}>5|<div style="…; opacity:1; "><div …></div>|…}}
+                                    ↑ the branch is cut here
+rustoid: #ifexpr receives "590-540>5||nothing"   (branch empty)
+```
+
+The consequence is that the branch is dropped entirely, so the template renders
+nothing. This needs its own investigation — the tokenizer must not split on a `|`
+that sits inside a quoted attribute value, which is a tokenizer question rather
+than a frame one. It is recorded here so the next session does not have to
+rediscover it.
+
 ### Phase 7 — Scale and hardening
 
 - Large pages, deep transclusion, resource limits, parallelism, cache
