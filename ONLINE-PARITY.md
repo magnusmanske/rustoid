@@ -302,6 +302,36 @@ implement. `#ifexist` and `#invoke` are both unimplemented, and the offending
 templates (`Template:Country topics`) lean on both, so this probably belongs
 with the Phase 3 `#invoke` work rather than here.
 
+#### The expansion blowup, measured — and a bad hour spent misreading it
+
+`Zebra` reproduces this, so it can now be worked on with the corpus cache rather
+than only on `Israel`. It is **not** a deadlock and **not** a parser bug, and both
+of those were believed for a while, which is worth recording.
+
+What it actually is: the expansion genuinely runs, but far slower than it should.
+Reaching the reference list needs a taxobox expansion whose template chain
+(`Template:Is italic taxon` → `Taxobox colour` → `Delink` → `Taxonomy/…` →
+`Taxobox colour` → `Delink` → …) keeps re-entering the same templates many times
+over. The process sits at **99% CPU with a growing RSS**, which is the shape of an
+exponential blowup: each round does real work, so no bound is hit and nothing
+looks stuck. MediaWiki avoids this with a preprocessor node-count limit
+(`$wgMaxPPNodeCount`) and an expansion-depth limit; rustoid has neither, and this
+is the case that needs both.
+
+**The measurement mistake, because it cost more than the bug did.** The obvious
+diagnostic — "is it working, or wedged?" — was answered wrong repeatedly because
+`pgrep -f "…rustoid-compare --wiki"` matches the **wrapping shell** first, whose
+command line contains the same string. Every `ps`/`sample`/`lldb` probe was
+pointing at that shell, which is genuinely idle, so the run looked like a deadlock
+at 0% CPU with an RSS of 1.7 MB. The real process was a sibling PID. Two
+"deadlocks" were diagnosed from that artefact and "fixed" before the third
+reading — this time over every matching process — showed 99% CPU.
+
+The lesson worth keeping: a `-f` pattern match is not a pid lookup. The way to be
+sure is to list *all* matches and check which one is doing work, or run the process
+under a supervisor that reports it. Everything concluded from a single `head -1`
+match was noise.
+
 #### The first real scoreboard, and what it says to build next
 
 With 44 of the 48 corpus pages cached (the other four, including the stalling
