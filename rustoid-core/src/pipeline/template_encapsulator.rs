@@ -389,9 +389,18 @@ pub fn adjust_parser_function_arg0(
 /// Prepare `ParamInfo` for a parser function transclusion. Mirrors
 /// `TemplateEncapsulator::preparePfParamInfos` for string-valued args (no
 /// source offsets are available yet).
+/// Prepare `ParamInfo` for a parser-function call.
+///
+/// Like [`prepare_tpl_param_infos`], the recorded wikitext comes from the
+/// argument's `srcOffsets` — the source range — rather than from stringifying
+/// the argument tokens. `key_value_to_string` has no arm that re-emits an HTML
+/// tag, so an argument such as `{{#ifeq:1|0|y|<div>hi</div>}}` recorded its
+/// fourth argument as `hi`, and the rendered branch lost the `<div>` entirely.
+/// Parsoid keeps the tags in `data-mw` and renders the element.
 pub fn prepare_pf_param_infos(
     target_wt: &str,
     params: &crate::pipeline::parser_functions::Params,
+    source: &str,
 ) -> Vec<ParamInfo> {
     use crate::wikitext::token_utils::key_value_to_string;
 
@@ -410,7 +419,12 @@ pub fn prepare_pf_param_infos(
     // params[0] was the target; iterate params[1..].
     for param in params.args.iter().skip(1) {
         let k = key_value_to_string(&param.key);
-        let v = key_value_to_string(&param.value);
+        // Prefer the source range, as the template path does; fall back to the
+        // stringified tokens only when the range is unavailable.
+        let v = match &param.src_offsets {
+            Some(so) => so.value_substr(source).to_string(),
+            None => key_value_to_string(&param.value),
+        };
         let mut info = ParamInfo::new(arg_index.to_string());
         info.value_wt = if k.is_empty() { v } else { format!("{k}={v}") };
         out.push(info);
@@ -584,12 +598,50 @@ mod tests {
             },
         ]);
 
-        let infos = prepare_pf_param_infos("#if:x", &params);
+        let infos = prepare_pf_param_infos("#if:x", &params, "");
         assert_eq!(infos.len(), 2);
         assert_eq!(infos[0].k, "1");
         assert_eq!(infos[0].value_wt, "x");
         assert_eq!(infos[1].k, "2");
         assert_eq!(infos[1].value_wt, "yes");
+    }
+
+    /// A parser-function argument carrying an HTML tag must record the tag, not
+    /// just the text: `data-mw` is what a round-trip reconstructs the source
+    /// from, and `{{#ifeq:1|0|y|<div>hi</div>}}` has to keep its `wt` intact.
+    #[test]
+    fn test_prepare_pf_param_infos_keeps_markup() {
+        use crate::wikitext::tokens_v2::{KV, KVSourceRange, KeyValue};
+
+        // `#ifeq:1|0|y|<div>hi</div>` — the fourth argument is the div.
+        let src = "#ifeq:1|0|y|<div>hi</div>";
+        let value_start = src.find("<div>").unwrap();
+        let params = crate::pipeline::parser_functions::Params::new(vec![
+            KV {
+                key: KeyValue::Str("#ifeq:1".to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Tokens(vec![]),
+                src_offsets: Some(KVSourceRange {
+                    key_start: value_start,
+                    key_end: value_start,
+                    value_start,
+                    value_end: src.len(),
+                    source: None,
+                }),
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+
+        let infos = prepare_pf_param_infos("#ifeq:1", &params, src);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[1].value_wt, "<div>hi</div>");
     }
 
     #[test]

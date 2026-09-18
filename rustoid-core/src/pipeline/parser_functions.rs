@@ -618,17 +618,30 @@ impl ParserFunctions {
         vec![Item::Str(dir.to_string())]
     }
 
-    /// Expand a KV into items (mirrors `expandKV` for string keys/values).
+    /// Expand a KV into items (mirrors `expandKV`).
+    ///
+    /// A token value is returned as *tokens*, not stringified, so an HTML tag in
+    /// the branch is parsed instead of escaped. `{{#ifeq:1|0|y|<div>hi</div>}}`
+    /// must render the element: Parsoid produces `<p>y</p><div>hi</div>`, and
+    /// `tokens_to_string` would have turned the tag into literal text.
+    ///
+    /// A `Str` value still becomes `Item::Str`, which is what an ordinary text
+    /// branch needs.
     fn expand_kv(kv: Option<&KV>, default: Option<&str>) -> Vec<Item> {
         match kv {
             None => vec![Item::Str(default.unwrap_or("").to_string())],
             Some(kv) => {
                 let k = key_value_to_string(&kv.key);
-                let v = value_to_string(&kv.value);
-                if !k.is_empty() {
-                    vec![Item::Str(format!("{k}={v}"))]
+                let value = match &kv.value {
+                    KeyValue::Tokens(tokens) => tokens.clone(),
+                    KeyValue::Str(v) => vec![Item::Str(v.clone())],
+                };
+                if k.is_empty() {
+                    value
                 } else {
-                    vec![Item::Str(v)]
+                    // A named entry keeps its `k=v` spelling; the value is text
+                    // in that position, so stringify as before.
+                    vec![Item::Str(format!("{k}={}", value_to_string(&kv.value)))]
                 }
             }
         }
@@ -933,6 +946,38 @@ mod tests {
         let p = params(vec![("a", ""), ("", "a"), ("", "yes"), ("", "no")]);
         let out = ParserFunctions::pf_ifeq(&p);
         assert_eq!(out, vec![Item::Str("yes".to_string())]);
+    }
+
+    /// A taken branch that is tokenized markup must stay tokens, so the tag is
+    /// parsed rather than escaped. Parsoid renders
+    /// `{{#ifeq:1|0|y|<div>hi</div>}}` as a real `<div>` element.
+    #[test]
+    fn test_pf_ifeq_branch_keeps_markup_tokens() {
+        use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
+
+        let mut div = TagTk::new("div", vec![], DataParsoid::default());
+        div.data_parsoid.src = Some("<div>".to_string());
+        let tokens = vec![Item::Tok(ParsoidToken::Tag(div))];
+
+        let p = Params::new(vec![
+            kv("1", ""),
+            kv("0", ""),
+            kv("", "y"),
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Tokens(tokens),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+        let out = ParserFunctions::pf_ifeq(&p);
+        // The div token survives; stringifying would have given `Item::Str`.
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "div"),
+            "expected the div token, got {out:?}"
+        );
     }
 
     #[test]

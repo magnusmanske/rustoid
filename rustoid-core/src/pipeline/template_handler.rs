@@ -723,8 +723,16 @@ impl TemplateHandler {
                     Some("old-parserfunction".to_string())
                 };
                 info.target_wt = Some(target_str.clone());
-                info.param_infos =
-                    super::template_encapsulator::prepare_pf_param_infos(&target_str, params);
+                info.param_infos = super::template_encapsulator::prepare_pf_param_infos(
+                    &target_str,
+                    params,
+                    // The argument wikitext is read from the source range, which
+                    // needs the ambient text the call came from.
+                    token
+                        .data_parsoid()
+                        .and_then(|dp| dp.src.as_deref())
+                        .unwrap_or(""),
+                );
                 encap.encap_tokens(result, &info)
             }
             Some(ResolvedTarget::Template { name, .. }) => {
