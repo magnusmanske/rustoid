@@ -190,3 +190,64 @@ async fn a_single_missing_template_is_requested_once() {
     let got = requests_for(&[], "{{Absent}}").await;
     assert_eq!(got, vec!["Template:Absent".to_string()]);
 }
+
+/// A caller that reuses a missing template's *answer* as the next target must
+/// settle instead of nesting a level deeper every time.
+///
+/// This is `Module:Autotaxobox`'s `'Taxonomy/' .. frame:expandTemplate{…}` — the
+/// shape that made `Zebra` and `Israel` unbounded. The module wants the target
+/// *name* back so it can ask about the next taxon up, so the answer has to read
+/// as a title. When it reads as markup instead, the module concatenates that
+/// markup into the title, the parser re-tokenizes it as wikitext, and the
+/// escaping compounds on every round until the string outgrows anything a limit
+/// can stop.
+///
+/// These are characterisation tests: the answer was already a title-text link
+/// when they were written, so they do not fix a bug. They pin the property that
+/// makes the runaway impossible, because the failure mode is a silent one — a
+/// hand-built anchor that merely looks like a link would pass a rendering review
+/// and still feed markup back to the caller.
+#[tokio::test]
+async fn a_missing_template_answers_with_its_title_as_text() {
+    let (source, _) = Recording::new(&[]);
+    let config = rustoid_core::mock::MockSiteConfig::new();
+    let parser = Parser::new(&config);
+    let options = ParserOptions::for_page("Test page");
+    let html = parser
+        .wikitext_to_html_expanded("{{Taxonomy/Nonexistent}}", &source, &options)
+        .await
+        .expect("parse");
+
+    assert!(
+        html.contains("Template:Taxonomy/Nonexistent"),
+        "the answer must carry the title as text, not markup: {html}"
+    );
+    assert!(
+        html.contains("mw:WikiLink"),
+        "a missing template should render as a link: {html}"
+    );
+    // The link *text* is the title alone. If Parsoid's internal JSON leaked into
+    // it, the anchor would contain `{` or a tag, and the caller reading the text
+    // back would build its next target from that — which is the runaway.
+    let text_start = html.find("'>").map(|i| i + 2).unwrap_or(0);
+    let text = &html[text_start..html.find("</a>").unwrap_or(html.len())];
+    assert!(
+        !text.contains('{') && !text.contains('<'),
+        "the link text must be the bare title, was {text:?}"
+    );
+}
+
+/// The runaway itself: a template that asks for a series of absent pages built
+/// from the previous answer must produce a bounded number of requests.
+///
+/// Without a term, each round's target embeds the previous round's markup, so
+/// the count and the string both grow without bound.
+#[tokio::test]
+async fn reading_an_answer_back_is_bounded() {
+    let got = requests_for(&[], "{{Loop/Absent}}").await;
+    assert!(
+        got.len() <= 4,
+        "a reused missing-template answer produced {} requests: {got:?}",
+        got.len()
+    );
+}
