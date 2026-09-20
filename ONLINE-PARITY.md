@@ -928,6 +928,58 @@ the literal text — while the serializer knows the difference by construction.
 would never hand that markup to a module either, and leaving it in is actively
 harmful; see the blow-up section below, where it is the fuel.
 
+#### The taxonomy walk, and three wrong answers on the way to it
+
+`Module:Autotaxobox` walks a taxon's ancestry by calling
+`frame:expandTemplate{ title = 'Taxonomy/' .. taxon }` and reading one field out
+of the answer. Getting that chain right needed three separate corrections, and
+two of the first three diagnoses were wrong — which is worth recording, because
+each looked conclusive:
+
+1. **A missing template must answer with its own title as text.** The module
+   uses the answer as the *next* target, so an answer that reads as markup has
+   the module splice that markup into a title, which the parser then
+   re-tokenizes and re-embeds a level deeper. An anchor with no content — which
+   is what rustoid produced — guaranteed exactly that. Fixed to Parsoid's
+   fallback, `[[:$titleText]]` (`Parser::braceSubstitution`), so the link text
+   is the full prefixed title. It goes through `add_red_links`, so
+   `class="new"`, `data-mw-i18n` and `?action=edit&redlink=1` all come out
+   right without a hand-built anchor.
+2. **A cached body under a slash-escaped title was unreachable.** `get` looked
+   up the key verbatim, but a body's filename escapes `/`, so
+   `Template:Taxonomy/Equus_(Hippotigris)` was indexed as
+   `Template:Taxonomy_Equus_(Hippotigris)` — and could never be found again.
+   Every `Taxonomy/*` title is of that form, so the whole hierarchy read as
+   absent while sitting on disk.
+
+**Two diagnoses that were wrong, and the measurement that settled them.**
+`Module:Autotaxobox` writes `{{Don't edit this line {{{machine code|}}} |rank=…}}`,
+and `{{{machine code|}}}` is in the *target*, so rustoid was suspected of not
+expanding an argument reference in a target's name. The live service disproved
+it in one request: for a missing template it reports `href`
+`./Template:SomePage` with `target.wt` `"SomePage {{{mc|}}}"`, i.e. the source
+keeps the reference while the *href* is built from the expanded name. Two
+further probes then showed the argument's value is genuinely part of the name —
+`{{Some  Page {{{mc|}}}|r=1}}` resolves to `Some_Page` because title
+normalisation collapses the runs, so there is no separator to trim — and that
+`Template:Don't edit this line parent` **exists** on the wiki, as `{{{parent|}}}`.
+So rustoid's name was right and the page was simply not cached. Three candidate
+"parser bugs" were chased and all three were not bugs.
+
+What made the difference was asking the live service for a specific href and
+`target.wt` rather than reading the rendered HTML, which does not show the
+distinction. `curl -X POST …/transform/wikitext/to/html/<page>` returns Parsoid's
+own output for arbitrary wikitext, needs no login, and is the fastest ground
+truth available for a question of this shape — one request replaced an hour of
+token inspection.
+
+**Still open.** A full taxobox run does not terminate. The loop is again
+`expand_templates` → `expand_target_templates` → `expand_templates` with tokens
+cloned at every level, and the sample is dominated by `realloc`/`memmove` — a
+string growing without bound, the same escaping-compounding shape as before. The
+taxonomy chain is now cached far enough to reach it, so the next step is to
+trace *which* target recurses, exactly as the `Taxonomy/` case was traced.
+
 #### Two parser bugs the corpus found, and one that turned out not to be one
 
 Comparing `Zebra` against the wiki's own Parsoid turned up two real parser bugs.
