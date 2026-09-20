@@ -381,20 +381,95 @@ fn migrate_data_mw_parts(link: &mut Node, text: &str, is_prefix: bool) {
     let Some(data_mw) = link.data_mw.as_deref() else {
         return;
     };
-    let mut json: serde_json::Value =
-        serde_json::from_str(data_mw).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    let Some(parts) = json.get_mut("parts").and_then(|p| p.as_array_mut()) else {
-        return;
-    };
-    let value = serde_json::Value::String(text.to_string());
-    if is_prefix {
-        if !parts.first().is_some_and(|f| *f == value) {
-            parts.insert(0, value);
-        }
-    } else if !parts.last().is_some_and(|f| *f == value) {
-        parts.push(value);
+    if let Some(updated) = migrate_parts_json(data_mw, text, is_prefix) {
+        link.data_mw = Some(updated);
     }
-    link.data_mw = Some(json.to_string());
+}
+
+/// The `data-mw` of `data_mw` with `text` prepended/appended to its `parts`.
+///
+/// Returns `None` when there is no `parts` array (nothing to do) or when the
+/// entry is already at that end.
+///
+/// This edits the *serialized* string rather than round-tripping it through a
+/// `serde_json::Value`, which is what the rest of this module would prefer.
+/// `serde_json` sorts an object's keys, and `data-mw` is compared byte-for-byte
+/// against Parsoid's output, which writes `target` before `params` before `i`.
+/// A round trip would silently reorder every part of every link that passes
+/// through here, so the edit is textual and the input's key order survives.
+fn migrate_parts_json(data_mw: &str, text: &str, is_prefix: bool) -> Option<String> {
+    let entry = serde_json::Value::String(text.to_string()).to_string();
+    // `"parts"` at the top level, i.e. as an object key rather than inside a
+    // string value. The `data-mw` envelope always begins with it.
+    let key = "\"parts\":";
+    let key_at = data_mw.find(key)?;
+    let after_key = key_at + key.len();
+    let rest = data_mw[after_key..].trim_start();
+    let rest = rest.strip_prefix('[')?;
+    // Empty parts: `[]` becomes `[<entry>]`.
+    if rest.trim_start().starts_with(']') {
+        let close = data_mw.len() - rest.trim_start().len() - 1;
+        let head = &data_mw[..close];
+        let tail = &data_mw[close + 1..];
+        let sep = if head.trim_end().ends_with('[') {
+            ""
+        } else {
+            ","
+        };
+        return Some(format!("{head}{sep}{entry}{tail}"));
+    }
+
+    // Find the matching `]` of this `parts` array, so a nested array inside a
+    // part does not end it early.
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in data_mw[after_key..].char_indices() {
+        let idx = after_key + i;
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+
+    // Already at that end? Then there is nothing to add, and — importantly —
+    // nothing to rewrite.
+    let inner = data_mw[after_key..close].trim();
+    if is_prefix && inner[1..].trim_start().starts_with(&entry) {
+        return None;
+    }
+    if !is_prefix && inner.trim_end().ends_with(&entry) {
+        return None;
+    }
+
+    Some(if is_prefix {
+        // Insert directly after the opening bracket, so whatever spacing the
+        // original had after it is preserved.
+        let open = data_mw[after_key..].find('[')? + after_key + 1;
+        format!("{}{entry},{}", &data_mw[..open], &data_mw[open..])
+    } else {
+        format!("{},{entry}{}", &data_mw[..close], &data_mw[close..])
+    })
 }
 
 /// Add a `typeof` token to the link's `typeof` attribute (space-separated, de-

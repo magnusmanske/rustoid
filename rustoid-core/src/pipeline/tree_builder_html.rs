@@ -959,29 +959,98 @@ fn dissolve_absorbed_ranges(node: &mut Node, outer_about: Option<&str>) {
 /// attaches the transclusion `parts` onto the target without discarding the
 /// target's existing `data-mw` fields.
 fn merge_encap_data_mw(encap: Option<String>, target: Option<String>) -> Option<String> {
-    let encap: serde_json::Value = serde_json::from_str(encap.as_deref()?).ok()?;
-    let target: serde_json::Value = match target {
-        Some(t) => match serde_json::from_str::<serde_json::Value>(&t) {
-            Ok(v) => v,
-            Err(_) => return Some(encap.to_string()),
-        },
-        None => return Some(encap.to_string()),
+    let encap = encap?;
+    let Some(target) = target else {
+        return Some(encap);
     };
+    // Both are `{"parts": … , …}` envelopes, so the merge is "keep the
+    // transclusion's `parts`, then splice in the target's other keys". Done
+    // textually because `serde_json` sorts an object's keys, and `data-mw` is
+    // compared byte-for-byte: Parsoid writes `target` before `params` before
+    // `i`, and a round trip through a `serde_json::Value` would reorder every
+    // part on every encapsulated element.
+    let extra = strip_data_mw_key(&target, "parts");
+    if extra.is_empty() {
+        return Some(encap);
+    }
+    let extra = extra.trim_matches(|c: char| c == '{' || c == '}' || c == ',' || c.is_whitespace());
+    if extra.is_empty() {
+        return Some(encap);
+    }
+    Some(splice_into_object(&encap, extra))
+}
 
-    let Some(mut obj) = encap.as_object().cloned() else {
-        return Some(encap.to_string());
-    };
-    if let Some(tobj) = target.as_object() {
-        for (k, v) in tobj {
-            // `parts` is the transclusion's own envelope; every other key
-            // (attribs, errors, caption, …) belongs to the target and must be
-            // preserved.
-            if k != "parts" {
-                obj.insert(k.clone(), v.clone());
+/// The value of `key` in a flat JSON object, or `None`. Used to pull `parts`
+/// out of a `data-mw` envelope without reparsing and losing key order.
+fn data_mw_key_span(json: &str, key: &str) -> Option<(usize, usize)> {
+    let needle = format!("\"{key}\":");
+    let start = json.find(&needle)? + needle.len();
+    let rest = json[start..].trim_start();
+    let lead = json[start..].len() - rest.len();
+    let start = start + lead;
+    let bytes = json.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in json[start..].char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
             }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                if depth == 0 {
+                    return Some((start, start + i));
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => return Some((start, start + i)),
+            _ => {}
+        }
+        // A bare scalar ends at the comma or the closing brace.
+        if depth == 0 && bytes.get(start + i).is_some_and(|b| *b == b',') {
+            return Some((start, start + i));
         }
     }
-    Some(serde_json::Value::Object(obj).to_string())
+    Some((start, json.len()))
+}
+
+/// `json` with the value of `key` removed, leaving the other entries intact.
+fn strip_data_mw_key(json: &str, key: &str) -> String {
+    let Some((start, end)) = data_mw_key_span(json, key) else {
+        return json.to_string();
+    };
+    // Also drop the separator that preceded the removed entry.
+    let mut cut_from = json[..start].rfind(':').map(|c| c + 1).unwrap_or(0);
+    if let Some(prev) = json[..cut_from].rfind(',') {
+        cut_from = prev;
+    }
+    format!("{}{}", &json[..cut_from], &json[end..])
+}
+
+/// Insert `extra` (already a `"key":value` fragment) into a `{…}` object.
+fn splice_into_object(json: &str, extra: &str) -> String {
+    match json.rfind('}') {
+        Some(close) => {
+            let head = json[..close].trim_end().trim_end_matches(',');
+            // An empty object needs no separator.
+            let sep = if head.trim_end().ends_with('{') {
+                ""
+            } else {
+                ","
+            };
+            format!("{head}{sep}{extra}{}", &json[close..])
+        }
+        None => json.to_string(),
+    }
 }
 
 /// Walk the AST, resolving `data-object-id` attributes into stashed

@@ -228,31 +228,65 @@ pub fn serialize_param_infos(param_infos: &[ParamInfo]) -> String {
 
 /// Serialize a `TemplateInfo` to the JSON object that PHP's
 /// `TemplateInfo::toJsonArray` emits (the `target`/`params`/`i` shape).
-pub fn serialize_template_info(info: &TemplateInfo) -> String {
-    let mut target = serde_json::Map::new();
-    target.insert(
-        "wt".to_string(),
-        info.target_wt
-            .as_ref()
-            .map(|s| serde_json::Value::String(s.clone()))
-            .unwrap_or(serde_json::Value::Null),
-    );
-    if let Some(func) = &info.func {
-        if info.ty.as_deref() == Some("parserfunction") {
-            target.insert("key".to_string(), serde_json::Value::String(func.clone()));
-        } else {
-            target.insert(
-                "function".to_string(),
-                serde_json::Value::String(func.clone()),
-            );
-        }
-    }
-    if let Some(href) = &info.href {
-        target.insert("href".to_string(), serde_json::Value::String(href.clone()));
+/// A JSON object whose key order is the insertion order.
+///
+/// `serde_json`'s own `Map` sorts its keys (`BTreeMap`), but `data-mw` is
+/// compared byte-for-byte against Parsoid's output and Parsoid writes
+/// `target` before `params` before `i`. A sorting map therefore loses the
+/// comparison on every transclusion no matter how correct the values are, so
+/// the order has to survive serialization. Values are pre-serialized JSON.
+#[derive(Default)]
+struct OrderedJson(Vec<(String, String)>);
+
+impl OrderedJson {
+    fn put(&mut self, key: &str, value: impl Into<String>) {
+        self.0.push((key.to_string(), value.into()));
     }
 
+    fn put_str(&mut self, key: &str, value: &str) {
+        self.put(key, json_string(value));
+    }
+
+    fn put_opt_str(&mut self, key: &str, value: Option<&str>) {
+        match value {
+            Some(v) => self.put_str(key, v),
+            // Absent wikitext serialises as null, as PHP's `?string` default does.
+            None => self.put(key, "null"),
+        }
+    }
+
+    fn finish(self) -> String {
+        let body: Vec<String> = self
+            .0
+            .into_iter()
+            .map(|(k, v)| format!("{}:{v}", json_string(&k)))
+            .collect();
+        format!("{{{}}}", body.join(","))
+    }
+}
+
+/// A JSON string literal for `s`, escaped by `serde_json` (so non-ASCII and
+/// control characters match what PHP's `json_encode` produces).
+fn json_string(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
+/// Serialize a `TemplateInfo` as the inner object of a `data-mw` part.
+pub fn serialize_template_info(info: &TemplateInfo) -> String {
+    // `target` first: Parsoid's order, verified against the live service.
+    let mut target = OrderedJson::default();
+    target.put_opt_str("wt", info.target_wt.as_deref());
+    if let Some(func) = &info.func {
+        if info.ty.as_deref() == Some("parserfunction") {
+            target.put_str("key", func);
+        } else {
+            target.put_str("function", func);
+        }
+    }
+    target.put_opt_str("href", info.href.as_deref());
+
     // Params object (preserve PHP's disambiguating "=N=key" for duplicate keys).
-    let mut params = serde_json::Map::new();
+    let mut params = OrderedJson::default();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut count = 0usize;
     for param in &info.param_infos {
@@ -263,30 +297,29 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
         }
         seen.insert(param.k.clone(), count);
 
-        let mut value = serde_json::Map::new();
-        // Empty wikitext serializes as null (mirrors PHP's `?string` default).
-        value.insert(
-            "wt".to_string(),
+        let mut value = OrderedJson::default();
+        value.put_opt_str(
+            "wt",
             if param.value_wt.is_empty() {
-                serde_json::Value::Null
+                None
             } else {
-                serde_json::Value::String(param.value_wt.clone())
+                Some(&param.value_wt)
             },
         );
         if let Some(html) = &param.html {
-            value.insert("html".to_string(), serde_json::Value::String(html.clone()));
+            value.put_str("html", html);
         }
         if let Some(key_wt) = &param.key_wt {
-            let mut key_obj = serde_json::Map::new();
-            key_obj.insert("wt".to_string(), serde_json::Value::String(key_wt.clone()));
-            value.insert("key".to_string(), serde_json::Value::Object(key_obj));
+            let mut key_obj = OrderedJson::default();
+            key_obj.put_str("wt", key_wt);
+            value.put("key", key_obj.finish());
         }
         // For parser-function params, emit `eq` (named-ness) and `order`
         // deviations from defaults (mirrors TemplateInfo::toJsonArray).
         if info.ty.as_deref() == Some("parserfunction") {
             let is_numeric = param.is_numeric_key();
             if is_numeric == param.named {
-                value.insert("eq".to_string(), serde_json::Value::Bool(param.named));
+                value.put("eq", if param.named { "true" } else { "false" });
             }
             let order = count;
             let default_order = if is_numeric {
@@ -295,16 +328,18 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
                 None
             };
             if default_order != Some(order) {
-                value.insert("order".to_string(), serde_json::Value::from(order));
+                value.put("order", order.to_string());
             }
         }
-        params.insert(key, serde_json::Value::Object(value));
+        params.put(&key, value.finish());
     }
 
-    let mut out = serde_json::Map::new();
-    out.insert("target".to_string(), serde_json::Value::Object(target));
-    out.insert("params".to_string(), serde_json::Value::Object(params));
-    serde_json::Value::Object(out).to_string()
+    let mut out = OrderedJson::default();
+    out.put("target", target.finish());
+    out.put("params", params.finish());
+    // `i` is the part index, zero for a single part. Parsoid emits it last.
+    out.put("i", "0");
+    out.finish()
 }
 
 /// Serialize a `TemplateInfo` into the full `data-mw` envelope that
@@ -324,17 +359,11 @@ pub fn serialize_data_mw(info: &TemplateInfo) -> String {
         Some("templatearg" | "template") | None => "template",
         Some(_) => "template",
     };
-    let mut part = serde_json::Map::new();
-    let inner = serde_json::from_str::<serde_json::Value>(&serialize_template_info(info))
-        .unwrap_or(serde_json::Value::Null);
-    part.insert(type_key.to_string(), inner);
-
-    let mut out = serde_json::Map::new();
-    out.insert(
-        "parts".to_string(),
-        serde_json::Value::Array(vec![serde_json::Value::Object(part)]),
-    );
-    serde_json::Value::Object(out).to_string()
+    // Assembled textually rather than through `serde_json::Value`: a
+    // `serde_json` object sorts its keys, which would undo the ordering
+    // [`serialize_template_info`] is careful to preserve.
+    let part = format!("\"{}\":{}", type_key, serialize_template_info(info));
+    format!("{{\"parts\":[{{{part}}}]}}")
 }
 
 /// Split the first colon-delimited argument from `params[0]` (for old
