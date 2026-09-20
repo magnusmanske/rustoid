@@ -190,7 +190,19 @@ impl WikiCache {
     /// first, so a normal entry never pays for the second `stat`.
     pub fn get(&self, kind: EntryKind, title: &str) -> Result<Option<CachedBody>> {
         let key = Self::key(kind, title);
-        let Some(meta) = self.index.entries.get(&key) else {
+        // The index normally holds the key verbatim. It may also hold the
+        // *path-sanitised* spelling, because a body's filename escapes `/` (so
+        // `Template:Taxonomy/Equus_(Hippotigris)` is stored, and indexed, as
+        // `Template:Taxonomy_Equus_(Hippotigris)`). Asking for the canonical
+        // title must still find that entry: a page whose name contains a slash
+        // is an ordinary subpage, and treating it as absent makes an offline
+        // run report templates as missing that are sitting on disk.
+        let entry = self
+            .index
+            .entries
+            .get(&key)
+            .or_else(|| self.index.entries.get(&sanitize_path_separators(&key)));
+        let Some(meta) = entry else {
             return Ok(None);
         };
         let canonical = self.body_path(&key);
