@@ -11,6 +11,43 @@ use std::collections::HashMap;
 
 use crate::traits::SiteConfig;
 
+/// MediaWiki's default expansion limits (the `$wg…` globals).
+///
+/// These bound the *preprocessor*: how much wikitext a page may generate while
+/// templates expand. They are separate from [`Wt2HtmlLimits`], which bounds what
+/// the parser does with the tokens it is handed.
+///
+/// The values are MediaWiki's own defaults (`DefaultSettings.php`), and a wiki
+/// that overrides them should report the override through
+/// [`SiteConfig::expansion_limits`].
+///
+/// `maxIncludeSize` (the post-expand include size, `2 * $wgMaxArticleSize *
+/// 1024`) belongs to the same family but is **not here**: nothing enforces it
+/// yet, and a field nothing reads is a promise the code does not keep. It should
+/// arrive with the check that uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpansionLimits {
+    /// `$wgMaxPPNodeCount` — how many times the preprocessor may descend into a
+    /// node. Not a count of nodes: see [`crate::pipeline::parser`]'s counter.
+    pub max_pp_node_count: u64,
+    /// `$wgMaxPPExpandDepth` — how deeply `PPFrame::expand` may nest. 40 before
+    /// MediaWiki 1.38, 100 since.
+    pub max_pp_expand_depth: u64,
+    /// `$wgMaxTemplateDepth` — how deeply templates may transclude one another.
+    /// This is `Frame::depth` (transclusion nesting), *not* either value above.
+    pub max_template_depth: u64,
+}
+
+impl Default for ExpansionLimits {
+    fn default() -> Self {
+        Self {
+            max_pp_node_count: 1_000_000,
+            max_pp_expand_depth: 100,
+            max_template_depth: 100,
+        }
+    }
+}
+
 /// Per-parse wt2html resource ceilings. A resource absent from the map is
 /// unlimited. Mirrors PHP `SiteConfig::$wt2htmlLimits`.
 #[derive(Debug, Clone)]

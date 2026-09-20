@@ -814,6 +814,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     // compares against standalone output) therefore leaves this off.
     let options = rustoid_core::ParserOptions {
         node_ids: true,
+        strip_data_parsoid: true,
         ..rustoid_core::ParserOptions::for_page(title)
     };
     let html = parser

@@ -482,6 +482,15 @@ fn render_invocation(target: &str, args: &[FrameArg]) -> String {
 /// tree builder and serializer a page uses, so a module gets what the page would
 /// have shown. A `mw:Transclusion` marker is Parsoid bookkeeping rather than
 /// output and is dropped.
+///
+// `data-parsoid` is stripped, and that is not cosmetic. A wiki removes it before
+/// serving, so it is not part of what "the page would have shown"; and because a
+/// module routinely feeds this string back in as a *title* or an argument
+/// (`'Taxonomy/' .. frame:expandTemplate{…}`), leaving Parsoid's internal
+/// `{"src":"<p>","tsr":[10,13]}` in it has the next parse read that JSON as
+/// wikitext. The escaping then nests one level deeper each round, and the
+/// expansion grows without bound. Dropping the attribute here is what a wiki
+/// does, and it also removes the fuel.
 pub fn render_answer(items: &[Item], config: &dyn crate::traits::SiteConfig) -> Result<String> {
     let kept: Vec<Item> = items
         .iter()

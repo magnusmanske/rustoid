@@ -30,6 +30,53 @@ fn raw_template_target(src: &str) -> Option<&str> {
     Some(inner.split_once('|').map_or(inner, |(t, _)| t))
 }
 
+/// Track PHP's `tableDataBlock` context over a token: true while the walk sits
+/// inside an unclosed `table` tag.
+///
+/// A template body expanded from a call site inherits the flag, which is what
+/// lets the body's `|` split cells when the governing `{|` came from an *earlier*
+/// expansion (`{{start}}\n|a\n{{end}}` with `Template:start` = `{|`). Free rather than
+/// a closure because two functions track it over different streams.
+fn track_table(item: &Item, depth: &mut usize) {
+    match item {
+        Item::Tok(ParsoidToken::Tag(tk)) if tk.name == "table" => *depth += 1,
+        Item::Tok(ParsoidToken::EndTag(tk)) if tk.name == "table" => {
+            *depth = depth.saturating_sub(1)
+        }
+        _ => {}
+    }
+}
+
+/// The `<span class="error">…</span>` a tripped expansion limit leaves in place
+/// of the expansion.
+///
+/// Both messages are hardcoded in PHP rather than i18n lookups, and the wrapper
+/// is `<span class="error">` — *not* the `<strong class="error">` that the
+/// preview-only messages use. Getting either wrong makes the output differ from
+/// the wiki's for exactly the pages where a limit tripped.
+fn error_span(message: &str) -> Vec<Item> {
+    use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, KV, KeyValue, TagTk};
+
+    let mut span = TagTk::new("span", vec![], DataParsoid::default());
+    span.attribs.push(KV {
+        key: KeyValue::Str("class".to_string()),
+        value: KeyValue::Str("error".to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    });
+
+    vec![
+        Item::Tok(ParsoidToken::Tag(span)),
+        Item::Str(message.to_string()),
+        Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid::default(),
+        ))),
+    ]
+}
+
 /// If `item` is a `<pre format="wikitext">` extension token, return the
 /// self-closing token; otherwise `None`.
 fn wikitext_pre_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
@@ -687,6 +734,29 @@ pub struct Parser<'a, C: SiteConfig> {
     /// expansion call would touch a dozen signatures to serve one caller, so it
     /// is recorded once per parse like the expansion depth above.
     page_title: std::cell::RefCell<String>,
+    /// Whether `data-parsoid` is omitted from output, recorded by `build_ast`
+    /// from the options.
+    ///
+    /// The serializer honours the option directly, but one output does not go
+    /// through it: `data-mw`'s `attribs[].html` fields are HTML *strings* built
+    /// during expansion (`value_to_dom_html`), long before the final serialise,
+    /// and a wiki's served HTML has no `data-parsoid` inside those either. Same
+    /// reason as `page_title` for living here rather than being threaded: one
+    /// caller, reached from several expansion paths.
+    strip_data_parsoid: std::cell::Cell<bool>,
+    /// How many times the preprocessor has entered a node during this parse.
+    /// Mirrors `Parser::mPPNodeCount`.
+    pp_node_count: std::cell::Cell<u64>,
+    /// How deeply expansion is currently nested. Mirrors the `static
+    /// $expansionDepth` local in `PPFrame_Hash::expand`.
+    ///
+    /// PHP's is a `static`, i.e. process-global and never reset — it only
+    /// unwinds when every `expand()` returns, and leaks outright on an abnormal
+    /// exit. That is an implementation accident rather than a semantic, and a
+    /// pooled parser would carry the leftover depth into the next request, so
+    /// this is a per-parse counter instead (reset in [`Parser::reset_expansion`]).
+    /// Within one parse the observable behaviour is identical.
+    expansion_depth: std::cell::Cell<u64>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
@@ -695,6 +765,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             config,
             lua_expansion_depth: std::cell::Cell::new(0),
             page_title: std::cell::RefCell::new(String::new()),
+            pp_node_count: std::cell::Cell::new(0),
+            expansion_depth: std::cell::Cell::new(0),
+            strip_data_parsoid: std::cell::Cell::new(false),
         }
     }
 
@@ -1155,6 +1228,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let serializer =
             crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions {
                 body_only: true,
+                strip_data_parsoid: self.strip_data_parsoid.get(),
                 ..crate::options::ParserOptions::for_page("")
             });
         serializer.serialize(&frag).unwrap_or_default()
@@ -1913,6 +1987,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // Recorded for `expand_invoke`, which needs the root page's title for
         // `mw.wikibase`; see the field's own comment.
         *self.page_title.borrow_mut() = title.get_prefixed_text();
+        self.strip_data_parsoid.set(options.strip_data_parsoid);
+        // A parse starts with the preprocessor counters clear, mirroring the part
+        // of `Parser::clearState` that zeroes `mPPNodeCount`.
+        self.reset_expansion();
         let frame = Frame::new(title.clone(), vec![]);
 
         let tokens = self
@@ -2067,6 +2145,55 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         ast
     }
 
+    /// Enter one preprocessor node on behalf of `expand_templates`.
+    ///
+    /// Faithful to `PPFrame_Hash::expand`'s prologue, with one deliberate
+    /// difference of *placement*: PHP counts one `expand()` call per node it
+    /// descends into, while this loop walks a flat token list and so counts one
+    /// node per `template`/`parser function` token it is about to expand. The
+    /// two agree on what matters — an expansion costs a node, plain text costs
+    /// nothing, and a repeat costs again — and the flat loop is exactly why PHP
+    /// needs the counting at all: a template whose body has 500 children pays 1
+    /// per `expand()`, not 500.
+    ///
+    /// Returns `Some(error tokens)` when a limit has been hit near the current
+    /// position, following the two rules PHP is explicit about:
+    ///
+    /// - The node count is `++`ed and compared with strict `>`, so it trips at
+    ///   `max + 1`.
+    /// - The depth check runs *before* the increment, also with strict `>`.
+    ///
+    /// On a hit the caller emits an error span in this position and carries on:
+    /// neither limit aborts the page, and neither is sticky.
+    fn enter_pp_node(&self) -> Option<Vec<Item>> {
+        let limits = self.config.expansion_limits();
+        let count = self.pp_node_count.get() + 1;
+        self.pp_node_count.set(count);
+        if count > limits.max_pp_node_count {
+            return Some(error_span("Node-count limit exceeded"));
+        }
+        let depth = self.expansion_depth.get();
+        if depth > limits.max_pp_expand_depth {
+            return Some(error_span("Expansion depth limit exceeded"));
+        }
+        self.expansion_depth.set(depth + 1);
+        None
+    }
+
+    /// Leave the node [`enter_pp_node`](Self::enter_pp_node) entered. Mirrors the
+    /// `--$expansionDepth` that `PPFrame_Hash::expand` runs on every return path.
+    fn leave_pp_node(&self) {
+        self.expansion_depth
+            .set(self.expansion_depth.get().saturating_sub(1));
+    }
+
+    /// Reset the preprocessor counters. Mirrors the part of
+    /// `Parser::clearState` that zeroes `mPPNodeCount`.
+    fn reset_expansion(&self) {
+        self.pp_node_count.set(0);
+        self.expansion_depth.set(0);
+    }
+
     /// Expand `template`/`templatearg` tokens in-place.
     ///
     /// `in_template` mirrors PHP's `wrapTemplates = !$options['inTemplate']`:
@@ -2096,13 +2223,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `{|` produced by expanding a previous template (`{{tbl-start}}`) opens
         // the table for the tokens after it, exactly as a literal `{|` would.
         let mut table_depth = 0usize;
-        let track_table = |item: &Item, depth: &mut usize| match item {
-            Item::Tok(ParsoidToken::Tag(tk)) if tk.name == "table" => *depth += 1,
-            Item::Tok(ParsoidToken::EndTag(tk)) if tk.name == "table" => {
-                *depth = depth.saturating_sub(1)
-            }
-            _ => {}
-        };
         for item in tokens {
             track_table(&item, &mut table_depth);
             let Item::Tok(tok) = &item else {
@@ -2115,211 +2235,42 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
 
             if stt.name == "template" || stt.name == "template3" {
-                let about_id = self.new_about_id(about_counter);
-                // A token spliced in from an *argument value* is expanded in
-                // template context: PHP expands argument values with a hard-coded
-                // `inTemplate => true` (see `mark_arg_value_tokens`).
-                let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
-                // The *target* (attribs[0]) may hold a nested template
-                // (`{{ {{T}} }}`): PHP's `expandTemplate` calls
-                // `AttributeExpander::expandFirstAttribute` before resolving the
-                // target, and `Frame::expand` runs the chunk through the TT2
-                // pipeline, expanding that inner template. rustoid's
-                // `Frame::expand` is synchronous, so do that pass here first and
-                // only then hand the (template-free) target to the
-                // AttributeTransformManager for the `{{{...}}}` substitution it
-                // owns. Argument values are deliberately left alone: PHP expands
-                // the template token's *body* arguments later, with
-                // `expandTemplates => false`.
-                let attribs = self
-                    .expand_target_templates(
+                // Charge one preprocessor node for this expansion. On a limit
+                // trip PHP substitutes an error span here and returns, leaving
+                // the rest of the chunk to expand normally.
+                if let Some(error) = self.enter_pp_node() {
+                    out.extend(error);
+                    continue;
+                }
+                let expanded = self
+                    .expand_template_token(
                         frame,
-                        stt.attribs.clone(),
+                        &item,
+                        stt,
                         source,
                         about_counter,
-                        in_tpl,
+                        in_template,
                         src_text,
+                        &mut table_depth,
                     )
                     .await;
-                // Expand `{{{…}}}` template-argument references in the token's
-                // argument keys/values against the current frame (mirrors PHP's
-                // `expandTemplateNatively` → `AttributeTransformManager::process`, so
-                // `{{#tag:pre|{{{1}}}|…}}` sees the argument's *value*).
-                let attribs = crate::pipeline::attribute_transform_manager::process(
-                    frame, false, in_tpl, &attribs,
-                )
-                .unwrap_or(attribs);
-                let params = crate::pipeline::parser_functions::Params::new(attribs.clone());
-
-                // The target may hold a nested template (`{{ {{T}} }}`), in which
-                // case the KV's key carries *tokens*, not a string: the
-                // AttributeTransformManager above expands it against the frame,
-                // and a multi-item result stays `Tokens`. Stringify it the way
-                // PHP's `processToString` does — a plain `as_str()` silently
-                // yielded `""`, producing an empty target.
-                let target_str = attribs
-                    .first()
-                    .map(|kv| match &kv.key {
-                        crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
-                        crate::wikitext::tokens_v2::KeyValue::Tokens(t) => {
-                            crate::wikitext::token_utils::tokens_to_string(t)
-                        }
-                    })
-                    .unwrap_or_default();
-
-                // A comment in the template *target* (`{{f<!---->oo}}`) is
-                // stripped by the PHP preprocessor before target resolution,
-                // so the template still expands, but Parsoid does not wrap the
-                // expansion in a `mw:Transclusion` wrapper (the target is no
-                // longer cleanly stringifiable). Detect this from the raw
-                // template source so the expansion matches PHP's
-                // `convertToString(..., /* expandTemplates */ true)` path,
-                // which emits the expansion unencapsulated.
-                let target_has_comment = stt
-                    .data_parsoid
-                    .src
-                    .as_deref()
-                    .and_then(raw_template_target)
-                    .map(|t| t.contains("<!--"))
-                    .unwrap_or(false);
-
-                match resolve_template_target(self.config, Some(frame.title()), &target_str) {
-                    // `#invoke` is Scribunto, not a parser function: MediaWiki
-                    // hands the call to Lua and feeds the result back through the
-                    // parser. Parsoid implements none of it in standalone mode,
-                    // which is why the fixture suite cannot exercise it.
-                    //
-                    // It is intercepted here, ahead of the synchronous
-                    // parser-function path, because fetching a module is async.
-                    Some(ResolvedTarget::ParserFunction {
-                        name, ref pf_arg, ..
-                    }) if name.eq_ignore_ascii_case("invoke") => {
-                        // Scribunto's `#invoke` is not an ordinary parser
-                        // function: everything after the colon is its argument
-                        // list, and the tokenizer has already split that on `|`,
-                        // so the pieces must be put back together.
-                        let invoke_arg = invoke_arg_text(pf_arg, &params);
-                        // Scribunto's `frame:getParent()` is the frame of the
-                        // *calling template*, and modules read its args
-                        // constantly (`Module:Infobox`, `Module:Check for
-                        // conflicting parameters` both do it on their first
-                        // lines). The parent's arguments are this frame's.
-                        let parent_args = frame.args().args.clone();
-                        let expanded = self
-                            .expand_invoke(
-                                source,
-                                frame,
-                                &invoke_arg,
-                                &target_str,
-                                about_id,
-                                tok,
-                                in_template,
-                                src_text,
-                                parent_args,
-                            )
-                            .await;
-                        for e in &expanded {
-                            track_table(e, &mut table_depth);
-                        }
-                        out.extend(expanded);
-                    }
-                    Some(ResolvedTarget::Template { name, title }) => {
-                        let expanded = self
-                            .expand_one_template(
-                                source,
-                                frame,
-                                &name,
-                                &target_str,
-                                &title,
-                                &params,
-                                about_id,
-                                tok,
-                                about_counter,
-                                in_tpl,
-                                target_has_comment,
-                                src_text,
-                                table_depth > 0,
-                            )
-                            .await;
-                        for e in &expanded {
-                            track_table(e, &mut table_depth);
-                        }
-                        out.extend(expanded);
-                    }
-                    Some(ResolvedTarget::Variable {
-                        magic_word_type: Some(magic),
-                        ..
-                    }) => {
-                        // The `{{!}}` magic word expands to a literal `|` at the
-                        // top level, or a `<td>` inside a template (so TableFixups
-                        // can reinterpret it as a cell separator). PHP's
-                        // `expandTemplate` → `processSpecialMagicWord` does this at
-                        // the token level; it must not be string-substituted and
-                        // re-tokenized into a table delimiter.
-                        //
-                        // A token spliced in from an *argument value* always counts
-                        // as in-template: PHP expands argument values under a
-                        // hard-coded `inTemplate => true` (see
-                        // `mark_arg_value_tokens`).
-                        let arg_value = stt.data_parsoid.tmp.in_arg_value;
-                        out.extend(
-                            crate::pipeline::template_handler::process_special_magic_word(
-                                &magic,
-                                in_template || arg_value,
-                            ),
-                        );
-                    }
-                    None => {
-                        // The target is not a template / variable / parser
-                        // function (e.g. an invalid title such as
-                        // `{{ {{T}} }}` → `Main Page|Something else`, whose `|`
-                        // makes it an illegal title). Bail back to literal
-                        // `{{` … `}}` around the re-tokenized source.
-                        let bailed =
-                            TemplateHandler::convert_to_string(tok, in_tpl, table_depth > 0);
-                        // PHP's `convertToString` runs the bailed chunk through
-                        // `wikitext-to-expanded-tokens`, so a nested template in
-                        // the source (the `{{T290526}}` above) still expands.
-                        let expanded = Box::pin(self.expand_templates(
-                            frame,
-                            bailed,
-                            source,
-                            about_counter,
-                            in_tpl,
-                            src_text,
-                        ))
-                        .await;
-                        for e in &expanded {
-                            track_table(e, &mut table_depth);
-                        }
-                        out.extend(expanded);
-                    }
-                    _ => {
-                        // Rebuild the token with expanded argument references so
-                        // parser-function / `mw:Param` / variable paths see the arg
-                        // *values* (e.g. `{{#tag:pre|{{{1}}}|…}}`).
-                        let mut expanded_tok = stt.clone();
-                        expanded_tok.attribs = attribs;
-                        let expanded_item = Item::Tok(ParsoidToken::SelfclosingTag(expanded_tok));
-                        let expanded = TemplateHandler.process(
-                            self.config,
-                            frame,
-                            about_counter,
-                            vec![expanded_item],
-                        );
-                        for e in &expanded {
-                            track_table(e, &mut table_depth);
-                        }
-                        out.extend(expanded);
-                    }
+                self.leave_pp_node();
+                for e in &expanded {
+                    track_table(e, &mut table_depth);
                 }
+                out.extend(expanded);
                 continue;
             }
 
             if stt.name == "templatearg" {
+                if let Some(error) = self.enter_pp_node() {
+                    out.extend(error);
+                    continue;
+                }
                 let about_id = self.new_about_id(about_counter);
                 let expanded =
                     TemplateHandler.handle_template_arg_token(frame, tok, about_id, !in_template);
+                self.leave_pp_node();
                 for e in &expanded {
                     track_table(e, &mut table_depth);
                 }
@@ -2333,6 +2284,224 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 table_depth = d;
             }
             out.push(item);
+        }
+        out
+    }
+
+    /// Expand one `template` token, whose preprocessor node has already been
+    /// charged by the caller. The `table_depth` is carried in and out because an
+    /// expansion's own tokens change whether the tokens *after* it sit in a table.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_template_token(
+        &self,
+        frame: &Frame,
+        _item: &Item,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+        src_text: &str,
+        table_depth: &mut usize,
+    ) -> Vec<Item> {
+        // The paths below were written against the enclosing `ParsoidToken`; keep
+        // that shape by borrowing the one token this self-closing child came from.
+        let token = ParsoidToken::SelfclosingTag(stt.clone());
+        let tok = &token;
+
+        // A token spliced in from an *argument value* is expanded in
+        // template context: PHP expands argument values with a hard-coded
+        // `inTemplate => true` (see `mark_arg_value_tokens`).
+        let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
+
+        let about_id = self.new_about_id(about_counter);
+
+        // The *target* (attribs[0]) may hold a nested template
+        // (`{{ {{T}} }}`): PHP's `expandTemplate` calls
+        // `AttributeExpander::expandFirstAttribute` before resolving the
+        // target, and `Frame::expand` runs the chunk through the TT2
+        // pipeline, expanding that inner template. rustoid's
+        // `Frame::expand` is synchronous, so do that pass here first and
+        // only then hand the (template-free) target to the
+        // AttributeTransformManager for the `{{{...}}}` substitution it
+        // owns. Argument values are deliberately left alone: PHP expands
+        // the template token's *body* arguments later, with
+        // `expandTemplates => false`.
+        let attribs = self
+            .expand_target_templates(
+                frame,
+                stt.attribs.clone(),
+                source,
+                about_counter,
+                in_tpl,
+                src_text,
+            )
+            .await;
+        // Expand `{{{…}}}` template-argument references in the token's
+        // argument keys/values against the current frame (mirrors PHP's
+        // `expandTemplateNatively` → `AttributeTransformManager::process`, so
+        // `{{#tag:pre|{{{1}}}|…}}` sees the argument's *value*).
+        let attribs =
+            crate::pipeline::attribute_transform_manager::process(frame, false, in_tpl, &attribs)
+                .unwrap_or(attribs);
+        let params = crate::pipeline::parser_functions::Params::new(attribs.clone());
+
+        // The target may hold a nested template (`{{ {{T}} }}`), in which
+        // case the KV's key carries *tokens*, not a string: the
+        // AttributeTransformManager above expands it against the frame,
+        // and a multi-item result stays `Tokens`. Stringify it the way
+        // PHP's `processToString` does — a plain `as_str()` silently
+        // yielded `""`, producing an empty target.
+        let target_str = attribs
+            .first()
+            .map(|kv| match &kv.key {
+                crate::wikitext::tokens_v2::KeyValue::Str(s) => s.clone(),
+                crate::wikitext::tokens_v2::KeyValue::Tokens(t) => {
+                    crate::wikitext::token_utils::tokens_to_string(t)
+                }
+            })
+            .unwrap_or_default();
+
+        // A comment in the template *target* (`{{f<!---->oo}}`) is
+        // stripped by the PHP preprocessor before target resolution,
+        // so the template still expands, but Parsoid does not wrap the
+        // expansion in a `mw:Transclusion` wrapper (the target is no
+        // longer cleanly stringifiable). Detect this from the raw
+        // template source so the expansion matches PHP's
+        // `convertToString(..., /* expandTemplates */ true)` path,
+        // which emits the expansion unencapsulated.
+        let target_has_comment = stt
+            .data_parsoid
+            .src
+            .as_deref()
+            .and_then(raw_template_target)
+            .map(|t| t.contains("<!--"))
+            .unwrap_or(false);
+
+        let mut out = Vec::new();
+        match resolve_template_target(self.config, Some(frame.title()), &target_str) {
+            // `#invoke` is Scribunto, not a parser function: MediaWiki
+            // hands the call to Lua and feeds the result back through the
+            // parser. Parsoid implements none of it in standalone mode,
+            // which is why the fixture suite cannot exercise it.
+            //
+            // It is intercepted here, ahead of the synchronous
+            // parser-function path, because fetching a module is async.
+            Some(ResolvedTarget::ParserFunction {
+                name, ref pf_arg, ..
+            }) if name.eq_ignore_ascii_case("invoke") => {
+                // Scribunto's `#invoke` is not an ordinary parser
+                // function: everything after the colon is its argument
+                // list, and the tokenizer has already split that on `|`,
+                // so the pieces must be put back together.
+                let invoke_arg = invoke_arg_text(pf_arg, &params);
+                // Scribunto's `frame:getParent()` is the frame of the
+                // *calling template*, and modules read its args
+                // constantly (`Module:Infobox`, `Module:Check for
+                // conflicting parameters` both do it on their first
+                // lines). The parent's arguments are this frame's.
+                let parent_args = frame.args().args.clone();
+                let expanded = self
+                    .expand_invoke(
+                        source,
+                        frame,
+                        &invoke_arg,
+                        &target_str,
+                        about_id,
+                        tok,
+                        in_template,
+                        src_text,
+                        parent_args,
+                    )
+                    .await;
+                for e in &expanded {
+                    track_table(e, table_depth);
+                }
+                out.extend(expanded);
+            }
+            Some(ResolvedTarget::Template { name, title }) => {
+                let expanded = self
+                    .expand_one_template(
+                        source,
+                        frame,
+                        &name,
+                        &target_str,
+                        &title,
+                        &params,
+                        about_id,
+                        tok,
+                        about_counter,
+                        in_tpl,
+                        target_has_comment,
+                        src_text,
+                        *table_depth > 0,
+                    )
+                    .await;
+                for e in &expanded {
+                    track_table(e, table_depth);
+                }
+                out.extend(expanded);
+            }
+            Some(ResolvedTarget::Variable {
+                magic_word_type: Some(magic),
+                ..
+            }) => {
+                // The `{{!}}` magic word expands to a literal `|` at the
+                // top level, or a `<td>` inside a template (so TableFixups
+                // can reinterpret it as a cell separator). PHP's
+                // `expandTemplate` → `processSpecialMagicWord` does this at
+                // the token level; it must not be string-substituted and
+                // re-tokenized into a table delimiter.
+                //
+                // A token spliced in from an *argument value* always counts
+                // as in-template: PHP expands argument values under a
+                // hard-coded `inTemplate => true` (see
+                // `mark_arg_value_tokens`).
+                let arg_value = stt.data_parsoid.tmp.in_arg_value;
+                out.extend(
+                    crate::pipeline::template_handler::process_special_magic_word(
+                        &magic,
+                        in_template || arg_value,
+                    ),
+                );
+            }
+            None => {
+                // The target is not a template / variable / parser
+                // function (e.g. an invalid title such as
+                // `{{ {{T}} }}` → `Main Page|Something else`, whose `|`
+                // makes it an illegal title). Bail back to literal
+                // `{{` … `}}` around the re-tokenized source.
+                let bailed = TemplateHandler::convert_to_string(tok, in_tpl, *table_depth > 0);
+                // PHP's `convertToString` runs the bailed chunk through
+                // `wikitext-to-expanded-tokens`, so a nested template in
+                // the source (the `{{T290526}}` above) still expands.
+                let expanded = Box::pin(self.expand_templates(
+                    frame,
+                    bailed,
+                    source,
+                    about_counter,
+                    in_tpl,
+                    src_text,
+                ))
+                .await;
+                for e in &expanded {
+                    track_table(e, table_depth);
+                }
+                out.extend(expanded);
+            }
+            _ => {
+                // Rebuild the token with expanded argument references so
+                // parser-function / `mw:Param` / variable paths see the arg
+                // *values* (e.g. `{{#tag:pre|{{{1}}}|…}}`).
+                let mut expanded_tok = stt.clone();
+                expanded_tok.attribs = attribs;
+                let expanded_item = Item::Tok(ParsoidToken::SelfclosingTag(expanded_tok));
+                let expanded =
+                    TemplateHandler.process(self.config, frame, about_counter, vec![expanded_item]);
+                for e in &expanded {
+                    track_table(e, table_depth);
+                }
+                out.extend(expanded);
+            }
         }
         out
     }
@@ -2515,9 +2684,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // still splits cells when the governing `{|` came from elsewhere.
         in_table: bool,
     ) -> Vec<Item> {
-        const MAX_TEMPLATE_DEPTH: usize = 40;
+        // `$wgMaxTemplateDepth`, MediaWiki's own default. This is *transclusion*
+        // nesting (`Frame::depth`), a different thing from the preprocessor's
+        // expansion depth that [`enter_pp_node`](Self::enter_pp_node) tracks.
+        const MAX_TEMPLATE_DEPTH: usize = 100;
 
-        // Enforce loop / depth constraints.
+        // Enforce loop / recursion constraints. Mirrors `Parser::braceSubstitution`,
+        // whose node-count and expansion-depth checks have already run in
+        // `expand_templates` by the time the template is resolved.
         if let Some(err) = crate::pipeline::template_handler::enforce_template_constraints(
             frame,
             name,
@@ -3123,6 +3297,194 @@ mod tests {
             .unwrap();
         assert!(html.contains("&lt;/pre>"), "got: {html}");
         assert!(!html.contains("<pre>"), "got: {html}");
+    }
+
+    /// A chain of *distinct* templates walks the depth limit without ever
+    /// looking like a loop. `loop_and_depth_check` compares titles up the frame
+    /// chain, so only an all-different chain isolates the preprocessor's own
+    /// depth bound from the loop detector.
+    ///
+    /// The observable contract is the one PHP states: the offending expansion is
+    /// replaced by an error span in place, the rest of the page still expands,
+    /// and nothing aborts.
+    #[tokio::test]
+    async fn expansion_depth_limit_yields_an_error_span() {
+        use crate::resource_limits::ExpansionLimits;
+
+        let source = crate::mock::MockDataSource::new();
+        const CHAIN: usize = 30;
+        for i in 0..CHAIN {
+            let body = if i + 1 == CHAIN {
+                "leaf".to_string()
+            } else {
+                format!("{{{{D{}}}}}", i + 1)
+            };
+            source.add_template(&format!("Template:D{i}"), &body);
+        }
+
+        let mut config = MockSiteConfig::new();
+        config.set_expansion_limits(ExpansionLimits {
+            max_pp_expand_depth: 10,
+            ..ExpansionLimits::default()
+        });
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "start {{D0}} end",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            html.contains("Expansion depth limit exceeded"),
+            "expected the depth error span, got: {html}"
+        );
+        // The error is emitted in place, not as a page-level failure: the text
+        // around it survives, which is what "parsing continues" means.
+        assert!(html.contains("start "), "got: {html}");
+        assert!(html.contains(" end"), "got: {html}");
+        // The wrapper is `<span class="error">`, not the `<strong>` the
+        // preview-only messages use. Extra attributes follow the class when the
+        // span is encapsulation-registered, so match the class alone.
+        assert!(html.contains("<span class=\"error\""), "got: {html}");
+    }
+
+    /// The node-count limit counts *expansion invocations*, so a template whose
+    /// body is large costs one node, not one per child. The other half of that
+    /// fact is that a repeat costs again: N transclusions of one template pay N.
+    #[tokio::test]
+    async fn node_count_limit_trips_on_repeated_transclusions() {
+        use crate::resource_limits::ExpansionLimits;
+
+        let source = crate::mock::MockDataSource::new();
+        // A body with many children: one expansion, one node.
+        source.add_template("Template:Big", "{{P}}".repeat(50).as_str());
+        source.add_template("Template:P", "x");
+
+        let mut config = MockSiteConfig::new();
+        config.set_expansion_limits(ExpansionLimits {
+            max_pp_node_count: 20,
+            ..ExpansionLimits::default()
+        });
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                &"{{Big}}\n".repeat(30),
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            html.contains("Node-count limit exceeded"),
+            "expected the node-count error span, got: {html}"
+        );
+        // `Template:Big`'s 50 children cost one node for the template, so the
+        // pages above the ceiling still produced output rather than nothing.
+        assert!(html.contains('x'), "got: {html}");
+    }
+
+    /// The node counter must not charge for plain text: only an expansion does.
+    /// A page of prose with no templates at all can never trip it, whatever the
+    /// ceiling.
+    #[tokio::test]
+    async fn plain_text_never_charges_a_node() {
+        use crate::resource_limits::ExpansionLimits;
+
+        let source = crate::mock::MockDataSource::new();
+        let mut config = MockSiteConfig::new();
+        config.set_expansion_limits(ExpansionLimits {
+            max_pp_node_count: 0,
+            max_pp_expand_depth: 0,
+            ..ExpansionLimits::default()
+        });
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                &"just words, no braces at all\n".repeat(50),
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(!html.contains("limit exceeded"), "got: {html}");
+        assert!(html.contains("just words"), "got: {html}");
+    }
+
+    /// A wiki strips `data-parsoid` before serving, so a comparison against
+    /// served HTML must not see it — while the default, which the fixture suite
+    /// relies on, keeps it.
+    #[test]
+    fn strip_data_parsoid_is_opt_in() {
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let wikitext = "a [[link]] here";
+
+        let kept = parser
+            .wikitext_to_html(wikitext, &ParserOptions::for_page("Test"))
+            .unwrap();
+        assert!(kept.contains("data-parsoid"), "got: {kept}");
+
+        let stripped = parser
+            .wikitext_to_html(
+                wikitext,
+                &ParserOptions {
+                    strip_data_parsoid: true,
+                    ..ParserOptions::for_page("Test")
+                },
+            )
+            .unwrap();
+        assert!(!stripped.contains("data-parsoid"), "got: {stripped}");
+        // Only that attribute goes: the link itself is untouched.
+        assert!(stripped.contains("mw:WikiLink"), "got: {stripped}");
+    }
+
+    /// The strip reaches `data-mw`'s `attribs[].html` fields too. Those are HTML
+    /// *strings* built during expansion rather than nodes serialized at the end,
+    /// so they take a separate path — and a wiki's served HTML has no
+    /// `data-parsoid` inside them either (`Zebra` carries `mw:ExpandedAttrs` with
+    /// `id` attributes in the fragment and no `data-parsoid` at all). The fixture
+    /// `attributeExpanderTests.txt` shows standalone output keeping it, escaped
+    /// as `&apos;` because the whole field is JSON inside an attribute.
+    #[tokio::test]
+    async fn strip_data_parsoid_reaches_data_mw_attrib_html() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template("Template:1x", "{{{1}}}");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let wikitext = "<div {{1x|1=style=\"color:red\"}}>hmm</div>";
+
+        let kept = parser
+            .wikitext_to_html_expanded(wikitext, &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        assert!(kept.contains("mw:ExpandedAttrs"), "got: {kept}");
+        assert!(
+            kept.contains("data-parsoid=&apos;")
+                || kept.contains("data-parsoid=\\\"")
+                || kept.contains("data-parsoid='"),
+            "the field carries it in standalone output: {kept}"
+        );
+
+        let stripped = parser
+            .wikitext_to_html_expanded(
+                wikitext,
+                &source,
+                &ParserOptions {
+                    strip_data_parsoid: true,
+                    ..ParserOptions::for_page("Test")
+                },
+            )
+            .await
+            .unwrap();
+        assert!(stripped.contains("mw:ExpandedAttrs"), "got: {stripped}");
+        assert!(
+            !stripped.contains("data-parsoid"),
+            "nothing carries it when stripping: {stripped}"
+        );
     }
 
     #[test]

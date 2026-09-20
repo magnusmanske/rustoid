@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::error::Result;
 use crate::lua::engine::SiteStats;
-use crate::resource_limits::Wt2HtmlLimits;
+use crate::resource_limits::{ExpansionLimits, Wt2HtmlLimits};
 use crate::title::Title;
 
 // ---------------------------------------------------------------------------
@@ -185,6 +185,13 @@ pub trait SiteConfig: Send + Sync {
     /// absent from the map is unlimited.
     fn wt2html_limits(&self) -> Wt2HtmlLimits {
         Wt2HtmlLimits::default()
+    }
+
+    /// The preprocessor's expansion limits (the `$wgMaxPPNodeCount` family).
+    ///
+    /// A wiki may override these; the default is MediaWiki's own.
+    fn expansion_limits(&self) -> ExpansionLimits {
+        ExpansionLimits::default()
     }
 
     /// The base URL for constructing full URLs (e.g. `"https://en.wikipedia.org"`).

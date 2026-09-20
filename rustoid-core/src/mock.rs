@@ -335,6 +335,8 @@ pub struct MockSiteConfig {
     subpages_ns: std::collections::HashSet<i32>,
     /// wt2html resource limits (mirrors PHP's `SiteConfig::$wt2htmlLimits`).
     wt2html_limits: crate::resource_limits::Wt2HtmlLimits,
+    /// Preprocessor expansion limits (the `$wgMaxPPNodeCount` family).
+    expansion_limits: crate::resource_limits::ExpansionLimits,
 }
 
 impl MockSiteConfig {
@@ -384,6 +386,7 @@ impl MockSiteConfig {
             localized_namespace_names: HashMap::new(),
             subpages_ns: std::collections::HashSet::new(),
             wt2html_limits: crate::resource_limits::Wt2HtmlLimits::default(),
+            expansion_limits: crate::resource_limits::ExpansionLimits::default(),
         };
 
         // Register standard MediaWiki namespaces. `case_sensitive` reflects
@@ -635,6 +638,13 @@ impl MockSiteConfig {
         self.wt2html_limits.set(resource, limit);
     }
 
+    /// Override the preprocessor expansion limits, so a test can trip one
+    /// without expanding a million nodes (mirrors a wiki setting its own
+    /// `$wgMaxPPNodeCount`).
+    pub fn set_expansion_limits(&mut self, limits: crate::resource_limits::ExpansionLimits) {
+        self.expansion_limits = limits;
+    }
+
     /// Enable subpages for a namespace (mirrors PHP's `enableSubpagesForNS`,
     /// which the parser-test `subpage` option toggles).
     pub fn enable_subpages_for_ns(&mut self, ns: i32) {
@@ -770,6 +780,10 @@ impl SiteConfig for MockSiteConfig {
 
     fn wt2html_limits(&self) -> crate::resource_limits::Wt2HtmlLimits {
         self.wt2html_limits.clone()
+    }
+
+    fn expansion_limits(&self) -> crate::resource_limits::ExpansionLimits {
+        self.expansion_limits
     }
 
     fn server_url(&self) -> &str {

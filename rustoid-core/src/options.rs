@@ -99,6 +99,23 @@ pub struct ParserOptions {
     #[serde(default)]
     pub node_ids: bool,
 
+    /// Strip `data-parsoid` from the output, as a wiki does before serving it.
+    ///
+    /// `data-parsoid` is Parsoid's round-trip metadata: `src`/`tsr`/`stx` and
+    /// friends, needed to map HTML back to wikitext. MediaWiki removes it before
+    /// the HTML ever reaches a reader (`DOMDataUtils::stripDataParsoid`), so the
+    /// HTML a wiki serves has none — while Parsoid's standalone output, which the
+    /// fixture suite compares against, keeps it throughout.
+    ///
+    /// Off by default, for the same reason as [`node_ids`](Self::node_ids): the
+    /// fixture suite is standalone output. `rustoid-compare` turns it on, because
+    /// the wiki strips it and an unstripped render differs on *every* page that
+    /// contains an element — which is every page.
+    ///
+    /// `data-mw` is deliberately **not** stripped: it survives into served HTML.
+    #[serde(default)]
+    pub strip_data_parsoid: bool,
+
     /// Enable lint error reporting.
     #[serde(default)]
     pub linting: bool,
@@ -139,6 +156,7 @@ impl Default for ParserOptions {
             offset_type: OffsetType::default(),
             page_bundle: PageBundleMode::default(),
             node_ids: false,
+            strip_data_parsoid: false,
             linting: false,
             annotations: false,
             language: default_language(),
