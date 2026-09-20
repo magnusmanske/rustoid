@@ -332,6 +332,61 @@ sure is to list *all* matches and check which one is doing work, or run the proc
 under a supervisor that reports it. Everything concluded from a single `head -1`
 match was noise.
 
+**What it turned out to be, and how to reproduce it in seconds.** The whole page
+is a bad instrument: a run costs minutes, which makes a hypothesis expensive to
+test. `rustoid-compare/examples/render.rs` renders a snippet from a file through
+the same `WikiSiteConfig` and cache, so the taxobox alone can be run instead of
+the article:
+
+```bash
+RUSTOID_CACHE_DIR=~/.cache/rustoid-compare \
+  ./target/release/examples/render Zebra /tmp/taxobox.wt
+```
+
+That reproduces the blow-up, and a stack sample of the hung process names the
+loop immediately: `expand_templates` → `expand_target_templates` →
+`expand_templates` → …, with the *same* target string, `Taxonomy/`, at every
+level and two children per node. Reading the offending token's own source settles
+it:
+
+```text
+{{Taxonomy/\n<p><a rel="mw:WikiLink" href=":Template:Taxonomy/ Equus (Hippotigris)"></a></p>|machine code=parent}}
+```
+
+The template *title* is not a title. `Module:Autotaxobox` writes
+`frame:expandTemplate{ title = 'Taxonomy/' .. taxon }`, and for a taxon whose
+`Taxonomy/…` page is missing it reads the previous answer back — which is
+**HTML** — and concatenates that into the next title. Rustoid then tokenizes the
+HTML as wikitext, escapes it, expands again, and re-embeds it one level deeper;
+the escaping compounds (`&amp;#39;`, `\\\"`), so the string roughly doubles
+per round.
+
+Three consequences, in order of usefulness:
+
+1. **The limits bound it but do not make it practical.** The node counter caps
+total work, and the depth bound caps nesting, but each node's *string* is
+exponentially larger than the one before it, so the cap is reached only after
+~1M expansions of a growing megabyte — minutes and gigabytes in a release build.
+MediaWiki has the same two limits and the same hazard; it does not meet it on
+`Zebra` because the template exists there. Which is to say the limits are
+faithful but this is not the bug they fix.
+2. **The strip above removed part of the fuel, not the mechanism.** The answer no
+longer carries Parsoid's `{"src":"<p>"…}` JSON into the next title, which is
+what made the escaping compound so fast, but a missing template still answers
+with markup rather than a title, so the loop survives in slower form.
+3. **The cache is still incomplete for this page.** `Template:Taxonomy/Equus
+(Hippotigris)` was absent; one online run fetched it. Its parents in the chain
+(`Taxonomy/Equus`, …, up to `Life`) are absent too. Zebra's own served HTML
+contains **no** redlink to any `Template:` page, so on the wiki the whole chain
+resolves — every offline failure here is a page that exists and was never
+cached.
+
+The next step is therefore two separate things, and they should not be confused:
+fix the missing-template answer so it cannot be re-used as a title (MediaWiki
+answers with the link text, and `template_to_wikilink` currently emits an
+anchor with *no* content and a `:`-prefixed `href`), and populate the `Taxonomy/*`
+chain so the offline run stops exercising a path the wiki never takes.
+
 #### The first real scoreboard, and what it says to build next
 
 With 44 of the 48 corpus pages cached (the other four, including the stalling
@@ -843,6 +898,36 @@ Two caveats on the Lua path, both recorded at `expand_invoke`:
 - **Exit criterion:** the previously-"unreachable" fixture family becomes
   reachable and passing.
 
+#### Integrated output strips `data-parsoid`, and that is why nothing matched
+
+`rustoid-compare` reported **0 of 44 pages** matching, and the largest single
+reason was not a parser gap at all. A wiki removes `data-parsoid` from Parsoid's
+output before serving it; the cached `Zebra` HTML contains **zero** occurrences
+of the attribute (while keeping 247 `data-mw` and 331 `rel="mw:WikiLink"`).
+rustoid emitted it on every element, so the two renderings differed on the first
+link of the first paragraph of *every* page. The scoreboard was measuring an
+attribute, not a parser.
+
+Parsoid's *standalone* output — what the fixture suite compares against — keeps
+`data-parsoid` throughout (`quotes.txt` alone has three), so this is an
+integrated/standalone difference in the same family as `node_ids`, and it is
+gated the same way:
+
+- `ParserOptions::strip_data_parsoid`, off by default, so the fixture suite and
+every round-trip test keep their meaning;
+- on in `rustoid-compare`, because its whole target is what a wiki serves.
+
+The attribute is dropped **in the serializer** (`HtmlSerializer`), not by a walk
+over the finished HTML. String surgery cannot tell an attribute from a page that
+quotes one — an article about Parsoid, or a `<syntaxhighlight>` block, contains
+the literal text — while the serializer knows the difference by construction.
+`data-mw` is deliberately kept: it survives into served HTML.
+
+`render_answer` — what a module receives from `frame:expandTemplate`,
+`preprocess` and `callParserFunction` — strips it too, unconditionally. A wiki
+would never hand that markup to a module either, and leaving it in is actively
+harmful; see the blow-up section below, where it is the fuel.
+
 #### Two parser bugs the corpus found, and one that turned out not to be one
 
 Comparing `Zebra` against the wiki's own Parsoid turned up two real parser bugs.
@@ -907,6 +992,50 @@ settled it in one step, and should have been the first step.
 - Large pages, deep transclusion, resource limits, parallelism, cache
   management, resumable batches, and a perf budget.
 
+#### Expansion limits — *done*
+
+MediaWiki bounds the preprocessor, and the bounds are three separate counters
+with three separate trip conditions. All three are now implemented, and the
+conditions are reproduced exactly rather than approximated, because the output
+changes at the boundary:
+
+| Limit | Default | Enforced in | Trip condition |
+|---|---|---|---|
+| `$wgMaxPPNodeCount` | 1000000 | `expand` | `++count > max` |
+| `$wgMaxPPExpandDepth` | 100 | `expand` | `depth > max`, checked *before* the increment |
+| `$wgMaxTemplateDepth` | 100 | `braceSubstitution` | `frame.depth >= max` |
+
+The three details that decide whether a port is faithful:
+
+- **The node counter counts `expand()` invocations, not AST nodes.** PHP returns
+  early for a string argument, before incrementing, so plain text costs nothing,
+  and its internal `$iteratorStack` walk never increments — a template whose body
+  has 500 children costs **one** node, not 500. A repeat costs again: there is no
+  memoisation on this path. rustoid charges one node per `template` token it is
+  about to expand, which is the same accounting in a loop that walks a flat token
+  list.
+- **On a trip, an error span is substituted in place and parsing continues.**
+  Neither limit aborts the page, and neither is sticky, so an over-limit page
+  degrades into a cascade of spans rather than a failure. The strings are
+  hardcoded PHP literals wrapped in `<span class="error">` — *not* the
+  `<strong class="error">` the preview-only i18n messages use.
+- **`$frame->depth` is not either of the other two.** The PHP source says so
+  explicitly, and `loopAndDepthCheck` uses it for both the loop test (walking
+  titles up the frame chain) and the recursion bound.
+
+The limits are read from `SiteConfig::expansion_limits`, defaulting to MediaWiki's
+own values. Nothing in `siteinfo` exposes them (they are not wiki settings a
+client can read), so a wiki that overrides them needs a config override rather
+than a fetch — worth knowing before looking for an API for it.
+
+**One deliberate deviation.** PHP's `$expansionDepth` is a function-local
+`static`: process-global, never reset by `clearState()`, and leaked outright if
+the expansion unwinds abnormally. That is an implementation accident rather than
+a semantic, and a parser reused across requests would carry the leftover depth
+into the next one. rustoid keeps it per parse instead, reset at the start of
+`build_ast`, which is indistinguishable within one parse. The counter is
+recorded here because it is the one place the port knowingly differs.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
@@ -924,5 +1053,5 @@ settled it in one step, and should have been the first step.
 ## How progress is measured
 
 Per wiki and corpus: pages matching byte-exactly, plus a histogram of first-
-difference categories. The fixture score (currently 871/891) remains the guard
+difference categories. The fixture score (currently 876/896) remains the guard
 for the shared core, so this work must not regress it.
