@@ -980,6 +980,34 @@ string growing without bound, the same escaping-compounding shape as before. The
 taxonomy chain is now cached far enough to reach it, so the next step is to
 trace *which* target recurses, exactly as the `Taxonomy/` case was traced.
 
+**Still open, and where the taxobox walk now stands.** The loop is fixed for a
+taxon whose chain is cached: `{{Automatic taxobox|taxon=Equus (Hippotigris)}}`
+renders in 0.3s with no limit errors, walking 36 real taxa. What remains is the
+case where a `Template:Taxonomy/*` page is **missing**, and the two measurements
+below do not yet agree, so nothing has been changed on their basis:
+
+- For a missing template, `frame:expandTemplate` returns **markup** — asking the
+  live service for the answer with `<` escaped shows a full
+  `<a rel="mw:WikiLink" …>Title</a>` anchor coming back. So a module really does
+  receive an anchor, and `'Taxonomy/' .. that` really does nest. But the wiki
+  renders a clean infobox for `taxon=NoSuchTaxonXYZ`, with no `Taxonomy/Template:`
+  nesting anywhere in the output, so it terminates regardless.
+- `{{#invoke:String|len|{{Taxonomy/NoSuchTaxonXYZ|machine code=parent}}}}` reports
+  **37** characters, while the anchor above is roughly 200. One of these two
+  readings is not measuring what I think it is, and I have not found which.
+
+rustoid answers the miss with an anchor whose *text* is the title, and the module
+concatenates the whole rendered string, so the nesting grows a level per round.
+The next step is to settle the two readings above — most likely by having a
+module return the answer's length and its first bytes, so the string the module
+actually holds is observed rather than inferred — and then match whatever it
+says.
+
+A practical note for corpus runs: there is no per-page time bound, so one page
+that does not terminate stalls the whole scoreboard. A wall-clock cap per page,
+reported as `stalled` rather than as a failure, would have turned this
+investigation's several hour-long waits into a single run.
+
 #### Two parser bugs the corpus found, and one that turned out not to be one
 
 Comparing `Zebra` against the wiki's own Parsoid turned up two real parser bugs.
