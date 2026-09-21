@@ -955,7 +955,7 @@ fn escape_attr_segment(seg: &str) -> String {
 
 /// `CounterType::NODE_DATA_ID::matches` → `/^mw[\w-]{2,}$/D` (the `mw` prefix
 /// followed by at least two word-/hyphen characters, e.g. `mw-xy`).
-fn is_node_data_id(id: &str) -> bool {
+pub(crate) fn is_node_data_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     if !id.starts_with("mw") {
         return false;

@@ -350,11 +350,33 @@ impl HtmlSerializer {
     fn serialize_attrs_impl(&self, node: &Node, buf: &mut String, include_href_src: bool) {
         // Preserve attribute insertion order (PHP Parsoid emits attributes in
         // the order they were set, e.g. `rel` before `href` on redirect links).
-        let attrs = node
+        //
+        // A generated node id is the exception, and it is a positional one. The
+        // id pass runs *after* everything else and appends `id` to the node's
+        // attributes, while `data-parsoid`/`data-mw` are emitted here from the
+        // typed fields. Writing them after the attribute list puts `id` before
+        // the metadata for every generated id, where the live service serves
+        // `… typeof="mw:Transclusion" data-mw='…' id="mwAg"`. Reading the
+        // cached HTML, that is the order for 1574 of 1576 such elements; the two
+        // that differ are `<sup>` in Cite output, where the `id` is *authored*
+        // (`cite_ref-…`) rather than generated, so it keeps its own position.
+        //
+        // So: emit the metadata before a trailing generated id, and leave every
+        // other attribute where it was.
+        let attrs: Vec<&crate::dom::node::Attribute> = node
             .attrs
             .iter()
-            .filter(|a| include_href_src || (a.key != "href" && a.key != "src"));
-        for attr in attrs {
+            .filter(|a| include_href_src || (a.key != "href" && a.key != "src"))
+            .collect();
+        let (generated_id, head) = match attrs.last() {
+            Some(last)
+                if last.key == "id" && crate::html::serializer::is_node_data_id(&last.value) =>
+            {
+                (Some(*last), &attrs[..attrs.len() - 1])
+            }
+            _ => (None, &attrs[..]),
+        };
+        for attr in head {
             serialize_attr(attr, buf);
         }
         // Add data-parsoid and data-mw if present
@@ -371,6 +393,9 @@ impl HtmlSerializer {
                 .replace('<', "&lt;")
                 .replace('\'', "&apos;");
             buf.push_str(&format!(" data-mw='{escaped}'"));
+        }
+        if let Some(id) = generated_id {
+            serialize_attr(id, buf);
         }
     }
 
