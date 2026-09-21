@@ -1238,6 +1238,24 @@ rather than locally. Forcing the body's `in_template` flag was tried and reverte
 it does not fix this and breaks `{{ {{T}} }}`, which legitimately keeps an inner
 span.
 
+**This is the blocker for more than it looks.** Chasing the Cite gap on `Zebra`
+(13 of its 158 refs missing) led to the same construct: the refs come from
+`{{sfn}}`, which is `Module:Footnotes` through `Template:Sfn`, and on the page
+they appear as literal `{{sfn|Plumb|Shaw|2018|p=54}}` inside a
+`<p about="#mwt15" typeof="mw:Transclusion">` whose `data-mw` names
+`Short_description/lowercasecheck` with `params:{"1":{"wt":"{{{1|}}}"}}`.
+
+So the `{{sfn}}` refs are not a module problem at all — `{{sfn}}` works in
+isolation, producing the right `cite_ref-FOOTNOTEPlumbShaw201854_1-0`. They are
+collateral from the range bug above, which concatenates one template's body into
+another's metadata and takes the page text with it. Cite itself is byte-identical
+to the served page for every ref that survives; the numbers differ (37 against
+30) purely because the missing refs shift the count.
+
+The practical consequence is a priority: the range fix is not one page's cosmetic
+difference, it is what unblocks Cite, `Module:Footnotes`, and the 200 literal
+`{{sfn}}` on a single article.
+
 #### Two parser bugs the corpus found, and one that turned out not to be one
 
 Comparing `Zebra` against the wiki's own Parsoid turned up two real parser bugs.
