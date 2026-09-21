@@ -1189,15 +1189,54 @@ answer from `variable_value`, which already had the logic.
 
 **What is left, and it is one thing.** `Canada` still shows 6,500 literal
 `{{cite web}}`/`{{Cite book}}` — those are inside `<ref>` tags, so they are
-Cite, a separate workstream, not a transclusion bug. And
-`Template:Short description` still differs in one specific way: the inner
-`#ifeq` is given its own `mw:Transclusion` encapsulation where the wiki gives it
-none, so the parser function's `data-mw` lands on the `<div>` instead of the
-outer `Short description` call's. Forcing the body's `in_template` flag to
-`true` does **not** fix it and breaks `{{ {{T}} }}` (which legitimately keeps an
-inner span), so that experiment is recorded as a dead end: the fix belongs in
-the encapsulation merge, where an absorbed inner range should dissolve into the
-outer one rather than competing with it.
+Cite, a separate workstream, not a transclusion bug.
+
+The other remaining item is encapsulation, and it is **not** the merge, which is
+where the previous note said to look. Reducing it to three lines of wikitext
+moved the diagnosis:
+
+```
+AAA{{If empty|<div>X</div>|b}}
+
+wiki:     <p>AAA</p><div about="#mwt1" typeof="mw:Transclusion"
+                            data-mw="If empty">X</div>
+rustoid:  <p about="#mwt1" … data-mw="If empty">AAA
+             <span about="#mwt2" … data-mw="#invoke:If empty">X</span></p>
+```
+
+Both give the outer template the right `data-mw`; what differs is the *range*.
+The wiki's range is the `<div>` alone. rustoid's runs from the `<p>` — so it
+absorbs the `AAA`, which precedes the template entirely, and then has nothing
+left to put the inner parser function's content in but a second span.
+
+The cause is upstream of encapsulation, in paragraph wrapping.
+`ParagraphWrapper::open_p_tag` scans the pending output for a non-SOL-transparent
+token to choose where `<p>` opens, then **overrides that choice backwards** to
+sit before a `mw:Transclusion` start meta (`tpl_start_index`). That is what puts
+the marker *inside* the `<p>`. Encapsulation then finds the marker by a nested
+search from `children[0]`, takes the `<p>` as the range start, and stamps `about`
+on every sibling through the end marker — including the text that came before
+the template.
+
+Two candidate fixes, and the second is the one to reach for:
+
+1. `open_p_tag` should not pull the marker inside the `<p>`. Its comment says
+   `tpl_start_index` is a faithful port, and the fixture suite (876/896) encodes
+   that behaviour, so this needs the PHP source in hand rather than an inference
+   about which direction the override should go. Two guesses here have already
+   been wrong, and each was wrong in a way that looked locally reasonable.
+2. `wrap_flipped_children` could refuse to extend the range *backwards* past the
+   marker's own `dsr.start`. The marker's `dsr` is `[3,30]` on `AAA{{…}}` —
+   exactly the template — so the text before offset 3 is provably not in the
+   range, and the sibling holding it can be excluded on that evidence alone
+   rather than on a heuristic. This is checkable per-range and does not depend on
+   how the paragraph wrapper decided to nest things.
+
+Recorded rather than attempted because it touches the range-finding rules that
+most of the fixture suite depends on, and a wrong change there fails broadly
+rather than locally. Forcing the body's `in_template` flag was tried and reverted:
+it does not fix this and breaks `{{ {{T}} }}`, which legitimately keeps an inner
+span.
 
 #### Two parser bugs the corpus found, and one that turned out not to be one
 
