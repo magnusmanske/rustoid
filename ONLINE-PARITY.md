@@ -1437,27 +1437,56 @@ reason `pages with literal {{...}}` in the scoreboard is the number to watch.
 
 ### Where `Template:Infobox` stands
 
-The first difference is now at **byte 66**, and it is attribute order:
+The first difference is now at **byte 351**, and everything before it is
+byte-identical to the served page — including the `<section>` wrapper and its
+`id`, the `<span class="mw-empty-elt">` transclusion wrapper, and the opening of
+the `<style>` an extension emitted:
 
+```html
+<section data-mw-section-id="0" id="mwAQ"><span class="mw-empty-elt"
+  about="#mwt1" typeof="mw:Transclusion"
+  data-mw='{"parts":[{"template":{"target":{"wt":"#invoke:Infobox",
+            "function":"invoke"},"params":{"1":{"wt":"infobox"}},"i":0}}]}'
+  id="mwAg"><style …
 ```
-live:    ... typeof="mw:Transclusion" data-mw='...' id="mwAg">
-rustoid: ... typeof="mw:Transclusion" id="mwAQ" data-mw='...'>
-```
 
-Two open items, both on the same element and both narrow:
+Three separate differences were fixed to get there, each recorded above or in the
+commit history: the `data-mw` shape, the `<includeonly>` content, the attribute
+order, and the section id. What remains is the `about` id on the `<style>`:
+`#mwt2` live, `#mwt4` in rustoid.
 
-- **Attribute order.** The live service puts `data-mw` before `id`; rustoid
-  appends the node id last. The `about`-id and node-id counters have diverged
-  by this point (`#mwt2` vs `#mwt4`, `mwAg` vs `mwAQ`), so the *contents* also
-  differ even once the order is right — fixing the order alone will not make the
-  page pass.
-- **The about-id counter.** The `<style>` an `#invoke` emits carries
-  `about="#mwt2"` live and `#mwt4` in rustoid, i.e. rustoid draws two extra ids
-  before it. The transclusion wrapper takes `#mwt1` in both, so the divergence is
-  inside the module's expansion.
+### `about` ids are allocated out of document order
 
-`data-mw` for that element now matches byte-for-byte, which is what makes the
-remaining difference legible at all.
+The `<style>` mismatch is not an off-by-two; it is a *sequencing* difference, and
+the ids on the page show it. rustoid allocates, in order:
+
+| id | element | why |
+|---|---|---|
+| `#mwt1` | the `#invoke` wrapper | the only one in the right place |
+| `#mwt4` | the first `<style>` | but Live says `#mwt2` |
+| `#mwt2` | the `Template:Documentation` wrapper | but Live says `#mwt3` |
+| `#mwt5` | the second `<style>` | |
+
+The cause is in `build_ast`: `expand_templatestyles` is a **token pass that runs
+before the tree is built**, so it walks the whole stream and allocates an `about`
+id for every stylesheet it can find — including stylesheets that are inside
+templates which have not expanded yet, and so are not yet in document order.
+Live allocates the id when the expansion *reaches* the stylesheet: inside the
+`#invoke`, after the wrapper took `#mwt1`, which is what makes it `#mwt2`.
+
+Two ids are pre-allocated before the expansion loop starts, which is exactly the
+`#mwt2` + `#mwt3` gap that pushes the first `<style>` to `#mwt4`.
+
+The faithful fix is to allocate the about id when the fragment placeholder is
+spliced into the tree rather than when the fragment is built — i.e. in
+`to_ast_with_fragments`, or by making the placeholder carry the id lazily. It is
+not a one-line change: `style_node` takes the id as an argument and builds the
+whole node eagerly, and the splice point is inside the tree-builder stage. Worth
+noting that the same pass also handles `gallery`, so whatever shape the fix takes
+should cover both.
+
+This matters beyond one page: every about id after the first two stylesheet is
+shifted, on every page with a `<templatestyles>`, which is most of them.
 
 ## Risks
 
