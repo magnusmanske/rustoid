@@ -470,50 +470,51 @@ fn render_invocation(target: &str, args: &[FrameArg]) -> String {
     out
 }
 
-/// Render an expansion to the text a module receives.
+/// The text a module receives from a frame call.
 ///
-/// These frame methods return strings — the manual says so of each — and that
-/// string is the *rendered* expansion, i.e. HTML. Scribunto's `mw.lua` binds
-/// them to `php.expandTemplate`/`php.preprocess`, whose PHP side runs the result
-/// through `recursiveTagParse`, which yields HTML; the module then concatenates
-/// it as text. `'''bold'''` therefore comes back as `<b>bold</b>`.
+/// These frame methods return strings — the manual says so of each — and the
+/// string is the expansion's **wikitext**, not its rendered HTML. That is easy
+/// to get wrong and expensive to guess at, so it was measured against the live
+/// service by asking a module for the answer's length and first bytes:
 ///
-/// The markup is produced by running the expansion's tokens through the same
-/// tree builder and serializer a page uses, so a module gets what the page would
-/// have shown. A `mw:Transclusion` marker is Parsoid bookkeeping rather than
-/// output and is dropped.
+/// | call | answer | length |
+/// |---|---|---|
+/// | `{{1x|'''b'''}}` | `'''b'''` | 7 (HTML would be 8) |
+/// | `{{1x|</b>}}` | `</b>` | 4 (HTML would be 0) |
+/// | `{{1x|&amp;}}` | `&amp;` | 5 (HTML would be 1) |
+/// | `{{Taxonomy/NoSuchTaxon|…}}` | `[[:Template:Taxonomy/NoSuchTaxon]]` | 37 |
 ///
-// `data-parsoid` is stripped, and that is not cosmetic. A wiki removes it before
-/// serving, so it is not part of what "the page would have shown"; and because a
-/// module routinely feeds this string back in as a *title* or an argument
-/// (`'Taxonomy/' .. frame:expandTemplate{…}`), leaving Parsoid's internal
-/// `{"src":"<p>","tsr":[10,13]}` in it has the next parse read that JSON as
-/// wikitext. The escaping then nests one level deeper each round, and the
-/// expansion grows without bound. Dropping the attribute here is what a wiki
-/// does, and it also removes the fuel.
-pub fn render_answer(items: &[Item], config: &dyn crate::traits::SiteConfig) -> Result<String> {
-    let kept: Vec<Item> = items
-        .iter()
-        .filter(|item| match item {
+/// So markup survives as *source*, which is what makes the fourth row work: a
+/// missing template answers with the wikitext `[[:Title]]` (PHP's
+/// `braceSubstitution`), and a module may feed that back in as a title or an
+/// argument. Rendering it to an anchor instead changes what the module holds,
+/// and `'Taxonomy/' .. <a …>Title</a>` is not a title the wiki would ever build.
+///
+/// Comments are the one thing removed, because the preprocessor strips them
+/// before the module sees anything (`{{1x|<!--c-->t}}` is 1 character, not 9).
+///
+/// A `mw:Transclusion` marker is Parsoid bookkeeping rather than output and is
+/// dropped.
+pub fn render_answer(items: &[Item]) -> String {
+    let mut out = String::new();
+    for item in items {
+        match item {
             // Both the opening marker and its `mw:Transclusion/End` partner are
-            // bookkeeping, not output.
-            Item::Tok(tok) => !is_transclusion_marker(tok),
-            Item::Str(_) => true,
-        })
-        .cloned()
-        .collect();
-    let stage = crate::pipeline::tree_builder_stage::TreeBuilderStage::new(true);
-    let mut kept = kept;
-    kept.push(Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Eof(
-        crate::wikitext::tokens_v2::EOFTk,
-    )));
-    let ast = stage.to_ast_with_fragments(kept, None, config, std::collections::HashMap::new());
-    let serializer =
-        crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions::for_page(""));
-    let html = serializer
-        .serialize(&ast)
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    Ok(inner_html(&html))
+            // bookkeeping, not output, and a comment never reaches a module.
+            Item::Tok(tok) => {
+                if is_transclusion_marker(tok)
+                    || matches!(tok, crate::wikitext::tokens_v2::ParsoidToken::Comment(_))
+                {
+                    continue;
+                }
+                out.push_str(&crate::wikitext::token_utils::tokens_to_source(
+                    std::slice::from_ref(item),
+                ));
+            }
+            Item::Str(s) => out.push_str(s),
+        }
+    }
+    out
 }
 
 /// Whether a token is a `mw:Transclusion` marker or its `/End` partner.
@@ -521,29 +522,6 @@ fn is_transclusion_marker(token: &crate::wikitext::tokens_v2::ParsoidToken) -> b
     token
         .get_attribute_v("typeof")
         .is_some_and(|ty| ty.starts_with("mw:Transclusion"))
-}
-
-/// The body content of a serialized document.
-///
-/// The serializer emits a whole document (`<!DOCTYPE html>…<body>…`); a module
-/// wants just the fragment, since its output is embedded in a page rather than
-/// being one.
-fn inner_html(html: &str) -> String {
-    let Some(start) = html.find("<body>").map(|i| i + "<body>".len()) else {
-        return html.to_string();
-    };
-    let end = html.rfind("</body>").unwrap_or(html.len());
-    // The document wrapper writes `</head>\n<body>\n` as *layout*, so the slice
-    // begins with that newline and it is not part of the body's content. It
-    // matters here rather than being cosmetic: a module concatenates this string
-    // into its next template *title* (`Module:Autotaxobox` does exactly that), and
-    // a leading newline turned a correct `Equus` into the title
-    // `Taxonomy/\nEquus` — a page that cannot exist, whose miss is itself a
-    // title, so the walk grew a level deeper every round.
-    html[start..end]
-        .strip_prefix('\n')
-        .unwrap_or(&html[start..end])
-        .to_string()
 }
 
 #[cfg(test)]

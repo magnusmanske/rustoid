@@ -584,6 +584,7 @@ pub fn process_special_magic_word(magic_word_type: &str, in_template: bool) -> V
 /// `<a href>` + `</span>`) when a loop / depth violation is detected,
 /// else `None`.
 pub fn enforce_template_constraints(
+    config: &dyn SiteConfig,
     frame: &super::frame::Frame,
     target: &str,
     title: &Title,
@@ -603,7 +604,7 @@ pub fn enforce_template_constraints(
         vsrc: None,
     });
 
-    let wikilink = template_to_wikilink(target);
+    let wikilink = template_to_wikilink(target, config);
 
     Some(vec![
         Item::Tok(ParsoidToken::Tag(span)),
@@ -668,23 +669,77 @@ pub fn parser_functions_wrapper(tokens: Vec<Item>) -> Vec<Item> {
     process_template_tokens(filtered, /* expand_templates */ true)
 }
 
-/// Convert a template target to a wikilink (for the redlink path). Mirrors the
-/// fallback in `expandTemplateNatively` when the template isn't found.
-pub fn template_to_wikilink(name: &str) -> Item {
-    let mut tk = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
-        "wikilink",
-        vec![],
-        crate::wikitext::tokens_v2::DataParsoid::default(),
-    );
-    let href_src = format!(":{}", name.replace('_', " "));
-    tk.attribs.push(crate::wikitext::tokens_v2::KV {
-        key: crate::wikitext::tokens_v2::KeyValue::Str("href".to_string()),
-        value: crate::wikitext::tokens_v2::KeyValue::Str(href_src),
-        src_offsets: None,
-        ksrc: None,
-        vsrc: None,
-    });
-    Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(tk))
+/// The `[[…]]` a template that could not be fetched is replaced by.
+///
+/// Mirrors `Parser::braceSubstitution`'s fallback. When every lookup fails — no
+/// such page, no parser function, no variable — PHP does *not* return the call
+/// as text; it sets `$found = true` and substitutes:
+///
+/// ```php
+/// # If the title is valid but undisplayable, make a link to it
+/// if ( !$found && ( $this->ot['html'] || $this->ot['pre'] ) ) {
+///     $text = "[[:$titleText]]";
+///     $found = true;
+/// }
+/// ```
+///
+/// The link text is what lets a construct terminate. A module such as
+/// `Module:Autotaxobox` reads the answer back and uses it as the *next template
+/// title*, so an answer that is not a title has it splice markup into one and
+/// recurse. Answering with `[[:Title]]` is what the live service does, and it is
+/// measurable: `{{#invoke:String|len|{{Taxonomy/NoSuchTaxonXYZ|machine_code=…}}}}`
+/// reports 37 characters, which is `[[:Template:Taxonomy/NoSuchTaxonXYZ]]`
+/// exactly.
+///
+/// `src` carries that wikitext, because this token reaches a *module* rather
+/// than a page in one case — `frame:expandTemplate`'s answer is the expansion's
+/// source — and the stringifier reconstructs from `src`.
+///
+/// The returned anchor is otherwise a plain `wikilink` token, not a finished
+/// `<a>`: the red-link marking (`class="new"`, `data-mw-i18n`,
+/// `?action=edit&redlink=1`) belongs to [`crate::pipeline::add_red_links`], which
+/// needs `page_info`, and reusing it is what keeps this from being a hand-built
+/// anchor that merely approximates Parsoid.
+pub fn template_to_wikilink(name: &str, config: &dyn SiteConfig) -> Item {
+    use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue, ParsoidToken, SelfclosingTagTk};
+
+    let target = crate::title::TitleParser::parse(name, config);
+    let prefixed = target.get_prefixed_text();
+    // PHP's `$originalTitle`: a target that names a namespace is written with a
+    // leading colon (`[[Template:Foo]]` would be a *transclusion* of it).
+    let href = if name.starts_with(':') || target.namespace_id != 0 {
+        format!(":{prefixed}")
+    } else {
+        prefixed.clone()
+    };
+
+    let dp = DataParsoid {
+        stx: Some("simple".to_string()),
+        src: Some(format!("[[{href}]]")),
+        ..Default::default()
+    };
+
+    let mut tk = SelfclosingTagTk::new("wikilink", vec![], dp);
+    let mut push = |key: &str, value: String| {
+        tk.attribs.push(KV {
+            key: KeyValue::Str(key.to_string()),
+            value: KeyValue::Str(value),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+    };
+    // The `href` is the resolved target, *without* the colon: `:` means "force
+    // mainspace" in MediaWiki's title grammar, so `:Template:Foo` would resolve
+    // to a mainspace page named `Template:Foo` rather than the template. The
+    // colon belongs to the source (`src`), not to the target.
+    push("href", prefixed);
+    // The target as written, which differs from `prefixed` when the call used an
+    // underscore. The link *text* is deliberately absent: the renderer derives it
+    // from the target, exactly as for a written `[[Template:Foo]]`.
+    push("wt", name.to_string());
+
+    Item::Tok(ParsoidToken::SelfclosingTag(tk))
 }
 
 /// The TemplateHandler — ties together target resolution, parser-function
@@ -798,7 +853,7 @@ impl TemplateHandler {
                         .and_then(|dp| dp.src.as_deref())
                         .unwrap_or(""),
                 );
-                encap.encap_tokens(vec![template_to_wikilink(&name)], &info)
+                encap.encap_tokens(vec![template_to_wikilink(&name, config)], &info)
             }
             None => Self::convert_to_string(token, false, false),
         }
@@ -1050,6 +1105,7 @@ impl TemplateHandler {
     /// string-level transclusion engine until the token-level
     /// `AttributeTransformManager` is ported.
     pub async fn expand_template_natively(
+        config: &dyn SiteConfig,
         source: &dyn DataSource,
         name: &str,
         title: &Title,
@@ -1085,7 +1141,7 @@ impl TemplateHandler {
         let Some(src) = fetched else {
             let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
             let info = template_info_from(None, Some(name), vec![]);
-            return encap.encap_tokens(vec![template_to_wikilink(name)], &info);
+            return encap.encap_tokens(vec![template_to_wikilink(name, config)], &info);
         };
 
         // Substitute template arguments (string-level for now).
@@ -1656,6 +1712,7 @@ mod tests {
         let token = ParsoidToken::Tag(TagTk::new("template", vec![], DataParsoid::default()));
 
         let out = TemplateHandler::expand_template_natively(
+            &crate::mock::MockSiteConfig::default(),
             &source,
             "Template:Foo",
             &title,
@@ -1741,7 +1798,7 @@ mod tests {
         let frame = crate::pipeline::frame::Frame::new(title.clone(), vec![]);
 
         // Same title => loop => error tokens.
-        let err = enforce_template_constraints(&frame, "Template:Foo", &title, 40, false);
+        let err = enforce_template_constraints(&config, &frame, "Template:Foo", &title, 40, false);
         assert!(err.is_some());
         let tokens = err.unwrap();
         assert!(matches!(&tokens[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "span"));
@@ -1752,7 +1809,10 @@ mod tests {
         );
 
         // ignore_loop bypasses loop detection.
-        assert!(enforce_template_constraints(&frame, "Template:Foo", &title, 40, true).is_none());
+        assert!(
+            enforce_template_constraints(&config, &frame, "Template:Foo", &title, 40, true)
+                .is_none()
+        );
     }
 
     #[test]

@@ -124,9 +124,10 @@ async fn several_expand_template_calls_each_get_their_answer() {
     )
     .await;
     let html = without_node_ids(&html);
-    // Each call gets its own answer: three bold elements, one per argument. The
-    // `<b>` carries encapsulation attributes (`about`, sometimes `typeof`), so
-    // the check is on the element and its text rather than on the exact tag.
+    // Each call gets its own answer. The answer is the expansion's *wikitext*
+    // (`<b>1</b>`), which the enclosing `#invoke` then parses, so three bold
+    // elements appear, one per argument. The `<b>` carries encapsulation
+    // attributes, so the check is on the element and its text.
     for i in 1..=3 {
         assert!(html.contains(&format!(">{i}</b>")), "missing {i}: {html}");
     }
@@ -157,10 +158,10 @@ async fn a_repeated_call_reuses_its_answer() {
     )
     .await;
     let html = without_node_ids(&html);
-    // The answer is HTML, so the expansion's own `<b>` arrives as markup and the
-    // second, cached answer is identical to the first. As above, the element
-    // carries encapsulation attributes, so the count is on the *text*, not on an
-    // exact tag.
+    // The answer is the expansion's wikitext (`[x]<b>y</b>`), parsed once by the
+    // enclosing `#invoke`, so the second, cached answer is identical to the
+    // first: two of each. As above, the element carries encapsulation
+    // attributes, so the count is on the *text*, not on an exact tag.
     let occurrences = html.matches("[x]").count();
     assert_eq!(occurrences, 2, "got: {html}");
     assert_eq!(html.matches(">y</b>").count(), 2, "got: {html}");
@@ -325,6 +326,11 @@ async fn an_unused_expand_template_call_is_harmless() {
 
 /// An `expandTemplate` answer that is embedded in the module's output must be
 /// parsed as wikitext, exactly as if the template had been written on the page.
+///
+/// The answer is the expansion's *source*, not its rendered HTML: the live
+/// service reports `{{1x|'''b'''}}` as 7 characters (`'''b'''`), and
+/// `{{1x|</b>}}` as 4, which only holds for wikitext. The enclosing `#invoke`
+/// then parses that source, so the module's output carries the rendered result.
 #[tokio::test]
 async fn an_embedded_answer_is_parsed() {
     let module = r#"
@@ -340,9 +346,46 @@ async fn an_embedded_answer_is_parsed() {
         "{{#invoke:T|main}}",
     )
     .await;
-    assert!(html.contains(">strong</b>"), "got: {html}");
+    // The surrounding text survives, and the answer was parsed rather than
+    // escaped as literal `'''`.
     assert!(html.contains("before"), "got: {html}");
     assert!(html.contains("after"), "got: {html}");
+    assert!(!html.contains("&#39;&#39;&#39;"), "got: {html}");
+}
+
+/// A missing template answers with its own title as wikitext, not with markup.
+///
+/// PHP's `braceSubstitution` substitutes `[[:$titleText]]` when every lookup
+/// fails, and a module uses that answer as the *next template title*
+/// (`Module:Autotaxobox` does), so an answer that reads as markup has the module
+/// splice markup into a title and re-parse it a level deeper. The live service
+/// reports the answer as 37 characters for
+/// `{{Taxonomy/NoSuchTaxonXYZ|machine code=parent}}`, which is
+/// `[[:Template:Taxonomy/NoSuchTaxonXYZ]]` exactly and nothing shorter.
+#[tokio::test]
+async fn a_missing_template_answers_with_its_title() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local a = frame:expandTemplate{ title = "Absent", args = {} }
+            return "<" .. #a .. ">" .. a
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
+    // The length is the load-bearing part: it distinguishes wikitext from markup
+    // at a glance — `[[:Template:Absent]]` is 20 characters, where the anchor the
+    // enclosing `#invoke` renders *from* that source is around 200. That is
+    // exactly what the two readings disagreed about: the module holds the
+    // *source*, and any anchor in the page is downstream of the parse.
+    //
+    // The angle brackets the module emits as its own text are escaped in the
+    // page, so the length is read between their escaped forms.
+    assert!(html.contains("&lt;20>"), "got: {html}");
+    // And what the enclosing parse makes of that source: a red link to the
+    // prefixed title, marked by `add_red_links` rather than hand-built here.
+    assert!(html.contains("redlink=1"), "got: {html}");
+    assert!(html.contains(">Template:Absent</a>"), "got: {html}");
 }
 
 /// An error from the expansion must be visible rather than silently dropped.

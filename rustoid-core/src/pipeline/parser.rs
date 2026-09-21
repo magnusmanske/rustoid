@@ -2693,6 +2693,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // whose node-count and expansion-depth checks have already run in
         // `expand_templates` by the time the template is resolved.
         if let Some(err) = crate::pipeline::template_handler::enforce_template_constraints(
+            self.config,
             frame,
             name,
             title,
@@ -2707,6 +2708,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if in_template {
                 return vec![crate::pipeline::template_handler::template_to_wikilink(
                     name,
+                    self.config,
                 )];
             }
             let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
@@ -2714,6 +2716,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             return encap.encap_tokens(
                 vec![crate::pipeline::template_handler::template_to_wikilink(
                     name,
+                    self.config,
                 )],
                 &info,
             );
@@ -2724,6 +2727,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if in_template {
                 return vec![crate::pipeline::template_handler::template_to_wikilink(
                     name,
+                    self.config,
                 )];
             }
             let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
@@ -2731,6 +2735,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             return encap.encap_tokens(
                 vec![crate::pipeline::template_handler::template_to_wikilink(
                     name,
+                    self.config,
                 )],
                 &info,
             );
@@ -2761,6 +2766,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 if in_template {
                     return vec![crate::pipeline::template_handler::template_to_wikilink(
                         name,
+                        self.config,
                     )];
                 }
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
@@ -2768,6 +2774,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 return encap.encap_tokens(
                     vec![crate::pipeline::template_handler::template_to_wikilink(
                         name,
+                        self.config,
                     )],
                     &info,
                 );
@@ -3065,8 +3072,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // caller wrote `#uc`, not a page name, so there is nothing to attribute
         // a separate transclusion to.
         if matches!(request, FrameRequest::CallParserFunction { .. }) {
-            return crate::pipeline::lua_deferred::render_answer(&expanded, self.config)
-                .unwrap_or_default();
+            return crate::pipeline::lua_deferred::render_answer(&expanded);
         }
         // `expandTemplate` is transclusion, so its expansion is wrapped the way
         // a template's is — but with the *module's* call as the source, not the
@@ -3077,7 +3083,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut info = template_info_from(None, Some("#invoke"), vec![]);
         info.ty = Some("parserfunction".to_string());
         let encapped = encap.encap_tokens(expanded, &info);
-        crate::pipeline::lua_deferred::render_answer(&encapped, self.config).unwrap_or_default()
+        crate::pipeline::lua_deferred::render_answer(&encapped)
     }
 }
 

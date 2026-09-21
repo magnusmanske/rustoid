@@ -185,6 +185,25 @@ pub fn tokens_to_string_with_opts(tokens: &[Item], opts: TokensToStringOpts<'_>)
                         out.push_str(src);
                     }
                 }
+                // Reconstruct a `wikilink` token as `[[target]]`.
+                //
+                // A wikilink token is normally replaced by a real `<a>` before
+                // this is reached, so the arm exists for the one place a token is
+                // *handed to a module* rather than rendered: a missing template's
+                // answer is the wikitext `[[:Title]]`, and `frame:expandTemplate`
+                // must give the module exactly that source. Without the arm the
+                // token stringified to nothing, and the redlink disappeared.
+                ParsoidToken::SelfclosingTag(tk) if tk.name == "wikilink" => {
+                    let href = tk
+                        .attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("href"))
+                        .and_then(|kv| kv.value.as_str())
+                        .unwrap_or_default();
+                    out.push_str("[[");
+                    out.push_str(href);
+                    out.push_str("]]");
+                }
                 // Resolve a DOM-fragment placeholder to its fragment's text
                 // content. A `TagTk` is followed by its `EndTagTk`, which is
                 // skipped (mirrors PHP's `$i += 1` + the "tag should be followed
@@ -287,6 +306,39 @@ pub fn tokens_to_string_with_nls(tokens: &[Item]) -> String {
                 }
                 _ => {}
             },
+        }
+    }
+    out
+}
+
+/// Stringify a chunk back to the *source* it came from, keeping tags.
+///
+/// [`tokens_to_string`] deliberately drops HTML tags, which is right for its
+/// Parsoid callers and wrong for one: the text a module receives from
+/// `frame:expandTemplate`. That text is wikitext, so `{{1x|<b>x</b>}}` must
+/// answer with `<b>x</b>` — eight characters, as the live service reports —
+/// and a stringifier that drops the tag answers with nothing at all.
+///
+/// Reconstructing from each token's recorded `src` is what makes that exact:
+/// the tokenizer already knows the bytes, so there is no need to re-derive a
+/// tag's spelling (attribute quoting, spacing, self-closing) from its parsed
+/// form and risk differing. A token with no recorded source contributes its
+/// name only when it has one, so nothing is invented.
+pub fn tokens_to_source(tokens: &[Item]) -> String {
+    let mut out = String::new();
+    for token in tokens {
+        match token {
+            Item::Str(s) => out.push_str(s),
+            Item::Tok(t) => {
+                // A comment is stripped by the preprocessor before a module sees
+                // anything, so it is not part of the answer.
+                if matches!(t, ParsoidToken::Comment(_)) {
+                    continue;
+                }
+                if let Some(src) = t.data_parsoid().and_then(|dp| dp.src.as_deref()) {
+                    out.push_str(src);
+                }
+            }
         }
     }
     out
