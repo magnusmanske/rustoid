@@ -1145,6 +1145,60 @@ template expansion is therefore the single highest-value next step, and the
 per-page `data-mw` and `data-parsoid` differences are downstream of it rather
 than independent problems.
 
+#### Chasing the literal `{{…}}`, and what it actually was
+
+That "fix the first template expansion" instruction was worth following literally,
+because it turned out to be three separate things wearing one symptom. The
+reduction that made it tractable was `{{Short description|Country in North
+America}}` — the leading template of almost every article — which produced its
+own body as visible `{{#ifeq:…}}` text.
+
+**A raw `<` in a `data-mw` value ends the attribute.** `data-mw` is JSON inside
+an HTML attribute, and a lenient parser stops the attribute at the first `<`
+outside a quote. `Template:Short description` passes its own body — which
+contains `<div class="shortdescription" …>` — as an `#ifeq` argument, so the
+attribute closed early and the rest of the JSON spilled out as page text. This
+was 455 literal `{{` on `Canada`, and it is why the page was 2.4x the expected
+size: the template *was* expanding, and then its metadata was being printed.
+
+The escaping differs between the two attributes, which is the part that is easy
+to get wrong and that the fixture suite caught when it was first done
+carelessly: `data-mw` writes `&apos;` where `data-parsoid` writes `&#39;`, both
+escape `&`, and only `data-mw` needs `<`. `>` is left alone. It must also be
+applied exactly once — in the JSON builder *and* the serializer double-encodes
+every `&` to `&amp;lt;` — and the nested HTML inside a `data-mw`
+`attribs[].html` field already carries its own escaping from when it was built.
+Three fixture files regressed by 7 cases on the first attempt, which is what
+pinned the rule down.
+
+**A parser function's colon argument was recorded twice.** For
+`{{#if:x|yes}}` the tokenizer puts the whole `#if:x` in `args[0].key`, so
+`args[1..]` are the branches — but the parameter builder also split `x` out of
+`target.wt` and prepended it, shifting every parameter by one. The live wiki
+records that call as `params:{"1":{"wt":"yes"}}`. Two unit tests had encoded
+the shifted numbering; both are corrected against the live service rather than
+the other way round.
+
+**`{{safesubst:ns:0}}` returned its own source.** `ns` is a registered function
+hook, so inside a template it resolves as a *parser function* — and there was no
+arm for it, so it fell through to the unknown-function fallback and echoed
+itself. `Template:Main other` compares exactly that call against the empty
+string to detect the main namespace, so it compared `"{{safesubst:ns:0}}"`
+instead and took the wrong branch on every transclusion. Both spellings now
+answer from `variable_value`, which already had the logic.
+
+**What is left, and it is one thing.** `Canada` still shows 6,500 literal
+`{{cite web}}`/`{{Cite book}}` — those are inside `<ref>` tags, so they are
+Cite, a separate workstream, not a transclusion bug. And
+`Template:Short description` still differs in one specific way: the inner
+`#ifeq` is given its own `mw:Transclusion` encapsulation where the wiki gives it
+none, so the parser function's `data-mw` lands on the `<div>` instead of the
+outer `Short description` call's. Forcing the body's `in_template` flag to
+`true` does **not** fix it and breaks `{{ {{T}} }}` (which legitimately keeps an
+inner span), so that experiment is recorded as a dead end: the fix belongs in
+the encapsulation merge, where an absorbed inner range should dissolve into the
+outer one rather than competing with it.
+
 #### Two parser bugs the corpus found, and one that turned out not to be one
 
 Comparing `Zebra` against the wiki's own Parsoid turned up two real parser bugs.
