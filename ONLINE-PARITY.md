@@ -1474,8 +1474,26 @@ templates which have not expanded yet, and so are not yet in document order.
 Live allocates the id when the expansion *reaches* the stylesheet: inside the
 `#invoke`, after the wrapper took `#mwt1`, which is what makes it `#mwt2`.
 
-Two ids are pre-allocated before the expansion loop starts, which is exactly the
-`#mwt2` + `#mwt3` gap that pushes the first `<style>` to `#mwt4`.
+The trace narrows it to the expansion sequence rather than to the stylesheet pass
+itself. With `RUSTOID_TRACE_TS=1` the allocations on that page are:
+
+```
+allocate #mwt1  in_tpl=false   the #invoke
+allocate #mwt2  in_tpl=false   Template:Documentation
+allocate #mwt3  in_tpl=false   #invoke:documentation
+allocate #mwt4  in_tpl=true    #tag:templatestyles  → the style
+allocate #mwt5  in_tpl=true    #tag:templatestyles  → the second style
+```
+
+Live serves only three ids (`#mwt1` the wrapper, `#mwt2` the style, `#mwt3`
+`Template:Documentation`), so two of those five are ids PHP never hands out —
+the `#tag` pair, which are `in_tpl=true` expansions that end up unencapsulated.
+Note that PHP allocates in the `TemplateEncapsulator` **constructor**
+(`$env->newAboutId()`), and `TemplateHandler::onTemplate` constructs one for
+every template token, so "allocate then discard" is itself faithful; the
+difference has to be in *which* calls reach that point, in what order. That is
+where the next attempt should start, by instrumenting the same allocation on the
+PHP side rather than reasoning from the count.
 
 The faithful fix is to allocate the about id when the fragment placeholder is
 spliced into the tree rather than when the fragment is built — i.e. in
@@ -1487,6 +1505,10 @@ should cover both.
 
 This matters beyond one page: every about id after the first two stylesheet is
 shifted, on every page with a `<templatestyles>`, which is most of them.
+
+Also recorded here: `frame:extensionTag` used to lower to `##tag`, which is not
+a call at all, so it silently failed to expand *and* consumed an about id. That
+is fixed, and it is why this trace has five allocations rather than more.
 
 ## Risks
 
