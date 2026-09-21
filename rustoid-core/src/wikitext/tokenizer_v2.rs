@@ -3419,6 +3419,18 @@ impl<'a> PegTokenizer<'a> {
     /// Try include limits: `<includeonly>`, `<noinclude>`, `<onlyinclude>` and
     /// their closing tags (`</includeonly>`, ...), emitting `mw:Includes/<Type>`
     /// and `mw:Includes/<Type>/End` markers respectively.
+    ///
+    /// An `includeonly` directive *owns its content*: the whole
+    /// `<includeonly>…</includeonly>` is recorded as `data-mw.src` on the marker
+    /// and consumed, so the content is never parsed. The live service shows this
+    /// on `Template:Infobox` — the marker carries
+    /// `data-mw='{"src":"&lt;includeonly>{{template other|…}}&lt;/includeonly>"}'`
+    /// and nothing inside it is expanded. Emitting only the markers and then
+    /// parsing the content anyway rendered that block as literal text, which in
+    /// turn opened a `<p>` the live HTML does not have.
+    ///
+    /// `noinclude` and `onlyinclude` do not consume their content; only the
+    /// markers are emitted.
     fn try_include_limits(&mut self) -> bool {
         let saved = self.pos;
         if !self.starts_with("<") {
@@ -3446,7 +3458,23 @@ impl<'a> PegTokenizer<'a> {
             return false;
         };
 
-        self.advance(tag_len);
+        // An opening `includeonly` swallows everything up to its closing tag,
+        // which is recorded in the marker's `data-mw.src` (mirrors the
+        // `$startTagWithContent` branch of PHP's `include_limits` rule). The
+        // closing tag was consumed, so its `/End` marker is emitted here too.
+        let mut owned: Option<String> = None;
+        let mut ends_at: Option<usize> = None;
+        if name == "includeonly" && !closing {
+            let close = "</includeonly>";
+            if let Some(rel) = self.remaining()[tag_len..].find(close) {
+                let end = tag_len + rel + close.len();
+                owned = Some(self.remaining()[..end].to_string());
+                ends_at = Some(saved + end);
+                self.advance(end);
+            }
+        } else {
+            self.advance(tag_len);
+        }
 
         let dp = self.make_dp(saved, self.pos);
         let mut meta_type = format!("mw:Includes/{}", name_to_include_type(name));
@@ -3456,8 +3484,25 @@ impl<'a> PegTokenizer<'a> {
 
         let mut stt = SelfclosingTagTk::new("meta", vec![], dp);
         stt.add_attribute_str("typeof", meta_type);
+        if let Some(src) = owned {
+            // The consumed directive is recorded on the marker for round-tripping
+            // (mirrors the `$meta->dataMw = new DataMw( [ 'src' => $dp->src ] )`
+            // branch of PHP's `include_limits` rule).
+            stt.add_attribute_str(
+                "data-mw",
+                format!("{{\"src\":{}}}", serde_json::Value::String(src)),
+            );
+        }
 
         self.emit_token(ParsoidToken::SelfclosingTag(stt));
+        if let Some(end) = ends_at {
+            // The consumed closing tag's own marker. Its `tsr` is empty at the
+            // end offset, matching the live service, which serves no `src` on it.
+            let edp = self.make_dp(end, end);
+            let mut end_stt = SelfclosingTagTk::new("meta", vec![], edp);
+            end_stt.add_attribute_str("typeof", "mw:Includes/IncludeOnly/End");
+            self.emit_token(ParsoidToken::SelfclosingTag(end_stt));
+        }
         true
     }
 
