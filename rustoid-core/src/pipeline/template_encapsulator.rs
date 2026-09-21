@@ -255,6 +255,15 @@ impl OrderedJson {
         }
     }
 
+    /// Write `key` only when there is a value, leaving it out otherwise — for
+    /// fields whose absence the live service expresses by omission rather than by
+    /// an explicit `null` (`href` on a parser function, which has no page).
+    fn put_some_str(&mut self, key: &str, value: Option<&str>) {
+        if let Some(v) = value {
+            self.put_str(key, v);
+        }
+    }
+
     fn finish(self) -> String {
         let body: Vec<String> = self
             .0
@@ -289,7 +298,17 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
             target.put_str("function", func);
         }
     }
-    target.put_opt_str("href", info.href.as_deref());
+    // `href` is omitted, not nulled, when there is none: a parser function has no
+    // page to link to, and the live service writes no `href` at all.
+    target.put_some_str("href", info.href.as_deref());
+
+    // All parameters are kept, for both `parserfunction` and
+    // `old-parserfunction`. PHP's `TemplateInfo::toJsonArray` *does* fold the
+    // first argument onto `target.wt` for a true `old-parserfunction` — but the
+    // live service serves `#if:1|a|b` as `wt = "#if:1"` with `params =
+    // {1:a, 2:b}`, i.e. unfolded, so the wiki's parser functions arrive here as
+    // `parserfunction` and the fold does not apply. Reinstating it dropped the
+    // first argument of every parser function instead of folding it.
 
     // Params object (preserve PHP's disambiguating "=N=key" for duplicate keys).
     let mut params = OrderedJson::default();
@@ -321,10 +340,13 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
             value.put("key", key_obj.finish());
         }
         // For parser-function params, emit `eq` (named-ness) and `order`
-        // deviations from defaults (mirrors TemplateInfo::toJsonArray).
+        // deviations from defaults (mirrors TemplateInfo::toJsonArray). The
+        // defaults are `eq = !isNumeric` and `order = isNumeric ? k : null`, so
+        // a key is written only when the param *departs* from its default —
+        // which is what keeps `{"1":{"wt":"a"}}` free of both.
         if info.ty.as_deref() == Some("parserfunction") {
             let is_numeric = param.is_numeric_key();
-            if is_numeric == param.named {
+            if param.named == is_numeric {
                 value.put("eq", if param.named { "true" } else { "false" });
             }
             let order = count;
@@ -354,16 +376,17 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
 /// `{"parts": [{"<type>": <TemplateInfo>}]}` where `<type>` is one of
 /// `template`, `parserfunction`, or `templatearg`.
 ///
-/// Old parser functions (`ty = "old-parserfunction"`) map back to
-/// `"template"` (with `func` set on the inner TemplateInfo), while v3 parser
-/// functions (`ty = "parserfunction"`) use the `"parserfunction"` key.
+/// Both `old-parserfunction` and `parserfunction` serialize to the `template`
+/// key: PHP's `DataMw::toJsonArray` normalizes only `old-parserfunction`, and
+/// the `parserfunction` key is reserved for a *modern* PFragment handler — a
+/// site-config extension, not anything core or Scribunto registers. The live
+/// service confirms it, serving `"template":{"target":{"wt":"#invoke:Infobox",
+/// "function":"invoke"},…}` for a `#invoke`.
 pub fn serialize_data_mw(info: &TemplateInfo) -> String {
-    // The parts key is `type`, with `old-parserfunction` normalized to
-    // `template` (mirrors `DataMw::toJsonArray`).
-    let type_key = match info.ty.as_deref() {
-        Some("parserfunction") => "parserfunction",
-        Some("templatearg" | "template") | None => "template",
-        Some(_) => "template",
+    let type_key = if info.ty.as_deref() == Some("templatearg") {
+        "templatearg"
+    } else {
+        "template"
     };
     // Assembled textually rather than through `serde_json::Value`: a
     // `serde_json` object sorts its keys, which would undo the ordering
@@ -886,18 +909,21 @@ mod tests {
 
     #[test]
     fn test_serialize_data_mw_parserfunction_v3() {
-        // A v3 parser function (ty = "parserfunction") uses the "parserfunction"
-        // parts key (mirrors `DataMw::toJsonArray`), with the func name in
-        // `target.key`.
+        // A v3 parser function (ty = "parserfunction") still serializes under the
+        // "template" parts key: PHP's `DataMw::toJsonArray` normalizes only
+        // `old-parserfunction`, and the "parserfunction" key is reserved for a
+        // modern PFragment handler. Note that the func name *is* written as
+        // `key` rather than `function` for this type (mirrors
+        // `TemplateInfo::toJsonArray`).
         let mut info = template_info_from(Some("if"), None, vec![]);
         info.ty = Some("parserfunction".to_string());
         info.target_wt = Some("#if:foo".to_string());
 
         let json = serialize_data_mw(&info);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert!(parsed["parts"][0].get("parserfunction").is_some());
-        assert!(parsed["parts"][0].get("template").is_none());
-        assert_eq!(parsed["parts"][0]["parserfunction"]["target"]["key"], "if");
+        assert!(parsed["parts"][0].get("template").is_some());
+        assert!(parsed["parts"][0].get("parserfunction").is_none());
+        assert_eq!(parsed["parts"][0]["template"]["target"]["key"], "if");
     }
 
     #[test]

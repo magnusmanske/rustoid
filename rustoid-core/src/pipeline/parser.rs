@@ -9,7 +9,7 @@ use crate::dom::node::Node;
 use crate::error::Result;
 use crate::options::ParserOptions;
 use crate::pipeline::frame::Frame;
-use crate::pipeline::template_encapsulator::{TemplateEncapsulator, template_info_from};
+use crate::pipeline::template_encapsulator::{ParamInfo, TemplateEncapsulator, template_info_from};
 use crate::pipeline::template_handler::{
     ProtectionContext, TemplateHandler, resolve_template_target,
 };
@@ -2479,7 +2479,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         source,
                         frame,
                         &invoke_arg,
-                        &target_str,
                         about_id,
                         tok,
                         in_template,
@@ -2984,7 +2983,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         pf_arg: &str,
-        target_str: &str,
         about_id: String,
         token: &ParsoidToken,
         in_template: bool,
@@ -2995,8 +2993,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // leave the call as source text (the standalone behaviour of every
         // parser function rustoid cannot implement).
         let Some(src) = source else {
-            return vec![Item::Str(format!("{{{{{target_str}}}}}"))];
+            return vec![Item::Str(format!("{{{{#invoke:{pf_arg}}}}}"))];
         };
+
+        // The module name is needed for the `data-mw` target as well as for the
+        // lookup, and `invoke()` would only re-derive it, so it is parsed here.
+        // The caller has already resolved this call as `invoke`, so `parse`
+        // cannot fail on it; the guard is for defence rather than for a case the
+        // tokenizer can produce.
+        let Some(call) = crate::lua::invoke::Invoke::parse(pf_arg) else {
+            return vec![Item::Str(format!("{{{{#invoke:{pf_arg}}}}}"))];
+        };
+        let module = call.module;
 
         let site = crate::lua::engine::LuaSite::from_config(self.config);
         // The parent frame's args and title are the calling template's, which
@@ -3074,10 +3082,46 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         if in_template {
             return expanded;
         }
+
+        // The `mw:Transclusion` metadata records the call the way the live
+        // service does for a Scribunto module: the part key `"template"`, a
+        // `function` of `invoke`, and the arguments in `params`. Verified against
+        // `{{#invoke:String|len|x}}` →
+        // `{"template":{"target":{"wt":"#invoke:String","function":"invoke"},
+        //   "params":{"1":{"wt":"len"},"2":{"wt":"x"}},"i":0}}`.
+        //
+        // Two things an earlier shape got wrong: `"parserfunction"` as the part
+        // key (the live one is `"template"`, since `invoke` is not a modern
+        // PFragment handler), and the target built by prepending `#invoke` to a
+        // string that already contained it — `pf_arg` is the text *after*
+        // `#invoke:`, but `target_str` is the whole `#invoke:Module`, so the two
+        // must not be concatenated.
+        //
+        // The parameters follow Scribunto's own view of the call: the function
+        // name is argument 1, because the tokenizer's `|`-split makes it the first
+        // piece after the module.
+        // `old-parserfunction` rather than `parserfunction`: the two differ only
+        // in this field name (PHP's `TemplateInfo::toJsonArray` writes `function`
+        // for the former, `key` for the latter), and the live service writes
+        // `function` for `#invoke`. Both spell it under the `template` parts key.
+        let mut info = template_info_from(Some("invoke"), None, vec![]);
+        info.target_wt = Some(format!("#invoke:{module}"));
+        info.param_infos = std::iter::once({
+            let mut p = ParamInfo::new("1".to_string());
+            p.value_wt = call.function.clone();
+            p
+        })
+        .chain(call.args.iter().enumerate().map(|(i, (name, value))| {
+            let mut p = ParamInfo::new((i + 2).to_string());
+            p.value_wt = match name {
+                Some(n) => format!("{n}={value}"),
+                None => value.clone(),
+            };
+            p.named = name.is_some();
+            p
+        }))
+        .collect();
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-        let mut info = template_info_from(None, Some(target_str), vec![]);
-        info.ty = Some("parserfunction".to_string());
-        info.target_wt = Some(format!("#invoke{target_str}"));
         encap.encap_tokens(expanded, &info)
     }
 
@@ -3184,9 +3228,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `#invoke` that contains it. Reusing the enclosing token made a missing
         // template render back as the `#invoke` call, which the module returned
         // and the pipeline expanded again, forever.
+        //
+        // The `data-mw` names the module handler, matching the shape the live
+        // service serves for a module-emitted transclusion: part key `template`,
+        // target `#invoke`, and the canonical `invoke` as the function.
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-        let mut info = template_info_from(None, Some("#invoke"), vec![]);
-        info.ty = Some("parserfunction".to_string());
+        let mut info = template_info_from(Some("invoke"), None, vec![]);
+        info.target_wt = Some("#invoke".to_string());
         let encapped = encap.encap_tokens(expanded, &info);
         crate::pipeline::lua_deferred::render_answer(&encapped)
     }
