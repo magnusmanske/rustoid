@@ -124,10 +124,17 @@ async fn several_expand_template_calls_each_get_their_answer() {
     )
     .await;
     let html = without_node_ids(&html);
-    // Each call gets its own answer: three bold elements, one per argument.
+    // Each call gets its own answer: three bold elements, one per argument. The
+    // `<b>` carries encapsulation attributes (`about`, sometimes `typeof`), so
+    // the check is on the element and its text rather than on the exact tag.
     for i in 1..=3 {
-        assert!(html.contains(&format!("<b>{i}</b>")), "missing {i}: {html}");
+        assert!(html.contains(&format!(">{i}</b>")), "missing {i}: {html}");
     }
+    assert_eq!(
+        html.matches("<b ").count() + html.matches("<b>").count(),
+        3,
+        "one <b> per call: {html}"
+    );
 }
 
 /// The same call twice must also work: the second lookup finds the answer the
@@ -150,10 +157,13 @@ async fn a_repeated_call_reuses_its_answer() {
     )
     .await;
     let html = without_node_ids(&html);
-    // The answer is HTML, so the expansion's own `<b>` arrives as markup and
-    // the second, cached answer is identical to the first.
-    let occurrences = html.matches("[x]<b>y</b>").count();
+    // The answer is HTML, so the expansion's own `<b>` arrives as markup and the
+    // second, cached answer is identical to the first. As above, the element
+    // carries encapsulation attributes, so the count is on the *text*, not on an
+    // exact tag.
+    let occurrences = html.matches("[x]").count();
     assert_eq!(occurrences, 2, "got: {html}");
+    assert_eq!(html.matches(">y</b>").count(), 2, "got: {html}");
 }
 
 #[tokio::test]

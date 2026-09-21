@@ -502,7 +502,11 @@ pub fn render_answer(items: &[Item], config: &dyn crate::traits::SiteConfig) -> 
         })
         .cloned()
         .collect();
-    let stage = crate::pipeline::tree_builder_stage::TreeBuilderStage::new(false);
+    let stage = crate::pipeline::tree_builder_stage::TreeBuilderStage::new(true);
+    let mut kept = kept;
+    kept.push(Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::Eof(
+        crate::wikitext::tokens_v2::EOFTk,
+    )));
     let ast = stage.to_ast_with_fragments(kept, None, config, std::collections::HashMap::new());
     let serializer =
         crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions::for_page(""));
@@ -529,7 +533,17 @@ fn inner_html(html: &str) -> String {
         return html.to_string();
     };
     let end = html.rfind("</body>").unwrap_or(html.len());
-    html[start..end].to_string()
+    // The document wrapper writes `</head>\n<body>\n` as *layout*, so the slice
+    // begins with that newline and it is not part of the body's content. It
+    // matters here rather than being cosmetic: a module concatenates this string
+    // into its next template *title* (`Module:Autotaxobox` does exactly that), and
+    // a leading newline turned a correct `Equus` into the title
+    // `Taxonomy/\nEquus` — a page that cannot exist, whose miss is itself a
+    // title, so the walk grew a level deeper every round.
+    html[start..end]
+        .strip_prefix('\n')
+        .unwrap_or(&html[start..end])
+        .to_string()
 }
 
 #[cfg(test)]

@@ -273,12 +273,18 @@ pub enum Outcome {
 
 /// How many times one `#invoke` may be re-run for deferred frame calls.
 ///
-/// Each round supplies at least one new answer, so this bounds how many
-/// distinct frame calls a module may make. The corpus's cached modules hold a
-/// combined 129 `expandTemplate`/`preprocess` call sites, so the bound is
-/// generous for real modules while stopping a module that fabricates a fresh
-/// request on every pass.
-const MAX_FRAME_ROUNDS: usize = 64;
+/// Each round supplies at least one new answer, so this bounds how many distinct
+/// frame calls a module may make, and it has to clear the busiest real module.
+/// `Module:Autotaxobox` is that one: it walks a taxon's whole ancestry, asking
+/// each `Template:Taxonomy/<taxon>` for several fields, so the count tracks the
+/// depth of the hierarchy rather than a fixed handful of calls. A zebra's
+/// ancestry is 36 templates deep and costs roughly two calls each, and the
+/// deepest known chains run a little past that — so the old bound of 64 cut the
+/// walk off mid-hierarchy and reported `could not run … after 70 rounds`.
+///
+/// 512 is far above any real chain while still stopping a module that fabricates
+/// a fresh request on every pass.
+const MAX_FRAME_ROUNDS: usize = 512;
 
 /// Run an `#invoke` call once, reporting what it needs from the parser.
 ///
