@@ -1491,10 +1491,39 @@ the `#tag` pair, which are `in_tpl=true` expansions that end up unencapsulated.
 Note that PHP allocates in the `TemplateEncapsulator` **constructor**
 (`$env->newAboutId()`), and `TemplateHandler::onTemplate` constructs one for
 every template token, so "allocate then discard" is itself faithful; the
-difference has to be in *which* calls reach that point, in what order. That is
-where the next attempt should start, by instrumenting the same allocation on the
-PHP side rather than reasoning from the count.
+difference has to be in *which* calls reach that point, in what order.
 
+#### The isolation that settles it
+
+A bare `{{#invoke:Infobox|infobox}}`, with no `Template:Documentation` anywhere,
+serves exactly two about ids:
+
+```
+about="#mwt1"    the transclusion wrapper
+about="#mwt2"    the <style>
+```
+
+So the style's id is allocated **inside the `#invoke` expansion**, immediately
+after the wrapper. The ordering is not a coincidence of how many other
+templates exist on the page; it is where in the expansion the stylesheet is
+reached.
+
+#### Why the fix is not local
+
+The id must therefore be taken while templates are expanding, and the blocker is
+that the path which creates the token is synchronous: `frame:extensionTag`
+lowers to `#tag`, `pf_tag` builds the extension token, and neither has the about
+counter. `expand_templatestyles` — which *does* have the counter — is a separate
+pass that runs after all expansion is done. Threading the counter into
+`call_parser_function`/`pf_tag`, or making the style fragment carry a *deferred*
+id resolved later at the point it was reached, are the two shapes the fix can
+take. The second is preferable: it keeps the sync path sync.
+
+That is where the next attempt should start, and the bare-`#invoke` case above is
+the test to write first — it is two ids, no templates, and reproduces the whole
+problem.
+
+Also recorded here: `frame:extensionTag` used to lower to `##tag`, which is not
 The faithful fix is to allocate the about id when the fragment placeholder is
 spliced into the tree rather than when the fragment is built — i.e. in
 `to_ast_with_fragments`, or by making the placeholder carry the id lazily. It is
