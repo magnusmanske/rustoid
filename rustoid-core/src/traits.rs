@@ -108,6 +108,27 @@ pub trait DataSource: Send + Sync {
         }
         Ok(ret)
     }
+
+    /// Page protection levels, keyed by action, for the titles a module may ask
+    /// about — `title.protectionLevels`.
+    ///
+    /// A separate call from [`DataSource::get_page_info`] because the two come
+    /// from different sources on a live wiki (`prop=info&inprop=protection`
+    /// rather than the plain info query), and because a title's protection is
+    /// only ever needed by `mw.title`.
+    ///
+    /// The default returns nothing for every title, which reads as "unprotected".
+    /// That is the conservative answer: a module that checks protection usually
+    /// falls back to the *permissive* branch when a page looks unprotected —
+    /// `Module:Effective protection level` tests for `sysop`/`templateeditor`
+    /// explicitly — whereas inventing a level would change which branch runs.
+    async fn get_title_protection(
+        &self,
+        titles: &[String],
+    ) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+        let _ = titles;
+        Ok(HashMap::new())
+    }
 }
 
 /// Page metadata used for link resolution (mirrors the per-title map returned

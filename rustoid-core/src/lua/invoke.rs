@@ -515,12 +515,22 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
         let is_redirect = content
             .as_deref()
             .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"));
+        // Protection is asked for in one batch rather than per title, and after
+        // the content loop so a data source that can only answer one of the two
+        // cheaply still gets asked once.
+        let protection = source
+            .get_title_protection(std::slice::from_ref(&title))
+            .await
+            .unwrap_or_default()
+            .remove(&title)
+            .unwrap_or_default();
         out.insert(
             title,
             TitleFacts {
                 exists,
                 is_redirect,
                 content,
+                protection,
             },
         );
     }

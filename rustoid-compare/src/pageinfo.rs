@@ -84,6 +84,44 @@ pub async fn page_info(
     Ok(out)
 }
 
+/// Protection levels per action, for titles a module may ask about through
+/// `mw.title`.
+///
+/// The response models protection as a *list* of `{type, level, expiry}` per
+/// action, and Scribunto exposes only the level as an array's first item. An
+/// action the wiki does not list is not protected, and is therefore absent from
+/// the returned map rather than present with an empty level — that distinction
+/// is what `Module:Effective protection level` reads.
+///
+/// A failure is reported as "nothing is protected" rather than as an error, for
+/// the same reason [`page_info_soft`] exists: an unreachable wiki should degrade
+/// into a conservative answer, not abort a parse.
+pub async fn title_protection(
+    client: &WikiClient,
+    titles: &[String],
+) -> HashMap<String, HashMap<String, Vec<String>>> {
+    let mut out = HashMap::new();
+    for chunk in titles.chunks(TITLES_PER_QUERY) {
+        let Ok(body) = client.protection_json(chunk).await else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<ProtectionResponse>(&body) else {
+            continue;
+        };
+        for page in parsed.query.pages {
+            let Some(title) = page.title else { continue };
+            let mut levels = HashMap::new();
+            for (action, entries) in page.protection.unwrap_or_default() {
+                if let Some(level) = entries.into_iter().next().and_then(|e| e.level) {
+                    levels.insert(action, vec![level]);
+                }
+            }
+            out.insert(title, levels);
+        }
+    }
+    out
+}
+
 /// Normalise a title for comparison: underscores are spaces, and the first
 /// letter is case-insensitive on a default wiki.
 fn normalise(title: &str) -> String {
@@ -115,6 +153,27 @@ struct PageEntry {
     /// Present only for redirects; its presence is the signal.
     #[serde(default)]
     redirect: Option<serde_json::Value>,
+    /// Keyed by action (`"edit"`, `"move"`), then a list of applied
+    /// restrictions. Absent entirely for an unprotected page.
+    #[serde(default)]
+    protection: Option<HashMap<String, Vec<Protection>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct Protection {
+    #[serde(default)]
+    level: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProtectionResponse {
+    query: ProtectionQuery,
+}
+
+#[derive(serde::Deserialize)]
+struct ProtectionQuery {
+    #[serde(default)]
+    pages: Vec<PageEntry>,
 }
 
 /// Existence checks that fail soft, for use from the parser.

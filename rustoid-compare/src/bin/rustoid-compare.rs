@@ -228,6 +228,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Outcome::Match => "MATCH".to_string(),
         Outcome::Differ { detail } => format!("DIFFER\n{detail}"),
         Outcome::Skipped { reason } => format!("SKIP ({reason})"),
+        Outcome::Stalled { seconds } => format!("STALLED (no render after {seconds:.0}s)"),
     };
     println!("{} @ r{} — {status}", comparison.title, comparison.revid);
     println!(

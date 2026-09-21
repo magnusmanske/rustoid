@@ -669,11 +669,11 @@ pub fn parser_functions_wrapper(tokens: Vec<Item>) -> Vec<Item> {
     process_template_tokens(filtered, /* expand_templates */ true)
 }
 
-/// The `[[…]]` a template that could not be fetched is replaced by.
+/// The fallback a template that could not be fetched is replaced by.
 ///
-/// Mirrors `Parser::braceSubstitution`'s fallback. When every lookup fails — no
-/// such page, no parser function, no variable — PHP does *not* return the call
-/// as text; it sets `$found = true` and substitutes:
+/// Mirrors `Parser::braceSubstitution`. When every lookup fails — no such page,
+/// no parser function, no variable — PHP does *not* return the call as text; it
+/// sets `$found = true` and substitutes:
 ///
 /// ```php
 /// # If the title is valid but undisplayable, make a link to it
@@ -686,14 +686,18 @@ pub fn parser_functions_wrapper(tokens: Vec<Item>) -> Vec<Item> {
 /// The link text is what lets a construct terminate. A module such as
 /// `Module:Autotaxobox` reads the answer back and uses it as the *next template
 /// title*, so an answer that is not a title has it splice markup into one and
-/// recurse. Answering with `[[:Title]]` is what the live service does, and it is
-/// measurable: `{{#invoke:String|len|{{Taxonomy/NoSuchTaxonXYZ|machine_code=…}}}}`
-/// reports 37 characters, which is `[[:Template:Taxonomy/NoSuchTaxonXYZ]]`
-/// exactly.
+/// recurse. Answering with a link is what the live service does, and the answer
+/// is measurable — see `render_answer`'s doc for the `String.sub` probe that
+/// reads its bytes rather than its rendered surface.
 ///
-/// `src` carries that wikitext, because this token reaches a *module* rather
-/// than a page in one case — `frame:expandTemplate`'s answer is the expansion's
-/// source — and the stringifier reconstructs from `src`.
+/// Two details of that answer are load-bearing and are recorded here because
+/// this function is the one that supplies them:
+///
+/// - The link is `[[:Title]]`, with the leading colon: a bare `[[Template:Foo]]`
+///   is a *transclusion* of it, and the answer must read as a link.
+/// - `src` carries that wikitext, because this token reaches a *module* rather
+///   than a page in one case — `frame:expandTemplate`'s answer is the expansion's
+///   *source* — and the stringifier reconstructs from `src`.
 ///
 /// The returned anchor is otherwise a plain `wikilink` token, not a finished
 /// `<a>`: the red-link marking (`class="new"`, `data-mw-i18n`,

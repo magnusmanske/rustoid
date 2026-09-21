@@ -105,9 +105,25 @@ impl Scoreboard {
             .count()
     }
 
+    /// Pages that did not finish rendering within the per-page cap.
+    ///
+    /// Counted separately from a skip because the two mean opposite things: a
+    /// skip says the *harness* lacked data, a stall says rustoid's own expansion
+    /// did not terminate.
+    pub fn stalled(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.outcome, Outcome::Stalled { .. }))
+            .count()
+    }
+
     /// Comparisons that actually produced two renderings to judge.
+    ///
+    /// Stalls are excluded alongside skips: a page with no rustoid HTML on the
+    /// rustoid side has not been compared, and counting it as a miss would
+    /// understate parity on pages that *were* rendered.
     pub fn compared(&self) -> usize {
-        self.total() - self.skipped()
+        self.total() - self.skipped() - self.stalled()
     }
 
     /// Percentage matched, over *compared* pages. Skips are excluded because a
@@ -246,6 +262,9 @@ impl Scoreboard {
         if self.skipped() > 0 {
             out.push_str(&format!(", {} skipped", self.skipped()));
         }
+        if self.stalled() > 0 {
+            out.push_str(&format!(", {} stalled", self.stalled()));
+        }
         out.push('\n');
 
         let (p, r) = self.byte_totals();
@@ -312,6 +331,7 @@ impl Scoreboard {
             for row in &failing {
                 let verdict = match &row.outcome {
                     Outcome::Skipped { reason } => format!("skip: {reason}"),
+                    Outcome::Stalled { seconds } => format!("stalled after {seconds:.0}s"),
                     _ => row.category().to_string(),
                 };
                 out.push_str(&format!(
@@ -428,6 +448,33 @@ mod tests {
         assert_eq!(b.skipped(), 1);
         // 1 of 3 compared, not 1 of 4.
         assert!((b.percent() - 33.333).abs() < 0.01, "{}", b.percent());
+    }
+
+    /// A stall is not a skip and not a difference: the harness had everything it
+    /// needed, and rustoid's own expansion did not terminate. It must therefore
+    /// stay out of both the skew and the score, and be visible as its own row.
+    #[test]
+    fn a_stalled_page_is_neither_compared_nor_skipped() {
+        let b = Scoreboard::new(
+            "test",
+            vec![
+                row("A", &["lua"], Outcome::Match),
+                row("B", &["lua"], Outcome::Stalled { seconds: 60.0 }),
+            ],
+        );
+        assert_eq!(b.total(), 2);
+        assert_eq!(b.stalled(), 1);
+        assert_eq!(b.skipped(), 0);
+        assert_eq!(b.compared(), 1, "a stall produces no rendering to judge");
+        assert_eq!(b.percent(), 100.0);
+        assert_eq!(
+            b.by_category().first().map(|c| c.name.as_str()),
+            Some("match")
+        );
+        // The report must name it, and how long it waited.
+        let report = b.render(false);
+        assert!(report.contains("1 stalled"), "{report}");
+        assert!(report.contains("stalled after 60s"), "{report}");
     }
 
     #[test]

@@ -295,6 +295,16 @@ pub struct TitleFacts {
     /// distinct from "empty": `getContent()` on an unfetched page returns nil,
     /// while a fetched empty page returns `""`.
     pub content: Option<String>,
+    /// Protection level per action (`"edit"`, `"move"`, …), as `title.protectionLevels`.
+    ///
+    /// Scribunto models this as a table of action to *array* whose first item is
+    /// the level, so it is kept as `action -> [level]` rather than flattened.
+    /// An unprotected page has no entry for the action, which is what the field
+    /// must distinguish from an entry with an empty level.
+    ///
+    /// Empty for a title that was never looked up, which reads as "unprotected" —
+    /// the same conservative answer `exists` gives.
+    pub protection: std::collections::HashMap<String, Vec<String>>,
 }
 
 pub struct LuaContext {
@@ -1850,6 +1860,33 @@ fn luafn_title_new(
                 "isRedirect" => Ok(Value::Boolean(
                     facts.as_ref().is_some_and(|f| f.is_redirect),
                 )),
+                // `protectionLevels` is a table keyed by action, each value an
+                // *array* whose first item is the level string:
+                // `{ edit = { 'sysop' } }`. `Module:Effective protection level`
+                // reads `title.protectionLevels[action][1]`, and a module that
+                // found a bare string there would index a character instead.
+                "protectionLevels" => {
+                    let levels = lua.create_table()?;
+                    if let Some(facts) = facts.as_ref() {
+                        for (action, value) in &facts.protection {
+                            let arr = lua.create_table()?;
+                            arr.set(1, value.first().map(String::as_str).unwrap_or(""))?;
+                            levels.set(action.as_str(), arr)?;
+                        }
+                    }
+                    Ok(Value::Table(levels))
+                }
+                // No cascading restrictions can be observed, and the documented
+                // shape is a table with empty `restrictions` and `sources` rather
+                // than nil — a module indexing `cascadingProtection.restrictions`
+                // on the live wiki finds a table, so returning nil here would turn
+                // a correct lookup into an error.
+                "cascadingProtection" => {
+                    let cp = lua.create_table()?;
+                    cp.set("restrictions", lua.create_table()?)?;
+                    cp.set("sources", lua.create_table()?)?;
+                    Ok(Value::Table(cp))
+                }
                 "talkPageTitle" => {
                     let talk = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
                     lua_str(lua, prefix_title(&site, talk, &text))

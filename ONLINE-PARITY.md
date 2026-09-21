@@ -983,30 +983,63 @@ trace *which* target recurses, exactly as the `Taxonomy/` case was traced.
 **Still open, and where the taxobox walk now stands.** The loop is fixed for a
 taxon whose chain is cached: `{{Automatic taxobox|taxon=Equus (Hippotigris)}}`
 renders in 0.3s with no limit errors, walking 36 real taxa. What remains is the
-case where a `Template:Taxonomy/*` page is **missing**, and the two measurements
-below do not yet agree, so nothing has been changed on their basis:
+case where a `Template:Taxonomy/*` page is **missing**.
 
-- For a missing template, `frame:expandTemplate` returns **markup** — asking the
-  live service for the answer with `<` escaped shows a full
-  `<a rel="mw:WikiLink" …>Title</a>` anchor coming back. So a module really does
-  receive an anchor, and `'Taxonomy/' .. that` really does nest. But the wiki
-  renders a clean infobox for `taxon=NoSuchTaxonXYZ`, with no `Taxonomy/Template:`
-  nesting anywhere in the output, so it terminates regardless.
-- `{{#invoke:String|len|{{Taxonomy/NoSuchTaxonXYZ|machine code=parent}}}}` reports
-  **37** characters, while the anchor above is roughly 200. One of these two
-  readings is not measuring what I think it is, and I have not found which.
+**The two readings disagreed because they measured different things, and both
+were right.** Resolved against the live service by reading the answer's bytes
+through *two* nested `String.sub` calls, one of which supplies the outer bound
+and so reveals the length by failing:
 
-rustoid answers the miss with an anchor whose *text* is the title, and the module
-concatenates the whole rendered string, so the nesting grows a level per round.
-The next step is to settle the two readings above — most likely by having a
-module return the answer's length and its first bytes, so the string the module
-actually holds is observed rather than inferred — and then match whatever it
-says.
+```
+{{#invoke:String|sub|{{#invoke:String|sub|{{Taxonomy/NoSuchTaxonXYZ|machine code=parent}}|1|50}}|1|34}}
+  -> [[Category:Errors reported by Modu
+{{#invoke:String|sub|{{#invoke:String|sub|{{Taxonomy/NoSuchTaxonXYZ|machine code=parent}}|1|50}}|12|37}}
+  -> Errors reported by Module
+```
+
+Both windows line up with one string and only one, and the outer `sub` reports
+`String subset index out of range` at `1|40` — so the answer is **37 characters
+of wikitext**:
+
+```
+[[Category:Errors reported by Module String]]
+```
+
+That is 11 (`[[Category:`) + 26 (`Errors reported by Module String`), and every
+character is now accounted for. Three consequences, each of which changes the
+port:
+
+1. **The answer is wikitext, as the `render_answer` fix assumed** — not markup.
+   The earlier reading that saw an anchor in the answer was reading the *page*:
+   the enclosing `#invoke` parses the answer, and a `[[Category:…]]` line renders
+   as a link-category element rather than as visible text, which is why the
+   surface showed an anchor where the module held a link. A `#invoke` whose
+   output is *only* that category line renders the anchor and nothing else.
+2. **A missing template does not answer with the title text at all** when the
+   call has arguments — it answers with the error-tracking category that
+   `Module:Autotaxobox` *checks for by name*, and that check is what terminates
+   the walk. `p.getTaxonInfoItem` does `pcall(frame.expandTemplate, …)`, finds
+   `ok`, and then needs `info == ''`; supplying the category is how the module
+   learns the template is absent. rustoid's `[[:$title]]` fallback satisfies
+   neither the check nor the byte comparison.
+3. **`MaxSearchLevels` is not the bound that fires here.** The module walks the
+   ancestry until `getTaxonInfoItem` says the template is missing, so the wiki
+   terminates on the *first* absent taxon. rustoid currently burns its whole
+   1,000,000-node PP budget first (18.9s) and only then emits
+   `Node-count limit exceeded`, which is a visible divergence rather than a
+   slow path.
+
+The shape is PHP's `Parser::braceSubstitution` error path: the category link is
+prepended *before* the `$found = true` fallback, so both appear. The remaining
+gaps in rustoid's missing-template branch are that the redlink marking is not
+applied, `data-parsoid.pi` does not record the arguments, and `data-mw` loses
+the target's `wt` and the parameter list.
 
 A practical note for corpus runs: there is no per-page time bound, so one page
 that does not terminate stalls the whole scoreboard. A wall-clock cap per page,
 reported as `stalled` rather than as a failure, would have turned this
-investigation's several hour-long waits into a single run.
+investigation's several hour-long waits into a single run. It is implemented now
+(see the scoreboard below).
 
 #### Two parser bugs the corpus found, and one that turned out not to be one
 

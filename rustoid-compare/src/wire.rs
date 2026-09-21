@@ -323,6 +323,26 @@ impl WikiClient {
         self.get_text(&url).await
     }
 
+    /// Page protection levels for up to 50 titles, with no wikitext.
+    ///
+    /// `inprop=protection` is what `mw.title`'s `protectionLevels` reads. It is
+    /// a separate request from [`WikiClient::page_info_json`] rather than a flag
+    /// on it, because only `mw.title` needs it and link resolution asks about
+    /// hundreds of titles per page.
+    pub async fn protection_json(&self, titles: &[String]) -> Result<String> {
+        let joined = titles
+            .iter()
+            .map(|t| urlencode(t))
+            .collect::<Vec<_>>()
+            .join("%7C");
+        let url = format!(
+            "{}?action=query&prop=info&inprop=protection&format=json&formatversion=2&titles={}",
+            self.wiki.api_url(),
+            joined
+        );
+        self.get_text(&url).await
+    }
+
     /// Fetch raw `siteinfo` JSON (namespaces, magic words, function hooks,
     /// extension tags, interwiki map, general).
     pub async fn siteinfo(&self) -> Result<String> {

@@ -24,7 +24,11 @@ use crate::siteconfig::WikiSiteConfig;
 use crate::wire::WikiClient;
 
 /// How one page's comparison turned out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: [`Outcome::Stalled`] carries a wall-clock duration, which is a
+/// measurement rather than part of the outcome's identity. Nothing compares two
+/// outcomes for equality anyway — the scoreboard matches on variants.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     /// Byte-identical after normalisation.
     Match,
@@ -32,6 +36,14 @@ pub enum Outcome {
     Differ { detail: String },
     /// The page could not be compared (missing, or a fetch failed).
     Skipped { reason: String },
+    /// rustoid did not finish rendering within the per-page cap.
+    ///
+    /// Deliberately *not* a failure or a skip. A page that does not terminate is
+    /// its own class of bug — an expansion blow-up, a template cycle — and it
+    /// says something different about the port than a `Differ` does. Before this
+    /// existed, one such page stalled an entire corpus run, which is why the
+    /// blow-up took hours to measure: the scoreboard never printed at all.
+    Stalled { seconds: f64 },
 }
 
 impl Outcome {
@@ -50,6 +62,7 @@ impl Outcome {
         match self {
             Self::Match => "match",
             Self::Skipped { .. } => "skipped",
+            Self::Stalled { .. } => "stalled",
             Self::Differ { detail } => classify(detail),
         }
     }
@@ -494,6 +507,22 @@ impl DataSource for CachedDataSource {
         Ok(crate::pageinfo::page_info_soft(client, titles).await)
     }
 
+    async fn get_title_protection(
+        &self,
+        titles: &[String],
+    ) -> rustoid_core::Result<
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+    > {
+        // Offline, or a wiki that cannot answer: report nothing protected. The
+        // default trait method already does that, and calling it explicitly keeps
+        // the reason next to the online branch rather than implicit in an absent
+        // override.
+        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
+            return Ok(std::collections::HashMap::new());
+        };
+        Ok(crate::pageinfo::title_protection(client, titles).await)
+    }
+
     async fn get_file_info(
         &self,
         _title: &rustoid_core::Title,
@@ -777,6 +806,22 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
     // --- rustoid's rendering ---
     let rustoid_html =
         render_rustoid(client, config, cache, &title, &wikitext, req.offline).await?;
+    let Some(rustoid_html) = rustoid_html else {
+        // The render hit the per-page cap. No HTML was produced, so there is
+        // nothing to compare and no unexpanded count to take.
+        return Ok(Comparison {
+            title: title.clone(),
+            revid,
+            wikitext,
+            unexpanded_rustoid: Unexpanded::default(),
+            unexpanded_parsoid: Unexpanded::count(&parsoid_html),
+            parsoid_html,
+            rustoid_html: String::new(),
+            outcome: Outcome::Stalled {
+                seconds: page_stall_seconds(),
+            },
+        });
+    };
 
     let outcome = compare_html(&parsoid_html, &rustoid_html);
 
@@ -794,6 +839,11 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
 
 /// Parse `wikitext` with rustoid, using a cache-backed data source so template
 /// fetches are persisted too.
+///
+/// Returns `None` if the render did not finish within [`page_stall_seconds`].
+/// The cap exists because an expansion that does not terminate would otherwise
+/// stall the whole corpus, and a scoreboard that never prints measures nothing —
+/// see [`Outcome::Stalled`].
 async fn render_rustoid<C: rustoid_core::SiteConfig>(
     client: &WikiClient,
     config: &C,
@@ -801,7 +851,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     title: &str,
     wikitext: &str,
     offline: bool,
-) -> Result<String> {
+) -> Result<Option<String>> {
     // The data source shares the harness's cache handle. A second handle would
     // keep its own in-memory manifest, so the two would clobber each other's
     // `index.json` and orphan every template fetched during expansion.
@@ -817,14 +867,42 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
         strip_data_parsoid: true,
         ..rustoid_core::ParserOptions::for_page(title)
     };
-    let html = parser
-        .wikitext_to_html_expanded(wikitext, &source, &options)
-        .await
-        .map_err(|e| CompareError::Parse(e.to_string()))?;
+    let html = match tokio::time::timeout(
+        std::time::Duration::from_secs_f64(page_stall_seconds()),
+        parser.wikitext_to_html_expanded(wikitext, &source, &options),
+    )
+    .await
+    {
+        Ok(Ok(html)) => html,
+        Ok(Err(e)) => return Err(CompareError::Parse(e.to_string())),
+        // Timed out. `timeout` cancels the future at an await point, but the
+        // blocking expansion in progress may still be running, so the cache
+        // handle is flushed below either way — a partial fetch is still worth
+        // keeping, and the next run benefits from it.
+        Err(_elapsed) => {
+            source.flush()?;
+            return Ok(None);
+        }
+    };
     // Expansion fetched templates into the source's own cache handle; persist any
     // entries that did not reach a periodic flush.
     source.flush()?;
-    Ok(html)
+    Ok(Some(html))
+}
+
+/// The per-page wall-clock cap, in seconds.
+///
+/// Generous on purpose: it is a *stall* detector, not a performance budget. A
+/// real page renders in well under a second, so anything in this range is a
+/// construct that is not terminating rather than one that is merely slow.
+///
+/// Overridable with `RUSTOID_PAGE_STALL_SECS`, because the right value depends on
+/// whether the run is trying to score pages or to diagnose the one that stalls.
+fn page_stall_seconds() -> f64 {
+    std::env::var("RUSTOID_PAGE_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0)
 }
 
 /// Attach the entity wiki, so `mw.wikibase` has something to read.
