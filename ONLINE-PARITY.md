@@ -1514,14 +1514,44 @@ The id must therefore be taken while templates are expanding, and the blocker is
 that the path which creates the token is synchronous: `frame:extensionTag`
 lowers to `#tag`, `pf_tag` builds the extension token, and neither has the about
 counter. `expand_templatestyles` — which *does* have the counter — is a separate
-pass that runs after all expansion is done. Threading the counter into
-`call_parser_function`/`pf_tag`, or making the style fragment carry a *deferred*
-id resolved later at the point it was reached, are the two shapes the fix can
-take. The second is preferable: it keeps the sync path sync.
+pass that runs after all expansion is done.
 
-That is where the next attempt should start, and the bare-`#invoke` case above is
-the test to write first — it is two ids, no templates, and reproduces the whole
-problem.
+**Two parts of this were fixed.** The fragment now carries a deferred id that the
+tree builder resolves where the wrapper tag actually sits, and the counter is
+threaded through `expand_invoke`/`expand_lua_request` — it had been
+`Cell::new(0)` per deferred call, so every module re-expansion restarted the
+sequence at 1.
+
+#### The count, not the order, is what is actually wrong
+
+Measuring the *number* of about ids rather than reading the first few changes
+the diagnosis materially:
+
+| | about ids | of which `mw:Transclusion` |
+|---|---|---|
+| live | **140** | 2 |
+| rustoid | **4** | 2 |
+
+So the wrappers agree and the ids do not, because the 140 are almost entirely
+extension elements — 93 `syntaxhighlight`, 43 `templatestyles`:
+
+```
+71  code  mw:Extension/syntaxhighlight
+34  link  mw:Extension/templatestyles
+22  div   mw:Extension/syntaxhighlight
+ 8  style mw:Extension/templatestyles
+```
+
+`Template:Documentation` is full of them, and rustoid is not producing those
+elements at all — which is the same fact as the output being 4452 bytes against
+live's 207945, not a separate one.
+
+**The lesson is the one already recorded for `{{sfn}}`:** a handful of matching
+ids at the start of a page says nothing, and counting the construct is what
+distinguishes "numbered in the wrong order" from "not produced at all". Two
+readings of this page were spent on the first explanation when the second was
+true. The ordering fix above is still correct and still needed — it just is not
+what is blocking this page.
 
 Also recorded here: `frame:extensionTag` used to lower to `##tag`, which is not
 The faithful fix is to allocate the about id when the fragment placeholder is
