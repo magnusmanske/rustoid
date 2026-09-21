@@ -1486,6 +1486,40 @@ fn is_transclusion_start(node: &Node) -> bool {
             .is_some_and(|t| t == "mw:Transclusion" || t == "mw:Param")
 }
 
+/// The source offset at which a transclusion starts, from its marker's `dsr`.
+///
+/// Returns `None` when the marker carries no `dsr`, in which case the range
+/// rules must fall back to nesting alone — an absent offset is not evidence that
+/// the sibling is outside the range.
+fn transclusion_start_offset(start_meta: &Node) -> Option<usize> {
+    start_meta
+        .dp
+        .as_ref()
+        .and_then(|dp| dp.dsr.as_ref())
+        .and_then(|dsr| dsr.start)
+}
+
+/// Whether `node`'s source range reaches as far as `offset`.
+///
+/// An element whose `dsr.end` is at or before `offset` ends before the offset, so
+/// it cannot contain anything occurring at that offset. Nodes without a `dsr`
+/// reach it by default: this test exists to *exclude* a sibling on positive
+/// evidence, and an unknown range is not evidence.
+fn sibling_reaches_offset(node: &Node, offset: Option<usize>) -> bool {
+    let Some(offset) = offset else {
+        return true;
+    };
+    let Some(end) = node
+        .dp
+        .as_ref()
+        .and_then(|dp| dp.dsr.as_ref())
+        .and_then(|dsr| dsr.end)
+    else {
+        return true;
+    };
+    end > offset
+}
+
 /// Whether a node is a transclusion/param *end* marker meta
 /// (`typeof="mw:Transclusion/End"` or `"mw:Param/End"`).
 fn is_transclusion_end(node: &Node) -> bool {
@@ -1919,6 +1953,19 @@ fn wrap_flipped_children(
             i += 1;
             continue;
         };
+
+        // A target *before* the start marker would extend the range backwards,
+        // which is only legitimate when the marker really is nested inside it.
+        //
+        // The marker's own `dsr.start` is the evidence that decides it: the
+        // template begins at that offset in the source, so a sibling that ends
+        // at or before it cannot be part of the range whatever the nesting says.
+        // Checked per range, so it does not depend on how the paragraph wrapper
+        // chose to nest things.
+        if t < i && !sibling_reaches_offset(&children[t], transclusion_start_offset(&start_meta)) {
+            i += 1;
+            continue;
+        }
 
         // Whether the range start is the sibling itself (`start_meta` is
         // `children[i]`) or a marker nested inside its subtree (PHP's

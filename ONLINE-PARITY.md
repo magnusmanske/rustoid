@@ -1238,6 +1238,70 @@ rather than locally. Forcing the body's `in_template` flag was tried and reverte
 it does not fix this and breaks `{{ {{T}} }}`, which legitimately keeps an inner
 span.
 
+#### Candidate 2 was tried, and the reduction shows why it cannot work
+
+The guard was implemented — a range that would extend *backwards* is refused when
+the sibling it would swallow ends at or before the start marker's `dsr.start`.
+That is sound reasoning and it changes nothing here, because the `<p>` is not
+before the marker: it is the marker's *parent*, and its `dsr` really does span the
+whole thing.
+
+A trace of the node `wrap_flipped_children` sees on `AAA{{If empty|<div>X</div>|b}}`
+settles it:
+
+```
+child[0]  <p>    dsr [0,35]   about=None   typeof=None
+child[1]  <meta> dsr [35,35]  about=#mwt1  typeof=mw:Transclusion/End
+```
+
+the start marker being nested inside `child[0]`, with its own `dsr` `[3,30]`.
+So `dsr` agrees with the nesting, and no amount of checking `dsr` can separate
+them.
+
+#### The real cause: the `<div>` is not in the token stream at all
+
+The paragraph wrapper is fed these tokens, in this order:
+
+```
+Str("AAA")
+meta  mw:Transclusion
+meta  mw:Transclusion
+Str("X")
+meta  mw:Transclusion/End
+meta  mw:Transclusion/End
+```
+
+There is **no `<div>` token** — it exists only inside the transclusion's argument,
+and materialises later, when encapsulation builds the DOM. So
+`currLineBlockTagSeen` is never set, no block element closes the `<p>`, and the
+`tplStartIndex` override in `openPTag` then pulls it back before the first
+`mw:Transclusion` meta. The `<p>` swallows `AAA` and the whole range with it.
+
+Live's `<p>` has `dsr [0,3]` and the `<div>` sits beside it, which means PHP's
+`ParagraphWrapper` *did* see a block element. Checking the stage order explains
+why — and this is the part worth remembering:
+
+- `ParagraphWrapper` is a **token-level** handler, in
+  `ParserPipelineFactory::STAGES['TokenTransform3']`, running *before* the tree
+  builder.
+- `PWrap` is a separate, **DOM-level** processor in the later
+  `FullParseDOMTransform` stage.
+- `TemplateHandler` (TT2) expands the argument, and `TokenStreamPatcher` (TT3,
+  ahead of `ParagraphWrapper`) has already turned the argument's `<div>` into a
+  real token by the time p-wrapping runs.
+
+rustoid has the token-level port only, and reaches the same place by
+encapsulating into the DOM *after* the tree exists. So the `<div>` reaches
+rustoid's paragraph wrapper a stage too late.
+
+**This is not a range-finding bug and cannot be fixed in the range-finder.**
+Making the two agree means either splicing a transclusion's argument tokens into
+the stream before the tree is built, or running encapsulation earlier — both
+pipeline reorderings, not edits to `wrap_flipped_children`. The finding is
+recorded here so the next attempt starts from the token stream rather than from
+the range rules; three separate readings of this reduction were spent on the
+latter.
+
 **This is the blocker for more than it looks.** Chasing the Cite gap on `Zebra`
 (13 of its 158 refs missing) led to the same construct: the refs come from
 `{{sfn}}`, which is `Module:Footnotes` through `Template:Sfn`, and on the page
@@ -1247,10 +1311,11 @@ they appear as literal `{{sfn|Plumb|Shaw|2018|p=54}}` inside a
 
 So the `{{sfn}}` refs are not a module problem at all — `{{sfn}}` works in
 isolation, producing the right `cite_ref-FOOTNOTEPlumbShaw201854_1-0`. They are
-collateral from the range bug above, which concatenates one template's body into
-another's metadata and takes the page text with it. Cite itself is byte-identical
-to the served page for every ref that survives; the numbers differ (37 against
-30) purely because the missing refs shift the count.
+collateral from the same `<p>`-swallows-the-transclusion behaviour — one
+template's body concatenated into another's metadata, taking the page text with
+it. Cite itself is byte-identical to the served page for every ref that
+survives; the numbers differ (37 against 30) purely because the missing refs
+shift the count.
 
 The practical consequence is a priority: the range fix is not one page's cosmetic
 difference, it is what unblocks Cite, `Module:Footnotes`, and the 200 literal
