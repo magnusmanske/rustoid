@@ -1302,6 +1302,52 @@ recorded here so the next attempt starts from the token stream rather than from
 the range rules; three separate readings of this reduction were spent on the
 latter.
 
+#### The reduction, after the argument fix
+
+Splicing the *argument* was the right instinct, but the missing `<div>` had a
+different cause, and fixing that moved this a long way. Two commits:
+
+**1. A module's arguments lost their tags.** `frame_args_to_lua` and
+`kv_to_source_text` both called `tokensToString` on the argument, which has no
+arm for a plain tag, so `{{#invoke:String|len|<div>X</div>}}` answered **1** where
+the service answers **12**. The argument is now read from its `srcOffsets` — the
+same technique template parameters already use. `<b>bold</b>` → 11 and
+`[[link]]` → 8 came with it.
+
+That is what put the `<div>` into the token stream, and with it the paragraph
+wrapper now sees a block element: the `<p>` closes after `AAA` and the `<div>`
+becomes a sibling carrying the transclusion, which is the structure the service
+serves. **The recorded "stage ordering" conclusion was wrong on the cause** — the
+`<div>` was not late, it had been dropped one step earlier.
+
+**2. `about` was stamped on a sibling that precedes the transclusion.** With the
+`<div>` in range, the `<p>` — which holds the start marker yet begins at offset 0
+while the template starts at 3 — was stamped too, so the `<p>` and the `<div>`
+shared one transclusion id. The service serves `<p id="mwAg">AAA</p>` with no
+`about` at all. The stamp is now withheld when the sibling's `dsr.start` precedes
+the marker's.
+
+Narrowing the *range* to drop that sibling was tried first and cost five
+fixtures: the range must stay contiguous for the span-wrapping and deletability
+steps that follow, so only the stamp is conditional.
+
+#### What is still wrong on the reduction
+
+```
+live:  <p id="mwAg" DP>AAA</p><div about="#mwt1" typeof="mw:Transclusion" …>X</div>
+rustoid: <p>AAA</p><div about="#mwt2" typeof="mw:Transclusion" …>X</div>
+         <meta typeof="mw:Transclusion" about="#mwt1" …/>      ← trailing
+```
+
+The `<p>` and the `<div>` now match. The outer template's metadata
+(`{{If empty|…}}`) should *wrap* the `<div>` — live puts `target.wt = "If empty"`
+on the `<div>` — and instead lands as a bare `<meta>` after it, so the `<div>`
+carries the inner `#invoke`'s metadata and the outer id is `#mwt2` rather than
+`#mwt1`. The outer range is not being found at all in this shape.
+
+That is the next step on this reduction, and it is the last one: the paragraph
+and the `<div>` are right, only the outer transclusion's range is not.
+
 **This is the blocker for more than it looks.** Chasing the Cite gap on `Zebra`
 (13 of its 158 refs missing) led to the same construct: the refs come from
 `{{sfn}}`, which is `Module:Footnotes` through `Template:Sfn`, and on the page
