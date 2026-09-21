@@ -597,9 +597,15 @@ fn language_object(lua: &Lua, code: &str) -> mlua::Result<Table> {
         lua.create_function(
             |_, (_self, fmt, ts): (Option<Value>, Value, Option<Value>)| {
                 let fmt = super::engine::coerce_string(&fmt, "formatDate")?;
+                // An omitted timestamp means *now*, which the manual states
+                // explicitly and `Module:Citation/CS1` relies on:
+                // `mw.getLanguage('en'):formatDate('U')` seeds its random id.
+                // Returning the empty string instead made `tonumber` nil and the
+                // module fail with "attempt to perform arithmetic on a nil
+                // value" — the most common corpus failure, on 13 pages.
                 let stamp = match ts {
                     Some(v) if !v.is_nil() => super::engine::coerce_string(&v, "formatDate")?,
-                    _ => return Ok(String::new()),
+                    _ => "now".to_string(),
                 };
                 Ok(super::engine::format_date(&fmt, &stamp))
             },

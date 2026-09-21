@@ -745,6 +745,33 @@ fixture score from 876 to **172** — the suite correctly reporting that standal
 output has no ids. `rustoid-compare` turns the option on, because matching what a
 wiki serves is its entire purpose.
 
+#### The magic words that take a colon but are not parser functions
+
+`{{PROTECTIONLEVEL:edit}}` and `{{PROTECTIONEXPIRY:edit}}` look exactly like
+parser functions and are resolved down a completely different path. They are
+*core magic words*, so `siteinfo` lists them in `magicwords`, and
+`resolve_target_string` checks that table **before** the parser-function one.
+Two attempts to implement them as parser functions in
+`call_parser_function` were therefore dead code that compiled, tested green,
+and never ran.
+
+The mock was what hid it. It registers no magic words by default, so the same
+wikitext took the parser-function path in the test and the magic-word path on
+the wiki. The tests passed and every live answer was empty — and an empty
+answer is invisible, because that is *also* what an unprotected page returns.
+
+The fix is small (the variable arm answers these two from the protection
+context) and the lasting part is that the routing is now pinned by a test of
+its own, and `MockSiteConfig::add_magic_word` is public so a test can register a
+magic word the way a wiki does. **A mock that is easier to satisfy than the
+wiki is a mock that certifies a bug**, and this one did so for several rounds.
+
+A second, quieter failure in the same area: the wiki returns protection as a
+flat `[{type, level, expiry}, …]` array, where the action is the `type` field.
+Reading it as a map keyed by action deserialises to *nothing at all* rather than
+erroring, so every page looked unprotected and the code path looked exercised.
+The wire shape is now pinned by a test copied from a real response.
+
 #### `mw.wikibase` — implemented (the lookup surface)
 
 The entities are read from Wikidata, which is a *different wiki* from the one
@@ -1040,6 +1067,50 @@ that does not terminate stalls the whole scoreboard. A wall-clock cap per page,
 reported as `stalled` rather than as a failure, would have turned this
 investigation's several hour-long waits into a single run. It is implemented now
 (see the scoreboard below).
+
+#### The first real scoreboard, and what it says to build next
+
+The corpus had never produced a scoreboard, because one non-terminating page
+stopped the whole run. With the stall cap in place it does, and the numbers are
+worth recording because they are the first measurement of the port as a whole
+rather than of one page.
+
+| run | compared | stalled | literal `{{…}}` | Lua failures |
+|---|---|---|---|---|
+| before the name fix | 0/44 | (run never finished) | — | — |
+| wikitext answers landed | 0/30 | 18 | 29/48 | 51 across 23 |
+| `protectionLevels` landed | 0/48 | 0 | 47/48 | 91 across 33 |
+| `TitleBlacklist` + magic words | 0/48 | 0 | 47/48 | 62 across 34 |
+
+Three things are worth reading off it.
+
+**The score is 0, and that number is not yet informative.** Every page still
+emits literal `{{…}}` (47 of 48), so every page diverges at the first
+transclusion. The headline figure will stay 0 until that reaches zero on at
+least one page, which makes the *secondary* numbers — stalls, Lua failures,
+unexpanded counts — the ones that actually measure progress right now. The
+scoreboard already reports them separately for exactly this reason.
+
+**Stalls went to zero, and that is the real cost saving.** 18 pages previously
+burned the full 1,000,000-node budget and 60s each. They now render. This is
+what makes the corpus usable as a loop at all: a 48-page run takes minutes
+rather than hours, so a change can be measured rather than guessed at.
+
+**The Lua failure list is now a work queue rather than a symptom.** Two entries
+dominate. `Module:Citation/CS1:4398` fails with "attempt to perform arithmetic
+on a nil value" on 13 pages — `Cite`, already the largest planned body of work.
+`Module:Lang:1121` fails on `string.char` with a value out of range on 6, which
+is a `mw.ustring` boundary bug rather than a missing feature. Holding in the
+tens, each with a module and a line number, is a very different position from
+the original "everything fails".
+
+**Where the remaining wrongness is, in one line.** The `transclusion` bucket is
+45 of 48, and it is not a missing feature: it is *unexpanded wikitext surviving
+into the output*. The pages render, at 2.37x the expected size — larger because
+the wiki's output has been expanded and rustoid's has not. Fixing the first
+template expansion is therefore the single highest-value next step, and the
+per-page `data-mw` and `data-parsoid` differences are downstream of it rather
+than independent problems.
 
 #### Two parser bugs the corpus found, and one that turned out not to be one
 

@@ -4416,6 +4416,22 @@ mod tests {
                 .unwrap(),
             "86400"
         );
+        // An omitted timestamp means *now*, not the empty string.
+        // `Module:Citation/CS1` seeds a random id from `formatDate('U')` with no
+        // stamp, and an empty result made `tonumber` nil — reported as
+        // arithmetic on a nil value, the most common corpus failure, on 13
+        // pages.
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = tonumber(mw.getContentLanguage():formatDate('U')) \
+                     if not n then return 'nil' end \
+                     if n < 1600000000 then return 'too old' end \
+                     return 'ok'"
+                )
+                .unwrap(),
+            "ok"
+        );
         // An unparseable date yields nothing, so `tonumber` gives nil and the
         // caller takes its documented failure path rather than comparing
         // against the epoch.
