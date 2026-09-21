@@ -425,7 +425,12 @@ fn normalise_combinators(selector: &str) -> String {
 /// `body` is always `{"extsrc":""}` in the output: the stylesheet is not
 /// round-trippable source, so Parsoid records it as empty and the CSS lives in
 /// the element's text.
-pub fn style_node(css: &str, revid: u64, src: &str, about: &str) -> crate::dom::node::Node {
+///
+/// The `about` id is left as [`crate::pipeline::tree_builder_html::DEFERRED_ABOUT`]
+/// rather than being taken here: this fragment is built during expansion, before
+/// the tree exists, so an id taken now would be numbered by *stream* order and
+/// not document order. See that constant for the evidence.
+pub fn style_node(css: &str, revid: u64, src: &str) -> crate::dom::node::Node {
     use crate::dom::node::{ElementKind, Node};
 
     let mut style = Node::element(ElementKind::Other("style".to_string()));
@@ -433,7 +438,7 @@ pub fn style_node(css: &str, revid: u64, src: &str, about: &str) -> crate::dom::
     // cached Parsoid output uses.
     style.set_attr("data-mw-deduplicate", format!("TemplateStyles:r{revid}"));
     style.set_attr("typeof", "mw:Extension/templatestyles");
-    style.set_attr("about", about);
+    style.set_attr("about", crate::pipeline::tree_builder_html::DEFERRED_ABOUT);
     style.set_attr(
         "data-mw",
         format!(r#"{{"name":"templatestyles","attrs":{{"src":"{src}"}},"body":{{"extsrc":""}}}}"#),

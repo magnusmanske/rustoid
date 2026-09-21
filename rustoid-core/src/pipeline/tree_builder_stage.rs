@@ -73,7 +73,7 @@ impl TreeBuilderStage {
 
     /// Run the TT3 handlers and convert the result to an AST.
     pub fn to_ast(&self, tokens: Vec<Item>, config: &dyn crate::traits::SiteConfig) -> Node {
-        self.to_ast_with_fragments(tokens, None, config, std::collections::HashMap::new())
+        self.to_ast_with_fragments(tokens, None, config, std::collections::HashMap::new(), None)
     }
 
     /// Run the TT3 handlers and convert to an AST, with the page source
@@ -84,23 +84,31 @@ impl TreeBuilderStage {
         source: Option<&str>,
         config: &dyn crate::traits::SiteConfig,
     ) -> Node {
-        self.to_ast_with_fragments(tokens, source, config, std::collections::HashMap::new())
+        self.to_ast_with_fragments(
+            tokens,
+            source,
+            config,
+            std::collections::HashMap::new(),
+            None,
+        )
     }
 
     /// Like [`to_ast_with_source`], but accepts pre-built sub-fragments for
-    /// `mw:dom-fragment-token` placeholders.
+    /// `mw:dom-fragment-token` placeholders, plus optionally the shared `about`
+    /// counter so a spliced fragment can take its id in document order.
     pub fn to_ast_with_fragments(
         &self,
         tokens: Vec<Item>,
         source: Option<&str>,
         config: &dyn crate::traits::SiteConfig,
         mut fragments: std::collections::HashMap<usize, crate::dom::node::Node>,
+        about_counter: Option<std::rc::Rc<std::cell::Cell<usize>>>,
     ) -> Node {
         // Continue fragment-id allocation after any pre-built fragments (from
         // `format="wikitext"` pre, etc.).
         let mut next_id = fragments.len();
         let tokens = self.process(tokens, config, &mut fragments, &mut next_id);
-        token_stream_to_ast_html_with_fragments(&tokens, source, fragments)
+        token_stream_to_ast_html_with_fragments(&tokens, source, fragments, about_counter)
     }
 }
 

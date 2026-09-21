@@ -580,6 +580,7 @@ pub fn render_inline_fragment(
         None,
         config,
         fragments.clone(),
+        None,
     ));
     let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
     crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
@@ -1460,7 +1461,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             self.build_inline_fragment(tokens, &mut fragments, &mut next_id)
         } else {
             let stage = TreeBuilderStage::new(false);
-            let mut ast = stage.to_ast_with_fragments(tokens, None, self.config, fragments.clone());
+            let mut ast =
+                stage.to_ast_with_fragments(tokens, None, self.config, fragments.clone(), None);
             let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
             crate::pipeline::p_wrap::run(&mut ast);
             crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None);
@@ -1492,7 +1494,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.render_language_variants(tokens);
 
         let stage = TreeBuilderStage::new(inline);
-        let mut ast = stage.to_ast_with_fragments(tokens, None, self.config, fragments);
+        let mut ast = stage.to_ast_with_fragments(tokens, None, self.config, fragments, None);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         if !inline {
             crate::pipeline::p_wrap::run(&mut ast);
@@ -1689,7 +1691,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // Build the inline tree, splicing the caption `mw:dom-fragment-token`
         // placeholders via the fragments map populated by `renderFile`.
         let stage = TreeBuilderStage::new(true);
-        let frag = stage.to_ast_with_fragments(tokens, None, self.config, fragments);
+        let frag = stage.to_ast_with_fragments(tokens, None, self.config, fragments, None);
         let mut frag = extract_fragment_children(&frag);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
         crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
@@ -1788,7 +1790,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         tokens: Vec<Item>,
         source: Option<&dyn DataSource>,
-        about_counter: &std::cell::Cell<usize>,
         next_id: &mut usize,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let Some(source) = source else {
@@ -1841,12 +1842,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
 
             let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
-            let node = crate::pipeline::templatestyles::style_node(
-                &css,
-                revid,
-                &src,
-                &self.new_about_id(about_counter),
-            );
+            let node = crate::pipeline::templatestyles::style_node(&css, revid, &src);
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(node);
             let id = *next_id;
@@ -1924,7 +1920,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             &mut next_id,
         );
         let stage = TreeBuilderStage::new(false);
-        let mut ast = stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments);
+        let mut ast =
+            stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments, None);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::p_wrap::run(&mut ast);
         // AddLinkAttributes runs *before* `dom-unpack` (mirrors PHP's
@@ -2115,13 +2112,28 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `<templatestyles>` needs a page fetch, so like `gallery` it runs here
         // rather than in the synchronous extension handler.
         let (tokens, style_fragments) = self
-            .expand_templatestyles(tokens, source, about_counter, &mut next_id)
+            .expand_templatestyles(tokens, source, &mut next_id)
             .await;
         fragments.extend(style_fragments);
 
         let stage = TreeBuilderStage::new(false);
-        let mut ast =
-            stage.to_ast_with_fragments(tokens, Some(page_source), self.config, fragments);
+        // The `about` counter is shared with the tree builder so an extension
+        // fragment spliced into the tree takes its id in *document* order.
+        // `expand_templatestyles` built those fragments before the tree existed,
+        // so numbering them there would go by stream order instead — and the
+        // live service numbers them where the expansion reaches them.
+        let tree_about_counter = std::rc::Rc::new(std::cell::Cell::new(about_counter.get()));
+        let mut ast = stage.to_ast_with_fragments(
+            tokens,
+            Some(page_source),
+            self.config,
+            fragments,
+            Some(std::rc::Rc::clone(&tree_about_counter)),
+        );
+        // Anything the builders handed out is now part of the document sequence,
+        // so a later transclusion must not reuse those ids.
+        about_counter.set(tree_about_counter.get());
+        drop(tree_about_counter);
         // Capture transclusion marker depth map over the freshly-built DOM
         // (before p-wrapping restructures it), mirroring PHP's
         // `transclusionMetaTagDepthMap` recorded at tree-build time.
@@ -2484,6 +2496,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         in_template,
                         src_text,
                         parent_args,
+                        about_counter,
                     )
                     .await;
                 for e in &expanded {
@@ -2988,6 +3001,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         in_template: bool,
         _page_source: &str,
         parent_args: Vec<crate::wikitext::tokens_v2::KV>,
+        about_counter: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         // Without a data source there is nothing to fetch the module from, so
         // leave the call as source text (the standalone behaviour of every
@@ -3044,7 +3058,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             site,
             &frame.title().full_text(),
             ctx,
-            |request| self.expand_lua_request(source, frame, request, about_id.clone(), token),
+            |request| {
+                self.expand_lua_request(
+                    source,
+                    frame,
+                    request,
+                    about_id.clone(),
+                    token,
+                    about_counter,
+                )
+            },
         )
         .await
         {
@@ -3150,6 +3173,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         request: crate::pipeline::lua_deferred::FrameRequest,
         about_id: String,
         token: &ParsoidToken,
+        about_counter: &std::cell::Cell<usize>,
     ) -> String {
         use crate::pipeline::lua_deferred::FrameRequest;
         // The manual is explicit that module output is not re-parsed for
@@ -3205,11 +3229,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let child = frame.new_child(frame.title().clone(), vec![]);
         self.lua_expansion_depth
             .set(self.lua_expansion_depth.get() + 1);
+        // The about counter is the *document's*, not a fresh one per deferred
+        // call: a module's `frame:extensionTag('templatestyles', …)` emits a
+        // `<style>` that takes its id where the expansion reaches it, which is
+        // inside the enclosing `#invoke` and before anything that follows the
+        // module on the page. A fresh counter restarted at 1 for every deferred
+        // call, so ids repeated and every later element was numbered too high.
+        // A parser function's own expansion carries no wrapper, but its
+        // arguments can still contain other transclusions, so it must share the
+        // sequence as well.
         let expanded = Box::pin(self.expand_templates(
             &child,
             items,
             Some(source),
-            &std::cell::Cell::new(0usize),
+            about_counter,
             /* in_template */ true,
             &text,
         ))

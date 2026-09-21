@@ -28,6 +28,16 @@ use crate::wikitext::tokens_v2::{DataParsoid as TDataParsoid, Item, KV, KeyValue
 /// builder (mirrors `DOMDataUtils::DATA_OBJECT_ATTR_NAME`).
 const DATA_OBJECT_ATTR_NAME: &str = "data-object-id";
 
+/// Placeholder `about` value on a fragment built before the tree exists.
+///
+/// A `<templatestyles>` fragment is built during expansion, but its `about` id
+/// belongs to document order, which is only known once the tree is built. The
+/// fragment therefore carries this marker and
+/// [`Html5TreeBuilder::resolve_deferred_about_ids`] replaces it at splice time.
+/// The value is deliberately not a valid `#mwtN`, so a marker that ever escaped
+/// resolution would be visible in a diff rather than silently plausible.
+pub const DEFERRED_ABOUT: &str = "#mwt-deferred";
+
 /// A stashed `NodeData` (mirrors PHP's `NodeData`).
 #[derive(Debug, Default)]
 struct StashedNodeData {
@@ -69,6 +79,17 @@ pub struct Html5TreeBuilder {
     uid_to_data_id: HashMap<usize, usize>,
     /// Pre-built sub-fragments keyed by id (carried by `mw:dom-fragment-token`).
     fragments: HashMap<usize, Node>,
+    /// Allocates the next transclusion `about` id (`#mwtN`), shared with the
+    /// expansion that produced the tokens.
+    ///
+    /// An extension fragment's `about` id cannot be allocated when the fragment
+    /// is *built* — that pass runs over the whole token stream before the tree
+    /// exists, so its ids come out in stream order rather than document order.
+    /// The live service allocates at the point the expansion reaches the
+    /// element, which is why a bare `{{#invoke:Infobox|infobox}}` serves
+    /// `#mwt1` for the wrapper and `#mwt2` for the `<style>` inside it. The
+    /// splice below is that point, so the id is taken there.
+    about_counter: Option<std::rc::Rc<std::cell::Cell<usize>>>,
 }
 
 impl Html5TreeBuilder {
@@ -104,6 +125,44 @@ impl Html5TreeBuilder {
             explicitly_ended: std::collections::HashSet::new(),
             uid_to_data_id: HashMap::new(),
             fragments,
+            about_counter: None,
+        }
+    }
+
+    /// Provide the shared transclusion `about` counter, so an extension fragment
+    /// spliced into the tree can take its id in document order.
+    pub fn with_about_counter(mut self, counter: std::rc::Rc<std::cell::Cell<usize>>) -> Self {
+        self.about_counter = Some(counter);
+        self
+    }
+
+    /// Take the next `#mwtN`, or `None` when no counter was supplied (the
+    /// standalone/fixture path, which has no transclusion wrappers to number).
+    fn next_about_id(&self) -> Option<String> {
+        let counter = self.about_counter.as_ref()?;
+        let n = counter.get() + 1;
+        counter.set(n);
+        Some(format!("#mwt{n}"))
+    }
+
+    /// Replace the [`DEFERRED_ABOUT`] marker on any element in a freshly spliced
+    /// fragment with a real `about` id, in document order.
+    ///
+    /// Walking the fragment (rather than only its root) matters because a
+    /// stylesheet can be nested: `Module:Infobox` emits its `<style>` inside the
+    /// transclusion it is itself part of, and the outer element may already have
+    /// an id of its own.
+    fn resolve_deferred_about_ids(&self, node: &mut Node) {
+        if node.get_attr("about") == Some(DEFERRED_ABOUT) {
+            match self.next_about_id() {
+                Some(id) => node.set_attr("about", id),
+                // No counter: leave no attribute rather than a marker string,
+                // which would end up in the output.
+                None => node.attrs.retain(|a| a.key != "about"),
+            }
+        }
+        for child in &mut node.children {
+            self.resolve_deferred_about_ids(child);
         }
     }
 
@@ -464,10 +523,14 @@ impl Html5TreeBuilder {
             .and_then(|kv| kv.value.as_str())
             .and_then(|s| s.parse::<usize>().ok());
         if let Some(fragment_id) = fragment_id
-            && let Some(fragment) = self.fragments.remove(&fragment_id)
-            && let Some(stashed) = self.stash.get_mut(&data_id)
+            && let Some(mut fragment) = self.fragments.remove(&fragment_id)
         {
-            stashed.fragment = Some(fragment);
+            // This is where the wrapper tag sits in document order, so an
+            // extension fragment that deferred its `about` id takes it now.
+            self.resolve_deferred_about_ids(&mut fragment);
+            if let Some(stashed) = self.stash.get_mut(&data_id) {
+                stashed.fragment = Some(fragment);
+            }
         }
 
         // Mirrors `insertExplicitStartTag`: if the tag produced no element
@@ -594,7 +657,9 @@ impl Html5TreeBuilder {
                 .and_then(|kv| kv.value.as_str())
                 .and_then(|s| s.parse::<usize>().ok());
             let fragment = fragment_id.and_then(|id| self.fragments.remove(&id));
-            let id = self.stash_fragment(fragment.unwrap_or_else(Node::document), dp);
+            let mut fragment = fragment.unwrap_or_else(Node::document);
+            self.resolve_deferred_about_ids(&mut fragment);
+            let id = self.stash_fragment(fragment, dp);
             let attrs = Attributes::from_pairs(vec![
                 ("typeof".to_string(), "mw:DOMFragment".to_string()),
                 (DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()),
@@ -2187,7 +2252,7 @@ pub fn token_stream_to_ast_html(tokens: &[Item]) -> Node {
 /// Run the HTML5 tree builder over a token stream, with the page source
 /// available for `tsr`-based source recovery in deleted-tag placeholders.
 pub fn token_stream_to_ast_html_with_source(tokens: &[Item], source: Option<&str>) -> Node {
-    token_stream_to_ast_html_with_fragments(tokens, source, HashMap::new())
+    token_stream_to_ast_html_with_fragments(tokens, source, HashMap::new(), None)
 }
 
 /// Like [`token_stream_to_ast_html_with_source`], but accepts pre-built
@@ -2196,8 +2261,13 @@ pub fn token_stream_to_ast_html_with_fragments(
     tokens: &[Item],
     source: Option<&str>,
     fragments: HashMap<usize, Node>,
+    about_counter: Option<std::rc::Rc<std::cell::Cell<usize>>>,
 ) -> Node {
-    let mut builder = Html5TreeBuilder::with_source_and_fragments(source.unwrap_or(""), fragments);
+    let builder = Html5TreeBuilder::with_source_and_fragments(source.unwrap_or(""), fragments);
+    let mut builder = match about_counter {
+        Some(c) => builder.with_about_counter(c),
+        None => builder,
+    };
     builder.process_chunk(tokens);
     builder.process_token(&Item::Tok(ParsoidToken::Eof(
         crate::wikitext::tokens_v2::EOFTk,
@@ -2657,7 +2727,7 @@ mod tests {
             Item::Tok(ParsoidToken::SelfclosingTag(frag_tok)),
             end("pre"),
         ];
-        let mut doc = token_stream_to_ast_html_with_fragments(&items, None, fragments);
+        let mut doc = token_stream_to_ast_html_with_fragments(&items, None, fragments, None);
         // `finalize` no longer unpacks fragments; the full-page pipeline runs
         // `unpack_dom_fragments` after p-wrapping/encapsulation via
         // `post_pwrap_transforms`. Run the unpack here directly.
