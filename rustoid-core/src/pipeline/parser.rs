@@ -3277,19 +3277,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 /// construct is re-read as text rather than expanded in place.
 fn kv_to_source_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
     use crate::wikitext::token_utils::key_value_to_string;
-    // Prefer the source range over stringifying the tokens. `tokensToString` has
-    // no arm for a plain tag, so a `#invoke` argument holding one —
-    // `{{#invoke:If empty|main|<div>X</div>}}` — stringified to `X`, and the
-    // module was handed the text without its tags. The live service gives the
-    // module `<div>X</div>`: `{{#invoke:String|len|<div>X</div>}}` answers 12,
-    // not 1. The range is the wikitext as written, which is what Scribunto sees.
-    let value = kv
-        .src_offsets
-        .as_ref()
-        .map(|so| so.value_substr(""))
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| key_value_to_string(&kv.value));
+    let value = kv_value_source(kv);
     let key = key_value_to_string(&kv.key);
     if key.trim().is_empty() {
         Some(value)
@@ -3410,6 +3398,23 @@ const MAX_LUA_EXPANSION_DEPTH: usize = 16;
 ///
 /// A numeric key is positional, anything else named — the same split the
 /// template path makes for arguments.
+/// The wikitext of a `KV`'s value, preferring its source range.
+///
+/// `tokensToString` has no arm for a plain tag, so stringifying an argument that
+/// holds one drops it: a module handed `{{#invoke:String|len|<div>X</div>}}`
+/// answered `1` where the live service answers `12`, and the loss showed up in
+/// `data-mw` as `{"wt":"X"}` instead of the whole tag. The range is the source
+/// as written, which is what Scribunto sees, and it is the same technique
+/// `prepare_tpl_param_infos` uses for template parameters.
+fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
+    kv.src_offsets
+        .as_ref()
+        .map(|so| so.value_substr(""))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::wikitext::token_utils::key_value_to_string(&kv.value))
+}
+
 fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua::engine::Arg> {
     use crate::lua::engine::Arg;
     use crate::wikitext::token_utils::key_value_to_string;
@@ -3417,7 +3422,7 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
     let mut out = Vec::new();
     for kv in args {
         let key = key_value_to_string(&kv.key);
-        let value = key_value_to_string(&kv.value);
+        let value = kv_value_source(kv);
         let trimmed = key.trim();
         match (trimmed.parse::<usize>(), trimmed.is_empty()) {
             (Ok(_), false) => out.push(Arg::Positional(value)),

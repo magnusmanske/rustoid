@@ -1520,6 +1520,24 @@ fn sibling_reaches_offset(node: &Node, offset: Option<usize>) -> bool {
     end > offset
 }
 
+/// Whether `node` begins before `offset` in the source.
+///
+/// An element starting before the transclusion cannot be part of it, even when
+/// the transclusion's start marker is nested inside the element — the marker's
+/// offset is the transclusion's, and the element's own range is evidence that it
+/// predates it. Nodes without a `dsr` begin nowhere in particular and so are not
+/// excluded on this ground.
+fn sibling_starts_before(node: &Node, offset: Option<usize>) -> bool {
+    let Some(offset) = offset else {
+        return false;
+    };
+    node.dp
+        .as_ref()
+        .and_then(|dp| dp.dsr.as_ref())
+        .and_then(|dsr| dsr.start)
+        .is_some_and(|start| start < offset)
+}
+
 /// Whether a node is a transclusion/param *end* marker meta
 /// (`typeof="mw:Transclusion/End"` or `"mw:Param/End"`).
 fn is_transclusion_end(node: &Node) -> bool {
@@ -1980,7 +1998,19 @@ fn wrap_flipped_children(
         let mut encap_target = None;
         for (j, child) in children.iter_mut().enumerate().skip(lo).take(hi - lo + 1) {
             if matches!(child.kind, NodeKind::Element(_)) && !is_transclusion_start(child) {
-                child.set_attr("about", start_meta.get_attr("about").unwrap_or(""));
+                // A sibling that begins *before* the transclusion cannot be in
+                // it, whatever the nesting says. This is the paragraph-wrapper
+                // case: on `AAA{{If empty|<div>X</div>|b}}` the `<p>` holds the
+                // start marker yet begins at offset 0, before the template at 3,
+                // so stamping it with `about` gave the `<p>` the same id as the
+                // `<div>` — two elements sharing one transclusion id, where the
+                // live service serves one. Narrowing the *range* to drop the
+                // element was tried and cost five fixtures: the range must stay
+                // contiguous for the span-wrapping and deletability steps below,
+                // so only the stamp is withheld here.
+                if !sibling_starts_before(child, transclusion_start_offset(&start_meta)) {
+                    child.set_attr("about", start_meta.get_attr("about").unwrap_or(""));
+                }
                 if encap_target.is_none() {
                     encap_target = Some(j);
                 }
