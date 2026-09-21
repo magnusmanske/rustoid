@@ -221,6 +221,20 @@ async fn a_different_title_does_not_borrow_the_pages_protection() {
     assert!(html.contains(">b</span>"), "got: {html}");
 }
 
+/// The `{{#…}}` spelling, which is what a *module* produces.
+///
+/// `frame:callParserFunction('PROTECTIONEXPIRY', …)` renders the call as
+/// wikitext and re-expands it, so the word arrives with a leading hash — and
+/// an unhandled hash spelling returns the call *source* verbatim, which
+/// `Module:Effective protection expiry` then fails to match as a timestamp. It
+/// reported "internal error: malformed expiry timestamp" on 34 of 48 corpus
+/// pages, from a call the page-level scan cannot even see.
+#[tokio::test]
+async fn the_hash_spelling_is_answered_too() {
+    let html = render("Canada", "{{#protectionlevel:edit|Canada}}", protected()).await;
+    assert!(html.contains("extendedconfirmed"), "got: {html}");
+}
+
 /// The routing is the thing that broke, and it is invisible in the output.
 ///
 /// On a real wiki these two are *magic words*, which sends them down the

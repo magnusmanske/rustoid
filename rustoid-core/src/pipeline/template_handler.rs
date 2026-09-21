@@ -954,8 +954,13 @@ impl TemplateHandler {
                     vsrc: None,
                 };
                 let token_src = token.data_parsoid().and_then(|dp| dp.src.clone());
-                let result =
-                    Self::call_parser_function(config, &name, &pf_params, token_src.as_deref());
+                let result = Self::call_parser_function(
+                    config,
+                    &name,
+                    &pf_params,
+                    token_src.as_deref(),
+                    protection,
+                );
                 let mut encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 if !colon.is_empty() {
                     encap.set_colon(Some(colon));
@@ -1092,11 +1097,18 @@ impl TemplateHandler {
     /// leaves an unrecognized `{{#…}}` invocation unexpanded (the standalone
     /// "Parser function implementation … missing" message is a native-only
     /// branch not exercised by the integrated fixtures).
+    ///
+    /// `protection` answers the two protection magic words, which reach here in
+    /// their `{{#…}}` spelling. That spelling is not cosmetic: it is what a module
+    /// produces, because `frame:callParserFunction` renders the call as wikitext
+    /// and re-expands it, and a module cannot know the wiki spells the same word
+    /// without a hash on a page.
     fn call_parser_function(
         config: &dyn SiteConfig,
         name: &str,
         params: &Params,
         token_src: Option<&str>,
+        protection: &ProtectionContext,
     ) -> Vec<Item> {
         match name {
             "if" => ParserFunctions::pf_if(params),
@@ -1117,6 +1129,28 @@ impl TemplateHandler {
             // `{{#dir:code}}` — the directionality (`ltr`/`rtl`) of a language.
             // Core `$noHashFunctions` member (invoked with a leading `#`).
             "dir" => ParserFunctions::pf_dir(params),
+            // The `#`-spelled protection words, which is how a module reaches them.
+            // The no-hash spelling is answered from the variable arm instead, because
+            // a *page* spells it that way and the site's magic-word table routes it
+            // there. Both spellings must agree, so both call `answer`.
+            "protectionlevel" | "protectionexpiry" => {
+                let raw = protection_full_arg(
+                    &params
+                        .args
+                        .first()
+                        .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
+                        .unwrap_or_default(),
+                    params,
+                );
+                let level = name == "protectionlevel";
+                vec![Item::Str(protection.answer(&raw, |e, action| {
+                    if level {
+                        e.level(action).map(str::to_string)
+                    } else {
+                        e.expiry(action).map(str::to_string)
+                    }
+                }))]
+            }
             // Unknown parser function: preserve the original source verbatim.
             _ => vec![Item::Str(token_src.unwrap_or("").to_string())],
         }

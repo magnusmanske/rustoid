@@ -3118,6 +3118,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             /* in_template */ true,
             self.config.extension_tags(),
         );
+        // A module reaching a protection magic word is the common case, not an
+        // edge one: `Module:Effective protection expiry` and
+        // `Module:Effective protection level` are both built entirely from
+        // `frame:callParserFunction('PROTECTIONEXPIRY', …)`. The page-level scan
+        // cannot see these — the call is created at expansion time — so the
+        // titles are fetched here, where the module's own call is in hand and an
+        // await is available. Merged rather than replaced, because the page's
+        // own scan may already have fetched other titles.
+        {
+            let mut named = Vec::new();
+            collect_protection_titles(&items, &mut named);
+            if !named.is_empty() {
+                let fetched = source
+                    .get_title_protection(&named)
+                    .await
+                    .unwrap_or_default();
+                if !fetched.is_empty() {
+                    self.protection.borrow_mut().extend(fetched);
+                }
+            }
+        }
         // A call made from inside a module is a call from the module's own
         // scope, so `{{{1}}}` resolves against the module's frame, not the
         // caller's — hence a child of *this* frame.
@@ -3336,8 +3357,13 @@ fn collect_protection_titles(tokens: &[Item], out: &mut Vec<String>) {
                 .first()
                 .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
                 .unwrap_or_default();
+            // A module writing `frame:callParserFunction('PROTECTIONEXPIRY', …)`
+            // produces the `{{#…}}` spelling, so the leading hash has to come off
+            // before the name is recognised — a page spells the same word without
+            // one, and both must be collected.
+            let whole = whole.strip_prefix(['#', '＃']).unwrap_or(&whole);
             for name in ["PROTECTIONLEVEL:", "PROTECTIONEXPIRY:"] {
-                let Some(rest) = strip_prefix_ci(&whole, name) else {
+                let Some(rest) = strip_prefix_ci(whole, name) else {
                     continue;
                 };
                 // `rest` is the action, and for a longer call also the title
