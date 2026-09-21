@@ -325,7 +325,17 @@ impl HtmlSerializer {
             buf.push_str(&format!(" data-parsoid='{escaped}'"));
         }
         if let Some(ref dm) = node.data_mw {
-            let escaped = dm.replace('&', "&amp;").replace('\'', "&#39;");
+            // `&apos;` rather than `&#39;`: a `data-mw` value is JSON, and
+            // Parsoid writes the JSON entity for a quote — `&#39;` (which
+            // `data-parsoid` above uses) is another spelling of the same
+            // character and would differ byte-for-byte. `<` is escaped for a
+            // sharper reason: it is what ends an attribute in a lenient HTML
+            // parser, so a value carrying `<div class="…">` would otherwise
+            // truncate `data-mw` and spill the rest of the document as markup.
+            let escaped = dm
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('\'', "&apos;");
             buf.push_str(&format!(" data-mw='{escaped}'"));
         }
     }
@@ -356,7 +366,10 @@ impl HtmlSerializer {
             buf.push_str(&format!(" data-parsoid='{escaped}'"));
         }
         if let Some(ref dm) = node.data_mw {
-            let escaped = dm.replace('&', "&amp;").replace('\'', "&#39;");
+            let escaped = dm
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('\'', "&apos;");
             buf.push_str(&format!(" data-mw='{escaped}'"));
         }
     }

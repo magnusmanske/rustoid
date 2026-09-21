@@ -13,7 +13,7 @@
 use crate::expand::transclusion;
 use crate::title::{Title, TitleParser};
 use crate::traits::{DataSource, SiteConfig};
-use crate::wikitext::token_utils::{is_entity_span_token, match_type_of};
+use crate::wikitext::token_utils::{is_entity_span_token, key_value_to_string, match_type_of};
 use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
 use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 use std::collections::HashMap;
@@ -1129,6 +1129,25 @@ impl TemplateHandler {
             // `{{#dir:code}}` — the directionality (`ltr`/`rtl`) of a language.
             // Core `$noHashFunctions` member (invoked with a leading `#`).
             "dir" => ParserFunctions::pf_dir(params),
+            // `{{ns:…}}`/`{{nse:…}}` reached as *functions* (`{{safesubst:ns:0}}`,
+            // `{{#ns:0}}`) rather than as bare magic words. Both spellings mean the
+            // same thing, so both answer from the same place: the logic already
+            // exists in `variable_value`, and duplicating it here would let the two
+            // drift.
+            //
+            // Without this arm the name is a registered function hook with no
+            // implementation, so it fell through to the unknown-parser-function
+            // fallback and returned its own source — which is how
+            // `Template:Main other` came to compare `{{safesubst:<noinclude/>ns:0}}`
+            // as text rather than as the empty namespace name.
+            "ns" | "nse" => {
+                let arg = params
+                    .args
+                    .first()
+                    .map(|kv| key_value_to_string(&kv.key))
+                    .unwrap_or_default();
+                vec![Item::Str(Self::variable_value(config, name, &arg))]
+            }
             // The `#`-spelled protection words, which is how a module reaches them.
             // The no-hash spelling is answered from the variable arm instead, because
             // a *page* spells it that way and the site's magic-word table routes it

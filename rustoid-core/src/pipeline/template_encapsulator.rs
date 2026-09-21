@@ -265,8 +265,14 @@ impl OrderedJson {
     }
 }
 
-/// A JSON string literal for `s`, escaped by `serde_json` (so non-ASCII and
-/// control characters match what PHP's `json_encode` produces).
+/// A JSON string literal for `s`.
+///
+/// `serde_json` alone is enough *here*: the `&`/`<`/`'` that a `data-mw`
+/// attribute needs are applied once, when the attribute is written
+/// ([`crate::html::serialize`]), because escaping at both points would double
+/// them. In particular the nested HTML inside a `data-mw` `attribs[].html`
+/// field already carries its own escaping from the time it was built, and that
+/// must not be escaped again either.
 fn json_string(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
@@ -436,8 +442,23 @@ pub fn prepare_pf_param_infos(
     let mut out = Vec::new();
     let mut arg_index = 1usize;
 
-    // Split the colon-separated first argument from target_wt.
-    if let Some(pos) = target_wt.find([':', '：']) {
+    // The colon argument is part of `target_wt`, but whether it is *also* a
+    // parameter depends on how the tokenizer split the call — and getting that
+    // wrong shifts every later parameter by one, which is a `data-mw`
+    // difference on every parser function.
+    //
+    // It is already a parameter exactly when `params[0].key` holds the whole
+    // `"#name:arg"`, which is what `{{#ifeq:x|y|…}}` produces: `args[1..]` are
+    // then the branches and the loop below numbers them from 1, while the colon
+    // argument is already represented by `target.wt` and must **not** be emitted
+    // again. When the two were split apart the colon argument is absent from
+    // `params` entirely, and it becomes parameter 1.
+    let colon_arg_is_a_param = params
+        .args
+        .first()
+        .map(|kv| key_value_to_string(&kv.key))
+        .is_some_and(|k| k.contains(':'));
+    if !colon_arg_is_a_param && let Some(pos) = target_wt.find([':', '：']) {
         let arg0 = &target_wt[pos + 1..];
         let mut info = ParamInfo::new(arg_index.to_string());
         info.value_wt = arg0.to_string();
@@ -451,7 +472,7 @@ pub fn prepare_pf_param_infos(
         // Prefer the source range, as the template path does; fall back to the
         // stringified tokens only when the range is unavailable.
         let v = match &param.src_offsets {
-            Some(so) => so.value_substr(source).to_string(),
+            Some(so) => strip_include_directives(so.value_substr(source)),
             None => key_value_to_string(&param.value),
         };
         let mut info = ParamInfo::new(arg_index.to_string());
@@ -474,6 +495,47 @@ pub fn prepare_pf_param_infos(
 ///
 /// `source` is the ambient wikitext, used only for arguments whose range carries
 /// no source of its own.
+/// Strip `<includeonly>`/`<noinclude>`/`<onlyinclude>` directives from an
+/// argument's wikitext, as MediaWiki's preprocessor does before recording it.
+///
+/// A directive can appear in an argument value — `{{#if:1|<includeonly>x</includeonly>y}}`
+/// — and the live wiki records the parameter as `y` with the directive gone
+/// entirely, not with it kept as text. Leaving it in puts raw `<includeonly>`
+/// markup inside the `data-mw` attribute, where it both differs from the wiki
+/// and *corrupts the attribute*, because an unescaped `<`/`>` inside a
+/// single-quoted JSON string ends the attribute early and the rest of the page
+/// is then read as markup. That is how `Template:Short description` came to
+/// shatter: its body's `<includeonly>` block leaked into a parameter and the
+/// document after it was re-read as literal `{{#ifeq:…}}` text.
+///
+/// `<includeonly>` drops its contents *and* its tags: the value is stringified
+/// outside a transclusion context, and the wiki records `{{#if:1|<includeonly>x</includeonly>y}}`
+/// as `y`. `<noinclude>` keeps its contents and drops the tags (`xy`), and
+/// `<onlyinclude>` behaves like `<noinclude>` in an argument value.
+fn strip_include_directives(text: &str) -> String {
+    let mut out = text.to_string();
+    // `<includeonly>…</includeonly>` goes whole, contents included. A stray
+    // opening or closing tag with no partner is dropped on its own, so a
+    // malformed directive cannot leave half of it in a `data-mw` attribute.
+    while let Some(start) = out.find("<includeonly>") {
+        let after = start + "<includeonly>".len();
+        match out[after..].find("</includeonly>") {
+            Some(end) => out.replace_range(start..after + end + "</includeonly>".len(), ""),
+            None => {
+                out.replace_range(start..after, "");
+                break;
+            }
+        }
+    }
+    out.replace("</includeonly>", "")
+        .replace("<noinclude>", "")
+        .replace("</noinclude>", "")
+        .replace("<onlyinclude>", "")
+        .replace("</onlyinclude>", "")
+}
+
+/// Build `ParamInfo`s for a template call from the source ranges of its
+/// arguments, so `data-mw` records the wikitext as written.
 pub fn prepare_tpl_param_infos(
     params: &crate::pipeline::parser_functions::Params,
     source: &str,
@@ -495,6 +557,7 @@ pub fn prepare_tpl_param_infos(
                 key_value_to_string(&param.value),
             ),
         };
+        let v_src = strip_include_directives(&v_src);
         let k_wt = k_src.trim().to_string();
 
         // `TokenUtils::tokensToString` returns a string; only when it cannot (the
@@ -505,7 +568,6 @@ pub fn prepare_tpl_param_infos(
             KeyValue::Tokens(_) => k_wt.clone(),
         };
         let mut v = v_src.clone();
-
         // Even an empty `k` stays positional only when the value directly follows
         // the key; otherwise it is a blank *named* parameter (which is valid).
         let is_positional = k.is_empty()
@@ -628,11 +690,12 @@ mod tests {
         ]);
 
         let infos = prepare_pf_param_infos("#if:x", &params, "");
-        assert_eq!(infos.len(), 2);
+        // Only `yes`: the colon argument `x` is already represented by
+        // `target.wt`, so it is not a parameter. Verified against the live
+        // service, which records `{{#if:x|yes}}` as `params:{"1":{"wt":"yes"}}`.
+        assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].k, "1");
-        assert_eq!(infos[0].value_wt, "x");
-        assert_eq!(infos[1].k, "2");
-        assert_eq!(infos[1].value_wt, "yes");
+        assert_eq!(infos[0].value_wt, "yes");
     }
 
     /// A parser-function argument carrying an HTML tag must record the tag, not
@@ -669,8 +732,11 @@ mod tests {
         ]);
 
         let infos = prepare_pf_param_infos("#ifeq:1", &params, src);
-        assert_eq!(infos.len(), 2);
-        assert_eq!(infos[1].value_wt, "<div>hi</div>");
+        // One parameter, the div: the colon argument `1` is already in
+        // `target.wt`, so it is not repeated here (see
+        // `test_prepare_pf_param_infos`).
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].value_wt, "<div>hi</div>");
     }
 
     #[test]

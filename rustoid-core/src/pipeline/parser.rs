@@ -2931,6 +2931,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // (TemplateHandler.php:621, :648-666), so the flag must be forwarded too:
         // `{{1x|1= {{!}}bar}}` at the top level expands `{{!}}` to a literal `|`
         // (the `<td>` form is reserved for argument values, expanded above).
+        //
+        // It is also the flag that decides whether a nested transclusion gets
+        // its own `mw:Transclusion` span, and there the caller's value is the
+        // correct one: `{{ {{T}} }}` must keep the inner span, so forcing `true`
+        // for a body breaks it.
         let expanded = Box::pin(self.expand_templates(
             &child_frame,
             spliced,
