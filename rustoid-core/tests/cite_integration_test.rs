@@ -68,10 +68,14 @@ async fn render_with(wikitext: &str, templates: &[(&str, &str)]) -> String {
 #[tokio::test]
 async fn a_ref_renders_a_marker() {
     let html = render("Text<ref>Body</ref> more.").await;
+    // The `<sup>` carries a transclusion `about` id as well as Cite's classes:
+    // the served page reads `<sup about="#mwt13" class="mw-ref reference" …>`,
+    // so the attribute is asserted rather than assumed absent.
     assert!(
-        html.contains("<sup class=\"mw-ref reference\""),
+        html.contains("class=\"mw-ref reference\""),
         "the ref must become a sup marker: {html}"
     );
+    assert!(html.contains("about=\"#mwt"), "no about id: {html}");
     assert!(html.contains("typeof=\"mw:Extension/ref\""), "{html}");
     assert!(html.contains("class=\"mw-reflink-text\""), "{html}");
     assert!(html.contains("class=\"cite-bracket\""), "{html}");

@@ -2177,6 +2177,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // module, which knows nothing about parsing.
         {
             let mut ids = crate::ext::cite::DocIds::new();
+            // Cite's `about` ids come out of the document's transclusion
+            // sequence, so it continues the counter the expansion already used
+            // rather than starting a second one.
+            ids.set_about_counter(about_counter.get());
             // `RefCell`/`Cell` because the body renderer must be `Fn` rather than
             // `FnMut`: Cite may call it for several notes, and a `FnMut` would force
             // the Cite module to hold a mutable borrow of state it does not own.
@@ -2195,6 +2199,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 frag
             };
             crate::ext::cite::run(&mut ast, &page_title_prefixed, &mut ids, &render_body);
+            // Hand the advanced counter back: ids are allocated in document
+            // order, so anything numbered after Cite must continue from here.
+            about_counter.set(ids.about_counter());
         }
         wrap_sections_in_ast(&mut ast, options.wrap_sections);
         // Page-bundle node ids are allocated last, after every pass that can create
