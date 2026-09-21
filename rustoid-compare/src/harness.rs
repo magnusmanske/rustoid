@@ -862,9 +862,16 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     // layer page-bundles Parsoid output and assigns each metadata-bearing element an
     // `id="mw…"`. Parsoid's standalone mode emits none, and the fixture suite (which
     // compares against standalone output) therefore leaves this off.
+    //
+    // `wrap_sections` is on for the same reason: the REST transform output wraps
+    // the body in `<section data-mw-section-id>` elements, and those wrappers take
+    // the first node ids on the page. Leaving it off shifted every id by one and
+    // made the difference read as an id mismatch rather than as the missing
+    // wrapper it actually is.
     let options = rustoid_core::ParserOptions {
         node_ids: true,
         strip_data_parsoid: true,
+        wrap_sections: true,
         ..rustoid_core::ParserOptions::for_page(title)
     };
     let html = match tokio::time::timeout(

@@ -435,7 +435,14 @@ pub fn render_call(request: &FrameRequest) -> String {
         // written even when the function ignores it.
         FrameRequest::CallParserFunction { name, args } => {
             let mut args = args.iter();
-            let mut out = format!("{{{{#{name}");
+            // The `#` is *syntax*, not part of the name: Scribunto names the
+            // function `tag`, and `{{#tag:…}}` writes the hash once. A name that
+            // arrives with its own leading `#` — which is how
+            // `frame:extensionTag` is lowered, to `"#tag"` — would otherwise
+            // render as `{{##tag:…}}`, which is not a call at all and silently
+            // failed to expand.
+            let bare = name.strip_prefix('#').unwrap_or(name);
+            let mut out = format!("{{{{#{bare}");
             if let Some(first) = args.next() {
                 out.push(':');
                 out.push_str(&first.value);
