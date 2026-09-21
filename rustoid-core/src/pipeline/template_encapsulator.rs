@@ -288,9 +288,51 @@ fn json_string(s: &str) -> String {
 
 /// Serialize a `TemplateInfo` as the inner object of a `data-mw` part.
 pub fn serialize_template_info(info: &TemplateInfo) -> String {
+    // An `old-parserfunction` — the v2 shape, which is what a wiki with
+    // `ParsoidExperimentalParserFunctionOutput` off serves, i.e. enwiki — folds
+    // the *first* argument onto `target.wt`, after a colon, and renumbers the
+    // survivors positionally. Mirrors the `array_shift` + `renumberParamInfos`
+    // pair in `TemplateInfo::toJsonArray`:
+    //
+    //     a {{#if:foo|bar|baz}} b
+    //     → target.wt = "#if:foo", params = {1:bar, 2:baz}
+    //
+    // The v3 shape (`parserfunction`) keeps every parameter and writes the
+    // function as `target.key` instead. Both shapes are exercised by
+    // `fixtures/v3ParserFunctions.txt`.
+    //
+    // `info.target_wt` is the part *before* the colon (`"#if"`) for a parser
+    // function, so the fold appends the colon and the argument. Appending to a
+    // `target_wt` that already carries the colon gives `"#if:foo:foo"`, and
+    // reading that double-append as "the fold must not apply here" led to a
+    // version that dropped the first argument of every call instead.
+    // The fold applies to an `old-parserfunction` whose `target.wt` does *not*
+    // already carry the colon argument — i.e. one the tokenizer split into
+    // ``target` + first parameter. A call whose `target.wt` is already
+    // `"#if:1"` keeps every parameter, which is what the live service serves.
+    // The two spellings really do occur: `{{#if:1|yes|no}}` reaches here with the
+    // colon argument in the target, while the fixture's `{{#if:foo|bar|baz}}`
+    // reaches it as parameter 1.
+    let is_v2 = info.ty.as_deref() != Some("parserfunction");
+    let folds_first_arg =
+        is_v2 && info.func.is_some() && !info.target_wt.as_deref().unwrap_or("").contains(':');
+    let wt = if folds_first_arg {
+        match info.param_infos.first() {
+            Some(first) => {
+                let mut wt = info.target_wt.clone().unwrap_or_default();
+                wt.push(':');
+                wt.push_str(&first.value_wt);
+                wt
+            }
+            None => info.target_wt.clone().unwrap_or_default(),
+        }
+    } else {
+        info.target_wt.clone().unwrap_or_default()
+    };
+
     // `target` first: Parsoid's order, verified against the live service.
     let mut target = OrderedJson::default();
-    target.put_opt_str("wt", info.target_wt.as_deref());
+    target.put_opt_str("wt", Some(&wt));
     if let Some(func) = &info.func {
         if info.ty.as_deref() == Some("parserfunction") {
             target.put_str("key", func);
@@ -302,25 +344,27 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
     // page to link to, and the live service writes no `href` at all.
     target.put_some_str("href", info.href.as_deref());
 
-    // All parameters are kept, for both `parserfunction` and
-    // `old-parserfunction`. PHP's `TemplateInfo::toJsonArray` *does* fold the
-    // first argument onto `target.wt` for a true `old-parserfunction` — but the
-    // live service serves `#if:1|a|b` as `wt = "#if:1"` with `params =
-    // {1:a, 2:b}`, i.e. unfolded, so the wiki's parser functions arrive here as
-    // `parserfunction` and the fold does not apply. Reinstating it dropped the
-    // first argument of every parser function instead of folding it.
-
     // Params object (preserve PHP's disambiguating "=N=key" for duplicate keys).
     let mut params = OrderedJson::default();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut count = 0usize;
-    for param in &info.param_infos {
+    for (idx, param) in info.param_infos.iter().enumerate() {
+        // The folded first argument is already on `wt`; it is dropped from
+        // `params` and the rest are renumbered from 1, positionally.
+        if folds_first_arg && idx == 0 {
+            continue;
+        }
         count += 1;
-        let mut key = param.k.clone();
+        let (k, named) = if folds_first_arg {
+            (count.to_string(), false)
+        } else {
+            (param.k.clone(), param.named)
+        };
+        let mut key = k;
         if seen.contains_key(&key) {
             key = format!("={count}={key}");
         }
-        seen.insert(param.k.clone(), count);
+        seen.insert(key.clone(), count);
 
         let mut value = OrderedJson::default();
         value.put_opt_str(
@@ -346,8 +390,8 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
         // which is what keeps `{"1":{"wt":"a"}}` free of both.
         if info.ty.as_deref() == Some("parserfunction") {
             let is_numeric = param.is_numeric_key();
-            if param.named == is_numeric {
-                value.put("eq", if param.named { "true" } else { "false" });
+            if named == is_numeric {
+                value.put("eq", if named { "true" } else { "false" });
             }
             let order = count;
             let default_order = if is_numeric {
@@ -376,17 +420,20 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
 /// `{"parts": [{"<type>": <TemplateInfo>}]}` where `<type>` is one of
 /// `template`, `parserfunction`, or `templatearg`.
 ///
-/// Both `old-parserfunction` and `parserfunction` serialize to the `template`
-/// key: PHP's `DataMw::toJsonArray` normalizes only `old-parserfunction`, and
-/// the `parserfunction` key is reserved for a *modern* PFragment handler — a
-/// site-config extension, not anything core or Scribunto registers. The live
-/// service confirms it, serving `"template":{"target":{"wt":"#invoke:Infobox",
-/// "function":"invoke"},…}` for a `#invoke`.
+/// `old-parserfunction` serializes under the `template` key: PHP's
+/// `DataMw::toJsonArray` normalizes exactly that one name. A genuine
+/// `parserfunction` keeps the `parserfunction` key — that is the v3 shape, and
+/// it is what `ParsoidExperimentalParserFunctionOutput=true` turns on.
+///
+/// Both are reachable on enwiki, which is *why* the `ty` distinction has to
+/// survive all the way to serialization: the fixture `v3ParserFunctions.txt`
+/// pins the v3 output, and the served HTML pins the v2 one. The `parts` key and
+/// the function's field name (`key` vs `function`) move together.
 pub fn serialize_data_mw(info: &TemplateInfo) -> String {
-    let type_key = if info.ty.as_deref() == Some("templatearg") {
-        "templatearg"
-    } else {
-        "template"
+    let type_key = match info.ty.as_deref() {
+        Some("parserfunction") => "parserfunction",
+        Some("templatearg") => "templatearg",
+        Some(_) | None => "template",
     };
     // Assembled textually rather than through `serde_json::Value`: a
     // `serde_json` object sorts its keys, which would undo the ordering
@@ -909,21 +956,82 @@ mod tests {
 
     #[test]
     fn test_serialize_data_mw_parserfunction_v3() {
-        // A v3 parser function (ty = "parserfunction") still serializes under the
-        // "template" parts key: PHP's `DataMw::toJsonArray` normalizes only
-        // `old-parserfunction`, and the "parserfunction" key is reserved for a
-        // modern PFragment handler. Note that the func name *is* written as
-        // `key` rather than `function` for this type (mirrors
-        // `TemplateInfo::toJsonArray`).
+        // A v3 parser function (ty = "parserfunction") uses the "parserfunction"
+        // parts key and writes the func as `target.key`, keeping every parameter
+        // (mirrors `TemplateInfo::toJsonArray`). PHP's `DataMw::toJsonArray`
+        // normalizes only `old-parserfunction` to `template`.
+        //
+        // This is the shape `ParsoidExperimentalParserFunctionOutput=true` turns
+        // on, and the tree builder reads the `parserfunction` key to add the
+        // `mw:ParserFunction/<name>` typeof — so both the key and the field name
+        // are load-bearing, on a config a real wiki can set.
         let mut info = template_info_from(Some("if"), None, vec![]);
         info.ty = Some("parserfunction".to_string());
-        info.target_wt = Some("#if:foo".to_string());
+        info.target_wt = Some("#if".to_string());
+        let mut first = ParamInfo::new("1");
+        first.value_wt = "foo".to_string();
+        info.param_infos = vec![first];
 
         let json = serialize_data_mw(&info);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert!(parsed["parts"][0].get("template").is_some());
-        assert!(parsed["parts"][0].get("parserfunction").is_none());
-        assert_eq!(parsed["parts"][0]["template"]["target"]["key"], "if");
+        assert!(parsed["parts"][0].get("parserfunction").is_some());
+        assert!(parsed["parts"][0].get("template").is_none());
+        assert_eq!(parsed["parts"][0]["parserfunction"]["target"]["key"], "if");
+        assert_eq!(parsed["parts"][0]["parserfunction"]["target"]["wt"], "#if");
+        assert_eq!(
+            parsed["parts"][0]["parserfunction"]["params"]["1"]["wt"],
+            "foo"
+        );
+    }
+
+    /// An `old-parserfunction` whose target carries no colon folds its first
+    /// argument onto `target.wt` and renumbers the rest. The fixture
+    /// `v3ParserFunctions.txt` pins the exact `data-mw` string.
+    #[test]
+    fn test_serialize_data_mw_v2_folds_the_colon_argument() {
+        let mut info = template_info_from(Some("if"), None, vec![]);
+        info.ty = Some("old-parserfunction".to_string());
+        info.target_wt = Some("#if".to_string());
+        info.param_infos = ["foo", "bar", "baz"]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut p = ParamInfo::new((i + 1).to_string());
+                p.value_wt = v.to_string();
+                p
+            })
+            .collect();
+
+        let json = serialize_data_mw(&info);
+        assert_eq!(
+            json,
+            r##"{"parts":[{"template":{"target":{"wt":"#if:foo","function":"if"},"params":{"1":{"wt":"bar"},"2":{"wt":"baz"}},"i":0}}]}"##
+        );
+    }
+
+    /// A call whose target already carries the colon argument is *not* folded:
+    /// the live service serves `{{#if:1|yes|no}}` with `wt = "#if:1"` and both
+    /// parameters intact.
+    #[test]
+    fn test_serialize_data_mw_a_colon_in_the_target_is_not_folded_again() {
+        let mut info = template_info_from(Some("if"), None, vec![]);
+        info.ty = Some("old-parserfunction".to_string());
+        info.target_wt = Some("#if:1".to_string());
+        info.param_infos = ["yes", "no"]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut p = ParamInfo::new((i + 1).to_string());
+                p.value_wt = v.to_string();
+                p
+            })
+            .collect();
+
+        let json = serialize_data_mw(&info);
+        assert_eq!(
+            json,
+            r##"{"parts":[{"template":{"target":{"wt":"#if:1","function":"if"},"params":{"1":{"wt":"yes"},"2":{"wt":"no"}},"i":0}}]}"##
+        );
     }
 
     #[test]
