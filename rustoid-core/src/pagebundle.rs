@@ -251,9 +251,13 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
     let mut assigned = 0;
 
     if node.kind.is_element() {
-        // Rule 1: metadata to key by. An empty `id=""` is treated as absent, as
-        // Parsoid does ("Forcibly reset the ID if it is invalid").
-        let has_metadata = node.data_parsoid.is_some() || node.data_mw.is_some();
+        // A node takes an id when Parsoid has something to key it by. That is
+        // `data-parsoid` or `data-mw`, plus the elements that were given an empty
+        // `data-parsoid` by `serializeNewEmptyDp` — [`Node::empty_dp_slot`]. An
+        // empty `id=""` is treated as absent, as Parsoid does ("Forcibly reset
+        // the ID if it is invalid").
+        let has_metadata =
+            node.data_parsoid.is_some() || node.data_mw.is_some() || node.empty_dp_slot;
         let has_id = node.get_attr("id").is_some_and(|v| !v.is_empty());
         if has_metadata && !has_id {
             let id = alloc.next_id();

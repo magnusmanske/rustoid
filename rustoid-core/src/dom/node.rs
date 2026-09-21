@@ -146,6 +146,17 @@ pub struct Node {
     /// `UnpackDOMFragments` to splice extension/template content back into the
     /// tree during finalize.
     pub fragment: Option<Box<Node>>,
+    /// This element has a `data-parsoid` *slot* but emits no attribute for it.
+    ///
+    /// Parsoid's integrated output runs with `serializeNewEmptyDp`, which creates
+    /// an empty `DataParsoid` for elements that have none, assigns them a node id
+    /// (the id pass fires on "has data-parsoid"), and then suppresses the empty
+    /// attribute from the output. A `<section>` is the visible case: the live
+    /// service serves `<section data-mw-section-id="0" id="mwAQ">` with no
+    /// `data-parsoid`, yet that section consumes the document's first id. So
+    /// "takes an id" and "emits `data-parsoid`" are genuinely different questions,
+    /// and this flag is the difference.
+    pub empty_dp_slot: bool,
 }
 
 impl Node {
@@ -159,6 +170,7 @@ impl Node {
             dp: None,
             data_mw: None,
             fragment: None,
+            empty_dp_slot: false,
         }
     }
 
@@ -172,6 +184,7 @@ impl Node {
             dp: None,
             data_mw: None,
             fragment: None,
+            empty_dp_slot: false,
         }
     }
 
@@ -185,6 +198,7 @@ impl Node {
             dp: None,
             data_mw: None,
             fragment: None,
+            empty_dp_slot: false,
         }
     }
 
@@ -198,6 +212,7 @@ impl Node {
             dp: None,
             data_mw: None,
             fragment: None,
+            empty_dp_slot: false,
         }
     }
 

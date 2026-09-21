@@ -39,6 +39,12 @@ impl SectionNumber {
 fn new_section(id: &str) -> Node {
     let mut section = Node::element(ElementKind::Section);
     section.set_attr("data-mw-section-id", id);
+    // A wrapper Parsoid created, so it has a `data-parsoid` slot even though the
+    // slot is empty and nothing is emitted for it — and therefore it takes a node
+    // id. The live service serves `<section data-mw-section-id="0" id="mwAQ">`,
+    // which is the document's *first* id, ahead of every element inside it.
+    // Without this the section is skipped and everything after it shifts by one.
+    section.empty_dp_slot = true;
     section
 }
 

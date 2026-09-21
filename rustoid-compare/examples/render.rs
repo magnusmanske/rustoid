@@ -50,6 +50,7 @@ async fn main() {
     let options = rustoid_core::ParserOptions {
         node_ids: true,
         strip_data_parsoid: true,
+        wrap_sections: std::env::var_os("RUSTOID_WRAP_SECTIONS").is_some(),
         ..rustoid_core::ParserOptions::for_page(&title)
     };
     let started = std::time::Instant::now();
