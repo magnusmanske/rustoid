@@ -10,10 +10,12 @@ use crate::error::Result;
 use crate::options::ParserOptions;
 use crate::pipeline::frame::Frame;
 use crate::pipeline::template_encapsulator::{TemplateEncapsulator, template_info_from};
-use crate::pipeline::template_handler::{TemplateHandler, resolve_template_target};
+use crate::pipeline::template_handler::{
+    ProtectionContext, TemplateHandler, resolve_template_target,
+};
 use crate::pipeline::tree_builder_stage::TreeBuilderStage;
 use crate::title::TitleParser;
-use crate::traits::{DataSource, SiteConfig};
+use crate::traits::{DataSource, ProtectionEntry, SiteConfig};
 use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
 use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
 
@@ -757,6 +759,18 @@ pub struct Parser<'a, C: SiteConfig> {
     /// this is a per-parse counter instead (reset in [`Parser::reset_expansion`]).
     /// Within one parse the observable behaviour is identical.
     expansion_depth: std::cell::Cell<u64>,
+    /// Protection level per action for the titles this page's `{{PROTECTIONLEVEL:…}}`
+    /// and `{{PROTECTIONEXPIRY:…}}` calls asked about, plus the page's own.
+    ///
+    /// Populated once, before the AST is built, from
+    /// [`crate::traits::DataSource::get_title_protection`]. It is gated with the
+    /// `page_title` above and for the same reason: one place needs it and it is
+    /// reached from several expansion paths, so threading it through every
+    /// signature would cost more than it explains.
+    protection: std::cell::RefCell<std::collections::HashMap<String, ProtectionEntry>>,
+    /// The protection levels of the page being parsed, as
+    /// `{{PROTECTIONLEVEL:action}}` with no title argument reports them.
+    page_protection: std::cell::RefCell<ProtectionEntry>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
@@ -768,7 +782,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             pp_node_count: std::cell::Cell::new(0),
             expansion_depth: std::cell::Cell::new(0),
             strip_data_parsoid: std::cell::Cell::new(false),
+            protection: std::cell::RefCell::new(std::collections::HashMap::new()),
+            page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
         }
+    }
+
+    /// The protection answers `{{PROTECTIONLEVEL:…}}`/`{{PROTECTIONEXPIRY:…}}`
+    /// may give during this parse.
+    ///
+    /// Borrows for as long as the returned context lives, so the caller must
+    /// not hold an expansion that writes the map. Both maps are written exactly
+    /// once, in [`Parser::build_ast`] before expansion starts, so a borrow taken
+    /// during expansion can never conflict with a write.
+    fn protection_context(&self) -> ProtectionContext<'_> {
+        ProtectionContext::new(&self.page_protection, &self.protection)
     }
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
@@ -1988,6 +2015,46 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `mw.wikibase`; see the field's own comment.
         *self.page_title.borrow_mut() = title.get_prefixed_text();
         self.strip_data_parsoid.set(options.strip_data_parsoid);
+        // The protection of the page being parsed, for `{{PROTECTIONLEVEL:action}}`
+        // with no title argument. Fetched once here rather than on demand because
+        // expansion is synchronous: a magic word cannot await a fetch, so the
+        // answer has to be in hand before the tokens are walked.
+        //
+        // Keyed by the *prefixed* title and also by the title as given, because
+        // `{{PROTECTIONLEVEL:edit|Foo}}` names it the way a module would, without
+        // knowing the namespace prefix was implied.
+        let mut page_protection = ProtectionEntry::default();
+        if let Some(source) = source {
+            let wanted = vec![title.get_prefixed_text(), page_title.to_string()];
+            if let Some(entry) = source
+                .get_title_protection(&wanted)
+                .await
+                .unwrap_or_default()
+                .remove(&title.get_prefixed_text())
+            {
+                page_protection = entry;
+            }
+        }
+        *self.page_protection.borrow_mut() = page_protection;
+        // Titles named by a `{{PROTECTIONLEVEL:action|title}}` on this page, which
+        // the magic word cannot fetch for itself (expansion is synchronous).
+        //
+        // Scanned off the *unexpanded* token stream, which is what makes it
+        // work: a protection check inside a transcluded template is not visible
+        // here, but `tokens` at this point already includes every template this
+        // page transcludes only after expansion. A call that arrives from a
+        // template therefore reads as unprotected, which is recorded in
+        // ONLINE-PARITY.md rather than papered over.
+        if let Some(source) = source {
+            let mut named = Vec::new();
+            collect_protection_titles(&tokens, &mut named);
+            if !named.is_empty() {
+                *self.protection.borrow_mut() = source
+                    .get_title_protection(&named)
+                    .await
+                    .unwrap_or_default();
+            }
+        }
         // A parse starts with the preprocessor counters clear, mirroring the part
         // of `Parser::clearState` that zeroes `mPPNodeCount`.
         self.reset_expansion();
@@ -2495,8 +2562,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let mut expanded_tok = stt.clone();
                 expanded_tok.attribs = attribs;
                 let expanded_item = Item::Tok(ParsoidToken::SelfclosingTag(expanded_tok));
-                let expanded =
-                    TemplateHandler.process(self.config, frame, about_counter, vec![expanded_item]);
+                let expanded = TemplateHandler.process(
+                    self.config,
+                    frame,
+                    about_counter,
+                    &self.protection_context(),
+                    vec![expanded_item],
+                );
                 for e in &expanded {
                     track_table(e, table_depth);
                 }
@@ -3238,6 +3310,86 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
 /// value` with no location at all, which cannot be attributed to anything; the
 /// first frame names the module and line. The full trace is still discarded,
 /// because it is long enough to distort the byte totals the scoreboard reports.
+/// The titles a `{{PROTECTIONLEVEL:…}}`/`{{PROTECTIONEXPIRY:…}}` call on this
+/// page names, so they can be fetched before expansion runs.
+///
+/// Walks the token stream rather than the AST because the fetch has to happen
+/// *before* the magic word is evaluated, and because attribute values are
+/// sub-pipelines whose tokens are reached through the tag, not through the tree.
+///
+/// A title built at runtime cannot be seen here and reads as unprotected, the
+/// same gap `preload_titles` has and for the same reason.
+fn collect_protection_titles(tokens: &[Item], out: &mut Vec<String>) {
+    for item in tokens {
+        let Item::Tok(tok) = item else { continue };
+        let attribs = match tok {
+            ParsoidToken::SelfclosingTag(t) => Some(&t.attribs),
+            ParsoidToken::Tag(t) => Some(&t.attribs),
+            _ => None,
+        };
+        if let Some(attribs) = attribs {
+            // The target is `args[0].key`: a magic word keeps the whole
+            // `NAME:action|title` text there, and the arguments after it are
+            // separate. Reading both is what covers `{{P:edit|X}}` and the
+            // named form alike.
+            let whole = attribs
+                .first()
+                .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
+                .unwrap_or_default();
+            for name in ["PROTECTIONLEVEL:", "PROTECTIONEXPIRY:"] {
+                let Some(rest) = strip_prefix_ci(&whole, name) else {
+                    continue;
+                };
+                // `rest` is the action, and for a longer call also the title
+                // after a `|`. When the tokenizer split them into separate
+                // parameters the title is in the *value* of the next one —
+                // verified by printing the token, not inferred: a positional
+                // parameter is `key=""`, `value="Canada"`.
+                let title = rest
+                    .split_once('|')
+                    .map(|(_, t)| t)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        attribs.get(1).map(|kv| {
+                            let key = crate::wikitext::token_utils::key_value_to_string(&kv.key);
+                            if key.is_empty() {
+                                crate::wikitext::token_utils::key_value_to_string(&kv.value)
+                            } else {
+                                key
+                            }
+                        })
+                    })
+                    .unwrap_or_default();
+                let title = title.trim().to_string();
+                if !title.is_empty() {
+                    // MediaWiki normalises underscores to spaces before it looks a
+                    // title up, so the fetch has to use the same spelling the
+                    // lookup will later try — otherwise `Can_ada` is fetched and
+                    // then searched for as `Can ada`.
+                    out.push(title.replace('_', " "));
+                }
+            }
+        }
+        // An attribute value is a sub-pipeline of its own, so a call inside one
+        // is only reachable by descending into the key/value token lists.
+        for kv in attribs.into_iter().flatten() {
+            for side in [&kv.key, &kv.value] {
+                if let crate::wikitext::tokens_v2::KeyValue::Tokens(inner) = side {
+                    collect_protection_titles(inner, out);
+                }
+            }
+        }
+    }
+}
+
+/// `strip_prefix`, case-insensitively, for a magic-word spelling.
+fn strip_prefix_ci<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = haystack.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &haystack[prefix.len()..])
+}
+
 fn script_error(message: &str) -> String {
     let short = message
         .split("\nstack traceback:")

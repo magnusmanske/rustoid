@@ -16,6 +16,7 @@ use crate::traits::{DataSource, SiteConfig};
 use crate::wikitext::token_utils::{is_entity_span_token, match_type_of};
 use crate::wikitext::tokenizer_v2::{PegTokenizer, TokenizerOptions};
 use crate::wikitext::tokens_v2::{Item, ParsoidToken};
+use std::collections::HashMap;
 
 use super::parser_functions::{Params, ParserFunctions};
 use super::template_encapsulator::{TemplateEncapsulator, TemplateInfo, template_info_from};
@@ -547,6 +548,36 @@ fn magic_word_for_variable(config: &dyn SiteConfig, name: &str) -> Option<(Strin
     None
 }
 
+/// The full `action|title` argument of a protection magic word.
+///
+/// `pf_arg` holds everything after the first colon, which is the whole argument
+/// when the tokenizer folded it into the target (`{{PROTECTIONLEVEL:edit|Canada}}`
+/// is one parameter whose key is the entire string). The tokenizer does not
+/// always do that, and when it does not, the title sits in the *value* of the
+/// next parameter with an empty key — so both are read here rather than one.
+fn protection_full_arg(pf_arg: &str, params: &Params) -> String {
+    if pf_arg.contains('|') {
+        return pf_arg.to_string();
+    }
+    let rest = params
+        .args
+        .get(1)
+        .map(|kv| {
+            let key = crate::wikitext::token_utils::key_value_to_string(&kv.key);
+            if key.is_empty() {
+                crate::wikitext::token_utils::key_value_to_string(&kv.value)
+            } else {
+                key
+            }
+        })
+        .unwrap_or_default();
+    if rest.is_empty() {
+        pf_arg.to_string()
+    } else {
+        format!("{pf_arg}|{rest}")
+    }
+}
+
 /// Process the special `!` magic word. Mirrors PHP's
 /// `TemplateHandler::processSpecialMagicWord`.
 ///
@@ -574,6 +605,95 @@ pub fn process_special_magic_word(magic_word_type: &str, in_template: bool) -> V
         // PHP throws an unreachable here for unsupported magic word types.
         // We return an empty chunk rather than panicking.
         Vec::new()
+    }
+}
+
+/// What `{{PROTECTIONLEVEL:…}}` and `{{PROTECTIONEXPIRY:…}}` can answer.
+///
+/// These are core magic words, but unlike `{{SITENAME}}` they need data no site
+/// configuration carries: the protection actually applied to a page. Expansion
+/// is synchronous, so the answers must be in hand before the tokens are walked —
+/// the parser fetches the page's own protection up front and this carries it.
+///
+/// A title the parser did not prefetch reports as unprotected, which is
+/// MediaWiki's answer for a title that does not exist and the conservative one
+/// for a title that was simply not asked about.
+pub struct ProtectionContext<'a> {
+    /// The page being parsed, for the no-title form.
+    pub page: std::cell::Ref<'a, crate::traits::ProtectionEntry>,
+    /// Protection for any other title a call named.
+    pub titles: std::cell::Ref<'a, HashMap<String, crate::traits::ProtectionEntry>>,
+}
+
+impl<'a> ProtectionContext<'a> {
+    /// Borrow both maps for as long as the returned context lives.
+    ///
+    /// Taking the `Ref`s here rather than at the call sites keeps the two
+    /// borrows together: a caller cannot accidentally hold one and drop the
+    /// other, and the expansion paths that need protection never touch the
+    /// `RefCell`s directly.
+    pub fn new(
+        page: &'a std::cell::RefCell<crate::traits::ProtectionEntry>,
+        titles: &'a std::cell::RefCell<HashMap<String, crate::traits::ProtectionEntry>>,
+    ) -> Self {
+        Self {
+            page: page.borrow(),
+            titles: titles.borrow(),
+        }
+    }
+}
+
+impl ProtectionContext<'_> {
+    /// Resolve the first argument of a protection magic word.
+    ///
+    /// With no argument the page being parsed is meant; with a title (or an
+    /// empty one) the named page. `None` means the title is not one the parser
+    /// looked up, which every caller answers as "unprotected" — the same answer
+    /// MediaWiki gives for a page that does not exist.
+    fn entry(&self, arg: &str) -> Option<&crate::traits::ProtectionEntry> {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return Some(&self.page);
+        }
+        // The wiki normalises underscores to spaces and capitalises the first
+        // letter, so a module writing `{{PROTECTIONLEVEL:edit|template:foo}}`
+        // must find what the parser stored under the prefixed spelling.
+        let normalized = arg.replace('_', " ");
+        self.titles
+            .get(arg)
+            .or_else(|| self.titles.get(&normalized))
+            .or_else(|| self.titles.get(&capitalize(&normalized)))
+    }
+
+    /// Shared shape of the two magic words: split `action` and the optional
+    /// title out of the colon argument, resolve the title's protection, and take
+    /// one field from it.
+    ///
+    /// `raw` is everything after the first colon, so `"edit"` or
+    /// `"edit|Canada"`. A missing action or an unprotected page both answer with
+    /// the empty string, which is what MediaWiki returns and what callers test
+    /// for.
+    pub fn answer(
+        &self,
+        raw: &str,
+        pick: impl Fn(&crate::traits::ProtectionEntry, &str) -> Option<String>,
+    ) -> String {
+        let (action, title) = match raw.split_once('|') {
+            Some((a, t)) => (a, t),
+            None => (raw, ""),
+        };
+        self.entry(title)
+            .and_then(|e| pick(e, action.trim()))
+            .unwrap_or_default()
+    }
+}
+
+/// Uppercase the first character, as MediaWiki title normalisation does.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -764,6 +884,7 @@ impl TemplateHandler {
         params: &Params,
         about_id: String,
         token: &crate::wikitext::tokens_v2::ParsoidToken,
+        protection: &ProtectionContext,
     ) -> Vec<Item> {
         // Extract the target (first arg key).
         let target_str = params
@@ -793,7 +914,24 @@ impl TemplateHandler {
                 if magic_word_type.as_deref() == Some("!") {
                     return vec![Item::Str("|".to_string())];
                 }
-                let value = Self::variable_value(config, &name, &pf_arg);
+                // `pf_arg` is only the text before the first `|` (the resolver
+                // splits on `:` first), so the title — when the tokenizer kept it
+                // as a separate parameter rather than folding it into the target
+                // — is read from the remaining parameters. Both spellings reach a
+                // page in practice, which is why both are handled.
+                let value = match name.as_str() {
+                    "protectionlevel" | "protectionexpiry" => {
+                        let raw = protection_full_arg(&pf_arg, params);
+                        protection.answer(&raw, |e, action| {
+                            if name == "protectionlevel" {
+                                e.level(action).map(str::to_string)
+                            } else {
+                                e.expiry(action).map(str::to_string)
+                            }
+                        })
+                    }
+                    _ => Self::variable_value(config, &name, &pf_arg),
+                };
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 let mut info = template_info_from(Some(&name), None, vec![]);
                 info.target_wt = Some(target_str.clone());
@@ -1054,6 +1192,7 @@ impl TemplateHandler {
         config: &dyn SiteConfig,
         frame: &super::frame::Frame,
         about_counter: &std::cell::Cell<usize>,
+        protection: &ProtectionContext,
         tokens: Vec<Item>,
     ) -> Vec<Item> {
         let mut out = Vec::new();
@@ -1075,8 +1214,14 @@ impl TemplateHandler {
                 // Build a `Params` from the token's attribs.
                 let params = Params::new(stt.attribs.clone());
                 let context_title = frame.title();
-                let expanded =
-                    self.handle_template(config, Some(context_title), &params, about_id, tok);
+                let expanded = self.handle_template(
+                    config,
+                    Some(context_title),
+                    &params,
+                    about_id,
+                    tok,
+                    protection,
+                );
                 out.extend(expanded);
                 continue;
             }
@@ -1507,6 +1652,9 @@ mod tests {
 
         let config = MockSiteConfig::new();
         let handler = TemplateHandler;
+        // These tests exercise dispatch, not protection, so both maps are empty.
+        let page_protection = std::cell::RefCell::new(Default::default());
+        let titles_protection = std::cell::RefCell::new(HashMap::new());
 
         // {{#if:x|yes|no}}: args[0].k is the full target before the first '|'.
         let args = vec![
@@ -1541,7 +1689,14 @@ mod tests {
                 crate::wikitext::tokens_v2::DataParsoid::default(),
             ));
 
-        let out = handler.handle_template(&config, None, &params, "#mwt1".to_string(), &token);
+        let out = handler.handle_template(
+            &config,
+            None,
+            &params,
+            "#mwt1".to_string(),
+            &token,
+            &ProtectionContext::new(&page_protection, &titles_protection),
+        );
 
         // Should be wrapped with mw:Transclusion markers and contain "yes".
         assert!(
@@ -1757,6 +1912,8 @@ mod tests {
         let title = TitleParser::parse("Template:Foo", &config);
         let frame = crate::pipeline::frame::Frame::new(title, vec![]);
         let about = std::cell::Cell::new(0usize);
+        let page_protection = std::cell::RefCell::new(Default::default());
+        let titles_protection = std::cell::RefCell::new(HashMap::new());
 
         // A `template` token with `{{#if:x|yes|no}}`.
         let mut stt = SelfclosingTagTk::new("template", vec![], DataParsoid::default());
@@ -1785,7 +1942,13 @@ mod tests {
         ];
 
         let input = vec![Item::Tok(ParsoidToken::SelfclosingTag(stt))];
-        let out = TemplateHandler.process(&config, &frame, &about, input);
+        let out = TemplateHandler.process(
+            &config,
+            &frame,
+            &about,
+            &ProtectionContext::new(&page_protection, &titles_protection),
+            input,
+        );
 
         // Wrapped with mw:Transclusion and contains "yes".
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "meta"));

@@ -295,16 +295,13 @@ pub struct TitleFacts {
     /// distinct from "empty": `getContent()` on an unfetched page returns nil,
     /// while a fetched empty page returns `""`.
     pub content: Option<String>,
-    /// Protection level per action (`"edit"`, `"move"`, …), as `title.protectionLevels`.
+    /// Protection levels per action (`"edit"`, `"move"`, …), as `title.protectionLevels`.
     ///
     /// Scribunto models this as a table of action to *array* whose first item is
-    /// the level, so it is kept as `action -> [level]` rather than flattened.
-    /// An unprotected page has no entry for the action, which is what the field
-    /// must distinguish from an entry with an empty level.
-    ///
+    /// the level, so [`crate::traits::ProtectionEntry`] keeps it in that shape.
     /// Empty for a title that was never looked up, which reads as "unprotected" —
     /// the same conservative answer `exists` gives.
-    pub protection: std::collections::HashMap<String, Vec<String>>,
+    pub protection: crate::traits::ProtectionEntry,
 }
 
 pub struct LuaContext {
@@ -1477,6 +1474,72 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     ext.set("data", ext_data)
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
+    // `mw.ext.TitleBlacklist.test` — whether the TitleBlacklist extension would
+    // block an action on a page.
+    //
+    // Returns `nil`, not a table: a *hit* carries restriction parameters, and
+    // rustoid cannot decide a hit. That asymmetry is deliberate rather than
+    // lazy. `Module:Effective protection level` reads the result as
+    // `if blacklistentry then <stricter level> elseif …`, so nil takes the
+    // permissive branch, and a blacklist that raises protection cannot raise it
+    // further by being ignored. Answering with a table would invent a hit and
+    // *stricter* protection than the wiki applies. The most common corpus Lua
+    // failure was this field being absent (34 of 48 pages).
+    let ext_blacklist = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext_blacklist
+        .set(
+            "test",
+            lua.create_function(|_, (_action, _title): (Value, Value)| Ok(Value::Nil))
+                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    // The extension exposes `test` on the table itself; `test` is also reachable
+    // as a method, so a module writing `mw.ext.TitleBlacklist:test(…)` must not
+    // get "attempt to call a nil value".
+    ext_blacklist
+        .set(
+            "check",
+            lua.create_function(|_, _title: Value| Ok(Value::Nil))
+                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext.set("TitleBlacklist", ext_blacklist)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
+    // `mw.ext.ParserFunctions.expr` — ParserFunctions' `#expr` as a function.
+    // `Module:Math` calls it when the `#expr` *parser function* is unavailable to
+    // it; rustoid already evaluates `#expr`, so the same implementation answers
+    // both, and the field is what stops "attempt to index a nil value
+    // (field 'ParserFunctions')".
+    let ext_pf = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext_pf
+        .set(
+            "expr",
+            lua.create_function(move |lua, expr: String| {
+                let value = crate::pipeline::parser_functions::evaluate_expression(&expr);
+                // `#expr` reports a malformed expression as an error span rather
+                // than as a value, and ParserFunctions' Lua binding turns that
+                // into a table with an `error` field. Detecting it the way
+                // `pf_iferror` does keeps the two paths in agreement.
+                if value.contains("class=\"error\"") {
+                    let err = lua.create_table()?;
+                    err.set("error", value)?;
+                    Ok(Value::Table(err))
+                } else {
+                    Ok(Value::String(lua.create_string(&value)?))
+                }
+            })
+            .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext.set("ParserFunctions", ext_pf)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
     mw.set("ext", ext)
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     // mw.message — the object methods live in `MESSAGE_LIB`, which is given the
@@ -1867,8 +1930,8 @@ fn luafn_title_new(
                 // found a bare string there would index a character instead.
                 "protectionLevels" => {
                     let levels = lua.create_table()?;
-                    if let Some(facts) = facts.as_ref() {
-                        for (action, value) in &facts.protection {
+                    if let Some(entry) = facts.as_ref().map(|f| &f.protection) {
+                        for (action, value) in &entry.levels {
                             let arr = lua.create_table()?;
                             arr.set(1, value.first().map(String::as_str).unwrap_or(""))?;
                             levels.set(action.as_str(), arr)?;

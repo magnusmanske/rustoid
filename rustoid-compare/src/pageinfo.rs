@@ -87,11 +87,16 @@ pub async fn page_info(
 /// Protection levels per action, for titles a module may ask about through
 /// `mw.title`.
 ///
-/// The response models protection as a *list* of `{type, level, expiry}` per
-/// action, and Scribunto exposes only the level as an array's first item. An
-/// action the wiki does not list is not protected, and is therefore absent from
-/// the returned map rather than present with an empty level — that distinction
-/// is what `Module:Effective protection level` reads.
+/// The response models protection as a *flat array* of `{type, level, expiry}`
+/// — the action is the `type` field, not a key — and Scribunto exposes only the
+/// level as an array's first item. Reading the flat shape as a map keyed by
+/// action yields nothing at all, silently, which is why the wire format is worth
+/// stating: `get_title_protection` returning empty looks identical to a page
+/// that is genuinely unprotected.
+///
+/// An action the wiki does not list is not protected, and is therefore absent
+/// from the returned map rather than present with an empty level — that
+/// distinction is what `Module:Effective protection level` reads.
 ///
 /// A failure is reported as "nothing is protected" rather than as an error, for
 /// the same reason [`page_info_soft`] exists: an unreachable wiki should degrade
@@ -99,7 +104,9 @@ pub async fn page_info(
 pub async fn title_protection(
     client: &WikiClient,
     titles: &[String],
-) -> HashMap<String, HashMap<String, Vec<String>>> {
+) -> HashMap<String, rustoid_core::traits::ProtectionEntry> {
+    use rustoid_core::traits::ProtectionEntry;
+
     let mut out = HashMap::new();
     for chunk in titles.chunks(TITLES_PER_QUERY) {
         let Ok(body) = client.protection_json(chunk).await else {
@@ -110,13 +117,25 @@ pub async fn title_protection(
         };
         for page in parsed.query.pages {
             let Some(title) = page.title else { continue };
-            let mut levels = HashMap::new();
-            for (action, entries) in page.protection.unwrap_or_default() {
-                if let Some(level) = entries.into_iter().next().and_then(|e| e.level) {
-                    levels.insert(action, vec![level]);
-                }
+            let mut entry = ProtectionEntry::default();
+            for restriction in page.protection.unwrap_or_default() {
+                let Some(action) = restriction.kind else {
+                    continue;
+                };
+                let Some(level) = restriction.level else {
+                    continue;
+                };
+                // Both lists come from the same entries and so stay index-
+                // aligned, which is what `ProtectionEntry` promises: a level and
+                // its expiry describe one restriction.
+                entry.levels.entry(action.clone()).or_default().push(level);
+                entry
+                    .expiries
+                    .entry(action)
+                    .or_default()
+                    .push(restriction.expiry.unwrap_or_default());
             }
-            out.insert(title, levels);
+            out.insert(title, entry);
         }
     }
     out
@@ -153,16 +172,23 @@ struct PageEntry {
     /// Present only for redirects; its presence is the signal.
     #[serde(default)]
     redirect: Option<serde_json::Value>,
-    /// Keyed by action (`"edit"`, `"move"`), then a list of applied
-    /// restrictions. Absent entirely for an unprotected page.
+    /// Present as a flat list for an unprotected page is *absent*; for a
+    /// protected one it is `[{type, level, expiry}, …]`, where the action is the
+    /// `type` field rather than a map key.
     #[serde(default)]
-    protection: Option<HashMap<String, Vec<Protection>>>,
+    protection: Option<Vec<Protection>>,
 }
 
 #[derive(serde::Deserialize)]
 struct Protection {
+    /// The action: `"edit"`, `"move"`, `"create"`, `"upload"`.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     level: Option<String>,
+    /// MediaWiki's 14-digit `YYYYMMDDHHMMSS`, or the literal `"infinity"`.
+    #[serde(default)]
+    expiry: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -230,5 +256,36 @@ mod tests {
         let json = r#"{"query":{"pages":[{"ns":0,"title":"R","pageid":2,"redirect":{}}]}}"#;
         let parsed: InfoResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.query.pages[0].redirect.is_some());
+    }
+
+    /// The protection field is a flat array of `{type, level, expiry}`, where
+    /// the *action* is `type`. Reading it as a map keyed by action deserialises
+    /// to nothing, silently — every page then looks unprotected, which is
+    /// indistinguishable from a page that genuinely is. This is the live shape,
+    /// copied from `action=query&prop=info&inprop=protection`.
+    #[test]
+    fn protection_is_read_from_the_flat_array_the_wiki_sends() {
+        let json = r#"{"query":{"pages":[{"ns":0,"title":"Canada","pageid":5042916,
+            "protection":[
+                {"type":"edit","level":"extendedconfirmed","expiry":"infinity"},
+                {"type":"move","level":"sysop","expiry":"infinity"}
+            ]}]}}"#;
+        let parsed: ProtectionResponse = serde_json::from_str(json).unwrap();
+        let page = &parsed.query.pages[0];
+        let protection = page.protection.as_ref().expect("protection present");
+        assert_eq!(protection.len(), 2);
+        assert_eq!(protection[0].kind.as_deref(), Some("edit"));
+        assert_eq!(protection[0].level.as_deref(), Some("extendedconfirmed"));
+        assert_eq!(protection[0].expiry.as_deref(), Some("infinity"));
+        assert_eq!(protection[1].kind.as_deref(), Some("move"));
+    }
+
+    /// An unprotected page omits the field entirely, which must read as "no
+    /// restriction" rather than as a parse failure.
+    #[test]
+    fn an_unprotected_page_has_no_field_at_all() {
+        let json = r#"{"query":{"pages":[{"ns":0,"title":"Plain","pageid":1}]}}"#;
+        let parsed: ProtectionResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.query.pages[0].protection.is_none());
     }
 }

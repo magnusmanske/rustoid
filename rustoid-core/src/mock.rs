@@ -583,7 +583,12 @@ impl MockSiteConfig {
         self.interwiki_map.insert(prefix.to_string(), info);
     }
 
-    fn add_magic_word(&mut self, canonical: &str, aliases: &[&str]) {
+    /// Register a magic word by its canonical name and aliases (PHP's
+    /// `$magicWords`). A test that exercises a magic word's *routing* needs
+    /// this: whether a construct resolves as a variable or as a parser function
+    /// is decided by this table, so a mock without the entry takes a different
+    /// path than the wiki does.
+    pub fn add_magic_word(&mut self, canonical: &str, aliases: &[&str]) {
         self.magic_words.insert(
             canonical.to_string(),
             MagicWordEntry {

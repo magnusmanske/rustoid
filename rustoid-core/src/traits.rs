@@ -14,6 +14,47 @@ use crate::title::Title;
 // Data source trait
 // ---------------------------------------------------------------------------
 
+/// The protection applied to one page, as MediaWiki's `Title::getRestrictions`
+/// reports it and Scribunto's `title.protectionLevels` exposes it.
+///
+/// Keyed by action (`"edit"`, `"move"`, `"create"`, `"upload"`). An action the
+/// wiki does not list is **not protected**, which is why an absent key rather
+/// than an empty vector is the signal — `Module:Effective protection level`
+/// reads the difference.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtectionEntry {
+    /// Action → the levels applied to it. More than one can apply at once
+    /// (`autoconfirmed` plus `sysop`, say), and the first is the one Scribunto
+    /// exposes as `protectionLevels[action][1]`.
+    pub levels: HashMap<String, Vec<String>>,
+    /// Action → when each level expires, in MediaWiki's 14-digit
+    /// `YYYYMMDDHHMMSS` form, with the literal `"infinity"` for no expiry.
+    ///
+    /// Parallel to `levels` rather than folded into it because
+    /// `{{PROTECTIONEXPIRY:…}}` reports the expiry *without* the level, and a
+    /// module may ask for either: `Module:Effective protection expiry` calls
+    /// only the former.
+    pub expiries: HashMap<String, Vec<String>>,
+}
+
+impl ProtectionEntry {
+    /// The first level applied to `action`, or `None` if unprotected.
+    pub fn level(&self, action: &str) -> Option<&str> {
+        self.levels
+            .get(action)
+            .and_then(|v| v.first())
+            .map(String::as_str)
+    }
+
+    /// The first expiry for `action`, in `YYYYMMDDHHMMSS` form or `"infinity"`.
+    pub fn expiry(&self, action: &str) -> Option<&str> {
+        self.expiries
+            .get(action)
+            .and_then(|v| v.first())
+            .map(String::as_str)
+    }
+}
+
 /// Abstract data source for wiki content.
 ///
 /// Implementations may fetch from a MediaWiki API, a local indexed dump,
@@ -125,7 +166,7 @@ pub trait DataSource: Send + Sync {
     async fn get_title_protection(
         &self,
         titles: &[String],
-    ) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
+    ) -> Result<HashMap<String, ProtectionEntry>> {
         let _ = titles;
         Ok(HashMap::new())
     }

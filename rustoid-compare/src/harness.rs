@@ -511,11 +511,11 @@ impl DataSource for CachedDataSource {
         &self,
         titles: &[String],
     ) -> rustoid_core::Result<
-        std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>>,
+        std::collections::HashMap<String, rustoid_core::traits::ProtectionEntry>,
     > {
-        // Offline, or a wiki that cannot answer: report nothing protected. The
-        // default trait method already does that, and calling it explicitly keeps
-        // the reason next to the online branch rather than implicit in an absent
+        // Offline, or a wiki that cannot answer: report nothing protected. That
+        // is what the trait's default does, and calling it explicitly keeps the
+        // reason next to the online branch rather than implicit in an absent
         // override.
         let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
             return Ok(std::collections::HashMap::new());
