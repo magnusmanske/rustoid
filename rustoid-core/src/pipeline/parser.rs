@@ -3277,7 +3277,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 /// construct is re-read as text rather than expanded in place.
 fn kv_to_source_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
     use crate::wikitext::token_utils::key_value_to_string;
-    let value = key_value_to_string(&kv.value);
+    // Prefer the source range over stringifying the tokens. `tokensToString` has
+    // no arm for a plain tag, so a `#invoke` argument holding one —
+    // `{{#invoke:If empty|main|<div>X</div>}}` — stringified to `X`, and the
+    // module was handed the text without its tags. The live service gives the
+    // module `<div>X</div>`: `{{#invoke:String|len|<div>X</div>}}` answers 12,
+    // not 1. The range is the wikitext as written, which is what Scribunto sees.
+    let value = kv
+        .src_offsets
+        .as_ref()
+        .map(|so| so.value_substr(""))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| key_value_to_string(&kv.value));
     let key = key_value_to_string(&kv.key);
     if key.trim().is_empty() {
         Some(value)

@@ -827,3 +827,31 @@ async fn language_format_date_supports_month_names() {
     let body = text_only(&html);
     assert!(body.contains("March/Dec"), "got: {body}");
 }
+
+/// An argument's *tags* must reach the module, not just its text.
+///
+/// `tokensToString` has no arm for a plain tag, so reassembling the `#invoke`
+/// arguments by stringifying them dropped the tags and handed the module the
+/// bare text. The live service gives `{{#invoke:String|len|<div>X</div>}}` the
+/// answer **12** — the literal tag characters — where the stringified form gave
+/// **1**. The argument is now read from its `srcOffsets`, which is the wikitext
+/// as written, the same source-range technique template parameters already use.
+#[tokio::test]
+async fn module_arguments_keep_their_tags() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return #frame.args[1]
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:Len", module)],
+        "{{#invoke:Len|main|<div>X</div>}}",
+    )
+    .await;
+    assert!(
+        text_only(&html).contains("12"),
+        "tags were dropped from the argument: {html}"
+    );
+}
