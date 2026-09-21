@@ -1364,6 +1364,101 @@ into the next one. rustoid keeps it per parse instead, reset at the start of
 `build_ast`, which is indistinguishable within one parse. The counter is
 recorded here because it is the one place the port knowingly differs.
 
+## The `#invoke` `data-mw`, and why three separate readings of it were wrong
+
+`Template:Infobox` is the smallest page in the corpus (341 bytes of wikitext) and
+it exercised a parser-function path that the fixture suite cannot reach, because
+standalone Parsoid implements no Scribunto. Reading the live transform endpoint
+settled it in one request; four earlier readings from PHP source alone were each
+wrong in a different way.
+
+### What the service serves
+
+| call | `parts` key | target | function | params |
+|---|---|---|---|---|
+| `{{#if:1|yes|no}}` | `template` | `{"wt":"#if:1"}` | `"function":"if"` | `{"1":"yes","2":"no"}` |
+| `{{#invoke:String|len|abc}}` | `template` | `{"wt":"#invoke:String"}` | `"function":"invoke"` | `{"1":"len","2":"abc"}` |
+
+Both are `typeof="mw:Transclusion"`, with no `mw:ParserFunction/*` type.
+
+### The four wrong readings, recorded so they are not retaken
+
+1. **`"parserfunction"` as the parts key.** PHP's `DataMw::toJsonArray`
+   normalizes only `old-parserfunction` to `template`, so a `parserfunction`
+   type keeps its own key — and an earlier test asserted exactly that. But the
+   `parserfunction` type is only reached when a **modern PFragment handler**
+   exists, or when `ParsoidExperimentalParserFunctionOutput` is set. Neither
+   holds for `#invoke` on this wiki: Scribunto registers `invoke` through the
+   legacy function-synonym table, so it arrives as `old-parserfunction` and the
+   key is `template`. The old test encoded a configuration this wiki does not
+   have.
+2. **`function` vs `key`.** These are the same distinction from the other side:
+   a genuine `old-parserfunction` writes `function`, a `parserfunction` writes
+   `key`. Same source line, opposite conclusion, because reading (1) backwards.
+3. **Folding the first argument onto the target.** `TemplateInfo::toJsonArray`
+   really does `array_shift` the first param and append `':'.$firstArg->valueWt`
+   to `target.wt` — *for an `old-parserfunction`*. Applying it unconditionally
+   gave `wt = "#invoke:Infobox:infobox"` and an empty `params`, and then, when
+   narrowed to `old-parserfunction`, silently dropped the first argument of
+   every call instead. The live output keeps the colon in the target and every
+   argument in `params`, so the fold does not apply at all here.
+4. **`href`.** `put_opt_str` writes an explicit `"href":null` for a missing
+   value, copying PHP's `?string` default. The service omits the key entirely.
+   This is the kind of difference that survives a `data-mw` comparison done with
+   a JSON parser and only shows up byte-for-byte.
+
+The doubled `#invoke#invoke:String` had a mundane cause worth recording:
+`pf_arg` is the text *after* `#invoke:`, while `target_str` is the whole
+`#invoke:Module`; the target was built by prepending `#invoke` to a string that
+already began with it. One is `"String|len|abc"` and the other `"#invoke:String"`,
+and both are in scope at the same call site.
+
+### `<includeonly>` consumes its content
+
+The other half of that page's diff was not a range problem at all. The live
+markup records the whole directive on the marker:
+
+```html
+<meta typeof="mw:Includes/IncludeOnly"
+      data-mw='{"src":"&lt;includeonly>{{template other|...}}&lt;/includeonly>"}'/>
+<meta typeof="mw:Includes/IncludeOnly/End"/>
+<meta typeof="mw:Includes/NoInclude"/>
+```
+
+so the content is never parsed. rustoid emitted the markers and tokenized the
+content anyway, and the leaked `{{template other|` text then set the paragraph
+wrapper's `curr_line_has_wrappable_tokens`, opening a `<p>` around the whole
+first line. **The `<p>` was a symptom of unexpanded wikitext, not of
+p-wrapping** — the same causal chain recorded for `{{sfn}}` on `Zebra`, and the
+reason `pages with literal {{...}}` in the scoreboard is the number to watch.
+
+`<noinclude>` and `<onlyinclude>` do not consume their content; only the
+`<includeonly>` case changes.
+
+### Where `Template:Infobox` stands
+
+The first difference is now at **byte 66**, and it is attribute order:
+
+```
+live:    ... typeof="mw:Transclusion" data-mw='...' id="mwAg">
+rustoid: ... typeof="mw:Transclusion" id="mwAQ" data-mw='...'>
+```
+
+Two open items, both on the same element and both narrow:
+
+- **Attribute order.** The live service puts `data-mw` before `id`; rustoid
+  appends the node id last. The `about`-id and node-id counters have diverged
+  by this point (`#mwt2` vs `#mwt4`, `mwAg` vs `mwAQ`), so the *contents* also
+  differ even once the order is right — fixing the order alone will not make the
+  page pass.
+- **The about-id counter.** The `<style>` an `#invoke` emits carries
+  `about="#mwt2"` live and `#mwt4` in rustoid, i.e. rustoid draws two extra ids
+  before it. The transclusion wrapper takes `#mwt1` in both, so the divergence is
+  inside the module's expansion.
+
+`data-mw` for that element now matches byte-for-byte, which is what makes the
+remaining difference legible at all.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
