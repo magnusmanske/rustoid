@@ -1998,16 +1998,16 @@ fn wrap_flipped_children(
         let mut encap_target = None;
         for (j, child) in children.iter_mut().enumerate().skip(lo).take(hi - lo + 1) {
             if matches!(child.kind, NodeKind::Element(_)) && !is_transclusion_start(child) {
-                // A sibling that begins *before* the transclusion cannot be in
-                // it, whatever the nesting says. This is the paragraph-wrapper
-                // case: on `AAA{{If empty|<div>X</div>|b}}` the `<p>` holds the
-                // start marker yet begins at offset 0, before the template at 3,
-                // so stamping it with `about` gave the `<p>` the same id as the
-                // `<div>` — two elements sharing one transclusion id, where the
-                // live service serves one. Narrowing the *range* to drop the
-                // element was tried and cost five fixtures: the range must stay
-                // contiguous for the span-wrapping and deletability steps below,
-                // so only the stamp is withheld here.
+                // A sibling that begins *before* the transclusion cannot be in it,
+                // whatever the nesting says. This is the paragraph-wrapper case:
+                // on `AAA{{If empty|<div>X</div>|b}}` the `<p>` holds the start
+                // marker yet begins at offset 0, before the template at 3, so
+                // stamping it gave the `<p>` the same transclusion id as the
+                // `<div>` — two elements sharing one id where the service serves
+                // one. Narrowing the *range* to drop the sibling, and moving the
+                // encapsulation *target* off it, were each tried and each cost
+                // five fixtures; only the stamp can be withheld without
+                // disturbing the span-wrapping and deletability steps below.
                 if !sibling_starts_before(child, transclusion_start_offset(&start_meta)) {
                     child.set_attr("about", start_meta.get_attr("about").unwrap_or(""));
                 }

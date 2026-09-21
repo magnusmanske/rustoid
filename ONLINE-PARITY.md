@@ -1333,20 +1333,31 @@ steps that follow, so only the stamp is conditional.
 
 #### What is still wrong on the reduction
 
+A node trace at encapsulation shows the finder **pairs the right markers and
+still shapes the range wrongly**:
+
 ```
-live:  <p id="mwAg" DP>AAA</p><div about="#mwt1" typeof="mw:Transclusion" …>X</div>
-rustoid: <p>AAA</p><div about="#mwt2" typeof="mw:Transclusion" …>X</div>
-         <meta typeof="mw:Transclusion" about="#mwt1" …/>      ← trailing
+[0] <p>   dsr [0,0]    about=None   kids: Text("AAA"), meta #mwt1 (mw:Transclusion)
+[1] <div> dsr [0,35]   about=#mwt2
+[2] meta  dsr [35,35]  about=#mwt1  (mw:Transclusion/End)
 ```
 
-The `<p>` and the `<div>` now match. The outer template's metadata
-(`{{If empty|…}}`) should *wrap* the `<div>` — live puts `target.wt = "If empty"`
-on the `<div>` — and instead lands as a bare `<meta>` after it, so the `<div>`
-carries the inner `#invoke`'s metadata and the outer id is `#mwt2` rather than
-`#mwt1`. The outer range is not being found at all in this shape.
+The outer start marker `#mwt1` is nested in the `<p>` at `.1` and its end marker
+is `[2]`, so the pair is correct. But the `<p>` is then taken as the range's start
+*element*, so `lo = 0` and the range spans `<p>`, `<div>`, meta — where live's
+spans only the `<div>` and the end marker.
 
-That is the next step on this reduction, and it is the last one: the paragraph
-and the `<div>` are right, only the outer transclusion's range is not.
+Two ways to narrow that were tried, and **each cost five fixtures**:
+
+- shrinking the range so the `<p>` is not in it, and
+- moving the encapsulation *target* off the `<p>` onto the `<div>`.
+
+Both disturb the span-wrapping and `is_deletable_in_range` steps that follow,
+which assume the range is contiguous and starts where the finder said. Only
+withholding the `about` stamp can be done without that collateral, which is what
+landed. The next attempt should look at those two later steps rather than at the
+range bounds — narrowing the bounds is the obvious move and it is the one that
+does not work.
 
 **This is the blocker for more than it looks.** Chasing the Cite gap on `Zebra`
 (13 of its 158 refs missing) led to the same construct: the refs come from
