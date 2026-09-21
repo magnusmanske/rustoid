@@ -68,6 +68,15 @@ pub struct Reference {
     /// are separated by a space. That asymmetry is real and verified against the
     /// cached output.
     pub uses: Vec<String>,
+    /// Which use supplied this note's wikitext, as an index into `uses`.
+    ///
+    /// **Not** necessarily the first. A reuse can precede the definition —
+    /// `A<ref name="x"/>B<ref name="x">body</ref>` is a real page shape, and
+    /// `Zebra` opens with one inside an infobox — in which case Cite allocates
+    /// the number and the first `id` from the *reuse*, and the later definition
+    /// merely fills in the text. The `data-mw` `body` pointer follows the text,
+    /// so it lands on the defining use rather than on use zero.
+    pub body_use: Option<usize>,
 }
 
 impl Reference {
@@ -162,16 +171,26 @@ impl CiteState {
                 self.references.push(Reference {
                     name: name.to_string(),
                     group: group.to_string(),
-                    body: body.to_string(),
+                    body: String::new(),
                     self_closing,
                     number,
                     uses: Vec::new(),
+                    body_use: None,
                 });
                 let i = self.references.len() - 1;
                 self.index.insert(key, i);
                 i
             }
         };
+
+        // A use that carries text *defines* the note, wherever it sits. An empty
+        // body never overwrites one, and never claims the pointer: a bare
+        // `<ref name="x"/>` contributes a back-link and nothing else.
+        let defines = !self_closing && !body.is_empty();
+        if defines {
+            self.references[idx].body = body.to_string();
+            self.references[idx].self_closing = false;
+        }
 
         // The id is keyed on the note the ref *resolved to*, not on this call's
         // spelling, so two uses of `<ref name="x" />` produce `-0` and `-1` for the
@@ -183,6 +202,11 @@ impl CiteState {
             use_index,
         );
         self.references[idx].uses.push(id.clone());
+        // The pointer belongs to the use that supplied the text, which is this one
+        // whenever it defines.
+        if defines {
+            self.references[idx].body_use = Some(self.references[idx].uses.len() - 1);
+        }
         id
     }
 
@@ -293,7 +317,7 @@ impl Default for DocIds {
 /// A named ref records its name; the group is recorded only when set. A ref with
 /// content records the body's wikitext as `extsrc`. Rendered in the attribute
 /// order the cached Parsoid output uses.
-pub fn ref_data_mw(reference: &Reference, first_use: bool) -> String {
+pub fn ref_data_mw(reference: &Reference, use_index: usize) -> String {
     let mut attrs = Vec::new();
     if !reference.name.is_empty() {
         attrs.push(format!("\"name\":{}", json_string(&reference.name)));
@@ -302,23 +326,21 @@ pub fn ref_data_mw(reference: &Reference, first_use: bool) -> String {
         attrs.push(format!("\"group\":{}", json_string(&reference.group)));
     }
     let attrs = format!("{{{}}}", attrs.join(","));
-    // Only the *first* use points at the note's rendered text. A later use of the
-    // same reference carries no `body` at all — the text already lives in the
-    // first note and Cite renders a back-link instead. Verified against the
-    // served page, where the first use reads
-    // `body:{"id":"mw-reference-text-cite_note-x-1"}` and the second reads only
-    // `{"name":"ref","attrs":{"name":"x"}}`.
+    // Only the use that supplied the note's text points at it. That is *not*
+    // necessarily the first use: a reuse may precede the definition
+    // (`A<ref name="x"/>B<ref name="x">body</ref>`), and `Zebra` opens with
+    // exactly that shape inside an infobox. Every other use carries no `body` at
+    // all, because its text already lives in the note the list renders.
     //
-    // `attrs` is emitted even when empty, which is also Cite's shape for a bare
+    // `attrs` is emitted even when empty, which is Cite's shape for a bare
     // `<ref>`.
-    if reference.self_closing || !first_use {
-        format!("{{\"name\":\"ref\",\"attrs\":{attrs}}}")
-    } else {
-        format!(
-            "{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"id\":{}}}}}",
-            json_string(&format!("mw-reference-text-{}", reference.note_id()))
-        )
+    if reference.body_use != Some(use_index) {
+        return format!("{{\"name\":\"ref\",\"attrs\":{attrs}}}");
     }
+    format!(
+        "{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"id\":{}}}}}",
+        json_string(&format!("mw-reference-text-{}", reference.note_id()))
+    )
 }
 
 /// The `data-mw` JSON for a `<references>` tag.
@@ -678,16 +700,16 @@ pub fn ref_marker_nodes(
 ) -> crate::dom::node::Node {
     use crate::dom::node::{ElementKind, Node};
 
-    // Whether this is the reference's first use, which decides the `data-mw`
-    // shape: only the first carries the note's `body` pointer.
-    let first_use = reference.uses.first().is_some_and(|u| u == ref_id);
+    // Whether this use is the one that supplied the note's text, which decides
+    // the `data-mw` shape: only that use carries the note's `body` pointer.
+    let use_index = reference.uses.iter().position(|u| u == ref_id).unwrap_or(0);
     let mut sup = Node::element(ElementKind::Other("sup".to_string()));
     sup.set_attr("about", ids.take_about());
     sup.set_attr("class", "mw-ref reference");
     sup.set_attr("id", ref_id);
     sup.set_attr("rel", "dc:references");
     sup.set_attr("typeof", "mw:Extension/ref");
-    sup.set_attr("data-mw", ref_data_mw(reference, first_use));
+    sup.set_attr("data-mw", ref_data_mw(reference, use_index));
 
     let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
     let mut a = Node::element(ElementKind::Other("a".to_string()));
@@ -900,7 +922,7 @@ mod tests {
         let mut st = CiteState::new();
         st.add("Badenhorst2019", "", "", true);
         assert_eq!(
-            ref_data_mw(&st.references[0], true),
+            ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{"name":"Badenhorst2019"}}"#
         );
 
@@ -910,7 +932,7 @@ mod tests {
         let mut st = CiteState::new();
         st.add("", "", "some text", false);
         assert_eq!(
-            ref_data_mw(&st.references[0], true),
+            ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{},"body":{"id":"mw-reference-text-cite_note--1"}}"#
         );
     }
@@ -1115,20 +1137,34 @@ mod tests {
         );
     }
 
+    /// The `body` pointer follows the *defining* use, which need not be the
+    /// first — and on a real page often is not, because a reuse can appear
+    /// earlier (inside an infobox, say) than the prose that carries the text.
     #[test]
-    fn ref_data_mw_points_only_the_first_use_at_the_note() {
+    fn ref_data_mw_points_at_the_defining_use_not_the_first() {
         let mut st = CiteState::new();
         st.add("x", "", "hello", false);
-        // First use: the note's rendered text lives in the list, so this is a
-        // pointer to it.
+        // Only use, and it defines: the pointer is here.
         assert_eq!(
-            ref_data_mw(&st.references[0], true),
+            ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{"name":"x"},"body":{"id":"mw-reference-text-cite_note-x-1"}}"#
         );
-        // A later use: no `body` at all.
+
+        // Reuse first, then the definition: the pointer moves to use 1, and use 0
+        // carries none. This is the shape `Zebra` opens with.
+        let mut st = CiteState::new();
+        st.add("x", "", "", true);
+        st.add("x", "", "hello", false);
         assert_eq!(
-            ref_data_mw(&st.references[0], false),
+            ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{"name":"x"}}"#
         );
+        assert_eq!(
+            ref_data_mw(&st.references[0], 1),
+            r#"{"name":"ref","attrs":{"name":"x"},"body":{"id":"mw-reference-text-cite_note-x-1"}}"#
+        );
+        // The bare reuse must not blank the note's text.
+        assert_eq!(st.references[0].body, "hello");
+        assert_eq!(st.references[0].number, 1);
     }
 }
