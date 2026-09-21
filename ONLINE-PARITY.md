@@ -772,6 +772,28 @@ Reading it as a map keyed by action deserialises to *nothing at all* rather than
 erroring, so every page looked unprotected and the code path looked exercised.
 The wire shape is now pinned by a test copied from a real response.
 
+**A magic word has two spellings, and only one of them is visible in wikitext.**
+`{{PROTECTIONEXPIRY:edit|Canada}}` and
+`frame:callParserFunction('PROTECTIONEXPIRY', 'edit', 'Canada')` are the same
+call, but the second is rendered back to wikitext by `render_call` as
+`{{#PROTECTIONEXPIRY:edit|Canada}}` — **with a hash** — and re-expanded. So the
+page-facing implementation is not enough: the hash spelling reaches the
+parser-function arm, and an arm that does not know the name returns the call
+*source* verbatim as "unknown parser function".
+
+`Module:Effective protection expiry` then matched that source against
+`'^(%d%d%d%d)(%d%d)(%d%d)(%d%d)(%d%d)(%d%d)$'`, failed, and raised
+`internal error … malformed expiry timestamp` — on **34 of 48 corpus pages**.
+That is the whole reason the failure count went *up* when
+`title.protectionLevels` first landed: the module had been erroring earlier, at
+the nil index, and fixing that exposed the next error behind it.
+
+It also cannot be found by scanning the page. The call is built at runtime
+inside the module, so the titles it names are not in the page's token stream at
+all; they are collected in `expand_lua_request`, where the module's own call is
+in hand and an await is available. Both modules in this pair are built entirely
+from such calls, which makes them the first real test of that path.
+
 #### `mw.wikibase` — implemented (the lookup surface)
 
 The entities are read from Wikidata, which is a *different wiki* from the one
@@ -1081,6 +1103,7 @@ rather than of one page.
 | wikitext answers landed | 0/30 | 18 | 29/48 | 51 across 23 |
 | `protectionLevels` landed | 0/48 | 0 | 47/48 | 91 across 33 |
 | `TitleBlacklist` + magic words | 0/48 | 0 | 47/48 | 62 across 34 |
+| `formatDate('U')` + `#` spelling | 0/48 | 0 | 47/48 | 49 across 33 |
 
 Three things are worth reading off it.
 
@@ -1096,13 +1119,23 @@ burned the full 1,000,000-node budget and 60s each. They now render. This is
 what makes the corpus usable as a loop at all: a 48-page run takes minutes
 rather than hours, so a change can be measured rather than guessed at.
 
-**The Lua failure list is now a work queue rather than a symptom.** Two entries
-dominate. `Module:Citation/CS1:4398` fails with "attempt to perform arithmetic
-on a nil value" on 13 pages — `Cite`, already the largest planned body of work.
-`Module:Lang:1121` fails on `string.char` with a value out of range on 6, which
-is a `mw.ustring` boundary bug rather than a missing feature. Holding in the
-tens, each with a module and a line number, is a very different position from
-the original "everything fails".
+**The Lua failure list has become a flat tail rather than a short head.** The
+first count was 51 failures across 23 distinct messages with one at 17 pages;
+after the fixes it is 49 across 33, with the largest at **6 pages** and most at
+1—2. The total barely moved while the *shape* changed completely, and the shape
+is the informative part: nothing systemic is left in the Lua layer, and what
+remains is one module at a time. That is also why the count went *up* twice on
+the way — fixing a blocked path exposes the next error behind it, so the number
+of failures is not monotonic and should not be read as one.
+
+**The exception to that is an error of my own, which is worth recording.**
+`title.protectionLevels` first made the failure count go from 62 to 91, because
+`Module:Effective protection expiry` calls the word through
+`frame:callParserFunction` — which rustoid renders with a **leading hash** — and
+the hash spelling was answered by neither arm, so it returned its own source and
+the module could not parse a timestamp out of it. 34 pages. The lesson is that
+a magic word has *two* spellings to a module, and only the page-facing one is
+obvious.
 
 **Where the remaining wrongness is, in one line.** The `transclusion` bucket is
 45 of 48, and it is not a missing feature: it is *unexpanded wikitext surviving
