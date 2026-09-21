@@ -542,9 +542,20 @@ pub fn is_fallback_id_span(node: &Node) -> bool {
 }
 
 /// `WTUtils::isRenderingTransparentNode` — metadata-like nodes that don't show
-/// up in output rendering (comments, SOL-transparent links, non-HTML metas, and
-/// fallback-id spans).
+/// up in output rendering (comments, SOL-transparent links, non-HTML metas,
+/// fallback-id spans, and `<style>`/`<link>` metadata elements).
 pub fn is_rendering_transparent_node(node: &Node) -> bool {
+    // A `<style>` or `<link>` an extension emitted (templatestyles, mostly) is
+    // metadata rather than content: it renders nothing, so a transclusion whose
+    // whole output is one cannot be encapsulated *on* it. Parsoid wraps it in
+    // `<span class="mw-empty-elt">` and puts the metadata on the span — the
+    // served `<span class="mw-empty-elt" about="#mwt1" typeof="mw:Transclusion">
+    // <style>…</style></span>` is exactly that — while encapsulating on the
+    // `<style>` itself produces an element with two `data-mw` attributes and a
+    // merged `typeof`.
+    if is_metadata_element(node) {
+        return true;
+    }
     match &node.kind {
         NodeKind::Comment(_) => true,
         _ if is_sol_transparent_link(node) => true,
@@ -561,6 +572,14 @@ pub fn is_rendering_transparent_node(node: &Node) -> bool {
         }
         _ => false,
     }
+}
+
+/// A `<style>` or `<link>` element: an HTML metadata element that renders
+/// nothing on its own and therefore cannot be a transclusion's encapsulation
+/// target.
+fn is_metadata_element(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Element(_))
+        && matches!(node_name(node).as_str(), "style" | "link")
 }
 
 /// `WTUtils::emitsSolTransparentSingleLineWT` — the node emits wikitext that is
