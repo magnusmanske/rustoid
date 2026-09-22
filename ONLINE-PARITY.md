@@ -1968,16 +1968,38 @@ They are concrete, each names a line, and the biggest is worth 7 pages:
   is exactly the signal the loop keys on. Worth doing, and worth doing
   deliberately: the same dynamic-name pattern appears in the other data-heavy
   modules, so it is structural, not one page's quirk.
-- `Module:Time ago:62` — `attempt to sub a 'string' with a 'string'`. Lua coerces
-  numeric strings in arithmetic (`'100' - '40'` is 60); rustoid's engine does not.
-- `Module:Math:389` — `attempt to perform 'n%0'`. Lua returns NaN, not an error.
-- `Module:Wikidata:247` — `'^\-'` is a valid Lua pattern escape in 5.1 and
-  rustoid's pattern compiler rejects it.
-- `Module:Multiple image:177` — arithmetic on a nil `totalwidth`, which the
-  manual says coerces from a numeric string.
+- `Module:Wikidata:247` — `invalid escape sequence near '"^\-'`. **This one is an
+  interpreter-version gap, not a module bug, and it needs a decision.**
 
-The three coercions are small, self-contained engine fixes and are the cheapest
-wins on this list.
+  The line is `mw.ustring.match(date, "^\-?%d+")`, and the service renders it
+  with no script error. Real Lua *5.4* rejects that escape — the `lua` binary here
+  is 5.5 and rejects it too — but Scribunto runs **Lua 5.1**, which treats an
+  unknown escape as the bare character. rustoid embeds `lua54`:
+
+  ```toml
+  mlua = { version = "0.10", features = ["lua54", "vendored"] }
+  ```
+
+  `lua51` is available in the same crate. Switching would make rustoid match the
+  interpreter Wikipedia's modules are actually written against, rather than being
+  gratuitously stricter — but it changes behaviour for *every* module, so it is a
+  deliberate call rather than a patch.
+
+  Measured before deciding: with `lua51` the whole workspace passes except one
+  test, `ustring_sub_clamps_instead_of_panicking`, which asserts 5.4's `string.sub`
+  bounds behaviour. Scribunto's `mw.ustring` is a PHP-backed implementation and
+  not plain 5.1 `string.sub`, so that test's expectation is the thing to verify
+  against the service first — not the reason to stay on 5.4. The change was
+  reverted untouched rather than forced through.
+- `Module:Time ago:62` — **fixed**. `formatDate('xnU')` emitted the month number
+  before the timestamp; `x` is the raw prefix and `n` alone is the number-format
+  modifier, so `xn` emits nothing. `Module:Time ago` now renders identically.
+- `Module:Math:389` — `attempt to perform 'n%0'`. Checked: Lua 5.4 raises this too,
+  so rustoid is right and the input is what differs. Not an engine coercion.
+- `Module:Multiple image:177` — arithmetic on a nil `totalwidth`. Lua coerces
+  numeric strings in arithmetic (`'100' - '40'` is 60, verified); worth checking
+  whether the nil comes from a coerced-string gap or from an earlier value
+  difference.
 
 ## Risks
 
