@@ -1931,28 +1931,34 @@ Zero matches is not the interesting number. These are:
 | compared | 0/40 | 0/46 | 0/46 |
 | stalled | 7 | 2 | 2 |
 | literal `{{...}}` | 39/47 | 45/48 | 45/48 |
-| distinct Lua failures | 20 | 21 | **20** |
-| entries in the Lua table | 34 | 31 | **29** |
+| distinct Lua failures | 20 | 21 | **18** |
+| entries in the Lua table | 34 | 31 | **21** |
 
-Four pages that used to stall now render, and the leading Lua failure has changed
-twice as entries were cleared:
+Four pages that used to stall now render, and the Lua table has lost a third of
+its entries. Every one of these was a named, checkable defect:
 
-- `Module:Lang` (`ustring.char`, 7 pages) — fixed.
-- `mw.html` (attribute table, 4 pages) — fixed.
+- `Module:Lang` (`ustring.char`, 7 pages) — fixed. It took bytes where Scribunto
+  takes codepoints.
+- `mw.html` (attribute table, 4 pages) — fixed, and the nil-value case with it.
 - `Module:Time ago` (2 pages) — fixed, and it needed *two* fixes: the format
-  string and then the input parsing. It disappeared from the table only on the
-  second run, which is the sort of thing that reads as a failed fix.
+  string and then the input parsing. It left the table only on the second run,
+  which is the sort of thing that reads as a failed fix.
+- `Module:Unicode data` (7 pages, the top entry) — fixed. It builds data-module
+  names at runtime and guards the load with `pcall`, so the static scan could not
+  see the name and the `pcall` swallowed the error the retry loop keys on. The
+  name is now collected as a side effect, where a `pcall` cannot eat it.
 
-The top entry is now `Module:Unicode data` (7 pages), which is diagnosed above and
-needs a design decision rather than a patch.
+The top entry is now `Module:Check for unknown parameters` at 2 pages — the
+table has no dominant cause left, which is the shape a work queue takes when it
+is nearly drained.
 
 ### The Lua failures are the work queue
 
 They are concrete, each names a line, and the biggest is worth 7 pages:
 
-- `Module:Unicode data:485` — `attempt to index a boolean value (field 'scripts')`.
-  Diagnosed, and it is the interesting one. The module builds its data-module
-  names at runtime:
+- `Module:Unicode data:485` — **fixed.** It was the top entry at 7 pages, and it is
+the most interesting one in the table. The module builds its data-module names at
+runtime:
 
   ```lua
   local loader = setmetatable({}, {
@@ -1967,17 +1973,20 @@ They are concrete, each names a line, and the biggest is worth 7 pages:
 
   Scribunto does not care: `mw.loadData` fetches synchronously, so the
   concatenated title resolves on demand. rustoid **preloads**, and the static scan
-  can only see the prefix `"Module:Unicode data/"` — the rest is computed. The
-  truncated title is not the page, so the data is absent, `data = false`, and the
-  caller then indexes it. The page `Module:Unicode data/scripts` does exist and is
-  fetchable (checked against the wiki).
+  can only see the prefix `"Module:Unicode data/"` — the rest is computed. So the
+  data was absent, `data = false`, and the caller indexed it.
 
-  **This needs a decision rather than a patch.** Making it work means letting
-  `mw.loadData` reach the deferred-fetch loop *from inside a `pcall`*, which is a
-  change to how a runtime module load is serviced — the error a `pcall` swallows
-  is exactly the signal the loop keys on. Worth doing, and worth doing
-  deliberately: the same dynamic-name pattern appears in the other data-heavy
-  modules, so it is structural, not one page's quirk.
+  Two mechanisms blocked the existing fix at once, which is why this one took a
+  while: the scan cannot see the name, and the `pcall` swallows the
+  `"module … was not preloaded"` error that the retry loop keys on. Reporting the
+  name *out of band* — `require` records it in a registry slot before raising, and
+  the run surfaces it as `Outcome::MissingModule` — gets it past both. The loop
+  then fetches and re-runs, which is the path an uncaught `require` already used.
+
+  `{{#invoke:Unicode data|lookup|script|41}}` answers `Latn`, matching the service.
+  Two data submodules still answer differently (`block`, `name`); that is a
+  data-shape question rather than a fetch one and is the next thing to look at
+  there.
 - `Module:Wikidata:247` — `invalid escape sequence near '"^\-'`. **This one is an
   interpreter-version gap, not a module bug, and it needs a decision.**
 
