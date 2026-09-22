@@ -2319,7 +2319,8 @@ impl NamespaceFacts {
 
 /// Look up the preloaded facts for a title, by full text and by bare text.
 fn title_facts_for(ctx: &LuaContext, ns_id: &i32, title_text: &str) -> Option<TitleFacts> {
-    if let Some(facts) = ctx.titles.get(&prefix_title(&ctx.site, *ns_id, title_text)) {
+    let key = prefix_title(&ctx.site, *ns_id, title_text);
+    if let Some(facts) = ctx.titles.get(&key) {
         return Some(facts.clone());
     }
     // Titles are keyed as written in `mw.title.new`, which may omit the
@@ -3377,7 +3378,26 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
         // exact set is a site detail, so this is the conservative reading.
         entry.set("isContent", id == 0 || id == 828).map_err(err)?;
         entry.set("isTalk", id % 2 == 1).map_err(err)?;
-        entry.set("subject", id - (id % 2)).map_err(err)?;
+        // `subject` and `talk` are *sub-tables*, not namespace numbers. Scribunto
+        // documents them as "a namespace object for the subject/talk namespace",
+        // and modules read `ns.subject.id` and `ns.talk.name`. A bare number here
+        // made `.subject` non-nil but `.subject.id` nil, so
+        // `mw.site.namespaces[10].subject.id` threw — and because
+        // `Module:Documentation` reaches it inside a `pcall`, the throw surfaced
+        // only as `subjectSpace = nil`, which cascaded to a nil `docTitle` and an
+        // empty documentation body. The whole 200KB of `Template:Infobox/doc`
+        // hung on this one field.
+        let subject_id = id - (id % 2);
+        let talk_id = subject_id + 1;
+        entry
+            .set(
+                "subject",
+                namespace_ref(lua, site, subject_id).map_err(err)?,
+            )
+            .map_err(err)?;
+        entry
+            .set("talk", namespace_ref(lua, site, talk_id).map_err(err)?)
+            .map_err(err)?;
         // The localized names, as a table. It must exist even when empty:
         // `Module:Namespace detect/data` iterates `ipairs(ns.aliases)` for every
         // namespace, and a missing field was an unattributed "attempt to index a
@@ -3393,6 +3413,26 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
         }
     }
     Ok(namespaces)
+}
+
+/// A minimal namespace object for the `subject`/`talk` fields.
+///
+/// Deliberately shallow: it carries the fields a module reads off
+/// `ns.subject`/`ns.talk` (`id`, `name`, `canonicalName`), and no further
+/// `subject`/`talk` of its own. Scribunto's are full objects, but the shape here
+/// exists to answer the reads that occur, and recursing would build a table per
+/// namespace per level for fields nothing asks for.
+fn namespace_ref(lua: &Lua, site: &LuaSite, id: i32) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    let name = if id == 0 {
+        String::new()
+    } else {
+        site.namespace_name(id)
+    };
+    t.set("id", id)?;
+    t.set("name", name.clone())?;
+    t.set("canonicalName", name)?;
+    Ok(t)
 }
 
 /// `mw.site.interwikiMap( filter )` — the interwiki prefixes, keyed by prefix.

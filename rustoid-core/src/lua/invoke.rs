@@ -362,7 +362,7 @@ where
         .clone()
         .unwrap_or_else(|| page_title.to_string());
     let mut frame = FrameContext {
-        titles: preload_titles(source, &registry, Some(&entity_page)).await,
+        titles: preload_titles(source, &registry, &site, Some(&entity_page)).await,
         entities: preload_entities(source, &registry, Some(&entity_page)).await,
         ..frame
     };
@@ -405,7 +405,7 @@ where
                         .unwrap_or_else(|| page_title.to_string());
                     frame
                         .titles
-                        .extend(preload_titles(source, &registry, Some(&page)).await);
+                        .extend(preload_titles(source, &registry, &site, Some(&page)).await);
                     frame.entities = preload_entities(
                         source,
                         &registry,
@@ -517,6 +517,7 @@ const DOC_SUBPAGES: &[&str] = &["doc", "sandbox", "testcases"];
 pub async fn preload_titles<S: DataSource + ?Sized>(
     source: &S,
     registry: &Registry,
+    site: &LuaSite,
     page_title: Option<&str>,
 ) -> HashMap<String, TitleFacts> {
     let mut out = HashMap::new();
@@ -534,7 +535,13 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
     }
 
     for title in wanted.into_iter().take(MAX_TITLES) {
-        let parsed = crate::title::Title::new_main(title.clone());
+        // The title is parsed against the site's namespaces, not assumed to be a
+        // main-namespace one: a subpage preload passes `Template:Infobox/doc`,
+        // and `Title::new_main` left it with namespace 0, so the lookup key was
+        // `Template:Infobox/doc` with no namespace and the fetched page was
+        // never found again. `exists` then read false for a page that was on
+        // disk, and `Module:Documentation` took its "does not exist" branch.
+        let parsed = title_from_text(site, &title);
         let content = source.get_page_content(&parsed).await.ok().flatten();
         let exists = content.is_some();
         // A redirect is a page whose content is `#REDIRECT [[…]]`; fetching it
@@ -564,6 +571,29 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
     }
 
     out
+}
+
+/// Parse a possibly namespace-prefixed title against the site's namespaces.
+///
+/// `Title::new_main` is not enough: a subpage preload passes
+/// `Template:Infobox/doc`, and leaving it in namespace 0 made the lookup key
+/// disagree with the cached page, so a fetched page was never found again and
+/// `exists` read false for it.
+fn title_from_text(site: &LuaSite, text: &str) -> crate::title::Title {
+    let (ns_id, rest) = match text.split_once(':') {
+        Some((head, rest)) => match site.namespace_id(head) {
+            Some(id) => (id, rest),
+            None => (0, text),
+        },
+        None => (0, text),
+    };
+    crate::title::Title {
+        interwiki: None,
+        namespace_id: ns_id,
+        text: rest.replace('_', " "),
+        fragment: None,
+        namespace_name: (ns_id != 0).then(|| site.namespace_name(ns_id)),
+    }
 }
 
 /// Entity data fetched for `mw.wikibase`, before the module runs.

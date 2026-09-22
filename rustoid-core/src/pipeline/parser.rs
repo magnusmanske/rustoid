@@ -772,6 +772,20 @@ pub struct Parser<'a, C: SiteConfig> {
     /// The protection levels of the page being parsed, as
     /// `{{PROTECTIONLEVEL:action}}` with no title argument reports them.
     page_protection: std::cell::RefCell<ProtectionEntry>,
+    /// Sub-fragments built during expansion, waiting for the tree builder.
+    ///
+    /// A `<templatestyles>` has to be resolved **while expansion is running**,
+    /// not in a pass afterwards: its `about` id comes from the document sequence
+    /// and the service numbers it where the expansion reaches it, so a
+    /// post-expansion pass numbers it behind everything the expansion already
+    /// took. On `Template:Infobox` the two stylesheets are ids 2 and 3, directly
+    /// after the `#invoke` wrapper's 1, which is only reachable from inside.
+    ///
+    /// Held on the parser rather than threaded through [`Parser::expand_templates`]
+    /// and its twelve call sites for the reason the other `Cell` fields here are:
+    /// one consumer, reached from several paths.
+    ext_fragments: std::cell::RefCell<std::collections::HashMap<usize, Node>>,
+    ext_next_id: std::cell::Cell<usize>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
@@ -785,6 +799,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             strip_data_parsoid: std::cell::Cell::new(false),
             protection: std::cell::RefCell::new(std::collections::HashMap::new()),
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
+            ext_fragments: std::cell::RefCell::new(std::collections::HashMap::new()),
+            ext_next_id: std::cell::Cell::new(0),
         }
     }
 
@@ -1766,6 +1782,72 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
+    /// Resolve one `<templatestyles>` extension token into a placeholder plus a
+    /// stashed `<style>` fragment, taking the `about` id from `about_counter`.
+    ///
+    /// Returns the token unchanged when the tag cannot be resolved (no source, no
+    /// page, no revision) — leaving it visible in the diff rather than silently
+    /// emitting an empty stylesheet.
+    async fn expand_one_templatestyles(
+        &self,
+        item: &Item,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let Some(stt) = templatestyles_target(item) else {
+            return vec![item.clone()];
+        };
+        let Some(source) = source else {
+            return vec![item.clone()];
+        };
+        // `src` and `wrapper` arrive as `data-mw` rich attribs: the tokenizer
+        // stores the parsed start-tag attributes there, not as plain token
+        // attributes.
+        let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
+        // A value that came through Lua reaches here with its quotes
+        // backslash-escaped (`\"Z.css\"`), because Scribunto passes the string
+        // through unchanged and `pf_tag` cannot unescape it the way it does for a
+        // plain tag. Strip both forms before treating it as a title.
+        let attr = |key: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some(key))
+                .and_then(|kv| kv.value.as_str())
+                .map(unquote_attr_value)
+                .filter(|v| !v.is_empty())
+        };
+
+        let resolved = match attr("src") {
+            Some(src) => {
+                let title = templatestyles_title(self.config, &src);
+                match source.get_page_with_revision(&title).await {
+                    Ok(Some((body, Some(revid)))) => Some((body, revid, src.to_string())),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        let Some((body, revid, src)) = resolved else {
+            return vec![item.clone()];
+        };
+
+        let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
+        // The id is taken *now*, before the fragment is stashed, so the sequence
+        // follows the expansion rather than the tree build.
+        let node = crate::pipeline::templatestyles::style_node(
+            &css,
+            revid,
+            &src,
+            &self.new_about_id(about_counter),
+        );
+        let mut frag = Node::document();
+        frag.push_child(node);
+        let id = self.ext_next_id.get();
+        self.ext_next_id.set(id + 1);
+        self.ext_fragments.borrow_mut().insert(id, frag);
+        emit_style_placeholder(stt, id)
+    }
+
     /// Inline every `<templatestyles>` stylesheet.
     ///
     /// Async because the CSS lives on a wiki page, like a template's source; the
@@ -1786,72 +1868,28 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// unexpanded tag visible in the diff instead of silently emitting an empty
     /// stylesheet. A stylesheet that *does* resolve but sanitises to nothing
     /// produces an empty `<style>`, which is what Parsoid does.
+    ///
+    /// This runs as a safety net for tokens that reach it unresolved — the
+    /// common case is handled inline by [`Parser::expand_one_templatestyles`]
+    /// during expansion, so that the id lands in document order.
     async fn expand_templatestyles(
         &self,
         tokens: Vec<Item>,
         source: Option<&dyn DataSource>,
-        next_id: &mut usize,
-    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
-        let Some(source) = source else {
-            return (tokens, std::collections::HashMap::new());
-        };
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::with_capacity(tokens.len());
-        let mut fragments: std::collections::HashMap<usize, Node> =
-            std::collections::HashMap::new();
-
         for item in tokens {
-            let Some(stt) = templatestyles_target(&item) else {
+            if templatestyles_target(&item).is_none() {
                 out.push(item);
                 continue;
-            };
-            // `src` and `wrapper` arrive as `data-mw` rich attribs: the tokenizer
-            // stores the parsed start-tag attributes there, not as plain token
-            // attributes.
-            let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
-            // A value that came through Lua reaches here with its quotes
-            // backslash-escaped (`\"Z.css\"`), because Scribunto passes the
-            // string through unchanged and `pf_tag` cannot unescape it the way it
-            // does for a plain tag. Strip both forms before treating it as a
-            // title: an attribute value is not part of the page name.
-            let attr = |key: &str| {
-                attrs
-                    .iter()
-                    .find(|kv| kv.key.as_str() == Some(key))
-                    .and_then(|kv| kv.value.as_str())
-                    .map(unquote_attr_value)
-                    .filter(|v| !v.is_empty())
-            };
-
-            let resolved = match attr("src") {
-                Some(src) => {
-                    let title = templatestyles_title(self.config, &src);
-                    match source.get_page_with_revision(&title).await {
-                        Ok(Some((body, Some(revid)))) => Some((body, revid, src.to_string())),
-                        // No revision means the source cannot be pinned, and a
-                        // dedup key that names no revision would still have to
-                        // match Parsoid's.
-                        _ => None,
-                    }
-                }
-                None => None,
-            };
-
-            let Some((body, revid, src)) = resolved else {
-                out.push(Item::Tok(ParsoidToken::SelfclosingTag(stt.clone())));
-                continue;
-            };
-
-            let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
-            let node = crate::pipeline::templatestyles::style_node(&css, revid, &src);
-            let mut frag = crate::dom::node::Node::document();
-            frag.push_child(node);
-            let id = *next_id;
-            *next_id += 1;
-            fragments.insert(id, frag);
-            out.extend(emit_style_placeholder(stt, id));
+            }
+            out.extend(
+                self.expand_one_templatestyles(&item, source, about_counter)
+                    .await,
+            );
         }
-
-        (out, fragments)
+        out
     }
 
     /// Synchronous [`expand_gallery`] for the `wikitext_to_ast` path (no data
@@ -2109,19 +2147,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &mut next_id,
             )
             .await;
-        // `<templatestyles>` needs a page fetch, so like `gallery` it runs here
-        // rather than in the synchronous extension handler.
-        let (tokens, style_fragments) = self
-            .expand_templatestyles(tokens, source, &mut next_id)
+        // `<templatestyles>` is normally resolved inline during expansion, so
+        // its `about` id lands in document order; anything left over here is a
+        // tag the inline pass could not resolve.
+        let tokens = self
+            .expand_templatestyles(tokens, source, about_counter)
             .await;
-        fragments.extend(style_fragments);
+        // Sub-fragments built during expansion (stylesheets). Collected after
+        // every pass has run, so none is lost.
+        fragments.extend(std::mem::take(&mut *self.ext_fragments.borrow_mut()));
 
         let stage = TreeBuilderStage::new(false);
-        // The `about` counter is shared with the tree builder so an extension
-        // fragment spliced into the tree takes its id in *document* order.
-        // `expand_templatestyles` built those fragments before the tree existed,
-        // so numbering them there would go by stream order instead — and the
-        // live service numbers them where the expansion reaches them.
+        // The `about` counter is still shared with the tree builder: a fragment
+        // that reaches it unresolved takes its id there rather than not at all.
         let tree_about_counter = std::rc::Rc::new(std::cell::Cell::new(about_counter.get()));
         let mut ast = stage.to_ast_with_fragments(
             tokens,
@@ -2320,6 +2358,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 continue;
             };
 
+            // Resolve a `<templatestyles>` here, in document order, so its
+            // `about` id comes from the same sequence as the transclusions
+            // around it. The service numbers the two stylesheets of
+            // `Template:Infobox` 2 and 3 — immediately after the `#invoke`
+            // wrapper's 1 — which a pass running after expansion cannot
+            // reproduce, because by then the whole documentation subtree has
+            // taken 4 onwards.
+            if templatestyles_target(&item).is_some() {
+                let emitted = self
+                    .expand_one_templatestyles(&item, source, about_counter)
+                    .await;
+                out.extend(emitted);
+                continue;
+            }
+
             if stt.name == "template" || stt.name == "template3" {
                 // Charge one preprocessor node for this expansion. On a limit
                 // trip PHP substitutes an error span here and returns, leaving
@@ -2498,7 +2551,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // function: everything after the colon is its argument
                 // list, and the tokenizer has already split that on `|`,
                 // so the pieces must be put back together.
-                let invoke_arg = invoke_arg_text(pf_arg, &params);
+                //
+                // Each argument value is *expanded* first, because that is what
+                // Scribunto receives: `{{#invoke:String|len|x{{#invoke:String|
+                // len|abc}}y}}` measures `x3y` and answers 3, not the 17 that
+                // the unexpanded text gives. The text handed to the module and
+                // the wikitext recorded in `data-mw` are therefore different
+                // things, and `data-mw` still reads the raw source through its
+                // own path (`prepare_pf_param_infos`).
+                let expanded_params = self
+                    .expand_invoke_args(&params, frame, source, about_counter, src_text)
+                    .await;
+                let invoke_arg = invoke_arg_text(pf_arg, &expanded_params);
                 // Scribunto's `frame:getParent()` is the frame of the
                 // *calling template*, and modules read its args
                 // constantly (`Module:Infobox`, `Module:Check for
@@ -3101,11 +3165,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         );
 
         let child = frame.new_child(frame.title().clone(), vec![]);
+        // The document's counter, not a fresh one. A module's output can carry a
+        // `<templatestyles>` — `Module:Infobox` emits one through
+        // `frame:extensionTag` — and that stylesheet's `about` id belongs to the
+        // page's sequence. A fresh counter started it at 1, so the `<style>`
+        // reused the id the enclosing `#invoke` wrapper had just been given.
         let expanded = Box::pin(self.expand_templates(
             &child,
             items,
             source,
-            &std::cell::Cell::new(0usize),
+            about_counter,
             in_template,
             /* src_text */ "",
         ))
@@ -3165,6 +3234,52 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         .collect();
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         encap.encap_tokens(expanded, &info)
+    }
+
+    /// Expand the argument values of a `#invoke` call, leaving the target alone.
+    ///
+    /// Scribunto receives expanded text, so a nested template or `#invoke` in an
+    /// argument is substituted before the module runs. The tokenizer keeps such a
+    /// value as tokens holding an unexpanded `template` token, which stringifies
+    /// to nothing useful — that is why the unexpanded form answered 17 where the
+    /// service answers 3.
+    ///
+    /// Only `args[1..]` are touched: `args[0]` is the `#invoke:` target and has
+    /// already been resolved.
+    async fn expand_invoke_args(
+        &self,
+        params: &crate::pipeline::parser_functions::Params,
+        frame: &Frame,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        src_text: &str,
+    ) -> crate::pipeline::parser_functions::Params {
+        use crate::wikitext::tokens_v2::KeyValue;
+
+        let mut out = params.clone();
+        for kv in out.args.iter_mut().skip(1) {
+            let KeyValue::Tokens(items) = &kv.value else {
+                continue;
+            };
+            if !items.iter().any(|it| {
+                matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t))
+                    if t.name == "template" || t.name == "template3")
+            }) {
+                continue;
+            }
+            let child = frame.new_child(frame.title().clone(), vec![]);
+            let expanded = Box::pin(self.expand_templates(
+                &child,
+                items.clone(),
+                source,
+                about_counter,
+                /* in_template */ true,
+                src_text,
+            ))
+            .await;
+            kv.value = KeyValue::Tokens(expanded);
+        }
+        out
     }
 
     /// Expand one deferred frame-call request into the text the module gets.
@@ -3292,29 +3407,92 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 }
 
-/// Render a token chunk's `key`/`value` back to source text, for cases where a
-/// construct is re-read as text rather than expanded in place.
-fn kv_to_source_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
-    use crate::wikitext::token_utils::key_value_to_string;
-    let value = kv_value_source(kv);
-    let key = key_value_to_string(&kv.key);
-    if key.trim().is_empty() {
-        Some(value)
-    } else {
-        Some(format!("{}={value}", key.trim()))
-    }
+/// Convert a frame's raw parameters into Scribunto `Arg`s.
+///
+/// A numeric key is positional, anything else named — the same split the
+/// template path makes for arguments.
+///
+/// The wikitext of a `KV`'s value, preferring its source range.
+///
+/// `tokensToString` has no arm for a plain tag, so stringifying an argument that
+/// holds one drops it: a module handed `{{#invoke:String|len|<div>X</div>}}`
+/// answered `1` where the live service answers `12`, and the loss showed up in
+/// `data-mw` as `{"wt":"X"}` instead of the whole tag. The range is the source
+/// as written, which is what `data-mw` records, and it is the same technique
+/// `prepare_tpl_param_infos` uses for template parameters.
+fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
+    kv.src_offsets
+        .as_ref()
+        .map(|so| so.value_substr(""))
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::wikitext::token_utils::key_value_to_string(&kv.value))
 }
-
 /// Rebuild the `#invoke:` argument text from the resolved colon argument and the
 /// token's remaining parameters.
 ///
 /// `{{#invoke:M|f|a|b=c}}` hands the module the text `M|f|a|b=c`; the tokenizer
 /// has already split that on `|` into the colon argument (`M`) plus parameters
 /// (`f`, `a`, `b=c`), so they are joined back in order.
+///
+/// The text is the *expanded* form, because that is what Scribunto receives: a
+/// nested `#invoke` in an argument is expanded by the parser before the module
+/// sees it, so `{{#invoke:String|len|x{{#invoke:String|len|abc}}y}}` measures
+/// `x3y` and answers **3**. Reading the argument's source range instead — which
+/// is what `data-mw` wants — left the nested call as literal text and answered
+/// **17**. The two callers genuinely need different things: `data-mw` records
+/// the wikitext as written, the module gets the expansion.
+///
+/// A tag argument keeps its tags either way, which is why stringifying is safe
+/// here only for the *value tokens*: those have already been expanded, so a
+/// `<div>` in one is a real tag token, and `item_to_string` would drop it. The
+/// expansion below therefore happens on the tokens and the result is rendered
+/// through [`expanded_arg_text`], which keeps tags.
 fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Params) -> String {
     let mut parts = vec![pf_arg.trim().to_string()];
-    parts.extend(params.args.iter().skip(1).filter_map(kv_to_source_text));
+    parts.extend(params.args.iter().skip(1).filter_map(expanded_arg_text));
     parts.join("|")
+}
+
+/// An argument's text as the module should receive it.
+///
+/// A tag inside a value has no faithful textual form — `tokensToString` has no
+/// arm for a tag, so `<div>X</div>` stringifies to `X` and the module is handed
+/// the wrong length. Such a value is therefore read from its source range, which
+/// is the wikitext as written and what the service passes (`{{#invoke:String|
+/// len|<div>X</div>}}` answers 12).
+///
+/// A value with no tag is stringified from its **expanded** tokens, so a nested
+/// template or `#invoke` is substituted: `x{{#invoke:String|len|abc}}y` must
+/// measure `x3y`. Those tokens are expanded by
+/// [`Parser::expand_invoke_args`] before this is reached; the source range would
+/// still hold the unexpanded form.
+fn expanded_arg_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
+    use crate::wikitext::tokens_v2::KeyValue;
+    let value = match &kv.value {
+        KeyValue::Tokens(items) => {
+            if items.iter().any(item_is_tag) {
+                kv_value_source(kv)
+            } else {
+                crate::wikitext::token_utils::tokens_to_string(items)
+            }
+        }
+        KeyValue::Str(s) => s.clone(),
+    };
+    let key = crate::wikitext::token_utils::key_value_to_string(&kv.key);
+    Some(if key.trim().is_empty() {
+        value
+    } else {
+        format!("{}={value}", key.trim())
+    })
+}
+
+/// Whether an item is a tag, whose text `tokensToString` cannot produce.
+fn item_is_tag(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Tok(ParsoidToken::Tag(_) | ParsoidToken::EndTag(_))
+    )
 }
 
 /// How many redirect hops may be followed before giving up.
@@ -3417,23 +3595,6 @@ const MAX_LUA_EXPANSION_DEPTH: usize = 16;
 ///
 /// A numeric key is positional, anything else named — the same split the
 /// template path makes for arguments.
-/// The wikitext of a `KV`'s value, preferring its source range.
-///
-/// `tokensToString` has no arm for a plain tag, so stringifying an argument that
-/// holds one drops it: a module handed `{{#invoke:String|len|<div>X</div>}}`
-/// answered `1` where the live service answers `12`, and the loss showed up in
-/// `data-mw` as `{"wt":"X"}` instead of the whole tag. The range is the source
-/// as written, which is what Scribunto sees, and it is the same technique
-/// `prepare_tpl_param_infos` uses for template parameters.
-fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
-    kv.src_offsets
-        .as_ref()
-        .map(|so| so.value_substr(""))
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| crate::wikitext::token_utils::key_value_to_string(&kv.value))
-}
-
 fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua::engine::Arg> {
     use crate::lua::engine::Arg;
     use crate::wikitext::token_utils::key_value_to_string;
