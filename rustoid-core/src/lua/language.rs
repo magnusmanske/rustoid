@@ -607,7 +607,14 @@ fn language_object(lua: &Lua, code: &str) -> mlua::Result<Table> {
                     Some(v) if !v.is_nil() => super::engine::coerce_string(&v, "formatDate")?,
                     _ => "now".to_string(),
                 };
-                Ok(super::engine::format_date(&fmt, &stamp))
+                // An unparseable stamp **raises**, as MediaWiki's does
+                // (`{{#time:U|nonsense}}` renders `Error: Invalid time.`).
+                // `Module:Time ago` wraps this call in `pcall` precisely to catch
+                // that and return its own message; returning a string instead let
+                // the `pcall` succeed, so the module put the error markup into
+                // arithmetic and failed with "attempt to sub a 'string' with a
+                // 'string'" instead of its own message.
+                super::engine::format_date(&fmt, &stamp).map_err(mlua::Error::runtime)
             },
         )?,
     )?;

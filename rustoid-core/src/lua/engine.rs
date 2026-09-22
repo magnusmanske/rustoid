@@ -2905,27 +2905,43 @@ fn format_strftime(spec: &str, utc: chrono::DateTime<chrono::Utc>) -> String {
 /// date (`Module:Citation/CS1` iterates `F` and `M` over a year). An unknown
 /// letter is passed through as-is, so unsupported formatting shows up in the
 /// output rather than silently producing an empty string.
-pub(crate) fn format_date(format: &str, stamp: &str) -> String {
+pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<String, String> {
     // A relative expression (`today + 2 days`, `now`) is a documented `#time`
     // input, and `Module:Citation/CS1` relies on it: it bounds an access date
     // against `today + 2 days`. The resulting instant then formats like any
     // other, so it is resolved to a date here and the rest is unchanged.
     let resolved = resolve_relative(stamp);
-    let stamp = resolved.as_deref().unwrap_or(stamp);
+    // An omitted or empty stamp means *now*, which the manual states explicitly
+    // and `Module:Citation/CS1` relies on: `mw.getLanguage('en'):formatDate('U')`
+    // seeds its random id.
+    let now = resolve_relative("now");
+    let stamp = resolved
+        .as_deref()
+        .or_else(|| {
+            stamp
+                .trim()
+                .is_empty()
+                .then_some(now.as_deref().unwrap_or(""))
+        })
+        .unwrap_or(stamp);
 
-    // Only the date part matters for the supported letters, and MediaWiki accepts
-    // `YYYY-MM-DD` (optionally with a time), which is what callers build.
-    let mut parts = stamp.split(['-', 'T', ' ']);
-    let year = parts.next().and_then(|s| s.parse::<i32>().ok());
-    let month = parts.next().and_then(|s| s.parse::<usize>().ok());
-    let day = parts.next().and_then(|s| s.parse::<u32>().ok());
-
-    // The time of day, which only `U` and `H`/`i`/`s` need; a date-only stamp
-    // means midnight.
-    let mut time = stamp.split(['T', ' ']).nth(1).unwrap_or("").split(':');
-    let hour = time.next().and_then(|s| s.trim().parse::<u32>().ok());
-    let minute = time.next().and_then(|s| s.trim().parse::<u32>().ok());
-    let second = time.next().and_then(|s| s.trim().parse::<u32>().ok());
+    // MediaWiki accepts several spellings of the date, and a caller that passes
+    // one it does not recognise gets an *error* rather than an empty string:
+    // `{{#time:U|nonsense}}` renders `Error: Invalid time.`. `Module:Time ago`
+    // wraps its call in `pcall` for exactly that reason and returns its own
+    // message — so returning `""` here turned a guarded error into an
+    // `attempt to sub a 'string' with a 'string'` further down.
+    let Some((year, month, day, hour, minute, second)) = parse_date(stamp) else {
+        return Err("Error: Invalid time.".to_string());
+    };
+    let (year, month, day, hour, minute, second) = (
+        Some(year),
+        Some(month),
+        Some(day),
+        Some(hour),
+        Some(minute),
+        Some(second),
+    );
 
     const LONG: [&str; 12] = [
         "January",
@@ -3005,7 +3021,138 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> String {
         }
     }
     let _ = DAYS;
-    out
+    Ok(out)
+}
+
+/// Parse a `#time` date stamp into `(year, month, day, hour, minute, second)`.
+///
+/// The shapes here are the ones the corpus asks for, each checked against the
+/// service:
+///
+/// - `2020-01-01`, optionally with a time (`2020-01-01 12:30`);
+/// - `2020-1-1`, single-digit parts;
+/// - `January 2020` and `2020 January`;
+/// - `20200101`, the eight-digit form;
+/// - a bare year (`2020`), which MediaWiki fills in with the current month and
+///   day — `{{#time:U|2020}}` on 2026-09-22 gave `1600732800`, i.e. 2020-09-22;
+/// - empty, meaning *now*, which the manual states explicitly and
+///   `Module:Citation/CS1` relies on for its random id.
+///
+/// `None` is not "the epoch": it means MediaWiki would have raised, and the
+/// caller turns it into the documented error.
+fn parse_date(stamp: &str) -> Option<(i32, usize, u32, u32, u32, u32)> {
+    let stamp = stamp.trim();
+    if stamp.is_empty() {
+        // `now` — the caller formats the current instant.
+        return None;
+    }
+
+    // The time of day, when the stamp carries one, is split off first so the
+    // date half can be matched without it. The test is whether the second half
+    // *looks like* a clock time, not merely whether a space is present:
+    // `January 2020` has a space but its second half is the year, and splitting
+    // on it put the year in the time slot and lost the date entirely.
+    let (date_part, time_part) = match stamp.split_once(['T', ' ']) {
+        Some((d, t)) if t.trim().contains(':') => (d.trim(), Some(t.trim())),
+        _ => (stamp, None),
+    };
+    let (hour, minute, second) = match time_part {
+        Some(t) => {
+            let mut it = t.split(':');
+            let h = it.next().and_then(|s| s.trim().parse::<u32>().ok())?;
+            let m = it
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            let s = it
+                .next()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            (h, m, s)
+        }
+        None => (0, 0, 0),
+    };
+
+    // `YYYY-MM-DD`, also accepting single digits as MediaWiki does.
+    let dashed: Vec<&str> = date_part.split('-').collect();
+    if dashed.len() == 3 {
+        return Some((
+            dashed[0].parse().ok()?,
+            dashed[1].parse().ok()?,
+            dashed[2].parse().ok()?,
+            hour,
+            minute,
+            second,
+        ));
+    }
+
+    // A bare year: MediaWiki completes it with the current month and day.
+    if dashed.len() == 1
+        && date_part.len() == 4
+        && let Ok(year) = date_part.parse::<i32>()
+    {
+        let (m, d) = today_month_day();
+        return Some((year, m, d, hour, minute, second));
+    }
+
+    // The eight-digit `YYYYMMDD` form.
+    if date_part.len() == 8 && date_part.bytes().all(|b| b.is_ascii_digit()) {
+        return Some((
+            date_part[..4].parse().ok()?,
+            date_part[4..6].parse().ok()?,
+            date_part[6..8].parse().ok()?,
+            hour,
+            minute,
+            second,
+        ));
+    }
+
+    // `<month name> <year>` and `<year> <month name>`, the two orders that occur.
+    let words: Vec<&str> = date_part.split_whitespace().collect();
+    if words.len() == 2 {
+        let (name, year_str) = if words[0].parse::<i32>().is_ok() {
+            (words[1], words[0])
+        } else {
+            (words[0], words[1])
+        };
+        if let (Some(month), Ok(year)) = (month_number(name), year_str.parse::<i32>()) {
+            return Some((year, month, 1, hour, minute, second));
+        }
+    }
+
+    None
+}
+
+/// The month number for an English month name, full or three-letter.
+fn month_number(name: &str) -> Option<usize> {
+    const NAMES: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let lower = name.to_lowercase();
+    NAMES
+        .iter()
+        .position(|n| {
+            *n == lower || n.starts_with(&lower[..lower.len().min(3)]) && lower.len() >= 3
+        })
+        .map(|i| i + 1)
+}
+
+/// The current month and day, for a bare-year stamp.
+fn today_month_day() -> (usize, u32) {
+    use chrono::Datelike;
+    let now = chrono::Utc::now();
+    (now.month() as usize, now.day())
 }
 
 /// The Unix timestamp of a date and time, or an empty string if it is not a
@@ -4607,16 +4754,20 @@ mod tests {
                 .unwrap(),
             "ok"
         );
-        // An unparseable date yields nothing, so `tonumber` gives nil and the
-        // caller takes its documented failure path rather than comparing
-        // against the epoch.
+        // An unparseable date **raises**, as MediaWiki's does, so a caller's
+        // `pcall` sees it. Returning an empty string instead let the `pcall`
+        // succeed and pushed the failure into whatever the caller did next —
+        // `Module:Time ago` turned it into `attempt to sub a 'string' with a
+        // 'string'` rather than its own error message.
         assert_eq!(
             engine
                 .eval(
-                    "return tostring(tonumber(mw.getContentLanguage():formatDate('U', 'nonsense')))"
+                    "local ok = pcall(mw.getContentLanguage().formatDate, \
+                     mw.getContentLanguage(), 'U', 'nonsense') \
+                     return tostring(ok)"
                 )
                 .unwrap(),
-            "nil"
+            "false"
         );
         // The other supported letters keep working alongside `U`.
         assert_eq!(
@@ -5200,17 +5351,53 @@ mod tests {
     /// and took `Module:Citation/CS1`'s date handling with it.
     #[test]
     fn format_date_handles_the_raw_prefix() {
-        assert_eq!(format_date("U", "2020-01-01"), "1577836800");
-        assert_eq!(format_date("xnU", "2020-01-01"), "1577836800");
-        assert_eq!(format_date("nU", "2020-01-01"), "11577836800");
+        let at = |f: &str| format_date(f, "2020-01-01").unwrap();
+        assert_eq!(at("U"), "1577836800");
+        assert_eq!(at("xnU"), "1577836800");
+        assert_eq!(at("nU"), "11577836800");
         // `x` makes the next code literal, and `n` contributes nothing at all.
-        assert_eq!(format_date("xU", "2020-01-01"), "U");
-        assert_eq!(format_date("xx", "2020-01-01"), "x");
-        assert_eq!(format_date("xn", "2020-01-01"), "");
+        assert_eq!(at("xU"), "U");
+        assert_eq!(at("xx"), "x");
+        assert_eq!(at("xn"), "");
         // A field may still follow the modifier: `H` is `00` here.
-        assert_eq!(format_date("HxnU", "2020-01-01"), "001577836800");
+        assert_eq!(at("HxnU"), "001577836800");
         // A trailing `x` has nothing to make literal and adds nothing.
-        assert_eq!(format_date("Ux", "2020-01-01"), "1577836800");
+        assert_eq!(at("Ux"), "1577836800");
+    }
+
+    /// The input shapes MediaWiki accepts, each checked against the service.
+    #[test]
+    fn format_date_parses_the_documented_stamp_shapes() {
+        let ts = |s: &str| format_date("U", s).unwrap();
+        assert_eq!(ts("2020-01-01"), "1577836800");
+        // Single-digit parts.
+        assert_eq!(ts("2020-1-1"), "1577836800");
+        // Eight digits, same instant.
+        assert_eq!(ts("2020-01-01"), ts("20200101"));
+        // A time of day is accepted, and the date half still matches.
+        assert_eq!(format_date("H:i", "2020-01-01 07:30").unwrap(), "07:30");
+        // A month name in either order; the service gives 2020-01-01 for both.
+        assert_eq!(ts("January 2020"), "1577836800");
+        assert_eq!(ts("2020 January"), "1577836800");
+        // A bare year keeps the current month and day, so it is pinned to a real
+        // instant inside that year rather than to an exact value. The service
+        // returned 1600732800 for `{{#time:U|2020}}` on 2026-09-22.
+        let year_only = ts("2020").parse::<i64>().unwrap();
+        assert!(
+            (1_577_836_800..1_609_459_200).contains(&year_only),
+            "a bare year must land inside 2020, got {year_only}"
+        );
+    }
+
+    /// An unparseable stamp is an *error*, as MediaWiki's is: `pcall` is what
+    /// callers use to catch it. Returning a string made `Module:Time ago`'s
+    /// `pcall` succeed and fed error markup into arithmetic.
+    #[test]
+    fn format_date_rejects_a_stamp_it_cannot_parse() {
+        assert!(format_date("U", "nonsense").is_err());
+        assert!(format_date("U", "not-a-date").is_err());
+        // Empty is *now*, not an error, which the manual states explicitly.
+        assert!(format_date("U", "").is_ok());
     }
 
     #[test]
