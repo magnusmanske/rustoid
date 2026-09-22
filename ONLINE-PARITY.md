@@ -1776,6 +1776,83 @@ Narrowing it to titles-only was the right call and cost no fixtures.
 Status: fixtures held at exactly 876/896. `Template:Infobox` moved from 6722
 bytes toward the served 209692; the scoreboard delta is recorded below.
 
+## The stall cap, and the four loops under it
+
+A corpus run used to hang on page 1 and print nothing. The cap was the reason
+it could not be diagnosed, so it was fixed first, then used.
+
+### The cap never fired
+
+`tokio::time::timeout` only cancels at an `.await` point. A non-terminating
+expansion is synchronous CPU work that never yields, so `Cristiano Ronaldo` sat
+at 100% CPU for nine minutes with the cap set to 60s and the corpus never
+reached page 2 — a scoreboard that never prints measures nothing.
+
+The render now runs on a blocking worker and its handle is raced against the
+timer. `spawn_blocking` needs `'static`, so `WikiSiteConfig` gained `Clone` and
+the render takes an owned input. A `std::thread::scope` borrows fine but its
+*implicit join at the end of the scope* re-blocks on the very thread the timer
+is abandoning, which defeats the cap — worth knowing, because it looks correct.
+
+An abandoned worker cannot be stopped in safe Rust. That leaks a core per
+stall, so the harness counts them and refuses to start more past two. The
+refusal is a real result, not a workaround: six stalled workers at ~600% CPU
+then starved `Template:Infobox` of a thread and it hung for 22 minutes *with a
+60s cap*, because its render never started.
+
+### `Module:Documentation` and the subpages no one preloaded
+
+`contentTitle` returned the empty string. Patching the cached module to print
+its state gave the answer in one run: `prefixed=Template:Yesno/doc` but
+`exists=false`. The title was right and the *fact* was missing.
+
+`preload_titles` preloaded `/doc`, `/sandbox` and `/testcases` for the **root
+page only**. `Module:Documentation` is transcluded from another template's body
+— `{{Yesno}}` ends with `{{Documentation}}` — so its `env.title` is
+`Template:Yesno`, not the page being rendered. The page it needs had never been
+asked for, `exists` was false, and the module took its "does not exist" branch.
+
+The lesson generalises: `page_title` and `getCurrentTitle()` are different
+titles, and a module that documents *its caller* needs the caller's subpages.
+
+### `parent.args` were handed over as source, not expanded
+
+Scribunto gives a module expanded text. rustoid passed `frame:getParent().args`
+raw, so the literal string `{{If empty|…}}` sat inside `parent.args`;
+`Module:Infobox` expands what it reads, and each expansion re-entered the parser
+and re-invoked the module. Fifty lines of exponential-looking stall, one wrong
+stringification.
+
+The tell was that expansions stayed bounded at 44 while fetch counts ran into
+the hundreds: **the expansion depth never grew, so the depth limit never
+fired.** A flat loop with growing breadth is a different animal from recursion,
+and the depth counter cannot see it.
+
+### Title facts are per render, not per invoke
+
+`preload_titles` runs once per `#invoke`, and its inputs barely change between
+calls, so every call re-fetched the same subpages: `{{Infobox person}}` asked
+for `Sandbox/doc` 29 times over 357 fetches. The facts cannot change mid-parse,
+so a render-wide cache is a dedupe rather than a heuristic. 357 → 201.
+
+### Still open: `{{Infobox person}}` does not terminate
+
+`{{Infobox person}}` alone still stalls, and 120s is not enough. What is known:
+
+- expansions are bounded at 44 and `frame.depth()` stays at 2 throughout, so it
+  is a breadth loop, not recursion;
+- `{{If empty}}` is expanded 28 times, **with no arguments**, at depth 2;
+- each of those invokes `Module:If empty`, which fetches `Module:Arguments`;
+- the per-invoke guards (`MAX_FRAME_ROUNDS`, the `asked` repeat check) do not
+  fire, so each round requests a *different* key.
+
+`{{If empty}}` with no arguments is fine on its own, and so is each helper
+(`Longitem`, `Main other`, `Pluralize from text`) alone. The loop needs the
+combination, which points at `Module:Arguments`' `wrappers` option: it reads
+`frame:getParent().args`, and if that frame's args are rebuilt on each read, the
+module re-runs forever. Worth checking next whether `getParent()` returns a
+frame whose `args` are lazily re-expanded.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
