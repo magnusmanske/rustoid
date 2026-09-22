@@ -1941,15 +1941,43 @@ attribute table) are gone, both fixed. The top entry is now `Module:Unicode data
 They are concrete, each names a line, and the biggest is worth 7 pages:
 
 - `Module:Unicode data:485` — `attempt to index a boolean value (field 'scripts')`.
-  The module's data table holds a boolean where a table is expected; likely a
-  `mw.loadData` shape difference.
+  Diagnosed, and it is the interesting one. The module builds its data-module
+  names at runtime:
+
+  ```lua
+  local loader = setmetatable({}, {
+      __index = function (self, key)
+          local success, data = pcall(mw.loadData, "Module:Unicode data/" .. key)
+          if not success then data = false end
+          self[key] = data
+          return data
+      end
+  })
+  ```
+
+  Scribunto does not care: `mw.loadData` fetches synchronously, so the
+  concatenated title resolves on demand. rustoid **preloads**, and the static scan
+  can only see the prefix `"Module:Unicode data/"` — the rest is computed. The
+  truncated title is not the page, so the data is absent, `data = false`, and the
+  caller then indexes it. The page `Module:Unicode data/scripts` does exist and is
+  fetchable (checked against the wiki).
+
+  **This needs a decision rather than a patch.** Making it work means letting
+  `mw.loadData` reach the deferred-fetch loop *from inside a `pcall`*, which is a
+  change to how a runtime module load is serviced — the error a `pcall` swallows
+  is exactly the signal the loop keys on. Worth doing, and worth doing
+  deliberately: the same dynamic-name pattern appears in the other data-heavy
+  modules, so it is structural, not one page's quirk.
 - `Module:Time ago:62` — `attempt to sub a 'string' with a 'string'`. Lua coerces
-  numeric strings in arithmetic ('100' - '40' is 60); rustoid's engine does not.
+  numeric strings in arithmetic (`'100' - '40'` is 60); rustoid's engine does not.
 - `Module:Math:389` — `attempt to perform 'n%0'`. Lua returns NaN, not an error.
 - `Module:Wikidata:247` — `'^\-'` is a valid Lua pattern escape in 5.1 and
   rustoid's pattern compiler rejects it.
 - `Module:Multiple image:177` — arithmetic on a nil `totalwidth`, which the
   manual says coerces from a numeric string.
+
+The three coercions are small, self-contained engine fixes and are the cheapest
+wins on this list.
 
 ## Risks
 
