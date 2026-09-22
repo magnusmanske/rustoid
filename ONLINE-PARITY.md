@@ -1726,18 +1726,55 @@ position also fails, and a token dump shows why —
 {{#invoke:String|len|a{{Template:Foo}}b}}  →  <template> … values "len" and "ab"
 ```
 
-**the nested transclusion is dropped from the argument value at tokenization
- time.** `a{{Template:Foo}}b` becomes the string `ab`, so there is no token left
-for `expand_invoke_args` to expand and nothing for `data-mw` to record. That is
-the next place to look, and it is in the tokenizer rather than in the invoke
-path: everything above it now behaves correctly for arguments that survive.
+#### Retraction: the nested transclusion was never dropped
 
-Until it lands, the page stays at 6722 bytes against the served 209692 — the
-module sees a non-empty `_content`, skips the `/doc` transclusion, and renders
-an empty container.
+The paragraph above is **wrong**, and was written from a misread probe. That probe
+iterated `t.attribs` and printed each `key`, so for `{{#invoke:String|len|a{{Yesno|yes}}b}}`
+the *target* position (`Value::Str("#invoke:String")`) was mistaken for the argument.
+A direct dump shows the tokenizer is correct:
 
-Also recorded here: `frame:extensionTag` used to lower to `##tag`, which is not
-a call at all, so it silently failed to expand *and* consumed an about id.
+```
+{{Talk|a{{Template:Foo}}b}}  →  Value::Tokens(3) = Str("a"), template("{{Template:Foo}}"), Str("b")
+```
+
+and `data-mw` records `"1":{"wt":"a{{Yesno|yes}}b"}`. Nothing is lost at
+tokenization. The real defect was in the *parser-function target*, above.
+
+#### The real bug: `data-mw` recorded the expanded target
+
+`{{#switch: {{lc:YES}} |yes=FOUND |#default=MISS}}` — the switch **did** answer
+`FOUND`, so the argument was expanding fine. What differed was `data-mw`:
+
+| | `target.wt` |
+|---|---|
+| service | `#switch: {{lc:YES}} ` |
+| rustoid | `#switch: yes` |
+
+The recorded target must be the source **as written**, not as expanded — the same
+rule already applied to argument values, which read from `srcOffsets`. rustoid
+built it from the expanded `target_str` that `resolve_template_target` consumes,
+so any parser function whose colon argument held a template recorded the answer.
+
+That is `Template:Yesno`, whose body is
+`{{<includeonly>safesubst:</includeonly>#switch: {{<includeonly>safesubst:</includeonly>lc: {{{1|¬}}} }} |…}}`,
+and through it `Template:Documentation`, `Template:Main other`, and every infobox.
+
+The fix reads the raw target back out of `DataParsoid::src` (`raw_template_target`)
+and records that, with `strip_include_directives` applied. The directive stripping
+is what makes the two spellings agree: the service records
+`{{#if:<includeonly>X</includeonly> |yes|no}}` as `"#if: "`, and
+`#if:<!-- c -->X |yes|no` keeps the comment as literal text. Checked both.
+
+One thing that *was* right in the old guess: `strip_subst_prefix` is genuinely
+load-bearing here, and it is correct as it stands. `{{<includeonly>safesubst:</includeonly>lc: y}}`
+really does resolve to the magic word `lc` — the service reports
+`{"target":{"wt":"lc: y","function":"lc"},"params":{}}` — because `subst` is a
+title prefix. It fires only when the whole target is a plain title, so a colon
+further in (`Foo:subst:Bar`) or a nested `{{…}}` in the argument leaves it alone.
+Narrowing it to titles-only was the right call and cost no fixtures.
+
+Status: fixtures held at exactly 876/896. `Template:Infobox` moved from 6722
+bytes toward the served 209692; the scoreboard delta is recorded below.
 
 ## Risks
 

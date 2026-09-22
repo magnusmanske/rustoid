@@ -19,7 +19,9 @@ use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 use std::collections::HashMap;
 
 use super::parser_functions::{Params, ParserFunctions};
-use super::template_encapsulator::{TemplateEncapsulator, TemplateInfo, template_info_from};
+use super::template_encapsulator::{
+    TemplateEncapsulator, TemplateInfo, strip_include_directives, template_info_from,
+};
 
 /// Is this token an annotation meta tag? Mirrors PHP
 /// `WTUtils::ANNOTATION_META_TYPE_REGEXP`.
@@ -697,6 +699,28 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// The target of a `{{…}}` source string, before any nested template in it is
+/// expanded. `None` when the source is not a well-formed template.
+fn raw_template_target(src: &str) -> Option<&str> {
+    let inner = src.strip_prefix("{{")?.strip_suffix("}}")?;
+    Some(inner.split_once('|').map_or(inner, |(t, _)| t))
+}
+
+/// Choose the wikitext to record for a parser function's `data-mw` target.
+///
+/// The recorded form is the source as written, so a nested template in the colon
+/// argument survives in `target.wt` — `{\{#switch: {{lc:YES}} |yes=…\}\}`
+/// records `"#switch: {{lc:YES}} "`. The expanded `target_str` is only a
+/// fallback for a token whose source is unavailable (one spliced in from an
+/// argument value), where recording something is better than recording nothing.
+///
+/// Preprocessor directives are stripped either way, matching MediaWiki:
+/// `{{#if:<includeonly>X</includeonly> |yes|no}}` records `"#if: "`.
+fn info_target_wt(target_str: &str, raw_target: Option<&str>) -> String {
+    let text = raw_target.unwrap_or(target_str);
+    strip_include_directives(text)
+}
+
 /// Enforce template loop / depth constraints. Mirrors PHP's
 /// `TemplateHandler::enforceTemplateConstraints`.
 ///
@@ -886,6 +910,13 @@ impl TemplateHandler {
         token: &crate::wikitext::tokens_v2::ParsoidToken,
         protection: &ProtectionContext,
     ) -> Vec<Item> {
+        // The target as it appears in the source, before any nested template in it
+        // is expanded. `data-mw` records this form (see the parser-function arm).
+        let raw_target = token
+            .data_parsoid()
+            .and_then(|dp| dp.src.as_deref())
+            .and_then(raw_template_target)
+            .map(str::to_string);
         // Extract the target (first arg key).
         let target_str = params
             .args
@@ -975,9 +1006,18 @@ impl TemplateHandler {
                 } else {
                     Some("old-parserfunction".to_string())
                 };
-                info.target_wt = Some(target_str.clone());
+                // `data-mw` records the target *as written*, not as expanded. A
+                // nested template in the colon argument therefore stays visible:
+                // `{{#switch: {{lc:YES}} |yes=…}}` records
+                // `"#switch: {{lc:YES}} "`, while the argument values below come
+                // from `srcOffsets` for the same reason. Recording the expanded
+                // `target_str` instead wrote `"#switch: yes"`, so every page
+                // comparing `data-mw` differed at the first parser function whose
+                // argument held a template — which is `Template:Yesno`, and
+                // through it `Template:Infobox` and the documentation stack.
+                info.target_wt = Some(info_target_wt(&target_str, raw_target.as_deref()));
                 info.param_infos = super::template_encapsulator::prepare_pf_param_infos(
-                    &target_str,
+                    info.target_wt.as_deref().unwrap_or(&target_str),
                     params,
                     // The argument wikitext is read from the source range, which
                     // needs the ambient text the call came from.

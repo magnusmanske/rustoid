@@ -580,9 +580,9 @@ pub fn prepare_pf_param_infos(
 ///
 /// `<includeonly>` drops its contents *and* its tags: the value is stringified
 /// outside a transclusion context, and the wiki records `{{#if:1|<includeonly>x</includeonly>y}}`
-/// as `y`. `<noinclude>` keeps its contents and drops the tags (`xy`), and
+/// `<noinclude>` keeps its contents and drops the tags (`xy`), and
 /// `<onlyinclude>` behaves like `<noinclude>` in an argument value.
-fn strip_include_directives(text: &str) -> String {
+pub(crate) fn strip_include_directives(text: &str) -> String {
     let mut out = text.to_string();
     // `<includeonly>…</includeonly>` goes whole, contents included. A stray
     // opening or closing tag with no partner is dropped on its own, so a

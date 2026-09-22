@@ -4434,7 +4434,25 @@ fn find_template_closing(input: &str) -> Option<usize> {
 /// the target is parsed before tag handling runs, so removing it is part of
 /// recognising the prefix. Case is not significant (`{{Subst:…}}` occurs) and
 /// whitespace may follow the colon.
+///
+/// This fires *only* when the whole target is a plain title. `subst` is a
+/// title prefix (the grammar's `subst_prefix` sits inside `template_target`),
+/// so it cannot swallow a colon that belongs to a magic word argument the way
+/// `{{lc: y}}` does in
+///
+/// ```text
+/// {{#switch: {{<includeonly>safesubst:</includeonly>lc: y}} |yes=… }}
+/// ```
+///
+/// That is `Template:Yesno`, and stripping the inner prefix resolved the
+/// argument *before* `#switch` ran — leaving a key of `" y"` that matched no
+/// case. The live parser leaves `{{lc: y}}` intact in the recorded target
+/// (only the `<includeonly>` pair, being a tag, disappears from it). A
+/// `[[wikilink]]` target is likewise not a title.
 fn strip_subst_prefix(target: &str) -> Option<String> {
+    if target.contains("{{") || target.contains("[[") {
+        return None;
+    }
     // Drop any `<noinclude />`/`<includeonly />` markers, then look for the
     // directive. Only those two go: any other tag between the word and the colon
     // means this is not a substitution but a title that happens to begin with
@@ -4466,12 +4484,14 @@ fn strip_subst_prefix(target: &str) -> Option<String> {
 
 /// The name half of [`strip_subst_prefix`], once any tags are gone.
 fn subst_name(text: &str) -> Option<String> {
-    let (word, after) = text.trim_start().split_once(':')?;
-    let word = word.trim();
+    // The word must be followed directly by the colon; any other colon in the
+    // target belongs to what follows it, not to a prefix (`Foo:subst:Bar`).
+    let colon = text.find(':')?;
+    let word = text[..colon].trim();
     if !word.eq_ignore_ascii_case("subst") && !word.eq_ignore_ascii_case("safesubst") {
         return None;
     }
-    let name = after.trim();
+    let name = text[colon + 1..].trim();
     // `{{subst:}}` names nothing. Leaving it alone keeps the literal text, which
     // is what the parser does with a directive it cannot resolve.
     (!name.is_empty()).then(|| name.to_string())
@@ -6104,7 +6124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_style_extension_tokenized_when_registered() {
+    fn test_tokenize_style_extension_tokenized_when_registered() {
         let mut opts = TokenizerOptions::default();
         opts.ext_tags.push("style".to_string());
         let mut tokenizer = PegTokenizer::new("<style>.foo{}</style>", &opts);
@@ -6817,5 +6837,35 @@ mod tests {
     fn an_empty_name_is_not_a_substitution() {
         assert_eq!(strip_subst_prefix("subst:"), None);
         assert_eq!(strip_subst_prefix("safesubst:   "), None);
+    }
+
+    /// Only a plain title takes the prefix. A colon further in the target belongs
+    /// to what follows it, as `Foo:subst:Bar` shows by leaving the name alone.
+    #[test]
+    fn a_colon_before_the_word_is_not_a_prefix() {
+        assert_eq!(
+            strip_subst_prefix("Foo:subst:Bar"),
+            None,
+            "the first colon ends the candidate word, so this is a title"
+        );
+        assert_eq!(subst_name("Foo:subst:Bar"), None);
+    }
+
+    /// The prefix is title syntax, so it cannot reach inside a magic word
+    /// argument. `Template:Yesno` depends on this: its switch key is
+    /// `{{safesubst:lc: {{{1|¬}}} }}`, and stripping that inner prefix resolved it
+    /// to a leading space before `#switch` ran, so no case ever matched.
+    #[test]
+    fn a_prefix_inside_a_magic_word_argument_is_left_alone() {
+        assert_eq!(strip_subst_prefix("{{safesubst:lc: y}}"), None);
+        assert_eq!(strip_subst_prefix("{{lc: y}}"), None);
+        assert_eq!(strip_subst_prefix("#switch: {{safesubst:lc: y}} "), None);
+    }
+
+    /// A wikilink target is not a title either, so it is left for the link
+    /// parser.
+    #[test]
+    fn a_wikilink_target_is_not_a_substitution() {
+        assert_eq!(strip_subst_prefix("[[subst:Foo]]"), None);
     }
 }
