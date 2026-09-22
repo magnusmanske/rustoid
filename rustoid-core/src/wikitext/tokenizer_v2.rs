@@ -4359,6 +4359,29 @@ fn find_wikilink_close_at(input: &str) -> Option<usize> {
 ///   Treating it as an argument reference swallowed everything up to the next
 ///   `}}}`, which changed how `<pre>` bodies tokenize.
 fn find_template_closing(input: &str) -> Option<usize> {
+    let mut memo = ScanMemo::default();
+    find_template_closing_memo(input, &mut memo)
+}
+
+/// Memo for one scan, shared by the template and tplarg scanners.
+///
+/// Both scanners re-enter each other on nested braces, and both re-examine the
+/// same suffixes when they unwind. That is exponential on the input a module's
+/// HTML table output produces — 29 unterminated `{{` and no `}}` at all drove the
+/// pair 85 frames deep and spun `{{Infobox person}}` past 120s while expansions
+/// stayed bounded, so the depth limits never fired.
+///
+/// The scans are deterministic, so "nothing closes from offset `p`" is a fact
+/// that cannot change while the same string is being scanned. Remembering it is
+/// what makes the walk linear, and the offsets only mean anything for the one
+/// string the scan is working on.
+#[derive(Default)]
+struct ScanMemo {
+    /// Offsets where a `{{{…}}}` was already found not to close.
+    tplarg_failed: std::collections::HashSet<usize>,
+}
+
+fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize> {
     /// Closer pushed by a nested `{{…}}` (and by the template being scanned).
     const TPL: &str = "}}";
     /// Closer pushed by a `[[…]]` wikilink.
@@ -4386,10 +4409,12 @@ fn find_template_closing(input: &str) -> Option<usize> {
             // A well-formed `{{{…}}}` argument reference is skipped whole; one
             // that PHP would reject leaves the `{` as ordinary content, so the
             // following `{{…}}` is then read as a template.
-            (Some(&TPL), _) if input[i..].starts_with("{{{") => match skip_tplarg(input, i) {
-                Some(end) => i = end,
-                None => i += 1,
-            },
+            (Some(&TPL), _) if input[i..].starts_with("{{{") => {
+                match skip_tplarg_memo(input, i, memo) {
+                    Some(end) => i = end,
+                    None => i += 1,
+                }
+            }
             // A nested transclusion pushes its own `}}` closer.
             (Some(&TPL), _) if input[i..].starts_with("{{") => {
                 stack.push(TPL);
@@ -4508,7 +4533,14 @@ fn subst_name(text: &str) -> Option<String> {
 /// the signal for the caller to treat the leading `{` as ordinary content.
 /// Contents may hold nested `{{…}}`/`{{{…}}}`/`[[…]]` pieces; a `}}` that is not
 /// part of a `}}}` ends the attempt, matching PHP's `preproc_piece` scan.
-fn skip_tplarg(input: &str, start: usize) -> Option<usize> {
+///
+/// The memo must be shared with the enclosing `find_template_closing_memo`: the
+/// two re-enter each other, so a memo local to one call is discarded exactly when
+/// it is needed.
+fn skip_tplarg_memo(input: &str, start: usize, memo: &mut ScanMemo) -> Option<usize> {
+    if memo.tplarg_failed.contains(&start) {
+        return None;
+    }
     let mut i = start + 3;
     while i < input.len() {
         // The closer.
@@ -4518,35 +4550,58 @@ fn skip_tplarg(input: &str, start: usize) -> Option<usize> {
         // A `}}` that is not part of a `}}}` is not admissible content, so this
         // is not an argument reference after all.
         if input[i..].starts_with("}}") {
+            memo.tplarg_failed.insert(start);
             return None;
         }
         // Nested pieces are skipped as units, so their own `}}`/`]]` cannot be
         // mistaken for this tplarg's boundary.
         if input[i..].starts_with("{{{") {
-            i = skip_tplarg(input, i)?;
+            match skip_tplarg_memo(input, i, memo) {
+                Some(end) => i = end,
+                None => {
+                    memo.tplarg_failed.insert(start);
+                    return None;
+                }
+            }
             continue;
         }
         if input[i..].starts_with("{{") {
-            let end = find_template_closing(&input[i + 2..])?;
-            i += 2 + end + 2;
+            match find_template_closing_memo(&input[i + 2..], memo) {
+                Some(end) => i += 2 + end + 2,
+                None => {
+                    memo.tplarg_failed.insert(start);
+                    return None;
+                }
+            }
             continue;
         }
         if input[i..].starts_with("[[") {
             // Inside a wikilink the pending closer is `]]`, so braces are
             // ordinary content (PHP's `inlineBreaks` keys off the top closer).
             let rest = &input[i + 2..];
-            let end = rest.find("]]")?;
-            i += 2 + end + 2;
+            match rest.find("]]") {
+                Some(end) => i += 2 + end + 2,
+                None => {
+                    memo.tplarg_failed.insert(start);
+                    return None;
+                }
+            }
             continue;
         }
         if input[i..].starts_with("<!--") {
             let rest = &input[i + 4..];
-            let end = rest.find("-->")?;
-            i += 4 + end + 3;
+            match rest.find("-->") {
+                Some(end) => i += 4 + end + 3,
+                None => {
+                    memo.tplarg_failed.insert(start);
+                    return None;
+                }
+            }
             continue;
         }
         i += input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
     }
+    memo.tplarg_failed.insert(start);
     None
 }
 
@@ -6455,6 +6510,44 @@ mod tests {
         );
         // Nothing to close at all.
         assert_eq!(find_template_closing("1x|foo"), None);
+    }
+
+    /// The two scanners must share one memo, and a failed `{{{` must be
+    /// remembered rather than rescanned.
+    ///
+    /// This pins the *mechanism* rather than the input that motivated it. The
+    /// blow-up cannot be reproduced at this level: it needs `Module:Infobox`'s
+    /// expansion state, and the same text renders promptly outside it — checked
+    /// by disabling the memo, which stalls `{{Infobox person}}` past 120s and
+    /// leaves every snippet tried here unaffected. The end-to-end guard is
+    /// therefore the corpus, and this test covers the invariant that the corpus
+    /// would be slow to attribute.
+    ///
+    /// What it does assert: a scan that fails remembers the offset, and a second
+    /// identical call does no work (it returns before touching the input), so the
+    /// recursion cannot redo a failed suffix.
+    #[test]
+    fn a_failed_tplarg_scan_is_remembered() {
+        let source = "{{{partners</td><td>{{if empty</td>";
+        let mut memo = ScanMemo::default();
+        assert_eq!(skip_tplarg_memo(source, 0, &mut memo), None);
+        assert!(
+            memo.tplarg_failed.contains(&0),
+            "a failed offset must be recorded, or the second scan redoes it"
+        );
+        // The second call short-circuits: same answer, and the memo is not grown.
+        let before = memo.tplarg_failed.len();
+        assert_eq!(skip_tplarg_memo(source, 0, &mut memo), None);
+        assert_eq!(memo.tplarg_failed.len(), before);
+    }
+
+    /// A memo is per scan, so a successful `{{{…}}}` is not poisoned by another
+    /// input's failure.
+    #[test]
+    fn a_successful_tplarg_still_closes() {
+        let mut memo = ScanMemo::default();
+        assert_eq!(skip_tplarg_memo("{{{a}}}", 0, &mut memo), Some(7));
+        assert!(memo.tplarg_failed.is_empty());
     }
 
     #[test]
