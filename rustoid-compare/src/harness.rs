@@ -963,10 +963,16 @@ static LIVE_STALLED_RENDERS: std::sync::atomic::AtomicUsize =
 /// How many abandoned renders the harness tolerates before refusing to start
 /// more.
 ///
-/// Small on purpose. Each one holds a core for the rest of the run, and the
-/// machine only has so many; past this point a fresh render would wait on a
-/// thread that never comes free, which reads as an unrelated page hanging.
-const MAX_LIVE_STALLED_RENDERS: usize = 2;
+/// Each one holds a core for the rest of the run, so an unbounded number would
+/// grind the machine to a halt — six of them already starved `Template:Infobox`
+/// of a blocking thread, and it hung for 22 minutes *with a 60s cap* because its
+/// render never started.
+///
+/// But the ceiling must not be so low that it stops measuring: at two, a corpus
+/// run with three bad pages reported `0/0 compared, 46 skipped` and learned
+/// nothing about the other 43. Eight is where a run still produces a scoreboard
+/// on a machine with a normal core count, which is the point of running one.
+const MAX_LIVE_STALLED_RENDERS: usize = 8;
 
 /// The per-page wall-clock cap, in seconds.
 ///

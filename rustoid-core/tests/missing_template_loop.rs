@@ -202,11 +202,9 @@ async fn a_single_missing_template_is_requested_once() {
 /// escaping compounds on every round until the string outgrows anything a limit
 /// can stop.
 ///
-/// These are characterisation tests: the answer was already a title-text link
-/// when they were written, so they do not fix a bug. They pin the property that
-/// makes the runaway impossible, because the failure mode is a silent one — a
-/// hand-built anchor that merely looks like a link would pass a rendering review
-/// and still feed markup back to the caller.
+/// The properties worth pinning are that the answer contains the title as text,
+/// that it comes back as *link* text rather than more wikitext to expand, and
+/// that the whole thing terminates.
 #[tokio::test]
 async fn a_missing_template_answers_with_its_title_as_text() {
     let (source, _) = Recording::new(&[]);
@@ -222,6 +220,8 @@ async fn a_missing_template_answers_with_its_title_as_text() {
         html.contains("Template:Taxonomy/Nonexistent"),
         "the answer must carry the title as text, not markup: {html}"
     );
+    // The answer is a link whose text is the title, so a caller reading it back
+    // gets the same absent page again and stops, rather than a deeper string.
     assert!(
         html.contains("mw:WikiLink"),
         "a missing template should render as a link: {html}"
