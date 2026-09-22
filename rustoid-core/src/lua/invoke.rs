@@ -343,6 +343,8 @@ pub async fn invoke<F, Fut>(
     // modules were preloaded.
     frame: FrameContext,
     expand: F,
+    // Render-wide title facts, shared across every `#invoke` on the page.
+    title_cache: &std::cell::RefCell<std::collections::HashMap<String, TitleFacts>>,
 ) -> Result<String>
 where
     F: Fn(crate::pipeline::lua_deferred::FrameRequest) -> Fut,
@@ -362,10 +364,24 @@ where
         .clone()
         .unwrap_or_else(|| page_title.to_string());
     let mut frame = FrameContext {
-        titles: preload_titles(source, &registry, &site, Some(&entity_page)).await,
+        titles: preload_titles(
+            source,
+            &registry,
+            &site,
+            &[&entity_page, page_title],
+            &frame.titles,
+        )
+        .await,
         entities: preload_entities(source, &registry, Some(&entity_page)).await,
         ..frame
     };
+    // Everything resolved here serves the next `#invoke` on the page too, and the
+    // facts cannot change mid-parse. Publishing them back is what stops the
+    // subpage preload from repeating for every call: without it `{{Infobox
+    // person}}` fetched `Sandbox/doc` 29 times and never finished.
+    title_cache
+        .borrow_mut()
+        .extend(frame.titles.iter().map(|(k, v)| (k.clone(), v.clone())));
     // Interface messages are fetched here rather than in the parser for the same
     // reason modules are: fetching is asynchronous and Lua is not.
     let site = {
@@ -403,9 +419,11 @@ where
                         .page_title
                         .clone()
                         .unwrap_or_else(|| page_title.to_string());
-                    frame
-                        .titles
-                        .extend(preload_titles(source, &registry, &site, Some(&page)).await);
+                    let known = frame.titles.clone();
+                    frame.titles.extend(
+                        preload_titles(source, &registry, &site, &[&entity_page, &page], &known)
+                            .await,
+                    );
                     frame.entities = preload_entities(
                         source,
                         &registry,
@@ -500,8 +518,8 @@ const DOC_SUBPAGES: &[&str] = &["doc", "sandbox", "testcases"];
 /// reason. Titles are discovered two ways:
 ///
 /// - `mw.title.new('…')` string literals in the preloaded sources, and
-/// - the current page's **subpages**, which a module reaches through a computed
-///   name rather than a literal.
+/// - the **subpages** of every frame title in scope, which a module reaches
+///   through a computed name rather than a literal.
 ///
 /// The subpages are the important half in practice. `Module:Documentation`
 /// builds its `docTitle` as `mw.title.new('<base>/doc')` at runtime, so no
@@ -511,14 +529,24 @@ const DOC_SUBPAGES: &[&str] = &["doc", "sandbox", "testcases"];
 /// documentation it serves. `sandbox` and `testcases` are the same shape and
 /// come from the same module.
 ///
-/// What this still cannot see: a title built from something other than the page
-/// itself (`mw.title.new(prefix .. name)`). Those report as non-existent, which
+/// `frame_titles` must therefore hold *every* title a `getCurrentTitle()` can
+/// return during this render, not just the root page. `Module:Documentation` is
+/// transcluded from another template's body — `{{Yesno}}` ends with
+/// `{{Documentation}}` — so its `env.title` is `Template:Yesno`, and the page it
+/// needs is `Template:Yesno/doc`. Preloading only the root page left that title
+/// unknown, `exists` false, `contentTitle` returned the empty string,
+/// `_content={{ }}` transcluded nothing, and `Module:documentation` retried
+/// forever: `{{Infobox football biography}}` alone hung the render.
+///
+/// What this still cannot see: a title built from something other than a frame
+/// title (`mw.title.new(prefix .. name)`). Those report as non-existent, which
 /// is the conservative answer, and the gap is recorded in ONLINE-PARITY.md.
 pub async fn preload_titles<S: DataSource + ?Sized>(
     source: &S,
     registry: &Registry,
     site: &LuaSite,
-    page_title: Option<&str>,
+    frame_titles: &[&str],
+    known: &HashMap<String, TitleFacts>,
 ) -> HashMap<String, TitleFacts> {
     let mut out = HashMap::new();
     let mut wanted: BTreeSet<String> = BTreeSet::new();
@@ -528,11 +556,18 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
             wanted.insert(title);
         }
     }
-    if let Some(page) = page_title {
+    for page in frame_titles {
         for sub in DOC_SUBPAGES {
             wanted.insert(format!("{page}/{sub}"));
         }
     }
+    // A title already answered stays answered: the map accumulates across a
+    // render, and re-asking re-does a fetch for a value that cannot have changed
+    // mid-parse. This is load-bearing rather than an optimisation —
+    // `preload_titles` runs once per `#invoke`, and the subpage set is the same
+    // for every call made from the same articles, so `{{Infobox person}}` asked
+    // for `Sandbox/doc` 29 times and the render never finished.
+    wanted.retain(|title| !known.contains_key(title));
 
     for title in wanted.into_iter().take(MAX_TITLES) {
         // The title is parsed against the site's namespaces, not assumed to be a

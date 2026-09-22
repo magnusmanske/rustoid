@@ -45,20 +45,49 @@ async fn main() {
     } else {
         None
     };
-    let source = CachedDataSource::new(client, Arc::new(Mutex::new(cache)), !online);
-    let parser = rustoid_core::Parser::new(&config);
-    let options = rustoid_core::ParserOptions {
-        node_ids: true,
-        strip_data_parsoid: true,
-        wrap_sections: std::env::var_os("RUSTOID_WRAP_SECTIONS").is_some(),
-        ..rustoid_core::ParserOptions::for_page(&title)
-    };
+    let cache = Arc::new(Mutex::new(cache));
     let started = std::time::Instant::now();
-    let html = parser
-        .wikitext_to_html_expanded(&wikitext, &source, &options)
-        .await
-        .expect("parse");
-    source.flush().expect("flush cache");
+    // The render is capped, because the whole point of this example is diagnosing
+    // an expansion that does not terminate: without a cap it hangs forever instead
+    // of reporting, which is the state that made the corpus unusable.
+    //
+    // It also runs on its own thread and outlives nothing — the process exits the
+    // moment the cap fires — because `timeout` only cancels at an `.await` point,
+    // and a non-terminating expansion never yields. Both the parser and the data
+    // source are built *inside* the worker: `Parser` borrows `config` and is not
+    // `Sync`, so neither can be moved in from here.
+    let cap = std::env::var("RUSTOID_PAGE_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(60.0);
+    let wrap_sections = std::env::var_os("RUSTOID_WRAP_SECTIONS").is_some();
+    let worker = tokio::task::spawn_blocking(move || {
+        let source = CachedDataSource::new(client, cache, !online);
+        let options = rustoid_core::ParserOptions {
+            node_ids: true,
+            strip_data_parsoid: true,
+            wrap_sections,
+            ..rustoid_core::ParserOptions::for_page(&title)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let parser = rustoid_core::Parser::new(&config);
+        let html = rt
+            .block_on(parser.wikitext_to_html_expanded(&wikitext, &source, &options))
+            .expect("parse");
+        source.flush().expect("flush cache");
+        html
+    });
+    let html = match tokio::time::timeout(std::time::Duration::from_secs_f64(cap), worker).await {
+        Ok(Ok(html)) => html,
+        Ok(Err(e)) => panic!("render task failed: {e}"),
+        Err(_elapsed) => {
+            eprintln!("STALLED: no render after {cap:.0}s");
+            std::process::exit(2);
+        }
+    };
     eprintln!(
         "rendered {} bytes in {:.1}s",
         html.len(),

@@ -922,17 +922,51 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     // owned input; a `std::thread::scope` would borrow fine but its implicit
     // join at the end of the scope re-blocks on the very thread the timer is
     // trying to abandon, which defeats the cap.
+    //
+    // A render that times out cannot be stopped in safe Rust, so its worker keeps
+    // burning a core. Those workers must not accumulate: a six-page run left six
+    // of them alive at ~600% CPU, and the next page then could not get a blocking
+    // thread to run in at all — `Template:Infobox` sat for 22 minutes with a 60s
+    // cap, because its render never started. Tracking the live count turns that
+    // into a clear refusal instead of a mystery hang.
+    let live = LIVE_STALLED_RENDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if live >= MAX_LIVE_STALLED_RENDERS {
+        LIVE_STALLED_RENDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return Err(CompareError::Parse(format!(
+            "{live} earlier renders are still stuck and cannot be cancelled; \
+             not starting another. Fix the non-terminating expansion."
+        )));
+    }
     let config = config.clone();
     let worker = tokio::task::spawn_blocking(move || input.render(&config));
-    match tokio::time::timeout(cap, worker).await {
+    let finished = tokio::time::timeout(cap, worker).await;
+    if finished.is_ok() {
+        // The worker is done, so its slot is free again.
+        LIVE_STALLED_RENDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    match finished {
         Ok(Ok(res)) => res,
         // The worker panicked.
         Ok(Err(e)) => Err(CompareError::Parse(e.to_string())),
-        // Abandoned mid-render. The thread cannot be stopped in safe Rust, so it
-        // is detached and left to burn its core while the corpus moves on.
+        // Abandoned mid-render: the thread stays alive, holding its count.
         Err(_elapsed) => Ok(None),
     }
 }
+
+/// Renders that timed out and whose worker thread is still spinning.
+///
+/// These cannot be cancelled, so they are counted rather than reaped. See
+/// [`MAX_LIVE_STALLED_RENDERS`].
+static LIVE_STALLED_RENDERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many abandoned renders the harness tolerates before refusing to start
+/// more.
+///
+/// Small on purpose. Each one holds a core for the rest of the run, and the
+/// machine only has so many; past this point a fresh render would wait on a
+/// thread that never comes free, which reads as an unrelated page hanging.
+const MAX_LIVE_STALLED_RENDERS: usize = 2;
 
 /// The per-page wall-clock cap, in seconds.
 ///

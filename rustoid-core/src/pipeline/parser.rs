@@ -769,6 +769,17 @@ pub struct Parser<'a, C: SiteConfig> {
     /// reached from several expansion paths, so threading it through every
     /// signature would cost more than it explains.
     protection: std::cell::RefCell<std::collections::HashMap<String, ProtectionEntry>>,
+    /// Title facts already fetched this render, keyed by the title as written.
+    ///
+    /// `preload_titles` runs once per `#invoke`, and the titles it wants — a
+    /// module's `mw.title.new` literals plus the frame's `/doc`, `/sandbox`,
+    /// `/testcases` — barely change from one call to the next. Without a
+    /// render-wide cache each call re-fetches them: `{{Infobox person}}` asked
+    /// for `Sandbox/doc` 29 times over 357 fetches and never finished. The facts
+    /// cannot change mid-parse, so remembering them is a correctness-preserving
+    /// dedupe as well as the difference between a render and a hang.
+    title_facts:
+        std::cell::RefCell<std::collections::HashMap<String, crate::lua::engine::TitleFacts>>,
     /// The protection levels of the page being parsed, as
     /// `{{PROTECTIONLEVEL:action}}` with no title argument reports them.
     page_protection: std::cell::RefCell<ProtectionEntry>,
@@ -798,6 +809,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             expansion_depth: std::cell::Cell::new(0),
             strip_data_parsoid: std::cell::Cell::new(false),
             protection: std::cell::RefCell::new(std::collections::HashMap::new()),
+            title_facts: std::cell::RefCell::new(std::collections::HashMap::new()),
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
             ext_fragments: std::cell::RefCell::new(std::collections::HashMap::new()),
             ext_next_id: std::cell::Cell::new(0),
@@ -2568,7 +2580,24 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // constantly (`Module:Infobox`, `Module:Check for
                 // conflicting parameters` both do it on their first
                 // lines). The parent's arguments are this frame's.
-                let parent_args = frame.args().args.clone();
+                //
+                // They must be **expanded**, exactly like the `#invoke` call's own
+                // arguments above: Scribunto hands a module the expanded text, so
+                // `{{If empty|…}}` written in a template's argument arrives as its
+                // value. Passing the raw source instead left the string
+                // `{{If empty|…}}` inside `parent.args`, and `Module:Infobox`
+                // expands what it reads — re-entering the parser, re-invoking the
+                // module, and expanding the same helpers again. The expansion
+                // breadth never grew, so the depth limit never fired:
+                // `{{Infobox person}}` alone fetched 337 templates in ten seconds
+                // and never finished.
+                let parent_args = {
+                    let raw =
+                        crate::pipeline::parser_functions::Params::new(frame.args().args.clone());
+                    self.expand_invoke_args(&raw, frame, source, about_counter, src_text)
+                        .await
+                        .args
+                };
                 let expanded = self
                     .expand_invoke(
                         source,
@@ -3127,6 +3156,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             has_parent: inside_template,
             page_source: _page_source.to_string(),
             page_title: Some(self.page_title.borrow().clone()),
+            // Seed the frame with every title already resolved this render, so
+            // `preload_titles` does not re-fetch them; see `title_facts`.
+            titles: self.title_facts.borrow().clone(),
             ..Default::default()
         };
 
@@ -3157,6 +3189,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                 )
             },
+            &self.title_facts,
         )
         .await
         {
