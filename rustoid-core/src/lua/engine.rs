@@ -476,6 +476,34 @@ impl LuaEngine {
         self.pending.borrow_mut().pop()
     }
 
+    /// Modules `require`/`mw.loadData` asked for and could not find, taken and
+    /// cleared.
+    ///
+    /// Read after a run rather than inferred from the error, because a `pcall`
+    /// around the call swallows the message — and a data module built by name at
+    /// runtime (`"Module:Unicode data/" .. key`) is both unwrappable by the static
+    /// scan and caught by the module itself.
+    pub fn take_missing_modules(&self) -> Vec<String> {
+        let Ok(t) = self
+            .lua
+            .named_registry_value::<mlua::Table>(MISSING_MODULES)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 1..=t.raw_len() {
+            if let Ok(v) = t.raw_get::<String>(i)
+                && !out.contains(&v)
+            {
+                out.push(v);
+            }
+        }
+        if let Ok(empty) = self.lua.create_table() {
+            let _ = self.lua.set_named_registry_value(MISSING_MODULES, empty);
+        }
+        out
+    }
+
     /// Run `module_source`'s function `function_name`.
     ///
     /// `title` names the module in error messages. Without it Lua reports
@@ -515,6 +543,12 @@ impl LuaEngine {
         // `mw.getCurrentFrame()` reads this.
         self.lua
             .set_named_registry_value("current_frame", frame.clone())
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        // A fresh missing-module collector for this run. `require` appends to it
+        // even when the caller's `pcall` swallows the error; see the comment at
+        // the raise in `install_module_loader`.
+        self.lua
+            .set_named_registry_value(MISSING_MODULES, self.lua.create_table()?)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
         let module = self.load_module_value(module_source, Some(title))?;
@@ -715,6 +749,13 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value> {
 /// An unknown id is *absent* rather than a table of empty tables: that is what
 /// `entityExists` reports, and the ~19 cached modules that guard on it then take
 /// their own fallback — the behaviour of a wiki without Wikidata.
+/// Named registry slot holding the titles `require` could not find.
+///
+/// A registry value rather than a field because the collector has to be reachable
+/// from the `require` closure and survive a `pcall` in the module. See
+/// [`LuaEngine::take_missing_modules`].
+const MISSING_MODULES: &str = "rustoid_missing_modules";
+
 const WIKIBASE_LIB: &str = r#"
 return function(args)
     local wb = {}
@@ -961,6 +1002,23 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
                 if let Some(lib) = builtin_library(lua, &title) {
                     cache.set(title, lib.clone())?;
                     return Ok(lib);
+                }
+                // Record the title before raising, so it survives a `pcall`.
+                //
+                // The error alone is not enough: `Module:Unicode data` builds its
+                // data-module names at runtime (`"Module:Unicode data/" .. key`)
+                // and calls `pcall(mw.loadData, …)`, so the message this raises is
+                // caught and converted to `false` — and the caller then indexes
+                // that boolean. The preload scan cannot see the name either, since
+                // only the prefix is a literal.
+                //
+                // Putting the name somewhere the *parser* can read after the round
+                // is what closes the gap: the deferred loop fetches it and re-runs,
+                // exactly as it already does for an uncaught `require`.
+
+                if let Ok(missing) = lua.named_registry_value::<Table>(MISSING_MODULES) {
+                    let len = missing.raw_len();
+                    missing.raw_set(len + 1, title.clone())?;
                 }
                 return Err(mlua::Error::runtime(format!(
                     "module {title} was not preloaded"
@@ -5412,5 +5470,70 @@ mod tests {
         "#;
         let result = engine.eval(source).unwrap();
         assert_eq!(result, "hello from module");
+    }
+
+    /// A module a run could not find is reported even when the caller's `pcall`
+    /// swallows the error.
+    ///
+    /// `Module:Unicode data` builds its data-module names at runtime
+    /// (`"Module:Unicode data/" .. key`) and wraps the load:
+    ///
+    /// ```lua
+    /// local success, data = pcall(mw.loadData, "Module:Unicode data/" .. key)
+    /// if not success then data = false end
+    /// ```
+    ///
+    /// The static preload scan cannot see the name — only the prefix is a literal —
+    /// and the `pcall` means the `"module … was not preloaded"` error never reaches
+    /// the retry loop. Before the collector existed the module silently got
+    /// `false` and failed later with "attempt to index a boolean value".
+    ///
+    /// This asserts the invariant rather than the end-to-end page: the name
+    /// survives the `pcall`, which is what the loop needs in order to fetch it.
+    #[test]
+    fn a_pcall_swallowed_missing_module_is_still_reported() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                -- The error is caught here, exactly as Module:Unicode data does it.
+                local ok = pcall(require, "Module:Nowhere/scripts")
+                return tostring(ok)
+            end
+            return p
+        "#;
+        // `execute` runs `main`; the missing module must be visible afterwards.
+        let out = engine.execute(src, "main", &[]).unwrap();
+        assert_eq!(out, "false", "the pcall must have caught the failure");
+        assert_eq!(
+            engine.take_missing_modules(),
+            vec!["Module:Nowhere/scripts".to_string()],
+            "the name must survive the pcall for the retry loop to fetch it"
+        );
+    }
+
+    /// The collector is per run, so one run's miss is not reported against the
+    /// next. Without the reset a module fetched on run 1 would look missing on
+    /// run 2 and the loop would never settle.
+    #[test]
+    fn the_missing_module_collector_is_reset_each_run() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                pcall(require, "Module:Nowhere/scripts")
+                return "ok"
+            end
+            return p
+        "#;
+        engine.execute(src, "main", &[]).unwrap();
+        assert_eq!(engine.take_missing_modules().len(), 1);
+        // `take` cleared it, and a second run with no miss reports nothing.
+        engine.execute(src, "main", &[]).unwrap();
+        assert_eq!(
+            engine.take_missing_modules().len(),
+            1,
+            "each run collects its own"
+        );
     }
 }

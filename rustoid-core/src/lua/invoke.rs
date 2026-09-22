@@ -269,6 +269,13 @@ fn module_literal_in(expression: &str) -> Option<String> {
 pub enum Outcome {
     Done(String),
     Deferred(crate::pipeline::lua_deferred::FrameRequest),
+    /// A module the run asked for that was not preloaded.
+    ///
+    /// Distinct from an error because it is recoverable: the caller fetches it and
+    /// runs again. It has to be its own variant rather than an error string because
+    /// the request may be made under a `pcall` that swallows the message — see
+    /// [`LuaEngine::take_missing_modules`].
+    MissingModule(String),
 }
 
 /// How many times one `#invoke` may be re-run for deferred frame calls.
@@ -315,13 +322,24 @@ pub fn run_once(
     let args = call.frame_args();
     match engine.execute_in(&entry, &title, &call.function, &args, answers) {
         Ok(out) => Ok(Outcome::Done(out)),
-        Err(RustoidError::Lua(msg)) => match engine.take_pending() {
-            // The module asked the host to expand something. `take_pending` is
-            // only set by the deferred path, so a genuine script error cannot
-            // be mistaken for a request.
-            Some(request) => Ok(Outcome::Deferred(request)),
-            None => Err(RustoidError::Lua(msg)),
-        },
+        Err(RustoidError::Lua(msg)) => {
+            // A module the run could not find, whether or not the failure escaped
+            // a `pcall` around it. Reported before the deferred check because a
+            // missing module is the more specific signal: `Module:Unicode data`
+            // calls `pcall(mw.loadData, "Module:Unicode data/" .. key)`, so the
+            // message never reaches here at all and the boolean it substitutes is
+            // what breaks the caller.
+            if let Some(missing) = engine.take_missing_modules().into_iter().next() {
+                return Ok(Outcome::MissingModule(missing));
+            }
+            match engine.take_pending() {
+                // The module asked the host to expand something. `take_pending` is
+                // only set by the deferred path, so a genuine script error cannot
+                // be mistaken for a request.
+                Some(request) => Ok(Outcome::Deferred(request)),
+                None => Err(RustoidError::Lua(msg)),
+            }
+        }
         Err(other) => Err(other),
     }
 }
@@ -397,6 +415,9 @@ where
     let mut fetched: BTreeSet<String> = BTreeSet::new();
 
     for _ in 0..MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS {
+        // A title to fetch this round, from whichever signal reported it: an
+        // uncaught `require` failure (the error text names it) or a `require`
+        // whose error a `pcall` swallowed (the engine collected it).
         let outcome = match run_once(
             &call,
             registry.clone(),
@@ -405,6 +426,13 @@ where
             &frame,
             &answers,
         ) {
+            Ok(Outcome::MissingModule(title)) => Err(RustoidError::Lua(format!(
+                "module {title} was not preloaded"
+            ))),
+            Ok(outcome) => Ok(outcome),
+            Err(e) => Err(e),
+        };
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(RustoidError::Lua(msg)) => match missing_module_from(&msg) {
                 // Fetch it, plus anything *it* needs, then try again. A module
@@ -456,6 +484,15 @@ where
                 let text = expand(request).await;
                 asked.push(key.clone());
                 answers.insert(key, text);
+            }
+            // Unreachable in this position: `MissingModule` is turned into the
+            // error text above, which the fetch arm consumes. Kept as an explicit
+            // arm rather than a wildcard so a future variant has to be considered
+            // here instead of being swallowed.
+            Outcome::MissingModule(title) => {
+                return Err(RustoidError::Lua(format!(
+                    "module {title} was not preloaded"
+                )));
             }
         }
     }
