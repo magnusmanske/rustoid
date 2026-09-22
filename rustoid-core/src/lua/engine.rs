@@ -2406,7 +2406,29 @@ local function new_node(tag)
 end
 
 function Node:attr(key, value)
+    -- The table form is documented — `html:attr{ id = 'x', class = 'y' }` — and
+    -- a module passing one had its table grown as the *key*, which then reached
+    -- `_render` and raised "attempt to concatenate a table value (local 'key')".
+    -- `pairs` is order-unspecified, as Scribunto's is.
+    if type(key) == 'table' then
+        for k, v in pairs(key) do self:attr(k, v) end
+        return self
+    end
     if key == nil then return self end
+    -- A nil value *unsets* the attribute, which is the documented behaviour.
+    -- Removing it from `_order` as well is what makes the unset take effect:
+    -- `_render` walks `_order` and would otherwise emit the stale key with
+    -- `tostring(nil)` for a value.
+    if value == nil then
+        self._attrs[key] = nil
+        for i, k in ipairs(self._order) do
+            if k == key then
+                table.remove(self._order, i)
+                break
+            end
+        end
+        return self
+    end
     if self._attrs[key] == nil then table.insert(self._order, key) end
     self._attrs[key] = value
     return self
@@ -5117,6 +5139,31 @@ mod tests {
             return p
         "#;
         assert_eq!(engine.execute(src, "main", &[]).unwrap(), "中/A中B/1");
+    }
+
+    /// `mw.html:attr` accepts a table of attributes as well as a name/value
+    /// pair, and a nil value *unsets*. A module passing a table had it used as
+    /// the attribute *key*, which reached `_render` and raised "attempt to
+    /// concatenate a table value (local 'key')" — four pages in the corpus.
+    #[test]
+    fn test_mw_html_attr_table_form() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                local d = mw.html.create('div')
+                d:attr{ id = 'x', class = 'y' }
+                d:attr('data-a', 1)
+                -- A nil value unsets rather than writing "nil".
+                d:attr('class', nil)
+                return tostring(d)
+            end
+            return p
+        "#;
+        assert_eq!(
+            engine.execute(src, "main", &[]).unwrap(),
+            r#"<div id="x" data-a="1"></div>"#
+        );
     }
 
     #[test]
