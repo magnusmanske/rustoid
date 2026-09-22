@@ -1672,24 +1672,72 @@ live's 207945, not a separate one.
 ids at the start of a page says nothing, and counting the construct is what
 distinguishes "numbered in the wrong order" from "not produced at all". Two
 readings of this page were spent on the first explanation when the second was
-true. The ordering fix above is still correct and still needed — it just is not
-what is blocking this page.
+true.
+
+#### The extension elements, resolved
+
+The 140 about ids trace back to `Module:Documentation` failing with
+
+```
+[string "Module:Documentation"]:555: attempt to call a nil value (method 'canonicalUrl')
+```
+
+Four separate module-observable facts had to exist for it to run, each one
+invisible from the outside because the module reaches it through a `pcall` that
+returns nil:
+
+1. `mw.title:canonicalUrl{…}` did not exist. It is the `/w/index.php?title=…`
+   form, server-relative, `%3A`/`+` encoded, `title` first; the shape was read
+   off rendered pages rather than guessed.
+2. `mw.site.namespaces[n].subject` was a **number**, not a table. Scribunto's is
+   a namespace object and modules read `ns.subject.id`. A number there made
+   `.subject.id` throw, which surfaced only as `subjectSpace = nil` →
+   `templateTitle` nil → `docpageBase` nil → `docTitle` nil. Everything hung on
+   that one field. `talk` has the same shape and was the same bug.
+3. `preload_titles` parsed candidates with `Title::new_main`, so
+   `Template:Infobox/doc` was fetched under a key with no namespace and never
+   found again — `exists` read false for a page that was on disk.
+4. `#invoke` argument values are expanded before the module sees them, while
+   `data-mw` records them as written. Those are different strings and had been
+   merged, so `data-mw` was recording the *answer* (`"4":{"wt":"2"}` where the
+   service has `"4":{"wt":"{{#invoke:String|len|xy}}"}`).
+
+`{{#invoke:documentation|main}}` went from 2203 bytes to 133390 and now renders
+the transcluded `/doc` body, with `data-mw` byte-identical to the service's.
+
+#### The last construct on this page
+
+`Template:Documentation` calls the module with
+`_content={{ {{#invoke:documentation|contentTitle}}}}`, and that argument is what
+still does not resolve. Reducing it:
+
+```
+{{#invoke:String|len|{{ {{#invoke:documentation|contentTitle}}}}}}
+  service: 36895   the /doc page, transcluded
+  rustoid: 26      the literal text
+```
+
+`contentTitle` itself now resolves correctly. The failure is one level down and
+is **not** about the computed target: `{{Template:Infobox/doc}}` in the same
+position also fails, and a token dump shows why —
+
+```
+{{#invoke:String|len|{{Template:Foo}}}}    →  <template> key="#invoke:String" "" value="len" "" value=""
+{{#invoke:String|len|a{{Template:Foo}}b}}  →  <template> … values "len" and "ab"
+```
+
+**the nested transclusion is dropped from the argument value at tokenization
+ time.** `a{{Template:Foo}}b` becomes the string `ab`, so there is no token left
+for `expand_invoke_args` to expand and nothing for `data-mw` to record. That is
+the next place to look, and it is in the tokenizer rather than in the invoke
+path: everything above it now behaves correctly for arguments that survive.
+
+Until it lands, the page stays at 6722 bytes against the served 209692 — the
+module sees a non-empty `_content`, skips the `/doc` transclusion, and renders
+an empty container.
 
 Also recorded here: `frame:extensionTag` used to lower to `##tag`, which is not
-The faithful fix is to allocate the about id when the fragment placeholder is
-spliced into the tree rather than when the fragment is built — i.e. in
-`to_ast_with_fragments`, or by making the placeholder carry the id lazily. It is
-not a one-line change: `style_node` takes the id as an argument and builds the
-whole node eagerly, and the splice point is inside the tree-builder stage. Worth
-noting that the same pass also handles `gallery`, so whatever shape the fix takes
-should cover both.
-
-This matters beyond one page: every about id after the first two stylesheet is
-shifted, on every page with a `<templatestyles>`, which is most of them.
-
-Also recorded here: `frame:extensionTag` used to lower to `##tag`, which is not
-a call at all, so it silently failed to expand *and* consumed an about id. That
-is fixed, and it is why this trace has five allocations rather than more.
+a call at all, so it silently failed to expand *and* consumed an about id.
 
 ## Risks
 
