@@ -1835,23 +1835,54 @@ calls, so every call re-fetched the same subpages: `{{Infobox person}}` asked
 for `Sandbox/doc` 29 times over 357 fetches. The facts cannot change mid-parse,
 so a render-wide cache is a dedupe rather than a heuristic. 357 → 201.
 
-### Still open: `{{Infobox person}}` does not terminate
+### `{{Infobox person}}` did not terminate — solved
 
-`{{Infobox person}}` alone still stalls, and 120s is not enough. What is known:
+This was the longest-running failure in the port, and the earlier notes on it were
+wrong. Both attempts at it were aimed at the wrong thing.
 
-- expansions are bounded at 44 and `frame.depth()` stays at 2 throughout, so it
-  is a breadth loop, not recursion;
-- `{{If empty}}` is expanded 28 times, **with no arguments**, at depth 2;
-- each of those invokes `Module:If empty`, which fetches `Module:Arguments`;
-- the per-invoke guards (`MAX_FRAME_ROUNDS`, the `asked` repeat check) do not
-  fire, so each round requests a *different* key.
+**What was misleading.** Expansions stayed bounded at 44 and `frame.depth()`
+stayed at 2 throughout, so it looked like a breadth loop with no depth to catch —
+and the per-invoke guards (`MAX_FRAME_ROUNDS`, the `asked` repeat check) never
+fired, because each round requested a *different* key. The guess recorded below,
+that `Module:Arguments`' `wrappers` option was rebuilding `getParent().args`, was
+wrong: `frame_common` builds a plain table and never re-expands.
 
-`{{If empty}}` with no arguments is fine on its own, and so is each helper
-(`Longitem`, `Main other`, `Pluralize from text`) alone. The loop needs the
-combination, which points at `Module:Arguments`' `wrappers` option: it reads
-`frame.getParent().args`, and if that frame's args are rebuilt on each read, the
-module re-runs forever. Worth checking next whether `getParent()` returns a
-frame whose `args` are lazily re-expanded.
+**What it actually was.** The profiler finally showed `find_template_closing` ↔
+`skip_tplarg` 85 frames deep, and a depth-40 `exit(9)` that dumped its input gave
+the answer: 1828 bytes of `<td>` cells holding `{{{…`, with 29 `{{` and **zero**
+`}}`. A module's HTML table output looks exactly like that to this scan.
+
+`Module:Infobox` emits rows whose cells hold a template call. The parser sees a
+`{{` with no closer anywhere ahead, and `skip_tplarg` recurses into every nested
+`{{{` it meets — each of which scans to the end of the input and then recurses
+again. Exponential, with a bounded *depth* and a bounded *expansion count*. That
+combination is what hid it from every counter the port already had, and it is why
+two attempts at bounding the recursion changed nothing and dropped the fixtures
+to 874.
+
+**The fix.** The scans are deterministic, so "nothing closes from offset `p`" is
+a fact that cannot change while the same string is scanned. One `ScanMemo`,
+shared by both scanners for the whole scan, makes the walk linear.
+
+The sharing is the load-bearing part. The first attempt at the memo keyed it
+per `skip_tplarg` call, which discards it at the exact moment the other scanner
+needs it — the two re-enter each other, so a memo that is not shared is no memo
+at all.
+
+**On the regression guard.** The tests pin the mechanism — a failed offset is
+recorded, and a successful `{{{…}}}` is not poisoned by another input's failure —
+not the input. The blow-up needs `Module:Infobox`'s expansion state, and the same
+text renders promptly outside it; verified by disabling the memo, which stalls
+`{{Infobox person}}` past 120s while every snippet tried in isolation is
+unaffected. The end-to-end guard is therefore the corpus, and the unit tests
+cover the invariant, which the corpus would be slow to attribute.
+
+**The lesson worth keeping.** A count being bounded does not mean the work is.
+Depth limits and node counts both looked healthy while the scan ran forever, and
+"the counters are fine" was read as "this is not a tokenizer problem" for two
+sessions. When something does not terminate but every instrumented counter does,
+the instrument to reach for is the profiler, not a third counter — and a depth
+guard that dumps its input is worth more than one that merely reports a count.
 
 ## The first real scoreboard
 
