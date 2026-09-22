@@ -2399,7 +2399,26 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `inTemplate => true` (see `mark_arg_value_tokens`).
         let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
 
-        let about_id = self.new_about_id(about_counter);
+        // The `about` id is taken only when this expansion can actually be
+        // wrapped. Every branch below that returns unencapsulated — the
+        // `in_template` case, and the parser-function/`#tag` case — used to take
+        // an id first and discard it, so the sequence ran 1, 2, 4, 5, 6 on
+        // Template:Infobox with `#mwt3` vanishing and every later id shifted. A
+        // discarded id is not harmless: the service serves contiguous ids over
+        // the elements it does wrap.
+        //
+        // PHP takes it in the `TemplateEncapsulator` constructor, which
+        // `onTemplate` runs for every template token, so `allocate then discard`
+        // is faithful *there*. The difference is which tokens reach it: a `#tag`
+        // lowered from a module's `frame:extensionTag` is not an `onTemplate`
+        // token, and the element it emits (the `<style>`) takes its id where it
+        // is spliced instead.
+        let needs_about_id = !in_tpl;
+        let about_id = if needs_about_id {
+            self.new_about_id(about_counter)
+        } else {
+            String::new()
+        };
 
         // The *target* (attribs[0]) may hold a nested template
         // (`{{ {{T}} }}`): PHP's `expandTemplate` calls
