@@ -2956,8 +2956,26 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> String {
 
     // Day of week needs a real date calculation, which this does not attempt:
     // the letters below are the ones the corpus asks for.
+    //
+    // `x` is MediaWiki's "raw" prefix: it makes the next code literal (`xU`
+    // renders a literal `U`). `n` is the exception, and the reason this is not a
+    // two-line special case: on its own `n` is the *number format* modifier, not
+    // a field, so `xn` emits nothing and `xnU` is simply the Unix timestamp.
+    // `Module:Time ago` calls `formatDate('xnU')` and then subtracts a timestamp
+    // from the result, so emitting a month number there made the whole module fail
+    // with "attempt to sub a 'string' with a 'string'" — `11577836800` is not a
+    // number it can use.
     let mut out = String::new();
-    for c in format.chars() {
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == 'x' {
+            match chars.next() {
+                // The modifier with no format code after it contributes nothing.
+                Some('n') | None => {}
+                Some(literal) => out.push(literal),
+            }
+            continue;
+        }
         match c {
             'Y' => out.push_str(&year.unwrap_or(0).to_string()),
             'y' => out.push_str(&format!("{:02}", year.unwrap_or(0).rem_euclid(100))),
@@ -2975,6 +2993,10 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> String {
             ),
             'j' => out.push_str(&day.unwrap_or(0).to_string()),
             'd' => out.push_str(&format!("{:02}", day.unwrap_or(0))),
+            'G' => out.push_str(&hour.unwrap_or(0).to_string()),
+            'H' => out.push_str(&format!("{:02}", hour.unwrap_or(0))),
+            'i' => out.push_str(&format!("{:02}", minute.unwrap_or(0))),
+            's' => out.push_str(&format!("{:02}", second.unwrap_or(0))),
             // `U` is the Unix timestamp, which is what `Module:Citation/CS1`
             // compares against when bounding an access date. An unparseable
             // date yields nothing rather than a misleading epoch.
@@ -5164,6 +5186,31 @@ mod tests {
             engine.execute(src, "main", &[]).unwrap(),
             r#"<div id="x" data-a="1"></div>"#
         );
+    }
+
+    /// `lang:formatDate` treats `x` as MediaWiki's "raw" prefix, and `n` as the
+    /// number-format modifier rather than a field.
+    ///
+    /// Checked against the service: `U` and `xnU` both give `1577836800` for
+    /// `2020-01-01`, `nU` gives `11577836800` (month then stamp), `xU` gives a
+    /// literal `U`, and `xx` a literal `x`. `xn` emits *nothing*.
+    ///
+    /// `Module:Time ago` subtracts a timestamp from `formatDate('xnU')`, so the
+    /// month number made it fail with "attempt to sub a 'string' with a 'string'"
+    /// and took `Module:Citation/CS1`'s date handling with it.
+    #[test]
+    fn format_date_handles_the_raw_prefix() {
+        assert_eq!(format_date("U", "2020-01-01"), "1577836800");
+        assert_eq!(format_date("xnU", "2020-01-01"), "1577836800");
+        assert_eq!(format_date("nU", "2020-01-01"), "11577836800");
+        // `x` makes the next code literal, and `n` contributes nothing at all.
+        assert_eq!(format_date("xU", "2020-01-01"), "U");
+        assert_eq!(format_date("xx", "2020-01-01"), "x");
+        assert_eq!(format_date("xn", "2020-01-01"), "");
+        // A field may still follow the modifier: `H` is `00` here.
+        assert_eq!(format_date("HxnU", "2020-01-01"), "001577836800");
+        // A trailing `x` has nothing to make literal and adds nothing.
+        assert_eq!(format_date("Ux", "2020-01-01"), "1577836800");
     }
 
     #[test]
