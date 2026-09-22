@@ -1926,15 +1926,25 @@ Zero matches is not the interesting number. These are:
 
 ### What changed since the previous scoreboard
 
-| | before | after |
-|---|---|---|
-| compared | 0/40 | 0/46 |
-| stalled | 7 | 2 |
-| literal `{{...}}` | 39/47 | 45/48 |
+| | session start | after the tokenizer fix | now |
+|---|---|---|---|
+| compared | 0/40 | 0/46 | 0/46 |
+| stalled | 7 | 2 | 2 |
+| literal `{{...}}` | 39/47 | 45/48 | 45/48 |
+| distinct Lua failures | 20 | 21 | **20** |
+| entries in the Lua table | 34 | 31 | **29** |
 
-Four pages that used to stall now render, and the leading Lua failure is a
-*different* one: `Module:Lang` (7 pages, `ustring.char`) and `mw.html` (4 pages,
-attribute table) are gone, both fixed. The top entry is now `Module:Unicode data`.
+Four pages that used to stall now render, and the leading Lua failure has changed
+twice as entries were cleared:
+
+- `Module:Lang` (`ustring.char`, 7 pages) — fixed.
+- `mw.html` (attribute table, 4 pages) — fixed.
+- `Module:Time ago` (2 pages) — fixed, and it needed *two* fixes: the format
+  string and then the input parsing. It disappeared from the table only on the
+  second run, which is the sort of thing that reads as a failed fix.
+
+The top entry is now `Module:Unicode data` (7 pages), which is diagnosed above and
+needs a design decision rather than a patch.
 
 ### The Lua failures are the work queue
 
@@ -1991,9 +2001,20 @@ They are concrete, each names a line, and the biggest is worth 7 pages:
   not plain 5.1 `string.sub`, so that test's expectation is the thing to verify
   against the service first — not the reason to stay on 5.4. The change was
   reverted untouched rather than forced through.
-- `Module:Time ago:62` — **fixed**. `formatDate('xnU')` emitted the month number
-  before the timestamp; `x` is the raw prefix and `n` alone is the number-format
-  modifier, so `xn` emits nothing. `Module:Time ago` now renders identically.
+- `Module:Time ago:62` — **fixed, twice.** First the `formatDate('xnU')` format
+  string (see the raw-prefix note above); then the two input defects: it did not
+  *raise* on an unparseable stamp (so `Module:Time ago`'s `pcall` succeeded and
+  the error became a subtraction), and it parsed only `YYYY-MM-DD`. A year-only
+  input like `2020` is common on the corpus and the service accepts it.
+  `{{#invoke:Time ago|main|nonsense}}` now renders the module's own
+  `Error: first parameter cannot be parsed as a date or time.`, byte for byte
+  with the service.
+
+  Worth noting how that one was found: the scoreboard still listed it *after* the
+  format-string fix, which looked like the fix had failed. It had not — the same
+  line has two independent defects, and the second only shows for inputs the
+  first one does not cover. A stale binary was the other candidate and was ruled
+  out by checking the timestamp first.
 - `Module:Math:389` — `attempt to perform 'n%0'`. Checked: Lua 5.4 raises this too,
   so rustoid is right and the input is what differs. Not an engine coercion.
 - `Module:Multiple image:177` — arithmetic on a nil `totalwidth`. Lua coerces
