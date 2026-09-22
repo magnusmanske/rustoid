@@ -1886,24 +1886,21 @@ guard that dumps its input is worth more than one that merely reports a count.
 
 ## The first real scoreboard
 
-With the cap working, a 47-page run completes in about eight minutes and
-produces numbers instead of nothing. `Template:Infobox` is excluded from the
-run below: it alone exceeds the eight-stall budget, so the summary would never
-print.
+Measured on a fresh `rustoid-compare` binary — check the timestamp first, because
+a stale one silently reports the previous build's results and that mistake was
+made once here already.
 
 ```
-score: 0/40 compared (0.0%), 7 stalled
-output: parsoid 64225921 bytes, rustoid 136403944 bytes (2.12x)
+score: 0/46 compared (0.0%), 2 stalled
+output: parsoid 64435613 bytes, rustoid 163885024 bytes (2.54x)
 
 unexpanded wikitext (rustoid side):
-  pages with literal {{...}}         39/47
-  pages with literal {{#invoke:      39/47
-  more literal syntax than parsoid   38/47
+  pages with literal {{...}}         45/48
+  pages with literal {{#invoke:      44/48
+  more literal syntax than parsoid   43/48
 
-lua failures (34 across 20 distinct):
-     7 pages  Module:Lang:1121: bad argument #1 to 'char' (value out of range)
-     4 pages  mw.html:81: attempt to concatenate a table value (local 'key')
-     2 pages  Module:Wikt-lang/data:4: bad argument #1 to 'U' (value out of range)
+lua failures (31 across 21 distinct):
+     7 pages  Module:Unicode data:485: attempt to index a boolean value (field 'scripts')
      2 pages  Module:Check for unknown parameters:195: attempt to index a nil value
      2 pages  Module:Hatnote inline:16: attempt to call a nil value (method 'newChild')
      2 pages  Module:Piechart:220: invalid piechart data: parseMetaParams
@@ -1913,28 +1910,46 @@ lua failures (34 across 20 distinct):
      1 page   Module:Location map:620: cannot find data/Pacific Ocean
      1 page   Module:Math:363: bad argument #1 to 'log10' (number expected, got string)
      1 page   Module:Math:389: attempt to perform 'n%0'
+     1 page   Module:Multiple image:177: arithmetic on a nil value (local 'totalwidth')
 ```
 
-Zero matches is not the interesting number — these two are:
+Zero matches is not the interesting number. These are:
 
-- **`39/47` pages still contain literal `{{...}}`.** A page that never expands
+- **`45/48` pages still contain literal `{{...}}`.** A page that never expands
   cannot match, and this says the failure is wholesale rather than a
   serialization detail. The `lua failures` list is the cause: a module that
   raises is replaced by the script-error markup, and everything it would have
   emitted stays as source.
-- **rustoid emits `2.12x` parsoid's bytes.** Un-expanded wikitext is left in
+- **rustoid emits `2.54x` parsoid's bytes.** Un-expanded wikitext is left in
   place *and* the script errors are emitted, so the page grows instead of
   shrinking.
 
-The Lua failures are the highest-value work available and they are concrete:
+### What changed since the previous scoreboard
 
-- `Module:Lang:1121` — `mw.ustring.char` range check, 7 pages, the single
-  biggest win.
-- `mw.html:81` — concatenating a table value into an attribute key.
-- `Module:Time ago:62` — arithmetic on two strings, which Lua coerces and
-  rustoid's engine does not.
+| | before | after |
+|---|---|---|
+| compared | 0/40 | 0/46 |
+| stalled | 7 | 2 |
+| literal `{{...}}` | 39/47 | 45/48 |
+
+Four pages that used to stall now render, and the leading Lua failure is a
+*different* one: `Module:Lang` (7 pages, `ustring.char`) and `mw.html` (4 pages,
+attribute table) are gone, both fixed. The top entry is now `Module:Unicode data`.
+
+### The Lua failures are the work queue
+
+They are concrete, each names a line, and the biggest is worth 7 pages:
+
+- `Module:Unicode data:485` — `attempt to index a boolean value (field 'scripts')`.
+  The module's data table holds a boolean where a table is expected; likely a
+  `mw.loadData` shape difference.
+- `Module:Time ago:62` — `attempt to sub a 'string' with a 'string'`. Lua coerces
+  numeric strings in arithmetic ('100' - '40' is 60); rustoid's engine does not.
+- `Module:Math:389` — `attempt to perform 'n%0'`. Lua returns NaN, not an error.
 - `Module:Wikidata:247` — `'^\-'` is a valid Lua pattern escape in 5.1 and
   rustoid's pattern compiler rejects it.
+- `Module:Multiple image:177` — arithmetic on a nil `totalwidth`, which the
+  manual says coerces from a numeric string.
 
 ## Risks
 
