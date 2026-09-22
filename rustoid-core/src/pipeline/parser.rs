@@ -2574,6 +2574,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         source,
                         frame,
                         &invoke_arg,
+                        &params,
                         about_id,
                         tok,
                         in_template,
@@ -3079,6 +3080,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         pf_arg: &str,
+        // The token's *own* arguments, unexpanded. `data-mw` records the call as
+        // written, so a nested `#invoke` in an argument stays literal there even
+        // though the module receives its expansion — `pf_arg` is the expanded
+        // text and would put the answer into the metadata.
+        raw_params: &crate::pipeline::parser_functions::Params,
         about_id: String,
         token: &ParsoidToken,
         in_template: bool,
@@ -3215,6 +3221,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // in this field name (PHP's `TemplateInfo::toJsonArray` writes `function`
         // for the former, `key` for the latter), and the live service writes
         // `function` for `#invoke`. Both spell it under the `template` parts key.
+        // The parameter wikitext comes from the token's own arguments, *not* from
+        // the parsed `pf_arg` — that one has been expanded, and `data-mw` records
+        // the call as written. Reading the parsed arguments here put the answer
+        // into the metadata: `{{#invoke:String|sub|abcde|0|
+        // {{#invoke:String|len|xy}}}}` recorded `"4":{"wt":"2"}` where the
+        // service records `"4":{"wt":"{{#invoke:String|len|xy}}"}`.
+        let raw_args: Vec<(Option<String>, String)> = raw_params
+            .args
+            .iter()
+            .skip(2)
+            .map(|kv| {
+                let key = crate::wikitext::token_utils::key_value_to_string(&kv.key);
+                let value = kv_value_source(kv);
+                let name = key.trim();
+                if name.is_empty() {
+                    (None, value)
+                } else {
+                    (Some(name.to_string()), value)
+                }
+            })
+            .collect();
         let mut info = template_info_from(Some("invoke"), None, vec![]);
         info.target_wt = Some(format!("#invoke:{module}"));
         info.param_infos = std::iter::once({
@@ -3222,7 +3249,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             p.value_wt = call.function.clone();
             p
         })
-        .chain(call.args.iter().enumerate().map(|(i, (name, value))| {
+        .chain(raw_args.iter().enumerate().map(|(i, (name, value))| {
             let mut p = ParamInfo::new((i + 2).to_string());
             p.value_wt = match name {
                 Some(n) => format!("{n}={value}"),
