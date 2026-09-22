@@ -538,12 +538,21 @@ pub fn prepare_pf_param_infos(
 
     // params[0] was the target; iterate params[1..].
     for param in params.args.iter().skip(1) {
-        let k = key_value_to_string(&param.key);
-        // Prefer the source range, as the template path does; fall back to the
-        // stringified tokens only when the range is unavailable.
-        let v = match &param.src_offsets {
-            Some(so) => strip_include_directives(so.value_substr(source)),
-            None => key_value_to_string(&param.value),
+        // Both halves come from the source range, so the argument is recorded as
+        // written. The *key* in particular keeps the whitespace before its `=`:
+        // the tokenizer trims it when building the token (it must, to match
+        // `"0"` against a switch key), but the live service records the raw
+        // `"0        = {{{no|}}}"` — `Template:Yesno`'s `|0        = …` case is
+        // the one that exposes it, and trimming wrote `"0= {{{no|}}}"`.
+        let (k, v) = match &param.src_offsets {
+            Some(so) => (
+                strip_include_directives(so.key_substr(source)),
+                strip_include_directives(so.value_substr(source)),
+            ),
+            None => (
+                key_value_to_string(&param.key),
+                key_value_to_string(&param.value),
+            ),
         };
         let mut info = ParamInfo::new(arg_index.to_string());
         info.value_wt = if k.is_empty() { v } else { format!("{k}={v}") };

@@ -701,10 +701,7 @@ fn capitalize(s: &str) -> String {
 
 /// The target of a `{{…}}` source string, before any nested template in it is
 /// expanded. `None` when the source is not a well-formed template.
-fn raw_template_target(src: &str) -> Option<&str> {
-    let inner = src.strip_prefix("{{")?.strip_suffix("}}")?;
-    Some(inner.split_once('|').map_or(inner, |(t, _)| t))
-}
+use crate::wikitext::tokenizer_v2::raw_template_target;
 
 /// Choose the wikitext to record for a parser function's `data-mw` target.
 ///
@@ -915,8 +912,7 @@ impl TemplateHandler {
         let raw_target = token
             .data_parsoid()
             .and_then(|dp| dp.src.as_deref())
-            .and_then(raw_template_target)
-            .map(str::to_string);
+            .and_then(raw_template_target);
         // Extract the target (first arg key).
         let target_str = params
             .args

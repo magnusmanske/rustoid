@@ -4435,24 +4435,20 @@ fn find_template_closing(input: &str) -> Option<usize> {
 /// recognising the prefix. Case is not significant (`{{Subst:…}}` occurs) and
 /// whitespace may follow the colon.
 ///
-/// This fires *only* when the whole target is a plain title. `subst` is a
-/// title prefix (the grammar's `subst_prefix` sits inside `template_target`),
-/// so it cannot swallow a colon that belongs to a magic word argument the way
-/// `{{lc: y}}` does in
+/// This fires only when the word *starts* the target, because `subst` is a
+/// title prefix (the grammar's `subst_prefix` sits inside `template_target`). It
+/// therefore cannot swallow a colon that belongs to a magic word argument:
+/// `{{lc: y}}` reaching it means the prefix belongs to a nested argument, and
+/// stripping it would resolve that argument before its own caller ran. That is
+/// `Template:Yesno`, whose `<includeonly>` pair resolves to
 ///
 /// ```text
-/// {{#switch: {{<includeonly>safesubst:</includeonly>lc: y}} |yes=… }}
+/// safesubst:#switch: {{{1|¬}}}
 /// ```
 ///
-/// That is `Template:Yesno`, and stripping the inner prefix resolved the
-/// argument *before* `#switch` ran — leaving a key of `" y"` that matched no
-/// case. The live parser leaves `{{lc: y}}` intact in the recorded target
-/// (only the `<includeonly>` pair, being a tag, disappears from it). A
-/// `[[wikilink]]` target is likewise not a title.
+/// Here the prefix *does* apply — it starts the target — and the service reports
+/// `"function":"switch"`, so the name is `#switch: {{{1|¬}}}`.
 fn strip_subst_prefix(target: &str) -> Option<String> {
-    if target.contains("{{") || target.contains("[[") {
-        return None;
-    }
     // Drop any `<noinclude />`/`<includeonly />` markers, then look for the
     // directive. Only those two go: any other tag between the word and the colon
     // means this is not a substitution but a title that happens to begin with
@@ -4489,6 +4485,14 @@ fn subst_name(text: &str) -> Option<String> {
     let colon = text.find(':')?;
     let word = text[..colon].trim();
     if !word.eq_ignore_ascii_case("subst") && !word.eq_ignore_ascii_case("safesubst") {
+        return None;
+    }
+    // Nothing may precede the word. `{{lc: y}}` reaching here means the prefix
+    // belongs to a *nested* argument, not to this title, and stripping it would
+    // resolve that argument before its own caller sees it. A `[[wikilink]]`
+    // target is likewise not a title. The colon already rules out an opening
+    // `{`/`[` in the word, so only the braces must be checked.
+    if word.contains('{') || word.contains('[') {
         return None;
     }
     let name = text[colon + 1..].trim();
@@ -5267,6 +5271,23 @@ fn split_template_args(inner: &str) -> Vec<String> {
 /// a link argument would otherwise serialize to an empty `wt`.
 fn split_template_args_with_offsets(inner: &str) -> Vec<(usize, String)> {
     split_template_args_impl_offsets(inner, false)
+}
+
+/// The target of a `{{…}}` source string, exactly as written.
+///
+/// The split is the tokenizer's own, so a `|` inside a nested `{{{…}}}`/`{{…}}`/
+/// `[[…]]` does not end the target: the live service records
+/// `{{#switch: {{{1|yes}}} |yes=YES}}` as `"#switch: {{{1|yes}}} "`, and a naive
+/// `split_once('|')` gives the truncated `"#switch: {{{1"` instead, which then
+/// also loses the fold of the first parameter (that depends on whether the
+/// recorded target carries a colon).
+///
+/// `None` when `src` is not a well-formed template or its target is empty, so the
+/// caller falls back to the resolved target.
+pub(crate) fn raw_template_target(src: &str) -> Option<String> {
+    let inner = src.strip_prefix("{{")?.strip_suffix("}}")?;
+    let parts = split_template_args_with_offsets(inner);
+    parts.into_iter().next().map(|(_, target)| target)
 }
 
 /// Variant that also treats `{{!}}` as a pipe separator (for wikilink content,
@@ -6860,6 +6881,24 @@ mod tests {
         assert_eq!(strip_subst_prefix("{{safesubst:lc: y}}"), None);
         assert_eq!(strip_subst_prefix("{{lc: y}}"), None);
         assert_eq!(strip_subst_prefix("#switch: {{safesubst:lc: y}} "), None);
+    }
+
+    /// `Template:Yesno`'s body, after its `<includeonly>` pair is resolved. The
+    /// prefix here applies to the whole target, so it *is* a substitution and the
+    /// remaining `#switch: …` is the magic word the service reports
+    /// (`"function":"switch"`).
+    #[test]
+    fn a_prefix_before_a_magic_word_is_a_title_prefix() {
+        assert_eq!(
+            strip_subst_prefix("safesubst:#switch: {{{1|¬}}}"),
+            Some("#switch: {{{1|¬}}}".to_string())
+        );
+        // With the `<includeonly>` pair still in the text, as the tokenizer sees
+        // it before directive resolution.
+        assert_eq!(
+            strip_subst_prefix("<includeonly>safesubst:</includeonly>#switch: x"),
+            Some("#switch: x".to_string())
+        );
     }
 
     /// A wikilink target is not a title either, so it is left for the link

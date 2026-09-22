@@ -649,7 +649,7 @@ impl Comparison {
 ///
 /// `config` supplies the site configuration (namespaces, magic words, …);
 /// `cache` is the per-wiki persistent store shared by every fetch.
-pub async fn compare_page<C: rustoid_core::SiteConfig>(
+pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     client: &WikiClient,
     config: &C,
     cache: &Arc<std::sync::Mutex<WikiCache>>,
@@ -837,6 +837,57 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
     })
 }
 
+/// Everything one offline render needs, owned so it can be moved to a worker
+/// thread that outlives the caller's borrow of `client`/`cache`.
+struct OwnedRenderInput {
+    client: WikiClient,
+    cache: Arc<std::sync::Mutex<WikiCache>>,
+    title: String,
+    wikitext: String,
+    offline: bool,
+}
+
+impl OwnedRenderInput {
+    fn render<C: rustoid_core::SiteConfig>(self, config: &C) -> Result<Option<String>> {
+        // The data source shares the harness's cache handle. A second handle would
+        // keep its own in-memory manifest, so the two would clobber each other's
+        // `index.json` and orphan every template fetched during expansion.
+        let source = CachedDataSource::new(
+            Some(Arc::new(self.client.clone())),
+            Arc::clone(&self.cache),
+            self.offline,
+        );
+        let source = with_entity_wiki(source, &self.client, &self.cache)?;
+        // `node_ids` is on because the target is what a *wiki serves*: MediaWiki's
+        // REST layer page-bundles Parsoid output and assigns each metadata-bearing
+        // element an `id="mw…"`. Parsoid's standalone mode emits none, and the
+        // fixture suite (which compares against standalone output) therefore
+        // leaves this off.
+        //
+        // `wrap_sections` is on for the same reason: the REST transform output
+        // wraps the body in `<section data-mw-section-id>` elements, and those
+        // wrappers take the first node ids on the page.
+        let options = rustoid_core::ParserOptions {
+            node_ids: true,
+            strip_data_parsoid: true,
+            wrap_sections: true,
+            ..rustoid_core::ParserOptions::for_page(&self.title)
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CompareError::Parse(e.to_string()))?;
+        let parser = rustoid_core::Parser::new(config);
+        let html = rt
+            .block_on(parser.wikitext_to_html_expanded(&self.wikitext, &source, &options))
+            .map_err(|e| CompareError::Parse(e.to_string()))?;
+        // Expansion fetched templates into the source's own cache handle; persist
+        // any entries that did not reach a periodic flush.
+        source.flush()?;
+        Ok(Some(html))
+    }
+}
+
 /// Parse `wikitext` with rustoid, using a cache-backed data source so template
 /// fetches are persisted too.
 ///
@@ -844,7 +895,7 @@ pub async fn compare_page<C: rustoid_core::SiteConfig>(
 /// The cap exists because an expansion that does not terminate would otherwise
 /// stall the whole corpus, and a scoreboard that never prints measures nothing —
 /// see [`Outcome::Stalled`].
-async fn render_rustoid<C: rustoid_core::SiteConfig>(
+async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     client: &WikiClient,
     config: &C,
     cache: &Arc<std::sync::Mutex<WikiCache>>,
@@ -852,49 +903,35 @@ async fn render_rustoid<C: rustoid_core::SiteConfig>(
     wikitext: &str,
     offline: bool,
 ) -> Result<Option<String>> {
-    // The data source shares the harness's cache handle. A second handle would
-    // keep its own in-memory manifest, so the two would clobber each other's
-    // `index.json` and orphan every template fetched during expansion.
-    let source = CachedDataSource::new(Some(Arc::new(client.clone())), Arc::clone(cache), offline);
-    let source = with_entity_wiki(source, client, cache)?;
-    let parser = rustoid_core::Parser::new(config);
-    // `node_ids` is on because the target is what a *wiki serves*: MediaWiki's REST
-    // layer page-bundles Parsoid output and assigns each metadata-bearing element an
-    // `id="mw…"`. Parsoid's standalone mode emits none, and the fixture suite (which
-    // compares against standalone output) therefore leaves this off.
+    let cap = std::time::Duration::from_secs_f64(page_stall_seconds());
+    let input = OwnedRenderInput {
+        client: client.clone(),
+        cache: Arc::clone(cache),
+        title: title.to_string(),
+        wikitext: wikitext.to_string(),
+        offline,
+    };
+    // The render runs on a blocking worker so the timer below can win.
+    // `Cristiano Ronaldo` is why it does not simply run inline:
+    // `tokio::time::timeout` only cancels at an `.await` point, and a
+    // non-terminating expansion is synchronous CPU work that never yields. The
+    // process sat at 100% CPU for nine minutes with the cap set to 60s, and the
+    // corpus never reached page 2.
     //
-    // `wrap_sections` is on for the same reason: the REST transform output wraps
-    // the body in `<section data-mw-section-id>` elements, and those wrappers take
-    // the first node ids on the page. Leaving it off shifted every id by one and
-    // made the difference read as an id mismatch rather than as the missing
-    // wrapper it actually is.
-    let options = rustoid_core::ParserOptions {
-        node_ids: true,
-        strip_data_parsoid: true,
-        wrap_sections: true,
-        ..rustoid_core::ParserOptions::for_page(title)
-    };
-    let html = match tokio::time::timeout(
-        std::time::Duration::from_secs_f64(page_stall_seconds()),
-        parser.wikitext_to_html_expanded(wikitext, &source, &options),
-    )
-    .await
-    {
-        Ok(Ok(html)) => html,
-        Ok(Err(e)) => return Err(CompareError::Parse(e.to_string())),
-        // Timed out. `timeout` cancels the future at an await point, but the
-        // blocking expansion in progress may still be running, so the cache
-        // handle is flushed below either way — a partial fetch is still worth
-        // keeping, and the next run benefits from it.
-        Err(_elapsed) => {
-            source.flush()?;
-            return Ok(None);
-        }
-    };
-    // Expansion fetched templates into the source's own cache handle; persist any
-    // entries that did not reach a periodic flush.
-    source.flush()?;
-    Ok(Some(html))
+    // `spawn_blocking` needs `'static` data, hence the cloned config and the
+    // owned input; a `std::thread::scope` would borrow fine but its implicit
+    // join at the end of the scope re-blocks on the very thread the timer is
+    // trying to abandon, which defeats the cap.
+    let config = config.clone();
+    let worker = tokio::task::spawn_blocking(move || input.render(&config));
+    match tokio::time::timeout(cap, worker).await {
+        Ok(Ok(res)) => res,
+        // The worker panicked.
+        Ok(Err(e)) => Err(CompareError::Parse(e.to_string())),
+        // Abandoned mid-render. The thread cannot be stopped in safe Rust, so it
+        // is detached and left to burn its core while the corpus moves on.
+        Err(_elapsed) => Ok(None),
+    }
 }
 
 /// The per-page wall-clock cap, in seconds.

@@ -251,7 +251,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// Pages are compared sequentially, not concurrently. The bottleneck is the
 /// wiki's rate limiter, not the local work, so concurrency would buy little
 /// while making a mid-run failure much harder to attribute.
-fn run_corpus<C: rustoid_core::SiteConfig>(
+fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     cli: &Cli,
     client: &Arc<WikiClient>,
     config: &C,

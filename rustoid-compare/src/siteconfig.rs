@@ -32,7 +32,11 @@ use serde::Deserialize;
 use crate::error::{CompareError, Result};
 
 /// A `SiteConfig` built from a wiki's `siteinfo` response.
-#[derive(Debug, Default)]
+///
+/// `Clone` so a render can be moved to a worker thread: the per-page stall cap
+/// only works if the render is `'static`, and the harness holds the config behind
+/// a borrow.
+#[derive(Debug, Default, Clone)]
 pub struct WikiSiteConfig {
     namespaces: HashMap<i32, NamespaceInfo>,
     interwiki_map: HashMap<String, InterwikiInfo>,
