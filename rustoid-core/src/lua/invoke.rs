@@ -362,7 +362,7 @@ where
         .clone()
         .unwrap_or_else(|| page_title.to_string());
     let mut frame = FrameContext {
-        titles: preload_titles(source, &registry).await,
+        titles: preload_titles(source, &registry, Some(&entity_page)).await,
         entities: preload_entities(source, &registry, Some(&entity_page)).await,
         ..frame
     };
@@ -399,7 +399,13 @@ where
                     registry.extend(preload(source, &title).await);
                     // A newly loaded module may reference new titles and new
                     // entities, so both are refreshed from the wider registry.
-                    frame.titles.extend(preload_titles(source, &registry).await);
+                    let page = frame
+                        .page_title
+                        .clone()
+                        .unwrap_or_else(|| page_title.to_string());
+                    frame
+                        .titles
+                        .extend(preload_titles(source, &registry, Some(&page)).await);
                     frame.entities = preload_entities(
                         source,
                         &registry,
@@ -481,20 +487,37 @@ fn missing_module_from(message: &str) -> Option<String> {
 /// network traffic, so it is bounded like the module preload is.
 const MAX_TITLES: usize = 60;
 
+/// The current page's subpages a module is likely to ask about by a computed
+/// name. `Module:Documentation` asks for all three; a `Template:` page normally
+/// has `/doc` and often `/sandbox` and `/testcases`.
+const DOC_SUBPAGES: &[&str] = &["doc", "sandbox", "testcases"];
+
 /// Fetch the page facts modules can observe but cannot compute.
 ///
 /// `existence`, `redirect` and `content` cannot be answered from inside
 /// synchronous Lua, so the titles a module is likely to ask about are gathered
 /// beforehand — the same trade the module preload makes, and for the same
-/// reason. Titles are discovered by scanning the preloaded sources for
-/// `mw.title.new('…')` string literals.
+/// reason. Titles are discovered two ways:
 ///
-/// What this cannot see: a title built at runtime (`mw.title.new(prefix .. name)`).
-/// Those report as non-existent, which is the conservative answer, and the gap is
-/// recorded in ONLINE-PARITY.md.
+/// - `mw.title.new('…')` string literals in the preloaded sources, and
+/// - the current page's **subpages**, which a module reaches through a computed
+///   name rather than a literal.
+///
+/// The subpages are the important half in practice. `Module:Documentation`
+/// builds its `docTitle` as `mw.title.new('<base>/doc')` at runtime, so no
+/// literal exists to scan — and with `docTitle.exists` false it took the
+/// "page does not exist" branch, called `title:canonicalUrl`, and died. That
+/// one title is what stood between `Template:Infobox` and the ~200KB of
+/// documentation it serves. `sandbox` and `testcases` are the same shape and
+/// come from the same module.
+///
+/// What this still cannot see: a title built from something other than the page
+/// itself (`mw.title.new(prefix .. name)`). Those report as non-existent, which
+/// is the conservative answer, and the gap is recorded in ONLINE-PARITY.md.
 pub async fn preload_titles<S: DataSource + ?Sized>(
     source: &S,
     registry: &Registry,
+    page_title: Option<&str>,
 ) -> HashMap<String, TitleFacts> {
     let mut out = HashMap::new();
     let mut wanted: BTreeSet<String> = BTreeSet::new();
@@ -502,6 +525,11 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
     for body in registry.values() {
         for title in referenced_titles(body) {
             wanted.insert(title);
+        }
+    }
+    if let Some(page) = page_title {
+        for sub in DOC_SUBPAGES {
+            wanted.insert(format!("{page}/{sub}"));
         }
     }
 

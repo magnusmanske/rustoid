@@ -1982,6 +1982,59 @@ fn luafn_title_new(
                         lua.create_function(move |_, _this: Value| Ok(url.clone()))?,
                     ))
                 }
+                // `title:canonicalUrl{action = 'edit', preload = …}` — the
+                // `index.php` form with the title and each supplied parameter as
+                // query arguments, in the order the table gave them. It is what
+                // `Module:Documentation` builds its "create this page" links from,
+                // and its absence was the first thing to fail once the module ran:
+                // `attempt to call a nil value (method 'canonicalUrl')`.
+                //
+                // The shape is read off rendered pages rather than guessed —
+                // `//en.wikipedia.org/w/index.php?title=Module_talk%3AMath&
+                // preload=Template%3ASubmit+an+edit+request%2Fpreload&action=edit` —
+                // so the server-relative `//` prefix, the `%3A`/`+` encoding and
+                // the `title` first are all as the service serves them.
+                "canonicalUrl" => {
+                    let site = site.clone();
+                    let full = full.clone();
+                    let f = lua.create_function(move |lua, (_this, opts): (Value, Value)| {
+                        // Scribunto also accepts a query-string form
+                        // (`canonicalUrl('action=edit')`), which is appended
+                        // verbatim.
+                        let mut query = format!("title={}", url_encode(&full));
+                        match &opts {
+                            Value::Table(t) => {
+                                for pair in t.clone().pairs::<Value, Value>() {
+                                    let (k, v) = pair.map_err(mlua::Error::external)?;
+                                    let (Ok(k), Ok(v)) = (
+                                        coerce_string(&k, "canonicalUrl"),
+                                        coerce_string(&v, "canonicalUrl"),
+                                    ) else {
+                                        continue;
+                                    };
+                                    query.push('&');
+                                    query.push_str(&url_encode(&k));
+                                    query.push('=');
+                                    query.push_str(&url_encode(&v));
+                                }
+                            }
+                            Value::String(s) => {
+                                let extra = s.to_str().map_err(mlua::Error::external)?;
+                                if !extra.is_empty() {
+                                    query.push('&');
+                                    query.push_str(&extra);
+                                }
+                            }
+                            _ => {}
+                        }
+                        let url = format!(
+                            "//{}/w/index.php?{query}",
+                            site.server.trim_start_matches("//")
+                        );
+                        Ok(Value::String(lua.create_string(&url)?))
+                    })?;
+                    Ok(Value::Function(f))
+                }
                 // `title:newline()` and friends come from `mw.html`; a title has
                 // no such method, so a miss must stay a miss rather than pretend.
                 _ => Ok(Value::Nil),
