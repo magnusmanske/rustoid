@@ -1413,6 +1413,13 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     ustring.set("len", lua.create_function(luafn_ustring_len)?)?;
     ustring.set("sub", lua.create_function(luafn_ustring_sub)?)?;
+    // `char` must be overridden rather than inherited through `__index`. Lua's
+    // `string.char` takes bytes and rejects anything above 255, while
+    // Scribunto's takes *codepoints*; `Module:Lang` calls
+    // `mw.ustring.char(codepoint)` on whatever it parsed out of a language tag,
+    // and the inherited byte version raised "value out of range" and took the
+    // whole module down with it on seven corpus pages.
+    ustring.set("char", lua.create_function(luafn_ustring_char)?)?;
     ustring.set("upper", lua.create_function(luafn_ustring_upper)?)?;
     ustring.set("lower", lua.create_function(luafn_ustring_lower)?)?;
     // `ucfirst`/`lcfirst` prefer the *first* character's case change, unlike
@@ -3079,6 +3086,37 @@ fn clone_into(lua: &Lua, memo: &Table, value: &Value) -> mlua::Result<Value> {
 
 fn luafn_ustring_len(_: &Lua, s: Value) -> mlua::Result<usize> {
     Ok(coerce_string(&s, "len")?.chars().count())
+}
+
+/// `mw.ustring.char( … )` — the characters for the given *codepoints*.
+///
+/// Codepoints, not bytes: the inherited `string.char` takes 0-255 and raises
+/// "value out of range" above that, which is what `Module:Lang` hit when it
+/// asked for the character of a codepoint it had parsed from a tag.
+///
+/// Lua numbers are doubles, so the arguments arrive as such and must be
+/// integral. A surrogate or a value past `char::MAX` has no character; skipping
+/// it matches the intent of a caller that is probing whether a codepoint is
+/// printable, and returning an error would abort a module over one bad value.
+fn luafn_ustring_char(_: &Lua, args: mlua::MultiValue) -> mlua::Result<String> {
+    let mut out = String::new();
+    for arg in args {
+        let n = match arg {
+            Value::Integer(i) => i,
+            Value::Number(f) if f.fract() == 0.0 => f as i64,
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "bad argument to 'char' (number expected, got {})",
+                    other.type_name()
+                )));
+            }
+        };
+        let Ok(n) = u32::try_from(n) else { continue };
+        if let Some(c) = char::from_u32(n) {
+            out.push(c);
+        }
+    }
+    Ok(out)
 }
 
 /// `mw.ustring.sub(s, i, j)` — codepoint-indexed, Lua's `string.sub` semantics.
@@ -5058,6 +5096,27 @@ mod tests {
             return p
         "#;
         assert_eq!(engine.execute(src, "main", &[]).unwrap(), "123/a+b+c/5");
+    }
+
+    /// `mw.ustring.char` takes *codepoints*, not bytes. Lua's `string.char`
+    /// rejects anything above 255, and the inherited version raised
+    /// "value out of range" on `Module:Lang`, taking the module down on seven
+    /// corpus pages.
+    #[test]
+    fn test_ustring_char_takes_codepoints() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                -- Above the byte range, so `string.char` would raise.
+                local u = mw.ustring.char(0x4E2D)
+                -- Mixed, and a codepoint with no character is skipped.
+                local m = mw.ustring.char(65, 0x4E2D, 0x110000, 66)
+                return u .. '/' .. m .. '/' .. mw.ustring.len(u)
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(src, "main", &[]).unwrap(), "中/A中B/1");
     }
 
     #[test]
