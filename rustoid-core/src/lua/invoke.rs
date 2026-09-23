@@ -449,6 +449,14 @@ where
     // or one past `MAX_MODULES` — made the loop re-request it every round and
     // report "could not run X after 70 rounds" instead of the real error.
     let mut fetched: BTreeSet<String> = BTreeSet::new();
+    // Page titles the loop has already tried to fetch *facts* for. Kept separate
+    // from `fetched` because the two mean different things and one title is
+    // routinely both: `Module:Location map` asks whether its data page exists
+    // before loading it, so the same title is a fact to fetch and then a module
+    // to load. Sharing one set made the fact fetch block the module load, and the
+    // module then failed with "was not preloaded" for a page the loop had already
+    // fetched — a failure with no visible cause, since it looks like a cache miss.
+    let mut fetched_facts: BTreeSet<String> = BTreeSet::new();
     // Titles the loop tried to fetch and could not get. On the next round the
     // engine is told about them so `require` raises a *catchable* "does not
     // exist" instead of reporting another preload miss that would fetch again.
@@ -517,7 +525,7 @@ where
                     .await;
                     continue;
                 }
-                _ => return Err(RustoidError::Lua(msg)),
+                _ => return Err(RustoidError::Lua(with_page(msg, &entity_page))),
             },
             Err(other) => return Err(other),
         };
@@ -530,7 +538,7 @@ where
             // non-module in the registry and make `require` succeed with
             // wikitext as the module body.
             Outcome::MissingTitle(title) => {
-                if !fetched.insert(title.clone()) {
+                if !fetched_facts.insert(title.clone()) {
                     // The loop already fetched this title and it is still being
                     // asked for: it genuinely does not exist, so answer it once
                     // and let the module take its own branch rather than
@@ -579,8 +587,9 @@ where
             // arm rather than a wildcard so a future variant has to be considered
             // here instead of being swallowed.
             Outcome::MissingModule(title) => {
-                return Err(RustoidError::Lua(format!(
-                    "module {title} was not preloaded"
+                return Err(RustoidError::Lua(with_page(
+                    format!("module {title} was not preloaded"),
+                    page_title,
                 )));
             }
         }
@@ -599,6 +608,27 @@ where
 /// of rounds is plenty; the bound exists so a module that asks for something
 /// impossible cannot loop.
 const MAX_PRELOAD_ROUNDS: usize = 6;
+
+/// Name the page an error was raised on, for a preload miss.
+///
+/// A preload miss is reported as the message the *module* raised, which names
+/// the module — and the corpus aggregates 48 pages' failures by that text, so
+/// two pages hitting the same module are one indistinguishable line. Naming the
+/// page makes the failure attributable, which is what a `does not exist` needed
+/// in order to be fixable at all.
+///
+/// Applied only to the preload-miss class. It is a diagnostic suffix rather than
+/// part of Scribunto's message, and appending it to every error would change
+/// text that modules and tests match on. The suffix comes *after* the
+/// `never preloaded` tail, so [`missing_module_from`] still parses the title out
+/// of a message that carries it.
+fn with_page(msg: String, page_title: &str) -> String {
+    if msg.contains("was not preloaded") {
+        format!("{msg} (on {page_title})")
+    } else {
+        msg
+    }
+}
 
 /// Parse `module X was not preloaded` into `X`.
 ///
