@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-or-later"
 repository = "https://github.com/magnusmanske/rustoid"
-authors = ["Magnus Manske <magnusmanskeproton.me>"]
+authors = ["Magnus Manske <magnusmanske@proton.me>"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
