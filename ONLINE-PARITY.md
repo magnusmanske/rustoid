@@ -3017,6 +3017,18 @@ namespace 0 is answered `""` regardless of what a configuration says its name is
 `MockSiteConfig` calls it `Main`, which is a display label; taking it as a prefix
 produced `Main:Sandbox` for `{{FULLPAGENAME}}`.
 
+### Scoreboard
+
+```
+before: 8 failures / 7 distinct, rustoid 164.7MB (2.55x)
+after:  7 failures / 6 distinct, rustoid 163.8MB (2.54x)   best ratio so far
+```
+
+The `Location map` entry leaves the table here, having been fixed two commits
+earlier — it was still listed because a full corpus run had not been made since.
+A wrong *value* does not always show up as a failure count, so the byte ratio is
+the number that moves for this fix; the failure table moved for the other.
+
 ## The reduction harness, and an oracle that is not the byte target
 
 `rustoid-compare --wikitext <file>` renders *chosen* wikitext and prints the
