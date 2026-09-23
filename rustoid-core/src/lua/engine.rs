@@ -3927,7 +3927,7 @@ fn luafn_ustring_find(
     let found = ustring::pattern::find_match(&s, &pattern, start, plain)
         .map_err(|e| mlua::Error::runtime(e.message()))?;
     let Some(m) = found else {
-        return Ok(mlua::MultiValue::new());
+        return Ok(single_nil());
     };
     let mut out = mlua::MultiValue::new();
     // Positions are 1-based codepoints; the end is inclusive.
@@ -3956,7 +3956,7 @@ fn luafn_ustring_match(
     let found = ustring::pattern::find_match(&s, &pattern, start, false)
         .map_err(|e| mlua::Error::runtime(e.message()))?;
     let Some(m) = found else {
-        return Ok(mlua::MultiValue::new());
+        return Ok(single_nil());
     };
     let mut out = mlua::MultiValue::new();
     if m.captures.is_empty() {
@@ -3990,13 +3990,27 @@ fn luafn_ustring_captures(
     let found = ustring::pattern::find_match(&s, &anchored, start, false)
         .map_err(|e| mlua::Error::runtime(e.message()))?;
     let Some(m) = found else {
-        return Ok(mlua::MultiValue::new());
+        return Ok(single_nil());
     };
     let mut out = mlua::MultiValue::new();
     for cap in &m.captures {
         push_capture(lua, &mut out, cap)?;
     }
     Ok(out)
+}
+
+/// A return of exactly one `nil`.
+///
+/// Several `mw.ustring` functions report "no match" this way rather than by
+/// returning no values at all, which is what Lua's own pattern functions do
+/// (`lstrlib.c`: `lua_pushnil(L); return 1;`). The distinction is observable,
+/// because a function called with *no* argument behaves differently from one
+/// called with an explicit nil — `tonumber()` raises where `tonumber(nil)`
+/// returns nil — so a caller that forwards the result hits an error.
+fn single_nil() -> mlua::MultiValue {
+    let mut out = mlua::MultiValue::new();
+    out.push_back(Value::Nil);
+    out
 }
 
 /// Resolve a Lua start offset to a 0-based codepoint index.
@@ -5544,6 +5558,72 @@ mod tests {
     fn test_mw_ustring_len() {
         let engine = make_engine();
         assert_eq!(engine.eval("return mw.ustring.len('hello')").unwrap(), "5");
+    }
+
+    /// A failed match returns exactly one `nil`, not zero values.
+    ///
+    /// Lua's own pattern functions do `lua_pushnil(L); return 1;` on a miss
+    /// (`lstrlib.c`), and the arity is observable because a function called with
+    /// no argument behaves differently from one called with an explicit nil:
+    /// `tonumber()` raises "value expected" where `tonumber(nil)` returns nil.
+    ///
+    /// This is not hypothetical. `Module:Subject bar:18` reads
+    /// `tonumber(mw.ustring.match(k, pattern))`, so returning no values made
+    /// every non-matching key raise and took out six corpus pages.
+    #[test]
+    fn a_failed_match_returns_one_nil() {
+        let engine = make_engine();
+        // `select('#', ...)` separates "one nil" from "no values".
+        assert_eq!(
+            engine
+                .eval("return select('#', (function() return mw.ustring.match('z','(%d+)') end)())")
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            engine
+                .eval("return select('#', (function() return mw.ustring.find('z','(%d+)') end)())")
+                .unwrap(),
+            "1"
+        );
+        // `select(2, x)` on a single value consumes it, leaving no values at
+        // all — stock Lua, verified against the `lua` binary, where
+        // `select('#', select(2, one_nil()))` is 0. So `select` is not a way to
+        // observe the arity; `select('#', ...)` applied to the call directly is.
+        // What matters for a caller is that the value can be held and forwarded,
+        // which is the `v` case below.
+        assert_eq!(
+            engine
+                .eval("local v = mw.ustring.match('z','(%d+)'); return tostring(v)")
+                .unwrap(),
+            "nil"
+        );
+        // And the arity survives being passed on: `tonumber` accepts one nil.
+        assert_eq!(
+            engine
+                .eval("return tostring(tonumber(mw.ustring.match('z','(%d+)')))")
+                .unwrap(),
+            "nil"
+        );
+    }
+
+    /// The shape of `Module:Subject bar`'s `findNumericArgs`, which is what
+    /// exposed the arity bug: a non-matching key must be skipped, not fatal.
+    #[test]
+    fn a_non_matching_key_is_skipped_not_fatal() {
+        let engine = make_engine();
+        let result = engine
+            .eval(
+                "local args = { commons = 'Bitcoin', portal1 = 'Numismatics' } \
+                 local values = {} \
+                 for k, v in pairs(args) do \
+                     local ord = tonumber(mw.ustring.match(k, '^portal_?(%d+)$')) \
+                     if ord then values[ord] = v end \
+                 end \
+                 return tostring(values[1])",
+            )
+            .unwrap();
+        assert_eq!(result, "Numismatics");
     }
 
     #[test]
