@@ -1,7 +1,7 @@
 # Built-in comparison corpus.
 #
-# One entry per line: `Title | tag, tag`. Blank lines and `#` comments are
-# ignored. Tags name the feature areas an entry is intended to exercise, so a
+# One entry per line: `Title @ revid | tag, tag`. Blank lines and `#` comments
+# are ignored. Tags name the feature areas an entry is intended to exercise, so a
 # failure can be attributed to a body of work rather than just counted.
 #
 # Entries are chosen to span the failure space, not to be representative of
@@ -12,65 +12,71 @@
 # A tag is only worth adding if it names something separately implementable; a
 # taxonomy that mirrors the diff rather than the work would not prioritise
 # anything.
+#
+# The `@ revid` pin belongs in this file, not only in the cache manifest: the
+# manifest is the one file whose loss is unrecoverable, and a corpus that states
+# its own revisions is what makes a scoreboard comparable across runs. An entry
+# whose revision the cache no longer holds is reported as skipped rather than
+# silently compared at a different revision.
 
 # --- Lua / Scribunto: the largest single lever ---
 # `invoke=164` and `invoke=101`: these two are the densest Lua consumers in the
 # corpus and the best single measure of `#invoke` progress.
-Cristiano Ronaldo | lua, transclusion, table, cite, media
-Lionel Messi | lua, transclusion, table, cite, media
-Taylor Swift | lua, transclusion, cite, media
-Israel | lua, transclusion, table, cite, media
-Python (programming language) | lua, parser-function, table, cite, media, syntaxhighlight
-COVID-19 pandemic | lua, transclusion, table, cite, media
-Template:Weather box | lua, parser-function, template-only
+Cristiano Ronaldo @ 1376289957 | lua, transclusion, table, cite, media
+Lionel Messi @ 1376298886 | lua, transclusion, table, cite, media
+Taylor Swift @ 1376223460 | lua, transclusion, cite, media
+Israel @ 1375815902 | lua, transclusion, table, cite, media
+Python (programming language) @ 1374673393 | lua, parser-function, table, cite, media, syntaxhighlight
+COVID-19 pandemic @ 1375388521 | lua, transclusion, table, cite, media
+Template:Weather box @ 1189173952 | lua, parser-function, template-only
 
 # --- Transclusion and parser functions, minimal Lua ---
-Albert Einstein | transclusion, cite, table, media, sub-sup
-World War II | transclusion, cite, parser-function, media
-United States | transclusion, cite, media, template-bang
-Wikipedia | transclusion, parser-function, cite, media, gallery
-France | transclusion, cite, media, template-bang
-The Beatles | transclusion, parser-function, cite, media, template-bang
-Titanic | transclusion, parser-function, cite, table, media
+Albert Einstein @ 1375023600 | transclusion, cite, table, media, sub-sup
+World War II @ 1375790811 | transclusion, cite, parser-function, media
+United States @ 1375959250 | transclusion, cite, media, template-bang
+Wikipedia @ 1375559883 | transclusion, parser-function, cite, media, gallery
+France @ 1373166385 | transclusion, cite, media, template-bang
+The Beatles @ 1375775640 | transclusion, parser-function, cite, media, template-bang
+Titanic @ 1375768600 | transclusion, parser-function, cite, table, media
 
 # --- Tables, in several shapes ---
-Periodic table | table, transclusion, cite, media, math
-List of sovereign states | table, transclusion, cite, media
-Commonwealth of Nations | table, transclusion, cite, media
-ISO 3166-1 alpha-2 | table, parser-function, transclusion, cite
+Periodic table @ 1375981470 | table, transclusion, cite, media, math
+List of sovereign states @ 1375759429 | table, transclusion, cite, media
+Commonwealth of Nations @ 1375522280 | table, transclusion, cite, media
+ISO 3166-1 alpha-2 @ 1374091039 | table, parser-function, transclusion, cite
 
 # --- Extensions other than Lua ---
 Zebra | gallery, transclusion, table, cite, media
-Chess | gallery, transclusion, table, cite, media, sub-sup
-Order of the British Empire | gallery, transclusion, table, cite, media
-Berlin | gallery, transclusion, table, cite, media
-Bicycle | gallery, transclusion, cite, media, template-bang
-International Space Station | gallery, transclusion, table, cite, media
-Hydrogen | math, transclusion, table, cite, media, sub-sup
-Earth | math, transclusion, table, cite, media, sub-sup
-Tropical cyclone | math, parser-function, transclusion, table, cite, media
-Sundial | math, transclusion, cite, media
+Chess @ 1375834211 | gallery, transclusion, table, cite, media, sub-sup
+Order of the British Empire @ 1375821255 | gallery, transclusion, table, cite, media
+Berlin @ 1376294941 | gallery, transclusion, table, cite, media
+Bicycle @ 1375091239 | gallery, transclusion, cite, media, template-bang
+International Space Station @ 1376269097 | gallery, transclusion, table, cite, media
+Hydrogen @ 1375188839 | math, transclusion, table, cite, media, sub-sup
+Earth @ 1376261019 | math, transclusion, table, cite, media, sub-sup
+Tropical cyclone @ 1371861997 | math, parser-function, transclusion, table, cite, media
+Sundial @ 1374325260 | math, transclusion, cite, media
 
 # --- Prose and plain structure: the baseline that must never regress ---
-Canada | transclusion, cite, media, parser-function
-Isaac Newton | transclusion, cite, media
-Unix | transclusion, cite, media
-Nobel Prize | transclusion, cite, media
-Megadeth | transclusion, cite, media
-Nigeria | transclusion, cite, media
-Bitcoin | transclusion, cite, media, sub-sup
-Association football | transclusion, cite, media, parser-function
-Anarchism | transclusion, cite, table, media, template-bang
-Doom (1993 video game) | transclusion, cite, media
-Grand Theft Auto V | transclusion, cite, table, media
-Brat (album) | transclusion, cite, table, media
-Polio vaccine | transclusion, cite, table, media, template-bang
-Chernobyl disaster | transclusion, cite, media
-2024 Summer Olympics | transclusion, cite, table, media
-India | transclusion, cite, table, media, math, gallery
-Quicksilver (film) | transclusion, cite, media, short
+Canada @ 1375721833 | transclusion, cite, media, parser-function
+Isaac Newton @ 1375414708 | transclusion, cite, media
+Unix @ 1373785117 | transclusion, cite, media
+Nobel Prize @ 1375748503 | transclusion, cite, media
+Megadeth @ 1375976842 | transclusion, cite, media
+Nigeria @ 1375894180 | transclusion, cite, media
+Bitcoin @ 1374642993 | transclusion, cite, media, sub-sup
+Association football @ 1375615990 | transclusion, cite, media, parser-function
+Anarchism @ 1375097780 | transclusion, cite, table, media, template-bang
+Doom (1993 video game) @ 1375650900 | transclusion, cite, media
+Grand Theft Auto V @ 1375961673 | transclusion, cite, table, media
+Brat (album) @ 1374192304 | transclusion, cite, table, media
+Polio vaccine @ 1357205817 | transclusion, cite, table, media, template-bang
+Chernobyl disaster @ 1375862713 | transclusion, cite, media
+2024 Summer Olympics @ 1375244378 | transclusion, cite, table, media
+India @ 1375927553 | transclusion, cite, table, media, math, gallery
+Quicksilver (film) @ 1375761840 | transclusion, cite, media, short
 
 # --- Edge cases and non-article namespaces ---
-Help:Introduction | transclusion, nowiki, media, non-article
-Module:Math | lua, module-source, parser-function
-Template:Infobox | transclusion, template-only
+Help:Introduction @ 1364609801 | transclusion, nowiki, media, non-article
+Module:Math @ 1348071265 | lua, module-source, parser-function
+Template:Infobox @ 855069164 | transclusion, template-only

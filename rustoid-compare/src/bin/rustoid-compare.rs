@@ -267,9 +267,9 @@ fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     for (n, entry) in corpus.entries.iter().enumerate() {
         let req = rustoid_compare::CompareRequest {
             title: entry.title.clone(),
-            // A pinned revision only makes sense for a single page; in a corpus
-            // each page resolves its own, and the cache pins it thereafter.
-            revid: None,
+            // A corpus entry may pin its own revision, which is what makes a
+            // scoreboard comparable across runs. `None` resolves the wiki's latest.
+            revid: entry.revid,
             refresh: cli.refresh,
             offline: cli.offline,
         };

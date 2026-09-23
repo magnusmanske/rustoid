@@ -13,12 +13,22 @@
 //! # comments and blank lines are ignored
 //! Template-heavy page | transclusion, magic-words
 //! Some other page     | table
+//! Some other page     @ 123456 | table
 //! ```
 //!
 //! The `| tags` part is optional. Tags are free-form labels describing *what the
 //! page is meant to exercise*; they are not parsed into an enum, because the
 //! useful set of tags changes as the parser grows and a closed set would mean
 //! recompiling to add one. They are lowercased and deduplicated.
+//!
+//! `@ revid` pins the revision to compare, and belongs *in this file* rather
+//! than in the cache manifest. The manifest is the only file whose loss is
+//! unrecoverable, and a revision lived only in it — so a reindex could serve
+//! every body and still report every page as skipped, and a replaced page
+//! silently orphaned the revision the corpus had been written against, with no
+//! copy of that revision anywhere a human could read it. A pinned corpus is
+//! therefore self-describing: the file states what it compares, and a cache that
+//! no longer holds that revision says so instead of quietly comparing another.
 //!
 //! The page title is everything before the first `|`, so titles containing a
 //! literal `|` (legal in MediaWiki titles) are not representable. That is a
@@ -35,11 +45,14 @@ pub struct CorpusEntry {
     pub title: String,
     /// Feature labels, lowercased and deduplicated, in sorted order.
     pub tags: BTreeSet<String>,
+    /// The revision to compare, when the corpus pins one.
+    pub revid: Option<u64>,
 }
 
 impl CorpusEntry {
-    /// Parse one `title | tag, tag` line. Returns `None` for a blank or comment
-    /// line, and an error for a line with an empty title.
+    /// Parse one `title [@ revid] [| tag, tag]` line. Returns `None` for a blank
+    /// or comment line, and an error for a line with an empty title or an
+    /// unreadable revision.
     pub fn parse(line: &str) -> Result<Option<Self>> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -48,6 +61,21 @@ impl CorpusEntry {
         let (title, tags) = match line.split_once('|') {
             Some((t, rest)) => (t, Some(rest)),
             None => (line, None),
+        };
+        let (title, revid) = match title.split_once('@') {
+            Some((t, r)) => {
+                let r = r.trim();
+                // A revision is a positive integer. Refusing anything else is what
+                // keeps a typo in the corpus from silently unpinning a page, which
+                // is the failure this field exists to prevent.
+                let revid = r.parse::<u64>().map_err(|_| {
+                    CompareError::Corpus(format!(
+                        "revision after `@` is not a number: {r:?} in {line:?}"
+                    ))
+                })?;
+                (t, Some(revid))
+            }
+            None => (title, None),
         };
         let title = title.trim();
         if title.is_empty() {
@@ -64,6 +92,7 @@ impl CorpusEntry {
         Ok(Some(Self {
             title: title.to_string(),
             tags,
+            revid,
         }))
     }
 }
@@ -146,6 +175,32 @@ mod tests {
         let e = CorpusEntry::parse("Main Page").unwrap().unwrap();
         assert_eq!(e.title, "Main Page");
         assert!(e.tags.is_empty());
+        assert_eq!(e.revid, None);
+    }
+
+    /// The revision is part of the entry, so a pinned corpus is readable without
+    /// consulting the cache that the pin protects.
+    #[test]
+    fn parses_a_pinned_revision_with_and_without_tags() {
+        let e = CorpusEntry::parse("Earth @ 1375983123 | math, table")
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.title, "Earth");
+        assert_eq!(e.revid, Some(1375983123));
+        assert_eq!(e.tags, tags(&["math", "table"]));
+
+        let e = CorpusEntry::parse("Earth@42").unwrap().unwrap();
+        assert_eq!(e.title, "Earth");
+        assert_eq!(e.revid, Some(42));
+    }
+
+    /// A revision that is not a number must be an error, not a silently dropped
+    /// pin: an unpinned entry still compares, so a typo would look like success.
+    #[test]
+    fn a_malformed_revision_is_an_error() {
+        assert!(CorpusEntry::parse("Earth @ latest | a").is_err());
+        assert!(CorpusEntry::parse("Earth @").is_err());
+        assert!(CorpusEntry::parse("Earth @ -3").is_err());
     }
 
     #[test]
@@ -224,5 +279,21 @@ mod tests {
             c.len(),
             "duplicate titles in the built-in corpus"
         );
+    }
+
+    /// The built-in corpus pins a revision for every entry, because that is what
+    /// makes two runs' scoreboards comparable. `Zebra` is the one exception: it
+    /// was added before the pin was recorded anywhere and its body predates the
+    /// manifest entry, so it is called out here rather than silently tolerated.
+    #[test]
+    fn the_builtin_corpus_pins_revisions() {
+        let c = Corpus::builtin();
+        let unpinned: Vec<&str> = c
+            .entries
+            .iter()
+            .filter(|e| e.revid.is_none())
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(unpinned, vec!["Zebra"]);
     }
 }
