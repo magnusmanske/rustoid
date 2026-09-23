@@ -82,6 +82,30 @@ fn key_value_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// Core's `decodeTrimExpand` minus the entity decoding: the comparison key of a
+/// `#switch` entry is its trimmed expansion.
+fn args_to_test(kv: &KeyValue) -> String {
+    key_value_to_string(kv).trim().to_string()
+}
+
+/// Does this argument carry an explicit `=` — i.e. is it `name=value`?
+///
+/// The tokenizer records a *positional* argument's key range as ending where its
+/// value begins, so `|=value` (empty name, real `=`) is distinguishable from
+/// `|value` even though both render an empty key. `#switch`'s fall-through groups
+/// depend on the difference.
+fn arg_is_named(kv: &KV) -> bool {
+    match &kv.src_offsets {
+        Some(so) => so.key_end != so.value_start,
+        None => !key_value_to_string(&kv.key).trim().is_empty(),
+    }
+}
+
+/// Core's `MagicWord::matchStartToEnd` for `default`.
+fn is_default_word(test: &str) -> bool {
+    test == "#default" || test == "default"
+}
+
 /// Serialize a `#tag` attribute list to a ` name="value"…` source fragment
 /// (mirrors the attribute serialization in core `tagObj`'s non-extension branch,
 /// used to reconstruct the opening tag source for an `extension` token).
@@ -162,74 +186,67 @@ impl ParserFunctions {
         }
     }
 
-    /// `#switch` — mirrors `pf_switch` / `switchLookupFallback`.
+    /// `#switch` — a port of core `ParserFunctions::switch`, which is what the
+    /// served HTML shows. (Parsoid's *native* `pf_switch` is a different,
+    /// simplified algorithm; the online target is core's.)
+    ///
+    /// The shape worth naming is how a *fall-through group* is written. Core
+    /// reads `|a|b|c=result` as "cases a and b fall through to c's result", and
+    /// it does that by remembering whether a positional entry matched and then
+    /// returning the next `=value` it sees. A `=value` with nothing before the
+    /// `=` is therefore a *result*, not a case — which is what
+    /// `|2|3|12|=exclude` in `Template:Short description` needs, and what an
+    /// earlier reading got wrong by treating every empty-key entry as a case.
     pub fn pf_switch(params: &Params) -> Vec<Item> {
         let args = &params.args;
-        let target = args
-            .first()
-            .map(|kv| key_value_to_string(&kv.key).trim().to_string())
-            .unwrap_or_default();
-
-        // Check dict (named args) first.
-        let dict = params.dict();
-        if !target.is_empty()
-            && let Some(v) = dict.get(&target)
-        {
-            return Self::branch_items(v);
-        }
-
-        // Fallback lookup over positional entries.
-        Self::switch_lookup_fallback(&args[1..], &target, &dict)
-    }
-
-    fn switch_lookup_fallback(
-        kvs: &[KV],
-        key: &str,
-        dict: &std::collections::HashMap<String, KeyValue>,
-    ) -> Vec<Item> {
-        let l = kvs.len();
-        if l == 0 {
+        let Some(primary) = args.first().map(|kv| args_to_test(&kv.key)) else {
             return vec![];
-        }
+        };
 
-        // Fall-through handling is approximated for the common cases:
-        // search for the first value-only entry matching the key via
-        // "a=b"-style positional pairs, or a bare default.
-        for kv in kvs {
-            let k = key_value_to_string(&kv.key);
-            if !k.is_empty() {
-                // Named/equal key: if it matches, return its value.
-                if k.trim() == key {
+        let mut found = false;
+        let mut default_found = false;
+        let mut default: Option<KeyValue> = None;
+        let mut last_item_had_no_equals = false;
+        let mut last_item: Vec<Item> = Vec::new();
+
+        for kv in args.iter().skip(1) {
+            if arg_is_named(kv) {
+                // `name=value`, including the empty name of `=value`.
+                last_item_had_no_equals = false;
+                if found {
+                    // A case matched earlier; this is its result.
                     return Self::branch_items(&kv.value);
                 }
-            } else {
-                // Value-only entry: this is a fall-through candidate.
-                let v = value_to_string(&kv.value);
-                if v.trim() == key {
-                    // Find the next non-empty-key entry's value.
-                    for next in kvs {
-                        let nk = key_value_to_string(&next.key);
-                        if !nk.is_empty() {
-                            return Self::branch_items(&next.value);
-                        }
-                    }
-                    return vec![];
+                let test = args_to_test(&kv.key);
+                if test == primary {
+                    return Self::branch_items(&kv.value);
                 }
+                if default_found || is_default_word(&test) {
+                    default = Some(kv.value.clone());
+                    default_found = false;
+                }
+            } else {
+                // A bare value: a case, compared against the target.
+                last_item_had_no_equals = true;
+                let test = value_to_string(&kv.value).trim().to_string();
+                if is_default_word(&test) {
+                    default_found = true;
+                }
+                if test == primary {
+                    found = true;
+                }
+                last_item = Self::branch_items(&kv.value);
             }
         }
 
-        // Default value (last value-only entry).
-        if let Some(last) = kvs.last()
-            && key_value_to_string(&last.key).is_empty()
-        {
-            return Self::branch_items(&last.value);
+        // A trailing case with no `=` is the default, written the other way.
+        if last_item_had_no_equals {
+            return last_item;
         }
-
-        if let Some(default) = dict.get("#default") {
-            return Self::branch_items(default);
+        match default {
+            Some(default) => Self::branch_items(&default),
+            None => vec![],
         }
-
-        vec![]
     }
 
     /// The items a matched `#switch` branch yields, with surrounding whitespace
@@ -811,23 +828,56 @@ pub(crate) fn evaluate_expression(expr: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 enum ExprToken {
     Num(f64),
+    /// Arithmetic: `+ - * / %`, plus `D` for `div` (integer division).
     Op(char),
+    /// A comparison, spelled `=`, `!=`, `<`, `>`, `<=` or `>=`. `<>` is
+    /// normalised to `!=` because that is what it means.
+    Cmp(&'static str),
+    And,
+    Or,
+    Not,
+    /// `^` — exponentiation, right-associative.
+    Caret,
     LParen,
     RParen,
 }
 
 fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
     let mut tokens = Vec::new();
-    let mut i = 0;
     let bytes = expr.as_bytes();
+    let lower = expr.to_ascii_lowercase();
+    let mut i = 0;
 
     while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\t' | b'\n' => {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Word operators. Anything else alphabetic is not part of the language
+        // (a bare word is not a value), so it is skipped as before.
+        if b.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
+            match &lower[start..i] {
+                "and" => tokens.push(ExprToken::And),
+                "or" => tokens.push(ExprToken::Or),
+                "not" => tokens.push(ExprToken::Not),
+                "div" => tokens.push(ExprToken::Op('D')),
+                "mod" => tokens.push(ExprToken::Op('%')),
+                _ => {}
+            }
+            continue;
+        }
+        match b {
             b'+' | b'-' | b'*' | b'/' | b'%' => {
-                tokens.push(ExprToken::Op(bytes[i] as char));
+                tokens.push(ExprToken::Op(b as char));
+                i += 1;
+            }
+            b'^' => {
+                tokens.push(ExprToken::Caret);
                 i += 1;
             }
             b'(' => {
@@ -837,6 +887,46 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             b')' => {
                 tokens.push(ExprToken::RParen);
                 i += 1;
+            }
+            // `=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`. MediaWiki compares
+            // numbers here, and every comparison answers `1` or `0` — which is
+            // what makes `{{#ifexpr: … > 100 | … }}` work at all.
+            b'=' => {
+                i += 1;
+                if bytes.get(i) == Some(&b'=') {
+                    i += 1;
+                }
+                tokens.push(ExprToken::Cmp("="));
+            }
+            b'!' => {
+                i += 1;
+                if bytes.get(i) == Some(&b'=') {
+                    i += 1;
+                    tokens.push(ExprToken::Cmp("!="));
+                }
+            }
+            b'<' => {
+                i += 1;
+                match bytes.get(i) {
+                    Some(b'=') => {
+                        i += 1;
+                        tokens.push(ExprToken::Cmp("<="));
+                    }
+                    Some(b'>') => {
+                        i += 1;
+                        tokens.push(ExprToken::Cmp("!="));
+                    }
+                    _ => tokens.push(ExprToken::Cmp("<")),
+                }
+            }
+            b'>' => {
+                i += 1;
+                if bytes.get(i) == Some(&b'=') {
+                    i += 1;
+                    tokens.push(ExprToken::Cmp(">="));
+                } else {
+                    tokens.push(ExprToken::Cmp(">"));
+                }
             }
             b'0'..=b'9' | b'.' => {
                 let start = i;
@@ -868,36 +958,83 @@ fn expr_parse(
 ) -> std::result::Result<f64, RustoidError> {
     let mut lhs = expr_primary(tokens, pos)?;
     while *pos < tokens.len() {
-        let op = match tokens.get(*pos) {
-            Some(ExprToken::Op(c)) => *c,
-            _ => break,
-        };
-        let prec = precedence(op);
-        if prec < min_prec {
+        let op = tokens[*pos].clone();
+        let prec = precedence(&op);
+        // `precedence` is 0 for everything that cannot appear between two
+        // operands — a `)`, a number, a parenthesis — and those must *end* the
+        // loop rather than be consumed as an operator with no effect. Treating
+        // them as operators swallowed the rest of the expression after a
+        // parenthesised group: `(650-590)/650*250` answered `60`.
+        if prec == 0 || prec < min_prec {
             break;
         }
+        // `^` binds to the right, so the same precedence is allowed on the
+        // right-hand side; everything else is left-associative.
+        let next_min = if op == ExprToken::Caret {
+            prec
+        } else {
+            prec + 1
+        };
         *pos += 1;
-        let rhs = expr_parse(tokens, pos, prec + 1)?;
+        let rhs = expr_parse(tokens, pos, next_min)?;
         lhs = match op {
-            '+' => lhs + rhs,
-            '-' => lhs - rhs,
-            '*' => lhs * rhs,
-            '/' => {
+            ExprToken::Op('+') => lhs + rhs,
+            ExprToken::Op('-') => lhs - rhs,
+            ExprToken::Op('*') => lhs * rhs,
+            ExprToken::Op('/') => {
                 if rhs == 0.0 {
                     return Err(RustoidError::Parse("division by zero".to_string()));
                 }
                 lhs / rhs
             }
-            '%' => {
+            ExprToken::Op('D') => {
+                if rhs == 0.0 {
+                    return Err(RustoidError::Parse("division by zero".to_string()));
+                }
+                (lhs / rhs).trunc()
+            }
+            ExprToken::Op('%') => {
                 if rhs == 0.0 {
                     return Err(RustoidError::Parse("modulo by zero".to_string()));
                 }
                 lhs - rhs * (lhs / rhs).trunc()
             }
+            ExprToken::Caret => {
+                if rhs == 0.0 {
+                    1.0
+                } else {
+                    lhs.powf(rhs)
+                }
+            }
+            ExprToken::And => bool_num(truthy(lhs) && truthy(rhs)),
+            ExprToken::Or => bool_num(truthy(lhs) || truthy(rhs)),
+            ExprToken::Cmp(cmp) => compare(cmp, lhs, rhs),
             _ => lhs,
         };
     }
     Ok(lhs)
+}
+
+/// MediaWiki's `#expr` answers `1`/`0` for a comparison, so a boolean is a
+/// number here too.
+fn truthy(v: f64) -> bool {
+    v != 0.0
+}
+
+fn bool_num(b: bool) -> f64 {
+    if b { 1.0 } else { 0.0 }
+}
+
+fn compare(cmp: &str, lhs: f64, rhs: f64) -> f64 {
+    bool_num(match cmp {
+        "=" => lhs == rhs,
+        "!=" => lhs != rhs,
+        "<" => lhs < rhs,
+        ">" => lhs > rhs,
+        "<=" => lhs <= rhs,
+        ">=" => lhs >= rhs,
+        _ => false,
+    })
 }
 
 fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f64, RustoidError> {
@@ -914,6 +1051,15 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
             let val = expr_primary(tokens, pos)?;
             Ok(-val)
         }
+        ExprToken::Op('+') => {
+            *pos += 1;
+            expr_primary(tokens, pos)
+        }
+        ExprToken::Not => {
+            *pos += 1;
+            let val = expr_primary(tokens, pos)?;
+            Ok(if truthy(val) { 0.0 } else { 1.0 })
+        }
         ExprToken::LParen => {
             *pos += 1;
             let val = expr_parse(tokens, pos, 0)?;
@@ -926,10 +1072,16 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
     }
 }
 
-fn precedence(op: char) -> u8 {
-    match op {
-        '+' | '-' => 1,
-        '*' | '/' | '%' => 2,
+/// MediaWiki's operator precedence, loosest first: `or`, `and`, comparison,
+/// additive, multiplicative, then `^`.
+fn precedence(t: &ExprToken) -> u8 {
+    match t {
+        ExprToken::Or => 1,
+        ExprToken::And => 2,
+        ExprToken::Cmp(_) => 3,
+        ExprToken::Op('+' | '-') => 4,
+        ExprToken::Op('*' | '/' | '%' | 'D') => 5,
+        ExprToken::Caret => 6,
         _ => 0,
     }
 }
@@ -1013,6 +1165,91 @@ mod tests {
         let p = params(vec![("2+3*4", "")]);
         let out = ParserFunctions::pf_expr(&p);
         assert_eq!(out, vec![Item::Str("14".to_string())]);
+    }
+
+    /// A comparison answers `1`/`0`, which is what makes `#ifexpr` work.
+    /// Without them the evaluator returned the left operand, so
+    /// `{{#ifexpr: 39>100 | yes | no}}` took the `yes` branch.
+    #[test]
+    fn test_expr_comparisons_and_booleans() {
+        for (expr, want) in [
+            ("39>100", "0"),
+            ("139>100", "1"),
+            ("1=1", "1"),
+            ("1<>2", "1"),
+            ("1!=1", "0"),
+            ("2<=2", "1"),
+            ("not 0", "1"),
+            ("1 and 0", "0"),
+            ("2>1 and 3>2", "1"),
+            ("1 or 0", "1"),
+            ("2^10", "1024"),
+            ("7 div 2", "3"),
+        ] {
+            assert_eq!(evaluate_expression(expr), want, "expr {expr:?}");
+        }
+    }
+
+    /// `|2|3|12|=exclude` is a fall-through group: the cases 2, 3 and 12 all
+    /// answer `exclude`. The `=exclude` is a *result* for the group, which is why
+    /// the tokenizer has to record whether a part had an `=` — both entries
+    /// render an empty key.
+    #[test]
+    fn test_pf_switch_fall_through_group() {
+        // `#switch:12|2|3|12|=exclude|#default=DEF`. The `=exclude` and
+        // `#default=DEF` parts are named (their key range does not end where
+        // their value begins); the bare cases are positional.
+        let positional = |v: &str| KV {
+            key: KeyValue::Str(String::new()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: Some(crate::wikitext::tokens_v2::KVSourceRange {
+                key_start: 0,
+                key_end: 0,
+                value_start: 0,
+                value_end: v.len(),
+                source: None,
+            }),
+            ksrc: None,
+            vsrc: None,
+        };
+        let named = |k: &str, v: &str| KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: Some(crate::wikitext::tokens_v2::KVSourceRange {
+                key_start: 0,
+                key_end: k.len(),
+                value_start: k.len() + 1,
+                value_end: k.len() + 1 + v.len(),
+                source: None,
+            }),
+            ksrc: None,
+            vsrc: None,
+        };
+        let p = Params::new(vec![
+            kv("12", ""),
+            positional("2"),
+            positional("3"),
+            positional("12"),
+            named("", "exclude"),
+            named("#default", "DEF"),
+        ]);
+        assert_eq!(
+            ParserFunctions::pf_switch(&p),
+            vec![Item::Str("exclude".to_string())]
+        );
+
+        let p = Params::new(vec![
+            kv("99", ""),
+            positional("2"),
+            positional("3"),
+            positional("12"),
+            named("", "exclude"),
+            named("#default", "DEF"),
+        ]);
+        assert_eq!(
+            ParserFunctions::pf_switch(&p),
+            vec![Item::Str("DEF".to_string())]
+        );
     }
 
     #[test]

@@ -1489,6 +1489,11 @@ fn page_name_variable(
         "rootpagenamee" => urlencode_title(&root),
         "namespace" => ns_name(ns),
         "namespacee" => ns_e_name(ns),
+        // The numeric id, which is what `{{#switch: {{NAMESPACENUMBER}} …}}`
+        // dispatches on — `Template:Short description` uses it to suppress its
+        // tracking categories outside the main namespace, and an empty answer
+        // there takes the `#default` branch and adds them on every page.
+        "namespacenumber" => ns.to_string(),
         "talkspace" => ns_name(talk_ns),
         "talkspacee" => ns_e_name(talk_ns),
         "subjectspace" | "articlespace" => ns_name(subject_ns),
@@ -1791,6 +1796,12 @@ mod tests {
             (&main, "talkspace", "Talk"),
             (&main, "fullpagename", "Sandbox"),
             (&main, "talkpagename", "Talk:Sandbox"),
+            // The numeric id, which is what `{{#switch: {{NAMESPACENUMBER}} }}`
+            // dispatches on. `Help:Introduction` is namespace 12, and an empty
+            // answer there made `Template:Short description` add its tracking
+            // categories to every non-article page.
+            (&help, "namespacenumber", "12"),
+            (&main, "namespacenumber", "0"),
         ];
         for (title, word, expected) in cases {
             assert_eq!(

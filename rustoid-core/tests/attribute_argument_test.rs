@@ -149,14 +149,16 @@ async fn arguments_inside_a_parser_function_in_an_attribute_resolve() {
 /// The same nesting in *text* position, to separate "a parser function does not
 /// see its arguments" from "an attribute does not".
 ///
-/// The parser function's result is wrapped in marker spans, so `10` is not
-/// contiguous with the `left:` around it — the assertion is on the value, not on
-/// the assembled attribute string.
+/// The parser function's result is *not* wrapped here: this runs inside a
+/// template body, and PHP's `wrapTemplates = !inTemplate` is false in the body
+/// pipeline, so nothing in it gets its own markers. The assertion is therefore on
+/// the assembled text, which is the stronger form anyway — an unresolved
+/// reference would leave `{{{1|0}}}*2` in place.
 #[tokio::test]
 async fn arguments_inside_a_parser_function_in_text_resolve() {
     let html = render("left:{{#expr:{{{1|0}}}*2}}px", "{{Real|5}}").await;
     assert!(
-        html.contains(">10</span>"),
+        html.contains("left:10px"),
         "a parser function in text position must see the arguments: {html}"
     );
 }

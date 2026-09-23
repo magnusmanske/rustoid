@@ -3012,7 +3012,18 @@ impl<'a> PegTokenizer<'a> {
         for (offset, part) in parts.iter().skip(1) {
             let part_start = inner_start + offset;
             let value_end = part_start + part.len();
-            match find_arg_separator_eq(part) {
+            // `starts_line` is what makes a *leading* `=` a name/value separ-
+            // ator rather than a heading opener. The part `=exclude` in
+            // `{{#switch:12|2|3|12|=exclude}}` begins mid-line, so its `=` is the
+            // empty-name separator the `#switch` fall-through group needs; a part
+            // that really does begin a line (`{{T|\n=== x ===}}`) still gets the
+            // heading behaviour, because its first character is the newline.
+            let starts_line = part_start == 0
+                || matches!(
+                    self.input.as_bytes().get(part_start - 1),
+                    Some(b'\n' | b'\r')
+                );
+            match find_arg_separator_eq(part, starts_line) {
                 Some(eq) => {
                     let k = part[..eq].trim().to_string();
                     let v = part[eq + 1..].to_string();
@@ -4867,9 +4878,9 @@ fn strip_html_comments(input: &str) -> String {
 /// A heading occupies its entire line, so every `=` on a line that begins with
 /// `=` (at SOL) is heading content, not a separator (mirrors
 /// `template_param_name` + `inlineBreaks` in `Grammar.pegphp`).
-fn find_arg_separator_eq(part: &str) -> Option<usize> {
+fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
     let bytes = part.as_bytes();
-    let mut at_sol = true;
+    let mut at_sol = starts_line;
     let mut in_heading = false;
     // Track nested `[[…]]`/`{{…}}`/`[…]` depth so an `=` inside a wikilink,
     // template, or extlink is *not* misread as the `name=value` separator

@@ -1199,7 +1199,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, true, body)
+                .expand_templates(frame, tokens, source, about_counter, true, false, body)
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
@@ -1458,7 +1458,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, in_template, body)
+                .expand_templates(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    in_template,
+                    false,
+                    body,
+                )
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
@@ -1595,7 +1603,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, false, &caption)
+                .expand_templates(frame, tokens, source, about_counter, false, false, &caption)
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -1649,7 +1657,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut next_id = 0usize;
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, false, &wikitext)
+                .expand_templates(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    false,
+                    false,
+                    &wikitext,
+                )
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -2105,7 +2121,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let frame = Frame::new(title.clone(), vec![]);
 
         let tokens = self
-            .expand_templates(&frame, tokens, source, about_counter, false, page_source)
+            .expand_templates(
+                &frame,
+                tokens,
+                source,
+                about_counter,
+                false,
+                false,
+                page_source,
+            )
             .await;
         // TT2 order: ExtensionHandler runs after TemplateHandler and before
         // AttributeExpander (PHP `ParserPipelineFactory::STAGES`). Attribute
@@ -2336,6 +2360,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `src_text` is the wikitext the tokens were tokenized from, used to
     /// recover argument source spans (`ParamInfo`'s `valueWt`). Tokens whose
     /// ranges carry their own source ignore it.
+    #[allow(clippy::too_many_arguments)]
     async fn expand_templates(
         &self,
         frame: &Frame,
@@ -2343,6 +2368,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
+        // Is this chunk a *nested pipeline's* content — a template body, an
+        // extension body, a module's output? PHP sets `inTemplate` on the
+        // pipeline that runs such a chunk, and `wrapTemplates = !inTemplate`
+        // follows from it, so nothing in here is encapsulated. It is a separate
+        // flag from `in_template`, which stays the *caller's* value: `{{!}}`
+        // keys off `atTopLevel` and the fixtures pin it to `|` one level down.
+        body: bool,
         src_text: &str,
     ) -> Vec<Item> {
         let mut out = Vec::new();
@@ -2398,6 +2430,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         source,
                         about_counter,
                         in_template,
+                        body,
                         src_text,
                         &mut table_depth,
                     )
@@ -2429,6 +2462,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     about_counter,
                     in_template,
+                    body,
                     src_text,
                 ))
                 .await;
@@ -2461,6 +2495,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
+        body: bool,
         src_text: &str,
         table_depth: &mut usize,
     ) -> Vec<Item> {
@@ -2472,21 +2507,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // A token spliced in from an *argument value* is expanded in
         // template context: PHP expands argument values with a hard-coded
         // `inTemplate => true` (see `mark_arg_value_tokens`).
-        let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
+        let arg_value = stt.data_parsoid.tmp.in_arg_value;
+        let in_tpl = in_template || arg_value;
 
-        // A `mw:Transclusion` wrapper needs an `about` id — but only a *template*
-        // expansion takes one here. A variable or parser function is wrapped by
-        // `TemplateHandler::process`, which takes its own id, and an in-template
-        // expansion is wrapped by whoever spliced it. Taking one up front for
-        // every token cost an id nothing used: `{{#if:1|X|Y}}{{PAGENAME}}`
-        // numbered `#mwt1` then `#mwt3` where the service serves `#mwt2`.
-        //
-        // PHP takes it in the `TemplateEncapsulator` constructor, which
-        // `onTemplate` runs for every template token, so `allocate then discard`
-        // looks faithful *there*. The difference is which tokens reach it: a
-        // `#tag` lowered from a module's `frame:extensionTag` is not an
-        // `onTemplate` token, and the element it emits (the `<style>`) takes its
-        // id where it is spliced instead.
+        // PHP's `wrapTemplates`, which decides whether this expansion gets its own
+        // `mw:Transclusion` markers. Nothing inside a template *body* is wrapped:
+        // the body runs in a nested pipeline, and its tokens are spliced into the
+        // caller's expansion, which carries the one wrapper. That includes the
+        // argument values spliced into it — PHP does not expand them up front
+        // (`AttributeTransformManager` there runs with `expandTemplates => false`)
+        // but hands them to `Frame::expand` inside the body, so
+        // `{{1x|{{T}}}}` has *one* wrapper, around the `1x` call, and the fixture
+        // suite pins that.
+        let wrap = !body && !in_tpl;
+
+        // The id is taken whenever PHP's `TemplateEncapsulator` constructor would
+        // run — for every `template` token — even when the expansion turns out not
+        // to be wrapped. The discarded id is load-bearing: the service serves
+        // contiguous ids over the elements it *does* wrap, so `{{1x|{{T}}}}`
+        // numbers the `1x` span after T's discarded id. (A variable or parser
+        // function takes its own inside `TemplateHandler::process`, which is the
+        // path that used to double up and skip one.)
         let take_id = || {
             if in_tpl {
                 String::new()
@@ -2513,6 +2554,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 source,
                 about_counter,
                 in_tpl,
+                body,
                 src_text,
             )
             .await;
@@ -2583,7 +2625,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // things, and `data-mw` still reads the raw source through its
                 // own path (`prepare_pf_param_infos`).
                 let expanded_params = self
-                    .expand_invoke_args(&params, frame, source, about_counter, src_text)
+                    .expand_invoke_args(&params, frame, source, about_counter, body, src_text)
                     .await;
                 let invoke_arg = invoke_arg_text(pf_arg, &expanded_params);
                 // Scribunto's `frame:getParent()` is the frame of the
@@ -2605,7 +2647,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let parent_args = {
                     let raw =
                         crate::pipeline::parser_functions::Params::new(frame.args().args.clone());
-                    self.expand_invoke_args(&raw, frame, source, about_counter, src_text)
+                    self.expand_invoke_args(&raw, frame, source, about_counter, body, src_text)
                         .await
                         .args
                 };
@@ -2618,6 +2660,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         about_id,
                         tok,
                         in_template,
+                        body,
                         src_text,
                         parent_args,
                         about_counter,
@@ -2642,6 +2685,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         tok,
                         about_counter,
                         in_tpl,
+                        wrap,
                         target_has_comment,
                         src_text,
                         *table_depth > 0,
@@ -2667,7 +2711,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // as in-template: PHP expands argument values under a
                 // hard-coded `inTemplate => true` (see
                 // `mark_arg_value_tokens`).
-                let arg_value = stt.data_parsoid.tmp.in_arg_value;
                 out.extend(
                     crate::pipeline::template_handler::process_special_magic_word(
                         &magic,
@@ -2691,6 +2734,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     about_counter,
                     in_tpl,
+                    body,
                     src_text,
                 ))
                 .await;
@@ -2712,7 +2756,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     &self.protection_context(),
                     vec![expanded_item],
-                    !in_tpl,
+                    wrap,
                 );
                 // A parser function hands back a *branch*, and a branch is
                 // wikitext: PHP's handlers return its tokens unexpanded and the
@@ -2732,6 +2776,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     about_counter,
                     in_tpl,
+                    body,
                     src_text,
                 ))
                 .await;
@@ -2757,6 +2802,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// Only attribs[0] is touched, matching `expandFirstAttribute`: an argument
     /// *value* holding a template stays unexpanded for the template body
     /// expansion to handle.
+    #[allow(clippy::too_many_arguments)]
     async fn expand_target_templates(
         &self,
         frame: &Frame,
@@ -2764,6 +2810,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
+        body: bool,
         src_text: &str,
     ) -> Vec<crate::wikitext::tokens_v2::KV> {
         let Some(target) = attribs.first_mut() else {
@@ -2782,6 +2829,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             source,
             about_counter,
             in_template,
+            body,
             src_text,
         ))
         .await;
@@ -2845,6 +2893,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             source,
                             about_counter,
                             false,
+                            false,
                             page_source.unwrap_or(""),
                         )
                         .await;
@@ -2859,6 +2908,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             toks.clone(),
                             source,
                             about_counter,
+                            false,
                             false,
                             page_source.unwrap_or(""),
                         )
@@ -2915,6 +2965,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         token: &ParsoidToken,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
+        // PHP's `wrapTemplates`: whether this expansion gets its own
+        // `mw:Transclusion` markers. False inside a template body, where the
+        // tokens are spliced into the caller's expansion and the caller carries
+        // the wrapper.
+        wrap: bool,
         target_has_comment: bool,
         page_source: &str,
         // Whether the *call site* was inside an open table (PHP's
@@ -2943,7 +2998,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         // Without a data source, a template becomes a redlink.
         let Some(src) = source else {
-            if in_template {
+            if !wrap {
                 return vec![crate::pipeline::template_handler::template_to_wikilink(
                     name,
                     self.config,
@@ -2962,7 +3017,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let fetched = src.get_template(title).await.ok().flatten();
         let Some(template_src) = fetched else {
-            if in_template {
+            if !wrap {
                 return vec![crate::pipeline::template_handler::template_to_wikilink(
                     name,
                     self.config,
@@ -3005,7 +3060,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // `[[Category:…]]` trailer are bookkeeping, and rendering them as
             // article text invents content Parsoid never emits.
             Redirected::Unresolved => {
-                if in_template {
+                if !wrap {
                     return vec![crate::pipeline::template_handler::template_to_wikilink(
                         name,
                         self.config,
@@ -3106,17 +3161,43 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // its own `mw:Transclusion` span, and there the caller's value is the
         // correct one: `{{ {{T}} }}` must keep the inner span, so forcing `true`
         // for a body breaks it.
+        // Expand the spliced body's remaining templates, in a nested pipeline:
+        // PHP's `processTemplateSource` hard-codes `'inTemplate' => true` for the
+        // body's own `wikitext-to-expanded-tokens` run, and `wrapTemplates =
+        // !inTemplate` follows from it, so nothing inside the body is
+        // encapsulated. The body's tokens are spliced into the caller's
+        // expansion, which carries the one wrapper. A `{{SHORTDESC:…}}` inside
+        // `Template:Short description` is invisible on the service for exactly
+        // this reason — it expands to nothing, and with no wrapper there is
+        // nothing left where the empty span would have been.
+        //
+        // `in_template` stays the *caller's* flag: `{{!}}` keys off PHP's
+        // `atTopLevel` and the fixtures pin it to a literal `|` one level down,
+        // and an argument value spliced into this body was expanded in the
+        // caller's pipeline, so it keeps its wrapper (see `wrap` above).
         let expanded = Box::pin(self.expand_templates(
             &child_frame,
             spliced,
             Some(src),
             about_counter,
             in_template,
+            /* body */ true,
             &template_src,
         ))
         .await;
 
-        if in_template || target_has_comment {
+        // A comment in a template body is dropped. PHP's `processTemplateTokens`
+        // strips top-level comments whenever the pipeline ran with
+        // `expandTemplates => false`, which is exactly the body pipeline — so
+        // `Template:Short description`'s `<!-- Start tracking -->` markers never
+        // reach the reader, and the same `if (!expandTemplates)` guard is what
+        // makes them survive on a *page*.
+        let expanded: Vec<Item> = expanded
+            .into_iter()
+            .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
+            .collect();
+
+        if !wrap || target_has_comment {
             // Nested/extension-content context, or a comment in the template
             // target (`{{f<!---->oo}}`): no `mw:Transclusion` wrapping.
             return expanded;
@@ -3156,6 +3237,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         raw_params: &crate::pipeline::parser_functions::Params,
         about_id: String,
         token: &ParsoidToken,
+        // PHP's `wrapTemplates` for *this* call, and the caller's `inTemplate`
+        // for the nested pipeline that runs the module's output.
+        wrap: bool,
         in_template: bool,
         _page_source: &str,
         parent_args: Vec<crate::wikitext::tokens_v2::KV>,
@@ -3263,6 +3347,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             source,
             about_counter,
             in_template,
+            false,
             /* src_text */ "",
         ))
         .await;
@@ -3277,7 +3362,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // worse than leaving the call unexpanded. The gap is recorded in
         // `ONLINE-PARITY.md`.
 
-        if in_template {
+        if !wrap {
             return expanded;
         }
 
@@ -3360,6 +3445,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
+        body: bool,
         src_text: &str,
     ) -> crate::pipeline::parser_functions::Params {
         use crate::wikitext::tokens_v2::KeyValue;
@@ -3382,6 +3468,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 source,
                 about_counter,
                 /* in_template */ true,
+                body,
                 src_text,
             ))
             .await;
@@ -3486,6 +3573,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(source),
             about_counter,
             /* in_template */ true,
+            /* body */ false,
             &text,
         ))
         .await;
