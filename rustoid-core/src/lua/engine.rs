@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, Value};
+use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Result, RustoidError};
@@ -1299,7 +1300,13 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // a module writes `mw.text.JSON_PRESERVE_KEYS` rather than a bare number.
     text.set("JSON_PRESERVE_KEYS", JSON_PRESERVE_KEYS)?;
     text.set("JSON_TRY_FIXING", JSON_TRY_FIXING)?;
+    text.set("JSON_PRETTY", JSON_PRETTY)?;
     text.set("jsonDecode", lua.create_function(luafn_text_json_decode)?)?;
+    // `mw.text.jsonEncode` is the JSON bridge in the other direction. The
+    // argument checks live in `LUA_STDLIB_EXTRAS`, where the Lua-level one in
+    // Scribunto sits, so the error text and stack level are the module's rather
+    // than a host function's.
+    text.set("jsonEncode", lua.create_function(luafn_text_json_encode)?)?;
     // `mw.text.split` and `mw.text.gsplit` are written in `LUA_STDLIB_EXTRAS`,
     // over the literal-split primitive below, because the pattern form needs
     // `mw.ustring.find` and the pattern dialect belongs in one place.
@@ -3177,6 +3184,48 @@ function mw.text.split(text, pattern, plain)
     end
     return out
 end
+
+-- `mw.text.jsonEncode( value, flags )`.
+--
+-- The validation is Scribunto's `checkForJsonEncode`, written in Lua in the
+-- reference for the reason it is written in Lua here: it has to walk the value
+-- itself, and it has to raise at the *caller's* level (`lvl = 3` at the top,
+-- incrementing per depth) so the error names the module line that passed the bad
+-- value rather than an internal frame. `jsonEncode` falls back to the host's
+-- encoder, which is where the array/object rule lives.
+function mw.text.__checkForJsonEncode(t, seen, lvl)
+    local tp = type(t)
+    if tp == 'table' then
+        if seen[t] then
+            error('mw.text.jsonEncode: Cannot use recursive tables', lvl)
+        end
+        seen[t] = 1
+        for k, v in pairs(t) do
+            if type(k) == 'number' then
+                -- A non-finite key is rejected before PHP would coerce it.
+                if k >= math.huge or k <= -math.huge then
+                    error("mw.text.jsonEncode: Cannot use 'inf' as a table key", lvl)
+                end
+            elseif type(k) ~= 'string' then
+                error(string.format("mw.text.jsonEncode: Cannot use type '%s' as a table key", type(k)), lvl)
+            end
+            mw.text.__checkForJsonEncode(v, seen, lvl + 1)
+        end
+        seen[t] = nil
+    elseif tp == 'number' then
+        if t ~= t or t >= math.huge or t <= -math.huge then
+            error('mw.text.jsonEncode: Cannot encode non-finite numbers', lvl)
+        end
+    elseif tp ~= 'boolean' and tp ~= 'string' and tp ~= 'nil' then
+        error(string.format("mw.text.jsonEncode: Cannot encode type '%s'", tp), lvl)
+    end
+end
+
+local __jsonEncodeRaw = mw.text.jsonEncode
+function mw.text.jsonEncode(value, flags)
+    mw.text.__checkForJsonEncode(value, {}, 3)
+    return __jsonEncodeRaw(value, flags)
+end
 end
 "#;
 
@@ -4206,6 +4255,9 @@ const JSON_PRESERVE_KEYS: i64 = 1;
 /// `mw.text.JSON_TRY_FIXING` — permit a terminal comma in arrays and objects.
 const JSON_TRY_FIXING: i64 = 2;
 
+/// `mw.text.JSON_PRETTY` — indent the output.
+const JSON_PRETTY: i64 = 4;
+
 /// `mw.text.jsonDecode(s, flags)` — decode a JSON string to a table.
 ///
 /// Two details are observable and are reproduced rather than approximated:
@@ -4233,6 +4285,245 @@ fn luafn_text_json_decode(lua: &Lua, (s, flags): (Value, Option<i64>)) -> mlua::
         .map_err(|e| mlua::Error::runtime(format!("mw.text.jsonDecode: {e}")))?;
     json_to_lua_flagged(lua, &parsed, preserve_keys)
         .map_err(|e| mlua::Error::runtime(e.to_string()))
+}
+
+/// `mw.text.jsonEncode(value, flags)` — encode a Lua value as JSON.
+///
+/// The array/object decision is Scribunto's, not a consequence of the encoding
+/// library, and it is the whole reason this is a port rather than a call to a
+/// serialiser:
+///
+/// - A Lua table is a JSON **array** when its keys are exactly `1..n` in order
+///   (or `0..n-1` under `JSON_PRESERVE_KEYS`, which suppresses the reindex).
+///   Otherwise it is an **object**. So `{}` is `[]`, `{1,2}` is `[1,2]`, and
+///   `{a=1}` is `{"a":1}`.
+/// - Numeric-string keys count as array keys when encoding (`{['1']=x}` is
+///   `[x]`), which the PHP `ctype_digit` arm of `reindexArrays` does and which
+///   the decoding direction deliberately does not mirror.
+/// - `PHP_INT_MIN` is used as the infinity key, because PHP array keys coerce a
+///   float to an int and an out-of-range float lands on the minimum. Lua's
+///   `math.huge` key is therefore a real key named `-9223372036854775808`.
+///
+/// The caller-facing errors (recursive tables, non-finite numbers, bad key
+/// types) are raised in `LUA_STDLIB_EXTRAS`' `mw.text.jsonEncode`, before this
+/// runs, so that the messages and the stack levels match Scribunto's.
+fn luafn_text_json_encode(lua: &Lua, (value, flags): (Value, Option<i64>)) -> mlua::Result<String> {
+    let flags = flags.unwrap_or(0);
+    let preserve_keys = flags & JSON_PRESERVE_KEYS != 0;
+    let encoded = json_from_lua(&value, preserve_keys, lua)?;
+    // `FormatJson::encode( …, ALL_OK )` sets `JSON_UNESCAPED_SLASHES |
+    // JSON_UNESCAPED_UNICODE`, so `/` stays a slash and non-ASCII stays literal.
+    // `serde_json` escapes both by default, and the difference is visible in
+    // every URL and non-Latin string a module encodes.
+    //
+    // The formatter is chosen by a branch rather than a boxed trait object:
+    // `serde_json`'s `Formatter` has generic methods and so is not dyn-compatible.
+    let mut buf = Vec::new();
+    if flags & JSON_PRETTY != 0 {
+        let mut ser = serde_json::Serializer::pretty(&mut buf);
+        encoded
+            .serialize(&mut ser)
+            .map_err(|e| mlua::Error::runtime(format!("mw.text.jsonEncode: {e}")))?;
+    } else {
+        let mut ser = serde_json::Serializer::new(&mut buf);
+        encoded
+            .serialize(&mut ser)
+            .map_err(|e| mlua::Error::runtime(format!("mw.text.jsonEncode: {e}")))?;
+    }
+    String::from_utf8(buf).map_err(|e| mlua::Error::runtime(format!("mw.text.jsonEncode: {e}")))
+}
+
+/// One key of a Lua table, classified the way PHP's `reindexArrays` does.
+///
+/// A table is a JSON *array* only if the keys are a run of consecutive integers
+/// starting at 1 (encoding) or 0 (decoding). PHP's array keys are ints or
+/// strings, and a float key is truncated to an int, so `1.0` and `1` are the
+/// same key and both are index 1. (An *infinite* key never gets this far: the
+/// Lua-level check rejects it first.)
+enum JsonKey {
+    /// An integer index, in Lua terms (a float with an integral value counts).
+    Int(i64),
+    /// A string that is all digits, and integral: a sequence key when encoding.
+    Digits(i64),
+    String(String),
+}
+
+impl PartialEq for JsonKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_json_key() == other.to_json_key()
+    }
+}
+
+impl Eq for JsonKey {}
+
+/// `PHP_INT_MIN`, which is what PHP's array-key coercion turns an
+/// out-of-range float into. Both infinities are refused by Scribunto's Lua-level
+/// check before reaching here, so this is a backstop for a float that is finite
+/// but beyond `i64` rather than a case a module can hit.
+const PHP_INT_MIN: i64 = i64::MIN;
+const PHP_INT_MAX: i64 = i64::MAX;
+
+impl JsonKey {
+    /// Classify a Lua table key, or `None` when the type cannot be a key at all.
+    fn of(key: &Value) -> Option<Self> {
+        match key {
+            Value::Integer(i) => Some(Self::Int(*i)),
+            Value::Number(f) => Some(Self::Int(float_to_key(*f))),
+            Value::String(s) => {
+                let text = s.to_str().ok()?.to_string();
+                if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+                    // A run of digits can still overflow an i64; PHP would keep
+                    // it a string key, and so does this. Mapping it to `String`
+                    // rather than failing keeps the encoder total.
+                    match text.parse::<i64>() {
+                        Ok(n) => Some(Self::Digits(n)),
+                        Err(_) => Some(Self::String(text)),
+                    }
+                } else {
+                    Some(Self::String(text))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The key as JSON writes it. Integer keys become strings, as in PHP's
+    /// `json_encode`.
+    fn to_json_key(&self) -> String {
+        match self {
+            Self::Int(n) | Self::Digits(n) => n.to_string(),
+            Self::String(s) => s.clone(),
+        }
+    }
+}
+
+/// The integer a float key stands for, following PHP's array-key coercion.
+///
+/// Beyond `PHP_INT_MAX` the cast is platform-defined in PHP and yields the
+/// minimum on 64-bit. Reproducing that rather than erroring keeps the encoder
+/// total: Lua's integer and float subtypes are one type to a module, so a
+/// computed key can arrive as a float.
+fn float_to_key(f: f64) -> i64 {
+    // Every finite float inside the range is its own key; anything outside it —
+    // including NaN, which is never comparable and so fails both bounds — lands
+    // on the minimum, which is what PHP's cast yields.
+    if (PHP_INT_MIN as f64..PHP_INT_MAX as f64).contains(&f) {
+        f as i64
+    } else {
+        PHP_INT_MIN
+    }
+}
+
+/// Build a `serde_json::Value` from a Lua value, applying Scribunto's
+/// array/object rule.
+///
+/// Empty tables are arrays, which is Scribunto's documented limitation and not
+/// an oversight: PHP cannot distinguish an empty array from an empty object
+/// either, so `{}` encodes as `[]`.
+fn json_from_lua(value: &Value, preserve_keys: bool, lua: &Lua) -> mlua::Result<serde_json::Value> {
+    Ok(match value {
+        Value::Nil => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        Value::Number(f) => match serde_json::Number::from_f64(*f) {
+            Some(n) => serde_json::Value::Number(n),
+            // A non-finite number is rejected up front by the Lua shim, so this
+            // is unreachable from a module; `null` keeps the encoder total.
+            None => serde_json::Value::Null,
+        },
+        Value::String(s) => serde_json::Value::String(s.to_str()?.to_string()),
+        Value::Table(t) => json_from_lua_table(t, preserve_keys, lua)?,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "mw.text.jsonEncode: Cannot encode type '{}'",
+                other.type_name()
+            )));
+        }
+    })
+}
+
+fn json_from_lua_table(
+    table: &Table,
+    preserve_keys: bool,
+    lua: &Lua,
+) -> mlua::Result<serde_json::Value> {
+    let mut entries: Vec<(JsonKey, Value)> = Vec::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        // A nil value is an absent key in Lua, and `pairs` never yields one.
+        let Some(key) = JsonKey::of(&k) else {
+            return Err(mlua::Error::runtime(format!(
+                "mw.text.jsonEncode: Cannot use type '{}' as a table key",
+                k.type_name()
+            )));
+        };
+        entries.push((key, v));
+    }
+
+    // The sequence test. PHP's `reindexArrays` walks the array in key order and
+    // requires each key to be the next index, so a gap or an out-of-order key
+    // makes it an object — and that is the *only* thing `ksort` is for: the
+    // reindex path needs the elements in index order to become a JSON array.
+    // Sorting unconditionally would reorder an object's keys, which PHP never
+    // does.
+    // The sequence test: PHP requires each key to be the next index, in order,
+    // so a gap or an out-of-order key makes it an object. This is the *only*
+    // purpose of the sort — the reindex path needs the elements in index order
+    // to become a JSON array. Sorting unconditionally would reorder an object's
+    // keys, which PHP never does.
+    let mut ordered: Vec<&JsonKey> = entries.iter().map(|(k, _)| k).collect();
+    ordered.sort_by(|a, b| {
+        sort_key(a)
+            .partial_cmp(&sort_key(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let first_index = if preserve_keys { 0 } else { 1 };
+    let is_sequence = ordered.iter().zip(first_index..).all(|(key, next)| {
+        match key {
+            JsonKey::Int(n) => *n == next,
+            // Only when *encoding* does a digit-string key count as an index.
+            JsonKey::Digits(n) => *n == next,
+            JsonKey::String(_) => false,
+        }
+    });
+
+    if is_sequence {
+        let items = ordered
+            .into_iter()
+            .map(|key| {
+                let idx = entries
+                    .iter()
+                    .position(|(k, _)| k == key)
+                    .expect("key came from entries");
+                let (_, v) = &entries[idx];
+                json_from_lua(v, preserve_keys, lua)
+            })
+            .collect::<mlua::Result<Vec<_>>>()?;
+        return Ok(serde_json::Value::Array(items));
+    }
+
+    // Not a sequence: an object, whose keys keep the order Lua iterated them
+    // in. PHP receives the table as an array already ordered by Lua's `pairs`
+    // and `json_encode` then preserves that order, so there is nothing to sort
+    // here — and nothing that *could* be sorted to match, since Lua's iteration
+    // order is a function of its string hash and table layout rather than of the
+    // keys. Recorded in ONLINE-PARITY.md as an irreducible difference.
+    let mut map = serde_json::Map::with_capacity(entries.len());
+    for (key, v) in entries {
+        map.insert(key.to_json_key(), json_from_lua(&v, preserve_keys, lua)?);
+    }
+    let _ = lua;
+    Ok(serde_json::Value::Object(map))
+}
+
+/// The sort key `ksort(…, SORT_NUMERIC)` implies: integer keys order as numbers
+/// and string keys as strings, with numbers before strings.
+fn sort_key(key: &JsonKey) -> (u8, f64, String) {
+    match key {
+        JsonKey::Int(n) | JsonKey::Digits(n) => (0, *n as f64, String::new()),
+        JsonKey::String(s) => (1, 0.0, s.clone()),
+    }
 }
 
 /// Remove commas that sit immediately before a closing `]` or `}`.
@@ -5224,6 +5515,206 @@ mod tests {
                 "mw.text.{call}"
             );
         }
+    }
+
+    /// `mw.text.jsonEncode` follows Scribunto's array/object rule, not a
+    /// serialiser's.
+    ///
+    /// The cases are the documented limitations verbatim: an empty table is an
+    /// array, a sequence is an array, and anything with a non-running key set is
+    /// an object. The `{['1']='x'}` case is the asymmetry that makes this a port
+    /// rather than a `serde_json` call — a digit *string* key counts as an index
+    /// when encoding, so it still produces an array.
+    #[test]
+    fn test_mw_text_json_encode_array_or_object() {
+        let engine = make_engine();
+        let cases = [
+            ("mw.text.jsonEncode({})", "[]"),
+            ("mw.text.jsonEncode({1,2,3})", "[1,2,3]"),
+            ("mw.text.jsonEncode({['1']='x'})", "[\"x\"]"),
+            ("mw.text.jsonEncode({['2']='x'})", "{\"2\":\"x\"}"),
+            ("mw.text.jsonEncode({['a']=1})", "{\"a\":1}"),
+            // A hole breaks the sequence, so it is an object either way.
+            (
+                "mw.text.jsonEncode({[1]='a',[3]='c'})",
+                "{\"1\":\"a\",\"3\":\"c\"}",
+            ),
+            ("mw.text.jsonEncode({{1,2},{3}})", "[[1,2],[3]]"),
+        ];
+        for (expr, want) in cases {
+            assert_eq!(engine.eval(expr).unwrap(), want, "for {expr}");
+        }
+    }
+
+    /// `JSON_PRESERVE_KEYS` is what makes a one-based Lua sequence encode as an
+    /// object, which is the documented workaround for wanting `{}`.
+    #[test]
+    fn test_mw_text_json_encode_preserve_keys() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.text.jsonEncode({1,2}, mw.text.JSON_PRESERVE_KEYS)")
+                .unwrap(),
+            "{\"1\":1,\"2\":2}"
+        );
+        // A zero-based sequence is an array only under the flag, which is the
+        // mirror of what `jsonDecode` does with it.
+        assert_eq!(
+            engine
+                .eval("return mw.text.jsonEncode({[0]='a',[1]='b'}, mw.text.JSON_PRESERVE_KEYS)")
+                .unwrap(),
+            "[\"a\",\"b\"]"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.text.jsonEncode({[0]='a',[1]='b'})")
+                .unwrap(),
+            "{\"0\":\"a\",\"1\":\"b\"}"
+        );
+    }
+
+    /// `FormatJson::encode( …, ALL_OK )` leaves non-ASCII and `/` alone, which
+    /// `serde_json` does not do by default. Both appear in every module that
+    /// encodes a URL or a non-Latin name.
+    #[test]
+    fn test_mw_text_json_encode_leaves_unicode_and_slashes_unescaped() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.text.jsonEncode({'https://x/y'})")
+                .unwrap(),
+            "[\"https://x/y\"]"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.text.jsonEncode({'Москва'})")
+                .unwrap(),
+            "[\"Москва\"]"
+        );
+        // Control characters are still escaped, as in any JSON encoder.
+        assert_eq!(
+            engine.eval("return mw.text.jsonEncode({'a\\nb'})").unwrap(),
+            "[\"a\\nb\"]"
+        );
+    }
+
+    /// The errors Scribunto raises *in Lua* are reproduced with the same text,
+    /// since a module's `pcall` may branch on them.
+    #[test]
+    fn test_mw_text_json_encode_rejects_unencodable_values() {
+        let engine = make_engine();
+        let cases = [
+            (
+                "local t = {} t.self = t return mw.text.jsonEncode(t)",
+                "Cannot use recursive tables",
+            ),
+            (
+                "return mw.text.jsonEncode({[true]='x'})",
+                "Cannot use type 'boolean' as a table key",
+            ),
+            (
+                "return mw.text.jsonEncode(0/0)",
+                "Cannot encode non-finite numbers",
+            ),
+            (
+                "return mw.text.jsonEncode({print})",
+                "Cannot encode type 'function'",
+            ),
+        ];
+        for (lua, want) in cases {
+            let err = engine.eval(lua).unwrap_err().to_string();
+            assert!(err.contains(want), "{lua}\n  got: {err}\n  want: {want}");
+        }
+    }
+
+    /// Numbers, booleans and nil round-trip; a float key is an integer key to
+    /// PHP, so `1.0` is still index 1.
+    #[test]
+    fn test_mw_text_json_encode_scalars() {
+        let engine = make_engine();
+        let cases = [
+            ("mw.text.jsonEncode(true)", "true"),
+            ("mw.text.jsonEncode(nil)", "null"),
+            ("mw.text.jsonEncode(42)", "42"),
+            ("mw.text.jsonEncode(1.5)", "1.5"),
+            ("mw.text.jsonEncode('x')", "\"x\""),
+            ("mw.text.jsonEncode({[1.0]='a'})", "[\"a\"]"),
+        ];
+        for (expr, want) in cases {
+            assert_eq!(engine.eval(expr).unwrap(), want, "for {expr}");
+        }
+        // An infinite key is refused by Scribunto's *Lua-level* check, before
+        // PHP's array-key coercion would ever see it — so it is an error, not a
+        // `PHP_INT_MIN` key. The Rust-side coercion exists for the float keys
+        // that do reach it.
+        let err = engine
+            .eval("return mw.text.jsonEncode({[math.huge]='x'})")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Cannot use 'inf' as a table key"), "{err}");
+    }
+
+    /// An object's key order follows Lua's iteration order, which is not the
+    /// insertion order the module wrote and not sorted. The encoder must not
+    /// *sort* it: PHP preserves whatever order the table arrived in, so sorting
+    /// would be a second, different wrong answer.
+    #[test]
+    fn test_mw_text_json_encode_object_key_order_is_not_sorted() {
+        let engine = make_engine();
+        let out = engine
+            .eval("return mw.text.jsonEncode({b=1, a=2, c=3})")
+            .unwrap();
+        assert!(
+            out.starts_with('{') && out.len() == "{\"a\":2,\"b\":1,\"c\":3}".len(),
+            "{out}"
+        );
+        // Every key is present exactly once, whatever the order.
+        for key in ["\"a\"", "\"b\"", "\"c\""] {
+            assert_eq!(out.matches(key).count(), 1, "{out}");
+        }
+    }
+
+    /// A real payload, checked against what the live wiki served.
+    ///
+    /// This is `Module:Owidslider`'s `mw.text.jsonEncode( { popupConfig } )` as
+    /// it appears in the cached Parsoid HTML of `Polio vaccine`. It pins the
+    /// shapes that matter together: a one-element wrapper array, booleans,
+    /// integral numbers, empty strings, a value containing `[[File:…|…]]`, and an
+    /// ampersand-free URL. The wiki's own output is the authority here, not a
+    /// reading of the encoder.
+    #[test]
+    fn test_mw_text_json_encode_matches_a_live_owidslider_payload() {
+        let engine = make_engine();
+        let lua = r#"
+            local c = {}
+            c.startingView = 'World'
+            c.caption = 'OWIDSlider-caption-X'
+            c.loop = false
+            c.title = ''
+            c.list = 'Template:OWID/ipv1 number unvaccinated#gallery'
+            c.location = 'commons'
+            c.file = '[[File:Ipv1 number unvaccinated, World, 2023 (cropped).svg|link=|thumb|upright=1.6|IPV number unvaccinated]]'
+            c.language = ''
+            c.start = 2023
+            return mw.text.jsonEncode({ c })
+        "#;
+        let got = engine.eval(lua).unwrap();
+        // The wiki served exactly this structure. Key *order* is Lua's iteration
+        // order and so cannot be asserted; presence, types and the escaping can.
+        let value: serde_json::Value = serde_json::from_str(&got).unwrap();
+        let obj = value.as_array().unwrap()[0].as_object().unwrap();
+        assert_eq!(obj["startingView"], "World");
+        assert_eq!(obj["loop"], false);
+        assert_eq!(obj["title"], "");
+        assert_eq!(obj["start"], 2023);
+        assert_eq!(
+            obj["list"],
+            "Template:OWID/ipv1 number unvaccinated#gallery"
+        );
+        assert!(obj["file"].as_str().unwrap().starts_with("[[File:"));
+        assert_eq!(obj.len(), 9, "{got}");
+        // No slash or unicode escaping, and no padding.
+        assert!(!got.contains("\\/"), "{got}");
     }
 
     #[test]
