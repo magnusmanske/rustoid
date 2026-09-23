@@ -2714,6 +2714,48 @@ no longer rank. The unexpanded-wikitext counts are the next instrument: 45/48
 pages still carry literal `{{…}}`, so the question is now which of those is a
 missing template, a missing module, and a genuine expansion defect.
 
+### A parser-function branch loses a transclusion — known, reduced, not fixed
+
+After both Lua fixes, the `Module:Piechart` entry moved *again*, to
+`Module:Piechart:213: piechart data is empty`. That is inside `renderPie`, on
+`if #json_data < 2`, so the argument arrives and is a string — but an empty one.
+
+Reducing it to six one-line calls gives a clean division:
+
+```
+{{#invoke:M|f|1={{#if:yes|LITERAL}}}}                    -> LITERAL
+template arg  {{#if:{{{v|}}}|{{#invoke:M|f}}}}           -> ""
+{{#invoke:M|f|1={{#if:yes|{{#invoke:M|f|N}}}}}}          -> ""
+{{#invoke:M|f|1={{#if:yes|{{Tpl}}}}}}                    -> ""
+positional    {{#if:yes|{{#invoke:M|f|N}}}}              -> ""
+{{#invoke:M|f|{{#invoke:M|f|N}}}}                        -> N   (no #if)
+```
+
+So the trigger is **not** the nested invoke, **not** the named argument, and
+**not** the template parameter: a parser function whose chosen branch holds a
+*transclusion of any kind* yields an empty string, whichever spelling reaches
+it. A literal branch is fine.
+
+The cause is visible in `ParserFunctions::expand_kv`
+(`pipeline/parser_functions.rs`): a branch that arrived as `KeyValue::Str`
+returns that string, but a branch that arrived as `KeyValue::Tokens` returns
+those tokens **verbatim** — and those tokens were captured before expansion, so
+they still hold the unexpanded transclusion. `handle_template` passes the
+result straight to `encap_tokens`, so nothing expands them afterwards.
+
+The `#ifeq` case already has a fixture guarding the token path
+(`test_pf_ifeq_branch_keeps_markup_tokens`), which is what makes this a
+*division* to respect rather than a switch to flip: markup tokens must survive as
+tokens, transclusion tokens must be expanded. Stringifying everything would fix
+this and break that.
+
+Not attempted here because it sits exactly on the token/string boundary the 896
+fixtures bind tightly — `REMAINING-BUCKETS.md` records a previous attempt at a
+neighbouring problem (`pf_tag` token splicing) regressing 821→812 — so it wants
+a run with room to bisect, not the tail of a session. It is the largest known
+remaining defect: it is on the path of every `Template:Pie chart`, and any
+template that guards a transclusion with `#if`.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
