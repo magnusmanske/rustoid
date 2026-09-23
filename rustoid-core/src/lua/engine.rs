@@ -4156,7 +4156,95 @@ fn frame_common(
             .map_err(err)?;
     }
 
+    // `frame:newChild{ title = …, args = … }` — a child frame whose *parent is
+    // this frame*. It exists so a module can hand another module a frame that
+    // looks like it came from a template, and `Module:Hatnote inline` uses it to
+    // call `Module:Hatnote` with its own arguments: without it the call fails as
+    // "attempt to call method 'newChild' (a nil value)".
+    //
+    // The child is a frame like any other, so it is built from this same
+    // function; what makes it a *child* is that its `getParent` returns this
+    // frame. Both the title and the args are optional: a missing title falls back
+    // to this frame's, and missing args to none, which is what the manual's
+    // "optional arguments and title" means.
+    let parent_answers = answers.clone();
+    let parent_pending = pending.clone();
+    frame
+        .set(
+            "newChild",
+            lua.create_function(move |lua, (this, spec): (Table, Option<Table>)| {
+                let title = spec
+                    .as_ref()
+                    .and_then(|s| s.get::<Option<String>>("title").ok().flatten());
+                let child_args = match spec.as_ref().map(|s| s.get::<Value>("args")) {
+                    Some(Ok(Value::Table(t))) => args_from_table(&t)?,
+                    // A caller may pass `args = nil`, or omit it entirely; both
+                    // mean "no arguments".
+                    _ => Vec::new(),
+                };
+                let child = frame_common(lua, &child_args, &parent_answers, &parent_pending)
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let child_title = title.unwrap_or_else(|| {
+                    // The creating frame's own title, which `create_frame` stores
+                    // alongside the method for exactly this purpose.
+                    this.raw_get::<Option<String>>("__title")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                });
+                child.set("__title", child_title.clone())?;
+                child.set(
+                    "getTitle",
+                    lua.create_function(move |_, ()| Ok(child_title.clone()))?,
+                )?;
+                // The defining property: this frame is the child's parent.
+                let frame = this.clone();
+                child.set(
+                    "getParent",
+                    lua.create_function(move |_, ()| Ok(frame.clone()))?,
+                )?;
+                Ok(child)
+            })?,
+        )
+        .map_err(err)?;
+
     Ok(frame)
+}
+
+/// Convert a Lua table of arguments into the host's [`Arg`] form.
+///
+/// `frame:newChild{ args = … }` receives whatever table the caller built, whose
+/// keys may be numbers or strings and whose values may be numbers. The args table
+/// takes both key spellings, so the numeric ones are kept numeric here and the
+/// rest become named.
+fn args_from_table(t: &Table) -> mlua::Result<Vec<Arg>> {
+    let mut positional: Vec<(i64, String)> = Vec::new();
+    let mut named: Vec<(String, String)> = Vec::new();
+    for pair in t.clone().pairs::<Value, Value>() {
+        let (k, v) = pair?;
+        // Values are stringified the way Lua's own argument passing does.
+        let s = match v {
+            Value::String(s) => s.to_str()?.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Boolean(b) => b.to_string(),
+            Value::Nil => continue,
+            other => other.type_name().to_string(),
+        };
+        match k {
+            Value::Integer(i) => positional.push((i, s)),
+            Value::Number(n) if n.fract() == 0.0 => positional.push((n as i64, s)),
+            Value::String(k) => named.push((k.to_str()?.to_string(), s)),
+            _ => {}
+        }
+    }
+    positional.sort_by_key(|(i, _)| *i);
+    let mut out: Vec<Arg> = positional
+        .into_iter()
+        .map(|(_, v)| Arg::Positional(v))
+        .collect();
+    out.extend(named.into_iter().map(|(k, v)| Arg::Named(k, v)));
+    Ok(out)
 }
 
 fn create_frame(
@@ -4173,6 +4261,10 @@ fn create_frame(
     // `frame:getTitle()` — the page the frame was invoked from.
     let title = page_title.to_string();
     let ctx_for_title = title.clone();
+    // Also kept as a plain field, so `newChild` can inherit it: a child with no
+    // title given takes the creating frame's, and reading it back off the method
+    // would be a Lua call from Rust.
+    frame.set("__title", title.clone())?;
     frame.set(
         "getTitle",
         lua.create_function(move |_, ()| Ok(ctx_for_title.clone()))?,

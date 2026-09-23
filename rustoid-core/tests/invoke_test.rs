@@ -550,6 +550,74 @@ async fn get_parent_exposes_the_calling_templates_title() {
     assert!(body.contains("called from Template:Wrapper"), "got: {body}");
 }
 
+/// `frame:newChild{ title, args }` builds a child frame whose parent is *this*
+/// frame.
+///
+/// `Module:Hatnote inline` calls `Module:Hatnote` through one, so without it the
+/// call failed as "attempt to call method 'newChild' (a nil value)". The
+/// defining property is the parent link, not the args: the whole point is to
+/// give the callee something that looks like a calling template.
+#[tokio::test]
+async fn new_child_builds_a_frame_whose_parent_is_this_frame() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local child = frame:newChild{
+                title = 'Module:Child',
+                args = { 'a', 'b', named = 'v' },
+            }
+            -- The child's parent must be the frame that created it.
+            local is_self = child:getParent() == frame
+            -- A bare newChild{} is legal: both fields are optional.
+            local bare = frame:newChild{}
+            return table.concat({
+                type(child),
+                child:getTitle(),
+                child.args[1],
+                child.args[2],
+                child.args.named,
+                tostring(#child.args),
+                tostring(is_self),
+                tostring(#bare.args),
+            }, '|')
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:NewChild", module)], "{{#invoke:NewChild|main}}").await;
+    assert!(
+        text_only(&html).contains("table|Module:Child|a|b|v|2|true|0"),
+        "got: {html}"
+    );
+}
+
+/// A child frame with no arguments given reports none, and its title falls back
+/// to the creating frame's rather than becoming nil.
+#[tokio::test]
+async fn new_child_without_args_is_empty_not_broken() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local bare = frame:newChild{}
+            return tostring(#bare.args) .. '|' .. tostring(bare:getTitle())
+                .. '|' .. tostring(bare:getParent() == frame)
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Bare", module);
+    source.add_template("Template:Wrap", "{{#invoke:Bare|main}}");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded("{{Wrap}}", &source, &ParserOptions::for_page("Test"))
+        .await
+        .unwrap();
+    let body = text_only(&html);
+    // The title falls back to the creating frame's, which for a transclusion is
+    // the calling template.
+    assert!(body.contains("0|Template:Wrap|true"), "got: {body}");
+}
+
 /// `mw.title.equals` compares two title objects.
 #[tokio::test]
 async fn mw_title_equals_compares_titles() {
