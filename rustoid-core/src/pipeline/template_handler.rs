@@ -898,6 +898,7 @@ impl TemplateHandler {
     /// encapsulated token chunk. `params` is the token's attribute list
     /// (the first entry is the target). Mirrors `onTemplate` for the
     /// non-template-fetch cases.
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_template(
         &self,
         config: &dyn SiteConfig,
@@ -906,6 +907,10 @@ impl TemplateHandler {
         about_id: String,
         token: &crate::wikitext::tokens_v2::ParsoidToken,
         protection: &ProtectionContext,
+        // PHP's `wrapTemplates` — false inside a template body. The body is
+        // spliced into its caller's expansion, which carries the wrapper, so a
+        // variable or parser function there must not add one of its own.
+        wrap: bool,
     ) -> Vec<Item> {
         // The target as it appears in the source, before any nested template in it
         // is expanded. `data-mw` records this form (see the parser-function arm).
@@ -959,6 +964,9 @@ impl TemplateHandler {
                     }
                     _ => Self::variable_value(config, &name, &pf_arg, context_title),
                 };
+                if !wrap {
+                    return vec![Item::Str(value)];
+                }
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 let mut info = template_info_from(Some(&name), None, vec![]);
                 info.target_wt = Some(target_str.clone());
@@ -989,6 +997,15 @@ impl TemplateHandler {
                     protection,
                     context_title,
                 );
+                if !wrap {
+                    // `{{SHORTDESC:…}}` inside `Template:Short description` is
+                    // the case that pins this: its result is empty, so without a
+                    // wrapper it leaves nothing — while a wrapper emitted an
+                    // empty `mw:Transclusion` span inside the div that Parsoid
+                    // never emits, which was `Help:Introduction`'s first
+                    // difference.
+                    return result;
+                }
                 let mut encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 if !colon.is_empty() {
                     encap.set_colon(Some(colon));
@@ -1299,6 +1316,9 @@ impl TemplateHandler {
         about_counter: &std::cell::Cell<usize>,
         protection: &ProtectionContext,
         tokens: Vec<Item>,
+        // PHP's `wrapTemplates`: false when expanding a template *body*, whose
+        // expansions are spliced into the caller's.
+        wrap: bool,
     ) -> Vec<Item> {
         let mut out = Vec::new();
         for item in tokens {
@@ -1322,6 +1342,7 @@ impl TemplateHandler {
                     about_id,
                     tok,
                     protection,
+                    wrap,
                 );
                 out.extend(expanded);
                 continue;
@@ -2012,6 +2033,7 @@ mod tests {
             "#mwt1".to_string(),
             &token,
             &ProtectionContext::new(&page_protection, &titles_protection),
+            true,
         );
 
         // Should be wrapped with mw:Transclusion markers and contain "yes".
@@ -2264,6 +2286,7 @@ mod tests {
             &about,
             &ProtectionContext::new(&page_protection, &titles_protection),
             input,
+            true,
         );
 
         // Wrapped with mw:Transclusion and contains "yes".

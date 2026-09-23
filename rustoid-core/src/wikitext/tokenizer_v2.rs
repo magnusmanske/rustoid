@@ -2873,78 +2873,54 @@ impl<'a> PegTokenizer<'a> {
         }
 
         let saved = self.pos;
-        self.advance(3);
 
-        // Find the closing `}}}` (respecting brace nesting).
-        let Some(end) = self.find_closing('}', 3) else {
-            self.pos = saved;
-            return None;
-        };
+        // The close is `}}}` and a nested `{{…}}`/`{{{…}}}` is skipped whole, so
+        // this uses the same scan as the template scanner. Counting braces here
+        // instead consumed the nested template's `}}` as part of this tplarg's
+        // `}}}`, which left the closer one brace short: `{{{p|{{T|d}}}}}` failed
+        // to parse and spilled into the output as literal text with the inner
+        // `{{T|d}}` re-read as a bogus transclusion.
+        let end = skip_tplarg_memo(self.input, saved, &mut ScanMemo::default())?;
 
-        // `end` is a byte offset relative to `self.pos` (after `{{{`).
-        let inner = self.remaining()[..end].to_string();
-        self.advance(end + 3);
+        // `end` is the byte offset just past the closing `}}}`.
+        let inner = self.input[saved + 3..end - 3].to_string();
+        self.pos = end;
 
         let mut dp = self.make_dp(saved, self.pos);
         dp.src = Some(self.input[saved..self.pos].to_string());
         let mut stt = SelfclosingTagTk::new("templatearg", vec![], dp);
 
-        // Split content on the first '|' for name | default. Comments in the
-        // argument name are stripped (as in template targets).
-        let (name, default) = match inner.split_once('|') {
-            Some((n, d)) => (
-                strip_html_comments(n).trim().to_string(),
-                Some(d.to_string()),
-            ),
-            None => (strip_html_comments(&inner).trim().to_string(), None),
-        };
+        // `tplarg_preproc`: the target is the part before the first top-level
+        // `|`, and each part after it is a default. Both are tokenized like an
+        // argument value — PHP reads them with `template_param_value` — so a
+        // nested `{{…}}`/`{{{…}}}` stays a live token. Keeping the default as raw
+        // text meant `{{{p|{{T}}}}}` rendered `{{T}}` literally, with no token for
+        // the expander to act on.
+        //
+        // Comments in the argument name are stripped (as in template targets).
+        let parts = split_template_args_with_offsets(&inner);
+        let name = parts
+            .first()
+            .map(|(_, s)| strip_html_comments(s).trim().to_string())
+            .unwrap_or_default();
 
-        // Mirrors `tplarg`: attribs[0] is KV(name, '') and attribs[1] (if any)
-        // is KV('', default).
+        // Mirrors `tplarg`: attribs[0] is KV(name, '') and each following
+        // attribute is KV('', default).
         if !name.is_empty() {
             stt.attribs.push(kv_str(&name, ""));
-            if let Some(default) = default {
-                stt.attribs.push(kv_str("", &default));
+            for (_, default) in parts.iter().skip(1) {
+                let value =
+                    tokenize_template_arg_value(default, self.lang_conv_enabled, &self.ext_tags);
+                stt.attribs.push(KV {
+                    key: KeyValue::Str(String::new()),
+                    value,
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                });
             }
         }
         Some(stt)
-    }
-
-    /// Find the byte offset (within `remaining`, exclusive) of the closing
-    /// delimiter made of `close` repeated `count` times, respecting nested
-    /// open/close pairs (two-level brace counting). Used for `{{{…}}}` arguments,
-    /// whose close must be a literal `}}}`.
-    fn find_closing(&self, close: char, count: usize) -> Option<usize> {
-        let rem = self.remaining();
-        let chars: Vec<char> = rem.chars().collect();
-        let mut depth: i32 = count as i32;
-        let mut byte_pos = 0usize;
-        let mut i = 0;
-        while i < chars.len() {
-            let ch_len = chars[i].len_utf8();
-            // Detect '{{' opens (for template nesting) regardless of final close char.
-            if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
-                depth += 2;
-                byte_pos += 2; // '{' and '{' are single-byte.
-                i += 2;
-                continue;
-            }
-            if chars[i] == close
-                && i + count - 1 < chars.len()
-                && chars[i..i + count].iter().all(|&c| c == close)
-            {
-                depth -= count as i32;
-                if depth <= 0 {
-                    return Some(byte_pos);
-                }
-                byte_pos += count; // 'close' is a single-byte ASCII char.
-                i += count;
-                continue;
-            }
-            byte_pos += ch_len;
-            i += 1;
-        }
-        None
     }
 
     /// Parse a `template` token (`{{ ... }}`) without emitting it.

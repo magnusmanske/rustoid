@@ -123,6 +123,20 @@ async fn a_link_holding_a_template_does_not_break_the_call() {
     );
 }
 
+/// A template in a `{{{p|…}}}` default is expanded, and the `{{{`/`}}}` are not
+/// left behind as text. The scanner counted the nested template's `}}` as part
+/// of the tplarg's `}}}`, so the closer came up one brace short and the whole
+/// reference spilled out.
+#[tokio::test]
+async fn a_template_in_a_tplarg_default_expands() {
+    let html = render(&[("Template:Large", "LARGE")], "A{{{p|{{Large}}}}}C").await;
+    assert!(html.contains("LARGE"), "default did not expand: {html}");
+    assert!(
+        !visible_text(&html).contains("{{"),
+        "the tplarg was emitted as literal text: {html}"
+    );
+}
+
 /// The text outside tags. A `data-mw`/`data-parsoid` attribute legitimately
 /// carries source wikitext, so a whole-document search for `{{` reports every
 /// correctly-rendered transclusion as unexpanded.

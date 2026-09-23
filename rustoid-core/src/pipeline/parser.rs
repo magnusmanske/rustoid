@@ -2416,9 +2416,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     continue;
                 }
                 let about_id = self.new_about_id(about_counter);
-                let expanded =
+                let produced =
                     TemplateHandler.handle_template_arg_token(frame, tok, about_id, !in_template);
                 self.leave_pp_node();
+                // The default is wikitext, and PHP's `Frame::expand` runs the
+                // chunk it comes from through the whole pipeline — so a template
+                // in a default expands: `{{{p|{{T}}}}}` answers `T`'s expansion,
+                // not its source. Re-walking is what expands it here.
+                let expanded = Box::pin(self.expand_templates(
+                    frame,
+                    produced,
+                    source,
+                    about_counter,
+                    in_template,
+                    src_text,
+                ))
+                .await;
                 for e in &expanded {
                     track_table(e, &mut table_depth);
                 }
@@ -2699,6 +2712,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     &self.protection_context(),
                     vec![expanded_item],
+                    !in_tpl,
                 );
                 // A parser function hands back a *branch*, and a branch is
                 // wikitext: PHP's handlers return its tokens unexpanded and the
