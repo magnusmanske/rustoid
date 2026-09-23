@@ -1987,29 +1987,105 @@ runtime:
   Two data submodules still answer differently (`block`, `name`); that is a
   data-shape question rather than a fetch one and is the next thing to look at
   there.
-- `Module:Wikidata:247` — `invalid escape sequence near '"^\-'`. **This one is an
-  interpreter-version gap, not a module bug, and it needs a decision.**
+- `Module:Wikidata:247` — `invalid escape sequence near '"^\-'`. **This one was an
+  interpreter-version gap, not a module bug.**
 
   The line is `mw.ustring.match(date, "^\-?%d+")`, and the service renders it
   with no script error. Real Lua *5.4* rejects that escape — the `lua` binary here
   is 5.5 and rejects it too — but Scribunto runs **Lua 5.1**, which treats an
-  unknown escape as the bare character. rustoid embeds `lua54`:
+  unknown escape as the bare character. rustoid embedded `lua54`:
 
   ```toml
   mlua = { version = "0.10", features = ["lua54", "vendored"] }
   ```
 
-  `lua51` is available in the same crate. Switching would make rustoid match the
-  interpreter Wikipedia's modules are actually written against, rather than being
-  gratuitously stricter — but it changes behaviour for *every* module, so it is a
-  deliberate call rather than a patch.
+### Lua 5.1 — settled by the documentation, not by preference
 
-  Measured before deciding: with `lua51` the whole workspace passes except one
-  test, `ustring_sub_clamps_instead_of_panicking`, which asserts 5.4's `string.sub`
-  bounds behaviour. Scribunto's `mw.ustring` is a PHP-backed implementation and
-  not plain 5.1 `string.sub`, so that test's expectation is the thing to verify
-  against the service first — not the reason to stay on 5.4. The change was
-  reverted untouched rather than forced through.
+This was left as "a deliberate call rather than a patch" pending a decision.
+`Extension:Scribunto` answers it outright:
+
+> Only binary files for Lua **5.1.x** are supported. LuaJIT, although
+> theoretically compatible, is not supported.
+
+The bundled binary is `lua5_1_5_linux_64_generic`, i.e. **Lua 5.1.5**. So 5.1 is
+the *contract* Wikipedia's modules are written against, not a preference, and the
+switch is a fidelity fix. The feature is now `lua51`.
+
+Two things had to be checked rather than assumed:
+
+- **The lexer.** Lua 5.1 has no `\xNN` escape; it has decimal `\ddd`. Probing the
+  embedded engine confirms rustoid's lexer already reproduces 5.1 exactly:
+  `'\195\169'` is 2 bytes, `'\xc3\xa9'` is the 6 literal characters `xc3xa9`,
+  `'\255'` is 1 byte, and `'\256'` raises `escape sequence too large` — all of
+  which are what `llex.c`'s `read_string` does.
+- **The one failing test** was `ustring_sub_clamps_instead_of_panicking`, and its
+  expectation, not the engine, was at fault: it wrote the é of `héllo` as
+  `'h\xc3\xa9llo'`, which in 5.1 lexes as `hxc3xa9llo`, and then sliced that to
+  `xc`. Rewritten with `'h\195\169llo'`; the comments attributing the values to
+  "Lua 5.4's `string.sub`" now say 5.1, which is the dialect Scribunto actually
+  runs. The `string.gfind` shim's comment (which claimed "Lua 5.4 dropped the
+  alias") was corrected for the same reason.
+
+### Title comparison was broken for every title — two separate causes
+
+The switch exposed `titles_compare_by_identity`, which had been failing all
+along. Reproducing it outside the parser gave the decisive clue: `getmetatable(t)`
+*had* an `__lt`, yet `c < a` still raised `attempt to compare two table values`.
+
+**Cause 1 — one metatable per title.** Lua 5.1 only dispatches a relational
+metamethod when *both* operands carry it. `mw.title.new('Foo')` built a fresh
+metatable per call, so `getmetatable(a) == getmetatable(b)` was false and no
+title could ever be compared with another. Worse, the metatable was *also* where
+the per-title `__index` closure lived (`facts`, `is_current`, `current_source`),
+so the two requirements pulled in opposite directions. The fix separates them:
+the metatable is built once and cached in the registry, and the per-title data is
+stored on the instance as a closure under `TITLE_FACTS_KEY`, which the generic
+`__index` invokes. Every construction path (`mw.title.new`, `subPageTitle`, the
+`*PageTitle` accessors) now shares the one metatable.
+
+**Cause 2 — `__eq` identity, which is a *mlua* bug.** With the metatable shared,
+`<` worked and `==` still did not. The cause is in mlua 0.10.5's
+`Table::equals`:
+
+```rust
+// Compare using `__eq` metamethod if exists
+if let Some(mt) = self.metatable() { if mt.contains_key("__eq")? { return mt.get::<Function>("__eq")?.call((self, other)); } }
+if let Some(mt) = other.metatable() { if mt.contains_key("__eq")? { return mt.get::<Function>("__eq")?.call((self, other)); } }
+```
+
+It fires the metamethod if *either* operand defines one. Lua 5.1 requires the
+metamethod to be the *same function* on both (the reference manual, footnote ‡:
+"the metamethod is only used if the same function is specified in both
+arguments' metatables"). The difference is observable, and a control experiment
+pins it down — two tables with distinct-but-identical `__eq` closures:
+
+| case | rustoid before | correct 5.1 |
+|---|---|---|
+| `__eq`, same metatable | `true` | `true` |
+| `__eq`, distinct metatables | `true` | **`false`** |
+
+A shared metatable cannot fix this, because a class-based `__eq` is a *different
+function* from the dispatcher that needs to see it. The resolution keeps the
+dispatcher as the one shared `__eq`: each comparison class registers its
+predicate and is tagged, instances are tagged to match, and the dispatcher
+compares only same-class objects. Because the tag is on the instances and the
+dispatcher is one function on the shared metatable, the identity rule falls out
+for free — and it deliberately does *not* install `__eq` on the class metatable,
+since doing so would make `title == {}` succeed where 5.1 raises.
+
+That this is the *correct* fix is worth stating plainly: a title is not a Lua
+table with a metamethod, it is an object whose `__index` happens to be a
+metatable — so overloading it to compare a title against an unrelated table is not
+something the 5.1 identity rule would ever have permitted.
+
+### An environment failure that is not a regression
+
+`templatestyles_parsoid_test` fails with "cache holds no stylesheet sources". It
+defaults to `/tmp/rustoid-cache` and looks for `html__*`/`page__*` files, while
+the compare cache uses `page:*` under `~/.cache/rustoid-compare`. It was not
+touched by this work (last modified in `ef5213c`) and no Lua change can affect
+it. Left alone rather than "repaired" blind; it needs the two cache layouts
+reconciled, which is a separate job.
 - `Module:Time ago:62` — **fixed, twice.** First the `formatDate('xnU')` format
   string (see the raw-prefix note above); then the two input defects: it did not
   *raise* on an unparseable stamp (so `Module:Time ago`'s `pcall` succeeded and
@@ -2030,6 +2106,50 @@ runtime:
   numeric strings in arithmetic (`'100' - '40'` is 60, verified); worth checking
   whether the nil comes from a coerced-string gap or from an earlier value
   difference.
+
+### Scoreboard after the Lua 5.1 switch
+
+Lua failure entries: **21 → 17**, and the distinct failure strings went from 20 to
+17 while the *page* count fell from 100 to 48. The `Module:Wikidata` escape
+failure is gone, as predicted. Progress, but the headline score is still `0/46`:
+the big entries are all downstream of one or two root causes.
+
+```
+score: 0/46 compared (0.0%), 2 stalled
+output: parsoid 64435613 bytes, rustoid 162291287 bytes (2.52x)
+unexpanded wikitext: pages with literal {{...}} = 45/48
+lua failures (48 across 17 distinct):
+    23 pages  Module:Citation/CS1:832: malformed pattern (missing ']')
+     7 pages  Module:Main list:28: bad argument #2 to 'format' (string expected, got nil)
+     2 pages  Module:Check for unknown parameters:195: attempt to index a nil value
+     2 pages  Module:Hatnote inline:16: attempt to call method 'newChild' (a nil value)
+     2 pages  Module:Piechart:220: invalid piechart data: parseMetaParams
+     1 page   Module:Country alias:228: attempt to index a nil value
+     1 page   Module:Location map:620: cannot find data/Pacific Ocean
+     1 page   Module:Math:100: bad argument #1 to 'random' (interval is empty)
+     1 page   Module:Math:363: bad argument #1 to 'log10' (number expected, got string)
+     1 page   Module:Multiple image:177: arithmetic on a nil value (local 'totalwidth')
+     1 page   Module:Multiple image:340: attempt to index a nil value
+     1 page   Module:Music chart:1736: attempt to call field 'loadJsonData' (a nil value)
+```
+
+The next targets, in order of pages affected:
+
+1. **`Module:Citation/CS1:832` — `malformed pattern (missing ']')` (23 pages).**
+   The single biggest entry, and a *pattern-dialect* question rather than a module
+   bug: it is `mw.ustring` pattern syntax, so the mismatch is either in rustoid's
+   pattern translation or in the string it is matching against. Worth checking
+   the exact expression against the live service before theorising — the same
+   discipline that settled the Lua version.
+2. **`Module:Main list:28` — `format` got nil (7 pages).** A `string.format`
+   argument that rustoid did not produce, so an upstream value differs.
+3. **`Module:Music chart:1736` — `loadJsonData` is nil (1 page, but newly
+   visible).** A genuine missing API: `mw.loadJsonData` (or the module's own
+   wrapper) was never implemented. Cheap and self-contained.
+
+The `by tag` table is still all zeros, which is expected while literal `{{...}}`
+remains on 45/48 pages: a page cannot byte-match while still showing its source.
+The unexpanded count is therefore the metric to watch until it starts falling.
 
 ## Risks
 
