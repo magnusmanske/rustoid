@@ -1661,7 +1661,9 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     lua.globals()
         .set("__rustoid_mw", Value::Nil)
         .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
-
+    // The comparison dispatcher is installed by the extras chunk, but only
+    // `setup_mw_table`'s callers build the objects that use it, so leave the
+    // entry point reachable rather than having each Rust constructor look it up.
     Ok(mw)
 }
 
@@ -1959,7 +1961,6 @@ fn luafn_title_new(
     // Derived fields are computed on demand rather than eagerly: a module that
     // never looks at `talkPageTitle` should not pay for building it, and eager
     // construction would recurse (a title's talk page is itself a title).
-    let site = ctx.site.clone();
     let facts = title_facts_for(ctx, &ns_id, &title_text);
     let is_current = {
         let current = ctx.page_title.replace('_', " ");
@@ -1967,169 +1968,34 @@ fn luafn_title_new(
     };
     let current_source = ctx.page_source.clone();
 
-    let mt = lua.create_table()?;
-    mt.set(
-        "__index",
-        lua.create_function(move |lua, (t, key): (Table, Value)| {
-            let key = match &key {
-                Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
-                _ => return Ok(Value::Nil),
-            };
-            let ns_id: i32 = t.get("namespace").unwrap_or(0);
-            let text: String = t.get("text").unwrap_or_default();
-            match key.as_str() {
-                "isTalkPage" => Ok(Value::Boolean(ns_id % 2 == 1)),
-                "isContentPage" => Ok(Value::Boolean(ns_id == 0 || ns_id == 828)),
-                "subjectNsText" => lua_str(lua, site.namespace_name(ns_id - (ns_id % 2))),
-                "nsText" => lua_str(lua, site.namespace_name(ns_id)),
-                "exists" => Ok(Value::Boolean(
-                    is_current || facts.as_ref().is_some_and(|f| f.exists),
-                )),
-                "isRedirect" => Ok(Value::Boolean(
-                    facts.as_ref().is_some_and(|f| f.is_redirect),
-                )),
-                // `protectionLevels` is a table keyed by action, each value an
-                // *array* whose first item is the level string:
-                // `{ edit = { 'sysop' } }`. `Module:Effective protection level`
-                // reads `title.protectionLevels[action][1]`, and a module that
-                // found a bare string there would index a character instead.
-                "protectionLevels" => {
-                    let levels = lua.create_table()?;
-                    if let Some(entry) = facts.as_ref().map(|f| &f.protection) {
-                        for (action, value) in &entry.levels {
-                            let arr = lua.create_table()?;
-                            arr.set(1, value.first().map(String::as_str).unwrap_or(""))?;
-                            levels.set(action.as_str(), arr)?;
-                        }
-                    }
-                    Ok(Value::Table(levels))
-                }
-                // No cascading restrictions can be observed, and the documented
-                // shape is a table with empty `restrictions` and `sources` rather
-                // than nil — a module indexing `cascadingProtection.restrictions`
-                // on the live wiki finds a table, so returning nil here would turn
-                // a correct lookup into an error.
-                "cascadingProtection" => {
-                    let cp = lua.create_table()?;
-                    cp.set("restrictions", lua.create_table()?)?;
-                    cp.set("sources", lua.create_table()?)?;
-                    Ok(Value::Table(cp))
-                }
-                "talkPageTitle" => {
-                    let talk = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
-                    lua_str(lua, prefix_title(&site, talk, &text))
-                }
-                "subjectPageTitle" => {
-                    let subject = ns_id - (ns_id % 2);
-                    lua_str(lua, prefix_title(&site, subject, &text))
-                }
-                "baseText" => lua_str(
-                    lua,
-                    text.rsplit_once('/')
-                        .map(|(b, _)| b)
-                        .unwrap_or("")
-                        .to_string(),
-                ),
-                "subpageText" => lua_str(
-                    lua,
-                    text.rsplit_once('/')
-                        .map(|(_, s)| s)
-                        .unwrap_or(&text)
-                        .to_string(),
-                ),
-                "fullUrl" => {
-                    // A *method*: modules call `title:fullUrl()`, so this returns a
-                    // function. Returning the URL string made the call fail with
-                    // "attempt to call a string value".
-                    let path = site.article_path.replace("$1", &url_encode(&full));
-                    let url = format!("{}{path}", site.server);
-                    Ok(Value::Function(
-                        lua.create_function(move |_, _this: Value| Ok(url.clone()))?,
-                    ))
-                }
-                // `title:canonicalUrl{action = 'edit', preload = …}` — the
-                // `index.php` form with the title and each supplied parameter as
-                // query arguments, in the order the table gave them. It is what
-                // `Module:Documentation` builds its "create this page" links from,
-                // and its absence was the first thing to fail once the module ran:
-                // `attempt to call a nil value (method 'canonicalUrl')`.
-                //
-                // The shape is read off rendered pages rather than guessed —
-                // `//en.wikipedia.org/w/index.php?title=Module_talk%3AMath&
-                // preload=Template%3ASubmit+an+edit+request%2Fpreload&action=edit` —
-                // so the server-relative `//` prefix, the `%3A`/`+` encoding and
-                // the `title` first are all as the service serves them.
-                "canonicalUrl" => {
-                    let site = site.clone();
-                    let full = full.clone();
-                    let f = lua.create_function(move |lua, (_this, opts): (Value, Value)| {
-                        // Scribunto also accepts a query-string form
-                        // (`canonicalUrl('action=edit')`), which is appended
-                        // verbatim.
-                        let mut query = format!("title={}", url_encode(&full));
-                        match &opts {
-                            Value::Table(t) => {
-                                for pair in t.clone().pairs::<Value, Value>() {
-                                    let (k, v) = pair.map_err(mlua::Error::external)?;
-                                    let (Ok(k), Ok(v)) = (
-                                        coerce_string(&k, "canonicalUrl"),
-                                        coerce_string(&v, "canonicalUrl"),
-                                    ) else {
-                                        continue;
-                                    };
-                                    query.push('&');
-                                    query.push_str(&url_encode(&k));
-                                    query.push('=');
-                                    query.push_str(&url_encode(&v));
-                                }
-                            }
-                            Value::String(s) => {
-                                let extra = s.to_str().map_err(mlua::Error::external)?;
-                                if !extra.is_empty() {
-                                    query.push('&');
-                                    query.push_str(&extra);
-                                }
-                            }
-                            _ => {}
-                        }
-                        let url = format!(
-                            "//{}/w/index.php?{query}",
-                            site.server.trim_start_matches("//")
-                        );
-                        Ok(Value::String(lua.create_string(&url)?))
-                    })?;
-                    Ok(Value::Function(f))
-                }
-                // `title:newline()` and friends come from `mw.html`; a title has
-                // no such method, so a miss must stay a miss rather than pretend.
-                _ => Ok(Value::Nil),
-            }
+    // The shared metatable's `__index` is generic — it cannot capture this
+    // title's facts — so the handful of per-title answers travel on the instance
+    // as a lookup closure, under a key the metatable knows.
+    let facts_for_lookup = facts.clone();
+    let full_for_lookup = full.clone();
+    table.raw_set(
+        TITLE_FACTS_KEY,
+        lua.create_function(move |lua, (_this, key): (Value, String)| {
+            title_derived_field(lua, &key, &facts_for_lookup, is_current, &full_for_lookup)
         })?,
     )?;
 
     // `getContent()` — the page's wikitext. Only available for pages that were
     // fetched (or the page being parsed, whose source rustoid already has);
     // Scribunto returns nil for a page it has not loaded.
-    //
-    // Registered on the metatable as well as the table, because modules call it
-    // as a method (`title:getContent()`); a `__index` miss would otherwise report
-    // "attempt to call a nil value (method 'getContent')".
-    let facts_for_content = title_facts_for(ctx, &ns_id, &title_text);
-    let has_current = is_current;
     table.set(
         "getContent",
         lua.create_function(move |lua, _this: Value| {
-            if has_current {
-                return Ok(Value::String(lua.create_string(current_source.clone())?));
+            if is_current {
+                return Ok(Value::String(lua.create_string(&current_source)?));
             }
-            Ok(
-                match facts_for_content.as_ref().and_then(|f| f.content.as_ref()) {
-                    Some(c) => Value::String(lua.create_string(c)?),
-                    None => Value::Nil,
-                },
-            )
+            Ok(match facts.as_ref().and_then(|f| f.content.as_ref()) {
+                Some(c) => Value::String(lua.create_string(c)?),
+                None => Value::Nil,
+            })
         })?,
     )?;
+
     // `title.subPageTitle(text)` — `mw.title.makeTitle(ns, text .. '/' .. text)`.
     // `Module:Flagg` builds a sandbox module name with it, and its absence made
     // the call fail as "attempt to call a nil value (method 'subPageTitle')".
@@ -2196,31 +2062,9 @@ fn luafn_title_new(
         })?,
     )?;
 
-    // `__tostring` is what `require(tostring(mw.title.new('Module:X')))` relies
-    // on: without it, `tostring` yields `table: 0x…`, and `Module:Flagg` asked
-    // for a module of that name — a request that could never be satisfied, so
-    // the preload loop retried it until it gave up.
-    mt.set(
-        "__tostring",
-        lua.create_function(|_, t: Table| t.get::<String>("prefixedText"))?,
-    )?;
-    // `__eq` and `__lt` compare the three identifying fields, in Scribunto's
-    // order (interwiki, namespace, text). Titles are compared with `==` and `<`
-    // in modules constantly, and without these Lua compares table identity.
-    mt.set(
-        "__eq",
-        lua.create_function(|_, (a, b): (Table, Table)| {
-            Ok(title_identity(&a) == title_identity(&b))
-        })?,
-    )?;
-    mt.set(
-        "__lt",
-        lua.create_function(|_, (a, b): (Table, Table)| {
-            Ok(title_identity(&a) < title_identity(&b))
-        })?,
-    )?;
-
-    table.set_metatable(Some(mt));
+    let title_mt = title_metatable(lua, &ctx.site)?;
+    mark_instance(&title_mt, &table)?;
+    table.set_metatable(Some(title_mt));
     Ok(table)
 }
 
@@ -2232,6 +2076,165 @@ fn title_identity(t: &Table) -> (String, i32, String) {
         t.get::<String>("text").unwrap_or_default(),
     )
 }
+
+/// The instance key holding a title's per-title field closure.
+const TITLE_FACTS_KEY: &str = "__rustoid_title_facts";
+
+/// Answer a field that needs the page facts, for a title built by
+/// [`luafn_title_new`].
+///
+/// The fields here depend on whether the page exists and what was preloaded,
+/// which is why they cannot live on the shared metatable.
+fn title_derived_field(
+    lua: &Lua,
+    key: &str,
+    facts: &Option<TitleFacts>,
+    is_current: bool,
+    full: &str,
+) -> mlua::Result<Value> {
+    match key {
+        "exists" => Ok(Value::Boolean(
+            is_current || facts.as_ref().is_some_and(|f| f.exists),
+        )),
+        "isRedirect" => Ok(Value::Boolean(
+            facts.as_ref().is_some_and(|f| f.is_redirect),
+        )),
+        // `protectionLevels` is a table keyed by action, each value an *array*
+        // whose first item is the level string: `{ edit = { 'sysop' } }`.
+        // `Module:Effective protection level` reads
+        // `title.protectionLevels[action][1]`, and a module that found a bare
+        // string there would index a character instead.
+        "protectionLevels" => {
+            let levels = lua.create_table()?;
+            if let Some(entry) = facts.as_ref().map(|f| &f.protection) {
+                for (action, value) in &entry.levels {
+                    let arr = lua.create_table()?;
+                    arr.set(1, value.first().map(String::as_str).unwrap_or(""))?;
+                    levels.set(action.as_str(), arr)?;
+                }
+            }
+            Ok(Value::Table(levels))
+        }
+        // No cascading restrictions can be observed, and the documented shape is
+        // a table with empty `restrictions` and `sources` rather than nil — a
+        // module indexing `cascadingProtection.restrictions` on the live wiki
+        // finds a table, so returning nil here would turn a correct lookup into
+        // an error.
+        "cascadingProtection" => {
+            let cp = lua.create_table()?;
+            cp.set("restrictions", lua.create_table()?)?;
+            cp.set("sources", lua.create_table()?)?;
+            Ok(Value::Table(cp))
+        }
+        "fullUrl" => Ok(full_url_closure(lua, full)?),
+        _ => Ok(Value::Nil),
+    }
+}
+
+/// The fields a title can answer from its namespace and text alone.
+///
+/// These are the ones a derived title (`subPageTitle`, `*PageTitle`) answers
+/// too, since they never depend on loaded page data.
+fn title_derived_without_facts(lua: &Lua, t: &Table, key: &str) -> mlua::Result<Value> {
+    let ns_id: i32 = t.get("namespace").unwrap_or(0);
+    let text: String = t.get("text").unwrap_or_default();
+    let site = site_for_titles(lua)?;
+    match key {
+        "isTalkPage" => Ok(Value::Boolean(ns_id % 2 == 1)),
+        "isContentPage" => Ok(Value::Boolean(ns_id == 0 || ns_id == 828)),
+        "talkPageTitle" => {
+            let talk = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
+            lua_str(lua, prefix_title(&site, talk, &text))
+        }
+        "subjectPageTitle" => {
+            let subject = ns_id - (ns_id % 2);
+            lua_str(lua, prefix_title(&site, subject, &text))
+        }
+        "fullUrl" => {
+            let full: String = t.get("fullText").unwrap_or_default();
+            full_url_closure(lua, &full)
+        }
+        // `title:canonicalUrl{action = 'edit', preload = …}` — the `index.php`
+        // form with the title and each supplied parameter as query arguments, in
+        // the order the table gave them. It is what `Module:Documentation` builds
+        // its "create this page" links from, and its absence was the first thing
+        // to fail once the module ran: `attempt to call a nil value (method
+        // 'canonicalUrl')`.
+        //
+        // The shape is read off rendered pages rather than guessed —
+        // `//en.wikipedia.org/w/index.php?title=Module_talk%3AMath&preload=…&action=edit`
+        // — so the server-relative `//` prefix, the `%3A`/`+` encoding and the
+        // `title` first are all as the service serves them.
+        "canonicalUrl" => {
+            let full: String = t.get("fullText").unwrap_or_default();
+            let server = site.server.trim_start_matches("//").to_string();
+            Ok(Value::Function(lua.create_function(
+                move |lua, (_this, opts): (Value, Value)| {
+                    // Scribunto also accepts a query-string form
+                    // (`canonicalUrl('action=edit')`), appended verbatim.
+                    let mut query = format!("title={}", url_encode(&full));
+                    match &opts {
+                        Value::Table(t) => {
+                            for pair in t.clone().pairs::<Value, Value>() {
+                                let (k, v) = pair.map_err(mlua::Error::external)?;
+                                let (Ok(k), Ok(v)) = (
+                                    coerce_string(&k, "canonicalUrl"),
+                                    coerce_string(&v, "canonicalUrl"),
+                                ) else {
+                                    continue;
+                                };
+                                query.push('&');
+                                query.push_str(&url_encode(&k));
+                                query.push('=');
+                                query.push_str(&url_encode(&v));
+                            }
+                        }
+                        Value::String(s) => {
+                            let extra = s.to_str().map_err(mlua::Error::external)?;
+                            if !extra.is_empty() {
+                                query.push('&');
+                                query.push_str(&extra);
+                            }
+                        }
+                        _ => {}
+                    }
+                    let url = format!("//{server}/w/index.php?{query}");
+                    Ok(Value::String(lua.create_string(&url)?))
+                },
+            )?))
+        }
+        // `title:newline()` and friends come from `mw.html`; a title has no such
+        // method, so a miss must stay a miss rather than pretend.
+        _ => Ok(Value::Nil),
+    }
+}
+
+/// `title:fullUrl()` — a *method*, not a field.
+///
+/// Modules call `title:fullUrl()`, so this returns a function. Returning the URL
+/// string made the call fail with "attempt to call a string value".
+fn full_url_closure(lua: &Lua, full: &str) -> mlua::Result<Value> {
+    let site = site_for_titles(lua)?;
+    let path = site.article_path.replace("$1", &url_encode(full));
+    let url = format!("{}{path}", site.server);
+    Ok(Value::Function(
+        lua.create_function(move |_, _this: Value| Ok(url.clone()))?,
+    ))
+}
+
+/// The site snapshot the shared metatable's `__index` needs.
+///
+/// The metatable is engine-wide, so the site has to be reachable from it too. It
+/// is a Rust snapshot rather than a Lua value, so it is held in the Lua app data
+/// rather than the registry.
+fn site_for_titles(lua: &Lua) -> mlua::Result<LuaSite> {
+    lua.app_data_ref::<TitleSite>()
+        .map(|s| s.0.clone())
+        .ok_or_else(|| mlua::Error::runtime("title site not registered"))
+}
+
+/// Wrapper making the site snapshot storable in Lua app data.
+struct TitleSite(LuaSite);
 
 /// Resolve a namespace argument that may be an id or a name.
 fn given_namespace_id(site: &LuaSite, ns: &Value) -> Option<i32> {
@@ -2277,14 +2280,147 @@ fn title_from_full_text(lua: &Lua, site: &LuaSite, full: &str) -> mlua::Result<V
         }
         None => table.set("canTalk", false)?,
     }
+    let mt = title_metatable(lua, site)?;
+    mark_instance(&mt, &table)?;
+    table.set_metatable(Some(mt));
+    Ok(Value::Table(table))
+}
+
+/// The metatable every title object carries.
+///
+/// Every construction path — `mw.title.new`, `subPageTitle`, the `*PageTitle`
+/// accessors — must go through this, or comparisons silently fall back to table
+/// identity for titles built by the paths that missed it. Lua 5.1 only honours a
+/// relational metamethod when *both* operands carry it, so a title compared
+/// against one built by another path raises "attempt to compare two table
+/// values". One shared table for the whole engine is what makes the operands
+/// match an ordinary `==` and any `~=`, `<`, `<=`, `>`, `>=`.
+fn title_metatable(lua: &Lua, site: &LuaSite) -> mlua::Result<Table> {
+    if let Ok(Some(mt)) = lua.named_registry_value(TITLE_METATABLE_KEY) {
+        return Ok(mt);
+    }
+    // Every object of a class shares one metatable *and* one `__eq` function.
+    // Lua 5.1 only dispatches `__eq` when both operands carry the very same
+    // function — distinct closures with identical bodies do not qualify — so the
+    // class's dispatcher closure has to be created once and reused.
     let mt = lua.create_table()?;
+    // `__index` answers the fields Scribunto derives rather than stores. It is
+    // generic — the per-title answers arrive through the `TITLE_FACTS_KEY`
+    // closure on the instance — so one metatable can serve every title.
+    mt.set(
+        "__index",
+        lua.create_function(|lua, (t, key): (Table, Value)| {
+            let Value::String(key) = &key else {
+                return Ok(Value::Nil);
+            };
+            let key = key.to_str().map_err(mlua::Error::external)?.to_string();
+            // Fields a title derives from its id and text alone are answered by
+            // the generic path. Only titles built by `mw.title.new` also carry a
+            // closure of facts-dependent answers, and it is consulted *second*,
+            // so a field it does not know about falls through rather than
+            // vanishing.
+            match title_derived_without_facts(lua, &t, &key)? {
+                Value::Nil => match t.raw_get::<Option<Function>>(TITLE_FACTS_KEY)? {
+                    Some(derived) => derived.call((t, key)),
+                    None => Ok(Value::Nil),
+                },
+                found => Ok(found),
+            }
+        })?,
+    )?;
+    let Some(eq) = identity_eq(lua, &mt, |a, b| title_identity(a) == title_identity(b))? else {
+        // The dispatcher is installed by the Lua extras, which run before any
+        // object is built; if it is missing, the engine was set up wrong. Fail
+        // loudly rather than silently falling back to comparing table identity.
+        return Err(mlua::Error::runtime(
+            "title metatable built before the comparison dispatcher",
+        ));
+    };
+    // `__tostring` is what `require(tostring(mw.title.new('Module:X')))` relies
+    // on: without it, `tostring` yields `table: 0x…`, and `Module:Flagg` asked
+    // for a module of that name — a request that could never be satisfied, so
+    // the preload loop retried it until it gave up.
     mt.set(
         "__tostring",
         lua.create_function(|_, t: Table| t.get::<String>("prefixedText"))?,
     )?;
-    table.set_metatable(Some(mt));
-    Ok(Value::Table(table))
+    // `__lt` and `__le` compare the three identifying fields, in Scribunto's
+    // order (interwiki, namespace, text). Titles are ordered with `<` and `<=`
+    // in modules constantly, and without these Lua will not compare them at all.
+    mt.set(
+        "__lt",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            Ok(title_identity(&a) < title_identity(&b))
+        })?,
+    )?;
+    mt.set(
+        "__le",
+        lua.create_function(|_, (a, b): (Table, Table)| {
+            Ok(title_identity(&a) <= title_identity(&b))
+        })?,
+    )?;
+    // `__eq` compares the same three fields. The dispatcher in the Lua extras
+    // supplies the identity rule around it; see `__rustoid_mark_class`.
+    mt.set("__eq", eq)?;
+    // The shared metatable's `__index` consults the site, so it is stashed once
+    // for the whole engine; only one wiki is ever parsed per engine.
+    lua.set_app_data(TitleSite(site.clone()));
+    lua.set_named_registry_value(TITLE_METATABLE_KEY, &mt)?;
+    Ok(mt)
 }
+
+/// Prepare `mt` for `__eq` comparisons and return the metamethod to install.
+///
+/// Scribunto's titles and mw.html nodes are objects with value semantics, so
+/// `==` is answered from their fields rather than from table identity. Lua 5.1
+/// additionally requires both operands' `__eq` to be the *same function* — a
+/// rule mlua's own table comparison does not enforce, which would let a table
+/// with any `__eq` at all decide the result.
+///
+/// `mt` is therefore tagged with `class`, and the returned closure defers to the
+/// registered predicate only after checking that both operands carry that same
+/// tag. Instances are tagged individually by [`mark_instance`].
+fn identity_eq(
+    lua: &Lua,
+    mt: &Table,
+    eq: impl Fn(&Table, &Table) -> bool + 'static,
+) -> mlua::Result<Option<Function>> {
+    let Ok(register) = lua
+        .globals()
+        .get::<Option<Function>>("__rustoid_register_eq")
+    else {
+        return Ok(None);
+    };
+    let Some(register) = register else {
+        return Ok(None);
+    };
+    let Some(class) = register.call::<Option<Value>>((
+        mt.clone(),
+        lua.create_function(move |_, (a, b): (Table, Table)| Ok(eq(&a, &b)))?,
+    ))?
+    else {
+        return Ok(None);
+    };
+    mt.raw_set("__rustoid_class", class.clone())?;
+    let mark: Function = lua.globals().get("__rustoid_mark_class")?;
+    mark.call::<()>((mt.clone(), class))?;
+    let dispatcher: Function = lua.globals().get("__rustoid_identity_eq")?;
+    Ok(Some(dispatcher))
+}
+
+/// Tag an object as a member of `mt`'s comparison class.
+///
+/// Without the tag the dispatcher refuses the comparison, exactly as Lua 5.1
+/// refuses a metamethod that only one operand carries.
+fn mark_instance(mt: &Table, instance: &Table) -> mlua::Result<()> {
+    if let Some(class) = mt.raw_get::<Option<Value>>("__rustoid_class")? {
+        instance.raw_set("__rustoid_class", class)?;
+    }
+    Ok(())
+}
+
+/// Registry slot holding the shared title metatable.
+const TITLE_METATABLE_KEY: &str = "rustoid.title_metatable";
 
 /// Split `Ns:Text#frag` into a namespace id and the bare title text.
 fn split_title(site: &LuaSite, full: &str) -> (i32, String) {
@@ -2600,6 +2736,50 @@ return html
 const LUA_STDLIB_EXTRAS: &str = r#"
 do
 local mw = __rustoid_mw
+
+-- Lua 5.1 only honours `__eq` when the operands carry the *same* metamethod,
+-- and mlua's `Table::equals` loosens that to "either operand has one". The
+-- loosening is observable and wrong: two tables with distinct `__eq` closures
+-- would compare by the first one found, where Lua 5.1 reports them unequal. It
+-- also makes `__eq` fire for the title and reference objects below, whose
+-- equality is decided by their fields rather than by a metamethod at all.
+--
+-- So `__eq` is not installed on those objects. Instead `__rustoid_register_eq`
+-- hooks the class's *fields* through this dispatcher, which reproduces the
+-- identity rule by requiring both operands to be instances of the same class.
+local eq_hooks = {}
+local class_marker = '__rustoid_class'
+
+-- Register `class`'s comparison predicate. The class's *identity* is the
+-- predicate function itself, which is what Lua 5.1 compares, and the tag handed
+-- back is that same function — so the tag is unique per class and no counter is
+-- needed.
+function __rustoid_register_eq(class, fn)
+    eq_hooks[fn] = fn
+    rawset(class, class_marker, fn)
+    return fn
+end
+
+-- The one `__eq` every comparison class installs. Lua 5.1 only dispatches when
+-- both operands carry this same function, so they are refused by the runtime
+-- unless they are of the same class — which is the intended behaviour, since an
+-- untagged value is not an instance of the class at all.
+function __rustoid_identity_eq(a, b)
+    local fa = rawget(a, class_marker)
+    local fb = rawget(b, class_marker)
+    -- Null means one of these is a plain table: tables compare by identity, and
+    -- `a` and `b` are two distinct objects by the time we get here.
+    if fa == nil or fb == nil then return false end
+    -- Different classes never compare; the identity requirement makes that so.
+    if fa ~= fb then return false end
+    return eq_hooks[fa](a, b)
+end
+
+function __rustoid_mark_class(class, tag)
+    rawset(class, class_marker, tag)
+    return class
+end
+
 if table.clone == nil then
     function table.clone(t)
         local copy = {}
@@ -2611,7 +2791,8 @@ end
 -- `string.gfind` is Lua 5.0's name for `gmatch`, kept in Lua 5.1 as a
 -- deprecated alias. Scribunto is built on 5.1, so the alias exists there and
 -- published modules call it: Module:Navbox uses it to collect TemplateStyles
--- strip markers. Lua 5.4 dropped the alias, so it is restored here.
+-- strip markers. It is supplied through `mw.ustring` below rather than by the
+-- 5.1 core library this build links, so restore it here.
 if string.gfind == nil then
     string.gfind = string.gmatch
 end
@@ -4950,6 +5131,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn tmp_probe_mark() {
+        let engine = make_engine();
+        for code in [
+            "local a = mw.title.new('Foo') return tostring(rawget(a, '__rustoid_class'))",
+            "local a = mw.title.new('Foo') local mt = getmetatable(a) \
+             return tostring(rawget(mt, '__rustoid_class'))",
+            "local a = mw.title.new('Foo') return tostring(a.fullUrl) .. '|' .. tostring(a.exists)",
+        ] {
+            println!("{:?}\n   => {:?}", code, engine.eval(code));
+        }
+    }
+
+    #[test]
     fn test_mw_ustring_len() {
         let engine = make_engine();
         assert_eq!(engine.eval("return mw.ustring.len('hello')").unwrap(), "5");
@@ -4958,8 +5153,9 @@ mod tests {
     #[test]
     fn test_mw_ustring_sub() {
         let engine = make_engine();
-        // Expected values verified against Lua 5.4's `string.sub`, which
-        // `ustring.sub` mirrors for codepoint-indexed strings. A previous
+        // Expected values verified against Lua 5.1's `string.sub`, which
+        // `ustring.sub` mirrors for codepoint-indexed strings. Scribunto runs
+        // on 5.1, so that is the reference. A previous
         // expectation here was `sub('hello world', 7, 5) == "world"`, which
         // encoded the bug: the third argument is an *end index*, so an inverted
         // range is empty, not a length.

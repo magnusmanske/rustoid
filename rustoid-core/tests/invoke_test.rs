@@ -398,8 +398,9 @@ async fn a_direct_invoke_has_no_parent() {
 /// string, which `Help:Introduction` produced — panicked the whole process,
 /// taking down a corpus run with it.
 ///
-/// The expected values are taken from Lua 5.4's own `string.sub`, which
+/// The expected values are taken from Lua 5.1's own `string.sub`, which
 /// `ustring.sub` mirrors, rather than from reasoning about the formula.
+/// Scribunto runs on Lua 5.1, so that is the reference dialect.
 #[tokio::test]
 async fn ustring_sub_clamps_instead_of_panicking() {
     let module = r#"
@@ -415,20 +416,23 @@ async fn ustring_sub_clamps_instead_of_panicking() {
                 '[' .. u.sub('abc', 0, 99) .. ']',   -- clamped both ways
                 '[' .. u.sub('abc', -99) .. ']',     -- start far before
                 '[' .. u.sub('abc', 1, -99) .. ']',  -- end far before
-                '[' .. u.sub('h\xc3\xa9llo', 2, 3) .. ']', -- codepoints, not bytes
+                '[' .. u.sub('h\195\169llo', 2, 3) .. ']', -- codepoints, not bytes
             }, ' ')
         end
         return p
     "#;
     let html = expand(&[("Module:Sub", module)], "{{#invoke:Sub|main}}").await;
     let body = text_only(&html);
-    // The ASCII cases, verified against Lua 5.4's own `string.sub`. The parser
+    // The ASCII cases, verified against Lua 5.1's own `string.sub`. The parser
     // splits text runs, so only the tail is contiguous.
     assert!(
         body.contains("[] [bc] [bc] [ab] [] [abc] [abc] []"),
         "got: {body}"
     );
     // The codepoint case: byte slicing would cut the two-byte `é` in half.
+    // The literal is written with Lua 5.1's `\ddd` decimal escapes, which is
+    // the only form 5.1 has; a `\xNN` spelling would lex as the four
+    // characters `xc3x` and silently test the wrong string.
     // Checked on the raw output, because the parser may split the text run.
     assert!(
         html.contains("[él]") || body.contains("[él]"),

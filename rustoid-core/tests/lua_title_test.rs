@@ -185,3 +185,41 @@ async fn fragment_is_settable() {
     .await;
     assert!(out.contains("Section"), "got: {out}");
 }
+
+/// Every title answers the methods its namespace and text alone determine.
+///
+/// These used to be reachable only on titles built by *derived* paths, because
+/// the facts-dependent answers were consulted first and returned nil for
+/// anything they did not know, hiding the generic ones. `Module:Documentation`
+/// builds "create this page" links with `canonicalUrl`, and its absence made the
+/// module stop at "attempt to call method 'canonicalUrl' (a nil value)".
+#[tokio::test]
+async fn every_title_answers_the_generic_methods() {
+    let out = eval(
+        r#"
+        local direct = mw.title.new('Module:Foo')
+        local derived = mw.title.new('Module:Foo'):subPageTitle('sandbox')
+        return tostring(direct.canonicalUrl) .. '|' .. tostring(derived.canonicalUrl)
+            .. '|' .. tostring(direct.talkPageTitle) .. '|' .. tostring(derived.talkPageTitle)
+        "#,
+    )
+    .await;
+    assert!(!out.contains("nil"), "got: {out}");
+}
+
+/// A facts-dependent field must survive alongside the generic ones.
+///
+/// `exists` comes from the preloaded page data, so it travels on the instance
+/// rather than the shared metatable; the two lookups have to compose.
+#[tokio::test]
+async fn facts_fields_still_resolve_with_the_generic_ones() {
+    let out = eval(
+        r#"
+        local t = mw.title.new('Foo')
+        return tostring(t.canonicalUrl ~= nil) .. '|' .. tostring(t.exists)
+            .. '|' .. tostring(t.getContent)
+        "#,
+    )
+    .await;
+    assert!(out.contains("true|"), "got: {out}");
+}
