@@ -501,10 +501,24 @@ impl LuaEngine {
     /// runtime (`"Module:Unicode data/" .. key`) is both unwrappable by the static
     /// scan and caught by the module itself.
     pub fn take_missing_modules(&self) -> Vec<String> {
-        let Ok(t) = self
-            .lua
-            .named_registry_value::<mlua::Table>(MISSING_MODULES)
-        else {
+        self.take_registry_titles(MISSING_MODULES)
+    }
+
+    /// Pages a run asked the existence of and the host had never looked up,
+    /// taken and cleared.
+    ///
+    /// The counterpart of [`take_missing_modules`](Self::take_missing_modules)
+    /// for a title whose facts were never preloaded. `Module:Location map` builds
+    /// its data page's name at runtime and reads `title.exists` before loading
+    /// it, so a false answer takes the "does not exist" branch and the load —
+    /// and therefore the module signal — never happens.
+    pub fn take_missing_titles(&self) -> Vec<String> {
+        self.take_registry_titles(MISSING_TITLES)
+    }
+
+    /// Drain a named registry list of titles, de-duplicated.
+    fn take_registry_titles(&self, slot: &str) -> Vec<String> {
+        let Ok(t) = self.lua.named_registry_value::<mlua::Table>(slot) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -516,7 +530,7 @@ impl LuaEngine {
             }
         }
         if let Ok(empty) = self.lua.create_table() {
-            let _ = self.lua.set_named_registry_value(MISSING_MODULES, empty);
+            let _ = self.lua.set_named_registry_value(slot, empty);
         }
         out
     }
@@ -566,6 +580,12 @@ impl LuaEngine {
         // the raise in `install_module_loader`.
         self.lua
             .set_named_registry_value(MISSING_MODULES, self.lua.create_table()?)
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        // And a fresh collector for pages asked about but never looked up. Read
+        // the same way, for the same reason: the module's own branch may swallow
+        // the consequence, and `title.exists` never raises at all.
+        self.lua
+            .set_named_registry_value(MISSING_TITLES, self.lua.create_table()?)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
         let module = self.load_module_value(module_source, Some(title))?;
@@ -763,15 +783,47 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value> {
 /// `sitelinks` and `claims` are read as they appear in the entity, which is what
 /// `Module:Wikidata` does when it walks a snak.
 ///
-/// An unknown id is *absent* rather than a table of empty tables: that is what
-/// `entityExists` reports, and the ~19 cached modules that guard on it then take
-/// their own fallback — the behaviour of a wiki without Wikidata.
-/// Named registry slot holding the titles `require` could not find.
+/// Named registry slot holding the titles a run wanted and did not have.
 ///
 /// A registry value rather than a field because the collector has to be reachable
 /// from the `require` closure and survive a `pcall` in the module. See
 /// [`LuaEngine::take_missing_modules`].
+///
+/// Two things write to it, and they are the same kind of fact: a module whose
+/// `require`/`mw.loadData`/`mw.loadJsonData` found nothing, and a `title.exists`
+/// asked about a title the host was never queried for. Both mean "fetch this and
+/// run again", and the payload is a page title either way.
 const MISSING_MODULES: &str = "rustoid_missing_modules";
+
+/// Named registry slot holding the *pages* a run asked the existence of and the
+/// host had never looked up. See [`LuaEngine::take_missing_titles`].
+///
+/// Separate from [`MISSING_MODULES`] because the caller's remedy differs: a
+/// missing module is fetched into the Lua registry and re-required, while a
+/// missing title is only a fact, and fetching it into the registry would be
+/// wrong — it is not a module and could be in any namespace.
+const MISSING_TITLES: &str = "rustoid_missing_titles";
+
+/// Record that the current run needed a title the host was not asked about.
+///
+/// Appends to [`MISSING_TITLES`], which the caller drains after the run and
+/// answers with a preload — the same shape as a missing module. Duplicates are
+/// avoided because a module may read `title.exists` in a loop, and the list is
+/// re-scanned on every retry round.
+fn note_missing_title(lua: &Lua, title: &str) -> mlua::Result<()> {
+    let Ok(missing) = lua.named_registry_value::<Table>(MISSING_TITLES) else {
+        // No collector installed (a bare engine in a unit test): the answer is
+        // still `false` for an unknown title, so this is not an error.
+        return Ok(());
+    };
+    let len = missing.raw_len();
+    for i in 1..=len {
+        if missing.raw_get::<Option<String>>(i)?.as_deref() == Some(title) {
+            return Ok(());
+        }
+    }
+    missing.raw_set(len + 1, title.to_string())
+}
 
 const WIKIBASE_LIB: &str = r#"
 return function(args)
@@ -2221,9 +2273,33 @@ fn title_derived_field(
     full: &str,
 ) -> mlua::Result<Value> {
     match key {
-        "exists" => Ok(Value::Boolean(
-            is_current || facts.as_ref().is_some_and(|f| f.exists),
-        )),
+        "exists" => {
+            // A title the host was never asked about is *unknown*, not absent.
+            //
+            // `preload_titles` finds titles by scanning module source for
+            // literals, so a name a module builds at runtime —
+            // `mw.title.new('Module:Location map/data/' .. map)` — is invisible
+            // to it. Reading `false` for such a title makes the module take its
+            // "does not exist" branch and never attempt the load, so nothing
+            // records a miss and the retry loop has nothing to act on: the
+            // failure is reported as the *module's* own error message, which is
+            // why `Module:Location map` said the definition "does not exist"
+            // while the page was sitting in the cache.
+            //
+            // Recording the title on the same out-of-band channel a missing
+            // module uses lets the caller preload it and re-run. It is recorded
+            // rather than raised, so a module asking about a page it genuinely
+            // does not care about does not turn into an error — and the record is
+            // a *request*, so a title that is fetched and still absent answers
+            // `false` on the next round without asking again.
+            let known = is_current || facts.is_some();
+            if !known && !full.is_empty() {
+                note_missing_title(lua, full)?;
+            }
+            Ok(Value::Boolean(
+                is_current || facts.as_ref().is_some_and(|f| f.exists),
+            ))
+        }
         "isRedirect" => Ok(Value::Boolean(
             facts.as_ref().is_some_and(|f| f.is_redirect),
         )),

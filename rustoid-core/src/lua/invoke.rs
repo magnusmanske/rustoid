@@ -276,6 +276,15 @@ pub enum Outcome {
     /// the request may be made under a `pcall` that swallows the message — see
     /// [`LuaEngine::take_missing_modules`].
     MissingModule(String),
+    /// A *page* the run asked the existence of and the host had never looked up.
+    ///
+    /// Distinguished from [`MissingModule`](Self::MissingModule) because the
+    /// remedy differs: a module is fetched into the Lua registry, while this is
+    /// only a fact about a title, so it is fetched into the frame's title table.
+    /// A module that reads `title.exists` before loading the page — which is what
+    /// `Module:Location map` does — never reaches the load, so the module case
+    /// never fires and the fact is the only signal there is.
+    MissingTitle(String),
 }
 
 /// How many times one `#invoke` may be re-run for deferred frame calls.
@@ -332,6 +341,15 @@ pub fn run_once(
         // without this arm the render "succeeds" with the data missing and the
         // retry never happens.
         Ok(out) => {
+            // A title request is reported before a module one when both are
+            // outstanding, because a module that could not be loaded may only
+            // have been unreachable *because* a fact it needed was a false
+            // `exists`. Resolving the fact can remove the module request; the
+            // reverse is not true. Either way the loop re-runs, so this is an
+            // ordering rather than a filter.
+            if let Some(title) = engine.take_missing_titles().into_iter().next() {
+                return Ok(Outcome::MissingTitle(title));
+            }
             if let Some(missing) = engine.take_missing_modules().into_iter().next() {
                 return Ok(Outcome::MissingModule(missing));
             }
@@ -344,6 +362,9 @@ pub fn run_once(
             // calls `pcall(mw.loadData, "Module:Unicode data/" .. key)`, so the
             // message never reaches here at all and the boolean it substitutes is
             // what breaks the caller.
+            if let Some(title) = engine.take_missing_titles().into_iter().next() {
+                return Ok(Outcome::MissingTitle(title));
+            }
             if let Some(missing) = engine.take_missing_modules().into_iter().next() {
                 return Ok(Outcome::MissingModule(missing));
             }
@@ -503,6 +524,43 @@ where
 
         match outcome {
             Outcome::Done(out) => return Ok(out),
+            // A page whose facts were never fetched. Loaded into `frame.titles`
+            // rather than the module registry: it is a fact about a page, and it
+            // may be in any namespace, so treating it as a module would put a
+            // non-module in the registry and make `require` succeed with
+            // wikitext as the module body.
+            Outcome::MissingTitle(title) => {
+                if !fetched.insert(title.clone()) {
+                    // The loop already fetched this title and it is still being
+                    // asked for: it genuinely does not exist, so answer it once
+                    // and let the module take its own branch rather than
+                    // rounding forever.
+                    unfetchable.insert(title);
+                    continue;
+                }
+                let parsed = title_from_text(&site, &title);
+                let content = source.get_page_content(&parsed).await.ok().flatten();
+                let exists = content.is_some();
+                let is_redirect = content
+                    .as_deref()
+                    .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"));
+                let protection = source
+                    .get_title_protection(std::slice::from_ref(&title))
+                    .await
+                    .unwrap_or_default()
+                    .remove(&title)
+                    .unwrap_or_default();
+                frame.titles.insert(
+                    title.clone(),
+                    TitleFacts {
+                        exists,
+                        is_redirect,
+                        content,
+                        protection,
+                    },
+                );
+                continue;
+            }
             Outcome::Deferred(request) => {
                 let key = request.key();
                 // Re-running with an answer the module already has would
