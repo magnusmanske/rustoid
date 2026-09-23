@@ -3122,3 +3122,134 @@ against a case with a known answer. Each was caught by doing that, once.
 Per wiki and corpus: pages matching byte-exactly, plus a histogram of first-
 difference categories. The fixture score (currently 876/896) remains the guard
 for the shared core, so this work must not regress it.
+
+## Three defects were one defect, and the guard could not see it
+
+The SPTAG family — a `SelfclosingTagTk::new("template", …)` reaching the DOM
+builder, which names an element after it (`<template Large="" 1="x">`) — is the
+*first* difference on `Help:Introduction`, and it sat in front of every
+comparison downstream. Reducing it with the harness turned up three separate
+symptoms, and they are one cause:
+
+```
+{{#ifeq:1|1|{{Large|1=x}}|z}}              -> <template Large="" 1="x">
+{{#if:1|X|Y}}{{PAGENAME}}                  -> #mwt1 then #mwt3
+{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}  -> literal text
+```
+
+A parser function returns a *branch*, and PHP hands a handler's tokens back to
+the token stream, which processes them again. rustoid spliced them verbatim, so
+the raw `template` token went through untouched. The same omission consumed an
+`about` id: the shared prelude took one for every token and the parser-function
+path then took its own, so `#mwt2` vanished. And the third case was not the
+expander at all — it was the *tokenizer*, which refused to close the call; that
+one is worth its own paragraph.
+
+### The id gap was two allocators with different conventions
+
+`Parser::new_about_id` and `attribute_expander::new_about_id` counted from 1,
+while two arms of `TemplateHandler::process` counted from 0. The discarded id
+had made the disagreement invisible: taking one up front and throwing it away
+put `process`'s 0-based count at 1 for the first call, so `#mwt1` looked right
+and only the *next* id was wrong. That is the shape to watch for — a compensating
+error that hides a real one. All four call sites now share the one helper.
+
+### `{{` inside `[[` pushes its own closer
+
+`{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}` rendered as literal text with only
+its arguments parsed. The cause is in `find_template_closing`, which kept a
+stack of pending closers and treated `{{` as ordinary content while a `[[` was
+open — so the branch's inner `}}` hit its "a `}}` under an open `[[` means this
+template can never close" arm and abandoned the whole scan.
+
+PHP's stack is document-order, and `Grammar.pegphp`'s `broken_template` comment
+says so outright: *"once you see `[[ {{` you are looking only for `}}`"*. The
+push now happens whatever the closer on top is. The `}}`-under-`[[` arm stays,
+because it is what keeps `{{1x|[[Foo}}` from closing across a following line's
+`]]` — the two rules are not in conflict, they are the push and the failure.
+
+### A tplarg default is wikitext, and its closer is not a brace count
+
+`X{{{p|{{T|d}}}}}Y` came out as `X{<link Template:D>}Y`. Two bugs stacked:
+
+- The tplarg's default was stored as raw text (`kv_str("", &default)`), so there
+  was no token for the expander to act on. PHP reads both the target and each
+  default with `template_param_value`, which is the same value tokenizer a
+  template argument uses.
+- The closer was found by counting `}` in threes, which ate the nested
+  template's `}}` as part of the tplarg's `}}}` and left the closer one brace
+  short — so the `{{{` was never a tplarg at all, and the leftovers re-read as a
+  bogus transclusion of `Template:D`. The existing `skip_tplarg_memo` already
+  did this correctly for the template scanner; the tplarg parser now uses it.
+  That is the second time a hand-rolled brace counter has disagreed with the
+  scanner next to it (`find_closing` vs `find_template_closing`), which is an
+  argument for there being one.
+
+`Frame::expand` runs the chunk through the pipeline, so the templatearg arm
+re-walks its result too — otherwise the default's template would be a token
+nothing ever expands.
+
+### What is left, and the bug it is really about
+
+`Help:Introduction` still differs at byte 348, and the difference is now
+diagnosed rather than reduced:
+
+```
+parsoid: …editors</div>\n<meta typeof="mw:Includes/NoInclude" id="mwAw"/>…
+rustoid: …editors<span about="#mwt4" typeof="mw:Transclusion"
+                   data-mw={…"function":"shortdesc"…}></span></div>…
+```
+
+The `{{SHORTDESC:…}}` is inside `Template:Short description`'s `#ifeq` branch.
+Its result is *empty*, so Parsoid emits nothing; rustoid wraps the emptiness in
+an `mw:Transclusion` span Parsoid never emits.
+
+The rule is `wrapTemplates = !inTemplate`, and a template body runs in a nested
+pipeline (`processTemplateSource` hard-codes `'inTemplate' => true`), so
+**nothing inside a template body is encapsulated**. The body's tokens are
+spliced into the caller's expansion, which carries the one wrapper, and
+`data-mw.parts` accumulates the nested transclusions — the cached page shows
+exactly that, one `<p about="#mwt4">` whose `parts` list holds *two* templates
+and the literal `</noinclude>` text between them.
+
+rustoid cannot express this today because it expands a body's own content and
+the argument values spliced into it in **one** pass, under one flag:
+
+- a *body* token must not be wrapped (it belongs to the nested pipeline);
+- an *argument value* spliced into that body must be wrapped, because PHP
+  expanded it in the caller's pipeline.
+
+The fixture suite pins both halves, which is why the obvious one-line change
+fails: forcing the body pass to `inTemplate=true` removes the `SHORTDESC` span
+but also turns `{{!}}` inside a body into a `<td>`, breaking
+`wikiLinks.txt`'s two `T290526` tests — `[[{{T290526}}]]` expects a *piped*
+link, i.e. a literal `|`. That failure is the measurement working: 876 → 875,
+and the diagnosis is that `{{!}}` keys off `atTopLevel` (`TokenHandler`, from the
+pipeline option `toplevel`), which is a third flag again.
+
+So the change is a real refactor, not a patch: a `body` (a.k.a. "nested
+pipeline") flag separate from `in_template` (the caller's flag, still needed for
+`{{!}}` and for `mw:Param`), used for every `wrapTemplates` decision. Until that
+lands, the first difference on the smallest page is understood but not crossed.
+
+`TemplateHandler::process` and `handle_template` now take the `wrap` flag
+explicitly, which is the seam this refactor needs; the call site passes
+`!in_tpl`, which is today's behaviour, so the plumbing is behaviour-preserving.
+
+### Scoreboard
+
+```
+before: 0/45 matched, rustoid 163.8MB  (2.54x)   7 failures / 6 distinct
+after:  0/45 matched, rustoid 130.0MB  (2.02x)   3 stalled, lua failures 16/12
+```
+
+No page matched yet — every page's *first* difference is still somewhere — but the
+byte ratio moved a fifth of the way with no new failures, and three fixes that
+were invisible in a 0/45 headline (a leaked element carrying the template's whole
+parameter list is expensive, which is why the ratio and not the count is what
+moves) are now in. `Help:Introduction` is the smallest failure at 23 KB and the
+next rung is `Quicksilver (film)` at 35 KB.
+
+The three fixes each removed a *class*, not an instance. That is the difference
+worth watching: the SPTAG leak was one bug counted 16 times on the smallest page,
+and the reduction that found it was `{{#ifeq:1|1|{{Large|1=x}}|z}}`, not the page.
