@@ -188,12 +188,17 @@ async fn a_redirect_passes_its_arguments_to_the_target() {
 /// The redirect's *target* is the transclusion recorded in `data-mw`, while the
 /// wikitext stays what the page wrote.
 ///
-/// Parsoid records the call as the editor wrote it (`wt: "Alias"`) but points
-/// `href` at the page that supplied the content. Both halves matter: the `href`
-/// is the redirect resolution, and the `wt` is what makes the HTML round-trip
-/// back to the original wikitext.
+/// `data-mw` records the call as the editor wrote it — `wt` *and* `href`.
+///
+/// Both name the redirect (`{{Alias}}` on the service is
+/// `"wt":"pp-semi-indef","href":"./Template:Pp-semi-indef"` even though the body
+/// comes from the target). `wt` is what makes the HTML round-trip back to the
+/// original wikitext; `href` is the page the reader — and any editor — is meant
+/// to follow, which is the redirect, not what it eventually resolves to. Taking
+/// the target would silently rewrite a page's transclusion to a name it never
+/// mentioned, and this test previously asserted that the `href` was the target.
 #[tokio::test]
-async fn data_mw_names_the_redirect_and_its_target() {
+async fn data_mw_names_the_redirect_and_not_its_target() {
     let (html, _) = render(
         &[
             ("Template:Alias", "#REDIRECT [[Template:Real]]"),
@@ -207,6 +212,14 @@ async fn data_mw_names_the_redirect_and_its_target() {
     assert!(
         html.contains("\"wt\":\"Alias\""),
         "data-mw should keep the called name: {html}"
+    );
+    assert!(
+        html.contains("\"href\":\"./Template:Alias\""),
+        "data-mw's href should name the redirect the page called: {html}"
+    );
+    assert!(
+        !html.contains("\"href\":\"./Template:Real\""),
+        "the href must not be renamed to the redirect's target: {html}"
     );
 }
 

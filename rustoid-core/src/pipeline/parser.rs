@@ -2991,8 +2991,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // redirect must be resolved before that frame exists.
         //
         // `data-mw` still names the *redirect* the page called, not the target —
-        // that is what Parsoid records — so only the body source and the frame
-        // title are replaced here.
+        // that is what Parsoid records (`{{pp-semi-indef}}` is written with
+        // `"wt":"pp-semi-indef","href":"./Template:Pp-semi-indef"` even though
+        // the body comes from `Template:Semi-protected indefinitely`) — so only
+        // the body source and the frame title are replaced here. `called_title`
+        // is what the `href` is built from, and the `data-mw` targets below it.
+        let called_title = title.clone();
         let (template_src, title) = match follow_template_redirect(src, title).await {
             Redirected::Followed { body, title } => (body, title),
             // The page exists and *is* a redirect, but its target could not be
@@ -3121,7 +3125,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         let mut info = template_info_from(None, Some(name), vec![]);
         info.target_wt = Some(target_str.to_string());
-        info.href = Some(crate::title::make_link(&title, self.config));
+        // The *called* title, not the redirect's target: `data-mw.target` names
+        // what the page wrote, and a followed redirect must not rename it.
+        info.href = Some(crate::title::make_link(&called_title, self.config));
         info.param_infos =
             crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params, page_source);
         encap.encap_tokens(expanded, &info)
