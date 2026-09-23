@@ -2417,6 +2417,115 @@ The remaining entries are now mostly one or two pages each, and several are
 | `Module:Multiple image:177` nil arithmetic | value difference |
 | `Module:Math:100` `random` empty interval | API behaviour |
 
+## Missing APIs, and the shape of what is left
+
+The failure table's top entries stopped being engine defects and became missing
+functionality. Working through them cleared most of the table, and two of the
+fixes were worth more than their page counts.
+
+| added | why it was blocking |
+|---|---|
+| `frame:newChild{}` | `Module:Hatnote inline` builds a frame for `Module:Hatnote` through it |
+| `mw.loadJsonData` | `Module:Music chart` loads its chart data from `Module:Music chart/%s.json` |
+| `mw.text.jsonDecode` | the same JSON bridge, with both documented flags |
+| `mw.ext.data.get` shape | `Module:NUMBEROF/data` walks `schema.fields` |
+
+### `frame:getParent()` for a direct invoke — the one that mattered
+
+`Module:Check for unknown parameters:195` opens with `frame:getParent().args` and
+failed on it. The cause was that `has_parent` was keyed on the **Template
+namespace**, so a call inside a template got a parent while a direct `{{#invoke:}}`
+from an article did not.
+
+The manual contradicts that twice over, most directly:
+
+> it returns the frame for the page that called `{{#invoke:}}`. … This remains
+> true regardless of whether this function is called directly from the "main"
+> module invoked by `{{#invoke:}}` or from library module code accessed via
+> `require()`.
+
+Only the debug console and `mw.loadData` see nil, and a parent's own
+`getParent()` is nil because there is no access to a grandparent frame.
+
+The namespace test is the interesting part: it looked plausible, and it made the
+*common* case pass. The defect only appeared on direct invocation, which is why it
+survived so long. An existing test asserted the nil behaviour and had to be
+inverted — it encoded the bug.
+
+### Return arity, again
+
+The `mw.ustring` pattern functions returned *zero* values on a failed match where
+Lua returns exactly one nil (`lstrlib.c`: `lua_pushnil(L); return 1;`). The arity
+is observable because a function given no argument differs from one given an
+explicit nil, so `tonumber(mw.ustring.match(k, p))` — which `Module:Subject bar:18`
+writes — raised "value expected" on every non-matching key.
+
+Adding `mw.text.jsonDecode` exposed the mirror image of the same lesson: the
+`pcall`-swallowed-missing-page case never reached the retry loop, because
+`run_once` only consulted the missing-module list on the *error* path. A module
+that wraps the load in `pcall` — which `Module:Music chart` does, substituting a
+red error span — "succeeded" with the data missing and the retry never happened.
+The success arm consults the list now.
+
+### Anchor handling in `gsub` and `gmatch`
+
+Three defects in the anchored-pattern plumbing, each confirmed against the `lua`
+binary rather than reasoned about:
+
+- **`gsub` did not stop after one substitution for an anchored pattern.** Lua's
+  `str_gsub` ends its first iteration with `if (anchor) break;`, so
+  `gsub('abc', '^(%a)', '<%1>')` is `<a>bc`. The loop re-anchored at every
+  position and produced `<a><b><c>`.
+- **`gmatch` stripped a leading `^`**, inventing matches: `gmatch_aux` passes the
+  pattern straight to the matcher, where `^` is an ordinary caret, so
+  `gmatch('abc', '^%a')` yields nothing where stripping yielded three.
+- **The anchored-captures primitive prefixed `^` unconditionally**, so an
+  already-anchored pattern became `^^(a)` — the second caret being literal — and
+  matched almost nothing, making `gsub` silently return its input.
+
+### Scoreboard
+
+```
+lua failures: 17 entries / 15 distinct  ->  9 entries / 8 distinct
+output: rustoid 171567479 bytes (2.66x)  ->  164242048 bytes (2.55x)
+```
+
+Best ratio so far, and no new entries appeared across four consecutive runs. What
+remains is mostly *absent data or absent extensions* rather than defects:
+
+| entry | kind |
+|---|---|
+| `Module:Music chart/album.json was not preloaded` | fetch loop does not reach it offline |
+| `Module:Wikidata label was not preloaded` | same |
+| `Module:Location map/data/Pacific Ocean` | missing data module |
+| `Module:Piechart` `parseMetaParams` (2 pages) | one module's own input handling, not yet diagnosed |
+| `function not found: main` | one page, not yet diagnosed |
+| `Module:Math:100` `random` empty interval | value difference / API behaviour |
+| `Module:Math:363` `log10` of a string | value difference |
+| `Module:Multiple image:177` nil arithmetic | value difference |
+
+The headline score is still `0/46` and 45/48 pages still carry literal `{{...}}`,
+so none of this has yet converted into a byte-identical page. The failures are the
+blocking errors; what remains after them is value parity, which is a different and
+less tractable kind of work — the pages must now be compared rather than
+debugged.
+
+### A method note
+
+Four times in this stretch, measurement overturned what reading suggested, and
+coding to the reading would have produced a wrong fix or a test that encoded the
+wrong behaviour:
+
+- `tonumber(nil)` does **not** raise; only `tonumber()` with no argument does.
+- `select(2, x)` returning no values is stock Lua, not a bug.
+- `(a)(x)?(b)` does **not** match `ab` — a `?` on a capture cannot match empty.
+- `mw.ustring.isutf8`, `tostring(select(...))` and `find`'s result were each
+  ambiguous as an oracle and were replaced rather than trusted.
+
+The `lua` binary on this machine is 5.5, so it is a reference for *semantics that
+5.5 did not change* rather than for everything; where 5.1 differs, `lstrlib.c`
+from the vendored source is the authority, and it settled `gsub`'s anchor rule.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
