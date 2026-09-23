@@ -2856,6 +2856,44 @@ serialized form, with the same class of defect, in two different files. That
 is the argument for the property-based assertion rather than a byte one: the
 invariant "this output is parseable JSON" would have caught both.
 
+## A host that cannot see a module is not a host that says it is absent
+
+The `exists` fix above did not work, and the corpus is what said so. The page
+still reported `Module:Location map/data/Pacific Ocean does not exist` even
+though fetching the module had changed nothing and the `exists` rule had been
+widened. ISS was fine when compared on its own and failing in a corpus run,
+which is the kind of difference that is easy to misread as ordering or state.
+
+Cutting it down to two `#invoke`s on one page reproduced it. Adding a debug
+print to the `exists` arm settled it in one line:
+
+```
+DBG exists key=exists known=true is_module=true full="Module:Location map/data/Pacific Ocean"
+```
+
+`known=true` — the title's facts were *already* recorded, so there was nothing
+to request. The host had answered the existence question, and answered **no**.
+
+The reason is a kind mismatch in the fetch path. A Module-namespace title is
+cached under `mod:`, because `require` and `mw.loadData` must be able to tell a
+module from an article of the same name — but `get_page_content`, which is what
+answers an existence question, looked under `page:` only. So it missed, the
+caller recorded `exists: false` as a fact, and the false fact then *suppressed*
+the fetch that would have corrected it. The miss was permanent.
+
+The general shape is worth keeping: **a `DataSource` that cannot reach a page
+must not be able to record that it is absent.** Reporting a failure as a fact is
+worse than reporting it as a failure, because a fact is cached and a failure is
+not. The namespace now decides which kind holds the content, so the common case
+costs one lookup and only a miss pays for the second.
+
+`MockDataSource` had the identical gap, and that is the part worth calling out:
+a test that adds a module and then asks whether it exists got the same wrong
+answer the production harness produced, so the two agreed and the bug was
+invisible from inside the test suite. It is fixed in both, with a test that
+asserts the negative case too — a main-namespace title that merely *spells*
+`Module:Foo` must still miss, or every article would resolve to a module.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
