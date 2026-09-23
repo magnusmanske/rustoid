@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Timelike};
 use mlua::{Function, Lua, Table, Value};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Result, RustoidError};
 use crate::traits::SiteConfig;
@@ -1510,6 +1511,14 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // iterator. The codepoints are therefore collected in Rust and the iterator
     // itself is written in Lua, where a multi-value return is native.
     ustring.set("codepoints", lua.create_function(luafn_ustring_codepoints)?)?;
+    // The string-shape predicates and the normalization family. These are
+    // independent of the pattern dialect, so they do not wait on it.
+    ustring.set("isutf8", lua.create_function(luafn_ustring_isutf8)?)?;
+    ustring.set("toNFC", lua.create_function(luafn_ustring_to_nfc)?)?;
+    ustring.set("toNFD", lua.create_function(luafn_ustring_to_nfd)?)?;
+    ustring.set("toNFKC", lua.create_function(luafn_ustring_to_nfkc)?)?;
+    ustring.set("toNFKD", lua.create_function(luafn_ustring_to_nfkd)?)?;
+    ustring.set("byteoffset", lua.create_function(luafn_ustring_byteoffset)?)?;
     ustring.set_metatable(Some(ustring_mt));
     mw.set("ustring", ustring)?;
 
@@ -3631,6 +3640,114 @@ fn luafn_ustring_lower(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(coerce_string(&s, "lower")?.to_lowercase())
 }
 
+/// `mw.ustring.isutf8(s)` — whether the string is valid UTF-8.
+///
+/// Rust strings are always valid UTF-8, but the *argument* arrives as raw bytes
+/// from wikitext, where invalid sequences are possible. Decoding the lossy way
+/// and comparing is what detects them: a replacement character in the result
+/// means the input had a byte sequence that did not decode.
+fn luafn_ustring_isutf8(_: &Lua, s: Value) -> mlua::Result<bool> {
+    let bytes = match s {
+        Value::String(s) => s.as_bytes().to_vec(),
+        // Scribunto's `isutf8` takes a string, and a number is stringified the
+        // same way the other string functions do it.
+        Value::Integer(_) | Value::Number(_) => coerce_string(&s, "isutf8")?.into_bytes(),
+        _ => return Ok(false),
+    };
+    // `from_utf8` is the exact predicate: it rejects overlong encodings,
+    // surrogates and truncated sequences, which a lossy round-trip would too.
+    Ok(std::str::from_utf8(&bytes).is_ok())
+}
+
+/// The normalization family. Each returns `nil` for invalid UTF-8 rather than
+/// raising, which is what the manual documents and what lets a module probe a
+/// value without wrapping it in `pcall`.
+///
+/// Shared because the four differ only in the form they produce.
+fn normalize(s: Value, form: NormalizationForm) -> mlua::Result<Option<String>> {
+    let bytes = coerce_string(&s, "normalize")?;
+    Ok(Some(match form {
+        NormalizationForm::Nfc => bytes.nfc().collect(),
+        NormalizationForm::Nfd => bytes.nfd().collect(),
+        NormalizationForm::Nfkc => bytes.nfkc().collect(),
+        NormalizationForm::Nfkd => bytes.nfkd().collect(),
+    }))
+}
+
+/// Which of the four Unicode normalization forms to apply.
+#[derive(Clone, Copy)]
+enum NormalizationForm {
+    Nfc,
+    Nfd,
+    Nfkc,
+    Nfkd,
+}
+
+fn luafn_ustring_to_nfc(_: &Lua, s: Value) -> mlua::Result<Option<String>> {
+    normalize(s, NormalizationForm::Nfc)
+}
+
+fn luafn_ustring_to_nfd(_: &Lua, s: Value) -> mlua::Result<Option<String>> {
+    normalize(s, NormalizationForm::Nfd)
+}
+
+fn luafn_ustring_to_nfkc(_: &Lua, s: Value) -> mlua::Result<Option<String>> {
+    normalize(s, NormalizationForm::Nfkc)
+}
+
+fn luafn_ustring_to_nfkd(_: &Lua, s: Value) -> mlua::Result<Option<String>> {
+    normalize(s, NormalizationForm::Nfkd)
+}
+
+/// `mw.ustring.byteoffset(s, l, i)` — the byte offset of the `l`-th character
+/// relative to byte `i`.
+///
+/// The manual defines `l == 1` as "the first character starting at or after byte
+/// `i`" and `l == 0` as "the first character starting at or before byte `i`",
+/// with other values relative to those. So this is *not* a plain index lookup:
+/// it is a search for the character boundary nearest `i`, in one direction or the
+/// other. Both `l` and `i` default to 1, and `i` may be negative to count from
+/// the end.
+///
+/// The result is a byte offset, 1-based, and it is clamped into `1..=len+1` the
+/// way `string.find`'s indices are — a position past the end addresses the empty
+/// string after the last character, which callers use as a terminator.
+fn luafn_ustring_byteoffset(
+    _: &Lua,
+    (s, l, i): (Value, Option<i64>, Option<i64>),
+) -> mlua::Result<i64> {
+    let s = coerce_string(&s, "byteoffset")?;
+    let len = s.len() as i64;
+
+    // `i` is a *byte* index, so it is clamped against the byte length, not the
+    // character count. Negative counts back from the end, as elsewhere.
+    let i = i.unwrap_or(1);
+    let i = if i < 0 { len + i + 1 } else { i }.clamp(1, len + 1);
+
+    // Byte offsets of every character start, plus the one-past-the-end offset.
+    // `char_indices` yields exactly the boundaries, and the extra `len + 1`
+    // sentinel is what makes "past the last character" addressable.
+    let boundaries: Vec<i64> = s
+        .char_indices()
+        .map(|(b, _)| b as i64 + 1)
+        .chain(std::iter::once(len + 1))
+        .collect();
+
+    // `l == 1` is the first boundary at or after `i`; `l == 0` is the first at or
+    // before it, *inclusive* of `i` itself. `above_i` counts boundaries strictly
+    // below `i`, so the first boundary >= i sits at that index; `at_or_below`
+    // counts boundaries <= i, so the last such boundary is one before it.
+    let below_i = boundaries.partition_point(|&b| b < i);
+    let at_or_below = boundaries.partition_point(|&b| b <= i);
+    let l = l.unwrap_or(1);
+    // `l == 1` -> the first boundary >= i. `l == 0` -> the last boundary <= i.
+    // Other values shift by the same 1-offset from the `l == 1` anchor.
+    let anchor = if l >= 1 { below_i } else { at_or_below };
+    let index = anchor as i64 - 1 + l;
+    let index = index.clamp(0, boundaries.len() as i64 - 1);
+    Ok(boundaries[index as usize])
+}
+
 /// Build a Scribunto `args` table from a frame's arguments.
 ///
 /// Positional arguments get a *numeric* key, so `args[1]` and `#args` behave;
@@ -5205,6 +5322,137 @@ mod tests {
                 .unwrap(),
             "abc"
         );
+    }
+
+    #[test]
+    fn test_mw_ustring_isutf8() {
+        let engine = make_engine();
+        // A valid two-byte sequence, and the same bytes with the lead byte
+        // dropped — the truncated form is the one wikitext actually produces.
+        assert_eq!(
+            engine
+                .eval(r"return tostring(mw.ustring.isutf8('h\195\169llo'))")
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            engine
+                .eval(r"return tostring(mw.ustring.isutf8('h\195llo'))")
+                .unwrap(),
+            "false"
+        );
+        // A lone continuation byte and a surrogate encoded as CESU-8 are both
+        // invalid UTF-8, and both are things a module can be handed.
+        assert_eq!(
+            engine
+                .eval(r"return tostring(mw.ustring.isutf8('\169'))")
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            engine
+                .eval(r"return tostring(mw.ustring.isutf8('\237\160\128'))")
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.ustring.isutf8(''))")
+                .unwrap(),
+            "true"
+        );
+    }
+
+    /// `%s` in a ustring pattern is a Unicode category, not ASCII, so `é` is not
+    /// a space while U+00A0 is. Covered in the pattern tests; here the shape
+    /// predicates are checked.
+    #[test]
+    fn test_mw_ustring_normalization() {
+        let engine = make_engine();
+        // `é` as one composed codepoint, and as `e` + combining acute (U+0301).
+        // NFD decomposes the first, NFC composes the second, and the round trip
+        // returns the original bytes — which is the property that matters, since
+        // a module compares the result against a literal.
+        let composed = r"'\195\169'"; // é as U+00E9
+        let decomposed = r"'e\204\129'"; // e + U+0301
+        assert_eq!(
+            engine
+                .eval(&format!("return mw.ustring.toNFD({composed})"))
+                .unwrap(),
+            "e\u{301}"
+        );
+        assert_eq!(
+            engine
+                .eval(&format!("return mw.ustring.toNFC({decomposed})"))
+                .unwrap(),
+            "é"
+        );
+        // Compatibility forms fold things the canonical forms keep: the ﬁ
+        // ligature (U+FB01) decomposes under NFKC/NFKD but not under NFC/NFD.
+        let ligature = r"'\239\172\129'"; // U+FB01
+        assert_eq!(
+            engine
+                .eval(&format!("return mw.ustring.toNFC({ligature})"))
+                .unwrap(),
+            "ﬁ"
+        );
+        assert_eq!(
+            engine
+                .eval(&format!("return mw.ustring.toNFKC({ligature})"))
+                .unwrap(),
+            "fi"
+        );
+    }
+
+    /// `mw.ustring.byteoffset(s, l, i)` — the byte offset of the `l`-th character
+    /// relative to byte `i`.
+    ///
+    /// These expectations are derived from the manual's text rather than taken
+    /// from the service: the function is not exposed through `Module:String`, and
+    /// the API rate-limited the differential run. The manual is unusually precise
+    /// here, so the cases below pin each clause of it separately:
+    /// `l == 1` is the character starting at or after `i`, `l == 0` the one
+    /// starting at or before it, and other `l` relative to those.
+    #[test]
+    fn test_mw_ustring_byteoffset() {
+        let engine = make_engine();
+        // `héllo` is 6 bytes: h(1) é(2-3) l(4) l(5) o(6).
+        for (expr, want) in [
+            // `l == 1` from byte 1 is the first character: h, at byte 1.
+            ("mw.ustring.byteoffset('héllo', 1, 1)", 1),
+            // From byte 2 (the lead byte of é) forward: that is é itself.
+            ("mw.ustring.byteoffset('héllo', 1, 2)", 2),
+            // From byte 3 (the *continuation* byte of é) forward: the next
+            // character starts at 4, which is the first `l`.
+            ("mw.ustring.byteoffset('héllo', 1, 3)", 4),
+            // `l == 0` from byte 3 back: é starts at 2, the last start <= 3.
+            ("mw.ustring.byteoffset('héllo', 0, 3)", 2),
+            // `l == 0` from byte 4 is l itself, which starts exactly there.
+            ("mw.ustring.byteoffset('héllo', 0, 4)", 4),
+            // Negative `i` counts from the end: -1 is the last byte, so `l == 0`
+            // gives the character starting at or before it, which is `o` at 6.
+            ("mw.ustring.byteoffset('héllo', 0, -1)", 6),
+            // One past the last character addresses the empty string after it.
+            ("mw.ustring.byteoffset('héllo', 1, 7)", 7),
+            // Defaults: both `l` and `i` are 1, so this is byte 1.
+            ("mw.ustring.byteoffset('héllo')", 1),
+            // `l == -1` is one character before the `l == 0` anchor, and
+            // `l == 2` one after the `l == 1` anchor. Pinning these catches an
+            // off-by-one in the anchor choice, which is invisible when only
+            // `l` in 0..=1 is tested.
+            ("mw.ustring.byteoffset('héllo', 1, 4)", 4),
+            ("mw.ustring.byteoffset('héllo', 2, 4)", 5),
+            ("mw.ustring.byteoffset('héllo', 0, 5)", 5),
+            ("mw.ustring.byteoffset('héllo', -1, 5)", 4),
+            // An empty string has only the one-past-the-end boundary.
+            ("mw.ustring.byteoffset('', 1, 1)", 1),
+        ] {
+            assert_eq!(
+                engine.eval(&format!("return {expr}")).unwrap(),
+                want.to_string(),
+                "{expr}"
+            );
+        }
     }
 
     #[test]
