@@ -321,7 +321,18 @@ pub fn run_once(
 
     let args = call.frame_args();
     match engine.execute_in(&entry, &title, &call.function, &args, answers) {
-        Ok(out) => Ok(Outcome::Done(out)),
+        // A successful run can still have wanted a page it did not have: a module
+        // that wraps the load in `pcall` swallows the error, so the record has to
+        // be consulted here too. `Module:Music chart` does exactly that
+        // (`pcall(mw.loadJsonData, …)`) and substitutes a red error span, so
+        // without this arm the render "succeeds" with the data missing and the
+        // retry never happens.
+        Ok(out) => {
+            if let Some(missing) = engine.take_missing_modules().into_iter().next() {
+                return Ok(Outcome::MissingModule(missing));
+            }
+            Ok(Outcome::Done(out))
+        }
         Err(RustoidError::Lua(msg)) => {
             // A module the run could not find, whether or not the failure escaped
             // a `pcall` around it. Reported before the deferred check because a

@@ -968,6 +968,9 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     let loading = lua.create_table().map_err(lua_err)?;
 
     let modules = ctx.modules.clone();
+    // A second handle on the module sources: `require` takes the first by move,
+    // and `mw.loadJsonData` needs to look up data pages in the same map.
+    let modules_for_json = modules.clone();
     let require = lua
         .create_function(move |lua, name: Value| {
             let title = match name {
@@ -1041,6 +1044,60 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     // `mw.loadData(name)` — a data module's table, read once. Scribunto marks the
     // result read-only; sharing the same value as `require` is enough here.
     let mw: Table = lua.globals().get("mw").map_err(lua_err)?;
+    // `mw.loadJsonData(page)` — a data page's JSON, parsed to a table.
+    //
+    // The manual: "the same as `mw.loadData()` above, except it loads data from
+    // JSON pages rather than Lua tables", and "it throws an error if the page
+    // does not exist or if it is empty". Because Lua cannot fetch, a page that
+    // was not preloaded is reported the same way a missing module is, so the
+    // caller's retry loop fetches it and re-runs — which is what lets
+    // `Module:Music chart` reach `Module:Music chart/data`.
+    mw.set(
+        "loadJsonData",
+        lua.create_function(move |lua, name: Value| {
+            let title = match &name {
+                Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "mw.loadJsonData expects a page name string, got a {}",
+                        other.type_name()
+                    )));
+                }
+            };
+            let Some(source) = lookup_module(&modules_for_json, &title) else {
+                // Same out-of-band record as `require`, so the name survives a
+                // `pcall` and the retry loop can act on it.
+                if let Ok(missing) = lua.named_registry_value::<Table>(MISSING_MODULES) {
+                    let len = missing.raw_len();
+                    missing.raw_set(len + 1, title.clone())?;
+                }
+                return Err(mlua::Error::runtime(format!(
+                    "module {title} was not preloaded"
+                )));
+            };
+            // An empty page is an error rather than an empty table, per the
+            // manual, so a module that guards on the result sees the failure.
+            if source.trim().is_empty() {
+                return Err(mlua::Error::runtime(format!(
+                    "mw.loadJsonData: page {title} is empty"
+                )));
+            }
+            let parsed: serde_json::Value = serde_json::from_str(source).map_err(|e| {
+                mlua::Error::runtime(format!("mw.loadJsonData: {title} is not valid JSON: {e}"))
+            })?;
+            // "The JSON content must be an array or object", so a bare scalar
+            // is rejected rather than silently wrapped.
+            if !parsed.is_array() && !parsed.is_object() {
+                return Err(mlua::Error::runtime(format!(
+                    "mw.loadJsonData: {title} must contain an array or object"
+                )));
+            }
+            json_to_lua(lua, &parsed).map_err(|e| mlua::Error::runtime(e.to_string()))
+        })
+        .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
+
     let require_fn: Function = lua.globals().get("require").map_err(lua_err)?;
     mw.set(
         "loadData",
@@ -1210,6 +1267,12 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     text.set("encode", lua.create_function(luafn_text_encode)?)?;
     text.set("decode", lua.create_function(luafn_text_decode)?)?;
     text.set("trim", lua.create_function(luafn_text_trim)?)?;
+    // `mw.text.jsonDecode(s, flags)` — the JSON bridge, over the host's parser.
+    // The two documented flags are exposed as the constants modules pass, since
+    // a module writes `mw.text.JSON_PRESERVE_KEYS` rather than a bare number.
+    text.set("JSON_PRESERVE_KEYS", JSON_PRESERVE_KEYS)?;
+    text.set("JSON_TRY_FIXING", JSON_TRY_FIXING)?;
+    text.set("jsonDecode", lua.create_function(luafn_text_json_decode)?)?;
     // `mw.text.split` and `mw.text.gsplit` are written in `LUA_STDLIB_EXTRAS`,
     // over the literal-split primitive below, because the pattern form needs
     // `mw.ustring.find` and the pattern dialect belongs in one place.
@@ -4039,6 +4102,129 @@ fn push_capture(
         None => out.push_back(Value::Nil),
     }
     Ok(())
+}
+
+/// `mw.text.JSON_PRESERVE_KEYS` — keep JSON's zero-based array indices.
+///
+/// The value is Scribunto's own bit flag; modules pass the constant rather than a
+/// literal, so the number only has to round-trip through `+`.
+const JSON_PRESERVE_KEYS: i64 = 1;
+
+/// `mw.text.JSON_TRY_FIXING` — permit a terminal comma in arrays and objects.
+const JSON_TRY_FIXING: i64 = 2;
+
+/// `mw.text.jsonDecode(s, flags)` — decode a JSON string to a table.
+///
+/// Two details are observable and are reproduced rather than approximated:
+///
+/// - **Array indices.** JSON arrays are zero-based and Lua's are one-based, so
+///   indices shift by one by default; `JSON_PRESERVE_KEYS` suppresses that.
+/// - **Null values.** A JSON object drops keys whose value is null, and an array
+///   containing null is not a Lua sequence. Both fall out of mapping null to
+///   nil, which is why no special case is needed for the object case — a `nil`
+///   value assigned to a table key simply leaves the key absent.
+///
+/// `JSON_TRY_FIXING` relaxes the terminal-comma rule. Rather than a lenient
+/// parser, a trailing comma before a closing bracket is removed textually, which
+/// is the one relaxation the flag documents.
+fn luafn_text_json_decode(lua: &Lua, (s, flags): (Value, Option<i64>)) -> mlua::Result<Value> {
+    let s = coerce_string(&s, "jsonDecode")?;
+    let flags = flags.unwrap_or(0);
+    let preserve_keys = flags & JSON_PRESERVE_KEYS != 0;
+    let text = if flags & JSON_TRY_FIXING != 0 {
+        strip_trailing_commas(&s)
+    } else {
+        s
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| mlua::Error::runtime(format!("mw.text.jsonDecode: {e}")))?;
+    json_to_lua_flagged(lua, &parsed, preserve_keys)
+        .map_err(|e| mlua::Error::runtime(e.to_string()))
+}
+
+/// Remove commas that sit immediately before a closing `]` or `}`.
+///
+/// This is what `JSON_TRY_FIXING` documents ("no terminal comma in arrays or
+/// objects"), and doing it textually keeps it honest: it cannot accidentally
+/// accept anything else that strict JSON rejects. Quotes are tracked so a comma
+/// inside a string is left alone.
+fn strip_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut pending_comma = false;
+    for c in s.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                if pending_comma {
+                    out.push(',');
+                    pending_comma = false;
+                }
+                in_string = true;
+                out.push(c);
+            }
+            ',' => pending_comma = true,
+            ']' | '}' => {
+                // The pending comma is dropped; this is the fix-up.
+                pending_comma = false;
+                out.push(c);
+            }
+            _ => {
+                if pending_comma {
+                    out.push(',');
+                    pending_comma = false;
+                }
+                out.push(c);
+            }
+        }
+    }
+    if pending_comma {
+        out.push(',');
+    }
+    out
+}
+
+/// `json_to_lua` with the optional key-preserving array rule.
+///
+/// Kept separate from the Wikidata path rather than adding a flag there: entity
+/// data is always read with one-based arrays, so threading a switch through it
+/// would invite the two callers to diverge for no reason.
+fn json_to_lua_flagged(lua: &Lua, value: &serde_json::Value, preserve_keys: bool) -> Result<Value> {
+    let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+    match value {
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table().map_err(lua_err)?;
+            for (i, item) in items.iter().enumerate() {
+                // JSON is zero-based; Lua's default is one-based.
+                let index = if preserve_keys { i } else { i + 1 };
+                table
+                    .set(index, json_to_lua_flagged(lua, item, preserve_keys)?)
+                    .map_err(lua_err)?;
+            }
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(map) => {
+            let table = lua.create_table().map_err(lua_err)?;
+            for (k, v) in map {
+                table
+                    .set(k.as_str(), json_to_lua_flagged(lua, v, preserve_keys)?)
+                    .map_err(lua_err)?;
+            }
+            Ok(Value::Table(table))
+        }
+        other => json_to_lua(lua, other),
+    }
 }
 
 /// Build a Scribunto `args` table from a frame's arguments.

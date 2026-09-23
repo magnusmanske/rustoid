@@ -226,6 +226,147 @@ async fn mw_language_content_language_is_available() {
     assert!(html.contains("en/"), "got: {html}");
 }
 
+/// `mw.text.jsonDecode` renumbers JSON's zero-based arrays to one-based, drops
+/// null-valued object keys, and honours its two documented flags.
+///
+/// Each of these is a documented limitation rather than a quirk, so each is
+/// asserted: a decoder that kept zero-based indices would silently shift every
+/// array read by one.
+#[tokio::test]
+async fn json_decode_follows_the_documented_rules() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local a = mw.text.jsonDecode('["x","y"]')
+            -- PRESERVE_KEYS keeps the zero-based index instead.
+            local b = mw.text.jsonDecode('["x","y"]', mw.text.JSON_PRESERVE_KEYS)
+            -- A null value drops the object key entirely.
+            local o = mw.text.jsonDecode('{"keep":1,"drop":null}')
+            -- TRY_FIXING relaxes the terminal-comma rule; strict rejects it.
+            local strict = pcall(mw.text.jsonDecode, '[1,2,]')
+            local fixed = mw.text.jsonDecode('[1,2,]', mw.text.JSON_TRY_FIXING)
+            return table.concat({
+                tostring(#a), a[1], tostring(a[0]),
+                tostring(b[0]), tostring(b[1]),
+                tostring(o.keep), tostring(o.drop == nil),
+                tostring(strict), tostring(#fixed),
+            }, '|')
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Json", module)], "{{#invoke:Json|main}}").await;
+    assert!(
+        text_only(&html).contains("2|x|nil|x|y|1|true|false|2"),
+        "got: {html}"
+    );
+}
+
+/// `mw.loadJsonData(page)` parses a JSON page into a table, and a page that was
+/// not preloaded is reported so the retry loop can fetch it.
+///
+/// `Module:Music chart` reaches its data through it
+/// (`Module:Music chart/%s.json`), so without the implementation the module stops
+/// at "attempt to call field 'loadJsonData' (a nil value)".
+///
+/// The missing-page half is asserted through the *outcome* rather than through a
+/// `pcall`, because the signal is deliberately not a plain error: a module may
+/// catch it and substitute a fallback, and the fetch must still happen. See
+/// `run_once`'s success arm.
+#[tokio::test]
+async fn load_json_data_parses_pages() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            local d = mw.loadJsonData('Module:Data/album.json')
+            local arr = mw.loadJsonData('Module:Data/list.json')
+            return table.concat({
+                type(d),
+                -- The two-level shape the real data pages use.
+                d.Argentina.Argentina.chart,
+                -- `_`-prefixed keys must survive: the module skips them.
+                tostring(d._schema ~= nil),
+                tostring(#arr),
+                tostring(arr[1]),
+            }, '|')
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Probe", module);
+    source.add_module(
+        "Module:Data/album.json",
+        r#"{"_schema": "x", "Argentina": {"Argentina": {"chart": "Argentine Albums"}}}"#,
+    );
+    // A JSON object, not an array, so `#` is 0 — the same shape the real pages
+    // have alongside their `_schema` key.
+    source.add_module("Module:Data/list.json", r#"{"a": 1}"#);
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{#invoke:Probe|main}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    let body = text_only(&html);
+    assert!(
+        body.contains("table|Argentine Albums|true|0"),
+        "got: {body}"
+    );
+}
+
+/// A JSON page that is empty or not JSON raises, and the value is a table rather
+/// than a string, so a module indexing it does not silently get characters.
+#[tokio::test]
+async fn load_json_data_rejects_empty_and_invalid_pages() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            -- `pcall` returns false for each; the *reason* is not asserted here
+            -- because rustoid hands the error back as an opaque value rather
+            -- than as a string. That is a separate divergence (the service
+            -- surfaces the message text) and is noted in ONLINE-PARITY.
+            local empty = pcall(mw.loadJsonData, 'Module:Data/empty.json')
+            local bad = pcall(mw.loadJsonData, 'Module:Data/bad.json')
+            local scalar = pcall(mw.loadJsonData, 'Module:Data/scalar.json')
+            -- The number is rejected too: Scribunto wants a string page name.
+            local num = pcall(mw.loadJsonData, 42)
+            -- And each failure still names the function rather than reporting a
+            -- bare conversion error, which is what distinguishes a working
+            -- implementation from a missing one.
+            local _, why = pcall(mw.loadJsonData, 'Module:Data/bad.json')
+            return table.concat({
+                tostring(empty), tostring(bad), tostring(scalar), tostring(num),
+                tostring(tostring(why):find('loadJsonData') ~= nil),
+            }, '|')
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Probe", module);
+    source.add_module("Module:Data/empty.json", "   \n  ");
+    source.add_module("Module:Data/bad.json", "{not json");
+    source.add_module("Module:Data/scalar.json", "42");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{#invoke:Probe|main}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    // Every one of the four is rejected, and the failure names the function —
+    // which a missing implementation would not.
+    assert!(
+        text_only(&html).contains("false|false|false|false|true"),
+        "got: {html}"
+    );
+}
+
 /// Lua's string functions coerce numbers, and modules rely on it: a numeric
 /// argument must not fail, but a missing one must name the function rather than
 /// report a bare conversion error.
