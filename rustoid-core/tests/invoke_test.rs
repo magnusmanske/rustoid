@@ -602,19 +602,49 @@ async fn get_parent_exposes_the_calling_templates_args() {
     assert!(body.contains("parent said bob/first"), "got: {body}");
 }
 
-/// A direct `{{#invoke:…}}` from the page has no parent frame, and Scribunto
-/// returns nil for `getParent()` there.
+/// A direct `{{#invoke:}}` still has a parent frame — the calling *page*'s frame.
+///
+/// This test previously asserted the opposite, and the expectation was wrong.
+/// The manual is explicit that `frame:getParent()` "returns the frame for the
+/// page that called `{{#invoke:}}` ... regardless of whether this function is
+/// called directly from the main module invoked by `{{#invoke:}}` or from library
+/// module code accessed via `require()`", and that only the debug console and
+/// `mw.loadData` see nil.
+///
+/// The distinction is load-bearing rather than pedantic:
+/// `Module:Check for unknown parameters` opens with `frame:getParent().args`, so
+/// returning nil made it fail on every direct invocation.
 #[tokio::test]
-async fn a_direct_invoke_has_no_parent() {
+async fn a_direct_invoke_still_has_a_parent_frame() {
     let module = r#"
         local p = {}
         function p.main(frame)
-            return tostring(frame:getParent())
+            local parent = frame:getParent()
+            -- The parent is the page's frame: named, with no arguments of its
+            -- own, and with no grandparent — Scribunto has no access to one.
+            return tostring(parent == nil)
+                .. '|' .. tostring(#parent.args)
+                .. '|' .. parent:getTitle()
+                .. '|' .. tostring(parent:getParent() == nil)
         end
         return p
     "#;
-    let html = expand(&[("Module:NoParent", module)], "{{#invoke:NoParent|main}}").await;
-    assert!(text_only(&html).contains("nil"), "got: {html}");
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:NoParent", module);
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{#invoke:NoParent|main}}",
+            &source,
+            &ParserOptions::for_page("Some Article"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        text_only(&html).contains("false|0|Some Article|true"),
+        "got: {html}"
+    );
 }
 
 /// `ustring.sub` must clamp every index combination without panicking.

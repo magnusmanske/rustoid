@@ -3146,14 +3146,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // always in the Template namespace.
         let parent = frame_args_to_lua(&parent_args);
         let parent_title = frame.title().full_text();
-        let inside_template = self
-            .config
-            .canonical_namespace_id("Template")
-            .is_some_and(|ns| frame.title().namespace_id == ns);
+        // `frame:getParent()` is never nil here, whatever the namespace. The
+        // manual is explicit: it "returns the frame for the page that called
+        // `{{#invoke:}}` ... regardless of whether this function is called
+        // directly from the main module invoked by `{{#invoke:}}` or from library
+        // module code accessed via `require()`", and only the debug console and
+        // `mw.loadData` see nil.
+        //
+        // Keying this on the Template namespace was wrong in a way that looked
+        // right: a call *inside* a template did get a parent, so the common case
+        // passed, while a direct `{{#invoke:}}` from an article returned nil and
+        // `Module:Check for unknown parameters` — which opens with
+        // `frame:getParent().args` — failed on it.
         let ctx = crate::lua::engine::FrameContext {
             parent_args: parent,
             parent_title: Some(parent_title),
-            has_parent: inside_template,
+            has_parent: true,
             page_source: _page_source.to_string(),
             page_title: Some(self.page_title.borrow().clone()),
             // Seed the frame with every title already resolved this render, so
