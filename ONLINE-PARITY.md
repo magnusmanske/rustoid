@@ -2894,6 +2894,85 @@ invisible from inside the test suite. It is fixed in both, with a test that
 asserts the negative case too — a main-namespace title that merely *spells*
 `Module:Foo` must still miss, or every article would resolve to a module.
 
+## The smallest page is the best instrument
+
+The 48-page corpus cannot rank its own failures. `0/46` reads the same for a page
+one byte off and a page that is entirely wrong, and every page diverges in the
+same place — the first template — so the headline is one bug counted 48 times
+with the second, third and fourth bugs invisible behind it. The cached page
+sizes make the range concrete: `Cristiano Ronaldo` is 3,126 KB and
+`Help:Introduction` is 23.7 KB, and the smaller one is a *different kind* of
+target as well as a smaller one.
+
+`Help:Introduction` is 4.2 KB of wikitext and 24 KB of output, with **25
+templates and zero `#invoke` and zero `<ref>`**. So whatever it fails on is core
+tokenizer/transclusion/serializer machinery rather than a missing extension, and
+its whole diff is readable. It is already in the corpus. The natural next target
+is therefore the corpus entry with the smallest parsoid output, which is why the
+failure list is now ordered that way and prints the size.
+
+### Two instruments were wrong, and both would have produced a false finding
+
+Worth recording because both looked like results rather than like mistakes:
+
+- **`RUSTOID_TRACE` is not the variable.** The fetch trace is gated on
+  `RUSTOID_TRACE_FETCH`, so a run with the wrong name printed no request lines
+  and appeared to prove that the expander never asks for anything. It asks for
+  plenty. The check that caught it was asking whether the trace worked *at all*
+  on a page known to fetch — cheap, and the only thing that separated "no
+  requests" from "no tracing".
+- **Title lookups are case-sensitive in a way the wikitext is not.** Comparing a
+  page's `{{intro to single}}` against the cache reported six templates missing,
+  because MediaWiki upper-cases the first letter and the cache holds
+  `Template:Intro to single`. Re-checked case-insensitively, **nothing is
+  missing**: the page's whole closure is cached.
+
+The second one mattered. It was about to become the conclusion "the corpus is
+measuring cache coverage, not engine defects" — a strategic claim, drawn from a
+faulty check, that would have redirected the work. The correct conclusion is the
+opposite and stronger: a 23 KB page with a *complete* cache still fails, so the
+bug is in rustoid.
+
+### What it actually fails on: an unexpanded template token leaks into the output
+
+Sixteen times on this one page, rustoid emits an element that Parsoid never
+emits:
+
+```
+parsoid: <meta typeof="mw:Includes/NoInclude" id="mwAw"/>
+rustoid: <template ="" id="mwAw"></template>
+
+parsoid: (the expanded Template:Clickable button)
+rustoid: <template Clickable button="" ="Editing " style="width:11em; …" id="mwOQ">
+```
+
+The ids match, so it is the same node in both — the element *kind* is wrong. The
+cause is visible in the tokenizer: a template call becomes a
+`SelfclosingTagTk::new("template", …)`, an internal token that the expander is
+supposed to consume. When it reaches the serializer unconsumed, the DOM builder
+makes an element named `template` and the target and parameters are written as
+attributes — which is where `<template Large="" 1="…">` comes from.
+
+The tokenizer already documents this shape as a *bug*: `{{ {{T}} }}` used to
+become "a literal `<template T="">`". Here it happens for ordinary calls,
+including ones whose templates are cached and whose names are static literals,
+so the trigger is not a dynamic name. The two `#invoke`-free facts above are what
+makes this tractable: no Lua is involved, and the reduction needs only
+wikitext.
+
+Not diagnosed further this session. What it needs next is a way to feed *chosen*
+wikitext through the real comparison path, which is the instrument this finding
+argues for:
+
+- The harness compares `page:<title>` against `html:<title>` from the cache, and
+  the live transform endpoint renders arbitrary wikitext for a chosen title. So
+  hand-writing those two cache entries for a scratch title gives arbitrary
+  reductions through the real comparison path — including the `data-mw`,
+  encapsulation and node-id stages — which a unit test over the tree builder does
+  not cover.
+- That is the same trick that already pays off elsewhere: the Owidslider and
+  Piechart payloads were checked against Parsoid HTML that was already on disk.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
