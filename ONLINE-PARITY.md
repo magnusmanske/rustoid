@@ -2357,6 +2357,66 @@ differs in what `pairs` yields there, and the module itself looks unable to
 survive a non-matching key — which makes this a question about the argument table
 rather than about `tonumber`.
 
+## Returning one `nil`, not no values
+
+`Module:Subject bar:18` reported `bad argument #1 to 'tonumber' (value expected)` on
+six pages. The line is
+
+```lua
+local ord = tonumber(mw.ustring.match(k, pattern))
+```
+
+and the cause was **arity, not a missing match**. A failed `mw.ustring.match`
+returned *zero* values, so `tonumber` was called with no argument at all.
+
+Lua's own pattern functions return exactly one nil on a miss
+(`lstrlib.c`: `lua_pushnil(L); return 1;`), and the difference is observable
+because a function given no argument behaves differently from one given an
+explicit nil: `tonumber()` raises "value expected" where `tonumber(nil)` returns
+nil. `find`, `match` and the anchored-captures primitive now all return one nil.
+
+The module was again fine and the runtime was wrong — its own `if ord then` guard
+is exactly the right code for a nil match, and the service renders the input
+cleanly.
+
+Two things were checked rather than assumed while tracing it, and both ruled out
+theory that looked plausible:
+
+- **`tonumber(nil)` returns nil; it does not raise.** Every form tested agrees
+  (`tonumber(nil)`, a nil variable, a function returning nil). Only `tonumber()`
+  with *no argument* raises, which is what made the arity the whole story rather
+  than a coercion gap.
+- **`select(2, x)` returning no values for a single-valued `x` is stock Lua**, not
+  a rustoid bug — confirmed against the `lua` binary, where
+  `select('#', select(2, one_nil()))` is 0. It was therefore rejected as evidence
+  twice, and an assertion built on it was rewritten rather than the engine being
+  "fixed" to match a wrong expectation.
+
+### Scoreboard
+
+```
+lua failures: 25 entries / 17 distinct  ->  19 entries / 16 distinct
+output: rustoid 171306922 bytes  ->  171099151 bytes (2.66x)
+```
+
+`Module:Subject bar` (6 pages) left the table. One entry entered it
+(`Module:Wikt-lang:213`, 1 page), and it is not caused by this change: it was
+already present in an earlier run's table. `Wikt-lang:213` is
+`parent.args[1] and parent.args or frame.args` with `parent` nil, i.e. a
+`getParent()` question rather than a pattern one, and it is the next thing to
+look at after the remaining entries.
+
+The remaining entries are now mostly one or two pages each, and several are
+*missing data or API* rather than value differences:
+
+| entry | kind |
+|---|---|
+| `Module:Hatnote inline:16` `newChild` | missing `mw.html` method |
+| `Module:Music chart:1736` `loadJsonData` | missing API |
+| `Module:Location map:620` `data/Pacific Ocean` | module not fetched |
+| `Module:Multiple image:177` nil arithmetic | value difference |
+| `Module:Math:100` `random` empty interval | API behaviour |
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
