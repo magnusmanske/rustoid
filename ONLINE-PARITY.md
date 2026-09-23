@@ -3253,3 +3253,13 @@ next rung is `Quicksilver (film)` at 35 KB.
 The three fixes each removed a *class*, not an instance. That is the difference
 worth watching: the SPTAG leak was one bug counted 16 times on the smallest page,
 and the reduction that found it was `{{#ifeq:1|1|{{Large|1=x}}|z}}`, not the page.
+
+**And it needs `data-mw.parts` merging first.** PHP's `TemplateEncapsulator`
+walks the tokens it is about to wrap and *collects* the `data-mw` of any nested
+transclusion wrappers into the outer `parts` array, removing the inner markers —
+which is why the cached page has one wrapper whose `parts` holds two templates.
+rustoid writes only the outer template's own `TemplateInfo`, so there is nothing
+to absorb a nested transclusion's `data-mw`: un-wrapping the body *without*
+merging the parts would delete the nested templates' provenance rather than
+relocate it. The order is therefore: merge parts, then stop wrapping bodies. A
+refactor that fixes the span first would look like progress and lose data.
