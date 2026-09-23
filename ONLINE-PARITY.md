@@ -2756,6 +2756,106 @@ a run with room to bisect, not the tail of a session. It is the largest known
 remaining defect: it is on the path of every `Template:Pie chart`, and any
 template that guards a transclusion with `#if`.
 
+## Three defects found by fetching one missing module
+
+`Module:Location map/data/Pacific Ocean` was absent from the cache, and the
+corpus reported it as a hard error on `International Space Station`. One
+targeted API request and a hand-written index entry fixed that — the guard now
+makes an online fetch safe, and the module is small enough that fetching it was
+cheaper than reasoning about whether it could be avoided.
+
+But fetching it changed **nothing**: the error was still reported on the next
+run. That is the useful part of this section. The module was on disk and
+served, and the failure was the *module's own* message naming a page that
+existed — which is the kind of error that looks like a data gap and is not. The
+cause is in `Module:Location map`:
+
+```lua
+local moduletitle = mw.title.new('Module:Location map/data/' .. map)
+...
+elseif moduletitle.exists then
+    local mapData = mw.loadData('Module:Location map/data/' .. map)
+else
+    error('Unable to find the specified location map definition: … does not exist')
+```
+
+The name is built at runtime, so the static title scan cannot see it and the
+fact was never preloaded — so `exists` read **false** for a page that was in the
+cache. The module took its "does not exist" branch, `mw.loadData` was never
+reached, and the retry signal that `require`/`loadData` already raise never
+fired, because there was nothing to load.
+
+`exists` now distinguishes **unknown** from **absent**: a title the host was
+never asked about is recorded on its own channel and the retry loop preloads the
+fact and re-runs. The channel is separate from the missing-module one because
+the remedy differs — a module goes into the Lua registry, while this is only a
+fact about a page and may be in any namespace, so putting it in the registry
+would make `require` succeed with wikitext as the module body. A title that is
+fetched and *still* absent is recorded as unfetchable, so a genuine miss answers
+`false` on the next round instead of rounding forever.
+
+The page stopped erroring and became an ordinary *difference*, which is what
+made the next two defects visible. Both are on the shortest path a page takes:
+
+### `data-mw` written as invalid JSON
+
+The served output differed at byte 306, and the rustoid side read:
+
+```
+data-mw='{"parts":[{"template":{…}}],"parts":}'
+```
+
+A duplicate `parts` key with an empty value — the *second* `parts`, appended by
+`migrate_parts_json`, with the bracket it should have written through **removed**.
+It appeared 131 times on that one page, on the leading `Template:Short
+description` transclusion, and it is not a cosmetic difference: the attribute is
+unparseable JSON.
+
+The function edits the serialized `data-mw` textually rather than round-tripping
+it through `serde_json`, for a good reason — `serde_json` sorts an object's keys
+and `data-mw` is compared byte-for-byte, so a round trip would reorder every part
+of every link. The cost of that decision is that a wrong byte offset produces
+*something that is not JSON* instead of an error, and the empty-`parts` branch
+had exactly that: it derived the closing bracket's position from
+
+```rust
+let close = data_mw.len() - rest.trim_start().len() - 1;
+```
+
+where `rest` had already been trimmed twice, so the offset was short by however
+much whitespace had been trimmed. `{"parts":[]}` came out as
+`{"parts":,"TEXT"]}`. Both brackets are now *located* in the string rather than
+computed from lengths.
+
+The tests assert the property that was missing rather than the fixed bytes —
+every output parses as JSON, the entry lands at the end it was migrated to, and a
+repeat migration is a no-op — because for a textual edit "valid JSON" is the
+invariant, and a byte-level expectation would not have caught the original bug.
+The regression was verified to fail with the old arithmetic restored, reporting
+`invalid JSON {"parts":,"TEXT"]}`.
+
+Worth noting how it was found: not by reading the function, which looks
+reasonable, and not by the fixture suite, which has no test for the empty-
+`parts` case. It was found by diffing *output* against the served HTML, one
+page in, after the error in front of it was cleared.
+
+**Fixing it changed nothing, and that was the more useful finding.** The same
+`"parts":}` was still in the output afterwards, which proved the corruption had
+a *second* source. Rule it out by disabling the function entirely and counting
+the occurrences again: still 131, so `migrate_parts_json` was not involved at
+all in this case. A candidate fix that changes nothing is evidence, and the
+cheap experiment (comment the call out, count) was worth more than re-reading
+three call sites.
+
+The real source was `strip_data_mw_key`, which removes the `parts` entry from a
+`data-mw` envelope to splice another envelope's other keys onto it. It cut at
+the key's colon and searched *back* for a comma — and for the first key of an
+object there is no comma, so the value was removed and the key was left behind:
+`{"parts":[1,2]}` became `{"parts":}`. Two textual editors of the same
+serialized form, with the same class of defect, in two different files. That
+is the argument for the property-based assertion rather than a byte one: the
+invariant "this output is parseable JSON" would have caught both.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
