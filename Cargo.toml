@@ -20,7 +20,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
-mlua = { version = "0.10", features = ["lua54", "vendored"] }
+mlua = { version = "0.10", features = ["lua51", "vendored"] }
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 regex = "1"
