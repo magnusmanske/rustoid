@@ -53,6 +53,16 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
+    /// Whether this kind is a pinned comparison baseline.
+    ///
+    /// Only `Rendered` is: it is the Parsoid output the comparison is against,
+    /// and replacing it silently orphans the revision the corpus asked for. The
+    /// others are either inputs (which may legitimately be refreshed) or
+    /// re-fetchable auxiliaries.
+    pub fn is_rendered(self) -> bool {
+        matches!(self, Self::Rendered)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Page => "page",
@@ -242,13 +252,81 @@ impl WikiCache {
     /// on read) rather than a dangling entry.
     pub fn put(&mut self, kind: EntryKind, title: &str, body: &str, meta: EntryMeta) -> Result<()> {
         let key = Self::key(kind, title);
-        let path = self.body_path(&key);
+        self.put_at_key(&key, body, meta)
+    }
+
+    /// Store a body under an already-built key, refusing to overwrite a pinned
+    /// comparison baseline (see [`would_orphan_baseline`](Self::would_orphan_baseline)).
+    ///
+    /// The refusal is a silent skip rather than an error: the caller is a fetch
+    /// path mid-parse, and aborting a page because a *replacement* was declined
+    /// would be a worse outcome than serving the pinned body it already had. The
+    /// skip is reported to stderr, because a corpus run that re-pins nothing looks
+    /// identical to one that fetched nothing.
+    fn put_at_key(&mut self, key: &str, body: &str, meta: EntryMeta) -> Result<()> {
+        if self.would_orphan_key(key, &meta) {
+            eprintln!(
+                "cache: keeping pinned {} (rev {:?}); refused to overwrite with rev {:?}",
+                key,
+                self.index.entries.get(key).and_then(|m| m.revid),
+                meta.revid
+            );
+            return Ok(());
+        }
+        let path = self.body_path(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
         }
         std::fs::write(&path, body).map_err(|e| io_err(&path, e))?;
-        self.index.entries.insert(key, meta);
+        self.index.entries.insert(key.to_string(), meta);
         Ok(())
+    }
+
+    /// Whether replacing this entry would orphan a *pinned* comparison baseline.
+    ///
+    /// The rendered (Parsoid) body is the thing the whole comparison is against,
+    /// and the corpus pins it to a specific revision. Overwriting it with a newer
+    /// revision is not a refresh — the pinned revision is then gone from the cache
+    /// and the page reports as skipped, because the pinned HTML is what the run
+    /// asked for and what it can no longer find. A full online corpus run does
+    /// this to every page it touches, silently.
+    ///
+    /// So a `Rendered` entry is only replaced when the incoming body is for the
+    /// *same* revision. Wikitext and auxiliary pages are not guarded: they are
+    /// re-fetchable and carry no pinned meaning of their own.
+    ///
+    /// A refresh that *intends* to re-pin goes through
+    /// [`remove`](Self::remove) first, which is what `--refresh` does.
+    pub fn would_orphan_baseline(&self, kind: EntryKind, title: &str, meta: &EntryMeta) -> bool {
+        self.would_orphan_key(&Self::key(kind, title), meta)
+    }
+
+    /// [`would_orphan_baseline`](Self::would_orphan_baseline) on a key that is
+    /// already built, so the guard can also sit *inside* the writer rather than
+    /// relying on every caller to consult it.
+    ///
+    /// An incoming body for a *replaced* wiki page says nothing about which
+    /// revision it is — [`EntryKind::Rendered`](EntryKind::Rendered) bodies are not
+    /// wikitext and carry no revision in the request — so the comparison is
+    /// against the revision the existing entry is pinned to. Only that revision's
+    /// disappearance is the damage being prevented, whatever the incoming body is
+    /// for.
+    fn would_orphan_key(&self, key: &str, meta: &EntryMeta) -> bool {
+        if !meta.kind.is_rendered() {
+            return false;
+        }
+        match self.index.entries.get(key) {
+            // Pinned to a revision the incoming body does not claim to be: a
+            // replacement orphans the pinned baseline.
+            Some(existing) => match existing.revid {
+                Some(have) => meta.revid != Some(have),
+                // A reindexed entry has no recorded revision; the body states its
+                // own, and the harness can match on that, so it is not treated as
+                // pinned.
+                None => false,
+            },
+            None => false,
+        }
     }
 
     /// Persist the manifest, merged with whatever is already on disk.
@@ -915,6 +993,195 @@ mod tests {
         let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
         assert_eq!(cache.reindex().unwrap(), 0);
         assert_eq!(cache.len(), 0);
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A pinned baseline can only be replaced by the same revision.
+    ///
+    /// This is the guard against the failure that cost a whole corpus: an online
+    /// run fetched each page's *wikitext* through a path that stored the wiki's
+    /// latest revision, and every `html:` entry was rewritten under it. The
+    /// pinned revisions were not recoverable and six pages could no longer be
+    /// compared at all.
+    #[test]
+    fn a_pinned_baseline_is_not_overwritten_by_another_revision() {
+        let root = temp_root("guard-pinned");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        cache
+            .put(
+                EntryKind::Rendered,
+                "Earth",
+                "<html>r1375</html>",
+                EntryMeta {
+                    kind: EntryKind::Rendered,
+                    title: "Earth".to_string(),
+                    revid: Some(1375983123),
+                    fetched_at: None,
+                },
+            )
+            .unwrap();
+
+        // An incoming body that does not claim the pinned revision — including one
+        // with no revision at all, which is what the damage actually looked like.
+        for revid in [None, Some(1376261019), Some(1376261019)] {
+            assert!(cache.would_orphan_baseline(
+                EntryKind::Rendered,
+                "Earth",
+                &EntryMeta {
+                    kind: EntryKind::Rendered,
+                    title: "Earth".to_string(),
+                    revid,
+                    fetched_at: None,
+                },
+            ));
+            cache
+                .put(
+                    EntryKind::Rendered,
+                    "Earth",
+                    "<html>r1376261019</html>",
+                    EntryMeta {
+                        kind: EntryKind::Rendered,
+                        title: "Earth".to_string(),
+                        revid,
+                        fetched_at: None,
+                    },
+                )
+                .unwrap();
+        }
+        let kept = cache.get(EntryKind::Rendered, "Earth").unwrap().unwrap();
+        assert_eq!(kept.body, "<html>r1375</html>");
+        assert_eq!(kept.meta.revid, Some(1375983123));
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// The guard is not a blanket refusal to write: the same revision is a
+    /// legitimate re-store, and wikitext is never guarded at all.
+    #[test]
+    fn the_guard_allows_a_same_revision_restore_and_any_wikitext() {
+        let root = temp_root("guard-allows");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        let rendered = |revid| EntryMeta {
+            kind: EntryKind::Rendered,
+            title: "Earth".to_string(),
+            revid,
+            fetched_at: None,
+        };
+        cache
+            .put(EntryKind::Rendered, "Earth", "old", rendered(Some(7)))
+            .unwrap();
+        assert!(!cache.would_orphan_baseline(EntryKind::Rendered, "Earth", &rendered(Some(7))));
+        cache
+            .put(EntryKind::Rendered, "Earth", "refreshed", rendered(Some(7)))
+            .unwrap();
+        assert_eq!(
+            cache
+                .get(EntryKind::Rendered, "Earth")
+                .unwrap()
+                .unwrap()
+                .body,
+            "refreshed"
+        );
+
+        // Wikitext is re-fetchable and carries no pinned meaning of its own, so a
+        // newer revision of a page or template *is* written — otherwise nothing
+        // would ever refresh.
+        cache
+            .put(
+                EntryKind::Page,
+                "Earth",
+                "old wt",
+                meta(EntryKind::Page, "Earth"),
+            )
+            .unwrap();
+        let mut newer = meta(EntryKind::Page, "Earth");
+        newer.revid = Some(43);
+        assert!(!cache.would_orphan_baseline(EntryKind::Page, "Earth", &newer));
+        cache
+            .put(EntryKind::Page, "Earth", "new wt", newer)
+            .unwrap();
+        assert_eq!(
+            cache.get(EntryKind::Page, "Earth").unwrap().unwrap().body,
+            "new wt"
+        );
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// An entry a `--reindex` recovered has no recorded revision, so it is not a
+    /// pin: refusing to write over it would make a reindexed cache unwritable.
+    #[test]
+    fn a_reindexed_entry_is_not_treated_as_pinned() {
+        let root = temp_root("guard-reindexed");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        cache
+            .put(
+                EntryKind::Rendered,
+                "Earth",
+                "<html>r1</html>",
+                EntryMeta {
+                    kind: EntryKind::Rendered,
+                    title: "Earth".to_string(),
+                    revid: None,
+                    fetched_at: None,
+                },
+            )
+            .unwrap();
+        let incoming = EntryMeta {
+            kind: EntryKind::Rendered,
+            title: "Earth".to_string(),
+            revid: Some(1),
+            fetched_at: None,
+        };
+        assert!(!cache.would_orphan_baseline(EntryKind::Rendered, "Earth", &incoming));
+        cache
+            .put(
+                EntryKind::Rendered,
+                "Earth",
+                "<html>r1 again</html>",
+                incoming,
+            )
+            .unwrap();
+        assert_eq!(
+            cache
+                .get(EntryKind::Rendered, "Earth")
+                .unwrap()
+                .unwrap()
+                .body,
+            "<html>r1 again</html>"
+        );
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// `--refresh` must still be able to re-pin, or the guard would prevent the
+    /// one way to deliberately move a baseline.
+    #[test]
+    fn removing_an_entry_lets_it_be_re_pinned() {
+        let root = temp_root("guard-repin");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        let rendered = |revid| EntryMeta {
+            kind: EntryKind::Rendered,
+            title: "Earth".to_string(),
+            revid,
+            fetched_at: None,
+        };
+        cache
+            .put(EntryKind::Rendered, "Earth", "old", rendered(Some(7)))
+            .unwrap();
+        assert!(cache.would_orphan_baseline(EntryKind::Rendered, "Earth", &rendered(Some(8))));
+
+        cache.remove(EntryKind::Rendered, "Earth").unwrap();
+        assert!(!cache.would_orphan_baseline(EntryKind::Rendered, "Earth", &rendered(Some(8))));
+        cache
+            .put(EntryKind::Rendered, "Earth", "new", rendered(Some(8)))
+            .unwrap();
+        assert_eq!(
+            cache
+                .get(EntryKind::Rendered, "Earth")
+                .unwrap()
+                .unwrap()
+                .meta
+                .revid,
+            Some(8)
+        );
         WikiCache::flush_all(&root).unwrap();
     }
 }

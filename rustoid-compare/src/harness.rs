@@ -216,6 +216,15 @@ impl CachedDataSource {
         if trace_enabled() {
             eprintln!("req {kind:?} {key} (sibling)");
         }
+        // The rendered HTML is a *rendering* of the wikitext, not wikitext, and it
+        // has no reader on this path: every caller wants a page's source. Fetching
+        // it here fetched the page as if it were a template, which is both wrong
+        // and destructive — the body landed under the article's own `html:` key and
+        // replaced the corpus's pinned baseline with the wiki's latest revision. A
+        // full online corpus run did exactly that to all 48 pages.
+        if kind.is_rendered() {
+            return Ok(None);
+        }
         // The guard is scoped to its own statement, and that is load-bearing rather
         // than stylistic. Written as `if let Some(hit) = wiki.cache.lock()?.get(..)?`,
         // the lock guard lives to the end of the `if let` block — so the `await`
