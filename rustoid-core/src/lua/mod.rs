@@ -7,4 +7,5 @@
 pub mod engine;
 pub mod invoke;
 pub mod language;
+pub mod ustring;
 pub mod wikibase;

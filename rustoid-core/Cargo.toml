@@ -29,6 +29,7 @@ tokio = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 ruwex = { workspace = true, optional = true }
 unicode-normalization.workspace = true
+unicode-properties = "0.1.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
