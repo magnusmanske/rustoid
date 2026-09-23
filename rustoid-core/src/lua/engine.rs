@@ -1610,8 +1610,21 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .set(
             "get",
             lua.create_function(|lua, _name: Value| {
+                // The shape a real `.tab` page yields, hollowed out. A module
+                // walking it should find empty tables all the way down rather
+                // than a nil that turns into an error: `Module:NUMBEROF/data`
+                // does `ipairs(statistics.schema.fields)`, so a missing `fields`
+                // was "bad argument #1 to 'ipairs' (table expected, got nil)"
+                // and took out two pages.
+                //
+                // An empty `fields` is also what the module's own loop expects:
+                // it builds a name-to-index map, so no fields means no map and
+                // no statistics, which is the honest result for an extension
+                // rustoid does not have.
                 let empty = lua.create_table()?;
-                empty.set("schema", lua.create_table()?)?;
+                let schema = lua.create_table()?;
+                schema.set("fields", lua.create_table()?)?;
+                empty.set("schema", schema)?;
                 empty.set("data", lua.create_table()?)?;
                 Ok(empty)
             })
