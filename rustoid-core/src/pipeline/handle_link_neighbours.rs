@@ -404,19 +404,20 @@ fn migrate_parts_json(data_mw: &str, text: &str, is_prefix: bool) -> Option<Stri
     let key = "\"parts\":";
     let key_at = data_mw.find(key)?;
     let after_key = key_at + key.len();
-    let rest = data_mw[after_key..].trim_start();
-    let rest = rest.strip_prefix('[')?;
+    // The `[` is located in the *untrimmed* tail so the index is an offset into
+    // `data_mw`. Deriving it from a trimmed slice's length instead — as an
+    // earlier version did — is off by however much whitespace was trimmed, which
+    // for the empty-`parts` case wrote the entry straight through the bracket:
+    // `{"parts":[]}` came out as the invalid `{"parts":,"TEXT"]}`.
+    let open = data_mw[after_key..].find('[')? + after_key;
+    let after_open = open + 1;
+
     // Empty parts: `[]` becomes `[<entry>]`.
-    if rest.trim_start().starts_with(']') {
-        let close = data_mw.len() - rest.trim_start().len() - 1;
-        let head = &data_mw[..close];
-        let tail = &data_mw[close + 1..];
-        let sep = if head.trim_end().ends_with('[') {
-            ""
-        } else {
-            ","
-        };
-        return Some(format!("{head}{sep}{entry}{tail}"));
+    if data_mw[after_open..].trim_start().starts_with(']') {
+        let close = data_mw[after_open..].find(']')? + after_open;
+        let head = &data_mw[..after_open];
+        let tail = &data_mw[close..];
+        return Some(format!("{head}{entry}{tail}"));
     }
 
     // Find the matching `]` of this `parts` array, so a nested array inside a
@@ -425,8 +426,8 @@ fn migrate_parts_json(data_mw: &str, text: &str, is_prefix: bool) -> Option<Stri
     let mut close = None;
     let mut in_str = false;
     let mut escaped = false;
-    for (i, ch) in data_mw[after_key..].char_indices() {
-        let idx = after_key + i;
+    for (i, ch) in data_mw[after_open..].char_indices() {
+        let idx = after_open + i;
         if in_str {
             if escaped {
                 escaped = false;
@@ -441,11 +442,11 @@ fn migrate_parts_json(data_mw: &str, text: &str, is_prefix: bool) -> Option<Stri
             '"' => in_str = true,
             '[' => depth += 1,
             ']' => {
-                depth -= 1;
                 if depth == 0 {
                     close = Some(idx);
                     break;
                 }
+                depth -= 1;
             }
             _ => {}
         }
@@ -454,19 +455,22 @@ fn migrate_parts_json(data_mw: &str, text: &str, is_prefix: bool) -> Option<Stri
 
     // Already at that end? Then there is nothing to add, and — importantly —
     // nothing to rewrite.
-    let inner = data_mw[after_key..close].trim();
-    if is_prefix && inner[1..].trim_start().starts_with(&entry) {
+    let inner = data_mw[after_open..close].trim();
+    if is_prefix && inner.starts_with(&entry) {
         return None;
     }
-    if !is_prefix && inner.trim_end().ends_with(&entry) {
+    if !is_prefix && inner.ends_with(&entry) {
         return None;
     }
 
     Some(if is_prefix {
         // Insert directly after the opening bracket, so whatever spacing the
         // original had after it is preserved.
-        let open = data_mw[after_key..].find('[')? + after_key + 1;
-        format!("{}{entry},{}", &data_mw[..open], &data_mw[open..])
+        format!(
+            "{}{entry},{}",
+            &data_mw[..after_open],
+            &data_mw[after_open..]
+        )
     } else {
         format!("{},{entry}{}", &data_mw[..close], &data_mw[close..])
     })
@@ -506,6 +510,86 @@ fn is_wikilink_rel(node: &Node) -> bool {
 mod tests {
     use super::*;
     use crate::mock::MockSiteConfig;
+
+    /// Every output of the parts migration must be *valid JSON*.
+    ///
+    /// The function edits a serialized `data-mw` textually, which is what keeps
+    /// Parsoid's key order, but it means a wrong byte offset produces a string
+    /// that is not JSON at all rather than an error. That happened: the
+    /// empty-`parts` branch derived its bracket position from the length of an
+    /// already-trimmed slice, so `{"parts":[]}` became the invalid
+    /// `{"parts":,"TEXT"]}` — and it reached the served output as a `data-mw`
+    /// attribute that no parser could read.
+    #[test]
+    fn parts_migration_always_produces_valid_json() {
+        let cases = [
+            // The empty array, at both ends, with and without spacing after the
+            // brackets — the case that was broken.
+            (r#"{"parts":[]}"#, true),
+            (r#"{"parts":[]}"#, false),
+            (r#"{"parts":[] }"#, true),
+            (r#"{"parts":[] }"#, false),
+            (r#"{"parts":[] ,"x":1}"#, true),
+            // A non-empty array, at both ends.
+            (r#"{"parts":[{"template":{}}]}"#, true),
+            (r#"{"parts":[{"template":{}}]}"#, false),
+            // A nested array inside a part must not end the outer one early.
+            (r#"{"parts":[["nested"],{"a":1}]}"#, false),
+            (r#"{"parts":[["nested"],{"a":1}]}"#, true),
+            // A `]` inside a string value is not the closing bracket.
+            (r#"{"parts":[{"wt":"]"}]}"#, false),
+            (r#"{"parts":[{"wt":"]"}]}"#, true),
+        ];
+        for (data_mw, is_prefix) in cases {
+            let out = migrate_parts_json(data_mw, "TEXT", is_prefix)
+                .unwrap_or_else(|| panic!("no migration for {data_mw} (prefix={is_prefix})"));
+            let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
+                panic!("{data_mw} (prefix={is_prefix}) -> invalid JSON {out}: {e}")
+            });
+            let parts = parsed["parts"].as_array().unwrap();
+            // The text is at the end it was migrated to, and nothing was lost.
+            let want = serde_json::Value::String("TEXT".to_string());
+            if is_prefix {
+                assert_eq!(parts.first(), Some(&want), "{data_mw} -> {out}");
+            } else {
+                assert_eq!(parts.last(), Some(&want), "{data_mw} -> {out}");
+            }
+        }
+    }
+
+    /// The exact envelope `encap_tokens` builds, migrated at both ends.
+    #[test]
+    fn parts_migration_round_trips_the_real_envelope() {
+        let data_mw = r#"{"parts":[{"template":{"target":{"wt":"Short description","href":"./Template:Short_description"},"params":{"1":{"wt":"x"}},"i":0}}]}"#;
+        let prefixed = migrate_parts_json(data_mw, "A", true).unwrap();
+        assert!(
+            prefixed.starts_with(r#"{"parts":["A",{"template":"#),
+            "{prefixed}"
+        );
+        let appended = migrate_parts_json(data_mw, "B", false).unwrap();
+        // Parsing rather than a string suffix, so the assertion is about the
+        // entry's position and not about how many braces the envelope ends with.
+        let parsed: serde_json::Value = serde_json::from_str(&appended).unwrap();
+        let parts = parsed["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "{appended}");
+        assert_eq!(parts[1], serde_json::json!("B"), "{appended}");
+        // The original key order survives — the reason the edit is textual.
+        assert!(prefixed.contains(r#""target":{"wt":"Short description","href":"#));
+    }
+
+    /// Migrating the same text to the same end twice must be idempotent, or a
+    /// retry would append the entry again.
+    #[test]
+    fn parts_migration_is_idempotent_at_each_end() {
+        for (data_mw, is_prefix) in [(r#"{"parts":[]}"#, true), (r#"{"parts":[]}"#, false)] {
+            let once = migrate_parts_json(data_mw, "TEXT", is_prefix).unwrap();
+            assert_eq!(
+                migrate_parts_json(&once, "TEXT", is_prefix),
+                None,
+                "{once} was migrated twice"
+            );
+        }
+    }
 
     fn link() -> Node {
         let mut a = Node::element(ElementKind::Wikilink);
