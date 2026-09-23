@@ -1088,17 +1088,42 @@ fn data_mw_key_span(json: &str, key: &str) -> Option<(usize, usize)> {
     Some((start, json.len()))
 }
 
-/// `json` with the value of `key` removed, leaving the other entries intact.
+/// `json` with the whole `"key":value` entry removed, leaving the other
+/// entries intact.
+///
+/// Removing the *value alone* is not enough, and getting that wrong is silent:
+/// it leaves `"key":` with nothing after it, so the envelope becomes
+/// `{"parts":}` — which is what `merge_encap_data_mw` used to splice into the
+/// output. That is not valid JSON, so the attribute it lands in cannot be read
+/// by anything, and it reached the served HTML 131 times on one page.
+///
+/// The entry's own separator goes with it, and it is the *preceding* comma when
+/// there is one, because removing the first entry of an object leaves a leading
+/// comma otherwise. A key at the end of the object has no following comma to
+/// take, so that case is handled by the preceding one too.
 fn strip_data_mw_key(json: &str, key: &str) -> String {
-    let Some((start, end)) = data_mw_key_span(json, key) else {
+    let Some((value_start, value_end)) = data_mw_key_span(json, key) else {
         return json.to_string();
     };
-    // Also drop the separator that preceded the removed entry.
-    let mut cut_from = json[..start].rfind(':').map(|c| c + 1).unwrap_or(0);
-    if let Some(prev) = json[..cut_from].rfind(',') {
-        cut_from = prev;
+    // Extend the cut back over the key's `"key":` — including the quotes — so
+    // the key goes with the value.
+    let quoted = format!("\"{key}\":");
+    let Some(key_start) = json[..value_start].rfind(&quoted) else {
+        return json.to_string();
+    };
+    let mut from = key_start;
+    let mut to = value_end;
+    // Take the preceding comma when there is one, else the following one, so the
+    // result is still a well-formed object either way.
+    match json[..from].rfind(',') {
+        Some(prev) => from = prev,
+        None => {
+            if json[to..].starts_with(',') {
+                to += 1;
+            }
+        }
     }
-    format!("{}{}", &json[..cut_from], &json[end..])
+    format!("{}{}", &json[..from], &json[to..])
 }
 
 /// Insert `extra` (already a `"key":value` fragment) into a `{…}` object.
@@ -2374,6 +2399,74 @@ mod tests {
     }
     fn txt(s: &str) -> Item {
         Item::Str(s.to_string())
+    }
+
+    /// Removing a key from a `data-mw` envelope must leave valid JSON.
+    ///
+    /// `strip_data_mw_key` edits the serialized string rather than a
+    /// `serde_json::Value`, so that Parsoid's key order survives. The cost is
+    /// that removing the *value* without the *key* is silent — and it happened:
+    /// the envelope became `{"parts":}`, which `merge_encap_data_mw` then
+    /// spliced into the output, and which is not JSON at all. It reached the
+    /// served HTML 131 times on `International Space Station`, on the leading
+    /// `Template:Short description` transclusion.
+    #[test]
+    fn test_strip_data_mw_key_leaves_valid_json() {
+        let cases = [
+            // The entry alone: the result is an empty object, not `{"parts":}`.
+            (r#"{"parts":[1,2]}"#, "{}"),
+            (r#"{"parts":[]}"#, "{}"),
+            // First entry, with a survivor after it: no leading comma may remain.
+            (
+                r#"{"parts":[1,2],"attribs":[{"a":"b"}]}"#,
+                r#"{"attribs":[{"a":"b"}]}"#,
+            ),
+            // Middle entry: both separators must not both survive.
+            (r#"{"a":1,"parts":[1],"b":2}"#, r#"{"a":1,"b":2}"#),
+            // Last entry: the preceding comma goes with it.
+            (r#"{"a":1,"parts":[1]}"#, r#"{"a":1}"#),
+            // An object value, not just an array.
+            (r#"{"parts":{"x":1},"y":2}"#, r#"{"y":2}"#),
+            // A key that is not present is a no-op.
+            (r#"{"attribs":[1]}"#, r#"{"attribs":[1]}"#),
+        ];
+        for (input, want) in cases {
+            let out = strip_data_mw_key(input, "parts");
+            assert_eq!(out, want, "for {input}");
+            // The property that matters, asserted independently of the bytes.
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("{input} -> invalid JSON {out}: {e}"));
+        }
+    }
+
+    /// `merge_encap_data_mw` splices a target's non-`parts` keys onto the
+    /// transclusion's envelope, and the result must be parseable.
+    #[test]
+    fn test_merge_encap_data_mw_is_valid_json() {
+        let encap = r#"{"parts":[{"template":{"target":{"wt":"Short description"}}}]}"#;
+        // A target with only `parts` contributes nothing, so the envelope is
+        // returned unchanged rather than gaining a dangling key.
+        assert_eq!(
+            merge_encap_data_mw(
+                Some(encap.to_string()),
+                Some(r#"{"parts":[1]}"#.to_string())
+            ),
+            Some(encap.to_string())
+        );
+        // A target with extra keys contributes exactly those.
+        let merged = merge_encap_data_mw(
+            Some(encap.to_string()),
+            Some(r#"{"parts":[1],"attribs":[{"k":"v"}]}"#.to_string()),
+        )
+        .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&merged).unwrap_or_else(|e| panic!("invalid JSON {merged}: {e}"));
+        // The transclusion's own parts survive; the target's do not overwrite them.
+        assert_eq!(
+            parsed["parts"][0]["template"]["target"]["wt"],
+            "Short description"
+        );
+        assert_eq!(parsed["attribs"][0]["k"], "v");
     }
 
     #[test]
