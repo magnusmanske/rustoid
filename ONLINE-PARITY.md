@@ -2526,6 +2526,132 @@ The `lua` binary on this machine is 5.5, so it is a reference for *semantics tha
 5.5 did not change* rather than for everything; where 5.1 differs, `lstrlib.c`
 from the vendored source is the authority, and it settled `gsub`'s anchor rule.
 
+## A cache that can be destroyed by a legitimate-looking run
+
+A full online corpus run — the obvious thing to do when the cache is missing a
+data module — rewrote **every** `html:` entry at the wiki's latest revision. The
+pinned revisions the corpus was written against are not recoverable from
+the cache afterwards, so six pages went from "compares and differs" to "cannot be
+compared at all", and the scoreboard's denominator silently changed from 46 to
+42. That is the worst failure mode available here: the run *looks* like it
+worked, and the number it prints is not comparable to the previous one.
+
+Two independent ways to lose a baseline, and the second is the one that fired:
+
+- `compare_page` writes `Rendered` at the corpus's pinned revision, which cannot
+  orphan anything.
+- `fetch_from`, the auxiliary wikitext path, asked `latest_revid` and stored the
+  answer under the page's own `html:` key. It had no reader for rendered HTML —
+  every caller wants a page's *source* — so it fetched the page as if it were a
+template and put the result where the baseline lived.
+
+The guard is now in the writer rather than in the callers: `put` refuses to
+replace a `Rendered` entry with a revision it does not already hold, whatever the
+caller says, and the auxiliary path refuses `Rendered` outright. The refusal is a
+trace rather than an error, because aborting a page over a *declined
+replacement* would be worse than serving the body it already had. `--refresh`
+still re-pins, by removing the entry first.
+
+The guard compares against the **existing** entry's revision, not the incoming
+body's. That is not a detail: the body that caused the damage stated no revision
+at all (`revid: None`), so a guard keyed on the incoming `revid` — which is what
+the first draft did — would have returned `false` and let the exact failure it
+exists to prevent straight through.
+
+### The pin now lives in the corpus, not only in the manifest
+
+`ONLINE-PARITY.md` already records that the manifest is the only file whose loss
+is unrecoverable. That is true of the revision too, and it had a consequence the
+reindex work did not cover: `--reindex` could serve every body and still report
+every page as skipped, because the revision lived *only* in the index. Writing
+the corpus by hand had the same gap — a pinned corpus that cannot state its
+pins.
+
+A corpus entry now carries its revision: `Title @ revid | tags`. The built-in
+corpus pins all 48 entries, and the six whose cached revision had been
+overwritten were re-pinned to what is on disk rather than re-downloaded. An
+entry whose revision is gone reports as skipped, because comparing another
+revision quietly is exactly the failure the pin prevents. `Zebra` is the single
+entry with no pin — its body predates the manifest entry — and a test names it
+rather than tolerating a silent absence.
+
+A malformed revision is a corpus *error*, not a dropped pin. An unpinned entry
+still compares, so a typo would look like success, which is the same trap as the
+manifest gap one level up.
+
+### Scoreboard, with the denominator restored
+
+```
+before: 0/42 compared, 6 skipped   (cache damage; not comparable)
+after:  0/46 compared, 0 skipped   (pinned; jsonEncode fixed)
+output: 64473554 bytes parsoid, 164849267 rustoid (2.56x)
+```
+
+The two stalled pages are `Cristiano Ronaldo` and `Lionel Messi`, the corpus's
+densest Lua consumers. They are reported as `stalled` rather than as failures,
+which is what the per-page cap is for; the previous run had them reaching a
+`transclusion` difference, so the next thing to check is whether this is a
+regression or the cap doing its job on a slower run.
+
+## `mw.text.jsonEncode`, and what an encoder port actually has to reproduce
+
+`Module:Owidslider:88` and `Module:Piechart` both encode a config table to JSON,
+and the call was a nil field, so the module errored instead of rendering.
+
+The interesting part is **not** the JSON, it is Scribunto's decision about the
+value, and reproducing that decision is why this is a port rather than a call to
+`serde_json`:
+
+- **Array or object.** A Lua table is a JSON *array* when its keys are exactly
+  `1..n` in order, or `0..n-1` under `JSON_PRESERVE_KEYS`; otherwise an *object*.
+  So `{}` is `[]`, and a table with a hole is an object. PHP's `reindexArrays`
+  decides this by walking the keys in sorted order and requiring each to be the
+  next index — and that sort is *only* for the reindex path. Sorting
+  unconditionally, which the first draft did, reorders an object's keys, which
+  PHP never does.
+- **A digit-string key is an index when encoding.** `{['1']='x'}` is `["x"]`.
+  The PHP has an explicit `ctype_digit` arm for this, and the decode direction
+deliberately does not mirror it.
+- **`ALL_OK` is not `serde_json`'s default.** `FormatJson::encode` is called with
+  `JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE`, so `/` and non-ASCII stay
+  literal where `serde_json` escapes both. Every module that encodes a URL or a
+  non-Latin name would have been wrong by a byte per character.
+- **The checks are Lua-level.** `checkForJsonEncode` walks the value and raises
+  at the *caller's* level (`lvl = 3`, incrementing per depth), so the error names
+  the module line that passed the bad value. It is reproduced in
+  `LUA_STDLIB_EXTRAS` for that reason, and every message is asserted verbatim
+  because a module's `pcall` may branch on it.
+- **Key order is Lua's iteration order.** PHP receives the table already ordered
+  by Lua's `pairs` and `json_encode` preserves it, so the observed order is
+  neither the module's insertion order nor sorted — it is a function of Lua
+  5.1's string hash and table layout. Verified against a live payload: the
+  observed order was `startingView, caption, loop, …` against an insertion order
+  of `loop, start, startingView, …`. **This is not reproducible without
+  reimplementing Lua's table layout**, and is recorded as an irreducible
+  difference rather than approximated. The encoder deliberately does not sort,
+  since sorting would be a second, different wrong answer — it preserves
+  iteration order, which is at least the order PHP would have received, even
+  though the iteration itself is Rust-side mlua's rather than Lua 5.1's.
+
+**A test encoded a wrong reading, and the implementation was right.** The first
+draft asserted that a `math.huge` table key encodes as PHP's
+`-9223372036854775808` key, reasoning from PHP's array-key coercion. It does
+not: Scribunto's *Lua-level* check rejects an infinite key first (`Cannot use
+'inf' as a table key`), so PHP's coercion never sees it. The test now asserts the
+error. This is the fifth time in this work that a reading was overturned by
+measurement, and the pattern is the same each time — the reading of *one* layer
+is right and the layer above it already handled the case.
+
+### The oracle for this one was on disk
+
+The `Polio vaccine` Parsoid HTML already in the cache carries the Owidslider
+payload the wiki actually served: a one-element wrapper array, booleans,
+integral numbers, empty strings, a value containing `[[File:…|…]]`. That is a
+stronger check than any hand-written expectation, and the test reproduces the
+payload rather than a paraphrase of it. It pins presence, types, and escaping
+without asserting key order, which the paragraph above explains cannot be
+asserted.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands

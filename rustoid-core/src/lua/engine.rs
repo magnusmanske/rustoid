@@ -5717,6 +5717,36 @@ mod tests {
         assert!(!got.contains("\\/"), "{got}");
     }
 
+    /// `Module:Piechart`'s `parseEnumParams` builds this shape and encodes it,
+    /// so the whole of `Template:Pie chart` depends on it: an array of objects
+    /// mixing an integral value, plain strings, a CSS colour, and one entry
+    /// carrying a boolean. It is also the shape that produced the scoreboard's
+    /// `invalid piechart data: parseMetaParams` entry.
+    #[test]
+    fn test_mw_text_json_encode_matches_a_live_piechart_payload() {
+        let engine = make_engine();
+        let lua = r#"
+            local result = {}
+            result[#result + 1] = { value = 32, label = 'Protestantism' , color = 'DarkBlue' }
+            result[#result + 1] = { value = 20, label = 'Catholicism' , color = 'Blue' }
+            result[#result + 1] = { value = 12, label = 'Non-specific Christian' , color = 'SkyBlue' }
+            result[#result + 1] = { visible = false, label = 'Other ($v)', color = '#FEFDFD' }
+            return mw.text.jsonEncode(result)
+        "#;
+        let got = engine.eval(lua).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&got).unwrap();
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 4, "{got}");
+        assert_eq!(arr[0]["value"], 32);
+        assert_eq!(arr[0]["label"], "Protestantism");
+        assert_eq!(arr[2]["label"], "Non-specific Christian");
+        assert_eq!(arr[3]["visible"], false);
+        assert_eq!(arr[3]["color"], "#FEFDFD");
+        // No slash in this payload, but the `#` and the mixed value types must
+        // not have forced a non-array shape.
+        assert!(got.starts_with('['), "{got}");
+    }
+
     #[test]
     fn test_mw_text_split() {
         let engine = make_engine();
