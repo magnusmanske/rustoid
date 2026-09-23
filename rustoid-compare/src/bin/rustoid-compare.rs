@@ -236,6 +236,18 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         comparison.parsoid_html.len(),
         comparison.rustoid_html.len()
     );
+    // Scribunto failures rustoid rendered into the page. The scoreboard has
+    // reported these per page for a while; this report did not, and that gap cost
+    // a diagnosis: a single-page run looked clean while the same page in a corpus
+    // run named an error, because the error was inside the output and only the
+    // scoreboard extracted it. Same source, so the two can no longer disagree.
+    let errors = rustoid_compare::harness::script_errors(&comparison.rustoid_html, 5);
+    if !errors.is_empty() {
+        println!("  rustoid script errors:");
+        for e in &errors {
+            println!("    {e}");
+        }
+    }
     if cli.verbose && !comparison.outcome.is_match() {
         println!("\n--- parsoid ---\n{}", comparison.parsoid_html);
         println!("\n--- rustoid ---\n{}", comparison.rustoid_html);

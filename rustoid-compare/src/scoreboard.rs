@@ -325,9 +325,15 @@ impl Scoreboard {
             }
         }
 
-        let failing: Vec<&Row> = self.rows.iter().filter(|r| !r.is_match()).collect();
+        // Smallest first, because the readable diff is the one worth working on:
+        // an order fixed by the corpus file puts a 3 MB article above a 24 KB one
+        // for no reason, and the headline score cannot rank them either — both
+        // are simply "failed". A skipped row has no rendered bytes and is not a
+        // candidate for a diff, so it sorts last.
+        let mut failing: Vec<&Row> = self.rows.iter().filter(|r| !r.is_match()).collect();
+        failing.sort_by_key(|r| (r.is_skipped(), r.parsoid_bytes, r.title.clone()));
         if !failing.is_empty() {
-            out.push_str("\nfailures:\n");
+            out.push_str("\nfailures (smallest parsoid first):\n");
             for row in &failing {
                 let verdict = match &row.outcome {
                     Outcome::Skipped { reason } => format!("skip: {reason}"),
@@ -335,9 +341,10 @@ impl Scoreboard {
                     _ => row.category().to_string(),
                 };
                 out.push_str(&format!(
-                    "  {:40} r{}  {verdict}\n",
+                    "  {:40} r{}  {:>9}  {verdict}\n",
                     truncate(&row.title, 40),
-                    row.revid.unwrap_or(0)
+                    row.revid.unwrap_or(0),
+                    kilobytes(row.parsoid_bytes),
                 ));
             }
         }
@@ -391,6 +398,15 @@ fn truncate(s: &str, n: usize) -> String {
     let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// A byte count as whole kilobytes, for a column that has to line up.
+fn kilobytes(bytes: usize) -> String {
+    if bytes == 0 {
+        "-".to_string()
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +563,48 @@ mod tests {
         assert_eq!(table[1].2, 2);
     }
 
+    /// The failure list is a work list, so it is ordered smallest-first and a
+    /// skip sorts last.
+    ///
+    /// The headline score cannot rank failures — a page one byte off and a page
+    /// that is entirely wrong both read as "failed" — and the corpus order is by
+    /// hand, so it put a 3 MB article above a 24 KB one for no reason. A skipped
+    /// page has no rendering to diff at all, so it is not a candidate and does
+    /// not belong at the top of the list.
+    #[test]
+    fn the_failure_list_is_a_smallest_first_work_list() {
+        let mut big = row("Big", &["lua"], differ("x"));
+        big.parsoid_bytes = 3_000_000;
+        let mut small = row("Small", &["lua"], differ("x"));
+        small.parsoid_bytes = 24_000;
+        let mut skipped = row(
+            "Skipped",
+            &["lua"],
+            Outcome::Skipped {
+                reason: "offline".to_string(),
+            },
+        );
+        skipped.parsoid_bytes = 0;
+        let b = Scoreboard::new("t", vec![big, skipped, small]);
+
+        let text = b.render(false);
+        let order: Vec<&str> = ["Small", "Big", "Skipped"].into_iter().collect();
+        // Each name must appear before the next in the rendered list.
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|n| {
+                text.find(n)
+                    .unwrap_or_else(|| panic!("{n} missing from\n{text}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "expected {order:?} in that order:\n{text}"
+        );
+        // The size is printed, so "smallest" is verifiable rather than a claim.
+        assert!(text.contains("23 KB"), "{text}");
+    }
+
     #[test]
     fn renders_a_score_and_a_histogram() {
         let text = board().render(false);
@@ -555,7 +613,10 @@ mod tests {
         assert!(text.contains("by outcome:"), "{text}");
         assert!(text.contains("by tag"), "{text}");
         assert!(text.contains("nothing passes"), "{text}");
-        assert!(text.contains("failures:"), "{text}");
+        assert!(
+            text.contains("failures (smallest parsoid first):"),
+            "{text}"
+        );
         // The detailed section is opt-in.
         assert!(!text.contains("first differences:"), "{text}");
     }
