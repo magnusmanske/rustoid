@@ -1221,3 +1221,64 @@ async fn module_arguments_keep_their_tags() {
         "tags were dropped from the argument: {html}"
     );
 }
+
+/// A `#invoke` whose argument is *itself* a `#invoke` call, passed by name.
+///
+/// This is `Template:Pie chart`'s shape verbatim: it passes the result of one
+/// `{{#invoke:Piechart|parseEnumParams}}` as the named argument `1` of another
+/// `{{#invoke:Piechart|pie}}`, and `p.pie` reads `frame.args[1]`. When the named
+/// key does not resolve to the numeric one the read is nil, which surfaced as
+/// `Module:Piechart:782: attempt to index local 's'` — an error that named
+/// neither arguments nor the invoke that produced them.
+///
+/// The expansion of the nested call was never the problem: `|X` (positional)
+/// worked all along, so the same construct failed or succeeded depending only on
+/// whether the argument was written with a `1=`.
+#[tokio::test]
+async fn a_nested_invoke_can_be_a_named_argument() {
+    const INNER: &str = r#"
+        local p = {}
+        function p.data(frame)
+            return "PAYLOAD"
+        end
+        return p
+    "#;
+    const OUTER: &str = r#"
+        local p = {}
+        function p.main(frame)
+            return "got:" .. tostring(frame.args[1])
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:Inner", INNER), ("Module:Outer", OUTER)],
+        "{{#invoke:Outer|main|1={{#invoke:Inner|data}}}}",
+    )
+    .await;
+    assert!(
+        text_only(&html).contains("got:PAYLOAD"),
+        "the inner invoke's output did not reach frame.args[1]: {html}"
+    );
+}
+
+/// The same construct with a parser function rather than a nested `#invoke`,
+/// which is `Template:Pie chart`'s `{{#if:{{{value1|}}}|…}}` guard.
+#[tokio::test]
+async fn a_parser_function_can_be_a_named_numeric_argument() {
+    const OUTER: &str = r#"
+        local p = {}
+        function p.main(frame)
+            return "got:" .. tostring(frame.args[1])
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:Outer", OUTER)],
+        "{{#invoke:Outer|main|1={{#if:yes|IFYES|IFNO}}}}",
+    )
+    .await;
+    assert!(
+        text_only(&html).contains("got:IFYES"),
+        "a parser-function argument did not reach frame.args[1]: {html}"
+    );
+}

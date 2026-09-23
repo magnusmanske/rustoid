@@ -4613,10 +4613,20 @@ fn json_to_lua_flagged(lua: &Lua, value: &serde_json::Value, preserve_keys: bool
 
 /// Build a Scribunto `args` table from a frame's arguments.
 ///
-/// Positional arguments get a *numeric* key, so `args[1]` and `#args` behave;
-/// named ones get their name. A metatable resolves the string spelling
-/// (`args["1"]`) as well, which modules also write, without duplicating keys and
-/// so without upsetting `pairs`.
+/// `#invoke` arguments are stored under the key they were written with: a
+/// positional one numerically, a named one as its name. So `|X` is `t[1]` and
+/// `|1=X` is `t["1"]`, and those are two different tables — which matters
+/// because `Module:Piechart` is reached as `|1={{…}}` and reads `frame.args[1]`.
+///
+/// Both spellings are written in the wild (`args[1]` and `args["1"]`), so the
+/// metatable resolves either to the other. It must try *both* keys: an earlier
+/// version only redirected to the numeric one, so `args[1]` on a named argument
+/// was nil while `args["1"]` on a positional one worked, and the asymmetry was
+/// invisible until a module was invoked the other way round. A lookup that
+/// misses both keys is nil rather than an error, as in Scribunto.
+///
+/// Reading through a metatable rather than duplicating keys is what keeps
+/// `pairs` from seeing every argument twice.
 ///
 /// Shared with the parent frame, because both are read the same way.
 fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
@@ -4639,23 +4649,48 @@ fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
         .set(
             "__index",
             lua.create_function(|_, (t, k): (Table, Value)| {
-                // Both spellings are written in the wild (`args[1]` and
-                // `args["1"]`), so map either to the other. `raw_get` keeps this
-                // from re-entering the metatable.
-                let alternative = match k {
-                    Value::Integer(i) => Some(Value::Integer(i)),
-                    Value::Number(n) if n.fract() == 0.0 => Some(Value::Integer(n as i64)),
-                    Value::String(ref s) => s
-                        .to_str()
-                        .ok()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .map(Value::Integer),
-                    _ => None,
-                };
-                match alternative {
-                    Some(key) => Ok(t.raw_get::<Value>(key)?),
-                    None => Ok(Value::Nil),
+                // The spelling the caller used, then its counterpart. `raw_get`
+                // keeps this from re-entering the metatable and looping.
+                //
+                // Keys are held as a string/integer pair rather than as Lua
+                // values so nothing has to be boxed onto the stack.
+                enum Key {
+                    Int(i64),
+                    Str(String),
                 }
+                let mut tries: Vec<Key> = Vec::with_capacity(2);
+                match k {
+                    Value::Integer(i) => {
+                        tries.push(Key::Str(i.to_string()));
+                        tries.push(Key::Int(i));
+                    }
+                    Value::Number(n) if n.fract() == 0.0 => {
+                        let i = n as i64;
+                        tries.push(Key::Str(i.to_string()));
+                        tries.push(Key::Int(i));
+                    }
+                    Value::String(ref s) => {
+                        // A key that is not a number is still a key; only the
+                        // integer spelling is added when it parses.
+                        let text = s.to_str().map(|s| s.to_string()).unwrap_or_default();
+                        if let Ok(i) = text.trim().parse::<i64>() {
+                            tries.push(Key::Int(i));
+                        }
+                        tries.push(Key::Str(text));
+                    }
+                    _ => {}
+                }
+                for key in tries {
+                    // A hit on either spelling wins; only a miss on both is nil.
+                    let found = match key {
+                        Key::Int(i) => t.raw_get::<Value>(i)?,
+                        Key::Str(s) => t.raw_get::<Value>(s)?,
+                    };
+                    if !matches!(found, Value::Nil) {
+                        return Ok(found);
+                    }
+                }
+                Ok(Value::Nil)
             })
             .map_err(err)?,
         )
@@ -6984,6 +7019,40 @@ mod tests {
             .execute(src, "main", &[Arg::Positional("x".to_string())])
             .unwrap();
         assert_eq!(result, "x/x");
+    }
+
+    /// A *named* argument spelled as a number resolves both ways too.
+    ///
+    /// `{{#invoke:Mod|fn|1=X}}` stores the value under the key `"1"`, and
+    /// `Module:Piechart` — reached exactly that way from `Template:Pie chart` —
+    /// reads it as `frame.args[1]`. The metatable used to redirect only toward
+    /// the numeric key, so this was nil while the reverse direction worked; the
+    /// asymmetry is invisible unless a module is invoked the other way round,
+    /// which is why it survived until a page was.
+    #[test]
+    fn test_named_numeric_arg_resolves_both_spellings() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                return tostring(frame.args[1]) .. "/" .. tostring(frame.args["1"])
+            end
+            return p
+        "#;
+        let args = [Arg::Named("1".to_string(), "x".to_string())];
+        assert_eq!(engine.execute(src, "main", &args).unwrap(), "x/x");
+
+        // A *non*-numeric name must still resolve by that name, and a miss must
+        // be nil rather than an error.
+        let src2 = r#"
+            local p = {}
+            function p.main(frame)
+                return tostring(frame.args.who) .. "/" .. tostring(frame.args[1])
+            end
+            return p
+        "#;
+        let args2 = [Arg::Named("who".to_string(), "table".to_string())];
+        assert_eq!(engine.execute(src2, "main", &args2).unwrap(), "table/nil");
     }
 
     /// `frame:argumentPairs()` must drive a generic `for` loop.
