@@ -2652,6 +2652,68 @@ payload rather than a paraphrase of it. It pins presence, types, and escaping
 without asserting key order, which the paragraph above explains cannot be
 asserted.
 
+## A frame argument resolved in only one direction
+
+Fixing `jsonEncode` did not clear the `Module:Piechart` entry — it moved it one
+step *down* the module, from `jsonEncode is nil` to
+`Module:Piechart:782: attempt to index local 's' (a nil value)`. That is the
+shape of progress worth recognising: the failure advanced rather than
+disappeared, which is what fixing a barrier looks like. The scoreboard went from
+9 failures / 8 distinct to 8 / 7, and the entry's *name* changed.
+
+The line is `priv.trim(frame.args[1])`. Isolating it took six one-line calls:
+
+| wikitext | before | after |
+|---|---|---|
+| `{{#invoke:M|f\|1=LIT}}` | `nil` | `LIT` |
+| `{{#invoke:M|f\|1={{#if:yes\|A\|B}}}}` | `nil` | `A` |
+| `{{#invoke:M|f\|1={{#invoke:M\|f\|N}}}}` | `nil` | `N` |
+| `{{#invoke:M|f\|X}}` (positional) | `X` | `X` |
+
+So the construct was never the problem. **A plain literal named argument failed
+exactly as a nested `#invoke` did**, which ruled out expansion entirely and
+pointed at the argument table. The asymmetry in the last row was the whole clue:
+positional worked, named did not.
+
+The args metatable is supposed to resolve `args[1]` and `args["1"]` to each
+other, and its comment said so — but it only ever redirected *toward* the
+numeric key. A positional argument is stored as `t[1]`, so `t["1"]` found it
+through the metatable; a named argument is stored as `t["1"]`, so `t[1]` looked
+up a numeric key that was never there and got `nil`. One direction worked and the
+other did not, and nothing exercised the second until a template was written that
+way — `Template:Pie chart` passes its data as `|1=…`.
+
+This is why the error was so far from its cause: the module read `nil` from an
+argument table that *had the value*, indexed the nil, and reported
+`attempt to index local 's'` with no mention of arguments or of the invoke. The
+`data-mw` on the same span showed the argument present and correct, which is what
+excluded the expansion theory.
+
+The metatable now tries the caller's spelling and then its counterpart, and a
+miss on both is nil rather than an error. The guard test was verified to fail
+with the old single-direction lookup restored — the third such verification this
+session, and the second where a test would have passed against the bug if it had
+only asserted one direction.
+
+### A note on what the failure table is now measuring
+
+The corpus's headline score has been `0/46` throughout, and it will stay 0 until a
+page matches byte-for-byte. The secondary count is the live measure, and it has
+become a *tail of one-offs*: after both fixes, 8 entries across 7 distinct,
+of which
+
+- 1 is a missing cached data page (`Module:Location map/data/Pacific Ocean`),
+- 1 is a missing cached JSON page (`Module:Music chart/album.json`),
+- 1 is a module that does not export `main`,
+- 2 are `Module:Math` value differences,
+- 1 is `Module:Multiple image` nil arithmetic,
+
+and none is a missing API. The remaining work is therefore *value* parity —
+expanding correctly and then rendering identically — which the failure list can
+no longer rank. The unexpanded-wikitext counts are the next instrument: 45/48
+pages still carry literal `{{…}}`, so the question is now which of those is a
+missing template, a missing module, and a genuine expansion defect.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
