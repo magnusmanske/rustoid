@@ -957,7 +957,7 @@ impl TemplateHandler {
                             }
                         })
                     }
-                    _ => Self::variable_value(config, &name, &pf_arg),
+                    _ => Self::variable_value(config, &name, &pf_arg, context_title),
                 };
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 let mut info = template_info_from(Some(&name), None, vec![]);
@@ -987,6 +987,7 @@ impl TemplateHandler {
                     &pf_params,
                     token_src.as_deref(),
                     protection,
+                    context_title,
                 );
                 let mut encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
                 if !colon.is_empty() {
@@ -1090,10 +1091,20 @@ impl TemplateHandler {
     }
 
     /// Resolve a magic variable to its string value. Mirrors the common
-    /// variable cases (full page-name variables require the page context,
-    /// which isn't yet wired). `pf_arg` carries the colon argument for
-    /// parameterized magic words like `{{ns:…}}`/`{{nse:…}}`.
-    fn variable_value(config: &dyn SiteConfig, name: &str, pf_arg: &str) -> String {
+    /// variable cases. `pf_arg` carries the colon argument for parameterized
+    /// magic words like `{{ns:…}}`/`{{nse:…}}`, and `context_title` is the page
+    /// being parsed, which the page-name variables are derived from.
+    fn variable_value(
+        config: &dyn SiteConfig,
+        name: &str,
+        pf_arg: &str,
+        context_title: Option<&crate::title::Title>,
+    ) -> String {
+        if let Some(title) = context_title
+            && let Some(value) = page_name_variable(config, name, title)
+        {
+            return value;
+        }
         match name {
             "sitename" => "MediaWiki".to_string(),
             "server" => config.server_url().to_string(),
@@ -1124,7 +1135,6 @@ impl TemplateHandler {
             _ => String::new(),
         }
     }
-
     /// Dispatch a parser function name to the `ParserFunctions` implementation.
     ///
     /// `token_src` is the original `{{#name:...}}` source. For an unknown
@@ -1145,6 +1155,7 @@ impl TemplateHandler {
         params: &Params,
         token_src: Option<&str>,
         protection: &ProtectionContext,
+        context_title: Option<&crate::title::Title>,
     ) -> Vec<Item> {
         match name {
             "if" => ParserFunctions::pf_if(params),
@@ -1182,7 +1193,12 @@ impl TemplateHandler {
                     .first()
                     .map(|kv| key_value_to_string(&kv.key))
                     .unwrap_or_default();
-                vec![Item::Str(Self::variable_value(config, name, &arg))]
+                vec![Item::Str(Self::variable_value(
+                    config,
+                    name,
+                    &arg,
+                    context_title,
+                ))]
             }
             // The `#`-spelled protection words, which is how a module reaches them.
             // The no-hash spelling is answered from the variable arm instead, because
@@ -1395,6 +1411,144 @@ impl TemplateHandler {
     }
 }
 
+/// The `{{…}}` magic words that name the page being parsed.
+///
+/// These need the *page*, not just the site, so they cannot be answered from
+/// `variable_value`'s site-wide match — and until now they fell through to its
+/// empty-string default. That is a worse failure than a missing word: an empty
+/// value looks like a legitimately empty answer, so a template acts on it.
+/// `{{#invoke:String|len|{{PAGENAME}}}}` returned `0` rather than `7`, and
+/// `{{#if:{{PAGENAME}}|yes|no}}` took the `no` branch — silently, and on every
+/// page whose templates mention the page name.
+///
+/// The split and encoding rules below are the *observed* ones, from the wiki's
+/// own rendering of a plain page, a namespace page, a subpage, and a title
+/// carrying `& ( ) , ! * ~ + % - _ . : /`. The `…E` forms are MediaWiki's
+/// `wfUrlencode`: spaces become underscores, then `rawurlencode`, then the
+/// characters it needlessly escaped are put back.
+fn page_name_variable(
+    config: &dyn SiteConfig,
+    name: &str,
+    title: &crate::title::Title,
+) -> Option<String> {
+    let ns = title.namespace_id;
+    // Even namespaces are subject spaces and the odd one above each is its talk
+    // page, which is why `Help` pairs with `Help talk` and main pairs with
+    // `Talk`.
+    let subject_ns = ns & !1;
+    let talk_ns = subject_ns | 1;
+    // The main namespace has no *prefix*, on every wiki: `{{NAMESPACE}}` on a
+    // main-namespace page is the empty string, and `{{FULLPAGENAME}}` is not
+    // prefixed. Taking the config's name for index 0 instead would write a
+    // display label (`Main` in a mock, and on some wikis) where a prefix belongs.
+    let ns_name = |id: i32| {
+        if id == 0 {
+            String::new()
+        } else {
+            config.namespace_name(id).unwrap_or_default()
+        }
+    };
+    let ns_e_name = |id: i32| urlencode_title(&ns_name(id));
+    // `Namespace:Text`, or just the text in the main namespace.
+    let prefixed = |prefix: &str| {
+        if prefix.is_empty() {
+            title.text.clone()
+        } else {
+            format!("{prefix}:{}", title.text)
+        }
+    };
+    let (base, sub, root) = split_subpage(&title.text);
+
+    Some(match name {
+        "pagename" => title.text.clone(),
+        "pagenamee" => urlencode_title(&title.text),
+        "fullpagename" => prefixed(&ns_name(ns)),
+        "fullpagenamee" => format!(
+            "{}{}",
+            ns_e_prefix(&ns_e_name(ns)),
+            urlencode_title(&title.text)
+        ),
+        "basepagename" => base.clone(),
+        "basepagenamee" => urlencode_title(&base),
+        "subpagename" => sub.clone(),
+        "subpagenamee" => urlencode_title(&sub),
+        "rootpagename" => root.clone(),
+        "rootpagenamee" => urlencode_title(&root),
+        "namespace" => ns_name(ns),
+        "namespacee" => ns_e_name(ns),
+        "talkspace" => ns_name(talk_ns),
+        "talkspacee" => ns_e_name(talk_ns),
+        "subjectspace" | "articlespace" => ns_name(subject_ns),
+        "subjectspacee" | "articlespacee" => ns_e_name(subject_ns),
+        "subjectpagename" | "articlepagename" => prefixed(&ns_name(subject_ns)),
+        "subjectpagenamee" | "articlepagenamee" => format!(
+            "{}{}",
+            ns_e_prefix(&ns_e_name(subject_ns)),
+            urlencode_title(&title.text)
+        ),
+        "talkpagename" => prefixed(&ns_name(talk_ns)),
+        "talkpagenamee" => format!(
+            "{}{}",
+            ns_e_prefix(&ns_e_name(talk_ns)),
+            urlencode_title(&title.text)
+        ),
+        _ => return None,
+    })
+}
+
+/// `Namespace:` for a prefixed name, or nothing in the main namespace.
+fn ns_e_prefix(ns: &str) -> String {
+    if ns.is_empty() {
+        String::new()
+    } else {
+        format!("{ns}:")
+    }
+}
+
+/// `(base, sub, root)` of a page name.
+///
+/// Without a `/` all three are the whole text — verified against the wiki, where
+/// `{{BASEPAGENAME}}` and `{{ROOTPAGENAME}}` on `Help:Introduction` are both
+/// `Introduction`. With subpages, `A/B/C` is base `A/B` (drop the last part),
+/// root `A` (keep the first), sub `C`.
+fn split_subpage(text: &str) -> (String, String, String) {
+    match text.rsplit_once('/') {
+        Some((base, sub)) => (
+            base.to_string(),
+            sub.to_string(),
+            text.split_once('/')
+                .map(|(root, _)| root.to_string())
+                .unwrap_or_else(|| text.to_string()),
+        ),
+        None => (text.to_string(), text.to_string(), text.to_string()),
+    }
+}
+
+/// MediaWiki's `wfUrlencode` for a title.
+///
+/// Spaces become underscores, everything outside `A-Za-z0-9-_.~` is
+/// percent-encoded, and the handful `rawurlencode` escapes needlessly are put
+/// back — `; @ $ ! * ( ) , / | :`. Matching that matters because these values end
+/// up in URLs and in category sort keys, where a `%2F` instead of a `/` is a
+/// different link.
+fn urlencode_title(s: &str) -> String {
+    let underscore = s.replace(' ', "_");
+    let mut out = String::with_capacity(underscore.len());
+    for b in underscore.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            // `rawurlencode` escapes these; `wfUrlencode` restores them.
+            b';' | b'@' | b'$' | b'!' | b'*' | b'(' | b')' | b',' | b'/' | b'|' | b':' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Tokenize a plain wikitext string into a flat `Vec<Item>`. Used to
 /// re-tokenize expanded template source.
 pub fn tokenize_wikitext_to_items(
@@ -1573,6 +1727,87 @@ mod tests {
             }
             other => panic!("expected variable, got {:?}", other),
         }
+    }
+
+    /// The page-name magic words, against what the live wiki renders.
+    ///
+    /// Every expectation here was measured from the wiki's own
+    /// `transform/wikitext/to/html` output for these three titles — a plain page,
+    /// a namespace page, and a subpage whose name carries punctuation — rather
+    /// than recalled. Before this they all returned the empty string, which is
+    /// the kind of wrong answer nothing notices: `{{#if:{{PAGENAME}}|yes|no}}`
+    /// took the `no` branch silently.
+    #[test]
+    fn test_page_name_variables() {
+        let config = MockSiteConfig::new();
+        let titled = |ns: i32, text: &str| crate::title::Title {
+            namespace_id: ns,
+            text: text.to_string(),
+            ..crate::title::Title::new_main(text)
+        };
+        let help = titled(12, "Introduction");
+        let subpage = titled(10, "Foo bar/baz");
+        let main = titled(0, "Sandbox");
+
+        // (title, word, expected)
+        let cases: &[(&crate::title::Title, &str, &str)] = &[
+            (&help, "pagename", "Introduction"),
+            (&help, "fullpagename", "Help:Introduction"),
+            (&help, "namespace", "Help"),
+            (&help, "talkspace", "Help talk"),
+            (&help, "subjectspace", "Help"),
+            (&help, "articlespace", "Help"),
+            // No `/`, so base, root and sub are the whole text.
+            (&help, "basepagename", "Introduction"),
+            (&help, "rootpagename", "Introduction"),
+            (&help, "subpagename", "Introduction"),
+            (&help, "talkpagename", "Help talk:Introduction"),
+            (&help, "articlepagename", "Help:Introduction"),
+            // Spaces become underscores; `&` and `%` are encoded but
+            // `! * ( ) , / :` are not — MediaWiki's `wfUrlencode`.
+            (&subpage, "pagename", "Foo bar/baz"),
+            (&subpage, "pagenamee", "Foo_bar/baz"),
+            (&subpage, "fullpagenamee", "Template:Foo_bar/baz"),
+            (&subpage, "basepagename", "Foo bar"),
+            (&subpage, "rootpagename", "Foo bar"),
+            (&subpage, "subpagename", "baz"),
+            (&subpage, "namespacee", "Template"),
+            // The main namespace has no name, and its talk space is `Talk`.
+            (&main, "namespace", ""),
+            (&main, "subjectspace", ""),
+            (&main, "talkspace", "Talk"),
+            (&main, "fullpagename", "Sandbox"),
+            (&main, "talkpagename", "Talk:Sandbox"),
+        ];
+        for (title, word, expected) in cases {
+            assert_eq!(
+                page_name_variable(&config, word, title).as_deref(),
+                Some(*expected),
+                "{{{{{word}}}}} on {}",
+                title.text
+            );
+        }
+        // A word that is not a page-name variable is *not* answered here, so
+        // `variable_value`'s site-wide arms still get their turn.
+        assert_eq!(page_name_variable(&config, "sitename", &help), None);
+    }
+
+    /// `wfUrlencode` keeps these characters that `rawurlencode` would escape.
+    #[test]
+    fn test_urlencode_title_keeps_mw_safe_characters() {
+        assert_eq!(urlencode_title("Foo bar"), "Foo_bar");
+        assert_eq!(urlencode_title("a&b+c%d"), "a%26b%2Bc%25d");
+        assert_eq!(urlencode_title("a(b),d!e*f~g"), "a(b),d!e*f~g");
+        assert_eq!(urlencode_title("A/B:C"), "A/B:C");
+    }
+
+    /// Base and root differ only from the second level down.
+    #[test]
+    fn test_split_subpage() {
+        let three = split_subpage("A/B/C");
+        assert_eq!(three, ("A/B".into(), "C".into(), "A".into()));
+        let none = split_subpage("Solo");
+        assert_eq!(none, ("Solo".into(), "Solo".into(), "Solo".into()));
     }
 
     #[test]
