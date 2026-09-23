@@ -2151,6 +2151,92 @@ The `by tag` table is still all zeros, which is expected while literal `{{...}}`
 remains on 45/48 pages: a page cannot byte-match while still showing its source.
 The unexpanded count is therefore the metric to watch until it starts falling.
 
+## The `mw.ustring` split, and the NUL byte in `Module:Citation/CS1`
+
+`Module:Citation/CS1:832` is the single largest entry in the failure table (23
+pages), and the cause is not a missing edge case but a structural one.
+
+**Isolation.** The line is `mw.ustring.find(v, pattern)`, where `pattern` comes
+from `cfg.invisible_chars`. Testing all fourteen of those patterns separately
+showed exactly one failing:
+
+```lua
+{'C0 control', '[\000-\008\011\012\014-\031]'},
+```
+
+Under Lua 5.1 a `\ddd` escape is *decimal*, so `\000` is a real NUL byte
+(measured: `#'\000'` is `1`, `string.byte('\000')` is `0`). Lua 5.1's `classend`
+scans a `[...]` set until `*p == '\0'`:
+
+```c
+if (*p == '\0')
+  luaL_error(ms->L, "malformed pattern (missing " LUA_QL("]") ")");
+```
+
+so a NUL anywhere inside a set raises. Reduced to the minimum, `string.find('abc',
+'[\000]')` fails, while a *bare* `\000` pattern succeeds — it goes through
+`singlematch`, never `classend`.
+
+**The measurement that changed the fix.** Live returns `0`, not an error, for
+both `[\000]` and `[\000-\008]`. So Scribunto does *not* have this bug, and the
+defect is rustoid's: `mw.ustring`'s metatable forwards everything to `string`, so
+every pattern function is Lua 5.1's byte-based, byte-indexed one. The manual says
+`mw.ustring` is "a direct reimplementation of the standard String library, except
+that the methods operate on characters in UTF-8 encoded strings rather than
+bytes", with its own pattern engine. The NUL bug is the first symptom the corpus
+reached, not the whole problem: `%a`/`%w`/`%s` are ASCII where Scribunto's are
+Unicode categories, and every index is a byte offset where Scribunto's is a
+codepoint.
+
+**What has landed so far.** The parts that need no pattern dialect and can be
+checked without the service:
+
+- `isutf8` (strict decoding, so overlong forms and surrogates are rejected),
+  the four normalization forms, and `byteoffset`.
+- The Unicode class table in `rustoid-core/src/lua/ustring/classes.rs`.
+
+`byteoffset` is worth noting because the manual's definition is not a plain index
+lookup: `l == 1` is the character starting *at or after* byte `i`, `l == 0` the
+one starting *at or before* it, and other `l` are relative to those. An
+implementation that treats `l == 0` as exclusive passes every case except the one
+where `i` lands exactly on a character boundary — which is why the tests cover
+`l` in `{-1, 0, 1, 2}` rather than just `0..=1`.
+
+**Verified against live, in one batch.** Each of these returned the whole value
+from `mw.ustring.match`, which means the class matched it:
+
+| call | result | establishes |
+|---|---|---|
+| `match('héllo', '%a+')` | `héllo` | `%a` is a Unicode Letter |
+| `match('１２３', '%d+')` | `１２３` | `%d` is Decimal_Number |
+| `match('１２３', '%x+')` | `１２３` | `%x` includes fullwidth hex |
+| `match('１２３', '%w+')` | `１２３` | `%w` is Letter|Decimal_Number |
+| `match('　', '%s')` | U+3000 | `%s` includes Separator |
+| `match('x', '%s')` | no match | `%s` is not ASCII-only |
+| `match('Ａ', '%u')` | `Ａ` | `%u` is Uppercase_Letter |
+| `match('ａ', '%l')` | `ａ` | `%l` is Lowercase_Letter |
+
+The `%x` case is the one that would have been easy to get wrong: reading the
+manual's "adds fullwidth character versions of the hex digits" as describing
+ASCII hex digits would reject `３`, and the service accepts it.
+
+**Still to do.** The pattern engine itself (`find`, `match`, `gmatch`, `gsub`),
+which is where the 23 pages are actually won. Cached modules call those 722 times
+against 134 calls to the already-correct `sub`, so it is unambiguously the
+priority. It needs `%b`, `%f`, captures, back-references and position captures,
+over codepoints. Two decisions are deliberately deferred until they can be
+measured rather than guessed:
+
+- `%c` vs the Cc category boundary, and `%g`'s exact printable set.
+- `maxStringLength`: the manual gives no value, and modules guard against it, so
+  an invented constant would be worse than a clear failure. `maxPatternLength`
+  is documented as 10000 and can be added whenever it is needed.
+
+`mw.ustring.format` is called 41 times and remains a pass-through to
+`string.format`. That is deliberate: every cached call site applies `%s`/`%i`/`%d`
+with no width or precision to non-ASCII text, where the two agree, so changing it
+would be churn without an observable difference.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
