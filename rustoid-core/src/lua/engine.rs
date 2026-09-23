@@ -2153,10 +2153,21 @@ fn luafn_title_new(
     // as a lookup closure, under a key the metatable knows.
     let facts_for_lookup = facts.clone();
     let full_for_lookup = full.clone();
+    // Whether this title is in the Module namespace, resolved once here because
+    // the closure below cannot reach the site. Only a module's missing facts
+    // drive a fetch (see `title_derived_field`).
+    let is_module = ctx.site.namespace_name(ns_id) == "Module";
     table.raw_set(
         TITLE_FACTS_KEY,
         lua.create_function(move |lua, (_this, key): (Value, String)| {
-            title_derived_field(lua, &key, &facts_for_lookup, is_current, &full_for_lookup)
+            title_derived_field(
+                lua,
+                &key,
+                &facts_for_lookup,
+                is_current,
+                &full_for_lookup,
+                is_module,
+            )
         })?,
     )?;
 
@@ -2271,29 +2282,34 @@ fn title_derived_field(
     facts: &Option<TitleFacts>,
     is_current: bool,
     full: &str,
+    is_module: bool,
 ) -> mlua::Result<Value> {
     match key {
         "exists" => {
-            // A title the host was never asked about is *unknown*, not absent.
+            // A title the host was never asked about is *unknown*, not absent —
+            // but only a **module** is worth insisting on.
             //
             // `preload_titles` finds titles by scanning module source for
-            // literals, so a name a module builds at runtime —
+            // literals, so a name built at runtime —
             // `mw.title.new('Module:Location map/data/' .. map)` — is invisible
             // to it. Reading `false` for such a title makes the module take its
             // "does not exist" branch and never attempt the load, so nothing
             // records a miss and the retry loop has nothing to act on: the
-            // failure is reported as the *module's* own error message, which is
-            // why `Module:Location map` said the definition "does not exist"
-            // while the page was sitting in the cache.
+            // failure is then the *module's own* message, which is why
+            // `Module:Location map` said the definition "does not exist" while
+            // the page was sitting in the cache.
             //
-            // Recording the title on the same out-of-band channel a missing
-            // module uses lets the caller preload it and re-run. It is recorded
-            // rather than raised, so a module asking about a page it genuinely
-            // does not care about does not turn into an error — and the record is
-            // a *request*, so a title that is fetched and still absent answers
-            // `false` on the next round without asking again.
+            // The narrowing to the Module namespace is what keeps this from
+            // being a regression rather than a fix. A module that *probes* for a
+            // page — `pcall(function() return title.exists end)`, which
+            // `Module:Portal` uses to test its data subpages — is asking a
+            // question it has an answer for, and `false` is that answer: making
+            // every probe a fetch turned four portal subpages into "does not
+            // exist" errors and took the failure count from 8 to 19. A data
+            // module is different — the module needs its *contents*, cannot
+            // proceed without them, and the retry loop can fetch it.
             let known = is_current || facts.is_some();
-            if !known && !full.is_empty() {
+            if !known && is_module && !full.is_empty() {
                 note_missing_title(lua, full)?;
             }
             Ok(Value::Boolean(
@@ -7473,5 +7489,87 @@ mod tests {
             1,
             "each run collects its own"
         );
+    }
+
+    /// A module build from the title's own namespace: `Module:Whatever`.
+    fn module_source(query: &str) -> String {
+        format!(
+            r#"
+            local p = {{}}
+            function p.main(frame)
+                local t = mw.title.new({query})
+                return tostring(t.exists)
+            end
+            return p
+        "#
+        )
+    }
+
+    /// A data module whose name was built at runtime must be *requested*, so the
+    /// retry loop can fetch it.
+    ///
+    /// `Module:Location map` does `mw.title.new('Module:Location map/data/' ..
+    /// map)` and reads `exists` before loading it. A false answer takes its
+    /// "does not exist" branch, so `mw.loadData` is never reached and the module
+    /// signal that would have triggered a fetch never fires — the failure is
+    /// then the module's own message, naming a page that is in the cache.
+    #[test]
+    fn an_unknown_module_title_is_requested() {
+        let engine = make_engine();
+        let src = module_source(r#"'Module:Location map/data/Pacific Ocean'"#);
+        assert_eq!(engine.execute(&src, "main", &[]).unwrap(), "false");
+        assert_eq!(
+            engine.take_missing_titles(),
+            vec!["Module:Location map/data/Pacific Ocean".to_string()],
+            "a computed module name must be fetchable"
+        );
+    }
+
+    /// A *non*-module title that a module probes for is answered `false` and is
+    /// **not** requested.
+    ///
+    /// `Module:Portal` wraps the read in `pcall` and its own comment says a
+    /// failure means "we're out of expensive parser function calls … in that case,
+    /// don't throw a Lua error": a probe has an answer, and `false` is it.
+    /// Requesting every probe turned four portal subpages into "does not exist"
+    /// errors and took the corpus's failure count from 8 to 19 — which is what
+    /// makes the Module-namespace narrowing load-bearing rather than tidy.
+    #[test]
+    fn an_unknown_non_module_title_is_not_requested() {
+        let engine = make_engine();
+        for query in [
+            r#"'Template:Some/thing'"#,
+            r#"'Some article'"#,
+            r#"'Category:Whatever'"#,
+        ] {
+            let src = module_source(query);
+            assert_eq!(
+                engine.execute(&src, "main", &[]).unwrap(),
+                "false",
+                "{query}"
+            );
+            assert!(
+                engine.take_missing_titles().is_empty(),
+                "{query} must not be fetched"
+            );
+        }
+    }
+
+    /// A title whose facts *were* preloaded is neither re-requested nor guessed:
+    /// its recorded existence is the answer.
+    #[test]
+    fn a_known_title_answers_from_its_facts() {
+        let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test");
+        ctx.titles.insert(
+            "Module:Known".to_string(),
+            TitleFacts {
+                exists: true,
+                ..Default::default()
+            },
+        );
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+        let src = module_source(r#"'Module:Known'"#);
+        assert_eq!(engine.execute(&src, "main", &[]).unwrap(), "true");
+        assert!(engine.take_missing_titles().is_empty());
     }
 }
