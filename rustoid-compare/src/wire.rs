@@ -240,6 +240,77 @@ impl WikiClient {
         self.get_text(&url).await
     }
 
+    /// Render `wikitext` with the wiki's own Parsoid, as if it were the source of
+    /// `title`.
+    ///
+    /// This is the oracle for input the caller *chose*, which the rest of the
+    /// harness cannot provide: every other comparison is against a page the wiki
+    /// already has, so varying the input means finding a cached page that
+    /// contains the construct — and the construct then arrives buried in
+    /// hundreds of kilobytes of unrelated markup, as a moving target. A
+    /// reduction needs to hold everything else still and change one thing.
+    ///
+    /// The title is not decoration: it is what Parsoid resolves `{{PAGENAME}}`,
+    /// the subject namespace and the page-scoped magic words against, so a
+    /// reduction should name a title in the namespace it means. The templates the
+    /// wikitext transcludes are resolved and fetched as usual.
+    pub async fn parsoid_html_for_wikitext(&self, title: &str, wikitext: &str) -> Result<String> {
+        let url = format!(
+            "{}/transform/wikitext/to/html/{}",
+            self.wiki.rest_url(),
+            urlencode(title)
+        );
+        let body = format!("wikitext={}", urlencode(wikitext));
+        self.post_form(&url, &body).await
+    }
+
+    /// POST an already form-encoded body, returning the response text.
+    ///
+    /// The transform endpoint is the only POST here, and the body is encoded by
+    /// the same `urlencode` the GETs use rather than by a form serializer: one
+    /// encoder means the title in the path and the wikitext in the body cannot
+    /// disagree about how a space is spelled.
+    async fn post_form(&self, url: &str, body: &str) -> Result<String> {
+        // Retried like the GETs, and for the same reason: a dropped connection
+        // would otherwise lose a reduction. A response with a status is not
+        // retried, because the server answered.
+        match self.post_form_once(url, body).await {
+            Ok(text) => Ok(text),
+            Err(CompareError::Http { status: 0, .. }) => self.post_form_once(url, body).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn post_form_once(&self, url: &str, body: &str) -> Result<String> {
+        self.throttle().await;
+        let resp = self
+            .http
+            .post(url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| CompareError::Http {
+                url: url.to_string(),
+                message: e.to_string(),
+                status: 0,
+            })?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| CompareError::Http {
+            url: url.to_string(),
+            message: e.to_string(),
+            status: 0,
+        })?;
+        if !status.is_success() {
+            return Err(CompareError::Http {
+                url: url.to_string(),
+                message: format!("HTTP {status}: {}", truncate(&text, 200)),
+                status: status.as_u16(),
+            });
+        }
+        Ok(text)
+    }
+
     /// Fetch a Wikidata entity as JSON, or `None` when the id does not exist.
     ///
     /// `Special:EntityData/<id>.json` is the canonical way to read one entity:

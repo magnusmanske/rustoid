@@ -2973,6 +2973,124 @@ argues for:
 - That is the same trick that already pays off elsewhere: the Owidslider and
   Piechart payloads were checked against Parsoid HTML that was already on disk.
 
+## The page-context magic words were returning the empty string
+
+Found by following the smallest page, and it is the largest single defect this
+session. Every page-name magic word answered `""`:
+
+| word | on `Help:Introduction` | rustoid was |
+|---|---|---|
+| `PAGENAME` | `Introduction` | `""` |
+| `FULLPAGENAME` | `Help:Introduction` | `""` |
+| `NAMESPACE` | `Help` | `""` |
+| `TALKSPACE`, `SUBPAGENAME`, `BASEPAGENAME`, `ROOTPAGENAME`, `…E` | | `""` |
+
+`SERVER` and `CONTENTLANGUAGE` worked, which is what made it look like a config
+problem rather than a missing feature. The cause is that `variable_value` had no
+page context to read them from, and its last arm was `_ => String::new()` with a
+comment admitting it: "requires page context".
+
+**An empty string is the worst possible wrong answer here**, which is why this
+survived: it is not an error, it does not look like unexpanded wikitext, and a
+template acts on it. The three-line reduction shows all three consequences:
+
+```
+{{PAGENAME}}                             -> ""        (should be "Sandbox")
+{{#if:{{PAGENAME}}|YES|NO}}              -> "NO"      (silently, a wrong branch)
+{{#invoke:String|len|{{PAGENAME}}}}      -> 0         (should be 7)
+```
+
+So the value reaches modules as an empty argument, takes the else branch of every
+guard, and appears in category sort keys as nothing. It is on the path of any
+template that mentions the page name, which is a large fraction of them.
+
+The fix threads the page title into `variable_value` and answers 13 words from
+it. Every expectation is **measured, not recalled**: the wiki's own
+`transform/wikitext/to/html` output for `Help:Introduction`, `Template:Foo bar/baz`
+and `Sandbox`, which pinned down both the subpage splits and the encoding. The
+`…E` forms are `wfUrlencode` — spaces become underscores, then `rawurlencode`,
+then the characters it needlessly escapes (`; @ $ ! * ( ) , / | :`) are put back.
+A test asserts all 13 against those three titles.
+
+One invariant worth stating: the main namespace has no *prefix* on any wiki, so
+namespace 0 is answered `""` regardless of what a configuration says its name is.
+`MockSiteConfig` calls it `Main`, which is a display label; taking it as a prefix
+produced `Main:Sandbox` for `{{FULLPAGENAME}}`.
+
+## The reduction harness, and an oracle that is not the byte target
+
+`rustoid-compare --wikitext <file>` renders *chosen* wikitext and prints the
+result. That is the instrument the small-page work needed: the corpus can only
+compare pages the wiki happens to have, so varying one thing meant finding a
+cached page that contained the construct — and the construct then arrived buried
+in hundreds of kilobytes of unrelated markup. It goes through the same render
+path as a corpus page, so it exercises the whole pipeline rather than one stage.
+
+`--page` names the title the input is rendered as, because that is what
+`{{PAGENAME}}` and page-scoped words resolve against; it defaults to `Sandbox`.
+
+**The wiki's `transform` endpoint is *not* the byte-level target.** It is a
+different rendering mode from the one the corpus compares against: it keeps
+`data-parsoid` where `rest_v1/page/html` strips it. A byte comparison against it
+reports a difference on *every* input including a bare paragraph, so the flag
+prints its rendering clearly labelled as a different mode and offers no verdict.
+Byte parity is the corpus's job. This is worth knowing before building on it —
+I nearly reported the mismatch as the finding.
+
+## Still unreduced, with reductions
+
+The smallest page's first difference is now its `<noinclude>`:
+
+```
+parsoid: <meta typeof="mw:Includes/NoInclude" id="mwAw"/>
+rustoid: <template ="" id="mwAw"></template>
+```
+
+Same node — the ids match — but the element is named `template` and carries an
+empty-named attribute. The tokenizer is *not* at fault: `include_limits` builds
+a proper `SelfclosingTagTk::new("meta", …)` with `typeof="mw:Includes/NoInclude"`.
+So the token is right and the DOM element is wrong, which means the meta is being
+replaced or renamed between the token stream and the tree — and the serializer's
+`mw:Includes/NoInclude` arm is therefore never reached. That is the next thing to
+look at, and it is the *first* difference on the page, so everything downstream
+is unmeasurable until it is fixed.
+
+Separately, reduced to one line via the harness — a pipe inside a wikilink
+inside an `#invoke` argument:
+
+```
+{{#invoke:String|len|[[Category:Foo|_VALUE_{{PAGENAME}}]]}}   -> fails
+The same without the {{PAGENAME}}                             -> fine
+The {{PAGENAME}} without the link, or the link without the call -> fine
+```
+
+All three ingredients are needed, so it is the argument splitter's
+pipe-inside-a-link tracking being confused by a nested call after the pipe.
+
+## Three instruments that were wrong, and how each was caught
+
+Recorded because all three looked like results, and two of them were about to
+become conclusions rather than measurements:
+
+- **`RUSTOID_TRACE` is not the variable** — it is `RUSTOID_TRACE_FETCH`. A run
+  with the wrong name printed no request lines and appeared to prove that the
+  expander asks for nothing. Caught by asking whether the trace worked at all on
+  a page known to fetch.
+- **Title lookups are case-sensitive where wikitext is not.** Comparing a page's
+  `{{intro to single}}` against the cache reported six templates missing, because
+  the cache holds `Template:Intro to single`. Re-checked, nothing is missing. This
+  was one step from becoming the conclusion "the corpus measures cache coverage,
+  not engine defects" — the opposite of the truth, and it would have redirected
+  the work.
+- **A `{{…}}` count over a whole rendering is meaningless.** A transclusion's
+  `data-mw` attribute legitimately contains the source wikitext, so every case
+  looked unexpanded. The probe now counts `{{` only outside tags, which is the
+  same distinction the harness's `Unexpanded` makes — and the mis-count made a
+  correctly-rendering case look broken, twice.
+
+The pattern in all three: the instrument was cheap to write and never checked
+against a case with a known answer. Each was caught by doing that, once.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands

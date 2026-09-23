@@ -927,6 +927,33 @@ impl OwnedRenderInput {
     }
 }
 
+/// Render wikitext the *caller* chose.
+///
+/// The corpus compares pages the wiki already has. This renders an input the
+/// caller supplies, which is what a reduction needs: the point is to vary one
+/// thing, and the only way to do that with the corpus is to find a cached page
+/// that happens to contain the construct — which makes the input a moving target
+/// buried in hundreds of kilobytes of unrelated markup.
+///
+/// It goes through the same render path as a corpus page, so what it produces
+/// covers the whole pipeline — tokenizer, expansion, tree building,
+/// encapsulation, `data-mw`, node ids — rather than the tree one stage left
+/// behind, which is all a unit test over that stage can see. That is the point:
+/// the diff to reduce is the *rendered* one.
+///
+/// Returns `None` for a render that hit the per-page cap, so a caller can say so
+/// rather than print an empty rendering as a result.
+pub async fn render_wikitext<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
+    client: &WikiClient,
+    config: &C,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
+    title: &str,
+    wikitext: &str,
+    offline: bool,
+) -> Result<Option<String>> {
+    render_rustoid(client, config, cache, title, wikitext, offline).await
+}
+
 /// Parse `wikitext` with rustoid, using a cache-backed data source so template
 /// fetches are persisted too.
 ///

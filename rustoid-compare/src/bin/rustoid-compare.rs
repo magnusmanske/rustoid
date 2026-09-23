@@ -47,6 +47,18 @@ struct Cli {
     #[arg(long, value_name = "FILE_OR_DEFAULT")]
     corpus: Option<String>,
 
+    /// Compare *chosen* wikitext: read it from this file and compare rustoid's
+    /// rendering of it against the wiki's own, instead of using a cached page.
+    ///
+    /// The oracle is the wiki's `transform/wikitext/to/html` endpoint, so this is
+    /// the instrument for reducing a difference to a minimal input: the corpus
+    /// can only compare pages the wiki happens to have, and the construct then
+    /// arrives buried in unrelated markup. The title the wikitext is rendered as
+    /// comes from `--page` (default `Sandbox`), because that is what
+    /// `{{PAGENAME}}` and page-scoped magic words resolve against.
+    #[arg(long, value_name = "FILE")]
+    wikitext: Option<String>,
+
     /// Print the scoreboard only, without the per-page detail lines.
     #[arg(long)]
     quiet: bool,
@@ -138,12 +150,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // A page or a corpus is required; with neither, report what is cached, which
-    // is the useful no-argument action. In corpus mode the page stays empty and
-    // is never used, because the corpus branch below returns first.
+    // A page, a corpus, or chosen wikitext is required; with none, report what is
+    // cached, which is the useful no-argument action. In corpus mode the page
+    // stays empty and is never used, because the corpus branch returns first; in
+    // wikitext mode an empty page means "render as `Sandbox`".
     let page = match cli.page.clone() {
         Some(page) => page,
         None if cli.corpus.is_some() => String::new(),
+        None if cli.wikitext.is_some() => String::new(),
         None => {
             println!(
                 "cache: {} — {} entries for {}",
@@ -213,6 +227,61 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         return run_corpus(cli, &client, &config, &cache, &rt, &corpus);
     }
 
+    // The loose-wikitext instrument. Evaluated before the page path because
+    // `--page` means something different here: it names the title the *input* is
+    // rendered as, not a page to look up.
+    if let Some(path) = &cli.wikitext {
+        let wikitext = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read wikitext {path}: {e}"))?;
+        let title = if page.is_empty() {
+            "Sandbox".to_string()
+        } else {
+            page.clone()
+        };
+        let rendered = rt.block_on(rustoid_compare::harness::render_wikitext(
+            &client,
+            &config,
+            &cache,
+            &title,
+            &wikitext,
+            cli.offline,
+        ))?;
+        let Some(rustoid_html) = rendered else {
+            println!("{title} — STALLED (the render hit the per-page cap)");
+            std::process::exit(1);
+        };
+        println!("--- rustoid ---\n{rustoid_html}");
+        let errors = rustoid_compare::harness::script_errors(&rustoid_html, 5);
+        if !errors.is_empty() {
+            println!("\nrustoid script errors:");
+            for e in &errors {
+                println!("  {e}");
+            }
+        }
+        // The wiki's rendering of the same input, from the *transform* endpoint.
+        //
+        // Deliberately not presented as a verdict. That endpoint is a different
+        // rendering mode from the one the corpus compares against: it keeps
+        // `data-parsoid` where `rest_v1/page/html` strips it, so a byte
+        // comparison against it would report a difference on every input
+        // including a bare paragraph. It is still the right question for
+        // "what does Parsoid *do* with this construct" — which is how the
+        // Owidslider and Piechart payloads were checked — and the wrong one for
+        // "did rustoid match". Byte parity is the corpus's job.
+        if !cli.offline {
+            let wiki = rt.block_on(client.parsoid_html_for_wikitext(&title, &wikitext))?;
+            println!("\n--- wiki (transform endpoint; a different rendering mode) ---\n{wiki}");
+            if let Outcome::Differ { detail } = rustoid_compare::compare_html(&wiki, &rustoid_html)
+            {
+                println!("\nfirst difference against the transform rendering:\n{detail}");
+            }
+        }
+        if !errors.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let req = rustoid_compare::CompareRequest {
         title: page.clone(),
         revid: cli.revision,
@@ -223,7 +292,18 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let comparison = rt.block_on(rustoid_compare::compare_page(
         &client, &config, &cache, &req,
     ))?;
+    report(&comparison, cli.verbose)
+}
 
+/// Print a comparison and return the exit status it implies.
+///
+/// Shared by the page and loose-wikitext paths so the two cannot report the same
+/// outcome differently — which has already happened once: the single-page report
+/// did not surface Script errors while the scoreboard did.
+fn report(
+    comparison: &rustoid_compare::Comparison,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let status = match &comparison.outcome {
         Outcome::Match => "MATCH".to_string(),
         Outcome::Differ { detail } => format!("DIFFER\n{detail}"),
@@ -248,7 +328,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("    {e}");
         }
     }
-    if cli.verbose && !comparison.outcome.is_match() {
+    if verbose && !comparison.outcome.is_match() {
         println!("\n--- parsoid ---\n{}", comparison.parsoid_html);
         println!("\n--- rustoid ---\n{}", comparison.rustoid_html);
     }
