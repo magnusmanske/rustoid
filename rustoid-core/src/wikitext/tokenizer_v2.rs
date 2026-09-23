@@ -4415,8 +4415,16 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
                     None => i += 1,
                 }
             }
-            // A nested transclusion pushes its own `}}` closer.
-            (Some(&TPL), _) if input[i..].starts_with("{{") => {
+            // A nested transclusion pushes its own `}}` closer. This happens
+            // even inside an open `[[`: PHP's preproc stack is document-order —
+            // "once you see `[[ {{` you are looking only for `}}`"
+            // (`Grammar.pegphp`'s `broken_template` comment) — so a template in a
+            // wikilink target is a token like any other. Guarding this on the top
+            // closer being `}}` made `{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}`
+            // unable to close at all: the inner `}}` hit the "`}}` under an open
+            // `[[`" arm above and abandoned the whole scan, so the call was
+            // emitted as literal text with only its arguments parsed.
+            _ if input[i..].starts_with("{{") => {
                 stack.push(TPL);
                 i += 2;
             }
@@ -6151,6 +6159,42 @@ mod tests {
             }
             other => panic!("expected a nested template token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_template_with_link_holding_a_template() {
+        // A template inside a wikilink inside a template argument is a token
+        // like any other: PHP's preproc stack is document-order, so `{{` pushes
+        // its own `}}` closer even while a `[[` is open. Reading the inner `}}`
+        // as "still inside the link" abandoned the whole scan, so the call was
+        // emitted as literal text with only its arguments parsed — which is what
+        // made `{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}` render as text.
+        let tokens = tokenize("{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected the outer template to close");
+
+        assert_eq!(template.attribs.len(), 4);
+        assert_eq!(template.attribs[0].key.as_str(), Some("#ifeq:S"));
+        let KeyValue::Tokens(items) = &template.attribs[3].value else {
+            panic!(
+                "expected the branch to be tokenized, got {:?}",
+                template.attribs[3].value
+            );
+        };
+        assert!(
+            items.iter().any(|it| matches!(
+                it,
+                Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "wikilink"
+            )),
+            "expected the branch to hold a wikilink, got {items:?}"
+        );
     }
 
     #[test]

@@ -876,10 +876,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 
     fn new_about_id(&self, counter: &std::cell::Cell<usize>) -> String {
-        // PHP Parsoid numbers transclusion `about` ids starting from 1.
-        let id = counter.get() + 1;
-        counter.set(id);
-        format!("#mwt{id}")
+        crate::pipeline::attribute_expander::new_about_id(counter)
     }
 
     /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
@@ -2464,25 +2461,25 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `inTemplate => true` (see `mark_arg_value_tokens`).
         let in_tpl = in_template || stt.data_parsoid.tmp.in_arg_value;
 
-        // The `about` id is taken only when this expansion can actually be
-        // wrapped. Every branch below that returns unencapsulated — the
-        // `in_template` case, and the parser-function/`#tag` case — used to take
-        // an id first and discard it, so the sequence ran 1, 2, 4, 5, 6 on
-        // Template:Infobox with `#mwt3` vanishing and every later id shifted. A
-        // discarded id is not harmless: the service serves contiguous ids over
-        // the elements it does wrap.
+        // A `mw:Transclusion` wrapper needs an `about` id — but only a *template*
+        // expansion takes one here. A variable or parser function is wrapped by
+        // `TemplateHandler::process`, which takes its own id, and an in-template
+        // expansion is wrapped by whoever spliced it. Taking one up front for
+        // every token cost an id nothing used: `{{#if:1|X|Y}}{{PAGENAME}}`
+        // numbered `#mwt1` then `#mwt3` where the service serves `#mwt2`.
         //
         // PHP takes it in the `TemplateEncapsulator` constructor, which
         // `onTemplate` runs for every template token, so `allocate then discard`
-        // is faithful *there*. The difference is which tokens reach it: a `#tag`
-        // lowered from a module's `frame:extensionTag` is not an `onTemplate`
-        // token, and the element it emits (the `<style>`) takes its id where it
-        // is spliced instead.
-        let needs_about_id = !in_tpl;
-        let about_id = if needs_about_id {
-            self.new_about_id(about_counter)
-        } else {
-            String::new()
+        // looks faithful *there*. The difference is which tokens reach it: a
+        // `#tag` lowered from a module's `frame:extensionTag` is not an
+        // `onTemplate` token, and the element it emits (the `<style>`) takes its
+        // id where it is spliced instead.
+        let take_id = || {
+            if in_tpl {
+                String::new()
+            } else {
+                self.new_about_id(about_counter)
+            }
         };
 
         // The *target* (attribs[0]) may hold a nested template
@@ -2559,6 +2556,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(ResolvedTarget::ParserFunction {
                 name, ref pf_arg, ..
             }) if name.eq_ignore_ascii_case("invoke") => {
+                let about_id = take_id();
                 // Scribunto's `#invoke` is not an ordinary parser
                 // function: everything after the colon is its argument
                 // list, and the tokenizer has already split that on `|`,
@@ -2618,6 +2616,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.extend(expanded);
             }
             Some(ResolvedTarget::Template { name, title }) => {
+                let about_id = take_id();
                 let expanded = self
                     .expand_one_template(
                         source,
@@ -2694,13 +2693,34 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let mut expanded_tok = stt.clone();
                 expanded_tok.attribs = attribs;
                 let expanded_item = Item::Tok(ParsoidToken::SelfclosingTag(expanded_tok));
-                let expanded = TemplateHandler.process(
+                let produced = TemplateHandler.process(
                     self.config,
                     frame,
                     about_counter,
                     &self.protection_context(),
                     vec![expanded_item],
                 );
+                // A parser function hands back a *branch*, and a branch is
+                // wikitext: PHP's handlers return its tokens unexpanded and the
+                // token stream processes them again, so `{{#ifeq:1|1|{{Large|…}}|z}}`
+                // expands `Large` and `{{#if:1|{{PAGENAME}}}}` answers the page
+                // name. Returning them verbatim instead leaked the raw
+                // `template` token through to the DOM builder, which named an
+                // element after it (`<template Large="" 1="x">`) — the whole
+                // family of `Help:Introduction`'s first difference, which is a
+                // `{{SHORTDESC:…}}` inside `Template:Short description`'s
+                // `#ifeq` branch. Expansion happens *after* the wrapper is built,
+                // so the wrapper's own id still precedes its children's, as on
+                // the service.
+                let expanded = Box::pin(self.expand_templates(
+                    frame,
+                    produced,
+                    source,
+                    about_counter,
+                    in_tpl,
+                    src_text,
+                ))
+                .await;
                 for e in &expanded {
                     track_table(e, table_depth);
                 }

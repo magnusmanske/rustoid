@@ -1311,11 +1311,7 @@ impl TemplateHandler {
                 continue;
             };
             if stt.name == "template" || stt.name == "template3" {
-                let about_id = {
-                    let id = about_counter.get();
-                    about_counter.set(id + 1);
-                    format!("#mwt{id}")
-                };
+                let about_id = crate::pipeline::attribute_expander::new_about_id(about_counter);
                 // Build a `Params` from the token's attribs.
                 let params = Params::new(stt.attribs.clone());
                 let context_title = frame.title();
@@ -1333,11 +1329,7 @@ impl TemplateHandler {
             if stt.name == "templatearg"
                 && let Some(name) = stt.attribs.first().and_then(|kv| kv.key.as_str())
             {
-                let about_id = {
-                    let id = about_counter.get();
-                    about_counter.set(id + 1);
-                    format!("#mwt{id}")
-                };
+                let about_id = crate::pipeline::attribute_expander::new_about_id(about_counter);
                 let src = format!("{{{{{name}}}}}");
                 let expanded = self.handle_template_arg(frame, &src, about_id, tok, true);
                 out.extend(expanded);
