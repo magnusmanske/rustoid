@@ -7,9 +7,11 @@
 //! codepoints, and the pattern classes are Unicode properties (see [`classes`]).
 //!
 //! Built up from the parts that depend only on Rust's Unicode tables, so that
-//! each can be checked without the live service. The pattern engine itself is
-//! not here yet.
+//! each can be checked without the live service. The matcher itself is in
+//! [`pattern`], and is a port of `lstrlib.c` rather than a reading of the manual.
 
 pub mod classes;
+pub mod pattern;
 
 pub use classes::LuaClass;
+pub use pattern::{Capture, MatchError, MatchResult};

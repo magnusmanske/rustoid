@@ -10,6 +10,7 @@ use mlua::{Function, Lua, Table, Value};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Result, RustoidError};
+use crate::lua::ustring;
 use crate::traits::SiteConfig;
 
 /// Configuration for the Lua engine.
@@ -1442,14 +1443,14 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
 
     // mw.ustring
     //
-    // Scribunto's `ustring` is a codepoint-aware version of Lua's `string`. The
-    // pattern-matching functions (`match`/`gmatch`/`gsub`/`find`) are the ones
-    // modules actually lean on, and implementing them by hand would be a project
-    // of its own, so they forward to Lua's `string` library. The divergence is
-    // real and worth stating: Lua's indices are *bytes* while Scribunto's are
-    // *codepoints*, so a module matching a pattern against a non-ASCII string
-    // and then slicing by index gets different offsets. `len` is overridden
-    // below, so the common counting case is correct.
+    // Scribunto's `ustring` is a codepoint-aware version of Lua's `string`,
+    // with its own pattern engine: the classes are Unicode properties (see
+    // `crate::lua::ustring`) and every index is a codepoint. The pattern
+    // functions below are therefore overridden rather than inherited, because
+    // inheriting them is observable — it raised "malformed pattern (missing
+    // ']')" on the C0-control set in `Module:Citation/CS1`, which the service
+    // matches happily, and it made `%d` ASCII-only where the service matches
+    // fullwidth digits.
     let ustring = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
@@ -1519,6 +1520,14 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     ustring.set("toNFKC", lua.create_function(luafn_ustring_to_nfkc)?)?;
     ustring.set("toNFKD", lua.create_function(luafn_ustring_to_nfkd)?)?;
     ustring.set("byteoffset", lua.create_function(luafn_ustring_byteoffset)?)?;
+    // The four pattern functions. `find` and `match` are the primitives; the
+    // iterator and replacement forms are written in Lua over them, which keeps
+    // the multi-value returns in Lua where they are native.
+    ustring.set("find", lua.create_function(luafn_ustring_find)?)?;
+    ustring.set("match", lua.create_function(luafn_ustring_match)?)?;
+    // The anchored-captures primitive the Lua-side `gsub`/`gmatch` drive their
+    // loops with. Double underscore marks it as internal, as elsewhere.
+    ustring.set("__captures", lua.create_function(luafn_ustring_captures)?)?;
     ustring.set_metatable(Some(ustring_mt));
     mw.set("ustring", ustring)?;
 
@@ -2828,6 +2837,117 @@ function mw.ustring.gcodepoint(s, i, j)
     end
 end
 
+-- `mw.ustring.gmatch( s, pattern )` — an iterator over every match.
+--
+-- Anchors are suppressed in the loop, because a pattern applied repeatedly must
+-- not keep re-anchoring at position 1: Lua's own `gmatch` strips a leading `^`
+-- for exactly that reason, and a pattern like `^%a+` would otherwise loop
+-- forever. A failed match advances by one *character* rather than one byte, so
+-- the iteration cannot stop inside a multibyte sequence.
+--
+-- The iterator is written here rather than in Rust because a `for` iterator must
+-- return a value and the next control, and a Rust closure's second return value
+-- does not survive that call (the same reason as `gcodepoint` above).
+function mw.ustring.gmatch(s, pattern)
+    local pos = 1
+    local len = mw.ustring.len(s)
+    if type(pattern) == 'string' and pattern:sub(1, 1) == '^' then
+        pattern = pattern:sub(2)
+    end
+    return function()
+        while pos <= len + 1 do
+            local a, b = mw.ustring.find(s, pattern, pos)
+            if a then
+                -- An empty match must still advance, or the loop never ends.
+                pos = (b >= a) and (b + 1) or (a + 1)
+                local caps = { mw.ustring.__captures(s, pattern, a) }
+                if #caps > 0 then return unpack(caps) end
+                return mw.ustring.sub(s, a, b)
+            end
+            pos = pos + 1
+        end
+        return nil
+    end
+end
+
+-- `mw.ustring.gsub( s, pattern, repl, n )` — replace every match.
+--
+-- `repl` may be a string (with `%0`..`%9` referring to captures), a table
+-- (indexed by the first capture, or by the whole match when there are none), or
+-- a function (called with the captures). All three forms are used by modules, so
+-- all three are supported; a `false` or `nil` replacement keeps the original
+-- text, which is how `gsub` is used as a filter.
+function mw.ustring.gsub(s, pattern, repl, n)
+    local out = {}
+    local pos = 1
+    local len = mw.ustring.len(s)
+    local count = 0
+    local max = n or math.huge
+
+    local function append_replacement(whole, ...)
+        local caps = { ... }
+        if type(repl) == 'function' then
+            -- Lua passes the captures, or the whole match when the pattern has
+            -- none; the `nil` argument that would otherwise arrive is what made
+            -- a `function(c)` replacement see `c == nil`.
+            local r
+            if #caps > 0 then r = repl(unpack(caps)) else r = repl(whole) end
+            if r == false or r == nil then return whole end
+            return tostring(r)
+        elseif type(repl) == 'table' then
+            local key
+            if #caps > 0 then key = caps[1] else key = whole end
+            local r = repl[key]
+            if r == false or r == nil then return whole end
+            return tostring(r)
+        else
+            -- A string replacement: `%0` is the whole match, `%1`.. `%9` the
+            -- captures, and `%%` a literal percent. When the pattern has no
+            -- captures, `%1` refers to the whole match rather than raising —
+            -- verified against the service, where `gsub('abc', '%a', '%1')`
+            -- gives `abc` and `gsub('abc', '%a', '%0%0')` gives `aabbcc`. The
+            -- error is therefore reserved for an index that is out of range
+            -- *given* that a captureless pattern has one implicit capture.
+            local r = repl:gsub('%%([%%0-9])', function(d)
+                if d == '%' then return '%' end
+                if d == '0' then return whole end
+                local i = tonumber(d)
+                local v
+                if #caps == 0 then
+                    -- The whole match is capture 1 when there are none.
+                    if i ~= 1 then
+                        error('invalid capture index %' .. d .. ' in replacement string', 2)
+                    end
+                    v = whole
+                else
+                    v = caps[i]
+                    if v == nil then
+                        error('invalid capture index %' .. d .. ' in replacement string', 2)
+                    end
+                end
+                return tostring(v)
+            end)
+            return r
+        end
+    end
+
+    while pos <= len + 1 and count < max do
+        local a, b = mw.ustring.find(s, pattern, pos)
+        if not a then break end
+        out[#out + 1] = mw.ustring.sub(s, pos, a - 1)
+        local caps = { mw.ustring.__captures(s, pattern, a) }
+        if #caps > 0 then
+            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), unpack(caps))
+        else
+            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b))
+        end
+        count = count + 1
+        if b >= a then pos = b + 1 else pos = a + 1 end
+    end
+    out[#out + 1] = mw.ustring.sub(s, pos)
+    return table.concat(out), count
+end
+
 -- `mw.text.split( s, pattern, plain )` and its iterator form
 -- `mw.text.gsplit`. The Rust side supplies only the literal split; the pattern
 -- form is the reference implementation from the manual, walking the string with
@@ -3746,6 +3866,127 @@ fn luafn_ustring_byteoffset(
     let index = anchor as i64 - 1 + l;
     let index = index.clamp(0, boundaries.len() as i64 - 1);
     Ok(boundaries[index as usize])
+}
+
+/// `mw.ustring.find(s, pattern, init, plain)` — codepoint indices.
+///
+/// Returns the 1-based start and end positions of the match followed by its
+/// captures, or just the start when the pattern has none — the same shape Lua's
+/// `string.find` returns, but measured in codepoints rather than bytes. That
+/// difference is the point: `Module:Citation/CS1` compares a capture against
+/// `'nowiki'` and uses the positions as string indices.
+///
+/// `init` is a codepoint offset, may be negative to count from the end, and
+/// defaults to 1.
+fn luafn_ustring_find(
+    lua: &Lua,
+    (s, pattern, init, plain): (Value, Value, Option<i64>, Option<bool>),
+) -> mlua::Result<mlua::MultiValue> {
+    let s = coerce_string(&s, "find")?;
+    let pattern = coerce_string(&pattern, "find")?;
+    let plain = plain.unwrap_or(false);
+    let start = resolve_init(&s, init);
+    let found = ustring::pattern::find_match(&s, &pattern, start, plain)
+        .map_err(|e| mlua::Error::runtime(e.message()))?;
+    let Some(m) = found else {
+        return Ok(mlua::MultiValue::new());
+    };
+    let mut out = mlua::MultiValue::new();
+    // Positions are 1-based codepoints; the end is inclusive.
+    let start_pos = m.start_index + 1;
+    let end_pos = m.start_index + m.whole.chars().count();
+    out.push_back(Value::Integer(start_pos as i64));
+    out.push_back(Value::Integer(end_pos as i64));
+    for cap in &m.captures {
+        push_capture(lua, &mut out, cap)?;
+    }
+    Ok(out)
+}
+
+/// `mw.ustring.match(s, pattern, init)` — the captures of the first match.
+///
+/// With no captures this returns the whole match, so the arity depends on the
+/// pattern, exactly as in Lua. `Module:Citation/CS1` assigns three values from
+/// one call, which is why the returns are a multivalue rather than a table.
+fn luafn_ustring_match(
+    lua: &Lua,
+    (s, pattern, init): (Value, Value, Option<i64>),
+) -> mlua::Result<mlua::MultiValue> {
+    let s = coerce_string(&s, "match")?;
+    let pattern = coerce_string(&pattern, "match")?;
+    let start = resolve_init(&s, init);
+    let found = ustring::pattern::find_match(&s, &pattern, start, false)
+        .map_err(|e| mlua::Error::runtime(e.message()))?;
+    let Some(m) = found else {
+        return Ok(mlua::MultiValue::new());
+    };
+    let mut out = mlua::MultiValue::new();
+    if m.captures.is_empty() {
+        out.push_back(Value::String(lua.create_string(m.whole)?));
+    } else {
+        for cap in &m.captures {
+            push_capture(lua, &mut out, cap)?;
+        }
+    }
+    Ok(out)
+}
+
+/// `mw.ustring.__captures(s, pattern, at)` — the captures of a match anchored
+/// at codepoint `at`.
+///
+/// `gsub` and `gmatch` need the captures of the match *at* a position, not of
+/// the first match at or after it: `find` slides forward, so using it to drive a
+/// replacement loop would skip the unmatched text between the position and the
+/// match and duplicate it. Anchoring with `^` is not enough either, because the
+/// pattern may itself start with one.
+///
+/// Returns the capture list, or nothing when the pattern does not match there.
+fn luafn_ustring_captures(
+    lua: &Lua,
+    (s, pattern, at): (Value, Value, i64),
+) -> mlua::Result<mlua::MultiValue> {
+    let s = coerce_string(&s, "match")?;
+    let pattern = coerce_string(&pattern, "match")?;
+    let start = resolve_init(&s, Some(at));
+    let anchored = format!("^{pattern}");
+    let found = ustring::pattern::find_match(&s, &anchored, start, false)
+        .map_err(|e| mlua::Error::runtime(e.message()))?;
+    let Some(m) = found else {
+        return Ok(mlua::MultiValue::new());
+    };
+    let mut out = mlua::MultiValue::new();
+    for cap in &m.captures {
+        push_capture(lua, &mut out, cap)?;
+    }
+    Ok(out)
+}
+
+/// Resolve a Lua start offset to a 0-based codepoint index.
+///
+/// Negative counts back from the end and an omitted (`nil`) offset is 1; either
+/// way the result is clamped into the string, so a caller may pass an
+/// uninitialised local — which `Module:IPA` does.
+fn resolve_init(s: &str, init: Option<i64>) -> usize {
+    let n = s.chars().count() as i64;
+    let init = init.unwrap_or(1);
+    let resolved = if init < 0 { n + init + 1 } else { init };
+    resolved.clamp(1, n + 1) as usize - 1
+}
+
+/// Append a capture's value in the form Lua returns it.
+fn push_capture(
+    lua: &Lua,
+    out: &mut mlua::MultiValue,
+    cap: &Option<ustring::Capture<'_>>,
+) -> mlua::Result<()> {
+    match cap {
+        Some(ustring::Capture::Text(t)) => out.push_back(Value::String(lua.create_string(*t)?)),
+        // A position capture is a number, not a string — `tostring` differs and
+        // modules compare it with `#` or arithmetic.
+        Some(ustring::Capture::Position(p)) => out.push_back(Value::Integer(*p as i64)),
+        None => out.push_back(Value::Nil),
+    }
+    Ok(())
 }
 
 /// Build a Scribunto `args` table from a frame's arguments.
