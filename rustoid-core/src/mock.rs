@@ -60,6 +60,13 @@ fn norm_title_key(title: &str) -> String {
 /// An in-memory data source for testing.
 ///
 /// Pages, templates, modules, and file info are added via builder methods.
+/// MediaWiki's canonical namespace id for `Module:`.
+///
+/// Fixed by the software rather than by a wiki's configuration, which is why a
+/// literal is honest here: `Module` is a built-in namespace and its id is 828 on
+/// every wiki.
+const MODULE_NAMESPACE: i32 = 828;
+
 pub struct MockDataSource {
     pages: RwLock<HashMap<String, String>>,
     templates: RwLock<HashMap<String, String>>,
@@ -179,7 +186,18 @@ impl DataSource for MockDataSource {
         if let Some(content) = case_insensitive_get(&self.pages, &key) {
             return Ok(Some(content.clone()));
         }
-        Ok(self.templates.read().unwrap().get(&key).cloned())
+        if let Some(content) = self.templates.read().unwrap().get(&key) {
+            return Ok(Some(content.clone()));
+        }
+        // A module is a page too. Its content is stored separately because
+        // `require` needs to tell a module from an article of the same name, but
+        // an existence question — `mw.title.new('Module:Foo/data').exists` — is
+        // about the page, and answering `None` here records a *false* fact that
+        // suppresses the fetch which would have corrected it.
+        if title.namespace_id == MODULE_NAMESPACE {
+            return Ok(self.modules.read().unwrap().get(&key).cloned());
+        }
+        Ok(None)
     }
 
     /// Content with the revision recorded for it, if any.
@@ -914,5 +932,34 @@ mod tests {
         let config = MockSiteConfig::new();
         assert!(config.interwiki_map().contains_key("wikipedia"));
         assert!(config.interwiki_map().contains_key("meatball"));
+    }
+
+    /// A module is a page, so `get_page_content` must find one.
+    ///
+    /// The content is stored separately because `require` must tell a module
+    /// from an article of the same name, but an existence question about a
+    /// module is about the *page*. Answering `None` records a false fact, which
+    /// then suppresses the fetch that would have corrected it — so the miss
+    /// becomes permanent, and the module reports that its own data page does not
+    /// exist while the page is right there.
+    #[tokio::test]
+    async fn get_page_content_finds_a_module() {
+        let source = MockDataSource::new();
+        source.add_module("Module:Probe/data", "return { x = 1 }");
+
+        let as_module = Title {
+            namespace_id: MODULE_NAMESPACE,
+            text: "Probe/data".to_string(),
+            ..Title::new_main("Probe/data")
+        };
+        assert_eq!(
+            source.get_page_content(&as_module).await.unwrap(),
+            Some("return { x = 1 }".to_string())
+        );
+
+        // A main-namespace title of the same name must still miss, or every
+        // article would resolve to a module with no namespace prefix.
+        let as_article = Title::new_main("Module:Probe/data");
+        assert_eq!(source.get_page_content(&as_article).await.unwrap(), None);
     }
 }

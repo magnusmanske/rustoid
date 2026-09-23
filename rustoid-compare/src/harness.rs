@@ -380,6 +380,21 @@ impl CachedDataSource {
 
 #[async_trait::async_trait]
 impl DataSource for CachedDataSource {
+    /// A page's wikitext, from whichever cache kind holds it.
+    ///
+    /// A Module-namespace title is cached under `Module`, not `Page`, because
+    /// `require` and `mw.loadData` need to distinguish a module from an article
+    /// of the same name. But a module *is* a page: a module reading
+    /// `mw.title.new('Module:Foo/data').exists` is asking the same question as
+    /// any other title lookup, and answering `None` for it records a *false*
+    /// fact — which then suppresses the request that would have fetched it, so
+    /// the miss is permanent for the rest of the page. That is what
+    /// `Module:Location map` hit: it reported that its data page "does not
+    /// exist" while the page was on disk under `mod:`.
+    ///
+    /// Templates get the same treatment for the same reason: `Template:Foo` is a
+    /// page, and `title.exists` on one must not depend on which kind the fetcher
+    /// happened to use.
     async fn get_page_content(
         &self,
         title: &rustoid_core::Title,
@@ -387,10 +402,25 @@ impl DataSource for CachedDataSource {
         // A DataSource error here would abort the parse; a cache/transport
         // failure is reported as "no content" so the comparison still produces
         // a result (a red link) rather than a hard failure.
-        Ok(self
-            .fetch(EntryKind::Page, &title.full_text())
-            .await
-            .unwrap_or(None))
+        let full = title.full_text();
+        // The namespace decides which kind holds it, so the common case costs
+        // one lookup and only a miss pays for the second. The id is compared
+        // against the canonical prefixes rather than a namespace table this
+        // source does not have: `Module` and `Template` are the two namespaces
+        // the harness splits out of `Page`, and their ids are fixed by MediaWiki
+        // (828 and 10) — `namespace_prefix` is the canonical mapping.
+        let kind = match rustoid_core::title::namespace_prefix(title.namespace_id) {
+            "Module" => EntryKind::Module,
+            "Template" => EntryKind::Template,
+            _ => EntryKind::Page,
+        };
+        if let Some(body) = self.fetch(kind, &full).await.unwrap_or(None) {
+            return Ok(Some(body));
+        }
+        if kind != EntryKind::Page {
+            return Ok(self.fetch(EntryKind::Page, &full).await.unwrap_or(None));
+        }
+        Ok(None)
     }
 
     /// Content *and* its revision, which `<templatestyles>` needs: the text is
