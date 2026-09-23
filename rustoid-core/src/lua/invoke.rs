@@ -306,6 +306,7 @@ pub fn run_once(
     page_title: &str,
     frame: &FrameContext,
     answers: &crate::pipeline::lua_deferred::DeferredAnswers,
+    unfetchable: &std::collections::HashSet<String>,
 ) -> Result<Outcome> {
     // Scribunto's entry module must be present; a `#invoke` of a non-existent
     // module is an error, and the caller turns it into MediaWiki's message.
@@ -316,6 +317,9 @@ pub fn run_once(
 
     let mut frame = frame.clone();
     frame.modules = registry;
+    // Titles already proven absent travel with the run, so `require` reports them
+    // as missing pages rather than as preload misses.
+    frame.unfetchable = unfetchable.clone();
     let ctx = LuaContext::with_parent(site, page_title.to_string(), frame);
     let engine = LuaEngine::new(LuaEngineConfig::default(), ctx)?;
 
@@ -424,6 +428,15 @@ where
     // or one past `MAX_MODULES` — made the loop re-request it every round and
     // report "could not run X after 70 rounds" instead of the real error.
     let mut fetched: BTreeSet<String> = BTreeSet::new();
+    // Titles the loop tried to fetch and could not get. On the next round the
+    // engine is told about them so `require` raises a *catchable* "does not
+    // exist" instead of reporting another preload miss that would fetch again.
+    //
+    // This is what makes `pcall(require, 'Module:Wikidata label')` in
+    // `Module:Owidslider` behave: the page really does not exist, so the module
+    // takes its own fallback, rather than the whole render aborting on a page
+    // that was never going to arrive.
+    let mut unfetchable: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for _ in 0..MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS {
         // A title to fetch this round, from whichever signal reported it: an
@@ -436,6 +449,7 @@ where
             page_title,
             &frame,
             &answers,
+            &unfetchable,
         ) {
             Ok(Outcome::MissingModule(title)) => Err(RustoidError::Lua(format!(
                 "module {title} was not preloaded"
@@ -452,6 +466,12 @@ where
                 // reported as-is.
                 Some(title) if !registry.contains_key(&title) && fetched.insert(title.clone()) => {
                     registry.extend(preload(source, &title).await);
+                    // A title the fetch did not produce is recorded as
+                    // unfetchable, so the next round can report it as absent
+                    // rather than as a miss to be fetched again.
+                    if !registry.contains_key(&title) {
+                        unfetchable.insert(title.clone());
+                    }
                     // A newly loaded module may reference new titles and new
                     // entities, so both are refreshed from the wider registry.
                     let page = frame

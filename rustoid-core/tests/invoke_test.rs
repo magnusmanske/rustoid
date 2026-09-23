@@ -122,6 +122,45 @@ async fn a_missing_module_reports_a_script_error() {
     assert!(html.contains("Absent"), "got: {html}");
 }
 
+/// `pcall(require, X)` for a module that does not exist must be catchable.
+///
+/// This is the `Module:Owidslider` shape, at the top of its file:
+///
+/// ```lua
+/// local hasWikidataLabel, wd = pcall(require, 'Module:Wikidata label')
+/// if not hasWikidataLabel then wd = nil end
+/// ```
+///
+/// `Module:Wikidata label` does not exist on the wiki, and the service renders
+/// `Owidslider|image` cleanly because that `pcall` takes the fallback. Reporting
+/// it as a *preload* miss instead asks the host to fetch a page that will never
+/// arrive, and the whole render aborts — so the difference between "does not
+/// exist" and "was not preloaded" is observable rather than pedantic.
+#[tokio::test]
+async fn a_pcall_around_a_missing_module_takes_its_fallback() {
+    let module = r#"
+        local ok, dep = pcall(require, 'Module:NotThere')
+        local p = {}
+        function p.main(frame)
+            if not ok then return 'fallback taken' end
+            return 'loaded ' .. tostring(dep)
+        end
+        return p
+    "#;
+    // The `pcall` runs at load time, so this also covers the module body.
+    let html = expand(&[("Module:Probe", module)], "{{#invoke:Probe|main}}").await;
+    assert!(text_only(&html).contains("fallback taken"), "got: {html}");
+    assert!(!html.contains("Script error"), "got: {html}");
+}
+
+/// A missing *entry* module is still a script error: the `pcall` fix must not
+/// make a genuinely absent `{{#invoke:}}` target render as if it worked.
+#[tokio::test]
+async fn a_pcall_fix_does_not_mask_a_missing_entry_module() {
+    let html = expand(&[], "{{#invoke:Absent|main}}").await;
+    assert!(html.contains("Script error"), "got: {html}");
+}
+
 /// A Lua error inside a module must not panic the parser.
 #[tokio::test]
 async fn a_lua_error_reports_a_script_error() {

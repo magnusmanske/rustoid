@@ -264,6 +264,14 @@ fn is_protocol_relative(url: &str) -> bool {
 pub struct FrameContext {
     /// Module sources available to `require`/`mw.loadData`.
     pub modules: std::collections::HashMap<String, String>,
+    /// Titles the host has already tried to fetch without success.
+    ///
+    /// `require` reports these as pages that do not exist rather than as modules
+    /// that were not preloaded. The difference is observable: the first is an
+    /// ordinary error a module's `pcall` handles and falls back from, while the
+    /// second asks the host to fetch again — which for a page that genuinely does
+    /// not exist means the whole render aborts.
+    pub unfetchable: std::collections::HashSet<String>,
     /// Arguments of the invoking template's frame.
     pub parent_args: Vec<Arg>,
     /// Its title.
@@ -335,6 +343,9 @@ pub struct LuaContext {
     /// modules are fetched *before* execution and looked up here; see
     /// [`crate::lua::invoke`].
     pub modules: std::collections::HashMap<String, String>,
+    /// Titles the host already tried and failed to fetch; see
+    /// [`FrameContext::unfetchable`].
+    pub unfetchable: std::collections::HashSet<String>,
     /// Wikidata entities available to `mw.wikibase`, keyed by upper-cased id
     /// (`Q42`), with the page title each id is the sitelink of when known.
     ///
@@ -355,6 +366,7 @@ impl LuaContext {
             page_source: String::new(),
             titles: std::collections::HashMap::new(),
             modules: std::collections::HashMap::new(),
+            unfetchable: std::collections::HashSet::new(),
             entities: crate::lua::wikibase::Entities::default(),
         }
     }
@@ -374,6 +386,7 @@ impl LuaContext {
             page_source: String::new(),
             titles: std::collections::HashMap::new(),
             modules,
+            unfetchable: std::collections::HashSet::new(),
             entities: crate::lua::wikibase::Entities::default(),
         }
     }
@@ -389,6 +402,7 @@ impl LuaContext {
             site,
             page_title: page_title.into(),
             modules: frame.modules,
+            unfetchable: frame.unfetchable,
             parent_args: frame.parent_args,
             parent_title: frame.parent_title,
             has_parent: frame.has_parent,
@@ -971,6 +985,7 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     // A second handle on the module sources: `require` takes the first by move,
     // and `mw.loadJsonData` needs to look up data pages in the same map.
     let modules_for_json = modules.clone();
+    let unfetchable = ctx.unfetchable.clone();
     let require = lua
         .create_function(move |lua, name: Value| {
             let title = match name {
@@ -1007,6 +1022,18 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
                 if let Some(lib) = builtin_library(lua, &title) {
                     cache.set(title, lib.clone())?;
                     return Ok(lib);
+                }
+                // A page the host already tried and could not get does not exist,
+                // so this is reported as an ordinary error rather than as a preload
+                // miss. The distinction matters because a miss asks the host to
+                // fetch, and for a page that will never arrive that turns a
+                // module's `pcall` fallback into an aborted render — which is what
+                // `Module:Owidslider`'s `pcall(require, 'Module:Wikidata label')`
+                // needs to survive.
+                if unfetchable.contains(&title) {
+                    return Err(mlua::Error::runtime(format!(
+                        "module {title} does not exist"
+                    )));
                 }
                 // Record the title before raising, so it survives a `pcall`.
                 //
