@@ -2755,6 +2755,44 @@ const LUA_STDLIB_EXTRAS: &str = r#"
 do
 local mw = __rustoid_mw
 
+-- `__pairs` and `__ipairs` are Lua 5.2 metamethods that Scribunto back-ports to
+-- its 5.1 runtime: the manual's own list of differences says "Support for the
+-- __pairs and __ipairs metamethods (added in Lua 5.2) has been added." They are
+-- not optional, because `Module:Arguments` — which most templates route through
+-- — returns an *empty* proxy table whose contents exist only behind these
+-- metamethods. Without them `pairs(args)` yields nothing, so
+-- `Module:TableTools.compressSparseArray` returns an empty array, so
+-- `Module:Hatnote list.andList` returns nil, so
+-- `string.format('%s', nil)` raises "bad argument #2 to 'format'" — which is
+-- exactly the failure `Module:Main list:28` reported on seven pages.
+--
+-- Both are added by wrapping the globals rather than by touching the runtime:
+-- the raw iterators stay available for the wrapper's own use (calling the
+-- wrapped `pairs` from inside would recurse), and a table without the
+-- metamethod behaves exactly as before.
+local raw_pairs, raw_ipairs = pairs, ipairs
+
+-- `pairs(t)`: when `t` has `__pairs`, its three returned values are used
+-- directly, as the manual specifies. `__pairs` is read through the metatable,
+-- so a table that merely *inherits* one is also covered.
+local function with_pairs(t)
+    local mt = getmetatable(t)
+    local h = mt and rawget(mt, '__pairs')
+    if h then return h(t) end
+    return raw_pairs(t)
+end
+
+-- `ipairs(t)` likewise, with the default being the `1, 2, 3, …` walk that stops
+-- at the first nil.
+local function with_ipairs(t)
+    local mt = getmetatable(t)
+    local h = mt and rawget(mt, '__ipairs')
+    if h then return h(t) end
+    return raw_ipairs(t)
+end
+
+pairs, ipairs = with_pairs, with_ipairs
+
 -- Lua 5.1 only honours `__eq` when the operands carry the *same* metamethod,
 -- and mlua's `Table::equals` loosens that to "either operand has one". The
 -- loosening is observable and wrong: two tables with distinct `__eq` closures

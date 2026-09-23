@@ -264,6 +264,90 @@ async fn misc_mw_helpers_needed_by_real_modules() {
     assert!(html.contains("false/a, b and c/0"), "got: {html}");
 }
 
+/// `__pairs` and `__ipairs` are Lua 5.2 metamethods that Scribunto back-ports,
+/// and `Module:Arguments` depends on them entirely.
+///
+/// `getArgs` returns an *empty* proxy table whose contents exist only behind
+/// `__pairs`, so a `pairs` that ignores the metamethod sees nothing. The chain
+/// that failed on seven corpus pages is exactly this: `pairs(args)` yields
+/// nothing, so `Module:TableTools.compressSparseArray` returns an empty array,
+/// so `Module:Hatnote list.andList` returns nil, so
+/// `string.format('%s', nil)` raises "bad argument #2 to 'format'".
+#[tokio::test]
+async fn pairs_and_ipairs_honour_their_metamethods() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            -- The shape `Module:Arguments` builds: nothing is stored on the
+            -- table itself.
+            local store = { a = 1, [1] = 'one', [2] = 'two' }
+            local proxy = setmetatable({}, {
+                __index = function(_, k) return store[k] end,
+                __pairs = function()
+                    return function(_, k) return next(store, k) end, nil, nil
+                end,
+                __ipairs = function()
+                    return function(_, i)
+                        i = i + 1
+                        local v = store[i]
+                        if v ~= nil then return i, v end
+                    end, nil, 0
+                end,
+            })
+            -- `#` on such a table really is 0, on the wiki too; only the
+            -- metamethods expose the contents.
+            local seen = {}
+            for k, v in pairs(proxy) do seen[#seen + 1] = tostring(k) .. ':' .. tostring(v) end
+            table.sort(seen)
+            local ip = {}
+            for i, v in ipairs(proxy) do ip[#ip + 1] = i .. ':' .. tostring(v) end
+            -- A plain table must be unaffected.
+            local plain = {}
+            for k in pairs({ x = 1 }) do plain[#plain + 1] = k end
+            return '#' .. #proxy .. '|' .. table.concat(seen, ',')
+                .. '|' .. table.concat(ip, ',') .. '|' .. table.concat(plain, ',')
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Proxy", module)], "{{#invoke:Proxy|main}}").await;
+    assert!(
+        text_only(&html).contains("0|1:one,2:two,a:1|1:one,2:two|x"),
+        "got: {html}"
+    );
+}
+
+/// The `Module:Main list` chain end to end, which is what the proxy fix unblocked.
+#[tokio::test]
+async fn a_proxy_args_table_drives_the_whole_chain() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            -- Stand in for `Module:Arguments.getArgs`: a proxy whose only
+            -- numeric key is reachable through `__pairs`.
+            local store = { [1] = 'Widgets' }
+            local args = setmetatable({}, {
+                __index = function(_, k) return store[k] end,
+                __pairs = function()
+                    return function(_, k) return next(store, k) end, nil, nil
+                end,
+            })
+            -- Stand in for `Module:TableTools.compressSparseArray`.
+            local nums = {}
+            for k in pairs(args) do
+                if type(k) == 'number' and k >= 1 then nums[#nums + 1] = k end
+            end
+            table.sort(nums)
+            local compressed = {}
+            for _, n in ipairs(nums) do compressed[#compressed + 1] = args[n] end
+            -- The reported failure was `string.format` receiving nil here.
+            return string.format('see %s!', table.concat(compressed, ','))
+        end
+        return p
+    "#;
+    let html = expand(&[("Module:Chain", module)], "{{#invoke:Chain|main}}").await;
+    assert!(html.contains("see Widgets!"), "got: {html}");
+}
+
 /// Scribunto adds `table.clone`; a module that calls it must not stop there.
 #[tokio::test]
 async fn table_clone_is_available() {
