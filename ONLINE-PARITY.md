@@ -2220,12 +2220,14 @@ The `%x` case is the one that would have been easy to get wrong: reading the
 manual's "adds fullwidth character versions of the hex digits" as describing
 ASCII hex digits would reject `３`, and the service accepts it.
 
-**Still to do.** The pattern engine itself (`find`, `match`, `gmatch`, `gsub`),
-which is where the 23 pages are actually won. Cached modules call those 722 times
-against 134 calls to the already-correct `sub`, so it is unambiguously the
-priority. It needs `%b`, `%f`, captures, back-references and position captures,
-over codepoints. Two decisions are deliberately deferred until they can be
-measured rather than guessed:
+**Still to do.** The pattern engine itself is now [`pattern.rs`], a port of
+`lstrlib.c` over codepoints. It needs `%b`, `%f`, captures, back-references and
+position captures, and all of those are in and tested; cached modules call the
+four pattern functions 722 times against 134 calls to the already-correct `sub`,
+so this was unambiguously the priority.
+
+Two decisions are deliberately deferred until they can be measured rather than
+guessed:
 
 - `%c` vs the Cc category boundary, and `%g`'s exact printable set.
 - `maxStringLength`: the manual gives no value, and modules guard against it, so
@@ -2236,6 +2238,61 @@ measured rather than guessed:
 `string.format`. That is deliberate: every cached call site applies `%s`/`%i`/`%d`
 with no width or precision to non-ASCII text, where the two agree, so changing it
 would be churn without an observable difference.
+
+## The pattern engine, and what it moved
+
+The matcher is a port of `lstrlib.c` rather than a design from the manual,
+because the manual does not spell out the corners that decide real output:
+greedy-vs-minimal backtracking order, the `%f` frontier rule, and how an empty
+capture reports a position. Those are settled by the C, and "looks equivalent"
+diverges on real patterns.
+
+The port is over **codepoints**, which is the observable difference from
+`string`. Verified against the service: `mw.ustring.find('héllo', 'l')` returns
+`3`, not byte 4, and `gsub('a1b2', '(%a)(%d)', '%2%1')` returns `1a2b`. Both match.
+
+Three behaviours were pinned by measurement rather than reasoning, and one of
+them corrected a real bug in the first draft:
+
+- **`gsub('abc', '%a', '%1')` is `abc`, not an error.** With no captures, `%1` in
+the replacement refers to the whole match. The draft raised "invalid capture
+index", which cost 36 pages. `gsub('abc', '%a', '%0%0')` is `aabbcc`, and
+`%2` with one capture *does* raise — so the error is reserved for an index out of
+range given that a captureless pattern has one implicit capture.
+- **`%f[%a]%a+` on `xword` is `xword`.** The frontier matches at position 0
+  because the previous character is out of range and reads as `\0`, which is not
+  a letter. My first expectation (`word`) was wrong.
+- **`%a(.-)%a` on `aXbXc` matches `aX`.** Minimal expansion takes the first
+  viable second letter; greedy would take `aXbXc`.
+
+Two Lua 5.1 behaviours are deliberately *not* reproduced, because the service
+does not have them:
+
+- a **NUL byte inside a set** is an ordinary character. Lua 5.1's `classend`
+  scans until `*p == '\0'` and raises "malformed pattern (missing ']')" — that is
+  the `Module:Citation/CS1` bug — while the service returns a normal result.
+  `nul_in_a_set_is_ordinary` is the regression guard, and it fails against a
+  literal transcription of the C.
+- a NUL in the *subject* is likewise a character, not a terminator.
+
+### Scoreboard: the 23-page entry is gone
+
+```
+lua failures: 48 entries / 17 distinct  ->  26 entries / 17 distinct
+output: rustoid 162291287 bytes (2.52x) -> 172428106 bytes (2.68x)
+```
+
+The `Module:Citation/CS1:832 malformed pattern` entry — 23 pages, the largest in
+the table — is **eliminated**, and no new failure took its place. `Module:Hatnote
+inline` fell from 2 pages to 1.
+
+The ratio going *up* is the honest reading of that: modules that previously
+aborted on a pattern error now run to completion and emit more output. That is
+progress towards parity but it is not parity — the pages are now producing
+plausible-looking content that still differs from Parsoid, which is a less
+visible failure mode than an error message. The score is still `0/46` and the
+next entries are all *value* differences rather than API gaps
+(`Module:Main list:28` formatting nil, 7 pages).
 
 ## Risks
 
