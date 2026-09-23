@@ -2294,6 +2294,69 @@ visible failure mode than an error message. The score is still `0/46` and the
 next entries are all *value* differences rather than API gaps
 (`Module:Main list:28` formatting nil, 7 pages).
 
+## `__pairs`/`__ipairs`, and the `Module:Arguments` proxy
+
+`Module:Main list:28` reported `bad argument #2 to 'format' (string expected, got
+nil)` on seven pages. The line is `string.format('For a more comprehensive list,
+see %s.', pages)` with `pages = mHatlist.andList(args, true)`, so the question was
+why `andList` returned nil — four modules away.
+
+Following the chain to its end found the real bug, and it is not in any of those
+modules:
+
+```
+Module:Main list      andList returns nil
+Module:Hatnote list   stringifyList returns nil because #list == 0
+Module:TableTools     compressSparseArray returns {} because pairs(args) is empty
+Module:Arguments      args is an *empty proxy table*; its contents exist only
+                      behind __pairs
+```
+
+`getArgs` returns `setmetatable({}, metatable)` — literally an empty table. Every
+argument lives in `metaArgs` and is reachable only through `__index`, `__pairs`
+and `__ipairs`. rustoid had **no `__pairs`/`__ipairs` support at all**, so `pairs`
+on that table yielded nothing, everything downstream saw an empty arguments table,
+and `string.format` got nil.
+
+The manual's own list of Scribunto's differences from stock Lua settles that this
+is part of the contract:
+
+> `ipairs()`: Support for the `__pairs` and `__ipairs` metamethods (added in Lua
+> 5.2) **has been added**.
+
+They are 5.2 features back-ported into Scribunto's 5.1 runtime, so a faithful port
+needs them. Both are implemented by wrapping the `pairs` and `ipairs` globals in
+Lua rather than by changing the runtime: the raw iterators are captured first (so
+the wrappers cannot recurse into themselves), `__pairs` is read through the
+metatable so an inherited one counts, and a table without the metamethod behaves
+exactly as before.
+
+This was worth more than the seven pages: `Module:Arguments` is the shared front
+door for template arguments across the wiki, so any module that reads its
+arguments through it was degraded, silently, into seeing none.
+
+### Scoreboard
+
+```
+lua failures: 26 entries  ->  25 entries
+output: rustoid 172428106 bytes  ->  171306922 bytes (2.66x)
+```
+
+One entry left the table (`Module:Main list`, 7 pages) and one entered it
+(`Module:Subject bar`, 6 pages). The entering one is **not** a regression, and
+this was checked rather than assumed: with the fix reverted, `Subject bar` fails
+ever more with `Module:Sister project links/config was not preloaded` — it used to
+die at the `pairs` step and now runs far enough to reach a defect of its own at
+line 18. The distinct-failure count is unchanged at 17, so the two swapped places
+rather than accumulating.
+
+The next entry is `Module:Subject bar:18`, where `tonumber(mw.ustring.match(k,
+pattern))` receives nil for a key the pattern does not match. Worth noting for
+whoever picks it up: the service renders the same input cleanly, so something
+differs in what `pairs` yields there, and the module itself looks unable to
+survive a non-matching key — which makes this a question about the argument table
+rather than about `tonumber`.
+
 ## Risks
 
 - **Scribunto fidelity is open-ended.** `Module:Citation/CS1` alone is thousands
