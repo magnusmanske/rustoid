@@ -2838,7 +2838,15 @@ local raw_pairs, raw_ipairs = pairs, ipairs
 -- `pairs(t)`: when `t` has `__pairs`, its three returned values are used
 -- directly, as the manual specifies. `__pairs` is read through the metatable,
 -- so a table that merely *inherits* one is also covered.
+--
+-- A non-table argument raises, as in Lua 5.1. The check is explicit so the
+-- message names `pairs` rather than the raw iterator the wrapper delegates to:
+-- a module that reads the error text would otherwise be told about a name it
+-- never wrote.
 local function with_pairs(t)
+    if type(t) ~= 'table' then
+        error('bad argument #1 to \'pairs\' (table expected, got ' .. type(t) .. ')', 2)
+    end
     local mt = getmetatable(t)
     local h = mt and rawget(mt, '__pairs')
     if h then return h(t) end
@@ -2848,6 +2856,9 @@ end
 -- `ipairs(t)` likewise, with the default being the `1, 2, 3, …` walk that stops
 -- at the first nil.
 local function with_ipairs(t)
+    if type(t) ~= 'table' then
+        error('bad argument #1 to \'ipairs\' (table expected, got ' .. type(t) .. ')', 2)
+    end
     local mt = getmetatable(t)
     local h = mt and rawget(mt, '__ipairs')
     if h then return h(t) end
@@ -2940,11 +2951,15 @@ end
 
 -- `mw.ustring.gmatch( s, pattern )` — an iterator over every match.
 --
--- Anchors are suppressed in the loop, because a pattern applied repeatedly must
--- not keep re-anchoring at position 1: Lua's own `gmatch` strips a leading `^`
--- for exactly that reason, and a pattern like `^%a+` would otherwise loop
--- forever. A failed match advances by one *character* rather than one byte, so
--- the iteration cannot stop inside a multibyte sequence.
+-- The anchor is *not* stripped. `^` is only special to the functions that
+-- anchor themselves (`find`, `match`); Lua's `gmatch_aux` hands the pattern
+-- straight to the matcher, so a leading `^` there is an ordinary caret. Verified
+-- against the `lua` binary: `gmatch('abc', '^%a')` yields no matches, while
+-- `gmatch('abc', '%a')` yields three. Stripping it — which an earlier version
+-- did — invents matches that the reference does not have.
+--
+-- A failed match advances by one *character*, not one byte, so the iteration
+-- cannot stop inside a multibyte sequence.
 --
 -- The iterator is written here rather than in Rust because a `for` iterator must
 -- return a value and the next control, and a Rust closure's second return value
@@ -2952,8 +2967,12 @@ end
 function mw.ustring.gmatch(s, pattern)
     local pos = 1
     local len = mw.ustring.len(s)
+    -- A leading `^` is a literal caret here, not an anchor, so it is escaped
+    -- before `find` is used to drive the loop — otherwise `find` would anchor at
+    -- every position and `gmatch('abc', '^%a')` would yield three matches where
+    -- the reference yields none.
     if type(pattern) == 'string' and pattern:sub(1, 1) == '^' then
-        pattern = pattern:sub(2)
+        pattern = '%' .. pattern
     end
     return function()
         while pos <= len + 1 do
@@ -2961,8 +2980,17 @@ function mw.ustring.gmatch(s, pattern)
             if a then
                 -- An empty match must still advance, or the loop never ends.
                 pos = (b >= a) and (b + 1) or (a + 1)
-                local caps = { mw.ustring.__captures(s, pattern, a) }
-                if #caps > 0 then return unpack(caps) end
+                -- `__captures` returns the count first, then the captures; the
+                -- count is needed because `#` on a capture list with a hole is
+                -- unspecified (see `__captures`). Lua 5.1 has no
+                -- `local n, ... = f()`, so the list is gathered into a table.
+                local got = { mw.ustring.__captures(s, pattern, a) }
+                local ncap = got[1] or 0
+                if ncap > 0 then
+                    local caps = {}
+                    for i = 2, ncap + 1 do caps[i - 1] = got[i] end
+                    return unpack(caps, 1, ncap)
+                end
                 return mw.ustring.sub(s, a, b)
             end
             pos = pos + 1
@@ -2984,20 +3012,25 @@ function mw.ustring.gsub(s, pattern, repl, n)
     local len = mw.ustring.len(s)
     local count = 0
     local max = n or math.huge
+    -- An anchored pattern substitutes at most once: Lua's `str_gsub` does
+    -- `if (anchor) break;` at the end of its first iteration. Without this the
+    -- loop re-anchors at every position and replaces far too much —
+    -- `gsub('abc', '^(%a)', '<%1>')` gave `<a><b><c>` where Lua gives `<a>bc`.
+    local anchored = type(pattern) == 'string' and pattern:sub(1, 1) == '^'
 
-    local function append_replacement(whole, ...)
+    local function append_replacement(whole, ncap, ...)
         local caps = { ... }
         if type(repl) == 'function' then
             -- Lua passes the captures, or the whole match when the pattern has
             -- none; the `nil` argument that would otherwise arrive is what made
             -- a `function(c)` replacement see `c == nil`.
             local r
-            if #caps > 0 then r = repl(unpack(caps)) else r = repl(whole) end
+            if ncap > 0 then r = repl(unpack(caps, 1, ncap)) else r = repl(whole) end
             if r == false or r == nil then return whole end
             return tostring(r)
         elseif type(repl) == 'table' then
             local key
-            if #caps > 0 then key = caps[1] else key = whole end
+            if ncap > 0 then key = caps[1] else key = whole end
             local r = repl[key]
             if r == false or r == nil then return whole end
             return tostring(r)
@@ -3014,7 +3047,7 @@ function mw.ustring.gsub(s, pattern, repl, n)
                 if d == '0' then return whole end
                 local i = tonumber(d)
                 local v
-                if #caps == 0 then
+                if ncap == 0 then
                     -- The whole match is capture 1 when there are none.
                     if i ~= 1 then
                         error('invalid capture index %' .. d .. ' in replacement string', 2)
@@ -3036,14 +3069,24 @@ function mw.ustring.gsub(s, pattern, repl, n)
         local a, b = mw.ustring.find(s, pattern, pos)
         if not a then break end
         out[#out + 1] = mw.ustring.sub(s, pos, a - 1)
-        local caps = { mw.ustring.__captures(s, pattern, a) }
-        if #caps > 0 then
-            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), unpack(caps))
+        -- The count comes first; see `__captures`. A capture list with a hole
+        -- gives an unspecified `#`, which is what made a valid replacement read
+        -- as "invalid capture index".
+        --
+        -- Lua 5.1 has no `local n, ... = f()` form, so the captures are gathered
+        -- into a table and the count taken from element 1.
+        local got = { mw.ustring.__captures(s, pattern, a) }
+        local ncap = got[1] or 0
+        local caps = {}
+        for i = 2, ncap + 1 do caps[i - 1] = got[i] end
+        if ncap > 0 then
+            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), ncap, unpack(caps, 1, ncap))
         else
-            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b))
+            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), 0)
         end
         count = count + 1
         if b >= a then pos = b + 1 else pos = a + 1 end
+        if anchored then break end
     end
     out[#out + 1] = mw.ustring.sub(s, pos)
     return table.concat(out), count
@@ -4038,10 +4081,12 @@ fn luafn_ustring_match(
 /// `gsub` and `gmatch` need the captures of the match *at* a position, not of
 /// the first match at or after it: `find` slides forward, so using it to drive a
 /// replacement loop would skip the unmatched text between the position and the
-/// match and duplicate it. Anchoring with `^` is not enough either, because the
-/// pattern may itself start with one.
+/// match and duplicate it.
 ///
-/// Returns the capture list, or nothing when the pattern does not match there.
+/// Returns the capture **count** followed by the captures, or a single nil when
+/// the pattern does not match there. The count leads because the captures cannot
+/// be counted by `#`: a pattern like `(a)(x)?(b)` leaves a hole when the optional
+/// group does not participate, and `#` on a table with a nil is unspecified.
 fn luafn_ustring_captures(
     lua: &Lua,
     (s, pattern, at): (Value, Value, i64),
@@ -4049,13 +4094,21 @@ fn luafn_ustring_captures(
     let s = coerce_string(&s, "match")?;
     let pattern = coerce_string(&pattern, "match")?;
     let start = resolve_init(&s, Some(at));
-    let anchored = format!("^{pattern}");
+    // Anchor only if the pattern is not anchored already: prefixing another `^`
+    // would make the second one a *literal* caret, so `^^(a)` would fail to
+    // match almost everything and `gsub` would silently return its input.
+    let anchored = if pattern.starts_with('^') {
+        pattern.clone()
+    } else {
+        format!("^{pattern}")
+    };
     let found = ustring::pattern::find_match(&s, &anchored, start, false)
         .map_err(|e| mlua::Error::runtime(e.message()))?;
     let Some(m) = found else {
         return Ok(single_nil());
     };
     let mut out = mlua::MultiValue::new();
+    out.push_back(Value::Integer(m.captures.len() as i64));
     for cap in &m.captures {
         push_capture(lua, &mut out, cap)?;
     }
@@ -5819,20 +5872,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn tmp_probe_mark() {
-        let engine = make_engine();
-        for code in [
-            "local a = mw.title.new('Foo') return tostring(rawget(a, '__rustoid_class'))",
-            "local a = mw.title.new('Foo') local mt = getmetatable(a) \
-             return tostring(rawget(mt, '__rustoid_class'))",
-            "local a = mw.title.new('Foo') return tostring(a.fullUrl) .. '|' .. tostring(a.exists)",
-        ] {
-            println!("{:?}\n   => {:?}", code, engine.eval(code));
-        }
-    }
-
-    #[test]
     fn test_mw_ustring_len() {
         let engine = make_engine();
         assert_eq!(engine.eval("return mw.ustring.len('hello')").unwrap(), "5");
@@ -5902,6 +5941,118 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, "Numismatics");
+    }
+
+    /// `gsub` and `gmatch` drive their loops with an anchored primitive, and an
+    /// already-anchored pattern must not be anchored twice.
+    ///
+    /// Prefixing another `^` makes the second one an ordinary character, so
+    /// `^^(a)` matches almost nothing and `gsub` silently returns its input —
+    /// which is how a corpus page came back unmodified instead of erroring.
+    #[test]
+    fn gsub_drives_anchored_patterns_without_double_anchoring() {
+        let engine = make_engine();
+        // The count and captures come from the anchored primitive.
+        assert_eq!(
+            engine
+                .eval("return tostring(select(1, mw.ustring.match('ab', '^(a)(b)')))")
+                .unwrap(),
+            "a"
+        );
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('a1b2', '(%a)(%d)', '%2%1'))")
+                .unwrap(),
+            "1a2b"
+        );
+        // The three replacement forms, over a pattern with two captures.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('ab', '(a)x-(b)', '[%1][%2]'))")
+                .unwrap(),
+            "[a][b]"
+        );
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('ab', '(a)x-(b)', { a = 'A' }))")
+                .unwrap(),
+            "A"
+        );
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('ab', '(a)x-(b)', '%2'))")
+                .unwrap(),
+            "b"
+        );
+        // `gmatch` does not strip an anchor: `^` is an ordinary caret there, so
+        // this yields nothing rather than three matches.
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = 0 for _ in mw.ustring.gmatch('abc', '^%a') do n = n + 1 end \
+                     return tostring(n)"
+                )
+                .unwrap(),
+            "0"
+        );
+        assert_eq!(
+            engine
+                .eval(
+                    "local n = 0 for _ in mw.ustring.gmatch('abc', '%a') do n = n + 1 end \
+                     return tostring(n)"
+                )
+                .unwrap(),
+            "3"
+        );
+        // An already-anchored pattern is the case that must not be anchored
+        // twice: `^^(a)` matches nothing, so gsub would return its input.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('abc', '^(%a)', '<%1>'))")
+                .unwrap(),
+            "<a>bc"
+        );
+        // A captureless pattern's `%1` is the whole match, not an error.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('abc', '%a', '%1'))")
+                .unwrap(),
+            "abc"
+        );
+    }
+
+    /// The wrapped `pairs`/`ipairs` must name *themselves* in an error, not the
+    /// raw iterators they delegate to.
+    ///
+    /// A module that reads the message would otherwise be told about a name it
+    /// never wrote, which is a small thing that makes a real error unreadable.
+    #[test]
+    fn wrapped_pairs_names_itself_in_errors() {
+        let engine = make_engine();
+        for (call, want) in [("ipairs", "ipairs"), ("pairs", "pairs")] {
+            let got = engine
+                .eval(&format!(
+                    "local ok, e = pcall({call}, nil) return tostring(e)"
+                ))
+                .unwrap();
+            assert!(
+                got.contains(&format!("to '{want}'")),
+                "{call}: expected the message to name '{want}', got: {got}"
+            );
+            // And the raw iterator's own name must not leak through.
+            assert!(!got.contains("raw_"), "{call}: leaked the raw name: {got}");
+        }
+        // A table with `__ipairs` still dispatches to it.
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = setmetatable({}, {__ipairs = function() \
+                     return function() return nil end, nil, 0 end}) \
+                     local n = 0 for _ in ipairs(t) do n = n + 1 end return tostring(n)"
+                )
+                .unwrap(),
+            "0"
+        );
     }
 
     #[test]
