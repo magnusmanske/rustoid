@@ -4146,3 +4146,69 @@ is a different change from this one: rustoid's link carries `data-parsoid` with 
   is a second, independent id gap in the same three bytes.
 - `{{#if:x|[[Category:Foo]]}}`: the service gives the *span* the wrapper's id and the
   link none.
+
+## The other half of the id question: a source range, not a blob
+
+The rule above — "an id is assigned when there is something to key the node by" —
+needed one correction to become usable. "Something" is **a source range**, not the
+presence of a `data-parsoid` blob:
+
+```rust
+let has_source_range = node.data_parsoid.as_deref()
+    .is_some_and(|json| json.contains("\"tsr\"") || json.contains("\"dsr\""));
+let has_metadata = has_source_range || node.data_mw.is_some() || node.empty_dp_slot;
+```
+
+`data-mw` stays because it is the wrapper's metadata, and `empty_dp_slot` — the
+`<section>` and the `<cite>` `<li>` — is the same distinction from the other side: an
+element that emits no `data-parsoid` yet does take an id.
+
+With that, `mark_in_text_branch` clears the source range (`tsr`/`dsr`/`src`/
+`srcContent`) as well as setting the flag, because the reference really does produce
+no source range for a branch's tokens — the *native* endpoint shows it directly:
+
+```
+{{Short description|Foo bar}}   →  <link rel="mw:PageProp/Category"
+                                      href="./Category:Articles_with_short_description"/>
+```
+
+an empty `data-parsoid` where the same link written on the page has `stx`, `a`, `sa`
+and `dsr`. Two mechanisms, one cause; a flag alone would have left the ids wrong and
+a cleared range alone would have left the marking.
+
+Measured, all with the fixture guard at 876/896 and the corpus at 0.88x:
+
+```
+                        before  after
+Unix                     480     550
+Quicksilver (film)       480     550
+Sundial                  446     516
+Nobel Prize              492     562
+Bicycle                  468     538
+Megadeth                 458     528
+```
+
+### What that leaves: the auto-inserted paragraph
+
+`List of sovereign states` is the closest page, and it is stuck at byte 23 on one
+thing:
+
+```
+parsoid: <p class="mw-empty-elt" id="mwAg"><span … id="mwAw">…
+rustoid: <p class="mw-empty-elt"><span … id="mwAg">…
+```
+
+The service numbers the paragraph; rustoid does not, so every id after it is one
+low. The paragraph is auto-inserted by `PWrap`, and the native endpoint shows what
+Parsoid puts on it:
+
+```
+a [[Foo]] b   →  <p id="mwAg" data-parsoid='{"dsr":[0,11,0,0]}'>
+```
+
+A `dsr` over the wrapped range. rustoid's `PWrap` gives its synthesized `<p>` a bare
+`DataParsoid::default()`, so under the rule above it has no source range and takes no
+id. That is the fix: the synthesized paragraph needs the range it covers. It is not
+a one-line change (the range has to be computed from the tokens it wraps, and it
+affects every auto-inserted paragraph in the corpus, not just this one), so it is
+recorded rather than guessed at.

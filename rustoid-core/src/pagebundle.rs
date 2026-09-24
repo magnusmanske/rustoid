@@ -251,13 +251,21 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
     let mut assigned = 0;
 
     if node.kind.is_element() {
-        // A node takes an id when Parsoid has something to key it by. That is
-        // `data-parsoid` or `data-mw`, plus the elements that were given an empty
-        // `data-parsoid` by `serializeNewEmptyDp` — [`Node::empty_dp_slot`]. An
-        // empty `id=""` is treated as absent, as Parsoid does ("Forcibly reset
-        // the ID if it is invalid").
-        let has_metadata =
-            node.data_parsoid.is_some() || node.data_mw.is_some() || node.empty_dp_slot;
+        // A node takes an id when the reference has something to key it by: a
+        // `data-mw`, or a `data-parsoid` that says where the node came from.
+        // "Where it came from" is the source range — a link whose target was
+        // resolved inside a `#if`/`#ifeq` branch has none, and the service gives
+        // it no id (see `mark_in_text_branch`). The `empty_dp_slot` case is the
+        // same distinction from the other side; a `<section>` has no
+        // `data-parsoid` yet still takes the document's first id.
+        //
+        // An empty `id=""` is treated as absent, as Parsoid does ("Forcibly
+        // reset the ID if it is invalid").
+        let has_source_range = node
+            .data_parsoid
+            .as_deref()
+            .is_some_and(|json| json.contains("\"tsr\"") || json.contains("\"dsr\""));
+        let has_metadata = has_source_range || node.data_mw.is_some() || node.empty_dp_slot;
         let has_id = node.get_attr("id").is_some_and(|v| !v.is_empty());
         if has_metadata && !has_id {
             let id = alloc.next_id();
@@ -363,11 +371,31 @@ mod tests {
 
     use crate::dom::node::{ElementKind, Node};
 
-    /// An element carrying metadata, which is what draws an id.
+    /// An element that came from source, which is what draws an id.
     fn storable() -> Node {
         let mut n = Node::element(ElementKind::Other("span".to_string()));
-        n.data_parsoid = Some("{}".to_string());
+        n.data_parsoid = Some("{\"dsr\":[0,1,0,0]}".to_string());
         n
+    }
+
+    /// A `data-parsoid` with no source range is not something to key a node by.
+    ///
+    /// A link whose target was resolved inside an `#if`/`#ifeq` branch carries
+    /// one — `stx`, but no `tsr`/`dsr` — and the service gives that link no id, so
+    /// an element holding it must not consume a counter either.
+    #[test]
+    fn a_data_parsoid_without_a_source_range_takes_no_id() {
+        let mut root = Node::document();
+        for json in ["{}", "{\"stx\":\"simple\"}"] {
+            let mut n = Node::element(ElementKind::Other("span".to_string()));
+            n.data_parsoid = Some(json.to_string());
+            root.push_child(n);
+        }
+        root.push_child(storable());
+        assign_node_ids(&mut root);
+        assert_eq!(root.children[0].get_attr("id"), None);
+        assert_eq!(root.children[1].get_attr("id"), None);
+        assert_eq!(root.children[2].get_attr("id"), Some("mwAQ"));
     }
 
     /// An element with no metadata to key, which must not consume a counter.

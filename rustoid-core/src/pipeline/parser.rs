@@ -58,12 +58,27 @@ fn track_table(item: &Item, depth: &mut usize) {
 /// targets templated; the flag is what tells the marking to behave as the service
 /// does. Attribute values nested in a token are walked too — that is where a
 /// wikilink's target lives.
+///
+/// The source range goes with it. Nothing in such a branch came from a page, so
+/// the tokens the reference produces for it carry no `tsr`/`dsr` and no `src` —
+/// a category link from a `#ifeq` branch shows an empty `data-parsoid` where the
+/// same link written on the page shows `stx`, `a`, `sa` and `dsr`. That is a
+/// different question from the flag (it decides ids, not marking) and it is the
+/// reason the two are set together here rather than at their two consumers.
 fn mark_in_text_branch(items: &mut [Item]) {
     use crate::wikitext::tokens_v2::KeyValue;
     for item in items.iter_mut() {
         let Item::Tok(tok) = item else { continue };
         if let Some(dp) = tok.data_parsoid_mut() {
             dp.tmp.in_text_branch = Some(true);
+            // The source range goes too: nothing in the branch came from a page,
+            // and the reference produces tokens with no `tsr`/`dsr` for it. That
+            // is a different question from the flag (it decides ids, not
+            // marking), which is why it is set here rather than at the consumer.
+            dp.tsr = None;
+            dp.dsr = None;
+            dp.src = None;
+            dp.src_content = None;
         }
         if let Some(attribs) = tok.attribs_mut() {
             for kv in attribs.iter_mut() {
