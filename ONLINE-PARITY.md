@@ -3737,6 +3737,37 @@ Two things are named by that pair:
 
 Both are left for the next session with their reductions; neither is guesswork.
 
+### A stray `\n|` out of `Template:Short description/lowercasecheck`
+
+The byte-2 failure on `List of sovereign states` turned out not to be the cleanup
+predicate I first suspected. rustoid's output there reads
+
+```
+<span about="#mwt1">\n|</span>
+```
+
+between the two tracking categories, where the service has nothing. Reduced with
+the scratch-template tooling to one call — `{{Short description/lowercasecheck|none}}`
+— which every article carrying `{{Short description}}` transcludes, so this is
+broad, not a `List of sovereign states` quirk.
+
+The template's shape is a nested `#ifeq` whose first arm holds a comment and an
+`#invoke`, whose second arm is `1\n`, and whose true arm is a `#switch` with
+fall-through cases and a `|`-bearing `[[Category:…|sortkey]]`. Three plausible
+causes were **checked and cleared** rather than assumed:
+
+- positional arguments are trimmed — `{{#ifeq:1|1\n|YES|NO}}` answers `YES`, and
+  `{{#if: 1 |YES|NO}}` answers `YES`, both at page level and inside a body;
+- `#switch` fall-through grouping matches the service exactly, for
+  `{{#switch: a|a|b}}`, `{{#switch: a|a|b=X}}` and the newline-separated
+  `{{#switch: none\n|none\n|pH\n|pH-dependent=X}}`;
+- a `|` inside a `[[…|…]]` in a switch case does not split the argument list.
+
+So the cause is in the nesting, not in any one of those rules, and the reduction
+that isolates it is the `#ifeq` true-arm alone as a scratch body — the extraction
+I had not yet got right when the session ended. The scratch tooling
+(`/tmp/tmpl.py --body-file`) reproduces it in one run; it is not in the repo.
+
 ## The `mw:ExpandedAttrs` gate, and why it is not a small fix
 
 Byte 404 is, on every page, the same two attributes on the same element:
