@@ -3855,7 +3855,9 @@ output: parsoid 64473554 bytes, rustoid 55907419 bytes (0.87x)
 ```
 
 Up from 0.77x at the end of the previous session — the byte ratio keeps moving
-before any page passes, which is the point of watching it.
+before any page passes, which is the point of watching it. Re-run after the title
+changes below: still 0/48, rustoid 56884909 bytes (0.88x) — the category values
+and the module subpages it pulled in cost about a megabyte.
 
 The reduction recorded at the end of the previous section — `{{pagetype|plural=y}}`
 answering `pages` where the service answers `articles` — is not a `Module:Pagetype`
@@ -3975,3 +3977,98 @@ first-difference byte 444 (111 686 bytes), so this is **not** a consequence of t
 title changes — the two revisions differ only in the byte count (111 686 → 111 894).
 Left as the next thing to look at; the limit is a per-parse counter reset in
 `build_ast`.
+
+## The `mw:ExpandedAttrs` gate and the stray ids are one bug
+
+With the category `href` fixed, `Unix` breaks at byte 404 on the marking, and — with
+the marking suppressed as an experiment — at byte 480 on two things at once:
+
+```
+parsoid: <link rel="mw:PageProp/Category" href="./Category:Articles_with_short_description"/><link ... Short_description_is_different_from_Wikidata"/>
+rustoid: <link typeof="mw:ExpandedAttrs" rel="mw:PageProp/Category" href="./Category:Articles_with_short_description" id="mwAw"/><link ... Short_description_with_empty_Wikidata_description" id="mwBA"/>
+```
+
+Both the `typeof`/`about`/`data-mw` marking *and* the `id` are wrong on the same
+element, and — this is the useful part — they have the same cause. The service gives
+that `<link>` neither, and it gives no id to the `<div class="shortdescription">`'s
+sibling links even though the div itself (`id="mwAg"`, from the same template body)
+has one.
+
+### The rule, measured
+
+The transform endpoint is *native* mode, so it cannot answer questions about a
+*template body* (a scratch `Template:` does not exist on the live wiki, and a probe
+built on one silently measures a redlink — which is how the first attempt at this
+table produced three false readings; the tell is `\"`-escaped quotes, i.e. a fragment
+quoted inside a `data-mw`, not a rendered element). What it can answer is the
+page-level case, and the cached service HTML answers the body case. Together:
+
+| construct | service |
+| --- | --- |
+| `[[Category:{{tpl}}]]` on the page | **marked** |
+| `{{#switch:x|x=[[Category:{{tpl}}]]}}` | **marked** |
+| `{{#ifeq:x\|y\|\|[[Category:{{tpl}}]]}}` | not marked |
+| `{{#if:x\|[[Category:{{tpl}}]]}}` | not marked |
+| `{{#ifexpr:1\|[[Category:{{tpl}}]]}}` | not marked |
+| `{{#iferror:…\|[[Category:{{tpl}}]]}}` | not marked |
+| any of the above nested inside an `#if` | not marked |
+| the same link inside `Template:Short description`'s body (inside its `#ifeq`) | not marked |
+
+So it is not "in a template body" (a body's *literal* templated attribute is marked —
+`Periodic table` marks 338 `td bgcolor="{{element color\|…}}"`, and `2024 Summer
+Olympics` marks a navbox `th style=`) and not "inside any parser function" (`#switch`
+marks). It is exactly the four conditionals that core expands with
+`trim($frame->expand(...))`: `#if`, `#ifeq`, `#ifexpr`, `#iferror`.
+
+### Why that produces *both* symptoms
+
+`$frame->expand` returns a **string**, and the string is spliced back into the token
+stream as text and re-tokenized. Re-tokenizing synthesized text is the whole story:
+
+- the wikilink is built from text where `{{pagetype}}` is already `Articles`, so its
+  target holds no template token — nothing to mark;
+- the tokens carry **no source offsets**, because their source was not the page (or
+  any page). With no `tsr`/`dsr` there is no `data-parsoid`, and `storeInPageBundle`
+  assigns an id only when there is something to key the node by.
+
+`#switch` returns its branch's *original* tokens (core's `RECOVER_ORIG`), so its
+branch keeps both the template and the source offsets, and both symptoms vanish.
+
+That the same page also shows `<div class="shortdescription" about="#mwt1"
+typeof="mw:Transclusion" id="mwAg">` — a literal source element from the *same*
+template body, with an id — is the control: the body's own source is intact; only
+the text that came back out of an `#if`/`#ifeq` is synthesized.
+
+### What the fix has to be
+
+`#if`, `#ifeq`, `#ifexpr` and `#iferror` must return their chosen branch *expanded to
+text and re-tokenized*, not as the argument's tokens. rustoid cannot do that where it
+currently evaluates them: `handle_template`/`call_parser_function` are pure functions
+over `Params` with no access to the expander, and the branch's templates are expanded
+later by the enclosing `expand_templates` walk.
+
+Two things follow, and they should be taken together rather than as the two flags they
+look like:
+
+- the marking sites (`build_expanded_attrs`, and the wikilink path in
+  `wiki_link_render.rs`) and the id allocation (`assign_node_ids`, keyed on
+  `data-parsoid`) both need the *fact* that a token was synthesized, not a
+  special case each. A `TempData` flag beside `cell_attr_terminator_seen` is the
+  natural carrier, but it should be set as part of re-tokenizing, not bolted onto
+  the two consumers.
+- the same change also explains a third difference measured while checking the
+  table: `{{#if:x|{{Short description|Y}}}}` renders 4 `mw:Transclusion` occurrences
+  in the service against rustoid's 2, because the branch's nested template is
+  flattened into the `#if`'s single part. A flag-only patch would leave that
+  difference behind, so it is worth doing the re-tokenization.
+
+Suppressing the marking alone was measured: it moves `Unix` and `Quicksilver (film)`
+from 404 to 480 and nothing else, and the experiment was reverted. It is not a
+free-standing win, which is why it is written down rather than landed.
+
+### Also visible at 480, and unrelated
+
+The second category in the same span is `Short_description_is_different_from_Wikidata`
+in the service against `Short_description_with_empty_Wikidata_description` in rustoid,
+i.e. `Module:SDcat` sees no Wikidata description. That is a `mw.wikibase` gap, not
+this one, and it will still be there once the marking is right.
