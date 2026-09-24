@@ -556,6 +556,21 @@ pub fn is_rendering_transparent_node(node: &Node) -> bool {
     if is_metadata_element(node) {
         return true;
     }
+    // A `mw:DOMFragment` placeholder stands in for a stashed sub-fragment, and
+    // Parsoid judges it by what it stands for (`placeholderTypeOf`/`nodeName`
+    // read the fragment's content). That is load-bearing for `<templatestyles>`:
+    // it reaches the tree builder as a placeholder around a `<style>`, so
+    // judging the placeholder on itself left the stylesheet unstashed inside an
+    // inline element, where `DedupeStyles` could only replace it with a `<link>`.
+    if let Some(frag) = &node.fragment
+        && node.get_attr("typeof").is_some_and(|ty| {
+            ty.split_whitespace()
+                .any(|t| t.starts_with("mw:DOMFragment"))
+        })
+        && let [first, ..] = frag.children.as_slice()
+    {
+        return is_rendering_transparent_node(first);
+    }
     match &node.kind {
         NodeKind::Comment(_) => true,
         _ if is_sol_transparent_link(node) => true,

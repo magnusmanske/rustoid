@@ -2032,7 +2032,31 @@ fn is_stashable_elt(node: &Node) -> bool {
         } else {
             true
         };
-    transparent || is_newline_wrapping_span(node) || name == "style"
+    let stashable = transparent || is_newline_wrapping_span(node) || name == "style";
+
+    // A `mw:DOMFragment` placeholder is stashable only if everything it stands
+    // for is: a `<templatestyles>` that reached the tree builder as a fragment is
+    // a placeholder at this point, so without this an *unstashed* `<style>` is
+    // never recognised and the `<span class="mw-empty-elt">` a template's
+    // leading stylesheet needs is never created (mirrors PHP, which reads the
+    // stashed children through `WTUtils::getDOMFragmentContents`). A placeholder
+    // with no stashed fragment yet is judged on itself.
+    if stashable && is_dom_fragment_wrapper(node) {
+        return match &node.fragment {
+            Some(frag) => frag.children.iter().all(is_stashable_elt),
+            None => true,
+        };
+    }
+    stashable
+}
+
+/// `WTUtils::isDOMFragmentWrapper` — a span standing in for a stashed
+/// sub-fragment (`mw:DOMFragment`, optionally `/sealed/<type>`).
+fn is_dom_fragment_wrapper(node: &Node) -> bool {
+    node.get_attr("typeof").is_some_and(|ty| {
+        ty.split_whitespace()
+            .any(|t| t == "mw:DOMFragment" || t.starts_with("mw:DOMFragment/"))
+    })
 }
 
 /// `DOMUtils::isNewlineWrappingSpan` — a span whose only child is a run of
@@ -2597,6 +2621,56 @@ mod tests {
             content[1].children[0].get_attr("about").is_none(),
             "the span carries the about, the moved links do not"
         );
+    }
+
+    /// A `<templatestyles>` reaches the tree builder as a `mw:DOMFragment`
+    /// placeholder, and a placeholder is stashable only when what it stands for
+    /// is. Judging it on itself left an unstashed `<style>` inside an inline
+    /// element, where `DedupeStyles` could only replace it with a `<link>` —
+    /// the shape `Template:Legend table` showed on `List of sovereign states`.
+    #[test]
+    fn a_dom_fragment_placeholder_standing_for_a_style_is_stashable() {
+        let mut placeholder = Node::element(ElementKind::Other("span".to_string()));
+        placeholder.set_attr("typeof", "mw:DOMFragment");
+        placeholder.set_attr("about", "#mwt1");
+        let mut frag = Node::document();
+        frag.push_child(Node::element(ElementKind::Other("style".to_string())));
+        placeholder.fragment = Some(Box::new(frag));
+
+        // The placeholder is the first range member and its only sibling is a
+        // block, which is the boundary `should_stash` asks for.
+        let mut div = Node::element(ElementKind::Div);
+        div.set_attr("about", "#mwt1");
+        assert!(should_stash(None, Some(&div), &placeholder));
+        let is_elt = |n: &Node| matches!(n.kind, NodeKind::Element(_));
+        let mut content = vec![placeholder, div];
+        stash_rendering_transparent_elts(&mut content, false);
+
+        assert!(is_elt(&content[0]));
+        assert_eq!(crate::html::wts_utils::node_name(&content[0]), "span");
+        assert_eq!(content[0].get_attr("class"), Some("mw-empty-elt"));
+        assert!(content[0].children.is_empty());
+        assert!(is_elt(&content[1]));
+        assert_eq!(crate::html::wts_utils::node_name(&content[1]), "div");
+    }
+
+    /// ...but a placeholder standing for real content is not, or a block would
+    /// be smuggled into a `mw-empty-elt` span.
+    #[test]
+    fn a_dom_fragment_placeholder_standing_for_content_is_not_stashable() {
+        let mut placeholder = Node::element(ElementKind::Other("span".to_string()));
+        placeholder.set_attr("typeof", "mw:DOMFragment");
+        let mut frag = Node::document();
+        frag.push_child(Node::text("real"));
+        placeholder.fragment = Some(Box::new(frag));
+
+        let mut div = Node::element(ElementKind::Div);
+        div.set_attr("about", "#mwt1");
+        let mut content = vec![placeholder, div];
+        stash_rendering_transparent_elts(&mut content, false);
+
+        assert_eq!(content[0].get_attr("class"), None);
+        assert_eq!(content[0].children.len(), 0);
     }
 
     /// A run whose following sibling shares its `about` and is not a block is

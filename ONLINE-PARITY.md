@@ -4533,3 +4533,72 @@ only page where the two are the same order of magnitude from the first byte on.
 
 (`Module:Math` is not a fair target at all: a `Module:` page renders under
 Scribunto's content model, which rustoid does not implement.)
+
+## The encapsulation head, measured
+
+I spent a session on the head and did not land it. What is now *known* is worth
+more than the guess I started with, because two of my starting beliefs were wrong.
+
+### What the service actually does (probe: `--wikitext` with `{{Redirect2|…}}`)
+
+```
+<span class="mw-empty-elt" about="#mwt1" typeof="mw:Transclusion" id="mwAg"
+      data-parsoid='{"autoInsertedStart":true,"autoInsertedEnd":true,
+                     "pi":[[…6 params…]],"dsr":[0,171,null,null]}'
+      data-mw='{"parts":[{"template":{"target":{"wt":"Redirect2",…}}]}'>
+  <style data-mw-deduplicate="TemplateStyles:r1368532237" …></style>
+</span>
+<div role="note" class="hatnote …" about="#mwt1" id="mwAw" data-parsoid='{"stx":"html"}'>…</div>
+```
+
+So the head span is a **new wrapper that exists only to hold the transclusion
+markers**, and it carries the parts that need a container: the `pi` (parameter
+info), the range `dsr`, the `autoInserted*` flags and `data-mw`. The block element
+that follows keeps its `about` and nothing else. That is exactly
+`ensureElementsInRangeAndAddAboutIds`' "Add a span wrapper to let us add about-ids
+to represent the DOM range as a contiguous chain" plus `findEncapTarget` skipping
+it — the two of which I had not connected: rustoid has the `isDeletableNode` half
+of that function (`span_wrap_nl`) but not the wrapper half.
+
+The minimal form of the same shape, rustoid already gets **right** — a table cell
+whose whole content is `{{Legend|…}}`:
+
+```
+<td id="mwBQ"><span class="mw-empty-elt" about="#mwt1" typeof="mw:Transclusion"
+  data-mw='…' id="mwBg"><style …Legend/styles.css…></style></span>
+  <div class="legend" about="#mwt1" id="mwBw">…</div></td>
+```
+
+### Belief I had wrong #1: the `<style>` inside the `<a>` is not a stash failure
+
+I read byte 477 as "the stylesheet was not stashed". It *is* stashed — in the right
+place, `Module:Hatnote`'s `TemplateStyles:r1368532237`. The `r981673959` that lands
+inside an `<a>` is `Template:Legend`'s, and it is the `#invoke:Format link` module
+output for a link *target*, so the `<a>` genuinely has it as a child. On the real
+page the stylesheet's correct home (`Template:Legend table`'s table cell) never got
+one because the flow does not reach the stash there — a separate question, and the
+one the byte-477 difference is actually about is the *head*.
+
+### Belief I had wrong #2: `isStashableElt`'s DOM-fragment check is not the blocker
+
+`is_stashable_elt` now recurses into a `mw:DOMFragment` placeholder's stashed
+children and `is_rendering_transparent_node` judges a placeholder by what it stands
+for, both faithful to PHP (`getDOMFragmentContents`, `placeholderTypeOf`). They are
+correct and the unit tests pin them, but they are **not** what byte 477 turns on:
+the placeholder that matters there has a whole hatnote in its fragment, so PHP's
+strict `all(isStashableElt)` answers false too. The change is kept because it is
+right and cheap, not because it moved a byte.
+
+### The next thing to build
+
+`ensureElementsInRangeAndAddAboutIds`' wrapper branch, i.e. in
+`wrap_transclusion_children`: when the range's first content node is an element that
+cannot carry content and the range is not "already contiguous at a boundary", insert
+a `<span class="mw-empty-elt">` **before the first content node**, mark it
+`autoInsertedStart`/`autoInsertedEnd` + `WRAPPER`, make it the head (so `pi`/`dsr`/
+`data-mw` land on it rather than on the block), and leave the block with only
+`about`. That is what turns `Help:Introduction`'s
+`<span class="mw-empty-elt" about="#mwt2" …>` into the service's
+`<p about="#mwt4" typeof="mw:Transclusion">` shape as well, since the head is then
+free to be a wrapper for the whole range rather than whichever node happened to
+carry `mw:Transclusion` first.
