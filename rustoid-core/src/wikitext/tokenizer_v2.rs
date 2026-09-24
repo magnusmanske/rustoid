@@ -5353,13 +5353,24 @@ fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
         .collect()
 }
 
+/// An open `{{ … }}` (template) or `{{{ … }}}` (tplarg) construct, as tracked by
+/// the argument splitter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Brace {
+    Template,
+    Tplarg,
+}
+
 fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize, String)> {
     let mut parts: Vec<(usize, String)> = Vec::new();
     let mut current = String::new();
     // Byte offset of the current part within `inner`.
     let mut part_start = 0usize;
-    let mut double_brace: i32 = 0;
-    let mut triple_brace: i32 = 0;
+    // The open `{{`/`{{{` constructs, innermost last. A stack (rather than a pair
+    // of counters) is what makes a *run* of closing braces work: the closer for
+    // the innermost construct decides how many braces it consumes, and the next
+    // construct in the run is the one below it.
+    let mut braces: Vec<Brace> = Vec::new();
     let mut bracket: i32 = 0;
     let mut extlink: i32 = 0;
     let mut table: i32 = 0;
@@ -5420,7 +5431,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
         }
         // Track nesting of `{{{`, `{{`, and `[[`.
         if inner[i..].starts_with("{{{") {
-            triple_brace += 1;
+            braces.push(Brace::Tplarg);
             current.push_str("{{{");
             i += 3;
             continue;
@@ -5432,8 +5443,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
         // word).
         if magic_pipe
             && lower[i..].starts_with("{{!}}")
-            && double_brace == 0
-            && triple_brace == 0
+            && braces.is_empty()
             && bracket == 0
             && table == 0
             && extlink == 0
@@ -5445,21 +5455,40 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
             continue;
         }
         if inner[i..].starts_with("{{") {
-            double_brace += 1;
+            braces.push(Brace::Template);
             current.push_str("{{");
             i += 2;
             continue;
         }
-        if inner[i..].starts_with("}}}") {
-            triple_brace = triple_brace.saturating_sub(1);
-            current.push_str("}}}");
-            i += 3;
-            continue;
-        }
-        if inner[i..].starts_with("}}") {
-            double_brace = double_brace.saturating_sub(1);
-            current.push_str("}}");
-            i += 2;
+        // A run of closing braces closes as many open constructs as it can, and
+        // which closer comes first is decided by the *innermost* open construct.
+        //
+        // Testing `}}}` before `}}` is wrong for the very common
+        // `{{a|{{b|x}}}}`: those four braces are two `}}` closers, but reading
+        // them as a `}}}` plus a stray `}` left the outer template open, so a
+        // following top-level `|` was not seen as a separator. `{{#if:1|S{{a|{{b|x}}}}T|F}}`
+        // then recorded **one** parameter (`S{{a|{{b|x}}}}T|F`) where the service
+        // records two, and rendered the else branch as literal text. Every
+        // article using `{{Short description}}` hit it, through
+        // `Template:Short description/lowercasecheck`.
+        if inner[i..].starts_with('}') {
+            let run = inner[i..].bytes().take_while(|&b| b == b'}').count();
+            let mut consumed = 0usize;
+            while consumed < run {
+                let remaining = run - consumed;
+                let close = match braces.last() {
+                    Some(Brace::Tplarg) if remaining >= 3 => 3,
+                    Some(Brace::Template) if remaining >= 2 => 2,
+                    _ => break,
+                };
+                braces.pop();
+                consumed += close;
+            }
+            // Braces this run did not close are literal, and there is always at
+            // least one of them to consume or the loop would not advance.
+            let taken = consumed.max(1);
+            current.push_str(&inner[i..i + taken]);
+            i += taken;
             continue;
         }
         if inner[i..].starts_with("[[") {
@@ -5478,7 +5507,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
         // A single-bracket `[...]` external link is a balanced atom: pipes in the
         // URL must not split the option/argument list (mirrors the PEG `url`/
         // `bracket` productions, which keep `|` inside an extlink intact).
-        if c == '[' && bracket == 0 && double_brace == 0 && triple_brace == 0 {
+        if c == '[' && bracket == 0 && braces.is_empty() {
             extlink += 1;
             current.push(c);
             i += 1;
@@ -5492,7 +5521,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
         }
         // A `{| … |}` table block is balanced: its internal `|` cell/row markers
         // must not split the enclosing option/argument list.
-        if inner[i..].starts_with("{|") && double_brace == 0 && triple_brace == 0 && bracket == 0 {
+        if inner[i..].starts_with("{|") && braces.is_empty() && bracket == 0 {
             table += 1;
             current.push_str("{|");
             i += 2;
@@ -5513,8 +5542,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
         // (`magic_pipe`) is scanned by `link_text`/`link_text_parameterized`,
         // where the `[...]` is an `extlink` atom and its pipes stay put.
         if c == '|'
-            && double_brace == 0
-            && triple_brace == 0
+            && braces.is_empty()
             && bracket == 0
             && table == 0
             && (!magic_pipe || extlink == 0)
@@ -5837,6 +5865,27 @@ fn parse_variant_option(opt: &str) -> Option<crate::wikitext::tokens_v2::Variant
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run of closing braces closes one construct per pair, decided by the
+    /// innermost open construct. Reading `}}}}` as a `}}}` plus a stray `}` left
+    /// an enclosing `{{…}}` open, so the next top-level `|` was not a separator:
+    /// `{{#if:1|S{{a|{{b|x}}}}T|F}}` recorded one parameter instead of two and
+    /// rendered the else branch as text. `{{Short description|none}}` reached this
+    /// on every article, through `Template:Short description/lowercasecheck`.
+    #[test]
+    fn nested_templates_keep_the_outer_pipe_split() {
+        let parts = split_template_args("#if:1|S{{a|{{b|x}}}}T|F");
+        assert_eq!(parts, vec!["#if:1", "S{{a|{{b|x}}}}T", "F"]);
+
+        // Three closers still close a tplarg (`{{{p|{{T|d}}}}}`), which is what
+        // the old saturating counters were there for.
+        let parts = split_template_args("#if:1|S{{{p|{{T|d}}}}}T|F");
+        assert_eq!(parts, vec!["#if:1", "S{{{p|{{T|d}}}}}T", "F"]);
+
+        // A pipe inside the nested constructs is still not a separator.
+        let parts = split_template_args("a|{{b|c|d}}|e");
+        assert_eq!(parts, vec!["a", "{{b|c|d}}", "e"]);
+    }
 
     fn tokenize(input: &str) -> Vec<Either<String, ParsoidToken>> {
         let mut tokenizer = PegTokenizer::new(input, &TokenizerOptions::default());

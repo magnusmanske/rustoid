@@ -30,16 +30,25 @@ fn has_class(node: &Node, class: &str) -> bool {
         .is_some_and(|c| c.split_whitespace().any(|t| t == class))
 }
 
-/// Whether a node is "rendering transparent" (a comment, or a meta/link that
-/// produces no visible output). Mirrors `WTUtils::isRenderingTransparentNode`
-/// for the cases reachable here (`meta`, `link`, comments; annotations and
-/// `mw:DOMFragment` wrappers are excluded).
+/// `WTUtils::isRenderingTransparentNode` — comments, SOL-transparent links
+/// (category/redirect/language page-property links), non-HTML metas, and
+/// fallback-id spans render nothing, so a flagged empty element containing only
+/// these is still empty.
+///
+/// The SOL-transparent link case is load-bearing: a `<p>` whose whole content is
+/// an empty `mw:Nowiki` wrapper plus a category link is empty, and the wiki
+/// serves it as `<p class="mw-empty-elt">`. Without it `List of sovereign
+/// states` differs at byte 2 — on the `<p>` itself.
 fn is_rendering_transparent(node: &Node) -> bool {
     if matches!(node.kind, NodeKind::Comment(_)) {
         return true;
     }
+    if crate::html::wts_utils::is_sol_transparent_link(node)
+        || crate::html::wts_utils::is_fallback_id_span(node)
+    {
+        return true;
+    }
     if let NodeKind::Element(kind) = &node.kind {
-        let tag = element_tag(kind);
         let typeof_attr = node.get_attr("typeof").unwrap_or("");
         let has_excluded_typeof = typeof_attr
             .split_whitespace()
@@ -47,14 +56,12 @@ fn is_rendering_transparent(node: &Node) -> bool {
         if has_excluded_typeof {
             return false;
         }
-        if tag == "meta" {
+        if element_tag(kind) == "meta" {
             return node
                 .data_parsoid
                 .as_deref()
                 .is_none_or(|dp| !dp.contains("\"stx\":\"html\""));
         }
-        // Rendering-transparent links (e.g. category/redirect/PageProp links) are
-        // not exercised here; kept minimal to match the p/li/tr cases.
     }
     false
 }

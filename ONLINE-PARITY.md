@@ -3739,8 +3739,7 @@ Both are left for the next session with their reductions; neither is guesswork.
 
 ### A stray `\n|` out of `Template:Short description/lowercasecheck`
 
-The byte-2 failure on `List of sovereign states` turned out not to be the cleanup
-predicate I first suspected. rustoid's output there reads
+The byte-2 failure on `List of sovereign states` was a rustoid output reading
 
 ```
 <span about="#mwt1">\n|</span>
@@ -3748,25 +3747,57 @@ predicate I first suspected. rustoid's output there reads
 
 between the two tracking categories, where the service has nothing. Reduced with
 the scratch-template tooling to one call — `{{Short description/lowercasecheck|none}}`
-— which every article carrying `{{Short description}}` transcludes, so this is
+— which every article carrying `{{Short description}}` transcludes, so it was
 broad, not a `List of sovereign states` quirk.
 
-The template's shape is a nested `#ifeq` whose first arm holds a comment and an
-`#invoke`, whose second arm is `1\n`, and whose true arm is a `#switch` with
-fall-through cases and a `|`-bearing `[[Category:…|sortkey]]`. Three plausible
-causes were **checked and cleared** rather than assumed:
+Three plausible causes were **checked and cleared** rather than assumed:
+positional arguments *are* trimmed (`{{#ifeq:1|1\n|YES|NO}}` answers `YES`, page
+and body alike); `#switch` fall-through grouping matches the service exactly; and a
+`|` inside a `[[…|…]]` in a switch case does not split the argument list.
 
-- positional arguments are trimmed — `{{#ifeq:1|1\n|YES|NO}}` answers `YES`, and
-  `{{#if: 1 |YES|NO}}` answers `YES`, both at page level and inside a body;
-- `#switch` fall-through grouping matches the service exactly, for
-  `{{#switch: a|a|b}}`, `{{#switch: a|a|b=X}}` and the newline-separated
-  `{{#switch: none\n|none\n|pH\n|pH-dependent=X}}`;
-- a `|` inside a `[[…|…]]` in a switch case does not split the argument list.
+Further reduction to `{{#if:1|S{{Testcases other|{{red|X}}}}T|F}}` — which renders
+`S…T` and then leaks the else branch as the literal text `|F` — named the real
+cause, and `data-mw` confirmed it: the service records two parameters, while
+rustoid recorded **one**, `S{{Testcases other|{{red|X}}}}T|F`. The tokenizer's
+argument splitter had not seen the `|` between `T` and `F`.
 
-So the cause is in the nesting, not in any one of those rules, and the reduction
-that isolates it is the `#ifeq` true-arm alone as a scratch body — the extraction
-I had not yet got right when the session ended. The scratch tooling
-(`/tmp/tmpl.py --body-file`) reproduces it in one run; it is not in the repo.
+#### The bug: a run of closing braces
+
+`split_template_args_impl_offsets` tracked nesting with a `double_brace` and a
+`triple_brace` counter and tested `}}}` **before** `}}`. For a run of four braces —
+the tail of the extremely common `{{a|{{b|x}}}}` — that read the run as a `}}}`
+(which saturating-subtracted from a `triple_brace` that was already 0) plus a stray
+`}`, so `double_brace` was never decremented. The splitter then believed it was
+still two constructs deep, and the following top-level `|` was invisible.
+
+The fix is a stack of open constructs instead of counters: on a run of `}`, the
+*innermost* open construct decides how many braces it consumes (3 for a tplarg, 2
+for a template), repeatedly, and anything left over is literal. That is what
+`}}}}` needs — two `}}` closers — while `}}}` still closes a tplarg.
+
+This changed real output on several corpus pages (the `List of sovereign states`
+ratio alone went 0.69 → 1.02) and the fixture guard held at 876/896 — no regression.
+
+### `mw-empty-elt` on a paragraph of page-property links
+
+With the pipe leak gone, `List of sovereign states` was still failing at byte 2 —
+this time on the `<p>` itself, which the service serves as
+`<p class="mw-empty-elt" id="mwAg">` and rustoid as a bare `<p>`. The `<p>` holds
+an empty `mw:Nowiki` wrapper and a category link, so `CleanUp::isEmptyNode` should
+count it empty; rustoid's `is_rendering_transparent` handled comments and non-HTML
+metas but **not** SOL-transparent links, which is the one case PHP's
+`WTUtils::isRenderingTransparentNode` has and the local predicate did not.
+
+Adding it moved the page from byte 2 to **23** (the residual is the `<p>`'s own
+`id`, which the service assigns and rustoid does not, plus the `mw:ExpandedAttrs`
+gate below).
+
+Note the order of discovery: this same predicate change was written first and looked
+**inert** — byte-identical output on `World War II` — so it was reverted. It was
+inert only because the pipe leak was putting a visible `\n|` span inside the
+paragraph, so `is_empty_node` returned false for a different reason. Fixing the
+tokenizer made the predicate change effective. A change that measures as a no-op is
+not necessarily wrong; it can be blocked by another bug.
 
 ## The `mw:ExpandedAttrs` gate, and why it is not a small fix
 
