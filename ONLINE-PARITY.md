@@ -3592,13 +3592,24 @@ fetched bodies unreachable offline. `--reindex` recovers them, and it only
 needs. Any future online population should either go through a corpus run or be
 followed by a `--reindex`.
 
-### Scoreboard (old binary, before these three fixes)
+### Scoreboard
 
 ```
-corpus: 0/43 compared (0.0%), 5 stalled
-output: parsoid 64.5 MB, rustoid 51.3 MB (0.80x)
-  transclusion 39 | stalled 5 | data-mw 1 | extension 1 | lua 1 | module-source 1
+session start:   0/45 matched, rustoid 163.8 MB (2.54x)
+after this run:  0/44 compared, 4 stalled, rustoid 49.9 MB (0.77x)
 ```
+
+The corpus grew from 45 to 48 entries during the session, so the comparison count
+is not directly comparable across the two runs. What *is* comparable is the first
+difference, and that moved on every article page (311 → 404 on `Quicksilver`,
+`Unix`; 294 → 370 on `Sundial`; 305 → 392 on `Bicycle`).
+
+The remaining `{{#invoke:` literals on 30 of 48 pages are mostly missing modules
+(`Module:Message box/configuration`, `Module:Settlement short description`,
+`Module:Unsubst-infobox`, `Template:Wikidata/i18n`) and JSON modules that need
+`mw.loadJsonData` preloading. `--reindex` recovered 330 bodies that earlier
+single-page fetches had written without recording them in the manifest, so some
+of those gaps are already closed; the rest need targeted fetches.
 
 ## `#invoke` passed its two flags swapped
 
