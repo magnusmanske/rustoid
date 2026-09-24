@@ -10,7 +10,7 @@
 //! This mirrors the empty-`<p>` handling in Parsoid's `CleanUp` pass, which runs
 //! after tree building and p-wrapping.
 
-use crate::dom::node::{Node, NodeKind};
+use crate::dom::node::{ElementKind, Node, NodeKind};
 use crate::html::wts_utils::element_tag;
 use crate::wikitext::tokens_v2::DataParsoid;
 
@@ -197,6 +197,93 @@ pub fn run(root: &mut Node) {
     }
 }
 
+/// Drop the `data-parsoid` of nodes inside a transclusion that the service keeps
+/// none for. Faithful to `CleanUp::markDiscardableDataParsoid`, and run where PHP
+/// runs it: as the cleanup traverser's *store* step, so it is called just before
+/// the page-bundle ids are allocated.
+///
+/// Inside an encapsulation range only the **first** node and the **last** keep
+/// their metadata, plus any node whose `data-parsoid` carries no `stx` and any
+/// node in native (extension) content; everything else loses it. The service does
+/// not key those nodes, and the ids are positional, so keeping one shifts every
+/// id after it — the module-output category link beside a `#ifeq` one was the
+/// visible case.
+///
+/// Only `data-parsoid` goes, not the structured `dp` and not `data-mw`: later
+/// passes and the round-trip serializers read `dp`, and a node with `data-mw` is
+/// keyed by it whatever its `data-parsoid` says.
+pub fn mark_discardable_data_parsoid(root: &mut Node) {
+    discard_in_siblings(&mut root.children, false);
+}
+
+/// One sibling list: find each encapsulation range and mark its interior.
+fn discard_in_siblings(children: &mut [Node], in_native: bool) {
+    let mut i = 0;
+    while i < children.len() {
+        if !is_first_encapsulation_wrapper(&children[i]) {
+            let inside = in_native || is_native_ext(&children[i]);
+            discard_in_siblings(&mut children[i].children, inside);
+            i += 1;
+            continue;
+        }
+        // A range runs from here through the last following element sibling with
+        // the same `about` (mirrors `WTUtils::getAboutSiblings`).
+        let about = children[i].get_attr("about").map(str::to_string);
+        let mut last = i;
+        while last + 1 < children.len() && children[last + 1].get_attr("about") == about.as_deref()
+        {
+            last += 1;
+        }
+        let span = last - i + 1;
+        for (offset, child) in children[i..=last].iter_mut().enumerate() {
+            let inside = in_native || is_native_ext(child);
+            discard_node(child, offset == 0, offset + 1 == span, inside);
+            // Every descendant sits inside the range but is neither its first nor
+            // its last node, so it never gets the boundary exemptions.
+            discard_in_range(&mut child.children, inside);
+        }
+        i = last + 1;
+    }
+}
+
+/// Mark the marked-state of every descendant of a range member.
+fn discard_in_range(children: &mut [Node], in_native: bool) {
+    for child in children.iter_mut() {
+        let inside = in_native || is_native_ext(child);
+        discard_node(child, false, false, inside);
+        discard_in_range(&mut child.children, inside);
+    }
+}
+
+/// Discard `node`'s `data-parsoid` unless it is a boundary node, native content,
+/// or an `stx`-bearing last node or heading (which the serializer needs `stx` on).
+fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool) {
+    if !node.kind.is_element() || is_first || in_native {
+        return;
+    }
+    let has_stx = node.dp.as_ref().is_some_and(|dp| dp.stx.is_some())
+        || node
+            .data_parsoid
+            .as_deref()
+            .is_some_and(|json| json.contains("\"stx\""));
+    let is_heading = matches!(node.kind, NodeKind::Element(ElementKind::Heading(_)));
+    if has_stx && (is_last || is_heading) {
+        return;
+    }
+    node.data_parsoid = None;
+}
+
+/// Whether the node is an extension's tag. Used for `CleanUp::inNativeContent`,
+/// conservatively: rustoid's site config does not distinguish native from
+/// non-native extension tags, so *any* extension content is treated as native,
+/// which discards less than the reference rather than more.
+fn is_native_ext(node: &Node) -> bool {
+    node.get_attr("typeof").is_some_and(|ty| {
+        ty.split_whitespace()
+            .any(|t| t.starts_with("mw:Extension/"))
+    })
+}
+
 /// Trim leading/trailing `[ \t]` whitespace from a trimmable-WS element, removing
 /// pure-whitespace text children and `mw:DisplaySpace` elements, and recording the
 /// trimmed widths in `dp.dsr.leading_ws`/`trailing_ws` (or `-1` when the widths
@@ -346,6 +433,88 @@ mod tests {
             "got: {:?}",
             root.children[0]
         );
+    }
+
+    /// Inside a transclusion range, an interior `stx`-bearing node loses its
+    /// `data-parsoid`, its `stx`-bearing *last* sibling keeps it, and the head is
+    /// never touched. This is the `Module:SDcat` category link: the service does
+    /// not key it, and keeping its key shifts every later id.
+    #[test]
+    fn discard_keeps_only_the_range_boundaries() {
+        fn stx_link() -> Node {
+            let mut n = Node::element(ElementKind::CategoryLink);
+            n.dp = Some(DataParsoid {
+                stx: Some("simple".to_string()),
+                ..Default::default()
+            });
+            n.data_parsoid = Some("{\"dsr\":[0,1,0,0],\"stx\":\"simple\"}".to_string());
+            n
+        }
+        let mut head = Node::element(ElementKind::Transclusion);
+        head.set_attr("about", "#mwt1");
+        head.set_attr("typeof", "mw:Transclusion");
+        head.dp = Some(DataParsoid {
+            stx: Some("simple".to_string()),
+            ..Default::default()
+        });
+        head.data_parsoid = Some("{\"dsr\":[0,1,0,0]}".to_string());
+        let mut interior = stx_link();
+        interior.set_attr("about", "#mwt1");
+        let mut last = stx_link();
+        last.set_attr("about", "#mwt1");
+
+        let mut root = Node::document();
+        root.push_child(head);
+        root.push_child(interior);
+        root.push_child(last);
+        mark_discardable_data_parsoid(&mut root);
+
+        assert!(root.children[0].data_parsoid.is_some(), "head keeps its dp");
+        assert!(
+            root.children[1].data_parsoid.is_none(),
+            "interior loses its dp"
+        );
+        assert!(root.children[2].data_parsoid.is_some(), "last keeps its dp");
+    }
+
+    /// A range member's *descendant* is interior even though it is not a
+    /// boundary of the range.
+    #[test]
+    fn discard_reaches_into_a_range_member() {
+        let mut head = Node::element(ElementKind::Transclusion);
+        head.set_attr("about", "#mwt1");
+        head.set_attr("typeof", "mw:Transclusion");
+        let mut member = Node::element(ElementKind::Span);
+        member.set_attr("about", "#mwt1");
+        let mut inner = Node::element(ElementKind::CategoryLink);
+        inner.dp = Some(DataParsoid {
+            stx: Some("simple".to_string()),
+            ..Default::default()
+        });
+        inner.data_parsoid = Some("{\"dsr\":[0,1,0,0]}".to_string());
+        member.push_child(inner);
+
+        let mut root = Node::document();
+        root.push_child(head);
+        root.push_child(member);
+        mark_discardable_data_parsoid(&mut root);
+
+        assert!(root.children[1].children[0].data_parsoid.is_none());
+    }
+
+    /// Outside any range nothing is discarded.
+    #[test]
+    fn discard_leaves_nodes_outside_a_range_alone() {
+        let mut link = Node::element(ElementKind::CategoryLink);
+        link.dp = Some(DataParsoid {
+            stx: Some("simple".to_string()),
+            ..Default::default()
+        });
+        link.data_parsoid = Some("{\"dsr\":[0,1,0,0]}".to_string());
+        let mut root = Node::document();
+        root.push_child(link);
+        mark_discardable_data_parsoid(&mut root);
+        assert!(root.children[0].data_parsoid.is_some());
     }
 
     #[test]

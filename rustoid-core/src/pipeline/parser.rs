@@ -2336,6 +2336,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             about_counter.set(ids.about_counter());
         }
         wrap_sections_in_ast(&mut ast, options.wrap_sections);
+        // PHP marks the `data-parsoid` a transclusion's interior nodes may not
+        // keep as its cleanup traverser stores them, i.e. just before the ids are
+        // handed out. Doing it here leaves every earlier pass its `dp`.
+        crate::pipeline::cleanup::mark_discardable_data_parsoid(&mut ast);
         // Page-bundle node ids are allocated last, after every pass that can create
         // or destroy an element. The ids are positional — one element inserted
         // earlier shifts every id after it — so the assignment cannot run before
@@ -2497,9 +2501,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     out.extend(error);
                     continue;
                 }
-                let about_id = self.new_about_id(about_counter);
+                // PHP builds the `TemplateEncapsulator` for a template argument
+                // only when it wraps it (`onTemplateArg`'s `wrapTemplates &&
+                // expandTemplates`), so a `{{{…}}}` inside a template body takes no
+                // about id at all. Taking one anyway advanced the page's counter
+                // for every argument in an expansion — `Template:Short description`
+                // has a dozen — and put the next transclusion's `about` far ahead
+                // of the service's (11 where the service has 2).
+                let wrap = !in_template;
+                let about_id = if wrap {
+                    self.new_about_id(about_counter)
+                } else {
+                    String::new()
+                };
                 let produced =
-                    TemplateHandler.handle_template_arg_token(frame, tok, about_id, !in_template);
+                    TemplateHandler.handle_template_arg_token(frame, tok, about_id, wrap);
                 self.leave_pp_node();
                 // The default is wikitext, and PHP's `Frame::expand` runs the
                 // chunk it comes from through the whole pipeline — so a template
@@ -2570,15 +2586,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // suite pins that.
         let wrap = !body && !in_tpl;
 
-        // The id is taken whenever PHP's `TemplateEncapsulator` constructor would
-        // run — for every `template` token — even when the expansion turns out not
-        // to be wrapped. The discarded id is load-bearing: the service serves
-        // contiguous ids over the elements it *does* wrap, so `{{1x|{{T}}}}`
-        // numbers the `1x` span after T's discarded id. (A variable or parser
-        // function takes its own inside `TemplateHandler::process`, which is the
-        // path that used to double up and skip one.)
+        // The id is taken exactly when the expansion is wrapped. PHP builds its
+        // `TemplateEncapsulator` — the object that owns the id — only where a
+        // wrapper is produced, and the service's `about` sequence shows it: a
+        // template's own expansion takes no id, so a `{{…}}` written in its source
+        // must not advance the counter either. `body` carries that context
+        // (the same pair of flags as `wrap` above). Taking an id for these instead
+        // put every transclusion after a busy template far ahead of the service:
+        // on `List of sovereign states` the Redirect2 hatnote was `#mwt11` where
+        // the service has `#mwt2`, because `Template:Short description`'s own
+        // expansion had consumed 2…10.
+        //
+        // A variable or parser function takes its own id inside
+        // `TemplateHandler::process`, which is a separate path.
         let take_id = || {
-            if in_tpl {
+            if in_tpl || body {
                 String::new()
             } else {
                 self.new_about_id(about_counter)

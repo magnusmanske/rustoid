@@ -4355,3 +4355,82 @@ Two cache facts came out of chasing it, worth knowing before an offline run:
 `test_wikitext_to_html_paragraph_break` and `test_wikitext_to_html_redirect_nowiki_bail`
 asserted on a literal `<p>` / `<ol><li>`. Both now carry `data-parsoid`, which is
 what Parsoid native mode emits, so the assertions match the tag boundary instead.
+
+## Two id rules inside a transclusion
+
+With byte 477 reached, the next difference was a pair of id questions about
+nodes *inside* a transclusion. They are separate rules and both had to be fixed.
+
+### The `about` counter is only advanced where a wrapper is produced
+
+`List of sovereign states` had the Redirect2 hatnote at `#mwt11` where the service
+has `#mwt2`. Instrumenting `new_about_id` (a temporary `RUSTOID_ABOUT_DEBUG`
+label at each call site) showed ids 2…10 going to `Template:Short description`'s
+own expansion — `Template:Pagetype`, four `#invoke`s, `lowercasecheck`,
+`First word`, `Main other` and the `SDcat` invoke.
+
+Those all expand inside a template *body*, and PHP runs a body through a nested
+pipeline with `inTemplate => true`, where the `TemplateEncapsulator` — the object
+that owns the id — is never built. rustoid already carries that context as
+`body` (`wrap` is `!body && !in_tpl`), but `take_id` only consulted `in_tpl`, so
+each of those tokens consumed an id while producing no wrapper. `take_id` is now
+`!body && !in_tpl`, i.e. exactly the condition under which it wraps, and the
+sequence comes out `1 (Short description), 2 (Redirect2), 3 (templatestyles)` —
+the service's.
+
+The earlier comment in the code claimed a discarded id was load-bearing for
+`{{1x|{{T}}}}`; that case has the inner call spliced in as an *argument value*,
+which is already `in_tpl`, so it never distinguished the two rules. The fixture
+guard is unchanged at 876/896.
+
+### `CleanUp::markDiscardableDataParsoid`
+
+One line below that, rustoid keyed the `Module:SDcat` category link where the
+service does not. That is `markDiscardableDataParsoid`: inside an encapsulation
+range only the **first** node and the **last** keep their `data-parsoid`, plus any
+node without `stx` and any node in native (extension) content. The range is the
+run of consecutive element siblings sharing the `about` (`WTUtils::getAboutSiblings`),
+and the running `tplInfo` comes from `DOMTraverser`.
+
+`cleanup::mark_discardable_data_parsoid` implements that, and it is called from
+`build_ast` just before `assign_node_ids` — PHP runs it as the cleanup traverser's
+*store* step, so every earlier pass keeps its `dp`. Only `data_parsoid` is
+dropped, not `dp` and not `data-mw`: a node with `data-mw` is keyed by it whatever
+`data-parsoid` says, which is why discarding cannot unkey a transclusion's head.
+
+Two deliberate approximations, both on the conservative side: `inNativeContent`
+treats *any* `mw:Extension/…` content as native (rustoid's site config has no
+native/non-native tag split, so this discards less than the reference rather than
+more), and a node with no `stx` is never discarded (the reference agrees — its
+condition is `empty($dp->stx) || !(last || heading)`).
+
+### Scoreboard
+
+```
+                          before   after
+List of sovereign states    477      477     <- now the encapsulation head
+Quicksilver (film)          577      590
+Unix                        577      852
+Sundial                     543      554
+Nobel Prize                 589      600
+Megadeth                    555      566
+Bicycle                     538      538
+Help:Introduction           403      403
+Zebra                       444      444
+rustoid bytes            3 831 607  3 760 471  (0.72x -> 0.70x)
+```
+
+What is left on the closest pages is now one shape, not a scattering:
+
+- **The encapsulation head.** `List of sovereign states` wants
+  `<span class="mw-empty-elt" about="#mwt2" typeof="mw:Transclusion">` around the
+  leading templatestyles and a separate `<div about="#mwt2">`; rustoid puts the
+  head on the `<div>` and, worse, leaves a `<style>` *inside* an `<a>`.
+  `Help:Introduction` wants `<p about="#mwt4" typeof="mw:Transclusion">` where
+  rustoid has `<span class="mw-empty-elt" about="#mwt9">`. These are
+  `DOMRangeBuilder` (the stash span, and where the head lands) and the placement
+  of a templatestyles a module emits from inside a link.
+- **Bicycle** differs on the *category name* (`matches_Wikidata` vs
+  `is_different_from_Wikidata`) — its Wikidata entity is not in the cache, so
+  `mw.wikibase` sees nothing. Every other entity lookup now works.
+- **Zebra** is the pre-existing node-count trip and is not a usable target.

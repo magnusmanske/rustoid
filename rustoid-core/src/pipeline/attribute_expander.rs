@@ -653,6 +653,9 @@ pub fn build_expanded_attrs(
         && !branch_text
     {
         let about_id = new_about_id(about_counter);
+        if std::env::var("RUSTOID_ABOUT_DEBUG").is_ok() {
+            eprintln!("about-alloc: {about_id} (expanded-attrs)");
+        }
         token.set_attribute("about", &about_id);
         token.add_space_separated_attribute("typeof", "mw:ExpandedAttrs");
 
