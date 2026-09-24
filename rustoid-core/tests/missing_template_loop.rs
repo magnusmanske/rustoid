@@ -229,8 +229,13 @@ async fn a_missing_template_answers_with_its_title_as_text() {
     // The link *text* is the title alone. If Parsoid's internal JSON leaked into
     // it, the anchor would contain `{` or a tag, and the caller reading the text
     // back would build its next target from that — which is the runaway.
-    let text_start = html.find("'>").map(|i| i + 2).unwrap_or(0);
-    let text = &html[text_start..html.find("</a>").unwrap_or(html.len())];
+    //
+    // The text is taken from the last `>` before `</a>`, i.e. the end of the
+    // anchor's own opening tag. Searching for the first `'>` instead would land in
+    // an earlier element's `data-parsoid='…'`, which is there on every element.
+    let anchor_end = html.find("</a>").unwrap_or(html.len());
+    let text_start = html[..anchor_end].rfind('>').map(|i| i + 1).unwrap_or(0);
+    let text = &html[text_start..anchor_end];
     assert!(
         !text.contains('{') && !text.contains('<'),
         "the link text must be the bare title, was {text:?}"
