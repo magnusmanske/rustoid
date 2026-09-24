@@ -3843,3 +3843,135 @@ attributes inside the body pipeline (a structural change that also moves the
 `about` allocations into it) or tagging body-produced tokens so the marking can
 skip them. Both are bigger than they look; the reduction stays
 `{{Short description|X}}` on any article.
+
+## `Module:Pagetype`: `getCurrentTitle()` was the invoking frame
+
+Scoreboard from the corpus run that opened the session (`/tmp/corpusC.txt`, the
+full 48, offline):
+
+```
+score: 0/48 compared (0.0%)
+output: parsoid 64473554 bytes, rustoid 55907419 bytes (0.87x)
+```
+
+Up from 0.77x at the end of the previous session — the byte ratio keeps moving
+before any page passes, which is the point of watching it.
+
+The reduction recorded at the end of the previous section — `{{pagetype|plural=y}}`
+answering `pages` where the service answers `articles` — is not a `Module:Pagetype`
+bug at all. Traced into the module, the `or` chain that decides the page type is
+fine; what is wrong is the title it is asked about:
+
+```
+cond=true | t.ns=10 | t.type=table | content=true | det=nil | ne=nil | pc=nil |
+mc=nil | nsp=nil | oth=template
+```
+
+`t.ns=10` — a page in the *Template* namespace. `p._main` opens with
+`title = mw.title.getCurrentTitle()`, and inside `Template:Pagetype` that returned
+**`Template:Pagetype`**, not `Zebra`. `getOtherPageType` then read
+`cfg.pagetypes[10]`, which is `template`.
+
+The cause is a conflation in `LuaContext`. Scribunto keeps three titles apart:
+
+| question | answer |
+| --- | --- |
+| `mw.title.getCurrentTitle()` | the *root* page (`Zebra`) |
+| `frame:getTitle()` on the `#invoke` frame | the *module* (`Module:Pagetype`) |
+| `frame:getParent():getTitle()` | the invoking frame (`Template:Pagetype`) |
+
+rustoid had one field (`LuaContext::page_title`) fed with the *invoking frame's*
+title and used it for both of the first two. The parser already had the root page
+in `FrameContext::page_title` — it was simply not carried into the engine, and
+`run_once` passed its own `page_title` argument (which the parser sets from
+`frame.title()`, i.e. the template) instead.
+
+The fix renames the field to `LuaContext::current_title`, fills it from
+`FrameContext::page_title` (falling back to the old value only when the root is
+unknown), and gives `execute_in`'s frame the *module* title that `create_frame`
+asked for. Three answers that were one value are now three.
+
+That the old value "worked" for `getContent()` is worth noting: `is_current` was
+compared against the *same* wrong title, so `mw.title.getCurrentTitle():getContent()`
+returned the page's own wikitext while claiming to be `Template:Pagetype`. The two
+errors cancelled; `Module:Pagetype`, which branches on the namespace, saw through it.
+
+## `subjectPageTitle` / `talkPageTitle` are title objects, and a subject page is itself
+
+Pulling the thread found a second, independent bug that the first had been hiding.
+`mw.title.lua` defines the derived page titles as:
+
+```lua
+if k == 'subjectPageTitle' then
+    local ns = mw.site.namespaces[data.namespace].subject
+    if ns.id == data.namespace then return obj end   -- the title itself
+    return title.makeTitle( ns.id, data.text )
+end
+if k == 'talkPageTitle' then
+    local ns = mw.site.namespaces[data.namespace].talk
+    if not ns then return nil end
+    if ns.id == data.namespace then return obj end
+    return title.makeTitle( ns.id, data.text )
+end
+```
+
+rustoid returned a **string** (`prefix_title(...)`), and used the namespace pairing
+`ns_id + if ns_id % 2 == 1 { -1 } else { 1 }` — which for a talk namespace gives the
+*subject* id, so `Talk:Zebra`'s `talkPageTitle` was `Zebra`.
+
+The string return matters more than it looks. `Module:Pagetype` reads
+`title.subjectPageTitle` and then asks the **result** for `exists`; a string has no
+`exists`, so `nonExistent` reported the page as missing and the module fell through
+to `cfg.otherDefault` — `page`. That is the `pages` in the reduction. With the title
+returned unchanged, `exists` still answers and the chain reaches
+`getOtherPageType` → `cfg.pagetypes[0]` → `article`.
+
+Fixed by building the derived titles through the same `title_object` constructor
+`subPageTitle` uses, returning the receiver itself when it is already in that
+namespace. The namespace pairing moved into two helpers,
+`subject_namespace_id`/`talk_namespace_id`, shaped like MediaWiki's
+`MWNamespace::getSubject`/`getTalk`:
+
+- a negative id (Special, Media) is its own subject and has no talk space;
+- a talk namespace's talk page is itself;
+- otherwise the pair is `2n`/`2n+1`.
+
+Both `luafn_site_namespaces` and `NamespaceFacts` now use them, which fixed two
+more divergences found on the way: `mw.site.namespaces[-1].talk` was a *table*
+(so `mw.title.lua`'s `if ns.talk ~= nil` could never be false), and
+`talkNsText` on a talk page was `""` instead of `"Talk"`.
+
+The corpus confirms the two fixes on `Unix`:
+
+```
+parsoid: <link rel="mw:PageProp/Category" href="./Category:Articles_with_short_description"/>
+rustoid: <link typeof="mw:ExpandedAttrs" rel="mw:PageProp/Category"
+               href="./Category:Articles_with_short_description" id="mwAw"/>
+```
+
+Same `href` now; what is left is the `mw:ExpandedAttrs` gate. `Zebra`, `Unix` and
+`Help:Introduction` all still break at the same byte as before, on that gate rather
+than on the category name.
+
+## `Module:Pagetype/setindex` and `/disambiguation` had to be fetched
+
+`parseContent` loads `mw.loadData('Module:Pagetype/' .. list)` for four lists, and
+two of them were not in the cache. The name is built at runtime, so the preload scan
+sees only the `'Module:Pagetype/'` prefix (and enqueues the bogus `Module:Pagetype/`);
+the retry loop fetches the real name — but only once the module gets far enough to
+ask. Before the fix `title.exists` was false, `parseContent` returned on its first
+line, and the loads never happened, which is why the gap had gone unnoticed.
+
+## A pre-existing node-count trip on `Zebra`
+
+`Zebra` reports `Category:Node-count_limit_exceeded_with_short_description`: the
+preprocessor's node counter reaches `max_pp_node_count` (1 000 000) while expanding
+`{{pagetype}}`, and the error span's text becomes the category. The service does not
+trip, so rustoid is counting more expansions than MediaWiki does on this page.
+
+Checked by stashing the title work and rebuilding: the old revision produces the
+identical `Node-count_limit_exceeded_with_short_description` and the identical
+first-difference byte 444 (111 686 bytes), so this is **not** a consequence of the
+title changes — the two revisions differ only in the byte count (111 686 → 111 894).
+Left as the next thing to look at; the limit is a per-parse counter reset in
+`build_ast`.

@@ -329,7 +329,15 @@ pub fn run_once(
     // Titles already proven absent travel with the run, so `require` reports them
     // as missing pages rather than as preload misses.
     frame.unfetchable = unfetchable.clone();
-    let ctx = LuaContext::with_parent(site, page_title.to_string(), frame);
+    // `mw.title.getCurrentTitle()` answers about the *page being parsed*, not the
+    // frame that made this `#invoke` call: a module invoked from inside a template
+    // still asks about the article. `page_title` here is the invoking frame's
+    // title, so it serves only as the fallback when the root page is unknown.
+    let current_title = frame
+        .page_title
+        .clone()
+        .unwrap_or_else(|| page_title.to_string());
+    let ctx = LuaContext::with_parent(site, current_title, frame);
     let engine = LuaEngine::new(LuaEngineConfig::default(), ctx)?;
 
     let args = call.frame_args();

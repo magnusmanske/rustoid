@@ -823,9 +823,10 @@ async fn new_child_without_args_is_empty_not_broken() {
         .await
         .unwrap();
     let body = text_only(&html);
-    // The title falls back to the creating frame's, which for a transclusion is
-    // the calling template.
-    assert!(body.contains("0|Template:Wrap|true"), "got: {body}");
+    // The title falls back to the creating frame's, which is the *module*: the
+    // frame `{{#invoke:}}` made stands for `Module:Bare`, not for the template
+    // that called it.
+    assert!(body.contains("0|Module:Bare|true"), "got: {body}");
 }
 
 /// `mw.title.equals` compares two title objects.
@@ -1280,5 +1281,38 @@ async fn a_parser_function_can_be_a_named_numeric_argument() {
     assert!(
         text_only(&html).contains("got:IFYES"),
         "a parser-function argument did not reach frame.args[1]: {html}"
+    );
+}
+
+/// `mw.title.getCurrentTitle()` answers about the page, even when the module was
+/// invoked from inside a template; `frame:getTitle()` answers about the module.
+///
+/// The two used to be the same value — the *invoking frame's* title — so a
+/// module reached through a template saw the template in `getCurrentTitle()`.
+/// `Module:Pagetype` reads `title.subjectPageTitle` and branches on the
+/// namespace, so reading `Template:` made it call every article a `template`.
+#[tokio::test]
+async fn current_title_is_the_page_not_the_invoking_template() {
+    const MODULE: &str = r#"
+        local p = {}
+        function p.main(frame)
+            local t = mw.title.getCurrentTitle()
+            return t.prefixedText .. '|' .. t.namespace .. '|' .. frame:getTitle()
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:T", MODULE);
+    source.add_template("Template:Caller", "{{#invoke:T|main}}");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded("{{Caller}}", &source, &ParserOptions::for_page("Test"))
+        .await
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    let text = text_only(&html);
+    assert!(
+        text.contains("Test|0|Module:T"),
+        "getCurrentTitle() or frame:getTitle() named the wrong title: {html}"
     );
 }

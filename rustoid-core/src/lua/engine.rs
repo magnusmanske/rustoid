@@ -317,7 +317,14 @@ pub struct TitleFacts {
 
 pub struct LuaContext {
     pub site: LuaSite,
-    pub page_title: String,
+    /// Title of the page being parsed — the *root* page, for
+    /// `mw.title.getCurrentTitle()`.
+    ///
+    /// Deliberately not the frame that made the `#invoke` call: a module
+    /// invoked from inside a template still asks about the article, and
+    /// answering with the template's title made `Module:Pagetype` read the
+    /// Template namespace and call the page a `template`.
+    pub current_title: String,
     /// Arguments of the frame that *invoked* the module — `frame:getParent().args`.
     /// Empty when there is no parent (a direct `{{#invoke:…}}` from the page).
     pub parent_args: Vec<Arg>,
@@ -357,10 +364,10 @@ pub struct LuaContext {
 }
 
 impl LuaContext {
-    pub fn new(site: LuaSite, page_title: impl Into<String>) -> Self {
+    pub fn new(site: LuaSite, current_title: impl Into<String>) -> Self {
         Self {
             site,
-            page_title: page_title.into(),
+            current_title: current_title.into(),
             parent_args: Vec::new(),
             parent_title: None,
             has_parent: false,
@@ -375,12 +382,12 @@ impl LuaContext {
     /// Same, with the preloaded module registry.
     pub fn with_modules(
         site: LuaSite,
-        page_title: impl Into<String>,
+        current_title: impl Into<String>,
         modules: std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             site,
-            page_title: page_title.into(),
+            current_title: current_title.into(),
             parent_args: Vec::new(),
             parent_title: None,
             has_parent: false,
@@ -398,10 +405,14 @@ impl LuaContext {
     /// Grouped rather than passed as six positional arguments: several are
     /// `Option`s or collections of the same type, and a struct makes the call
     /// site say which is which.
-    pub fn with_parent(site: LuaSite, page_title: impl Into<String>, frame: FrameContext) -> Self {
+    pub fn with_parent(
+        site: LuaSite,
+        current_title: impl Into<String>,
+        frame: FrameContext,
+    ) -> Self {
         Self {
             site,
-            page_title: page_title.into(),
+            current_title: current_title.into(),
             modules: frame.modules,
             unfetchable: frame.unfetchable,
             parent_args: frame.parent_args,
@@ -555,16 +566,26 @@ impl LuaEngine {
         // after the load made that call index nil and failed the whole module,
         // which took `Module:lang`, `Module:Annotated link` and every page that
         // transcludes them with it.
+        // `frame:getTitle()` on the frame `{{#invoke:}}` created is "the title
+        // of the module invoked" (the manual is explicit) — not the page, and
+        // not the template the call sat in. The parent frame's title is the
+        // calling frame's, with the page standing in when the caller *is* the
+        // page frame.
+        let parent_title = self
+            ._context
+            .parent_title
+            .clone()
+            .unwrap_or_else(|| self._context.current_title.clone());
         let frame = create_frame(
             &self.lua,
             args,
-            &self._context.page_title,
+            title,
             // `Option`: a `#invoke` made outside any template has no parent
             // frame, and Scribunto returns nil for `getParent()` there.
             self._context
                 .has_parent
                 .then_some(self._context.parent_args.as_slice()),
-            self._context.parent_title.as_deref(),
+            &parent_title,
             answers.clone(),
             // The engine's own collector: `take_pending` reads what this run
             // asked for, so a fresh one per run would lose it.
@@ -2143,7 +2164,7 @@ fn luafn_title_new(
     // construction would recurse (a title's talk page is itself a title).
     let facts = title_facts_for(ctx, &ns_id, &title_text);
     let is_current = {
-        let current = ctx.page_title.replace('_', " ");
+        let current = ctx.current_title.replace('_', " ");
         full.eq_ignore_ascii_case(&current) || title_text.eq_ignore_ascii_case(&current)
     };
     let current_source = ctx.page_source.clone();
@@ -2362,14 +2383,24 @@ fn title_derived_without_facts(lua: &Lua, t: &Table, key: &str) -> mlua::Result<
     match key {
         "isTalkPage" => Ok(Value::Boolean(ns_id % 2 == 1)),
         "isContentPage" => Ok(Value::Boolean(ns_id == 0 || ns_id == 828)),
-        "talkPageTitle" => {
-            let talk = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
-            lua_str(lua, prefix_title(&site, talk, &text))
-        }
-        "subjectPageTitle" => {
-            let subject = ns_id - (ns_id % 2);
-            lua_str(lua, prefix_title(&site, subject, &text))
-        }
+        // Scribunto defines these as `mw.title.makeTitle(ns.subject.id, text)`
+        // and `makeTitle(ns.talk.id, text)`, returning the title *itself* when
+        // the page is already in that namespace, and nil for a talk page in a
+        // namespace with no talk space. The self-return is load-bearing: a
+        // main-namespace article's `subjectPageTitle` is the very title object
+        // the module already holds, so `exists` and `getContent` still answer.
+        // `Module:Pagetype` reads `title.subjectPageTitle` and then tests that
+        // result's existence; a fact-less substitute made it report the page as
+        // non-existent and answer `page` where the service answers `article`.
+        "subjectPageTitle" => derived_page_title(lua, &site, t, subject_namespace_id(ns_id), &text),
+        "talkPageTitle" => match talk_namespace_id(ns_id) {
+            // A namespace with no talk space has no talk page title; that is the
+            // same condition `mw.site.namespaces[ns].talk` being nil expresses.
+            Some(talk) if NamespaceFacts::of(&site, ns_id).talk_name.is_some() => {
+                derived_page_title(lua, &site, t, talk, &text)
+            }
+            _ => Ok(Value::Nil),
+        },
         "fullUrl" => {
             let full: String = t.get("fullText").unwrap_or_default();
             full_url_closure(lua, &full)
@@ -2474,8 +2505,23 @@ fn given_namespace_id(site: &LuaSite, ns: &Value) -> Option<i32> {
 /// derived rather than looked up, so none of the preloaded page facts apply.
 fn title_from_full_text(lua: &Lua, site: &LuaSite, full: &str) -> mlua::Result<Value> {
     let (ns_id, title_text) = split_title(site, full);
+    title_object(lua, site, ns_id, &title_text, full)
+}
+
+/// Build a title object for `ns_id` / `title_text`, with `full` as its full text.
+///
+/// `full` is passed rather than recomputed so a title parsed from a string keeps
+/// the spacing it arrived with, while the derived `*PageTitle` accessors pass
+/// the canonical `Ns:Text` they just built.
+fn title_object(
+    lua: &Lua,
+    site: &LuaSite,
+    ns_id: i32,
+    title_text: &str,
+    full: &str,
+) -> mlua::Result<Value> {
     let ns = NamespaceFacts::of(site, ns_id);
-    let sub = SubpageFields::of(&title_text);
+    let sub = SubpageFields::of(title_text);
     let table = lua.create_table()?;
     table.set("text", title_text)?;
     table.set("nsText", site.namespace_name(ns_id))?;
@@ -2504,6 +2550,51 @@ fn title_from_full_text(lua: &Lua, site: &LuaSite, full: &str) -> mlua::Result<V
     mark_instance(&mt, &table)?;
     table.set_metatable(Some(mt));
     Ok(Value::Table(table))
+}
+
+/// The subject namespace of `ns_id`, as `mw.site.namespaces[ns].subject.id`
+/// reports it.
+///
+/// Mirrors MediaWiki's `MWNamespace::getSubject`: a namespace below zero
+/// (Special, Media) is its own subject, an even id is a subject namespace and an
+/// odd one pairs with the id below it. [`luafn_site_namespaces`] builds its
+/// `subject` field with this, so the derived `subjectPageTitle`'s "already the
+/// subject page" test agrees with the table a module compares against.
+fn subject_namespace_id(ns_id: i32) -> i32 {
+    if ns_id < 0 {
+        ns_id
+    } else {
+        ns_id - (ns_id % 2)
+    }
+}
+
+/// The talk namespace of `ns_id`, as `mw.site.namespaces[ns].talk.id` reports it.
+///
+/// `None` for the namespaces with no talk space (Special, Media) — where the
+/// manual says `mw.site.namespaces[ns].talk` is nil — and for unknown ids. A
+/// talk namespace's talk page is itself, which is what makes `talkPageTitle`
+/// return the title unchanged for `Talk:` pages.
+fn talk_namespace_id(ns_id: i32) -> Option<i32> {
+    (ns_id >= 0).then(|| subject_namespace_id(ns_id) + 1)
+}
+
+/// Build the subject or talk page of `t` in namespace `ns_id`.
+///
+/// Scribunto returns the title *itself* when the page is already in that
+/// namespace — the same table, so its facts (`exists`, `getContent`, …) still
+/// answer — and a fresh `mw.title.makeTitle(ns, text)` otherwise.
+fn derived_page_title(
+    lua: &Lua,
+    site: &LuaSite,
+    t: &Table,
+    ns_id: i32,
+    text: &str,
+) -> mlua::Result<Value> {
+    if t.get::<i32>("namespace").unwrap_or(0) == ns_id {
+        return Ok(Value::Table(t.clone()));
+    }
+    let full = prefix_title(site, ns_id, text);
+    title_object(lua, site, ns_id, text, &full)
 }
 
 /// The metatable every title object carries.
@@ -2715,22 +2806,16 @@ struct NamespaceFacts {
 impl NamespaceFacts {
     fn of(site: &LuaSite, ns_id: i32) -> Self {
         let special_id = site.namespace_id("Special").unwrap_or(-1);
-        let media_id = site.namespace_id("Media").unwrap_or(-2);
-        // Media and Special have no talk space; a namespace with no canonical
-        // name at all is also treated as having none, which keeps an unknown id
-        // from inventing one.
-        let has_talk = ns_id != special_id && ns_id != media_id && site.namespace_id_exists(ns_id);
-        let talk_id = ns_id + if ns_id % 2 == 1 { -1 } else { 1 };
-        let talk_name = if has_talk && site.namespace_id_exists(talk_id) {
-            Some(site.namespace_name(talk_id))
-        } else {
-            None
-        };
-        // The subject namespace of a talk page is the even id below it; of a
-        // subject namespace, itself.
-        let subject_id = ns_id - (ns_id % 2);
+        // A namespace has a talk space when its id is not negative and the paired
+        // namespace is real. Special and Media therefore report none, which is
+        // what makes `canTalk` false and the `talkPageTitle` derived field nil.
+        let talk_name = talk_namespace_id(ns_id)
+            .filter(|id| site.namespace_id_exists(*id))
+            .map(|id| site.namespace_name(id));
+        // The subject namespace of a talk page is the even id below it; a
+        // subject namespace is its own subject, as is a negative one.
         Self {
-            subject_name: site.namespace_name(subject_id),
+            subject_name: site.namespace_name(subject_namespace_id(ns_id)),
             talk_name,
             is_content: ns_id == 0,
             special_id,
@@ -2752,11 +2837,6 @@ fn title_facts_for(ctx: &LuaContext, ns_id: &i32, title_text: &str) -> Option<Ti
         .map(|(_, v)| v.clone())
 }
 
-/// A `Value::String` from an owned Rust string.
-fn lua_str(lua: &Lua, s: String) -> mlua::Result<Value> {
-    Ok(Value::String(lua.create_string(&s)?))
-}
-
 /// `Namespace:Text`, or just `Text` for the main namespace.
 fn prefix_title(site: &LuaSite, ns_id: i32, text: &str) -> String {
     let prefix = site.namespace_name(ns_id);
@@ -2770,13 +2850,13 @@ fn prefix_title(site: &LuaSite, ns_id: i32, text: &str) -> String {
 /// `mw.title.getCurrentTitle()` — the page being parsed.
 ///
 /// Built as a full title object (rather than a bare table) so it carries the
-/// metatable, `getContent()` and the derived fields. The *page frame's* title is
-/// the page itself, which `create_frame` passes in as `page_title`.
+/// metatable, `getContent()` and the derived fields. The title is the *root*
+/// page, not the frame that made the `#invoke` call.
 fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
     luafn_title_new(
         lua,
         ctx,
-        Value::String(lua.create_string(&ctx.page_title)?),
+        Value::String(lua.create_string(&ctx.current_title)?),
         None,
     )
 }
@@ -4947,16 +5027,17 @@ fn args_from_table(t: &Table) -> mlua::Result<Vec<Arg>> {
 fn create_frame(
     lua: &Lua,
     args: &[Arg],
-    page_title: &str,
+    title: &str,
     parent_args: Option<&[Arg]>,
-    parent_title: Option<&str>,
+    parent_title: &str,
     answers: crate::pipeline::lua_deferred::DeferredAnswers,
     pending: std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
 ) -> Result<Value> {
     let frame = frame_common(lua, args, &answers, &pending)?;
 
-    // `frame:getTitle()` — the page the frame was invoked from.
-    let title = page_title.to_string();
+    // `frame:getTitle()` — the title the frame stands for: the module for the
+    // `{{#invoke:}}` frame, the calling template for its parent.
+    let title = title.to_string();
     let ctx_for_title = title.clone();
     // Also kept as a plain field, so `newChild` can inherit it: a child with no
     // title given takes the creating frame's, and reading it back off the method
@@ -4979,7 +5060,7 @@ fn create_frame(
             // The parent is a frame like any other, so it is built by the same
             // code; only its title and its own (absent) parent differ.
             let p = frame_common(lua, parent_args, &answers, &pending)?;
-            let parent_name = parent_title.unwrap_or(page_title).to_string();
+            let parent_name = parent_title.to_string();
             p.set(
                 "getTitle",
                 lua.create_function(move |_, ()| Ok(parent_name.clone()))?,
@@ -5054,17 +5135,20 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
         // only as `subjectSpace = nil`, which cascaded to a nil `docTitle` and an
         // empty documentation body. The whole 200KB of `Template:Infobox/doc`
         // hung on this one field.
-        let subject_id = id - (id % 2);
-        let talk_id = subject_id + 1;
         entry
             .set(
                 "subject",
-                namespace_ref(lua, site, subject_id).map_err(err)?,
+                namespace_ref(lua, site, subject_namespace_id(id)).map_err(err)?,
             )
             .map_err(err)?;
-        entry
-            .set("talk", namespace_ref(lua, site, talk_id).map_err(err)?)
-            .map_err(err)?;
+        // Left unset where there is no talk space (Special, Media): `mw.title.lua`
+        // tests `if ns.talk ~= nil` and nil is how it says "this title cannot have
+        // a talk page".
+        if let Some(talk_id) = talk_namespace_id(id) {
+            entry
+                .set("talk", namespace_ref(lua, site, talk_id).map_err(err)?)
+                .map_err(err)?;
+        }
         // The localized names, as a table. It must exist even when empty:
         // `Module:Namespace detect/data` iterates `ipairs(ns.aliases)` for every
         // namespace, and a missing field was an unattributed "attempt to index a

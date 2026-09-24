@@ -223,3 +223,57 @@ async fn facts_fields_still_resolve_with_the_generic_ones() {
     .await;
     assert!(out.contains("true|"), "got: {out}");
 }
+
+/// `subjectPageTitle` is a *title object*, and for a subject page it is the
+/// title itself.
+///
+/// Scribunto defines it as `mw.title.makeTitle(ns.subject.id, text)`, returning
+/// the title unchanged when it is already in that namespace — so the object's
+/// facts (`exists`, `getContent`) still answer. `Module:Pagetype` reads it and
+/// then tests that result's existence; an earlier string-valued answer made
+/// every article report itself as non-existent.
+#[tokio::test]
+async fn subject_page_title_is_the_title_itself_for_a_subject_page() {
+    let out = eval(
+        r#"
+        local t = mw.title.getCurrentTitle()
+        local s = t.subjectPageTitle
+        return tostring(s) .. '|' .. s.namespace .. '|' .. tostring(s == t)
+        "#,
+    )
+    .await;
+    // The page is `Test` (main namespace), so its subject page is itself.
+    assert!(out.contains("Test|0|true"), "got: {out}");
+}
+
+/// The derived page titles are built in the neighbouring namespace, and a talk
+/// page's own talk page is itself.
+#[tokio::test]
+async fn derived_page_titles_cross_and_stay_by_namespace() {
+    let out = eval(
+        r#"
+        local t = mw.title.new('Foo')
+        local tk = t.talkPageTitle
+        local talk = mw.title.new('Talk:Foo')
+        return tostring(tk) .. '|' .. tk.namespace
+            .. '|' .. tostring(talk.talkPageTitle == talk)
+            .. '|' .. tostring(talk.subjectPageTitle)
+        "#,
+    )
+    .await;
+    assert!(out.contains("Talk:Foo|1|true|Foo"), "got: {out}");
+}
+
+/// A namespace without a talk space has no talk page title, which is how the
+/// manual reads `mw.site.namespaces[ns].talk` being nil.
+#[tokio::test]
+async fn a_namespace_without_talk_has_no_talk_page_title() {
+    let out = eval(
+        r#"
+        local t = mw.title.new('Special:Movepage')
+        return tostring(t.talkPageTitle) .. '|' .. tostring(t.subjectPageTitle)
+        "#,
+    )
+    .await;
+    assert!(out.contains("nil|Special:Movepage"), "got: {out}");
+}
