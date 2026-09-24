@@ -56,35 +56,44 @@ fn track_table(item: &Item, depth: &mut usize) {
 /// wikitext targets inside the branch were resolved before any attribute pass
 /// saw them. rustoid expands the branch in place instead, which leaves those
 /// targets templated; the flag is what tells the marking to behave as the service
-/// does. Attribute values nested in a token are walked too — that is where a
-/// wikilink's target lives.
-///
-/// The source range goes with it. Nothing in such a branch came from a page, so
-/// the tokens the reference produces for it carry no `tsr`/`dsr` and no `src` —
-/// a category link from a `#ifeq` branch shows an empty `data-parsoid` where the
-/// same link written on the page shows `stx`, `a`, `sa` and `dsr`. That is a
-/// different question from the flag (it decides ids, not marking) and it is the
-/// reason the two are set together here rather than at their two consumers.
+/// does.
 fn mark_in_text_branch(items: &mut [Item]) {
-    use crate::wikitext::tokens_v2::KeyValue;
     for item in items.iter_mut() {
         let Item::Tok(tok) = item else { continue };
         if let Some(dp) = tok.data_parsoid_mut() {
             dp.tmp.in_text_branch = Some(true);
-            // The source range goes too: nothing in the branch came from a page,
-            // and the reference produces tokens with no `tsr`/`dsr` for it. That
-            // is a different question from the flag (it decides ids, not
-            // marking), which is why it is set here rather than at the consumer.
-            dp.tsr = None;
-            dp.dsr = None;
-            dp.src = None;
-            dp.src_content = None;
         }
-        if let Some(attribs) = tok.attribs_mut() {
-            for kv in attribs.iter_mut() {
-                if let KeyValue::Tokens(nested) = &mut kv.value {
-                    mark_in_text_branch(nested);
-                }
+        strip_token_source_range(tok);
+    }
+}
+
+/// Drop the source *range* from every token in `items`, recursively through
+/// attribute values (which is where a wikilink's target lives).
+///
+/// Nothing that came from a *string* has a position in the page: a parser
+/// function's branch, a module's output. The offsets a re-tokenization invents
+/// describe the string, not the page, and keeping them keys nodes the service
+/// does not key — and the ids are positional, so every later one shifts.
+///
+/// Only the range goes. `src` and `srcContent` are left alone: clearing those too
+/// on a module's output made `Unix` take over 60 s and render nothing, and the
+/// loop that reads them has not been found. `ONLINE-PARITY.md` records it.
+fn strip_source_ranges(items: &mut [Item]) {
+    for item in items.iter_mut() {
+        let Item::Tok(tok) = item else { continue };
+        strip_token_source_range(tok);
+    }
+}
+
+fn strip_token_source_range(tok: &mut ParsoidToken) {
+    if let Some(dp) = tok.data_parsoid_mut() {
+        dp.tsr = None;
+        dp.dsr = None;
+    }
+    if let Some(attribs) = tok.attribs_mut() {
+        for kv in attribs.iter_mut() {
+            if let crate::wikitext::tokens_v2::KeyValue::Tokens(nested) = &mut kv.value {
+                strip_source_ranges(nested);
             }
         }
     }
@@ -3406,11 +3415,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Err(e) => script_error(&e.to_string()),
         };
 
-        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+        let mut items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
             &output,
             /* in_template */ true,
             self.config.extension_tags(),
         );
+
+        // A module's output is a *string* Scribunto built; its offsets describe
+        // that string, not the page.
+        strip_source_ranges(&mut items);
 
         let child = frame.new_child(frame.title().clone(), vec![]);
         // The document's counter, not a fresh one. A module's output can carry a

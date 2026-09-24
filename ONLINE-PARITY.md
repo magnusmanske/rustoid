@@ -4212,3 +4212,41 @@ id. That is the fix: the synthesized paragraph needs the range it covers. It is 
 a one-line change (the range has to be computed from the tokens it wraps, and it
 affects every auto-inserted paragraph in the corpus, not just this one), so it is
 recorded rather than guessed at.
+
+## A module's output has no source range either
+
+The same reasoning applies one step out. A module's output is a *string* Scribunto
+built, and rustoid tokenizes it (`tokenize_wikitext_to_items`) — so the offsets its
+tokens carry describe that string, not the page. `Module:SDcat`'s second category
+link is the one that showed it: rustoid keyed it (`id="mwAw"`) where the service
+leaves it bare, one line below `Template:Short_description`'s own link, which the
+branch fix had just stopped keying.
+
+So the tokenizer's output is stripped of its source range at the point the module's
+output enters the pipeline, through the same `strip_source_ranges` the branches use.
+
+### What not to clear: `src`
+
+Clearing `tsr`/`dsr` is what the ids need; clearing `src` and `srcContent` too made
+`Unix` take **over 60 s and render nothing** (0 bytes against 365 082). Bisected by
+making only that pair conditional: with them kept, `Unix` is back at byte 550 and
+the corpus at 0.87x. The loop that reads `src` has not been found; it is left in
+place and recorded here because a missing `src` turning into an unbounded-looking
+run is exactly the kind of latent hazard that is cheaper to know about than to
+rediscover.
+
+### Scoreboard after the three id/marking steps
+
+```
+                        start of session   now
+rustoid bytes            56 883 107        56 209 784   (0.88x -> 0.87x)
+Unix first difference     404               550
+Quicksilver (film)        404               550
+Sundial                   370               516
+Bicycle                   392               538
+Megadeth                  382               528
+Nobel Prize               416               562
+```
+
+`List of sovereign states` is still the closest page, still blocked at byte 23 by
+the auto-inserted paragraph's missing `dsr` — see above; that is the next thing.
