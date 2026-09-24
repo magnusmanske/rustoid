@@ -821,18 +821,29 @@ pub async fn preload_entities<S: DataSource + ?Sized>(
         }
     }
 
-    // The page's own entity is resolved first, so it is stored by id and the loop
-    // below does not fetch it a second time.
+    // The page's own entity is resolved first and fetched on its own, *outside*
+    // the cap below. A module calling `getEntityIdForCurrentPage()` never names an
+    // id, and the literal set gathered from a large registry can exceed the cap,
+    // so leaving it in `wanted` would let `take` drop the one entity that is
+    // needed on every page.
     let current = match page_title {
         Some(title) => source.get_entity_id_for_page(title).await.ok().flatten(),
         None => None,
     };
-    if let Some(id) = &current {
-        wanted.insert(id.clone());
-    }
 
     let mut entities = Entities::default();
+    if let Some(id) = &current
+        && let Some(json) = source.get_entity(id).await.ok().flatten()
+    {
+        entities.insert(id, json);
+    }
     for id in wanted.into_iter().take(MAX_ENTITIES) {
+        if current
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&id))
+        {
+            continue;
+        }
         if let Some(json) = source.get_entity(&id).await.ok().flatten() {
             entities.insert(&id, json);
         }

@@ -4475,7 +4475,10 @@ mod tests {
             .unwrap();
         assert!(html.contains("First"), "got: {html}");
         assert!(html.contains("Second"), "got: {html}");
-        assert!(html.matches("<p>").count() >= 2, "got: {html}");
+        // The tag carries `data-parsoid` (native mode), so match the tag boundary
+        // rather than a bare `<p>`.
+        let paragraphs = html.matches("<p ").count() + html.matches("<p>").count();
+        assert!(paragraphs >= 2, "got: {html}");
     }
 
     #[test]
@@ -4628,7 +4631,7 @@ mod tests {
                 &ParserOptions::for_page("Test"),
             )
             .unwrap();
-        assert!(html.contains("<ol><li>"), "got: {html}");
+        assert!(html.contains("<ol") && html.contains("<li"), "got: {html}");
         assert!(html.contains("REDIRECT [["), "got: {html}");
         assert!(html.contains("mw:Nowiki"), "got: {html}");
         assert!(html.contains("[[Bar]]"), "got: {html}");

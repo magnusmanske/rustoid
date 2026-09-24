@@ -4322,3 +4322,36 @@ Zebra                      444       444
 
 Every `<p>` on every page now takes an id, and the 8 unchanged pages show their
 first difference was never the paragraph's id. Fixture guard 876/896.
+
+## The page's own Wikidata entity was evicted by the entity cap
+
+With the id sequence right, the next difference on `List of sovereign states` was
+`Module:SDcat`'s category: `Short_description_with_empty_Wikidata_description`
+where the service has `Short_description_is_different_from_Wikidata`. The module
+asks `mw.wikibase.getDescription( qid )` with the qid it got from
+`getEntityIdForCurrentPage()`, so the *page's own* entity has to be in hand.
+
+`preload_entities` resolved it — `get_entity_id_for_page` is a sitelink search — but
+then inserted it into the same `BTreeSet` as the literals gathered from every module
+in the registry, and the loop fetched `wanted.into_iter().take(MAX_ENTITIES)`. The
+registry yielded more ids than the cap, and `take` is by sort order, so the one
+entity that is needed on every page could be (and here was) dropped on the floor.
+It is now fetched on its own, outside the cap, and skipped by the literal loop.
+
+Two cache facts came out of chasing it, worth knowing before an offline run:
+
+- The page→entity answers live under a `sitelink:` key in the **entity** wiki's
+  index, and here that index had been reduced to two entries while the body files
+  survived. Every sitelink lookup therefore missed. `rustoid-compare --wiki
+  www.wikidata.org --reindex` rebuilt it (198 bodies recovered, 200 entries) — and
+  for entities that is enough, because unlike an article there is no revision to
+  recover.
+- `entity:sitelink:List of sovereign states.txt` held `Q11750`, whose English
+  description is `Wikimedia list article` — which is what makes the service's answer
+  `is different from Wikidata` for a short description of `none`.
+
+## Test fixtures that pinned the missing blob
+
+`test_wikitext_to_html_paragraph_break` and `test_wikitext_to_html_redirect_nowiki_bail`
+asserted on a literal `<p>` / `<ol><li>`. Both now carry `data-parsoid`, which is
+what Parsoid native mode emits, so the assertions match the tag boundary instead.
