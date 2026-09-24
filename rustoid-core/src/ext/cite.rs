@@ -256,7 +256,6 @@ fn marker_id(name: &str, number: usize, use_index: usize) -> String {
 /// ids, which are derived from the note; both appear in a Cite rendering.
 #[derive(Debug)]
 pub struct DocIds {
-    n: usize,
     /// The document's `about` counter, shared with the rest of the expansion.
     ///
     /// A `<sup>` for a `<ref>` carries `about="#mwt42"` drawn from the *same*
@@ -269,7 +268,6 @@ pub struct DocIds {
 impl DocIds {
     pub fn new() -> Self {
         Self {
-            n: 0,
             about: std::cell::Cell::new(0),
         }
     }
@@ -292,18 +290,19 @@ impl DocIds {
     pub fn about_counter(&self) -> usize {
         self.about.get()
     }
+}
 
-    /// The next id, e.g. `mwCg`.
-    ///
-    /// Delegates to the page-bundle encoder, because these are the same ids the
-    /// dedicated pass assigns: a Cite span is numbered in the same document-order
-    /// sequence as every other element. Keeping one encoder means a Cite rendering
-    /// cannot drift from the rest of the document.
-    pub fn take(&mut self) -> String {
-        let n = self.n;
-        self.n += 1;
-        crate::pagebundle::counter_to_id(n as u64)
-    }
+/// Mark `node` as one the document's id pass must number.
+///
+/// Cite does not number its own elements. Parsoid's Cite post-processor only
+/// builds the DOM; the single document-order id pass assigns every `id="mw…"`
+/// in the served output. Numbering them here from a second counter put Cite's
+/// ids at the *front* of the sequence — `mwAA` first, which the service never
+/// emits, then `mwAQ`… — and the real allocator then skipped that whole range,
+/// which is why the first body element came out as `mwGg` instead of `mwAQ` on
+/// every page.
+fn mark_for_id(node: &mut crate::dom::node::Node) {
+    node.empty_dp_slot = true;
 }
 
 impl Default for DocIds {
@@ -561,7 +560,7 @@ fn walk_render(
         // renderer's signature about what it needs rather than about what happens to
         // be available.
         let body = |r: &Reference| body_of(&r.body);
-        let list = references_list_nodes(&refs, &group, page_title, &body, ids);
+        let list = references_list_nodes(&refs, &group, page_title, &body);
         let mut wrap = crate::dom::node::Node::element(crate::dom::node::ElementKind::Other(
             "div".to_string(),
         ));
@@ -714,20 +713,20 @@ pub fn ref_marker_nodes(
     let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
     let mut a = Node::element(ElementKind::Other("a".to_string()));
     a.set_attr("href", href);
-    a.set_attr("id", ids.take());
+    mark_for_id(&mut a);
 
     let mut text = Node::element(ElementKind::Other("span".to_string()));
     text.set_attr("class", "mw-reflink-text");
-    text.set_attr("id", ids.take());
+    mark_for_id(&mut text);
 
     let mut open = Node::element(ElementKind::Other("span".to_string()));
     open.set_attr("class", "cite-bracket");
-    open.set_attr("id", ids.take());
+    mark_for_id(&mut open);
     open.push_child(Node::text("["));
 
     let mut close = Node::element(ElementKind::Other("span".to_string()));
     close.set_attr("class", "cite-bracket");
-    close.set_attr("id", ids.take());
+    mark_for_id(&mut close);
     close.push_child(Node::text("]"));
 
     text.push_child(open);
@@ -749,7 +748,6 @@ pub fn references_list_nodes(
     group: &str,
     page_title: &str,
     body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
-    ids: &mut DocIds,
 ) -> crate::dom::node::Node {
     use crate::dom::node::{ElementKind, Node};
 
@@ -759,7 +757,7 @@ pub fn references_list_nodes(
     if !group.is_empty() {
         ol.set_attr("data-mw-group", group);
     }
-    ol.set_attr("id", ids.take());
+    mark_for_id(&mut ol);
 
     for r in refs {
         let note_id = r.note_id();
@@ -772,16 +770,16 @@ pub fn references_list_nodes(
         // `<span class="mw-cite-backlink">` and separated by a space. That
         // asymmetry is Cite's actual output, verified against a cached page.
         if r.uses.len() == 1 {
-            li.push_child(backlink_node(&r.uses[0], &page, group, None, ids));
+            li.push_child(backlink_node(&r.uses[0], &page, group, None));
         } else {
             let mut wrap = Node::element(ElementKind::Other("span".to_string()));
             wrap.set_attr("class", "mw-cite-backlink");
-            wrap.set_attr("id", ids.take());
+            mark_for_id(&mut wrap);
             for (n, use_id) in r.uses.iter().enumerate() {
                 if n > 0 {
                     wrap.push_child(Node::text(" "));
                 }
-                wrap.push_child(backlink_node(use_id, &page, group, Some(n + 1), ids));
+                wrap.push_child(backlink_node(use_id, &page, group, Some(n + 1)));
             }
             li.push_child(wrap);
         }
@@ -809,7 +807,6 @@ fn backlink_node(
     page: &str,
     group: &str,
     label: Option<usize>,
-    ids: &mut DocIds,
 ) -> crate::dom::node::Node {
     use crate::dom::node::{ElementKind, Node};
 
@@ -823,11 +820,11 @@ fn backlink_node(
         }
         a.set_attr("rel", "mw:referencedBy");
     }
-    a.set_attr("id", ids.take());
+    mark_for_id(&mut a);
 
     let mut text = Node::element(ElementKind::Other("span".to_string()));
     text.set_attr("class", "mw-linkback-text");
-    text.set_attr("id", ids.take());
+    mark_for_id(&mut text);
     text.push_child(Node::text(match label {
         Some(n) => n.to_string(),
         None => "\u{2191}".to_string(),
@@ -1008,15 +1005,10 @@ mod tests {
     fn a_single_use_note_has_a_bare_backlink() {
         let mut st = CiteState::new();
         st.add("", "", "body", false);
-        let mut ids = DocIds::new();
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let ol = references_list_nodes(
-            &refs,
-            "",
-            "Zebra",
-            &|_| crate::dom::node::Node::text("BODY"),
-            &mut ids,
-        );
+        let ol = references_list_nodes(&refs, "", "Zebra", &|_| {
+            crate::dom::node::Node::text("BODY")
+        });
         assert_eq!(ol.get_attr("class"), Some("mw-references references"));
         let li = &ol.children[0];
         assert_eq!(li.get_attr("id"), Some("cite_note--1"));
@@ -1057,15 +1049,8 @@ mod tests {
         let mut st = CiteState::new();
         st.add("Badenhorst2019", "", "body", false);
         st.add("Badenhorst2019", "", "", true);
-        let mut ids = DocIds::new();
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let ol = references_list_nodes(
-            &refs,
-            "",
-            "Zebra",
-            &|_| crate::dom::node::Node::text("B"),
-            &mut ids,
-        );
+        let ol = references_list_nodes(&refs, "", "Zebra", &|_| crate::dom::node::Node::text("B"));
         let li = &ol.children[0];
         let wrap = &li.children[0];
         assert_eq!(wrap.get_attr("class"), Some("mw-cite-backlink"));
@@ -1099,15 +1084,10 @@ mod tests {
     fn a_group_adds_the_group_attributes() {
         let mut st = CiteState::new();
         st.add("", "lower-alpha", "a", false);
-        let mut ids = DocIds::new();
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let ol = references_list_nodes(
-            &refs,
-            "lower-alpha",
-            "Zebra",
-            &|_| crate::dom::node::Node::text("A"),
-            &mut ids,
-        );
+        let ol = references_list_nodes(&refs, "lower-alpha", "Zebra", &|_| {
+            crate::dom::node::Node::text("A")
+        });
         assert_eq!(ol.get_attr("data-mw-group"), Some("lower-alpha"));
         let li = &ol.children[0];
         assert_eq!(
