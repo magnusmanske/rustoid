@@ -4434,3 +4434,39 @@ What is left on the closest pages is now one shape, not a scattering:
   `is_different_from_Wikidata`) — its Wikidata entity is not in the cache, so
   `mw.wikibase` sees nothing. Every other entity lookup now works.
 - **Zebra** is the pre-existing node-count trip and is not a usable target.
+
+## A module's `frame:getParent().args` can still hold unexpanded `{{{…}}}`
+
+Chasing `Bicycle` (whose only remaining difference at byte 538 is the category
+name, `matches_Wikidata` vs `is_different_from_Wikidata`) turned up a real bug with
+a clear trace. `Module:SDcat` compares the local short description against
+`mw.wikibase.getDescription()`, and the local one arrives through
+`frame:getParent().args.sd`, because `Template:SDcat` is just
+`{{#invoke:SDcat|setCat}}`. A debug print in the invoke path showed the parent
+argument still raw:
+
+```
+INV frame=Template:SDcat invoke_arg="SDcat|setCat"
+    params=["#invoke:SDcat=", "=setCat"] parent=["sd=None/src=\"{{{1|}}} \""]
+```
+
+So `args.sd` is not the description; the comparison sees `nil` (or the literal
+`{{{1|}}}`) and answers "different" where the service answers "matches" (the local
+description and Q11442's are both `pedal-driven two-wheel vehicle`).
+
+The value never got expanded. `{{SDcat|sd={{{1|}}} }}` is written in
+`Template:Short description`'s source, but it sits inside `{{Main other|…}}`'s
+argument, so by the time the `#invoke` runs the chain is
+`Short description → Main other → SDcat`, and `expand_invoke_args` neither expands
+`templatearg` tokens nor tracks *which* frame the value was written in. MediaWiki
+resolves it because the `{{{1|}}}` node carries the frame it came from; rustoid's
+`Frame` has a `parent_frame` chain but the node does not record where it belongs.
+
+Two things were checked and are *not* the cause: `mw.text.trim(…):lower()` and the
+description lookup compare correctly in isolation (a scratch engine with Q11442
+answers `true`), and the entity is in the cache (`entity:Q11442.txt`).
+
+A fix has to give a lazily-expanded argument value the frame it was written in, or
+expand `{{{…}}}` eagerly at the call site in the caller's frame. The second is
+wrong for `{{{sd}}}`-style values (they must expand where they were written, not in
+the callee), so the first is the shape to aim at.
