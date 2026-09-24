@@ -1766,6 +1766,42 @@ fn wrap_transclusion_children(
                 }
                 span.children.push(inner);
                 new_content.insert(et, span);
+                // PHP's `handleFirstRenderingTransparentNode` migrates the whole
+                // contiguous run of stashable siblings, not just the target: a
+                // template expanding to `<meta property="mw:PageProp/…"/>[[Category:X]]`
+                // serves both inside one span. Gated on the same boundary test the
+                // trailing-run stash uses, so an interior run is still left alone.
+                let is_elt = |n: &Node| matches!(n.kind, NodeKind::Element(_));
+                let mut last = et;
+                while let Some(k) = (last + 1..new_content.len()).find(|&k| is_elt(&new_content[k]))
+                {
+                    if !is_stashable_elt(&new_content[k]) {
+                        break;
+                    }
+                    last = k;
+                }
+                if last > et {
+                    let prev = (0..et)
+                        .rev()
+                        .find(|&k| is_elt(&new_content[k]))
+                        .map(|k| &new_content[k]);
+                    let next = (last + 1..new_content.len())
+                        .find(|&k| is_elt(&new_content[k]))
+                        .map(|k| &new_content[k]);
+                    if should_stash(prev, next, &new_content[et].children[0]) {
+                        let mut moved = Vec::new();
+                        for node in new_content.splice(et + 1..=last, std::iter::empty()) {
+                            if !is_elt(&node) || crate::html::wts_utils::node_name(&node) == "span"
+                            {
+                                continue;
+                            }
+                            let mut node = node;
+                            node.attrs.retain(|a| a.key != "about");
+                            moved.push(node);
+                        }
+                        new_content[et].children.extend(moved);
+                    }
+                }
             }
 
             if let Some(typeof_) = &typeof_attr {

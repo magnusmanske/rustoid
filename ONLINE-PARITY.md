@@ -3677,7 +3677,67 @@ Chernobyl disaster        317      414
 Help:Introduction         403      403
 ```
 
-## The current gate: `mw:ExpandedAttrs` on body content
+## Two more findings from the first-difference sweep
+
+A sweep of every corpus page's first difference (and its size ratio) put the
+systematic gates in order, and turned up two more:
+
+```
+World War II        255 / 1.79 MB vs 2.55 MB   the run below
+List of sovereign   2 / 0.98 MB vs 0.67 MB    a missing mw-empty-elt
+Hydrogen            1 / 1.08 MB vs 4.36 MB    (output 4x too big)
+Module:Math         1                            content-model page
+Template:Infobox    6                            content-model page
+Toolbar: nothing passes
+```
+
+`Template:Weather box` looks like the closest page by matching prefix (18 505
+bytes) but is not: rustoid emits 23 KB against Parsoid's 352 KB, so the prefix
+matches only because rustoid stops producing content. Size ratio is the better
+tie-break, and it points at `Quicksilver` (0.96), `Association football` (0.95)
+and `COVID-19`/`Chess` (1.03).
+
+### The transparent run is migrated as a whole
+
+`World War II` byte 255: `Template:No image carousel` is
+`__NOMEDIAVIEWERCAROUSEL__<includeonly>[[Category:…]]</includeonly>`, so its
+range is `[<meta property="mw:PageProp/nomediaviewercarousel"/>, <link …Category…>]`
+— both rendering-transparent. Parsoid serves **both inside one**
+`<span class="mw-empty-elt" about typeof="mw:Transclusion" data-mw>`, while
+rustoid wrapped only the first and left the link beside it.
+
+`DOMRangeBuilder::handleFirstRenderingTransparentNode` collects the whole
+*contiguous run* of stashable siblings (`getNextElementSibling` while
+`isStashableElt`) and migrates all of them, so the early transparent-target wrap
+now does the same, gated on the same boundary test the trailing stash uses. That
+is a structural match now; the residual on those bytes is the extra `id`s below.
+
+### rustoid gives ids to nodes the service leaves bare
+
+With the run fixed, `World War II` still differs at 255, now only because
+rustoid writes `id="mwAw"` on the `<meta>` and `id="mwBA"` on the category
+`<link>` where the service writes neither. The same shape appears at the end of
+`Quicksilver`: rustoid serves
+`<link rel="mw:PageProp/Category" href="./Category:1986_films" id="mwow"/>`,
+while the service wraps a *run* of page-level closed-marker tails —
+`<span class="mw-empty-elt"><link rel="mw:PageProp/Category" …/><link
+rel="mw-deduplicated-inline-style" …/></span>` — with no `about` and no `id` at
+all.
+
+Two things are named by that pair:
+
+- a **page-prop link or meta must not be metadata-bearing** in the id pass unless
+  it is inside a transclusion (the service's `<link … about="#mwt2" id="mwBQ"/>`
+  has both, its bare page-level one has neither). rustoid sets `data_parsoid`
+  where Parsoid sets none, so `assign_node_ids` numbers them;
+- there is a **page-level** transparent-run stash too: the service's span at the
+  end of `Quicksilver` carries no `about`, so it is not an encapsulation target
+  but a bare grouping of closed-marker tails. `stash_rendering_transparent_elts`
+  only runs inside a range today, so rustoid never makes that span.
+
+Both are left for the next session with their reductions; neither is guesswork.
+
+## The `mw:ExpandedAttrs` gate, and why it is not a small fix
 
 Byte 404 is, on every page, the same two attributes on the same element:
 
@@ -3708,3 +3768,16 @@ minimal case, and it also carries a second, unrelated difference in the same
 `href` — the category is `Pages_with_short_description` instead of
 `Articles_with_short_description`, i.e. `Module:Pagetype` answering `Pages` where
 the service answers `Articles`.
+
+Tracing the marking showed why the gate is structural rather than a flag: rustoid
+runs `expand_templates` over the whole page first (which recursively expands every
+transclusion and splices each body's tokens into one stream) and only then
+`expand_attributes` **once**, at the page level. By that point the body's wikilink
+still carries a token-valued target, so `build_expanded_attrs` marks it with the
+page's (`in_template = false`) options. PHP does not flatten: the body is a nested
+pipeline, and `AttributeExpander` runs *inside* it with the body's
+`inTemplate = true`. So matching integrated mode means either expanding a body's
+attributes inside the body pipeline (a structural change that also moves the
+`about` allocations into it) or tagging body-produced tokens so the marking can
+skip them. Both are bigger than they look; the reduction stays
+`{{Short description|X}}` on any article.
