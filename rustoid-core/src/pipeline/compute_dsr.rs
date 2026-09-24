@@ -486,6 +486,60 @@ pub fn run(root: &mut Node, source: &str) {
         };
         root.dp.get_or_insert_with(DataParsoid::default).dsr = Some(dsr);
     }
+
+    store_dsrs(root);
+}
+
+/// Mirror the computed `dsr` from the structured `dp` into each node's
+/// `data-parsoid` blob.
+///
+/// ComputeDSR works on `dp`, but the id pass (`assign_node_ids`) and the
+/// serializer read the JSON blob. In PHP the two are one representation, so a
+/// range ComputeDSR writes is visible to every later pass for free; here they
+/// must be kept in step explicitly. Without this, a `<p>` the paragraph wrapper
+/// synthesized has a range in `dp` but none in the blob, takes no id, and every
+/// id after it on the page shifts by one.
+///
+/// Nodes expanded from a text branch are skipped: nothing in such a branch came
+/// from a page, so the computation would invent a range from position where the
+/// service keeps none (and gives the node no id).
+fn store_dsrs(node: &mut Node) {
+    // The synthetic `<html>` root is the serializer's document wrapper, not page
+    // content: the service has no id on it, and the nodes inside `<body>` are
+    // what the id pass numbers. Giving it a range would consume the document's
+    // first counter and shift every id on the page by one.
+    let is_document_wrapper = crate::html::wts_utils::node_name(node) == "html";
+    let in_text_branch = node
+        .dp
+        .as_ref()
+        .is_some_and(|dp| dp.tmp.in_text_branch == Some(true));
+    if !is_document_wrapper
+        && !in_text_branch
+        && let Some(dsr) = node.dp.as_ref().and_then(|dp| dp.dsr.as_ref())
+    {
+        let dsr_json = dsr.to_json_array();
+        match node.data_parsoid.take() {
+            // Only the `dsr` key is touched, so keys `dp` does not model (a
+            // wrapper's `tmp`, say) survive in the blob.
+            Some(json) => {
+                node.data_parsoid = match serde_json::from_str::<serde_json::Value>(&json) {
+                    Ok(serde_json::Value::Object(mut map)) => {
+                        map.insert("dsr".to_string(), dsr_json);
+                        Some(serde_json::Value::Object(map).to_string())
+                    }
+                    _ => Some(json),
+                };
+            }
+            // No blob yet: the range is the node's only metadata, so it is the
+            // whole blob.
+            None => {
+                node.data_parsoid = node.dp.as_ref().and_then(|dp| dp.to_data_parsoid_json());
+            }
+        }
+    }
+    for child in &mut node.children {
+        store_dsrs(child);
+    }
 }
 
 #[cfg(test)]

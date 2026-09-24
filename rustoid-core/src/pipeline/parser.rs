@@ -67,17 +67,12 @@ fn mark_in_text_branch(items: &mut [Item]) {
     }
 }
 
-/// Drop the source *range* from every token in `items`, recursively through
-/// attribute values (which is where a wikilink's target lives).
+/// Drop the source *range* from `items`, recursing through attribute values
+/// (which is where a wikilink's target lives).
 ///
-/// Nothing that came from a *string* has a position in the page: a parser
-/// function's branch, a module's output. The offsets a re-tokenization invents
-/// describe the string, not the page, and keeping them keys nodes the service
-/// does not key — and the ids are positional, so every later one shifts.
-///
-/// Only the range goes. `src` and `srcContent` are left alone: clearing those too
-/// on a module's output made `Unix` take over 60 s and render nothing, and the
-/// loop that reads them has not been found. `ONLINE-PARITY.md` records it.
+/// Only the range goes. `src` and `srcContent` are left alone: clearing those
+/// too once made `Unix` take over 60 s and render nothing, and the loop that
+/// reads them has not been found. `ONLINE-PARITY.md` records it.
 fn strip_source_ranges(items: &mut [Item]) {
     for item in items.iter_mut() {
         let Item::Tok(tok) = item else { continue };
@@ -3415,15 +3410,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Err(e) => script_error(&e.to_string()),
         };
 
-        let mut items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
             &output,
             /* in_template */ true,
             self.config.extension_tags(),
         );
-
-        // A module's output is a *string* Scribunto built; its offsets describe
-        // that string, not the page.
-        strip_source_ranges(&mut items);
 
         let child = frame.new_child(frame.title().clone(), vec![]);
         // The document's counter, not a fresh one. A module's output can carry a

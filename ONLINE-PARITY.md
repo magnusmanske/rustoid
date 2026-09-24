@@ -4250,3 +4250,75 @@ Nobel Prize               416               562
 
 `List of sovereign states` is still the closest page, still blocked at byte 23 by
 the auto-inserted paragraph's missing `dsr` — see above; that is the next thing.
+
+## The auto-inserted paragraph: the blob was never written
+
+The blocker above dissolves once the direction is right. `ComputeDSR` computes the
+range for the synthesized `<p>` correctly — `compute_node_dsr`'s `p` case reaches
+`Consts::$WtTagWidths['p'] = [0, 0]`, so the range is exactly `[0, 26, 0, 0]`, as
+the native endpoint showed. What was missing was the *write*. The range landed in
+the structured `dp` and never reached the `data-parsoid` blob, and the id pass keys
+on the blob. In PHP there is one representation — a pass that sets a `DataParsoid`
+makes it visible to every later pass — so the two have to be kept in step here
+explicitly.
+
+`compute_dsr::store_dsrs` now mirrors `dp.dsr` into the blob, with two exclusions:
+
+- Nodes expanded from a **text branch** (`dp.tmp.in_text_branch`): nothing in the
+  branch came from a page, so the computation would invent a range from position
+  where the service keeps none.
+- The synthetic **`<html>`** root. It is the serializer's document wrapper, not
+  page content, and giving it a range spends the document's first counter (`mwAQ`)
+  on an element the output never prints — which shifts every id on the page by one.
+  This is what the first attempt did: byte 23 → 31 and no further.
+
+Only the `dsr` key is added, so keys `dp` does not model (a wrapper's `tmp`) survive
+in the blob.
+
+## A module's output keeps its source range (the section above was wrong)
+
+Stripping `tsr`/`dsr` from a module's output was on the reasoning that the offsets
+describe the module's string rather than the page. The service disagrees, and
+`List of sovereign states` shows both sides of the distinction inside one paragraph:
+
+```
+<p class="mw-empty-elt" id="mwAg">
+  <span typeof="mw:Nowiki mw:Transclusion" … id="mwAw"></span>
+  <link … href="./Category:Articles_with_short_description" about="#mwt1"/>           <- no id
+  <link … href="./Category:Short_description_is_different_from_Wikidata" about="#mwt1" id="mwBA"/>  <- id
+</p>
+```
+
+The first link is `Template:Short_description`'s own `[[Category:…]]`, reached through
+a `#ifeq` branch: a *text* expansion, re-tokenized, no `tsr`, no id. The second is
+`Module:SDcat`'s return value. Both are strings, but only the branch loses the range
+to the re-tokenization: a module's output is a nested pipeline with its own source,
+and its tokens keep the `tsr` that pipeline gave them. The service keys the node
+that has one, however bogus the offset is as a *page* position — the id pass reads
+presence, never the value.
+
+So the strip is removed. The write-back above is what turns the retained `tsr` into
+the key. (`src`/`srcContent` are still left alone; the note about `Unix` hanging
+when they were cleared stands, even though the module strip that motivated it is
+gone.)
+
+### Scoreboard
+
+Nine closest pages, offline. Only the target moved, because the other eight diverge
+earlier for unrelated reasons:
+
+```
+                          before   after
+List of sovereign states    23       418     <- now the Wikidata description
+Unix                       550       550
+Quicksilver (film)         550       550
+Sundial                    516       516
+Bicycle                    538       538
+Nobel Prize                562       562
+Megadeth                   528       528
+Help:Introduction          403       403
+Zebra                      444       444
+```
+
+Every `<p>` on every page now takes an id, and the 8 unchanged pages show their
+first difference was never the paragraph's id. Fixture guard 876/896.

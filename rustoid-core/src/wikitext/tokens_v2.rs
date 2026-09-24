@@ -512,20 +512,7 @@ impl DataParsoid {
             );
         }
         if let Some(dsr) = &self.dsr {
-            // Faithful to PHP's `DomSourceRange::toJsonArray`: a 4-element
-            // array, extended to 6 elements only when trimmed-WS info is
-            // recorded (leadingWS/trailingWS non-zero).
-            let mut arr = vec![
-                serde_json::Value::from(dsr.start.map(|v| v as u64)),
-                serde_json::Value::from(dsr.end.map(|v| v as u64)),
-                serde_json::Value::from(dsr.open_width.map(|v| v as u64)),
-                serde_json::Value::from(dsr.close_width.map(|v| v as u64)),
-            ];
-            if dsr.leading_ws != 0 || dsr.trailing_ws != 0 {
-                arr.push(serde_json::Value::from(dsr.leading_ws));
-                arr.push(serde_json::Value::from(dsr.trailing_ws));
-            }
-            obj.insert("dsr".to_string(), serde_json::Value::Array(arr));
+            obj.insert("dsr".to_string(), dsr.to_json_array());
         }
         if let Some(tail) = &self.tail {
             obj.insert("tail".to_string(), serde_json::Value::String(tail.clone()));
@@ -623,6 +610,23 @@ pub struct DomSourceRange {
 }
 
 impl DomSourceRange {
+    /// The `data-parsoid.dsr` array: `[start, end, openWidth, closeWidth]`,
+    /// extended to six elements only when trimmed-whitespace info is recorded
+    /// (mirrors PHP's `DomSourceRange::toJsonArray`).
+    pub fn to_json_array(&self) -> serde_json::Value {
+        let mut arr = vec![
+            serde_json::Value::from(self.start.map(|v| v as u64)),
+            serde_json::Value::from(self.end.map(|v| v as u64)),
+            serde_json::Value::from(self.open_width.map(|v| v as u64)),
+            serde_json::Value::from(self.close_width.map(|v| v as u64)),
+        ];
+        if self.leading_ws != 0 || self.trailing_ws != 0 {
+            arr.push(serde_json::Value::from(self.leading_ws));
+            arr.push(serde_json::Value::from(self.trailing_ws));
+        }
+        serde_json::Value::Array(arr)
+    }
+
     pub fn inner_start(&self) -> usize {
         self.start.unwrap_or(0) + self.open_width.unwrap_or(0)
     }
