@@ -1331,7 +1331,19 @@ impl TemplateHandler {
                 continue;
             };
             if stt.name == "template" || stt.name == "template3" {
-                let about_id = crate::pipeline::attribute_expander::new_about_id(about_counter);
+                // An id is taken only when this expansion can be wrapped. PHP's
+                // `TemplateEncapsulator` constructor allocates one for every
+                // template token and the unused ones are simply not emitted —
+                // which is fine natively, where Parsoid expands the nesting. On a
+                // *page* it never sees that nesting at all: the core preprocessor
+                // expands a body's templates and parser functions before Parsoid
+                // tokenizes the result. Allocating here anyway put rustoid at
+                // `#mwt90` on `Help:Introduction`, where the service reaches 12.
+                let about_id = if wrap {
+                    crate::pipeline::attribute_expander::new_about_id(about_counter)
+                } else {
+                    String::new()
+                };
                 // Build a `Params` from the token's attribs.
                 let params = Params::new(stt.attribs.clone());
                 let context_title = frame.title();
@@ -1350,7 +1362,11 @@ impl TemplateHandler {
             if stt.name == "templatearg"
                 && let Some(name) = stt.attribs.first().and_then(|kv| kv.key.as_str())
             {
-                let about_id = crate::pipeline::attribute_expander::new_about_id(about_counter);
+                let about_id = if wrap {
+                    crate::pipeline::attribute_expander::new_about_id(about_counter)
+                } else {
+                    String::new()
+                };
                 let src = format!("{{{{{name}}}}}");
                 let expanded = self.handle_template_arg(frame, &src, about_id, tok, true);
                 out.extend(expanded);
