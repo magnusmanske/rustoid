@@ -3471,3 +3471,59 @@ Module:Shortcut       {...,"body":{"extsrc":""}}   {...,"body":{"extsrc":""}}
 rustoid's `templatestyles::style_node` hardcodes `"body":{"extsrc":""}` for
 every sheet, so three of the four should have no `body` at all. That is upstream
 of the dedup pass and is the next gate, together with the two extra occurrences.
+
+## Page-scope magic words were resolved against the *template*
+
+Chasing the two extra occurrences led somewhere much more important. Every
+corpus page's first difference sat at byte 294–317 — a *systematic* early
+difference, not a per-page accident — and on `Quicksilver (film)` it read:
+
+```
+parsoid: <span class="mw-empty-elt" about="#mwt1"><link rel="mw:PageProp/Category"
+           href="./Category:Articles_with_short_description"/><link …Wikidata/></span>
+rustoid: (nothing — the two category links were missing entirely)
+```
+
+`Template:Short description` computes that category from `{{#switch:
+{{NAMESPACENUMBER}}|…}}` and `Template:Dated maintenance category` guards its own
+with `{{#ifexpr:{{#if:{{NAMESPACE}}|0|1}}+…}}`. On an article both must see the
+**article's** namespace (0, no name) — and on rustoid they saw the *template's*
+(10, `Template`). The `#switch` hit `10 = exclude`, the `#ifexpr` took the false
+branch, and the categories vanished silently.
+
+### The cause, and why the two titles were conflated
+
+`TemplateHandler` had a single `context_title`, set to `frame.title()`. That is
+correct for one job and wrong for another:
+
+- **relative `/subpage` targets** resolve against the frame's title — the
+template that wrote `/sub` — mirroring `resolveTemplateTarget( …, $this->frame->title )`;
+- **page-name magic words** resolve against the *page*.
+
+In PHP the two never meet: the variable expansion runs in the extension, against
+`$env->getPageConfig()->getTitle()`, while the target resolution stays in the
+template handler. rustoid passed the frame's title to both.
+
+`Frame::root_title()` now walks the parent chain to the frame the parse started
+with, and `handle_template` / `variable_value` / `call_parser_function` take the
+page title separately from the frame title. The oracle agrees the root is the
+page: on `Sandbox/test` — a title in a namespace where subpages are **off** —
+`{{ROOTPAGENAME}}` is `Sandbox/test`, while on `Template:Sandbox/a/b` it is
+`Sandbox`; that subpage-enabled distinction is a *separate* gap rustoid still has
+(`split_subpage` always splits on `/`).
+
+### `FULLROOTPAGENAME` is not in the API's magic-word table
+
+While fixing the above I found `{{FULLROOTPAGENAME}}` resolved as a transclusion
+of `Template:FULLROOTPAGENAME`. It is a real core variable — the oracle answers
+`Template:Sandbox` for it on `Template:Sandbox/a/b` — but neither the cached nor
+the live `siteinfo&siprop=magicwords` lists `fullrootpagename`. rustoid derives
+its variable table from that list, so the name fell through to a template. A
+reserved-name fallback (`reserved_page_name_variable`) now answers the page-name
+family even when the API omits a member; these names are reserved, so the
+fallback cannot shadow a real template.
+
+The single-page scoreboard moved `Quicksilver (film)` from 0.76x to 0.94x of
+Parsoid's size (27.1 KB → 33.7 KB against 35.9 KB); its first difference is still
+byte 311, now the templated-`href` `mw:ExpandedAttrs` marking and the missing
+sibling merge rather than a dropped category.

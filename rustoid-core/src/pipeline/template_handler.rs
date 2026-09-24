@@ -532,6 +532,50 @@ pub fn parse_template_arg_src(src: &str) -> Option<(String, Option<String>)> {
     Some((name, default))
 }
 
+/// Find the page-name magic variable whose canonical name is `name`.
+///
+/// The siteinfo `magicwords` list — which is what `config.magic_words()` mirrors —
+/// omits some core page-name variables. `fullrootpagename` is absent from
+/// enwiki's list, yet `{{FULLROOTPAGENAME}}` resolves on the wiki (verified
+/// against the oracle: on `Template:Sandbox/a/b` it is `Template:Sandbox`). A
+/// lookup that trusts the list alone falls through to a *template* transclusion
+/// of `Template:FULLROOTPAGENAME`, which is both wrong and silently empty on any
+/// page that has no such template. These names are reserved by MediaWiki, so
+/// consulting this list cannot shadow a real template.
+fn reserved_page_name_variable(name: &str) -> Option<String> {
+    const NAMES: &[&str] = &[
+        "pagename",
+        "pagenamee",
+        "fullpagename",
+        "fullpagenamee",
+        "basepagename",
+        "basepagenamee",
+        "subpagename",
+        "subpagenamee",
+        "rootpagename",
+        "rootpagenamee",
+        "fullrootpagename",
+        "fullrootpagenamee",
+        "namespace",
+        "namespacee",
+        "namespacenumber",
+        "talkspace",
+        "talkspacee",
+        "subjectspace",
+        "subjectspacee",
+        "articlespace",
+        "articlespacee",
+        "subjectpagename",
+        "subjectpagenamee",
+        "articlepagename",
+        "articlepagenamee",
+        "talkpagename",
+        "talkpagenamee",
+    ];
+    let lower = name.to_lowercase();
+    NAMES.contains(&lower.as_str()).then_some(lower)
+}
+
 /// Find a magic variable whose alias matches `name`. Mirrors
 /// `SiteConfig::getMagicWordForVariable`.
 /// Returns (canonical name, whether it's a variable). Variables are magic
@@ -547,7 +591,8 @@ fn magic_word_for_variable(config: &dyn SiteConfig, name: &str) -> Option<(Strin
             return Some((canonical.clone(), true));
         }
     }
-    None
+    // The API's table is incomplete for these; see the helper's doc.
+    reserved_page_name_variable(&lower).map(|canonical| (canonical, true))
 }
 
 /// The full `action|title` argument of a protection magic word.
@@ -902,7 +947,16 @@ impl TemplateHandler {
     pub fn handle_template(
         &self,
         config: &dyn SiteConfig,
+        // The *frame's* title (the template being expanded). It is the base for a
+        // relative `/subpage` target, mirroring PHP's `resolveTemplateTarget( …,
+        // $this->frame->title )`.
         context_title: Option<&crate::title::Title>,
+        // The *page* title. Page-scope magic words resolve against this, not
+        // against the template: `{{NAMESPACE}}` in a template transcluded onto an
+        // article is the empty string. In PHP the two never mix because the
+        // variable expansion runs in the extension against
+        // `$env->getPageConfig()->getTitle()`.
+        page_title: Option<&crate::title::Title>,
         params: &Params,
         about_id: String,
         token: &crate::wikitext::tokens_v2::ParsoidToken,
@@ -962,7 +1016,7 @@ impl TemplateHandler {
                             }
                         })
                     }
-                    _ => Self::variable_value(config, &name, &pf_arg, context_title),
+                    _ => Self::variable_value(config, &name, &pf_arg, page_title),
                 };
                 if !wrap {
                     return vec![Item::Str(value)];
@@ -995,7 +1049,7 @@ impl TemplateHandler {
                     &pf_params,
                     token_src.as_deref(),
                     protection,
-                    context_title,
+                    page_title,
                 );
                 if !wrap {
                     // `{{SHORTDESC:…}}` inside `Template:Short description` is
@@ -1110,7 +1164,7 @@ impl TemplateHandler {
     /// Resolve a magic variable to its string value. Mirrors the common
     /// variable cases. `pf_arg` carries the colon argument for parameterized
     /// magic words like `{{ns:…}}`/`{{nse:…}}`, and `context_title` is the page
-    /// being parsed, which the page-name variables are derived from.
+    /// being parsed — the *page*, not the template that names the variable.
     fn variable_value(
         config: &dyn SiteConfig,
         name: &str,
@@ -1346,10 +1400,14 @@ impl TemplateHandler {
                 };
                 // Build a `Params` from the token's attribs.
                 let params = Params::new(stt.attribs.clone());
+                // Relative `/subpage` targets resolve against the frame's title;
+                // page-scope magic words resolve against the page's.
                 let context_title = frame.title();
+                let page_title = frame.root_title();
                 let expanded = self.handle_template(
                     config,
                     Some(context_title),
+                    Some(page_title),
                     &params,
                     about_id,
                     tok,
@@ -1503,6 +1561,23 @@ fn page_name_variable(
         "subpagenamee" => urlencode_title(&sub),
         "rootpagename" => root.clone(),
         "rootpagenamee" => urlencode_title(&root),
+        // The root page name *with* its namespace prefix. `FULLROOTPAGENAME` on a
+        // subpage is the namespace plus the first path segment (`Template:Foo` for
+        // `Template:Foo/bar/baz`), and on `Help:Introduction` — no `/` — it is the
+        // whole prefixed name, exactly like `FULLPAGENAME`. Unlike `ROOTPAGENAME`
+        // it keeps the prefix, which is why `Template:Dated maintenance category`
+        // compares it against `Wikipedia:Template messages`.
+        "fullrootpagename" => {
+            let n = ns_name(ns);
+            if n.is_empty() {
+                root.clone()
+            } else {
+                format!("{n}:{root}")
+            }
+        }
+        "fullrootpagenamee" => {
+            format!("{}{}", ns_e_prefix(&ns_e_name(ns)), urlencode_title(&root))
+        }
         "namespace" => ns_name(ns),
         "namespacee" => ns_e_name(ns),
         // The numeric id, which is what `{{#switch: {{NAMESPACENUMBER}} …}}`
@@ -1805,6 +1880,11 @@ mod tests {
             (&subpage, "basepagename", "Foo bar"),
             (&subpage, "rootpagename", "Foo bar"),
             (&subpage, "subpagename", "baz"),
+            // `FULLROOTPAGENAME` keeps the namespace prefix and takes the *first*
+            // path segment as the root; `ROOTPAGENAME` drops both.
+            (&subpage, "fullrootpagename", "Template:Foo bar"),
+            (&subpage, "fullrootpagenamee", "Template:Foo_bar"),
+            (&main, "fullrootpagename", "Sandbox"),
             (&subpage, "namespacee", "Template"),
             // The main namespace has no name, and its talk space is `Talk`.
             (&main, "namespace", ""),
@@ -2055,6 +2135,7 @@ mod tests {
 
         let out = handler.handle_template(
             &config,
+            None,
             None,
             &params,
             "#mwt1".to_string(),

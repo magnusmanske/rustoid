@@ -40,6 +40,23 @@ impl Frame {
         &self.title
     }
 
+    /// The title of the outermost frame — the page being parsed.
+    ///
+    /// Page-scope magic words (`{{PAGENAME}}`, `{{NAMESPACE}}`,
+    /// `{{NAMESPACENUMBER}}`, …) resolve against the *page*, not against the
+    /// template that spells them: `{{NAMESPACE}}` inside `Template:Dated
+    /// maintenance category` is the empty string when that template is
+    /// transcluded onto an article, because the article is in the main namespace.
+    /// The frame's own `title()` is the template's, which is why it cannot answer
+    /// these; the root frame is the one the parse started with.
+    pub fn root_title(&self) -> &Title {
+        let mut frame = self;
+        while let Some(parent) = frame.parent_frame.as_deref() {
+            frame = parent;
+        }
+        &frame.title
+    }
+
     pub fn args(&self) -> &Params {
         &self.args
     }
@@ -331,6 +348,27 @@ mod tests {
 
         // ignore_loop bypasses loop detection.
         assert!(frame.loop_and_depth_check(&root_title, 40, true).is_none());
+    }
+
+    /// Page-scope magic words resolve against the *page*, so `root_title` must
+    /// walk past every template frame to the one the parse started with.
+    /// Without this, `{{NAMESPACE}}` inside a template transcluded onto an
+    /// article answered `Template`, and `{{#ifexpr:{{#if:{{NAMESPACE}}|0|1}}…}}`
+    /// took the wrong branch — which is how `Template:Dated maintenance
+    /// category` stopped emitting its tracking categories on every article.
+    #[test]
+    fn root_title_is_the_page_not_the_template() {
+        let config = MockSiteConfig::new();
+        let page = TitleParser::parse("Quicksilver (film)", &config);
+        let root = Frame::new(page.clone(), vec![]);
+        let t1 = root.new_child(TitleParser::parse("Template:A", &config), vec![]);
+        let t2 = t1.new_child(TitleParser::parse("Template:A/B", &config), vec![]);
+
+        assert_eq!(root.root_title().text, "Quicksilver (film)");
+        assert_eq!(t1.root_title().text, "Quicksilver (film)");
+        assert_eq!(t2.root_title().text, "Quicksilver (film)");
+        // The frame's own title is still the template's, for `/subpage` targets.
+        assert_eq!(t2.title().text, "A/B");
     }
 
     #[test]
