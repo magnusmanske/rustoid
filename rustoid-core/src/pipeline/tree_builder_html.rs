@@ -1880,10 +1880,161 @@ fn wrap_transclusion_children(
             new_content.push(span);
         }
 
+        // Last step of `encapsulateTemplates`, after the marker metas are gone
+        // and the metadata has landed on the target.
+        stash_rendering_transparent_elts(&mut new_content, false);
+
         out.extend(new_content);
         i = end + 1;
     }
     out
+}
+
+/// `DOMRangeBuilder::handleRenderingTransparentEltsBetweenBlocks` (T370751,
+/// T378906).
+///
+/// A run of rendering-transparent elements at a transclusion boundary — the
+/// trailing `mw:PageProp/Category` links a template emits, a redirect link, a
+/// newline span, a `<style>` — is moved into a `<span class="mw-empty-elt">`. The
+/// span takes the run's `about`, and the moved nodes lose theirs, which is why
+/// the served markup reads `<span class="mw-empty-elt" about="#mwt1"><link
+/// rel="mw:PageProp/Category" href="…"/></span>` with no `about` on the links.
+/// Wrapping them gives CSS a bounded number of elements to select between two
+/// blocks, which is what the navbox styling it was written for needs.
+///
+/// `fostered` is `isFosterablePosition` of the *parent*: nothing in a table's
+/// fosterable position is stashable.
+fn stash_rendering_transparent_elts(content: &mut Vec<Node>, fostered: bool) {
+    stash_stashable_runs(content, fostered);
+    // The PHP walk descends into Remex block nodes (its traverser visits every
+    // descendant), so a run can also sit at a block's own boundary.
+    for child in content.iter_mut() {
+        if matches!(child.kind, NodeKind::Element(_))
+            && crate::html::dom_utils::is_wikitext_block_node(child)
+        {
+            let fostered = crate::wikitext::consts::fosterable_position()
+                .contains(&crate::html::wts_utils::node_name(child));
+            stash_rendering_transparent_elts(&mut child.children, fostered);
+        }
+    }
+}
+
+/// Group each maximal run of stashable siblings among `content` into one
+/// `mw-empty-elt` span. Faithful to `handleFirstRenderingTransparentNode`, which
+/// handles the run starting at the first stashable element it is called on.
+fn stash_stashable_runs(content: &mut Vec<Node>, fostered: bool) {
+    if fostered {
+        return;
+    }
+    let is_elt = |n: &Node| matches!(n.kind, NodeKind::Element(_));
+    let mut i = 0;
+    while i < content.len() {
+        if !is_elt(&content[i]) || !is_stashable_elt(&content[i]) {
+            i += 1;
+            continue;
+        }
+        // Extend the run to the last following *element* that is stashable
+        // (`getNextElementSibling` skips non-elements while searching).
+        let start = i;
+        let mut last = i;
+        let mut j = i + 1;
+        while let Some(k) = (j..content.len()).find(|&k| is_elt(&content[k])) {
+            if !is_stashable_elt(&content[k]) {
+                break;
+            }
+            last = k;
+            j = k + 1;
+        }
+        let prev = (0..start)
+            .rev()
+            .find(|&k| is_elt(&content[k]))
+            .map(|k| &content[k]);
+        let next = (last + 1..content.len())
+            .find(|&k| is_elt(&content[k]))
+            .map(|k| &content[k]);
+        if !should_stash(prev, next, &content[start]) {
+            i += 1;
+            continue;
+        }
+
+        let about = content[start].get_attr("about").map(str::to_string);
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("class", "mw-empty-elt");
+        if let Some(about) = about {
+            span.set_attr("about", about);
+        }
+        // `migrateElements`: non-elements and newline spans are dropped, and the
+        // rest keep their content but lose their `about` (the span has it now).
+        let mut moved = Vec::new();
+        for node in content.splice(start..=last, std::iter::empty()) {
+            if !is_elt(&node) || crate::html::wts_utils::node_name(&node) == "span" {
+                continue;
+            }
+            let mut node = node;
+            node.attrs.retain(|a| a.key != "about");
+            moved.push(node);
+        }
+        span.children = moved;
+        content.insert(start, span);
+        i = start + 1;
+    }
+}
+
+/// `DOMRangeBuilder::isStashableElt`, minus its `isFosterablePosition` check
+/// (the caller owns it, since it is a property of the parent).
+fn is_stashable_elt(node: &Node) -> bool {
+    let name = crate::html::wts_utils::node_name(node);
+    let transparent = crate::html::wts_utils::is_rendering_transparent_node(node)
+        && if name == "meta" {
+            // Only page properties other than the TOC, `<*include*>` markers, and
+            // stripped tags are stashable metas; `mw:Param`, language variants and
+            // the indent-pre whitespace meta must stay where they are.
+            let property = node.get_attr("property").unwrap_or("");
+            (property.starts_with("mw:PageProp/") && !property.starts_with("mw:PageProp/toc"))
+                || crate::html::dom_utils::has_type_of(node, "mw:Placeholder/StrippedTag")
+                || crate::html::dom_utils::match_type_of(node, "^mw:Includes/").is_some()
+        } else {
+            true
+        };
+    transparent || is_newline_wrapping_span(node) || name == "style"
+}
+
+/// `DOMUtils::isNewlineWrappingSpan` — a span whose only child is a run of
+/// newlines, the wrapper a transclusion's newline is kept inside the paragraph
+/// with.
+fn is_newline_wrapping_span(node: &Node) -> bool {
+    crate::html::wts_utils::node_name(node) == "span"
+        && node.children.len() == 1
+        && matches!(&node.children[0].kind, NodeKind::Text(t) if !t.is_empty() && t.chars().all(|c| c == '\n'))
+}
+
+/// `DOMRangeBuilder::shouldStashRenderingTransparentNodes` — a run is stashed
+/// only at a transclusion boundary or next to a block, never in the middle of a
+/// transclusion's inline content.
+fn should_stash(prev: Option<&Node>, next: Option<&Node>, node: &Node) -> bool {
+    let about = node.get_attr("about");
+    let after_boundary = match prev {
+        None => true,
+        Some(p) => {
+            is_transclusion_start(p)
+                || crate::html::wts_utils::is_first_encapsulation_wrapper_node(node)
+                || matches!(
+                    crate::html::wts_utils::node_name(p).as_str(),
+                    "div" | "table"
+                )
+        }
+    };
+    let before_boundary = match next {
+        None => true,
+        Some(n) => {
+            n.get_attr("about") != about
+                || matches!(
+                    crate::html::wts_utils::node_name(n).as_str(),
+                    "div" | "table"
+                )
+        }
+    };
+    after_boundary && before_boundary
 }
 
 /// Whether a whitespace-only text node inside a transclusion range should be
@@ -2380,8 +2531,52 @@ pub fn token_stream_to_ast_html_with_fragments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dom::node::{ElementKind, NodeKind};
+    use crate::dom::node::{ElementKind, Node, NodeKind};
     use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, SelfclosingTagTk, TagTk};
+
+    fn category_link(about: &str) -> Node {
+        let mut link = Node::element(ElementKind::Other("link".to_string()));
+        link.set_attr("rel", "mw:PageProp/Category");
+        link.set_attr("href", "./Category:X");
+        link.set_attr("about", about);
+        link
+    }
+
+    /// A transclusion's trailing category links are stashed in one
+    /// `mw-empty-elt` span, which takes the `about` and leaves the links bare —
+    /// the shape the wiki serves after `{{Short description|…}}`.
+    #[test]
+    fn stashes_trailing_category_links_after_a_block() {
+        let mut div = Node::element(ElementKind::Div);
+        div.set_attr("about", "#mwt1");
+        let mut content = vec![div, category_link("#mwt1"), category_link("#mwt1")];
+        stash_rendering_transparent_elts(&mut content, false);
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(crate::html::wts_utils::node_name(&content[1]), "span");
+        assert_eq!(content[1].get_attr("class"), Some("mw-empty-elt"));
+        assert_eq!(content[1].get_attr("about"), Some("#mwt1"));
+        assert_eq!(content[1].children.len(), 2);
+        assert!(
+            content[1].children[0].get_attr("about").is_none(),
+            "the span carries the about, the moved links do not"
+        );
+    }
+
+    /// A run whose following sibling shares its `about` and is not a block is
+    /// inline content, not a page-property tail, so it is left alone.
+    #[test]
+    fn leaves_an_interior_transparent_run_alone() {
+        let mut div = Node::element(ElementKind::Div);
+        div.set_attr("about", "#mwt1");
+        let mut tail = Node::element(ElementKind::Span);
+        tail.set_attr("about", "#mwt1");
+        tail.push_child(Node::text("more"));
+        let mut content = vec![div, category_link("#mwt1"), tail];
+        stash_rendering_transparent_elts(&mut content, false);
+        assert_eq!(content.len(), 3);
+        assert_eq!(crate::html::wts_utils::node_name(&content[1]), "link");
+    }
 
     fn tag(name: &str) -> Item {
         Item::Tok(ParsoidToken::Tag(TagTk::new(

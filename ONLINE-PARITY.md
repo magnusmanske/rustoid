@@ -3527,3 +3527,75 @@ The single-page scoreboard moved `Quicksilver (film)` from 0.76x to 0.94x of
 Parsoid's size (27.1 KB → 33.7 KB against 35.9 KB); its first difference is still
 byte 311, now the templated-`href` `mw:ExpandedAttrs` marking and the missing
 sibling merge rather than a dropped category.
+
+## The trailing category span is `handleRenderingTransparentEltsBetweenBlocks`
+
+Every corpus page's first difference is the same shape — a transclusion whose
+output is `[block element][category links]`, where the service emits the block
+and then
+
+```html
+<span class="mw-empty-elt" about="#mwt1"><link rel="mw:PageProp/Category" href="…"/><link …/></span>
+```
+
+with **no `about` on the links**, and rustoid emitted the links bare with
+`about` and `typeof="mw:ExpandedAttrs"`. The pass that builds that span is
+`DOMRangeBuilder::handleRenderingTransparentEltsBetweenBlocks` (master path
+`src/Wt2Html/DOM/Processors/DOMRangeBuilder.php`, not the `PP/` copy the earlier
+notes pointed at — the API listing is the reliable index here). It runs as the
+*
+last* step of `encapsulateTemplates`, after the marker metas are gone, and it
+collects a maximal run of *stashable* elements — rendering-transparent nodes
+(the category/redirect links), newline-wrapping spans, `<style>` — into one
+`<span class="mw-empty-elt">`, moving the run's `about` onto the span.
+
+Three details make the difference between right and nearly-right:
+
+- **`migrateElements` strips `about`** from everything it moves. That is why the
+  served links carry only `rel`/`href`; an implementation that leaves the stamp
+  on them produces an extra attribute on every category link on the page.
+- **`shouldStashRenderingTransparentNodes` needs a boundary**, not just a run: the
+  previous element must be `null`, a transclusion start marker, the range's first
+  encapsulation wrapper, or a `div`/`table`; and the next must be `null`, carry a
+  *different* `about`, or be a `div`/`table`. Without this an inline run inside a
+  transclusion gets wrapped too.
+- **`isStashableElt` filters metas**: only page properties other than the TOC,
+  `<*include*>` markers and stripped tags are stashable. `mw:Param`, language
+  variants and the indent-pre whitespace meta must stay where they are.
+
+### What is still missing: compound ranges
+
+The port fixed the *standalone* case — a transclusion that is only a category
+link now wraps correctly, and `Quicksilver`'s second short-description category
+(`{{Main other|{{SDcat|…}}}}`) stashes as it should. Its **first** category link
+still does not, and the reason is the handoff's unresolved blocker, now pinned:
+
+rustoid encapsulates **nested** transclusion ranges eagerly, innermost first. By
+the time the outer range runs, the inner `{{SDcat}}` range is already a
+`<span class="mw-empty-elt" typeof="mw:Transclusion">`, and a wrapper span is not
+stashable, so the run `[linkA, linkB]` that PHP sees is `[linkA, span]` in
+rustoid and the boundary test fails. PHP instead merges the overlapping ranges
+into one *compound* range (`findTopLevelNonOverlappingRanges` +
+`recordTemplateInfo`), so all the constituent parts are range-level siblings and
+the run is contiguous. Until that merge exists, the trailing-run stashing can
+only work on a range that has no nested transclusion inside it.
+
+### A cache gap the work exposed
+
+`Template:SDcat` was missing from the cache — rustoid had never fetched it,
+because the NAMESPACE bug above suppressed the very branch that calls it — so
+rustoid rendered a red link where the service renders a category. Fetching it
+one page online wrote the body but **not** the manifest: `write_index` is only
+called on the corpus path, so a single-page or `--wikitext` run leaves newly
+fetched bodies unreachable offline. `--reindex` recovers them, and it only
+*adds*: existing page entries keep their revisions, which is what the corpus pin
+needs. Any future online population should either go through a corpus run or be
+followed by a `--reindex`.
+
+### Scoreboard (old binary, before these three fixes)
+
+```
+corpus: 0/43 compared (0.0%), 5 stalled
+output: parsoid 64.5 MB, rustoid 51.3 MB (0.80x)
+  transclusion 39 | stalled 5 | data-mw 1 | extension 1 | lua 1 | module-source 1
+```
