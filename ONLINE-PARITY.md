@@ -3624,30 +3624,76 @@ page-level content (a `<pre>` per template parameter, swallowing the page tail).
 `body` is the value that matches the service, so the parameter is now named for
 what it is rather than for what the comment guessed.
 
-## The real first difference now: Cite reserves the first 25 ids
+## Cite reserved the first 25 ids — and no longer does
 
-With the category span shape right, every corpus page's first difference is the
-`id` on the **first body element** — and it is not off by one, it is off by 25:
+With the category span shape right, every corpus page's first difference was the
+`id` on the **first body element** — and it was not off by one, it was off by 25:
 
 ```
 parsoid: <section data-mw-section-id="0" id="mwAQ">   (counter 1)
 rustoid: <section data-mw-section-id="0" id="mwGg">   (counter 26)
 ```
 
-A temporary trace of `assign_node_ids` shows why: 47 ids are already in the tree
-when the pass starts, and 25 of them are `mwAA`, `mwAQ`, `mwAg`, … `mwCA` —
-assigned by the **Cite** pass. `DocIds::take` numbers Cite's spans from its own
-counter that starts at **0** (`DocIds::new` sets `n: 0`), so the first one is
-`mwAA`, which the live service never emits at all, and the allocator then skips
-the whole range, pushing the body's first element to 26.
+A temporary trace of `assign_node_ids` showed why: 47 ids were already in the tree
+when the pass started, and 25 of them were `mwAA`, `mwAQ`, `mwAg`, … `mwCA` —
+assigned by the **Cite** pass. `DocIds::take` numbered Cite's spans from its own
+counter that started at **0**, so the first one was `mwAA` (which the live service
+never emits at all) and the allocator then skipped the whole range.
 
-Parsoid does not pre-assign these: Cite's DOM post-processor creates elements and
-the single document-order id pass numbers them along with everything else. So the
-fix is not "start at 1" — that only relabels the hole — but to stop assigning ids
-in Cite at all and let `assign_node_ids` number those elements in document order.
-Every `take()` result is used directly as an `id` attribute (never as an `href`
-target — the anchors use the authored `cite_note-…` ids), so nothing else needs the
-value, which makes the change tractable; the elements must then be recognised by
-the id pass (the `empty_dp_slot` marker is the existing mechanism for "takes an id
-but emits no `data-parsoid`"). This is the next gate, and it is a global one:
-it shifts every id on every page.
+Parsoid does not pre-assign these: Cite's DOM post-processor only builds elements,
+and the single document-order id pass numbers them along with everything else. So
+the fix was not "start at 1" — that would only relabel the hole — but to stop
+assigning ids in Cite and mark the elements for the id pass instead
+(`empty_dp_slot`, the existing "takes an id but emits no `data-parsoid`"
+mechanism). Every `take()` result was used directly as an `id` attribute and never
+as an `href` target — the anchors use the authored `cite_note-…` ids — so nothing
+else needed the value.
+
+That is the whole change, and it is a global one: the ids on both sides now agree,
+and every article page's first difference moves from byte 311 to **404**:
+
+```
+                        before   after
+Quicksilver (film)        311      404
+Unix                      311      404
+Sundial                   294      370
+Bicycle                   305      392
+Megadeth                  300      382
+Canada                    300      380
+Israel                    -        372
+Nobel Prize               317      416
+Chernobyl disaster        317      414
+Help:Introduction         403      403
+```
+
+## The current gate: `mw:ExpandedAttrs` on body content
+
+Byte 404 is, on every page, the same two attributes on the same element:
+
+```
+parsoid: <link rel="mw:PageProp/Category" href="./Category:Articles_with_short_description"/>
+rustoid: <link typeof="mw:ExpandedAttrs" rel="mw:PageProp/Category"
+               href="./Category:Pages_with_short_description" id="mwAw"/>
+```
+
+`Template:Short description` writes its category as
+`[[Category:{{{pagetype|{{pagetype|…}}}}} with short description]]`. In **native**
+Parsoid that attribute value holds a template, so `AttributeExpander` marks the
+token `about` + `typeof="mw:ExpandedAttrs"` (verified: `PHP`'s marking is
+unconditional on `wrapTemplates`) — and that is what rustoid reproduces. In
+**integrated** mode the core preprocessor has already substituted the value, so
+there is no template in the attribute, `tmpDataMW` is empty, and no marking
+happens. rustoid expands the value itself at attribute-expansion time, so it still
+sees the template.
+
+The tempting fix — gate the marking on `!in_template` — is not free: the same
+flag drives `wrapTemplates`, which feeds the `nlTkIndex` newline decisions, so
+routing the real value into `build_expanded_attrs` (the call site currently
+hardcodes `false`) changes more than the marking. Gating only the marking block
+is the smaller experiment, but it would diverge from native output, which the
+fixture suite pins, so it needs the fixtures checked. Left for the next session
+with the reduction written down: `{{Short description|X}}` on any article is the
+minimal case, and it also carries a second, unrelated difference in the same
+`href` — the category is `Pages_with_short_description` instead of
+`Articles_with_short_description`, i.e. `Module:Pagetype` answering `Pages` where
+the service answers `Articles`.
