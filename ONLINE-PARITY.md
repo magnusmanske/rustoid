@@ -4470,3 +4470,54 @@ A fix has to give a lazily-expanded argument value the frame it was written in, 
 expand `{{{…}}}` eagerly at the call site in the caller's frame. The second is
 wrong for `{{{sd}}}`-style values (they must expand where they were written, not in
 the callee), so the first is the shape to aim at.
+
+## Two test failures that are not this work's
+
+`cargo test --release --workspace` reports two failures, and both reproduce at the
+session-start commit `aac41df` (checked in a worktree):
+
+- `templatestyles_parsoid_test::render_matches_parsoid_for_every_cached_stylesheet`
+  — environment (the `/tmp` cache layout).
+- `templatestyles_test::the_lua_frame_method_reaches_the_same_handler` — the
+  module's `frame:extensionTag('templatestyles', …)` emits an empty
+  `mw:Transclusion` span. Pre-existing; worth a look later, and the handoff's
+  note that only the first fails was incomplete.
+
+`missing_template_loop::a_missing_template_answers_with_its_title_as_text` *was*
+broken by the write-through: it took the link text as everything after the first
+`'>` in the page, which was the anchor's opening tag only while no earlier
+element carried `data-parsoid`. It now reads from the last `>` before `</a>`.
+
+## Full-corpus scoreboard, offline (48 pages)
+
+```
+score: 0/46 compared, 2 stalled
+output: parsoid 64 473 554 bytes, rustoid 52 427 586 (0.81x)
+```
+
+The closest pages by first difference, and what each one is:
+
+```
+       1  Hydrogen                     the About hatnote's leading templatestyles (as List, but first)
+       6  Template:Infobox             a missing class="mw-empty-elt" on the invoke's wrapper span
+     403  Help:Introduction            encapsulation head: <span class="mw-empty-elt"> vs <p>
+     444  Zebra                        the pre-existing node-count trip
+     477  List of sovereign states     encapsulation head: <span class="mw-empty-elt"> vs <div>
+     518  Israel                       (not yet reduced)
+     538  Bicycle                      the unexpanded {{{1|}}} in a module's parent args
+     554  Sundial / Taylor Swift       (not yet reduced)
+```
+
+`Zebra` is not a usable target (node-count trip; rustoid renders 113 KB where the
+service renders 560 KB).
+
+### The two stalls are pre-existing and are a performance limit, not a regression
+
+`United States` and `India` exceed the 60 s per-page cap. Both **also stall at the
+session-start commit** (checked in a worktree), and both are CPU-bound (`user`
+59.7 s), so nothing in this work caused them. They started stalling when the
+Wikidata entity index was rebuilt: with entities resolvable, modules such as
+`Module:Wd` do real work instead of taking their no-data fallback, and two of the
+largest pages no longer finish. That is rustoid being slower than the service, not
+differing from it — the 0.81x byte ratio (down from 0.87x) is mostly the freed
+`data-parsoid` and the corrected id/keying, not missing content.
