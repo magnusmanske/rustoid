@@ -1206,6 +1206,29 @@ impl TemplateHandler {
             _ => String::new(),
         }
     }
+    /// Does this parser function return its branch as *text*?
+    ///
+    /// Core's `#if`, `#ifeq`, `#ifexpr` and `#iferror` all answer
+    /// `trim($frame->expand(…))` — a string — and the parser hands that string
+    /// back to the token stream, which tokenizes it again. Two things follow,
+    /// and both are visible in the served HTML:
+    ///
+    /// - the branch's templates are gone by the time anything looks at it, so a
+    ///   wikitext target inside the branch holds no template token and nothing is
+    ///   marked `mw:ExpandedAttrs`;
+    /// - the tokens that come back have no source range, so they get no id.
+    ///
+    /// `#switch` is deliberately *not* here: core answers its branch with
+    /// `PPFrame::RECOVER_ORIG`, i.e. the branch's original tokens, so its
+    /// templates are still templates when the branch is spliced in — and the
+    /// service marks a `#switch` branch and numbers its nodes.
+    pub fn expands_branch_to_text(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "if" | "ifeq" | "ifexpr" | "iferror"
+        )
+    }
+
     /// Dispatch a parser function name to the `ParserFunctions` implementation.
     ///
     /// `token_src` is the original `{{#name:...}}` source. For an unknown

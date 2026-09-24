@@ -4072,3 +4072,77 @@ The second category in the same span is `Short_description_is_different_from_Wik
 in the service against `Short_description_with_empty_Wikidata_description` in rustoid,
 i.e. `Module:SDcat` sees no Wikidata description. That is a `mw.wikibase` gap, not
 this one, and it will still be there once the marking is right.
+
+## Landed: the text-expanding branches no longer mark their targets
+
+The rule from the previous section is now implemented, in the shape the evidence
+supports rather than the shape Parsoid has. `#if`, `#ifeq`, `#ifexpr` and `#iferror`
+are recognised by `TemplateHandler::expands_branch_to_text`, and the branch they
+return is flagged `TempData::in_text_branch` in `expand_template_token`'s `_` arm
+(which is where parser functions are dispatched). `AttributeExpander::build_expanded_attrs`
+then skips its marking block for a flagged token.
+
+Measured on the pages whose first difference was this gate:
+
+```
+                        before  after
+Unix                     404     480
+Quicksilver (film)       404     480
+Sundial                  370     446
+Bicycle                  392     468
+Megadeth                 382     458
+Nobel Prize              416     492
+Association football     ~390    466
+Bitcoin                  ~404    480
+```
+
+Every one moves by the same ~76 bytes, which is what a gate removed uniformly
+looks like; the corpus is unmoved in aggregate (0.88x both before and after).
+`Help:Introduction` (403) and `Zebra` (444) are unmoved — neither is this gate.
+
+### Why a flag and not the re-tokenization Parsoid does
+
+The faithful implementation is "expand the branch, serialize it to wikitext,
+re-tokenize". It was written first and **it does not work in rustoid**, for a reason
+worth recording: `tokens_to_string` over *expanded* tokens is lossy. The branch's
+`[[Category:Article_with_sd]]` came out as `[[]]`, because the target of a wikilink
+token lives in its data rather than in anything the serializer emits. (The
+`data-parsoid.src` fallback that `tpl_toks_to_string` uses would only give the
+*unexpanded* source back, which is the problem, not the fix.)
+
+Core can do this because its expander is text→text and the re-tokenization happens
+where the string is spliced in. rustoid's expander is token→token throughout; the
+only text it can produce is a token serialization, and a wikilink's target is not in
+one. So the *effect* — that an attribute which still looks templated in a branch is
+not treated as templated — is what the flag encodes, at the one site that depends on
+it.
+
+### The ids do *not* follow from the same flag
+
+The remaining byte at 480 on `Unix` is still `id="mwAw"` on the category link, and
+the tempting reading — "the branch was re-tokenized, so it has no source range, so
+it gets no id" — is **wrong**. The probe that kills it:
+
+```
+{{#if:x|[[Foo]]}}        oracle: <a rel="mw:WikiLink" href="./Foo" about="#mwt1"
+                                  typeof="mw:Transclusion" ... id="mwAw">
+```
+
+A link inside an `#if` branch *does* get an id. It gets one because it carries the
+`#if`'s transclusion wrapper, i.e. `data-mw`; `storeInPageBundle` assigns an id
+whenever there is something to key the node by — `data-mw` or a non-empty
+`data-parsoid`. The category link in `Template:Short description` carries neither:
+the wrapping lands on the enclosing `<span class="mw-empty-elt" about="#mwt1">`, and
+its `data-parsoid` is *empty*, which Parsoid discards (`$discardDataParsoid` for
+`IS_NEW` + `isEmpty()`) — so nothing is keyed and no id is assigned.
+
+So the id side is a rule about **empty `data-parsoid`**, not about provenance, and it
+is a different change from this one: rustoid's link carries `data-parsoid` with a
+`tsr`, and `assign_node_ids` counts *presence*. Two probes to keep in mind for it:
+
+- `[[Category:Foo]]` at page level: the service gives the link an id (it has a real
+  source range); rustoid agrees but numbers the `<p>` differently — the service
+  numbers the auto-inserted paragraph (`<p id="mwAg">`) and rustoid does not, which
+  is a second, independent id gap in the same three bytes.
+- `{{#if:x|[[Category:Foo]]}}`: the service gives the *span* the wrapper's id and the
+  link none.

@@ -49,6 +49,32 @@ fn track_table(item: &Item, depth: &mut usize) {
     }
 }
 
+/// Flag a text-returning parser function's branch as such, in place.
+///
+/// See [`crate::wikitext::tokens_v2::TempData::in_text_branch`]: core answers
+/// `#if`/`#ifeq`/`#ifexpr`/`#iferror` with a *string* and re-tokenizes it, so the
+/// wikitext targets inside the branch were resolved before any attribute pass
+/// saw them. rustoid expands the branch in place instead, which leaves those
+/// targets templated; the flag is what tells the marking to behave as the service
+/// does. Attribute values nested in a token are walked too — that is where a
+/// wikilink's target lives.
+fn mark_in_text_branch(items: &mut [Item]) {
+    use crate::wikitext::tokens_v2::KeyValue;
+    for item in items.iter_mut() {
+        let Item::Tok(tok) = item else { continue };
+        if let Some(dp) = tok.data_parsoid_mut() {
+            dp.tmp.in_text_branch = Some(true);
+        }
+        if let Some(attribs) = tok.attribs_mut() {
+            for kv in attribs.iter_mut() {
+                if let KeyValue::Tokens(nested) = &mut kv.value {
+                    mark_in_text_branch(nested);
+                }
+            }
+        }
+    }
+}
+
 /// The `<span class="error">…</span>` a tripped expansion limit leaves in place
 /// of the expansion.
 ///
@@ -2604,7 +2630,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .unwrap_or(false);
 
         let mut out = Vec::new();
-        match resolve_template_target(self.config, Some(frame.title()), &target_str) {
+        let resolved = resolve_template_target(self.config, Some(frame.title()), &target_str);
+        // Whether this call's result is a *string* the token stream re-tokenizes,
+        // rather than the branch's own tokens. See
+        // [`TemplateHandler::expands_branch_to_text`]; the `_` arm below is where
+        // it takes effect.
+        let branch_is_text = matches!(
+            &resolved,
+            Some(ResolvedTarget::ParserFunction { name, .. })
+                if TemplateHandler::expands_branch_to_text(name)
+        );
+        match resolved {
             // `#invoke` is Scribunto, not a parser function: MediaWiki
             // hands the call to Lua and feeds the result back through the
             // parser. Parsoid implements none of it in standalone mode,
@@ -2794,6 +2830,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     src_text,
                 ))
                 .await;
+                let mut expanded = expanded;
+                if branch_is_text {
+                    // The branch is text in the service, so nothing in it is a
+                    // templated *attribute* by the time it is spliced in — see
+                    // [`TemplateHandler::expands_branch_to_text`]. rustoid expands
+                    // the branch in place, which leaves the templates of a
+                    // wikitext target unexpanded until `expand_attributes` looks
+                    // at them; flagging them here is what keeps that difference
+                    // from turning into a marking the service does not have.
+                    mark_in_text_branch(&mut expanded);
+                }
                 for e in &expanded {
                     track_table(e, table_depth);
                 }

@@ -638,9 +638,19 @@ pub fn build_expanded_attrs(
     // Mark the token as having expanded attributes, unless it already carries
     // an `about` (an existing transclusion/extension wrapping). Template tokens
     // are omitted because the attribute expander is just resolving the target.
+    //
+    // Nor when the attribute came out of a parser function whose branch core
+    // expands to *text* (`#if`/`#ifeq`/`#ifexpr`/`#iferror`): there the wikitext
+    // target was resolved before any attribute pass saw it, so an attribute that
+    // still looks templated is not one, and the service leaves it unmarked.
+    let branch_text = token
+        .data_parsoid()
+        .and_then(|dp| dp.tmp.in_text_branch)
+        .unwrap_or(false);
     if token.get_attribute_v("about").is_none()
         && !tmp_data_mw.is_empty()
         && token_name != "template"
+        && !branch_text
     {
         let about_id = new_about_id(about_counter);
         token.set_attribute("about", &about_id);

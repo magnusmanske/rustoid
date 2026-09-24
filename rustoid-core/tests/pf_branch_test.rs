@@ -137,6 +137,51 @@ async fn a_template_in_a_tplarg_default_expands() {
     );
 }
 
+/// Only the branches that stay *tokens* are marked as expanded attributes.
+///
+/// Core answers `#if`/`#ifeq`/`#ifexpr`/`#iferror` with `trim($frame->expand(…))`
+/// — a string, which the parser re-tokenizes — so the wikitext target inside such
+/// a branch is already resolved when the attribute pass sees it, and the service
+/// does not mark it `mw:ExpandedAttrs`. The same target written directly on the
+/// page *is* marked, and so is one in a `#switch` branch, because core answers
+/// that with the branch's original tokens (`PPFrame::RECOVER_ORIG`).
+#[tokio::test]
+async fn only_non_text_branches_are_marked_as_expanded_attributes() {
+    const TARGET: &str = "[[Category:{{PAGENAME}}]]";
+
+    let page = render(&[], TARGET).await;
+    assert!(
+        page.contains("mw:ExpandedAttrs"),
+        "page-level target: {page}"
+    );
+
+    let switch = render(&[], &format!("{{{{#switch:1|1={TARGET}}}}}")).await;
+    assert!(
+        switch.contains("mw:ExpandedAttrs"),
+        "a #switch branch keeps its tokens: {switch}"
+    );
+
+    for (label, wikitext) in [
+        ("if", format!("{{{{#if:1|{TARGET}}}}}")),
+        ("ifeq", format!("{{{{#ifeq:1|1|{TARGET}}}}}")),
+        ("ifexpr", format!("{{{{#ifexpr:1|{TARGET}}}}}")),
+        (
+            "iferror",
+            format!("{{{{#iferror:{{{{#expr:1/0}}}}|{TARGET}}}}}"),
+        ),
+    ] {
+        let html = render(&[], &wikitext).await;
+        assert!(
+            html.contains("Category:Test"),
+            "#{label} lost the link: {html}"
+        );
+        assert!(
+            !html.contains("mw:ExpandedAttrs"),
+            "#{label} expands its branch to text, so it must not be marked: {html}"
+        );
+    }
+}
+
 /// The text outside tags. A `data-mw`/`data-parsoid` attribute legitimately
 /// carries source wikitext, so a whole-document search for `{{` reports every
 /// correctly-rendered transclusion as unexpanded.

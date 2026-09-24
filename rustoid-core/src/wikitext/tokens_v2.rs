@@ -716,6 +716,16 @@ pub struct TempData {
     /// The first wikitext node of a multi-template-content-block (html→wt
     /// serialization).
     pub first_wikitext_node: Option<String>,
+    /// Set on tokens that came out of a parser function whose branch core
+    /// expands to *text* — `#if`, `#ifeq`, `#ifexpr`, `#iferror`, i.e.
+    /// [`crate::pipeline::template_handler::TemplateHandler::expands_branch_to_text`].
+    ///
+    /// Core hands that branch back to the parser as a string, which re-tokenizes
+    /// it, so the wikitext targets inside it were resolved before anything looked
+    /// at them: an attribute that still *looks* templated is not, and must not be
+    /// marked `mw:ExpandedAttrs`. `#switch` is not one of these — it answers its
+    /// branch's original tokens, and the service does mark those.
+    pub in_text_branch: Option<bool>,
     /// Set by `TreeBuilderStage` while inside a transclusion (mirrors
     /// `TempData::IN_TRANSCLUSION`).
     pub in_transclusion: bool,
@@ -881,6 +891,16 @@ impl ParsoidToken {
             ParsoidToken::EndTag(t) => &t.attribs,
             ParsoidToken::SelfclosingTag(t) => &t.attribs,
             _ => &[],
+        }
+    }
+
+    /// Get the attributes mutably.
+    pub fn attribs_mut(&mut self) -> Option<&mut Vec<KV>> {
+        match self {
+            ParsoidToken::Tag(t) => Some(&mut t.attribs),
+            ParsoidToken::EndTag(t) => Some(&mut t.attribs),
+            ParsoidToken::SelfclosingTag(t) => Some(&mut t.attribs),
+            _ => None,
         }
     }
 
