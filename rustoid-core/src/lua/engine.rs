@@ -2010,9 +2010,14 @@ fn luafn_text_trim(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(coerce_string(&s, "trim")?.trim().to_string())
 }
 
-/// `mw.text.listToText` — joins items with `sep` and a `conjunction` before the
-/// last, e.g. `a, b and c`. MediaWiki's default conjunction for English is
-/// "and".
+/// `mw.text.listToText` — joins all but the last item with `sep`, then appends the
+/// conjunction and the last item, e.g. `a, b and c`.
+///
+/// The conjunction is used *verbatim*, with no space inserted around it: Scribunto
+/// concatenates it, so a caller that wants `and` spaced must pass `" and "`. The
+/// default is the English `and` message, which carries its own spaces. (rustoid
+/// used to wrap the conjunction in spaces, which doubled them whenever a caller
+/// passed a spaced one — `Module:Hatnote list` does.)
 fn luafn_text_list_to_text(
     _: &Lua,
     (items, sep, conj): (Table, Option<Value>, Option<Value>),
@@ -2023,7 +2028,7 @@ fn luafn_text_list_to_text(
     };
     let conj = match &conj {
         Some(v) => coerce_string(v, "listToText")?,
-        None => "and".to_string(),
+        None => " and ".to_string(),
     };
     let mut parts: Vec<String> = Vec::new();
     for item in items.sequence_values::<Value>() {
@@ -2035,7 +2040,7 @@ fn luafn_text_list_to_text(
         1 => parts.remove(0),
         _ => {
             let last = parts.pop().unwrap_or_default();
-            format!("{} {} {last}", parts.join(&sep), conj)
+            format!("{}{conj}{last}", parts.join(&sep))
         }
     })
 }
@@ -5650,6 +5655,39 @@ mod tests {
             engine.eval("return mw.text.trim('  hello  ')").unwrap(),
             "hello"
         );
+    }
+
+    /// The conjunction is concatenated verbatim: a caller passing `' and '` gets
+    /// one space on each side, not two. `Module:Hatnote list` builds its lists
+    /// this way, so the doubled spaces showed up in every hatnote.
+    #[test]
+    fn test_mw_text_list_to_text_uses_the_conjunction_verbatim() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.text.listToText({'a', 'b'}, ', ', ' and ')")
+                .unwrap(),
+            "a and b"
+        );
+        // The default conjunction is the English `and` message, spaces included.
+        assert_eq!(
+            engine
+                .eval("return mw.text.listToText({'a', 'b'})")
+                .unwrap(),
+            "a and b"
+        );
+        // Three items take the separator between the first pair.
+        assert_eq!(
+            engine
+                .eval("return mw.text.listToText({'a', 'b', 'c'})")
+                .unwrap(),
+            "a, b and c"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.listToText({'a'})").unwrap(),
+            "a"
+        );
+        assert_eq!(engine.eval("return mw.text.listToText({})").unwrap(), "");
     }
 
     /// `mw.text.nowiki` escapes what would otherwise be read as wikitext.
