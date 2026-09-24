@@ -151,7 +151,13 @@ fn value_to_string(kv: &KeyValue) -> String {
 pub struct ParserFunctions;
 
 impl ParserFunctions {
-    /// `#if` — mirrors `pf_if`.
+    /// `#if` — a port of core `ParserFunctions::if`, which answers
+    /// `trim($frame->expand($args[n]))`.
+    ///
+    /// Parsoid's *native* `pf_if` does not trim (`expandKV` runs with its
+    /// `$trim` default of false), so the two disagree on a branch with surrounding
+    /// blanks — `{{#if:1|Y }}` is `Y` on the service and `Y ` natively. The served
+    /// HTML is the target, so this trims.
     pub fn pf_if(params: &Params) -> Vec<Item> {
         let args = &params.args;
         let condition = args
@@ -159,13 +165,13 @@ impl ParserFunctions {
             .map(|kv| key_value_to_string(&kv.key))
             .unwrap_or_default();
         if condition.trim() != "" {
-            Self::expand_kv(args.get(1), None)
+            Self::trimmed_branch(args.get(1))
         } else {
-            Self::expand_kv(args.get(2), None)
+            Self::trimmed_branch(args.get(2))
         }
     }
 
-    /// `#ifeq` — mirrors `pf_ifeq` / `ifeq_worker`.
+    /// `#ifeq` — a port of core `ParserFunctions::ifeq`.
     pub fn pf_ifeq(params: &Params) -> Vec<Item> {
         let args = &params.args;
         if args.len() < 3 {
@@ -180,10 +186,20 @@ impl ParserFunctions {
             .map(|kv| key_value_to_string(&kv.value))
             .unwrap_or_default();
         if a.trim() == b.trim() {
-            Self::expand_kv(args.get(2), None)
+            Self::trimmed_branch(args.get(2))
         } else {
-            Self::expand_kv(args.get(3), None)
+            Self::trimmed_branch(args.get(3))
         }
+    }
+
+    /// One of a conditional's branches, trimmed. Core's `if`, `ifeq`, `ifexpr`
+    /// and `iferror` all answer `trim($frame->expand(…))`, and the trim happens
+    /// *after* expansion — so a branch that is a bare newline, or whose blanks
+    /// come from the source, loses them.
+    fn trimmed_branch(kv: Option<&KV>) -> Vec<Item> {
+        let mut items = Self::expand_kv(kv, None);
+        trim_item_edges(&mut items);
+        items
     }
 
     /// `#switch` — a port of core `ParserFunctions::switch`, which is what the
@@ -288,9 +304,9 @@ impl ParserFunctions {
             .unwrap_or_default();
         let res = evaluate_expression(&target);
         if res != "0" && !res.is_empty() && !res.contains("error") {
-            Self::expand_kv(args.get(1), None)
+            Self::trimmed_branch(args.get(1))
         } else {
-            Self::expand_kv(args.get(2), None)
+            Self::trimmed_branch(args.get(2))
         }
     }
 
@@ -304,9 +320,9 @@ impl ParserFunctions {
         let has_error =
             target.contains("class=\"error\"") || target.contains("<strong class=\"error\">");
         if has_error {
-            Self::expand_kv(args.get(1), None)
+            Self::trimmed_branch(args.get(1))
         } else {
-            Self::expand_kv(args.get(2), None)
+            Self::trimmed_branch(args.get(2))
         }
     }
 
@@ -677,21 +693,63 @@ impl ParserFunctions {
     }
 }
 
-/// Trim leading and trailing whitespace from an item list's outer *string*
-/// items, leaving every token in place.
+/// Trim leading and trailing whitespace from an item list, mirroring
+/// `TokenUtils::tokenTrim`.
+///
+/// That function walks from each end until it reaches a non-empty string or a
+/// token that is not a newline: a leading or trailing `NlTk` is replaced by the
+/// empty string and the walk *continues*, and a string is stripped of its
+/// whitespace. Only strings and newline tokens are touched, so a markup token at
+/// either end stops the walk and its neighbouring blanks are left alone.
 ///
 /// `#switch` trims its matched branch, but a branch may hold markup whose tokens
 /// must survive: `{{#switch:x|x=<div>a</div>}}` keeps the `<div>` and loses only
-/// the surrounding blanks. Trimming the stringified form instead would discard
+/// the surrounding blanks. Trimming the *stringified* form instead would discard
 /// the tags along with the whitespace.
+///
+/// Handling the newline token is load-bearing rather than tidy: a branch that is
+/// a bare `\n` is a newline *token*, not a whitespace string, so
+/// `{{#switch:other|other|#default=\n}}` used to answer a newline where the
+/// service answers nothing — and inside `Template:Main other` that newline is
+/// what left a stray `<span about="#mwtN"> </span>` on `Help:Introduction`.
 fn trim_item_edges(items: &mut Vec<Item>) {
-    if let Some(Item::Str(first)) = items.first_mut() {
-        *first = first.trim_start().to_string();
+    let mut start = 0;
+    while start < items.len() {
+        match &mut items[start] {
+            Item::Str(s) => {
+                let trimmed = s.trim_start();
+                if trimmed.len() != s.len() {
+                    *s = trimmed.to_string();
+                }
+                if !s.is_empty() {
+                    break;
+                }
+                start += 1;
+            }
+            Item::Tok(ParsoidToken::Nl(_)) => start += 1,
+            _ => break,
+        }
     }
-    if let Some(Item::Str(last)) = items.last_mut() {
-        *last = last.trim_end().to_string();
+    items.drain(..start);
+
+    while let Some(last) = items.last_mut() {
+        match last {
+            Item::Str(s) => {
+                let trimmed = s.trim_end();
+                if trimmed.len() != s.len() {
+                    *s = trimmed.to_string();
+                }
+                if !s.is_empty() {
+                    break;
+                }
+                items.pop();
+            }
+            Item::Tok(ParsoidToken::Nl(_)) => {
+                items.pop();
+            }
+            _ => break,
+        }
     }
-    items.retain(|it| !matches!(it, Item::Str(s) if s.is_empty()));
 }
 
 /// Append a single character to `out` wrapped in an `mw:Entity` span, so it
@@ -1249,6 +1307,58 @@ mod tests {
         assert_eq!(
             ParserFunctions::pf_switch(&p),
             vec![Item::Str("DEF".to_string())]
+        );
+    }
+
+    /// A branch that is a bare newline is a newline *token*, not a whitespace
+    /// string, and `TokenUtils::tokenTrim` walks past it. Missing that left a
+    /// stray `<span about="#mwtN"> </span>` inside `Template:Short description`
+    /// on `Help:Introduction`: `Template:Main other`'s body ends with
+    /// `| #default = {{{2|}}}\n}}`, so the matched value was a newline.
+    #[test]
+    fn test_token_trim_walks_past_newline_tokens() {
+        use crate::wikitext::tokens_v2::{NlTk, SourceRange};
+
+        let named = |v: &str| KV {
+            key: KeyValue::Str("#default".to_string()),
+            value: KeyValue::Tokens(vec![
+                Item::Tok(ParsoidToken::Nl(NlTk::new(SourceRange::new(0, 1)))),
+                Item::Str(v.to_string()),
+            ]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        // `#default` whose value is only a newline: nothing survives.
+        let p = Params::new(vec![kv("other", ""), named("")]);
+        assert_eq!(ParserFunctions::pf_switch(&p), vec![]);
+
+        // A newline *inside* the value stops the walk: the text is kept.
+        let p = Params::new(vec![kv("other", ""), named("x")]);
+        assert_eq!(
+            ParserFunctions::pf_switch(&p),
+            vec![Item::Str("x".to_string())]
+        );
+    }
+
+    /// Core trims a conditional's taken branch after expanding it, so a branch's
+    /// surrounding blanks are not part of the answer. Parsoid's native versions
+    /// do not trim, which is why the fixture expectations can disagree.
+    #[test]
+    fn test_conditionals_trim_their_branch() {
+        let p = params(vec![("1", ""), ("", "Y "), ("", "N")]);
+        assert_eq!(ParserFunctions::pf_if(&p), vec![Item::Str("Y".to_string())]);
+
+        let p = params(vec![("1", ""), ("", "1"), ("", " Y "), ("", "N")]);
+        assert_eq!(
+            ParserFunctions::pf_ifeq(&p),
+            vec![Item::Str("Y".to_string())]
+        );
+
+        let p = params(vec![("1", ""), ("", " Y "), ("", "N")]);
+        assert_eq!(
+            ParserFunctions::pf_ifexpr(&p),
+            vec![Item::Str("Y".to_string())]
         );
     }
 
