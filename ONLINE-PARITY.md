@@ -3334,3 +3334,81 @@ still the first byte after the opening div.
 That residue is whitespace, and it is the next thing to look at: rustoid leaves
 `<span about="#mwt1"> </span>` where the service has nothing, so a template
 body's trailing space survives here and is dropped there.
+
+## The integrated preprocessor is why nesting leaves no trace
+
+Following `Help:Introduction`'s first difference past the whitespace produced the
+finding that reorganises the rest of this work, and it also *cancels* an earlier
+one. In integrated mode the service runs MediaWiki's core preprocessor before
+Parsoid sees the text, and that preprocessor expands a template body's templates
+and parser functions. So Parsoid's own expander only ever runs for the page's own
+transclusions. Two consequences, both measurable:
+
+- **No `about` ids for nesting.** PHP's `TemplateEncapsulator` constructor
+  allocates an id per template token and silently drops the unused ones, which is
+  right natively (Parsoid walks the nesting) and wrong on a page (it does not see
+  the nesting at all). rustoid allocated anyway and reached `#mwt90` on
+  `Help:Introduction`, where the service reaches `#mwt12`. Taking an id only when
+  the expansion can be wrapped brought it to 41. An id scheme that far out cannot
+  be patched downstream — every `about` in the document is off — so this was a
+  hard gate, not a detail.
+- **No `data-mw` parts for nesting.** The cached page's short-description wrapper
+  has exactly *one* part; the `{{Main other}}`/`{{SDcat}}` calls inside that
+  template are absent. So the earlier worry — that un-wrapping a body loses nested
+  provenance that Parsoid merges into the outer wrapper — is unfounded *in
+  integrated mode*: there are no nested parts to lose, which is why the
+  body-unwrapping change moved the ratio from 2.02x to 0.92x without losing
+  anything the service emits.
+
+The merge that *is* needed is therefore only between **sibling** page-level
+ranges. Parsoid's `<p about="#mwt4">` carries `parts` of three things: the
+`pp-semi-indef` transclusion, the literal text `</noinclude>`, and the
+`intro to single` transclusion. That is
+`DOMRangeBuilder::findTopLevelNonOverlappingRanges` merging overlapping/adjacent
+ranges and `recordTemplateInfo` collecting the interleaved page wikitext as
+string parts (recovered through DSR). rustoid emits the first of the three as its
+own `mw-empty-elt` span and stops there — and its `<p>` never appears, because the
+`<p>` exists precisely because the *merged* content contains non-transparent text.
+
+### Two more gates, both measured rather than guessed
+
+The residue after the id fix is not mysterious any more; counting the elements
+that differ names it:
+
+```
+                         service   rustoid
+mw:ExpandedAttrs               0         6
+<styl> templatestyles          4         9   (5 duplicates of one sheet)
+max about id                  12        41
+```
+
+- **`mw:ExpandedAttrs` on body content.** The marking fires whenever an attribute
+  value holds a template; inside a *body* the preprocessor has already expanded
+  those, so the service never marks them. rustoid emits 6 spans the service does
+  not — a direct output difference, not only an id.
+- **templatestyles are deduplicated.** rustoid emits one `<style>` per *use*, so
+  `Plainlist/styles.css` appears five times where the service emits each unique
+  stylesheet once.
+
+### While I was there: the code pages are not the smaller target
+
+`Module:Math` and `Template:Infobox` looked promising — small, self-contained,
+"data-mw" and "extension" failures rather than a transclusion swamp. They are not:
+both differ at byte 1 with a 13x size gap, because a `Module:` page's wikitext is
+rendered under Scribunto's *content model* — the source goes into a
+syntaxhighlighted `<pre>`, it is never parsed as wikitext. rustoid parses it, so
+its output is paragraphs of Lua. Implementing the content model is its own feature
+and not a shortcut to a first passing page.
+
+### Scoreboard
+
+```
+before this stretch: 0/45 matched, rustoid  70.4MB (1.09x)
+after:               0/45 matched, rustoid  59.3MB (0.92x)   3 stalled, lua 14/12
+```
+
+rustoid is now *smaller* than Parsoid, which is the right direction after a long
+stretch of emitting spurious wrappers, and the deficit is accounted for: the
+missing merges (one merged wrapper's `parts` and its `<p>`), plus the elements the
+gates above name. No page matched; `Help:Introduction`'s first difference moved
+353 → 403 and is now the sibling-range merge.
