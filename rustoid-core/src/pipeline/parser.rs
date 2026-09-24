@@ -2225,6 +2225,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `data-mw.parts`).
         crate::pipeline::handle_link_neighbours::run(&mut ast, self.config);
         crate::pipeline::table_fixups::run(&mut ast, self.config, Some(page_source));
+        // DedupeStyles: the third handler of the `fixups` traverser
+        // (`MigrateTrailingCategories,TableFixups,DedupeStyles`). It replaces
+        // every repeat of an already-emitted `<templatestyles>` with a `<link>`.
+        crate::pipeline::dedupe_styles::run(&mut ast);
         // DisplaySpace (`displayspace`): armor French spaces. PHP runs it as a
         // global DOM pass after extension post-processing and before `cleanup`.
         crate::pipeline::display_space::run(&mut ast);

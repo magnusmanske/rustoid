@@ -3412,3 +3412,62 @@ stretch of emitting spurious wrappers, and the deficit is accounted for: the
 missing merges (one merged wrapper's `parts` and its `<p>`), plus the elements the
 gates above name. No page matched; `Help:Introduction`'s first difference moved
 353 → 403 and is now the sibling-range merge.
+
+## DedupeStyles — one `<style>` per sheet, a `<link>` for every repeat
+
+One of the two gates named above is now closed. A faithful port of
+`src/Wt2Html/DOM/Handlers/DedupeStyles.php` lives in
+`pipeline/dedupe_styles.rs` and runs as the third handler of the `fixups`
+traverser (`MigrateTrailingCategories,TableFixups,DedupeStyles`), i.e. right
+after `table_fixups`.
+
+The rule is small: the **first** `<style data-mw-deduplicate="TemplateStyles:r…">`
+for a key is kept, and every later occurrence of the same key is replaced by
+
+```html
+<link rel="mw-deduplicated-inline-style" href="mw-data:TemplateStyles:r…"
+      about="#mwtN" typeof="mw:Extension/templatestyles" data-mw='…'/>
+```
+
+with the `about`/`typeof`/`data-mw` copied **verbatim** from the node being
+replaced; a duplicate that sits in a fosterable position (the parent is `table`,
+`thead`, `tbody`, `tfoot`, `tr`) cannot be swapped for a sibling without
+disturbing the table, so its text is emptied instead. `seen` is per document,
+matching `$env->styleTagKeys`. `skipNested` turned out to be a no-op here: it
+gates only the top-level document (`DOMPostProcessor.php:810`), and the pipeline
+is always top-level.
+
+### Two facts the first attempt got wrong, both from the output
+
+- **`data-mw` on a templatestyles node is a plain attribute, not the `data_mw`
+  field.** The tag is inserted through a `mw:DOMFragment` placeholder, which
+  bypasses the token-stash path that moves `data-mw` into the field for ordinary
+  elements. Copying only `style.data_mw` produced a `<link>` with no `data-mw` at
+  all — visible immediately in the rendered output. The pass now copies the
+  attribute when present and falls back to the field.
+- **The `<link>` is emitted, never dropped.** PHP's `else` branch *empties* the
+  style; the non-fosterable branch replaces it. Getting either backwards would
+  silently delete CSS or duplicate it.
+
+### What is fixed, and what the dedup exposed
+
+`Help:Introduction` now emits one `<style>` per unique `data-mw-deduplicate` key
+(4) plus a `<link>` for each repeat, exactly as the service does. The residual
+difference is no longer "5 copies of one sheet" — it is **9 templatestyles
+occurrences in rustoid against 7 in the service**, i.e. rustoid transcludes two
+templatestyles tags too many, and the `data-mw` `body` field is wrong on all of
+them:
+
+```
+                      service                        rustoid
+Intro to single       {...,"attrs":{...}}            {...,"body":{"extsrc":""}}
+Plainlist             {...,"attrs":{...}}            {...,"body":{"extsrc":""}}
+Hide checkboxes       {...,"attrs":{...}}            {...,"body":{"extsrc":""}}
+Module:Shortcut       {...,"body":{"extsrc":""}}   {...,"body":{"extsrc":""}}
+```
+
+`body` is present in `data-mw` iff the source tag was **not** self-closing
+(`Templatestyles::wt2html`: `if ( !$selfclosing ) { $dataMw->body = [ 'extsrc' => $content ]; }`).
+rustoid's `templatestyles::style_node` hardcodes `"body":{"extsrc":""}` for
+every sheet, so three of the four should have no `body` at all. That is upstream
+of the dedup pass and is the next gate, together with the two extra occurrences.

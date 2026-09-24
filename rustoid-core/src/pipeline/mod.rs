@@ -11,6 +11,7 @@ pub mod attribute_transform_manager;
 pub mod behavior_switch_handler;
 pub mod cleanup;
 pub mod compute_dsr;
+pub mod dedupe_styles;
 pub mod display_space;
 pub mod extension_handler;
 pub mod external_link_handler;
