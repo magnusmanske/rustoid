@@ -2663,7 +2663,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         &params,
                         about_id,
                         tok,
-                        in_template,
+                        // `wrapTemplates` for this call, then the caller's
+                        // `inTemplate` for the nested pipeline that runs the
+                        // module's output. Passing the caller's flags *without*
+                        // `wrap` here inverted both: a page-level `#invoke` was
+                        // left unwrapped (no `about`/`typeof`/`data-mw`, where the
+                        // service emits `<span about="#mwt1"
+                        // typeof="mw:Transclusion">3</span>`), while one inside a
+                        // template body was wrapped — and a wrapped wrapper is not
+                        // stashable, which is what stopped a template's trailing
+                        // category run from being grouped.
+                        wrap,
                         body,
                         src_text,
                         parent_args,
@@ -3241,10 +3251,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         raw_params: &crate::pipeline::parser_functions::Params,
         about_id: String,
         token: &ParsoidToken,
-        // PHP's `wrapTemplates` for *this* call, and the caller's `inTemplate`
-        // for the nested pipeline that runs the module's output.
+        // PHP's `wrapTemplates` for *this* call, and whether the call is being
+        // expanded as part of a template body — the latter is what the nested
+        // pipeline that runs the module's output inherits.
         wrap: bool,
-        in_template: bool,
+        body: bool,
         _page_source: &str,
         parent_args: Vec<crate::wikitext::tokens_v2::KV>,
         about_counter: &std::cell::Cell<usize>,
@@ -3350,7 +3361,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             items,
             source,
             about_counter,
-            in_template,
+            body,
             false,
             /* src_text */ "",
         ))
