@@ -4521,3 +4521,15 @@ Wikidata entity index was rebuilt: with entities resolvable, modules such as
 largest pages no longer finish. That is rustoid being slower than the service, not
 differing from it — the 0.81x byte ratio (down from 0.87x) is mostly the freed
 `data-parsoid` and the corrected id/keying, not missing content.
+
+### "Byte 1" is not near-parity
+
+`Hydrogen` and `Module:Math` report a first difference at byte 1, and
+`Template:Infobox` at byte 6 — but rustoid renders 3.9 MB against Hydrogen's
+1.07 MB and 6 KB against `Template:Infobox`'s 196 KB. The first differing byte
+says where the two *start* to disagree, not how much agrees; read it next to the
+size column. `List of sovereign states`, at 1001 KB against 981 KB, is still the
+only page where the two are the same order of magnitude from the first byte on.
+
+(`Module:Math` is not a fair target at all: a `Module:` page renders under
+Scribunto's content model, which rustoid does not implement.)
