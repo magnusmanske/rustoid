@@ -277,7 +277,7 @@ fn render_media_sync(title_str: &str, opts_str: &str, config: &dyn SiteConfig) -
     let mut link_ctx = WikiLinkContext::new(config);
     link_ctx.set_suppress_media_formats();
     let mut fragments = std::collections::HashMap::new();
-    let mut next_id = 0usize;
+    let next_id = std::cell::Cell::new(0usize);
     let tokens: Vec<Item> = tokens
         .into_iter()
         .flat_map(|item| {
@@ -304,16 +304,16 @@ fn render_media_sync(title_str: &str, opts_str: &str, config: &dyn SiteConfig) -
                 &target,
                 false,
                 &mut fragments,
-                &mut next_id,
+                &next_id,
                 &mut |items| {
                     let mut f = std::collections::HashMap::new();
-                    let mut id = 0usize;
-                    render_inline_fragment(config, items, &mut f, &mut id)
+                    let id = std::cell::Cell::new(0usize);
+                    render_inline_fragment(config, items, &mut f, &id)
                 },
             )
         })
         .collect();
-    let frag = render_inline_fragment(config, tokens, &mut fragments, &mut next_id);
+    let frag = render_inline_fragment(config, tokens, &mut fragments, &next_id);
     frag.children.into_iter().next()
 }
 
@@ -735,13 +735,9 @@ fn caption_to_nodes(caption: &str, config: &dyn SiteConfig) -> Vec<Node> {
         .collect();
 
     let mut fragments = std::collections::HashMap::new();
-    let mut next_id = 0usize;
-    let frag = crate::pipeline::parser::render_inline_fragment(
-        config,
-        items,
-        &mut fragments,
-        &mut next_id,
-    );
+    let next_id = std::cell::Cell::new(0usize);
+    let frag =
+        crate::pipeline::parser::render_inline_fragment(config, items, &mut fragments, &next_id);
     frag.children
 }
 

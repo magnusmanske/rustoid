@@ -36,7 +36,7 @@ impl TreeBuilderStage {
         tokens: Vec<Item>,
         config: &dyn crate::traits::SiteConfig,
         fragments: &mut std::collections::HashMap<usize, Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         let mut out = tokens;
 
@@ -106,8 +106,8 @@ impl TreeBuilderStage {
     ) -> Node {
         // Continue fragment-id allocation after any pre-built fragments (from
         // `format="wikitext"` pre, etc.).
-        let mut next_id = fragments.len();
-        let tokens = self.process(tokens, config, &mut fragments, &mut next_id);
+        let next_id = std::cell::Cell::new(fragments.len());
+        let tokens = self.process(tokens, config, &mut fragments, &next_id);
         token_stream_to_ast_html_with_fragments(&tokens, source, fragments, about_counter)
     }
 }
@@ -146,8 +146,8 @@ mod tests {
     fn process(tokens: Vec<Item>) -> Vec<Item> {
         let stage = TreeBuilderStage::new(false);
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        stage.process(tokens, &config(), &mut fragments, &mut next_id)
+        let next_id = std::cell::Cell::new(0usize);
+        stage.process(tokens, &config(), &mut fragments, &next_id)
     }
 
     #[test]

@@ -446,7 +446,7 @@ fn render_wiki_link_with_fragment(
     target: &WikiLinkTargetInfo,
     build_fragment: Option<CaptionFragmentBuilder>,
     fragments: Option<&mut std::collections::HashMap<usize, crate::dom::node::Node>>,
-    next_id: Option<&mut usize>,
+    next_id: Option<&std::cell::Cell<usize>>,
 ) -> Vec<Item> {
     let (attribs, content, dp) = add_link_attributes_and_get_content(ctx, token, target);
 
@@ -957,7 +957,7 @@ pub fn render_file(
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
     build_fragment: CaptionFragmentBuilder,
 ) -> Vec<Item> {
     use super::media_options::{MediaOpts, get_format, get_wrapper_info};
@@ -1620,10 +1620,10 @@ pub(crate) fn dom_fragment_token(
     frag: crate::dom::node::Node,
     token: &ParsoidToken,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Item {
-    let id = *next_id;
-    *next_id += 1;
+    let id = next_id.get();
+    next_id.set(id + 1);
     fragments.insert(id, frag);
 
     let dp = token.data_parsoid().cloned().unwrap_or_default();
@@ -1650,7 +1650,7 @@ pub fn render_wiki_link_dispatched(
     target: &WikiLinkTargetInfo,
     is_redirect: bool,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
     build_fragment: CaptionFragmentBuilder,
 ) -> Vec<Item> {
     if let Some(title) = &target.title {
@@ -1748,7 +1748,7 @@ pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<I
         &target,
         true,
         &mut std::collections::HashMap::new(),
-        &mut 0usize,
+        &std::cell::Cell::new(0usize),
         &mut |_| crate::dom::node::Node::document(),
     );
 
@@ -1846,7 +1846,7 @@ mod tests {
         let token = wikilink_token("Main Page", Some("the main page <pre>x</pre>"));
         let target = get_wiki_link_target_info(&ctx, "Main Page", "Main Page").unwrap();
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
+        let next_id = std::cell::Cell::new(0usize);
 
         let out = render_wiki_link_dispatched(
             &mut ctx,
@@ -1854,13 +1854,13 @@ mod tests {
             &target,
             false,
             &mut fragments,
-            &mut next_id,
+            &next_id,
             &mut |items| {
                 crate::pipeline::parser::render_inline_fragment(
                     config_static(),
                     items,
                     &mut std::collections::HashMap::new(),
-                    &mut 0usize,
+                    &std::cell::Cell::new(0usize),
                 )
             },
         );
@@ -2062,7 +2062,7 @@ mod tests {
             &token,
             &target,
             &mut std::collections::HashMap::new(),
-            &mut 0usize,
+            &std::cell::Cell::new(0usize),
             &mut |_| crate::dom::node::Node::document(),
         );
 
@@ -2097,7 +2097,7 @@ mod tests {
             &token,
             &target,
             &mut std::collections::HashMap::new(),
-            &mut 0usize,
+            &std::cell::Cell::new(0usize),
             &mut |_| crate::dom::node::Node::document(),
         );
 

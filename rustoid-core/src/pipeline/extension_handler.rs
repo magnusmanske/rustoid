@@ -24,7 +24,7 @@ fn expand_extension(
     token: &SelfclosingTagTk,
     config: &dyn crate::traits::SiteConfig,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Option<Vec<Item>> {
     if token.name != "extension" {
         return None;
@@ -80,13 +80,13 @@ fn attr_str<'t>(token: &'t SelfclosingTagTk, name: &str) -> Option<&'t str> {
 fn nowiki_fragment_items(
     token: &SelfclosingTagTk,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Option<Vec<Item>> {
     let items = nowiki_items(token);
     let frag = nowiki_items_to_fragment(&items);
 
-    let id = *next_id;
-    *next_id += 1;
+    let id = next_id.get();
+    next_id.set(id + 1);
     fragments.insert(id, frag);
 
     let mut dp = token.data_parsoid.clone();
@@ -297,7 +297,7 @@ fn i18n_items(token: &SelfclosingTagTk) -> Vec<Item> {
 fn pwraptest_fragment_items(
     token: &SelfclosingTagTk,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Vec<Item> {
     use crate::dom::node::{ElementKind, Node};
     use crate::wikitext::tokens_v2::KeyValue;
@@ -315,8 +315,8 @@ fn pwraptest_fragment_items(
     frag.push_child(span);
     frag.push_child(style);
 
-    let id = *next_id;
-    *next_id += 1;
+    let id = next_id.get();
+    next_id.set(id + 1);
     fragments.insert(id, frag);
 
     // Emit an `mw:dom-fragment-token` placeholder carrying the fragment id.
@@ -419,7 +419,7 @@ fn pre_items(token: &SelfclosingTagTk, _config: &dyn crate::traits::SiteConfig) 
 fn style_items(
     token: &SelfclosingTagTk,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Vec<Item> {
     use crate::dom::node::{ElementKind, Node};
 
@@ -435,8 +435,8 @@ fn style_items(
     let mut frag = Node::document();
     frag.push_child(style);
 
-    let id = *next_id;
-    *next_id += 1;
+    let id = next_id.get();
+    next_id.set(id + 1);
     fragments.insert(id, frag);
 
     // Emit an empty `<style typeof="mw:DOMFragment">` + `</style>` pair carrying
@@ -586,7 +586,7 @@ pub fn run(
     tokens: Vec<Item>,
     config: &dyn crate::traits::SiteConfig,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Vec<Item> {
     let mut out = Vec::with_capacity(tokens.len());
     for item in tokens {
@@ -623,7 +623,7 @@ pub fn expand_in_attributes(
     tokens: Vec<Item>,
     config: &dyn crate::traits::SiteConfig,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Vec<Item> {
     use crate::wikitext::tokens_v2::KV;
 
@@ -675,7 +675,7 @@ fn expand_key_value(
     value: &crate::wikitext::tokens_v2::KeyValue,
     config: &dyn crate::traits::SiteConfig,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> crate::wikitext::tokens_v2::KeyValue {
     use crate::wikitext::tokens_v2::KeyValue;
     let KeyValue::Tokens(items) = value else {
@@ -908,8 +908,8 @@ mod tests {
         let mut tok = SelfclosingTagTk::new("extension", vec![], DataParsoid::default());
         tok.add_attribute_str("name", "pwraptest");
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        let items = pwraptest_fragment_items(&tok, &mut fragments, &mut next_id);
+        let next_id = std::cell::Cell::new(0usize);
+        let items = pwraptest_fragment_items(&tok, &mut fragments, &next_id);
 
         // The output is a single `mw:dom-fragment-token` placeholder.
         assert_eq!(items.len(), 1);
@@ -951,6 +951,6 @@ mod tests {
                 .iter()
                 .any(|c| matches!(&c.kind, crate::dom::node::NodeKind::Text(t) if t == "p{}"))
         );
-        assert_eq!(next_id, 1);
+        assert_eq!(next_id.get(), 1);
     }
 }

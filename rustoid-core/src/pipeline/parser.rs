@@ -321,6 +321,58 @@ fn reconstruct_link_src(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, href
     src
 }
 
+/// The `mw:DOMFragment` placeholder starting at `items[i]`, if there is one:
+/// the exclusive end index, the placeholder's tokens, and the name its strip
+/// marker carries.
+///
+/// A placeholder is either a bare `mw:dom-fragment-token` (a gallery) or a
+/// `typeof="mw:DOMFragment"` element pair — `<style>…</style>`,
+/// `<span>…</span>` — whose body is opaque.
+fn placeholder_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, String)> {
+    fn attrs_typeof(t: &crate::wikitext::tokens_v2::TagTk) -> Option<&str> {
+        t.attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str())
+    }
+    let is_fragment = |ty: Option<&str>| {
+        ty.is_some_and(|ty| {
+            ty.split_whitespace()
+                .any(|t| t == "mw:DOMFragment" || t.starts_with("mw:DOMFragment/"))
+        })
+    };
+    match &items[i] {
+        Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw:dom-fragment-token" => {
+            Some((i + 1, vec![items[i].clone()], "gallery".to_string()))
+        }
+        Item::Tok(ParsoidToken::Tag(t)) if is_fragment(attrs_typeof(t)) => {
+            let name = t.name.clone();
+            let mut depth = 0usize;
+            for (k, item) in items.iter().enumerate().skip(i) {
+                match item {
+                    Item::Tok(ParsoidToken::Tag(u)) if u.name == name => depth += 1,
+                    Item::Tok(ParsoidToken::EndTag(u)) if u.name == name => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // A `<style>` placeholder is a `<templatestyles>`;
+                            // the name is what `Module:Infobox` matches on.
+                            let tag = if name == "style" {
+                                "templatestyles".to_string()
+                            } else {
+                                "extension".to_string()
+                            };
+                            return Some((k + 1, items[i..=k].to_vec(), tag));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Emit the `mw:dom-fragment-token` placeholder for a `<gallery>` extension,
 /// referencing the pre-built gallery fragment by `id` (mirrors the generic
 /// extension encapsulation in `extension_handler::gallery_items`).
@@ -477,7 +529,7 @@ pub fn render_inline_fragment(
     config: &dyn SiteConfig,
     tokens: Vec<Item>,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &mut usize,
+    next_id: &std::cell::Cell<usize>,
 ) -> Node {
     use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
     use crate::pipeline::wiki_link_render::{
@@ -545,8 +597,8 @@ pub fn render_inline_fragment(
                 next_id,
                 &mut |items| {
                     let mut f = std::collections::HashMap::new();
-                    let mut id = 0usize;
-                    render_inline_fragment(config, items, &mut f, &mut id)
+                    let id = std::cell::Cell::new(0usize);
+                    render_inline_fragment(config, items, &mut f, &id)
                 },
             )
         })
@@ -842,6 +894,18 @@ pub struct Parser<'a, C: SiteConfig> {
     /// one consumer, reached from several paths.
     ext_fragments: std::cell::RefCell<std::collections::HashMap<usize, Node>>,
     ext_next_id: std::cell::Cell<usize>,
+    /// Sundered extension output, addressed by a `UNIQ…QINU` strip marker.
+    ///
+    /// A `frame:extensionTag('templatestyles', …)` answer is the extension's
+    /// *output*, which reaches the token stream as an `mw:DOMFragment`
+    /// placeholder with no wikitext form. Scribunto hands the module a strip
+    /// marker that survives concatenation and string handling and is spliced
+    /// back in when the module's output is parsed, and modules depend on that
+    /// shape — `Module:Infobox` reorders its stylesheets by matching
+    /// `\127…UNIQ--templatestyles-…QINU…\127` against `</tr>`. This is that
+    /// marker: text the module may hold and move, mapped back to the placeholder
+    /// tokens to splice when the output is re-expanded.
+    strip_markers: std::cell::RefCell<std::collections::HashMap<String, Vec<Item>>>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
@@ -858,6 +922,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
             ext_fragments: std::cell::RefCell::new(std::collections::HashMap::new()),
             ext_next_id: std::cell::Cell::new(0),
+            strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -931,7 +996,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         tokens: Vec<Item>,
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
         context_title: Option<&crate::title::Title>,
     ) -> Vec<Item> {
         use crate::pipeline::wiki_link_render::{
@@ -1056,8 +1121,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // Build the caption fragment with a fresh sub-pipeline context
                     // (nested captions resolve their own nested fragments locally).
                     let mut f = std::collections::HashMap::new();
-                    let mut id = 0usize;
-                    self.build_inline_fragment(items, &mut f, &mut id)
+                    let id = std::cell::Cell::new(0usize);
+                    self.build_inline_fragment(items, &mut f, &id)
                 },
             );
             out.extend(rendered);
@@ -1075,7 +1140,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
         href: &str,
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         // The redirect word source (e.g. `#REDIRECT `).
         let src = stt.data_parsoid.src.clone().unwrap_or_default();
@@ -1114,7 +1179,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         tokens: Vec<Item>,
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
 
@@ -1241,7 +1306,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // available (the synchronous `wikitext_to_ast` path has none).
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let mut next_id = 0usize;
+        let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
                 .expand_templates(frame, tokens, source, about_counter, true, false, body)
@@ -1251,7 +1316,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 tokens,
                 self.config,
                 &mut fragments,
-                &mut next_id,
+                &next_id,
             );
             tokens = self
                 .expand_attributes(
@@ -1261,7 +1326,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     None,
                     &mut fragments,
-                    &mut next_id,
+                    &next_id,
                 )
                 .await;
         }
@@ -1270,7 +1335,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &mut next_id);
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &next_id);
         flatten_nowiki_spans(&mut frag);
         frag
     }
@@ -1279,8 +1344,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// optionally template-expanded) token stream.
     fn fragment_from_tokens(&self, tokens: Vec<Item>) -> Node {
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        self.build_inline_fragment(tokens, &mut fragments, &mut next_id)
+        let next_id = std::cell::Cell::new(0usize);
+        self.build_inline_fragment(tokens, &mut fragments, &next_id)
     }
 
     /// Build an inline fragment document from caption tokens, resolving links
@@ -1293,7 +1358,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         tokens: Vec<Item>,
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> crate::dom::node::Node {
         render_inline_fragment(self.config, tokens, fragments, next_id)
     }
@@ -1316,7 +1381,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         kv: &crate::wikitext::tokens_v2::KeyValue,
         fragments: &mut std::collections::HashMap<usize, Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> String {
         use crate::pipeline::attribute_transform_manager::key_value_to_items;
 
@@ -1357,7 +1422,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         self.expand_wikitext_pre_with(source, frame, about_counter, tokens, next_id)
             .await
@@ -1369,7 +1434,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn expand_wikitext_pre_sync(
         &self,
         tokens: Vec<Item>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
         let mut out: Vec<Item> = Vec::new();
@@ -1381,8 +1446,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
             let body = extension_body(pre_stt);
             let sub = self.fragment_from_body(&body);
-            let id = *next_id;
-            *next_id += 1;
+            let id = next_id.get();
+            next_id.set(id + 1);
             fragments.insert(id, sub);
             emit_pre_placeholder(pre_stt, id, &mut out);
         }
@@ -1402,7 +1467,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
         let mut out: Vec<Item> = Vec::new();
@@ -1430,8 +1495,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             } else {
                 self.block_fragment_from_body(&body)
             };
-            let id = *next_id;
-            *next_id += 1;
+            let id = next_id.get();
+            next_id.set(id + 1);
             fragments.insert(id, sub);
             emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
         }
@@ -1443,7 +1508,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn expand_wrapper_tag_sync(
         &self,
         tokens: Vec<Item>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
         let mut out: Vec<Item> = Vec::new();
@@ -1459,8 +1524,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             } else {
                 self.block_fragment_from_body(&body)
             };
-            let id = *next_id;
-            *next_id += 1;
+            let id = next_id.get();
+            next_id.set(id + 1);
             fragments.insert(id, sub);
             emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
         }
@@ -1500,7 +1565,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let mut next_id = 0usize;
+        let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
                 .expand_templates(
@@ -1518,7 +1583,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 tokens,
                 self.config,
                 &mut fragments,
-                &mut next_id,
+                &next_id,
             );
             tokens = self
                 .expand_attributes(
@@ -1528,7 +1593,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     None,
                     &mut fragments,
-                    &mut next_id,
+                    &next_id,
                 )
                 .await;
         }
@@ -1536,7 +1601,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             crate::wikitext::tokens_v2::EOFTk,
         )));
         let mut ast = if inline {
-            self.build_inline_fragment(tokens, &mut fragments, &mut next_id)
+            self.build_inline_fragment(tokens, &mut fragments, &next_id)
         } else {
             let stage = TreeBuilderStage::new(false);
             let mut ast =
@@ -1565,9 +1630,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // Render links, external links, behavior switches, and language variants
         // (the token-level stages that run before tree building on the main page).
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, None);
-        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
+        let next_id = std::cell::Cell::new(0usize);
+        let tokens = self.render_links(tokens, &mut fragments, &next_id, None);
+        let tokens = self.render_external_links(tokens, &mut fragments, &next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
 
@@ -1591,7 +1656,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
         tokens: Vec<Item>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
         let mut fragments = std::collections::HashMap::new();
         let mut out: Vec<Item> = Vec::new();
@@ -1605,8 +1670,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let sub = self
                 .process_fragment_body(&body, source, frame, about_counter)
                 .await;
-            let id = *next_id;
-            *next_id += 1;
+            let id = next_id.get();
+            next_id.set(id + 1);
             fragments.insert(id, sub);
             emit_pre_placeholder(pre_stt, id, &mut out);
         }
@@ -1645,7 +1710,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let mut next_id = 0usize;
+        let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
                 .expand_templates(frame, tokens, source, about_counter, false, false, &caption)
@@ -1654,7 +1719,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 tokens,
                 self.config,
                 &mut fragments,
-                &mut next_id,
+                &next_id,
             );
             tokens = self
                 .expand_attributes(
@@ -1664,11 +1729,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     None,
                     &mut fragments,
-                    &mut next_id,
+                    &next_id,
                 )
                 .await;
         }
-        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &mut next_id);
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &next_id);
         std::mem::take(&mut frag.children)
     }
 
@@ -1699,7 +1764,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let wikitext = format!("[[{title_str}|{opts_str}|none]]");
         let mut tokens = self.tokenize(&wikitext).ok()?;
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
+        let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
                 .expand_templates(
@@ -1716,7 +1781,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 tokens,
                 self.config,
                 &mut fragments,
-                &mut next_id,
+                &next_id,
             );
             tokens = self
                 .expand_attributes(
@@ -1726,7 +1791,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     None,
                     &mut fragments,
-                    &mut next_id,
+                    &next_id,
                 )
                 .await;
         }
@@ -1760,16 +1825,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     &target,
                     false,
                     &mut fragments,
-                    &mut next_id,
+                    &next_id,
                     &mut |items| {
                         let mut f = std::collections::HashMap::new();
-                        let mut id = 0usize;
-                        render_inline_fragment(self.config, items, &mut f, &mut id)
+                        let id = std::cell::Cell::new(0usize);
+                        render_inline_fragment(self.config, items, &mut f, &id)
                     },
                 )
             })
             .collect();
-        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_external_links(tokens, &mut fragments, &next_id);
         let mut tokens = self.render_behavior_switches(tokens);
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
@@ -1805,7 +1870,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
         fragments: &mut std::collections::HashMap<usize, Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
 
@@ -1843,8 +1908,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
-            let id = *next_id;
-            *next_id += 1;
+            let id = next_id.get();
+            next_id.set(id + 1);
             fragments.insert(id, frag);
             out.push(emit_gallery_placeholder(stt, id));
         }
@@ -1969,7 +2034,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens: Vec<Item>,
         about_counter: &std::cell::Cell<usize>,
         fragments: &mut std::collections::HashMap<usize, Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         for item in tokens {
@@ -1983,8 +2048,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
-            let id = *next_id;
-            *next_id += 1;
+            let id = next_id.get();
+            next_id.set(id + 1);
             fragments.insert(id, frag);
             out.push(emit_gallery_placeholder(stt, id));
         }
@@ -2012,20 +2077,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let tokens = self.tokenize(wikitext)?;
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, context_title);
-        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
+        let next_id = std::cell::Cell::new(0usize);
+        let tokens = self.render_links(tokens, &mut fragments, &next_id, context_title);
+        let tokens = self.render_external_links(tokens, &mut fragments, &next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
-        let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens, &mut next_id);
+        let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens, &next_id);
         fragments.extend(pre_fragments);
-        let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens, &mut next_id);
+        let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens, &next_id);
         fragments.extend(wrapper_fragments);
         let tokens = self.expand_gallery_sync(
             tokens,
             &std::cell::Cell::new(0usize),
             &mut fragments,
-            &mut next_id,
+            &next_id,
         );
         let stage = TreeBuilderStage::new(false);
         let mut ast =
@@ -2182,12 +2247,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // them before attributes are expanded.
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
-        let mut next_id = 0usize;
+        // One fragment-id space for the whole document, exactly as PHP's
+        // `Env::newFragmentId` provides: a link's tunnelled caption, a
+        // stylesheet, and a gallery all draw from the same counter, so no two
+        // placeholders can share an id and resolve to each other's content.
+        // `expand_one_templatestyles` allocates from this same counter while
+        // expansion is still running.
+        let next_id = &self.ext_next_id;
         let tokens = crate::pipeline::extension_handler::expand_in_attributes(
             tokens,
             self.config,
             &mut fragments,
-            &mut next_id,
+            next_id,
         );
         let tokens = self
             .expand_attributes(
@@ -2197,22 +2268,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 about_counter,
                 Some(page_source),
                 &mut fragments,
-                &mut next_id,
+                next_id,
             )
             .await;
-        let tokens = self.render_links(tokens, &mut fragments, &mut next_id, Some(&title));
-        let tokens = self.render_external_links(tokens, &mut fragments, &mut next_id);
+        let tokens = self.render_links(tokens, &mut fragments, next_id, Some(&title));
+        let tokens = self.render_external_links(tokens, &mut fragments, next_id);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
         // Route `format="wikitext"` extension bodies through the inline
         // sub-pipeline, producing `mw:dom-fragment-token` placeholders + their
         // pre-built sub-fragments.
         let (tokens, pre_fragments) = self
-            .expand_wikitext_pre(tokens, source, &frame, about_counter, &mut next_id)
+            .expand_wikitext_pre(tokens, source, &frame, about_counter, next_id)
             .await;
         fragments.extend(pre_fragments);
         let (tokens, wrapper_fragments) = self
-            .expand_wrapper_tag(tokens, source, &frame, about_counter, &mut next_id)
+            .expand_wrapper_tag(tokens, source, &frame, about_counter, next_id)
             .await;
         fragments.extend(wrapper_fragments);
         let tokens = self
@@ -2222,7 +2293,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &frame,
                 about_counter,
                 &mut fragments,
-                &mut next_id,
+                next_id,
             )
             .await;
         // `<templatestyles>` is normally resolved inline during expansion, so
@@ -2319,16 +2390,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let note_fragments = std::cell::RefCell::new(std::collections::HashMap::new());
             let next_note_id = std::cell::Cell::new(0usize);
             let render_body = |body: &str| -> Node {
-                let mut next = next_note_id.get();
                 let mut fragments = note_fragments.borrow_mut();
-                let frag = render_inline_fragment(
+                render_inline_fragment(
                     self.config,
                     self.tokenize(body).unwrap_or_default(),
                     &mut fragments,
-                    &mut next,
-                );
-                next_note_id.set(next);
-                frag
+                    &next_note_id,
+                )
             };
             crate::ext::cite::run(&mut ast, &page_title_prefixed, &mut ids, &render_body);
             // Hand the advanced counter back: ids are allocated in document
@@ -2404,6 +2472,102 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         self.expansion_depth.set(0);
     }
 
+    /// Render a Lua frame call's expansion to the string the module receives,
+    /// replacing each `mw:DOMFragment` placeholder with a `UNIQ…QINU` strip
+    /// marker and remembering the placeholder tokens under that marker.
+    ///
+    /// [`crate::pipeline::lua_deferred::render_answer`] converts tokens to their
+    /// wikitext source, which a fragment placeholder does not have — it is a
+    /// built sub-tree, not markup. Dropping it is what lost every stylesheet a
+    /// module emitted through `frame:extensionTag`; the marker is Scribunto's
+    /// own answer shape and keeps the output alive through the module's string
+    /// handling.
+    fn render_answer_markers(&self, items: &[Item]) -> String {
+        let mut replaced: Vec<Item> = Vec::with_capacity(items.len());
+        let mut i = 0;
+        while i < items.len() {
+            match placeholder_span(items, i) {
+                Some((end, tokens, tag)) => {
+                    let marker = format!(
+                        "\u{7f}UNIQ--{tag}-{:08X}-QINU\u{7f}",
+                        self.strip_markers.borrow().len()
+                    );
+                    self.strip_markers
+                        .borrow_mut()
+                        .insert(marker.clone(), tokens);
+                    replaced.push(Item::Str(marker));
+                    i = end;
+                }
+                None => {
+                    replaced.push(items[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        crate::pipeline::lua_deferred::render_answer(&replaced)
+    }
+
+    /// Splice remembered strip markers back into their placeholder tokens.
+    ///
+    /// The counterpart to [`Parser::render_answer_markers`]: a module's output
+    /// is parsed as wikitext, so a marker that reaches a token stream becomes
+    /// the fragment placeholder it stood for, exactly where the module left it.
+    fn substitute_strip_markers(&self, tokens: Vec<Item>) -> Vec<Item> {
+        if !tokens
+            .iter()
+            .any(|it| matches!(it, Item::Str(s) if s.contains('\u{7f}')))
+        {
+            return tokens;
+        }
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut pending: Vec<String> = Vec::new();
+        let flush = |pending: &mut Vec<String>, out: &mut Vec<Item>| {
+            if pending.is_empty() {
+                return;
+            }
+            let joined = pending.join("");
+            pending.clear();
+            // A marker is `\x7f…\x7f` with no sentinel in between; everything
+            // outside one is ordinary text.
+            let mut rest = joined.as_str();
+            while let Some(start) = rest.find('\u{7f}') {
+                if start > 0 {
+                    out.push(Item::Str(rest[..start].to_string()));
+                }
+                let after = &rest[start + 1..];
+                let Some(end) = after.find('\u{7f}') else {
+                    out.push(Item::Str(rest[start..].to_string()));
+                    return;
+                };
+                let marker = &rest[start..start + end + 2];
+                match self.strip_markers.borrow().get(marker) {
+                    Some(items) => out.extend(items.iter().cloned()),
+                    None => out.push(Item::Str(marker.to_string())),
+                }
+                rest = &after[end + 1..];
+            }
+            if !rest.is_empty() {
+                out.push(Item::Str(rest.to_string()));
+            }
+        };
+        for item in tokens {
+            // The tokenizer splits a marker at every `-`, so the sentinel may be
+            // several adjacent `Str` items. Join exactly the runs that hold one;
+            // a run without a marker keeps its boundaries.
+            if let Item::Str(s) = &item {
+                pending.push(s.clone());
+                if !s.contains('\u{7f}') && !pending.iter().any(|p| p.contains('\u{7f}')) {
+                    out.append(&mut pending.drain(..).map(Item::Str).collect());
+                }
+                continue;
+            }
+            flush(&mut pending, &mut out);
+            out.push(item);
+        }
+        flush(&mut pending, &mut out);
+        out
+    }
+
     /// Expand `template`/`templatearg` tokens in-place.
     ///
     /// `in_template` mirrors PHP's `wrapTemplates = !$options['inTemplate']`:
@@ -2430,6 +2594,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         body: bool,
         src_text: &str,
     ) -> Vec<Item> {
+        // A marker a module held and moved becomes the fragment placeholder it
+        // stood for, in the position the module left it.
+        let tokens = self.substitute_strip_markers(tokens);
         let mut out = Vec::new();
         // PHP's `tableDataBlock` context for the token being expanded: true while
         // the walk sits inside an unclosed `table` tag. A template body expanded
@@ -2952,7 +3119,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: &std::cell::Cell<usize>,
         page_source: Option<&str>,
         fragments: &mut std::collections::HashMap<usize, Node>,
-        next_id: &mut usize,
+        next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         use crate::wikitext::tokens_v2::{KV, KeyValue};
 
@@ -2982,9 +3149,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
             // Expand each templated key/value (template args and templates).
             let outer_fragments = &mut *fragments;
-            let outer_next_id = &mut *next_id;
             let fragments = std::cell::RefCell::new(std::mem::take(outer_fragments));
-            let next_id = std::cell::Cell::new(*outer_next_id);
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
@@ -3034,17 +3199,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 expanded_attrs,
                 about_counter,
                 false,
-                &|kv| {
-                    let mut id = next_id.get();
-                    let html = self.value_to_dom_html(kv, &mut fragments.borrow_mut(), &mut id);
-                    next_id.set(id);
-                    html
-                },
+                &|kv| self.value_to_dom_html(kv, &mut fragments.borrow_mut(), next_id),
                 page_source,
             );
             out.extend(result);
             *outer_fragments = fragments.into_inner();
-            *outer_next_id = next_id.get();
         }
         out
     }
@@ -3710,7 +3869,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // caller wrote `#uc`, not a page name, so there is nothing to attribute
         // a separate transclusion to.
         if matches!(request, FrameRequest::CallParserFunction { .. }) {
-            return crate::pipeline::lua_deferred::render_answer(&expanded);
+            return self.render_answer_markers(&expanded);
         }
         // `expandTemplate` is transclusion, so its expansion is wrapped the way
         // a template's is — but with the *module's* call as the source, not the
@@ -4386,8 +4545,8 @@ mod tests {
         // context).
         let kv = crate::wikitext::tokens_v2::KeyValue::Str("color:red".to_string());
         let mut fragments = std::collections::HashMap::new();
-        let mut next_id = 0usize;
-        let html = parser.value_to_dom_html(&kv, &mut fragments, &mut next_id);
+        let next_id = std::cell::Cell::new(0usize);
+        let html = parser.value_to_dom_html(&kv, &mut fragments, &next_id);
         assert_eq!(html, "color:red", "got: {html:?}");
     }
 

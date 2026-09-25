@@ -192,3 +192,32 @@ async fn the_lua_frame_method_reaches_the_same_handler() {
         "scoped css: {html}"
     );
 }
+
+/// A stylesheet and a tunnelled link caption must not share a fragment id.
+///
+/// Both reach the tree builder as `mw:DOMFragment` placeholders: the link
+/// tunnels its caption (`addLinkAttributesAndGetContent(…, true)`), and the
+/// stylesheet is resolved into its own fragment. With two counters both starting
+/// at 0 the ids collided, so `unpack_dom_fragments` spliced the stylesheet into
+/// the anchor — and the caption text vanished. PHP has one counter
+/// (`Env::newFragmentId`).
+#[tokio::test]
+async fn a_stylesheet_beside_a_link_keeps_the_link_text() {
+    let html = expand(
+        "<templatestyles src=\"Hlist/styles.css\"/>[[Main Page]]",
+        Some(("Template:Hlist/styles.css", ".a{b:1}", 7)),
+    )
+    .await;
+    assert!(
+        html.contains(">Main Page</a>"),
+        "link text survived: {html}"
+    );
+    assert!(
+        html.contains(r#"data-mw-deduplicate="TemplateStyles:r7""#),
+        "the stylesheet is still inlined: {html}"
+    );
+    assert!(
+        html.contains(".mw-parser-output .a{b:1}"),
+        "scoped css: {html}"
+    );
+}

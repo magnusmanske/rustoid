@@ -4623,3 +4623,124 @@ they asserted the *fixture's* imagined output rather than the function's actual
 behaviour, so each fix was a guess at a different wrong answer. The behaviour that
 settled it: a `\n` between a transclusion start marker and a table yields
 `["span", "table"]` — a lone text node never survives bare in a range.
+
+## Byte 477 was not the wrapper step: two fragment-id counters, one map
+
+The head `<span class="mw-empty-elt">` above was real, and it was not reachable by
+building the wrapper branch. What byte 477 actually turned on was a **fragment-id
+collision**, and the plan above was built on a wrong reading of rustoid's own
+tree.
+
+### The wrong reading
+
+`{{Redirect2|…}}`'s range content in rustoid was *not* `[style, div]`. A minimal
+probe that removes the page around it shows the truth:
+
+```
+{{Hatnote|Test [[Main Page]].}}
+rustoid: <div role="note" class="hatnote" about="#mwt1" …>Test <a href="./Main_Page">
+             <style …Module:Hatnote/styles.css…></style></a>.</div>
+```
+
+Two bugs in one line, and neither is about the wrapper branch:
+
+- the link's **label is gone** (`Main Page` was dropped), and
+- the stylesheet landed **inside the `<a>`** — as its only child.
+
+### The cause: two counters, both starting at 0
+
+`[[Main Page]]` renders its caption through a tunnelled DOM fragment
+(`render_wiki_link_with_fragment` → `dom_fragment_token`, PHP's
+`addLinkAttributesAndGetContent(…, $buildDOMFragment = true)`). The id came from
+`build_ast`'s token-side counter, which starts at `0`.
+
+`<templatestyles>` — reached through `frame:extensionTag` in `Module:Hatnote` —
+allocates its fragment id from `Parser::ext_next_id`, a **separate** counter that
+also starts at `0`. Both fragments then went into the one map the tree builder
+resolves `mw:DOMFragment` placeholders against (`fragments.extend(ext_fragments)`),
+so id `0` was ambiguous: `unpack_dom_fragments` spliced the stylesheet into the
+anchor and the caption text somewhere else, where it vanished.
+
+Probing the token stream directly (`RUSTOID_DUMP_TOKENS`) made it visible in one
+line: `TOK[1] … mw:dom-fragment-token data-fragment-id="0"` (the caption) and
+`TOK[3] <style typeof="mw:DOMFragment" data-fragment-id="0">` (the stylesheet) —
+the same id, in the same stream, for two different fragments.
+
+### The fix: one id space, as PHP has
+
+PHP keeps a **single** counter and a **single** map on the environment
+(`Env::newFragmentId` returns `"mwf" . $this->fid++`; `Env::setDOMFragment` stores
+into `$this->fragmentMap`). rustoid's split space was the deviation. The
+`next_id` parameter of every token-side pass is now a shared
+`&Cell<usize>`, and `build_ast` passes the parser's own counter
+(`&self.ext_next_id`) where it used to keep a local `usize`. Sub-pipelines that
+consume their fragments internally (`fragment_from_tokens_with_context`, a link
+caption's `build_inline_fragment`) keep a local `Cell::new(0)`; none of their ids
+reaches the top-level map.
+
+After the fix the minimal probe is:
+
+```
+{{Hatnote|Test [[Main Page]].}}
+rustoid: <div role="note" class="hatnote" about="#mwt1">Test <a href="./Main_Page">Main Page</a></div>
+```
+
+### The second bug underneath: a module's `extensionTag` answer was dropped
+
+With the collision fixed, the stylesheet was gone rather than misplaced. The
+`frame:extensionTag('templatestyles', …)` answer is the extension's *output*, which
+has no wikitext form in rustoid: it is an `mw:DOMFragment` placeholder.
+`lua_deferred::render_answer` converts tokens to their source, and a placeholder
+has none, so the answer came back **empty** — every stylesheet a module emitted
+this way was lost, which is also why
+`templatestyles_test::the_lua_frame_method_reaches_the_same_handler` had been
+failing since before `aac41df`.
+
+Scribunto's answer is a `\x7fUNIQ--name-hash-QINU\x7f` strip marker, and modules
+depend on that shape: `Module:Infobox` reorders its stylesheets by matching
+`\127…UNIQ--templatestyles-…QINU…\127` against `</tr>`, and `Module:Message box`
+hands the answer to `mw.html:wikitext()`. rustoid now emits that marker and
+substitutes it back:
+
+- `Parser::render_answer_markers` renders a frame call's expansion, replacing each
+  `mw:DOMFragment` placeholder with a marker and remembering the placeholder's
+  tokens under it (a `<style>` placeholder names its marker `templatestyles`, which
+  is what `Module:Infobox` matches).
+- `Parser::substitute_strip_markers`, run at the top of `expand_templates`, splices
+  the tokens back wherever the module left the marker. The tokenizer splits a
+  marker at every `-`, so the runs that hold a sentinel are joined first; a run
+  without one keeps its boundaries.
+
+The `about` id is still taken during expansion (that is what
+`Module:Infobox`'s numbering needs), and the marker carries the *fragment id*, not
+an about id, so re-expansion is not even needed: the marker goes straight back to
+the placeholder.
+
+`Template:Infobox`'s realignment (moving its stylesheets before `</tr>`) now has
+the marker to work on; whether it lands byte-for-byte is not yet measured.
+
+### Scoreboard after the two fixes
+
+`List of sovereign states`'s first difference moved from byte **477** to **1498**,
+and the subset's rustoid total grew from 3 761 177 to 3 879 985 bytes (0.70x →
+0.72x) as the missing stylesheets came back. `Help:Introduction` is still at
+403.
+
+### What byte 1498 is
+
+The head span and the div now match the service exactly. Two differences remain,
+both inside the div:
+
+1. **The div has no `id`.** The service serves
+   `<div role="note" class="hatnote navigation-not-searchable" about="#mwt2" id="mwBg">`;
+   rustoid omits `id="mwBg"`. `assign_node_ids` keys on a source range or
+   `data-mw`, and the div — the range member the wrapper step did *not* move
+   metadata onto — has neither (`dp=None dmw=false`). The service gives ids to
+   nodes the same walk finds nothing to key: a `<style about="#mwt3" dmw=…>` in the
+   same tree also has no id, while `#mwt2`'s div does, so "has an `about`" is not
+   the rule either. Not yet diagnosed.
+2. **A spurious category link.** rustoid emits
+   `<link rel="mw:PageProp/Category" href="./Category:Articles_with_hatnote_templates_targeting_a_nonexistent_page"/>`
+   after each link; the service emits none. `Module:Format link` decides the target
+   "does not exist", so its `mw.title` existence check is wrong in rustoid — a
+   different bug from the ids, and the next thing to look at.
