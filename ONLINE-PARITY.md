@@ -4744,3 +4744,31 @@ both inside the div:
    after each link; the service emits none. `Module:Format link` decides the target
    "does not exist", so its `mw.title` existence check is wrong in rustoid — a
    different bug from the ids, and the next thing to look at.
+
+### The div's id: where the search got to
+
+The div *does* have a full `dp` (dsr `[36,457,59,6]`, `stx:html`) and a blob with
+that `dsr` at encapsulation time. It loses both to
+`cleanup::discard_node`, which runs just before `assign_node_ids` and, for an
+interior member of a transclusion range, sets `node.data_parsoid = None`. The id
+pass keys on the blob, so the node is left unkeyed.
+
+That mirrors `CleanUp::markDiscardableDataParsoid`, but not its *effect* in PHP:
+there the `DataParsoid` object stays in the bag with a `DISCARDABLE_DP` temp flag,
+and `storeInPageBundle` still sees NodeData. Two experiments, both wrong:
+
+- Setting `empty_dp_slot` in `discard_node` ("the slot survives, the blob does
+  not") gave an id to the first `Category:Articles_with_short_description` link,
+  which the service leaves unkeyed — the first difference went *backwards*, to
+  byte 348. So a discarded dp does **not** key a node; the service's own
+  `$discardDataParsoid` branch suppresses `pbData->parsoid` outright.
+- Setting it for every non-transparent range member added ids across the whole
+  page (+17 KB) with no improvement.
+
+So the div and the first category link are both discarded interior range members,
+yet the service keys one and not the other. `markDiscardableDataParsoid`'s
+conditions do not distinguish them (both have `stx`, neither is the range's first
+or last node), so the difference is somewhere the four fetched PHP files do not
+show — most likely in how the *page bundle* records a node whose dp is empty but
+not `IS_NEW`. Reverted; the state is back at byte 1498. Next: resolve it against a
+real page bundle, which the inline HTML cannot answer.
