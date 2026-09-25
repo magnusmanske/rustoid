@@ -4768,7 +4768,55 @@ and `storeInPageBundle` still sees NodeData. Two experiments, both wrong:
 So the div and the first category link are both discarded interior range members,
 yet the service keys one and not the other. `markDiscardableDataParsoid`'s
 conditions do not distinguish them (both have `stx`, neither is the range's first
-or last node), so the difference is somewhere the four fetched PHP files do not
-show — most likely in how the *page bundle* records a node whose dp is empty but
-not `IS_NEW`. Reverted; the state is back at byte 1498. Next: resolve it against a
-real page bundle, which the inline HTML cannot answer.
+or last node). Reverted; the state is back at byte 1498.
+
+### The right-version sources (and what they settle)
+
+The dead end above was partly a **version trap**: the `/tmp` PHP files were from
+different commits. The served page says
+`data-mw-parsoid-version="0.24.0.0-alpha23"`, which is the git tag
+`v0.24.0-a23`, and the four files that matter are:
+
+| file | why |
+| --- | --- |
+| `src/Utils/DOMDataUtils.php` | `storeRichAttributes` / `storeInPageBundle` |
+| `src/Wt2Html/DOM/Handlers/CleanUp.php` | `markDiscardableDataParsoid` |
+| `src/Config/Env.php` | `setupTopLevelDoc` — the `serializeNewEmptyDp` flag |
+| `src/Parsoid.php` | `wikitext2html` — `storeInPageBundle` |
+
+What they settle, in the order the value flows:
+
+1. **`storeInPageBundle` is what assigns an id**, and it runs only when
+   `wikitext2html` is called with `pageBundle => true`
+   (`Parsoid::wikitext2html` passes `$env->pageBundle`). The inline attributes in
+   the served HTML are written afterwards, when the page bundle is converted back
+   with `toInlineAttributeHtml`. So the *id pass* sees a page bundle, not inline
+   attributes, even though the bytes on the wire are inline.
+2. **`serializeNewEmptyDp` is `true` for a wt2html top-level document
+   (`Env::setupTopLevelDoc`), and it is the load-bearing flag.** With it set,
+   `storeRichAttributes` gives **every** element that is not explicitly discarded
+   an empty `DataParsoid` — and an empty `DataParsoid` still produces a
+   `$pbData`, so the element takes an id while serializing no `data-parsoid`
+   (an empty one is not written). That is exactly the "takes an id, emits
+   nothing" slot `empty_dp_slot` models, and it is why most elements on a page
+   have ids that nothing else explains.
+3. **What removes the slot is `CleanUp::markDiscardableDataParsoid`**, which sets
+   a `DISCARDABLE_DP` temp flag on interior template-range nodes; a flagged node
+   fails the `!$discardDataParsoid` gate and gets no `$pbData->parsoid` at all.
+   So "discarded" really does mean "no id" — which is what the reverted
+   experiment assumed, and why it looked right for the category link.
+
+**The contradiction that remains.** Under (2) + (3) the div should be discarded:
+it is an interior member of the `#mwt2` range, it has `stx` (`"html"`), and it is
+neither the range's first node nor its last, so
+`( empty( $dp->stx ) || !( last === $node || isHeading ) )` holds either way —
+discarded by both branches. Yet the service keys it (`id="mwBg"`). Something in
+the traversal's `tplInfo` bookkeeping must make `$state->tplInfo` null (or the
+node the range's `last`) for exactly this node, and that is in
+`src/Utils/DOMTraverser.php` / `TemplateInfo.php`, not in the four files above.
+That is the next file to read — not another guess at the rule.
+
+Also worth fixing on the rustoid side regardless: `cleanup::discard_node` clears
+`node.data_parsoid` (the blob) but leaves `node.dp` (the structured object) alive,
+so rustoid's two representations disagree about whether a node has metadata. PHP
+has one representation and a flag.
