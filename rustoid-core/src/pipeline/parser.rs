@@ -3558,16 +3558,39 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let KeyValue::Tokens(items) = &kv.value else {
                 continue;
             };
-            if !items.iter().any(|it| {
+            // A template *argument reference* (`{{{1}}}`) is not a template, but it
+            // has to expand here too. Scribunto receives a `#invoke` argument with
+            // its `{{{…}}}` already substituted, and rustoid's `Frame::expand` —
+            // the substitute used by the paths that do expand it — is synchronous
+            // and only runs where the frame still has the argument. Left as written
+            // the text reaches the module verbatim: a `Module:Protected page`
+            // call whose `alt` was `Page {{{protectionlevel}}}` made the module
+            // emit `type(msg) ~= 'string'`, so the whole padlock indicator was
+            // replaced by a Lua error where the service renders
+            // `Page semi-protected` (the `Help:Introduction` difference at byte
+            // 403).
+            let has_template = items.iter().any(|it| {
                 matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t))
                     if t.name == "template" || t.name == "template3")
-            }) {
+            });
+            let has_arg_ref = items
+                .iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "templatearg"));
+            if !has_template && !has_arg_ref {
                 continue;
             }
+            // The argument reference is substituted from the **parent** frame, as
+            // MediaWiki does: the value was written in the calling template, and
+            // the child frame built below has no arguments of its own.
+            let substituted = if has_arg_ref {
+                frame.expand(items)
+            } else {
+                items.clone()
+            };
             let child = frame.new_child(frame.title().clone(), vec![]);
             let expanded = Box::pin(self.expand_templates(
                 &child,
-                items.clone(),
+                substituted,
                 source,
                 about_counter,
                 /* in_template */ true,
