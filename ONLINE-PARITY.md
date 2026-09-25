@@ -4602,3 +4602,24 @@ a `<span class="mw-empty-elt">` **before the first content node**, mark it
 `<p about="#mwt4" typeof="mw:Transclusion">` shape as well, since the head is then
 free to be a wrapper for the whole range rather than whichever node happened to
 carry `mw:Transclusion` first.
+
+## The wrapper step has a double-wrap trap (not yet built)
+
+An attempt at `ensureElementsInRangeAndAddAboutIds`' wrapper branch was written and
+then reverted, because a unit test caught what it did to the whitespace path.
+Recording the trap so the next attempt does not rediscover it.
+
+`wrap_transclusion_children` has *two* places that create the single-space `about`
+span a newline inside a range becomes: the `NodeKind::Text` arm of the content loop,
+and (in PHP) `addSpanWrappers`. In rustoid the loop's `is_deletable_in_range` gate
+does **not** drop a newline that sits between a transclusion marker and a
+`<table>` — so the newline becomes a `" "` span there. A wrapper step that then wraps
+"every node that is not an element" wraps that span again, producing
+`<span about=…><span about=…> </span></span>`. Whoever builds the branch has to skip
+what the first step already produced, or fuse the two steps into one.
+
+The three unit tests written for the branch were also wrong in a way worth naming:
+they asserted the *fixture's* imagined output rather than the function's actual
+behaviour, so each fix was a guess at a different wrong answer. The behaviour that
+settled it: a `\n` between a transclusion start marker and a table yields
+`["span", "table"]` — a lone text node never survives bare in a range.
