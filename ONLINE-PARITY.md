@@ -4820,3 +4820,60 @@ Also worth fixing on the rustoid side regardless: `cleanup::discard_node` clears
 `node.data_parsoid` (the blob) but leaves `node.dp` (the structured object) alive,
 so rustoid's two representations disagree about whether a node has metadata. PHP
 has one representation and a flag.
+
+### Solved: the traverser's `about`-sibling walk (and why the rule then fails)
+
+`DOMTraverser::traverseInternal` sets `tplInfo` on the first encapsulation
+wrapper it meets and — this is the part the four previous files could not show —
+**clears it again in two places**:
+
+```php
+// after running the handlers on a node
+if ( $this->traverseWithTplInfo && ( $state->tplInfo->clear ?? false ) ) {
+    $state->tplInfo = null;
+}
+...
+// after advancing
+if ( $this->traverseWithTplInfo && ( ( $state->tplInfo->last ?? null ) === $workNode ) ) {
+    $state->tplInfo = null;
+}
+```
+
+So `tplInfo` is live for the range's members **and** for everything *between*
+them, and goes null exactly when the walk reaches `last`. What is `last`?
+`WTUtils::getAboutSiblings` stops at the first following element whose `about`
+differs, then **trims trailing IEW** off the end. `markDiscardableDataParsoid`
+reads `tplInfo->first`/`tplInfo->last`, and `DOMUtils::isHeading` is `/^h[1-6]$/`
+(`v0.24.0-a23`), so the two boundary exemptions are the range's first node, its
+last node, and a heading.
+
+Measured against the real tree, `#mwt2`'s sibling list is:
+
+```
+<p> about=None
+<span> about=#mwt2 typeof=mw:Transclusion   <- tplInfo->first
+<div>  about=#mwt2                            <- interior, stx=html
+<span> about=#mwt2                            <- tplInfo->last
+```
+
+The div is **interior** (not first, not last), carries `stx: "html"`, and is not
+a heading — so `markDiscardableDataParsoid` discards it, and by the rule the
+div should have **no** id. The service gives it `id="mwBg"`.
+
+That contradiction is the useful result, because it rules the rule out as the
+complete explanation. What it means mechanically: with
+`serializeNewEmptyDp` true, discarding a node's `data-parsoid` does *not* remove
+the node from the id pass, because `storeRichAttributes` re-creates an empty
+`DataParsoid` for it (the `$dp === null` → `new DataParsoid` branch) on the way
+into the page bundle — while still suppressing the serialized attribute. Both
+facts are measured: rustoid's own div has `dp=Some(…dsr [36,457], stx=html)` at
+encapsulation time, and the service emits no `data-parsoid` for it.
+
+So the model rustoid needs is: **a node takes an id when it is an element that is
+not a stashed rendering-transparent node** — which is what the `empty_dp_slot`
+flag already means, and which the `markDiscardableDataParsoid` port gets wrong by
+dropping the slot along with the blob. Setting the slot in `discard_node` was
+tried in the previous session and made the *first* category link take an id the
+service does not give it, so "not rendering-transparent" is not the right filter
+for that node either; the two nodes differ in something the four files still do
+not show. Recorded, not guessed at.

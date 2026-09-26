@@ -242,6 +242,18 @@ fn discard_in_siblings(children: &mut [Node], in_native: bool) {
             // its last node, so it never gets the boundary exemptions.
             discard_in_range(&mut child.children, inside);
         }
+        // The `about`-sibling walk stops at the first element that does *not*
+        // share the range's id, so anything between two members is off-range. In
+        // PHP the traverser's `tplInfo` therefore goes null for those nodes and
+        // `markDiscardableDataParsoid` leaves their data-parsoid alone.
+        let mut j = i;
+        while j <= last {
+            if j > i && children[j].get_attr("about") != about.as_deref() {
+                let inside = in_native || is_native_ext(&children[j]);
+                keep_in_range(&mut children[j].children, inside);
+            }
+            j += 1;
+        }
         i = last + 1;
     }
 }
@@ -252,6 +264,17 @@ fn discard_in_range(children: &mut [Node], in_native: bool) {
         let inside = in_native || is_native_ext(child);
         discard_node(child, false, false, inside);
         discard_in_range(&mut child.children, inside);
+    }
+}
+
+/// A node sitting *between* two `about` siblings: the range walk stopped before
+/// it, so PHP's `tplInfo` is null and the node keeps its data-parsoid — and so
+/// takes an id. Its subtree is ordinary top-level content again, so the range
+/// marking restarts inside it.
+fn keep_in_range(children: &mut [Node], in_native: bool) {
+    for child in children.iter_mut() {
+        let inside = in_native || is_native_ext(child);
+        discard_in_siblings(std::slice::from_mut(child), inside);
     }
 }
 
