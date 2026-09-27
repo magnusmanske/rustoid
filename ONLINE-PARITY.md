@@ -4877,3 +4877,89 @@ tried in the previous session and made the *first* category link take an id the
 service does not give it, so "not rendering-transparent" is not the right filter
 for that node either; the two nodes differ in something the four files still do
 not show. Recorded, not guessed at.
+
+## The spurious hatnote category: a fetch is not a fact
+
+`List of sovereign states` served by rustoid carried **two**
+`<link rel="mw:PageProp/Category"
+href="./Category:Articles_with_hatnote_templates_targeting_a_nonexistent_page"/>`
+links that the service does not emit at all. They are not an id or a marking
+problem; they are the *module* reaching a branch the reference never reaches.
+
+### The chain, measured
+
+The name reaches `mw.title.new` correctly. Instrumenting `title_derived_field`
+(`RUSTOID_TITLE_DEBUG`) shows the exact reads on the real page:
+
+```
+TITLEDBG exists name="Lists of sovereign states and dependent territories" answer=false
+TITLEDBG exists name="Dependent territory"           answer=false
+TITLEDBG exists name="List of countries"            answer=false
+TITLEDBG exists name="List of nations"              answer=false
+TITLEDBG exists name="Portal:Countries"             answer=false
+```
+
+So the names are right and the answer is wrong, and `known=false` for all of them
+— which is the actual bug:
+
+```
+TITLEDBG miss key="List of sovereign states" text="List of sovereign states"
+have=["List of sovereign states/doc", "…/sandbox", "…/testcases",
+      "Template:Pagetype/doc", …]
+```
+
+The facts map holds only the `/doc`-family subpages. `preload_titles` discovers
+titles two ways — literals in module source (`referenced_titles`) and the
+`DOC_SUBPAGES` of every frame title — and **a page name arriving as a parameter is
+neither**. `Module:Hatnote list` hands `Module:Format link` a name straight out of
+`frame.args`, so nothing preloaded it, `title_facts_for` finds nothing, and
+`exists` answers `false`. `Module:Format link` then takes its
+`categorizeMissing` branch and emits the tracking category.
+
+That is the whole first bug. The second is that the obvious fix for it is wrong.
+
+### Why `exists` cannot simply record the title
+
+`title_derived_field` already has a `note_missing_title` hook, but it is narrowed
+to the **Module** namespace, and the comment says why: recording every probe once
+took the corpus failure count from 8 to 19. Widening it was tried, because the
+narrowing is what leaves `List of sovereign states` broken:
+
+1. **Recording every content title works for the hatnote and breaks
+   `Module:Portal`.** With the record widened, the two spurious category links
+   disappear and the rustoid total drops 984 718 -> 983 472 bytes — but byte 3
+   becomes the first difference, because a new script error appears:
+
+   ```
+   module Module:Portal/images/c does not exist ([string "Module:Portal"])
+   ```
+
+   Reproduced in isolation with `{{Portal|Countries}}`.
+
+2. **Adding the module preload for the answered title does not help.**
+   `Module:Portal`'s `exists()` helper is a *gate* around
+   `mw.loadData('Module:Portal/images/' .. subpage .. sandbox)` for all 27
+   letters. Answering `exists` true lets the module past the gate, and the
+   `loadData` then runs before anything fetched those submodules. Running
+   `preload` on the answered title does not fix it, because the submodule name is
+   built at runtime (`'Module:Portal/images/' .. subpage`) and so is not a
+   literal the scan can see — the same blind spot, one level down.
+
+3. **A third error follows the second** once the gate opens:
+   `Module:Redirect hatnote`:94 `bad argument #1 to 'find' (string expected, got
+   nil)` — the module read `exists` true, took its `not isRedirect` branch, and
+   called `redirTitle:getContent()`, which is `nil` because existence came from
+   `get_page_info` while the body was never fetched. Fetching the body too does
+   not help, because the body fetch re-enters the same gate problem.
+
+The general shape is the lesson, and it is worth stating plainly: **in this
+design `exists` and `loadData` are not independent answers.** A module uses the
+first to decide whether to attempt the second, so making existence answerable
+without the corresponding fetch does not fill a gap — it moves the failure from a
+wrong `false` to a wrong `true`, and the corpus got *worse*, not better.
+
+Everything was reverted; the state is back at byte 1498 and the guard at 876/896.
+The correct fix has to keep `exists` and the registry in step, which means the
+retry loop needs to fetch the titles a module's *new branch* will go on to
+`loadData` — and finding those requires resolving a runtime-built name, which is
+the original blind spot rather than a way around it.
