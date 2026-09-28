@@ -6875,3 +6875,28 @@ right phase (with the token carrying the id); `<style>`/`<pre>` were left to thi
 follow-up precisely because their id is rebuilt from rich `data-mw` attribs. The
 next step is to give templatestyles the same treatment: a placeholder that the
 chunk's extension phase numbers, in chunk order.
+
+**The inline resolution is wrong on its own, and a probe pins it.** The current
+`expand_one_templatestyles` runs during the item walk, so a `<templatestyles>`
+takes its id *where it sits* relative to templates. Parsoid numbers the chunk's
+templates first and its extensions after, so an extension that *precedes* a
+template in the source is still numbered second. The transform endpoint settles
+it — `<templatestyles src="Plainlist/styles.css"/>{{Center|b}}` (rendered as
+`Sandbox`):
+
+```
+wiki : Center about="#mwt1"   templatestyles about="#mwt2"
+rustoid: templatestyles #mwt1  Center #mwt2
+```
+
+The style is first in the source and rustoid numbers it first; the service
+numbers the transclusion first regardless. The nested shape already agrees —
+`{{Center|X<templatestyles …/>Y}}` is `#mwt1`/`#mwt2` on both sides, because the
+nested chunk's own extension phase runs after the wrapper's id is taken — so the
+bug is narrow: **an id-allocating extension before a template in the same
+chunk**. `pre`/`ref` already have the post-pass; `templatestyles` is the one left
+inline. Fixing it means the fragment is created inline (the CSS fetch is async)
+but its `about` is written by the chunk's extension post-pass, in document order
+— and `frame:extensionTag`'s answer must then carry the placeholder (not a
+numbered `<style>`), so the module's output chunk is where it is numbered. That
+is the three ids on `Nobel Prize`, and it is the next step.
