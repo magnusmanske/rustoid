@@ -366,14 +366,7 @@ impl CachedDataSource {
             .lock()
             .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
             .put(kind, &title, &body, meta)?;
-        if self
-            .pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
-            >= CACHE_FLUSH_EVERY
-        {
-            self.flush()?;
-        }
+        self.note_written()?;
         Ok(Some((body, Some(revid))))
     }
 }
@@ -552,14 +545,40 @@ impl DataSource for CachedDataSource {
     ) -> rustoid_core::Result<
         std::collections::HashMap<String, rustoid_core::traits::ProtectionEntry>,
     > {
-        // Offline, or a wiki that cannot answer: report nothing protected. That
-        // is what the trait's default does, and calling it explicitly keeps the
-        // reason next to the online branch rather than implicit in an absent
-        // override.
+        // A cached answer serves offline runs. Protection is a fact about a page
+        // that the wikitext cannot supply, so without this an offline render of
+        // any protected page reads "unprotected" and `Module:Protection banner`
+        // emits its "incorrect protection template" category where the service
+        // emits the real one.
+        let mut out = std::collections::HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for title in titles {
+            match self.cached_protection(title) {
+                Some(entry) => {
+                    out.insert(title.clone(), entry);
+                }
+                None => missing.push(title.clone()),
+            }
+        }
+        // Offline, or a wiki that cannot answer: a miss stays a miss. That is the
+        // conservative answer, and calling it out explicitly keeps the reason next
+        // to the online branch.
         let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
-            return Ok(std::collections::HashMap::new());
+            return Ok(out);
         };
-        Ok(crate::pageinfo::title_protection(client, titles).await)
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let fetched = crate::pageinfo::title_protection(client, &missing).await;
+        for title in missing {
+            // `title_protection` keys its answer by the request, falling back to
+            // the wiki's spelling, so an exact lookup finds it; the fallback keeps
+            // a title the wiki answered under a different name from being lost.
+            let entry = fetched.get(&title).cloned().unwrap_or_default();
+            self.store_protection(&title, &entry);
+            out.insert(title, entry);
+        }
+        Ok(out)
     }
 
     async fn get_file_info(
@@ -580,6 +599,60 @@ impl DataSource for CachedDataSource {
 
     async fn get_message(&self, _lang: &str, _key: &str) -> rustoid_core::Result<Option<String>> {
         Ok(None)
+    }
+}
+
+impl CachedDataSource {
+    /// A title's cached protection levels, if this cache holds them.
+    ///
+    /// A parse failure is treated as a miss rather than an error: the body is a
+    /// cache artifact written by this same code, and a corrupt one should be
+    /// re-fetched, not abort a parse.
+    fn cached_protection(&self, title: &str) -> Option<rustoid_core::traits::ProtectionEntry> {
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(EntryKind::Protection, title).ok().flatten());
+        cached.and_then(|hit| serde_json::from_str(&hit.body).ok())
+    }
+
+    /// Write a title's protection levels to the cache.
+    ///
+    /// A failure is swallowed: this is an optimisation for a later offline run,
+    /// and losing it must not turn a render into an error. The manifest flush is
+    /// the same rule every other cache writer follows.
+    fn store_protection(&self, title: &str, entry: &rustoid_core::traits::ProtectionEntry) {
+        let Ok(body) = serde_json::to_string(entry) else {
+            return;
+        };
+        let meta = EntryMeta {
+            kind: EntryKind::Protection,
+            title: title.to_string(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        if let Ok(mut guard) = self.cache.lock() {
+            let _ = guard.put(EntryKind::Protection, title, &body, meta);
+        }
+        let _ = self.note_written();
+    }
+
+    /// Count a cache write towards the next manifest flush.
+    ///
+    /// Extracted so every writer shares the rule: `WikiCache::put` does not
+    /// persist the manifest by itself, so a writer that skips this can leave
+    /// entries where a re-run cannot find them.
+    fn note_written(&self) -> Result<()> {
+        if self
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+            >= CACHE_FLUSH_EVERY
+        {
+            self.flush()?;
+        }
+        Ok(())
     }
 }
 

@@ -98,6 +98,11 @@ pub async fn page_info(
 /// from the returned map rather than present with an empty level — that
 /// distinction is what `Module:Effective protection level` reads.
 ///
+/// The result is keyed by the title *as requested*, not by the wiki's own
+/// spelling. The wiki normalises some spellings (underscores to spaces), and a
+/// caller looks its answer up by the string it asked with, so keying by the
+/// reply would drop it; the same reasoning [`page_info`] documents.
+///
 /// A failure is reported as "nothing is protected" rather than as an error, for
 /// the same reason [`page_info_soft`] exists: an unreachable wiki should degrade
 /// into a conservative answer, not abort a parse.
@@ -115,6 +120,10 @@ pub async fn title_protection(
         let Ok(parsed) = serde_json::from_str::<ProtectionResponse>(&body) else {
             continue;
         };
+        let mut asked: HashMap<String, String> = HashMap::new();
+        for t in chunk {
+            asked.insert(normalise(t), t.clone());
+        }
         for page in parsed.query.pages {
             let Some(title) = page.title else { continue };
             let mut entry = ProtectionEntry::default();
@@ -135,8 +144,19 @@ pub async fn title_protection(
                     .or_default()
                     .push(restriction.expiry.unwrap_or_default());
             }
+            // Key by the request where one is recognisable, so the caller finds
+            // its answer; fall back to the wiki's spelling otherwise.
+            match asked.get(&normalise(&title)) {
+                Some(original) => out.insert(original.clone(), entry.clone()),
+                None => out.insert(title.clone(), entry.clone()),
+            };
             out.insert(title, entry);
         }
+    }
+    // Anything the API never mentioned is unprotected, present with an empty
+    // entry so a caller cannot mistake "unknown" for "no such title".
+    for t in titles {
+        out.entry(t.clone()).or_default();
     }
     out
 }

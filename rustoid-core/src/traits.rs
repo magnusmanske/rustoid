@@ -3,6 +3,7 @@
 /// These traits abstract over different data sources (MediaWiki API, indexed dump, mock)
 /// so the parser core doesn't depend on any specific backend.
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::Result;
@@ -21,7 +22,7 @@ use crate::title::Title;
 /// wiki does not list is **not protected**, which is why an absent key rather
 /// than an empty vector is the signal — `Module:Effective protection level`
 /// reads the difference.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectionEntry {
     /// Action → the levels applied to it. More than one can apply at once
     /// (`autoconfirmed` plus `sysop`, say), and the first is the one Scribunto

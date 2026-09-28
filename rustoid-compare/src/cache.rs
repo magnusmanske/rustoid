@@ -50,6 +50,14 @@ pub enum EntryKind {
     /// Entities live on their own wiki, so this kind is cached under that wiki's
     /// directory rather than the article wiki's.
     Entity,
+    /// A page's protection levels, as JSON.
+    ///
+    /// Protection is a fact about a page that a module reads through
+    /// `title.protectionLevels`, and it cannot be derived from the page body:
+    /// an offline run that has the wikitext still needs this answer, and the
+    /// answer is not in the wikitext. Cached per title so a populated cache can
+    /// serve it offline, exactly as it serves the body.
+    Protection,
 }
 
 impl EntryKind {
@@ -71,6 +79,7 @@ impl EntryKind {
             Self::Rendered => "html",
             Self::SiteInfo => "siteinfo",
             Self::Entity => "entity",
+            Self::Protection => "prot",
         }
     }
 
@@ -83,6 +92,7 @@ impl EntryKind {
             "html" => Some(Self::Rendered),
             "siteinfo" => Some(Self::SiteInfo),
             "entity" => Some(Self::Entity),
+            "prot" => Some(Self::Protection),
             _ => None,
         }
     }
