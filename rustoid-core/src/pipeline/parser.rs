@@ -3093,6 +3093,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .map(|t| t.contains("<!--"))
             .unwrap_or(false);
 
+        // The transclusion's `data-mw.target.wt` is the *source substring* of
+        // the target key, not the cleaned name: PHP's
+        // `TemplateEncapsulator::getTemplateInfo` takes it from
+        // `$params[0]->srcOffsets->key->substr($src)`, which skips leading
+        // whitespace but keeps trailing whitespace and comments. So
+        // `{{Infobox machine\n|…}}` records `"Infobox machine\n"` and
+        // `{{Use dmy dates|…}}` records `"Use dmy dates"`, while `target_str`
+        // (trimmed, comments stripped) is what resolves the template.
+        let target_wt = stt
+            .data_parsoid
+            .src
+            .as_deref()
+            .and_then(raw_template_target)
+            .map(|t| t.trim_start().to_string())
+            .unwrap_or_else(|| target_str.clone());
+
         let mut out = Vec::new();
         let resolved = resolve_template_target(self.config, Some(frame.title()), &target_str);
         // Whether this call's result is a *string* the token stream re-tokenizes,
@@ -3235,7 +3251,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         source,
                         frame,
                         &name,
-                        &target_str,
+                        &target_wt,
                         &title,
                         &params,
                         about_id,
@@ -3519,7 +3535,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         name: &str,
-        target_str: &str,
+        // The raw source of the target, for `data-mw.target.wt`.
+        target_wt: &str,
         title: &crate::title::Title,
         params: &crate::pipeline::parser_functions::Params,
         about_id: String,
@@ -3766,7 +3783,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
         let mut info = template_info_from(None, Some(name), vec![]);
-        info.target_wt = Some(target_str.to_string());
+        info.target_wt = Some(target_wt.to_string());
         // The *called* title, not the redirect's target: `data-mw.target` names
         // what the page wrote, and a followed redirect must not rename it.
         info.href = Some(crate::title::make_link(&called_title, self.config));
