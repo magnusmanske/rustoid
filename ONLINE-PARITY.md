@@ -5192,3 +5192,74 @@ Both are now blocked on the *same* class, which is the next thing to take: an
 `{{#ifexist:Category:{{{1}}} {{{2}}} {{{3}}}}}` reaching the output unexpanded
 through `Template:Use British English` → `Module:Unsubst`. It is the
 lazily-expanded-argument-value family already recorded for `Bicycle`.
+
+## The lazily-expanded argument value, and the two wrong answers
+
+`Bicycle`'s remaining difference was the short-description category:
+`Short_description_is_different_from_Wikidata` where the service emits
+`..._matches_Wikidata`. `Module:SDcat` compares the local short description with
+`mw.wikibase.getDescription()`, and the local one arrives through
+`frame:getParent().args.sd`; the module was reading `{{{1|}}}`.
+
+The chain is `Short description → Main other → SDcat`, and the value's *tokens*
+were correct the whole time. What was wrong was which representation the parser
+read back:
+
+- `kv.value` — the expanded tokens — held the description.
+- `kv.src_offsets` — the recorded source range — still held the wikitext as
+  written, `{{{1|}}}` included.
+
+`frame_args_to_lua` preferred the range (`kv_value_source`), so the module got the
+stale source. The fix reads the tokens **when they are all plain text**, which is
+exactly when the range is stale and the tokens are complete.
+
+### Why not simply prefer the tokens
+
+Because rustoid's token→text rendering is lossy, and preferring the tokens
+everywhere traded one wrong rendering for another. Measured, not assumed: with
+`frame_args_to_lua` reading the tokens unconditionally, `Megadeth`'s hatnote —
+`For a definition of that term, see the Wiktionary entry megadeath` — collapsed to
+`, see the Wiktionary entry ` and the page lost 50 KB, and the same shape cost
+`Sundial` 70 KB. `tokensToString` has no arm for a wikilink, a tag, or an
+unexpanded parser-function token, and drops each; a value made of those has no
+faithful textual form in rustoid today, so the range remains the lesser evil for
+it. **Rendering those tokens faithfully is the follow-up**, and it is what would
+let the range be dropped entirely.
+
+A second attempt — invalidating `src_offsets` at the substitution itself, in
+`Frame::expand`'s attribute walk — is the *right place* conceptually and the
+wrong one in practice: the same `KV` is read by the DOM pipeline, so dropping the
+offsets there also changes `data-mw`/attribute reconstruction and moved content
+far beyond the Lua path (Bicycle lost 148 KB). The offsets need to be split, or
+the Lua-facing text computed at expansion time and stored, before that can work.
+Both attempts were reverted; the record above is what they measured.
+
+### The first argument was never expanded at all
+
+Found while tracing the above, and a bug in its own right: `expand_invoke_args`
+iterated `args.iter_mut().skip(1)` with the comment "`args[0]` is the `#invoke:`
+target and has already been resolved". That is true of the call's own argument
+list and false of a **parent frame's**, which has no target — so the calling
+template's *first* argument was left unexpanded. It is the position
+`{{see Wiktionary|…}}` uses to hand its text to `Module:Hatnote`, which is why the
+hatnote reads `args[1]`.
+
+The fix passes the arguments to expand as a slice, so each caller says which list
+it means (`&params.args[1..]` for the call's own, the whole list for the parent's)
+and the two cannot be confused again.
+
+### Scoreboard
+
+```
+Bicycle                   first difference at byte 733 (was 538); category agrees
+List of sovereign states  1947   (the {{#ifexist:…}} leak below, still open)
+Megadeth                  1650   (unchanged)
+fixture guard             876/896
+subset total              3 880 069 bytes (was 3 880 042)
+```
+
+The `List of sovereign states` difference is still the `{{#ifexist:Category:{{{1}}}
+{{{2}}} {{{3}}}}}` reaching the output through `Template:Use British English` →
+`Module:Unsubst`. That is a different shape from the above — a `{{safesubst:}}`
+invocation whose `$B` body is returned by the module and then re-expanded — and it
+is *not* fixed by any of this, so it is the next thing to reduce.
