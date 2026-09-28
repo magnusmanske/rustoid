@@ -5324,3 +5324,74 @@ piecemeal. That is a bigger job than this session had room for, and landing it
 half-done would trade a mis-resolution for a silent loss.
 
 Reverted; the tree is back at the previous section's state.
+
+## The `Use British English` leak is `#ifexist`, and nothing else
+
+`List of sovereign states`'s difference at byte 1947 was recorded as a
+`{{#ifexist:Category:{{{1}}} {{{2}}} {{{3}}}}}` reaching the output through
+`Template:Use British English` → `Module:Unsubst`. Reducing it settles what the
+Unsubst/`safesubst:` part actually costs: **nothing**. The safesubst invocation is
+handled — `$B` is returned by the module and re-expanded, `{{{date|}}}` is
+substituted in the frame that wrote it — and the leak is reachable without any of
+it:
+
+```
+{{Dated maintenance category|1=A|2=B|3=C|4=D}}
+```
+
+on a plain page produces
+
+```html
+<link rel="mw:PagePropCategory" href="./Category:A_B_C"/>
+<span>{{#ifexist:Category:{{{1}}} {{{2}}} {{{3}}}
+    | … |[[Category:Articles with invalid date parameter in template]]}}</span>
+```
+
+Note the two failures in one fragment. `[[Category:A B C]]` — the branch
+*condition* — is substituted and rendered correctly, so the frame work in the
+path is fine. The `#ifexist` is emitted **verbatim from the token's source**, with
+its arguments still carrying `{{{1}}}`.
+
+### Why
+
+`{{#ifexist:…}}` is not implemented. It falls through to the unknown-parser
+function arm of `TemplateHandler::call_parser_function`, whose contract is
+"preserve the original source verbatim" — `token_src`, the wikitext the token was
+tokenized from. That is the right answer in *standalone* Parsoid (which has no
+wiki to ask and emits `Parser function implementation for pf_ifexist missing`),
+and the wrong one in integrated mode, where the wiki answers it.
+
+The `{{{1}}}` is not a separate bug: the source is what the token was tokenized
+from, so it holds the body's text before substitution. Re-rendering the fallback
+from its (substituted) attribs is therefore free and more faithful — but it is not
+a parity gain, because the `#ifexist` itself still would not run, and the branch it
+selects is the difference.
+
+### What implementing it costs
+
+`#ifexist` is a *synchronous* parser function whose answer needs an async
+existence check — the same shape as `PROTECTIONLEVEL`, which rustoid answers from a
+pre-pass (`collect_protection_titles`) that fetches `get_title_protection` before
+expansion runs. That pattern **cannot** be reused here, and the reason is worth
+recording because it is the general obstacle:
+
+- The title to check is written inside a template's body
+  (`Category:{{{1}}} {{{2}}} {{{3}}}`), and at pre-scan time — before expansion —
+  its arguments are unsubstituted, so the string a pre-pass would collect is not
+  the title. `collect_protection_titles` has the same hole, and the notebook
+  already records that a `{{PROTECTIONLEVEL:…}}` arriving from a template "reads as
+  unprotected"; for `#ifexist` that would mean taking the *wrong branch* on every
+  such call, which is worse than the current visible leak.
+- The existence map the parser already builds (`add_red_links`) is a *DOM
+  post-pass*, so it is not available during expansion either.
+
+So a faithful `#ifexist` needs a **deferred answer for magic words**: raise a
+request while expanding, have the host fetch the title, and re-run the expansion
+with the answer — which is the mechanism `frame:expandTemplate` and friends
+already use for Lua (`pipeline/lua_deferred.rs`), generalized from module frame
+calls to parser functions. That is the next architectural step, not a local fix,
+and it also carries MediaWiki's 500-call expensive-parser-function limit.
+
+Recorded rather than attempted: the session had no room for a mechanism of that
+size, and a half-answer (branching on an unsubstituted title) would be a
+regression dressed as progress.
