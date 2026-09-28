@@ -2179,21 +2179,10 @@ fn luafn_title_new(
     // as a lookup closure, under a key the metatable knows.
     let facts_for_lookup = facts.clone();
     let full_for_lookup = full.clone();
-    // Whether this title is in the Module namespace, resolved once here because
-    // the closure below cannot reach the site. Only a module's missing facts
-    // drive a fetch (see `title_derived_field`).
-    let is_module = ctx.site.namespace_name(ns_id) == "Module";
     table.raw_set(
         TITLE_FACTS_KEY,
         lua.create_function(move |lua, (_this, key): (Value, String)| {
-            title_derived_field(
-                lua,
-                &key,
-                &facts_for_lookup,
-                is_current,
-                &full_for_lookup,
-                is_module,
-            )
+            title_derived_field(lua, &key, &facts_for_lookup, is_current, &full_for_lookup)
         })?,
     )?;
 
@@ -2308,34 +2297,34 @@ fn title_derived_field(
     facts: &Option<TitleFacts>,
     is_current: bool,
     full: &str,
-    is_module: bool,
 ) -> mlua::Result<Value> {
     match key {
         "exists" => {
-            // A title the host was never asked about is *unknown*, not absent —
-            // but only a **module** is worth insisting on.
+            // A title the host was never asked about is *unknown*, not absent.
+            // Scribunto answers this from the wiki's database, so the faithful
+            // answer is the page's real existence; rustoid approximates it with
+            // a preload, and when the preload missed, the retry loop is asked to
+            // fetch it and answer properly next round.
             //
             // `preload_titles` finds titles by scanning module source for
             // literals, so a name built at runtime —
-            // `mw.title.new('Module:Location map/data/' .. map)` — is invisible
-            // to it. Reading `false` for such a title makes the module take its
-            // "does not exist" branch and never attempt the load, so nothing
-            // records a miss and the retry loop has nothing to act on: the
-            // failure is then the *module's own* message, which is why
-            // `Module:Location map` said the definition "does not exist" while
-            // the page was sitting in the cache.
+            // `mw.title.new('Module:Location map/data/' .. map)`, or a page name
+            // arriving through `frame.args` — is invisible to it. Reading
+            // `false` for such a title makes the module take its "does not
+            // exist" branch: `Module:Format link` then emits a spurious
+            // tracking category, and `Module:Location map` says its definition
+            // "does not exist" while the page is sitting in the cache.
             //
-            // The narrowing to the Module namespace is what keeps this from
-            // being a regression rather than a fix. A module that *probes* for a
-            // page — `pcall(function() return title.exists end)`, which
-            // `Module:Portal` uses to test its data subpages — is asking a
-            // question it has an answer for, and `false` is that answer: making
-            // every probe a fetch turned four portal subpages into "does not
-            // exist" errors and took the failure count from 8 to 19. A data
-            // module is different — the module needs its *contents*, cannot
-            // proceed without them, and the retry loop can fetch it.
+            // Recording *every* probed title, in any namespace, is deliberate:
+            // the answer Scribunto gives does not depend on the namespace. The
+            // one hazard is a module that probes a title only to decide whether
+            // to `loadData` it, because a `true` answer then unlocks a load the
+            // registry may not satisfy; that is handled where it happens — a
+            // runtime `loadData` of an unfetched module raises
+            // [`crate::lua::engine::MISSING_MODULES`] and the loop fetches it —
+            // so existence and the registry stay in step.
             let known = is_current || facts.is_some();
-            if !known && is_module && !full.is_empty() {
+            if !known && !full.is_empty() {
                 note_missing_title(lua, full)?;
             }
             Ok(Value::Boolean(
@@ -7647,17 +7636,24 @@ mod tests {
         );
     }
 
-    /// A *non*-module title that a module probes for is answered `false` and is
-    /// **not** requested.
+    /// A title in *any* namespace that a module probes is requested, not just a
+    /// module-namespace one.
     ///
-    /// `Module:Portal` wraps the read in `pcall` and its own comment says a
-    /// failure means "we're out of expensive parser function calls … in that case,
-    /// don't throw a Lua error": a probe has an answer, and `false` is it.
-    /// Requesting every probe turned four portal subpages into "does not exist"
-    /// errors and took the corpus's failure count from 8 to 19 — which is what
-    /// makes the Module-namespace narrowing load-bearing rather than tidy.
+    /// Scribunto answers `title.exists` from the wiki's database, and that answer
+    /// has nothing to do with the namespace, so rustoid must be able to fetch the
+    /// title whichever namespace it is in. The narrowing to the Module namespace
+    /// was an earlier workaround, and it is what left a spurious tracking
+    /// category on `List of sovereign states`: `Module:Format link` reads
+    /// `mw.title.new(parsed.page).exists` for a page name that arrived through
+    /// `frame.args`, so the preload scan could not see it, and the `false`
+    /// answer took the module's `categorizeMissing` branch.
+    ///
+    /// The coupling that made the narrowing look load-bearing — a module that
+    /// probes a title only to decide whether to `loadData` it — is handled where
+    /// it actually occurs: a runtime `loadData` of an unfetched module raises its
+    /// own recoverable signal, so existence and the registry stay in step.
     #[test]
-    fn an_unknown_non_module_title_is_not_requested() {
+    fn an_unknown_title_in_any_namespace_is_requested() {
         let engine = make_engine();
         for query in [
             r#"'Template:Some/thing'"#,
@@ -7670,9 +7666,10 @@ mod tests {
                 "false",
                 "{query}"
             );
-            assert!(
-                engine.take_missing_titles().is_empty(),
-                "{query} must not be fetched"
+            assert_eq!(
+                engine.take_missing_titles(),
+                vec![query.trim_matches('\'').to_string()],
+                "{query} must be fetchable so the answer can be truthful"
             );
         }
     }
