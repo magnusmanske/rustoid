@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use rustoid_compare::cache::WikiCache;
-use rustoid_compare::harness::CachedDataSource;
+use rustoid_compare::harness::{CachedDataSource, SiblingWiki};
 use rustoid_compare::siteconfig::WikiSiteConfig;
 use rustoid_compare::wire::{Wiki, WikiClient};
 
@@ -46,6 +46,24 @@ async fn main() {
         None
     };
     let cache = Arc::new(Mutex::new(cache));
+    // `mw.wikibase` reads entities from Wikidata, which is a *different* wiki
+    // with its own cache. The comparison harness attaches it; without it here a
+    // probe of any page that touches `mw.wikibase` diverges from the real run
+    // (SDcat reported "empty Wikidata description" for a page whose entity was
+    // cached), which makes the probe lie about exactly the bugs it is used to
+    // find.
+    let entities = {
+        let mut entities_cache =
+            WikiCache::open(&root, "www.wikidata.org").expect("open entity cache");
+        if entities_cache.is_empty() {
+            let _ = entities_cache.reindex();
+        }
+        let client = WikiClient::new(Wiki::new("www.wikidata.org")).expect("entity client");
+        SiblingWiki {
+            client: Arc::new(client),
+            cache: Arc::new(Mutex::new(entities_cache)),
+        }
+    };
     let started = std::time::Instant::now();
     // The render is capped, because the whole point of this example is diagnosing
     // an expansion that does not terminate: without a cap it hangs forever instead
@@ -62,7 +80,7 @@ async fn main() {
         .unwrap_or(60.0);
     let wrap_sections = std::env::var_os("RUSTOID_WRAP_SECTIONS").is_some();
     let worker = tokio::task::spawn_blocking(move || {
-        let source = CachedDataSource::new(client, cache, !online);
+        let source = CachedDataSource::new(client, cache, !online).with_entities(Some(entities));
         let options = rustoid_core::ParserOptions {
             node_ids: true,
             strip_data_parsoid: true,
