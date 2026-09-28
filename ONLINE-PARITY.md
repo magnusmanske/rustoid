@@ -5116,3 +5116,79 @@ So the next step is a dedicated `indicator` handler in `extension_handler`, plus
 the nowiki interaction above it, not a generic "unknown extension" fallback: most
 unimplemented extensions have visible output that a `<meta>` would lose, and only
 `indicator` is a meta precisely because MediaWiki hoists it to `<head>`.
+
+## The indicator, and what the placeholder was throwing away
+
+The prediction in the previous section held: implementing `<indicator>` moved both
+nearest pages past the protection block. `List of sovereign states` now differs at
+the `{{#ifexist:…}}` leak in `Template:Use British English` instead of at the
+padlock, and its protection paragraph is **byte-identical** to the served bytes:
+
+```html
+<p class="mw-empty-elt" id="mwBw"><span typeof="mw:Nowiki mw:Transclusion"
+  about="#mwt4" data-mw='…' id="mwCA"></span><meta
+  typeof="mw:Extension/indicator" about="#mwt4" data-mw='{"name":"indicator",
+  "attrs":{"name":"pp-default"},"body":{"extsrc":"[[File:Semi-protection-…]]"}}'
+  id="mwCQ"/><link rel="mw:PageProp/Category" href="./Category:Wikipedia_…"
+  about="#mwt4" id="mwCg"/></p>
+```
+
+Two things are worth keeping from this one, because both were surprises that the
+served bytes settled and reasoning alone would have got wrong.
+
+### The indicator is not a `ParserHook` element
+
+The `<meta>` is not just *spelled* differently from a normal extension's output —
+it is a different construction. A `divtag`/`spantag`/`pre` is a real element whose
+body is tunnelled through it; an indicator has no body in the document at all.
+Parsoid records the declaration in `data-mw` and MediaWiki renders it into the
+page header from there. That is why:
+
+- the body is `extsrc` — raw and **unexpanded**, so the file spec is recorded as
+  the module wrote it rather than resolved by us. On the page that is the full
+  `[[File:Semi-protection-shackle.svg|20px|link=…|alt=…|This article is
+  semi-protected.]]`.
+
+One trap here, recorded because it cost a wrong turn: the *isolated* probe of
+`{{#tag:indicator|…|name=pp-default}}` recorded an empty pipe parameter
+(`…|20px|`). That is an artifact of the probe, not the rule — in a plain page the
+`{{#tag:}}` argument splitter eats the parameter after the pipe. **The page is the
+oracle**; the probe is for shape. The rule is the simple one: passthrough.
+
+### The tree builder was discarding the placeholder's metadata
+
+This is the part that cost the time, and it is a general defect rather than an
+indicator quirk. A `mw:dom-fragment-token` carried `typeof` and `data-mw` on the
+token, and `process_selfclosing` threw both away: it built the placeholder
+attributes from scratch as
+
+```rust
+let attrs = Attributes::from_pairs(vec![
+    ("typeof".to_string(), "mw:DOMFragment".to_string()),
+    (DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()),
+]);
+```
+
+Every placeholder therefore became a typeless `<meta>`, and the *fragment* it
+stood for — a bare `<meta>` with no attributes of its own — could not supply the
+missing type at unpack time. Any future extension shaped like this (metadata
+recorded on the extension, element carrying no body) would have failed the same
+way, which is why the fix is in `stash_fragment`/`process_selfclosing` rather
+than in the indicator handler.
+
+`mw:DOMFragment` stays the fallback when the token carries no `typeof`, so
+transclusion markers are untouched; the guard is on absence, not on a whitelist.
+
+### Scoreboard
+
+```
+List of sovereign states  first difference at byte 1947 (protection block now exact)
+Help:Introduction          first difference at byte 416
+fixture guard              876/896
+clippy                     0 warnings
+```
+
+Both are now blocked on the *same* class, which is the next thing to take: an
+`{{#ifexist:Category:{{{1}}} {{{2}}} {{{3}}}}}` reaching the output unexpanded
+through `Template:Use British English` → `Module:Unsubst`. It is the
+lazily-expanded-argument-value family already recorded for `Bicycle`.
