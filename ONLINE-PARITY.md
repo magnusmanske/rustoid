@@ -6337,3 +6337,123 @@ remains is no longer markup: the infobox reference renders as
 `about="#mwt11"` in Parsoid and `about="#mwt199"` in rustoid. That is the
 `about`-id allocation order — the same lazy-`frame.args` shape recorded above,
 now the single thing standing between `Bicycle` and byte parity.
+
+## The encapsulation merge: a whole-DOM range plan
+
+`Help:Introduction` opened with `<noinclude>{{pp-semi-indef|small=yes}}</noinclude>{{intro to single|…}}`,
+and the service served **one** `<p about="#mwt4" typeof="mw:Transclusion">` whose
+`data-mw.parts` were `[pp-semi-indef, "</noinclude>", intro-to-single]` — with
+`"i":0` and `"i":1` on the two templates. rustoid emitted only the second
+template, and the first diff sat at byte 492, inside that attribute.
+
+The shape is PHP's `DOMRangeBuilder::findTopLevelNonOverlappingRanges`. The
+`intro to single` markers straddle the paragraph boundary (its start marker
+lands *inside* the auto-inserted `<p>`, its end marker after the template's
+`<div>`), so its range lifts to the `<p>`'s parent; the `pp-semi-indef` range
+lives entirely inside that `<p>`, so its start marker's **ancestor** carries the
+outer range and it is *nested*. A nested range is not encapsulated at all: its
+markers are dropped and its template object — plus the source wikitext between
+the two templates — is recorded into the enclosing range's `compoundTpls`, then
+`i` is renumbered across the merged list.
+
+rustoid could not see this. Its encapsulation is a bottom-up walk, one sibling
+list at a time, so a marker whose partner is in a different list is invisible to
+it until `wrap_flipped_children` reaches their common ancestor — and by then the
+inner range has already been encapsulated as its own `<span>`. The fix is a
+range *plan* computed once over the whole DOM before any encapsulation, in a new
+module-level pass (`compute_range_plan`):
+
+1. walk the tree collecting `mw:Transclusion[/End]` markers with their paths,
+   `dsr`, and `data-mw` parts (PHP's `findWrappableTemplateRanges`);
+2. pair them by `about`, and for each pair compute the common ancestor and the
+   two top-level siblings on the start and end paths (PHP's `findEnclosingRange`);
+3. attach each range to the top-level nodes it spans, then reproduce PHP's
+   nesting walk and overlap merge, building `compoundTpls` as `subsumedRanges`
+   records it (`findTopLevelNonOverlappingRanges`);
+4. hand the two facts that need the whole tree back to the existing per-list
+   code: which `about`s are absorbed, and the compound `data-mw.parts` each
+   surviving range must carry.
+
+`wrap_transclusion_children` now drops both markers of an absorbed range (both
+are in one sibling list in the case that matters) instead of encapsulating it,
+and takes its `data-mw` from the plan's compound parts — text-split and
+`i`-renumbered, not through `serde_json`, which sorts object keys and would lose
+the byte comparison. `wrap_flipped_children` uses the same compound when it
+transfers a cross-paragraph range onto its target.
+
+**Effect.** `Help:Introduction`'s first difference moved 492 → **1098** on the
+strength of the correct `<p>` `data-mw` alone.
+
+### The wrong turn: pre-removing the absorbed markers
+
+PHP removes a nested range's marker metas in `findTopLevelNonOverlappingRanges`,
+before `encapsulateTemplates`. Copying that — a pre-pass deleting every absorbed
+range's markers by path — **broke two table fixtures**: `{{tbl-start}}…{{tbl-end}}`
+tables stopped putting `typeof="mw:Transclusion"` on the `<table>` and put it on
+the `<tbody>` instead. Deleting the markers changed the *enclosing* range's
+`range_end` scan, and `table_body_content_target`'s `well_balanced` test flipped
+with it. The markers are not independent data: the enclosing range is recomputed
+from the DOM in rustoid, while PHP carries a precomputed `DOMRangeInfo` through.
+The pre-pass was reverted; letting each sibling list drop the absorbed markers
+as it reaches them achieves the same DOM without moving the enclosing range. The
+guard is back at 876/896.
+
+### Two rules for `<noinclude>`: a value keeps it, a target strips it
+The next difference (1098) was the `lead` argument's `wt`: the service recorded
+`…the basics<noinclude>, and each tutorial…quickly.</noinclude>`, rustoid recorded
+it with the tags gone. `prepare_tpl_param_infos` was running
+`strip_include_directives` over every argument value. That is the *target* rule,
+not the value rule — the transform endpoint settles both:
+
+```
+{{1x|a<noinclude>X</noinclude>b}}       → params.1.wt = "a<noinclude>X</noinclude>b"
+{{1x|a<includeonly>X</includeonly>b}}   → params.1.wt = "a<includeonly>X</includeonly>b"
+{{1x|a<onlyinclude>X</onlyinclude>b}}   → params.1.wt = "a<onlyinclude>X</onlyinclude>b"
+{{#if:<includeonly>X</includeonly> |y|n}}→ target.wt  = "#if: "        (whole gone)
+{{#if:a<noinclude>X</noinclude> |y|n}}  → target.wt  = "#if:aX "       (tags gone)
+```
+
+A template argument's `wt` is the source **as written**, tags and all; only a
+parser-function target goes through the preprocessor's include handling. Dropping
+the strip from the value path moved the first difference 1098 → **5161** and
+held the guard at 876/896.
+
+### What is left on `Help:Introduction`
+
+At 5161 the divergence is the `pp-semi-indef` range's own output, now bare inside
+the `<p>` as intended. Two defects remain there, neither about the merge:
+
+- rustoid leaves an empty `<span typeof="mw:Nowiki"></span>` where the service
+  has none — the absorbed range's marker-shape target, which Parsoid never
+  builds because a nested range is never encapsulated;
+- the `<meta typeof="mw:Extension/indicator">` has lost its `about`. Parsoid
+  gives it `about="#mwt3"` (the pp invocation's id, assigned when the extension
+  was emitted inside the expansion, not at encapsulation). rustoid only ever set
+  that `about` during encapsulation, so skipping the nested range drops it.
+
+Both are downstream of *how many* ids the two engines hand out and in what
+order — the lazy-`frame.args` shape that also blocks `Bicycle` — so the merge is
+the last purely-structural piece of this page.
+
+### Scoreboard after the merge
+
+```
+Help:Introduction         492 -> 5161
+Nobel Prize               1112  (unchanged)
+Megadeth                  2801  (unchanged)
+Unix                      4772  (unchanged)
+Quicksilver (film)        2732  (unchanged)
+Bicycle                   8151  (unchanged)
+Sundial                   1897  (unchanged)
+List of sovereign states  4009  (unchanged)
+Zebra                     2172  (unchanged)
+fixture guard             876/896
+subset total              3 846 606 -> 3 818 304
+```
+
+Every other page's first difference is byte-identical to the previous run, so the
+merge changed only `Help:Introduction`'s head. The subset total fell ~28 KB, and
+almost all of it is `List of sovereign states` (718 370 → 692 977): the absorbed
+ranges' eager wrapper spans are gone. That is a *structural* drop, not lost
+content — a text-only comparison of the two renderings (tags stripped, entities
+decoded) has the new one 326 bytes **larger**, not smaller.
