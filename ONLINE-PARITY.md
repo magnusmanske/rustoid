@@ -6216,10 +6216,40 @@ Nobel Prize                600 -> 1112
 Megadeth                  1650 -> 2801
 Unix                      1736 -> 4772
 Quicksilver (film)        1551 -> 2732
-Bicycle                   3168 -> 6979
+Bicycle                   3168 -> 6979   (then the diff changed; see below)
 Sundial                   1897        (unchanged; media cache)
 List of sovereign states  2771 -> 4009
 Zebra                     2172        (unchanged)
 fixture guard             876/896
 subset total              4 007 778 -> 3 799 716 (0.71x)
 ```
+
+### After the file-info cache (offline, 138 files cached)
+
+```
+score                     0/9
+output                    3 879 604 vs parsoid 5 351 722 (0.73x)
+by outcome                media 3, extension 5, transclusion 1
+lua failures              6 pages, 1 distinct
+  Module:Authority control / renderSnak   6
+  Module:DecodeEncode does not exist      0  (fetched by the online run)
+```
+
+The rustoid total *grew* by ~80 KB: the media renders instead of falling back
+to the broken span, so this is the metric getting honest again, not a
+regression. `Module:DecodeEncode` was a genuine cache gap and is now filled.
+
+**`Bicycle`'s first difference moved past the image.** At byte 6979 the two
+renderings now part on table whitespace, not media:
+
+```
+parsoid  <tbody><tr><th colspan="2" class="infobox-above">Bicycle</th></tr>…
+rustoid  <tbody>  <tr class="">    <th colspan="2" class="infobox-above">Bicycle</th>…
+```
+
+So the old "Bicycle is blocked on media" reading was really "blocked on the
+image in the infobox", and behind the image was a whitespace/`class=""` defect
+in the table the infobox transcludes. The corpus's outcome label still says
+`media` because `classify` scans the 400-char window *around* the divergence,
+and the `mw:File` span that opens the infobox image sits inside it while
+`<tr>` does not — the label names the nearest loud marker, not the cause.
