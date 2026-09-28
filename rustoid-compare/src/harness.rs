@@ -152,6 +152,121 @@ fn existing() -> rustoid_core::traits::PageInfo {
     }
 }
 
+/// One cached fact, with the time it was fetched.
+#[derive(Debug, Clone)]
+struct FactAge {
+    epoch: u64,
+    kind: EntryKind,
+    key: String,
+}
+
+/// The newest cached fact a render consulted, for the consistency check.
+///
+/// The Parsoid oracle is pinned to a revision, but the *facts* a render leans on
+/// — a title's existence and redirect-ness, its protection, a file's size — are
+/// not revisioned. The cache holds whatever the wiki answered when the entry was
+/// fetched, and that can be a different day from the oracle. When it is, a
+/// difference between the two renderings may be wiki drift rather than a parser
+/// bug, and this is what lets a run say so instead of misattributing it.
+#[derive(Debug, Clone, Default)]
+pub struct FactAges {
+    newest: Option<FactAge>,
+}
+
+impl FactAges {
+    /// Note a consulted entry's fetch time, keeping the newest.
+    fn observe(&mut self, meta: &EntryMeta) {
+        let Some(epoch) = meta.fetched_at.as_deref().and_then(parse_epoch) else {
+            return;
+        };
+        if self.newest.as_ref().is_none_or(|n| epoch > n.epoch) {
+            self.newest = Some(FactAge {
+                epoch,
+                kind: meta.kind,
+                key: meta.title.clone(),
+            });
+        }
+    }
+
+    /// The newest consulted fact, if any carried a fetch time.
+    pub fn newest(&self) -> Option<(u64, EntryKind, &str)> {
+        self.newest
+            .as_ref()
+            .map(|f| (f.epoch, f.kind, f.key.as_str()))
+    }
+}
+
+/// Parse the harness's `epoch:<secs>` fetch stamp.
+fn parse_epoch(stamp: &str) -> Option<u64> {
+    stamp.strip_prefix("epoch:")?.parse().ok()
+}
+
+/// How much newer a consulted fact may be than the oracle before a difference is
+/// called suspect.
+///
+/// Small on purpose. A page's oracle and the facts it needs are fetched within
+/// seconds of each other — the oracle, the wikitext and one render — so anything
+/// beyond a minute apart was fetched in a *different* session, which is exactly
+/// when a fact can have moved on from the revision the oracle rendered.
+const FACT_TOLERANCE_SECS: u64 = 60;
+
+/// A difference that is plausibly wiki drift, not a parser bug.
+///
+/// Reported rather than hidden: the page still counts as a difference, but the
+/// run names the fact that moved and by how much, so the difference is not
+/// chased as a bug when re-pinning the fact would erase it.
+#[derive(Debug, Clone)]
+pub struct FactDrift {
+    pub kind: EntryKind,
+    pub key: String,
+    /// How much newer the fact is than the oracle, in seconds.
+    pub seconds: u64,
+}
+
+impl FactDrift {
+    /// Whether a fact fetched *after* the oracle is far enough past it to explain
+    /// a difference. A fact older than the oracle is not drift: the oracle is the
+    /// later, authoritative state, and it is what the render is compared against.
+    fn detect(oracle: Option<&str>, facts: &FactAges) -> Option<Self> {
+        let oracle = oracle.and_then(parse_epoch)?;
+        let (epoch, kind, key) = facts.newest()?;
+        let seconds = epoch.saturating_sub(oracle);
+        if seconds <= FACT_TOLERANCE_SECS {
+            return None;
+        }
+        Some(Self {
+            kind,
+            key: key.to_string(),
+            seconds,
+        })
+    }
+}
+
+impl std::fmt::Display for FactDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "facts {} newer than the oracle (newest: {}:{})",
+            human_age(self.seconds),
+            self.kind.as_str(),
+            self.key
+        )
+    }
+}
+
+/// A coarse duration for a drift report: seconds, then minutes, hours, days.
+fn human_age(seconds: u64) -> String {
+    if seconds < 120 {
+        format!("{seconds}s")
+    } else if seconds < 7200 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 48 * 3600 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
 /// A cache-backed `DataSource`, so template and module fetches during expansion
 /// are persisted too — not just the top-level page.
 ///
@@ -188,6 +303,9 @@ pub struct CachedDataSource {
     /// Entries stored since the manifest was last written, so the manifest is
     /// not re-serialised on every one of hundreds of template fetches.
     pending: std::sync::atomic::AtomicUsize,
+    /// The newest cached fact consulted so far, for [`FactDrift`]. Shared by
+    /// every fetch path on this source, and read back after the render.
+    facts: Arc<std::sync::Mutex<FactAges>>,
 }
 
 /// A second wiki whose content the parse can reach, with its own cache.
@@ -211,7 +329,20 @@ impl CachedDataSource {
             entities: None,
             offline,
             pending: std::sync::atomic::AtomicUsize::new(0),
+            facts: Arc::new(std::sync::Mutex::new(FactAges::default())),
         }
+    }
+
+    /// Note a cached fact that this render consulted, for the consistency check.
+    fn observe(&self, meta: &EntryMeta) {
+        if let Ok(mut facts) = self.facts.lock() {
+            facts.observe(meta);
+        }
+    }
+
+    /// The facts consulted so far, for [`FactDrift::detect`].
+    pub fn fact_ages(&self) -> FactAges {
+        self.facts.lock().map(|f| f.clone()).unwrap_or_default()
     }
 
     /// Same, with a wiki to read `mw.wikibase` entities from.
@@ -259,6 +390,7 @@ impl CachedDataSource {
             guard.get(kind, key)?
         };
         if let Some(hit) = cached {
+            self.observe(&hit.meta);
             return Ok(Some(hit.body));
         }
         if self.offline {
@@ -355,6 +487,7 @@ impl CachedDataSource {
             guard.get(kind, key)?
         };
         if let Some(hit) = cached {
+            self.observe(&hit.meta);
             return Ok(Some((hit.body, hit.meta.revid)));
         }
 
@@ -487,6 +620,7 @@ impl DataSource for CachedDataSource {
             .ok()
             .and_then(|c| c.get(EntryKind::Entity, &key).ok().flatten());
         if let Some(hit) = cached {
+            self.observe(&hit.meta);
             return Ok(Some(hit.body).filter(|b| !b.is_empty()));
         }
         if self.offline {
@@ -687,7 +821,9 @@ impl CachedDataSource {
             .lock()
             .ok()
             .and_then(|guard| guard.get(EntryKind::Protection, title).ok().flatten());
-        cached.and_then(|hit| serde_json::from_str(&hit.body).ok())
+        let hit = cached?;
+        self.observe(&hit.meta);
+        serde_json::from_str(&hit.body).ok()
     }
 
     /// Write a title's protection levels to the cache.
@@ -721,7 +857,9 @@ impl CachedDataSource {
             .lock()
             .ok()
             .and_then(|guard| guard.get(EntryKind::PageInfo, title).ok().flatten());
-        cached.and_then(|hit| serde_json::from_str(&hit.body).ok())
+        let hit = cached?;
+        self.observe(&hit.meta);
+        serde_json::from_str(&hit.body).ok()
     }
 
     /// Write a title's link-resolution facts to the cache.
@@ -758,7 +896,9 @@ impl CachedDataSource {
             .lock()
             .ok()
             .and_then(|guard| guard.get(EntryKind::FileInfo, key).ok().flatten());
-        cached.and_then(|hit| serde_json::from_str(&hit.body).ok())
+        let hit = cached?;
+        self.observe(&hit.meta);
+        serde_json::from_str(&hit.body).ok()
     }
 
     /// Write a file's media info (or its absence) to the cache.
@@ -878,6 +1018,10 @@ pub struct Comparison {
     pub parsoid_html: String,
     pub rustoid_html: String,
     pub outcome: Outcome,
+    /// Set when a difference is plausibly wiki drift rather than a parser bug:
+    /// a consulted fact that was fetched well after the pinned oracle. See
+    /// [`FactDrift`].
+    pub suspect: Option<FactDrift>,
 }
 
 impl Comparison {
@@ -893,6 +1037,7 @@ impl Comparison {
             parsoid_html: String::new(),
             rustoid_html: String::new(),
             outcome: Outcome::Skipped { reason },
+            suspect: None,
         }
     }
 }
@@ -1020,13 +1165,17 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
             .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
         guard.get(EntryKind::Rendered, &title)?
     };
-    let parsoid_html = match cached {
-        Some(c) if c.meta.revid == Some(revid) => c.body,
+    // The oracle's own fetch time, for the drift check: a fact newer than this is
+    // a different day's answer than the revision the oracle rendered.
+    let (parsoid_html, oracle_fetched_at) = match cached {
+        Some(c) if c.meta.revid == Some(revid) => (c.body, c.meta.fetched_at),
         // A cache recovered by `reindex` has no recorded revision, but the HTML
         // states its own — so the body can still be matched against the wikitext
         // instead of being reported as absent. This is what makes a reindexed
         // cache usable for an offline run at all.
-        Some(c) if c.meta.revid.is_none() && parsoid_revision(&c.body) == Some(revid) => c.body,
+        Some(c) if c.meta.revid.is_none() && parsoid_revision(&c.body) == Some(revid) => {
+            (c.body, c.meta.fetched_at)
+        }
         _ if req.offline => {
             return Ok(Comparison::skipped(
                 title,
@@ -1037,6 +1186,7 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         }
         _ => {
             let body = client.parsoid_html_at(&title, revid).await?;
+            let fetched_at = now_rfc3339();
             cache
                 .lock()
                 .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
@@ -1048,17 +1198,17 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
                         kind: EntryKind::Rendered,
                         title: title.clone(),
                         revid: Some(revid),
-                        fetched_at: now_rfc3339(),
+                        fetched_at: fetched_at.clone(),
                     },
                 )?;
-            body
+            (body, fetched_at)
         }
     };
 
     // --- rustoid's rendering ---
     let rustoid_html =
         render_rustoid(client, config, cache, &title, &wikitext, req.offline).await?;
-    let Some(rustoid_html) = rustoid_html else {
+    let Some((rustoid_html, fact_ages)) = rustoid_html else {
         // The render hit the per-page cap. No HTML was produced, so there is
         // nothing to compare and no unexpanded count to take.
         return Ok(Comparison {
@@ -1072,10 +1222,18 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
             outcome: Outcome::Stalled {
                 seconds: page_stall_seconds(),
             },
+            suspect: None,
         });
     };
 
     let outcome = compare_html(&parsoid_html, &rustoid_html);
+    // Only a difference can be misattributed; a match is a match whatever the
+    // facts' age. Naming the drifted fact here keeps a wiki-drift difference from
+    // being chased as a parser bug.
+    let suspect = match &outcome {
+        Outcome::Differ { .. } => FactDrift::detect(oracle_fetched_at.as_deref(), &fact_ages),
+        _ => None,
+    };
 
     Ok(Comparison {
         title,
@@ -1086,6 +1244,7 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         parsoid_html,
         rustoid_html,
         outcome,
+        suspect,
     })
 }
 
@@ -1100,7 +1259,8 @@ struct OwnedRenderInput {
 }
 
 impl OwnedRenderInput {
-    fn render<C: rustoid_core::SiteConfig>(self, config: &C) -> Result<Option<String>> {
+    /// Render, returning the HTML and the freshness of the facts it consulted.
+    fn render<C: rustoid_core::SiteConfig>(self, config: &C) -> Result<(String, FactAges)> {
         // The data source shares the harness's cache handle. A second handle would
         // keep its own in-memory manifest, so the two would clobber each other's
         // `index.json` and orphan every template fetched during expansion.
@@ -1136,7 +1296,7 @@ impl OwnedRenderInput {
         // Expansion fetched templates into the source's own cache handle; persist
         // any entries that did not reach a periodic flush.
         source.flush()?;
-        Ok(Some(html))
+        Ok((html, source.fact_ages()))
     }
 }
 
@@ -1164,7 +1324,11 @@ pub async fn render_wikitext<C: rustoid_core::SiteConfig + Clone + Send + 'stati
     wikitext: &str,
     offline: bool,
 ) -> Result<Option<String>> {
-    render_rustoid(client, config, cache, title, wikitext, offline).await
+    Ok(
+        render_rustoid(client, config, cache, title, wikitext, offline)
+            .await?
+            .map(|(html, _)| html),
+    )
 }
 
 /// Parse `wikitext` with rustoid, using a cache-backed data source so template
@@ -1181,7 +1345,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     title: &str,
     wikitext: &str,
     offline: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, FactAges)>> {
     let cap = std::time::Duration::from_secs_f64(page_stall_seconds());
     let input = OwnedRenderInput {
         client: client.clone(),
@@ -1224,7 +1388,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         LIVE_STALLED_RENDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
     match finished {
-        Ok(Ok(res)) => res,
+        Ok(Ok(res)) => res.map(Some),
         // The worker panicked.
         Ok(Err(e)) => Err(CompareError::Parse(e.to_string())),
         // Abandoned mid-render: the thread stays alive, holding its count.
@@ -1579,6 +1743,77 @@ mod tests {
     use rustoid_core::traits::SiteConfig;
 
     use super::*;
+
+    fn fact(kind: EntryKind, key: &str, epoch: u64) -> EntryMeta {
+        EntryMeta {
+            kind,
+            title: key.to_string(),
+            revid: None,
+            fetched_at: Some(format!("epoch:{epoch}")),
+        }
+    }
+
+    #[test]
+    fn a_fact_fetched_after_the_oracle_is_flagged_as_drift() {
+        let mut facts = FactAges::default();
+        facts.observe(&fact(EntryKind::PageInfo, "Electric bicycle", 1_000_000));
+        let drift = FactDrift::detect(Some("epoch:999000"), &facts).expect("1000s past the oracle");
+        assert_eq!(drift.kind, EntryKind::PageInfo);
+        assert_eq!(drift.key, "Electric bicycle");
+        assert_eq!(drift.seconds, 1000);
+        assert_eq!(
+            drift.to_string(),
+            "facts 16m newer than the oracle (newest: info:Electric bicycle)"
+        );
+    }
+
+    #[test]
+    fn a_fact_fetched_with_the_oracle_is_not_drift() {
+        let mut facts = FactAges::default();
+        facts.observe(&fact(EntryKind::PageInfo, "X", 1_000_000));
+        assert!(FactDrift::detect(Some("epoch:999990"), &facts).is_none());
+    }
+
+    #[test]
+    fn a_fact_older_than_the_oracle_is_not_drift() {
+        // The oracle is the later, authoritative state; an older fact cannot
+        // explain a difference against it.
+        let mut facts = FactAges::default();
+        facts.observe(&fact(EntryKind::FileInfo, "File:X", 500_000));
+        assert!(FactDrift::detect(Some("epoch:999000"), &facts).is_none());
+    }
+
+    #[test]
+    fn the_newest_observed_fact_wins() {
+        let mut facts = FactAges::default();
+        facts.observe(&fact(EntryKind::FileInfo, "old", 900_000));
+        facts.observe(&fact(EntryKind::Protection, "newer", 1_500_000));
+        facts.observe(&fact(EntryKind::PageInfo, "middle", 1_200_000));
+        assert_eq!(
+            facts.newest(),
+            Some((1_500_000, EntryKind::Protection, "newer"))
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_fetch_time_is_not_counted() {
+        let mut facts = FactAges::default();
+        facts.observe(&EntryMeta {
+            kind: EntryKind::Template,
+            title: "T".to_string(),
+            revid: Some(1),
+            fetched_at: None,
+        });
+        assert!(facts.newest().is_none());
+        assert!(FactDrift::detect(Some("epoch:1"), &facts).is_none());
+    }
+
+    #[test]
+    fn no_oracle_time_means_no_drift_claim() {
+        let mut facts = FactAges::default();
+        facts.observe(&fact(EntryKind::PageInfo, "X", 1_000_000));
+        assert!(FactDrift::detect(None, &facts).is_none());
+    }
 
     #[test]
     fn identical_html_matches() {

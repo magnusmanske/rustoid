@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::harness::{Outcome, Unexpanded};
+use crate::harness::{FactDrift, Outcome, Unexpanded};
 
 /// The result of one entry in the run.
 #[derive(Debug, Clone)]
@@ -32,6 +32,8 @@ pub struct Row {
     pub unexpanded_parsoid: Unexpanded,
     /// Distinct Scribunto failures rustoid reported (see [`script_errors`]).
     pub script_errors: Vec<String>,
+    /// Set when a difference is plausibly wiki drift rather than a parser bug.
+    pub suspect: Option<FactDrift>,
 }
 
 impl Row {
@@ -282,6 +284,23 @@ impl Scoreboard {
             out.push_str(&format!("  {:20} {}\n", b.name, b.count));
         }
 
+        // Differences that may be wiki drift rather than parser bugs, named so
+        // they are not chased as the latter. Reported separately from the score:
+        // the page still counts as a difference.
+        let suspects: Vec<&Row> = self.rows.iter().filter(|r| r.suspect.is_some()).collect();
+        if !suspects.is_empty() {
+            out.push_str(&format!(
+                "\npossibly stale facts ({} of {} compared — the difference may be wiki drift):\n",
+                suspects.len(),
+                self.compared()
+            ));
+            for row in &suspects {
+                if let Some(drift) = &row.suspect {
+                    out.push_str(&format!("  {:40} {drift}\n", truncate(&row.title, 40)));
+                }
+            }
+        }
+
         // The diagnosis that matters while expansion is incomplete.
         let un = self.unexpanded_summary();
         if un.compared > 0 {
@@ -339,6 +358,11 @@ impl Scoreboard {
                     Outcome::Skipped { reason } => format!("skip: {reason}"),
                     Outcome::Stalled { seconds } => format!("stalled after {seconds:.0}s"),
                     _ => row.category().to_string(),
+                };
+                let verdict = if row.suspect.is_some() {
+                    format!("{verdict} (suspect drift)")
+                } else {
+                    verdict
                 };
                 out.push_str(&format!(
                     "  {:40} r{}  {:>9}  {verdict}\n",
@@ -424,6 +448,7 @@ mod tests {
             unexpanded_rustoid: Unexpanded::default(),
             unexpanded_parsoid: Unexpanded::default(),
             script_errors: Vec::new(),
+            suspect: None,
         }
     }
 
@@ -498,6 +523,29 @@ mod tests {
         let b = Scoreboard::new("empty", vec![]);
         assert_eq!(b.percent(), 0.0);
         assert_eq!(b.compared(), 0);
+    }
+
+    #[test]
+    fn a_suspect_difference_is_named_but_still_counts_as_a_difference() {
+        let mut b = board();
+        b.rows[1].suspect = Some(FactDrift {
+            kind: crate::cache::EntryKind::PageInfo,
+            key: "Electric bicycle".to_string(),
+            seconds: 615_000,
+        });
+        let report = b.render(false);
+        assert!(
+            report.contains("possibly stale facts (1 of 3 compared"),
+            "{report}"
+        );
+        assert!(
+            report.contains("facts 7d newer than the oracle"),
+            "{report}"
+        );
+        assert!(report.contains("newest: info:Electric bicycle"), "{report}");
+        // The score is unchanged: drift is a caveat on a difference, not a pass.
+        assert!(report.contains("1/3 compared"), "{report}");
+        assert!(report.contains("suspect drift"), "{report}");
     }
 
     #[test]

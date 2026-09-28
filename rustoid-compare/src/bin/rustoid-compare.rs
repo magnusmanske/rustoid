@@ -328,6 +328,12 @@ fn report(
             println!("    {e}");
         }
     }
+    // A difference that is plausibly wiki drift, not a parser bug. Named up
+    // front so a single-page run does not send someone hunting a parser bug that
+    // a re-pin would erase.
+    if let Some(drift) = &comparison.suspect {
+        println!("  suspect: {drift}");
+    }
     if verbose && !comparison.outcome.is_match() {
         println!("\n--- parsoid ---\n{}", comparison.parsoid_html);
         println!("\n--- rustoid ---\n{}", comparison.rustoid_html);
@@ -387,6 +393,7 @@ fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
                 unexpanded_parsoid: c.unexpanded_parsoid,
                 script_errors: rustoid_compare::harness::script_errors(&c.rustoid_html, 3),
                 outcome: c.outcome,
+                suspect: c.suspect,
             },
             Err(e) => Row {
                 title: entry.title.clone(),
@@ -400,6 +407,7 @@ fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
                 outcome: Outcome::Skipped {
                     reason: e.to_string(),
                 },
+                suspect: None,
             },
         };
         // The category closes the progress line opened above. Under `--quiet`

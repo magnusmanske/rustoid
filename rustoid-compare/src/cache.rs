@@ -87,7 +87,7 @@ impl EntryKind {
         matches!(self, Self::Rendered)
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Page => "page",
             Self::Template => "tpl",

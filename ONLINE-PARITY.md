@@ -6574,8 +6574,71 @@ Nobel Prize                1112   (unchanged)
 Megadeth                   2801   (unchanged)
 Unix                       4772   (unchanged)
 Quicksilver (film)         2732   (unchanged)
-Sundial                    1897   (unchanged)
-List of sovereign states   4009   (unchanged)
-Zebra                      2172   (unchanged)
+Sundial                   1897   (unchanged)
+List of sovereign states  4009   (unchanged)
+Zebra                     2172   (unchanged)
 fixture guard              876/896
 ```
+
+## The age guard: a difference can be wiki drift, not a bug
+
+The 11836-byte first difference above is not a parser bug. rustoid renders
+`[[Electric bicycle]]` with `class="mw-redirect"` and the service does not, but
+the cached `info:Electric bicycle` was fetched *seven days after* the
+`html:Bicycle` oracle. The redirect was created in between. Nothing in the run
+said so: it printed a byte offset and left the reader to assume rustoid was
+wrong.
+
+That is a class of error the harness could not previously distinguish. The
+**oracle is pinned to a revision**; the **facts** a render leans on — a title's
+existence and redirect-ness (`PageInfo`), its protection (`Protection`), a file's
+size (`FileInfo`), an entity — are not revisioned. The cache holds whatever the
+wiki answered when the entry was fetched. If that was a different day from the
+oracle, a difference between the two renderings may be drift, and re-pinning the
+fact would erase it rather than any code change fixing it.
+
+### What is measured
+Every cache hit during a render is now observed through `CachedDataSource`
+(`FactAges`), keeping the **newest** entry it saw. The harness already records
+`fetched_at` on every entry (it was added for timelining, and every fact kind
+already writes it), so this costs nothing to observe. After the render,
+`FactDrift::detect` compares that newest fact against the oracle's own
+`fetched_at`: a fact more than `FACT_TOLERANCE_SECS` (**60**) newer marks the
+comparison **suspect**.
+
+Sixty seconds, not more: a page's oracle, wikitext and render are fetched within
+seconds of each other, so anything beyond a minute apart was fetched in a
+different session — which is exactly when a fact can have moved on from the
+revision the oracle rendered. Only facts **newer** than the oracle count; an
+older fact cannot explain a difference against the later, authoritative oracle.
+
+### It is reported, not hidden
+The page still counts as a difference — the score is unchanged — because the
+drift is a *caveat* on a difference, not a pass. It is named and listed:
+
+```
+possibly stale facts (8 of 9 compared — the difference may be wiki drift):
+  Bicycle                     facts 7d newer than the oracle (newest: file:File:Banana-bike.jpg@w250)
+```
+
+and the failure line carries `(suspect drift)`, and a single-page run prints
+`suspect: …` under the verdict. The message names the *newest* fact, which is
+illustrative, not necessarily the culprit — the actionable part is the age.
+Deliberately a distinct signal rather than a `Skipped`: the user wants to see it,
+not have it disappear from the count.
+
+### What the guard says about the current cache
+Run offline over the 9-page subset, **8 of 9** pages are flagged `7d newer`. That
+is accurate and it is the cache's state, not a design flaw: the `html:` oracle
+baselines were pinned at `epoch:~1789975300`, while the `info:`/`prot:`/`file:`
+entries were populated days later, on demand, as the session filled gaps. It
+means the current subset scoreboard is measured against a baseline a week older
+than the facts around it, and should be read with that in mind — which is exactly
+the honesty the guard exists to force. A clean measurement needs a cache whose
+facts and oracle were populated together.
+
+### Guarded by tests
+Six unit tests cover `FactDrift::detect` (newer/within-tolerance/older, newest
+wins, missing `fetched_at`, missing oracle time) and one covers the scoreboard
+section; the display format is asserted so the report cannot silently change
+shape.
