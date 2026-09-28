@@ -5690,3 +5690,106 @@ Megadeth                  1650
 fixture guard             876/896
 subset total               parsoid 5 351 722 / rustoid 4 330 015 (0.81x)
 ```
+
+## The argument renderer, and expanding a link target
+
+The two jobs the previous section deferred were the argument renderer and the
+title-substitution inside a link. Both are now in, and the `$B` family — the
+`Use mdy dates` / `Use British English` / `Use American English` stack behind six
+of the nine pages — renders its categories.
+
+### The renderer covers a link, a tag and quotes now
+
+The renderer only trusted plain text, `mw-quote` and the `{{!}}` marker, so any
+value that expanded to a *link* fell back to its source range. That range is the
+wikitext as written, which for a substituted value is stale, and for the `$B`
+argument of `Module:Unsubst` is the template call itself. Worse, the `#invoke`
+path rendered such a value with `tokens_to_string`, whose wikilink arm reads the
+token's `href` as a *string* — but the href is a **token list** (the target is
+tokenized so a templated target can expand), so `as_str` returned `None` and the
+value arrived as `[[]]`.
+
+`{{#invoke:Unsubst||$B={{DMCA|A|B|C}}}}` is the minimal case, and it now renders
+`Category:A_B_C`. `{{Use mdy dates|date=February 2026}}` renders
+`Category:Use_mdy_dates_from_February_2026`, where before the whole value was
+`[[]]`.
+
+The renderer — `argument_value_text`, deliberately **separate** from the shared
+`tokens_to_string` that also feeds DOM attribute values — now covers:
+
+- `Str`; comments and newlines (dropped, as `tokensToString` drops them);
+- `mw-quote` (from its `value` attribute) and the `{{!}}` marker (`|`);
+- `wikilink`, rebuilt from its `href` and `mw:maybeContent` fields and recursing,
+  because those are token lists;
+- `extension`, from its source (`<nowiki/>`).
+
+Anything else still returns `None`, so the containment — *a value is rendered from
+tokens only when every token has an exact textual form* — is unchanged. The
+`#invoke` call is also built **structurally** now (`Invoke::from_parts`) from the
+module and the expanded arguments, instead of being re-joined into
+`M|f|a|b=c` text and re-parsed: a value may contain `|` (a link's display text)
+or `=`, and the text round-trip cannot tell either from a separator.
+
+### A link target is a token list, and expansion has to look inside it
+
+`expand_templates` walks the top level of a chunk and leaves a `wikilink` alone,
+because the target is a token list *inside* the token. On a page the
+`expand_attributes` pass resolves it afterwards; an argument has no such pass, and
+Scribunto receives the expanded text. So `{{#invoke:String|len|[[{{PAGENAME}}]]}}`
+answered 16 (the source) where the service answers 8.
+
+The pre-check in `expand_invoke_args` was the second half of the bug: it scanned
+only *top-level* items for a `template`, and `[[{{PAGENAME}}]]` has none there, so
+the value was skipped entirely. It now looks inside tokens (`expandable_content`),
+and the expansion half of `expand_attributes` runs on the value
+(`expand_attrib_templates`) — without the `mw:ExpandedAttrs` marking, which
+describes the DOM a link becomes rather than the string a module is handed.
+`[[{{PAGENAME}}]]`, `[[{{lc:ABC}}]]` and `[[{{#if:1|Yes|No}}]]` all answer the
+expanded length now.
+
+### The size metric became honest, and that is not a loss
+
+The subset total fell from 4.33 MB to 4.01 MB (0.81x → 0.75x) across these two
+changes. Almost all of it is ~318 KB of *garbage* that the old render emitted: a
+runaway `data-mw` in which a `{{col begin}}` transclusion listed the rest of the
+page as a literal string part and leaked `{{#ifeq:{{{bigbox` as text. That leak
+is now zero (matching the service), the two affected lines are otherwise the only
+difference between old and new (verified by line diff — every other line is
+byte-length-identical), and the page's tail, categories and tables are intact. So
+the ratio was inflated before; it is now the real one.
+
+### Scoreboard
+
+```
+Help:Introduction          416
+Quicksilver (film)         590 -> 1551
+Unix                       904 -> 1736
+Zebra                     2172
+Sundial                   1897  (media: the file info is not cached)
+Bicycle                   2465 -> 3168
+Nobel Prize                600
+List of sovereign states  1947 -> 2771
+Megadeth                  1650
+fixture guard             876/896
+subset total               parsoid 5 351 722 / rustoid 4 007 778 (0.75x)
+```
+
+### What the remaining first differences are
+
+Reduced to four shapes, none of them the `$B` family any more:
+
+- **`about` id off by one** — `Bicycle` (3168) and `List of sovereign states`
+  (2771) both show rustoid one transclusion id *behind* the service, so something
+  earlier took an id it should not have, or missed one it should. This is the
+  cheapest of the four and the next thing to reduce.
+- **The encapsulation merge** — `Help:Introduction` (416) and `Zebra` (2172): the
+  service groups adjacent transclusions (`{{pp-semi-indef}}`, the literal
+  `</noinclude>`, `{{intro to single}}`) into one wrapper with several `parts`;
+  rustoid emits them separately. `Zebra` also shows an indicator whose `attrs.name`
+  is the single space `" "`.
+- **The protection category** — `Nobel Prize` (600): rustoid emits
+  `Wikipedia pages with incorrect protection templates` where the service emits
+  the real protection. The `prot:` fact is populated for some titles and not this
+  one, which is the offline half of the page-info problem and a targeted fetch.
+- **Media** — `Sundial` (1897): rustoid renders `mw-broken-media` because the
+  file info is not cached, which is a cache gap rather than a parser gap.
