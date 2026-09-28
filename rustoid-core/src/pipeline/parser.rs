@@ -3980,13 +3980,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // replaced by a Lua error where the service renders
             // `Page semi-protected` (the `Help:Introduction` difference at byte
             // 403).
-            let has_template = items.iter().any(|it| {
-                matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t))
-                    if t.name == "template" || t.name == "template3")
-            });
-            let has_arg_ref = items
-                .iter()
-                .any(|it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "templatearg"));
+            //
+            // The scan looks *inside* tokens as well as at the top level, because a
+            // `wikilink` keeps its target in a token list: `[[{{PAGENAME}}]]` has no
+            // top-level template at all, and a top-level-only scan skipped it — so
+            // the module received the target as written.
+            let found = expandable_content(items);
+            let (has_template, has_arg_ref) = (found.template, found.arg);
             if !has_template && !has_arg_ref {
                 continue;
             }
@@ -4009,7 +4009,96 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 src_text,
             ))
             .await;
+            // A target the expansion left nested — `[[{{PAGENAME}}]]` — is
+            // resolved here, because nothing else will look at these tokens:
+            // the value is flattened to the string a module receives, and the
+            // `expand_attributes` pass that does this on a page runs on the
+            // *document*, not on an argument.
+            let expanded = Box::pin(self.expand_attrib_templates(
+                &child,
+                expanded,
+                source,
+                about_counter,
+                true,
+                body,
+                src_text,
+            ))
+            .await;
             kv.value = KeyValue::Tokens(expanded);
+        }
+        out
+    }
+
+    /// Expand the templates a chunk holds in its tokens' *attributes*.
+    ///
+    /// [`Parser::expand_templates`] walks the top level of a chunk and leaves a
+    /// `wikilink` alone there — its target is a token list inside the token, not a
+    /// top-level item — so `[[{{PAGENAME}}]]` reaches the argument renderer with
+    /// its target still unexpanded. On a page the `expand_attributes` pass
+    /// resolves it afterwards, and `render_links` then sees a plain target; an
+    /// argument has no such pass, and Scribunto receives the *expanded* text, so
+    /// the target has to be resolved before the value is rendered.
+    ///
+    /// This is the expansion half of `expand_attributes`, without its
+    /// `mw:ExpandedAttrs` marking: that marking describes the DOM a link
+    /// eventually becomes, and here the tokens are about to be flattened to the
+    /// string a module is handed.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_attrib_templates(
+        &self,
+        frame: &Frame,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+        body: bool,
+        src_text: &str,
+    ) -> Vec<Item> {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let mut out = Vec::with_capacity(tokens.len());
+        for item in tokens {
+            let Item::Tok(tok) = &item else {
+                out.push(item);
+                continue;
+            };
+            if !matches!(tok, ParsoidToken::Tag(_) | ParsoidToken::SelfclosingTag(_)) {
+                out.push(item);
+                continue;
+            }
+            let attribs = tok.get_attribs();
+            if !attribs.iter().any(|kv| {
+                matches!(kv.key, KeyValue::Tokens(_)) || matches!(kv.value, KeyValue::Tokens(_))
+            }) {
+                out.push(item);
+                continue;
+            }
+            let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
+            for kv in attribs {
+                let mut new_kv = kv.clone();
+                for field in [&mut new_kv.key, &mut new_kv.value] {
+                    let KeyValue::Tokens(toks) = field else {
+                        continue;
+                    };
+                    let expanded = self
+                        .expand_templates(
+                            frame,
+                            toks.clone(),
+                            source,
+                            about_counter,
+                            in_template,
+                            body,
+                            src_text,
+                        )
+                        .await;
+                    *field =
+                        crate::pipeline::attribute_transform_manager::items_to_key_value(expanded);
+                }
+                expanded_attrs.push(new_kv);
+            }
+            let mut new_tok = tok.clone();
+            new_tok.set_attribs(expanded_attrs);
+            out.push(Item::Tok(new_tok));
         }
         out
     }
@@ -4183,6 +4272,47 @@ fn expanded_arg_pair(kv: &crate::wikitext::tokens_v2::KV) -> (Option<String>, St
     } else {
         (Some(name.to_string()), value)
     }
+}
+
+/// What expansion still has to resolve in a token chunk.
+#[derive(Default, Clone, Copy)]
+struct ExpandableContent {
+    /// A `{{…}}` template, parser function or magic variable.
+    template: bool,
+    /// A `{{{…}}}` argument reference.
+    arg: bool,
+}
+
+/// Scan a chunk for what expansion has to resolve, looking inside tokens.
+///
+/// A `wikilink` keeps its target — and its display parts — in token lists held
+/// *inside* the token, so a top-level scan of `[[{{PAGENAME}}]]` finds nothing to
+/// expand. That is not a detail: it is why such a target reached a module
+/// unexpanded, and why an `#invoke` argument has to be inspected this way before
+/// deciding it needs no work.
+fn expandable_content(items: &[Item]) -> ExpandableContent {
+    use crate::wikitext::tokens_v2::{KeyValue, ParsoidToken};
+    let mut found = ExpandableContent::default();
+    for item in items {
+        let Item::Tok(tok) = item else { continue };
+        if let ParsoidToken::SelfclosingTag(t) = tok {
+            match t.name.as_str() {
+                "template" | "template3" => found.template = true,
+                "templatearg" => found.arg = true,
+                _ => {}
+            }
+        }
+        for kv in tok.get_attribs() {
+            for field in [&kv.key, &kv.value] {
+                if let KeyValue::Tokens(toks) = field {
+                    let nested = expandable_content(toks);
+                    found.template |= nested.template;
+                    found.arg |= nested.arg;
+                }
+            }
+        }
+    }
+    found
 }
 
 /// How many `#ifexist` titles one render may resolve.
@@ -5617,6 +5747,42 @@ mod tests {
         );
         let item = Item::Tok(ParsoidToken::SelfclosingTag(stt));
         assert!(wrapper_tag_target(&item).is_none());
+    }
+
+    /// A module receives an argument's *expanded* text, and that includes a link
+    /// whose target is built from a template or a magic variable: the target is a
+    /// token list held inside the `wikilink` token, so expansion has to look there
+    /// rather than only at the top level. `[[{{PAGENAME}}]]` on `Test` is
+    /// `[[Test]]`.
+    #[tokio::test]
+    async fn a_link_target_in_an_invoke_argument_is_expanded() {
+        use crate::mock::MockDataSource;
+
+        let config = MockSiteConfig::new();
+        let source = MockDataSource::new();
+        // Echo its second `#invoke` argument, so the value the module received is
+        // what the render shows.
+        source.add_module(
+            "Module:Echo",
+            "return { main = function(frame) return frame.args[1] end }",
+        );
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{#invoke:Echo|main|[[{{PAGENAME}}]]}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            html.contains("./Test"),
+            "the link target must be expanded to the page title: {html}"
+        );
+        assert!(
+            html.contains("mw-selflink"),
+            "the expanded target links to this page: {html}"
+        );
     }
 
     /// `#ifexist` answers its `then`/`else` from the title's existence, which the
