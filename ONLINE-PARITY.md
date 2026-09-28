@@ -6713,3 +6713,38 @@ occurrences as the service. Its first difference stays at 1112, but the cause
 changed — it is now the **protection expiry**, which rustoid leaves empty where
 the service has `semi-protected until November 28, 2026 at 18:01 UTC`. That is
 the next thread.
+
+### The protection expiry: `formatDate` could not read `@<unix>`
+The empty `until ,` was not the fact and not the magic word. Both were already
+right: the cache holds `prot:Nobel Prize` = `"expiries":{"edit":
+["20261128180122"]}`, and `{{#invoke:Effective protection expiry|edit}}` returns
+`2026-11-28T18:01:22`. The loss was one step further along, in
+`Module:Protected page`:
+
+```lua
+-- Blurb:_formatDate
+local success, date = pcall(
+    lang.formatDate, lang,
+    self._cfg.msg['expiry-date-format'] or 'j F Y',   -- 'F j, Y "at" H:i e'
+    '@' .. tostring(num)
+)
+if success then return date end                        -- no error on failure
+```
+
+`mw.language:formatDate` therefore had to read two things rustoid's `format_date`
+did not: the **`@<seconds>` Unix-timestamp input** (`parse_date` knew ISO, the
+eight-digit form, month names and a bare year, but not `@`), and the format codes
+**`"…"`** (a literal run, quotes dropped) and **`e`** (the timezone identifier,
+`UTC`). Because the caller wraps the call in `pcall` and returns its own value
+when it fails, the failure was *silent*: the `${EXPIRY}` parameter came back
+`nil` and the banner read `until ,`. The `@` form now parses with `chrono`, and
+`"`/`e` are handled. The served and rustoid banners are byte-identical:
+
+```
+This article is semi-protected until November 28, 2026 at 18:01 UTC, due to vandalism
+```
+
+**Effect.** `Nobel Prize`'s first difference moves **1112 -> 4269**, and the
+whole protection block before it is now exact. The new first difference is an
+`about`-id mismatch (`#mwt15` here, `#mwt6` there) on an infobox's templatestyles
+— the id-ordering thread again, one spending decision upstream of it.

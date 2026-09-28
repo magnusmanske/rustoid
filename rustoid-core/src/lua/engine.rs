@@ -3841,16 +3841,41 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<Stri
     // wraps its call in `pcall` for exactly that reason and returns its own
     // message — so returning `""` here turned a guarded error into an
     // `attempt to sub a 'string' with a 'string'` further down.
-    let Some((year, month, day, hour, minute, second)) = parse_date(stamp) else {
-        return Err("Error: Invalid time.".to_string());
+    //
+    // `@<seconds>` is MediaWiki's Unix-timestamp input, read as UTC. It is how
+    // `Module:Protected page` re-formats an expiry it first turned into a
+    // timestamp (`formatDate('F j, Y "at" H:i e', '@' .. unix)`), and without
+    // it that `pcall` failed silently and the banner read "until ," .
+    let parsed = if let Some(rest) = stamp.trim().strip_prefix('@') {
+        let secs = rest
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| "Error: Invalid time.".to_string())?;
+        let dt = chrono::DateTime::from_timestamp(secs, 0)
+            .ok_or_else(|| "Error: Invalid time.".to_string())?
+            .naive_utc();
+        use chrono::{Datelike, Timelike};
+        (
+            dt.year(),
+            dt.month() as usize,
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+        )
+    } else {
+        let Some(parsed) = parse_date(stamp) else {
+            return Err("Error: Invalid time.".to_string());
+        };
+        parsed
     };
     let (year, month, day, hour, minute, second) = (
-        Some(year),
-        Some(month),
-        Some(day),
-        Some(hour),
-        Some(minute),
-        Some(second),
+        Some(parsed.0),
+        Some(parsed.1),
+        Some(parsed.2),
+        Some(parsed.3),
+        Some(parsed.4),
+        Some(parsed.5),
     );
 
     const LONG: [&str; 12] = [
@@ -3903,6 +3928,27 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<Stri
             continue;
         }
         match c {
+            // A double-quoted run is literal text (the `"` markers are dropped),
+            // and a backslash escapes the character after it. MediaWiki's `#time`
+            // spells the literal `at` in an expiry banner this way.
+            '"' => {
+                while let Some(qc) = chars.next() {
+                    match qc {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(esc) = chars.next() {
+                                out.push(esc);
+                            }
+                        }
+                        other => out.push(other),
+                    }
+                }
+            }
+            '\\' => {
+                if let Some(esc) = chars.next() {
+                    out.push(esc);
+                }
+            }
             'Y' => out.push_str(&year.unwrap_or(0).to_string()),
             'y' => out.push_str(&format!("{:02}", year.unwrap_or(0).rem_euclid(100))),
             'n' => out.push_str(&month.unwrap_or(0).to_string()),
@@ -3923,6 +3969,9 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<Stri
             'H' => out.push_str(&format!("{:02}", hour.unwrap_or(0))),
             'i' => out.push_str(&format!("{:02}", minute.unwrap_or(0))),
             's' => out.push_str(&format!("{:02}", second.unwrap_or(0))),
+            // The wiki's timezone is UTC, so both the identifier and the
+            // abbreviation are `UTC`.
+            'e' | 'T' => out.push_str("UTC"),
             // `U` is the Unix timestamp, which is what `Module:Citation/CS1`
             // compares against when bounding an access date. An unparseable
             // date yields nothing rather than a misleading epoch.
@@ -7723,6 +7772,24 @@ mod tests {
         assert!(
             (1_577_836_800..1_609_459_200).contains(&year_only),
             "a bare year must land inside 2020, got {year_only}"
+        );
+    }
+
+    /// `@<seconds>` is MediaWiki's Unix-timestamp input, read as UTC, and the
+    /// `"…"` literal and `e` timezone codes are formatted. `Module:Protected
+    /// page` builds a protection banner's expiry with exactly this pair
+    /// (`formatDate('F j, Y "at" H:i e', '@' .. unix)`); while the `@` form was
+    /// unparseable its `pcall` swallowed the error and the banner read "until ,".
+    #[test]
+    fn format_date_reads_a_unix_timestamp_and_quoted_literals() {
+        assert_eq!(
+            format_date("F j, Y \"at\" H:i e", "@1795888882").unwrap(),
+            "November 28, 2026 at 18:01 UTC"
+        );
+        // The same instant from the ISO spelling gives the same timestamp.
+        assert_eq!(
+            format_date("U", "2026-11-28T18:01:22").unwrap(),
+            "1795888882"
         );
     }
 
