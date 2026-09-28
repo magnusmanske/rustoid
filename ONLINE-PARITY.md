@@ -5395,3 +5395,145 @@ and it also carries MediaWiki's 500-call expensive-parser-function limit.
 Recorded rather than attempted: the session had no room for a mechanism of that
 size, and a half-answer (branching on an unsubstituted title) would be a
 regression dressed as progress.
+
+## Two contained bugs, and the page a node-count trip had been eating
+
+The next session went looking for a difference to reduce and found two, both in
+the *template metadata* path rather than in expansion. Neither is architectural,
+and the second one is the largest single win recorded here so far.
+
+### An empty template argument is `"wt":""`, not `"wt":null`
+
+`TemplateInfo::toJsonArray` writes `'wt' => $info->valueWt` unconditionally, and
+every builder (`prepareTplParamInfos`, `preparePfParamInfos`,
+`prepareTemplate3ParamInfos`) assigns `valueWt` a real source string — possibly
+empty, never null. rustoid's `OrderedJson::put_opt_str` collapsed an empty value
+to JSON `null` instead, so `{{About||the butterfly genus|Bicyclus…}}` recorded
+`{"1":{"wt":null}}` where the service serves `{"1":{"wt":""}}`.
+
+A one-line change (`put_str` instead of `put_opt_str`, and `put_opt_str` was then
+dead and removed). It moves `Bicycle`'s first difference 733 → 1588. Neither
+spelling is pinned by a fixture — the suite has no `"wt":""` or `"wt":null` at
+all — which is why the wrong one survived.
+
+### A named argument reaching Lua was not trimmed
+
+`Frame::expand_template_arg` trims a *named* argument's value for `{{{name}}}`
+substitution, and MediaWiki's preprocessor trims it before Scribunto sees the
+call at all — but `frame_args_to_lua` passed the expanded text through
+untrimmed. The visible consequence was `Zebra`.
+
+`Zebra`'s taxobox is `{{Automatic taxobox | taxon = Equus (Hippotigris)}}`. The
+module got `" Equus (Hippotigris)"` with a leading space, built
+`Template:Taxonomy/ Equus (Hippotigris)` *with the space*, missed it, and then
+walked a parent chain that never terminated: `Template:Taxonomy/` (empty taxon),
+`[[Template:Taxonomy/]]`, `Taxonomy/{{Taxonomy/[[:Template:Taxonomy/]]|machine
+code=parent}}`, and onward, each level expanding the last. It reached
+**1,000,000 preprocessor nodes** and tripped the node-count limit, after which
+*every* later expansion on the page was the error span.
+
+That is why `Zebra` was 113 KB against the service's 560 KB, and why its first
+difference sat at byte 444 as a nonsense category
+(`Node-count_limit_exceeded_with_short_description`). With named values trimmed,
+the page renders 632 KB in 1.9s (was 147 KB in 17s), it no longer trips the
+node-count limit at all, and its first difference moves 444 → 1486.
+
+The limit itself was never wrong; a million expansions is a real trip. The bug
+was upstream of it, and the trap is worth naming: **a runaway expansion reports
+as a limit, not as a miss**, so the diagnosis has to start from *what* is being
+expanded (the debug counter over `expand_templates`' target showed the
+`Taxonomy/` chain immediately) rather than from the limit value.
+
+### Scoreboard
+
+```
+List of sovereign states   first difference at byte 1947   (unchanged)
+Help:Introduction          416
+Quicksilver (film)         590
+Unix                       904   (was 852: protection now cached, see below)
+Sundial                    1460
+Bicycle                    1588  (was 733)
+Nobel Prize                600
+Megadeth                   1650
+Zebra                      1486  (was 444; page no longer eaten)
+fixture guard              876/896
+subset total               parsoid 5 351 722 / rustoid 4 290 867 (0.80x, was 0.73x)
+```
+
+## What is actually left, and one prerequisite that keeps recurring
+
+The remaining first differences fall into a small number of groups, and **three
+of them need the same thing the cache does not yet store**. Recording the shape
+because it is the recurring obstacle, not a one-off.
+
+### The offline cache stores content, not facts
+
+`get_page_info` (link existence, `mw-disambig`, `mw-redirect`) is answered by the
+harness's `page_info`, which fetches `prop=info`. **Its result is never cached.**
+Offline, `get_page_info` therefore returns “everything exists, no link classes”
+(`page_info_soft`/`existing()`), so:
+
+- `Module:Format link`'s `title.exists` check is answered from *content*, and an
+  uncached-but-real target reads as a red link — `Bicyclus`, `Zebro`,
+  `Sundial (disambiguation)` all produced a spurious
+  `Articles with hatnote templates targeting a nonexistent page` category
+  (`Bicycle` byte 1588, `Zebra` 1486, `Sundial` 1460).
+- `mw-disambig` is applied by `add_red_links` from `PageInfo::linkclasses`, which
+  `page_info` never fills (it does not request `ppprop=disambiguation` at all).
+  Offline it could not be filled even if it did.
+- `#ifexist` (see above) would read “every title exists” offline, so the branch it
+  selects would be wrong for exactly the maintenance categories that usually do
+  not exist — worse than not implementing it.
+
+So the prerequisite for the next several fixes is a **cached page-info fact**:
+store `{missing, known, redirect, linkclasses}` per title, populated by an online
+run, and read offline. That is the honest fix for the hatnote categories, for
+`mw-disambig`, and for `#ifexist`; patching any of them to the *live* wiki's
+existence without it would only move the lie.
+
+A cheaper stopgap was tried and *reverted*, and the record matters: making the
+Lua `TitleFacts` derive `exists` from `get_page_info` when content is absent.
+It is more faithful on the live wiki, but offline it asserts `exists = true`
+while `content` stays `None`, and modules read on from there —
+`Module:Listen` indexed `title.file` on a file it now “knew” existed,
+`Module:Redirect hatnote` called `:find` on a nil `getContent()`. It surfaced
+seven new Lua failures. The lesson is the same as above: **`exists` and
+`content` must come from one source**, or one of them is a claim the render
+cannot honour.
+
+### Cache populated this session
+
+Running the subset **online once** (with the baseline guard in place, so no
+pinned revision was touched) filled the protection facts and the disambiguation
+pages that the renders ask about. Offline output total went 4 193 380 → 4 290 867
+bytes and `Unix`'s first difference 852 → 904 (its `prot:` entry was the
+missing fact). The run hit HTTP 429 partway through the last four pages, which
+is itself the reason the next population should be targeted rather than a whole
+corpus: the requests are mostly cache *hits*, but the misses are per-page and
+the API is not sized for nine at speed.
+
+### The rest
+
+- `Help:Introduction` (416) — an adjacent-transclusion **encapsulation merge**:
+  the service groups `{{pp-semi-indef}}` and `{{intro to single}}` (with the
+  literal `</noinclude>` between them) into one `#mwt4` wrapper; rustoid emits
+  only the second, so the `mw:Transclusion` part list is short and the id is one
+  low.
+- `List of sovereign states` (1947) — the `#ifexist` leak, **confirmed** rather
+  than inferred. The `<p>` the service serves as `class="mw-empty-elt"` holds,
+  on rustoid's side, the empty `mw:Nowiki` protection span, the indicator
+  `<meta>`, and then the two leaked `{{#ifexist:Category:{{{1}}} {{{2}}} {{{3}}}`
+  spans. The leak is *text*, so `is_empty_node` refuses to mark the `<p>` empty
+  and the class goes missing at 1947. This closes the loop the previous section
+  opened: the leak and the missing class are one difference, not two.
+- `Unix` / `Nobel Prize` protection categories — a missing `prot:` fact, now the
+  cheap half of the page-info problem and already partly populated.
+
+### The probe was lying about entities
+
+`examples/render` did not attach the Wikidata wiki, so any page touching
+`mw.wikibase` diverged from a real comparison run — `Module:SDcat` reported
+"empty Wikidata description" for a page whose entity was cached, which sent a
+diagnosis after a bug that was not there. It now builds the same `SiblingWiki`
+`harness::with_entity_wiki` does. A probe that fails to reproduce the real run is
+worse than no probe, because it manufactures confident wrong answers.
