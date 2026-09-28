@@ -6216,7 +6216,7 @@ Nobel Prize                600 -> 1112
 Megadeth                  1650 -> 2801
 Unix                      1736 -> 4772
 Quicksilver (film)        1551 -> 2732
-Bicycle                   3168 -> 6979   (then the diff changed; see below)
+Bicycle                   3168 -> 6979 -> 8151
 Sundial                   1897        (unchanged; media cache)
 List of sovereign states  2771 -> 4009
 Zebra                     2172        (unchanged)
@@ -6253,3 +6253,72 @@ in the table the infobox transcludes. The corpus's outcome label still says
 `media` because `classify` scans the 400-char window *around* the divergence,
 and the `mw:File` span that opens the infobox image sits inside it while
 `<tr>` does not — the label names the nearest loud marker, not the cause.
+
+That table whitespace was itself three bugs in a trench coat; they are unrolled in
+the next section, which took the difference on to byte 8151.
+
+## Behind the image: three fidelity bugs the fixtures could not see
+
+Once the media rendered, `Bicycle`'s first difference jumped 6979 → 7791 →
+8151 on the strength of three independent defects, none of which the parser-test
+fixtures could catch. They are worth listing together because the *reason* the
+guard stayed green is the same in all three: the harness normalizes what the
+served page is compared verbatim.
+
+### The output serializer was pretty-printing
+
+`HtmlSerializer` emitted `"  ".repeat(depth)` before `p`, `table`/`tr`/`td`/`th`,
+lists, `div`, and `hr`. Parsoid's `XHtmlSerializer` emits **compact** markup, and
+the served page shows it: the infobox table is `<tbody><tr><th…` with no
+whitespace. At depth 0 the indent was empty, which is why the whole lead of a
+page matched and the first difference landed at the infobox — the first
+indenting element below the root.
+
+The parser-test harness sorts attributes and *collapses whitespace between block
+elements*, so both the fixture's expected HTML (which has its own, source-derived
+newlines) and rustoid's indented output normalized to the same string. A green
+fixture suite was therefore not evidence about output whitespace at all. The fix
+removes the indentation entirely; the guard did not move.
+
+### `mw.html`'s `addClass(nil)` is a no-op
+
+Scribunto's `mw.html.lua`:
+
+```lua
+function methodtable.addClass( t, class )
+    if class ~= nil then … t:attr( 'class', class ) … end
+    return t
+end
+```
+
+An **absent** class adds nothing. Rustoid's `Node:addClass` built a list, skipped
+nil entries, and then *always* called `self:attr('class', concat(list))` — so
+`addClass(nil)` set `class=""`. `Module:Infobox` calls
+`addClass(rowArgs.rowclass)` for every row, and the row class is normally absent,
+so every `<tr>` was rendered `<tr class="">` where Parsoid emitted `<tr>`. An
+empty attribute is not the same as an omitted one.
+
+### `widthOption` is the wiki's default thumb size, not the first limit
+
+`WikiLinkHandler::renderFile` sizes an unsized `thumb`/`frameless` media at
+`SiteConfig::widthOption()`, and `Api\SiteConfig` computes
+
+```php
+$this->widthOption = $data['general']['thumblimits'][$data['defaultoptions']['thumbsize']];
+```
+
+On enwiki `thumblimits = {0:180, 1:250, 2:400}` and `defaultoptions.thumbsize = 1`,
+so the default is **250**, not the 180 that rustoid hardcoded (and not 180 alone,
+which was harmless only because the fixture site config really does use 180).
+`SiteConfig` gained `width_option()` (default 180, matching
+`ParserTests\SiteConfig::widthOption()`), the comparison config derives it from
+`siteinfo`, and `siteinfo` now requests `defaultoptions`. The cached `siteinfo`
+predated that request, so it was refetched once — a config, not a page revision.
+
+### Where that leaves `Bicycle`
+
+The three fixes moved the first difference from 6979 to **8151**, and what
+remains is no longer markup: the infobox reference renders as
+`about="#mwt11"` in Parsoid and `about="#mwt199"` in rustoid. That is the
+`about`-id allocation order — the same lazy-`frame.args` shape recorded above,
+now the single thing standing between `Bicycle` and byte parity.
