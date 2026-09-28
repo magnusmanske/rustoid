@@ -2928,6 +2928,10 @@ function Node:addClass(...)
     for _, class in ipairs({ ... }) do
         if class ~= nil then table.insert(list, tostring(class)) end
     end
+    -- Scribunto's `addClass(nil)` is a no-op; only a class actually added (or
+    -- already present) sets the attribute. Setting `class=""` is not the same
+    -- as omitting it, and a module that passes an absent parameter passes nil.
+    if #list == 0 then return self end
     return self:attr('class', table.concat(list, ' '))
 end
 
