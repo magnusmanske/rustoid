@@ -4963,3 +4963,108 @@ The correct fix has to keep `exists` and the registry in step, which means the
 retry loop needs to fetch the titles a module's *new branch* will go on to
 `loadData` — and finding those requires resolving a runtime-built name, which is
 the original blind spot rather than a way around it.
+
+## The real blocker was the *name*, and the fetch/registry coupling was a decoy
+
+The previous section ended on a wrong conclusion: that making `exists` truthful
+would need the loop to resolve a runtime-built `loadData` target, which is "the
+original blind spot". It does not. Running the widened `note_missing_title`
+against the real page and *reading the trace* showed the loop was asking for the
+wrong title:
+
+```
+req Page Countries          # the MissingTitle handler's fetch
+```
+
+`Portal:Countries` had been reduced to `Countries` on the way to the data source.
+Every name-resolution question above was moot until that was fixed.
+
+### `namespace_prefix` stopped at the core namespaces
+
+`Title::full_text` is the key a `DataSource` is asked about, and it resolves the
+namespace through `namespace_prefix`, a hand-written table that ended at
+`Module` (828). There was no entry for **Portal (100)** — nor Book, Draft,
+TimedText, Gadget, Education program — and a missing entry does not fail loudly.
+It returns `""`, `full_text` drops the prefix, and `Portal:Countries` becomes the
+key `Countries`: the fetch goes to a main-namespace title, misses, and the miss is
+stored as "no such page", which makes the wrong answer permanent for the rest of
+the render.
+
+The ids for the namespaces MediaWiki and its shipped extensions register are
+fixed by id and cannot vary by wiki, so the table is extended with them. A
+wiki-private namespace genuinely has no canonical English name, and the empty
+fallback stays correct for it. (The locally-`git`-visible tell was cheap: a
+`RUSTOID_TITLE_DEBUG` print in `luafn_title_new` showed `ns_id=100
+ns_text="Portal"` — the Lua side was right, and the fault was one call later, in
+`full_text`.)
+
+### Widening the record to every namespace is correct
+
+With the name fixed, `note_missing_title` is no longer narrowed to the Module
+namespace. Scribunto answers `exists` from the wiki's database and the namespace
+plays no part, so the narrowing was the wrong axis; it is what left
+`Module:Format link` — reading `mw.title.new(parsed.page).exists` for a page name
+that arrived through `frame.args` — on its `categorizeMissing` branch.
+
+The coupling that made the narrowing look load-bearing (a module probing a title
+only to decide whether to `loadData` it) is already handled where it happens: a
+runtime `loadData` of an unfetched module raises the recoverable missing-module
+signal, so existence and the registry do not need to be kept in step by hand.
+`Module:Portal`'s `exists` gate therefore opens only when `Portal:Countries` is
+actually resolvable — which is a *cache* question, not a code one.
+
+**The lesson from the two reverted attempts stands**, though: an offline run can
+only answer for titles it has. Widening the record makes the answer truthful
+*where a body is cached*; for a probed title that is not, the answer stays the
+conservative `false` and the corpus does not move. This is why the first
+difference on `List of sovereign states` did not shift until the four probed
+titles were fetched (a `render … online` of the redirect2 probe, ~97 KB: the two
+redirects plus two articles). The hatnote category then disappeared and the first
+difference moved from byte 1498 to 1945.
+
+## Protection is a fact the wikitext cannot supply
+
+Byte 1945 is the protection block. The page's `{{protection padlock}}`,
+`{{pp-move}}` and (on `Help:Introduction`) `{{pp-semi-indef}}` are rendered by
+`Module:Protection banner`, which decides between the real padlock and the
+`Category:Wikipedia_pages_with_incorrect_protection_templates` tracking category
+by reading `mw.title.getCurrentTitle().protectionLevels`. rustoid gave it no
+levels, so it always chose "incorrect".
+
+Three separate faults were behind that, and each is general:
+
+1. **The fact was never fetched offline.** `get_title_protection` returned empty
+   offline by design, and the online result was not cached. Now cached per title
+   under a `prot:` entry kind, so one online run leaves a cache that answers
+   offline; `title_protection` also keys its answer by the title *as requested*
+   rather than the wiki's spelling, since the caller looks it up by the string it
+   asked with.
+2. **The page's own protection never reached Lua.** `build_ast` fetches it once
+   and stores it in `page_protection`, which serves the `{{PROTECTIONLEVEL:…}}`
+   magic word — but Lua reads the same fact through the *title-facts* map, a
+   different route. Both are now seeded from the one fetch.
+3. **The frame's facts map was being replaced, not merged.** `invoke` seeded the
+   frame with the render's accumulated facts, then assigned `frame.titles` the
+   return of `preload_titles` — which deliberately contains only titles *not*
+   already known. So the seed was discarded and the second `#invoke` on a page
+   could not see what the first had resolved. Fixed by merging, which the sibling
+   call site already did.
+
+With the fact correct, `Module:Protection banner` now emits the indicator instead
+of the bogus category — and the next difference is the `<indicator>` extension
+itself: rustoid drops it (`ElementKind::Indicator` exists and maps to `meta`, but
+nothing constructs it). Both nearest pages now differ at, or just after, the
+protection block:
+
+```
+Help:Introduction         first difference at byte 416  (was 403)
+List of sovereign states  first difference at byte 1947 (was 1498, then 1945)
+fixture guard             876/896
+```
+
+Note the wider `<p>` vs `<span>` question in the same block, which is **not** the
+protection fact and is still open: parsoid wraps a standalone protected-page
+transclusion in `<p class="mw-empty-elt">` where rustoid uses a bare
+`<span class="mw-empty-elt">`, while `{{pp-move}}` gets a `<span>` from both. The
+two differ in the indicator's presence, so implementing the extension is the
+prerequisite for telling the two apart rather than guessing at the rule.
