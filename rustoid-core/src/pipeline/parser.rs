@@ -273,6 +273,27 @@ fn wrapper_tag_target(
     }
 }
 
+/// If `item` is an `indicator` extension token, return it.
+///
+/// The indicator is handled with the wrapper extensions rather than inside
+/// `extension_handler::run` because it needs the sub-fragment machinery: its
+/// `<meta>` is rendering-transparent and must keep the `about` of the enclosing
+/// transclusion, so it is stashed and re-inserted by `unpack_dom_fragments`
+/// exactly as a `divtag` body is.
+fn indicator_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    (stt.name == "extension"
+        && stt
+            .attribs
+            .iter()
+            .find(|a| a.key.as_str() == Some("name"))
+            .and_then(|a| a.value.as_str())
+            == Some("indicator"))
+    .then_some(stt)
+}
+
 /// Is this item a `template`/`template3` token? Used to decide whether the
 /// template token's target chunk still needs template expansion (see
 /// `Parser::expand_target_templates`).
@@ -495,6 +516,51 @@ fn emit_wrapper_placeholder(
         vec![],
         crate::wikitext::tokens_v2::DataParsoid::default(),
     ))));
+}
+
+/// Emit the `mw:dom-fragment-token` placeholder for a resolved `<indicator>`,
+/// referencing the pre-built `<meta>` fragment by `id`.
+///
+/// Unlike the wrapper extensions, whose placeholder is a real element pair around
+/// a tunnelled body, an indicator *is* the fragment: the `<meta>` is the whole
+/// output, and `typeof`/`data-mw` describe it. So both travel on the bare
+/// `mw:dom-fragment-token` here, and the tree builder carries them onto the
+/// element it inserts. Those keys describe the *element the placeholder stands
+/// for* — the indicator's own `name` and body — not the placeholder itself.
+fn emit_indicator_placeholder(
+    stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    id: usize,
+) -> Vec<Item> {
+    use crate::wikitext::tokens_v2::{KV, SelfclosingTagTk};
+
+    let mut dp = stt.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+
+    let mut frag = SelfclosingTagTk::new("mw:dom-fragment-token", vec![], dp);
+    let kv = |k: &str, v: String| KV {
+        key: crate::wikitext::tokens_v2::KeyValue::Str(k.to_string()),
+        value: crate::wikitext::tokens_v2::KeyValue::Str(v),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    };
+    frag.attribs
+        .push(kv("typeof", "mw:Extension/indicator".to_string()));
+    frag.attribs
+        .push(kv("data-mw", indicator_placeholder_data_mw(stt)));
+    frag.attribs.push(kv("data-fragment-id", id.to_string()));
+
+    vec![Item::Tok(ParsoidToken::SelfclosingTag(frag))]
+}
+
+/// The `data-mw` an indicator placeholder carries, taken from the fragment the
+/// caller already built so the two cannot disagree.
+fn indicator_placeholder_data_mw(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String {
+    let body = extension_body(stt);
+    let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
+    crate::pipeline::extension_handler::indicator_data_mw(&body, &attrs)
 }
 
 /// Extract the body-content children from a tree-builder document (`<html>`
@@ -1504,6 +1570,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         (out, fragments)
     }
 
+    /// Expand `<indicator>` extension tokens in place.
+    ///
+    /// An indicator is rendered by MediaWiki into a fixed slot in the page
+    /// header, not into the article's own text; Parsoid's job is to record the
+    /// declaration for that header. So unlike every other extension here the body
+    /// is *never* parsed or resolved through the frame — it is passed through as
+    /// wikitext for the header to render — and the element is a `<meta>` carrying
+    /// only metadata. That is also why this needs neither a `Frame` nor a
+    /// `DataSource`, and so is the one extension expansion that is not `async`.
+    fn expand_indicator(
+        &self,
+        tokens: Vec<Item>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        self.expand_indicator_with(tokens, next_id, |body, attrs| {
+            Node::document_with_child(crate::pipeline::extension_handler::indicator_node(
+                &body, &attrs,
+            ))
+        })
+    }
+
     /// Synchronous [`expand_wrapper_tag`] for the `wikitext_to_ast` path.
     fn expand_wrapper_tag_sync(
         &self,
@@ -1528,6 +1615,53 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             next_id.set(id + 1);
             fragments.insert(id, sub);
             emit_wrapper_extension_placeholder(stt, ext_name, wrapper, id, &mut out);
+        }
+
+        (out, fragments)
+    }
+
+    /// Synchronous `<indicator>` expansion for the `wikitext_to_ast` path.
+    ///
+    /// The body is *not* parsed: it is recorded verbatim as the fragment, because
+    /// the indicator's content reaches the reader's page header as wikitext rather
+    /// than as page markup, and the extension output only carries it for the
+    /// header to render. So this is the one extension whose body must survive
+    /// unexpanded, and `extract_ext_body` is the whole of its handling.
+    fn expand_indicator_sync(
+        &self,
+        tokens: Vec<Item>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        self.expand_indicator_with(tokens, next_id, |body, attrs| {
+            Node::document_with_child(crate::pipeline::extension_handler::indicator_node(
+                &body, &attrs,
+            ))
+        })
+    }
+
+    /// Shared driver for the indicator path, parameterized by the fragment
+    /// builder so the async and sync entry points cannot drift apart in the
+    /// placeholder handling (which is the fiddly part).
+    fn expand_indicator_with(
+        &self,
+        tokens: Vec<Item>,
+        next_id: &std::cell::Cell<usize>,
+        build: impl Fn(String, Vec<crate::wikitext::tokens_v2::KV>) -> Node,
+    ) -> (Vec<Item>, std::collections::HashMap<usize, Node>) {
+        let mut fragments = std::collections::HashMap::new();
+        let mut out: Vec<Item> = Vec::new();
+
+        for item in tokens {
+            let Some(stt) = indicator_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let body = extension_body(stt);
+            let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
+            let id = next_id.get();
+            next_id.set(id + 1);
+            fragments.insert(id, build(body, attrs));
+            out.extend(emit_indicator_placeholder(stt, id));
         }
 
         (out, fragments)
@@ -2086,6 +2220,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments.extend(pre_fragments);
         let (tokens, wrapper_fragments) = self.expand_wrapper_tag_sync(tokens, &next_id);
         fragments.extend(wrapper_fragments);
+        let (tokens, indicator_fragments) = self.expand_indicator_sync(tokens, &next_id);
+        fragments.extend(indicator_fragments);
         let tokens = self.expand_gallery_sync(
             tokens,
             &std::cell::Cell::new(0usize),
@@ -2301,6 +2437,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .expand_wrapper_tag(tokens, source, &frame, about_counter, next_id)
             .await;
         fragments.extend(wrapper_fragments);
+        let (tokens, indicator_fragments) = self.expand_indicator(tokens, next_id);
+        fragments.extend(indicator_fragments);
         let tokens = self
             .expand_gallery(
                 tokens,

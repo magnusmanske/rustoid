@@ -183,7 +183,16 @@ impl Html5TreeBuilder {
 
     /// Stash a pre-built sub-fragment node (and the placeholder token's `dp`, so
     /// its `tsr`/`extTagOffsets` survive into `ComputeDSR`) and return its id.
-    fn stash_fragment(&mut self, fragment: Node, dp: &TDataParsoid) -> usize {
+    ///
+    /// `data_mw` is the placeholder's own metadata, which the unpacked element
+    /// keeps: it describes the element *this placeholder stands for* (an
+    /// indicator's `name`/`body`), not the placeholder itself.
+    fn stash_fragment(
+        &mut self,
+        fragment: Node,
+        dp: &TDataParsoid,
+        data_mw: Option<String>,
+    ) -> usize {
         let id = self.next_data_id;
         self.next_data_id += 1;
         self.stash.insert(
@@ -191,7 +200,7 @@ impl Html5TreeBuilder {
             StashedNodeData {
                 data_parsoid: dp.to_data_parsoid_json(),
                 dp: Some(dp.clone()),
-                data_mw: None,
+                data_mw,
                 fragment: Some(fragment),
             },
         );
@@ -649,8 +658,14 @@ impl Html5TreeBuilder {
 
         if name == "mw:dom-fragment-token" {
             // Look up the pre-built sub-fragment, stash it, and emit an unfostered
-            // `<span typeof="mw:DOMFragment">` placeholder carrying the id that
-            // resolves back to it (unpacked by `UnpackDOMFragments` in finalize).
+            // placeholder carrying the id that resolves back to it (unpacked by
+            // `UnpackDOMFragments` in finalize).
+            //
+            // The placeholder's own `typeof`/`data-mw` are *carried over*, not
+            // replaced: the element that replaces this placeholder takes its type
+            // from here (`mw:Extension/indicator`, say), and dropping it left the
+            // tag name to be guessed instead. `meta` stays the default because a
+            // tunnelled fragment with no type of its own is a transclusion marker.
             let fragment_id = attribs
                 .iter()
                 .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
@@ -659,12 +674,24 @@ impl Html5TreeBuilder {
             let fragment = fragment_id.and_then(|id| self.fragments.remove(&id));
             let mut fragment = fragment.unwrap_or_else(Node::document);
             self.resolve_deferred_about_ids(&mut fragment);
-            let id = self.stash_fragment(fragment, dp);
-            let attrs = Attributes::from_pairs(vec![
-                ("typeof".to_string(), "mw:DOMFragment".to_string()),
-                (DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()),
-            ]);
-            self.insert_unfostered_meta(attrs);
+            let id = self.stash_fragment(fragment, dp, data_mw);
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for kv in attribs {
+                let Some(k) = kv.key.as_str() else { continue };
+                // The indirection keys are consumed here; `data-mw` is looked up
+                // on the token rather than copied from the attribute list.
+                if k == DATA_OBJECT_ATTR_NAME || k == "data-fragment-id" || k == "data-mw" {
+                    continue;
+                }
+                if let Some(v) = kv.value.as_str() {
+                    pairs.push((k.to_string(), v.to_string()));
+                }
+            }
+            if !pairs.iter().any(|(k, _)| k == "typeof") {
+                pairs.push(("typeof".to_string(), "mw:DOMFragment".to_string()));
+            }
+            pairs.push((DATA_OBJECT_ATTR_NAME.to_string(), id.to_string()));
+            self.insert_unfostered_meta(Attributes::from_pairs(pairs));
             return;
         }
 
@@ -3211,6 +3238,60 @@ mod tests {
             contains_text(&doc, "fragment-body"),
             "fragment not spliced: {doc:?}"
         );
+    }
+
+    /// A `mw:dom-fragment-token` that carries a `typeof` keeps it on the element
+    /// it becomes, rather than every such placeholder forcing
+    /// `typeof="mw:DOMFragment"`.
+    ///
+    /// This is what an `<indicator>` rides on: the fragment is a `<meta>` whose
+    /// type is the whole point, and the placeholder is the only place that type
+    /// travels. Dropping it collapsed the element to a bare `<meta>` with no
+    /// `typeof` at all.
+    #[test]
+    fn test_dom_fragment_token_keeps_its_typeof() {
+        let sub = Node::element(ElementKind::Other("meta".to_string()));
+        let mut fragments = HashMap::new();
+        fragments.insert(7usize, Node::document_with_child(sub));
+
+        let mut frag_tok =
+            SelfclosingTagTk::new("mw:dom-fragment-token", vec![], DataParsoid::default());
+        for (k, v) in [
+            ("typeof", "mw:Extension/indicator"),
+            ("data-mw", r#"{"name":"indicator"}"#),
+            ("data-fragment-id", "7"),
+        ] {
+            frag_tok.attribs.push(crate::wikitext::tokens_v2::KV {
+                key: crate::wikitext::tokens_v2::KeyValue::Str(k.to_string()),
+                value: crate::wikitext::tokens_v2::KeyValue::Str(v.to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
+        }
+
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(frag_tok))];
+        let doc = token_stream_to_ast_html_with_fragments(&items, None, fragments, None);
+
+        let meta = find_tag_node(&doc, "meta").expect("an indicator meta: {doc:?}");
+        assert_eq!(meta.get_attr("typeof"), Some("mw:Extension/indicator"));
+        // `data-mw` is node data rather than an attribute (the tree builder takes
+        // it off the attribute list), so it is read from the field.
+        assert_eq!(meta.data_mw.as_deref(), Some(r#"{"name":"indicator"}"#));
+        assert!(meta.fragment.is_some(), "the sub-fragment must be stashed");
+    }
+
+    /// The first element with this HTML tag name, depth-first.
+    fn find_tag_node<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
+        if node_name_of(node) == name {
+            return Some(node);
+        }
+        node.children.iter().find_map(|c| find_tag_node(c, name))
+    }
+
+    /// The HTML tag name of a node, for [`find_tag_node`].
+    fn node_name_of(node: &Node) -> String {
+        crate::html::wts_utils::node_name(node)
     }
 
     #[test]
