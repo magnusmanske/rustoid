@@ -5068,3 +5068,51 @@ transclusion in `<p class="mw-empty-elt">` where rustoid uses a bare
 `<span class="mw-empty-elt">`, while `{{pp-move}}` gets a `<span>` from both. The
 two differ in the indicator's presence, so implementing the extension is the
 prerequisite for telling the two apart rather than guessing at the rule.
+
+### The `<indicator>` oracle, measured
+
+`Module:Protected page`'s padlock is built from exactly two deferred calls:
+
+```lua
+return frame:extensionTag{name = 'nowiki'} .. frame:extensionTag{
+    name = 'indicator',
+    args = {name = self._indicatorName},
+    content = self:renderImage(),   -- [[File:Semi-protection-shackle.svg|20px|…]]
+}
+```
+
+so `{{#tag:indicator|[[File:…]]|name=pp-default}}` is the minimal input. Asking the
+transform endpoint for it (Parsoid `alpha24`, one request) settles the shape
+rather than guessing it:
+
+```html
+<meta typeof="mw:Extension/indicator mw:Transclusion" about="#mwt1" id="mwAg"
+      data-parsoid='{"pi":[[{"k":"1"},{"k":"2"},{"k":"3"}]],"dsr":[0,114,null,null]}'
+      data-mw='{"name":"indicator","attrs":{"name":"pp-default"},
+                "body":{"extsrc":"[[File:Semi-protection-shackle.svg|20px|…]]"},
+                "parts":[{"template":{"target":{"wt":"#tag:indicator","function":"tag"},…}}]}'/>
+```
+
+Three things follow, and they are why this is not a one-liner:
+
+1. The element is a **`<meta>`** with `typeof="mw:Extension/indicator"`, and the
+   `data-mw` carries the extension's *own* shape (`name`/`attrs`/`body.extsrc`)
+   **before** the transclusion's `parts`. rustoid currently emits
+   `<extension typeof="mw:Extension" name="indicator" source='…'>` — the raw
+   token leaking through, because nothing in `extension_handler::expand_extension`
+   matches `indicator`. The body is `extsrc` (unexpanded), which is what
+   `templatestyles` already models.
+2. It is **not p-wrapped**, unlike the padlock on `List of sovereign states`,
+   where the served meta is a *sibling* of a `mw:Nowiki mw:Transclusion` span that
+   carries the `about`. So the `#tag:nowiki` answer is load-bearing too: it is
+   what makes the transclusion span exist, and the meta then shares its `about`.
+   Which of the two shapes appears depends on the enclosing context, so both must
+   be reproduced, not just the meta.
+3. `data-parsoid` is present in the transform rendering only because the transform
+   endpoint keeps it (see the note near the top of this file); the served bytes
+   drop it. The transform output is for *shape*, not for bytes.
+
+So the next step is a dedicated `indicator` handler in `extension_handler`, plus
+the nowiki interaction above it, not a generic "unknown extension" fallback: most
+unimplemented extensions have visible output that a `<meta>` would lose, and only
+`indicator` is a meta precisely because MediaWiki hoists it to `<head>`.
