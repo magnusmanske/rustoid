@@ -108,17 +108,6 @@ fn seed_media_files(source: &MockDataSource) {
 
     for (title, fname, width, height, mime, prefix) in files {
         let file_url = format!("{BASE}/{prefix}/{fname}");
-        let mut thumb_urls = HashMap::new();
-        // Populate thumbnails for a representative set of widths (the fixture
-        // exercises 50/120/137/180/220/274/320/360/440/…-px variants). The
-        // exact value for a given width is recomputed by the parser's
-        // `handle_size`; here we only need the *URL* string.
-        for w in [50u32, 100, 120, 137, 180, 220, 240, 274, 320, 360, 440] {
-            thumb_urls.insert(
-                w.to_string(),
-                format!("{BASE}/thumb/{prefix}/{fname}/{w}px-{fname}"),
-            );
-        }
         source.add_file(
             title,
             FileInfo {
@@ -129,8 +118,8 @@ fn seed_media_files(source: &MockDataSource) {
                 height: *height,
                 description_url: format!("{BASE}/{fname}"),
                 file_url,
-                thumb_urls,
                 bad_file: *fname == "Bad.jpg",
+                ..FileInfo::default()
             },
         );
     }

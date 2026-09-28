@@ -6043,6 +6043,27 @@ category instead of a script error.
 
 ## The remaining shapes, and two reductions worth keeping
 
+### Fresh 48-page corpus measurement
+
+The built-in corpus (`--corpus default`, 48 entries, 3 stalled) is the widest
+instrument available, and the `lang` fix above made it worth re-taking:
+
+```
+                        before    after lang fix
+score                   0/45      0/45
+output (x parsoid)      0.59x     0.60x
+lua failures            72/19     57/18     distinct
+  function not found: lang   16 pages   0 pages
+  Module:Authority control / renderSnak   32   34
+pages with literal {{...}}   44/48     44/48
+```
+
+`function not found: lang` is gone; `renderSnak` is now the largest cluster (and
+grew, because the pages it was masking now reach it). `wikilink`, `media`, and
+`nowiki` are the first-difference outcomes for the rest, and **44 of 48 pages
+still leak a literal `{{…}}`**, which is the structural blocker behind most of
+them rather than any single construct.
+
 Four independent defects stand between the subset and a passing page. None is
 reduced to a fix, but two have a minimal input now, which is the part that took
 the time.
@@ -6107,11 +6128,85 @@ blind.
 `Sundial` (1897) all now halt at a *fact* rather than a parser bug: the last two
 at a missing file's media info, `Quicksilver` at the id order that lazy
 `frame.args` fixes, `Bicycle` at the same media gap. `AddMediaInfo` fetches
-through `DataSource::get_file_info`, whose comparison-harness implementation is
-a stub returning `None`, so offline media is always `mw-broken-media`.
-Populating it needs a thumbnail width, which the trait does not carry
-(`getFileInfo` in PHP takes `$width`), so it is a small interface change plus a
-cache kind rather than a fetch.
+through `DataSource::get_file_info`, whose comparison-harness implementation was
+a stub returning `None`, so offline media was always `mw-broken-media`.
+Populating it needed a thumbnail width, which the trait did not carry
+(`getFileInfo` in PHP takes `$width`). That is now done; the account is in *The
+file-info cache* below, and the two pages blocked here (`Sundial`, `List of
+sovereign states`) are blocked on a *populated* cache rather than on the
+interface.
+
+## The file-info cache: `missing` is not "no file"
+
+The first implementation of `get_file_info` bailed out with `Ok(None)` as soon
+as the API said `missing: true`. For a file with a local description page that is
+harmless, and that is why the bug survived review: on Wikipedia most images *are*
+local, so the branch looks like the ordinary "file does not exist" path. But a
+**Commons-shared** file is reported `missing: true` (there is no local
+description page) *while carrying a full `imageinfo` array*:
+
+```json
+{"title":"File:Left side of Flying Pigeon.jpg",
+ "missing":true, "known":true, "imagerepository":"shared",
+ "imageinfo":[{"thumburl":"…/250px-…","thumbwidth":250,"thumbheight":167, …}]}
+```
+
+The presence of `imageinfo`, not the `missing` flag, is what says the file
+exists — Parsoid's `DataAccess` reads the array. Treating `missing` as the signal
+made the harness cache a `null` for the file, and a cached `null` is a *hit*, so
+the wrong answer survived every later run; the cache entry had to be deleted by
+hand to reproduce the fix.
+
+### The returned size is the display size
+
+The second half is `handleSize`. It does **not** derive the rendered size from
+the requested width; it adopts the `thumbwidth`/`thumbheight` the wiki returned
+(`!empty($info['thumburl']) && !empty($info['thumbheight'])` ⇒ use it). The old
+Rust code computed the size from the request and scaled by aspect ratio, which
+happened to agree with the wiki for simple thumbnails and diverged everywhere
+else — most visibly for a **bucketed** thumbnail, where a 180px request returns a
+`250px-…` URL whose `thumbwidth` is nonetheless 180. So `FileInfo` grew
+`thumb_url`, `thumb_width`, `thumb_height`, and `responsive_urls`, and
+`handle_size` now ports PHP's rule directly, including the upscale denial for a
+`thumb`/`frameless` *bitmap*.
+
+### URL shape, and where the rewrite belongs
+
+The API returns absolute URLs stamped `utm_campaign=imageinfo`; the served page
+carries protocol-relative URLs stamped `utm_campaign=parser` (and a framed `src`
+makes that `utm_content=thumbnail_unscaled`). The rewrite is mechanical, but
+putting it in `AddMediaInfo` was **wrong**: the parser-test fixtures supply their
+own `http://example.com` URLs, and stripping the scheme turned each `<img>` into
+a bare `<img/>` and cost 5 media fixtures. The two URL forms are the *data
+source's* business, so the rewrite lives on `FileInfo::normalize_api_urls`, and
+the API-backed sources (`mw_api`, `compare::fileinfo`) call it while the mock
+(rightly) does not.
+
+### The mock has to answer per request
+
+With `handle_size` faithful, `MockDataSource` could no longer hand back one fixed
+`FileInfo` and let the parser invent the size: PHP's `MockApiHelper::imageInfo`
+scales the file for the requested size, exactly as the wiki does. The mock now
+ports `MockApiHelper::transformHelper` (itself a port of `ImageHandler`,
+`fitBoxWidth`, and `File::scaleHeight`) plus the core thumbnail-URL and
+`responsiveUrls` rules, deriving the `/thumb/<d1>/<d2>/<name>/<w>px-<name>`
+layout from the stored raw URL. Without this, five packed-gallery fixtures failed
+because `scaleMedia` reads the resolved `<img>` width, which `handle_size` was no
+longer supplying from the request.
+
+### Attribute order and the missing `srcset`
+
+`srcset` was never emitted (`srcset()` returned `None`); now it is built from
+`responsiveUrls`. The attribute order is also now faithful, because byte parity
+is the goal and it is verifiable against the served page: PHP copies `resource`,
+then sets `thumbattribs` (`src`, `decoding`, `loading`, `srcset` — the API's order
+with `width`/`height` unset), then `alt`, then `lang`, then `data-file-*`, then
+the normalized `height`/`width`, then `class`. The 250px `Bicycle` thumbnail now
+renders byte-identically, `srcset` and all.
+
+The fixture guard never moved: attribute order is sorted by the harness, so only
+the *values* (the returned size, the `src`) had to agree — which is exactly why
+the media bugs hid behind a green fixture suite.
 
 ## Scoreboard
 

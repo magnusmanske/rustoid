@@ -123,6 +123,25 @@ fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("RUSTOID_TRACE_FETCH").is_some())
 }
 
+/// The cache key for one file's media info at a requested display size.
+///
+/// The size is part of the key because the wiki returns a thumbnail for the
+/// width it was asked for; two containers using one file at different sizes need
+/// different answers, and the same size can share one.
+fn file_info_key(title: &str, width: Option<u32>, height: Option<u32>) -> String {
+    match (width, height) {
+        (None, None) => title.to_string(),
+        (w, h) => format!(
+            "{title}@{}",
+            [w.map(|v| format!("w{v}")), h.map(|v| format!("h{v}"))]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("x")
+        ),
+    }
+}
+
 /// A `PageInfo` for a title known to exist.
 fn existing() -> rustoid_core::traits::PageInfo {
     rustoid_core::traits::PageInfo {
@@ -618,11 +637,30 @@ impl DataSource for CachedDataSource {
 
     async fn get_file_info(
         &self,
-        _title: &rustoid_core::Title,
+        title: &rustoid_core::Title,
+        width: Option<u32>,
+        height: Option<u32>,
     ) -> rustoid_core::Result<Option<rustoid_core::traits::FileInfo>> {
-        // File metadata is not needed to compare markup, and fetching it would
-        // multiply the request count against the rate limiter.
-        Ok(None)
+        let key = file_info_key(&title.full_text(), width, height);
+        if let Some(info) = self.cached_file_info(&key) {
+            return Ok(info);
+        }
+        // Offline, an uncached file is simply unknown; that renders as the
+        // broken-media markup the wiki itself would not serve, which is the
+        // honest answer rather than a fabricated size.
+        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
+            return Ok(None);
+        };
+        // A transport failure answers conservatively but is **not** written, for
+        // the same reason protection is not: a guess must not outlive the
+        // failure it came from.
+        let info = match crate::fileinfo::file_info(client, &title.full_text(), width, height).await
+        {
+            Ok(info) => info,
+            Err(_) => return Ok(None),
+        };
+        self.store_file_info(&key, info.as_ref());
+        Ok(info)
     }
 
     async fn resolve_redirect(
@@ -704,6 +742,38 @@ impl CachedDataSource {
         };
         if let Ok(mut guard) = self.cache.lock() {
             let _ = guard.put(EntryKind::PageInfo, title, &body, meta);
+        }
+        let _ = self.note_written();
+    }
+
+    /// A file's cached media info, if this cache holds it for the size asked.
+    ///
+    /// The body is `null` for a file the wiki does not have, so a cached miss is
+    /// itself a hit — refetching a missing file on every offline run is exactly
+    /// what the cache exists to avoid. A parse failure is a miss, as in
+    /// [`Self::cached_page_info`].
+    fn cached_file_info(&self, key: &str) -> Option<Option<rustoid_core::traits::FileInfo>> {
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(EntryKind::FileInfo, key).ok().flatten());
+        cached.and_then(|hit| serde_json::from_str(&hit.body).ok())
+    }
+
+    /// Write a file's media info (or its absence) to the cache.
+    fn store_file_info(&self, key: &str, info: Option<&rustoid_core::traits::FileInfo>) {
+        let Ok(body) = serde_json::to_string(&info) else {
+            return;
+        };
+        let meta = EntryMeta {
+            kind: EntryKind::FileInfo,
+            title: key.to_string(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        if let Ok(mut guard) = self.cache.lock() {
+            let _ = guard.put(EntryKind::FileInfo, key, &body, meta);
         }
         let _ = self.note_written();
     }

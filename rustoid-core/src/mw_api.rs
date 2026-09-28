@@ -213,8 +213,15 @@ impl MediaWikiApiDataSource {
     }
 
     /// Fetch file info from the API.
-    async fn fetch_file_info(&self, title: &str) -> Result<Option<FileInfo>> {
-        let params = [
+    async fn fetch_file_info(
+        &self,
+        title: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Option<FileInfo>> {
+        let width_s = width.map(|w| w.to_string());
+        let height_s = height.map(|h| h.to_string());
+        let mut params: Vec<(&str, &str)> = vec![
             ("action", "query"),
             ("prop", "imageinfo"),
             ("iiprop", "url|size|mime"),
@@ -222,6 +229,15 @@ impl MediaWikiApiDataSource {
             ("format", "json"),
             ("formatversion", "2"),
         ];
+        // A requested size makes the wiki return a thumbnail, and the answer's
+        // `thumbwidth` is what the rendered `<img>` uses (mirrors Parsoid's
+        // per-request `dims` reaching `DataAccess::getFileInfo`).
+        if let Some(w) = &width_s {
+            params.push(("iiurlwidth", w));
+        }
+        if let Some(h) = &height_s {
+            params.push(("iiurlheight", h));
+        }
 
         let resp = self
             .client
@@ -241,7 +257,18 @@ impl MediaWikiApiDataSource {
                 if let Some(imageinfo) = page["imageinfo"].as_array()
                     && let Some(info) = imageinfo.first()
                 {
-                    return Ok(Some(FileInfo {
+                    // A requested size makes the wiki return a thumbnail whose
+                    // *returned* width is what `AddMediaInfo::handleSize` adopts,
+                    // plus the density map `srcset` is built from.
+                    let mut responsive_urls = std::collections::BTreeMap::new();
+                    if let Some(map) = info["responsiveUrls"].as_object() {
+                        for (density, url) in map {
+                            if let Some(url) = url.as_str() {
+                                responsive_urls.insert(density.clone(), url.to_string());
+                            }
+                        }
+                    }
+                    let mut result = FileInfo {
                         title: page["title"].as_str().unwrap_or("").to_string(),
                         mime_type: info["mime"].as_str().unwrap_or("").to_string(),
                         size: info["size"].as_u64().unwrap_or(0),
@@ -249,9 +276,16 @@ impl MediaWikiApiDataSource {
                         height: info["height"].as_u64().unwrap_or(0) as u32,
                         description_url: info["descriptionurl"].as_str().unwrap_or("").to_string(),
                         file_url: info["url"].as_str().unwrap_or("").to_string(),
-                        thumb_urls: HashMap::new(),
+                        thumb_url: info["thumburl"].as_str().map(str::to_string),
+                        thumb_width: info["thumbwidth"].as_u64().map(|w| w as u32),
+                        thumb_height: info["thumbheight"].as_u64().map(|h| h as u32),
+                        responsive_urls,
                         bad_file: page["badfile"].as_bool().unwrap_or(false),
-                    }));
+                    };
+                    // The API expands URLs and stamps its own UTM campaign; the
+                    // parser wants the protocol-relative, `parser`-campaign form.
+                    result.normalize_api_urls();
+                    return Ok(Some(result));
                 }
             }
         }
@@ -295,8 +329,14 @@ impl DataSource for MediaWikiApiDataSource {
         self.fetch_module(&title.full_text()).await
     }
 
-    async fn get_file_info(&self, title: &Title) -> Result<Option<FileInfo>> {
-        self.fetch_file_info(&title.full_text()).await
+    async fn get_file_info(
+        &self,
+        title: &Title,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Option<FileInfo>> {
+        self.fetch_file_info(&title.full_text(), width, height)
+            .await
     }
 
     async fn resolve_redirect(&self, title: &Title) -> Result<Option<Title>> {

@@ -4,7 +4,7 @@
 /// so the parser core doesn't depend on any specific backend.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::Result;
 use crate::lua::engine::SiteStats;
@@ -75,8 +75,22 @@ pub trait DataSource: Send + Sync {
     /// Fetch the source code of a Lua (Scribunto) module.
     async fn get_module(&self, title: &Title) -> Result<Option<String>>;
 
-    /// Fetch metadata for a file (image, audio, video, etc.).
-    async fn get_file_info(&self, title: &Title) -> Result<Option<FileInfo>>;
+    /// Fetch metadata for a file (image, audio, video, etc.), at a requested
+    /// display size.
+    ///
+    /// `width`/`height` are the media option's requested dimensions, the same
+    /// pair PHP's `DataAccess::getFileInfo( $pageConfig, $requests )` receives
+    /// per request (`$request[1]['width'|'height']`): they size the thumbnail the
+    /// wiki generates, and the answer's [`thumb_url`](FileInfo::thumb_url) and
+    /// [`thumb_width`](FileInfo::thumb_width)/[`thumb_height`](FileInfo::thumb_height)
+    /// describe the returned thumbnail. `None` means the file is displayed
+    /// unscaled (`framed`), so no thumbnail is requested.
+    async fn get_file_info(
+        &self,
+        title: &Title,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Option<FileInfo>>;
 
     /// Resolve a redirect to its target page.
     /// Returns `None` if the page is not a redirect.
@@ -193,7 +207,11 @@ pub struct PageInfo {
 }
 
 /// Metadata for a file (image, audio, video).
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` so a data source can cache the answer at a
+/// requested display size: it is a fact the file's wikitext cannot supply, and
+/// without it an offline run renders every image as `mw-broken-media`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileInfo {
     /// Canonical file title (without namespace prefix).
     pub title: String,
@@ -209,11 +227,54 @@ pub struct FileInfo {
     pub description_url: String,
     /// URL to the raw file itself.
     pub file_url: String,
-    /// Thumbnail URLs keyed by width (e.g. `"120"`, `"300"`).
-    pub thumb_urls: HashMap<String, String>,
+    /// Thumbnail URL for the requested display size (PHP `thumburl`).
+    ///
+    /// The wiki's URL, not always at `thumb_width`: MediaWiki serves a
+    /// pre-rendered *bucket* size (a 180px request returns a `250px-…` path
+    /// whose `thumbwidth` is nonetheless 180), so the path cannot be rebuilt
+    /// from the dimensions.
+    pub thumb_url: Option<String>,
+    /// The display width the wiki returned (`thumbwidth`), which
+    /// `AddMediaInfo::handleSize` adopts over the natural width.
+    pub thumb_width: Option<u32>,
+    /// The display height the wiki returned (`thumbheight`).
+    pub thumb_height: Option<u32>,
+    /// Display density → URL (`responsiveUrls`), the source of the `srcset`
+    /// attribute. A `BTreeMap` keeps the densities in ascending order, as PHP's
+    /// `foreach` over the API's map does.
+    pub responsive_urls: BTreeMap<String, String>,
     /// Whether the file is on the wiki's bad-image list (rendered broken with
     /// `mw:Error` + `apierror-badfile` even though the file exists).
     pub bad_file: bool,
+}
+
+impl FileInfo {
+    /// Rewrite the wiki API's URLs into the form the parsed output carries.
+    ///
+    /// Two mechanical differences: the API expands URLs to the absolute
+    /// canonical form while parsed output is protocol-relative, and the API
+    /// stamps its own `utm_campaign=imageinfo` where the parser stamps
+    /// `utm_campaign=parser` (both come from MediaWiki's thumbnail URL builder,
+    /// differing only in the caller). Applied by the API-backed data sources; a
+    /// mock keeps its own URLs, so the media processor never has to know which
+    /// source supplied the answer.
+    pub fn normalize_api_urls(&mut self) {
+        fn normalize(url: &str) -> String {
+            let url = url
+                .strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .map(|rest| format!("//{rest}"))
+                .unwrap_or_else(|| url.to_string());
+            url.replace("utm_campaign=imageinfo", "utm_campaign=parser")
+        }
+        self.file_url = normalize(&self.file_url);
+        if let Some(u) = self.thumb_url.take() {
+            self.thumb_url = Some(normalize(&u));
+        }
+        for url in self.responsive_urls.values_mut() {
+            *url = normalize(url);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

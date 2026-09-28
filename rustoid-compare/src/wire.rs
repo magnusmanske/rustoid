@@ -416,6 +416,32 @@ impl WikiClient {
         self.get_text(&url).await
     }
 
+    /// `imageinfo` for one file, optionally at a requested display size.
+    ///
+    /// `iiurlwidth`/`iiurlheight` make the wiki generate a thumbnail at that
+    /// size and return its URL *and* `thumbwidth`/`thumbheight`; that returned
+    /// width is what the rendered `<img>` uses, mirroring Parsoid's per-request
+    /// `dims` reaching `DataAccess::getFileInfo`.
+    pub async fn file_info_json(
+        &self,
+        title: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<String> {
+        let mut url = format!(
+            "{}?action=query&prop=imageinfo&iiprop=url%7Csize%7Cmime&format=json&formatversion=2&titles={}",
+            self.wiki.api_url(),
+            urlencode(title)
+        );
+        if let Some(w) = width {
+            url.push_str(&format!("&iiurlwidth={w}"));
+        }
+        if let Some(h) = height {
+            url.push_str(&format!("&iiurlheight={h}"));
+        }
+        self.get_text(&url).await
+    }
+
     /// Fetch raw `siteinfo` JSON (namespaces, magic words, function hooks,
     /// extension tags, interwiki map, general).
     pub async fn siteinfo(&self) -> Result<String> {

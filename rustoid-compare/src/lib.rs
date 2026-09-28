@@ -25,6 +25,7 @@
 pub mod cache;
 pub mod corpus;
 pub mod error;
+pub mod fileinfo;
 pub mod harness;
 pub mod pageinfo;
 pub mod scoreboard;

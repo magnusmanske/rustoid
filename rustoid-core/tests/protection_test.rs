@@ -48,6 +48,8 @@ impl rustoid_core::traits::DataSource for ProtectedSource {
     async fn get_file_info(
         &self,
         _title: &rustoid_core::Title,
+        _width: Option<u32>,
+        _height: Option<u32>,
     ) -> rustoid_core::Result<Option<rustoid_core::traits::FileInfo>> {
         Ok(None)
     }

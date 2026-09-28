@@ -66,6 +66,14 @@ pub enum EntryKind {
     /// with no classes", which is why a link to a disambiguation page lost its
     /// `mw-disambig` class and a link to an uncached-but-real page looked red.
     PageInfo,
+    /// A file's media metadata, as JSON, at one requested display size.
+    ///
+    /// The key carries the size (`File:X.png@250`) because the wiki only returns
+    /// a thumbnail URL for the width it was asked for, and the rendered `<img>`
+    /// uses that returned width. Like [`Protection`](Self::Protection) this is a
+    /// fact the body cannot supply: without it offline media is always
+    /// `mw-broken-media`.
+    FileInfo,
 }
 
 impl EntryKind {
@@ -89,6 +97,7 @@ impl EntryKind {
             Self::Entity => "entity",
             Self::Protection => "prot",
             Self::PageInfo => "info",
+            Self::FileInfo => "file",
         }
     }
 
@@ -103,6 +112,7 @@ impl EntryKind {
             "entity" => Some(Self::Entity),
             "prot" => Some(Self::Protection),
             "info" => Some(Self::PageInfo),
+            "file" => Some(Self::FileInfo),
             _ => None,
         }
     }

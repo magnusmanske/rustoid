@@ -175,6 +175,130 @@ impl Default for MockDataSource {
     }
 }
 
+/// Scale a file's metadata to a requested display size, mirroring
+/// `MockApiHelper::imageInfo`: run the core transform and fill in the thumbnail
+/// URL, its dimensions, and the responsive density map.
+///
+/// The URL layout is the wiki's: a raw file at `<root>/<d1>/<d2>/<name>` has its
+/// thumbnails under `<root>/thumb/<d1>/<d2>/<name>/<w>px-<name>`.
+fn mock_image_transform(info: &mut FileInfo, tw: Option<u32>, th: Option<u32>) {
+    let mediatype = mock_mediatype(&info.mime_type);
+    let (width, height) = (info.width, info.height);
+    let mut tw = tw;
+    let mut th = th;
+    // A drawing or video with no requested size is still rendered at its natural
+    // size, unlike a bitmap.
+    if matches!(mediatype, "VIDEO" | "DRAWING") && tw.is_none() && th.is_none() {
+        tw = Some(width);
+        th = Some(height);
+    }
+    if tw.is_none() && th.is_none() {
+        return;
+    }
+    let Some((root, prefix, name)) = split_media_url(&info.file_url) else {
+        return;
+    };
+    let thumb_base = format!("{root}/thumb/{prefix}/{name}");
+    let (orig_w, orig_h) = (tw, th);
+    transform_helper(width, height, &mut tw, &mut th);
+    let tw = tw.unwrap_or(width);
+    let th = th.unwrap_or(height);
+    let suffix = match mediatype {
+        "VIDEO" | "OFFICE" => ".jpg",
+        "DRAWING" => ".png",
+        _ => "",
+    };
+    // A bitmap is never enlarged by the PHP API, so the URL keeps the natural
+    // width; every other type gets a real transformed thumbnail.
+    let url_width = if tw > width && mediatype != "DRAWING" {
+        width
+    } else {
+        tw
+    };
+    let thumb_url =
+        if url_width != width || matches!(mediatype, "AUDIO" | "VIDEO" | "OFFICE" | "DRAWING") {
+            format!("{thumb_base}/{url_width}px-{name}{suffix}")
+        } else {
+            info.file_url.clone()
+        };
+    info.thumb_width = Some(tw);
+    info.thumb_height = Some(th);
+    info.thumb_url = Some(thumb_url.clone());
+
+    // The 2x density candidate (T226683), scaled from the *original* request.
+    let mut stw = orig_w.map(|w| (f64::from(w) * 2.0).round() as u32);
+    let mut sth = orig_h.map(|h| (f64::from(h) * 2.0).round() as u32);
+    transform_helper(width, height, &mut stw, &mut sth);
+    let stw = stw.unwrap_or(width);
+    let st_url = if stw < width || matches!(mediatype, "DRAWING" | "OFFICE") {
+        format!("{thumb_base}/{stw}px-{name}{suffix}")
+    } else {
+        info.file_url.clone()
+    };
+    if thumb_url != st_url && mediatype != "AUDIO" {
+        info.responsive_urls.insert("2".to_string(), st_url);
+    }
+}
+
+/// The MediaWiki media type for a MIME type (`MockApiHelper`'s `mediatype`).
+fn mock_mediatype(mime: &str) -> &'static str {
+    match mime {
+        "image/svg+xml" => "DRAWING",
+        "image/vnd.djvu" => "OFFICE",
+        m if m.starts_with("audio/") => "AUDIO",
+        m if m.starts_with("video/") => "VIDEO",
+        _ => "BITMAP",
+    }
+}
+
+/// Split a wiki file URL into its `(root, md5-prefix, file-name)` parts.
+fn split_media_url(url: &str) -> Option<(String, String, String)> {
+    let (rest, name) = url.rsplit_once('/')?;
+    let (rest, dir2) = rest.rsplit_once('/')?;
+    let (root, dir1) = rest.rsplit_once('/')?;
+    Some((root.to_string(), format!("{dir1}/{dir2}"), name.to_string()))
+}
+
+/// Port of `MockApiHelper::transformHelper` (itself a port of core's
+/// `ImageHandler::normaliseParams`, `MediaHandler::fitBoxWidth`, and
+/// `File::scaleHeight`): fill in whichever of `tw`/`th` is missing so both are
+/// set, keeping the aspect ratio.
+fn transform_helper(width: u32, height: u32, tw: &mut Option<u32>, th: &mut Option<u32>) {
+    let (width, height) = if width == 0 || height == 0 {
+        (f64::from(tw.unwrap_or(0)), f64::from(th.unwrap_or(0)))
+    } else {
+        (f64::from(width), f64::from(height))
+    };
+    // `MediaHandler::fitBoxWidth`, which keeps the height as the constraint.
+    let fit_box = |th: u32| -> u32 {
+        let ideal = width * f64::from(th) / height;
+        let rounded_up = ideal.ceil();
+        if (rounded_up * height / width).round() > f64::from(th) {
+            ideal.floor() as u32
+        } else {
+            rounded_up as u32
+        }
+    };
+    match (*tw, *th) {
+        (Some(tw_v), None) => {
+            *th = Some((height * f64::from(tw_v) / width).round() as u32);
+        }
+        (None, Some(th_v)) => {
+            *tw = Some(fit_box(th_v));
+        }
+        (Some(tw_v), Some(th_v)) => {
+            if f64::from(tw_v) * height > f64::from(th_v) * width {
+                *tw = Some(fit_box(th_v));
+            } else if (height * f64::from(tw_v) / width).round() > f64::from(th_v) {
+                *tw = Some((width * f64::from(th_v) / height).ceil() as u32);
+            } else {
+                *th = Some((height * f64::from(tw_v) / width).round() as u32);
+            }
+        }
+        (None, None) => {}
+    }
+}
+
 #[async_trait]
 impl DataSource for MockDataSource {
     async fn get_page_content(&self, title: &Title) -> Result<Option<String>> {
@@ -250,7 +374,12 @@ impl DataSource for MockDataSource {
             .or_else(|| case_insensitive_get(&self.modules, &key)))
     }
 
-    async fn get_file_info(&self, title: &Title) -> Result<Option<FileInfo>> {
+    async fn get_file_info(
+        &self,
+        title: &Title,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<Option<FileInfo>> {
         // Files are keyed by their canonical prefixed DB key (English `File:`
         // prefix + underscore-separated name), independent of the localized
         // content-language alias (e.g. `Dosiero:`/`Файл:` map to the same file).
@@ -261,13 +390,22 @@ impl DataSource for MockDataSource {
         } else {
             format!("{canon}:{dbkey}")
         };
-        Ok(self
+        let base = self
             .files
             .read()
             .unwrap()
             .get(&key)
             .cloned()
-            .or_else(|| case_insensitive_get(&self.files, &key)))
+            .or_else(|| case_insensitive_get(&self.files, &key));
+        // The mock mimics the wiki's per-request answer: it scales the file for
+        // the requested size and returns a thumbnail URL, exactly as
+        // `MockApiHelper::imageInfo` does (`transformHelper` plus the core
+        // thumbnail-URL rules). A source that stored one fixed `FileInfo` would
+        // answer the media processor's `handleSize` with natural dimensions.
+        Ok(base.map(|mut info| {
+            mock_image_transform(&mut info, width, height);
+            info
+        }))
     }
 
     async fn resolve_redirect(&self, title: &Title) -> Result<Option<Title>> {
@@ -308,7 +446,7 @@ impl DataSource for MockDataSource {
             let t = crate::title::Title::new_main(title.clone());
             let has_content = self.get_page_content(&t).await?.is_some();
             // A file can be "known" even without a local description page.
-            let known_file = self.get_file_info(&t).await?.is_some();
+            let known_file = self.get_file_info(&t, None, None).await?.is_some();
             ret.insert(
                 title.clone(),
                 PageInfo {

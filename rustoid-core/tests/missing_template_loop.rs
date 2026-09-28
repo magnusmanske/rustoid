@@ -70,7 +70,12 @@ impl DataSource for Recording {
         Ok(None)
     }
 
-    async fn get_file_info(&self, _title: &Title) -> rustoid_core::Result<Option<FileInfo>> {
+    async fn get_file_info(
+        &self,
+        _title: &Title,
+        _width: Option<u32>,
+        _height: Option<u32>,
+    ) -> rustoid_core::Result<Option<FileInfo>> {
         Ok(None)
     }
 

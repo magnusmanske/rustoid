@@ -79,9 +79,13 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
             Ok(Some(target)) => target,
             _ => job.title.clone(),
         };
-        let key = job.title.full_text();
+        let (req_w, req_h) = requested_dims(job);
+        let key = info_key(&job.title, job);
         if let Entry::Vacant(entry) = infos.entry(key) {
-            let info = source.get_file_info(&fetch_title).await.unwrap_or(None);
+            let info = source
+                .get_file_info(&fetch_title, req_w, req_h)
+                .await
+                .unwrap_or(None);
             entry.insert(info);
         }
 
@@ -92,9 +96,12 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
         // the same file) must still retrieve the manual-thumb info.
         if let Some(mt) = &job.manualthumb {
             let mt_title = Title::new(6, mt.clone());
-            let mt_key = mt_title.full_text();
+            let mt_key = info_key(&mt_title, job);
             if let Entry::Vacant(entry) = infos.entry(mt_key) {
-                let mt_info = source.get_file_info(&mt_title).await.unwrap_or(None);
+                let mt_info = source
+                    .get_file_info(&mt_title, req_w, req_h)
+                    .await
+                    .unwrap_or(None);
                 entry.insert(mt_info);
             }
         }
@@ -125,6 +132,25 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
     }
 }
 
+/// The requested display size for a container, from its `data-width`/`data-height`
+/// (PHP's `$dims['width']`/`$dims['height']`). A zero value is treated as absent,
+/// as PHP's `(int)$attr ?: null` does.
+fn requested_dims(job: &ContainerJob) -> (Option<u32>, Option<u32>) {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+    };
+    (parse(&job.data_width), parse(&job.data_height))
+}
+
+/// PHP's `$infoKey`: the file DB key together with the requested size. Two
+/// containers that resolve to the same file *and* the same requested size share
+/// one fetch (and one image-limit slot), which is why the key carries both.
+fn info_key(title: &Title, job: &ContainerJob) -> String {
+    format!("{}\u{1}{}", title.full_text(), job.dims_key)
+}
+
 /// A `mw:File` container discovered during the collection walk.
 struct ContainerJob {
     /// Path of child indices from `root` to the container node.
@@ -140,6 +166,10 @@ struct ContainerJob {
     /// The `data-upright` factor on the broken span (only present for
     /// `thumb`/`frameless` + `upright`), if any.
     upright: Option<f64>,
+    /// The media format (PHP `WTUtils::getMediaFormat`): `"Thumb"`, `"Frame"`,
+    /// `"Frameless"`, or `""` (basic). `handleSize` uses it to decide whether to
+    /// deny upscaling.
+    format: String,
     /// The original wikitext source of the `resource` (e.g. `Image:Foobar.jpg`),
     /// recovered from the broken span's `data-parsoid.sa.resource`, used to
     /// round-trip a non-canonical namespace alias through html2wt.
@@ -478,6 +508,7 @@ fn collect_containers(
             data_height: data_height_from_container(node),
             manualthumb: data_mw_txt(node, "manualthumb"),
             upright: upright_from_container(node),
+            format: media_format(node),
             href_src: href_src_from_container(node),
             limit_reached: false,
         });
@@ -494,7 +525,9 @@ fn apply_media_info(
     page_info: &HashMap<String, crate::traits::PageInfo>,
     config: &dyn SiteConfig,
 ) {
-    let info = infos.get(&job.title.full_text()).and_then(|i| i.clone());
+    let info = infos
+        .get(&info_key(&job.title, job))
+        .and_then(|i| i.clone());
 
     // T314059: migrate any reopened formatting elements (from a content-model
     // violation, e.g. `<p>''[[File:…|thumb]]''</p>`) out of the anchor and into
@@ -592,7 +625,7 @@ fn apply_media_info(
     let mut manualthumb_missing = false;
     let media_info = if let Some(mt) = &job.manualthumb {
         let mt_title = Title::new(6, mt.clone());
-        match infos.get(&mt_title.full_text()).and_then(|i| i.clone()) {
+        match infos.get(&info_key(&mt_title, job)).and_then(|i| i.clone()) {
             Some(mt_info) => mt_info,
             // A missing manual-thumb file errors the whole media (mirrors the
             // `!$manualinfo` → `apierror-filedoesnotexist` branch).
@@ -646,16 +679,17 @@ fn apply_media_info(
         handle_size(job, &media_info)
     };
 
-    // The image `src` is the thumbnail at the *resolved* width (before any
-    // packed-gallery scaling).
-    let src = {
-        let resolved_key = resolved_width.to_string();
-        image_src(&media_info, Some(&resolved_key))
-    };
+    // The image `src` is the thumbnail the wiki returned for the requested size,
+    // independent of the resolved display size (PHP's `getPath` reads `thumburl`,
+    // not the `handleSize` result).
+    let src = image_src(&media_info);
     let width = resolved_width;
     let height = resolved_height;
 
-    // Build the `<img>` replacement.
+    // Build the `<img>` replacement. Attribute order matters for byte parity:
+    // PHP copies `resource` first, then sets `thumbattribs` (whose order is
+    // `src`, `decoding`, `loading`, `srcset`), then `alt`, then `lang`, and only
+    // then the `data-file-*` and the normalized `height`/`width`.
     let mut img = Node::element(ElementKind::Other("img".to_string()));
     // resource copied from the broken span's title (the file DB key).
     let canonical_resource = crate::title::make_link(&job.title, config);
@@ -673,15 +707,24 @@ fn apply_media_info(
             dp.set_sa("resource", href_src);
         }
     }
-    // alt from the explicit option/caption (when present), before the fixed
-    // attrs (mirrors PHP's `thumbattribs` ordering: `src`, `decoding`,
-    // `loading`, then `data-file-*`, then `width`/`height`).
+    // `src` comes from `thumbattribs`, whose first key it is; PHP then overwrites
+    // it with `getPath` (the same URL), so it stays in place.
+    img.set_attr("src", &src);
+    // Fixed attribute set (decoding/loading) — the rest of `thumbattribs`.
+    for (k, v) in IMG_ATTRIBS {
+        img.set_attr(k, v);
+    }
+    // `srcset` from `responsiveUrls` (or `thumbattribs.srcset`, which it mirrors).
+    if let Some(srcset) = srcset(&media_info) {
+        img.set_attr("srcset", &srcset);
+    }
+    // alt from the explicit option/caption (when present).
     if let Some(alt) = &alt {
         img.set_attr("alt", alt);
     }
-    // Fixed attribute set (decoding/loading).
-    for (k, v) in IMG_ATTRIBS {
-        img.set_attr(k, v);
+    // `lang` is copied from the broken span after the `thumbattribs` loop.
+    if let Some(lang) = &lang {
+        img.set_attr("lang", lang);
     }
     // data-file-* read-only original size info (T64881). For manualthumb these
     // reflect the manual-thumb file, matching PHP's `$info` replacement.
@@ -691,11 +734,6 @@ fn apply_media_info(
         "data-file-type",
         media_type_from_mime(&media_info.mime_type),
     );
-    // src + srcset (responsive 2x).
-    img.set_attr("src", src);
-    if let Some(srcset) = srcset(&media_info) {
-        img.set_attr("srcset", srcset);
-    }
     // Rendered dimensions.
     img.set_attr("height", height.to_string());
     img.set_attr("width", width.to_string());
@@ -967,72 +1005,85 @@ fn node_at_read<'a>(root: &'a Node, path: &[usize]) -> Option<&'a Node> {
     Some(node)
 }
 
-/// Compute the rendered width/height for a bitmap image (mirrors `handleSize`
-/// for the common non-upscaling bitmap cases). When `data-height` is present and
-/// smaller than the file height, the thumbnail is *height-constrained* (as for
-/// the packed gallery, whose `dimensions()` requests a large width but a concrete
-/// height), so the width is derived from the aspect ratio.
+/// The rendered `<img>` dimensions (PHP `AddMediaInfo::handleSize`).
+///
+/// A returned thumbnail's dimensions win over the natural size; then, for a
+/// `thumb`/`frameless` bitmap, a request that would *upscale* is denied, keeping
+/// the natural size (the wiki's server-side thumbnailer refuses to upscale
+/// either). A non-bitmap (`mustRender`) may upscale.
 fn handle_size(job: &ContainerJob, info: &FileInfo) -> (u32, u32) {
-    let (mut width, mut height) = (info.width, info.height);
+    let mut width = info.width;
+    let mut height = info.height;
 
-    let req_w = job
-        .data_width
-        .as_deref()
-        .and_then(|s| s.parse::<u32>().ok());
-    let req_h = job
-        .data_height
-        .as_deref()
-        .and_then(|s| s.parse::<u32>().ok());
-
-    // Height-constrained thumbnail: a concrete `data-height` smaller than the
-    // file height drives the thumbnail dimensions; the width preserves the
-    // aspect ratio (mirrors core's thumbnail generation, which rounds up).
-    if let Some(h) = req_h
-        && h > 0
-        && h < info.height
-        && info.height > 0
-    {
-        height = h;
-        let w = (info.width as u64 * h as u64).div_ceil(info.height as u64);
-        width = w as u32;
-        return (width, height);
+    // `!empty($info['thumburl']) && !empty($info['thumbheight'])` — a zero/absent
+    // returned dimension leaves the natural one in place.
+    if info.thumb_url.is_some() {
+        if let Some(h) = info.thumb_height.filter(|h| *h > 0) {
+            height = h;
+        }
+        if let Some(w) = info.thumb_width.filter(|w| *w > 0) {
+            width = w;
+        }
     }
 
-    // A `thumb`/`frameless` request carries the target width on the broken span
-    // (`data-width`). Scale proportionally (exact thumb-height is not derivable
-    // from `FileInfo`, so we preserve the file's aspect ratio).
-    if let Some(w) = req_w
-        && w > 0
-        && info.width > 0
+    // BITMAP files can be scaled by the browser, so upscaling is refused; every
+    // other media type must be rendered by the server (`mustRender`) and may be
+    // upscaled.
+    let must_render = media_type_from_mime(&info.mime_type) != "bitmap";
+
+    // The scaling ratio from the requested width/height; the smaller of the two
+    // constrains (`$ratio = ($ratio === null || $r < $ratio) ? $r : $ratio`).
+    let ratio = match (
+        requested_axis(&job.data_height, info.height),
+        requested_axis(&job.data_width, info.width),
+    ) {
+        (Some(h), Some(w)) => Some(h.min(w)),
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (None, None) => None,
+    };
+
+    if let Some(r) = ratio
+        && r > 1.0
+        && !must_render
+        && matches!(job.format.as_str(), "Thumb" | "Frameless")
     {
-        width = w;
-        // Scale height proportionally, rounding half-up (mirrors core's
-        // `File::scaleHeight` → `round( $height * $twidth / $width )`).
-        let scaled = (info.height as u64 * w as u64 + info.width as u64 / 2) / info.width as u64;
-        height = scaled as u32;
+        width = info.width;
+        height = info.height;
     }
 
     (width, height)
 }
 
-/// The `src` URL for the image (thumbnail for the requested width, else raw).
-fn image_src(info: &FileInfo, requested_width: Option<&str>) -> String {
-    if let Some(w) = requested_width
-        && let Some(thumb) = info.thumb_urls.get(w)
-    {
-        return thumb.clone();
+/// A requested dimension as a fraction of the file's natural dimension, or
+/// `None` when either is zero/absent (PHP's `!empty(...)` guard).
+fn requested_axis(requested: &Option<String>, natural: u32) -> Option<f64> {
+    let req = requested.as_deref()?.parse::<f64>().ok()?;
+    if req <= 0.0 || natural == 0 {
+        return None;
     }
-    info.file_url.clone()
+    Some(req / natural as f64)
 }
 
-/// The 2x `srcset` value (responsive images), mirroring PHP's `responsiveUrls`.
-/// Only derivable when the data source exposes a 2x thumbnail; otherwise absent.
+/// The `src` URL for the image: the request's thumbnail if there is one, else
+/// the raw file (PHP `getPath`).
+fn image_src(info: &FileInfo) -> String {
+    info.thumb_url
+        .clone()
+        .unwrap_or_else(|| info.file_url.clone())
+}
+
+/// The `srcset` value (PHP `AddMediaInfo::handleImage`'s `responsiveUrls` loop):
+/// one `url densityx` candidate per density, ascending.
 fn srcset(info: &FileInfo) -> Option<String> {
-    // A "2x" candidate maps to a thumbnail at twice the natural width. We can
-    // only emit it when the file provides both natural and a wider thumb; for
-    // now, no srcset is emitted (the harness strips it from comparison anyway).
-    let _ = info;
-    None
+    if info.responsive_urls.is_empty() {
+        return None;
+    }
+    let candidates: Vec<String> = info
+        .responsive_urls
+        .iter()
+        .map(|(density, url)| format!("{url} {density}x"))
+        .collect();
+    Some(candidates.join(", "))
 }
 
 /// Map a MIME type to the lowercase `data-file-type` value PHP emits
@@ -1412,11 +1463,6 @@ mod tests {
     }
 
     fn seed_file(ds: &MockDataSource) {
-        let mut thumb_urls = HashMap::new();
-        thumb_urls.insert(
-            "180".to_string(),
-            "http://example.com/images/thumb/3/3a/Foobar.jpg/180px-Foobar.jpg".to_string(),
-        );
         ds.add_file(
             "File:Foobar.jpg",
             FileInfo {
@@ -1427,8 +1473,7 @@ mod tests {
                 height: 220,
                 description_url: "http://example.com/images/Foobar.jpg".to_string(),
                 file_url: "http://example.com/images/3/3a/Foobar.jpg".to_string(),
-                thumb_urls,
-                bad_file: false,
+                ..FileInfo::default()
             },
         );
     }
@@ -1509,8 +1554,8 @@ mod tests {
                 height: 100,
                 description_url: "".to_string(),
                 file_url: "http://example.com/images/Foobar.jpg".to_string(),
-                thumb_urls: HashMap::new(),
                 bad_file: true,
+                ..FileInfo::default()
             },
         );
         let cfg = MockSiteConfig::new();

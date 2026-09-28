@@ -107,7 +107,12 @@ impl DataSource for RuwexDataSource {
         self.read_page(&module_title)
     }
 
-    async fn get_file_info(&self, _title: &Title) -> Result<Option<FileInfo>> {
+    async fn get_file_info(
+        &self,
+        _title: &Title,
+        _width: Option<u32>,
+        _height: Option<u32>,
+    ) -> Result<Option<FileInfo>> {
         // ruwex doesn't handle file metadata — return empty
         Ok(None)
     }
