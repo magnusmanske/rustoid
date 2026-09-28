@@ -6980,3 +6980,98 @@ Module-namespace page renders its *source* where the service renders the
 documentation tree — a namespace/content-model gap of its own. Facts for 39 of
 40 are 7 d newer than their pinned baselines, so several of these may be drift
 (the harness flags them `suspect`); only a re-pin can settle those.
+
+## The `mw-empty-elt` wrapper was a cache bug, not a parser bug
+
+Seven of the ten smallest wide-corpus differences were one shape: rustoid rendered
+the empty `{{Pp}}` line as a bare `<span class="mw-empty-elt">`, the service as
+`<p class="mw-empty-elt">…</p>`. `CleanUp::handleEmptyElements` only marks a
+paragraph empty when its children are *rendering-transparent*, and rustoid's
+child was a `<a rel="mw:WikiLink" href="./Template:Cs1_config">` — a red link to
+a template that plainly exists. So the paragraph was not "empty" and never got
+the wrapper or the `id`.
+
+The template exists: `Template:CS1 config` (rev 1305415940) is real, and
+`Template:Cs1 config` is a **redirect** to it. rustoid asked for the first and
+got the second's wikitext. The cause was not title resolution at all — it was the
+**cache filename scheme**.
+
+### The defect
+
+Bodies are stored as `pages/<key>.txt`, and the "current" scheme escaped only
+`/`, `\` and NUL, leaving case alone:
+
+```rust
+key.replace(['/', '\\', '\0'], "_").replace("..", "__")
+```
+
+Two properties of that are wrong, and both silently serve one page's wikitext for
+another:
+
+- **`/` and `_` collide on *every* filesystem.** `Module:Citation/CS1` and
+  `Module:Citation_CS1` are different keys with one file between them. Measured
+  on the corpus cache: **530 index-key groups** share a sanitised stem.
+- **Case collides on a case-insensitive filesystem** (macOS's default). The cache
+  itself reported *no* two files differing only by case — because the filesystem
+  does not permit them — while the *index* held 34 case-foldable key groups.
+  `Template:CS1 config` and `Template:Cs1 config` shared `tpl:Template:CS1
+  config.txt`, last write wins.
+
+Most such groups are harmless: the two keys name the same page (a redirect alias,
+or a title the API normalised), and one body genuinely serves both — 549 of the
+563 groups carry a single revision. But **14 groups carry two different
+revisions**, i.e. two different pages, and the shared file holds only one. The
+surviving body under `tpl:Template:CS1 config.txt` was the redirect
+(`#REDIRECT [[Template:CS1 config]]`), which is why the paragraph above was a red
+link.
+
+Wrong turn worth recording: this was first written up as a *case-policy* gap —
+template transclusion on enwiki supposedly folding case after the first letter,
+which rustoid did not implement. It was not. Reading the cache body file (81
+bytes of `#REDIRECT`) is what exposed the collision; `index.json` recorded two
+entries with different revisions and looked perfectly healthy.
+
+### The fix
+
+`escape_body_stem` now maps a key to a filename **injectively**, escaping only
+what would otherwise lose information, as `%XX` uppercase hex:
+
+- `/`, `\`, NUL (cannot be in a filename at all);
+- ASCII uppercase (folded by a case-insensitive filesystem);
+- every non-ASCII byte (same folding reason, and no normalisation form assumed);
+- `%` and `~` (so the escapes stay unambiguous, and `~` stays reserved).
+
+`%XX` keeps titles greppable (`grep -i cs1` still finds the file) while making
+`Template:CS1 config` and `Template:Cs1 config` distinct on *any* filesystem. A
+key whose escaped stem would overflow the ~255-byte filename limit is truncated
+and given a `~` + FNV-1a hash suffix; such a stem is not decodable and `reindex`
+ignores it. The longest key in the cache escapes to 203 bytes, so the limit is
+headroom rather than a live concern.
+
+The two older schemes are still *read* (`locate_body` tries current, then the
+`_`-escaped form, then the `__`-colon form), because a corpus cache is hours of
+rate-limited fetching and moving files is not worth it. Only writes use the new
+scheme.
+
+Genuinely-colliding entries (the 14 groups) cannot be recovered from disk —
+nothing records which page the surviving file belongs to — so they are dropped
+and re-fetched. `WikiCache::drop_colliding_bodies` does this and is exposed as
+`--repair-cache`; it is conservative, skipping any group whose members already
+have a file under the new scheme, so it is a no-op on a healthy or repaired
+cache. Run against the real cache: **30 entries dropped** (exactly the 14
+groups), 7928 → 7898, then `--reindex` recovered 960 bodies that earlier
+interrupted runs had left unflushed.
+
+### Result
+
+`Template:CS1 config` holds the real `<nowiki/><!--…-->` template again, and
+COVID-19 pandemic's first difference moved from the empty-`p` wrapper to **byte
+962** — the wrapper's `class="mw-empty-elt"` and `id="mwAw"` are now present on
+both sides. The remaining difference there is the **indicator name**: service
+`attrs.name` `"good-star"`, rustoid `" "` (the no-argument-transclusion bug from
+the wide-corpus table, now the first thing in the way).
+
+Validation: cache unit tests (31, incl. injective-stem, intermediate-scheme read,
+long-key truncation, and the repair), `cargo test --release --workspace`,
+`clippy --workspace --all-targets`, `fmt --check`, and the fixture guard
+**876/896** all clean.
