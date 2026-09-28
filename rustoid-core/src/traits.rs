@@ -346,6 +346,17 @@ pub trait SiteConfig: Send + Sync {
         "/w"
     }
 
+    /// The default thumbnail width in pixels, PHP's `SiteConfig::widthOption()`.
+    ///
+    /// A `thumb`/`frameless` media option with no explicit size is rendered at
+    /// this width (`WikiLinkHandler::renderFile`), so it is not a constant: the
+    /// wiki derives it from `thumblimits[defaultoptions.thumbsize]` (250px on
+    /// enwiki, not the 180px of `thumblimits[0]`). Defaults to 180, MediaWiki's
+    /// first thumb limit, for a config that does not report one.
+    fn width_option(&self) -> u32 {
+        180
+    }
+
     /// The wiki-wide counters, for `mw.site.stats`. Defaults to zeroes: a config
     /// that carries no statistics is a wiki whose counts are unknown, and zero
     /// keeps a module that reads them from stopping on a nil index.

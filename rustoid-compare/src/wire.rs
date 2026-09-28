@@ -443,10 +443,10 @@ impl WikiClient {
     }
 
     /// Fetch raw `siteinfo` JSON (namespaces, magic words, function hooks,
-    /// extension tags, interwiki map, general).
+    /// extension tags, interwiki map, general, default options).
     pub async fn siteinfo(&self) -> Result<String> {
         let url = format!(
-            "{}?action=query&meta=siteinfo&siprop=general%7Cnamespaces%7Cnamespacealiases%7Cmagicwords%7Cfunctionhooks%7Cextensiontags%7Cinterwikimap%7Cstatistics&format=json&formatversion=2",
+            "{}?action=query&meta=siteinfo&siprop=general%7Cnamespaces%7Cnamespacealiases%7Cmagicwords%7Cfunctionhooks%7Cextensiontags%7Cinterwikimap%7Cstatistics%7Cdefaultoptions&format=json&formatversion=2",
             self.wiki.api_url()
         );
         self.get_text(&url).await

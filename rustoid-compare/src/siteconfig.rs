@@ -36,7 +36,7 @@ use crate::error::{CompareError, Result};
 /// `Clone` so a render can be moved to a worker thread: the per-page stall cap
 /// only works if the render is `'static`, and the harness holds the config behind
 /// a borrow.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct WikiSiteConfig {
     namespaces: HashMap<i32, NamespaceInfo>,
     interwiki_map: HashMap<String, InterwikiInfo>,
@@ -47,6 +47,28 @@ pub struct WikiSiteConfig {
     article_path: String,
     language_code: String,
     stats: SiteStats,
+    /// PHP's `SiteConfig::widthOption()`: the default thumbnail width for a
+    /// `thumb`/`frameless` media option with no explicit size.
+    width_option: u32,
+}
+
+impl Default for WikiSiteConfig {
+    fn default() -> Self {
+        Self {
+            namespaces: HashMap::new(),
+            interwiki_map: HashMap::new(),
+            magic_words: MagicWordMap::default(),
+            function_hooks: Vec::new(),
+            extension_tags: Vec::new(),
+            server_url: String::new(),
+            article_path: String::new(),
+            language_code: String::new(),
+            stats: SiteStats::default(),
+            // MediaWiki's first thumb limit; a config that reports none keeps
+            // this, which is the conservative choice (a smaller thumbnail).
+            width_option: 180,
+        }
+    }
 }
 
 impl WikiSiteConfig {
@@ -74,6 +96,25 @@ impl WikiSiteConfig {
             }
             if let Some(lang) = g.lang {
                 cfg.language_code = lang;
+            }
+            // PHP's `widthOption()` is `thumblimits[defaultoptions.thumbsize]`,
+            // not the first limit: the wiki-wide default thumbnail at 250px is
+            // `thumblimits[1]`, and the two are the same only when the default
+            // user preference picks index 0. Fall back to the first limit when
+            // the index is absent, which keeps a partial `siteinfo` usable.
+            if let Some(limits) = g.thumblimits {
+                let index = q
+                    .defaultoptions
+                    .as_ref()
+                    .and_then(|d| d.get("thumbsize"))
+                    .and_then(json_u64);
+                let chosen = index
+                    .and_then(|i| limits.get(&i.to_string()))
+                    .and_then(json_u64)
+                    .or_else(|| limits.get("0").and_then(json_u64));
+                if let Some(w) = chosen {
+                    cfg.width_option = w as u32;
+                }
             }
         }
 
@@ -289,6 +330,10 @@ impl SiteConfig for WikiSiteConfig {
     fn site_stats(&self) -> SiteStats {
         self.stats.clone()
     }
+
+    fn width_option(&self) -> u32 {
+        self.width_option
+    }
 }
 
 // ---- wire types ----
@@ -316,6 +361,9 @@ struct SiteInfoQuery {
     interwikimap: Option<Vec<InterwikiEntry>>,
     #[serde(default)]
     statistics: Option<Statistics>,
+    /// `defaultoptions` carries the `thumbsize` index into `general.thumblimits`.
+    #[serde(default)]
+    defaultoptions: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// The `statistics` section of `siteinfo`, which is `mw.site.stats`.
@@ -345,6 +393,15 @@ struct General {
     articlepath: Option<String>,
     #[serde(default)]
     lang: Option<String>,
+    /// The selectable thumbnail widths, keyed by index as a string.
+    #[serde(default)]
+    thumblimits: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// A JSON number or numeric string as `u64` (the API mixes both spellings).
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -433,8 +490,10 @@ mod tests {
           "sitename": "Wikipedia",
           "server": "//en.wikipedia.org",
           "articlepath": "/wiki/$1",
-          "lang": "en"
+          "lang": "en",
+          "thumblimits": { "0": 180, "1": 250, "2": 400 }
         },
+        "defaultoptions": { "thumbsize": 1 },
         "namespaces": {
           "0":  { "id": 0,  "case": "first-letter", "name": "",     "content": true },
           "10": { "id": 10, "case": "first-letter", "name": "Template", "canonical": "Template", "content": false }
@@ -457,6 +516,22 @@ mod tests {
 
     fn cfg() -> WikiSiteConfig {
         WikiSiteConfig::from_siteinfo_json(SAMPLE).unwrap()
+    }
+
+    /// `widthOption` is `thumblimits[defaultoptions.thumbsize]`, not the first
+    /// thumb limit: enwiki's default thumbnail is 250px (`thumblimits[1]`), and
+    /// a config that ignores the index renders every unsized thumbnail at 180.
+    #[test]
+    fn width_option_follows_the_default_thumbsize() {
+        assert_eq!(cfg().width_option(), 250);
+    }
+
+    /// Without the index (a partial `siteinfo`), fall back to the first limit.
+    #[test]
+    fn width_option_falls_back_to_the_first_limit() {
+        let json = SAMPLE.replace("\"defaultoptions\": { \"thumbsize\": 1 },", "");
+        let cfg = WikiSiteConfig::from_siteinfo_json(&json).unwrap();
+        assert_eq!(cfg.width_option(), 180);
     }
 
     /// Formatversion=2 spells the localized namespace name `name`, not `*`; if
