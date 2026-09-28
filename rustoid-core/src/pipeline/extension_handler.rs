@@ -383,6 +383,14 @@ fn pre_items(token: &SelfclosingTagTk, _config: &dyn crate::traits::SiteConfig) 
     let mut pre = TagTk::new("pre", sanitized, dp);
     pre.data_mw = None;
     pre.add_attribute_str("typeof", "mw:Extension/pre");
+    // The id TT2 spent on this extension (see `Parser::expand_templates`).
+    // PHP's `ExtensionHandler::onDocumentFragment` sets `about` on the
+    // fragment's first node and all its siblings; for a `<pre>` that is this
+    // one element. It is appended after `typeof` to match the served order
+    // (`… typeof="mw:Extension/pre" about="#mwt2" …`).
+    if let Some(about) = attr_str(token, "about") {
+        pre.add_attribute_str("about", about);
+    }
 
     let open = Item::Tok(ParsoidToken::Tag(pre));
     let close = Item::Tok(ParsoidToken::EndTag(EndTagTk::new(

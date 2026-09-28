@@ -2981,11 +2981,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         //
         // Only the extensions whose output consumes the id are numbered here.
         // `<ref>`/`<references>` keep it on the `<extension>` element the Cite
-        // pass later reads. `<nowiki>` is lean markup with no `about` at all.
-        // `<pre>`/`<style>` and the rest are rebuilt from their rich `data-mw`
-        // attribs (`extension_kv_attrs`), which do not carry a token attribute,
-        // so numbering them here would spend an id the output never shows — a
-        // second, different drift. They are left to a follow-up.
+        // pass later reads; `<pre>` keeps it on the `<pre>` element (see
+        // `extension_handler::pre_items`). `<nowiki>` is lean markup with no
+        // `about` at all. The remaining extensions are rebuilt from their rich
+        // `data-mw` attribs (`extension_kv_attrs`), which do not carry a token
+        // attribute, so numbering them here would spend an id the output never
+        // shows — a second, different drift. They are left to a follow-up.
         for item in out.iter_mut() {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                 continue;
@@ -2998,7 +2999,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .iter()
                 .find(|kv| kv.key.as_str() == Some("name"))
                 .and_then(|kv| kv.value.as_str());
-            if !matches!(name, Some("ref") | Some("references")) {
+            if !matches!(name, Some("ref") | Some("references") | Some("pre")) {
                 continue;
             }
             if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
@@ -6007,6 +6008,32 @@ mod tests {
         assert!(
             nested.contains(r##"<span about="#mwt4""##),
             "the reference is numbered before the two following templates: {nested}"
+        );
+    }
+
+    /// `<pre>` is a non-`nowiki` extension, so TT2 numbers it and the id reaches
+    /// the output. The fixture suite cannot see this — it strips `about` — so the
+    /// assertion is on the rendered `<pre>`.
+    #[tokio::test]
+    async fn a_pre_extension_is_numbered_and_shows_the_id() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template("Template:1x", "{{{1|}}}");
+        let config = crate::mock::MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        // The `<pre>` is written *first*, but the chunk's template is numbered
+        // before it (templates before extensions), so the pre is `#mwt2`.
+        let html = parser
+            .wikitext_to_html_expanded(
+                "<pre>x</pre>{{1x|a}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(html.contains(r##"about="#mwt1""##), "got: {html}");
+        assert!(
+            html.contains(r##"<pre typeof="mw:Extension/pre" about="#mwt2""##),
+            "the pre must carry the id TT2 spent: {html}"
         );
     }
 }
