@@ -7075,3 +7075,40 @@ Validation: cache unit tests (31, incl. injective-stem, intermediate-scheme read
 long-key truncation, and the repair), `cargo test --release --workspace`,
 `clippy --workspace --all-targets`, `fmt --check`, and the fixture guard
 **876/896** all clean.
+
+## `mw.ext.FlaggedRevs` was missing, and the wrapper it hid
+
+With the cache collision fixed, COVID-19 pandemic's first difference moved to the
+indicator name. The other pages the wide table blamed on the same missing
+`mw-empty-elt` class did **not** move, and reading their differing window shows
+why: their paragraph is not merely *missing the class*, it contains a red link.
+`ISO 3166-1 alpha-2` transcludes `{{pp-pc}}`, which resolves to
+`Template:Pending changes–protected` and reaches `Module:Effective protection
+level`; that module's line 15 is
+
+```lua
+local level = mw.ext.FlaggedRevs.getStabilitySettings(title)
+```
+
+and rustoid exposed no `mw.ext.FlaggedRevs`, so the transclusion aborted into
+`<strong class="error">Script error: … attempt to index field 'FlaggedRevs' (a
+nil value)</strong>`. A rendering error is not rendering-transparent, so
+`CleanUp::handleEmptyElements` declined to mark the paragraph — the same *shape*
+as the cache bug, reached from a different cause.
+
+The fix is the same kind of honest stub the neighbouring `mw.ext` entries use:
+`getStabilitySettings` returns `nil`, which is how the wiki answers for a page with
+no stability configuration and what `Module:Effective protection level` reads as
+`level and level.autoreview` (the "no extra review requirement" branch). A table
+would invent a review level the wiki does not apply.
+
+Effect on `ISO 3166-1 alpha-2`: the Lua error is gone and the first difference
+moves 600 -> 598. What remains there is now the *same* shape as Grand Theft Auto V
+— a template-only line whose empty-`elt` marking lands on the inner
+`<span class="mw-empty-elt">` instead of on a wrapping
+`<p class="mw-empty-elt" id="mwAw">`. That is a paragraph-wrapping question, not a
+cache or Lua one, and it is the next target rather than another miss.
+
+The 9-page subset is unchanged (Sundial 1897, Zebra 2172, Megadeth 2801, List of
+sovereign states 4009, Quicksilver 4213, Unix 4772, Help:Introduction 5161,
+Nobel Prize 5926, Bicycle 11836), and the fixture guard stays **876/896**.

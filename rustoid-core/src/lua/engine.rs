@@ -1848,6 +1848,28 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     ext.set("TitleBlacklist", ext_blacklist)
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
+    // `mw.ext.FlaggedRevs.getStabilitySettings(title)` — a page's pending-changes
+    // (FlaggedRevs) configuration. Returns `nil`: that is how the wiki answers for
+    // a page with no stability configuration, and `Module:Effective protection
+    // level` reads it as `level and level.autoreview`, so `nil` takes the branch
+    // that reports no extra review requirement. A table would invent a review
+    // level the wiki does not apply. Its absence was "attempt to index field
+    // 'FlaggedRevs' (a nil value)", which aborted `Template:Pp-pc` (reached from
+    // `{{pp-pc}}`) and so left every `mw-empty-elt` paragraph that wrapped it
+    // unmarked.
+    let ext_flagged = lua
+        .create_table()
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext_flagged
+        .set(
+            "getStabilitySettings",
+            lua.create_function(|_, _title: Value| Ok(Value::Nil))
+                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+        )
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    ext.set("FlaggedRevs", ext_flagged)
+        .map_err(|e| RustoidError::Lua(e.to_string()))?;
+
     // `mw.ext.ParserFunctions.expr` — ParserFunctions' `#expr` as a function.
     // `Module:Math` calls it when the `#expr` *parser function* is unavailable to
     // it; rustoid already evaluates `#expr`, so the same implementation answers
