@@ -714,6 +714,7 @@ impl MockSiteConfig {
             id,
             NamespaceInfo {
                 canonical: canonical.to_string(),
+                local: None,
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
                 case_sensitive,
                 default_content_model: content_model.to_string(),

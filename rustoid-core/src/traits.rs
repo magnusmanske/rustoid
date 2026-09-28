@@ -406,11 +406,12 @@ pub trait SiteConfig: Send + Sync {
 
     /// The localized (display) name for a namespace, e.g. `"Archivo"` for the
     /// File namespace in Spanish, `"File"` in English. Mirrors PHP's
-    /// `SiteConfig::namespaceName`. Falls back to the canonical name.
+    /// `SiteConfig::namespaceName`: the wiki's own name when it has one, else the
+    /// canonical name. On enwiki namespace 4 is `"Wikipedia"`, not `"Project"`.
     fn namespace_name(&self, ns: i32) -> Option<String> {
         self.namespaces()
             .get(&ns)
-            .map(|info| info.canonical.clone())
+            .map(|info| info.local.clone().unwrap_or_else(|| info.canonical.clone()))
     }
 
     /// `SiteConfig::interwikiMapNoNamespaces` — the interwiki map with entries
@@ -723,7 +724,12 @@ fn regex_escape(s: &str) -> String {
 pub struct NamespaceInfo {
     /// Canonical name (e.g. `"Template"`, `"Category"`).
     pub canonical: String,
-    /// Localized name(s).
+    /// The wiki's own name for the namespace, e.g. `"Wikipedia"` for namespace 4
+    /// on enwiki, whose canonical name is `"Project"`. `None` when the wiki
+    /// supplies none, in which case the canonical name is the display name.
+    pub local: Option<String>,
+    /// Every spelling that resolves to this namespace: the localized name (when
+    /// there is one) plus the registered aliases (e.g. `"WP"`).
     pub aliases: Vec<String>,
     /// Whether this namespace treats its content as case-sensitive page names.
     pub case_sensitive: bool,

@@ -151,10 +151,12 @@ impl WikiSiteConfig {
                     aliases.extend(extra);
                 }
                 aliases.dedup();
+                let local = entry.localized_name().map(str::to_string);
                 cfg.namespaces.insert(
                     id_num,
                     NamespaceInfo {
                         canonical: entry.canonical.unwrap_or_default(),
+                        local,
                         aliases,
                         // `case` is `first-letter` (insensitive) or
                         // `case-sensitive`.
@@ -612,6 +614,23 @@ mod tests {
         );
         // Namespace 0 has an empty localized name; that must not become an alias.
         assert!(c.namespaces().get(&0).unwrap().aliases.is_empty());
+    }
+
+    #[test]
+    fn namespace_name_is_the_localized_name_not_the_canonical() {
+        // On enwiki namespace 4's canonical name is "Project" but the wiki calls
+        // it "Wikipedia". A link served by the wiki uses the wiki's own name, so
+        // resolving a prefix must not fall back to the canonical one.
+        let c = WikiSiteConfig::from_siteinfo_json(
+            r#"{"query":{"namespaces":{
+              "4":{"id":4,"case":"first-letter","name":"Wikipedia","canonical":"Project","content":true}
+            }}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.namespace_name(4).as_deref(), Some("Wikipedia"));
+        // Both spellings still resolve to the namespace.
+        assert_eq!(c.namespace_id("Wikipedia"), Some(4));
+        assert_eq!(c.namespace_id("Project"), Some(4));
     }
 
     #[test]
