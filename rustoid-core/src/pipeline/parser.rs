@@ -2205,7 +2205,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 page_protection = entry;
             }
         }
-        *self.page_protection.borrow_mut() = page_protection;
+        *self.page_protection.borrow_mut() = page_protection.clone();
+        // The page's own protection is a Lua fact as well as a magic-word one:
+        // `Module:Protection banner` reads
+        // `mw.title.getCurrentTitle().protectionLevels`, which goes through the
+        // title-facts map rather than through `page_protection`. Seed both from
+        // the one fetch so the module and the magic word cannot disagree.
+        if !page_protection.levels.is_empty() {
+            self.title_facts.borrow_mut().insert(
+                page_title_prefixed.clone(),
+                crate::lua::engine::TitleFacts {
+                    exists: true,
+                    protection: page_protection,
+                    ..Default::default()
+                },
+            );
+        }
         // Titles named by a `{{PROTECTIONLEVEL:action|title}}` on this page, which
         // the magic word cannot fetch for itself (expansion is synchronous).
         //
