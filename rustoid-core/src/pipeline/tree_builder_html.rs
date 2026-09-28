@@ -1616,6 +1616,416 @@ fn parser_function_name(start_meta: &Node) -> Option<String> {
     pf.get("target")?.get("key")?.as_str().map(str::to_string)
 }
 
+/// A planned set of transclusion ranges, computed once over the whole DOM before
+/// any encapsulation (a faithful port of `DOMRangeBuilder`'s three steps:
+/// `findWrappableTemplateRanges` → `findTopLevelNonOverlappingRanges` →
+/// `encapsulateTemplates`).
+///
+/// rustoid encapsulates bottom-up per sibling list, so it cannot see a range that
+/// spans a paragraph boundary. The plan supplies the two facts that need the
+/// whole tree: which ranges are absorbed (nested or overlap-merged) and are
+/// therefore *not* encapsulated on their own, and the compound `data-mw.parts`
+/// each remaining top-level range must carry.
+#[derive(Default)]
+struct RangePlan {
+    /// `about` ids of absorbed ranges (PHP's `subsumedRanges` / overlap merges).
+    nested: std::collections::HashSet<String>,
+    /// For each top-level range `about`, the raw JSON elements of its compound
+    /// `data-mw.parts` array, in source order, with `i` renumbered.
+    compound: std::collections::HashMap<String, Vec<String>>,
+    /// The `dsr.end` of the last constituent, for trailing-wikitext recovery.
+    compound_end: std::collections::HashMap<String, Option<usize>>,
+}
+
+impl RangePlan {
+    fn is_nested(&self, about: &str) -> bool {
+        self.nested.contains(about)
+    }
+
+    /// The compound `data-mw` for a top-level range, or `None` when the plan has
+    /// nothing extra (the caller then falls back to the single-template build).
+    fn compound_data_mw(
+        &self,
+        about: &str,
+        source: Option<&str>,
+        range_end: Option<usize>,
+    ) -> Option<String> {
+        let elems = self.compound.get(about)?;
+        let mut parts = elems.clone();
+        if let (Some(re), Some(le)) = (range_end, self.compound_end.get(about).copied().flatten())
+            && re > le
+            && let Some(src) = source
+            && let Some(tail) = src.get(le..re)
+            && !tail.is_empty()
+        {
+            parts.push(format!("\"{}\"", json_escape(tail)));
+        }
+        Some(format!("{{\"parts\":[{}]}}", parts.join(",")))
+    }
+}
+
+/// One `<meta typeof="mw:Transclusion[/End]">` marker, with the tree path used
+/// to compare node document order without holding a borrow.
+#[derive(Clone)]
+struct PlanMeta {
+    path: Vec<usize>,
+    about: String,
+    is_end: bool,
+    dsr_start: Option<usize>,
+    dsr_end: Option<usize>,
+    elements: Vec<String>,
+}
+
+/// One paired start/end marker with the top-level sibling span it encloses
+/// (PHP's `DOMRangeInfo`).
+#[derive(Clone)]
+struct PlanRange {
+    about: String,
+    /// First child of the common ancestor, toward the start marker.
+    range_start: Vec<usize>,
+    /// The same for the end marker.
+    range_end: Vec<usize>,
+    start_offset: usize,
+    dsr_end: Option<usize>,
+    elements: Vec<String>,
+}
+
+/// Compute the [`RangePlan`] over the whole document.
+fn compute_range_plan(root: &Node, source: Option<&str>) -> RangePlan {
+    let mut metas: Vec<PlanMeta> = Vec::new();
+    let mut elem_paths: std::collections::HashSet<Vec<usize>> = std::collections::HashSet::new();
+    collect_plan_metas(root, &mut Vec::new(), &mut metas, &mut elem_paths);
+
+    // Pair markers by `about` in document order (PHP's `findWrappableTemplateRanges`).
+    let mut pending: std::collections::HashMap<String, PlanMeta> = std::collections::HashMap::new();
+    let mut ranges: Vec<PlanRange> = Vec::new();
+    for meta in metas {
+        if !meta.is_end {
+            // PHP ignores a start marker without a `tsr`: it is nested content.
+            if meta.dsr_start.is_some() {
+                pending.insert(meta.about.clone(), meta);
+            }
+        } else if let Some(start) = pending.remove(&meta.about) {
+            let lca = common_prefix(&start.path, &meta.path);
+            // The start marker cannot be an ancestor of the end marker.
+            if lca >= start.path.len() || lca >= meta.path.len() {
+                continue;
+            }
+            ranges.push(PlanRange {
+                about: start.about.clone(),
+                range_start: start.path[..=lca].to_vec(),
+                range_end: meta.path[..=lca].to_vec(),
+                start_offset: start.dsr_start.unwrap_or(0),
+                dsr_end: start.dsr_end,
+                elements: start.elements.clone(),
+            });
+        }
+    }
+
+    // Attach each range to the top-level nodes it spans (PHP's `addNodeRange`).
+    let mut node_ranges: std::collections::HashMap<Vec<usize>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (ri, r) in ranges.iter().enumerate() {
+        let l = r.range_start.len() - 1;
+        let prefix = &r.range_start[..l];
+        for k in r.range_start[l]..=r.range_end[l] {
+            let mut p = prefix.to_vec();
+            p.push(k);
+            if elem_paths.contains(&p) {
+                node_ranges.entry(p).or_default().push(ri);
+            }
+        }
+    }
+
+    // Nesting / overlap detection (PHP's `findTopLevelNonOverlappingRanges`).
+    let mut subsumed: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for ri in 0..ranges.len() {
+        let mut path = ranges[ri].range_start.clone();
+        loop {
+            if let Some(rs) = node_ranges.get(&path) {
+                if path != ranges[ri].range_start {
+                    let outer = *rs.iter().min_by_key(|&&o| ranges[o].start_offset).unwrap();
+                    subsumed.insert(ri, outer);
+                    break;
+                }
+                let e_tpls = node_ranges.get(&ranges[ri].range_end);
+                let mut found = false;
+                let mut best: Option<usize> = None;
+                for &o in rs {
+                    if o != ri
+                        && e_tpls.is_some_and(|v| v.contains(&o))
+                        && (ranges[ri].range_start != ranges[o].range_start
+                            || ranges[ri].range_end != ranges[o].range_end
+                            || ranges[o].start_offset < ranges[ri].start_offset)
+                        && !introduces_cycle(ri, o, &subsumed)
+                    {
+                        found = true;
+                        match best {
+                            Some(b) if ranges[o].start_offset >= ranges[b].start_offset => {}
+                            _ => best = Some(o),
+                        }
+                    }
+                }
+                if found {
+                    if let Some(b) = best {
+                        subsumed.insert(ri, b);
+                    }
+                    break;
+                }
+            }
+            if path.is_empty() {
+                break;
+            }
+            path.pop();
+        }
+    }
+
+    // Merge loop, in source order (PHP sorts `$tplRanges` by `startOffset`).
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&i| ranges[i].start_offset);
+
+    let mut plan = RangePlan::default();
+    let mut constituents: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut prev: Option<usize> = None;
+    for &ri in &order {
+        if let Some(e) = top_level_enclosing(ri, &subsumed) {
+            plan.nested.insert(ranges[ri].about.clone());
+            constituents.entry(e).or_default().push(ri);
+        } else if let Some(p) = prev {
+            if in_document_order(&ranges[ri].range_start, &ranges[p].range_end) && ri != p {
+                subsumed.insert(ri, p);
+                plan.nested.insert(ranges[ri].about.clone());
+                constituents.entry(p).or_default().push(ri);
+            } else {
+                constituents.entry(ri).or_default().push(ri);
+                prev = Some(ri);
+            }
+        } else {
+            constituents.entry(ri).or_default().push(ri);
+            prev = Some(ri);
+        }
+    }
+
+    // Build the compound parts for each top-level range. A range with a single
+    // constituent needs nothing beyond the single-template build, so it is left
+    // out of the plan (the caller falls back to `build_compound_data_mw`).
+    for (top, mut cons) in constituents {
+        cons.sort_by_key(|&c| ranges[c].start_offset);
+        cons.dedup();
+        if cons.len() <= 1 {
+            continue;
+        }
+        let mut elems: Vec<String> = Vec::new();
+        let mut prev_end: Option<usize> = None;
+        let mut idx = 0usize;
+        for c in cons {
+            let r = &ranges[c];
+            if let (Some(pe), Some(src)) = (prev_end, source)
+                && pe < r.start_offset
+                && let Some(gap) = src.get(pe..r.start_offset)
+                && !gap.is_empty()
+            {
+                elems.push(format!("\"{}\"", json_escape(gap)));
+            }
+            for el in &r.elements {
+                if el.starts_with('"') {
+                    elems.push(el.clone());
+                } else {
+                    elems.push(renumber_part_i(el, idx));
+                    idx += 1;
+                }
+            }
+            prev_end = r.dsr_end;
+        }
+        plan.compound_end
+            .insert(ranges[top].about.clone(), prev_end);
+        plan.compound_end
+            .insert(ranges[top].about.clone(), prev_end);
+        plan.compound.insert(ranges[top].about.clone(), elems);
+    }
+
+    plan
+}
+
+fn collect_plan_metas(
+    node: &Node,
+    path: &mut Vec<usize>,
+    out: &mut Vec<PlanMeta>,
+    elem_paths: &mut std::collections::HashSet<Vec<usize>>,
+) {
+    for (i, child) in node.children.iter().enumerate() {
+        path.push(i);
+        if matches!(child.kind, NodeKind::Element(_)) {
+            elem_paths.insert(path.clone());
+        }
+        if is_transclusion_marker_meta(child)
+            && let Some(about) = child.get_attr("about")
+        {
+            let (dsr_start, dsr_end) = child
+                .dp
+                .as_ref()
+                .and_then(|d| d.dsr.as_ref())
+                .map(|d| (d.start, d.end))
+                .unwrap_or((None, None));
+            out.push(PlanMeta {
+                path: path.clone(),
+                about: about.to_string(),
+                is_end: is_transclusion_end(child),
+                dsr_start,
+                dsr_end,
+                elements: child
+                    .data_mw
+                    .as_deref()
+                    .map(parts_elements)
+                    .unwrap_or_default(),
+            });
+        }
+        collect_plan_metas(child, path, out, elem_paths);
+        path.pop();
+    }
+}
+
+/// Length of the longest common prefix of two node paths (the common ancestor's
+/// depth).
+fn common_prefix(a: &[usize], b: &[usize]) -> usize {
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// Is `a` at or before `b` in document order (preorder paths compare
+/// lexicographically). Mirrors `DOMUtils::inSiblingOrder`.
+fn in_document_order(a: &[usize], b: &[usize]) -> bool {
+    a <= b
+}
+
+/// Walk the `subsumed` chain from `start` to its top-level enclosing range, or
+/// `None` when `start` is itself top-level. Mirrors `findToplevelEnclosingRange`.
+fn top_level_enclosing(
+    start: usize,
+    subsumed: &std::collections::HashMap<usize, usize>,
+) -> Option<usize> {
+    let mut top = None;
+    let mut cur = subsumed.get(&start).copied();
+    while let Some(c) = cur {
+        top = Some(c);
+        cur = subsumed.get(&c).copied();
+    }
+    top
+}
+
+/// Would adding `end` under `start` close a cycle? Mirrors `introducesCycle`.
+fn introduces_cycle(
+    start: usize,
+    end: usize,
+    subsumed: &std::collections::HashMap<usize, usize>,
+) -> bool {
+    let mut cur = subsumed.get(&end).copied();
+    while let Some(c) = cur {
+        if c == start {
+            return true;
+        }
+        cur = subsumed.get(&c).copied();
+    }
+    false
+}
+
+/// The top-level JSON elements of a `data-mw`'s `parts` array.
+fn parts_elements(data_mw: &str) -> Vec<String> {
+    let Some((s, e)) = data_mw_key_span(data_mw, "parts") else {
+        return Vec::new();
+    };
+    let arr = data_mw[s..e].trim();
+    let inner = arr
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .unwrap_or("");
+    split_top_level(inner)
+}
+
+/// Split the contents of a JSON array into its top-level element substrings.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut start = 0usize;
+    for (i, ch) in s.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
+/// Escape a string for embedding as a JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Rewrite the transclusion index `"i":N` of a `data-mw.parts` element. Only a
+/// numeric `i` is touched, so a named parameter `i=<x>` (`"i":{"wt":…}`) is
+/// left alone.
+fn renumber_part_i(elem: &str, n: usize) -> String {
+    let mut result = elem.to_string();
+    let mut from = 0usize;
+    while let Some(rel) = result[from..].find("\"i\":") {
+        let pos = from + rel;
+        let after = pos + 4;
+        let digits: String = result[after..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == ' ')
+            .collect();
+        let trimmed = digits.trim();
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+            let end = after + digits.len();
+            let next = result[end..].chars().next();
+            if matches!(next, Some('}') | Some(',')) {
+                result.replace_range(after..end, &n.to_string());
+                return result;
+            }
+        }
+        from = after;
+    }
+    result
+}
+
 /// Encapsulate transclusion meta markers into wrapping `<span>` elements (the
 /// common, non-fostered case of PHP's `DOMRangeBuilder::encapsulateTemplates`).
 ///
@@ -1623,16 +2033,21 @@ fn parser_function_name(start_meta: &Node) -> Option<String> {
 /// pair (with a matching `about`) is replaced by a `<span>` carrying `about`,
 /// `typeof`, `data-parsoid`, and `data-mw`, wrapping the intervening siblings.
 fn encapsulate_transclusions(node: &mut Node, source: Option<&str>) {
+    let plan = compute_range_plan(node, source);
+    encapsulate_transclusions_inner(node, source, &plan);
+}
+
+fn encapsulate_transclusions_inner(node: &mut Node, source: Option<&str>, plan: &RangePlan) {
     // Recurse into element children first, then process direct children.
     for child in &mut node.children {
         if matches!(child.kind, NodeKind::Element(_)) {
-            encapsulate_transclusions(child, source);
+            encapsulate_transclusions_inner(child, source, plan);
         }
     }
 
     let children = std::mem::take(&mut node.children);
-    let children = wrap_transclusion_children(children, source, Some(node));
-    node.children = wrap_flipped_children(children, source, Some(node));
+    let children = wrap_transclusion_children(children, source, Some(node), plan);
+    node.children = wrap_flipped_children(children, source, Some(node), plan);
 }
 
 /// Wrap transclusion ranges among a parent's direct children (the sibling case,
@@ -1650,9 +2065,10 @@ fn encapsulate_transclusions(node: &mut Node, source: Option<&str>) {
 /// `typeof`/metadata merged onto its target before the enclosing range is
 /// processed, so two nested `mw:Transclusion` markers collapse to one.
 fn wrap_transclusion_children(
-    children: Vec<Node>,
+    mut children: Vec<Node>,
     source: Option<&str>,
     parent: Option<&Node>,
+    plan: &RangePlan,
 ) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
@@ -1660,6 +2076,22 @@ fn wrap_transclusion_children(
         if !is_transclusion_start(&children[i]) {
             out.push(children[i].clone());
             i += 1;
+            continue;
+        }
+
+        // A range the plan marked absorbed (nested in, or overlap-merged into,
+        // another range) is not encapsulated on its own: PHP removes both marker
+        // metas in `findTopLevelNonOverlappingRanges` and leaves the content
+        // bare. Its `data-mw` lives in the enclosing range's compound parts, and
+        // its nodes keep whatever `about` their own expansion gave them.
+        if let Some(about) = children[i].get_attr("about").map(str::to_string)
+            && plan.is_nested(&about)
+            && let Some(j) = children[i..]
+                .iter()
+                .position(|c| is_transclusion_end(c) && c.get_attr("about") == Some(about.as_str()))
+        {
+            children.remove(i + j);
+            children.remove(i);
             continue;
         }
 
@@ -1691,7 +2123,7 @@ fn wrap_transclusion_children(
 
         // Fuse any *nested* ranges in the content first (innermost-first).
         let content: Vec<Node> = children[i + 1..end].to_vec();
-        let content = wrap_transclusion_children(content, source, parent);
+        let content = wrap_transclusion_children(content, source, parent, plan);
 
         // Stamp `about` on every element in the range and find the first
         // element (the encapsulation target), dropping deletable text and
@@ -1892,8 +2324,11 @@ fn wrap_transclusion_children(
             // target preserves the target's own `attribs` while attaching the
             // transclusion `parts`. Losing the target's `data-mw` here would
             // drop e.g. a `link=` option and break `AddMediaInfo`.
+            let plan_mw = about
+                .as_deref()
+                .and_then(|a| plan.compound_data_mw(a, source, None));
             new_content[et].data_mw = merge_encap_data_mw(
-                build_compound_data_mw(&start_meta, source, None),
+                plan_mw.or_else(|| build_compound_data_mw(&start_meta, source, None)),
                 new_content[et].data_mw.clone(),
             );
             // A templated *table* whose range encloses nested transclusion ranges
@@ -2184,6 +2619,7 @@ fn wrap_flipped_children(
     mut children: Vec<Node>,
     source: Option<&str>,
     parent: Option<&Node>,
+    plan: &RangePlan,
 ) -> Vec<Node> {
     let mut i = 0;
     while i < children.len() {
@@ -2381,7 +2817,7 @@ fn wrap_flipped_children(
         remove_end_meta(&mut children[t], about.as_deref());
         {
             let encap_node = table_body_content_target(&mut children[et], well_balanced);
-            transfer_transclusion_to_element(encap_node, &start_meta, source, range_end);
+            transfer_transclusion_to_element(encap_node, &start_meta, source, range_end, plan);
         }
         // Remove the start marker meta: either the sibling element itself, or
         // the marker nested in the range-start element's subtree.
@@ -2529,6 +2965,7 @@ fn transfer_transclusion_to_element(
     start_meta: &Node,
     source: Option<&str>,
     range_end: Option<usize>,
+    plan: &RangePlan,
 ) {
     if let Some(about) = start_meta.get_attr("about") {
         target.set_attr("about", about);
@@ -2537,7 +2974,10 @@ fn transfer_transclusion_to_element(
         target.set_attr("typeof", typeof_);
     }
     target.data_parsoid = start_meta.data_parsoid.clone();
-    target.data_mw = build_compound_data_mw(start_meta, source, range_end);
+    let plan_mw = start_meta
+        .get_attr("about")
+        .and_then(|a| plan.compound_data_mw(a, source, range_end));
+    target.data_mw = plan_mw.or_else(|| build_compound_data_mw(start_meta, source, range_end));
     apply_encap_dp_fields(target, start_meta);
 }
 
@@ -2908,7 +3348,7 @@ mod tests {
         td2.push_child(Node::text(" 123"));
         td2.push_child(end_meta());
 
-        let out = wrap_flipped_children(vec![td1, td2], None, None);
+        let out = wrap_flipped_children(vec![td1, td2], None, None, &RangePlan::default());
 
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(out[0].get_attr("about"), Some("#mwt1"));
@@ -2955,6 +3395,7 @@ mod tests {
             }],
             None,
             Some(&parent),
+            &RangePlan::default(),
         );
 
         assert_eq!(out.len(), 3, "{out:?}");
@@ -3764,5 +4205,87 @@ mod tests {
             return true;
         }
         node.children.iter().any(contains_data_parsoid)
+    }
+
+    fn tpl_meta(is_end: bool, about: &str, dsr: (usize, usize), name: &str) -> Node {
+        let mut m = Node::element(ElementKind::Other("meta".to_string()));
+        m.set_attr(
+            "typeof",
+            if is_end {
+                "mw:Transclusion/End"
+            } else {
+                "mw:Transclusion"
+            },
+        );
+        m.set_attr("about", about);
+        m.data_mw = Some(format!(
+            "{{\"parts\":[{{\"template\":{{\"target\":{{\"wt\":\"{name}\"}},\"params\":{{}},\"i\":0}}}}]}}"
+        ));
+        m.dp = Some(TDataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(dsr.0),
+                end: Some(dsr.1),
+                ..Default::default()
+            }),
+            ..TDataParsoid::default()
+        });
+        m
+    }
+
+    /// A range whose markers straddle a paragraph boundary (start inside the
+    /// `<p>`, end outside it) *contains* a sibling range that lives wholly
+    /// inside that `<p>`, so the inner range is absorbed: its template joins the
+    /// outer range's compound `data-mw.parts` (with the intervening source
+    /// text), interleaved in source order. This is `Help:Introduction`'s
+    /// `{{pp-semi-indef}}</noinclude>{{intro to single}}` merge.
+    #[test]
+    fn overlapping_ranges_merge_into_the_outer_compound_parts() {
+        //                  0         1         2         3         4
+        //                  0123456789012345678901234567890123456789012345678901
+        let source = "............pp-semi-indef}</noinclude>{{intro-to-single.......";
+        // pp range: [11, 30); intro range: [42, 60).
+        let pp_about = "#mwt2";
+        let intro_about = "#mwt4";
+
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(tpl_meta(false, pp_about, (11, 30), "pp-semi-indef"));
+        let mut indicator = Node::element(ElementKind::Other("meta".to_string()));
+        indicator.set_attr("typeof", "mw:Extension/indicator");
+        p.push_child(indicator);
+        p.push_child(tpl_meta(true, pp_about, (30, 30), "pp-semi-indef"));
+        p.push_child(tpl_meta(false, intro_about, (42, 60), "intro to single"));
+
+        let mut div = Node::element(ElementKind::Div);
+        div.push_child(tpl_meta(true, intro_about, (60, 60), "intro to single"));
+
+        let mut html = Node::element(ElementKind::Other("html".to_string()));
+        html.push_child(p);
+        html.push_child(div);
+        let mut root = Node::document();
+        root.push_child(html);
+
+        let plan = compute_range_plan(&root, Some(source));
+
+        assert!(
+            plan.is_nested(pp_about),
+            "the range wholly inside the <p> is absorbed"
+        );
+        assert!(!plan.is_nested(intro_about), "the enclosing range survives");
+
+        let parts = plan
+            .compound
+            .get(intro_about)
+            .expect("the enclosing range carries a compound parts list");
+        assert_eq!(
+            parts.len(),
+            3,
+            "template + intervening text + template: {parts:?}"
+        );
+        assert!(parts[0].contains("pp-semi-indef"), "{parts:?}");
+        assert_eq!(parts[1], format!("\"{}\"", &source[30..42]));
+        assert!(parts[2].contains("intro to single"), "{parts:?}");
+        // The template indices are renumbered across the merged list.
+        assert!(parts[0].contains("\"i\":0"), "{parts:?}");
+        assert!(parts[2].contains("\"i\":1"), "{parts:?}");
     }
 }
