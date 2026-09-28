@@ -6953,27 +6953,30 @@ page's first difference is an `about` id** (the harness has a `marker-ids`
 category for exactly that; the bucket is empty). The id-ordering thread is
 clean at the first difference across all 40.
 
-The smallest first differences, and what they are (none is this session's
-work; each is a known, unrelated gap):
+The smallest differences fall into a handful of *unrelated* shapes, and none is
+this session's work. Reading the differing bytes rather than the category label
+is what shows it — several were first mis-filed here:
 
-| first diff | page | shape |
+| first diff | page | actual shape |
 |---|---|---|
-| 544 | Zebro | redirect page |
-| 546 | Grand Theft Auto V | `Short_description_is_different_from_Wikidata` — the `Module:SDcat`/`getParent().args` chain (§"The lazily-expanded argument value") |
-| 572 | Polio vaccine | same SDcat category |
-| 578 | Python (programming language) | same |
-| 588 | Chernobyl disaster | same |
-| 600 | ISO 3166-1 alpha-2 | same |
-| 642 | COVID-19 pandemic | same |
-| 896 | Doom (1993 video game) | same |
-| 939 | World War II | same |
-| 976 | Hydrogen | same |
-| 5926 | Nobel Prize | image: `typeof="mw:File"` + `data-mw` where the service emits an `<a>`-wrapped `mw:File/Frameless` |
-| 4269→5926 | (was this session's id gap) | now past |
+| 544 | Zebro | `Short_description_…`: `is_different_from` vs `with_empty_Wikidata_description` |
+| 546 | Grand Theft Auto V | an empty `{{Pp}}` line: service `<p class="mw-empty-elt" id="mwAw">` wrapping the nowiki transclusion, rustoid a bare `<span class="mw-empty-elt" about="#mwt2">` |
+| 572 | Polio vaccine | same empty-elt line, but rustoid's `<p id="mwAw">` is missing the class |
+| 578 | Python (programming language) | `Short_description_matches_Wikidata` is on both sides; the diff is the same empty-elt wrapper |
+| 588 | Chernobyl disaster | same empty-elt wrapper |
+| 600 | ISO 3166-1 alpha-2 | same, missing `class="mw-empty-elt"` |
+| 642 | COVID-19 pandemic | same, missing `class="mw-empty-elt"` |
+| 896 | Doom (1993 video game) | indicator `attrs.name` `featured-star` vs `" "` (§ the indicator-name bug) |
+| 939 | World War II | same empty-elt wrapper, on a `<span>` |
+| 976 | Hydrogen | a disambiguation link is missing `class="mw-disambig"` |
+| 1492 | Isaac Newton | same missing `mw-disambig` |
+| 1521 | Albert Einstein | a hatnote `<span about="#mwt2">` is missing ` id="mwBA"` |
+| 5926 | Nobel Prize | image: `typeof="mw:File"` + `data-mw` where the service has an `<a>`-wrapped `mw:File/Frameless` |
 
-So the next page to fall is an `SDcat` fix, not another id. `Module:Math`
-differs at byte 1 because the Module-namespace page renders its *source* where
-the service renders the documentation tree — a namespace/content-model gap of
-its own. Facts for 39 of 40 are 7 d newer than their pinned baselines, so many
-small differences may be drift (the harness flags them `suspect`); only a
-re-pin can settle those.
+So the next page to fall is the **empty-`{{Pp}}` line's `mw-empty-elt` wrapper**
+(seven of the ten smallest), then the missing `mw-disambig` class and the
+hatnote `id`. `Module:Math` differs at byte 1 for a different reason: the
+Module-namespace page renders its *source* where the service renders the
+documentation tree — a namespace/content-model gap of its own. Facts for 39 of
+40 are 7 d newer than their pinned baselines, so several of these may be drift
+(the harness flags them `suspect`); only a re-pin can settle those.
