@@ -2170,6 +2170,43 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         emit_style_placeholder(stt, id)
     }
 
+    /// Resolve one `<indicator>` extension token into a placeholder plus a
+    /// stashed `<meta>` fragment, spending an `about` id.
+    ///
+    /// Inline, for the same reason as [`Parser::expand_one_templatestyles`]: the
+    /// id belongs to the expansion's position in the document. It matters here
+    /// because a module emits the indicator from *inside* a template; a pass
+    /// running after expansion would number it after everything the template
+    /// expansion produced, and the transclusion that follows the template would
+    /// take the id the indicator should have spent. PHP's `ExtensionHandler::
+    /// onDocumentFragment` allocates an id for every extension except `nowiki`,
+    /// and the `<meta>` ends up sharing the enclosing transclusion's `about` in
+    /// the output — the id is spent and discarded, but the spend is what shifts
+    /// every following transclusion by one.
+    ///
+    /// Returns `None` when `item` is not an indicator token, so the caller can
+    /// fall through to the other extension paths.
+    fn expand_one_indicator(
+        &self,
+        item: &Item,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Vec<Item>> {
+        let stt = indicator_target(item)?;
+        let body = extension_body(stt);
+        let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
+        let node = Node::document_with_child(crate::pipeline::extension_handler::indicator_node(
+            &body, &attrs,
+        ));
+        // The extension spends the id whether or not it survives into the
+        // output (see the method comment). Allocating it *before* stashing the
+        // fragment also keeps the sequence in expansion order.
+        let _ = self.new_about_id(about_counter);
+        let id = self.ext_next_id.get();
+        self.ext_next_id.set(id + 1);
+        self.ext_fragments.borrow_mut().insert(id, node);
+        Some(emit_indicator_placeholder(stt, id))
+    }
+
     /// Inline every `<templatestyles>` stylesheet.
     ///
     /// Async because the CSS lives on a wiki page, like a template's source; the
@@ -2908,6 +2945,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     track_table(e, &mut table_depth);
                 }
                 out.extend(expanded);
+                continue;
+            }
+
+            // An `<indicator>` is resolved *here*, in document order, for the
+            // same reason as `<templatestyles>` above: the extension spends an
+            // `about` id (PHP's `ExtensionHandler::onDocumentFragment` calls
+            // `newAboutId` for every tag except `nowiki`), and a module emits
+            // the indicator from *inside* a template, so a pass running after
+            // expansion would number it too late — the transclusion following
+            // the template would take the id the indicator should have spent.
+            if let Some(emitted) = self.expand_one_indicator(&item, about_counter) {
+                out.extend(emitted);
                 continue;
             }
 

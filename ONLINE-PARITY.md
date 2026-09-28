@@ -5793,3 +5793,77 @@ Reduced to four shapes, none of them the `$B` family any more:
   one, which is the offline half of the page-info problem and a targeted fetch.
 - **Media** — `Sundial` (1897): rustoid renders `mw-broken-media` because the
   file info is not cached, which is a cache gap rather than a parser gap.
+
+## The `about`-id off-by-one: an extension spends an id it never emits
+
+Both pages with a protection template were one id *behind* the service from the
+padlock onward, and the shape was narrow enough to name: on `Bicycle` the
+emitted ids are `1…6` for the head, then the service has no `#mwt7` at all and
+uses `#mwt8` for `{{Use dmy dates}}`, while rustoid used `#mwt7`. On
+`List of sovereign states` the same gap sits one block earlier — the service
+spends `#mwt5` between `{{pp-semi-indef}}` and `{{pp-move}}` and emits it
+nowhere. Both gaps fall immediately after a template whose module emits an
+`<indicator>`.
+
+The cause is `ExtensionHandler::onDocumentFragment`. For **every** extension tag
+except `nowiki`, Parsoid does:
+
+```php
+$about = $env->newAboutId();
+$n = $firstNode;
+while ( $n ) { $n->setAttribute( 'about', $about ); $n = $n->nextSibling; }
+```
+
+`nowiki` is special-cased to lean markup and skips the block; everything else
+spends an id at the moment its token is processed, *in document order*. The id
+is frequently not the one that survives: an extension emitted by a template is
+a child of the transclusion, whose encapsulator overwrites `about` with its own.
+The indicator is exactly that case — the served `<meta>` carries the
+`pp-protected` template's id — but the spend still happened, so every following
+transclusion is numbered one higher than the emitted ids suggest.
+
+### It has to be spent *during* expansion, not in the indicator pass
+
+The first attempt spent the id in `expand_templates`, for any `extension` token
+whose name is not `nowiki`. That over-corrected by one: the indicator's token is
+walked **twice**. `Module:Protected page` reaches `<indicator>` through
+`frame:extensionTag`, which rustoid lowers to `#tag` and answers on a deferred
+re-run; that re-run's own `expand_templates` sees the token, and then the
+module's output — which still carries the raw marker — is tokenized and walked
+again. Two spends, one indicator.
+
+The asymmetry is visible against `<templatestyles>`, which is already correct:
+its `#tag` expansion builds the real `<style>` placeholder *inline* in
+`expand_templates`, so the callback stores the placeholder under a marker and
+the final walk splices the placeholder rather than re-expanding a token. The
+indicator was handled only by the separate `expand_indicator` pass, which runs
+after all expansion, so the callback could not build its placeholder and the
+token survived to be expanded a second time.
+
+The fix mirrors templatestyles: a new `Parser::expand_one_indicator` resolves
+the token inline, spends the `about` id, stashes the `<meta>` fragment in
+`self.ext_fragments`, and emits the placeholder. Now the callback produces the
+placeholder, the final walk splices it once, and the id lands in expansion
+order. The leftover `expand_indicator` pass is kept as a safety net for tokens
+that never pass through `expand_templates` (it does not spend an id, so those
+rare cases would still be one low — recorded rather than papered over).
+
+The rule worth carrying forward: **a document-level `about` id is spent where
+the extension's token is processed, even when the id is thrown away.** Any
+extension rustoid handles in a pass that runs after expansion will be one id
+low unless the pass runs inline, as templatestyles and now the indicator do.
+
+### Scoreboard
+
+```
+Help:Introduction          416 -> 492
+Bicycle                   3168 -> 3577
+List of sovereign states  2771 -> 4009
+fixture guard             876/896
+subset total              4 007 778 -> 4 006 549
+```
+
+`Bicycle`'s new first difference is a `data-mw` target `wt` that keeps the
+newline before the first `|` (`"Infobox machine\n"` where rustoid trims it);
+`Help:Introduction` is the encapsulation merge; `List of sovereign states` now
+reaches its first missing file-info fact at the map figure.
