@@ -2967,6 +2967,46 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             out.push(item);
         }
+
+        // TT2's `ExtensionHandler` numbers every extension token with
+        // `$env->newAboutId()`, and `TokenHandlerPipeline::processChunk` runs each
+        // transformer over the *whole* chunk — `TemplateHandler` then
+        // `ExtensionHandler` — so at each level the chunk's templates are
+        // expanded and numbered first, the extensions after. The id has to be
+        // spent here, inside the expansion, because a pass that runs once the
+        // tree is built cannot reproduce that order: `Bicycle`'s infobox `<ref>`
+        // is `#mwt11` in the service and `#mwt199` here, the 188 in between
+        // being infobox rows the late Cite pass ran past before numbering the
+        // ref.
+        //
+        // Only the extensions whose output consumes the id are numbered here.
+        // `<ref>`/`<references>` keep it on the `<extension>` element the Cite
+        // pass later reads. `<nowiki>` is lean markup with no `about` at all.
+        // `<pre>`/`<style>` and the rest are rebuilt from their rich `data-mw`
+        // attribs (`extension_kv_attrs`), which do not carry a token attribute,
+        // so numbering them here would spend an id the output never shows — a
+        // second, different drift. They are left to a follow-up.
+        for item in out.iter_mut() {
+            let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+                continue;
+            };
+            if t.name != "extension" {
+                continue;
+            }
+            let name = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("name"))
+                .and_then(|kv| kv.value.as_str());
+            if !matches!(name, Some("ref") | Some("references")) {
+                continue;
+            }
+            if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
+                continue;
+            }
+            let about = self.new_about_id(about_counter);
+            t.add_attribute_str("about", &about);
+        }
         out
     }
 
@@ -5910,6 +5950,63 @@ mod tests {
         assert!(
             !html.contains(">{{#ifexist"),
             "the call must not leak its source as text: {html}"
+        );
+    }
+
+    /// A chunk's templates are numbered before its extensions.
+    ///
+    /// `TokenHandlerPipeline::processChunk` runs each transformer over the whole
+    /// chunk, and `TemplateHandler` precedes `ExtensionHandler`, so
+    /// `ExtensionHandler::onExtension`'s `$env->newAboutId()` calls all happen
+    /// after the chunk's templates have taken theirs. A `<ref>` after a template
+    /// therefore takes the *next* id — and one written *before* the template
+    /// still takes the later one. Both spellings pin the rule, because only the
+    /// second distinguishes it from plain document order. This is why
+    /// `Bicycle`'s infobox `<ref>` is `#mwt11` in the service.
+    #[tokio::test]
+    async fn extensions_are_numbered_after_templates_in_a_chunk() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template("Template:1x", "{{{1|}}}");
+        let config = crate::mock::MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let render = |wt: &str| {
+            let parser = &parser;
+            let source = &source;
+            let wt = wt.to_string();
+            async move {
+                parser
+                    .wikitext_to_html_expanded(&wt, source, &ParserOptions::for_page("Test"))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let after = render("{{1x|a}}<ref name=\"r\">b</ref>").await;
+        assert!(after.contains(r##"<span about="#mwt1""##), "got: {after}");
+        assert!(after.contains(r##"<sup about="#mwt2""##), "got: {after}");
+
+        let before = render("<ref name=\"r\">b</ref>{{1x|a}}").await;
+        assert!(
+            before.contains(r##"<span about="#mwt1""##),
+            "the template is numbered first even when written second: {before}"
+        );
+        assert!(before.contains(r##"<sup about="#mwt2""##), "got: {before}");
+
+        // The reference inside a template is numbered during that template's
+        // expansion, *before* the templates that follow it, so the counter has
+        // already moved past the reference by the time `{{1x|a}}` is numbered.
+        // The `<sup>`'s own `about` cannot show this — encapsulation overwrites
+        // it with the enclosing template's — so the evidence is the *later* ids:
+        // with the TT2 numbering `{{1x|a}}` is `#mwt3`; had the late Cite pass
+        // numbered the reference, it would be `#mwt2`.
+        //
+        // The service numbers these `#mwt4`/`#mwt5`: it spends one id more than
+        // rustoid on this shape, a separate gap recorded in `ONLINE-PARITY.md`
+        // and deliberately not asserted here.
+        let nested = render("{{1x|X<ref name=\"r\">b</ref>}}{{1x|a}}{{1x|b}}").await;
+        assert!(
+            nested.contains(r##"<span about="#mwt4""##),
+            "the reference is numbered before the two following templates: {nested}"
         );
     }
 }

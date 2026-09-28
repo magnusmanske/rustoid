@@ -566,7 +566,11 @@ fn walk_render(
         ));
         wrap.set_attr("class", "mw-references-wrap");
         wrap.set_attr("typeof", "mw:Extension/references");
-        wrap.set_attr("about", ids.take_about());
+        // The id was spent during expansion (see `expand_templates`), where the
+        // service spends it; only a tag that somehow reached here unnumbered
+        // takes a fresh one.
+        let about = node.get_attr("about").map(str::to_string);
+        wrap.set_attr("about", about.unwrap_or_else(|| ids.take_about()));
         wrap.set_attr("data-mw", references_data_mw(&attrs_json, false));
         wrap.push_child(list);
         *node = wrap;
@@ -581,7 +585,8 @@ fn walk_render(
         let Some(reference) = state.references.iter().find(|r| r.uses.contains(&ref_id)) else {
             return;
         };
-        let marker = ref_marker_nodes(reference, &ref_id, page_title, ids);
+        let about = node.get_attr("about").map(str::to_string);
+        let marker = ref_marker_nodes(reference, &ref_id, page_title, ids, about);
         *node = marker;
         *rendered += 1;
     }
@@ -696,6 +701,7 @@ pub fn ref_marker_nodes(
     ref_id: &str,
     page_title: &str,
     ids: &mut DocIds,
+    about: Option<String>,
 ) -> crate::dom::node::Node {
     use crate::dom::node::{ElementKind, Node};
 
@@ -703,7 +709,10 @@ pub fn ref_marker_nodes(
     // the `data-mw` shape: only that use carries the note's `body` pointer.
     let use_index = reference.uses.iter().position(|u| u == ref_id).unwrap_or(0);
     let mut sup = Node::element(ElementKind::Other("sup".to_string()));
-    sup.set_attr("about", ids.take_about());
+    // The expansion already spent the id (see `expand_templates`); a marker that
+    // reached here without one — a ref built outside the expansion, e.g. in a
+    // test — falls back to a fresh one.
+    sup.set_attr("about", about.unwrap_or_else(|| ids.take_about()));
     sup.set_attr("class", "mw-ref reference");
     sup.set_attr("id", ref_id);
     sup.set_attr("rel", "dc:references");
@@ -956,6 +965,7 @@ mod tests {
             "cite_ref-Badenhorst2019_1-0",
             "Zebra",
             &mut ids,
+            None,
         );
 
         assert_eq!(
