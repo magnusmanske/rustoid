@@ -3078,8 +3078,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let about_id = take_id();
                 // Scribunto's `#invoke` is not an ordinary parser
                 // function: everything after the colon is its argument
-                // list, and the tokenizer has already split that on `|`,
-                // so the pieces must be put back together.
+                // list, and the tokenizer has already split that on `|`.
                 //
                 // Each argument value is *expanded* first, because that is what
                 // Scribunto receives: `{{#invoke:String|len|x{{#invoke:String|
@@ -3100,7 +3099,24 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         src_text,
                     )
                     .await;
-                let invoke_arg = invoke_arg_text(pf_arg, &expanded_args);
+                // The call is built *structurally* from `pf_arg` (the module) and
+                // the expanded arguments, not by re-joining them into text: the
+                // first argument is the function name, the rest are the module's
+                // arguments, and re-joining would re-derive a value's name from a
+                // string that cannot tell a `|` or `=` inside a value from a
+                // separator. See [`crate::lua::invoke::Invoke::from_parts`].
+                let mut arg_pairs: Vec<(Option<String>, String)> =
+                    expanded_args.iter().map(expanded_arg_pair).collect();
+                let function = if arg_pairs.is_empty() {
+                    String::new()
+                } else {
+                    arg_pairs.remove(0).1
+                };
+                let Some(call) =
+                    crate::lua::invoke::Invoke::from_parts(pf_arg, &function, arg_pairs)
+                else {
+                    return vec![Item::Str(format!("{{{{#invoke:{pf_arg}}}}}"))];
+                };
                 // Scribunto's `frame:getParent()` is the frame of the
                 // *calling template*, and modules read its args
                 // constantly (`Module:Infobox`, `Module:Check for
@@ -3137,7 +3153,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .expand_invoke(
                         source,
                         frame,
-                        &invoke_arg,
+                        &call,
                         &params,
                         about_id,
                         tok,
@@ -3725,11 +3741,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         source: Option<&dyn DataSource>,
         frame: &Frame,
-        pf_arg: &str,
+        // The resolved call, with its arguments already expanded.
+        call: &crate::lua::invoke::Invoke,
         // The token's *own* arguments, unexpanded. `data-mw` records the call as
         // written, so a nested `#invoke` in an argument stays literal there even
-        // though the module receives its expansion — `pf_arg` is the expanded
-        // text and would put the answer into the metadata.
+        // though the module receives its expansion — `call` carries the expanded
+        // form and would put the answer into the metadata.
         raw_params: &crate::pipeline::parser_functions::Params,
         about_id: String,
         token: &ParsoidToken,
@@ -3746,18 +3763,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // leave the call as source text (the standalone behaviour of every
         // parser function rustoid cannot implement).
         let Some(src) = source else {
-            return vec![Item::Str(format!("{{{{#invoke:{pf_arg}}}}}"))];
+            return vec![Item::Str(call.source_text())];
         };
 
-        // The module name is needed for the `data-mw` target as well as for the
-        // lookup, and `invoke()` would only re-derive it, so it is parsed here.
-        // The caller has already resolved this call as `invoke`, so `parse`
-        // cannot fail on it; the guard is for defence rather than for a case the
-        // tokenizer can produce.
-        let Some(call) = crate::lua::invoke::Invoke::parse(pf_arg) else {
-            return vec![Item::Str(format!("{{{{#invoke:{pf_arg}}}}}"))];
-        };
-        let module = call.module;
+        // `call` was parsed by the caller, which already resolved the target as
+        // `invoke`; the module name is needed for the `data-mw` target as well as
+        // for the lookup.
+        let module = call.module.clone();
 
         let site = crate::lua::engine::LuaSite::from_config(self.config);
         // The parent frame's args and title are the calling template's, which
@@ -3803,7 +3815,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // MediaWiki's script-error markup, so a broken call reads as broken
         // rather than as silently absent text.
         let output = match crate::lua::invoke::invoke(
-            pf_arg,
+            call,
             src,
             site,
             &frame.title().full_text(),
@@ -4149,77 +4161,28 @@ fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| crate::wikitext::token_utils::key_value_to_string(&kv.value))
 }
-/// Rebuild the `#invoke:` argument text from the resolved colon argument and the
-/// token's remaining parameters.
+/// One `#invoke` argument as the module receives it: its name (when it has one) and
+/// its value.
 ///
-/// `{{#invoke:M|f|a|b=c}}` hands the module the text `M|f|a|b=c`; the tokenizer
-/// has already split that on `|` into the colon argument (`M`) plus parameters
-/// (`f`, `a`, `b=c`), so they are joined back in order.
+/// The value is the **expanded** tokens rendered by [`argument_value_or_source`],
+/// because that is what Scribunto receives: a nested template or `#invoke` is
+/// substituted before the module sees it, so `{{#invoke:String|len|x{{#invoke:Str
+/// ing|len|abc}}y}}` measures `x3y` and answers **3**, not the 17 the unexpanded
+/// text gives. A value the renderer declines keeps to its source range, which is
+/// what `data-mw` records and what `{{#invoke:String|len|<div>X</div>}}` needs
+/// (the service answers 12 there, because the tag reaches the module as text).
 ///
-/// The text is the *expanded* form, because that is what Scribunto receives: a
-/// nested `#invoke` in an argument is expanded by the parser before the module
-/// sees it, so `{{#invoke:String|len|x{{#invoke:String|len|abc}}y}}` measures
-/// `x3y` and answers **3**. Reading the argument's source range instead — which
-/// is what `data-mw` wants — left the nested call as literal text and answered
-/// **17**. The two callers genuinely need different things: `data-mw` records
-/// the wikitext as written, the module gets the expansion.
-///
-/// A tag argument keeps its tags either way, which is why stringifying is safe
-/// here only for the *value tokens*: those have already been expanded, so a
-/// `<div>` in one is a real tag token, and `item_to_string` would drop it. The
-/// expansion below therefore happens on the tokens and the result is rendered
-/// through [`expanded_arg_text`], which keeps tags.
-fn invoke_arg_text(pf_arg: &str, args: &[crate::wikitext::tokens_v2::KV]) -> String {
-    let mut parts = vec![pf_arg.trim().to_string()];
-    parts.extend(args.iter().filter_map(expanded_arg_text));
-    parts.join("|")
-}
-
-/// An argument's text as the module should receive it.
-///
-/// A tag inside a value has no faithful textual form — `tokensToString` has no
-/// arm for a tag, so `<div>X</div>` stringifies to `X` and the module is handed
-/// the wrong length. Such a value is therefore read from its source range, which
-/// is the wikitext as written and what the service passes (`{{#invoke:String|
-/// len|<div>X</div>}}` answers 12).
-///
-/// A value with no tag is stringified from its **expanded** tokens, so a nested
-/// template or `#invoke` is substituted: `x{{#invoke:String|len|abc}}y` must
-/// measure `x3y`. Those tokens are expanded by
-/// [`Parser::expand_invoke_args`] before this is reached; the source range would
-/// still hold the unexpanded form.
-fn expanded_arg_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
-    use crate::wikitext::tokens_v2::KeyValue;
-    // NB: this path re-joins the arguments as *text* (`invoke_arg_text` joins on
-    // `|`), so a value that renders to one containing `|` would be split into two
-    // arguments by the re-parse. `{{!}}` must therefore stay marked here, and the
-    // renderer is deliberately not applied: the fix belongs where the arguments
-    // are structured, which is `frame_args_to_lua` — see
-    // [`expanded_argument_text`].
-    let value = match &kv.value {
-        KeyValue::Tokens(items) => {
-            if items.iter().any(item_is_tag) {
-                kv_value_source(kv)
-            } else {
-                crate::wikitext::token_utils::tokens_to_string(items)
-            }
-        }
-        KeyValue::Str(s) => s.clone(),
-    };
+/// The name is the tokenizer's, not re-derived from the value: only the tokenizer
+/// can tell a `=` that names an argument from one inside a value.
+fn expanded_arg_pair(kv: &crate::wikitext::tokens_v2::KV) -> (Option<String>, String) {
     let key = crate::wikitext::token_utils::key_value_to_string(&kv.key);
-    Some(if key.trim().is_empty() {
-        value
+    let value = argument_value_or_source(kv);
+    let name = key.trim();
+    if name.is_empty() {
+        (None, value)
     } else {
-        format!("{}={value}", key.trim())
-    })
-}
-
-/// Whether an item is a tag, whose text `tokensToString` cannot produce.
-fn item_is_tag(item: &Item) -> bool {
-    matches!(
-        item,
-        Item::Tok(ParsoidToken::Tag(_) | ParsoidToken::EndTag(_))
-    )
+        (Some(name.to_string()), value)
+    }
 }
 
 /// How many `#ifexist` titles one render may resolve.
@@ -4360,41 +4323,56 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
 
 /// A parent-frame argument's text, as Scribunto hands it to the module.
 ///
-/// The **tokens** are the answer when they are all plain text, because they are
-/// the *expanded* value while the recorded source range still holds the wikitext
-/// as written — `{{{1|}}}` included — and so is stale. Reading the range gave
-/// `Module:SDcat` the literal `{{{1|}}}` where the service gave the short
-/// description, and made it report "is different from Wikidata" for a page whose
-/// description matches.
+/// The **tokens** are the answer when every one of them has an exact textual form
+/// ([`argument_value_text`]), because they are the *expanded* value while the
+/// recorded source range still holds the wikitext as written — `{{{1|}}}`
+/// included — and so is stale. Reading the range gave `Module:SDcat` the literal
+/// `{{{1|}}}` where the service gave the short description, and made it report
+/// "is different from Wikidata" for a page whose description matches.
 ///
-/// Anything else keeps to the source range, because `tokensToString` has no arm
-/// for the tokens such a value holds (a wikilink, a tag, a parser-function token)
-/// and would drop them. Rendering those faithfully is a separate job — recorded
-/// in ONLINE-PARITY.md, together with why the range is the lesser evil meanwhile.
+/// Anything else keeps to the source range, which is the lesser evil only for the
+/// tokens the renderer declines: it is *unexpanded*, so it is wrong in a different
+/// way, but it at least keeps the construct visible instead of dropping it.
 fn expanded_argument_text(kv: &crate::wikitext::tokens_v2::KV) -> String {
+    argument_value_or_source(kv)
+}
+
+/// An argument value as the module receives it: the tokens rendered when they all
+/// have an exact textual form, else the recorded source.
+///
+/// The single place both argument paths agree on, so the `#invoke` call's own
+/// arguments and a parent frame's cannot diverge on what a value means.
+fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
     use crate::wikitext::tokens_v2::KeyValue;
-    match &kv.value {
-        KeyValue::Tokens(items) => match argument_value_text(items) {
-            Some(text) => text,
-            None => kv_value_source(kv),
-        },
-        _ => kv_value_source(kv),
+    if let KeyValue::Tokens(items) = &kv.value
+        && let Some(text) = argument_value_text(items)
+    {
+        return text;
     }
+    kv_value_source(kv)
 }
 
 /// Render an argument value's tokens to the text Scribunto receives, when every
 /// token has an exact textual form.
 ///
 /// `None` means *some* token does not, and the caller must keep to the recorded
-/// source instead (see [`expanded_argument_text`]). The distinction is the whole
+/// source instead (see [`argument_value_or_source`]). The distinction is the whole
 /// point: a renderer that returns a string for a value it cannot represent
 /// faithfully drops the part it cannot render, which is how an earlier attempt
 /// lost a wikilink out of a `Megadeth` hatnote.
 ///
-/// The three shapes handled are the ones a value made of *plain text* actually
-/// contains, plus the one that motivated this:
+/// This is deliberately **separate** from
+/// [`crate::wikitext::token_utils::tokens_to_string`], which also renders DOM
+/// attribute values: adding the display text of a link there changed a
+/// `Module:Navbox` title attribute's length and made `Sundial` emit an
+/// unrendered `[[Philosophy of space and time`. A module's argument is a
+/// different question from an attribute value, so it gets its own answer.
+///
+/// The shapes handled, each with an exact textual form:
 ///
 /// - `Item::Str` — the text itself.
+/// - comments and newlines — dropped, as `tokensToString` drops them (MediaWiki's
+///   preprocessor strips comments before a module sees an argument).
 /// - `mw-quote` — its delimiter (`''`/`'''`) is in its `value` attribute, and in
 ///   Scribunto's string view `''x''` is quite literally `''x''`.
 /// - the `{{!}}` marker — a `<td>` carrying an empty `attrSrc` and the
@@ -4406,26 +4384,72 @@ fn expanded_argument_text(kv: &crate::wikitext::tokens_v2::KV) -> String {
 ///   `parseLink` could not split on the pipe — so the hatnote checked the
 ///   existence of a page *named* `Bicyclus{{!}}''Bicyclus''`, and `Bicycle`
 ///   gained a nonexistent-page category on a blue link.
+/// - `wikilink` — `[[target|display…]]`, rebuilt from the `href` and
+///   `mw:maybeContent` fields. Their values are themselves token lists (the
+///   target is tokenized so a templated target can be expanded), so this recurses
+///   rather than reading a string. A module is handed the *wikitext* of a link, and
+///   `{{#invoke:Unsubst||$B={{DMCA|A|B|C}}}}` is the case that pins it: the `$B`
+///   value expands to a `wikilink`, and rendering it without this arm produced
+///   `[[]]`.
+/// - `extension` — the source of the tag (`<nowiki/>`), which is what a module
+///   receives for one.
+///
+/// Anything else — a bare `<div>`, a `template` token that somehow survived
+/// expansion — returns `None`, so the value keeps to its source range rather than
+/// losing the construct.
 fn argument_value_text(items: &[Item]) -> Option<String> {
     use crate::wikitext::tokens_v2::ParsoidToken;
     let mut out = String::new();
     for item in items {
         match item {
             Item::Str(s) => out.push_str(s),
+            Item::Tok(ParsoidToken::Comment(_) | ParsoidToken::Nl(_)) => {}
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
+                let value = t.attribs.iter().find(|kv| kv.key.as_str() == Some("value"));
                 out.push_str(
-                    t.attribs
-                        .iter()
-                        .find(|kv| kv.key.as_str() == Some("value"))
-                        .and_then(|kv| kv.value.as_str())
-                        .unwrap_or("''"),
+                    &value
+                        .and_then(|kv| key_value_text(&kv.value))
+                        .unwrap_or_else(|| "''".to_string()),
                 );
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension" => {
+                out.push_str(t.data_parsoid.src.as_deref()?);
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "wikilink" => {
+                let href = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))?;
+                out.push_str("[[");
+                out.push_str(&key_value_text(&href.value)?);
+                for part in t
+                    .attribs
+                    .iter()
+                    .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+                {
+                    out.push('|');
+                    out.push_str(&key_value_text(&part.value)?);
+                }
+                out.push_str("]]");
             }
             Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
             _ => return None,
         }
     }
     Some(out)
+}
+
+/// A single key/value field rendered to text, for [`argument_value_text`].
+///
+/// A `Tokens` field recurses through the same renderer, so a link target that
+/// holds markup (or an argument reference that was substituted into one) renders
+/// exactly as the value it sits in would.
+fn key_value_text(value: &crate::wikitext::tokens_v2::KeyValue) -> Option<String> {
+    use crate::wikitext::tokens_v2::KeyValue;
+    match value {
+        KeyValue::Str(s) => Some(s.clone()),
+        KeyValue::Tokens(items) => argument_value_text(items),
+    }
 }
 
 /// Whether a `td` tag is the `{{!}}` marker rather than a real table cell.

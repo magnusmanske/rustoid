@@ -56,10 +56,7 @@ impl Invoke {
         if module.is_empty() {
             return None;
         }
-        let function = match parts.next() {
-            Some(f) if !f.trim().is_empty() => f.trim().to_string(),
-            _ => "main".to_string(),
-        };
+        let function = parts.next().unwrap_or_default();
 
         let mut args = Vec::new();
         for part in parts {
@@ -73,11 +70,58 @@ impl Invoke {
             }
         }
 
+        Self::from_parts(module, function, args)
+    }
+
+    /// A call from its parts, with the arguments already parsed.
+    ///
+    /// The parser's path does not go through [`Invoke::parse`]: it holds each
+    /// argument as the tokenizer split it, already expanded, and re-joining those
+    /// into text only to split them again would re-derive the names from a
+    /// string — which cannot tell a `|` or an `=` *inside* a value from a
+    /// separator. `{{#invoke:Unsubst||$B={{DMCA|A|B|C}}}}` is the case in point:
+    /// its `$B` value expands to a link whose text contains neither, but a
+    /// positional value such as `[[Foo|a=b]]` contains both.
+    ///
+    /// An omitted or empty function name defaults to `main`; see
+    /// [`Invoke::parse`].
+    pub fn from_parts(
+        module: &str,
+        function: &str,
+        args: Vec<(Option<String>, String)>,
+    ) -> Option<Self> {
+        let module = module.trim();
+        if module.is_empty() {
+            return None;
+        }
+        let function = if function.trim().is_empty() {
+            "main".to_string()
+        } else {
+            function.trim().to_string()
+        };
         Some(Self {
             module: module.to_string(),
             function,
             args,
         })
+    }
+
+    /// The call as the `{{#invoke:…}}` text a module's failure should echo.
+    ///
+    /// Used only where the call cannot run at all (no data source, so nothing to
+    /// fetch the module from), which is the standalone behaviour.
+    pub fn source_text(&self) -> String {
+        let mut out = format!("{{{{#invoke:{}|{}", self.module, self.function);
+        for (name, value) in &self.args {
+            out.push('|');
+            if let Some(name) = name {
+                out.push_str(name);
+                out.push('=');
+            }
+            out.push_str(value);
+        }
+        out.push_str("}}");
+        out
     }
 
     /// Full title of the module page, with the first letter capitalised.
@@ -397,7 +441,7 @@ pub fn run_once(
 /// (`frame:expandTemplate` and friends). Both retries look the same from here:
 /// the module failed, what it wants is fetched or expanded, and it runs again.
 pub async fn invoke<F, Fut>(
-    pf_arg: &str,
+    call: &Invoke,
     source: &(impl DataSource + ?Sized),
     site: LuaSite,
     page_title: &str,
@@ -412,9 +456,6 @@ where
     F: Fn(crate::pipeline::lua_deferred::FrameRequest) -> Fut,
     Fut: std::future::Future<Output = String>,
 {
-    let Some(call) = Invoke::parse(pf_arg) else {
-        return Err(RustoidError::Lua(format!("malformed #invoke: {pf_arg:?}")));
-    };
     let entry_title = call.module_title(&site.language_code);
     let mut registry = preload(source, &entry_title).await;
     // The page an entity is looked up for is the *root* page, not the frame that
@@ -490,7 +531,7 @@ where
         // uncaught `require` failure (the error text names it) or a `require`
         // whose error a `pcall` swallowed (the engine collected it).
         let outcome = match run_once(
-            &call,
+            call,
             registry.clone(),
             site.clone(),
             page_title,
