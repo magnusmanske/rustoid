@@ -175,7 +175,11 @@ pub trait DataSource: Send + Sync {
 
 /// Page metadata used for link resolution (mirrors the per-title map returned
 /// by PHP `DataAccess::getPageInfo`).
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize`/`Deserialize` so a data source can cache the answer: it is a fact
+/// about a page that the wikitext cannot supply, and an offline run that has the
+/// body still needs it (see the `Protection` cache kind in `rustoid-compare`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageInfo {
     /// The target does not exist (a red link).
     pub missing: bool,

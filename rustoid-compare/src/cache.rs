@@ -58,6 +58,14 @@ pub enum EntryKind {
     /// answer is not in the wikitext. Cached per title so a populated cache can
     /// serve it offline, exactly as it serves the body.
     Protection,
+    /// A page's link-resolution metadata, as JSON: existence, redirect-ness and
+    /// link classes (e.g. `mw-disambig`).
+    ///
+    /// Same reasoning as [`Protection`](Self::Protection) — this is a fact the
+    /// body cannot supply. Without it an offline run answers "everything exists,
+    /// with no classes", which is why a link to a disambiguation page lost its
+    /// `mw-disambig` class and a link to an uncached-but-real page looked red.
+    PageInfo,
 }
 
 impl EntryKind {
@@ -80,6 +88,7 @@ impl EntryKind {
             Self::SiteInfo => "siteinfo",
             Self::Entity => "entity",
             Self::Protection => "prot",
+            Self::PageInfo => "info",
         }
     }
 
@@ -93,6 +102,7 @@ impl EntryKind {
             "siteinfo" => Some(Self::SiteInfo),
             "entity" => Some(Self::Entity),
             "prot" => Some(Self::Protection),
+            "info" => Some(Self::PageInfo),
             _ => None,
         }
     }

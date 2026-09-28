@@ -61,7 +61,7 @@ pub async fn page_info(
                 missing,
                 known: !missing,
                 redirect: info.redirect.is_some(),
-                linkclasses: Vec::new(),
+                linkclasses: link_classes(&info.pageprops),
             };
             if let Some(original) = asked.get(&key) {
                 out.insert(original.clone(), entry.clone());
@@ -161,6 +161,25 @@ pub async fn title_protection(
     out
 }
 
+/// The link classes a page's properties imply.
+///
+/// The wiki's `DataAccess` marks a link to a disambiguation page with
+/// `mw-disambig`, and that class reaches the output: the served
+/// `[[Bicycle (disambiguation)]]` is
+/// `<a … class="mw-disambig">`, while a link without it is not. The property
+/// comes from the `__DISAMBIG__` magic word and is *not* derivable from the
+/// target's body, which is why it is requested here rather than guessed.
+fn link_classes(pageprops: &Option<serde_json::Value>) -> Vec<String> {
+    let Some(props) = pageprops.as_ref().and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    let mut classes = Vec::new();
+    if props.contains_key("disambiguation") {
+        classes.push("mw-disambig".to_string());
+    }
+    classes
+}
+
 /// Normalise a title for comparison: underscores are spaces, and the first
 /// letter is case-insensitive on a default wiki.
 fn normalise(title: &str) -> String {
@@ -192,6 +211,10 @@ struct PageEntry {
     /// Present only for redirects; its presence is the signal.
     #[serde(default)]
     redirect: Option<serde_json::Value>,
+    /// `prop=pageprops` output, e.g. `{"disambiguation": ""}`. An object of
+    /// property name to value (usually the empty string).
+    #[serde(default)]
+    pageprops: Option<serde_json::Value>,
     /// Present as a flat list for an unprotected page is *absent*; for a
     /// protected one it is `[{type, level, expiry}, …]`, where the action is the
     /// `type` field rather than a map key.
@@ -276,6 +299,23 @@ mod tests {
         let json = r#"{"query":{"pages":[{"ns":0,"title":"R","pageid":2,"redirect":{}}]}}"#;
         let parsed: InfoResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.query.pages[0].redirect.is_some());
+    }
+
+    /// `disambiguation` is a page *property*, sent only when requested with
+    /// `prop=pageprops&ppprop=disambiguation`. A link to such a page carries
+    /// `mw-disambig`; reading anything else, or nothing, loses the class.
+    #[test]
+    fn a_disambiguation_page_property_becomes_the_link_class() {
+        let json = r#"{"query":{"pages":[
+            {"ns":0,"title":"Bicycle (disambiguation)","pageid":1,"pageprops":{"disambiguation":""}},
+            {"ns":0,"title":"Bicyclus","pageid":2}
+        ]}}"#;
+        let parsed: InfoResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            link_classes(&parsed.query.pages[0].pageprops),
+            vec!["mw-disambig".to_string()]
+        );
+        assert!(link_classes(&parsed.query.pages[1].pageprops).is_empty());
     }
 
     /// The protection field is a flat array of `{type, level, expiry}`, where

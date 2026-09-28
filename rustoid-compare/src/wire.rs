@@ -379,7 +379,9 @@ impl WikiClient {
     ///
     /// `prop=info` answers "does this exist, and is it a redirect?" in one
     /// request, which is what link resolution needs. Fetching content instead
-    /// would be two requests per link.
+    /// would be two requests per link. `prop=pageprops&ppprop=disambiguation`
+    /// rides along in the same request: a link to a disambiguation page carries
+    /// `mw-disambig`, and the property that says so is not in the target's body.
     pub async fn page_info_json(&self, titles: &[String]) -> Result<String> {
         let joined = titles
             .iter()
@@ -387,7 +389,7 @@ impl WikiClient {
             .collect::<Vec<_>>()
             .join("%7C");
         let url = format!(
-            "{}?action=query&prop=info&format=json&formatversion=2&titles={}",
+            "{}?action=query&prop=info%7Cpageprops&ppprop=disambiguation&format=json&formatversion=2&titles={}",
             self.wiki.api_url(),
             joined
         );

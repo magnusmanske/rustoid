@@ -525,6 +525,25 @@ impl DataSource for CachedDataSource {
         titles: &[String],
     ) -> rustoid_core::Result<std::collections::HashMap<String, rustoid_core::traits::PageInfo>>
     {
+        // Cached facts win, so an offline run answers truthfully for every title
+        // a previous online run looked up, and a mixed run fetches only what it
+        // does not have. This is the whole point of the `PageInfo` cache kind: the
+        // facts are not derivable from a body, so without them offline link
+        // resolution can only guess.
+        let mut out = std::collections::HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for title in titles {
+            match self.cached_page_info(title) {
+                Some(entry) => {
+                    out.insert(title.clone(), entry);
+                }
+                None => missing.push(title.clone()),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(out);
+        }
+
         // `offline` is checked, not just the presence of a client. The client is
         // always built — it is needed for the entity wiki even in a run that must not
         // touch the network — so testing `client.is_none()` here sent `--offline`
@@ -532,11 +551,27 @@ impl DataSource for CachedDataSource {
         // about *every* wikilink title on the page, so one offline run of `Zebra`
         // fired thousands of paced requests and appeared to hang.
         let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
-            // Offline: assume everything exists, which marks nothing as a red
-            // link. Recording it would be a claim the run cannot support.
-            return Ok(titles.iter().map(|t| (t.clone(), existing())).collect());
+            // Offline and not cached: assume everything exists, which marks nothing
+            // as a red link. Recording it would be a claim the run cannot support.
+            out.extend(missing.into_iter().map(|t| (t, existing())));
+            return Ok(out);
         };
-        Ok(crate::pageinfo::page_info_soft(client, titles).await)
+        let fetched = match crate::pageinfo::page_info(client, &missing).await {
+            Ok(fetched) => fetched,
+            // A transport failure is reported as "everything exists" — the same
+            // conservative answer offline gives — but it is *not* written to the
+            // cache: caching a guess would outlive the failure and make every
+            // later offline run wrong for these titles.
+            Err(_) => {
+                out.extend(missing.into_iter().map(|t| (t, existing())));
+                return Ok(out);
+            }
+        };
+        for (title, info) in &fetched {
+            self.store_page_info(title, info);
+        }
+        out.extend(fetched);
+        Ok(out)
     }
 
     async fn get_title_protection(
@@ -634,6 +669,41 @@ impl CachedDataSource {
         };
         if let Ok(mut guard) = self.cache.lock() {
             let _ = guard.put(EntryKind::Protection, title, &body, meta);
+        }
+        let _ = self.note_written();
+    }
+
+    /// A title's cached link-resolution facts, if this cache holds them.
+    ///
+    /// A parse failure is a miss, for the same reason [`Self::cached_protection`]
+    /// treats one that way.
+    fn cached_page_info(&self, title: &str) -> Option<rustoid_core::traits::PageInfo> {
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(EntryKind::PageInfo, title).ok().flatten());
+        cached.and_then(|hit| serde_json::from_str(&hit.body).ok())
+    }
+
+    /// Write a title's link-resolution facts to the cache.
+    ///
+    /// Keyed by the title *as the parser asked*, which is what `add_red_links`
+    /// will ask with again; the wiki's own spelling is not the key because the
+    /// caller never learns it. A failure is swallowed, as in
+    /// [`Self::store_protection`].
+    fn store_page_info(&self, title: &str, info: &rustoid_core::traits::PageInfo) {
+        let Ok(body) = serde_json::to_string(info) else {
+            return;
+        };
+        let meta = EntryMeta {
+            kind: EntryKind::PageInfo,
+            title: title.to_string(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        if let Ok(mut guard) = self.cache.lock() {
+            let _ = guard.put(EntryKind::PageInfo, title, &body, meta);
         }
         let _ = self.note_written();
     }
