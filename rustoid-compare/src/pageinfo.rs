@@ -142,7 +142,9 @@ pub async fn title_protection(
                     .expiries
                     .entry(action)
                     .or_default()
-                    .push(restriction.expiry.unwrap_or_default());
+                    .push(to_wiki_expiry(
+                        restriction.expiry.as_deref().unwrap_or_default(),
+                    ));
             }
             // Key by the request where one is recognisable, so the caller finds
             // its answer; fall back to the wiki's spelling otherwise.
@@ -178,6 +180,43 @@ fn link_classes(pageprops: &Option<serde_json::Value>) -> Vec<String> {
         classes.push("mw-disambig".to_string());
     }
     classes
+}
+
+/// Convert a protection expiry to the form MediaWiki exposes to the parser.
+///
+/// `action=query&prop=info&inprop=protection` reports the expiry as ISO 8601
+/// (`2026-11-28T18:01:22Z`), but `{{PROTECTIONEXPIRY:…}}` and Scribunto's
+/// `title.protectionLevels` hand the script the raw DB form
+/// (`20261128180122`), and the literal `"infinity"` for no expiry.
+/// `Module:Effective protection expiry` matches exactly fourteen digits and
+/// raises `malformed expiry timestamp` otherwise, so the ISO spelling does not
+/// merely look different — it breaks the module. Values already in either
+/// accepted form pass through unchanged.
+fn to_wiki_expiry(expiry: &str) -> String {
+    if expiry.is_empty() || expiry == "infinity" {
+        return expiry.to_string();
+    }
+    if expiry.len() == 14 && expiry.bytes().all(|b| b.is_ascii_digit()) {
+        return expiry.to_string();
+    }
+    // `YYYY-MM-DDTHH:MM:SSZ` (or an offset, which MediaWiki does not emit).
+    let Some((date, rest)) = expiry.split_once('T') else {
+        return expiry.to_string();
+    };
+    let date: String = date.chars().filter(char::is_ascii_digit).collect();
+    let time: String = rest
+        .split(['Z', '+'])
+        .next()
+        .unwrap_or(rest)
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    let combined = format!("{date}{time}");
+    if combined.len() == 14 {
+        combined
+    } else {
+        expiry.to_string()
+    }
 }
 
 /// Normalise a title for comparison: underscores are spaces, and the first
@@ -273,6 +312,20 @@ pub async fn page_info_soft(client: &WikiClient, titles: &[String]) -> HashMap<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Module:Effective protection expiry` matches exactly fourteen digits, so
+    /// the API's ISO spelling of a finite expiry must be converted to
+    /// MediaWiki's DB form. `"infinity"` and an already-raw value must survive
+    /// unchanged.
+    #[test]
+    fn protection_expiry_is_the_raw_db_form_the_module_matches() {
+        assert_eq!(to_wiki_expiry("2026-11-28T18:01:22Z"), "20261128180122");
+        assert_eq!(to_wiki_expiry("infinity"), "infinity");
+        assert_eq!(to_wiki_expiry("20261128180122"), "20261128180122");
+        assert_eq!(to_wiki_expiry(""), "");
+        // Anything unrecognisable is passed through rather than mangled.
+        assert_eq!(to_wiki_expiry("whenever"), "whenever");
+    }
 
     #[test]
     fn normalisation_treats_underscores_as_spaces() {

@@ -5941,3 +5941,32 @@ argument at that moment; the cost is one module re-run per first-read key, which
 for a busy infobox is dozens of runs and needs measuring before it lands. It is
 recorded rather than started, because it is a change to *when* the module runs,
 not to any single pass.
+
+## `PROTECTIONEXPIRY` wants the database's 14 digits, not ISO 8601
+
+`Nobel Prize`'s first difference was, once its protection fact was in the cache,
+`Script error: … Module:Effective protection expiry; malformed expiry
+timestamp`. The module matches the parser function's answer against
+`^(%d%d%d%d)(%d%d)(%d%d)(%d%d)(%d%d)(%d%d)$` — MediaWiki's raw DB form,
+`20261128180122` — while the cache stored the `action=query&prop=info`
+`expiry` verbatim, which is ISO 8601 (`2026-11-28T18:01:22Z`).
+
+The trait already documented the DB form (`ProtectionEntry::expiries` is "in
+MediaWiki's 14-digit `YYYYMMDDHHMMSS` form, with the literal `"infinity"`"), so
+the fetch, not the consumer, was wrong: `pageinfo::title_protection` now
+converts through `to_wiki_expiry`, passing `"infinity"`, an empty value and an
+already-raw 14-digit string through unchanged. The two cached entries that
+already held ISO shapes were rewritten in place rather than re-fetched, since
+the transformation is exactly the one the new code performs.
+
+The `Nobel Prize` page did not fall out of the fix alone — the next difference
+is the banner's expiry *date* (`until November 28, 2026 at 18:01 UTC`, empty in
+rustoid) — but the module now runs, which it did not before.
+
+### Scoreboard
+
+```
+Nobel Prize   600 -> 1112
+fixture guard 876/896
+subset total  4 006 648 -> 4 006 649
+```
