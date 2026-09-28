@@ -2974,6 +2974,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             })
             .unwrap_or_default();
 
+        // The target may hold a nested template
         // A comment in the template *target* (`{{f<!---->oo}}`) is
         // stripped by the PHP preprocessor before target resolution,
         // so the template still expands, but Parsoid does not wrap the
@@ -4264,7 +4265,17 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
         match (trimmed.parse::<usize>(), trimmed.is_empty()) {
             (Ok(_), false) => out.push(Arg::Positional(value)),
             (_, true) => out.push(Arg::Positional(value)),
-            _ => out.push(Arg::Named(trimmed.to_string(), value)),
+            // A named argument's value is trimmed, exactly as `{{{name}}}`
+            // substitution trims it ([`Frame::expand_template_arg`]) and as
+            // MediaWiki's preprocessor does. Without this `{{Automatic taxobox
+            // | taxon = Equus (Hippotigris)}}` handed the module ` Equus
+            // (Hippotigris)`, so `Module:Autotaxobox` looked up
+            // `Template:Taxonomy/ Equus (Hippotigris)` (with the space), missed,
+            // and walked a broken taxonomy chain that expanded `Template:Taxonomy/`
+            // recursively until the node-count limit fired.
+            //
+            // [`Frame::expand_template_arg`]: crate::pipeline::frame::Frame::expand_template_arg
+            _ => out.push(Arg::Named(trimmed.to_string(), value.trim().to_string())),
         }
     }
     out
