@@ -6009,3 +6009,71 @@ fixture guard     876/896
 subset total      4 006 649 -> 3 839 039   (the drop is removed duplicated
                                             raw wikitext, not content)
 ```
+
+## The remaining shapes, and two reductions worth keeping
+
+Four independent defects stand between the subset and a passing page. None is
+reduced to a fix, but two have a minimal input now, which is the part that took
+the time.
+
+### The encapsulation merge (`Help:Introduction` 492, `Zebra` 2172)
+
+A page-level run of adjacent transclusions is merged by the service into a
+single `mw:Transclusion` wrapper whose `parts` list interleaves template parts
+and *string* parts for the literal text between them. The reduce is
+`<noinclude>{{pp-semi-indef|small=yes}}</noinclude>{{intro to single}}`: the
+service serves one `<p about="#mwt4">` with
+`parts:[pp-semi-indef, "</noinclude>", intro-to-single]`, while rustoid emits
+only the second. `WrapSectionsState::collapseWrappers` is the pass that builds
+those mixed `parts` (the fetched source is quoted in the earlier section), but
+it is reached from `resolveTplExtSectionConflicts`, and which pair of wrappers
+lands in one section range is not something reasoning has pinned down here.
+
+Worse, on the full page rustoid does not merely omit the merge — it emits the
+`pp-semi-indef` wrapper *near the end of the body* (byte 5163 of 20934) instead
+of at the head, so its position is wrong as well as its grouping. The reduced
+input reproduces the wrong *nesting* (the padlock ends up a child of the
+`intro to single` paragraph) but not the displacement, so a bisect inside
+`Template:Intro to single` is the next step, not a guess at the merge.
+
+### `#tag` arguments lose their parameter substitution (`Megadeth` 2801, `Zebra`)
+
+`Template:Featured article` -> `{{Top icon|id=featured-star|…}}`, and
+`Template:Top icon` is `<includeonly>{{#tag:indicator|<body>|name=<expr>}}</includeonly>`.
+Reduced to `{{Top icon|imagename=cscr-featured.svg|id=featured-star}}`, rustoid
+produces `"attrs":{"name":" "}` and an `extsrc` that still spells
+`{{{image|{{{imagename|{{{1|}}}}}}}}}`; the service has `name:"featured-star"`
+and the fully substituted file spec. The name expression contains `{{{id|}}}`,
+so the failure is generic: **`{{{…}}}` inside a `#tag` argument is not
+substituted** (it is inside the value's nested tokens, which
+`attribute_transform_manager` does not descend into, and `pf_tag` runs before the
+`produced` tokens are re-expanded). Zebra's `name:" "` is the same defect, and
+`Megadeth` only moved once its link-existence facts were cached.
+
+### Lazy `frame.args` (above) and the file-info cache
+
+`Quicksilver` (2732), `Bicycle` (6979), `List of sovereign states` (4009) and
+`Sundial` (1897) all now halt at a *fact* rather than a parser bug: the last two
+at a missing file's media info, `Quicksilver` at the id order that lazy
+`frame.args` fixes, `Bicycle` at the same media gap. `AddMediaInfo` fetches
+through `DataSource::get_file_info`, whose comparison-harness implementation is
+a stub returning `None`, so offline media is always `mw-broken-media`.
+Populating it needs a thumbnail width, which the trait does not carry
+(`getFileInfo` in PHP takes `$width`), so it is a small interface change plus a
+cache kind rather than a fetch.
+
+## Scoreboard
+
+```
+Help:Introduction          416 -> 492
+Nobel Prize                600 -> 1112
+Megadeth                  1650 -> 2801
+Unix                      1736 -> 4772
+Quicksilver (film)        1551 -> 2732
+Bicycle                   3168 -> 6979
+Sundial                   1897        (unchanged; media cache)
+List of sovereign states  2771 -> 4009
+Zebra                     2172        (unchanged)
+fixture guard             876/896
+subset total              4 007 778 -> 3 799 716 (0.71x)
+```
