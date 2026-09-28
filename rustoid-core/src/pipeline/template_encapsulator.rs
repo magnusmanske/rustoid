@@ -247,14 +247,6 @@ impl OrderedJson {
         self.put(key, json_string(value));
     }
 
-    fn put_opt_str(&mut self, key: &str, value: Option<&str>) {
-        match value {
-            Some(v) => self.put_str(key, v),
-            // Absent wikitext serialises as null, as PHP's `?string` default does.
-            None => self.put(key, "null"),
-        }
-    }
-
     /// Write `key` only when there is a value, leaving it out otherwise — for
     /// fields whose absence the live service expresses by omission rather than by
     /// an explicit `null` (`href` on a parser function, which has no page).
@@ -332,7 +324,7 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
 
     // `target` first: Parsoid's order, verified against the live service.
     let mut target = OrderedJson::default();
-    target.put_opt_str("wt", Some(&wt));
+    target.put_str("wt", &wt);
     if let Some(func) = &info.func {
         if info.ty.as_deref() == Some("parserfunction") {
             target.put_str("key", func);
@@ -367,14 +359,12 @@ pub fn serialize_template_info(info: &TemplateInfo) -> String {
         seen.insert(key.clone(), count);
 
         let mut value = OrderedJson::default();
-        value.put_opt_str(
-            "wt",
-            if param.value_wt.is_empty() {
-                None
-            } else {
-                Some(&param.value_wt)
-            },
-        );
+        // PHP writes `'wt' => $info->valueWt` unconditionally, and every builder
+        // assigns `valueWt` a real (possibly empty) source string. An empty
+        // value is therefore `"wt":""`, not `"wt":null`: `{{About||…}}`'s first
+        // argument is present and empty, and the service serves `"wt":""` for
+        // it (`Bicycle`'s `Template:About`).
+        value.put_str("wt", &param.value_wt);
         if let Some(html) = &param.html {
             value.put_str("html", html);
         }
