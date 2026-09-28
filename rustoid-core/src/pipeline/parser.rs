@@ -4127,6 +4127,12 @@ fn invoke_arg_text(pf_arg: &str, args: &[crate::wikitext::tokens_v2::KV]) -> Str
 /// still hold the unexpanded form.
 fn expanded_arg_text(kv: &crate::wikitext::tokens_v2::KV) -> Option<String> {
     use crate::wikitext::tokens_v2::KeyValue;
+    // NB: this path re-joins the arguments as *text* (`invoke_arg_text` joins on
+    // `|`), so a value that renders to one containing `|` would be split into two
+    // arguments by the re-parse. `{{!}}` must therefore stay marked here, and the
+    // renderer is deliberately not applied: the fix belongs where the arguments
+    // are structured, which is `frame_args_to_lua` — see
+    // [`expanded_argument_text`].
     let value = match &kv.value {
         KeyValue::Tokens(items) => {
             if items.iter().any(item_is_tag) {
@@ -4297,11 +4303,69 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
 fn expanded_argument_text(kv: &crate::wikitext::tokens_v2::KV) -> String {
     use crate::wikitext::tokens_v2::KeyValue;
     match &kv.value {
-        KeyValue::Tokens(items) if items.iter().all(|it| matches!(it, Item::Str(_))) => {
-            crate::wikitext::token_utils::tokens_to_string(items)
-        }
+        KeyValue::Tokens(items) => match argument_value_text(items) {
+            Some(text) => text,
+            None => kv_value_source(kv),
+        },
         _ => kv_value_source(kv),
     }
+}
+
+/// Render an argument value's tokens to the text Scribunto receives, when every
+/// token has an exact textual form.
+///
+/// `None` means *some* token does not, and the caller must keep to the recorded
+/// source instead (see [`expanded_argument_text`]). The distinction is the whole
+/// point: a renderer that returns a string for a value it cannot represent
+/// faithfully drops the part it cannot render, which is how an earlier attempt
+/// lost a wikilink out of a `Megadeth` hatnote.
+///
+/// The three shapes handled are the ones a value made of *plain text* actually
+/// contains, plus the one that motivated this:
+///
+/// - `Item::Str` — the text itself.
+/// - `mw-quote` — its delimiter (`''`/`'''`) is in its `value` attribute, and in
+///   Scribunto's string view `''x''` is quite literally `''x''`.
+/// - the `{{!}}` marker — a `<td>` carrying an empty `attrSrc` and the
+///   `AT_SRC_START` flag, which [`crate::pipeline::template_handler::process_special_magic_word`]
+///   emits *inside a template* so `TableFixups` can reclaim a cell separator.
+///   Its text is `|`, and a module reads it as exactly that: without this,
+///   `{{About||the butterfly genus|Bicyclus{{!}}''Bicyclus''|other uses}}` handed
+///   `Module:Hatnote list` the value `Bicyclus{{!}}''Bicyclus''`, whose
+///   `parseLink` could not split on the pipe — so the hatnote checked the
+///   existence of a page *named* `Bicyclus{{!}}''Bicyclus''`, and `Bicycle`
+///   gained a nonexistent-page category on a blue link.
+fn argument_value_text(items: &[Item]) -> Option<String> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    let mut out = String::new();
+    for item in items {
+        match item {
+            Item::Str(s) => out.push_str(s),
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
+                out.push_str(
+                    t.attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("value"))
+                        .and_then(|kv| kv.value.as_str())
+                        .unwrap_or("''"),
+                );
+            }
+            Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Whether a `td` tag is the `{{!}}` marker rather than a real table cell.
+///
+/// [`crate::pipeline::template_handler::process_special_magic_word`] builds it
+/// with an empty `attrSrc` and the `AT_SRC_START` flag, which is what
+/// `TableFixups` keys on; nothing else produces that pair.
+fn is_bang_marker(t: &crate::wikitext::tokens_v2::TagTk) -> bool {
+    t.name == "td"
+        && t.data_parsoid.tmp.at_src_start
+        && t.data_parsoid.tmp.attr_src.as_deref() == Some("")
 }
 
 /// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`
@@ -4442,6 +4506,42 @@ mod tests {
             .unwrap();
         assert!(html.contains("<h2"), "got: {html}");
         assert!(html.contains("Heading"), "got: {html}");
+    }
+
+    #[test]
+    fn an_argument_value_with_bang_and_quotes_renders_from_its_tokens() {
+        use crate::pipeline::template_handler::process_special_magic_word;
+        use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk};
+
+        // `Bicyclus{{!}}''Bicyclus''` as the tokens a module's parent argument
+        // holds: text, the `{{!}}` cell marker, and two `mw-quote` delimiters.
+        let quote = |value: &str| {
+            let mut tk = SelfclosingTagTk::new("mw-quote", vec![], DataParsoid::default());
+            tk.add_attribute_str("value", value);
+            Item::Tok(ParsoidToken::SelfclosingTag(tk))
+        };
+        let mut items = vec![Item::Str("Bicyclus".to_string())];
+        items.extend(process_special_magic_word("!", true));
+        items.push(quote("''"));
+        items.push(Item::Str("Bicyclus".to_string()));
+        items.push(quote("''"));
+
+        assert_eq!(
+            argument_value_text(&items).as_deref(),
+            Some("Bicyclus|''Bicyclus''"),
+            "the `{{!}}` marker is a `|` and the quotes are literal text"
+        );
+    }
+
+    #[test]
+    fn an_argument_value_the_renderer_cannot_represent_is_declined() {
+        use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
+
+        // A real tag has no faithful text, so the renderer must return `None` and
+        // let the caller keep to the source range rather than drop the tag.
+        let div = TagTk::new("div", vec![], DataParsoid::default());
+        let items = vec![Item::Tok(ParsoidToken::Tag(div))];
+        assert_eq!(argument_value_text(&items), None);
     }
 
     #[test]
