@@ -62,8 +62,10 @@ impl HtmlSerializer {
         depth: usize,
         escape: bool,
     ) -> Result<()> {
-        let indent = "  ".repeat(depth);
-
+        // No indentation is emitted at any depth: Parsoid's `XHtmlSerializer`
+        // produces compact markup, and a synthetic indent is whitespace that
+        // is *not* in the served HTML (it showed up as the first difference
+        // inside a transcluded table, where depth > 0).
         match &node.kind {
             NodeKind::Document => {
                 for child in node.children.iter() {
@@ -74,7 +76,7 @@ impl HtmlSerializer {
                 let _tag = self.element_tag(kind);
                 match kind {
                     ElementKind::Paragraph => {
-                        buf.push_str(&format!("{indent}<p"));
+                        buf.push_str("<p");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
@@ -82,7 +84,7 @@ impl HtmlSerializer {
                     }
                     ElementKind::Heading(level) => {
                         let h = format!("h{level}");
-                        buf.push_str(&format!("{indent}<{h}"));
+                        buf.push_str(&format!("<{h}"));
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
@@ -103,7 +105,7 @@ impl HtmlSerializer {
                         buf.push_str("</i>");
                     }
                     ElementKind::Preformatted => {
-                        buf.push_str(&format!("{indent}<pre"));
+                        buf.push_str("<pre");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         // `<pre>` is a raw-text escaping element in HTML
@@ -125,42 +127,42 @@ impl HtmlSerializer {
                         buf.push_str("</pre>");
                     }
                     ElementKind::Table => {
-                        buf.push_str(&format!("{indent}<table"));
+                        buf.push_str("<table");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
-                        buf.push_str(&format!("{indent}</table>"));
+                        buf.push_str("</table>");
                     }
                     ElementKind::TableRow => {
-                        buf.push_str(&format!("{indent}<tr"));
+                        buf.push_str("<tr");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
-                        buf.push_str(&format!("{indent}</tr>"));
+                        buf.push_str("</tr>");
                     }
                     ElementKind::TableCell => {
-                        buf.push_str(&format!("{indent}<td"));
+                        buf.push_str("<td");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</td>");
                     }
                     ElementKind::TableHeader => {
-                        buf.push_str(&format!("{indent}<th"));
+                        buf.push_str("<th");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth)?;
                         buf.push_str("</th>");
                     }
                     ElementKind::UnorderedList => {
-                        buf.push_str(&format!("{indent}<ul"));
+                        buf.push_str("<ul");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
                         buf.push_str("</ul>");
                     }
                     ElementKind::OrderedList => {
-                        buf.push_str(&format!("{indent}<ol"));
+                        buf.push_str("<ol");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         self.serialize_children(node, buf, depth + 1)?;
@@ -174,12 +176,12 @@ impl HtmlSerializer {
                         buf.push_str("</li>");
                     }
                     ElementKind::Div => {
-                        buf.push_str(&format!("{indent}<div"));
+                        buf.push_str("<div");
                         self.serialize_attrs(node, buf);
                         buf.push('>');
                         if !node.children.is_empty() {
                             self.serialize_children(node, buf, depth + 1)?;
-                            buf.push_str(&format!("{indent}</div>"));
+                            buf.push_str("</div>");
                         } else {
                             buf.push_str("</div>");
                         }
@@ -195,7 +197,7 @@ impl HtmlSerializer {
                         buf.push_str("<br/>");
                     }
                     ElementKind::HorizontalRule => {
-                        buf.push_str(&format!("{indent}<hr/>"));
+                        buf.push_str("<hr/>");
                     }
                     ElementKind::Wikilink => {
                         buf.push_str("<a");
@@ -228,11 +230,8 @@ impl HtmlSerializer {
                         buf.push_str("</figure-inline>");
                     }
                     _ => {
-                        // Generic element serialization. No leading `indent`
-                        // here: Parsoid's `XHtmlSerializer` emits compact output
-                        // with no synthetic whitespace between elements (inline
-                        // elements like `<small>`/`<code>` reach this arm, and a
-                        // pretty-print indent would inject spurious text nodes).
+                        // Generic element serialization (inline elements like
+                        // `<small>`/`<code>`, plus any tag without a dedicated arm).
                         let tag = self.element_tag(kind);
                         // Void/self-closing elements (meta, link, img, etc.)
                         // serialize without a closing tag.
