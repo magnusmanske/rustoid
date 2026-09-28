@@ -5867,3 +5867,77 @@ subset total              4 007 778 -> 4 006 549
 newline before the first `|` (`"Infobox machine\n"` where rustoid trims it);
 `Help:Introduction` is the encapsulation merge; `List of sovereign states` now
 reaches its first missing file-info fact at the map figure.
+
+## `data-mw.target.wt` is the target's *source*, not its cleaned name
+
+The `Bicycle` diff above was the visible half of a general bug: rustoid recorded
+`info.target_wt` from the cleaned, trimmed target string, so every transclusion
+whose target carried trailing whitespace (a newline before the first `|`, a
+space before a wrapped call) lost it in `data-mw`.
+
+PHP takes it from the *source range* of the target key
+(`TemplateEncapsulator::getTemplateInfo`):
+
+```php
+$tgtSrcOffsets = $params[0]->srcOffsets;
+if ( $tgtSrcOffsets ) { $ret->targetWt = $tgtSrcOffsets->key->substr( $src ); }
+```
+
+so the rule is *leading whitespace skipped, everything else kept*. Confirmed
+against the transform oracle, one request, five shapes:
+
+| wikitext | `wt` |
+|---|---|
+| `{{Template:Infobox machine\n|…}}` | `Template:Infobox machine\n` |
+| `{{  Template:Infobox machine  |…}}` | `Template:Infobox machine  ` |
+| `{{ Template:Infobox machine|…}}` | `Template:Infobox machine` |
+| `{{Template:Infobox mach<!--x-->ine|…}}` | `Template:Infobox mach<!--x-->ine` |
+| `{{Template:Infobox machine<!--c-->|…}}` | `Template:Infobox machine<!--c-->` |
+
+Note the fourth row: the comment is *kept in `wt`* even though resolution strips
+it (the title resolves to `Template:Infobox_machine`). So the two strings are
+genuinely different — resolution uses the cleaned key, `wt` the raw source — and
+rustoid now keeps both, deriving `wt` with `raw_template_target(…).trim_start()`
+at the call site and passing it into `expand_one_template`.
+
+### Scoreboard
+
+```
+Bicycle                   3577 -> 6979   (now the file-info cache)
+Quicksilver (film)        1551 -> 2732
+fixture guard             876/896
+subset total              4 006 549 -> 4 006 648
+```
+
+## `#invoke` arguments are expanded lazily, and the id order shows it
+
+`Quicksilver`'s new first difference is a `<style about>` id: the service has
+`#mwt5` on `Module:Infobox/styles.css`, rustoid `#mwt14`. Nine ids sit between
+the Infobox wrapper (`#mwt4`) and its own stylesheet, and a labelled trace names
+them at once — all nine are `Plainlist/styles.css`:
+
+```
+ALLOC take_id #mwt1..#mwt4
+ALLOC templatestyles #mwt5  src=Plainlist/styles.css
+... #mwt6..#mwt13, all Plainlist/styles.css
+ALLOC templatestyles #mwt14 src=Module:Infobox/styles.css
+```
+
+The nine `Plainlist` styles come from `{{ubl|…}}`, which is the infobox's
+`producer` argument. rustoid expands **every `#invoke` argument up front**
+(`expand_invoke_args` runs before `expand_invoke`), so the argument's templates
+spend their ids before the module has run at all. The service numbers the
+module's *own* stylesheet first because Scribunto's `frame.args` is **lazy**: an
+argument value is preprocessed the first time the module reads that key, not
+when the frame is created. `Module:Infobox` emits its stylesheet before it reads
+`frame.args.producer`, so the stylesheet takes `#mwt5` and the `{{ubl}}` styles
+come after.
+
+The eager expansion was itself a fix — handing the module the raw source left
+`{{If empty|…}}` inside `frame.args` and made modules re-enter the parser — so
+this is not a matter of reverting it. The faithful shape is to answer each
+`frame.args` read as a deferred request (`FrameRequest`), expanding that one
+argument at that moment; the cost is one module re-run per first-read key, which
+for a busy infobox is dozens of runs and needs measuring before it lands. It is
+recorded rather than started, because it is a change to *when* the module runs,
+not to any single pass.
