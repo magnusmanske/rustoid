@@ -425,15 +425,25 @@ where
         .page_title
         .clone()
         .unwrap_or_else(|| page_title.to_string());
-    let mut frame = FrameContext {
-        titles: preload_titles(
+    // Merge the newly preloaded facts *into* the seeded ones rather than
+    // replacing them. `preload_titles` deliberately skips a title it has already
+    // answered, so its result holds only the new ones; assigning it directly
+    // would drop every fact this render has already resolved and make the second
+    // `#invoke` on a page answer from nothing. The frame is the map Lua reads,
+    // and the seed came from the parser's render-wide `title_facts`.
+    let mut titles = frame.titles.clone();
+    titles.extend(
+        preload_titles(
             source,
             &registry,
             &site,
             &[&entity_page, page_title],
-            &frame.titles,
+            &titles,
         )
         .await,
+    );
+    let mut frame = FrameContext {
+        titles,
         entities: preload_entities(source, &registry, Some(&entity_page)).await,
         ..frame
     };
