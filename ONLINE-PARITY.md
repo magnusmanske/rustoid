@@ -6239,6 +6239,21 @@ The rustoid total *grew* by ~80 KB: the media renders instead of falling back
 to the broken span, so this is the metric getting honest again, not a
 regression. `Module:DecodeEncode` was a genuine cache gap and is now filled.
 
+### After the three fidelity fixes
+
+```
+score                     0/9
+output                    3 846 606 vs parsoid 5 351 722 (0.72x)
+by outcome                extension 6, media 2, transclusion 1
+lua failures              6 pages, 1 distinct  (unchanged)
+Bicycle's first diff       6979 -> 8151, outcome label media -> extension
+```
+
+The total *fell* by ~33 KB, all of it the dropped indentation. `Bicycle`'s label
+changed because its divergence is now the `about="#mwt199"` on a `<sup
+class="mw-ref">` — a Cite marker, hence `extension` — rather than the media
+markup inside the classifier's window.
+
 **`Bicycle`'s first difference moved past the image.** At byte 6979 the two
 renderings now part on table whitespace, not media:
 
