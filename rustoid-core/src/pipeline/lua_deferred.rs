@@ -41,9 +41,68 @@ pub const RESULTS: &str = "__rustoid_frame_results";
 /// real pipeline, so all it needs is the wikitext-equivalent description.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameRequest {
-    ExpandTemplate { title: String, args: Vec<FrameArg> },
+    ExpandTemplate {
+        title: String,
+        args: Vec<FrameArg>,
+    },
     Preprocess(String),
-    CallParserFunction { name: String, args: Vec<FrameArg> },
+    CallParserFunction {
+        name: String,
+        args: Vec<FrameArg>,
+    },
+    /// One or more `frame.args` reads the host has not expanded yet.
+    ///
+    /// Scribunto expands an argument the *first time the module reads it*, and
+    /// never before: the templates inside an argument spend their `about` ids
+    /// at that moment, not when the frame is created. So a single `args[k]`
+    /// read carries one slot, and the `pairs`/`argumentPairs` view carries
+    /// every still-unexpanded slot at once, in the frame's own order.
+    ExpandArgs {
+        slots: Vec<ArgSlot>,
+    },
+}
+
+/// Which raw argument list a [`FrameRequest::ExpandArgs`] slot indexes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArgSource {
+    /// The `#invoke` call's own arguments.
+    Call,
+    /// The arguments of the frame that made the call — `frame:getParent().args`.
+    Parent,
+}
+
+impl ArgSource {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Parent => "parent",
+        }
+    }
+}
+
+/// One `frame.args` argument the host has not expanded yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgSlot {
+    pub source: ArgSource,
+    /// Position in the raw argument list it belongs to.
+    pub index: usize,
+    /// The name it is stored under in `frame.args`; `None` for a positional
+    /// argument, whose key is its number.
+    pub name: Option<String>,
+    /// The argument as written. Kept so the call can be echoed when nothing can
+    /// be expanded (no data source), which never reads an argument at all.
+    pub raw: String,
+}
+
+impl ArgSlot {
+    /// The key this argument's expanded text is cached under.
+    ///
+    /// A `HashMap` key rather than a positional identity, because the answers
+    /// travel as strings: two slots never collide, since the source names the
+    /// list and `index` its position.
+    pub fn key(&self) -> String {
+        format!("invoke-arg:{}:{}", self.source.tag(), self.index)
+    }
 }
 
 /// One argument of a frame call: a value, and the name it was given if any.
@@ -78,7 +137,7 @@ impl FrameRequest {
     pub fn args(&self) -> &[FrameArg] {
         match self {
             Self::ExpandTemplate { args, .. } | Self::CallParserFunction { args, .. } => args,
-            Self::Preprocess(_) => &[],
+            Self::Preprocess(_) | Self::ExpandArgs { .. } => &[],
         }
     }
 
@@ -118,6 +177,13 @@ impl FrameRequest {
             Self::Preprocess(text) => format!("preprocess:{text}"),
             Self::CallParserFunction { name, args } => {
                 format!("{{{{#{name}:{}}}}}", render(args))
+            }
+            // Unused: a slot's answer is keyed by the slot itself
+            // ([`ArgSlot::key`]), so the batch request never needs a key of its
+            // own. Kept total rather than panicking.
+            Self::ExpandArgs { slots } => {
+                let keys: Vec<String> = slots.iter().map(ArgSlot::key).collect();
+                format!("expand-args:{}", keys.join("\u{1f}"))
             }
         }
     }
@@ -459,6 +525,9 @@ pub fn render_call(request: &FrameRequest) -> String {
             out
         }
         FrameRequest::Preprocess(text) => text.clone(),
+        // Not a call at all: the host serves an `ExpandArgs` request by
+        // expanding the slots directly, not by rendering wikitext.
+        FrameRequest::ExpandArgs { .. } => String::new(),
     }
 }
 

@@ -33,9 +33,16 @@ use crate::traits::DataSource;
 pub struct Invoke {
     /// Module name without the `Module:` prefix, e.g. `Weather box`.
     pub module: String,
-    /// Entry point, e.g. `main`.
+    /// Entry point, e.g. `main`. Expanded eagerly, as Scribunto does.
     pub function: String,
-    /// Arguments in call order; `None` name means positional.
+    /// Each argument's wikitext **as written**, in call order; `None` name means
+    /// positional.
+    ///
+    /// Deliberately unexpanded: Scribunto hands the module each value's text only
+    /// when it first reads it ([`ArgSlot`]), and the call's arguments travel to
+    /// the engine as [`Arg`]s separately. This field exists to reconstruct the
+    /// call for the one path that cannot run it at all — no data source, so
+    /// nothing can be fetched or expanded.
     pub args: Vec<(Option<String>, String)>,
 }
 
@@ -109,7 +116,9 @@ impl Invoke {
     /// The call as the `{{#invoke:…}}` text a module's failure should echo.
     ///
     /// Used only where the call cannot run at all (no data source, so nothing to
-    /// fetch the module from), which is the standalone behaviour.
+    /// fetch the module from), which is the standalone behaviour. The arguments
+    /// are the raw source, not the expanded text: expanding them would be the
+    /// very work this path cannot do, and it is never what the echo wants.
     pub fn source_text(&self) -> String {
         let mut out = format!("{{{{#invoke:{}|{}", self.module, self.function);
         for (name, value) in &self.args {
@@ -138,17 +147,6 @@ impl Invoke {
     pub fn module_title(&self, language_code: &str) -> String {
         let name = crate::title::ucfirst(&self.module.replace('_', " "), language_code);
         format!("Module:{name}")
-    }
-
-    /// The frame arguments, in Scribunto's shape.
-    pub fn frame_args(&self) -> Vec<Arg> {
-        self.args
-            .iter()
-            .map(|(name, value)| match name {
-                Some(n) => Arg::Named(n.clone(), value.clone()),
-                None => Arg::Positional(value.clone()),
-            })
-            .collect()
     }
 }
 
@@ -352,12 +350,18 @@ const MAX_FRAME_ROUNDS: usize = 512;
 /// in it raises a request instead of returning. The engine is created here, so
 /// a caller that re-runs on [`Outcome::Deferred`] starts from scratch — which
 /// is safe because a frame method's result depends only on its arguments.
+#[allow(clippy::too_many_arguments)] // the call, its frame, and the host's state are all distinct
 pub fn run_once(
     call: &Invoke,
     registry: Registry,
     site: LuaSite,
     page_title: &str,
     frame: &FrameContext,
+    // The call's arguments, unexpanded where the host has not read them yet.
+    // They travel beside `call`, not inside it: the frame's arguments are a
+    // *lazy* view (see [`crate::pipeline::lua_deferred::ArgSlot`]), while
+    // `call.args` is the call as written.
+    args: &[Arg],
     answers: &crate::pipeline::lua_deferred::DeferredAnswers,
     unfetchable: &std::collections::HashSet<String>,
 ) -> Result<Outcome> {
@@ -384,8 +388,7 @@ pub fn run_once(
     let ctx = LuaContext::with_parent(site, current_title, frame);
     let engine = LuaEngine::new(LuaEngineConfig::default(), ctx)?;
 
-    let args = call.frame_args();
-    match engine.execute_in(&entry, &title, &call.function, &args, answers) {
+    match engine.execute_in(&entry, &title, &call.function, args, answers) {
         // A successful run can still have wanted a page it did not have: a module
         // that wraps the load in `pcall` swallows the error, so the record has to
         // be consulted here too. `Module:Music chart` does exactly that
@@ -440,8 +443,11 @@ pub fn run_once(
 /// stopped 36 of 39 corpus pages), and a module that calls back into the parser
 /// (`frame:expandTemplate` and friends). Both retries look the same from here:
 /// the module failed, what it wants is fetched or expanded, and it runs again.
+#[allow(clippy::too_many_arguments)] // the call, its arguments, and the host's state are all distinct
 pub async fn invoke<F, Fut>(
     call: &Invoke,
+    // The call's arguments, unexpanded where the host has not read them yet.
+    args: &[Arg],
     source: &(impl DataSource + ?Sized),
     site: LuaSite,
     page_title: &str,
@@ -454,7 +460,10 @@ pub async fn invoke<F, Fut>(
 ) -> Result<String>
 where
     F: Fn(crate::pipeline::lua_deferred::FrameRequest) -> Fut,
-    Fut: std::future::Future<Output = String>,
+    // One request may carry several answers: a single frame method is one pair,
+    // while `frame.args` held up by `pairs` is one per argument. The key names
+    // where the text is cached, so the loop below can hold them all together.
+    Fut: std::future::Future<Output = Vec<(String, String)>>,
 {
     let entry_title = call.module_title(&site.language_code);
     let mut registry = preload(source, &entry_title).await;
@@ -536,6 +545,7 @@ where
             site.clone(),
             page_title,
             &frame,
+            args,
             &answers,
             &unfetchable,
         ) {
@@ -629,17 +639,23 @@ where
                 continue;
             }
             Outcome::Deferred(request) => {
-                let key = request.key();
-                // Re-running with an answer the module already has would
-                // reproduce the same request forever, so a repeat is a loop.
-                if asked.contains(&key) {
-                    return Err(RustoidError::Lua(format!(
-                        "deferred frame call did not settle: {key}"
-                    )));
+                if std::env::var("RUSTOID_TRACE_DEFER").is_ok() {
+                    eprintln!("DEFER round: {request:?}");
                 }
-                let text = expand(request).await;
-                asked.push(key.clone());
-                answers.insert(key, text);
+                // A request may carry several answers at once (a `pairs` over a
+                // lazy `frame.args`), and each answer is keyed by the thing it
+                // expands, so the loop can hand them out together.
+                for (key, text) in expand(request).await {
+                    // Re-running with an answer the module already has would
+                    // reproduce the same request forever, so a repeat is a loop.
+                    if asked.contains(&key) {
+                        return Err(RustoidError::Lua(format!(
+                            "deferred frame call did not settle: {key}"
+                        )));
+                    }
+                    asked.push(key.clone());
+                    answers.insert(key, text);
+                }
             }
             // Unreachable in this position: `MissingModule` is turned into the
             // error text above, which the fetch arm consumes. Kept as an explicit
@@ -1181,10 +1197,10 @@ mod tests {
     #[test]
     fn positional_args_keep_their_order_and_names_attach() {
         let i = Invoke::parse("M|f|a|b|c=d").unwrap();
-        let args = i.frame_args();
-        assert_eq!(args[0], Arg::Positional("a".to_string()));
-        assert_eq!(args[1], Arg::Positional("b".to_string()));
-        assert_eq!(args[2], Arg::Named("c".to_string(), "d".to_string()));
+        let args = &i.args;
+        assert_eq!(args[0], (None, "a".to_string()));
+        assert_eq!(args[1], (None, "b".to_string()));
+        assert_eq!(args[2], (Some("c".to_string()), "d".to_string()));
     }
 
     #[test]

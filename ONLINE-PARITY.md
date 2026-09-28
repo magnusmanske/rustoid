@@ -5933,6 +5933,9 @@ when the frame is created. `Module:Infobox` emits its stylesheet before it reads
 `frame.args.producer`, so the stylesheet takes `#mwt5` and the `{{ubl}}` styles
 come after.
 
+> **Done.** This was implemented in §"Lazy `#invoke` arguments" (the end of this
+> file); it is one argument per read, not all at once.
+
 The eager expansion was itself a fix — handing the module the raw source left
 `{{If empty|…}}` inside `frame.args` and made modules re-enter the parser — so
 this is not a matter of reverting it. The faithful shape is to answer each
@@ -6780,3 +6783,95 @@ disabling `expand_invoke_args` moved `Bicycle`'s `<sup>` from `#mwt199` to
 `#mwt204` — so the answer is real lazy expansion, not removal. What the trace adds
 is that the eager pass is the whole of the discrepancy at this position, and
 which tokens it overspends on.
+
+## Lazy `#invoke` arguments: `frame.args` is expanded on first read
+
+The diagnosis above is now a fix, and the PHP settles the exact shape. The
+earlier reading of `PPTemplateFrame_Hash` as "expand every argument on the
+frame's first read" was **wrong** — that method, `expandArgs`, does not exist in
+the current core. The real code expands **one argument per read**:
+
+```php
+// PPTemplateFrame_Hash
+getArgument($name)  → getNumberedArgument($name) ?: getNamedArgument($name)
+getNumberedArgument($index)  // caches in $numberedExpansionCache, no trim
+getNamedArgument($name)      // caches in $namedExpansionCache, trim() after expand
+getArguments()               // getArgument() for every key: numbered first, then named
+```
+
+Scribunto's Lua side is lazy per key too (`Engines/LuaCommon/lualib/mw.lua`):
+`frame.args` is an empty table whose metatable's `__index` calls
+`php.getExpandedArgument(frameId, name)` — one argument, cached in the Lua-side
+`argCache` — and whose `__pairs` calls `php.getAllExpandedArguments` (i.e.
+`getArguments`, all of them). `frame:argumentPairs()` is literally
+`return pairs( self.args )`. And `Hooks::invokeHook` expands exactly two things
+up front, the ones it must to pick a target at all:
+
+```php
+$moduleName   = trim( $frame->expand( $args[0] ) );
+$functionName = trim( $frame->expand( $args[1] ) );
+unset( $args[0], $args[1] );
+$childFrame = $frame->newChild( $args, $title, … );   // the rest: raw PPNodes
+```
+
+### The implementation
+
+`Arg` gained a `Lazy(ArgSlot)` variant. An `ArgSlot` names the raw argument —
+which list (`Call` for the `#invoke` call's own arguments, `Parent` for
+`frame:getParent().args`) and its index — and carries the wikitext as written
+for the no-data-source echo. The parser builds the slots; `expand_invoke` holds
+the raw `KV` lists beside them.
+
+`build_args_table` materializes only *answered* slots as raw keys, and installs
+three metamethods for the rest:
+
+- `__index` resolves the read key (both spellings, `1` and `"1"`) against the
+  unresolved slots. A hit records `FrameRequest::ExpandArgs { slots: [one] }`
+  and raises the `NOT_CACHED` signal; the host expands that single argument (the
+  same code the eager path used, now per key) and the module is re-run.
+- `__pairs` — reachable because rustoid already back-ports `__pairs`/`__ipairs`
+  — records **every** still-unresolved slot at once, numbered before named as
+  `getArguments` does, so `pairs(frame.args)` costs one round rather than one per
+  argument.
+- `__ipairs` reproduces Scribunto's `argsInext`: read `1, 2, 3, …` through the
+  same lazy resolution, stopping at the first absent key.
+
+`invoke`'s host closure now returns `Vec<(String, String)>` — a request may
+carry several answers — and the round guard is keyed per answer, so a `pairs`
+over 108 arguments is still one settled round.
+
+### Effect
+
+`Nobel Prize`'s infobox templatestyles moved from `#mwt15` to `#mwt9`: the
+nine-id gap the trace found is down to **three**. The three that remain are a
+different mechanism, below. No other page's first difference moved, the fixture
+guard held at 876/896, and the corpus total is byte-identical to four decimals
+(`3 839 090` vs `3 839 107` before — the 17 bytes are that id's digits). That is
+the honest measurement: this fix changes *id allocation order inside an
+`#invoke`*, and almost every page's first difference sits elsewhere.
+
+### The three ids left, and why they are a different fix
+
+Tracing them names the mechanism exactly. `Module:Infobox` reads its `data8`
+(country) and `data9` (presenter) arguments in `parseDataParameters`, *before*
+`loadTemplateStyles` emits its own `Module:Infobox/styles.css`. Each of those
+arguments contains a `{{Plainlist}}`, so expanding them allocates
+`Plainlist/styles.css`'s `about` ids. In rustoid that happens at argument-expansion
+time, in module *read* order — so the Plainlist styles take `#mwt6`/`#mwt7` and
+the module's own stylesheet gets `#mwt9`. The service has `Module:Infobox/styles.css`
+`#mwt6` and Plainlist `#mwt7`: **document order in the module's output**, where
+`loadTemplateStyles() .. root` puts the base style before the table that holds
+the `data8`/`data9` rows.
+
+That is the extension-numbering phase again (§"The extension-numbering phase"),
+from its unnumbered side. `ExtensionHandler::onExtension` numbers every
+non-`nowiki` extension in TT2, *after* `TemplateHandler`, over the whole chunk —
+so a module's emitted `<templatestyles>` (and `<ref>`, …) should be numbered when
+the module's **output** is parsed, in the output's order, not when the
+`frame:extensionTag` request is served. Today rustoid numbers them inline:
+`expand_lua_request` renders the answer's tokens, and `expand_one_templatestyles`
+takes the id then. The `<ref>`/`<references>` post-pass already numbers in the
+right phase (with the token carrying the id); `<style>`/`<pre>` were left to this
+follow-up precisely because their id is rebuilt from rich `data-mw` attribs. The
+next step is to give templatestyles the same treatment: a placeholder that the
+chunk's extension phase numbers, in chunk order.

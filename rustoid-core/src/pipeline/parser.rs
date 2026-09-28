@@ -9,6 +9,7 @@ use crate::dom::node::Node;
 use crate::error::Result;
 use crate::options::ParserOptions;
 use crate::pipeline::frame::Frame;
+use crate::pipeline::lua_deferred::{ArgSlot, ArgSource};
 use crate::pipeline::template_encapsulator::{ParamInfo, TemplateEncapsulator, template_info_from};
 use crate::pipeline::template_handler::{
     ProtectionContext, TemplateHandler, resolve_template_target,
@@ -3182,79 +3183,74 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 name, ref pf_arg, ..
             }) if name.eq_ignore_ascii_case("invoke") => {
                 let about_id = take_id();
-                // Scribunto's `#invoke` is not an ordinary parser
-                // function: everything after the colon is its argument
-                // list, and the tokenizer has already split that on `|`.
+                // Scribunto's `#invoke` is not an ordinary parser function:
+                // everything after the colon is its argument list, and the
+                // tokenizer has already split that on `|`. `params.args[0]` is
+                // the target (`#invoke:Module`), the rest are the arguments.
                 //
-                // Each argument value is *expanded* first, because that is what
-                // Scribunto receives: `{{#invoke:String|len|x{{#invoke:String|
-                // len|abc}}y}}` measures `x3y` and answers 3, not the 17 that
-                // the unexpanded text gives. The text handed to the module and
-                // the wikitext recorded in `data-mw` are therefore different
-                // things, and `data-mw` still reads the raw source through its
-                // own path (`prepare_pf_param_infos`).
-                // `args[0]` is the target, which has already been resolved, so
-                // only the arguments after it are handed over.
-                let expanded_args = self
-                    .expand_invoke_args(
-                        &params.args[1..],
-                        frame,
-                        source,
-                        about_counter,
-                        body,
-                        src_text,
-                    )
-                    .await;
-                // The call is built *structurally* from `pf_arg` (the module) and
-                // the expanded arguments, not by re-joining them into text: the
-                // first argument is the function name, the rest are the module's
-                // arguments, and re-joining would re-derive a value's name from a
-                // string that cannot tell a `|` or `=` inside a value from a
-                // separator. See [`crate::lua::invoke::Invoke::from_parts`].
-                let mut arg_pairs: Vec<(Option<String>, String)> =
-                    expanded_args.iter().map(expanded_arg_pair).collect();
-                let function = if arg_pairs.is_empty() {
-                    String::new()
-                } else {
-                    arg_pairs.remove(0).1
+                // Only the *function name* is expanded up front. Scribunto does
+                // exactly that — `$functionName = trim( $frame->expand( $args[1] ) )`
+                // in `invokeHook` — because it has to pick the entry point before
+                // the module runs. Every other argument is handed over
+                // **unexpanded** and expanded when the module first reads it, so
+                // the templates inside one spend their `about` ids at that moment,
+                // not before the module has run. See
+                // [`crate::pipeline::lua_deferred::ArgSlot`].
+                let function = match params.args.get(1) {
+                    Some(kv) => {
+                        let expanded = self
+                            .expand_invoke_args(
+                                std::slice::from_ref(kv),
+                                frame,
+                                source,
+                                about_counter,
+                                body,
+                                src_text,
+                            )
+                            .await;
+                        expanded
+                            .first()
+                            .map(expanded_arg_pair)
+                            .map(|(_, value)| value)
+                            .unwrap_or_default()
+                    }
+                    None => String::new(),
                 };
+                // The module's arguments, raw. `raw_pairs` preserves the call as
+                // written for the one path that cannot run it (no data source,
+                // so nothing can be expanded).
+                let raw_call_args: Vec<crate::wikitext::tokens_v2::KV> = params
+                    .args
+                    .get(2..)
+                    .map(<[crate::wikitext::tokens_v2::KV]>::to_vec)
+                    .unwrap_or_default();
+                let raw_pairs: Vec<(Option<String>, String)> = raw_call_args
+                    .iter()
+                    .map(|kv| {
+                        let name = crate::wikitext::token_utils::key_value_to_string(&kv.key)
+                            .trim()
+                            .to_string();
+                        let value = kv_value_source(kv);
+                        if name.is_empty() {
+                            (None, value)
+                        } else {
+                            (Some(name), value)
+                        }
+                    })
+                    .collect();
+                // Scribunto's `frame:getParent()` is the frame of the *calling
+                // template*: a `{{#invoke:}}` inside a template hands the module
+                // that template's own arguments. They are read the same lazy way,
+                // so they are passed raw as well; the parent's list has no
+                // `#invoke:` target, so every entry is an argument — including the
+                // first, which `{{see Wiktionary|…}}` hands to `Module:Hatnote`.
+                let raw_parent_args: Vec<crate::wikitext::tokens_v2::KV> =
+                    frame.args().args.clone();
                 let Some(call) =
-                    crate::lua::invoke::Invoke::from_parts(pf_arg, &function, arg_pairs)
+                    crate::lua::invoke::Invoke::from_parts(pf_arg, &function, raw_pairs)
                 else {
                     return vec![Item::Str(format!("{{{{#invoke:{pf_arg}}}}}"))];
                 };
-                // Scribunto's `frame:getParent()` is the frame of the
-                // *calling template*, and modules read its args
-                // constantly (`Module:Infobox`, `Module:Check for
-                // conflicting parameters` both do it on their first
-                // lines). The parent's arguments are this frame's.
-                //
-                // They must be **expanded**, exactly like the `#invoke` call's own
-                // arguments above: Scribunto hands a module the expanded text, so
-                // `{{If empty|…}}` written in a template's argument arrives as its
-                // value. Passing the raw source instead left the string
-                // `{{If empty|…}}` inside `parent.args`, and `Module:Infobox`
-                // expands what it reads — re-entering the parser, re-invoking the
-                // module, and expanding the same helpers again. The expansion
-                // breadth never grew, so the depth limit never fired:
-                // `{{Infobox person}}` alone fetched 337 templates in ten seconds
-                // and never finished.
-                // The parent's argument list has no `#invoke:` target, so every
-                // entry is an argument — including the first. Skipping one here (as
-                // the call above does for its target) silently left the calling
-                // template's *first* argument unexpanded, so a module read its
-                // `{{{…}}}` verbatim: `{{see Wiktionary|…}}` hands its text to
-                // `Module:Hatnote` through exactly that position.
-                let parent_args = self
-                    .expand_invoke_args(
-                        &frame.args().args.clone(),
-                        frame,
-                        source,
-                        about_counter,
-                        body,
-                        src_text,
-                    )
-                    .await;
                 let expanded = self
                     .expand_invoke(
                         source,
@@ -3276,7 +3272,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         wrap,
                         body,
                         src_text,
-                        parent_args,
+                        raw_call_args,
+                        raw_parent_args,
                         about_counter,
                     )
                     .await;
@@ -3848,12 +3845,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         source: Option<&dyn DataSource>,
         frame: &Frame,
-        // The resolved call, with its arguments already expanded.
+        // The resolved call. Its `function` is expanded; its arguments are only
+        // used to echo the call when nothing can be expanded at all.
         call: &crate::lua::invoke::Invoke,
         // The token's *own* arguments, unexpanded. `data-mw` records the call as
         // written, so a nested `#invoke` in an argument stays literal there even
-        // though the module receives its expansion — `call` carries the expanded
-        // form and would put the answer into the metadata.
+        // though the module receives its expansion.
         raw_params: &crate::pipeline::parser_functions::Params,
         about_id: String,
         token: &ParsoidToken,
@@ -3863,7 +3860,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         wrap: bool,
         body: bool,
         _page_source: &str,
-        parent_args: Vec<crate::wikitext::tokens_v2::KV>,
+        // The call's own arguments and the calling frame's, both raw. Scribunto
+        // expands an argument when the module first reads it, so the module is
+        // handed lazy [`ArgSlot`](crate::pipeline::lua_deferred::ArgSlot)s that
+        // index into these lists; the host expands the one that was read.
+        raw_call_args: Vec<crate::wikitext::tokens_v2::KV>,
+        raw_parent_args: Vec<crate::wikitext::tokens_v2::KV>,
         about_counter: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         // Without a data source there is nothing to fetch the module from, so
@@ -3880,12 +3882,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let site = crate::lua::engine::LuaSite::from_config(self.config);
         // The parent frame's args and title are the calling template's, which
-        // modules read through `frame:getParent()`. A `#invoke` written directly
-        // on a page has no parent frame at all, which is distinguishable from
-        // one inside a template by the frame's namespace: a template frame is
-        // always in the Template namespace.
-        let parent = frame_args_to_lua(&parent_args);
+        // modules read through `frame:getParent()`.
+        let lazy_parent = lazy_args(&raw_parent_args, ArgSource::Parent);
         let parent_title = frame.title().full_text();
+        let lazy_call = lazy_args(&raw_call_args, ArgSource::Call);
         // `frame:getParent()` is never nil here, whatever the namespace. The
         // manual is explicit: it "returns the frame for the page that called
         // `{{#invoke:}}` ... regardless of whether this function is called
@@ -3899,7 +3899,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `Module:Check for unknown parameters` — which opens with
         // `frame:getParent().args` — failed on it.
         let ctx = crate::lua::engine::FrameContext {
-            parent_args: parent,
+            parent_args: lazy_parent,
             parent_title: Some(parent_title),
             has_parent: true,
             page_source: _page_source.to_string(),
@@ -3911,9 +3911,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
 
         // A module may call back into the parser (`frame:expandTemplate`,
-        // `frame:preprocess`). Those calls cannot happen inside Lua — the
-        // pipeline is async — so each one is deferred and the module re-run
-        // with the answer available; see [`crate::pipeline::lua_deferred`].
+        // `frame:preprocess`) or read an argument that has not been expanded yet.
+        // Neither can happen inside Lua — the pipeline is async — so each one is
+        // deferred and the module re-run with the answer available; see
+        // [`crate::pipeline::lua_deferred`].
         //
         // The closure is `Fn`, not `FnOnce`: the answer is expanded once per
         // distinct request, and `invoke` may call it several times.
@@ -3923,19 +3924,64 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // rather than as silently absent text.
         let output = match crate::lua::invoke::invoke(
             call,
+            &lazy_call,
             src,
             site,
             &frame.title().full_text(),
             ctx,
             |request| {
-                self.expand_lua_request(
-                    source,
-                    frame,
-                    request,
-                    about_id.clone(),
-                    token,
-                    about_counter,
-                )
+                // Bind the references first, so the `move` block below copies
+                // them rather than consuming the values they point at: the
+                // closure is `Fn`, and `about_id` in particular is owned.
+                let raw_call_args = &raw_call_args;
+                let raw_parent_args = &raw_parent_args;
+                let about_id = &about_id;
+                async move {
+                    match request {
+                        // One or more `frame.args` reads. Expanding each in the
+                        // order given is what puts the argument templates' ids
+                        // where the module asked for them.
+                        crate::pipeline::lua_deferred::FrameRequest::ExpandArgs { slots } => {
+                            let mut out = Vec::with_capacity(slots.len());
+                            for slot in &slots {
+                                let kvs = match slot.source {
+                                    ArgSource::Call => raw_call_args,
+                                    ArgSource::Parent => raw_parent_args,
+                                };
+                                let text = match kvs.get(slot.index) {
+                                    Some(kv) => {
+                                        self.expand_invoke_arg_text(
+                                            kv,
+                                            frame,
+                                            source,
+                                            about_counter,
+                                            body,
+                                            _page_source,
+                                        )
+                                        .await
+                                    }
+                                    None => String::new(),
+                                };
+                                out.push((slot.key(), text));
+                            }
+                            out
+                        }
+                        other => {
+                            let key = other.key();
+                            let text = self
+                                .expand_lua_request(
+                                    source,
+                                    frame,
+                                    other,
+                                    about_id.clone(),
+                                    token,
+                                    about_counter,
+                                )
+                                .await;
+                            vec![(key, text)]
+                        }
+                    }
+                }
             },
             &self.title_facts,
         )
@@ -4047,19 +4093,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
     /// Expand a list of `#invoke` arguments, in place.
     ///
-    /// Scribunto receives expanded text, so a nested template or `#invoke` in an
-    /// argument is substituted before the module runs. The tokenizer keeps such a
-    /// value as tokens holding an unexpanded `template` token, which stringifies
-    /// to nothing useful — that is why the unexpanded form answered 17 where the
-    /// service answers 3.
+    /// Used for the one argument Scribunto expands eagerly — the *function
+    /// name*, so the entry point can be picked before the module runs — and, one
+    /// at a time, for the arguments a module actually reads (see
+    /// [`Self::expand_invoke_arg_text`]). Scribunto receives expanded text, so a
+    /// nested template or `#invoke` in an argument is substituted: the tokenizer
+    /// keeps such a value as tokens holding an unexpanded `template` token, which
+    /// stringifies to nothing useful — that is why the unexpanded form answered
+    /// 17 where the service answers 3.
     ///
-    /// The caller passes only the arguments to expand, so the two shapes that
-    /// need this cannot be confused: the `#invoke` call's own list starts at
-    /// `args[1]` because `args[0]` is the already-resolved target, while a
-    /// **parent** frame's list has no target and is passed whole. Skipping one
-    /// entry there silently left the calling template's *first* argument
-    /// unexpanded, so a module read its `{{{…}}}` verbatim — the shape
-    /// `{{see Wiktionary|…}}` hands to `Module:Hatnote` as `args[1]`.
+    /// The caller passes only the arguments to expand, so the two shapes cannot
+    /// be confused: the `#invoke` call's own list starts after the target, while
+    /// a **parent** frame's list has no target and is passed whole.
     async fn expand_invoke_args(
         &self,
         args: &[crate::wikitext::tokens_v2::KV],
@@ -4134,6 +4179,40 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             kv.value = KeyValue::Tokens(expanded);
         }
         out
+    }
+
+    /// Expand one lazy `frame.args` argument to the text a module receives.
+    ///
+    /// Called when the module first reads the key, which is when Scribunto
+    /// expands it — so the templates inside spend their `about` ids here rather
+    /// than before the module ran. The text is exactly what the eager path used
+    /// to produce for the same argument ([`expanded_arg_pair`]), so the value a
+    /// module sees is unchanged; only *when* it is produced differs.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_invoke_arg_text(
+        &self,
+        kv: &crate::wikitext::tokens_v2::KV,
+        frame: &Frame,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        body: bool,
+        src_text: &str,
+    ) -> String {
+        let expanded = self
+            .expand_invoke_args(
+                std::slice::from_ref(kv),
+                frame,
+                source,
+                about_counter,
+                body,
+                src_text,
+            )
+            .await;
+        expanded
+            .first()
+            .map(expanded_arg_pair)
+            .map(|(_, value)| value)
+            .unwrap_or_default()
     }
 
     /// Expand the templates a chunk holds in its tokens' *attributes*.
@@ -4377,16 +4456,13 @@ fn expanded_arg_pair(kv: &crate::wikitext::tokens_v2::KV) -> (Option<String>, St
     if name.is_empty() {
         (None, value)
     } else {
-        // A named argument's value is trimmed before the module sees it, the
-        // same rule [`frame_args_to_lua`] already applies to the parent frame's
-        // arguments and MediaWiki's preprocessor applies to both. The `#invoke`
-        // call's own arguments went through untrimmed, which is visible in
-        // `Template:Infobox OS`: its `{{#invoke:Unsubst||$B=\n{{Main other|…}}}}`
-        // carries a leading newline in `$B`, and left in place it survives into
-        // the module's return value and renders as a stray
+        // A named argument's value is trimmed before the module sees it, which
+        // MediaWiki's preprocessor does for every frame's arguments
+        // (`getNamedArgument` runs `trim()`, `getNumberedArgument` does not).
+        // Without it `Template:Infobox OS`'s `{{#invoke:Unsubst||$B=\n{{Main
+        // other|…}}}}` carries a leading newline in `$B`, and left in place it
+        // survives into the module's return value and renders as a stray
         // `<span about=…> </span>` the service does not have.
-        //
-        // [`frame_args_to_lua`]: frame_args_to_lua
         (Some(name.to_string()), value.trim().to_string())
     }
 }
@@ -4536,52 +4612,42 @@ async fn follow_template_redirect(src: &dyn DataSource, title: &crate::title::Ti
 /// so a module that asks for itself cannot run until the stack overflows.
 const MAX_LUA_EXPANSION_DEPTH: usize = 16;
 
-/// Convert a frame's raw parameters into Scribunto `Arg`s.
+/// Build the lazy `frame.args` view of a raw argument list.
 ///
-/// A numeric key is positional, anything else named — the same split the
-/// template path makes for arguments.
-fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua::engine::Arg> {
+/// Scribunto expands an argument when the module first reads it, so the frame is
+/// handed [`Arg::Lazy`](crate::lua::engine::Arg::Lazy) slots that index into the
+/// raw list rather than expanded text. `source` says which list, because the
+/// `#invoke` call's own arguments and the calling frame's are expanded through
+/// the same code but cached separately.
+///
+/// The name is the tokenizer's, not re-derived from the value: only the
+/// tokenizer can tell a `=` that names an argument from one inside a value. An
+/// empty name is a positional argument, whose Lua key is its number.
+fn lazy_args(
+    args: &[crate::wikitext::tokens_v2::KV],
+    source: ArgSource,
+) -> Vec<crate::lua::engine::Arg> {
     use crate::lua::engine::Arg;
     use crate::wikitext::token_utils::key_value_to_string;
 
-    let mut out = Vec::new();
-    for kv in args {
-        let key = key_value_to_string(&kv.key);
-        let value = expanded_argument_text(kv);
-        let trimmed = key.trim();
-        match (trimmed.parse::<usize>(), trimmed.is_empty()) {
-            (Ok(_), false) => out.push(Arg::Positional(value)),
-            (_, true) => out.push(Arg::Positional(value)),
-            // A named argument's value is trimmed, exactly as `{{{name}}}`
-            // substitution trims it ([`Frame::expand_template_arg`]) and as
-            // MediaWiki's preprocessor does. Without this `{{Automatic taxobox
-            // | taxon = Equus (Hippotigris)}}` handed the module ` Equus
-            // (Hippotigris)`, so `Module:Autotaxobox` looked up
-            // `Template:Taxonomy/ Equus (Hippotigris)` (with the space), missed,
-            // and walked a broken taxonomy chain that expanded `Template:Taxonomy/`
-            // recursively until the node-count limit fired.
-            //
-            // [`Frame::expand_template_arg`]: crate::pipeline::frame::Frame::expand_template_arg
-            _ => out.push(Arg::Named(trimmed.to_string(), value.trim().to_string())),
-        }
-    }
-    out
-}
-
-/// A parent-frame argument's text, as Scribunto hands it to the module.
-///
-/// The **tokens** are the answer when every one of them has an exact textual form
-/// ([`argument_value_text`]), because they are the *expanded* value while the
-/// recorded source range still holds the wikitext as written — `{{{1|}}}`
-/// included — and so is stale. Reading the range gave `Module:SDcat` the literal
-/// `{{{1|}}}` where the service gave the short description, and made it report
-/// "is different from Wikidata" for a page whose description matches.
-///
-/// Anything else keeps to the source range, which is the lesser evil only for the
-/// tokens the renderer declines: it is *unexpanded*, so it is wrong in a different
-/// way, but it at least keeps the construct visible instead of dropping it.
-fn expanded_argument_text(kv: &crate::wikitext::tokens_v2::KV) -> String {
-    argument_value_or_source(kv)
+    args.iter()
+        .enumerate()
+        .map(|(index, kv)| {
+            let key = key_value_to_string(&kv.key);
+            let trimmed = key.trim();
+            let name = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+            Arg::Lazy(ArgSlot {
+                source,
+                index,
+                name,
+                raw: kv_value_source(kv),
+            })
+        })
+        .collect()
 }
 
 /// An argument value as the module receives it: the tokens rendered when they all

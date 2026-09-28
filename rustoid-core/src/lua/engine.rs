@@ -12,6 +12,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Result, RustoidError};
 use crate::lua::ustring;
+use crate::pipeline::lua_deferred::{ArgSlot, DeferredAnswers, FrameRequest, NOT_CACHED};
 use crate::traits::SiteConfig;
 
 /// Configuration for the Lua engine.
@@ -430,10 +431,16 @@ impl LuaContext {
 /// MediaWiki's preprocessor keys positional arguments by number and named ones
 /// by name, and modules rely on both spellings: `frame.args[1]` and
 /// `frame.args[1]`-as-`"1"` are both written in the wild.
+///
+/// A [`Lazy`](Self::Lazy) argument is one whose text the host has not expanded
+/// yet. Scribunto expands an argument the first time the module reads it — see
+/// [`ArgSlot`] — so the value is fetched through the args metatable rather than
+/// stored up front. `newChild` and the engine's own tests build ready values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
     Positional(String),
     Named(String, String),
+    Lazy(ArgSlot),
 }
 
 pub struct LuaEngine {
@@ -4987,10 +4994,28 @@ fn json_to_lua_flagged(lua: &Lua, value: &serde_json::Value, preserve_keys: bool
 /// `pairs` from seeing every argument twice.
 ///
 /// Shared with the parent frame, because both are read the same way.
-fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
+///
+/// A [`Lazy`](Arg::Lazy) argument is *not* stored: Scribunto expands an argument
+/// when the module first reads it, and the templates inside it spend their
+/// `about` ids at that moment. The metatable's `__index` therefore asks the host
+/// to expand the one slot that was read, raising the "not cached" signal the
+/// module loop turns into a re-run; the answer is materialized as a raw key on
+/// the next round. `__pairs`/`__ipairs` mirror Scribunto's own (`getArguments`
+/// and the `1, 2, 3 …` walk), so iteration keeps working on a lazy table.
+fn build_args_table(
+    lua: &Lua,
+    args: &[Arg],
+    answers: &DeferredAnswers,
+    pending: &std::rc::Rc<std::cell::RefCell<Vec<FrameRequest>>>,
+) -> Result<Table> {
     let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let args_table = lua.create_table().map_err(err)?;
     let mut next_positional = 0usize;
+    // The slots still waiting to be expanded, with the table key each answers
+    // to. Positional slots come first, as `getArguments` merges `numberedArgs`
+    // before `namedArgs`, so the request order below is the frame's own.
+    let mut lazy_positional: Vec<(ArgKey, ArgSlot)> = Vec::new();
+    let mut lazy_named: Vec<(ArgKey, ArgSlot)> = Vec::new();
     for arg in args {
         match arg {
             Arg::Positional(v) => {
@@ -5000,61 +5025,194 @@ fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
             Arg::Named(k, v) => {
                 args_table.set(k.clone(), v.clone()).map_err(err)?;
             }
+            Arg::Lazy(slot) => {
+                let key = match &slot.name {
+                    Some(name) => ArgKey::Str(name.clone()),
+                    None => {
+                        next_positional += 1;
+                        ArgKey::Int(next_positional as i64)
+                    }
+                };
+                // An answer from an earlier round is materialized as a raw key,
+                // so a later read of it does not round-trip again.
+                match answers.get(&slot.key()) {
+                    Some(text) => match &key {
+                        ArgKey::Int(i) => args_table.set(*i, text.clone()).map_err(err)?,
+                        ArgKey::Str(s) => args_table.set(s.clone(), text.clone()).map_err(err)?,
+                    },
+                    None => match key {
+                        ArgKey::Int(_) => lazy_positional.push((key, slot.clone())),
+                        ArgKey::Str(_) => lazy_named.push((key, slot.clone())),
+                    },
+                }
+            }
         }
     }
+    lazy_positional.extend(lazy_named);
+    let lazy = lazy_positional;
+
     let args_mt = lua.create_table().map_err(err)?;
-    args_mt
-        .set(
-            "__index",
-            lua.create_function(|_, (t, k): (Table, Value)| {
-                // The spelling the caller used, then its counterpart. `raw_get`
-                // keeps this from re-entering the metatable and looping.
-                //
-                // Keys are held as a string/integer pair rather than as Lua
-                // values so nothing has to be boxed onto the stack.
-                enum Key {
-                    Int(i64),
-                    Str(String),
-                }
-                let mut tries: Vec<Key> = Vec::with_capacity(2);
-                match k {
-                    Value::Integer(i) => {
-                        tries.push(Key::Str(i.to_string()));
-                        tries.push(Key::Int(i));
-                    }
-                    Value::Number(n) if n.fract() == 0.0 => {
-                        let i = n as i64;
-                        tries.push(Key::Str(i.to_string()));
-                        tries.push(Key::Int(i));
-                    }
-                    Value::String(ref s) => {
-                        // A key that is not a number is still a key; only the
-                        // integer spelling is added when it parses.
-                        let text = s.to_str().map(|s| s.to_string()).unwrap_or_default();
-                        if let Ok(i) = text.trim().parse::<i64>() {
-                            tries.push(Key::Int(i));
+    {
+        let pending = pending.clone();
+        let lazy = lazy.clone();
+        args_mt
+            .set(
+                "__index",
+                lua.create_function(move |_, (t, k): (Table, Value)| {
+                    // The spelling the caller used, then its counterpart. `raw_get`
+                    // keeps this from re-entering the metatable and looping.
+                    let spellings = arg_key_spellings(&k);
+                    for key in &spellings {
+                        let found = read_arg_key(&t, key)?;
+                        if !matches!(found, Value::Nil) {
+                            return Ok(found);
                         }
-                        tries.push(Key::Str(text));
                     }
-                    _ => {}
-                }
-                for key in tries {
-                    // A hit on either spelling wins; only a miss on both is nil.
-                    let found = match key {
-                        Key::Int(i) => t.raw_get::<Value>(i)?,
-                        Key::Str(s) => t.raw_get::<Value>(s)?,
-                    };
-                    if !matches!(found, Value::Nil) {
-                        return Ok(found);
+                    // Not materialized: an argument the host has not expanded
+                    // yet. Its text comes back on the next round.
+                    if let Some(slot) = lazy
+                        .iter()
+                        .find(|(key, _)| spellings.contains(key))
+                        .map(|(_, slot)| slot.clone())
+                    {
+                        return Err(raise_for_slot(&pending, slot));
                     }
-                }
-                Ok(Value::Nil)
-            })
-            .map_err(err)?,
-        )
-        .map_err(err)?;
+                    Ok(Value::Nil)
+                })
+                .map_err(err)?,
+            )
+            .map_err(err)?;
+    }
+
+    if !lazy.is_empty() {
+        // Scribunto's `getArguments()`: expand every argument, numbered first.
+        // The whole list is requested at once, so `pairs` costs one round rather
+        // than one per argument. This round always has something to expand, so
+        // the handler always raises; when nothing is left the metatable has no
+        // `__pairs` and Lua's own `next` walks the fully materialized table.
+        let slots: Vec<ArgSlot> = lazy.iter().map(|(_, slot)| slot.clone()).collect();
+        let first = slots[0].key();
+        {
+            let pending = pending.clone();
+            let slots = slots.clone();
+            args_mt
+                .set(
+                    "__pairs",
+                    lua.create_function(move |_, _t: Table| -> mlua::Result<mlua::MultiValue> {
+                        if pending.borrow().is_empty() {
+                            pending.borrow_mut().push(FrameRequest::ExpandArgs {
+                                slots: slots.clone(),
+                            });
+                        }
+                        Err(mlua::Error::runtime(format!("{NOT_CACHED}{first}")))
+                    })
+                    .map_err(err)?,
+                )
+                .map_err(err)?;
+        }
+        // Scribunto's `argsInext`: read `1, 2, 3, …` until one is absent. Each
+        // read goes through the lazy list, so an unexpanded positional argument
+        // round-trips exactly as a named one does.
+        let ipairs: Vec<(ArgKey, ArgSlot)> = lazy
+            .iter()
+            .filter(|(key, _)| matches!(key, ArgKey::Int(_)))
+            .cloned()
+            .collect();
+        if !ipairs.is_empty() {
+            let pending = pending.clone();
+            args_mt
+                .set(
+                    "__ipairs",
+                    lua.create_function(move |lua, t: Table| {
+                        // A fresh copy per `ipairs()` call: the outer closure is
+                        // `Fn`, but the inner iterator owns its captures for as
+                        // long as the loop runs.
+                        let pending = pending.clone();
+                        let ipairs = ipairs.clone();
+                        let step = lua.create_function(move |_, (t, i): (Table, i64)| {
+                            let key = i + 1;
+                            if let Some(slot) = ipairs
+                                .iter()
+                                .find(|(k, _)| *k == ArgKey::Int(key))
+                                .map(|(_, slot)| slot.clone())
+                            {
+                                return Err(raise_for_slot(&pending, slot));
+                            }
+                            let value: Value = t.raw_get(key)?;
+                            if matches!(value, Value::Nil) {
+                                Ok(mlua::MultiValue::new())
+                            } else {
+                                Ok(mlua::MultiValue::from_vec(vec![Value::Integer(key), value]))
+                            }
+                        })?;
+                        Ok((step, t, 0i64))
+                    })
+                    .map_err(err)?,
+                )
+                .map_err(err)?;
+        }
+    }
     args_table.set_metatable(Some(args_mt));
+
     Ok(args_table)
+}
+
+/// A `frame.args` key in the two spellings Scribunto accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArgKey {
+    Int(i64),
+    Str(String),
+}
+
+/// The spellings of a Lua key that address the same argument: `1` and `"1"`.
+///
+/// A key that is not a number has only the string spelling, and a non-integer
+/// key yields nothing at all — a miss is nil, not an error, as in Scribunto.
+fn arg_key_spellings(k: &Value) -> Vec<ArgKey> {
+    let mut tries: Vec<ArgKey> = Vec::with_capacity(2);
+    match k {
+        Value::Integer(i) => {
+            tries.push(ArgKey::Str(i.to_string()));
+            tries.push(ArgKey::Int(*i));
+        }
+        Value::Number(n) if n.fract() == 0.0 => {
+            let i = *n as i64;
+            tries.push(ArgKey::Str(i.to_string()));
+            tries.push(ArgKey::Int(i));
+        }
+        Value::String(s) => {
+            let text = s.to_str().map(|s| s.to_string()).unwrap_or_default();
+            if let Ok(i) = text.trim().parse::<i64>() {
+                tries.push(ArgKey::Int(i));
+            }
+            tries.push(ArgKey::Str(text));
+        }
+        _ => {}
+    }
+    tries
+}
+
+fn read_arg_key(t: &Table, key: &ArgKey) -> mlua::Result<Value> {
+    match key {
+        ArgKey::Int(i) => t.raw_get(*i),
+        ArgKey::Str(s) => t.raw_get(s.as_str()),
+    }
+}
+
+/// Record a slot's expansion request and build the signal that re-runs the
+/// module. Only the first miss of a round is recorded; the error unwinds the
+/// whole call anyway.
+fn raise_for_slot(
+    pending: &std::rc::Rc<std::cell::RefCell<Vec<FrameRequest>>>,
+    slot: ArgSlot,
+) -> mlua::Error {
+    let key = slot.key();
+    if pending.borrow().is_empty() {
+        pending
+            .borrow_mut()
+            .push(FrameRequest::ExpandArgs { slots: vec![slot] });
+    }
+    mlua::Error::runtime(format!("{NOT_CACHED}{key}"))
 }
 
 // ---- Frame ----
@@ -5070,25 +5228,25 @@ fn build_args_table(lua: &Lua, args: &[Arg]) -> Result<Table> {
 fn frame_common(
     lua: &Lua,
     args: &[Arg],
-    answers: &crate::pipeline::lua_deferred::DeferredAnswers,
-    pending: &std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
+    answers: &DeferredAnswers,
+    pending: &std::rc::Rc<std::cell::RefCell<Vec<FrameRequest>>>,
 ) -> Result<Table> {
     let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let frame = lua.create_table().map_err(err)?;
     frame
-        .set("args", build_args_table(lua, args)?)
+        .set("args", build_args_table(lua, args, answers, pending)?)
         .map_err(err)?;
 
-    // `frame:argumentPairs()` — the generic-for protocol: return (iterator,
-    // state, control). Lua's own `next` is the iterator, so the args table is
-    // the state and no snapshot has to be stored on the Lua side.
+    // `frame:argumentPairs()` — Scribunto defines it as `pairs( self.args )`, so
+    // it goes through the args metatable's `__pairs` (expanding every argument)
+    // and returns Lua's own iterator over the now-complete table.
     frame
         .set(
             "argumentPairs",
             lua.create_function(|lua, this: Table| {
                 let args: Table = this.get("args")?;
-                let next: Function = lua.globals().get("next")?;
-                Ok((next, args, Value::Nil))
+                let pairs: Function = lua.globals().get("pairs")?;
+                pairs.call::<mlua::MultiValue>(args)
             })
             .map_err(err)?,
         )
@@ -5493,6 +5651,7 @@ pub(crate) fn lua_value_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::mock::MockSiteConfig;
+    use crate::pipeline::lua_deferred::ArgSource;
 
     fn make_engine() -> LuaEngine {
         let ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test Page");
@@ -7402,6 +7561,101 @@ mod tests {
                 .unwrap(),
             "true"
         );
+    }
+
+    /// A lazy argument is expanded only when the module *reads* it.
+    ///
+    /// This is the whole point of the lazy `frame.args` view: a module that
+    /// ignores an argument must not expand the templates inside it, because that
+    /// expansion is what spends `about` ids. Asserted through the engine's own
+    /// request collector, which is what a real run turns into a re-run.
+    #[test]
+    fn a_lazy_argument_is_expanded_only_when_read() {
+        let engine = make_engine();
+        let slot = |index| ArgSlot {
+            source: ArgSource::Call,
+            index,
+            name: None,
+            raw: "x".to_string(),
+        };
+
+        // Ignored: nothing is requested.
+        let ignored = "local p = {} function p.main(frame) return 'constant' end return p";
+        let out = engine
+            .execute(ignored, "main", &[Arg::Lazy(slot(0))])
+            .unwrap();
+        assert_eq!(out, "constant");
+        assert!(
+            engine.take_pending().is_none(),
+            "an unread argument must not be expanded"
+        );
+
+        // Read: the expansion is requested, keyed by the slot it belongs to.
+        let reads = "local p = {} function p.main(frame) return frame.args[1] end return p";
+        let err = engine
+            .execute(reads, "main", &[Arg::Lazy(slot(0))])
+            .unwrap_err();
+        assert!(err.to_string().contains(NOT_CACHED), "{err}");
+        match engine.take_pending() {
+            Some(FrameRequest::ExpandArgs { slots }) => {
+                assert_eq!(slots.len(), 1);
+                assert_eq!(slots[0].key(), slot(0).key());
+            }
+            other => panic!("expected one argument request, got {other:?}"),
+        }
+    }
+
+    /// An answered argument is handed to the module as a real string.
+    #[test]
+    fn an_answered_lazy_argument_reads_back_as_its_text() {
+        let engine = make_engine();
+        let slot = ArgSlot {
+            source: ArgSource::Call,
+            index: 0,
+            name: None,
+            raw: "x".to_string(),
+        };
+        let answers: DeferredAnswers =
+            std::iter::once((slot.key(), "expanded".to_string())).collect();
+        let src = "local p = {} function p.main(frame) return frame.args[1] end return p";
+        let out = engine
+            .execute_in(src, "Module:Test", "main", &[Arg::Lazy(slot)], &answers)
+            .unwrap();
+        assert_eq!(out, "expanded");
+        assert!(engine.take_pending().is_none());
+    }
+
+    /// A `pairs` over a lazy `args` requests every argument at once, in the
+    /// frame's order (`getArguments` merges numbered before named).
+    #[test]
+    fn pairs_over_lazy_args_requests_every_slot_at_once() {
+        let engine = make_engine();
+        let lazy = |index, name: Option<&str>| {
+            Arg::Lazy(ArgSlot {
+                source: ArgSource::Call,
+                index,
+                name: name.map(str::to_string),
+                raw: String::new(),
+            })
+        };
+        let src = "local p = {} function p.main(frame)\n".to_string()
+            + "local n = 0 for _ in pairs(frame.args) do n = n + 1 end return tostring(n) end return p";
+        let args = vec![
+            Arg::Positional("ignored".to_string()),
+            lazy(1, Some("b")),
+            lazy(0, Some("a")),
+        ];
+        let err = engine.execute(&src, "main", &args).unwrap_err();
+        assert!(err.to_string().contains(NOT_CACHED), "{err}");
+        match engine.take_pending() {
+            Some(FrameRequest::ExpandArgs { slots }) => {
+                let keys: Vec<Option<&str>> = slots.iter().map(|s| s.name.as_deref()).collect();
+                // The ready positional is already materialized, so only the two
+                // named slots remain, in the order they were declared.
+                assert_eq!(keys, vec![Some("b"), Some("a")]);
+            }
+            other => panic!("expected one argument request, got {other:?}"),
+        }
     }
 
     #[test]
