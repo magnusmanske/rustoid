@@ -626,7 +626,13 @@ pub fn prepare_tpl_param_infos(
                 key_value_to_string(&param.value),
             ),
         };
-        let v_src = strip_include_directives(&v_src);
+        // A template argument's recorded `wt` is the source **as written**, so
+        // `<noinclude>`/`<includeonly>`/`<onlyinclude>` stay exactly where the
+        // author put them. Only a parser-function *target* strips them
+        // ([`strip_include_directives`], applied in `serialize_template_info`).
+        // Verified against the service: `{{1x|a<noinclude>X</noinclude>b}}`
+        // records `a<noinclude>X</noinclude>b`, while `{{#if:a<noinclude>X…}}`
+        // records the target `#if:aX`.
         let k_wt = k_src.trim().to_string();
 
         // `TokenUtils::tokensToString` returns a string; only when it cannot (the
