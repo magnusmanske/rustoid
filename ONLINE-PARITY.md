@@ -6010,6 +6010,37 @@ subset total      4 006 649 -> 3 839 039   (the drop is removed duplicated
                                             raw wikitext, not content)
 ```
 
+## A module receives a substituted argument, not its source range
+
+The fresh 82-page corpus run surfaced `function not found: lang: error
+converting Lua nil to function` on **16 pages**, and it reduced to
+
+```
+A{{#invoke:Lang|{{{fn|lang}}}|fr|bonjour}}   -> ok
+B{{Lang|fr|bonjour}}                        -> Script error: function not found: lang
+```
+
+`Template:Lang` is `<includeonly>{{#invoke:Lang|{{{fn|lang}}}}}</includeonly>`,
+and `Module:Lang` does export `lang`. The name handed to `module_function` was
+not `lang` at all — a trace showed `function="{{{fn|lang}}}"`.
+
+`argument_value_or_source` was the cause. It asked `argument_value_text` only
+for a `KeyValue::Tokens` value and, for everything else, fell through to
+`kv_value_source`, which prefers the recorded **source range**. But
+the tokenizer already produced the `{{{fn|lang}}}` argument as a token list, and
+`attribute_transform_manager` had substituted it back to a `KeyValue::Str("lang")`
+— at which point the source range is the *unsubstituted* text. So the module was
+handed `{{{fn|lang}}}` where it must see `lang`.
+
+The rule is now spelled out in the function: a `Str` value **is** the argument
+text (the tokenizer leaves a plain value as one, and the transform manager folds
+a substituted reference back to one), so it is returned directly; only a token
+list can need the source, because its text is not always exactly representable.
+
+This is a *content* fix, not a size one: the subset total rose 3 799 716 ->
+3 804 788 because the module now produces its `<i lang="fr">…</i>` and tracking
+category instead of a script error.
+
 ## The remaining shapes, and two reductions worth keeping
 
 Four independent defects stand between the subset and a passing page. None is

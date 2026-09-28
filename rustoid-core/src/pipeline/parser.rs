@@ -4550,12 +4550,22 @@ fn expanded_argument_text(kv: &crate::wikitext::tokens_v2::KV) -> String {
 /// arguments and a parent frame's cannot diverge on what a value means.
 fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
     use crate::wikitext::tokens_v2::KeyValue;
-    if let KeyValue::Tokens(items) = &kv.value
-        && let Some(text) = argument_value_text(items)
-    {
-        return text;
+    match &kv.value {
+        // A string value *is* the argument text. The tokenizer leaves a plain
+        // value as a `Str`, and `attribute_transform_manager` folds a
+        // substituted `{{{…}}}` back to one — but the recorded source range is
+        // the *unsubstituted* text, so preferring it returned `{{{fn|lang}}}`
+        // where the module must see `lang`. That is the `function not found:
+        // lang` failure on every `{{lang}}`/`{{langx}}` call: `Template:Lang`
+        // invokes `#invoke:Lang|{{{fn|lang}}}`, and the function name reached
+        // `module_function` still spelled as the reference.
+        KeyValue::Str(s) => s.clone(),
+        // Only a token list can need the source: its text is not always exactly
+        // representable (see [`argument_value_text`]).
+        KeyValue::Tokens(items) => {
+            argument_value_text(items).unwrap_or_else(|| kv_value_source(kv))
+        }
     }
-    kv_value_source(kv)
 }
 
 /// Render an argument value's tokens to the text Scribunto receives, when every
