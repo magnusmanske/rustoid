@@ -31,7 +31,11 @@ impl<'a> PipelineContext<'a> {
     pub fn new_about_id(&self) -> String {
         let id = self.about_counter.get();
         self.about_counter.set(id + 1);
-        format!("#mwt{id}")
+        let out = format!("#mwt{id}");
+        if std::env::var_os("RUSTOID_TRACE_ABOUT").is_some() {
+            eprintln!("about {out} pipeline-context");
+        }
+        out
     }
 }
 

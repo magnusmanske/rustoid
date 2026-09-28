@@ -1104,8 +1104,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .collect())
     }
 
-    fn new_about_id(&self, counter: &std::cell::Cell<usize>) -> String {
-        crate::pipeline::attribute_expander::new_about_id(counter)
+    fn new_about_id(&self, counter: &std::cell::Cell<usize>, tag: &str) -> String {
+        crate::pipeline::attribute_expander::new_about_id(counter, tag)
     }
 
     /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
@@ -2091,7 +2091,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // `about` to extension top-level nodes) so the html2wt serializer
             // recognizes it as `mw:Extension/gallery` rather than a plain list.
             if let crate::dom::node::NodeKind::Element(_) = ul.kind {
-                ul.set_attr("about", self.new_about_id(about_counter));
+                ul.set_attr("about", self.new_about_id(about_counter, "gallery"));
             }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
@@ -2160,7 +2160,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             &css,
             revid,
             &src,
-            &self.new_about_id(about_counter),
+            &self.new_about_id(about_counter, "templatestyles"),
         );
         let mut frag = Node::document();
         frag.push_child(node);
@@ -2200,7 +2200,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // The extension spends the id whether or not it survives into the
         // output (see the method comment). Allocating it *before* stashing the
         // fragment also keeps the sequence in expansion order.
-        let _ = self.new_about_id(about_counter);
+        let _ = self.new_about_id(about_counter, "indicator");
         let id = self.ext_next_id.get();
         self.ext_next_id.set(id + 1);
         self.ext_fragments.borrow_mut().insert(id, node);
@@ -2268,7 +2268,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
             let mut ul = crate::pipeline::gallery::build_with_sync(stt, self.config);
             if let crate::dom::node::NodeKind::Element(_) = ul.kind {
-                ul.set_attr("about", self.new_about_id(about_counter));
+                ul.set_attr("about", self.new_about_id(about_counter, "gallery"));
             }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
@@ -2920,7 +2920,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // of the service's (11 where the service has 2).
                 let wrap = !in_template;
                 let about_id = if wrap {
-                    self.new_about_id(about_counter)
+                    self.new_about_id(about_counter, "templatearg")
                 } else {
                     String::new()
                 };
@@ -3005,7 +3005,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
                 continue;
             }
-            let about = self.new_about_id(about_counter);
+            let about = self.new_about_id(about_counter, "extension-id");
             t.add_attribute_str("about", &about);
         }
         out
@@ -3066,7 +3066,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if in_tpl || body {
                 String::new()
             } else {
-                self.new_about_id(about_counter)
+                self.new_about_id(about_counter, "template")
             }
         };
 

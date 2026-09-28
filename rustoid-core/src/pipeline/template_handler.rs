@@ -1451,7 +1451,7 @@ impl TemplateHandler {
                 // tokenizes the result. Allocating here anyway put rustoid at
                 // `#mwt90` on `Help:Introduction`, where the service reaches 12.
                 let about_id = if wrap {
-                    crate::pipeline::attribute_expander::new_about_id(about_counter)
+                    crate::pipeline::attribute_expander::new_about_id(about_counter, "template")
                 } else {
                     String::new()
                 };
@@ -1479,7 +1479,7 @@ impl TemplateHandler {
                 && let Some(name) = stt.attribs.first().and_then(|kv| kv.key.as_str())
             {
                 let about_id = if wrap {
-                    crate::pipeline::attribute_expander::new_about_id(about_counter)
+                    crate::pipeline::attribute_expander::new_about_id(about_counter, "templatearg")
                 } else {
                     String::new()
                 };

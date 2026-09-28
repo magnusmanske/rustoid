@@ -348,9 +348,26 @@ pub fn split_tokens(
 }
 
 /// Allocate the next transclusion `about` id (mirrors `Env::newAboutId`).
-pub fn new_about_id(counter: &std::cell::Cell<usize>) -> String {
+///
+/// `tag` names the *kind* of thing being numbered — a template wrapper, an
+/// extension, an expanded attribute, … — and is only used by the
+/// `RUSTOID_TRACE_ABOUT` trace. That trace exists because the ids are the only
+/// evidence of several bugs that the output hides: an extension that spends an id
+/// it never emits, or a wrapper whose id encapsulation overwrites, looks like a
+/// silent gap in the sequence, and the sequence alone cannot say which *kind* was
+/// responsible.
+pub fn new_about_id(counter: &std::cell::Cell<usize>, tag: &str) -> String {
     let id = counter.get() + 1;
     counter.set(id);
+    if let Some(mode) = std::env::var_os("RUSTOID_TRACE_ABOUT") {
+        eprintln!("about #mwt{id} {tag}");
+        // `bt` names the allocating call path, which the id sequence alone
+        // cannot: an id spent on a token that is later dropped looks the same as
+        // one spent on a token whose `about` encapsulation overwrites.
+        if mode == "bt" {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+    }
     format!("#mwt{id}")
 }
 
@@ -652,7 +669,7 @@ pub fn build_expanded_attrs(
         && token_name != "template"
         && !branch_text
     {
-        let about_id = new_about_id(about_counter);
+        let about_id = new_about_id(about_counter, "expanded-attrs");
         token.set_attribute("about", &about_id);
         token.add_space_separated_attribute("typeof", "mw:ExpandedAttrs");
 

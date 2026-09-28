@@ -6748,3 +6748,35 @@ This article is semi-protected until November 28, 2026 at 18:01 UTC, due to vand
 whole protection block before it is now exact. The new first difference is an
 `about`-id mismatch (`#mwt15` here, `#mwt6` there) on an infobox's templatestyles
 — the id-ordering thread again, one spending decision upstream of it.
+
+## An `about`-id trace, and the nine ids it found
+That mismatch had only ever been *reasoned* about. The output cannot settle it:
+rustoid allocates **392** ids and emits only **309** distinct ones, and an id spent
+on a token that is later dropped looks exactly like one whose `about`
+encapsulation overwrites. So `new_about_id` now takes a `tag` naming the kind of
+thing numbered (a template wrapper, an extension, an expanded attribute, …) and,
+under `RUSTOID_TRACE_ABOUT`, logs every allocation. `RUSTOID_TRACE_ABOUT=bt` also
+prints a backtrace, which names the *code path* rather than just the kind.
+
+The trace answered the question immediately. rustoid's allocations `#mwt6`..
+`#mwt14` — six templatestyles and three refs — are **invisible** (no element
+carries the id), and every one of them has the same stack:
+
+```
+expand_one_templatestyles <- expand_templates <- expand_template_token
+  <- expand_templates <- expand_invoke_args <- expand_template_token ...
+```
+
+while the first *visible* one, `#mwt15`, has `expand_invoke <- expand_lua_request`
+instead. So the nine ids are spent expanding the **arguments** of an `#invoke`
+call — eagerly, up front — and Parsoid spends nothing there because it expands an
+`#invoke` argument **lazily**, when the callee first reads it. That is the
+recorded lazily-expanded-argument-value family (§"The lazily-expanded argument
+value", §"`#invoke` arguments are expanded lazily"), now measured to the id: it
+is worth exactly the 9-id gap on `Nobel Prize`'s infobox.
+
+This is a *diagnosis*, not a fix. The earlier measurement stands — simply
+disabling `expand_invoke_args` moved `Bicycle`'s `<sup>` from `#mwt199` to
+`#mwt204` — so the answer is real lazy expansion, not removal. What the trace adds
+is that the eager pass is the whole of the discrepancy at this position, and
+which tokens it overspends on.

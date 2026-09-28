@@ -101,7 +101,12 @@ impl<'a> WikiLinkContext<'a> {
     /// global DOM ids; we approximate with a per-parse counter.
     pub fn new_about_id(&mut self) -> String {
         self.about_id_counter += 1;
-        format!("#mwt{}", self.about_id_counter)
+        let id = format!("#mwt{}", self.about_id_counter);
+        if std::env::var_os("RUSTOID_TRACE_ABOUT").is_some() {
+            // A *separate* counter from the document's, so the trace names it.
+            eprintln!("about {id} wikilink(counter={})", self.about_id_counter);
+        }
+        id
     }
 
     /// Resolve a URL-decoded title string to a Title (mirrors
