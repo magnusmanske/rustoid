@@ -139,6 +139,15 @@ impl Title {
 }
 
 /// Map a namespace ID to its canonical English prefix (fallback without SiteConfig).
+///
+/// The table must cover every namespace whose prefix can reach a data-lookup
+/// key (`Title::full_text`), because a missing entry does not fail loudly — it
+/// silently drops the prefix, so `Portal:Countries` becomes the key `Countries`
+/// and a fetch for the portal page is made against the wrong title (the miss is
+/// then permanent, since the reply is cached as "no such page"). The ids below
+/// are fixed by MediaWiki and its shipped extensions and cannot vary by wiki, so
+/// hardcoding them is safe; a wiki-private namespace genuinely has no canonical
+/// English name and the empty fallback is correct for it.
 pub fn namespace_prefix(ns_id: i32) -> &'static str {
     match ns_id {
         -2 => "Media",
@@ -159,8 +168,22 @@ pub fn namespace_prefix(ns_id: i32) -> &'static str {
         13 => "Help talk",
         14 => "Category",
         15 => "Category talk",
+        100 => "Portal",
+        101 => "Portal talk",
+        108 => "Book",
+        109 => "Book talk",
+        118 => "Draft",
+        119 => "Draft talk",
+        446 => "Education program",
+        447 => "Education program talk",
+        710 => "TimedText",
+        711 => "TimedText talk",
         828 => "Module",
         829 => "Module talk",
+        2300 => "Gadget",
+        2301 => "Gadget talk",
+        2302 => "Gadget definition",
+        2303 => "Gadget definition talk",
         _ => "",
     }
 }
@@ -720,6 +743,27 @@ mod tests {
             "Main Page"
         );
         assert_eq!(Title::new(10, "Foo").get_prefixed_text(), "Template:Foo");
+    }
+
+    /// `full_text` is the *data-lookup* key, so it must keep a namespace the
+    /// prefix table knows. A namespace the table is missing used to be dropped
+    /// silently — `Portal:Countries` keyed as `Countries` — so a fetch for the
+    /// portal page was made against a main-namespace title, missed, and was
+    /// cached as "no such page".
+    #[test]
+    fn test_full_text_keeps_extension_namespaces() {
+        for (id, prefix) in [
+            (100, "Portal"),
+            (108, "Book"),
+            (118, "Draft"),
+            (710, "TimedText"),
+            (2300, "Gadget"),
+        ] {
+            assert_eq!(
+                Title::new(id, "Countries").full_text(),
+                format!("{prefix}:Countries")
+            );
+        }
     }
 
     #[test]
