@@ -5552,11 +5552,20 @@ purpose, and the reason is written at the call site.
 
 ### Scoreboard
 
-The fix changes no first difference yet — `Bicycle` still differs at 1588 —
-because the corrected title is `Bicyclus`, which is still not cached, so the
-category survives for the *other* reason. What it does change is the diagnosis:
-the probe now asks `Page Bicyclus`, and the remaining `Bicycle`/`Zebra`/`Sundial`
-differences are the cache gap, nothing else.
+With the renderer fixed, `Bicyclus` was the *only* thing left in `Bicycle`'s
+hatnote, and a targeted online run (pinned to the cached revision, so it did not
+resolve or fetch a new baseline) cached it and `Zebro` alongside. That is what
+moves the two pages:
+
+```
+Bicycle   1588 -> 1697   (the residual is mw-disambig, below)
+Zebra     1486 -> 2114   (the residual is mw-disambig)
+Sundial   1460           (mw-disambig only; content was never the problem)
+```
+
+So the hatnote *existence* category is now gone from all three; what is left on
+them is `class="mw-disambig"` on a link to a disambiguation page, which is
+`add_red_links`'s `linkclasses` (see above) and needs the page-info fact.
 
 ### The rest
 
