@@ -188,6 +188,17 @@ impl Node {
         }
     }
 
+    /// Create a document node whose only child is `child`.
+    ///
+    /// A DOM fragment reached through a placeholder is a document of one
+    /// element — that is the shape `unpack_dom_fragments` swaps in — so this
+    /// saves every producer of such a fragment from spelling the two steps out.
+    pub fn document_with_child(child: Node) -> Self {
+        let mut doc = Self::document();
+        doc.push_child(child);
+        doc
+    }
+
     /// Create a new text node.
     pub fn text(content: impl Into<String>) -> Self {
         Self {
@@ -216,6 +227,7 @@ impl Node {
         }
     }
 
+    /// Create a new comment node.
     /// Add a child node to this element/document.
     pub fn push_child(&mut self, child: Node) {
         self.children.push(child);

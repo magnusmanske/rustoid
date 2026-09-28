@@ -459,6 +459,90 @@ fn style_items(
     ]
 }
 
+/// Build the `<meta typeof="mw:Extension/indicator">` element Parsoid emits for
+/// an `<indicator>` tag, as a document of one node.
+///
+/// MediaWiki renders an indicator in a fixed slot in the page header; Parsoid's
+/// part is only to record *which* indicator and what it contains, so it emits a
+/// `<meta>` (no visible content of its own) whose `data-mw` carries the
+/// extension's shape. The rendered body — the file link, the tooltip — is put
+/// into the reader's page header from that metadata, not from the body here.
+///
+/// The shape is measured against the live service rather than inferred; the
+/// served bytes for `{{protection padlock}}` on `List of sovereign states` are:
+///
+/// ```html
+/// <meta typeof="mw:Extension/indicator" about="#mwt4"
+///       data-mw='{"name":"indicator","attrs":{"name":"pp-default"},
+///                 "body":{"extsrc":"[[File:Semi-protection-shackle.svg|…]]"}}'
+///       id="mwCQ"/>
+/// ```
+///
+/// Note what the `data-mw` does *not* have here, because both are easy to get
+/// wrong: no `parts` (nothing re-parses the body, so there is no source to
+/// attribute it to) and no `source` attribute (the tokenizer's generic extension
+/// token carries one because other extensions round-trip their markup; an
+/// indicator does not). The body is `extsrc` — the raw, *unexpanded* wikitext —
+/// which is why the file link is recorded as written rather than as rendered.
+///
+/// The `about` id is taken by the caller, which knows where in the document
+/// sequence the indicator belongs: it shares the id of the transclusion that
+/// produced it, so the two are one about-chain through the page. The element is
+/// rendering-transparent to the document — it renders into the page header — so
+/// the tree builder stashes it and `unpack_dom_fragments` re-inserts it, exactly
+/// as a module-emitted style does.
+pub fn indicator_node(
+    body: &str,
+    attrs: &[crate::wikitext::tokens_v2::KV],
+) -> crate::dom::node::Node {
+    use crate::dom::node::{ElementKind, Node};
+
+    let mut meta = Node::element(ElementKind::Indicator);
+    meta.set_attr("typeof", "mw:Extension/indicator");
+    if !attrs.is_empty() {
+        meta.set_attr("data-mw", indicator_data_mw(body, attrs));
+    }
+    meta
+}
+
+/// The `data-mw` blob for an `<indicator>`, in the field order the served bytes
+/// use: `name`, then `attrs`, then `body`.
+///
+/// `attrs` is the tag's own parsed start-tag attributes (`name="pp-default"`),
+/// re-emitted as JSON rather than re-serialized from the raw tag, because that is
+/// what MediaWiki's parser records. An attribute with no value is dropped rather
+/// than emitted as `""`: the recorded attributes are the ones the indicator
+/// implementation reads, and a bare flag is not one of them.
+pub fn indicator_data_mw(body: &str, attrs: &[crate::wikitext::tokens_v2::KV]) -> String {
+    let mut out = String::from(r#"{"name":"indicator""#);
+    let pairs: Vec<String> = attrs
+        .iter()
+        .filter_map(|kv| {
+            let key = kv.key.as_str()?;
+            let value = kv.value.as_str()?;
+            (!key.is_empty()).then(|| format!("{}:{}", json_string(key), json_string(value)))
+        })
+        .collect();
+    if !pairs.is_empty() {
+        out.push_str(r#","attrs":{"#);
+        out.push_str(&pairs.join(","));
+        out.push('}');
+    }
+    out.push_str(r#","body":{"extsrc":"#);
+    out.push_str(&json_string(body));
+    out.push_str(r#"}}"#);
+    out
+}
+
+/// A JSON string literal for `s`.
+///
+/// `serde_json` is enough: the escaping a `data-mw` attribute needs for
+/// `&`/`<`/`'` is applied once, when the attribute is written
+/// (`crate::html::serialize`), and escaping at both points would double it.
+fn json_string(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
 /// Recover the parsed start-tag attributes from an extension token's `data-mw`
 /// rich attribs (set by the tokenizer's `extension_data_mw`).
 pub fn extension_kv_attrs(token: &SelfclosingTagTk) -> Vec<crate::wikitext::tokens_v2::KV> {
@@ -952,5 +1036,37 @@ mod tests {
                 .any(|c| matches!(&c.kind, crate::dom::node::NodeKind::Text(t) if t == "p{}"))
         );
         assert_eq!(next_id.get(), 1);
+    }
+
+    /// The `data-mw` an `<indicator>` carries, byte-for-byte against the shape the
+    /// live service serves. Measured from the `{{protection padlock}}` block on
+    /// `List of sovereign states`: field order `name`, `attrs`, `body`, with the
+    /// body as unexpanded `extsrc`. JSON key order is part of the comparison, so
+    /// this is asserted as a string rather than parsed.
+    #[test]
+    fn indicator_data_mw_matches_the_served_shape() {
+        let attrs = vec![crate::wikitext::tokens_v2::KV {
+            key: crate::wikitext::tokens_v2::KeyValue::Str("name".to_string()),
+            value: crate::wikitext::tokens_v2::KeyValue::Str("pp-default".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        assert_eq!(
+            indicator_data_mw("[[File:Semi-protection-shackle.svg|20px]]", &attrs),
+            r#"{"name":"indicator","attrs":{"name":"pp-default"},"body":{"extsrc":"[[File:Semi-protection-shackle.svg|20px]]"}}"#
+        );
+    }
+
+    /// An indicator with no attributes records no `attrs` key at all, and the
+    /// body is escaped as a JSON string rather than spliced in raw (a quote in a
+    /// file caption would otherwise produce an attribute the tree builder cannot
+    /// parse back).
+    #[test]
+    fn indicator_data_mw_omits_empty_attrs_and_escapes_the_body() {
+        assert_eq!(
+            indicator_data_mw("a\"b", &[]),
+            r#"{"name":"indicator","body":{"extsrc":"a\"b"}}"#
+        );
     }
 }
