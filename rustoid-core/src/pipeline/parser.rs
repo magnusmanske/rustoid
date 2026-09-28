@@ -932,6 +932,17 @@ pub struct Parser<'a, C: SiteConfig> {
     /// reached from several expansion paths, so threading it through every
     /// signature would cost more than it explains.
     protection: std::cell::RefCell<std::collections::HashMap<String, ProtectionEntry>>,
+    /// Whether an `#ifexist` title exists, keyed by the title as the call named
+    /// it.
+    ///
+    /// `#ifexist` is a *synchronous* parser function whose answer is a fetch, so
+    /// the answer has to be in hand before the token walk reaches the call. Unlike
+    /// `protection` above it cannot be pre-scanned from the unexpanded stream: the
+    /// title is written inside a template's body (`Category:{{{1}}} {{{2}}}
+    /// {{{3}}}`), so it is only known *after* the surrounding arguments are
+    /// substituted. [`Parser::prime_ifexist`] therefore resolves it at the point
+    /// the call is reached, which is where the substitution has already happened.
+    ifexist: std::cell::RefCell<std::collections::HashMap<String, bool>>,
     /// Title facts already fetched this render, keyed by the title as written.
     ///
     /// `preload_titles` runs once per `#invoke`, and the titles it wants — a
@@ -984,6 +995,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             expansion_depth: std::cell::Cell::new(0),
             strip_data_parsoid: std::cell::Cell::new(false),
             protection: std::cell::RefCell::new(std::collections::HashMap::new()),
+            ifexist: std::cell::RefCell::new(std::collections::HashMap::new()),
             title_facts: std::cell::RefCell::new(std::collections::HashMap::new()),
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
             ext_fragments: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1001,6 +1013,47 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// during expansion can never conflict with a write.
     fn protection_context(&self) -> ProtectionContext<'_> {
         ProtectionContext::new(&self.page_protection, &self.protection)
+    }
+
+    /// Resolve the existence an `#ifexist` call is about to read, if it is not
+    /// already known.
+    ///
+    /// `#ifexist` is a synchronous parser function but existence is a fact the
+    /// parser can only fetch asynchronously, so the answer has to be resolved
+    /// before the (synchronous) parser-function call runs — the same shape
+    /// `PROTECTIONLEVEL` uses, except that the title is only known *after* the
+    /// surrounding arguments are substituted, so it cannot be pre-scanned from
+    /// the unexpanded token stream. [`Parser::expand_template_token`] calls this
+    /// once the target is resolved and its `{{{…}}}` are substituted.
+    ///
+    /// A fetch failure records `false`, which is MediaWiki's answer for a title
+    /// that does not exist: the alternative is to leak the raw `{{#ifexist:…}}`
+    /// back into the output, which is what falling through to the
+    /// unknown-parser-function arm did.
+    async fn prime_ifexist(&self, title: &str, source: Option<&dyn DataSource>) {
+        let title = title.trim();
+        if title.is_empty() || self.ifexist.borrow().contains_key(title) {
+            return;
+        }
+        // MediaWiki bounds expensive parser functions (`#ifexist` is one of
+        // them, at 500 per page) so page content cannot drive unbounded
+        // database work. rustoid fetches once per *distinct* title, not per
+        // call, so the bound is on the map's size; beyond it the answer is
+        // `false`, which is also what an unanswered call reads as.
+        if self.ifexist.borrow().len() >= MAX_IFEXIST_TITLES {
+            return;
+        }
+        let Some(source) = source else {
+            return;
+        };
+        let titles = [title.to_string()];
+        let exists = source
+            .get_page_info(&titles)
+            .await
+            .ok()
+            .and_then(|m| m.get(title).map(|i| !i.missing))
+            .unwrap_or(false);
+        self.ifexist.borrow_mut().insert(title.to_string(), exists);
     }
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
@@ -3002,6 +3055,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(ResolvedTarget::ParserFunction { name, .. })
                 if TemplateHandler::expands_branch_to_text(name)
         );
+        // `#ifexist` needs its answer before the synchronous parser-function call
+        // below. The title is known here — the target's `{{{…}}}` have already
+        // been substituted into `target_str` — which is exactly why this cannot be
+        // a pre-pass over the unexpanded stream.
+        if let Some(ResolvedTarget::ParserFunction { name, pf_arg, .. }) = &resolved
+            && name.eq_ignore_ascii_case("ifexist")
+        {
+            self.prime_ifexist(pf_arg, source).await;
+        }
         match resolved {
             // `#invoke` is Scribunto, not a parser function: MediaWiki
             // hands the call to Lua and feeds the result back through the
@@ -3185,6 +3247,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     frame,
                     about_counter,
                     &self.protection_context(),
+                    &self.ifexist.borrow(),
                     vec![expanded_item],
                     wrap,
                 );
@@ -4159,6 +4222,14 @@ fn item_is_tag(item: &Item) -> bool {
     )
 }
 
+/// How many `#ifexist` titles one render may resolve.
+///
+/// MediaWiki caps expensive parser functions at 500 per page and `#ifexist` is
+/// one of them. The bound is on *distinct* titles here because rustoid answers
+/// each title once and reuses the answer, which is a stricter budget than
+/// MediaWiki's per-call count and therefore never exceeds it.
+const MAX_IFEXIST_TITLES: usize = 500;
+
 /// How many redirect hops may be followed before giving up.
 ///
 /// MediaWiki bounds redirect resolution (`$wgMaxRedirects`); a redirect cycle
@@ -4536,7 +4607,6 @@ mod tests {
     #[test]
     fn an_argument_value_the_renderer_cannot_represent_is_declined() {
         use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
-
         // A real tag has no faithful text, so the renderer must return `None` and
         // let the caller keep to the source range rather than drop the tag.
         let div = TagTk::new("div", vec![], DataParsoid::default());
@@ -5523,5 +5593,47 @@ mod tests {
         );
         let item = Item::Tok(ParsoidToken::SelfclosingTag(stt));
         assert!(wrapper_tag_target(&item).is_none());
+    }
+
+    /// `#ifexist` answers its `then`/`else` from the title's existence, which the
+    /// parser resolves before the (synchronous) call runs. A title with content is
+    /// not missing; a title with none is. Before this was implemented the call
+    /// fell through to the unknown-parser-function arm and leaked its own source.
+    #[tokio::test]
+    async fn ifexist_takes_the_branch_the_title_selects() {
+        use crate::mock::MockDataSource;
+
+        let config = MockSiteConfig::new();
+        let source = MockDataSource::new();
+        source.add_page("Exists", "content");
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{#ifexist:Exists|EXISTY|EXISTN}} {{#ifexist:Absent|ABSENTY|ABSENTN}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            html.contains(">EXISTY</span>"),
+            "an existing title takes `then`: {html}"
+        );
+        assert!(
+            !html.contains(">EXISTN</span>"),
+            "...and not `else`: {html}"
+        );
+        assert!(
+            html.contains(">ABSENTN</span>"),
+            "a missing title takes `else`: {html}"
+        );
+        assert!(
+            !html.contains(">ABSENTY</span>"),
+            "...and not `then`: {html}"
+        );
+        assert!(
+            !html.contains(">{{#ifexist"),
+            "the call must not leak its source as text: {html}"
+        );
     }
 }

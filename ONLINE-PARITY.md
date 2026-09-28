@@ -5592,3 +5592,101 @@ them is `class="mw-disambig"` on a link to a disambiguation page, which is
 diagnosis after a bug that was not there. It now builds the same `SiblingWiki`
 `harness::with_entity_wiki` does. A probe that fails to reproduce the real run is
 worse than no probe, because it manufactures confident wrong answers.
+
+## Cached page-info, and `#ifexist`
+
+### The `PageInfo` cache kind
+
+The prerequisite the previous section named is now built. `EntryKind::PageInfo`
+(prefix `info:`) stores `{missing, known, redirect, linkclasses}` per title, and
+`get_page_info` prefers the cache, fetches only what it does not have, and stores
+what it fetches. A transport failure still answers conservatively but is **not**
+written, so a guess cannot outlive the failure it came from.
+
+The other half was in `page_info` itself: it never requested `ppprop=disambiguation`,
+so `linkclasses` was always empty and `mw-disambig` could not exist even online.
+The property comes from the `__DISAMBIG__` magic word and is not in the target's
+body, which is the whole reason it is a cached fact.
+
+Populated for the subset, this moves the three hatnote pages:
+
+```
+Sundial   1460 -> 1897
+Bicycle   1697 -> 2465
+Zebra     2114 -> 2172
+```
+
+### `#ifexist`, ported
+
+`#ifexist` is now implemented rather than falling through to the
+unknown-parser-function arm that leaked its own source. Core's semantics: answer
+`then` when the title exists, `else` otherwise, and **do not trim** the branch
+(`trimmed_branch` mirrors `#if`; `untrimmed_branch` is the separate rule).
+
+The mechanism is the one the earlier section designed: `#ifexist` is synchronous
+but existence is a fetch, so the answer is resolved *at the call site* —
+`expand_template_token`, once the target's `{{{…}}}` are substituted — into the
+parser's `ifexist` map, which the synchronous `call_parser_function` then reads.
+It is **not** a pre-scan, and that distinction is the point: a pre-scan over the
+unexpanded stream would collect `Category:{{{1}}} {{{2}}} {{{3}}}` instead of the
+title, which is the wrong-branch trap recorded two sections up. The map is
+deduped by title and capped at 500 entries, mirroring MediaWiki's budget for
+expensive parser functions.
+
+**A caveat, recorded because it is load-bearing.** The port is faithful by
+construction, but the *input* is not, in exactly the path that motivated it: the
+`Use mdy dates` / `Use British English` stack reaches `#ifexist` through
+`Module:Unsubst`'s `$B`, and there the title is still `Category:{{{1}}} {{{2}}}
+{{{3}}}` — because the argument that should carry `A`/`B`/`C` is lost upstream
+(below). So today the branch it takes in that path is right only by luck (offline
+it reads "exists", which happens to match). Fixing the argument expansion makes
+`#ifexist` correct for free; until then it is a prerequisite, not a fix. It also
+moved no first difference on its own — it removed the leaked source and made the
+output slightly smaller — but it is the piece the earlier section said had no
+room to land.
+
+### The real blocker: an expanded argument cannot be rendered back to text
+
+The `$B` argument is where the `Use mdy dates` family actually fails, and it is
+one minimal reproduction:
+
+```
+{{#invoke:Unsubst||$B={{DMCA|A|B|C}}}}
+```
+
+renders `[[]]` where the service renders `Category:A_B_C`. `Module:Unsubst`
+returns `frame.args['$B']`, and what rustoid hands it is not
+`[[Category:A B C]]` but `[[]]`.
+
+The chain: `expand_invoke_args` expands `{{DMCA|A|B|C}}` — and the arguments do
+arrive, the trace shows `Template:Dated maintenance category` called with
+`1=A;2=B;3=C` — but the *result* it stringifies is a `wikilink` token whose
+`href` is not set yet. `href` is assigned by `render_links`, a later pass, so
+`tokens_to_string`'s wikilink arm reads an empty `href` and emits `[[` + `` +
+`]]`. The faithful text Scribunto receives is the *substituted wikitext*
+`[[Category:A B C]]`.
+
+This is the argument renderer again, and it is the same shape the earlier section
+could not land: rendering an expanded argument back to its wikitext needs every
+token covered, and a wikilink is one `tokens_to_string` gets wrong *when the link
+has not been rendered*. The narrow fix (fall back to the token's own source) is
+not obviously right either, because the recorded source is the *unsubstituted*
+body. It is recorded here rather than attempted with the session's remaining
+room, and it is what stands between the `Use …` stack and every page that uses
+it.
+
+### Scoreboard
+
+```
+Help:Introduction          416
+Quicksilver (film)         590  (ifexist leak gone; the [[ ]] below is the difference)
+Unix                       904  (same)
+Zebra                     2172
+Sundial                   1897
+Bicycle                   2465
+Nobel Prize                600
+List of sovereign states  1947
+Megadeth                  1650
+fixture guard             876/896
+subset total               parsoid 5 351 722 / rustoid 4 330 015 (0.81x)
+```

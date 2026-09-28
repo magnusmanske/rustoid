@@ -202,6 +202,13 @@ impl ParserFunctions {
         items
     }
 
+    /// A conditional's branch with **no** trimming — `#ifexist` answers
+    /// `$then`/`$else` verbatim, without the `trim` that `if`/`ifeq`/`iferror`
+    /// apply. Kept separate so the two rules cannot be collapsed by accident.
+    pub fn untrimmed_branch(kv: Option<&KV>) -> Vec<Item> {
+        Self::expand_kv(kv, None)
+    }
+
     /// `#switch` — a port of core `ParserFunctions::switch`, which is what the
     /// served HTML shows. (Parsoid's *native* `pf_switch` is a different,
     /// simplified algorithm; the online target is core's.)

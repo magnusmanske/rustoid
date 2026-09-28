@@ -961,6 +961,9 @@ impl TemplateHandler {
         about_id: String,
         token: &crate::wikitext::tokens_v2::ParsoidToken,
         protection: &ProtectionContext,
+        // Whether each `#ifexist` title this call names exists; see
+        // [`TemplateHandler::process`].
+        ifexist: &std::collections::HashMap<String, bool>,
         // PHP's `wrapTemplates` — false inside a template body. The body is
         // spliced into its caller's expansion, which carries the wrapper, so a
         // variable or parser function there must not add one of its own.
@@ -1049,6 +1052,7 @@ impl TemplateHandler {
                     &pf_params,
                     token_src.as_deref(),
                     protection,
+                    ifexist,
                     page_title,
                 );
                 if !wrap {
@@ -1243,12 +1247,16 @@ impl TemplateHandler {
     /// produces, because `frame:callParserFunction` renders the call as wikitext
     /// and re-expands it, and a module cannot know the wiki spells the same word
     /// without a hash on a page.
+    #[allow(clippy::too_many_arguments)]
     fn call_parser_function(
         config: &dyn SiteConfig,
         name: &str,
         params: &Params,
         token_src: Option<&str>,
         protection: &ProtectionContext,
+        // Whether each `#ifexist` title this call names exists; see
+        // [`TemplateHandler::process`].
+        ifexist: &std::collections::HashMap<String, bool>,
         context_title: Option<&crate::title::Title>,
     ) -> Vec<Item> {
         match name {
@@ -1258,6 +1266,27 @@ impl TemplateHandler {
             "expr" => ParserFunctions::pf_expr(params),
             "ifexpr" => ParserFunctions::pf_ifexpr(params),
             "iferror" => ParserFunctions::pf_iferror(params),
+            // `{{#ifexist:TITLE|then|else}}` — core `ParserFunctions::ifexist`,
+            // which answers `then` when the title exists and `else` otherwise,
+            // and does **not** trim its branch (unlike `#if`). The existence
+            // answer is a fetch and therefore could not be computed here; the
+            // host resolved it before this synchronous call ran (see
+            // [`crate::pipeline::parser`]'s `prime_ifexist`). A title the host
+            // never resolved — none, in a production run — reads as absent,
+            // which is what MediaWiki answers for a page that does not exist.
+            "ifexist" => {
+                let title = params
+                    .args
+                    .first()
+                    .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
+                    .unwrap_or_default();
+                let branch = if ifexist.get(title.trim()).copied().unwrap_or(false) {
+                    params.args.get(1)
+                } else {
+                    params.args.get(2)
+                };
+                ParserFunctions::untrimmed_branch(branch)
+            }
             "lc" => ParserFunctions::pf_lc(params),
             "uc" => ParserFunctions::pf_uc(params),
             "ucfirst" => ParserFunctions::pf_ucfirst(params),
@@ -1386,12 +1415,17 @@ impl TemplateHandler {
     /// `handle_template_arg` respectively. Mirrors PHP's
     /// `TemplateHandler::onTag` + `XMLTagBasedHandler::process` (the
     /// TokenTransform2 dispatch loop).
+    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &self,
         config: &dyn SiteConfig,
         frame: &super::frame::Frame,
         about_counter: &std::cell::Cell<usize>,
         protection: &ProtectionContext,
+        // Whether each `#ifexist` title this chunk names exists, resolved before
+        // the (synchronous) call runs. See [`crate::pipeline::parser`]'s
+        // `prime_ifexist`.
+        ifexist: &std::collections::HashMap<String, bool>,
         tokens: Vec<Item>,
         // PHP's `wrapTemplates`: false when expanding a template *body*, whose
         // expansions are spliced into the caller's.
@@ -1435,6 +1469,7 @@ impl TemplateHandler {
                     about_id,
                     tok,
                     protection,
+                    ifexist,
                     wrap,
                 );
                 out.extend(expanded);
@@ -2164,6 +2199,7 @@ mod tests {
             "#mwt1".to_string(),
             &token,
             &ProtectionContext::new(&page_protection, &titles_protection),
+            &std::collections::HashMap::new(),
             true,
         );
 
@@ -2416,6 +2452,7 @@ mod tests {
             &frame,
             &about,
             &ProtectionContext::new(&page_protection, &titles_protection),
+            &std::collections::HashMap::new(),
             input,
             true,
         );
