@@ -193,6 +193,42 @@ async fn the_lua_frame_method_reaches_the_same_handler() {
     );
 }
 
+/// A stylesheet *before* a template is still numbered after it.
+///
+/// Parsoid's TT2 runs `TemplateHandler` over a chunk and only then
+/// `ExtensionHandler`, so a chunk's transclusions take their ids first and its
+/// extensions follow — in source order among themselves, not in document order
+/// against the templates. The transform endpoint pins it:
+/// `<templatestyles src="X.css"/>{{T}}` is the template at `#mwt1` and the
+/// stylesheet at `#mwt2`. Resolving the tag where the walk reaches it gave the
+/// stylesheet `#mwt1`, which is what this test caught.
+#[tokio::test]
+async fn a_stylesheet_before_a_template_is_numbered_after_it() {
+    let mut config = MockSiteConfig::new();
+    config.add_extension_tag("templatestyles");
+    let source = MockDataSource::new();
+    source.add_template("Template:X.css", ".x{a:1}");
+    source.set_revision("Template:X.css", 5);
+    source.add_template("Template:T", "body");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "<templatestyles src=\"X.css\"/>{{T}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        html.contains(r##"about="#mwt1" typeof="mw:Transclusion""##),
+        "the transclusion takes the first id: {html}"
+    );
+    assert!(
+        html.contains(r##"typeof="mw:Extension/templatestyles" about="#mwt2""##),
+        "the extension is numbered after the transclusion: {html}"
+    );
+}
+
 /// A stylesheet and a tunnelled link caption must not share a fragment id.
 ///
 /// Both reach the tree builder as `mw:DOMFragment` placeholders: the link

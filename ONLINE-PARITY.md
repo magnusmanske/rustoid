@@ -6843,12 +6843,13 @@ over 108 arguments is still one settled round.
 ### Effect
 
 `Nobel Prize`'s infobox templatestyles moved from `#mwt15` to `#mwt9`: the
-nine-id gap the trace found is down to **three**. The three that remain are a
-different mechanism, below. No other page's first difference moved, the fixture
-guard held at 876/896, and the corpus total is byte-identical to four decimals
-(`3 839 090` vs `3 839 107` before — the 17 bytes are that id's digits). That is
-the honest measurement: this fix changes *id allocation order inside an
-`#invoke`*, and almost every page's first difference sits elsewhere.
+nine-id gap the trace found is down to **three** at that point (the last three
+are a different mechanism, fixed in §"The three ids left" below). No other
+page's first difference moved, the fixture guard held at 876/896, and the corpus
+total is byte-identical to four decimals (`3 839 090` vs `3 839 107` before — the
+17 bytes are that id's digits). That is the honest measurement: this fix changes
+*id allocation order inside an `#invoke`*, and almost every page's first
+difference sits elsewhere.
 
 ### The three ids left, and why they are a different fix
 
@@ -6866,37 +6867,67 @@ the `data8`/`data9` rows.
 That is the extension-numbering phase again (§"The extension-numbering phase"),
 from its unnumbered side. `ExtensionHandler::onExtension` numbers every
 non-`nowiki` extension in TT2, *after* `TemplateHandler`, over the whole chunk —
-so a module's emitted `<templatestyles>` (and `<ref>`, …) should be numbered when
-the module's **output** is parsed, in the output's order, not when the
-`frame:extensionTag` request is served. Today rustoid numbers them inline:
-`expand_lua_request` renders the answer's tokens, and `expand_one_templatestyles`
-takes the id then. The `<ref>`/`<references>` post-pass already numbers in the
-right phase (with the token carrying the id); `<style>`/`<pre>` were left to this
-follow-up precisely because their id is rebuilt from rich `data-mw` attribs. The
-next step is to give templatestyles the same treatment: a placeholder that the
-chunk's extension phase numbers, in chunk order.
+so a chunk's extensions are numbered after its transclusions. Two things in
+rustoid violated that, and both are now fixed.
 
-**The inline resolution is wrong on its own, and a probe pins it.** The current
-`expand_one_templatestyles` runs during the item walk, so a `<templatestyles>`
-takes its id *where it sits* relative to templates. Parsoid numbers the chunk's
-templates first and its extensions after, so an extension that *precedes* a
-template in the source is still numbered second. The transform endpoint settles
-it — `<templatestyles src="Plainlist/styles.css"/>{{Center|b}}` (rendered as
-`Sandbox`):
+#### The templatestyles post-pass
+
+`expand_one_templatestyles` used to take the `about` id where the walk reached the
+tag, which is document order *against* the templates — the transform endpoint
+rejects it:
 
 ```
-wiki : Center about="#mwt1"   templatestyles about="#mwt2"
-rustoid: templatestyles #mwt1  Center #mwt2
+<templatestyles src="Plainlist/styles.css"/>{{Center|b}}   (rendered as Sandbox)
+wiki   : Center #mwt1, templatestyles #mwt2
+rustoid: templatestyles #mwt1, Center #mwt2      (before this fix)
 ```
 
-The style is first in the source and rustoid numbers it first; the service
-numbers the transclusion first regardless. The nested shape already agrees —
-`{{Center|X<templatestyles …/>Y}}` is `#mwt1`/`#mwt2` on both sides, because the
-nested chunk's own extension phase runs after the wrapper's id is taken — so the
-bug is narrow: **an id-allocating extension before a template in the same
-chunk**. `pre`/`ref` already have the post-pass; `templatestyles` is the one left
-inline. Fixing it means the fragment is created inline (the CSS fetch is async)
-but its `about` is written by the chunk's extension post-pass, in document order
-— and `frame:extensionTag`'s answer must then carry the placeholder (not a
-numbered `<style>`), so the module's output chunk is where it is numbered. That
-is the three ids on `Nobel Prize`, and it is the next step.
+Now the resolved stylesheet is stashed in `pending_styles` keyed by its fragment
+id, and `number_style_placeholders` — the same shape as the `ref`/`pre` post-pass
+that was already there — walks the chunk's output at the end of
+`expand_templates`, assigning ids in document order and building the `<style>`
+fragment then. A nested chunk still numbers its own first (a stylesheet inside a
+template body is `#mwt2` behind the wrapper's `#mwt1`, on both sides), because
+the post-pass runs per chunk. A pinned test
+(`a_stylesheet_before_a_template_is_numbered_after_it`) fails on the old order.
+
+#### Arguments expand without spending extension ids
+
+The second half is `arg_expansion` (a counter, not a bool, so nesting is exact).
+Scribunto's `frame.args` hands a module the argument's *text*, and the templates
+in it are expanded by the preprocessor — which numbers no extensions. So while
+`expand_invoke_args` runs, the extension post-passes are skipped: no `about` is
+spent on a token that is about to be rendered back to text and discarded. The
+instrumented trace settled it: `data8`/`data9`/`presenter`/`country` were each
+spending one or two ids during argument expansion, all discarded (`presenter`'s
+text came back as the *source* `{{Plainlist|…}}`, which the module's output then
+re-expanded and numbered a second time). Resolving is left alone — the rendered
+text is the argument's source fallback either way — and the module's own
+`frame:extensionTag` calls still number, because they run from `expand_invoke`,
+not from an argument.
+
+### Effect
+
+`Nobel Prize`'s infobox stylesheet is now `#mwt6`, matching the service, and its
+first difference moved **4269 → 5926** — the id mismatch is gone and the next
+difference is unrelated (an image: rustoid renders `typeof="mw:File"` +
+`data-mw` where the service has `<a>`-wrapped `mw:File/Frameless`).
+`Quicksilver` also moved, **2732 → 4213**, on the same mechanism. No page's first
+difference regressed:
+
+```
+Help:Introduction          5161   (unchanged)
+Quicksilver (film)         2732 -> 4213
+Unix                       4772   (unchanged)
+Zebra                      2172   (unchanged)
+Sundial                    1897   (unchanged)
+Bicycle                   11836   (unchanged)
+Nobel Prize                4269 -> 5926
+List of sovereign states   4009   (unchanged)
+Megadeth                   2801   (unchanged)
+fixture guard             876/896
+```
+
+All four order probes agree with the service now (style-before-template,
+template-before-style, style in an argument, style in a template body), and the
+whole workspace suite and clippy are clean.

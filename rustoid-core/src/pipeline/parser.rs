@@ -883,6 +883,30 @@ fn wrap_sections_in_ast(ast: &mut Node, wrap_sections: bool) {
     }
 }
 
+/// A resolved `<templatestyles>` whose `about` id is not assigned yet.
+///
+/// Held between the walk that sees the tag and the post-pass that numbers it:
+/// Parsoid's TT2 numbers a chunk's extensions only after its templates, so the
+/// id cannot be taken where the tag is encountered. See
+/// [`Parser::number_style_placeholders`].
+struct PendingStyle {
+    css: String,
+    revid: u64,
+    src: String,
+}
+
+/// Counts one nesting level of `#invoke` argument expansion.
+///
+/// A guard so every return path — including an error unwinding out of an
+/// `await` — decrements it. See [`Parser::arg_expansion`].
+struct ArgExpansion<'a>(&'a std::cell::Cell<u32>);
+
+impl Drop for ArgExpansion<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 /// The wikitext parser, bound to a site configuration.
 pub struct Parser<'a, C: SiteConfig> {
     config: &'a C,
@@ -960,18 +984,40 @@ pub struct Parser<'a, C: SiteConfig> {
     page_protection: std::cell::RefCell<ProtectionEntry>,
     /// Sub-fragments built during expansion, waiting for the tree builder.
     ///
-    /// A `<templatestyles>` has to be resolved **while expansion is running**,
-    /// not in a pass afterwards: its `about` id comes from the document sequence
-    /// and the service numbers it where the expansion reaches it, so a
-    /// post-expansion pass numbers it behind everything the expansion already
-    /// took. On `Template:Infobox` the two stylesheets are ids 2 and 3, directly
-    /// after the `#invoke` wrapper's 1, which is only reachable from inside.
+    /// A `<templatestyles>` is resolved while expansion is running — the CSS
+    /// lives on a wiki page, so it cannot be fetched by a later synchronous pass
+    /// — and the `<style>` element is stashed here, reached from the token
+    /// stream through an `mw:DOMFragment` placeholder.
+    ///
+    /// Its `about` id is *not* taken where the tag was resolved: Parsoid's TT2
+    /// runs `TemplateHandler` over the whole chunk and only then
+    /// `ExtensionHandler`, so the chunk's transclusions take their ids first and
+    /// its extensions follow, in document order. The id is therefore assigned by
+    /// [`Parser::number_style_placeholders`], at the end of the chunk the
+    /// placeholder ends up in — which for a value that reaches Lua and comes
+    /// back is the module's output chunk, not the argument.
     ///
     /// Held on the parser rather than threaded through [`Parser::expand_templates`]
     /// and its twelve call sites for the reason the other `Cell` fields here are:
     /// one consumer, reached from several paths.
     ext_fragments: std::cell::RefCell<std::collections::HashMap<usize, Node>>,
     ext_next_id: std::cell::Cell<usize>,
+    /// Resolved stylesheets by fragment id, awaiting an `about` id from the
+    /// chunk's extension pass. Drained by
+    /// [`Parser::number_style_placeholders`]; an entry whose placeholder never
+    /// reached a token stream (an argument rendered back to source) is simply
+    /// never drained, and spends no id.
+    pending_styles: std::cell::RefCell<std::collections::HashMap<usize, PendingStyle>>,
+    /// Non-zero while an `#invoke` argument is being expanded.
+    ///
+    /// Scribunto's `frame.args` hands a module the argument's *text*, and the
+    /// templates in it are expanded by the preprocessor — which numbers no
+    /// extensions. A `<templatestyles>` or `<ref>` inside an argument is
+    /// numbered only where the module's **output** puts it, so numbering it
+    /// here spends ids the service never spends (three on `Nobel Prize`).
+    /// Resolving is left alone: the rendered text is the argument's source
+    /// fallback either way.
+    arg_expansion: std::cell::Cell<u32>,
     /// Sundered extension output, addressed by a `UNIQ…QINU` strip marker.
     ///
     /// A `frame:extensionTag('templatestyles', …)` answer is the extension's
@@ -1001,6 +1047,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
             ext_fragments: std::cell::RefCell::new(std::collections::HashMap::new()),
             ext_next_id: std::cell::Cell::new(0),
+            pending_styles: std::cell::RefCell::new(std::collections::HashMap::new()),
+            arg_expansion: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
@@ -1107,6 +1155,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
     fn new_about_id(&self, counter: &std::cell::Cell<usize>, tag: &str) -> String {
         crate::pipeline::attribute_expander::new_about_id(counter, tag)
+    }
+
+    /// Enter one level of `#invoke` argument expansion; the returned guard leaves
+    /// it on drop. See [`Parser::arg_expansion`].
+    fn begin_arg_expansion(&self) -> ArgExpansion<'_> {
+        self.arg_expansion.set(self.arg_expansion.get() + 1);
+        ArgExpansion(&self.arg_expansion)
+    }
+
+    /// Whether an `#invoke` argument is currently being expanded, in which case
+    /// extension ids must not be spent. See [`Parser::arg_expansion`].
+    fn in_arg_expansion(&self) -> bool {
+        self.arg_expansion.get() > 0
     }
 
     /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
@@ -2105,8 +2166,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
-    /// Resolve one `<templatestyles>` extension token into a placeholder plus a
-    /// stashed `<style>` fragment, taking the `about` id from `about_counter`.
+    /// Resolve one `<templatestyles>` extension token into a placeholder, stashing
+    /// the resolved stylesheet for the chunk's extension pass to number.
+    ///
+    /// The `about` id is deliberately *not* taken here — see
+    /// [`Parser::number_style_placeholders`] — so the placeholder carries only a
+    /// fragment id, and an expansion that is later rendered back to source spends
+    /// no id at all.
     ///
     /// Returns the token unchanged when the tag cannot be resolved (no source, no
     /// page, no revision) — leaving it visible in the diff rather than silently
@@ -2115,7 +2181,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         item: &Item,
         source: Option<&dyn DataSource>,
-        about_counter: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         let Some(stt) = templatestyles_target(item) else {
             return vec![item.clone()];
@@ -2155,29 +2220,80 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
 
         let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
-        // The id is taken *now*, before the fragment is stashed, so the sequence
-        // follows the expansion rather than the tree build.
-        let node = crate::pipeline::templatestyles::style_node(
-            &css,
-            revid,
-            &src,
-            &self.new_about_id(about_counter, "templatestyles"),
-        );
-        let mut frag = Node::document();
-        frag.push_child(node);
+        // The `about` id is not taken yet: the chunk's extension pass numbers the
+        // placeholder (see [`Self::number_style_placeholders`]). Until then the
+        // resolved stylesheet waits here, keyed by the fragment id the placeholder
+        // carries — an entry a discarded placeholder never drains spends no id.
         let id = self.ext_next_id.get();
         self.ext_next_id.set(id + 1);
-        self.ext_fragments.borrow_mut().insert(id, frag);
+        self.pending_styles
+            .borrow_mut()
+            .insert(id, PendingStyle { css, revid, src });
         emit_style_placeholder(stt, id)
+    }
+
+    /// Assign `about` ids to the templatestyles placeholders in a chunk, in
+    /// document order, and build the stashed `<style>` fragments.
+    ///
+    /// Parsoid's TT2 runs `TemplateHandler` over the whole chunk and only then
+    /// `ExtensionHandler`, so a chunk's transclusions take their ids first and
+    /// its extensions follow *in source order* — an id-allocating extension that
+    /// precedes a `{{template}}` is still numbered after it. Resolving a
+    /// `<templatestyles>` where the walk reaches it would spend the id before the
+    /// later transclusion's, which the transform endpoint rejects:
+    /// `<templatestyles src="Plainlist/styles.css"/>{{Center|b}}` is
+    /// `#mwt2`/`#mwt1` on the service and was `#mwt1`/`#mwt2` here.
+    ///
+    /// A placeholder whose fragment id is not pending was already numbered by a
+    /// nested chunk's pass (the fragment is stashed then), so it is skipped; a
+    /// pending entry whose placeholder never reached a token stream is never
+    /// drained and spends nothing.
+    fn number_style_placeholders(&self, out: &mut [Item], about_counter: &std::cell::Cell<usize>) {
+        for item in out.iter_mut() {
+            let Item::Tok(ParsoidToken::Tag(t)) = item else {
+                continue;
+            };
+            if t.name != "style" {
+                continue;
+            }
+            let is_fragment = t.attribs.iter().any(|kv| {
+                kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:DOMFragment")
+            });
+            if !is_fragment {
+                continue;
+            }
+            let Some(id) = t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+                .and_then(|kv| kv.value.as_str())
+                .and_then(|v| v.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let Some(pending) = self.pending_styles.borrow_mut().remove(&id) else {
+                continue;
+            };
+            let about = self.new_about_id(about_counter, "templatestyles");
+            let node = crate::pipeline::templatestyles::style_node(
+                &pending.css,
+                pending.revid,
+                &pending.src,
+                &about,
+            );
+            self.ext_fragments
+                .borrow_mut()
+                .insert(id, Node::document_with_child(node));
+        }
     }
 
     /// Resolve one `<indicator>` extension token into a placeholder plus a
     /// stashed `<meta>` fragment, spending an `about` id.
     ///
-    /// Inline, for the same reason as [`Parser::expand_one_templatestyles`]: the
-    /// id belongs to the expansion's position in the document. It matters here
-    /// because a module emits the indicator from *inside* a template; a pass
-    /// running after expansion would number it after everything the template
+    /// Numbered where the token is seen: the id belongs to the expansion's
+    /// position in the document. It matters here because a module emits the
+    /// indicator from *inside* a template; a pass running after expansion would
+    /// number it after everything the template
     /// expansion produced, and the transclusion that follows the template would
     /// take the id the indicator should have spent. PHP's `ExtensionHandler::
     /// onDocumentFragment` allocates an id for every extension except `nowiki`,
@@ -2200,8 +2316,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         ));
         // The extension spends the id whether or not it survives into the
         // output (see the method comment). Allocating it *before* stashing the
-        // fragment also keeps the sequence in expansion order.
-        let _ = self.new_about_id(about_counter, "indicator");
+        // fragment also keeps the sequence in expansion order. Inside an
+        // `#invoke` argument the id is not spent — the placeholder is rendered
+        // back to text and the indicator re-created where the module's output
+        // places it (see [`Parser::arg_expansion`]).
+        if !self.in_arg_expansion() {
+            let _ = self.new_about_id(about_counter, "indicator");
+        }
         let id = self.ext_next_id.get();
         self.ext_next_id.set(id + 1);
         self.ext_fragments.borrow_mut().insert(id, node);
@@ -2231,7 +2352,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     ///
     /// This runs as a safety net for tokens that reach it unresolved — the
     /// common case is handled inline by [`Parser::expand_one_templatestyles`]
-    /// during expansion, so that the id lands in document order.
+    /// during expansion. Its placeholders are numbered here, in document order; a
+    /// leftover tag is behind everything the expansion took, so this is the tail
+    /// of the sequence either way.
     async fn expand_templatestyles(
         &self,
         tokens: Vec<Item>,
@@ -2244,11 +2367,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             }
-            out.extend(
-                self.expand_one_templatestyles(&item, source, about_counter)
-                    .await,
-            );
+            out.extend(self.expand_one_templatestyles(&item, source).await);
         }
+        self.number_style_placeholders(&mut out, about_counter);
         out
     }
 
@@ -2540,9 +2661,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 next_id,
             )
             .await;
-        // `<templatestyles>` is normally resolved inline during expansion, so
-        // its `about` id lands in document order; anything left over here is a
-        // tag the inline pass could not resolve.
+        // `<templatestyles>` is normally resolved during expansion, so its `.about`
+        // id is already spent; anything left over here is a tag the inline pass
+        // could not resolve (a missing sheet, or one produced after expansion).
         let tokens = self
             .expand_templatestyles(tokens, source, about_counter)
             .await;
@@ -2863,17 +2984,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 continue;
             };
 
-            // Resolve a `<templatestyles>` here, in document order, so its
-            // `about` id comes from the same sequence as the transclusions
-            // around it. The service numbers the two stylesheets of
-            // `Template:Infobox` 2 and 3 — immediately after the `#invoke`
-            // wrapper's 1 — which a pass running after expansion cannot
-            // reproduce, because by then the whole documentation subtree has
-            // taken 4 onwards.
+            // A `<templatestyles>` is resolved here so the CSS is fetched while
+            // the expansion is running, but its `about` id is *not* taken yet:
+            // this chunk's transclusions are numbered during the walk below, and
+            // Parsoid numbers a chunk's extensions only after them. The id is
+            // assigned by the `number_style_placeholders` post-pass at the end of
+            // the chunk.
             if templatestyles_target(&item).is_some() {
-                let emitted = self
-                    .expand_one_templatestyles(&item, source, about_counter)
-                    .await;
+                let emitted = self.expand_one_templatestyles(&item, source).await;
                 out.extend(emitted);
                 continue;
             }
@@ -2969,6 +3087,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             out.push(item);
         }
 
+        // Extension ids are not spent while an `#invoke` argument is being
+        // expanded: the argument's tokens are rendered back to text and
+        // discarded, and the service numbers the extensions only where the
+        // module's output places them. See [`Parser::arg_expansion`].
+        if self.in_arg_expansion() {
+            return out;
+        }
         // TT2's `ExtensionHandler` numbers every extension token with
         // `$env->newAboutId()`, and `TokenHandlerPipeline::processChunk` runs each
         // transformer over the *whole* chunk — `TemplateHandler` then
@@ -3009,6 +3134,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let about = self.new_about_id(about_counter, "extension-id");
             t.add_attribute_str("about", &about);
         }
+        // TT2's `ExtensionHandler` numbers the chunk's extensions after its
+        // templates; `<templatestyles>` is the extension whose id belongs on a
+        // stashed fragment rather than on a token, so it is numbered here.
+        self.number_style_placeholders(&mut out, about_counter);
         out
     }
 
@@ -4115,6 +4244,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         src_text: &str,
     ) -> Vec<crate::wikitext::tokens_v2::KV> {
         use crate::wikitext::tokens_v2::KeyValue;
+
+        // Number no extensions while these arguments expand: Scribunto hands the
+        // module expanded *text*, and the extensions in it are numbered where the
+        // module's output places them, not here. The token stream below is
+        // rendered back to text by the caller, so an id spent here is spent on a
+        // token the output never shows.
+        let _guard = self.begin_arg_expansion();
 
         let mut out = args.to_vec();
         for kv in out.iter_mut() {
