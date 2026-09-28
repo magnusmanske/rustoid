@@ -641,6 +641,57 @@ async fn get_parent_exposes_the_calling_templates_args() {
     assert!(body.contains("parent said bob/first"), "got: {body}");
 }
 
+/// A `{{{…}}}` written in one template's body and handed to *another* template as
+/// an argument value is substituted in the frame that wrote it, not the frame
+/// that receives it.
+///
+/// The receiver's own frame is the wrong one, and invisibly so: it resolves
+/// against the callee's arguments, so `sd={{{1|}}}` came back as the callee's
+/// (absent) parameter 1 rather than the value the writer passed. That is how
+/// `Module:SDcat` came to compare the literal text `{{{1|}}}` with Wikidata and
+/// answer "is different" for a page whose short description matches.
+#[tokio::test]
+async fn an_argument_reference_in_a_value_resolves_in_the_writers_frame() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return "sd=" .. tostring(frame:getParent().args['sd'])
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:UsesParent", module);
+    // The module is reached through a template, so its parent frame is that
+    // template's and `sd` is read from `frame:getParent().args`.
+    source.add_template("Template:Inner", "{{#invoke:UsesParent|main}}");
+    // `{{{1|}}}` sits in Inner's argument value, written in Outer's body.
+    source.add_template("Template:Outer", "{{Inner|sd={{{1|}}} }}");
+    // And one level deeper, the shape the real chain has: Short description →
+    // Main other → SDcat. The value now travels through a second template whose
+    // own parameter is also called `1`, and — this is the part that matters —
+    // that template *returns* its parameter reference rather than holding the
+    // invocation itself, so the nested template is handed back by an argument
+    // reference and is not reached by the attribute walk.
+    source.add_template("Template:Middle", "{{{1|}}}");
+    source.add_template("Template:Deep", "{{Middle|{{Inner|sd={{{1|}}} }} }}");
+    source.add_template("Template:Passthru", "{{#switch: main | main = {{{1|}}} }}");
+    source.add_template("Template:Deep2", "{{Passthru|{{Inner|sd={{{1|}}} }} }}");
+    let parser = Parser::new(&config);
+    for wikitext in [
+        "{{Outer|pedal-driven}}",
+        "{{Deep|pedal-driven}}",
+        "{{Deep2|pedal-driven}}",
+    ] {
+        let html = parser
+            .wikitext_to_html_expanded(wikitext, &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        let body = text_only(&html);
+        assert!(body.contains("sd=pedal-driven"), "{wikitext} gave: {body}");
+    }
+}
+
 /// A direct `{{#invoke:}}` still has a parent frame — the calling *page*'s frame.
 ///
 /// This test previously asserted the opposite, and the expectation was wrong.

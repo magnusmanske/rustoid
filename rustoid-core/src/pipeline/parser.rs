@@ -3025,10 +3025,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // the wikitext recorded in `data-mw` are therefore different
                 // things, and `data-mw` still reads the raw source through its
                 // own path (`prepare_pf_param_infos`).
-                let expanded_params = self
-                    .expand_invoke_args(&params, frame, source, about_counter, body, src_text)
+                // `args[0]` is the target, which has already been resolved, so
+                // only the arguments after it are handed over.
+                let expanded_args = self
+                    .expand_invoke_args(
+                        &params.args[1..],
+                        frame,
+                        source,
+                        about_counter,
+                        body,
+                        src_text,
+                    )
                     .await;
-                let invoke_arg = invoke_arg_text(pf_arg, &expanded_params);
+                let invoke_arg = invoke_arg_text(pf_arg, &expanded_args);
                 // Scribunto's `frame:getParent()` is the frame of the
                 // *calling template*, and modules read its args
                 // constantly (`Module:Infobox`, `Module:Check for
@@ -3045,13 +3054,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // breadth never grew, so the depth limit never fired:
                 // `{{Infobox person}}` alone fetched 337 templates in ten seconds
                 // and never finished.
-                let parent_args = {
-                    let raw =
-                        crate::pipeline::parser_functions::Params::new(frame.args().args.clone());
-                    self.expand_invoke_args(&raw, frame, source, about_counter, body, src_text)
-                        .await
-                        .args
-                };
+                // The parent's argument list has no `#invoke:` target, so every
+                // entry is an argument — including the first. Skipping one here (as
+                // the call above does for its target) silently left the calling
+                // template's *first* argument unexpanded, so a module read its
+                // `{{{…}}}` verbatim: `{{see Wiktionary|…}}` hands its text to
+                // `Module:Hatnote` through exactly that position.
+                let parent_args = self
+                    .expand_invoke_args(
+                        &frame.args().args.clone(),
+                        frame,
+                        source,
+                        about_counter,
+                        body,
+                        src_text,
+                    )
+                    .await;
                 let expanded = self
                     .expand_invoke(
                         source,
@@ -3844,7 +3862,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         encap.encap_tokens(expanded, &info)
     }
 
-    /// Expand the argument values of a `#invoke` call, leaving the target alone.
+    /// Expand a list of `#invoke` arguments, in place.
     ///
     /// Scribunto receives expanded text, so a nested template or `#invoke` in an
     /// argument is substituted before the module runs. The tokenizer keeps such a
@@ -3852,21 +3870,26 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// to nothing useful — that is why the unexpanded form answered 17 where the
     /// service answers 3.
     ///
-    /// Only `args[1..]` are touched: `args[0]` is the `#invoke:` target and has
-    /// already been resolved.
+    /// The caller passes only the arguments to expand, so the two shapes that
+    /// need this cannot be confused: the `#invoke` call's own list starts at
+    /// `args[1]` because `args[0]` is the already-resolved target, while a
+    /// **parent** frame's list has no target and is passed whole. Skipping one
+    /// entry there silently left the calling template's *first* argument
+    /// unexpanded, so a module read its `{{{…}}}` verbatim — the shape
+    /// `{{see Wiktionary|…}}` hands to `Module:Hatnote` as `args[1]`.
     async fn expand_invoke_args(
         &self,
-        params: &crate::pipeline::parser_functions::Params,
+        args: &[crate::wikitext::tokens_v2::KV],
         frame: &Frame,
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         body: bool,
         src_text: &str,
-    ) -> crate::pipeline::parser_functions::Params {
+    ) -> Vec<crate::wikitext::tokens_v2::KV> {
         use crate::wikitext::tokens_v2::KeyValue;
 
-        let mut out = params.clone();
-        for kv in out.args.iter_mut().skip(1) {
+        let mut out = args.to_vec();
+        for kv in out.iter_mut() {
             let KeyValue::Tokens(items) = &kv.value else {
                 continue;
             };
@@ -4082,9 +4105,9 @@ fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 /// `<div>` in one is a real tag token, and `item_to_string` would drop it. The
 /// expansion below therefore happens on the tokens and the result is rendered
 /// through [`expanded_arg_text`], which keeps tags.
-fn invoke_arg_text(pf_arg: &str, params: &crate::pipeline::parser_functions::Params) -> String {
+fn invoke_arg_text(pf_arg: &str, args: &[crate::wikitext::tokens_v2::KV]) -> String {
     let mut parts = vec![pf_arg.trim().to_string()];
-    parts.extend(params.args.iter().skip(1).filter_map(expanded_arg_text));
+    parts.extend(args.iter().filter_map(expanded_arg_text));
     parts.join("|")
 }
 
@@ -4236,7 +4259,7 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
     let mut out = Vec::new();
     for kv in args {
         let key = key_value_to_string(&kv.key);
-        let value = kv_value_source(kv);
+        let value = expanded_argument_text(kv);
         let trimmed = key.trim();
         match (trimmed.parse::<usize>(), trimmed.is_empty()) {
             (Ok(_), false) => out.push(Arg::Positional(value)),
@@ -4245,6 +4268,29 @@ fn frame_args_to_lua(args: &[crate::wikitext::tokens_v2::KV]) -> Vec<crate::lua:
         }
     }
     out
+}
+
+/// A parent-frame argument's text, as Scribunto hands it to the module.
+///
+/// The **tokens** are the answer when they are all plain text, because they are
+/// the *expanded* value while the recorded source range still holds the wikitext
+/// as written — `{{{1|}}}` included — and so is stale. Reading the range gave
+/// `Module:SDcat` the literal `{{{1|}}}` where the service gave the short
+/// description, and made it report "is different from Wikidata" for a page whose
+/// description matches.
+///
+/// Anything else keeps to the source range, because `tokensToString` has no arm
+/// for the tokens such a value holds (a wikilink, a tag, a parser-function token)
+/// and would drop them. Rendering those faithfully is a separate job — recorded
+/// in ONLINE-PARITY.md, together with why the range is the lesser evil meanwhile.
+fn expanded_argument_text(kv: &crate::wikitext::tokens_v2::KV) -> String {
+    use crate::wikitext::tokens_v2::KeyValue;
+    match &kv.value {
+        KeyValue::Tokens(items) if items.iter().all(|it| matches!(it, Item::Str(_))) => {
+            crate::wikitext::token_utils::tokens_to_string(items)
+        }
+        _ => kv_value_source(kv),
+    }
 }
 
 /// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`
