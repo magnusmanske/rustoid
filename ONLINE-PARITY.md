@@ -6457,3 +6457,36 @@ almost all of it is `List of sovereign states` (718 370 → 692 977): the absorb
 ranges' eager wrapper spans are gone. That is a *structural* drop, not lost
 content — a text-only comparison of the two renderings (tags stripped, entities
 decoded) has the new one 326 bytes **larger**, not smaller.
+
+## The id order: `Bicycle`'s `<sup>` is not the eager-args case
+The follow-up on the todo list was the lazy `frame.args`. `Bicycle` is the page
+that motivated it: its infobox reference renders `about="#mwt11"` in Parsoid and
+`about="#mwt199"` in rustoid. The two id sequences, in document order of first
+appearance, agree exactly up to the ninth:
+
+```
+parsoid  #mwt1 #mwt2 #mwt3 #mwt4 #mwt5 #mwt6 #mwt8 #mwt9 #mwt10 #mwt11 …
+rustoid  #mwt1 #mwt2 #mwt3 #mwt4 #mwt5 #mwt6 #mwt8 #mwt9 #mwt10 #mwt199 …
+```
+
+So the *order* is right; the *counter* has run 188 ids further ahead by the time
+the `<sup>` is numbered. The obvious suspect is the eager `#invoke` argument
+expansion that explains `Quicksilver` above, so it was measured rather than
+assumed: forcing `expand_invoke_args` to a no-op moves the `<sup>` from
+`#mwt199` to **`#mwt204`** — five ids, in the *wrong* direction. The eager
+argument expansion is **not** what costs the 188 here. (`Quicksilver`'s nine
+`Plainlist` styles are a real instance of it; `Bicycle` is not.)
+
+The 188 ids belong to infobox rows that appear *after* the caption in the
+document, numbered before the caption's `<ref>`. That is an allocation *phase*
+difference, not an ordering one: Parsoid numbers the `<ref>`'s output when the
+caption argument is expanded, while rustoid numbers it in the later Cite pass,
+by which time `Module:Infobox` has already run and spent the rows' ids. The fix
+belongs where extension output gets its `about`, not in `frame.args` — which is
+also why the earlier section's remedy, recorded against `Quicksilver`, is not the
+one `Bicycle` needs.
+
+This is left recorded rather than started: it is a change to *when* an extension
+node is numbered, it touches every extension on every page, and doing it blind —
+against a diagnosis the measurement just contradicted — is how the last three
+"fidelity bugs" got shipped behind a green fixture guard.
