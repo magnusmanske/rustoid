@@ -4336,7 +4336,17 @@ fn expanded_arg_pair(kv: &crate::wikitext::tokens_v2::KV) -> (Option<String>, St
     if name.is_empty() {
         (None, value)
     } else {
-        (Some(name.to_string()), value)
+        // A named argument's value is trimmed before the module sees it, the
+        // same rule [`frame_args_to_lua`] already applies to the parent frame's
+        // arguments and MediaWiki's preprocessor applies to both. The `#invoke`
+        // call's own arguments went through untrimmed, which is visible in
+        // `Template:Infobox OS`: its `{{#invoke:Unsubst||$B=\n{{Main other|…}}}}`
+        // carries a leading newline in `$B`, and left in place it survives into
+        // the module's return value and renders as a stray
+        // `<span about=…> </span>` the service does not have.
+        //
+        // [`frame_args_to_lua`]: frame_args_to_lua
+        (Some(name.to_string()), value.trim().to_string())
     }
 }
 

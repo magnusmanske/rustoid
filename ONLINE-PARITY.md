@@ -5970,3 +5970,42 @@ Nobel Prize   600 -> 1112
 fixture guard 876/896
 subset total  4 006 648 -> 4 006 649
 ```
+
+## The `#invoke` call's own arguments were not trimmed
+
+`Unix`'s first difference was a stray `<span about="#mwt5"> </span>` where the
+service has nothing. It reduces to `{{Infobox OS}}` alone, and the template
+opens with
+
+```
+{{ {{{|safesubst:}}}#invoke:Unsubst||date=__DATE__|$B=
+{{Main other|…}}
+```
+
+— a `$B` whose value begins with a newline. `Module:Unsubst` returns
+`frame.args['$B']`, so the newline survives into the module's output and rustoid
+rendered it as a whitespace span carrying the transclusion's `about`.
+
+The trim already existed, but only on one of the two argument paths:
+`frame_args_to_lua` trims a **parent frame's** named values (the `a46b172` fix
+for `Module:Autotaxobox`), while `expanded_arg_pair` — the `#invoke` call's
+*own* arguments — passed the value through raw. Both now trim, which the
+oracle confirms is the rule: `{{#invoke:String|len|  ab  }}` answers `6`
+(positional, untrimmed) and `{{#invoke:String|len|1=  ab  }}` answers `2`
+(named, trimmed).
+
+The size effect was large and one-sided: `Bicycle` fell 618 KB -> 469 KB
+because most templates on the page carry the same `$B=\n…` shape, and the
+untrimmed newline had been making rustoid emit a *second*, raw-wikitext copy of
+whole paragraphs (`{{sfn|Wilson|1973|p=82}} They are also used professionally
+by …`) that the rendered copy already covered. The first difference moved
+backwards only because the media gap sits before the affected region.
+
+### Scoreboard
+
+```
+Unix              1736 -> 4772
+fixture guard     876/896
+subset total      4 006 649 -> 3 839 039   (the drop is removed duplicated
+                                            raw wikitext, not content)
+```
