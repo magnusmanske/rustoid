@@ -6045,10 +6045,30 @@ produces `"attrs":{"name":" "}` and an `extsrc` that still spells
 `{{{image|{{{imagename|{{{1|}}}}}}}}}`; the service has `name:"featured-star"`
 and the fully substituted file spec. The name expression contains `{{{id|}}}`,
 so the failure is generic: **`{{{…}}}` inside a `#tag` argument is not
-substituted** (it is inside the value's nested tokens, which
-`attribute_transform_manager` does not descend into, and `pf_tag` runs before the
-`produced` tokens are re-expanded). Zebra's `name:" "` is the same defect, and
-`Megadeth` only moved once its link-existence facts were cached.
+substituted**. Zebra's `name:" "` is the same defect, and `Megadeth` only
+moved once its link-existence facts were cached.
+
+The reduce pins the two halves exactly. A page-level
+`{{#tag:indicator|[[File:{{{1|X.svg}}}|20px]]|name={{{2|foo}}}}}` comes out with
+`name:"foo"` (a *plain* named value is substituted by
+`attribute_transform_manager`) but `extsrc:"[[File:{{{1|X.svg}}}|20px]]"`: the
+positional content is a `wikilink`, and its target is a token list the
+transform manager does not descend into — the same shape the `#invoke` argument
+path already had to fix. And `{{#tag:indicator|…|name={{#if:…}}}}` shows the
+other half: a *nested template* in a `#tag` argument is not expanded before
+`pf_tag` runs, because only `attribs[0]` (the target) goes through
+`expand_target_templates` and the rest are handed straight to the tag.
+
+An attempt to fix it by running `#tag`'s arguments through
+`expand_invoke_args` before `TemplateHandler::process` is **not** in the tree:
+it left the wikilink body unexpanded anyway (the argument-reference half of
+`frame.expand` does not reach a link target), and it *lost* content — the subset
+fell 3.80 MB -> 3.23 MB because `#tag` also carries bodies (`ref`, `nowiki`,
+`pre`) whose arguments must not be pre-expanded the way a template's are. The
+right shape is smaller and more careful than that: it has to tell the body
+argument of a *raw-content* tag from one that is wikitext, which needs the
+extension's `hasWikitextInput` flag to reach `pf_tag`. Recorded, not retried
+blind.
 
 ### Lazy `frame.args` (above) and the file-info cache
 
