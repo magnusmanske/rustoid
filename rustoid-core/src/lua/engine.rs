@@ -726,6 +726,13 @@ fn entity_table(lua: &Lua, ctx: &LuaContext) -> Result<Table> {
         .map_err(lua_err)?;
     out.set("current", ctx.entities.current().map(str::to_string))
         .map_err(lua_err)?;
+    // `wfEscapeWikiText`, for `mw.wikibase.renderSnak`'s plain-text escaping.
+    out.set(
+        "escape",
+        lua.create_function(|_, s: String| Ok(crate::sanitizer::escape_wikitext_text(&s)))
+            .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
     Ok(out)
 }
 
@@ -1016,6 +1023,65 @@ return function(args)
     -- The wiki the entities come from. `getGlobalSiteId` is the *client* wiki's
     -- language, which is `enwiki` on the wiki under test.
     function wb.getGlobalSiteId() return 'enwiki' end
+
+    -- `renderSnak` / `renderSnaks` / `formatValue` / `formatValues`, ported from
+    -- `SnakSerializationRenderer` over `DataAccessSnakFormatterFactory`.
+    --
+    -- `renderSnak` is TYPE_ESCAPED_PLAINTEXT: the value is formatted plain and
+    -- then escaped with `wfEscapeWikiText`, except a `url`, which is returned
+    -- unescaped (the dispatcher's whole point). `formatValue` is
+    -- TYPE_RICH_WIKITEXT: the same value wrapped in a `<span>`.
+    --
+    -- Only the datatypes the corpus actually reaches are formatted: `string`,
+    -- `external-id`, `commonsMedia` and `url` are their own value, and
+    -- `monolingualtext` its `text`. A datatype whose plain form is a computed
+    -- rendering (`time`, `quantity`, `globecoordinate`, `wikibase-item`'s label)
+    -- returns its raw value rather than a wrong one; that is a recorded gap, not
+    -- an accident, and it does not arise on a cached page yet.
+    local function plainValue(snak)
+        if snak == nil or snak.snaktype ~= 'value' then return '' end
+        local dv = snak.datavalue
+        if dv == nil then return '' end
+        local v = dv.value
+        if type(v) == 'table' then
+            if v.text ~= nil then return v.text end
+            return ''
+        end
+        if v == nil then return '' end
+        return tostring(v)
+    end
+
+    local function snakPlain(snak)
+        local s = plainValue(snak)
+        if snak ~= nil and snak.datatype == 'url' then return s end
+        return args.escape(s)
+    end
+
+    local function snakRich(snak)
+        local s = args.escape(plainValue(snak))
+        if s == '' then return '' end
+        return '<span>' .. s .. '</span>'
+    end
+
+    function wb.renderSnak(snak) return snakPlain(snak) end
+    function wb.formatValue(snak) return snakRich(snak) end
+
+    -- A list is comma-joined with the wiki's comma separator; the rich variant
+    -- wraps the whole list in one outer `<span>` (not one per value).
+    local function snakList(snaks, rich)
+        if type(snaks) ~= 'table' then return '' end
+        local parts = {}
+        for _, s in ipairs(snaks) do
+            local formatted = rich and args.escape(plainValue(s)) or snakPlain(s)
+            if formatted ~= '' then parts[#parts + 1] = formatted end
+        end
+        local list = table.concat(parts, ', ')
+        if list == '' or not rich then return list end
+        return '<span>' .. list .. '</span>'
+    end
+
+    function wb.renderSnaks(snaks) return snakList(snaks, false) end
+    function wb.formatValues(snaks) return snakList(snaks, true) end
 
     return wb
 end
@@ -2889,71 +2955,122 @@ local html = {}
 local Node = {}
 Node.__index = Node
 
-local function new_node(tag)
-    return setmetatable({ _tag = tag, _attrs = {}, _order = {}, _children = {} }, Node)
+-- Tags Scribunto renders as `<br />` rather than `<br></br>`.
+local selfClosingTags = {
+    area = true, base = true, br = true, col = true, command = true, embed = true,
+    hr = true, img = true, input = true, keygen = true, link = true, meta = true,
+    param = true, source = true, track = true, wbr = true,
+}
+
+local htmlEncodeMap = { ['>'] = '&gt;', ['<'] = '&lt;', ['&'] = '&amp;', ['"'] = '&quot;' }
+
+-- Attribute values are HTML-encoded at build time (`_build`), as Scribunto does.
+local function htmlEncode(s)
+    return (string.gsub(tostring(s), '[<>&"]', htmlEncodeMap))
+end
+
+-- `mw.html`'s `cssEncode`: escape every character outside `[32-57]`/`[60-127]`
+-- as `\XX ` (upper-case hex). Characters 58 (`:`) and 59 (`;`) are therefore
+-- escaped, so a *value* cannot break out into a new declaration. Pure-ASCII input
+-- uses `string.gsub`, the Unicode path only when it must.
+local function cssEncode(s)
+    s = tostring(s)
+    local g = string.find(s, '[^%z\1-\127]') and mw.ustring.gsub or string.gsub
+    return (g(s, '[^\32-\57\60-\127]', function(m)
+        return string.format('\\%X ', mw.ustring.codepoint(m))
+    end))
+end
+
+local function isValidAttributeName(s)
+    return type(s) == 'string' and s:match('^[a-zA-Z_:][a-zA-Z0-9_.:-]*$') ~= nil
+end
+
+-- Attributes are an ordered list of `{ name =, val = }`, and CSS declarations a
+-- separate list, because `mw.html` serializes the two differently: an attribute
+-- is ` name="value"`, a declaration is `name:value` joined by `;` with no spaces.
+-- Merging the two into one `style` string (as this used to) put a space after
+-- every colon and a `;` after the last declaration, so every navbox and infobox
+-- built with `:css` differed from the served bytes by that spacing.
+local function new_node(tag, self_closing)
+    return setmetatable({
+        _tag = tag,
+        _attributes = {},
+        _styles = {},
+        _children = {},
+        _selfClosing = selfClosingTags[tag] or self_closing or false,
+    }, Node)
+end
+
+local function getAttr(t, name)
+    for i, attr in ipairs(t._attributes) do
+        if attr.name == name then return attr, i end
+    end
 end
 
 function Node:attr(key, value)
-    -- The table form is documented — `html:attr{ id = 'x', class = 'y' }` — and
-    -- a module passing one had its table grown as the *key*, which then reached
-    -- `_render` and raised "attempt to concatenate a table value (local 'key')".
+    -- The table form is documented — `html:attr{ id = 'x', class = 'y' }`.
     -- `pairs` is order-unspecified, as Scribunto's is.
     if type(key) == 'table' then
         for k, v in pairs(key) do self:attr(k, v) end
         return self
     end
     if key == nil then return self end
-    -- A nil value *unsets* the attribute, which is the documented behaviour.
-    -- Removing it from `_order` as well is what makes the unset take effect:
-    -- `_render` walks `_order` and would otherwise emit the stale key with
-    -- `tostring(nil)` for a value.
-    if value == nil then
-        self._attrs[key] = nil
-        for i, k in ipairs(self._order) do
-            if k == key then
-                table.remove(self._order, i)
-                break
-            end
-        end
+    -- Setting the `style` attribute replaces everything added with `css()` and
+    -- `cssText()`, which is Scribunto's documented behaviour (`attr('style',
+    -- val)` resets the declaration list to the one raw string).
+    if key == 'style' then
+        self._styles = { value }
         return self
     end
-    if self._attrs[key] == nil then table.insert(self._order, key) end
-    self._attrs[key] = value
+    if not isValidAttributeName(key) then
+        error(string.format("bad argument #1 to 'attr' (invalid attribute name '%s')", tostring(key)), 2)
+    end
+    local attr, i = getAttr(self, key)
+    if attr then
+        if value ~= nil then attr.val = value else table.remove(self._attributes, i) end
+    elseif value ~= nil then
+        table.insert(self._attributes, { name = key, val = value })
+    end
     return self
 end
 
-function Node:addClass(...)
-    local list = {}
-    if self._attrs['class'] then table.insert(list, self._attrs['class']) end
-    for _, class in ipairs({ ... }) do
-        if class ~= nil then table.insert(list, tostring(class)) end
-    end
-    -- Scribunto's `addClass(nil)` is a no-op; only a class actually added (or
-    -- already present) sets the attribute. Setting `class=""` is not the same
-    -- as omitting it, and a module that passes an absent parameter passes nil.
-    if #list == 0 then return self end
-    return self:attr('class', table.concat(list, ' '))
+function Node:getAttr(name)
+    local attr = getAttr(self, name)
+    return attr and attr.val
 end
 
-local function add_style(self, name, value)
-    local existing = self._attrs['style']
-    local prefix = existing and (existing .. ' ') or ''
-    return self:attr('style', prefix .. tostring(name) .. ': ' .. tostring(value) .. ';')
+function Node:addClass(class)
+    if class ~= nil then
+        local attr = getAttr(self, 'class')
+        if attr then
+            attr.val = tostring(attr.val) .. ' ' .. tostring(class)
+        else
+            self:attr('class', class)
+        end
+    end
+    return self
 end
 
 function Node:css(name, value)
     if type(name) == 'table' then
-        for key, val in pairs(name) do add_style(self, key, val) end
+        for key, val in pairs(name) do self:css(key, val) end
         return self
     end
-    return add_style(self, name, value)
+    -- A declaration with the same property replaces the previous one.
+    for i, prop in ipairs(self._styles) do
+        if type(prop) == 'table' and prop.name == name then
+            if value ~= nil then prop.val = value else table.remove(self._styles, i) end
+            return self
+        end
+    end
+    if value ~= nil then table.insert(self._styles, { name = name, val = value }) end
+    return self
 end
 
 function Node:cssText(text)
     if text == nil then return self end
-    local existing = self._attrs['style']
-    local prefix = existing and (existing .. ' ') or ''
-    return self:attr('style', prefix .. tostring(text))
+    table.insert(self._styles, tostring(text))
+    return self
 end
 
 function Node:tag(tag)
@@ -2988,8 +3105,28 @@ function Node:_render()
     local out = {}
     if self._tag ~= nil then
         table.insert(out, '<' .. self._tag)
-        for _, key in ipairs(self._order) do
-            table.insert(out, ' ' .. key .. '="' .. tostring(self._attrs[key]) .. '"')
+        for _, attr in ipairs(self._attributes) do
+            table.insert(out, ' ' .. attr.name .. '="' .. htmlEncode(attr.val) .. '"')
+        end
+        -- The style attribute is built last, from the declaration list: each
+        -- declaration is `name:value`, joined by `;`, with no space after the
+        -- colon and no trailing semicolon.
+        if #self._styles > 0 then
+            table.insert(out, ' style="')
+            local css = {}
+            for _, prop in ipairs(self._styles) do
+                if type(prop) ~= 'table' then -- added with cssText()
+                    table.insert(css, htmlEncode(prop))
+                else -- added with css()
+                    table.insert(css, htmlEncode(cssEncode(prop.name) .. ':' .. cssEncode(prop.val)))
+                end
+            end
+            table.insert(out, table.concat(css, ';'))
+            table.insert(out, '"')
+        end
+        if self._selfClosing then
+            table.insert(out, ' />')
+            return table.concat(out)
         end
         table.insert(out, '>')
     end
@@ -3020,7 +3157,9 @@ Node.__tostring = function(self) return self:_render() end
 
 function html.create(tag)
     -- The table form is accepted too: `mw.html.create{ 'div', selfClosing = true }`.
-    if type(tag) == 'table' then tag = tag[1] end
+    if type(tag) == 'table' then
+        return new_node(tag[1], tag.selfClosing)
+    end
     return new_node(tag)
 end
 
@@ -6463,6 +6602,47 @@ mod tests {
         );
     }
 
+    /// `mw.wikibase.renderSnak` formats a snak's value and escapes it with
+    /// `wfEscapeWikiText` (`SnakSerializationRenderer` over
+    /// `DataAccessSnakFormatterFactory` TYPE_ESCAPED_PLAINTEXT), except a `url`,
+    /// which is returned unescaped. Before this existed the method was nil, so
+    /// `Module:Authority control` stopped with "attempt to call field 'renderSnak'
+    /// (a nil value)" and its whole navbox was lost on every page that has one.
+    #[test]
+    fn test_mw_wikibase_render_snak() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "return mw.wikibase.renderSnak{ snaktype='value', datatype='string', \
+                     datavalue={ value='a & b', type='string' } }"
+                )
+                .unwrap(),
+            "a &#38; b"
+        );
+        // A `url` is dispatched to the non-escaping formatter.
+        assert_eq!(
+            engine
+                .eval(
+                    "return mw.wikibase.renderSnak{ snaktype='value', datatype='url', \
+                     datavalue={ value='http://x', type='string' } }"
+                )
+                .unwrap(),
+            "http://x"
+        );
+        // A list is comma-joined, and the rich variant wraps the whole list once.
+        assert_eq!(
+            engine
+                .eval(
+                    "return mw.wikibase.renderSnaks{ \
+                     { snaktype='value', datatype='string', datavalue={ value='x' } }, \
+                     { snaktype='value', datatype='string', datavalue={ value='y' } } }"
+                )
+                .unwrap(),
+            "x, y"
+        );
+    }
+
     #[test]
     fn test_mw_uri_encode() {
         let engine = make_engine();
@@ -7463,6 +7643,36 @@ mod tests {
         assert_eq!(
             engine.execute(src, "main", &[]).unwrap(),
             r#"<div id="x" data-a="1"></div>"#
+        );
+    }
+
+    /// `mw.html:css` keeps declarations in a list and serializes them
+    /// `name:value` joined by `;` — no space after the colon, no trailing `;` —
+    /// so a navbox built with `:css('width', '1%')` matches the served
+    /// `style="width:1%"`. Merging them into the `style` attribute string (as
+    /// this used to) put a space and a trailing semicolon after every one.
+    #[test]
+    fn test_mw_html_css_serialization() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main(frame)
+                local d = mw.html.create('div')
+                d:css('width', '1%')
+                d:css('line-height', '1.2em')
+                -- A repeated property replaces the earlier one.
+                d:css('width', '2%')
+                -- Setting the style attribute resets the declaration list.
+                local e = mw.html.create('div'):css('color', 'red')
+                e:attr('style', 'margin:0')
+                local br = mw.html.create('br')
+                return tostring(d) .. '|' .. tostring(e) .. '|' .. tostring(br)
+            end
+            return p
+        "#;
+        assert_eq!(
+            engine.execute(src, "main", &[]).unwrap(),
+            r#"<div style="width:2%;line-height:1.2em"></div>|<div style="margin:0"></div>|<br />"#
         );
     }
 

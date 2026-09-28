@@ -6642,3 +6642,74 @@ Six unit tests cover `FactDrift::detect` (newer/within-tolerance/older, newest
 wins, missing `fetched_at`, missing oracle time) and one covers the scoreboard
 section; the display format is asserted so the report cannot silently change
 shape.
+
+## Two Lua fidelity bugs behind one navbox
+The `mw.wikibase.renderSnak` gap had been on the list for sessions as "not on the
+critical path". It is on the path to *reading* the pages, though: it made
+`Module:Authority control` stop with `attempt to call field 'renderSnak' (a nil
+value)` on **6 of the 9 subset pages**, so their whole authority-control navbox
+was replaced by a `Script error`. Both bugs below are in the Lua engine, and both
+were found by opening the served bytes rather than trusting a summary.
+
+### `mw.html`: styles are a separate list, not a `style` string
+Rustoid's `mw.html` merged `:css()` declarations into the `style` attribute as
+`name: value;`. Scribunto does not do that. It keeps declarations in their own
+list and serializes them at build time as `name:value` joined by `;` — no space
+after the colon, no trailing semicolon:
+
+```lua
+-- mw.html.lua, methodtable._build
+if #t.styles > 0 then
+    table.insert( ret, ' style="' )
+    ... table.insert( css, prop.name .. ':' .. prop.val ) ...
+    table.insert( ret, table.concat( css, ';' ) )
+```
+
+So a navbox group cell built with `:css('width', '1%')` is served as
+`style="width:1%"`, and rustoid emitted `style="width: 1%;"`. The same applies
+to several details the split makes possible and the merged string could not:
+`attr('style', v)` **replaces** everything `:css`/`:cssText` added, a repeated
+property replaces the earlier one, and `cssText` adds a raw declaration. Scalar
+characters 58 (`:`) and 59 (`;`) are escaped inside a declaration by
+`cssEncode`, which the merged form never did. Self-closing tags (`<br />`) were
+also rendered as `<br></br>`.
+
+The port now mirrors `mw.html.lua`'s structure: an ordered `{name=,val=}`
+attribute list, a separate declaration list, and `htmlEncode`/`cssEncode` at
+build. `addClass` is **one** argument, as Scribunto's is (`addClass('a','b')
+ignores `b`); the invoke test that passed two is corrected. Effect on the
+subset: **+20 818 bytes** (3 818 259 -> 3 839 077), with every navbox/infobox
+`style` now byte-identical. It moves no *first* difference — the first
+difference on every subset page is above the first navbox — so the scoreboard
+still reads 0/9. That is the honest measure, not a lack of change.
+
+### `mw.wikibase.renderSnak`
+The method did not exist. The PHP chain is short and unambiguous:
+`WikibaseLibrary::renderSnak` -> `SnakSerializationRenderer::renderSnak` -> the
+`DataAccessSnakFormatterFactory` formatter with
+`TYPE_ESCAPED_PLAINTEXT`. That type is a `BinaryOptionDispatchingSnakFormatter`
+whose whole point is one exception: a `url` snak is formatted plain and returned
+**unescaped**, everything else is run through
+`SnakFormatter::FORMAT_PLAIN` and then `wfEscapeWikiText`.
+
+`wfEscapeWikiText` lives in `GlobalFunctions.php` (mediawiki/core) — it is *not*
+`Sanitizer::escapeWikitext`, which no longer exists; and it is a different
+function from Parsoid's html->wt serializer escaper. It is a replacement table
+(`&`->`&#38;`, `[`->`&#91;`, `://`->`&#58;//`, …) plus first/last-character
+protection (a leading `+`/`-`/`_`/`~`, a trailing `_`/`~`/newline) plus
+`\b(protocol):` for the colon-suffixed `$wgUrlProtocols`. It is ported as
+`sanitizer::escape_wikitext_text`, with its own tests.
+
+In the cached corpus `renderSnak` is only ever reached with **`string`**
+snaks — `P1810` qualifiers, 984 of them, and nothing else — so the formatter
+handles `string`/`external-id`/`commonsMedia`/`url`/`monolingualtext` exactly and
+returns a datatype whose plain form is computed (`time`, `quantity`, …) as its
+raw value rather than a *wrong* one. `renderSnaks`, `formatValue` and
+`formatValues` are implemented too, from the same shape.
+
+**Effect.** The `Script error` is gone and the authority-control navbox renders:
+`Nobel Prize` now has the same `1` `GND` link and the same `156` `navbox`
+occurrences as the service. Its first difference stays at 1112, but the cause
+changed — it is now the **protection expiry**, which rustoid leaves empty where
+the service has `semi-protected until November 28, 2026 at 18:01 UTC`. That is
+the next thread.

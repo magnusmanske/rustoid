@@ -131,6 +131,172 @@ fn is_idn_ignored(c: char) -> bool {
     IDN_RE.contains(&c) || (0xE0020..=0xE0FFF).contains(&cp) || (0xE0002..=0xE001F).contains(&cp)
 }
 
+/// MediaWiki's `wfEscapeWikiText` (`GlobalFunctions.php`): make text safe to
+/// splice into wikitext, so its characters do not form links, tables, headings,
+/// magic words, signatures or protocol autolinks.
+///
+/// This is the escaper Wikibase's *client-side* snak formatters use —
+/// `mw.wikibase.renderSnak` wraps a value with it. It is a different function
+/// from Parsoid's html→wikitext serializer escaper
+/// (`html::wikitext_escape_handlers`), even though both escape for wikitext: this
+/// one is called on a *value*, not on DOM text, and it protects against a value
+/// starting or ending a token (`__FOO__`, `~~~~`, a protocol).
+///
+/// The magic-link rows of PHP's table are absent because `$wgEnableMagicLinks` is
+/// off by default (and on the wiki under test), and the protocol list is
+/// MediaWiki's default `$wgUrlProtocols`.
+pub fn escape_wikitext_text(input: &str) -> String {
+    // Longest key first at each position, as PHP's `strtr` with an array does.
+    const REPL: &[(&str, &str)] = &[
+        ("\"", "&#34;"),
+        ("&", "&#38;"),
+        ("'", "&#39;"),
+        ("<", "&#60;"),
+        ("=", "&#61;"),
+        (">", "&#62;"),
+        ("[", "&#91;"),
+        ("]", "&#93;"),
+        ("{", "&#123;"),
+        ("|", "&#124;"),
+        ("}", "&#125;"),
+        (";", "&#59;"),
+        ("!!", "&#33;!"),
+        ("\n!", "\n&#33;"),
+        ("\r!", "\r&#33;"),
+        ("\n#", "\n&#35;"),
+        ("\r#", "\r&#35;"),
+        ("\n*", "\n&#42;"),
+        ("\r*", "\r&#42;"),
+        ("\n:", "\n&#58;"),
+        ("\r:", "\r&#58;"),
+        ("\n ", "\n&#32;"),
+        ("\r ", "\r&#32;"),
+        ("\n\n", "\n&#10;"),
+        ("\r\n", "&#13;\n"),
+        ("\n\r", "\n&#13;"),
+        ("\r\r", "\r&#13;"),
+        ("\n\t", "\n&#9;"),
+        ("\r\t", "\r&#9;"),
+        ("\n----", "\n&#45;---"),
+        ("\r----", "\r&#45;---"),
+        ("__", "_&#95;"),
+        ("://", "&#58;//"),
+        ("\u{FF3F}", "&#xFF3F;"),
+        ("~~~", "~~&#126;"),
+    ];
+    // Characters that could merge with following text into `|+`, `-{`, `__FOO__`
+    // or `~~~` when the value is spliced in.
+    const FIRST: &[(&str, &str)] = &[
+        ("+", "&#43;"),
+        ("-", "&#45;"),
+        ("_", "&#95;"),
+        ("~", "&#126;"),
+    ];
+    // The mirror of `FIRST` at the other end.
+    const LAST: &[(&str, &str)] = &[
+        ("_", "&#95;"),
+        ("~", "&#126;"),
+        ("\n", "&#10;"),
+        ("\r", "&#13;"),
+        ("\t", "&#9;"),
+    ];
+    // The colon-suffixed protocols from MediaWiki's default `$wgUrlProtocols`;
+    // `\\\\b(proto):` becomes `$1&#58;`.
+    const PROTOCOLS: &[&str] = &[
+        "bitcoin", "geo", "magnet", "mailto", "news", "sip", "sips", "sms", "tel", "urn", "xmpp",
+    ];
+
+    // The prepended newline lets a `\n…` key match at the very start; PHP drops it
+    // again with `substr(strtr("\n$input", $repl), 1)`.
+    let mut text = strtr(&format!("\n{input}"), REPL);
+    text.remove(0); // the prepended '\n' (one byte)
+    if text.is_empty() {
+        return text;
+    }
+
+    // Protect the first and last character.
+    let chars: Vec<char> = text.chars().collect();
+    text = if chars.len() == 1 {
+        strtr_char(chars[0], FIRST)
+    } else {
+        let first = strtr_char(chars[0], FIRST);
+        let last = strtr_char(chars[chars.len() - 1], LAST);
+        let middle: String = chars[1..chars.len() - 1].iter().collect();
+        format!("{first}{middle}{last}")
+    };
+
+    escape_protocols(&text, PROTOCOLS)
+}
+
+/// Replace every key of `table` in `input`, scanning left to right, longest key
+/// first at each position — the semantics of PHP's `strtr($s, $array)`. Output is
+/// not rescanned.
+fn strtr(input: &str, table: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let rest = &input[i..];
+        let best = table
+            .iter()
+            .filter(|(k, _)| rest.starts_with(*k))
+            .max_by_key(|(k, _)| k.len());
+        if let Some((k, v)) = best {
+            out.push_str(v);
+            i += k.len();
+            continue;
+        }
+        let c = rest.chars().next().expect("non-empty remainder");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// `strtr` for a single character against a table of one-char keys.
+fn strtr_char(c: char, table: &[(&str, &str)]) -> String {
+    table
+        .iter()
+        .find(|(k, _)| k.chars().eq(std::iter::once(c)))
+        .map(|(_, v)| (*v).to_string())
+        .unwrap_or_else(|| c.to_string())
+}
+
+/// Replace `\b(proto):` with `$1&#58;`, case-insensitively (PHP's `$repl2`).
+fn escape_protocols(input: &str, protocols: &[&str]) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        // `\b`: a word boundary before the protocol name.
+        let at_boundary = i == 0 || !is_word_byte(bytes[i - 1]);
+        let hit = if at_boundary {
+            protocols.iter().find(|p| {
+                rest.len() > p.len()
+                    && rest[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+                    && rest[p.len()] == b':'
+            })
+        } else {
+            None
+        };
+        if let Some(p) = hit {
+            out.push_str(&input[i..i + p.len()]);
+            out.push_str("&#58;");
+            i += p.len() + 1;
+            continue;
+        }
+        let c = input[i..].chars().next().expect("non-empty remainder");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// PHP's `\w` for a single ASCII byte (the protocol regex has no `/u`).
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// URL-encode characters not in the legacy parser's `EXT_LINK_URL_CLASS`
 /// (matching PHP's `encodeUrlForExtLink`). The pipe char is a special
 /// exception introduced in core commit 2519512.
@@ -1333,6 +1499,37 @@ mod tests {
 
     fn allow_all(_proto: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn escape_wikitext_text_matches_the_character_table() {
+        // Plain text is untouched.
+        assert_eq!(escape_wikitext_text("plain text"), "plain text");
+        assert_eq!(escape_wikitext_text(""), "");
+        // The characters that would start a link, table, template or heading.
+        assert_eq!(escape_wikitext_text("a & b"), "a &#38; b");
+        assert_eq!(escape_wikitext_text("a[1]"), "a&#91;1&#93;");
+        assert_eq!(escape_wikitext_text("{{x}}"), "&#123;&#123;x&#125;&#125;");
+        assert_eq!(escape_wikitext_text("a|b"), "a&#124;b");
+        // `://` becomes `&#58;//`, so a bare URL no longer autolinks.
+        assert_eq!(escape_wikitext_text("http://x"), "http&#58;//x");
+    }
+
+    #[test]
+    fn escape_wikitext_text_protects_the_first_and_last_character() {
+        // A leading `+`/`-`/`_`/`~` could merge with the following text into a
+        // token (`|+`, `-{`, `__FOO__`, `~~~`).
+        assert_eq!(escape_wikitext_text("+x"), "&#43;x");
+        assert_eq!(escape_wikitext_text("~x"), "&#126;x");
+        // A trailing `~` could start a signature from the other side.
+        assert_eq!(escape_wikitext_text("x~"), "x&#126;");
+    }
+
+    #[test]
+    fn escape_wikitext_text_escapes_colon_protocols_at_a_word_boundary() {
+        assert_eq!(escape_wikitext_text("tel:123"), "tel&#58;123");
+        // Not at a word boundary: left alone.
+        assert_eq!(escape_wikitext_text("notelephone:1"), "notelephone:1");
     }
 
     #[test]

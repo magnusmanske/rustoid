@@ -553,7 +553,9 @@ async fn mw_html_builds_and_accepts_a_tagless_builder() {
         local p = {}
         function p.main(frame)
             local tagless = mw.html.create():wikitext('bare'):done()
-            local div = mw.html.create('div'):addClass('a', 'b'):attr('id', 'x')
+            -- Scribunto's `addClass` takes one class; a second is added by calling
+            -- it again (`addClass('a','b')` ignores 'b' on the wiki).
+            local div = mw.html.create('div'):addClass('a'):addClass('b'):attr('id', 'x')
                 :wikitext('inner'):done()
             -- `allDone()` returns the root *node*, so it is rendered with
             -- `tostring` rather than concatenated directly.
