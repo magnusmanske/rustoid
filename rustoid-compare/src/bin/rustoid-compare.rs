@@ -96,6 +96,18 @@ struct Cli {
     #[arg(long)]
     reindex: bool,
 
+    /// Drop cached entries whose body file is shared by two different pages, then
+    /// exit. See [`WikiCache::drop_colliding_bodies`].
+    ///
+    /// A cache written before the filename scheme became injective can hold two
+    /// keys that fold to one file — a slash read as `_`, or two titles differing
+    /// only by case on a case-insensitive filesystem. Where the two name the same
+    /// page the shared body is still correct and is kept; where they carry
+    /// different revisions the body is one page's wikitext served for another, so
+    /// the entry is dropped and refilled on the next online run.
+    #[arg(long)]
+    repair_cache: bool,
+
     /// Delete every wiki's cache, then exit.
     #[arg(long)]
     flush_all: bool,
@@ -144,6 +156,16 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         let added = cache.reindex()?;
         println!(
             "reindexed {}: {added} bodies recovered, {} entries now",
+            cli.wiki,
+            cache.len()
+        );
+        return Ok(());
+    }
+
+    if cli.repair_cache {
+        let dropped = cache.drop_colliding_bodies()?;
+        println!(
+            "repaired {}: {dropped} colliding entries dropped, {} entries remain",
             cli.wiki,
             cache.len()
         );

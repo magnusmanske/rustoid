@@ -15,14 +15,16 @@
 //!     pages/<key>.txt     # wikitext bodies, one file per entry
 //! ```
 //!
-//! Keys are host-relative and sanitised, so a title like `Template:Foo/bar`
-//! cannot escape the cache directory. A `flush` removes a wiki's directory
-//! wholesale (or the whole root), which is what a `--refresh` run wants.
+//! Keys are host-relative and encoded *injectively* into filenames, so a title
+//! like `Template:Foo/bar` cannot escape the cache directory, and two distinct
+//! keys can never share one file — not even on a case-insensitive filesystem,
+//! where `Template:CS1 config` and `Template:Cs1 config` would otherwise collide.
+//! See `escape_body_stem`.
 //!
 //! Bodies are stored as separate files rather than one blob so that a large wiki
 //! cache stays inspectable, diffable, and cheap to append to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -245,14 +247,7 @@ impl WikiCache {
         let Some(meta) = entry else {
             return Ok(None);
         };
-        let canonical = self.body_path(&key);
-        let path = if canonical.exists() {
-            canonical
-        } else {
-            self.dir()
-                .join("pages")
-                .join(format!("{}.txt", Self::legacy_stem(&key)))
-        };
+        let path = self.locate_body(&key);
         let body = match std::fs::read_to_string(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -393,18 +388,36 @@ impl WikiCache {
         std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))
     }
 
-    /// Where a key's body lives.
-    ///
-    /// The stem is the key itself, with only `/`, `\` and NUL replaced. Colons
-    /// and spaces survive deliberately: `mod:Module:Foo` and `page:Module:Foo`
-    /// are different keys and must not collapse into one file, and keeping the
-    /// title readable is what makes a populated cache inspectable by hand. The
-    /// key is therefore recoverable from the filename, which
-    /// [`reindex`](Self::reindex) relies on.
+    /// Where a key's body lives under the current scheme
+    /// ([`escape_body_stem`]).
     fn body_path(&self, key: &str) -> PathBuf {
         self.dir()
             .join("pages")
-            .join(format!("{}.txt", sanitize_path_separators(key)))
+            .join(format!("{}.txt", escape_body_stem(key)))
+    }
+
+    /// Find a key's body file, whichever filename scheme wrote it.
+    ///
+    /// The current, injective scheme ([`escape_body_stem`]) is tried first. Two
+    /// older schemes are still read, because a corpus cache is hours of
+    /// rate-limited fetching and rewriting it just to move files is not worth it:
+    /// [`sanitize_path_separators`] (which collapsed `/` and `\` to `_`) and
+    /// [`legacy_stem`](Self::legacy_stem) (which escaped every `:` as `__`). A
+    /// body written by either is used as-is. When nothing is on disk the canonical
+    /// path is returned, so a read reports `NotFound` and the caller sees a miss.
+    fn locate_body(&self, key: &str) -> PathBuf {
+        let pages = self.dir().join("pages");
+        for stem in [
+            escape_body_stem(key),
+            sanitize_path_separators(key),
+            Self::legacy_stem(key),
+        ] {
+            let path = pages.join(format!("{stem}.txt"));
+            if path.exists() {
+                return path;
+            }
+        }
+        self.body_path(key)
     }
 
     /// The filename stem the older cache layout produced for a key.
@@ -525,6 +538,73 @@ impl WikiCache {
         self.write_index()?;
         Ok(added)
     }
+
+    /// Drop entries whose shared body file cannot be trusted.
+    ///
+    /// The older filename schemes were not injective: `/` and `\` both became `_`
+    /// ([`sanitize_path_separators`]), and a case-insensitive filesystem folds the
+    /// rest. Many keys that collide that way name the *same* page — a redirect
+    /// alias, or a title the API normalised — so one body genuinely serves both and
+    /// those entries are kept. But when the colliding keys carry *different*
+    /// revisions they are different pages, and the file holds only whichever was
+    /// written last: one page's wikitext is silently served for another. Nothing on
+    /// disk records which, so the only correct recovery is to forget them all and
+    /// let a later fetch refill them.
+    ///
+    /// Returns the number of entries dropped. This is a repair for a cache written
+    /// before [`escape_body_stem`], so it is a separate, explicit action rather
+    /// than something [`get`](Self::get) does on the fly.
+    pub fn drop_colliding_bodies(&mut self) -> Result<usize> {
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for key in self.index.entries.keys() {
+            groups
+                .entry(sanitize_path_separators(key).to_lowercase())
+                .or_default()
+                .push(key.clone());
+        }
+
+        let mut dropped = 0;
+        for keys in groups.values() {
+            if keys.len() < 2 {
+                continue;
+            }
+            // A group whose members already have a file under the current scheme is
+            // already separated by it, so any sharing the old scheme had is moot.
+            // Guarding on *any* member keeps the repair conservative: it never
+            // touches a cache a fetch has already refilled.
+            if keys.iter().any(|k| self.body_path(k).exists()) {
+                continue;
+            }
+            let revisions: HashSet<u64> = keys
+                .iter()
+                .filter_map(|k| self.index.entries.get(k).and_then(|m| m.revid))
+                .collect();
+            if revisions.len() < 2 {
+                continue;
+            }
+            for key in keys {
+                for stem in [
+                    escape_body_stem(key),
+                    sanitize_path_separators(key),
+                    Self::legacy_stem(key),
+                ] {
+                    let path = self.dir().join("pages").join(format!("{stem}.txt"));
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io_err(&path, e)),
+                    }
+                }
+                self.index.entries.remove(key);
+                self.removed.insert(key.clone());
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            self.write_index()?;
+        }
+        Ok(dropped)
+    }
 }
 
 /// A cached body plus its metadata.
@@ -570,12 +650,124 @@ fn sanitize_component(s: &str) -> String {
     }
 }
 
+/// Encode a cache key into a filename stem, injectively.
+///
+/// The key is what makes a cache inspectable, so only the bytes that would
+/// otherwise lose information are escaped:
+///
+/// - `/`, `\` and NUL cannot appear in a filename at all, and a scheme that
+///   merely replaced them with `_` made `Module:Citation/CS1` and
+///   `Module:Citation_CS1` the same file;
+/// - ASCII uppercase, which a case-insensitive filesystem (macOS by default)
+///   folds together with its lowercase form, so `Template:CS1 config` and
+///   `Template:Cs1 config` — two different pages — shared one file;
+/// - every non-ASCII byte, for the same folding reason, and so that no Unicode
+///   normalisation form is assumed.
+///
+/// `~` is escaped too, because it marks a truncated stem (below). Escaped bytes
+/// are written `%XX` (uppercase hex), and `%` is itself escaped, so the escapes
+/// are unambiguous and the key can be recovered exactly ([`unescape_body_stem`]).
+fn escape_body_stem(key: &str) -> String {
+    /// Prefix length, chosen so the whole name (`<prefix>~<16 hex>.txt`) stays
+    /// inside the 255-byte filename limit common to ext4 and APFS.
+    const MAX_STEM: usize = 230;
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(key.len());
+    for &b in key.as_bytes() {
+        if b.is_ascii()
+            && !b.is_ascii_uppercase()
+            && !matches!(b, b'%' | b'/' | b'\\' | b'\0' | b'~')
+        {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    if out.len() <= MAX_STEM {
+        return out;
+    }
+    // A title long enough that escaping would overflow the filename limit: keep a
+    // readable prefix and disambiguate the tail with a hash of the full key. The
+    // `~` marks the stem as truncated, so it is never decoded — such a key cannot
+    // be recovered by `reindex`, which is acceptable for a title at the limit.
+    out.truncate(MAX_STEM);
+    format!("{out}~{:016X}", fnv1a(key.as_bytes()))
+}
+
+/// A 64-bit FNV-1a hash, used only to disambiguate over-long filename stems.
+///
+/// A named, fixed algorithm rather than [`std::hash`], which does not promise the
+/// same value across Rust releases — and these hashes end up in filenames that
+/// outlive the binary that wrote them.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// The inverse of [`escape_body_stem`], but only when the stem decodes cleanly.
+///
+/// Bodies written by the *older* schemes kept the key nearly verbatim, so a legacy
+/// stem may contain a `%` that is not an escape. Decoding and requiring the result
+/// to re-encode to the same stem keeps the two apart: only a stem this scheme
+/// produced decodes. A `~` marks a truncated stem (see [`escape_body_stem`]),
+/// which carries no recoverable key.
+fn unescape_body_stem(stem: &str) -> Option<String> {
+    if stem.contains('~') {
+        return None;
+    }
+    let bytes = stem.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex_digit(*bytes.get(i + 1)?)?;
+            let lo = hex_digit(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    (escape_body_stem(&decoded) == stem).then_some(decoded)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Whether a stem is the truncated form produced by [`escape_body_stem`] for an
+/// over-long key: an escaped prefix followed by `~` and sixteen uppercase hex
+/// digits. Such a stem carries a hash, not the key, so it cannot be decoded.
+fn is_truncated_stem(stem: &str) -> bool {
+    match stem.rsplit_once('~') {
+        Some((_, tail)) => {
+            tail.len() == 16
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+        }
+        None => false,
+    }
+}
+
 /// Escape only what cannot appear in a filename, keeping the rest verbatim.
 ///
-/// A cache key is `<kind>:<title>`, and the title is what makes a cache
-/// inspectable — `mod:Module:Hatnote list` should look like itself on disk. Only
-/// `/`, `\` and NUL can actually escape a directory or truncate a path, so only
-/// those are replaced, which also makes the key recoverable from the filename.
+/// This is the *older* scheme, still read by [`locate_body`](WikiCache::locate_body)
+/// but no longer written: it kept a key readable but was not injective, because
+/// `/`, `\` and NUL all collapsed to `_`. New bodies use [`escape_body_stem`].
 fn sanitize_path_separators(key: &str) -> String {
     key.replace(['/', '\\', '\0'], "_").replace("..", "__")
 }
@@ -590,25 +782,36 @@ fn io_err(path: &Path, e: std::io::Error) -> CompareError {
 /// Recover `(kind, title)` from the stem of a body file, or `None` if the file is
 /// not a body.
 ///
-/// Two spellings are understood. A key is `<kind>:<title>`, and the title is what
-/// makes a cache inspectable — `mod:Module:Hatnote list` should look like itself
-/// on disk. Two schemes have been used for that:
+/// Three schemes are understood, tried in order:
 ///
-/// - current: only `/`, `\` and NUL are replaced, so the key reads through
-///   almost verbatim;
-/// - pre-`sanitize_path_separators`: every `:` became `__`, which is lossy, so a
-///   recovered title cannot be reconstructed exactly.
+/// - current ([`escape_body_stem`]): the stem carries `%XX` escapes and decodes
+///   exactly;
+/// - the intermediate scheme ([`sanitize_path_separators`]): only `/`, `\` and NUL
+///   were replaced, so the key reads almost verbatim (and is *not* recoverable
+///   exactly when the title contained a separator);
+/// - the original scheme ([`legacy_stem`](WikiCache::legacy_stem)): every `:`
+///   became `__`, likewise lossy.
 ///
-/// The old form is still read because a cache outlives the code that wrote it,
+/// The old forms are still read because a cache outlives the code that wrote it,
 /// and a corpus cache is hours of rate-limited fetching — refusing to read one
-/// would make recovering it pointless. A `__`-escaped title keeps its embedded
-/// colons escaped, and the *recovered* title is what gets recorded, so `get`
-/// looks the body up by the same string rather than by a reconstruction that
-/// cannot be exact.
-///
-/// A stem with no recognised kind is rejected rather than assumed, so a stray
-/// file in `pages/` cannot become a phantom cache entry.
+/// would make recovering it pointless. A stem with no recognised kind is rejected
+/// rather than assumed, so a stray file in `pages/` cannot become a phantom entry.
 fn key_from_body_stem(stem: &str) -> Option<(EntryKind, String)> {
+    // A truncated stem carries a hash, not a key.
+    if is_truncated_stem(stem) {
+        return None;
+    }
+    // The current scheme, when the stem carries an escape. A stem without `%` or
+    // `~` is spelled the same by every scheme, so it needs no special case here.
+    if stem.contains('%')
+        && let Some(key) = unescape_body_stem(stem)
+        && let Some((kind, title)) = key.split_once(':')
+        && let Some(kind) = EntryKind::from_str(kind)
+        && !title.is_empty()
+    {
+        return Some((kind, title.to_string()));
+    }
+
     let (kind, rest) = stem.split_once("__").or_else(|| stem.split_once(':'))?;
     let kind = EntryKind::from_str(kind)?;
     if rest.is_empty() {
@@ -893,11 +1096,174 @@ mod tests {
             (EntryKind::SiteInfo, "siteinfo"),
             (EntryKind::Entity, "Q42"),
         ] {
-            let stem = sanitize_path_separators(&WikiCache::key(kind, title));
+            let stem = escape_body_stem(&WikiCache::key(kind, title));
             let (got_kind, got_title) = key_from_body_stem(&stem).expect(&stem);
             assert_eq!(got_kind, kind);
             assert_eq!(got_title, title);
         }
+    }
+
+    /// The regression the injective scheme exists for: two *different* keys must
+    /// never land on one file, whether they differ by case (which a
+    /// case-insensitive filesystem folds) or by a separator (which the older scheme
+    /// turned into `_`).
+    #[test]
+    fn distinct_keys_get_distinct_body_files() {
+        for (a, b) in [
+            ("Template:CS1 config", "Template:Cs1 config"),
+            ("Module:Citation/CS1", "Module:Citation_CS1"),
+            ("Template:A", "template:A"),
+        ] {
+            let ka = WikiCache::key(EntryKind::Template, a);
+            let kb = WikiCache::key(EntryKind::Template, b);
+            let (pa, pb) = (escape_body_stem(&ka), escape_body_stem(&kb));
+            assert_ne!(pa, pb, "{a:?} and {b:?} share {pa:?}");
+            assert_ne!(
+                pa.to_lowercase(),
+                pb.to_lowercase(),
+                "{pa:?} and {pb:?} fold together"
+            );
+        }
+    }
+
+    /// A body written by the intermediate scheme (`/` and `\` to `_`, case kept)
+    /// is still found and used, so a populated cache survives the scheme change.
+    #[test]
+    fn get_reads_a_body_written_by_the_intermediate_scheme() {
+        let root = temp_root("intermediate-scheme");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        let pages = cache.dir().join("pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        // `Template:Foo/bar` was stored, and indexed, as `tpl:Template:Foo_bar`.
+        std::fs::write(pages.join("tpl:Template:Foo_bar.txt"), "body").unwrap();
+        cache.reindex().unwrap();
+
+        assert_eq!(
+            cache
+                .get(EntryKind::Template, "Template:Foo/bar")
+                .unwrap()
+                .unwrap()
+                .body,
+            "body"
+        );
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// A key whose escaped stem would overflow the filename limit is stored under a
+    /// bounded, hashed stem; such a stem cannot be decoded, so `reindex` ignores it.
+    #[test]
+    fn an_over_long_key_gets_a_bounded_hashed_stem() {
+        let key = WikiCache::key(EntryKind::Template, &"Ä".repeat(200));
+        let stem = escape_body_stem(&key);
+        assert!(stem.len() <= 247, "stem is {} bytes: {stem}", stem.len());
+        assert!(is_truncated_stem(&stem), "not marked truncated: {stem}");
+        assert!(key_from_body_stem(&stem).is_none());
+    }
+
+    /// The repair for a cache written by the non-injective scheme: forget the
+    /// entries that share a file across *different* revisions, but keep those that
+    /// only share because they name the same page.
+    #[test]
+    fn drop_colliding_bodies_forgets_only_genuine_collisions() {
+        let root = temp_root("drop-colliding");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        // Build the legacy on-disk state: one body file shared by keys the old,
+        // non-injective scheme folded together.
+        let pages = cache.dir().join("pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(pages.join("tpl:Template:CS1 config.txt"), "body").unwrap();
+        std::fs::write(pages.join("mod:Module:List.txt"), "same").unwrap();
+        let entry = |kind, title: &str, revid: u64| EntryMeta {
+            kind,
+            title: title.to_string(),
+            revid: Some(revid),
+            fetched_at: None,
+        };
+        // Different revisions that fold to one file: genuinely two pages, one lost.
+        cache.index.entries.insert(
+            "tpl:Template:CS1 config".into(),
+            entry(EntryKind::Template, "Template:CS1 config", 100),
+        );
+        cache.index.entries.insert(
+            "tpl:Template:Cs1 config".into(),
+            entry(EntryKind::Template, "Template:Cs1 config", 101),
+        );
+        // Same revision under both spellings: one body serves both, so it stays.
+        cache.index.entries.insert(
+            "mod:Module:List".into(),
+            entry(EntryKind::Module, "Module:List", 200),
+        );
+        cache.index.entries.insert(
+            "mod:Module:list".into(),
+            entry(EntryKind::Module, "Module:list", 200),
+        );
+
+        assert_eq!(cache.drop_colliding_bodies().unwrap(), 2);
+        assert!(
+            cache
+                .get(EntryKind::Template, "Template:CS1 config")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(EntryKind::Template, "Template:Cs1 config")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(EntryKind::Module, "Module:List")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .get(EntryKind::Module, "Module:list")
+                .unwrap()
+                .is_some()
+        );
+
+        // A reopened cache does not resurrect what the repair dropped.
+        let reopened = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        assert!(
+            reopened
+                .get(EntryKind::Template, "Template:CS1 config")
+                .unwrap()
+                .is_none()
+        );
+        WikiCache::flush_all(&root).unwrap();
+    }
+
+    /// The repair leaves a cache that already uses the current scheme alone, so it
+    /// is safe to run more than once.
+    #[test]
+    fn drop_colliding_bodies_is_a_no_op_on_a_current_cache() {
+        let root = temp_root("drop-current");
+        let mut cache = WikiCache::open(&root, "en.wikipedia.org").unwrap();
+        for (title, rev) in [("Template:CS1 config", 100), ("Template:Cs1 config", 101)] {
+            cache
+                .put(
+                    EntryKind::Template,
+                    title,
+                    "body",
+                    EntryMeta {
+                        kind: EntryKind::Template,
+                        title: title.to_string(),
+                        revid: Some(rev),
+                        fetched_at: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(cache.drop_colliding_bodies().unwrap(), 0);
+        assert!(
+            cache
+                .get(EntryKind::Template, "Template:CS1 config")
+                .unwrap()
+                .is_some()
+        );
+        WikiCache::flush_all(&root).unwrap();
     }
 
     /// The earlier filename scheme escaped every colon, and bodies written by it
