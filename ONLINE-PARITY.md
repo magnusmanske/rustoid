@@ -6931,3 +6931,49 @@ fixture guard             876/896
 All four order probes agree with the service now (style-before-template,
 template-before-style, style in an argument, style in a template body), and the
 whole workspace suite and clippy are clean.
+
+## A wider corpus: all 48 cached article baselines
+
+The 9-page subset is too narrow to see whether an id fix is broadly safe, so the
+measurement was widened to **every cached Parsoid baseline** (48 titles, 40
+compared, 6 skipped, 2 stalled). Offline, `--corpus /tmp/wide.corpus`:
+
+```
+score: 0/40 compared (0.0%), 6 skipped, 2 stalled
+output: parsoid 49 802 466 bytes, rustoid 33 215 208 bytes (0.67x)
+
+by outcome: extension 20, transclusion 11, media 4, wikilink 3,
+            data-mw 1, nowiki 1, skipped 6, stalled 2
+```
+
+No page passes, and the ratio is worse than the subset's (0.67× vs 0.72×)
+because the wide set is full of huge articles whose templates this rustoid
+still expands short — but the useful fact is *where* they differ. **Not one
+page's first difference is an `about` id** (the harness has a `marker-ids`
+category for exactly that; the bucket is empty). The id-ordering thread is
+clean at the first difference across all 40.
+
+The smallest first differences, and what they are (none is this session's
+work; each is a known, unrelated gap):
+
+| first diff | page | shape |
+|---|---|---|
+| 544 | Zebro | redirect page |
+| 546 | Grand Theft Auto V | `Short_description_is_different_from_Wikidata` — the `Module:SDcat`/`getParent().args` chain (§"The lazily-expanded argument value") |
+| 572 | Polio vaccine | same SDcat category |
+| 578 | Python (programming language) | same |
+| 588 | Chernobyl disaster | same |
+| 600 | ISO 3166-1 alpha-2 | same |
+| 642 | COVID-19 pandemic | same |
+| 896 | Doom (1993 video game) | same |
+| 939 | World War II | same |
+| 976 | Hydrogen | same |
+| 5926 | Nobel Prize | image: `typeof="mw:File"` + `data-mw` where the service emits an `<a>`-wrapped `mw:File/Frameless` |
+| 4269→5926 | (was this session's id gap) | now past |
+
+So the next page to fall is an `SDcat` fix, not another id. `Module:Math`
+differs at byte 1 because the Module-namespace page renders its *source* where
+the service renders the documentation tree — a namespace/content-model gap of
+its own. Facts for 39 of 40 are 7 d newer than their pinned baselines, so many
+small differences may be drift (the harness flags them `suspect`); only a
+re-pin can settle those.
