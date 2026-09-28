@@ -5512,6 +5512,52 @@ is itself the reason the next population should be targeted rather than a whole
 corpus: the requests are mostly cache *hits*, but the misses are per-page and
 the API is not sized for nine at speed.
 
+### The `{{!}}` in a hatnote argument was reaching the module as `{{!}}`
+
+Chasing `Bicycle`'s hatnote category past the cache gap showed the title was not
+`Bicyclus` at all: the probe's fetch trace said `Page Bicyclus{{!}}''Bicyclus''`.
+
+The wikitext is
+`{{About||the butterfly genus|Bicyclus{{!}}''Bicyclus''|other uses}}`. Scribunto
+receives each argument as *text*, and the preprocessor's `{{!}}` is a `|`, so the
+module's `parseLink` sees `Bicyclus|''Bicyclus''`, splits it, and checks
+`Bicyclus`. rustoid instead handed it the literal `Bicyclus{{!}}''Bicyclus''`,
+so the page it checked for existence was the whole string, and the blue link
+gained a nonexistent-page category.
+
+The cause is the argument renderer's precondition, not the tokenizer. Inside a
+template, `process_special_magic_word` produces a `<td>` marker for `{{!}}` (so
+`TableFixups` can reclaim a cell separator) — right at the token level, wrong as
+text. `expanded_argument_text` only trusted a value whose tokens were *all*
+`Str`, so a value carrying the marker fell back to the source range, which still
+spells `{{!}}`.
+
+`argument_value_text` now has an **exact** form for precisely the token shapes a
+plain-text value is made of — `Str`, `mw-quote` (its `value` attribute holds the
+`''`/`'''` delimiter, and in Scribunto's string view `''x''` is literally that),
+and the `{{!}}` marker (`|`) — and returns `None` for *any* other token, which
+keeps the source range as the fallback. That containment is the whole safety
+argument: values with a wikilink, a tag, or any other construct render exactly
+as before, so the only behaviour that moves is a value carrying `{{!}}` or
+quote markup, both of which the old path got wrong (`tokens_to_string` has no
+`mw-quote` arm and drops the quotes).
+
+**Applied to the parent-frame arguments only.** The `#invoke` call's own
+arguments are still re-joined as *text* (`invoke_arg_text` joins on `|` before
+`Invoke::parse` splits them again), so rendering a `|` there splits one argument
+into two: `{{#invoke:String|len|a{{!}}b}}` went from wrongly answering `7` to
+wrongly answering `1`. That path needs the arguments handed over *structured*
+rather than as a reconstructed string; until then it keeps the old rendering on
+purpose, and the reason is written at the call site.
+
+### Scoreboard
+
+The fix changes no first difference yet — `Bicycle` still differs at 1588 —
+because the corrected title is `Bicyclus`, which is still not cached, so the
+category survives for the *other* reason. What it does change is the diagnosis:
+the probe now asks `Page Bicyclus`, and the remaining `Bicycle`/`Zebra`/`Sundial`
+differences are the cache gap, nothing else.
+
 ### The rest
 
 - `Help:Introduction` (416) — an adjacent-transclusion **encapsulation merge**:
