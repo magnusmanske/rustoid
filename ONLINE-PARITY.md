@@ -6490,3 +6490,92 @@ This is left recorded rather than started: it is a change to *when* an extension
 node is numbered, it touches every extension on every page, and doing it blind —
 against a diagnosis the measurement just contradicted — is how the last three
 "fidelity bugs" got shipped behind a green fixture guard.
+
+## The extension-numbering phase: extensions are numbered in TT2
+The measured facts above said the gap was a *when-is-an-extension-numbered*
+difference. The PHP settles both halves.
+
+**Where the id comes from.** Every non-`nowiki` extension gets its `about` in
+`ExtensionHandler::onExtension`, and only there — Cite does not number its own
+refs (`Cite/src/Parsoid/RefTagHandler.php` only *reads* `about`):
+
+```php
+// ExtensionHandler.php, in onExtension, for $extensionName !== 'nowiki'
+$about = $env->newAboutId();
+$n = $firstNode;
+while ( $n ) { $n->setAttribute( 'about', $about ); $n = $n->nextSibling; }
+```
+
+**When.** `ExtensionHandler` sits in `TokenTransform2`, right after
+`TemplateHandler`, before `AttributeExpander`, and
+`TokenHandlerPipeline::processChunk` runs each transformer over the **whole
+chunk** before the next one:
+
+```php
+foreach ( $this->transformers as $transformer ) {
+    $tokens = $transformer->process( $tokens );
+}
+```
+
+So at each level the chunk's templates are expanded and numbered first, and the
+extensions are numbered after — regardless of their order in the source. The
+transform endpoint confirms it: `<ref>a</ref>{{1x|b}}` numbers the *template*
+`#mwt1` and the ref `#mwt2`, and so does `{{1x|b}}<ref>a</ref>`.
+
+### The fix
+`Parser::expand_templates` is TT2, and it already resolves `<templatestyles>` and
+`<indicator>` inline for exactly this reason. Its post-pass now numbers every
+`ref`/`references` extension token in the chunk's output after the template loop,
+writing the id onto the token's `about` attribute so it reaches the DOM. The Cite
+pass then *consumes* that id instead of allocating its own. The post-pass runs on
+`out`, so a chunk nested in a template (a template body, an `#invoke` argument)
+is numbered by its own recursive call first, and a token that already carries an
+`about` is left alone.
+
+Only the extensions whose output consumes the id are numbered here.
+`<ref>`/`<references>` keep it on the `<extension>` element Cite reads.
+`<nowiki>` is lean markup with no `about`. `<pre>`/`<style>` and the rest are
+rebuilt from their rich `data-mw` attribs (`extension_kv_attrs`), which do not
+carry a token attribute, so numbering them here would spend an id the output
+never shows — a second drift. They are left to a follow-up.
+
+**Effect.** `Bicycle`'s `<sup class="mw-ref reference">` is now `about="#mwt11"`,
+matching the service exactly, and its first difference moved **8151 → 11836**. No
+other subset page's first difference moved, and the guard held at 876/896.
+
+### The guard cannot see any of this
+The parser-test harness strips `about` in `normalizeOut` (`harness/mod.rs`, the
+same list as `prefix`/`rev`). So a change that only moves `about` ids is invisible
+to all 896 fixtures — which is why `<pre>` has been missing its `about` for a long
+time without a single failure, and why this fix had to be validated against the
+served page and the transform endpoint. The new unit test asserts on the rendered
+HTML, and it was checked to *fail* when the post-pass is disabled.
+
+### Two gaps left on `Bicycle`
+- **One id fewer than the service** on a reference nested in a template:
+  `{{1x|X<ref name=r>b</ref>}}{{1x|a}}` numbers the later templates `#mwt3`/`#mwt4`
+  where the service has `#mwt4`/`#mwt5`. The reference's own `about` is
+  overwritten by encapsulation either way, so only the counter position shows it.
+  Recorded, not asserted.
+- **The new first difference (11836) is a fact drift, not a bug.** rustoid renders
+  `[[Electric bicycle]]` with `class="mw-redirect"`; the service does not. The API
+  says the page *is* a redirect today, but the cached `info:Electric bicycle` was
+  fetched at `epoch:1790590761`, seven days after the `html:Bicycle` baseline at
+  `epoch:1789975300`, so the redirect was created between the two. Facts are not
+  revisioned, so an old baseline can be compared against a newer fact; the only
+  clean repair is to re-pin the baseline, which the corpus rules forbid casually.
+
+### Scoreboard after the extension-numbering phase
+
+```
+Bicycle                   8151 -> 11836
+Help:Introduction          5161   (unchanged)
+Nobel Prize                1112   (unchanged)
+Megadeth                   2801   (unchanged)
+Unix                       4772   (unchanged)
+Quicksilver (film)         2732   (unchanged)
+Sundial                    1897   (unchanged)
+List of sovereign states   4009   (unchanged)
+Zebra                      2172   (unchanged)
+fixture guard              876/896
+```
