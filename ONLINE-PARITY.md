@@ -5263,3 +5263,64 @@ The `List of sovereign states` difference is still the `{{#ifexist:Category:{{{1
 `Module:Unsubst`. That is a different shape from the above — a `{{safesubst:}}`
 invocation whose `$B` body is returned by the module and then re-expanded — and it
 is *not* fixed by any of this, so it is the next thing to reduce.
+
+## The faithful argument renderer: understood, built, and not landed
+
+The follow-up promised in the previous section was to render a module's argument
+value from its tokens *completely*, so the stale source range could be dropped
+rather than worked around. It was written, measured, and reverted — the
+measurements are the result.
+
+### What the tokens actually are
+
+Instrumenting `expanded_argument_text` on `Megadeth` gives the shapes a module's
+arguments are made of. For the hatnote value
+(`{{see Wiktionary|…}}` → `Module:Hatnote`'s `args[1]`) the `#if`s are expanded
+(it is the *first* parent argument, which the previous section's fix stopped
+skipping) and what remains is:
+
+```
+[" ", "\"", "Megadeath", "\" redirects here. For a definition of that ",
+ "term", ", see the Wiktionary entry ",
+ sc:wikilink src="[[wikt:{{{2}}}|{{{2}}}]]" attrs=[href=wikt:megadeath,
+                                              mw:maybeContent="megadeath"],
+ "."]
+```
+
+Two things follow. The wikilink's **attributes are substituted** while its
+`dp.src` is not, so the source cannot be used and the attributes must be — which
+is exactly what `wikilink_source` (now shared by `reconstruct_link_src`) does.
+And the value is otherwise plain text, so a renderer that handles the wikilink
+makes it faithful.
+
+The navbox-shaped values on the same page are different: they interleave
+`sc:mw-quote` markers (`''`/`'''`), `<div>`/`<ul>`/`<li>`/`</style>` tags, and
+`sc:extension`. `tokensToString` has no arm for `mw-quote` or for a tag, so it
+drops them: `''[[Foo]]''` stringifies to `[[Foo]]`.
+
+### Why it was not landed
+
+- **Adding the display text to the shared `tokensToString` arm is wrong.** That
+  renderer also feeds attribute values on the DOM path: with it changed, a
+  `Module:Navbox` title attribute's length changed, and `Sundial` rendered
+  `[[Philosophy of space and time</th>` — an *unrendered* link — and lost 13 KB.
+  The argument renderer must be separate, which is what
+  `argument_tokens_to_string` was.
+- **Separate and contained, it has no measurable effect on the scoreboard.** With
+  the renderer used only for values whose tokens contain nothing it would drop,
+  the subset is byte-for-byte unchanged and no first difference moves: the real
+  values carry `mw-quote`/tag tokens, so the containment excludes precisely the
+  values that would benefit. Widening it to render those made `Megadeth`'s
+  hatnote value faithful and moved that page's first difference 1650 → 1595 — but
+  it also shifted ~10 KB of already-diverged content on `Sundial`, `Megadeth` and
+  `Nobel Prize` in ways that were not shown to be improvements, and one shape
+  leaked a literal `[[Template:Ndash]]` into a Cite id.
+
+So the prerequisite is a renderer that covers *every* token an argument value can
+hold — `mw-quote` and tags included, tags from their start/end `dp.src` — before
+the source range can be dropped, and the containment predicate **is** the
+statement "the renderer is complete", which is why it cannot be relaxed
+piecemeal. That is a bigger job than this session had room for, and landing it
+half-done would trade a mis-resolution for a silent loss.
+
+Reverted; the tree is back at the previous section's state.
