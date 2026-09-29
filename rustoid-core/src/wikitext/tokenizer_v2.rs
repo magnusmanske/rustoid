@@ -2829,10 +2829,19 @@ impl<'a> PegTokenizer<'a> {
     /// it, returning the token. Mirrors the `directive` grammar rule, which is
     /// shared by inline text and attribute-name positions.
     fn parse_directive(&mut self) -> Option<SelfclosingTagTk> {
-        if self.starts_with("{{{") {
-            self.parse_templatearg_token()
-        } else {
+        // MediaWiki's "ideal precedence" for a run of `{`: a run of N braces
+        // opens a template when `N % 3 == 2`, an argument when `N % 3 == 0`, and
+        // when `N % 3 == 1` one `{` is literal text and the rest is
+        // reconsidered. The grammar spells it out — five braces are `{{` + `{{{`
+        // (a template whose name begins with an argument: the `subst` /
+        // `safesubst` idiom `{{{{{♥|safesubst:}}}#invoke:…}}`), six are `{{{` +
+        // `{{{`. Choosing on `starts_with("{{{")` alone read the five-brace form
+        // as an argument and leaked it into the output as literal text.
+        let run = self.remaining().bytes().take_while(|&b| b == b'{').count();
+        if run % 3 == 2 {
             self.parse_template_token()
+        } else {
+            self.parse_templatearg_token()
         }
     }
 
@@ -2925,7 +2934,13 @@ impl<'a> PegTokenizer<'a> {
 
     /// Parse a `template` token (`{{ ... }}`) without emitting it.
     fn parse_template_token(&mut self) -> Option<SelfclosingTagTk> {
-        if !self.starts_with("{{") || self.starts_with("{{{") {
+        if !self.starts_with("{{") {
+            return None;
+        }
+        // A run of braces whose length is a multiple of three is an argument,
+        // not the `{{` of a template (see `parse_directive`).
+        let run = self.remaining().bytes().take_while(|&b| b == b'{').count();
+        if run % 3 == 0 {
             return None;
         }
 

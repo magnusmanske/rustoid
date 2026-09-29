@@ -289,7 +289,6 @@ fn resolve_target_string(
     }
 
     let mut prefix = pieces[0].trim().to_string();
-    let has_hash = target.starts_with('#') || target.starts_with('＃');
     let mut have_colon = pieces.len() > 1;
 
     // safesubst found in content should be treated as if no modifier were
@@ -304,6 +303,13 @@ fn resolve_target_string(
         prefix = pieces[0].trim().to_string();
         have_colon = pieces.len() > 1;
     }
+
+    // Whether the target is a `#`-prefixed parser function. Computed *after* the
+    // `subst`/`safesubst` strip: a name that only becomes `#…` once the modifier
+    // is gone (`{{{{{♥|safesubst:}}}#invoke:…}}`, i.e. `Template:Convert`'s own
+    // body) has to be recognised as a parser function, or it is taken for a
+    // template title and resolves to the wrong page.
+    let has_hash = target.starts_with('#') || target.starts_with('＃');
 
     let untrimmed_prefix_len = pieces[0].len();
     let pf_arg = if have_colon {
