@@ -7430,3 +7430,50 @@ That leaves the *grouping*: which ranges become constituents of one compound —
 overlap-merge test `in_document_order(range_start, prev.range_end)` — a port of
 `DOMRangeBuilder::findTopLevelNonOverlappingRanges`. That is the next target, and
 it is a correctness fix to the range graph rather than to any string slice.
+
+### The range graph against PHP: four divergences, and the one I tried
+
+Checked line by line against `DOMRangeBuilder.php` (v0.24.0-a23,
+`src/Wt2Html/DOM/Processors/DOMRangeBuilder.php`). Four places where rustoid's
+`compute_range_plan` does not follow PHP:
+
+1. **Start-marker gate.** PHP takes a start marker as a range start only when
+   `!empty(getDataParsoid($elem)->tsr)` (`findWrappableTemplateRangesRecursive`);
+   an end marker is always taken. rustoid gates the start on `dsr_start.is_some()`,
+   which admits template-content markers whose `dsr.start` is a bogus 0 / 94.
+2. **`startOffset`.** PHP: `DOMDataUtils::getDataParsoid($startMeta)->tsr->start`
+   (`findEnclosingRange`). rustoid: the marker's `dsr.start`.
+3. **Flipped ranges.** PHP's `addNodeRange` walks
+   `!flipped ? start : end` … `!flipped ? end : start`, and `rangesOverlap` swaps
+   the ends for a flipped range. rustoid has no `flipped` notion in either.
+4. **Order.** PHP's `DOMUtils::inSiblingOrder` compares DSR starts; rustoid's
+   `in_document_order` compares tree paths (`a <= b`).
+
+Aligning (1) alone — gating the start on the marker's `tsr` — did what the graph
+analysis predicted: it removed the 446,141-byte `BIG_GAP` and the whole `#mwt468`
+compound build, and left fixtures at **876/896**, `clippy` and `fmt` clean. But it
+moved **no** first-difference byte on the 41-page corpus while changing output
+*sizes* on four pages, in **both** directions (33881→33424, 17881→17880,
+1348594→1348681, 2168375→2168667). A change with no scoreboard effect and
+inconsistent metadata deltas is not demonstrably an improvement, so it was
+reverted: (1)–(4) are coupled and want to be done as one change, measured on the
+corpus.
+
+### The trap is not in the range plan at all
+
+The `<ul about="#mwt468">`'s ~460 KB `data-mw` is never built by any path I
+instrumented. Logs that fire on a `data-mw` over 20 KB were added to
+`build_compound_data_mw`, `build_compound_data_mw_with_nested`,
+`merge_encap_data_mw`, `RangePlan::compound_data_mw`, and the `resolve_data_ids`
+stash — zero of them fired on Israel (only the legitimate 21 KB `Refbegin`), yet
+the attribute is there, fully assembled. Its `parts` (`PAGENAME`, `Template:2`,
+then the page tail as literal text) come with the transclusion from the
+template/Lua layer, before any DOM encapsulation runs.
+
+That layer is also where `safesubst` leaks: it appears **14** times in rustoid's
+Israel and **0** in the oracle, the first at byte 301,434 — *before* the trapped
+region — e.g. the five-brace `{{{{{|safesubst:}}}#if:1473946…` seen in the
+`Authority control` output. An unbalanced brace run is exactly what would make the
+rest of the page read as literal text inside the transclusion. So the next thread
+is the `safesubst` / `{{ … |safesubst:}}` handling in the template layer, not
+`compute_range_plan`.
