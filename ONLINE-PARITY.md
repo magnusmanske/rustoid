@@ -7608,3 +7608,34 @@ lost), and on the four biggest shrinkers the `<section>` and `mw-references-wrap
 counts now **match the oracle exactly** (`Doom` 23/2, `Association football`
 30/2, `Isaac Newton` 41/2, `2024 Summer Olympics` 42/3-of-4). The remaining
 `<li>` shortfall is the reference *content* gap, not section structure.
+
+### Re-landing the `#tag` named-attribute expansion, with the record corrected
+
+With both bugs above fixed, the `#tag` named-attribute expansion that
+`908f689` reverted (`8bf5690`) was re-landed. Its revert recorded the reason as
+"the reference handler only tracks two groups … the expanded group makes it drop
+the bulk of the list" — and that record is **wrong**, so it is corrected here.
+What actually happened:
+
+- Without the expansion, `Template:Reflist`'s `group={{{group|}}}` stayed
+  unexpanded, so every `<references>` call recorded an **empty** group. Israel's
+  bare `{{reflist}}` and `{{notelist}}` *both* rendered the ungrouped list, and
+  the page carried **748 duplicated `cite_note` ids** — invalid HTML, the same
+  notes twice.
+- With the expansion, the groups are `fn`, `lower-alpha` and ungrouped, written
+  separately, and every `cite_note` id is unique: **748 distinct notes, oracle
+  765.**
+
+The "drop" from 1496 to 748 ids is the duplicate going away, not content being
+lost — the earlier reading compared the wrong number. The real reference loss
+that *did* exist (Israel's missing `==References==`) was the trapped section and
+the section-wrapper drop, both fixed above; the expansion was blamed for a
+different bug's symptom.
+
+Effect: the corpus first-difference byte moves later on three pages and never
+earlier (`Doom` 896→937, `Megadeth` 2801→2842, `COVID-19 pandemic` 962→999);
+total output falls from 0.65× to 0.56× of the oracle, which is the duplicate
+removal. Fixtures **876/896**, `clippy`/`fmt` clean, workspace tests green.
+The residual gap — 748 notes where the oracle has 765, and the `fn` /
+`lower-alpha` lists empty where the oracle has 6 and 9 — is *collection*, not
+structure, and is the next thing to chase.
