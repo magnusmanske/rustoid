@@ -7174,3 +7174,18 @@ which is why the named-attribute half landed alone.
 
 Documentation: this is the first difference on COVID-19 pandemic at byte 999
 (extsrc), and on Megadeth at 2842.
+
+### Why the content half is not a small patch
+
+The "source regeneration" the fix above points at is a *new component*, not a
+correction to `tag_extension_token`. Every token-to-wikitext path in rustoid
+returns the token's original `data_parsoid.src`:
+`parser_functions::token_to_source` (line 857) and
+`wikitext::token_utils::tokens_to_source` (the one `lua_deferred::render_answer`
+uses) both check `dp.src` first. So after an argument substitution updates a
+wikilink's `href`, the only source that can be produced is still the *old* one
+`[[File:{{{1|X.svg}}}|20px]]`. Reproducing core here means expanding the inner
+from its *text* (core's `PPFrame` works on string nodes and regenerates) or
+building a general token→wikitext serializer — rustoid is a wt2html-only port and
+has neither. Recorded as the shape of the remaining work on COVID-19 pandemic's
+byte-999 difference, rather than attempted as a patch.
