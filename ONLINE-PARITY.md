@@ -7189,3 +7189,86 @@ from its *text* (core's `PPFrame` works on string nodes and regenerates) or
 building a general token→wikitext serializer — rustoid is a wt2html-only port and
 has neither. Recorded as the shape of the remaining work on COVID-19 pandemic's
 byte-999 difference, rather than attempted as a patch.
+
+## The `#tag` argument expansion was a wrong turn; the serializer lands alone
+
+This section corrects the record and is worth reading before any more `#tag`
+work. The document above describes `expand_tag_args` (expanding a `#tag` call's
+named attributes the way `tagObj` does) as the fix that moved the indicator
+**name** to `good-star`. It did that — and it was still the wrong change to land.
+
+A wide-corpus comparison showed the output *shrinking* by about 6.7 MB
+(0.72× → 0.58× of the oracle). Per page, `Israel` fell from 2,561,103 bytes to
+2,074,437 and from 1091 `<li>` to 303, while the oracle has 2243 and **three**
+reference lists (`fn`, `lower-alpha`, and an ungrouped list) to rustoid's two.
+Rendering Israel through three checkouts isolated it:
+
+| state | bytes | `<li>` | reference lists |
+|---|---|---|---|
+| before `expand_tag_args` | 2,561,103 | 1091 | 2 (`fn`, ungrouped) |
+| with `expand_tag_args` | 2,074,437 | 303 | 2 (`fn`, `lower-alpha`) |
+| oracle | 2,702,824 | 2243 | 3 |
+
+The mechanism is not the expansion as such but what it feeds:
+`Template:Notelist` passes `group={{safesubst:#switch:…}}` to `{{reflist}}`, and
+`Template:Reflist` is
+`{{#tag:references|{{{refs|}}}|group={{{group|}}}|responsive=…}}`. Expanding the
+`group` **named attribute** changes which group the `<references>` handler
+records, and rustoid's handler then drops the bulk of the list. **The reference
+handler only tracks two groups; the oracle needs three.** That is the real bug
+underneath, and until it is fixed the argument expansion cannot be turned on:
+it buys a handful of bytes on a few pages and costs megabytes on the reference-
+heavy ones. The named-attribute *and* the inner (content) expansion were tried;
+the inner expansion additionally introduced two stalls (`India`,
+`United States`). Both are reverted.
+
+What survives the revert, deliberately:
+
+- **the `pf_tag` named-attribute trim.** `tagObj` trims a named attribute's name
+  and value before stripping a surrounding quote pair, and that normalisation is
+  correct on its own — it is not an expansion, it changes nothing Israel's
+  reference recording depends on, and Israel is byte-identical with and without
+  it. Only the *expansion* is gone.
+- **a token→wikitext serializer**, `tag_content_source` +
+  `strip_html_comments`, next to `argument_value_text`. It rebuilds a `#tag`
+  content's source from the tokens instead of trusting the stale
+  `data_parsoid.src`: it keeps newlines (the content is wikitext, and
+  `#tag:pre`'s `extsrc` carries them), drops comments the way the preprocessor
+  does, rebuilds a `wikilink` from its `href`/`mw:maybeContent` **attribs** so a
+  substituted target is rendered, and returns `None` for anything it cannot
+  render so the caller keeps the recorded source rather than losing the
+  construct. Unit-tested, and it fires on a top-level probe
+  (`{{#tag:indicator|[[File:{{{1|X.svg}}}|20px]]|name=foo}}` →
+  `extsrc: "[[File:X.svg|20px]]"`, the substituted target).
+
+### The serializer is dormant on the current top differences — and the earlier
+### “the content is already substituted” claim is only half true
+
+The document above says the content is already substituted and only the source is
+stale. That is true for a `#tag` written at the **top level** of a page, and it is
+what the probe exercises. It is **not** true inside a template, which is where the
+interesting calls live. Tracing `{{Top icon|…}}` (what `Template:Good article`
+reaches on COVID-19 pandemic) shows the `#tag:indicator` content is a *single
+wikilink* whose `href` **is** substituted (`File:symbol support vote.svg`) but
+whose `mw:maybeContent` still holds **unexpanded** `{{#if}}` and
+`{{Str number/trim}}` template tokens. `argument_value_text` refuses a live
+`template` token by design, so `tag_content_source` returns `None` and the caller
+falls back to the recorded source — the unexpanded `{{{image|…}}}` the page
+currently shows. So the serializer is a correct, tested building block and a
+prerequisite, but on today's corpus it moves **no scoreboard entry**: every
+top difference is earlier (an `attrs.name` indicator, a hatnote category), and the
+one case it targets is blocked by the content's own unexpanded templates.
+
+Measurements with the serializer alone (expansion reverted, trim kept):
+
+- fixture guard **876/896** (unchanged), `clippy --all-targets` 0 warnings,
+  `cargo test --release --workspace` green;
+- Israel byte-identical with and without the serializer, back to the pre-change
+  baseline (2,561,103 bytes, 1091 `<li>`);
+- the wide corpus is the 0.72× baseline again — same first-difference byte on
+  every page (COVID-19 pandemic 962, Israel 1646, France 1601, India 1499, …).
+
+Next step is not more `#tag` work: it is the reference handler's two-group limit,
+because that is what blocks the indicator-name fix (and with it the `attrs.name`
+difference that is the first byte on France, India, Canada, Periodic table and
+COVID-19 pandemic).
