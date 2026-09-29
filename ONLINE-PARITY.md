@@ -7639,3 +7639,38 @@ removal. Fixtures **876/896**, `clippy`/`fmt` clean, workspace tests green.
 The residual gap — 748 notes where the oracle has 765, and the `fn` /
 `lower-alpha` lists empty where the oracle has 6 and 9 — is *collection*, not
 structure, and is the next thing to chase.
+
+### The collection gap was a brace counter in `find_arg_separator_eq`
+
+Chasing that gap reached the tokenizer. A minimal reproduction isolates it
+without Cite:
+
+    {{#if:1|{{t|{{{a|{{{b|C}}}}}}|g=f}}|X}}   →   {{t|{{{a|{{{b|C}}}}}}|g=f}}
+
+The `#if` branch is returned as **literal text**, and instrumenting `pf_if`
+showed why: its arguments were split as `1`, `{{t|{{{a|{{{b|C}}}}}}|g`, `f}}`,
+`X`. The branch's `=` in `|g=f` was taken for a `name=value` separator, so the
+whole branch became one named argument.
+
+`find_arg_separator_eq` only splits on a **top-level** `=` (PHP's
+`template_param_name`), and it tracked nested braces with a flat counter: `+1`
+per `{{`, `−1` per `}}`. But `{{{` is three braces and its closer `}}}` is
+three braces, so a run of six `}` — two tplarg closers — decremented the
+counter **three** times. On `{{t|{{{a|{{{b|C}}}}}}|g=f}}` that drove the depth to
+0 before `|g=f`, and the nested `=` looked top-level. The argument *splitter*
+(`split_template_args_impl_offsets`) already used a stack of innermost closers
+and got this right; `find_arg_separator_eq` now uses the same stack.
+
+Why it mattered so much: `Template:Refn` and `Template:Efn` both build their
+footnote as `{{#tag:ref|…|group=…}}` **inside an `#if`** — exactly the shape
+here — so every grouped footnote was emitted as raw wikitext and the `fn` /
+`lower-alpha` lists stayed empty. That is the "collection" gap: the refs were
+never collected because they were never built. With the fix Israel's groups
+render (755 notes, oracle 765; `fn` and `lower-alpha` present).
+
+Effect: corpus output grows on 30 of 41 pages and shrinks on none of
+consequence (total +257 KB toward the oracle: `List of sovereign states`
++79 KB, `India` +37 KB, `Periodic table` +19 KB), while **no first-difference
+byte moves** — the remaining diffs are still the early hatnote category and
+indicator name. Fixtures **876/896**, `clippy`/`fmt` clean, workspace tests
+green.
