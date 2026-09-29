@@ -2776,24 +2776,47 @@ fn wrap_flipped_children(
             continue;
         };
 
-        // Determine the range's end DSR by merging the start-meta's `dsr.end`
-        // with any *following* sibling whose DSR extends past it (mirrors PHP's
-        // `encapsulateTemplates` `$dp1DSR->end = $dp2DSR->end` merge). This
-        // covers multi-template-content-blocks where the transclusion output
-        // spills past the element holding the end marker (e.g. a fostered
-        // `<p>` followed by a `<table>`), so the trailing wikitext part and the
-        // range's `about` chain both include the whole block.
+        // Determine the range's end DSR from the sibling that holds the end
+        // marker (`children[t]`) — PHP's `getRangeEndDSR($range)` — merged with
+        // the start-meta's `dsr.end` (`$dp1DSR->end = $dp2DSR->end`). Only that
+        // one node, plus any sibling the adoption pass above stamped with the
+        // range's `about` (a fostered block wrapped alongside its table). Taking
+        // the max DSR end over *every* following sibling instead swept unrelated
+        // later content into the trailing-wikitext part: on Israel the Etymology
+        // paragraph's wrapper absorbed the rest of the page up to EOF.
         let tpl_end = start_meta
             .dp
             .as_ref()
             .and_then(|d| d.dsr.as_ref().and_then(|r| r.end));
+        // The range's end node is the sibling holding the end marker
+        // (`children[t]`), plus any following sibling the adoption pass stamped
+        // with the range's `about` (a fostered block wrapped alongside its
+        // table). The end offset must be a *source* offset: for a template
+        // marker the `tsr` carries it, while its `dsr.end` can hold the
+        // template-*output* length instead (the end meta here is `dsr` 131,
+        // `tsr` 122), so `tsr.end` wins when present. Using `dsr` for every
+        // following sibling, as an earlier version did, also swept unrelated
+        // later sections into the trailing wikitext part — on Israel the
+        // Etymology paragraph's wrapper absorbed the rest of the page to EOF.
+        let source_end = |c: &Node| -> Option<usize> {
+            c.dp.as_ref().and_then(|d| {
+                d.tsr
+                    .as_ref()
+                    .map(|r| r.end)
+                    .or_else(|| d.dsr.as_ref().and_then(|r| r.end))
+            })
+        };
         let mut range_end = tpl_end;
-        for child in children.iter().skip(i + 1) {
-            if let Some(end) = child
-                .dp
-                .as_ref()
-                .and_then(|d| d.dsr.as_ref().and_then(|r| r.end))
-            {
+        if let Some(end) = source_end(&children[t]) {
+            range_end = Some(range_end.map_or(end, |cur| cur.max(end)));
+        }
+        let range_about = start_meta.get_attr("about");
+        for child in children.iter().skip(t + 1) {
+            let adopted = range_about.is_some_and(|a| child.get_attr("about") == Some(a));
+            if !adopted {
+                break;
+            }
+            if let Some(end) = source_end(child) {
                 range_end = Some(range_end.map_or(end, |cur| cur.max(end)));
             }
         }
