@@ -7112,3 +7112,65 @@ cache or Lua one, and it is the next target rather than another miss.
 The 9-page subset is unchanged (Sundial 1897, Zebra 2172, Megadeth 2801, List of
 sovereign states 4009, Quicksilver 4213, Unix 4772, Help:Introduction 5161,
 Nobel Prize 5926, Bicycle 11836), and the fixture guard stays **876/896**.
+
+## PWrap was a misdiagnosis: the empty-`<p>` shape is protection facts
+
+The wide table's next-shape target was read as "PWrap does not wrap the
+template-only line in a `<p>`". It is not PWrap. `ISO 3166-1 alpha-2`,
+`Grand Theft Auto V`, `Polio vaccine`, `Python (programming language)` and
+`Chernobyl disaster` all differ at a line that *is* a template-only line, but
+rustoid's transclusion output is short of the indicator that would make the line
+non-transparent, so ParagraphWrapper correctly leaves it unwrapped and CleanUp
+marks the inner `<span>` instead.
+
+The line is `{{pp-pc}}` / `{{Pp-vandalism}}` / `{{pp-semi-indef}}`, which reach
+`Module:Protected page` → `Module:Effective protection level` →
+`mw.ext.FlaggedRevs.getStabilitySettings(title)`. With the field absent the call
+was a Lua error (fixed by the stub in the previous commit). With it `nil`, the
+module lands on the *unprotected* branch — "Wikipedia pages with incorrect
+protection templates" — where the service shows the padlock indicator.
+
+The reason it cannot simply be made faithful: **pending-changes protection is not
+in the read API.** `action=query&prop=info&inprop=protection` on the live wiki
+returns `"protection": []` for `ISO 3166-1 alpha-2` even though it *is*
+pending-changes protected (re-pinning the baseline at the current revision still
+shows the indicator). `mw.ext.FlaggedRevs` is a Scribunto library fed by the
+FlaggedRevs extension server-side, and Parsoid core-compat gets it by running the
+real Scribunto; rustoid has no equivalent source, so `getStabilitySettings`
+cannot return anything but a guess. The honest stub is `nil` — it removes the
+crash, and a page rustoid cannot classify reads as unprotected rather than
+erroring — and these rows are recorded as blocked on data the read API does not
+carry, not on a parser bug.
+
+## `#tag` arguments, and the half that is fixed
+
+`CoreParserFunctions::tagObj` runs the inner (second) argument and every named
+attribute's **name and value** through `$frame->expand` before building the tag,
+because the tag's content and attributes are strings nothing re-expands later.
+rustoid expanded only the target. `expand_tag_args` now expands a `#tag` call's
+named attributes the same way, and `pf_tag` trims them (`trim` first, then the
+surrounding-quote strip, matching `tagObj`'s order).
+
+That is what fixes the indicator **name**: `Template:Top icon`'s
+`name = {{#if:…}}…{{{id|}}}…` was stringified unexpanded and came out `" "`;
+it is now `good-star`. COVID-19 pandemic's first difference moves **962 -> 999**;
+the 9-page subset improves by one (Megadeth 2801 -> 2842); the fixture guard
+stays **876/896**.
+
+The **content** half is deliberately not in this change, and the reason is worth
+recording because the obvious fix is wrong. The content *is* already substituted
+by the time `pf_tag` runs — the trace of
+`{{#tag:indicator|[[File:{{{1|X.svg}}}|20px]]|name=foo}}` shows the wikilink's
+`href` already `File:X.svg`. What is stale is the *source*: `tag_extension_token`
+builds `extsrc` with `token_to_source`, which returns the token's original
+`data_parsoid.src` (`[[File:{{{1|X.svg}}}|20px]]`) rather than regenerating it
+from the expanded attributes. Re-running the pipeline over the content
+(`frame.expand` + `expand_templates`) fixes nothing and *breaks* `#tag:pre`:
+`Template:Pre` is `{{#tag:pre|{{{1}}}|format="wikitext"}}` and its `{{!}}` table
+arguments are already resolved to the in-template `<td>` form, which the second
+pass empties (the `Template pre: Table` fixtures fell 876 -> 874). The right fix
+is source regeneration in `tag_extension_token`, not another expansion pass —
+which is why the named-attribute half landed alone.
+
+Documentation: this is the first difference on COVID-19 pandemic at byte 999
+(extsrc), and on Megadeth at 2842.

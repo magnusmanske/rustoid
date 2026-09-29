@@ -477,8 +477,15 @@ impl ParserFunctions {
             if key_value_to_string(&kv.key).is_empty() {
                 content.extend(key_value_to_items(&kv.value));
             } else {
+                // Core's `tagObj` trims a named attribute's name and value
+                // (`trim($frame->expand(…))`) before storing them, then strips a
+                // surrounding pair of quotes. Without the trim, `name = {{#if:…}} `
+                // keeps the blanks the source wrote around the expression.
+                let name = key_value_to_string(&kv.key).trim().to_string();
+                let value = strip_attr_value_quotes(key_value_to_string(&kv.value).trim());
                 let mut kv = kv.clone();
-                kv.value = KeyValue::Str(strip_attr_value_quotes(&key_value_to_string(&kv.value)));
+                kv.key = KeyValue::Str(name);
+                kv.value = KeyValue::Str(value);
                 tag_attribs.push(kv);
             }
         }
@@ -1409,6 +1416,25 @@ mod tests {
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "hello"))
         );
+    }
+
+    /// Core's `tagObj` trims a named attribute's name and value, then strips a
+    /// surrounding pair of quotes. `class = ' foo '` is therefore the attribute
+    /// `class`, value `foo` — not the value ` foo ` in a `class ` attribute.
+    #[test]
+    fn test_pf_tag_trims_attribute_name_and_value() {
+        let config = crate::mock::MockSiteConfig::new();
+        // `b` is not a registered extension tag, so the plain path keeps the
+        // attributes on the tag token where they can be read directly.
+        let p = params(vec![("b", ""), ("", "hello"), ("  class  ", " 'foo' ")]);
+        let out = ParserFunctions::pf_tag(&config, &p);
+        let Item::Tok(ParsoidToken::Tag(t)) = &out[0] else {
+            panic!("expected a tag token, got {out:?}");
+        };
+        assert_eq!(t.attribs.len(), 1);
+        assert_eq!(t.attribs[0].key.as_str(), Some("class"));
+        // Trim outermost, then strip the quotes (core's order).
+        assert_eq!(t.attribs[0].value.as_str(), Some("foo"));
     }
 
     #[test]
