@@ -7512,3 +7512,99 @@ the previously-leaked templates expand. This does not touch the References trap
 (still 2 of 3 lists, `id="References"` absent, whose `data-mw` is assembled
 before the DOM layer), but the leaked text this section suspected of unbalancing
 the preprocessor is gone.
+
+## The References trap: two bugs, and the `#mwt1666` tsr that ties them together
+
+The trap is solved, and it was two independent defects that produced the same
+symptom. The thread that finally located the first one is worth recording because
+it is a template for the next one: **instrument the boundary, do not reason from
+the category label.**
+
+### Locating it: the marker with a page-relative `tsr` it had no right to
+
+Logging every `data-mw` over 20 KB inside the DOM encapsulation
+(`transfer_transclusion_to_element`, `RangePlan::compound_data_mw`) showed the
+alleged "assembled before the DOM layer" 457 KB attribute *is* built by the range
+plan, for the `External links` `<ul>` `about="#mwt468"`. The plan's own log named
+the culprit:
+
+    TRAP_PLAN_GROUP top=#mwt468 n=7 first=#mwt1666 (off 0) last=#mwt468 (off 446972)
+
+A range `#mwt1666` with `start_offset = 0` was being absorbed into `#mwt468`, so
+the gap slice `source[0 .. 446271]` — the whole page tail, References section
+included — became one `parts` string. `#mwt1666` is a `{{PAGENAME}}` marker
+inside a wikilink target: `Template:Wikiatlas` is
+`[[commons:Atlas of {{PAGENAME}}|Wikimedia Atlas of {{PAGENAME}}]]`, and the
+wikilink's `href` is attribute-expanded at page level. Its `tsr` was `(0, 12)`
+with `source: None` — i.e. **relative to the sub-source `{{PAGENAME}}`
+(12 characters), presented as a page offset.** `page_source[0..12]` is
+`{{Short desc`, so the marker looked like a top-level transclusion starting at
+offset 0.
+
+### Fix 1: clear `tsr` on template content, as PHP does
+
+PHP clears the `tsr` of everything a template / parser function / variable
+expansion produced (`TemplateHandler::processTemplateTokens`:
+`unset( $t->dataParsoid->tsr )`), and `DOMRangeBuilder` relies on it —
+`findWrappableTemplateRangesRecursive` only takes a start marker as a range start
+when the `tsr` is set, precisely *because* template content has none. rustoid
+applied that clearing only to parser-function output (`parser_functions_wrapper`),
+so a variable expanded inside an **attribute value** kept a sub-source `tsr`.
+`Parser::expand_attributes` now runs `token_utils::clear_tsr` over each attribute
+key/value expansion, mirroring `processTemplateTokens`. Israel's `#mwt468`
+`data-mw` drops from 457 KB to the legitimate 1.3 KB (the `official website`
+list), and the `==References==` section is no longer trapped as text.
+
+That alone did **not** make `id="References"` appear, though — because of the
+second bug.
+
+### Fix 2: the section wrapper dropped a section it had nested
+
+With the trap gone, the unwrapped render had **3** reference lists and the
+References heading, but the wrapped render (what the wiki serves, and what the
+oracle has) still lost the whole section, and section id **48** was simply
+absent. `RUSTOID_TRAP_SEC` logging in `section_wrapper::wrap_level` showed the
+References heading *was* seen and wrapped. The bug: opening a section onto the
+nesting stack and later **popping** it discarded it —
+`while … { stack.pop(); }` in the heading branch threw the node away, and only
+the single `current` section was ever committed. On Israel:
+
+    Notes (h2)      → current
+    References (h2) → Notes committed; References = current
+    Sources (h3)    → References pushed onto the stack
+    External links (h2) → References popped and DISCARDED
+
+So the `==References==` section, with `{{Duplicated citations}}` and
+`{{reflist}}`, vanished — a bug that also cost a section on every page with a
+nested-then-popped heading (`Doom`, `Isaac Newton`, `Association football`,
+`2024 Summer Olympics`, …). `wrap_level` is rewritten around a single stack
+whose top is the innermost open section; `close_above` attaches each closed
+section to its parent (or emits it as a top-level sibling) instead of dropping
+it, and the lead section is kept out of the stack so nesting cannot swallow it.
+A regression test (`test_section_nesting_a_deeper_heading_survives_a_later_sibling`)
+pins the exact shape.
+
+### Result and validation
+
+Israel, wrapped, against the pinned oracle:
+
+| metric | before | after | oracle |
+|---|---|---|---|
+| `mw-references-wrap` lists | 2 | **3** | 3 |
+| `id="References"` | absent | **present** | present |
+| `<section data-mw-section-id>` | 42 | **51** | 51 |
+| `<li>` | 1091 | 1940 | 2243 |
+| bytes | 1 196 123 | 1 833 465 | 2 703 684 |
+
+Fixtures stay **876/896**, `clippy --all-targets` 0 warnings, `cargo fmt
+--all --check` clean, `cargo test --release --workspace` green.
+
+On the 41-page corpus the **first-difference byte does not move on any page** —
+every page still differs earlier, at the hatnote category or the indicator name —
+and the score is still **0/41**, so this buys no scoreboard entry yet. What it
+does buy is honest: total rustoid output rises from 0.61× to **0.65×** of the
+oracle, four pages shrink because their traps are removed (not because content is
+lost), and on the four biggest shrinkers the `<section>` and `mw-references-wrap`
+counts now **match the oracle exactly** (`Doom` 23/2, `Association football`
+30/2, `Isaac Newton` 41/2, `2024 Summer Olympics` 42/3-of-4). The remaining
+`<li>` shortfall is the reference *content* gap, not section structure.
