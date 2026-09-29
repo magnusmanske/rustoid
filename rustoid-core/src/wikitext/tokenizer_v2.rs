@@ -4902,7 +4902,14 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
     // (mirrors the PEG `template_param_name` production, which only splits on a
     // top-level `=`).
     let mut bracket = 0i32;
-    let mut brace = 0i32;
+    // A *stack*, not a counter: a run of `}` braces closes as many open
+    // constructs as it can, and which comes first is decided by the innermost.
+    // A flat counter decrements once per `}}`, so the six braces of
+    // `{{{a|{{{b|C}}}}}}` closed one construct too many. That drove the depth to
+    // 0 before the nested `|g=f`, whose `=` was then taken for a name/value
+    // separator: `{{#if:1|{{t|{{{a|{{{b|C}}}}}}|g=f}}|X}}` recorded the branch
+    // as the key `{{t|…|g` with value `f}}` and rendered it as literal text.
+    let mut braces: Vec<Brace> = Vec::new();
     let mut extlink = 0i32;
     let mut i = 0usize;
     while i < bytes.len() {
@@ -4941,18 +4948,35 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
         }
         // Nested `{{` / `}}` (and `{{{` / `}}}`) atoms.
         if b == b'{' && bytes.get(i + 1) == Some(&b'{') {
-            brace += 1;
-            i += 2;
+            let tplarg = bytes.get(i + 2) == Some(&b'{');
+            braces.push(if tplarg {
+                Brace::Tplarg
+            } else {
+                Brace::Template
+            });
+            i += if tplarg { 3 } else { 2 };
             at_sol = false;
             continue;
         }
-        if b == b'}' && bytes.get(i + 1) == Some(&b'}') && brace > 0 {
-            brace -= 1;
-            i += 2;
+        if b == b'}' && bytes.get(i + 1) == Some(&b'}') && !braces.is_empty() {
+            let run = bytes[i..].iter().take_while(|&&c| c == b'}').count();
+            let mut consumed = 0usize;
+            while consumed < run {
+                let remaining = run - consumed;
+                let close = match braces.last() {
+                    Some(Brace::Tplarg) if remaining >= 3 => 3,
+                    Some(Brace::Template) if remaining >= 2 => 2,
+                    _ => break,
+                };
+                braces.pop();
+                consumed += close;
+            }
+            // Always advance, or a run of unmatched `}` would not progress.
+            i += consumed.max(1);
             continue;
         }
         // Single-bracket `[…]` extlink atom.
-        if b == b'[' && bracket == 0 && brace == 0 {
+        if b == b'[' && bracket == 0 && braces.is_empty() {
             extlink += 1;
             i += 1;
             at_sol = false;
@@ -4963,7 +4987,7 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
             i += 1;
             continue;
         }
-        if bracket > 0 || brace > 0 || extlink > 0 {
+        if bracket > 0 || !braces.is_empty() || extlink > 0 {
             // Inside a nested construct: `=` is content, not a separator.
             i += 1;
             continue;
@@ -6699,6 +6723,27 @@ mod tests {
         // `pipe` rule, so it does not split the arguments.
         let parts = split_template_args("1x|[[http://e.com |123]]");
         assert_eq!(parts, vec!["1x", "[[http://e.com |123]]"]);
+    }
+
+    #[test]
+    fn test_arg_separator_ignores_eq_inside_nested_tplarg_run() {
+        // A `=` is a name/value separator only at the top level. The six closing
+        // braces of `{{{a|{{{b|C}}}}}}` are two `}}}` tplarg closers, not three
+        // `}}`; a flat brace counter consumed them as three and drove the depth
+        // to 0, so the `=` in the following `|g=f` looked top-level. That turned
+        // `{{#if:1|{{t|{{{a|{{{b|C}}}}}}|g=f}}|X}}`'s branch into the named
+        // argument `{{t|…|g=f}}` and printed it as literal text.
+        assert_eq!(
+            find_arg_separator_eq("{{t|{{{a|{{{b|C}}}}}}|g=f}}", false),
+            None
+        );
+
+        // A genuine top-level `=` after a balanced nested run is still found.
+        assert_eq!(
+            find_arg_separator_eq("{{{a|{{{b|C}}}}}}=d", false),
+            Some("{{{a|{{{b|C}}}}}}".len())
+        );
+        assert_eq!(find_arg_separator_eq("{{t|a}}=b", false), Some(7));
     }
 
     #[test]
