@@ -7400,3 +7400,33 @@ gaps are being sliced with output-coordinate offsets exactly like the end marker
 `attribute_expander::split_tokens` are where to look next. Until that is fixed the
 References section stays trapped, so this remains the target — but it is now two
 known, reproducible defects rather than one unlocated one.
+
+### Locating the compound-parts bug: it is the grouping, not the slice
+
+Instrumenting the parts construction narrows the second defect to one line of
+output. `compute_range_plan` splices the wikitext between two constituents of a
+compound transclusion as
+`source[prev_end .. r.start_offset]` with `prev_end = ranges[c].dsr_end`, and for
+the `Authority control` `<ul>` (top-level range `#mwt468`) it produces:
+
+    BIG_GAP top=#mwt468 c=#mwt463 len=446141 pe=130 start=446271
+
+446 KB spliced from offset 130 to 446271 — the same page tail that traps the
+References section. So `#mwt468` is being treated as a *compound* whose
+constituents span from near the top of the page to the Sources section; the huge
+part is a symptom of that grouping, and the gap slice is faithful given it.
+
+Four candidate causes were ruled out by measurement (each changed nothing on
+Israel and kept the fixture guard at 876/896):
+
+- `RangePlan::compound_data_mw`'s trailing tail,
+- `build_compound_data_mw`'s leading `unwrappedWT` and trailing parts,
+- `handle_link_neighbours::migrate_parts_json` (no text node > 1000 bytes is ever
+  migrated),
+- a `tsr`-vs-`dsr` preference in `collect_plan_metas` (the two agree here).
+
+That leaves the *grouping*: which ranges become constituents of one compound —
+`compute_range_plan`'s `subsumed` graph, `top_level_enclosing`, and the
+overlap-merge test `in_document_order(range_start, prev.range_end)` — a port of
+`DOMRangeBuilder::findTopLevelNonOverlappingRanges`. That is the next target, and
+it is a correctness fix to the range graph rather than to any string slice.
