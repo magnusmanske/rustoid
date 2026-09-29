@@ -7477,3 +7477,38 @@ region — e.g. the five-brace `{{{{{|safesubst:}}}#if:1473946…` seen in the
 rest of the page read as literal text inside the transclusion. So the next thread
 is the `safesubst` / `{{ … |safesubst:}}` handling in the template layer, not
 `compute_range_plan`.
+
+### The safesubst thread: the brace run, and the modifier (fixed)
+
+Following that lead found two real bugs, both now fixed (`3bd3528`).
+
+**1. The brace run.** `Template:Convert` is
+`{{{{{♥|safesubst:}}}#invoke:convert|convert}}`. MediaWiki's grammar gives the
+rule explicitly (`Grammar.pegphp`, `tplarg_or_template`, "ideal precedence"): a
+run of N `{` opens a template when `N % 3 == 2`, an argument when `N % 3 == 0`,
+and when `N % 3 == 1` one `{` is literal text and the rest is reconsidered — so
+five braces are `{{` + `{{{` and six are `{{{` + `{{{`. rustoid's
+`parse_directive` chose on `starts_with("{{{")` alone, so the five-brace form was
+read as an argument and leaked. Minimal repro, no templates needed:
+`{{{{{x|#if:}}}1|yes|no}}` gave `{#if:1|yes|no}}` and now gives `yes`. The tell
+was that the *same* construct with a space after `{{` (`{{ {{{x|#if:}}}1|yes|no}}`)
+always worked, which isolates the fault to how the run of braces is split.
+`parse_directive` now chooses on the run length mod 3 and `parse_template_token`
+no longer bails on `{{{`. Effect on Israel: `safesubst` occurrences **14 → 0**.
+
+**2. `safesubst` as a modifier on a *dynamic* name.** With (1) fixed,
+`{{Convert|750|m|}}` stopped leaking but reported "Template loop detected:
+Template:Convert": the name only becomes `safesubst:#invoke:convert` once the
+argument reference expands, and `resolve_target_string` computed `has_hash`
+*before* stripping the `safesubst:` modifier, so `#invoke` was never recognised
+as a parser function and the whole name was resolved as a template title.
+Computing `has_hash` after the strip fixes it: `{{Convert|750|m|}}` now renders
+`750 metres (2,460 ft)`.
+
+Validation: fixtures **876/896**, `clippy`/`fmt` clean, no new stalls. On the
+41-page corpus the first-difference byte is unchanged — every page still differs
+earlier, at the hatnote category or the indicator name — while 22 pages grow as
+the previously-leaked templates expand. This does not touch the References trap
+(still 2 of 3 lists, `id="References"` absent, whose `data-mw` is assembled
+before the DOM layer), but the leaked text this section suspected of unbalancing
+the preprocessor is gone.
