@@ -3282,29 +3282,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let mut out = Vec::new();
         let resolved = resolve_template_target(self.config, Some(frame.title()), &target_str);
-        // `#tag`'s arguments are expanded *eagerly*, unlike a template's. Core's
-        // `CoreParserFunctions::tagObj` runs the inner (second) argument and every
-        // named attribute's name and value through `$frame->expand` before it
-        // builds the tag, because the tag's content and attributes are *strings*:
-        // nothing re-expands them later. A template's arguments are the opposite —
-        // they stay unexpanded until the body reads them — which is why this is
-        // scoped to `#tag` rather than folded into `attribute_transform_manager`.
-        //
-        // Without it, `{{#tag:indicator|<body>|name=<expr>}}` recorded the
-        // unexpanded `{{{…}}}`/`{{…}}` in its `data-mw`: `Template:Top icon`'s
-        // indicator name came out `" "` and its `extsrc` still spelled
-        // `{{{image|…}}}` (the first difference on Grand Theft Auto V and, once
-        // its other breaks were cleared, on COVID-19 pandemic).
-        let attribs = if matches!(
-            &resolved,
-            Some(ResolvedTarget::ParserFunction { name, .. })
-                if name.eq_ignore_ascii_case("tag")
-        ) {
-            self.expand_tag_args(frame, attribs, source, about_counter, src_text)
-                .await
-        } else {
-            attribs
-        };
         // Whether this call's result is a *string* the token stream re-tokenizes,
         // rather than the branch's own tokens. See
         // [`TemplateHandler::expands_branch_to_text`]; the `_` arm below is where
@@ -3610,119 +3587,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         .await;
         target.key = crate::wikitext::tokens_v2::KeyValue::Tokens(expanded);
         attribs
-    }
-
-    /// Expand a `#tag` call's arguments the way core's `tagObj` does.
-    ///
-    /// `CoreParserFunctions::tagObj` runs the inner (second) argument and every
-    /// named attribute's name and value through `$frame->expand`, so the tag is
-    /// built from expanded strings. The target (argument zero) is already done by
-    /// [`Self::expand_target_templates`]. Only the second positional argument is
-    /// content — `tagObj` shifts two positional arguments and reads the rest as
-    /// `name=value` — so a positional argument beyond the second is left alone.
-    #[allow(clippy::too_many_arguments)]
-    async fn expand_tag_args(
-        &self,
-        frame: &Frame,
-        attribs: Vec<crate::wikitext::tokens_v2::KV>,
-        source: Option<&dyn DataSource>,
-        about_counter: &std::cell::Cell<usize>,
-        src_text: &str,
-    ) -> Vec<crate::wikitext::tokens_v2::KV> {
-        use crate::wikitext::tokens_v2::KeyValue;
-
-        let mut out = attribs;
-        for (i, kv) in out.iter_mut().enumerate() {
-            if i == 0 {
-                // The target, already expanded.
-                continue;
-            }
-            // Only a *named* attribute (`name=value`) is expanded here. A
-            // positional argument is the tag's inner content, which the existing
-            // path already hands to `pf_tag` as tokens; expanding it again re-runs
-            // the token pipeline over magic pipes the argument pass has already
-            // resolved, which emptied them (`Template:Pre`'s `{{!}}` table). The
-            // content's expansion is therefore still open — see ONLINE-PARITY.md.
-            let key_empty = match &kv.key {
-                KeyValue::Str(s) => s.is_empty(),
-                KeyValue::Tokens(_) => false,
-            };
-            if key_empty {
-                continue;
-            }
-            self.expand_tag_field(frame, &mut kv.key, source, about_counter, src_text)
-                .await;
-            self.expand_tag_field(frame, &mut kv.value, source, about_counter, src_text)
-                .await;
-        }
-        out
-    }
-
-    /// Expand one `#tag` argument field — the inner value, or an attribute's name
-    /// or value — to the tokens the frame produces for it.
-    ///
-    /// The argument references belong to the *calling* frame; the nested templates
-    /// then expand in a child frame with no arguments of its own, mirroring
-    /// [`Self::expand_invoke_args`]. Expansion runs in template context
-    /// (`in_template => true`) so nothing is wrapped in `mw:Transclusion` markers:
-    /// the field is about to be flattened to a string, and a wrapper there would
-    /// both leak its own source (`{{PAGENAME}}`) into the text and spend an `about`
-    /// id the service does not spend.
-    #[allow(clippy::too_many_arguments)]
-    async fn expand_tag_field(
-        &self,
-        frame: &Frame,
-        field: &mut crate::wikitext::tokens_v2::KeyValue,
-        source: Option<&dyn DataSource>,
-        about_counter: &std::cell::Cell<usize>,
-        src_text: &str,
-    ) {
-        use crate::wikitext::tokens_v2::KeyValue;
-
-        let KeyValue::Tokens(items) = field else {
-            return;
-        };
-        let found = expandable_content(items);
-        if !found.template && !found.arg {
-            return;
-        }
-        let substituted = if found.arg {
-            frame.expand(items)
-        } else {
-            items.clone()
-        };
-        let child = frame.new_child(frame.title().clone(), vec![]);
-        let expanded = Box::pin(self.expand_templates(
-            &child,
-            substituted,
-            source,
-            about_counter,
-            // The field is flattened to a *string*, so magic words must expand to
-            // their text (`{{!}}` -> `|`) rather than to the in-template `<td>`
-            // form, and nothing may be wrapped in `mw:Transclusion` markers — a
-            // wrapper there both leaks its own source into the text and spends an
-            // `about` id the service does not. `body` is what suppresses the
-            // wrapper without turning on the template-context magic-word forms.
-            /* in_template */
-            false,
-            /* body */ true,
-            src_text,
-        ))
-        .await;
-        // A target the expansion left nested — `[[{{PAGENAME}}]]` — is resolved
-        // here, because nothing else looks at these tokens: they are about to be
-        // flattened to the string the tag carries.
-        let expanded = Box::pin(self.expand_attrib_templates(
-            &child,
-            expanded,
-            source,
-            about_counter,
-            /* in_template */ false,
-            /* body */ true,
-            src_text,
-        ))
-        .await;
-        *field = KeyValue::Tokens(expanded);
     }
 
     /// Expand templated attribute keys/values on `Tag`/`SelfclosingTag` tokens,
@@ -5058,6 +4922,91 @@ fn is_bang_marker(t: &crate::wikitext::tokens_v2::TagTk) -> bool {
         && t.data_parsoid.tmp.attr_src.as_deref() == Some("")
 }
 
+/// Render `#tag` content tokens back to the wikitext the tag records as its
+/// `source`/`extsrc`.
+///
+/// Core's `$frame->expand` returns the *expanded* text, but a token's
+/// `data_parsoid.src` is the source as written, and that is stale once an
+/// argument reference inside it — a link target, typically — has been
+/// substituted. So the text is regenerated from the token's own fields, the way
+/// [`argument_value_text`] does for a module argument. Two differences make this
+/// its own function rather than a call to that one:
+///
+/// - newlines are **kept**: the tag content is wikitext, and `#tag:pre`'s
+///   `extsrc` carries them while a Scribunto argument drops them;
+/// - a token this cannot render makes the *whole* content fall back to the
+///   recorded source (the caller's `unwrap_or_else`), so a construct it does not
+///   know is never silently dropped.
+pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    let mut out = String::new();
+    for item in items {
+        match item {
+            Item::Str(s) => out.push_str(s),
+            // A comment is stripped by the preprocessor; a newline is content.
+            Item::Tok(ParsoidToken::Comment(_)) => {}
+            Item::Tok(ParsoidToken::Nl(_)) => out.push('\n'),
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
+                let value = t.attribs.iter().find(|kv| kv.key.as_str() == Some("value"));
+                out.push_str(
+                    &value
+                        .and_then(|kv| key_value_text(&kv.value))
+                        .unwrap_or_else(|| "''".to_string()),
+                );
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension" => {
+                out.push_str(t.data_parsoid.src.as_deref()?);
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "wikilink" => {
+                let href = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))?;
+                out.push_str("[[");
+                out.push_str(&key_value_text(&href.value)?);
+                for part in t
+                    .attribs
+                    .iter()
+                    .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+                {
+                    out.push('|');
+                    out.push_str(&key_value_text(&part.value)?);
+                }
+                out.push_str("]]");
+            }
+            Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
+            _ => return None,
+        }
+    }
+    Some(strip_html_comments(&out))
+}
+
+/// Strip HTML comments, as the preprocessor does before a template body is
+/// expanded.
+///
+/// A comment inside a `#tag` argument is not a `Comment` token: the tokenizer
+/// keeps it as text inside the argument value (`Template:Top icon`'s file spec
+/// carries `<!--\n-->` between its parameters), so `$frame->expand` on the
+/// service returns the content with the comments gone and the surrounding
+/// whitespace kept. An unclosed `<!--` swallows the rest, which is what the
+/// preprocessor does with one.
+fn strip_html_comments(s: &str) -> String {
+    if !s.contains("<!--") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start + 4..].find("-->") {
+            Some(end) => rest = &rest[start + 4 + end + 3..],
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Render a Scribunto failure the way MediaWiki does, so a broken `#invoke`
 /// shows up as an error in the output rather than as silently missing text.
 ///
@@ -6372,6 +6321,47 @@ mod tests {
         assert!(
             html.contains(r##"<pre typeof="mw:Extension/pre" about="#mwt2""##),
             "the pre must carry the id TT2 spent: {html}"
+        );
+    }
+
+    /// `tag_content_source` must rebuild a link from its expanded fields (the
+    /// recorded `data_parsoid.src` is stale once the target is substituted), drop
+    /// comments the way the preprocessor does, and keep newlines — the three
+    /// things that make a `#tag` `extsrc` match the service.
+    #[test]
+    fn tag_content_source_rebuilds_a_link_and_drops_comments_but_keeps_newlines() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue, NlTk, ParsoidToken, SelfclosingTagTk};
+
+        let kv = |k: &str, v: &str| KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        // `[[File:X.svg|20px<!--c--> ]]` with the href already substituted and the
+        // comment held as text inside the content value, which is what the
+        // tokenizer produces for a comment in a link.
+        let mut link = SelfclosingTagTk::new("wikilink", vec![], Default::default());
+        link.attribs.push(kv("href", "File:X.svg"));
+        link.attribs.push(kv("mw:maybeContent", "20px<!--c--> "));
+        let items = vec![
+            Item::Tok(ParsoidToken::SelfclosingTag(link)),
+            Item::Tok(ParsoidToken::Nl(NlTk {
+                data_parsoid: Default::default(),
+            })),
+        ];
+        assert_eq!(
+            tag_content_source(&items),
+            Some("[[File:X.svg|20px ]]\n".to_string())
+        );
+        // A token it cannot render makes the whole content fall back, so the
+        // caller keeps the recorded source rather than losing the construct.
+        assert_eq!(
+            tag_content_source(&[Item::Tok(ParsoidToken::SelfclosingTag(
+                SelfclosingTagTk::new("template", vec![], Default::default())
+            ))]),
+            None
         );
     }
 }

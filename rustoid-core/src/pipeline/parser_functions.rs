@@ -532,13 +532,15 @@ impl ParserFunctions {
         // pipes they produce aren't consumed as argument separators (mirrors the
         // token-level `processSpecialMagicWord`/`!` magic-variable handling).
         let content_src: String = crate::expand::tpl_args::replace_magic_pipe(
-            &content
-                .iter()
-                .map(|it| match it {
-                    Item::Str(s) => s.clone(),
-                    Item::Tok(t) => token_to_source(t),
-                })
-                .collect::<String>(),
+            &crate::pipeline::parser::tag_content_source(content).unwrap_or_else(|| {
+                content
+                    .iter()
+                    .map(|it| match it {
+                        Item::Str(s) => s.clone(),
+                        Item::Tok(t) => token_to_source(t),
+                    })
+                    .collect::<String>()
+            }),
         );
         let attr_src = serialize_tag_attribs(display_target, tag_attribs);
         let open_tag = format!("<{}{attr_src}>", display_target.to_lowercase());
