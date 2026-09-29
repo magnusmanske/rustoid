@@ -7299,3 +7299,54 @@ it. That is a transclusion/identity bug (two calls colliding on something the
 group feeds, an `about` id or a shared extension node), not a Cite group limit,
 and it is the thing to chase next — not by re-landing the expansion, which only
 moves the hole.
+
+### Chasing the `<references>` merge: the loss is not in Cite
+
+Following the dropped `<references>` the correction points at says it is right
+in spirit and wrong in location. Rendering `Israel` and reading the byte layout,
+the first page-sized defect is that the **Etymology paragraph's
+`mw:Transclusion` wrapper carries a ~416 KB `data-mw`** whose `parts` absorb the
+*rest of the page* as one string:
+
+    <p about="#mwt27" typeof="mw:Transclusion"
+       data-mw='{"parts":[{"template":{"target":{"wt":"Further",…}}},
+                        "\nThe names [[Land of Israel]] … ",
+                        {"template":{…"lang"…}}, …,
+                        ", \"[[El (deity)|El (God)]] persists/rules\") refers to
+                        the patriarch [[Jacob]] … ===Sports=== …
+                        ==Notes== … ==References== … {{reflist}} … }]}'>
+
+The trapped text is a *JSON string*, so everything after the Etymology paragraph
+— including `==References==` and its `{{reflist}}` — is never parsed as a
+section. That is why `id="References"` is absent from rustoid's Israel and why
+the ungrouped `<references>` list never renders: the reference section is there,
+but as text inside an attribute. The same wikitext also occurs again later in the
+document (`Pawn stars` appears three times), so the page is duplicated as well.
+So this is not a Cite group limit and not a `<references>` merge: it is the
+transclusion encapsulation window, upstream of `ext/cite.rs`.
+
+Minimal reproduction, six lines, no Israel required:
+
+    ==Etymology==
+    {{Further|Israel (name)|Names of the Levant#Israel and Judea}}
+
+    The names [[Land of Israel]] {{langx|grc|X}}
+
+    ==SENTINEL==
+    X
+
+`X`'s paragraph comes out as
+`data-mw='{"parts":[{…"Langx"…},"\n\n==SENTINEL==\nX"]}'` — the sentinel is
+both trapped in `parts` *and* rendered. Every ingredient is needed: removing the
+heading, renaming it `==Foo==`, dropping the second `Further` parameter, using a
+plain template instead of the hatnote, replacing the wikilink, or changing the
+language code `grc` to `xx` each makes the trap go away. That the *heading text*
+and the *language code* matter is the tell that it is offset/identity-sensitive
+rather than a regex misfire — and it cannot be the trail merge, because the
+default `link_trail_regex` is `^[a-z]+` and cannot match `"\n\n==SENTINEL==\nX"`.
+The shape points at the window end computed when a template whose expansion is a
+block (`{{langx|grc|…}}` → `<dl>`) closes a paragraph under a heading.
+
+Not yet pinned: where that window end is computed, and whether the trap and the
+duplicate are one bug or two. That — not `CiteState` — is the next target: it is
+what actually breaks Israel's reference section.
