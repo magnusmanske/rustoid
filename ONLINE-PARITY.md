@@ -7272,3 +7272,30 @@ Next step is not more `#tag` work: it is the reference handler's two-group limit
 because that is what blocks the indicator-name fix (and with it the `attrs.name`
 difference that is the first byte on France, India, Canada, Periodic table and
 COVID-19 pandemic).
+
+### Correction: it is not a group limit, it is a dropped `<references>`
+
+The sentence above repeats the earlier guess. Reproducing the regression
+(re-checking out `8bf5690`'s two files, rendering Israel) says the guess is
+wrong, and the real shape is simpler. Israel's reference section makes four
+`<references>`-producing calls: `footnotes = {{notelist}}` in the infobox,
+`{{Reflist|group=fn}}` and `{{notelist}}` under `==Notes==`, and a bare
+`{{reflist}}` under `==References==`. The oracle renders **three** lists — groups
+`fn`, `lower-alpha`, and the ungrouped one. rustoid renders **two**, and *which
+two is what the argument expansion changes*:
+
+| state | groups rustoid renders | missing |
+|---|---|---|
+| expansion off | `fn`, ungrouped | `lower-alpha` |
+| expansion on | `fn`, `lower-alpha` | ungrouped |
+
+Both of rustoid's lists sit in the Notes section (byte offsets ~1,473,686 and
+~1,474,374 in a 2.6 MB render, 688 bytes apart); the References `{{reflist}}` and
+the infobox `{{notelist}}` produce no list at all. `CiteState` keys groups in a
+`HashMap`, so it has no two-group ceiling — the failure is that whole
+`<references>` invocations are **lost or merged**, and the group value decides
+which, which is why expanding `group=` reshuffles the damage instead of creating
+it. That is a transclusion/identity bug (two calls colliding on something the
+group feeds, an `about` id or a shared extension node), not a Cite group limit,
+and it is the thing to chase next — not by re-landing the expansion, which only
+moves the hole.
