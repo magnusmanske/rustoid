@@ -3636,7 +3636,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
-                    let expanded = self
+                    let mut expanded = self
                         .expand_templates(
                             frame,
                             toks.clone(),
@@ -3647,12 +3647,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             page_source.unwrap_or(""),
                         )
                         .await;
+                    // Attribute contents are template output: an expansion
+                    // marker here carries a source range relative to the
+                    // expanded sub-source, not the page (PHP's
+                    // `processTemplateTokens` clears these).
+                    crate::wikitext::token_utils::clear_tsr(&mut expanded);
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
                     kv.key.clone()
                 };
                 let new_value = if let KeyValue::Tokens(toks) = &kv.value {
-                    let expanded = self
+                    let mut expanded = self
                         .expand_templates(
                             frame,
                             toks.clone(),
@@ -3663,6 +3668,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             page_source.unwrap_or(""),
                         )
                         .await;
+                    crate::wikitext::token_utils::clear_tsr(&mut expanded);
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
                     kv.value.clone()

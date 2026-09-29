@@ -30,6 +30,46 @@ pub fn is_html_tag(token: &ParsoidToken) -> bool {
     false
 }
 
+/// Clear the `tsr` on every token in a chunk, and on tokens nested inside its
+/// attributes.
+///
+/// Mirrors PHP's `TemplateHandler::processTemplateTokens`, which `unset`s `tsr`
+/// on everything a template / parser function / variable expansion produced: a
+/// token from an expanded *sub-source* carries a source range relative to that
+/// source, not the page, so leaving it set lets the encapsulation range plan
+/// read it as a bogus page offset. On `Israel` a `{{PAGENAME}}` expanded inside
+/// a wikilink target (`Template:Wikiatlas` is `[[commons:Atlas of
+/// {{PAGENAME}}|…]]`) kept `tsr = (0, 12)`; the range plan took it for a
+/// top-level transclusion starting at page offset 0 and folded the page tail
+/// into the `External links` list's `data-mw`, trapping the `==References==`
+/// section inside an attribute.
+pub fn clear_tsr(items: &mut [Item]) {
+    for item in items.iter_mut() {
+        clear_tsr_item(item);
+    }
+}
+
+fn clear_tsr_item(item: &mut Item) {
+    let Item::Tok(tok) = item else {
+        return;
+    };
+    if let Some(dp) = tok.data_parsoid_mut() {
+        dp.tsr = None;
+    }
+    if let Some(attribs) = tok.attribs_mut() {
+        for kv in attribs.iter_mut() {
+            clear_tsr_value(&mut kv.key);
+            clear_tsr_value(&mut kv.value);
+        }
+    }
+}
+
+fn clear_tsr_value(value: &mut KeyValue) {
+    if let KeyValue::Tokens(items) = value {
+        clear_tsr(items);
+    }
+}
+
 /// Determine whether the token matches the given `typeof` attribute value
 /// (exact match). Mirrors `TokenUtils::hasTypeOf`.
 pub fn has_type_of(token: &ParsoidToken, expected: &str) -> bool {

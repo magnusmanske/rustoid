@@ -54,90 +54,71 @@ fn new_section(id: &str) -> Node {
 /// non-heading content). `at_top` indicates this is the `<body>` level, where
 /// the always-present lead section is created.
 fn wrap_level(children: &[Node], counter: &mut SectionNumber, at_top: bool) -> Vec<Node> {
-    // Stack of open parent heading-sections. `stack.last()` is the innermost
-    // enclosing section, and `current` is the most-recently-opened section,
-    // into which subsequent sibling content is appended.
+    // Open heading-sections, outermost first; `stack.last()` is the innermost,
+    // the one that subsequent sibling content belongs to.
     let mut stack: Vec<OpenSection> = Vec::new();
-    let mut current: Option<OpenSection> = None;
-
     let mut out: Vec<Node> = Vec::new();
-    // The lead section is created only at the top level, is always present,
-    // and always comes first; content before the first heading belongs to it.
+    // The lead section is created only at the top level, is always present, and
+    // always comes first; content before the first heading belongs to it. It is
+    // kept in the output but never on the stack: a heading opens a *new*
+    // top-level section, it does not nest inside the lead.
     if at_top {
         out.push(new_section("0"));
     }
 
     for child in children {
         if let Some(level) = heading_level(child) {
-            // Pop parent sections that cannot nest this level.
-            while stack.last().is_some_and(|s| level <= s.level) {
-                stack.pop();
-            }
-
-            // If the currently-open heading section can nest this level, it
-            // becomes a parent; otherwise it is now closed and committed to the
-            // output as a sibling.
-            match current.take() {
-                Some(cur) if level > cur.level => {
-                    stack.push(cur);
-                }
-                Some(cur) => {
-                    out.push(cur.node);
-                }
-                None => {}
-            }
-
-            // Open the new heading section.
+            // A heading of this level ends every open section that cannot nest
+            // it. Each closed section is attached to its parent, or emitted as a
+            // top-level sibling; a section opened for an earlier heading and
+            // then popped here must be *kept*, not dropped — on `Israel` the
+            // `==References==` section nested `===Sources===`, and the following
+            // `==External links==` popped it back off the stack.
+            close_above(&mut stack, &mut out, level);
             let mut section = new_section(&counter.next().to_string());
             section.push_child(child.clone());
-            current = Some(OpenSection {
+            stack.push(OpenSection {
                 level,
                 node: section,
             });
         } else {
-            // Content that is not a heading belongs to the innermost open
-            // section, or (before the first heading, at top level) the lead
-            // section held at out[0].
+            // Non-heading content belongs to the innermost open section, or
+            // (before the first heading, at top level) the lead section at
+            // `out[0]`, or — below the top level, where there is no lead — to the
+            // output as-is.
             let transformed = transform_subtree(child, counter);
-            if current.is_none() && at_top {
-                if let Some(lead) = out.first_mut() {
-                    lead.push_child(transformed);
-                }
-            } else if let Some(cur) = current.as_mut() {
-                cur.node.push_child(transformed);
+            if let Some(open) = stack.last_mut() {
+                open.node.push_child(transformed);
+            } else if at_top && let Some(lead) = out.first_mut() {
+                // Before the first heading, at the top level, content belongs to
+                // the always-present lead section at `out[0]`. Below the top
+                // level there is no lead, so it is emitted as-is — appending it
+                // to `out[0]` there would nest it inside whatever came first.
+                lead.push_child(transformed);
             } else {
                 out.push(transformed);
             }
         }
     }
 
-    // Commit any still-open section (nesting back into its parents).
-    if let Some(leaf) = current.take() {
-        attach_sections(leaf, &mut stack, &mut out);
-    } else {
-        while let Some(parent) = stack.pop() {
-            out.insert(0, parent.node);
-        }
-    }
-
+    // Commit every still-open section, innermost first.
+    close_above(&mut stack, &mut out, 0);
     out
 }
 
-/// Attach `leaf` (a still-open section) into its parent section, recursively
-/// walking back up the stack of opened sections. Each popped parent is pushed
-/// into its own parent (or `out`), then the leaf is pushed as the last child of
-/// the nearest parent.
-fn attach_sections(leaf: OpenSection, stack: &mut Vec<OpenSection>, out: &mut Vec<Node>) {
-    let mut child = leaf.node;
-
-    // Walk up the stack, making each parent contain its child.
-    while let Some(mut parent) = stack.pop() {
-        parent.node.push_child(child);
-        child = parent.node;
+/// Close every open section that cannot contain a heading of `level`: pop it,
+/// attach it to its parent section if one is still open, else emit it as a
+/// top-level sibling. `level == 0` closes them all (a heading level is never 0).
+fn close_above(stack: &mut Vec<OpenSection>, out: &mut Vec<Node>, level: u8) {
+    while stack.last().is_some_and(|s| s.level >= level) {
+        let Some(section) = stack.pop() else {
+            break;
+        };
+        match stack.last_mut() {
+            Some(parent) => parent.node.push_child(section.node),
+            None => out.push(section.node),
+        }
     }
-
-    // The outermost opened section becomes a top-level sibling.
-    out.push(child);
 }
 
 /// Recurse into a non-heading element's children, wrapping any nested headings.
@@ -231,5 +212,30 @@ mod tests {
         wrap_sections(&mut body);
         // Lead (0), h2 (1), h2 (2) as siblings.
         assert_eq!(section_ids(&body), vec!["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_section_nesting_a_deeper_heading_survives_a_later_sibling() {
+        // h2 (References) nests h3 (Sources); the following h2 (External links)
+        // ends both. The References section must remain, as must Sources inside
+        // it — an earlier version dropped a section that had been pushed onto the
+        // nesting stack and was then popped, losing the whole References section
+        // of `Israel`.
+        let mut body = Node::element(ElementKind::Other("body".to_string()));
+        body.push_child(heading(2)); // Notes
+        body.push_child(text("n"));
+        body.push_child(heading(2)); // References
+        body.push_child(text("r"));
+        body.push_child(heading(3)); // Sources
+        body.push_child(text("s"));
+        body.push_child(heading(2)); // External links
+        body.push_child(text("e"));
+        wrap_sections(&mut body);
+
+        // Lead (0), Notes (1), References (2), External links (4); Sources is
+        // numbered 3 in document order but nested inside References.
+        assert_eq!(section_ids(&body), vec!["0", "1", "2", "4"]);
+        let references = &body.children[2];
+        assert_eq!(section_ids(references), vec!["3".to_string()]);
     }
 }
