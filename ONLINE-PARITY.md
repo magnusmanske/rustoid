@@ -7350,3 +7350,53 @@ block (`{{langx|grc|…}}` → `<dl>`) closes a paragraph under a heading.
 Not yet pinned: where that window end is computed, and whether the trap and the
 duplicate are one bug or two. That — not `CiteState` — is the next target: it is
 what actually breaks Israel's reference section.
+
+## The window end: a first (partial) fix, and the bug it uncovers
+
+The window end from the previous section is in `wrap_flipped_children`
+(`tree_builder_html.rs`). It computed `range_end` as the **max `dsr.end` over
+*every* following sibling**; PHP's `encapsulateTemplates` uses
+`getRangeEndDSR($range)` — the DSR of the *range's end node* — and only that
+(`$dp1DSR->end = $dp2DSR->end`). The over-broad max is what dragged the rest of
+the page in: on the six-line reproduction it took the `==SENTINEL==` heading's
+DSR, and on Israel the `==References==` section's, straight through EOF.
+
+Two things were wrong, not one. Restricted to the end-marker sibling
+(`children[t]`) plus any sibling the adoption pass stamped with the range's
+`about`, the value was still bad, because the offsets came from two coordinate
+systems. Tracing the reproduction's sibling list shows the end-marker `<meta>`
+at `dsr = (131, 131)` — the template *output* length — while its `tsr` is
+`(null, 122)`, the *source* end of `{{langx|grc|X}}`, and the sentinel nodes are
+source-relative. Slicing `source[122 .. 131]` yields `"\n\n==SENTI"`. The fix
+reads the source offset from `tsr.end` (falling back to `dsr.end`), which is what
+a template marker's `tsr` is for.
+
+Effect: the reproduction renders
+`data-mw='{"parts":[{…"Langx"…}]}'` with no trailing part, and Israel loses
+about **900 KB of bogus `data-mw` echo** — a 416 KB attribute on the Etymology
+`<p>` was the first. Nothing rendered changed: `<p` 141, `<li` 1091, `<a` 3033,
+`<td` 90 are **identical** before and after, the wide corpus keeps the same
+first-difference byte on every page, and the fixture guard stays **876/896**.
+So the earlier "closeness" to the oracle's byte count was padding from the bogus
+echo, not content.
+
+### It does not yet fix Israel's references
+
+A second, different bug remains, and it is why `id="References"` is still
+absent (`mw-references-wrap` 2 where the oracle has 3). A `<ul about="#mwt468">`
+wrapper on Israel carries `parts` sliced from the **top of the page**:
+
+    {"parts":[{"template":{"target":{"wt":"PAGENAME","function":"pagename"},…}},
+               "ription|Country in West Asia}}\n{{About|the country|the region|…",
+               {"template":…"Template:2"…},
+               "ob|other uses}}\n{{pp-extended|small=yes}}\n{{Use…"]}
+
+`"ription|Country in West Asia}}"` is the tail of `{{Short description|Country in
+West Asia}}`, cut mid-word. This is the *other* half of the same PHP pair:
+`recordTemplateInfo` interpolates the wikitext *between* templates
+(`$prevTplInfo->dsr->end … $dsr->start`) and the leading `unwrappedWT`, and those
+gaps are being sliced with output-coordinate offsets exactly like the end marker's
+`dsr` was. rustoid's `build_compound_data_mw_with_nested` and
+`attribute_expander::split_tokens` are where to look next. Until that is fixed the
+References section stays trapped, so this remains the target — but it is now two
+known, reproducible defects rather than one unlocated one.
