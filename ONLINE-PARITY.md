@@ -7952,4 +7952,30 @@ One cost is worth recording because it is easy to mistake for a bug: the fix
 expands values that previously fell back to a source that re-expanded to
 *nothing*, so `India` grew from under 180 s to **3 m 0 s**. Its first difference
 still moved *later* (1499 → 1557), and the 180 s stall cap in the corpus recipe
-therefore now reports it as stalled. That is real work being done, not a loop.
+therefore reports it as stalled (at a 260 s cap it completes, and `United
+States` is the only stall left, as before). That is real work being done, not a
+loop.
+
+### Scoreboard
+
+Wide corpus (48 titles, offline, 180 s cap unless noted): first-difference byte
+below is the best of this round against the previous `/tmp/wide_pi.txt` run.
+
+```
+Module:Math                 1        (1)        Anarchism            1622 -> 2535
+Python (programming)        578      (578)      Isaac Newton         1546 -> 4073
+ISO 3166-1 alpha-2          598      (598)      Periodic table       1754 -> 4265
+World War II                939      (939)      Hydrogen             1026 -> 3722
+Association football        1438 ->  9496       Megadeth             7463 -> 7766
+Zebro                       3026     (3026)     Nigeria              1564 -> 2187
+Chernobyl disaster          5795     (5795)     France               1649 -> 19849
+Grand Theft Auto V          3895     (3895)     Chess                1696 -> 5449
+Doom (1993 video game)      5543     (5543)     India                1546 -> 1557
+Polio vaccine               5306     (5306)     COVID-19 pandemic   10018    (10018)
+```
+
+No page's first difference regressed, and the score is still **0/41** — the
+smallest remaining differences are `Module:Math` at byte 1 (a namespace/content
+model gap of its own), then four pages that all differ inside the first paragraph
+or hatnote. Total output rose 28.10 M → **28.26 M** bytes (0.56× → 0.57× the
+oracle), the growth being content that previously re-expanded to nothing.
