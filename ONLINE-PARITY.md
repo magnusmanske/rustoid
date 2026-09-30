@@ -7979,3 +7979,78 @@ smallest remaining differences are `Module:Math` at byte 1 (a namespace/content
 model gap of its own), then four pages that all differ inside the first paragraph
 or hatnote. Total output rose 28.10 M → **28.26 M** bytes (0.56× → 0.57× the
 oracle), the growth being content that previously re-expanded to nothing.
+
+## The frame a template's arguments are expanded in
+
+`Polio vaccine` differed at 5350 on a **spurious error**: rustoid served
+`Template loop detected: Template:Main other` where the service renders the
+category links. It reduces to one line against the live endpoint:
+
+```
+{{Main other|{{Main other|X}}}}     service: X      rustoid: Template loop detected
+```
+
+`Template:Main other` does not call itself, so no loop exists. The chain rustoid
+checked was, at the point the inner call was expanded:
+
+```
+Template:Main other (whose body is being expanded)
+  Template:Short description          <- the value being spliced in
+    Template:Infobox drug
+      Polio vaccine
+```
+
+`Template:Short description` ends with `{{Main other|{{SDcat|…}}}}`, and
+`Template:Infobox drug` wraps its own short-description call in
+`{{Main other|…}}` — so *whether the inner call runs before or after the outer
+frame is entered* decides whether this looks like a loop. It is not one, because
+the service expands a call's argument values **in the calling frame**, before the
+callee's frame exists. rustoid spliced them into the body and expanded them
+there, i.e. in the callee's frame — one frame too deep.
+
+The same property explains the module-argument gap recorded above: a module's
+`frame:getParent().args` arrives *expanded*, which is why the
+`<div class="plainlist">` it echoes back carries no `about` and costs no extra
+`#mwt` ids. rustoid handed it unexpanded wikitext, so re-expanding it in the
+module's output built a fresh transclusion. Expanding the value at call time
+fixes both at once, and it is what `Frame::expandArg`'s
+`'expandTemplates' => true` does in Parsoid's own (parser-test-only) native path;
+the production path gets it from the preprocessor.
+
+### Two things the change needed care with
+
+**The helper frame's title.** Expanding an argument value needs a frame of its
+own, and rustoid built those with `frame.new_child(frame.title().clone(), …)` —
+a child whose title *equals the caller's*. An argument that calls the caller's own
+template then matches that frame in `loopAndDepthCheck` and reports a loop, which
+is the same class of false positive one level down. The helper is now titled with
+the *page*, which can never equal a template title; Parsoid's equivalent frame
+has a null title, which can never match anything.
+
+**One more arm in the argument renderer.** With the values expanded, the text a
+module receives is built from `argument_value_text`, which refused the value
+outright because of an `mw:Entity` span — so the whole value fell back to a
+stale source range and `Template:Redirect-several`'s link list came out as
+"other terms". The renderer now emits the entity *as written* (`&#32;`) and skips
+the decoded character and the end tag, mirroring PHP's `$i += 2`; re-parsing the
+module's output rebuilds the same span.
+
+### Scoreboard
+
+```
+Association football        9496 ->  6122      France              19849 -> 18416
+Chernobyl disaster          5795 ->  4109      COVID-19 pandemic   10018 ->  8291
+Chess                       5449 ->  3863      Megadeth             7766 ->  5613
+```
+
+No page's first difference regressed, and the fixture guard moved for the first
+time this round — **876 → 877** (`tables.txt` 88 → 89), the fixed fixture being
+the argument-value cell splitting that the same code path drives. The wider
+corpus total *fell* 28.26 M → 27.99 M bytes: spurious loop-error markup is gone,
+and values that used to re-expand in the module's frame no longer do so twice.
+
+`Polio vaccine` stays at 5350, but what differs there changed: the category links
+are no longer wrapped in the `<span class="mw-empty-elt">` the service gives
+them, and rustoid's stylesheet takes `about="#mwt6"` where the service takes
+`#mwt7`. Those are the id/`shouldStashRenderingTransparentNodes` thread again — a
+page-local about-id is being spent one time too few — not the loop.
