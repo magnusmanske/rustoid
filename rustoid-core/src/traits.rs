@@ -165,6 +165,21 @@ pub trait DataSource: Send + Sync {
         Ok(ret)
     }
 
+    /// Page metadata for a title a *module* probes, from recorded facts only.
+    ///
+    /// Distinct from [`DataSource::get_page_info`], which serves link
+    /// resolution and silently answers "exists" for a title it cannot check (so
+    /// that an offline run does not paint the whole page red). A module asking
+    /// `title.exists` needs the truth: a wrong "yes" makes it load a page it has
+    /// not got, and a wrong "no" sends it down its missing branch — which is
+    /// what put `Category:Missing redirects` on `Association football` for a
+    /// redirect the run had a fact for but no body. So an unknown title is
+    /// simply absent from the map, and the caller falls back to the body.
+    async fn get_known_page_info(&self, titles: &[String]) -> Result<HashMap<String, PageInfo>> {
+        let _ = titles;
+        Ok(HashMap::new())
+    }
+
     /// Page protection levels, keyed by action, for the titles a module may ask
     /// about — `title.protectionLevels`.
     ///

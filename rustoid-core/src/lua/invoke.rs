@@ -615,27 +615,9 @@ where
                     unfetchable.insert(title);
                     continue;
                 }
-                let parsed = title_from_text(&site, &title);
-                let content = source.get_page_content(&parsed).await.ok().flatten();
-                let exists = content.is_some();
-                let is_redirect = content
-                    .as_deref()
-                    .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"));
-                let protection = source
-                    .get_title_protection(std::slice::from_ref(&title))
-                    .await
-                    .unwrap_or_default()
-                    .remove(&title)
-                    .unwrap_or_default();
-                frame.titles.insert(
-                    title.clone(),
-                    TitleFacts {
-                        exists,
-                        is_redirect,
-                        content,
-                        protection,
-                    },
-                );
+                frame
+                    .titles
+                    .insert(title.clone(), title_facts_of(source, &site, &title).await);
                 continue;
             }
             Outcome::Deferred(request) => {
@@ -801,42 +783,64 @@ pub async fn preload_titles<S: DataSource + ?Sized>(
     wanted.retain(|title| !known.contains_key(title));
 
     for title in wanted.into_iter().take(MAX_TITLES) {
-        // The title is parsed against the site's namespaces, not assumed to be a
-        // main-namespace one: a subpage preload passes `Template:Infobox/doc`,
-        // and `Title::new_main` left it with namespace 0, so the lookup key was
-        // `Template:Infobox/doc` with no namespace and the fetched page was
-        // never found again. `exists` then read false for a page that was on
-        // disk, and `Module:Documentation` took its "does not exist" branch.
-        let parsed = title_from_text(site, &title);
-        let content = source.get_page_content(&parsed).await.ok().flatten();
-        let exists = content.is_some();
-        // A redirect is a page whose content is `#REDIRECT [[…]]`; fetching it
-        // again to find out would double the traffic for a value most modules do
-        // not read.
-        let is_redirect = content
-            .as_deref()
-            .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"));
-        // Protection is asked for in one batch rather than per title, and after
-        // the content loop so a data source that can only answer one of the two
-        // cheaply still gets asked once.
-        let protection = source
-            .get_title_protection(std::slice::from_ref(&title))
-            .await
-            .unwrap_or_default()
-            .remove(&title)
-            .unwrap_or_default();
-        out.insert(
-            title,
-            TitleFacts {
-                exists,
-                is_redirect,
-                content,
-                protection,
-            },
-        );
+        out.insert(title.clone(), title_facts_of(source, site, &title).await);
     }
 
     out
+}
+
+/// Resolve the facts a title object answers, from its body and from the
+/// recorded page-info.
+///
+/// Existence and redirect-ness are database facts that the body cannot supply:
+/// Scribunto answers `title.exists` from the wiki's page table, not by loading
+/// the page. Deriving them only from the body made a title whose body was not
+/// cached read as non-existent even when the run *had* the fact — which is what
+/// put `Category:Missing redirects` and
+/// `Category:Articles with hatnote templates targeting a nonexistent page` on
+/// `Association football`, for `Soccer`, a redirect the cache knew about. The
+/// phantom categories also cost the hatnote its node id, because they added a
+/// trailing member to the transclusion range and the `div` stopped being the
+/// range's last node (the exemption `markDiscardableDataParsoid` grants it).
+///
+/// A recorded fact that says the page is *missing* is not overridden by a body:
+/// `get_page_content` returns `None` for both "absent" and "not cached", so a
+/// body only ever adds existence, never removes it.
+pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
+    source: &S,
+    site: &LuaSite,
+    title: &str,
+) -> TitleFacts {
+    let parsed = title_from_text(site, title);
+    let content = source.get_page_content(&parsed).await.ok().flatten();
+    let info = source
+        .get_known_page_info(std::slice::from_ref(&title.to_string()))
+        .await
+        .unwrap_or_default()
+        .remove(title);
+    let exists = content.is_some() || info.as_ref().is_some_and(|i| !i.missing);
+    // A redirect is a page whose content is `#REDIRECT [[…]]` — but that is only
+    // visible when the body was fetched, so the recorded flag is the one that
+    // survives an offline run.
+    let is_redirect = content
+        .as_deref()
+        .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"))
+        || info.as_ref().is_some_and(|i| i.redirect);
+    // Protection is asked for in one batch rather than per title, and after the
+    // content loop so a data source that can only answer one of the two cheaply
+    // still gets asked once.
+    let protection = source
+        .get_title_protection(std::slice::from_ref(&title.to_string()))
+        .await
+        .unwrap_or_default()
+        .remove(title)
+        .unwrap_or_default();
+    TitleFacts {
+        exists,
+        is_redirect,
+        content,
+        protection,
+    }
 }
 
 /// Parse a possibly namespace-prefixed title against the site's namespaces.

@@ -678,53 +678,22 @@ impl DataSource for CachedDataSource {
         titles: &[String],
     ) -> rustoid_core::Result<std::collections::HashMap<String, rustoid_core::traits::PageInfo>>
     {
-        // Cached facts win, so an offline run answers truthfully for every title
-        // a previous online run looked up, and a mixed run fetches only what it
-        // does not have. This is the whole point of the `PageInfo` cache kind: the
-        // facts are not derivable from a body, so without them offline link
-        // resolution can only guess.
-        let mut out = std::collections::HashMap::new();
-        let mut missing: Vec<String> = Vec::new();
-        for title in titles {
-            match self.cached_page_info(title) {
-                Some(entry) => {
-                    out.insert(title.clone(), entry);
-                }
-                None => missing.push(title.clone()),
-            }
-        }
-        if missing.is_empty() {
-            return Ok(out);
-        }
+        Ok(lookup_page_info(self, titles, true).await)
+    }
 
-        // `offline` is checked, not just the presence of a client. The client is
-        // always built — it is needed for the entity wiki even in a run that must not
-        // touch the network — so testing `client.is_none()` here sent `--offline`
-        // runs to the network anyway. That is not a small leak: `AddRedLinks` asks
-        // about *every* wikilink title on the page, so one offline run of `Zebra`
-        // fired thousands of paced requests and appeared to hang.
-        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
-            // Offline and not cached: assume everything exists, which marks nothing
-            // as a red link. Recording it would be a claim the run cannot support.
-            out.extend(missing.into_iter().map(|t| (t, existing())));
-            return Ok(out);
-        };
-        let fetched = match crate::pageinfo::page_info(client, &missing).await {
-            Ok(fetched) => fetched,
-            // A transport failure is reported as "everything exists" — the same
-            // conservative answer offline gives — but it is *not* written to the
-            // cache: caching a guess would outlive the failure and make every
-            // later offline run wrong for these titles.
-            Err(_) => {
-                out.extend(missing.into_iter().map(|t| (t, existing())));
-                return Ok(out);
-            }
-        };
-        for (title, info) in &fetched {
-            self.store_page_info(title, info);
-        }
-        out.extend(fetched);
-        Ok(out)
+    /// Existence and redirect-ness for a title a module probes, from recorded
+    /// facts only — see [`rustoid_core::traits::DataSource::get_known_page_info`].
+    ///
+    /// The difference from [`Self::get_page_info`] is only the fallback for a
+    /// title the run cannot answer: link resolution guesses "exists" so nothing
+    /// is painted red, while a module's `title.exists` must stay a miss so it
+    /// takes its own missing branch. Both share the cache and the fetch.
+    async fn get_known_page_info(
+        &self,
+        titles: &[String],
+    ) -> rustoid_core::Result<std::collections::HashMap<String, rustoid_core::traits::PageInfo>>
+    {
+        Ok(lookup_page_info(self, titles, false).await)
     }
 
     async fn get_title_protection(
@@ -807,6 +776,75 @@ impl DataSource for CachedDataSource {
     async fn get_message(&self, _lang: &str, _key: &str) -> rustoid_core::Result<Option<String>> {
         Ok(None)
     }
+}
+
+/// The shared body of [`CachedDataSource::get_page_info`] and
+/// [`CachedDataSource::get_known_page_info`].
+///
+/// Cached facts win, so an offline run answers truthfully for every title a
+/// previous online run looked up, and a mixed run fetches only what it does not
+/// have. This is the whole point of the `PageInfo` cache kind: the facts are not
+/// derivable from a body, so without them offline link resolution can only
+/// guess.
+///
+/// `guess_offline` is the one thing that separates the two callers: when set, a
+/// title the run could not answer is reported as existing (link resolution, so
+/// nothing is painted red); when clear it is left out, because a module probing
+/// `title.exists` must not be told a page it cannot load is there.
+///
+/// `offline` is checked, not just the presence of a client. The client is always
+/// built — it is needed for the entity wiki even in a run that must not touch
+/// the network — so testing `client.is_none()` here sent `--offline` runs to the
+/// network anyway. That is not a small leak: `AddRedLinks` asks about *every*
+/// wikilink title on the page, so one offline run of `Zebra` fired thousands of
+/// paced requests and appeared to hang.
+async fn lookup_page_info(
+    source: &CachedDataSource,
+    titles: &[String],
+    guess_offline: bool,
+) -> std::collections::HashMap<String, rustoid_core::traits::PageInfo> {
+    let mut out = std::collections::HashMap::new();
+    let mut missing: Vec<String> = Vec::new();
+    for title in titles {
+        match source.cached_page_info(title) {
+            Some(entry) => {
+                out.insert(title.clone(), entry);
+            }
+            None => missing.push(title.clone()),
+        }
+    }
+    if missing.is_empty() {
+        return out;
+    }
+
+    let Some(client) = source.client.as_ref().filter(|_| !source.offline) else {
+        // Offline and not cached. Link resolution assumes everything exists,
+        // which marks nothing as a red link; a module probe gets nothing,
+        // because claiming a page it cannot see exists would send it into a load
+        // it cannot complete. Neither is written to the cache: recording a guess
+        // would outlive the run and make later offline runs wrong.
+        if guess_offline {
+            out.extend(missing.into_iter().map(|t| (t, existing())));
+        }
+        return out;
+    };
+    let fetched = match crate::pageinfo::page_info(client, &missing).await {
+        Ok(fetched) => fetched,
+        // A transport failure is reported the same way the offline branch is —
+        // but it is *not* written to the cache, because caching a guess would
+        // outlive the failure and make every later offline run wrong.
+        Err(_) => {
+            if guess_offline {
+                out.extend(missing.into_iter().map(|t| (t, existing())));
+            }
+            return out;
+        }
+    };
+    for (title, info) in &fetched {
+        source.store_page_info(title, info);
+    }
+    out.extend(fetched);
+    out
 }
 
 impl CachedDataSource {
