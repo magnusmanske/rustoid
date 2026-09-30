@@ -7758,3 +7758,31 @@ is correct.
 Updated scoreboard head (wide corpus, offline): `Module:Math` 1, `Python`
 578, `ISO 3166-1 alpha-2` 598, `World War II` 939, `Hydrogen` 976,
 `Association football` 1438. Score still **0/41**.
+
+### Link-resolution facts: the `mw-disambig` class and the hatnote category
+
+The same class of gap, one layer down. `AddRedLinks` asks about *every* wikilink
+on a page; uncached, an offline run cannot say whether a target exists or is a
+disambiguation page, so a `… (disambiguation)` link lost its `mw-disambig` class
+and a hatnote's existence check answered "nonexistent" — the
+`Category:Articles with hatnote templates targeting a nonexistent page` that the
+oracle does not have. `populate_taxonomy` gains a `pageinfo` mode (one
+`prop=info|pageprops` request per batch of titles). Nine pages' first difference
+moved later by ~50 bytes each (`Anarchism` 1571 → 1622, `Hydrogen` 976 → 1026,
+`Chess` 1649 → 1696, `France` 1601 → 1649, `India` 1499 → 1546, …), none
+earlier.
+
+That test also *falsified* the earlier reading of the scoreboard: `Association
+football` did **not** move, and its remaining diff is a missing `id` on the
+hatnote `<div about="#mwt2">` — a node-id assignment question, not a link fact.
+
+### The pattern, stated once
+
+Every one of this round's wins came from a **fact a page body cannot supply** —
+page protection, a link target's existence/class, the page's own Wikidata entity
+(and its sitelink manifest entry) — not from the parser. The parser is now close
+enough that these gaps are what the smallest first differences are made of. The
+durable lesson for this work is recorded above and repeated here because it cost
+an hour to learn: *a difference that looks like a PWrap or empty-element shape
+may be a template rendering differently because a fact is missing.* Read the
+bytes the two sides actually produce; do not infer the pass from the shape.

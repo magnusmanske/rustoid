@@ -69,6 +69,9 @@ async fn main() {
         Some("protection") => {
             populate_protection(&client, &cache, &args[2..]).await;
         }
+        Some("pageinfo") => {
+            populate_pageinfo(&client, &cache, &args[2..]).await;
+        }
         _ => {
             eprintln!("usage: populate_taxonomy taxon <taxon> | titles <Title> …");
             std::process::exit(2);
@@ -143,6 +146,42 @@ async fn populate_protection(
                 &body,
                 EntryMeta {
                     kind: EntryKind::Protection,
+                    title: title.clone(),
+                    revid: None,
+                    fetched_at: None,
+                },
+            )
+            .expect("cache put");
+        println!("  {title} -> {body}");
+    }
+}
+
+/// Fetch and store link-resolution facts (existence, redirect-ness, link
+/// classes) for each title.
+///
+/// `AddRedLinks` asks about *every* wikilink on a page; uncached, an offline run
+/// answers "everything exists, with no classes", so a `… (disambiguation)` link
+/// loses its `mw-disambig` class and a hatnote's existence check answers
+/// "nonexistent". One `prop=info|pageprops` request per batch of titles.
+async fn populate_pageinfo(client: &WikiClient, cache: &Arc<Mutex<WikiCache>>, titles: &[String]) {
+    let Ok(fetched) = rustoid_compare::pageinfo::page_info(client, titles).await else {
+        eprintln!("page info fetch failed");
+        return;
+    };
+    for title in titles {
+        let Some(info) = fetched.get(title) else {
+            continue;
+        };
+        let body = serde_json::to_string(info).expect("serialize page info");
+        cache
+            .lock()
+            .expect("cache lock")
+            .put(
+                EntryKind::PageInfo,
+                title,
+                &body,
+                EntryMeta {
+                    kind: EntryKind::PageInfo,
                     title: title.clone(),
                     revid: None,
                     fetched_at: None,
