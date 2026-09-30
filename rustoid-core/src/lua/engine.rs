@@ -1755,6 +1755,12 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // iterator. The codepoints are therefore collected in Rust and the iterator
     // itself is written in Lua, where a multi-value return is native.
     ustring.set("codepoints", lua.create_function(luafn_ustring_codepoints)?)?;
+    // The singular `codepoint(s, i, j)` — `string.byte`'s codepoint-aware twin.
+    // It is easy to forget because the plural iterator is the one modules call
+    // directly; `mw.html`'s `cssEncode` reaches for the singular, and without it
+    // `Module:...` pages that build CSS through the library raised "attempt to
+    // call field 'codepoint' (a nil value)" where the service renders the sheet.
+    ustring.set("codepoint", lua.create_function(luafn_ustring_codepoint)?)?;
     // The string-shape predicates and the normalization family. These are
     // independent of the pattern dialect, so they do not wait on it.
     ustring.set("isutf8", lua.create_function(luafn_ustring_isutf8)?)?;
@@ -4376,6 +4382,47 @@ fn luafn_ustring_codepoints(
         .collect())
 }
 
+/// `mw.ustring.codepoint(s, i, j)` — the codepoints of `s[i..=j]`, as a
+/// **multivalue** of integers (like Lua's `string.byte`, not a table).
+///
+/// Scribunto's `UstringLibrary::ustringCodepoint`: `i` defaults to 1 and `j` to
+/// the *original* `i`; a negative index counts back from the end; if `j < i`
+/// (after that adjustment) the result is empty; then both are clamped to
+/// `[1, len + 1]` so a start one past the end yields nothing rather than an
+/// error. `mw.html`'s `cssEncode` calls it with a single character and reads the
+/// one value, so the multivalue shape matters: a table would break
+/// `string.format('%X', …)`.
+fn luafn_ustring_codepoint(
+    _: &Lua,
+    (s, i, j): (Value, Option<i64>, Option<i64>),
+) -> mlua::Result<mlua::MultiValue> {
+    let s = coerce_string(&s, "codepoint")?;
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+
+    // `j` defaults to the index `i` *as passed*, before the negative adjust.
+    let mut start = i.unwrap_or(1);
+    let mut end = j.unwrap_or(start);
+    if start < 0 {
+        start = n + start + 1;
+    }
+    if end < 0 {
+        end = n + end + 1;
+    }
+    let mut out = mlua::MultiValue::new();
+    if end < start {
+        return Ok(out);
+    }
+    let start = start.clamp(1, n + 1);
+    let end = end.clamp(1, n + 1);
+    for k in start..=end {
+        if let Some(c) = chars.get((k - 1) as usize) {
+            out.push_back(Value::Integer(*c as i64));
+        }
+    }
+    Ok(out)
+}
+
 fn luafn_ustring_lower(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(coerce_string(&s, "lower")?.to_lowercase())
 }
@@ -5725,6 +5772,56 @@ mod tests {
     fn test_basic_lua_execution() {
         let engine = make_engine();
         assert_eq!(engine.eval("return 1 + 1").unwrap(), "2");
+    }
+
+    /// `mw.ustring.codepoint` — the singular sibling of the `gcodepoint` helper.
+    ///
+    /// Its absence was invisible until `mw.html`'s `cssEncode` called it; the
+    /// nil-field error then became a `Script error` inside a transclusion on
+    /// `World War II`, which made the wrapping `<p>` non-empty.
+    #[test]
+    fn test_ustring_codepoint() {
+        let engine = make_engine();
+        assert_eq!(
+            engine.eval("return mw.ustring.codepoint('A')").unwrap(),
+            "65"
+        );
+        // A range returns a multivalue, like `string.byte`.
+        assert_eq!(
+            engine
+                .eval("return table.concat({mw.ustring.codepoint('ABC', 1, 3)}, ',')")
+                .unwrap(),
+            "65,66,67"
+        );
+        // Indices count codepoints, not bytes: 'é' is one codepoint.
+        assert_eq!(
+            engine
+                .eval("return mw.ustring.codepoint('héllo', 2)")
+                .unwrap(),
+            "233"
+        );
+        // A negative index counts back from the end.
+        assert_eq!(
+            engine
+                .eval("return mw.ustring.codepoint('abc', -1)")
+                .unwrap(),
+            "99"
+        );
+        // A start past the end yields no values at all, not an error.
+        assert_eq!(
+            engine
+                .eval("return select('#', mw.ustring.codepoint('abc', 5))")
+                .unwrap(),
+            "0"
+        );
+        // The end-to-end call site that made the gap visible: `mw.html`'s
+        // `cssEncode` escapes a non-ASCII declaration value as `\XX `.
+        assert_eq!(
+            engine
+                .eval("return tostring(mw.html.create('span'):css('color', 'é'))")
+                .unwrap(),
+            "<span style=\"color:\\E9 \"></span>"
+        );
     }
 
     /// Scribunto keeps the four `os` functions that cannot touch the system.

@@ -8102,3 +8102,58 @@ The same probe shows the general symptom, not just the whitespace:
   compared pages report "facts 9d newer than the oracle", so the served HTML is
   a different revision than the facts being rendered. A fresh offline corpus
   needs the oracles re-pinned first.
+
+## The missing `mw.ustring.codepoint`, and WW2's `<p class="mw-empty-elt">`
+
+With the stray span gone, `World War II`'s first difference moved to byte 2472,
+where the service serves `<p class="mw-empty-elt" id="mwBg">` and rustoid served
+`<p id="mwBg">`. The natural reading — and the one already written down for
+`List of sovereign states` — was that `CleanUp::isEmptyNode` was under-counting,
+so the next step looked like extending `is_rendering_transparent`. **That reading
+was wrong too.** Instrumenting `handle_empty_element` showed no `<p>` at cleanup
+time with the oracle's child list; the element DID have one more child, a
+`<strong>`, and its text was the answer:
+
+```
+Script error: lua error: … [string "mw.html"]:29: attempt to call field 'codepoint' (a nil value)
+```
+
+So rustoid had injected an error where the service renders nothing, and the
+auto-inserted paragraph was non-empty *because of the error*. The `mw-empty-elt`
+classification was right all along; the input was not.
+
+`HTML_LIB` is rustoid's Lua port of Scribunto's `mw.html`, and its `cssEncode`
+(line 29) escapes a non-ASCII CSS character with
+`string.format('\\%X ', mw.ustring.codepoint(m))`. `mw.ustring.codepoints` (the
+plural `gcodepoint` helper) existed; the singular `codepoint` did not, and it is
+not in Lua's `string` either, so the field read was `nil`.
+
+`luafn_ustring_codepoint` ports Scribunto's `UstringLibrary::ustringCodepoint`:
+`i` defaults to 1 and `j` to the **original** `i`, a negative index counts back
+from the end, `j < i` after that adjustment yields nothing, and both are then
+clamped to `[1, len + 1]`. The return is a **multivalue** of integers, like
+`string.byte` — a table would break the `string.format` call that reads it.
+
+- `World War II` first difference: **2472 -> 4546**, and its output grew
+  1 361 659 -> 1 376 696 bytes (the stylesheet is rendered instead of an error).
+- The new difference at 4546 is the **encapsulation head**: the service wraps the
+  infobox transclusion's leading `<style>` in
+  `<span class="mw-empty-elt" about="#mwt11" typeof="mw:Transclusion">` and puts
+  only `about` on the `<p>`; rustoid puts the whole `typeof`/`data-mw` on the
+  `<p>`. That is the `ensureElementsInRangeAndAddAboutIds` wrapper branch already
+  scoped out in "The encapsulation head, measured".
+- Fixture guard unchanged at **877/896**. Any page whose templates build CSS
+  through `mw.html` with a non-ASCII value now renders the sheet rather than a
+  `Script error`.
+
+### One more wrong turn worth recording
+
+Two of this round's three diagnoses were wrong in the same way: a *symptom* of an
+upstream difference was read as a bug in the pass where it surfaced. The stray
+`about` span was a comment that should not have survived the branch expansion,
+not an `is_deletable_in_range` rule; and the missing `mw-empty-elt` class was an
+injected Lua error, not an `isEmptyNode` predicate. Both times the pass that
+produced the visible byte was correct for its input. The habit that found the
+cause was the same both times: render one page, look at the *whole* node the
+service and rustoid disagree on, and ask what is in rustoid's copy that is not in
+the service's — rather than what rule the disagreeing pass applies.
