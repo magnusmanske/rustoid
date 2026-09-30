@@ -70,6 +70,21 @@ pub fn is_wikitext_block_node(node: &Node) -> bool {
     consts::wikitext_block_elems().contains(&node_name(node))
 }
 
+/// `DOMUtils::isRemexBlockNode` — an element the HTML tree builder can treat as a
+/// block: anything that is neither inline-only content nor metadata.
+///
+/// This is deliberately *not* the wikitext block set. The HTML tree builder
+/// synthesizes elements that no wikitext tag names — `tbody`, `thead`, `tfoot` —
+/// and a pass that walks the DOM has to descend through them. `DomRangeBuilder`'s
+/// stashing pass uses this predicate for exactly that reason: without it a
+/// `<style>` inside a table cell is never reached, and the
+/// `<span class="mw-empty-elt">` the service wraps it in is never created.
+pub fn is_remex_block_node(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Element(_))
+        && !consts::only_inline_elements().contains(&node_name(node))
+        && !consts::meta_data_tags().contains(&node_name(node))
+}
+
 /// `DOMUtils::isFosterablePosition` — would a text node/placeholder inside this
 /// element be fostered out by the HTML tree builder?
 /// (PHP: `Consts::$HTML['FosterablePosition'][nodeName( $n->parentNode )]`.)

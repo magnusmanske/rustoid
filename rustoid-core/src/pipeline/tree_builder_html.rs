@@ -2404,12 +2404,13 @@ fn wrap_transclusion_children(
 /// fosterable position is stashable.
 fn stash_rendering_transparent_elts(content: &mut Vec<Node>, fostered: bool) {
     stash_stashable_runs(content, fostered);
-    // The PHP walk descends into Remex block nodes (its traverser visits every
-    // descendant), so a run can also sit at a block's own boundary.
+    // PHP runs a `DOMTraverser` over every `isRemexBlockNode` in the range, whose
+    // handler is this same function, so a run can also sit at a block's own
+    // boundary. The predicate is `isRemexBlockNode`, not the wikitext block set:
+    // the tree builder's `tbody`/`thead`/`tfoot` are not wikitext tags, and
+    // stopping there is what left a table cell's `<style>` unstashed.
     for child in content.iter_mut() {
-        if matches!(child.kind, NodeKind::Element(_))
-            && crate::html::dom_utils::is_wikitext_block_node(child)
-        {
+        if crate::html::dom_utils::is_remex_block_node(child) {
             let fostered = crate::wikitext::consts::fosterable_position()
                 .contains(&crate::html::wts_utils::node_name(child));
             stash_rendering_transparent_elts(&mut child.children, fostered);
