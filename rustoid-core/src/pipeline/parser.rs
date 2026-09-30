@@ -4444,6 +4444,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             } else {
                 items.clone()
             };
+            // The text this argument keeps to when the expansion below cannot be
+            // rendered exactly (see [`argument_value_or_source`]). It has to be
+            // taken from the tokens *now*, before they are expanded: the recorded
+            // source range can be stale, because the tokenizer already substituted
+            // any `{{{…}}}` the value contained. `Template:Infobox sport` passes
+            // `data3={{{nicknames|{{{nickname|}}}}}}`, whose tokens are
+            // `{{Plainlist|…}}` while its range still spells the reference — and a
+            // reference re-expanded in the *module's* frame has no `nickname`, so it
+            // collapsed to nothing and the infobox row rendered blank.
+            if let Some(text) = argument_value_text(&substituted) {
+                kv.vsrc = Some(text);
+            }
             let child = frame.new_child(frame.title().clone(), vec![]);
             let expanded = Box::pin(self.expand_templates(
                 &child,
@@ -4723,6 +4735,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 /// as written, which is what `data-mw` records, and it is the same technique
 /// `prepare_tpl_param_infos` uses for template parameters.
 fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
+    // A value the caller re-rendered — the `#invoke` argument path substitutes and
+    // expands the value, so the recorded range no longer describes it. Recording
+    // the re-rendered text is what keeps this fallback from handing the module a
+    // stale reference; see `expand_invoke_args`.
+    if let Some(vsrc) = kv.vsrc.as_deref()
+        && !vsrc.is_empty()
+    {
+        return vsrc.to_string();
+    }
     kv.src_offsets
         .as_ref()
         .map(|so| so.value_substr(""))
@@ -5010,6 +5031,10 @@ fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 ///   `[[]]`.
 /// - `extension` — the source of the tag (`<nowiki/>`), which is what a module
 ///   receives for one.
+/// - `template`/`template3` — the call's own source, from the token's `src`. A
+///   value the tokenizer left with an unexpanded call inside it is handed to the
+///   module as that call, so the module's output re-expands it where the module
+///   put it.
 ///
 /// Anything else — a bare `<div>`, a `template` token that somehow survived
 /// expansion — returns `None`, so the value keeps to its source range rather than
@@ -5030,6 +5055,19 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 );
             }
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension" => {
+                out.push_str(t.data_parsoid.src.as_deref()?);
+            }
+            // A template or parser-function call left unexpanded. Its source is the
+            // call, and a module is handed that text so its own output re-expands it
+            // where the module placed it. This is how `Template:Infobox sport`'s
+            // `data3={{{nicknames|{{{nickname|}}}}}}` arrives: the tokenizer already
+            // substituted the reference, so the value's tokens hold
+            // `{{Plainlist|…}}` while the recorded source range still spans the
+            // *unsubstituted* `{{{…}}}` — which, re-expanded in the module's own
+            // frame, collapses to its empty default.
+            Item::Tok(ParsoidToken::SelfclosingTag(t))
+                if t.name == "template" || t.name == "template3" =>
+            {
                 out.push_str(t.data_parsoid.src.as_deref()?);
             }
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "wikilink" => {
