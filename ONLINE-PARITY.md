@@ -8157,3 +8157,66 @@ produced the visible byte was correct for its input. The habit that found the
 cause was the same both times: render one page, look at the *whole* node the
 service and rustoid disagree on, and ask what is in rustoid's copy that is not in
 the service's — rather than what rule the disagreeing pass applies.
+
+## The wide corpus is mostly measuring a half-empty cache
+
+The third reading of `World War II` — the note that its 4546 difference is the
+*encapsulation head* — was wrong as well, and this one matters more than the
+other two because it says something about the corpus rather than one page.
+
+At 4546 the service has `<span class="mw-empty-elt" about="#mwt11"
+…>`, and rustoid a `<p about="#mwt11" …>`. Looking *inside* rustoid's `<p>`
+answered it: its content was
+
+```html
+<extension typeof="mw:Extension" name="templatestyles"
+  source='&lt;templatestyles src="Module:Infobox military conflict/styles.css">&lt;/templatestyles>'></extension>
+<a rel="mw:WikiLink" href="./Template:Stack_begin" title="Template:Stack begin">Template:Stack begin</a>
+```
+
+a literal placeholder for a `<templatestyles>` whose stylesheet
+(`Module:Infobox military conflict/styles.css`) was **not in the cache**, and a
+redlink for a `Template:Stack begin` that was not either. Those two unexpanded
+nodes are what made the auto-inserted `<p>` exist at all; the encapsulation head
+was never the difference. Fetching the missing pages and re-rendering took `World
+War II` from **0.77x to 1.00x** of the oracle in one step, first difference 4546 ->
+**8709** (now an `about` id on a stylesheet, `#mwt12` vs `#mwt31` — the
+encapsulation-head thread proper).
+
+### The same gap dominates the whole corpus
+
+The corpus's own report says it: **38 of 42** pages still contain a literal
+`{{…}}` in rustoid's output, and 26 of 42 have more literal wikitext than the
+service. A page whose inputs are missing cannot match whatever its parser does.
+
+The fix is to populate the cache, and that is where it gets awkward: a full
+online corpus run is not practical. The wiki answered **HTTP 429 Too Many
+Requests** after roughly five pages, so the run skipped 42 of its 48
+comparisons. The *renders* still ran for the pages it reached, so their missing
+inputs were fetched — which is why five pages improved in the offline re-score
+below — but the corpus cannot be populated this way in one sitting, and the
+handoff's "never run a full corpus online" rule turns out to have a second reason
+beyond rewriting baselines.
+
+### Offline re-score (same 48-title corpus, same pinned baselines)
+
+```
+Albert Einstein    1521 ->  4234      2024 Summer Olympics  1628 ->  6008
+Anarchism          2535 ->  6130      Nigeria               2187 -> 13411
+World War II       4546 ->  8709
+```
+
+Everything else is unchanged, and the total rose 28 003 898 -> 29 112 110 bytes
+(0.56x -> 0.58x): the newly expanded templates and stylesheets are content that
+was previously a placeholder. **The byte total growing is the improvement here**,
+which is the clearest statement of how misleading the 0.56x ratio was as a
+progress bar. The pinned `html:` baselines were not touched — the run's own
+message is `keeping pinned html:World War II (rev Some(1375790811)); refused to
+overwrite with rev Some(1377143094)`.
+
+So the next session's first move should be to populate the cache (slowly, well
+inside the rate limit, and resumable) before trusting any page-level scoreboard.
+`Module:Math` (byte 1, a `Module:` content model), `Python` and
+`ISO 3166-1 alpha-2` (byte 578/598, a protection-tracking category that the live
+API now says is *correct* — the page lost its protection since the oracle was
+pinned) are the smallest offsets but all three are unfixable as measured.
