@@ -7674,3 +7674,40 @@ consequence (total +257 KB toward the oracle: `List of sovereign states`
 byte moves** — the remaining diffs are still the early hatnote category and
 indicator name. Fixtures **876/896**, `clippy`/`fmt` clean, workspace tests
 green.
+
+### The indicator body: `tagObj` expands the inner content too
+
+The remaining first difference on the protection/indicator pages was the
+`<indicator>` body. `Template:Top icon` is
+
+    {{#tag:indicator|[[File:{{{image|{{{imagename|{{{1|}}}}}}}}}|{{#if:...}}…]]|name=…}}
+
+and rustoid recorded its `extsrc` as that literal text — unexpanded — where the
+oracle has `[[File:symbol support vote.svg|20x20px |link=Wikipedia:Good
+articles*   |This is a good article. Click here for more information.]]`. Core's
+`tagObj` runs the inner (second) argument through `$frame->expand` as well as
+the named attributes, because the content is a string nothing re-expands later;
+`expand_tag_args` expanded only the named attributes (the inner half had been
+left open deliberately — see the `#tag` revert above). It now expands the
+positional content, and the indicator body matches the oracle byte for byte.
+
+One exception, and it is the one that matters for speed: a `#tag:ref`'s content
+is the reference *body*, which the Cite extension renders from the recorded
+source. The served `<ref>` records only `body.id`, never an `extsrc`, so
+nothing observable changes by skipping it — and expanding it made `India`'s
+render take minutes, because the body's templates were expanded a second time.
+With `ref` skipped, `India` completes again and the rest of the corpus is
+unchanged. (A first attempt that expanded *every* content including `ref`
+reproduced the documented `India`/`United States` stall; the trace showed a
+single `#tag:ref` content expansion that never finished.)
+
+Effect: `Doom (1993 video game)` first difference 937 → **5543**, `Megadeth`
+2842 → **7463**, `COVID-19 pandemic` 999 → **1238**; no page moves earlier, the
+other 38 are unchanged, and total output is flat. Fixtures **876/896**,
+`clippy`/`fmt` clean, workspace tests green.
+
+The next stop on `COVID-19 pandemic` is 1238: the empty-transclusion shape — the
+oracle serves `<p class="mw-empty-elt" id="mwAw"><span typeof="mw:Nowiki
+mw:Transclusion" about="#mwt4">…</span><meta typeof="mw:Extension/indicator"
+…/></p>` where rustoid emits the `<span class="mw-empty-elt" …>` without the
+`<p>` wrapper or the `mw:Nowiki` typeof.
