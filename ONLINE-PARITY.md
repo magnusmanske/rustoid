@@ -8220,3 +8220,39 @@ inside the rate limit, and resumable) before trusting any page-level scoreboard.
 `ISO 3166-1 alpha-2` (byte 578/598, a protection-tracking category that the live
 API now says is *correct* — the page lost its protection since the oracle was
 pinned) are the smallest offsets but all three are unfixable as measured.
+
+## Populating the cache exposed an alphabetized `data-mw`
+
+Two pages got *worse* when their inputs were fetched, and that turned out to be
+the most useful thing the populate did. `Doom (1993 video game)` moved 5543 ->
+2163 and `Grand Theft Auto V` 3895 -> 2189, both landing on the same shape:
+
+```
+parsoid: {"parts":[{"template":{"target":{…},"params":{"title":…,"image":…,"alt":…},"i":0}}]}
+rustoid: {"parts":[{"template":{"i":0,"params":{"alt":…,"artist":…,"caption":…}}}]}
+```
+
+Every key is in **alphabetical** order, and `target` has moved after `params`.
+That is not Parsoid's order, which is a fixed schema (`target`, `params`, `i`) with
+the parameters in *source* order.
+
+The cause is a serialization round-trip. `prepend_unwrapped_wt_part` and
+`append_trailing_wt_part` (the `recordTemplateInfo` leading/trailing-wikitext
+steps) parse a `data-mw` string into a `serde_json::Value`, edit it, and print it
+back with `to_string()`. `serde_json`'s default `Map` is a `BTreeMap`, so that
+round-trip re-sorts every object in the document at once. The templates that
+reach it are the ones whose range carries an `unwrappedWT`; the fetch is what got
+the corpus far enough into those ranges to see it.
+
+The fix is `features = ["preserve_order"]` on the workspace's `serde_json`, which
+makes `Map` an insertion-ordered map. The code had already assumed this: the
+comments on `serialize_template_info` ("the order has to survive serialization") and
+on `json_from_lua` ("keys keep the order Lua iterated them in … `json_encode` then
+preserves that order") both describe insertion order, and the second is a place
+where the `BTreeMap` silently contradicted the stated intent.
+
+- `Doom (1993 video game)` 2163 -> **5529** and `Grand Theft Auto V` 2189 ->
+  **3881** — i.e. back past their pre-populate 5543/3895, so the populate is a net
+  gain now that the ordering bug it exposed is fixed.
+- Fixture guard unchanged at **877/896**; the full workspace suite passes, so
+  nothing that asserts on JSON order depended on the sort.
