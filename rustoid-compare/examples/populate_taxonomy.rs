@@ -19,6 +19,7 @@
 //! Usage:
 //!   `… --example populate_taxonomy -- taxon <taxon>`
 //!   `… --example populate_taxonomy -- titles <Title> <Title> …`
+//!   `… --example populate_taxonomy -- protection <Title> <Title> …`
 
 use std::sync::{Arc, Mutex};
 
@@ -64,6 +65,9 @@ async fn main() {
             for title in &args[2..] {
                 populate_title(&client, &cache, title).await;
             }
+        }
+        Some("protection") => {
+            populate_protection(&client, &cache, &args[2..]).await;
         }
         _ => {
             eprintln!("usage: populate_taxonomy taxon <taxon> | titles <Title> …");
@@ -111,6 +115,42 @@ async fn fetch_or_get(
         .expect("cache put");
     println!("  fetched {title} r{revid}");
     Some((body, true))
+}
+
+/// Fetch and store the protection levels for each title.
+///
+/// Protection is the fact a wiki module reads through
+/// `mw.title.protectionLevels` and that no page body can supply. Without it an
+/// offline render of a protected page reads "unprotected", and
+/// `Module:Protection banner` emits its "incorrect protection template"
+/// category where the service emits the padlock indicator. One `prop=info`
+/// request per batch of titles, so this is cheap and re-runs cost nothing.
+async fn populate_protection(
+    client: &WikiClient,
+    cache: &Arc<Mutex<WikiCache>>,
+    titles: &[String],
+) {
+    let fetched = rustoid_compare::pageinfo::title_protection(client, titles).await;
+    for title in titles {
+        let entry = fetched.get(title).cloned().unwrap_or_default();
+        let body = serde_json::to_string(&entry).expect("serialize protection");
+        cache
+            .lock()
+            .expect("cache lock")
+            .put(
+                EntryKind::Protection,
+                title,
+                &body,
+                EntryMeta {
+                    kind: EntryKind::Protection,
+                    title: title.clone(),
+                    revid: None,
+                    fetched_at: None,
+                },
+            )
+            .expect("cache put");
+        println!("  {title} -> {body}");
+    }
 }
 
 /// Fetch one title, reporting whether it was already cached or is absent.
