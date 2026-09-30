@@ -698,10 +698,24 @@ impl ParserFunctions {
                     KeyValue::Str(v) => vec![Item::Str(v.clone())],
                 };
                 if k.is_empty() {
+                    // `$frame->expand` removes HTML comments wherever they
+                    // appear (`PPFrame_Hash::expand`'s `comment` arm appends the
+                    // empty string in HTML output mode), so a comment in a
+                    // branch value is gone *before* the caller trims. Dropping
+                    // it here is not cosmetic: `trim_item_edges` stops at any
+                    // token that is not a newline, so a comment keeps the blanks
+                    // around it alive — and that leftover whitespace is the
+                    // stray `<span about="#mwtN"> </span>` that
+                    // `Template:Redirect-several` leaves on `Polio vaccine`
+                    // (its `#switch` default is `<!-- … -->\n     {{#switch:…}}`).
                     value
+                        .into_iter()
+                        .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
+                        .collect()
                 } else {
                     // A named entry keeps its `k=v` spelling; the value is text
-                    // in that position, so stringify as before.
+                    // in that position, so stringify as before (`tokens_to_string`
+                    // already drops comments).
                     vec![Item::Str(format!("{k}={}", value_to_string(&kv.value)))]
                 }
             }

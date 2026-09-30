@@ -8054,3 +8054,51 @@ are no longer wrapped in the `<span class="mw-empty-elt">` the service gives
 them, and rustoid's stylesheet takes `about="#mwt6"` where the service takes
 `#mwt7`. Those are the id/`shouldStashRenderingTransparentNodes` thread again — a
 page-local about-id is being spent one time too few — not the loop.
+
+## A comment in a parser-function branch survived the trim
+
+The handoff read `World War II`'s first difference (byte 939) as an
+`is_deletable_in_range` bug: rustoid wrapped the leading `"\n     "` before
+`{{redirect-several|…}}` in a stray `<span about="#mwt3"> </span>` where the
+service wrapped nothing, and the note blamed PHP's `isDeletableNode` for
+requiring a text node's content to be exactly `"\n"`. **That reading was wrong.**
+The node should not have been there at all; `is_deletable_in_range` was answering
+correctly for what it was handed.
+
+The stray whitespace is a comment's fault. `Template:Redirect-several`'s outer
+`#switch` has a `#default` branch that begins
+`<!-- This is for if … -->\n     {{#switch:…}}`, and the same shape recurs one
+level down. `#switch` (MediaWiki core's, which the production path uses) answers
+`trim( $frame->expand( $valueNode ) )`, and `PPFrame_Hash::expand` appends the
+**empty string** for a `comment` node in HTML output mode — so the comment, and
+the blanks on both sides of it, are gone before the trim. rustoid kept the
+comment as a `Comment` token, and `trim_item_edges` stops at any token that is
+not a newline, so the trim never reached the whitespace: it survived as a
+`"\n     "` text node inside the transclusion range, non-deletable by any rule,
+and `wrap_transclusion_children` wrapped it in the single-space `about` span.
+
+Deleting the two comments from the cached template by hand made the region
+byte-identical, which is what pinned the cause. The fix is one filter: a
+parser-function branch value drops its top-level `Comment` tokens in `expand_kv`,
+the common path of `trimmed_branch`, `untrimmed_branch` and `branch_items`.
+Nested template invocations are `SelfclosingTag` tokens at that level, so their
+inner comments are left for their own expansion — matching `$frame->expand`,
+which recurses only into the tree it was given.
+
+The same probe shows the general symptom, not just the whitespace:
+`A{{#if:1|a<!--c-->b}}B` served as `A…>ab</span>B` and rustoid as
+`A…>a</span><!--c--><span…>b</span>B`. Both `#if` and `#switch` now render `ab`.
+
+- `World War II` first difference: **939 → 2472**. The new difference is a
+  `<p class="mw-empty-elt">` classification (the `{{Good article}}` indicator),
+  a separate thread — see the next section.
+- Corpus totals (offline, `/tmp/wide_r8.txt`): rustoid 27 989 325 → 27 988 859
+  bytes. No page's *bucket* (first-difference kind) changed, because the pages
+  that carry comments at a branch head are not the pages that differ first;
+  the win is measured on the byte total and on the two reduced snippets.
+- Fixture guard unchanged at **877/896**; `php/comments.txt`'s two failures are
+  the pre-existing standalone skips.
+- The wider corpus is currently **unreliable as a scoreboard**: 40 of 41
+  compared pages report "facts 9d newer than the oracle", so the served HTML is
+  a different revision than the facts being rendered. A fresh offline corpus
+  needs the oracles re-pinned first.
