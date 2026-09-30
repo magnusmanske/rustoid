@@ -422,15 +422,32 @@ fn normalise_combinators(selector: &str) -> String {
 /// ```
 ///
 /// `revid` is the fetched revision, which is what makes the dedup key match.
-/// `body` is always `{"extsrc":""}` in the output: the stylesheet is not
-/// round-trippable source, so Parsoid records it as empty and the CSS lives in
-/// the element's text.
+///
+/// `has_body` decides the one field that is *not* constant. A literal
+/// `<templatestyles src="…"/>` in template source has no content, and the service
+/// serves it without a `body`:
+///
+/// ```html
+/// <style … data-mw='{"name":"templatestyles","attrs":{"src":"Plainlist/styles.css"}}'>
+/// ```
+///
+/// while the `frame:extensionTag{name='templatestyles', args={src=…}}` form that
+/// modules emit is a tag *pair* with empty content, and carries
+/// `"body":{"extsrc":""}`. Both were checked against the live transform
+/// endpoint; the stylesheet itself is not round-trippable source, so where a
+/// `body` exists its `extsrc` is empty and the CSS lives in the element's text.
 ///
 /// The `about` id is taken by the caller, which knows where in the document
 /// sequence the stylesheet belongs: a `<templatestyles>` is resolved while
 /// expansion runs, so its id follows the transclusions around it rather than
 /// trailing the whole page.
-pub fn style_node(css: &str, revid: u64, src: &str, about: &str) -> crate::dom::node::Node {
+pub fn style_node(
+    css: &str,
+    revid: u64,
+    src: &str,
+    about: &str,
+    has_body: bool,
+) -> crate::dom::node::Node {
     use crate::dom::node::{ElementKind, Node};
 
     let mut style = Node::element(ElementKind::Other("style".to_string()));
@@ -441,7 +458,13 @@ pub fn style_node(css: &str, revid: u64, src: &str, about: &str) -> crate::dom::
     style.set_attr("about", about);
     style.set_attr(
         "data-mw",
-        format!(r#"{{"name":"templatestyles","attrs":{{"src":"{src}"}},"body":{{"extsrc":""}}}}"#),
+        if has_body {
+            format!(
+                r#"{{"name":"templatestyles","attrs":{{"src":"{src}"}},"body":{{"extsrc":""}}}}"#
+            )
+        } else {
+            format!(r#"{{"name":"templatestyles","attrs":{{"src":"{src}"}}}}"#)
+        },
     );
     style.push_child(Node::text(css));
     style

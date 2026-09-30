@@ -893,6 +893,9 @@ struct PendingStyle {
     css: String,
     revid: u64,
     src: String,
+    /// Whether the extension tag had content, which the `<style>`'s `data-mw`
+    /// records as a `body` field. See [`Parser::expand_one_templatestyles`].
+    has_body: bool,
 }
 
 /// Counts one nesting level of `#invoke` argument expansion.
@@ -2220,15 +2223,28 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
 
         let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
+        // Whether the tag had content, which decides whether the resolved `<style>`
+        // records `body` in its `data-mw`. A literal `<templatestyles src="…"/>`
+        // has none, while the `frame:extensionTag{name='templatestyles', …}` form
+        // Scribunto emits is a tag pair with empty content — and the service keeps
+        // the two apart in the served bytes. The tokenizer records the matched end
+        // tag as `extTagOffsets`, which is exactly that distinction.
+        let has_body = stt.data_parsoid.ext_tag_offsets.is_some();
         // The `about` id is not taken yet: the chunk's extension pass numbers the
         // placeholder (see [`Self::number_style_placeholders`]). Until then the
         // resolved stylesheet waits here, keyed by the fragment id the placeholder
         // carries — an entry a discarded placeholder never drains spends no id.
         let id = self.ext_next_id.get();
         self.ext_next_id.set(id + 1);
-        self.pending_styles
-            .borrow_mut()
-            .insert(id, PendingStyle { css, revid, src });
+        self.pending_styles.borrow_mut().insert(
+            id,
+            PendingStyle {
+                css,
+                revid,
+                src,
+                has_body,
+            },
+        );
         emit_style_placeholder(stt, id)
     }
 
@@ -2280,6 +2296,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 pending.revid,
                 &pending.src,
                 &about,
+                pending.has_body,
             );
             self.ext_fragments
                 .borrow_mut()

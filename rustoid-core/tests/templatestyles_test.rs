@@ -53,11 +53,16 @@ async fn a_stylesheet_is_fetched_scoped_and_inlined() {
         html.contains(r#"typeof="mw:Extension/templatestyles""#),
         "extension marker: {html}"
     );
+    // The tag in the wikitext is *self-closing*, so it had no content and the
+    // service records no `body`. A tag pair — which is what
+    // `frame:extensionTag{name='templatestyles', …}` produces — carries an empty
+    // `"body":{"extsrc":""}` instead; both shapes were checked against the live
+    // transform endpoint.
     assert!(
         html.contains(
-            r#"data-mw='{"name":"templatestyles","attrs":{"src":"Module:Hatnote/styles.css"},"body":{"extsrc":""}}'"#
+            r#"data-mw='{"name":"templatestyles","attrs":{"src":"Module:Hatnote/styles.css"}}'"#
         ),
-        "data-mw records the source page: {html}"
+        "data-mw records the source page, and a self-closing tag records no body: {html}"
     );
     assert!(
         html.contains(
@@ -65,6 +70,29 @@ async fn a_stylesheet_is_fetched_scoped_and_inlined() {
 @media print{body.ns-0 .mw-parser-output .hatnote{display:none!important}}</style>"
         ),
         "the css is scoped and minified, and `body` keeps the scope after it: {html}"
+    );
+}
+
+/// The same stylesheet written as a *tag pair* records `body`.
+///
+/// The two forms differ in the served bytes, and only in this field: a
+/// self-closing `<templatestyles src="…"/>` has no content, while the
+/// `frame:extensionTag{name='templatestyles', …}` shape Scribunto produces is a
+/// tag pair with empty content. The parser must not normalise them together.
+#[tokio::test]
+async fn a_stylesheet_tag_pair_records_its_body() {
+    let css = ".hatnote { font-style: italic; }";
+    let html = expand(
+        "<templatestyles src=\"Module:Hatnote/styles.css\"></templatestyles>",
+        Some(("Module:Hatnote/styles.css", css, 1368532237)),
+    )
+    .await;
+
+    assert!(
+        html.contains(
+            r#"data-mw='{"name":"templatestyles","attrs":{"src":"Module:Hatnote/styles.css"},"body":{"extsrc":""}}'"#
+        ),
+        "a tag pair records an empty body: {html}"
     );
 }
 
