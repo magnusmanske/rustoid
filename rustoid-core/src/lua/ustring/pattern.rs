@@ -480,11 +480,9 @@ impl<'a> Matcher<'a> {
             '.' => true,
             '%' => {
                 let class_char = pattern[p + 1];
-                match LuaClass::from_letter(class_char) {
-                    Some(class) => class.matches(subject_char),
-                    // Not a class: a literal escape comparing equal to the char.
-                    None => class_char == subject_char,
-                }
+                // A class letter, its complement, or a literal escape — see
+                // [`LuaClass::class_matches`].
+                LuaClass::class_matches(class_char, subject_char)
             }
             '[' => self.match_bracket_class(pattern, p, ep, subject_char),
             other => other == subject_char,
@@ -504,12 +502,9 @@ impl<'a> Matcher<'a> {
         while p < last {
             if pattern[p] == '%' && p + 1 < last {
                 p += 1;
-                let cl = pattern[p];
-                if let Some(class) = LuaClass::from_letter(cl) {
-                    if class.matches(c) {
-                        return !negate;
-                    }
-                } else if cl == c {
+                // A class letter, its complement, or a literal escape — see
+                // [`LuaClass::class_matches`].
+                if LuaClass::class_matches(pattern[p], c) {
                     return !negate;
                 }
                 p += 1;

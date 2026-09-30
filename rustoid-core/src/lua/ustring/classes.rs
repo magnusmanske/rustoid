@@ -77,6 +77,22 @@ impl LuaClass {
         })
     }
 
+    /// Whether the pattern item `%cl` matches `c`.
+    ///
+    /// This is Lua's `match_class`: the ten lowercase letters are the classes,
+    /// an *uppercase* letter is the complement of the same class, and any other
+    /// character after `%` is a literal escape that matches only itself (`%%` is
+    /// a literal `%`, and `%1` is handled as a back-reference before reaching
+    /// here). Missing the complements made `%S` compare the letter `S` against
+    /// the subject, so it never matched — which silently emptied every list built
+    /// by `Module:List`, whose argument filter is `mw.ustring.find(value, '%S')`.
+    pub fn class_matches(cl: char, c: char) -> bool {
+        match Self::from_letter(cl.to_ascii_lowercase()) {
+            Some(class) => class.matches(c) != cl.is_ascii_uppercase(),
+            None => cl == c,
+        }
+    }
+
     /// Whether `c` is in this class.
     pub fn matches(self, c: char) -> bool {
         // The *group* is what most of these need: "Letter" is Lu|Ll|Lt|Lm|Lo, so
@@ -191,6 +207,33 @@ mod tests {
         for c in ['1', '%', '.', 'A', 'z', ' '] {
             assert_eq!(LuaClass::from_letter(c), None, "{c:?} is not a class");
         }
+    }
+
+    /// The uppercase spellings are complements, and a non-class letter after `%`
+    /// is a literal escape. `single_match`/`match_bracket_class` route every
+    /// `%x` through [`LuaClass::class_matches`], so this is where the rule is
+    /// asserted.
+    #[test]
+    fn complements_and_literal_escapes() {
+        // `%S` is "not whitespace": `mw.ustring.find('a b', '%S')` finds the `a`.
+        assert!(LuaClass::class_matches('S', 'a'));
+        assert!(!LuaClass::class_matches('S', ' '));
+        assert!(!LuaClass::class_matches('s', 'a'));
+        assert!(LuaClass::class_matches('s', ' '));
+        // `%D` is a non-digit, `%W` a non-alphanumeric, `%A` a non-letter.
+        assert!(LuaClass::class_matches('D', 'x'));
+        assert!(!LuaClass::class_matches('D', '7'));
+        assert!(LuaClass::class_matches('W', '-'));
+        assert!(!LuaClass::class_matches('W', '7'));
+        assert!(LuaClass::class_matches('A', '7'));
+        assert!(!LuaClass::class_matches('A', 'é'));
+        // A non-class letter is a literal escape: `%B` matches a literal `B`, not
+        // the (nonexistent) complement of balance matching.
+        assert!(LuaClass::class_matches('B', 'B'));
+        assert!(!LuaClass::class_matches('B', 'b'));
+        // `%%` is a literal percent.
+        assert!(LuaClass::class_matches('%', '%'));
+        assert!(!LuaClass::class_matches('%', 'a'));
     }
 
     /// The uppercase spellings are complements, which the caller forms rather
