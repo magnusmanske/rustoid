@@ -4015,6 +4015,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // reads the mark to pick the right `inTemplate`.
         let mut child_args: Vec<crate::wikitext::tokens_v2::KV> =
             params.args.iter().skip(1).cloned().collect();
+        // Production Parsoid expands templates through MediaWiki's preprocessor
+        // (`Env::$nativeTemplateExpansion` is set only for parser tests), and the
+        // preprocessor evaluates a call's argument values in the *calling* frame,
+        // before the callee's frame exists. See
+        // [`Self::expand_template_arg_values`] for why that is observable.
+        self.expand_template_arg_values(
+            frame,
+            &mut child_args,
+            source,
+            about_counter,
+            in_template,
+            page_source,
+        )
+        .await;
         for arg in child_args.iter_mut() {
             let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &mut arg.value else {
                 continue;
@@ -4409,6 +4423,82 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// The caller passes only the arguments to expand, so the two shapes cannot
     /// be confused: the `#invoke` call's own list starts after the target, while
     /// a **parent** frame's list has no target and is passed whole.
+    /// Expand a template call's argument *values* in the calling frame.
+    ///
+    /// Production Parsoid expands templates through MediaWiki's preprocessor
+    /// (`Env::$nativeTemplateExpansion` says so: it is "only used during parser
+    /// tests; in production, template expansion is done via MediaWiki's legacy
+    /// preprocessor"), and the preprocessor evaluates a call's argument values in
+    /// the *calling* frame, before the callee's frame exists. Two observable
+    /// consequences, both checked against the live transform endpoint:
+    ///
+    /// - `{{Main other|{{Main other|X}}}}` renders `X`. Expanding the inner call
+    ///   from inside the callee's frame trips `loopAndDepthCheck` instead, which
+    ///   is what rustoid served — `Template loop detected: Template:Main other`
+    ///   in the middle of `Polio vaccine`, because `Template:Short description`
+    ///   ends with `{{Main other|{{SDcat|…}}}}` and `Template:Infobox drug` wraps
+    ///   its own short-description call in `{{Main other|…}}`.
+    /// - A module's `frame:getParent().args` arrives already expanded. That is why
+    ///   the `<div class="plainlist">` a module echoes back carries no `about`
+    ///   and costs no extra `#mwt` ids: the service hands it markup, not wikitext
+    ///   that re-expands into a fresh transclusion.
+    ///
+    /// The helper frame is titled with the *page*, not the caller: the value's
+    /// templates are expanded in the caller's scope, and a child frame cloning the
+    /// caller's title would make an argument that calls the caller's own template
+    /// look like a loop. PHP's equivalent frame has a null title, which can never
+    /// match.
+    ///
+    /// Unlike [`Self::expand_invoke_args`], extension tags inside the value are
+    /// numbered here: the value is rendered where it is spliced into the body, not
+    /// by a module that returns text.
+    async fn expand_template_arg_values(
+        &self,
+        frame: &Frame,
+        args: &mut [crate::wikitext::tokens_v2::KV],
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+        page_source: &str,
+    ) {
+        for kv in args.iter_mut() {
+            let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value else {
+                continue;
+            };
+            let found = expandable_content(items);
+            if !found.template && !found.arg {
+                continue;
+            }
+            let substituted = if found.arg {
+                frame.expand(items)
+            } else {
+                items.clone()
+            };
+            let child = frame.new_child(frame.root_title().clone(), vec![]);
+            let expanded = Box::pin(self.expand_templates(
+                &child,
+                substituted,
+                source,
+                about_counter,
+                in_template,
+                /* body */ true,
+                page_source,
+            ))
+            .await;
+            let expanded = Box::pin(self.expand_attrib_templates(
+                &child,
+                expanded,
+                source,
+                about_counter,
+                in_template,
+                true,
+                page_source,
+            ))
+            .await;
+            kv.value = crate::wikitext::tokens_v2::KeyValue::Tokens(expanded);
+        }
+    }
+
     async fn expand_invoke_args(
         &self,
         args: &[crate::wikitext::tokens_v2::KV],
@@ -5048,19 +5138,26 @@ fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 ///   `[[]]`.
 /// - `extension` — the source of the tag (`<nowiki/>`), which is what a module
 ///   receives for one.
+/// - an `mw:Entity` span (`&#32;`, `&nbsp;`) — the entity *as written*, i.e. the
+///   span's `src`. Its decoded character and its end tag are skipped: the source
+///   stands for all three, and re-parsing the module's output rebuilds the same
+///   span. `Template:Redirect-several` is the case that pins it — its link list
+///   separates terms with `&#32;and`/`&#44;&#32;and`, and without this arm the
+///   whole value declined and fell back to a source range whose `{{{1|}}}` no
+///   longer resolves in the module's frame, so the hatnote read "other terms".
 /// - `template`/`template3` — the call's own source, from the token's `src`. A
 ///   value the tokenizer left with an unexpanded call inside it is handed to the
 ///   module as that call, so the module's output re-expands it where the module
 ///   put it.
 ///
-/// Anything else — a bare `<div>`, a `template` token that somehow survived
-/// expansion — returns `None`, so the value keeps to its source range rather than
-/// losing the construct.
+/// Anything else — a bare `<div>`, a live HTML element — returns `None`, so the
+/// value keeps to its source range rather than losing the construct.
 fn argument_value_text(items: &[Item]) -> Option<String> {
     use crate::wikitext::tokens_v2::ParsoidToken;
     let mut out = String::new();
-    for item in items {
-        match item {
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
             Item::Str(s) => out.push_str(s),
             Item::Tok(ParsoidToken::Comment(_) | ParsoidToken::Nl(_)) => {}
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
@@ -5105,10 +5202,23 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 out.push_str("]]");
             }
             Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
+            Item::Tok(tok) if crate::wikitext::token_utils::is_entity_span_token(tok) => {
+                let ParsoidToken::Tag(t) = tok else {
+                    return None;
+                };
+                out.push_str(t.data_parsoid.src.as_deref()?);
+                // Mirrors PHP's `$i += 2` — skip the decoded character and the
+                // end tag, which the entity source stands in for.
+                if matches!(items.get(i + 2), Some(Item::Tok(ParsoidToken::EndTag(e))) if e.name == "span")
+                {
+                    i += 2;
+                }
+            }
             _ => return None,
         }
+        i += 1;
     }
-    Some(out)
+    Some(strip_html_comments(&out))
 }
 
 /// A single key/value field rendered to text, for [`argument_value_text`].
