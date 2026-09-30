@@ -7897,35 +7897,56 @@ is recorded on the value as `vsrc`, which `kv_value_source` prefers. The value's
 source is then the text the module must see, and re-expanding **it** in the
 module's output is what puts the real markup back.
 
+### Two of those three were ordinary bugs, and closing them helped widely
+
+The wrapper and the `body` field turned out to be a node the pass never reached
+and a field written unconditionally; only the id numbering is the design
+difference. Both were found by instrumenting `stash_stashable_runs` (PHP's
+`handleFirstRenderingTransparentNode`) with a candidate dump, which showed that
+for a `<style>` inside a table cell the pass produced **no candidate at all**.
+
+**The walk stopped at `tbody`.** `DOMRangeBuilder`'s stashing pass walks the
+range and, for each `isRemexBlockNode`, runs a traverser over its whole subtree.
+rustoid recursed into the *wikitext* block set, which has no `tbody`/`thead`/
+`tfoot` — those are the HTML tree builder's elements, not wikitext tags — so the
+walk ended at `tbody` and never reached a cell. `is_remex_block_node` is now
+ported from `DOMUtils` (an element that is neither inline-only nor metadata).
+
+That fix is broad, because it is exactly the infobox shape: `Association
+football` 9366 → **9496**, `Chess` 1696 → **5449**, `Anarchism` 1622 → **2535**,
+`Isaac Newton` 1546 → **4073**, `Periodic table` 1754 → **4265**, `France` 1649 →
+**19849**, `Nigeria` 1564 → **2187**, with no page's first difference regressing.
+
+**`data-mw`'s `body` was written unconditionally.** The served bytes keep the two
+source forms of `<templatestyles>` apart, and the live transform endpoint settles
+it: `<templatestyles src="Plainlist/styles.css"/>` serves
+`{"name":"templatestyles","attrs":{…}}`, while
+`<templatestyles src="Plainlist/styles.css"></templatestyles>` serves
+`…,"body":{"extsrc":""}}`. The pair is what
+`frame:extensionTag{name='templatestyles', …}` produces, which is why
+`Module:Hatnote`'s stylesheet has a body and `Template:Plain list`'s does not.
+The tokenizer already records the distinction — `extTagOffsets` is set only for a
+matched end tag — so `style_node` now takes it. The unit test that asserted the
+always-body shape had encoded the bug and now pins the self-closing form, with a
+second test for the pair.
+
+Neither of these moved a first difference on its own (the `body` field sits
+behind the `about` id that still differs, and the wrapper fix moved later pages),
+which is the reason both are recorded rather than left as a byte-level footnote.
+
 ### What is left on this page, and what it says about the design
 
-At byte 9366 the sides now disagree about the *templatestyles* inside that
-value. The service serves:
-
-```
-<span class="mw-empty-elt"><style data-mw-deduplicate="TemplateStyles:r1126788409"
-  typeof="mw:Extension/templatestyles" about="#mwt10"
-  data-mw='{"name":"templatestyles","attrs":{"src":"Plainlist/styles.css"}}'>…</style></span>
-<div class="plainlist ">
-<ul>…</ul>
-</div>
-```
-
-and rustoid a bare `<style … about="#mwt12" data-mw='…,"body":{"extsrc":""}}'>`
-with no `<span class="mw-empty-elt">` wrapper. Two differences, and the id
-numbering (`#mwt10` vs `#mwt12`) is a third: rustoid spends two ids more.
-
-The wrapper and the two extra ids are one fact, and it is the design difference
-this round did not close. The service hands a module the argument **expanded** —
-the probe `{{Infobox|data2={{Plainlist|*a}}}}` against the live transform
-endpoint shows the `<div class="plainlist ">` with *no* `about`/`typeof`, i.e.
-literal HTML in the module's output. rustoid hands it the unexpanded wikitext, so
-re-expanding it in the module's output builds a fresh transclusion with its own
-`about` id — the extra ids — and the extension lands outside the wrapper the
-service gives it. Closing this needs the expanded value serialized back to text
-(the value's own HTML/wikitext), which is the token-to-wikitext serializer
-already on the list; the `argument_value_text` whitelist is the other half of the
-same work.
+At byte 9496 the only remaining difference in that value is the id itself:
+`about="#mwt10"` on the service against `about="#mwt12"` in rustoid. That is the
+design difference this round did not close. The service hands a module the
+argument **expanded** — the probe `{{Infobox|data2={{Plainlist|*a}}}}` against
+the live transform endpoint shows the `<div class="plainlist ">` with *no*
+`about`/`typeof`, i.e. literal HTML in the module's output. rustoid hands it the
+unexpanded wikitext, so re-expanding it in the module's output builds a fresh
+transclusion with its own `about` id — the two extra ids. Closing this needs the
+expanded value serialized back to text (the value's own HTML/wikitext), which is
+the token-to-wikitext serializer already on the list; the `argument_value_text`
+whitelist is the other half of the same work.
 
 One cost is worth recording because it is easy to mistake for a bug: the fix
 expands values that previously fell back to a source that re-expanded to
