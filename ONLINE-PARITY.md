@@ -7711,3 +7711,50 @@ oracle serves `<p class="mw-empty-elt" id="mwAw"><span typeof="mw:Nowiki
 mw:Transclusion" about="#mwt4">…</span><meta typeof="mw:Extension/indicator"
 …/></p>` where rustoid emits the `<span class="mw-empty-elt" …>` without the
 `<p>` wrapper or the `mw:Nowiki` typeof.
+
+### Correction: that was not the empty-transclusion shape, it was missing facts
+
+The paragraph above is wrong, and the way it was wrong is worth keeping. The
+`<p class="mw-empty-elt">` grouping was **already correct**; the corpus diff at
+1238 was `COVID-19 pandemic`'s *protection* template, whose output differs when
+the page reads "unprotected". Chasing it reached three separate cache/fact gaps,
+not a PWrap bug:
+
+- **Protection.** `Module:Protection banner` reads
+  `mw.title.protectionLevels`; uncached, every article page read "unprotected"
+  and the module emitted its "incorrect protection template" category where the
+  service emits the padlock. The cache held protection for templates and
+  subpages but not for article pages. `populate_taxonomy` gains a `protection`
+  mode (one `prop=info&inprop=protection` request per batch). Effect on the
+  first difference: `Chernobyl disaster` 588 → **5795**, `Grand Theft Auto V`
+  546 → **3895**, `COVID-19 pandemic` 1238 → **10018**.
+- **`Template:Cs1 config` was absent from the cache**, so `{{Cs1 config}}`
+  rendered as a red link *inside* the lead paragraph — which made the paragraph
+  non-empty and cost it its `mw-empty-elt` class, the actual diff on `Polio
+  vaccine`. Fetching it moved Polio 572 → **5306**.
+- **A sitelink entry that existed on disk but not in the manifest.** `Zebro`'s
+  `entity:sitelink:Zebro` (→ `Q51881083`) was written as a body but never
+  indexed, so `mw.wikibase.getDescription(nil)` saw no current entity and
+  `Module:SDcat` answered `Short description with empty Wikidata description`
+  where the oracle says `…is different from Wikidata` (the entity's description
+  is `"unidentifed wild or feral equine"` — the local one is `"Unidentified…"`,
+  so they genuinely differ). `rustoid-compare --wiki www.wikidata.org --reindex`
+  recovered 14 bodies; Zebro's first difference moved 544 → **3026**.
+
+All four are **facts a page body cannot supply**, which is why an offline render
+cannot infer them and why the fixes are cache population rather than code.
+
+### Newly exposed: `title.categories`
+
+Caching protection turned five pages `extendedconfirmed`, and on those
+`Module:Protected page` (line 881) now calls
+`inArray(protectionObj.title.talkPageTitle.categories, …)` — and rustoid's Lua
+`mw.title` has **no `categories` field at all**, so the call errors. On the wiki
+the talk page always has categories (WikiProject banners), so the field is a
+table; supplying it needs the talk page's body, which rustoid never fetches.
+That is the next real gap those pages will hit, after the protection category
+is correct.
+
+Updated scoreboard head (wide corpus, offline): `Module:Math` 1, `Python`
+578, `ISO 3166-1 alpha-2` 598, `World War II` 939, `Hydrogen` 976,
+`Association football` 1438. Score still **0/41**.
