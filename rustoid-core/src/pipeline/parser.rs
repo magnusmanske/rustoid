@@ -3617,9 +3617,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `CoreParserFunctions::tagObj` runs the inner (second) argument and every
     /// named attribute's name and value through `$frame->expand`, so the tag is
     /// built from expanded strings. The target (argument zero) is already done by
-    /// [`Self::expand_target_templates`]. Only the second positional argument is
-    /// content — `tagObj` shifts two positional arguments and reads the rest as
-    /// `name=value` — so a positional argument beyond the second is left alone.
+    /// [`Self::expand_target_templates`]. A positional argument is the tag's
+    /// inner content; `tagObj` expands it too, because the content is a string
+    /// that nothing re-expands later — leaving it alone recorded
+    /// `Template:Top icon`'s indicator body as the literal
+    /// `[[File:{{{image|{{{imagename|…}}}}}}|…]]` instead of the resolved file.
     #[allow(clippy::too_many_arguments)]
     async fn expand_tag_args(
         &self,
@@ -3632,22 +3634,36 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         use crate::wikitext::tokens_v2::KeyValue;
 
         let mut out = attribs;
+        // The tag's name (`ref` in `#tag:ref`). A `#tag:ref`'s content is the
+        // reference *body*, which the Cite extension renders from the recorded
+        // source; expanding it here is redundant, and on `India` it made the
+        // render take minutes — the body's templates were expanded a second
+        // time. The served `<ref>` records only `body.id`, no `extsrc`, so
+        // nothing observable changes.
+        let tag_name = out
+            .first()
+            .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
+            .unwrap_or_default();
+        let expand_content = !tag_name
+            .rsplit(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("ref");
+
         for (i, kv) in out.iter_mut().enumerate() {
             if i == 0 {
                 // The target, already expanded.
                 continue;
             }
-            // Only a *named* attribute (`name=value`) is expanded here. A
-            // positional argument is the tag's inner content, which the existing
-            // path already hands to `pf_tag` as tokens; expanding it again re-runs
-            // the token pipeline over magic pipes the argument pass has already
-            // resolved, which emptied them (`Template:Pre`'s `{{!}}` table). The
-            // content's expansion is therefore still open — see ONLINE-PARITY.md.
-            let key_empty = match &kv.key {
-                KeyValue::Str(s) => s.is_empty(),
-                KeyValue::Tokens(_) => false,
-            };
+            // An empty key is the tag's inner content, a non-empty one a named
+            // attribute (`name=value`).
+            let key_empty = matches!(&kv.key, KeyValue::Str(s) if s.is_empty());
             if key_empty {
+                if expand_content {
+                    self.expand_tag_field(frame, &mut kv.value, source, about_counter, src_text)
+                        .await;
+                }
                 continue;
             }
             self.expand_tag_field(frame, &mut kv.key, source, about_counter, src_text)
