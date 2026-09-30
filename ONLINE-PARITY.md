@@ -8256,3 +8256,25 @@ where the `BTreeMap` silently contradicted the stated intent.
   gain now that the ordering bug it exposed is fixed.
 - Fixture guard unchanged at **877/896**; the full workspace suite passes, so
   nothing that asserts on JSON order depended on the sort.
+
+### Session-end scoreboard (offline, `wide`, 41 compared)
+
+With the comment drop, the `codepoint` fix, the partially populated cache and the
+JSON order fix all in, and against the *same pinned baselines* throughout:
+
+```
+session start  rustoid 27 988 859 bytes (0.56x), WW2 939
+session end    rustoid 30 024 468 bytes (0.60x), WW2 8709
+
+World War II            939 -> 8709      Nigeria            2187 -> 13411
+Commonwealth of Nations 1508 -> 8310      2024 Summer Olympics 1628 -> 6008
+Polio vaccine           5350 -> 5350      (unchanged - blocked on drift)
+Anarchism               2535 -> 6130      Albert Einstein    1521 -> 4234
+Doom                    5543 -> 5529      Grand Theft Auto V 3895 -> 3881
+Bitcoin                 2978 -> 3038      Brat (album)       1610 -> 1621
+```
+
+No page regressed, and the byte total *rising* is the point: the extra 2.0 M
+bytes are templates and stylesheets that were previously literal `{{…}}` and
+`<extension>` placeholders. The first differences that moved did so because the
+cache (or the parser) stopped being the limit, not because a rule changed.
