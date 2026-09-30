@@ -7773,8 +7773,14 @@ moved later by ~50 bytes each (`Anarchism` 1571 → 1622, `Hydrogen` 976 → 102
 earlier.
 
 That test also *falsified* the earlier reading of the scoreboard: `Association
-football` did **not** move, and its remaining diff is a missing `id` on the
-hatnote `<div about="#mwt2">` — a node-id assignment question, not a link fact.
+football` did **not** move. The reading that replaced it — "its remaining diff is
+a missing `id` on the hatnote `<div about="#mwt2">`, a node-id assignment
+question, not a link fact" — was also wrong, and in a way worth its own section:
+the missing id *was* a link fact, one removal away (see "The hatnote `id` was a
+*consequence* of the missing fact" below). The useful part of the mistake is that
+the page did not move on this test while the id question looked like a parser
+gap, which is the shape of a fact that is queried through a different door than
+the one the test filled.
 
 ### The pattern, stated once
 
@@ -7786,3 +7792,143 @@ durable lesson for this work is recorded above and repeated here because it cost
 an hour to learn: *a difference that looks like a PWrap or empty-element shape
 may be a template rendering differently because a fact is missing.* Read the
 bytes the two sides actually produce; do not infer the pass from the shape.
+
+## The hatnote `id`, the `%S` complement, and the substituted argument
+
+Three fixes, in the order the evidence forced them. All three were found by
+reading the differing bytes on `Association football`, whose first difference
+went **1438 → 9366**; `Hydrogen` moved 1026 → 3722 and `Megadeth` 7463 → 7766,
+and no page's first difference regressed. Fixtures stay **876/896**.
+
+### The hatnote `id` was a *consequence* of the missing fact, not an id bug
+
+The recorded reading of this difference was wrong and is corrected here. The
+scoreboard said the hatnote `<div about="#mwt2">` was missing `id="mwBA"`,
+and that read like a node-id assignment bug (`pagebundle::assign_node_ids`).
+It was not. The missing id and a spurious tracking category were the *same*
+bug seen twice:
+
+```
+<span class="mw-empty-elt" about="#mwt2" typeof="mw:Transclusion" … id="mwAw"><style …/></span>
+<div role="note" class="hatnote navigation-not-searchable" about="#mwt2">"Soccer" redirects here…</div>
+<span class="mw-empty-elt" about="#mwt2"><link rel="mw:PageProp/Category" href="./Category:Missing_redirects"/></span>
+<p class="mw-empty-elt" id="mwBA">…
+```
+
+`{{Redirect|Soccer|other uses|Soccer (disambiguation)}}` runs
+`Module:Redirect hatnote`, which asks `mw.title.new(v).exists` for the redirect
+term. rustoid answered **false** for `Soccer` — a page it had no body for, though
+the cache held `info:Soccer` — so the module emitted `Category:Missing redirects`
+and `Module:Hatnote` emitted the nonexistent-page category. Those two `<link>`s
+became a *trailing* `<span>` in the `#mwt2` range, which made the hatnote `div`
+**interior** rather than the range's `last` node — and `CleanUp::markDiscardableDataParsoid`
+explicitly exempts the range's last node from the empty-`DataParsoid` treatment
+that gives it the slot an id is allocated from. Remove the phantom categories and
+the div becomes `last` again and takes `id="mwBA"`.
+
+So the fix is a fact, not a parser pass. `mw.title`'s `exists`/`isRedirect` were
+derived from `get_page_content`, which for an offline run is `None` for both
+"absent" and "not cached"; they now consult the recorded page-info as well.
+
+That needed a second entry point on `DataSource` rather than a change to
+`get_page_info`: the link-resolution call deliberately answers **"exists"** for a
+title it cannot check, so an offline run paints nothing red — a good guess for a
+link and a wrong one for a module, because a wrong *yes* makes it load a page it
+has not got (the reason `preload_titles` narrows to a namespace in the first
+place). `get_known_page_info` therefore answers only what is *known*: an uncached
+title is simply absent from the map, and the caller falls back to the body. Both
+share one lookup in the harness, differing only in that fallback.
+
+### `%S` never matched: the pattern engine had no complement classes
+
+With the hatnote fixed, `Association football`'s next difference was an infobox
+row whose `{{Plainlist|…}}` rendered **empty**. It reduced to
+`{{Infobox sport|name=Test|nickname={{hlist|a}}}}` — any template-valued
+infobox parameter did it — and the module reported
+`Category:Articles using infobox templates with no data rows`: `Module:List`'s
+`frame.args` was empty.
+
+`Module:List`'s argument filter is
+`mw.ustring.find(value, '%S')` to drop blank values, so an empty list means that
+call answered "not found" for `a`. It did: `LuaClass::from_letter` maps only the
+*ten lowercase* letters, and `single_match`/`match_bracket_class` fell through to
+`class_char == subject_char` for anything else — so `%S` compared the letter `S`
+against the subject and never matched. Lua's rule is `match_class`:
+`tolower(cl)` selects the class and `isupper(cl)` negates it. `LuaClass::class_matches`
+now does exactly that, and both call sites use it. `%B` (a non-class letter) is
+still a literal escape, which the new test pins.
+
+This is the "pattern engine" item from the todo list, and it was load-bearing
+rather than cosmetic: it emptied every list built by `Module:List`, which is
+`{{hlist}}`, `{{plainlist}}`, `{{unbulleted list}}` and the rest.
+
+### The module argument gets its *substituted* text, not its source range
+
+That fixed `{{hlist}}` everywhere except inside a template's argument. The
+remaining shape is `Template:Infobox sport`:
+
+```
+| data3 = {{{nicknames|{{{nickname|}}}}}}
+```
+
+with `{{Infobox|…|data3={{{nicknames|{{{nickname|}}}}}}|…}}` passed down to
+`{{#invoke:Infobox|infobox}}`. The module reads `frame:getParent().args.data3`,
+and rustoid handed it `{{{nicknames|{{{nickname|}}}}}}` — the *recorded source
+range* — where the service hands it the value's text. Re-expanded in the
+*module's* frame, `nickname` does not exist (it is an argument of `Infobox
+sport`), so the reference collapsed to its empty default and the row rendered
+blank.
+
+The instrumented argument showed why the two disagree. The tokenizer already
+substituted the reference when it tokenized `Template:Infobox sport`'s body, so
+the value's *tokens* are `{{Plainlist|…}}` while its `src_offsets` still span the
+unsubstituted `{{{…}}}`:
+
+```
+data3 toks = [Str(" "), Tok(template) src=Some("{{Plainlist|*a}}"), Tok(nl)]
+```
+
+`argument_value_or_source` renders expanded tokens when it can and falls back to
+that source range when it cannot — and an expansion that produces markup cannot
+be rendered, so the stale range was what reached the module. The renderer now
+runs *before* the templates are expanded (`argument_value_text` gained an arm
+that renders a `template`/`template3` token from its own `src`), and its result
+is recorded on the value as `vsrc`, which `kv_value_source` prefers. The value's
+source is then the text the module must see, and re-expanding **it** in the
+module's output is what puts the real markup back.
+
+### What is left on this page, and what it says about the design
+
+At byte 9366 the sides now disagree about the *templatestyles* inside that
+value. The service serves:
+
+```
+<span class="mw-empty-elt"><style data-mw-deduplicate="TemplateStyles:r1126788409"
+  typeof="mw:Extension/templatestyles" about="#mwt10"
+  data-mw='{"name":"templatestyles","attrs":{"src":"Plainlist/styles.css"}}'>…</style></span>
+<div class="plainlist ">
+<ul>…</ul>
+</div>
+```
+
+and rustoid a bare `<style … about="#mwt12" data-mw='…,"body":{"extsrc":""}}'>`
+with no `<span class="mw-empty-elt">` wrapper. Two differences, and the id
+numbering (`#mwt10` vs `#mwt12`) is a third: rustoid spends two ids more.
+
+The wrapper and the two extra ids are one fact, and it is the design difference
+this round did not close. The service hands a module the argument **expanded** —
+the probe `{{Infobox|data2={{Plainlist|*a}}}}` against the live transform
+endpoint shows the `<div class="plainlist ">` with *no* `about`/`typeof`, i.e.
+literal HTML in the module's output. rustoid hands it the unexpanded wikitext, so
+re-expanding it in the module's output builds a fresh transclusion with its own
+`about` id — the extra ids — and the extension lands outside the wrapper the
+service gives it. Closing this needs the expanded value serialized back to text
+(the value's own HTML/wikitext), which is the token-to-wikitext serializer
+already on the list; the `argument_value_text` whitelist is the other half of the
+same work.
+
+One cost is worth recording because it is easy to mistake for a bug: the fix
+expands values that previously fell back to a source that re-expanded to
+*nothing*, so `India` grew from under 180 s to **3 m 0 s**. Its first difference
+still moved *later* (1499 → 1557), and the 180 s stall cap in the corpus recipe
+therefore now reports it as stalled. That is real work being done, not a loop.
