@@ -167,8 +167,8 @@ fn visible_text(html: &str) -> String {
 #[tokio::test]
 async fn notes_are_numbered_by_first_use() {
     let html = render("A<ref>one</ref>B<ref>two</ref>\n<references/>").await;
-    assert!(html.contains("cite_note--1"), "{html}");
-    assert!(html.contains("cite_note--2"), "{html}");
+    assert!(html.contains("cite_note-1"), "{html}");
+    assert!(html.contains("cite_note-2"), "{html}");
     // The markers show the numbers.
     assert!(html.contains(">[</span>1<span"), "{html}");
     assert!(html.contains(">[</span>2<span"), "{html}");
@@ -245,7 +245,7 @@ async fn a_ref_inside_a_template_is_collected() {
 async fn a_group_numbers_separately() {
     let html =
         render("A<ref group=\"notes\">n</ref>B<ref>m</ref>\n<references group=\"notes\"/>").await;
-    assert!(html.contains("cite_note--1"), "{html}");
+    assert!(html.contains("cite_note-1"), "{html}");
     assert!(
         html.contains("data-mw-group=\"notes\""),
         "the list carries its group: {html}"
@@ -276,7 +276,7 @@ async fn a_reflist_template_renders_the_list() {
         html.contains("mw-references references"),
         "the list must render from inside the template: {html}"
     );
-    assert!(html.contains("cite_note--1"), "{html}");
+    assert!(html.contains("cite_note-1"), "{html}");
 }
 
 /// An empty `<references>` and a `<references>` with no refs both must not crash.

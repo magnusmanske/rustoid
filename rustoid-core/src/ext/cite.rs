@@ -36,11 +36,14 @@
 //! </sup>
 //! ```
 //!
-//! The `id`s follow Cite's own scheme: `cite_ref-<name>_<n>-<use index>` for the
-//! marker and `cite_note-<name>-<n>` for the note. Note the *different* separators
-//! — `_` before the number in the marker, `-` in the note — which is Cite's actual
-//! output and not a typo here. For an anonymous ref the name segment is empty, so
-//! the ids are `cite_ref-1-0` and `cite_note--1`.
+//! The `id`s follow Cite's `AnchorFormatter`: `cite_note-<name>-<n>` for a note,
+//! `cite_ref-<name>_<n>-<use>` for a marker. Note the *different* separators —
+//! `_` before the number in the marker, `-` in the note. An anonymous ref has no
+//! name segment, so its note is `cite_note-<n>`, and its marker drops the `-<use>`
+//! suffix entirely on the first use (`cite_ref-<n>`): Cite cannot know then whether
+//! the ref will be reused, and a later use does get `-1`, `-2`, … A named ref
+//! always carries the suffix, since its marker is keyed by name and number. Runs
+//! of `_`/whitespace in a name collapse to one `_`.
 
 use std::collections::HashMap;
 
@@ -80,12 +83,22 @@ pub struct Reference {
 }
 
 impl Reference {
-    /// The note's `id`, e.g. `cite_note-Badenhorst2019-1`.
+    /// The note's `id`, e.g. `cite_note-Badenhorst2019-1`, or `cite_note-1`
+    /// when the ref is anonymous.
     pub fn note_id(&self) -> String {
-        format!("cite_note-{}-{}", id_segment(&self.name), self.number)
+        if self.name.is_empty() {
+            format!("cite_note-{}", self.number)
+        } else {
+            format!(
+                "cite_note-{}-{}",
+                normalize_fragment_identifier(&self.name),
+                self.number
+            )
+        }
     }
 
-    /// The marker `id` for the first use, e.g. `cite_ref-Badenhorst2019_1-0`.
+    /// The marker `id` for the first use, e.g. `cite_ref-Badenhorst2019_1-0`,
+    /// or `cite_ref-1` when the ref is anonymous.
     pub fn ref_id(&self) -> String {
         marker_id(&self.name, self.number, 0)
     }
@@ -230,22 +243,46 @@ impl CiteState {
     }
 }
 
-/// Cite's `id` segment: the ref name with spaces as underscores, empty when the
-/// ref is anonymous.
-fn id_segment(name: &str) -> String {
-    name.replace(' ', "_")
+/// `AnchorFormatter::normalizeFragmentIdentifier`: collapse a run of `_` and
+/// whitespace to a single `_`. MediaWiki normalizes underscores in `[[#…]]`
+/// links but not in `id="…"` attributes, so Cite normalizes up front to make the
+/// two agree.
+fn normalize_fragment_identifier(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    let mut in_run = false;
+    for c in id.chars() {
+        if c == '_' || c.is_whitespace() {
+            if !in_run {
+                out.push('_');
+                in_run = true;
+            }
+        } else {
+            out.push(c);
+            in_run = false;
+        }
+    }
+    out
 }
 
-/// A marker's `id` for one use: `cite_ref-<name>_<n>-<use>`.
+/// A marker's `id` for one use (`AnchorFormatter::getBacklinkIdentifier`):
+/// `cite_ref-<name>_<n>-<use>` when named, `cite_ref-<n>` when anonymous.
 ///
-/// The underscore before the number only appears when the ref *has* a name;
-/// anonymous refs read `cite_ref-1-0`. That is Cite's rule, and it is encoded here
-/// once so the two call sites cannot drift apart.
+/// The `-<use>` suffix is skipped for the first use of an *anonymous* ref: Cite
+/// cannot know yet whether the ref will be reused, so `cite_ref-1` stays as it is
+/// and a later use appends `-1`, `-2`, … A named ref always carries the suffix
+/// because its marker is keyed by name and number from the outset.
 fn marker_id(name: &str, number: usize, use_index: usize) -> String {
     if name.is_empty() {
-        format!("cite_ref-{number}-{use_index}")
+        if use_index == 0 {
+            format!("cite_ref-{number}")
+        } else {
+            format!("cite_ref-{number}-{use_index}")
+        }
     } else {
-        format!("cite_ref-{}_{number}-{use_index}", id_segment(name))
+        format!(
+            "cite_ref-{}-{use_index}",
+            normalize_fragment_identifier(&format!("{name}_{number}"))
+        )
     }
 }
 
@@ -897,8 +934,29 @@ mod tests {
 
         let mut st = CiteState::new();
         let id = st.add("", "", "anon", false);
-        assert_eq!(id, "cite_ref-1-0");
-        assert_eq!(st.references[0].note_id(), "cite_note--1");
+        assert_eq!(id, "cite_ref-1");
+        assert_eq!(st.references[0].note_id(), "cite_note-1");
+    }
+
+    #[test]
+    fn anonymous_ids_skip_the_use_suffix_only_on_first_use() {
+        // Cite cannot know at the first use whether the ref will be reused, so
+        // the marker is `cite_ref-1`; the reuse appends `-1`.
+        let mut st = CiteState::new();
+        let first = st.add("", "", "same", false);
+        let second = st.add("", "", "same", true);
+        assert_eq!(first, "cite_ref-1");
+        assert_eq!(second, "cite_ref-1-1");
+        assert_eq!(st.references[0].note_id(), "cite_note-1");
+    }
+
+    #[test]
+    fn name_runs_of_underscore_and_space_collapse() {
+        // `normalizeFragmentIdentifier`: `[\s_]+` becomes one `_`.
+        assert_eq!(super::normalize_fragment_identifier("a b"), "a_b");
+        assert_eq!(super::normalize_fragment_identifier("a__b"), "a_b");
+        assert_eq!(super::normalize_fragment_identifier("a _b"), "a_b");
+        assert_eq!(super::normalize_fragment_identifier("a_"), "a_");
     }
 
     #[test]
@@ -939,7 +997,7 @@ mod tests {
         st.add("", "", "some text", false);
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
-            r#"{"name":"ref","attrs":{},"body":{"id":"mw-reference-text-cite_note--1"}}"#
+            r#"{"name":"ref","attrs":{},"body":{"id":"mw-reference-text-cite_note-1"}}"#
         );
     }
 
@@ -1021,11 +1079,11 @@ mod tests {
         });
         assert_eq!(ol.get_attr("class"), Some("mw-references references"));
         let li = &ol.children[0];
-        assert_eq!(li.get_attr("id"), Some("cite_note--1"));
+        assert_eq!(li.get_attr("id"), Some("cite_note-1"));
         assert_eq!(li.get_attr("data-mw-footnote-number"), Some("1"));
 
         let a = &li.children[0];
-        assert_eq!(a.get_attr("href"), Some("./Zebra#cite_ref-1-0"));
+        assert_eq!(a.get_attr("href"), Some("./Zebra#cite_ref-1"));
         assert_eq!(a.get_attr("rel"), Some("mw:referencedBy"));
         assert_eq!(
             a.children[0].children[0].kind,
@@ -1041,7 +1099,7 @@ mod tests {
 
         // The note text span, which carries the body.
         let text = li.children.last().unwrap();
-        assert_eq!(text.get_attr("id"), Some("mw-reference-text-cite_note--1"));
+        assert_eq!(text.get_attr("id"), Some("mw-reference-text-cite_note-1"));
         assert_eq!(
             text.get_attr("class"),
             Some("mw-reference-text reference-text")

@@ -8911,3 +8911,38 @@ Neither is cosmetic for a page that uses `{{flatlist}}`/`{{hlist}}`, so the next
 step is to give the argument-value tokens a source range that survives the
 DSR pass (or to run the trim against the value's own source) rather than to
 paper over either symptom.
+
+## Cite's anonymous-ref ids: the `-0` was never there
+
+`2024 Summer Olympics` was the one corpus page whose earliest divergence was a
+Cite id. The service emitted `id="cite_ref-1"` and
+`body:{"id":"mw-reference-text-cite_note-1"}`; rustoid emitted
+`cite_ref-1-0` and `cite_note--1`. The port had read the scheme off *named* refs
+(`cite_ref-Badenhorst2019_1-0`, which is correct) and generalised the suffix to
+anonymous ones, where it is not.
+
+Cite's `AnchorFormatter` states the rule exactly:
+
+```php
+// getNoteIdentifier: anonymous
+$id = $globalId;                       // cite_note-1
+// getBacklinkIdentifier: 
+$id = $name ? normalize("{$name}_$globalId") : $globalId;
+if ( $name || $count > 1 ) { $id .= '-' . ( $count - 1 ); }
+```
+
+so an anonymous *first* use is `cite_ref-1` — there is no `-0`, because Cite
+cannot know yet whether the ref will be reused. A later use does get `-1`, `-2`;
+a named ref always carries the suffix (its marker is keyed by name and number from
+the start). `normalizeFragmentIdentifier` also collapses a run of `_`/whitespace
+to one `_`, which the old `name.replace(' ', "_")` did not, so
+`cite_ref-a__1-0` was possible.
+
+Fixed in `ext::cite::marker_id`/`note_id`, with `id_segment` replaced by a
+`normalize_fragment_identifier` that matches the PHP regex, plus tests for the
+anonymous reuse (`cite_ref-1` then `cite_ref-1-1`) and the normalization. The
+scheme now matches the service id-for-id on the page; the *numbers* still drift
+(rustoid collects 528 notes against the service's 545), so a collection gap
+remains, and `2024 Summer Olympics`'s first difference is upstream of all of it —
+an `about="#mwt10"` where rustoid has `#mwt8`, i.e. the document-order `about`
+counter, not Cite.
