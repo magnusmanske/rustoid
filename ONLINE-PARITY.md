@@ -8563,6 +8563,9 @@ rustoid: <div class="stack mw-stack stack-right"        about="#mwt11" …
 `Template:Stack` writes `class="stack mw-stack {{#switch:{{{clear|}}}|left|true=clear-}}right"`,
 and rustoid reads `clear` as unset where the service sees `true`.
 
+**Resolved** — see "The Stack class" below; it was two defects on the module
+answer path, not the class itself.
+
 ### The `mw:ExpandedAttrs` gate, finished
 
 The gate is a per-token flag, as the earlier section planned, and not more
