@@ -8837,3 +8837,77 @@ The `<div class="hlist ">` content: the service emits `\n<ul><li>…`, rustoid t
 literal `* German …`. A `* ` list inside that div was never recognised as a
 list, which is a list-parsing issue in a value that arrives from a template, not
 another stylesheet detail.
+
+## Template-argument values are tokenized as blocks, not inline comments
+
+That hlist was the visible symptom of a tokenizer that tokened a template
+argument *value* as inline content only. The value is `\n* a\n* b\n`, and both
+the `{{flatlist|…}}` call on the page and `Template:Flat list`'s
+`{{#if:{{{1|}}}|\n{{{1}}}\n</div>}}` push it through the same reader, so the
+reduction is just the loose wikitext (against the transform endpoint):
+
+```
+{{#if:1|\n* a\n* b\n}}
+```
+
+The service answered a two-item list; rustoid answered
+`<ul><li>a</li></ul><span> </span><p>* b</p>` — the **first** line became a list
+item and the second did not. That shape is `TokenStreamPatcher`'s T2529 hack
+firing on one string: a marker meta precedes `Str("* a")`, so the T2529 branch
+re-tokenizes `"* a"` alone; the next `Nl`/`Str("* b")` arrive after it and are
+left as text (see `token_stream_patcher.rs`).
+
+The root cause was one rule read short. PHP's grammar defines
+
+```
+template_param_value = template_param_text<equal=false, …>
+template_param_text  = (nested_block / newlineToken)+
+```
+
+so a value is a sequence of **blocks**; the `sol` rule consumes a leading newline
+and emits it as an `NlTk`, and the block that follows may be a list, a heading or
+an hr (tables are suppressed by the `table=false` flag). rustoid's
+`tokenize_template_arg_value` instead looped inline-only — it emitted the
+newlines (which is why the value was already a `Tokens`, and why the
+all-`Str` guard in `re_tokenize_sol_prefix` never fired for `{{1x|\n* a\n* b\n}}`
+either) but never tried a block line. `nested_block` was the missing half.
+
+The loader now tries `sol` + `block_line` (heading / list_item / hr, no table)
+before falling back to inline content, mirroring `(nested_block / newlineToken)`;
+a failed attempt is rolled back so the newline is still emitted by the
+`newlineToken` branch. `find_arg_separator_eq` already modelled the heading
+case (a `=` at start of line opens a heading rather than a `name=value`
+separator), so the two agree. Verified against the endpoint: for
+`{{#if:1|\n* a\n* b\n}}`, `{{1x|\n* a\n* b\n}}` and `{{flatlist|\n* a\n* b\n}}`
+all three shapes now render the two-item list the service does; a heading inside
+an argument (`{{1x|new\n=== test ===\nline}}`) also now produces the `<h3>` and
+section split the service does, which the old inline loop left as literal text.
+
+`test_template_arg_heading_not_split` was asserting the old behaviour (the
+heading left as text); it is updated to assert the heading **token** and keep its
+real point — that the line is not split at `=` (the argument stays positional).
+
+### Measured, and what is still wrong
+
+The first-difference offsets do not move, because every page's earliest
+divergence is *earlier* than its hlist; the fix is a downstream correction. The
+fixture guard holds at **877/896**, workspace tests, clippy and fmt are clean,
+and rustoid's total output size shifts on the pages that use these templates.
+
+Two smaller divergences sit right behind the fixed one, both visible on the same
+reduction and both left for a follow-up because they share one cause — the list
+items born inside an argument value carry source ranges *relative to the value
+string*, so `compute_dsr` drops them and `CleanUp::trimWhiteSpace` has no `dsr` to
+record its trim on:
+
+- the service keeps the value's leading newline before the list
+  (`<div class="hlist ">\n<ul>`); rustoid trims every leading `Nl` of the branch
+  in `trimmed_branch`, including the one that came from the substituted value;
+- the first item's leading space is trimmed in rustoid but the second item's is
+  not (`<li> b</li>` where the service has `<li>b</li>`), the same missing-`dsr`
+  gap seen from the other side.
+
+Neither is cosmetic for a page that uses `{{flatlist}}`/`{{hlist}}`, so the next
+step is to give the argument-value tokens a source range that survives the
+DSR pass (or to run the trim against the value's own source) rather than to
+paper over either symptom.

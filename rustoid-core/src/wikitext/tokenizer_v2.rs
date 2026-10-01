@@ -610,6 +610,22 @@ impl<'a> PegTokenizer<'a> {
         false
     }
 
+    /// `block_line` without the table alternative. PHP's template-argument value
+    /// tokenizer runs `nested_block<table=false>`, so a list/heading/hr forms but
+    /// a table line does not; see [`tokenize_template_arg_value`].
+    fn try_block_line_no_table(&mut self) -> bool {
+        if self.try_heading() {
+            return true;
+        }
+        if self.try_list_item() {
+            return true;
+        }
+        if self.try_hr() {
+            return true;
+        }
+        false
+    }
+
     /// Try to parse an inline line (until newline or EOF).
     fn try_parse_inlineline(&mut self) -> bool {
         self.try_parse_inlineline_impl(true)
@@ -5071,12 +5087,14 @@ fn kv_str(key: &str, value: &str) -> KV {
 /// `template_param_value` → `template_param_text` (which runs
 /// `nested_block<table=false, extlink=false, templateArg=true, tableCellArg=false>`).
 ///
-/// The value is in an inline (mid-line) position immediately after `{{target|`,
-/// so — like PHP's `block` → `inlineline` in a non-SOL position — it tokenizes
-/// wikilinks, quotes, entities, templates (`{{…}}`) and template-args (`{{{…}}}`)
-/// but **not** lists/tables/headings (those form only at start-of-line). A bare
-/// text run collapses back to a plain `Str`, mirroring PHP's `flattenIfArray`
-/// single-string case. Newlines stay as text so multi-line values round-trip.
+/// The value is a sequence of top-level blocks, exactly as PHP's
+/// `template_param_text = (nested_block / newlineToken)+` reads it: at
+/// start-of-line a list/heading/hr forms (the `sol` rule emits the preceding
+/// newline as an `Nl` token), while the `table=false` flag suppresses table
+/// lines. Elsewhere the value is inline (mid-line) content — wikilinks, quotes,
+/// entities, templates (`{{…}}`) and template-args (`{{{…}}}`). A bare text run
+/// collapses back to a plain `Str`, mirroring PHP's `flattenIfArray`
+/// single-string case. Newlines stay as tokens so multi-line values round-trip.
 fn tokenize_template_arg_value(
     input: &str,
     lang_conv_enabled: bool,
@@ -5091,12 +5109,25 @@ fn tokenize_template_arg_value(
     };
     let mut tk = PegTokenizer::new(input, &options);
 
-    // Inline-tokenize the whole value. Newlines are emitted as `Nl` tokens
-    // (mirrors PHP's `newlineToken`), carrying their source offset so a
-    // serializer that retains newlines (e.g. the `format="wikitext"` `<pre>`
-    // body) can recover `\n`, while `tokensToString` strips them in attribute
-    // context.
+    // Tokenize the whole value as PHP's `template_param_text = (nested_block /
+    // newlineToken)+`: at start of line a block construct (list/heading/hr) is
+    // recognized — the `sol` rule consumes the preceding newline and emits it as
+    // an `Nl` token — and elsewhere inline content is tokenized. Newlines are
+    // emitted as `Nl` tokens (mirrors PHP's `newlineToken`), carrying their
+    // source offset so a serializer that retains newlines (e.g. the
+    // `format="wikitext"` `<pre>` body) can recover `\n`, while `tokensToString`
+    // strips them in attribute context. Tables are suppressed (`table=false`).
     while !tk.eof() {
+        // `nested_block` — a block line at SOL. A failed attempt is rolled back
+        // so the newline is handled by the `newlineToken` branch below.
+        let block_saved = tk.pos;
+        let block_out = tk.output.len();
+        if tk.try_parse_sol() && tk.try_block_line_no_table() {
+            continue;
+        }
+        tk.pos = block_saved;
+        tk.output.truncate(block_out);
+
         let ch = tk.peek_char().unwrap();
         if ch == '\n' || ch == '\r' {
             let p = tk.pos;
@@ -6178,8 +6209,10 @@ mod tests {
     fn test_template_arg_heading_not_split() {
         // A `===` heading inside a template argument must not be read as a
         // `name=value` separator; the whole line is positional content. The
-        // multi-line value tokenizes to text runs + `Nl` tokens (mirrors PHP's
-        // `template_param_text` → `newlineToken = NlTk`).
+        // `=` *does* still open a heading block, though: PHP's
+        // `template_param_text` runs `nested_block` at start of line, so the
+        // heading is tokenized (`{{1x|new\n=== test ===\nline}}` renders an
+        // `<h3>` on the service) even though it is not an assignment.
         let tokens = tokenize("{{#tag:pre|new\n=== test ===\nline|format=\"wikitext\"}}");
         let template = tokens
             .iter()
@@ -6195,12 +6228,17 @@ mod tests {
         assert_eq!(template.attribs[0].key.as_str(), Some("#tag:pre"));
         // Second arg is positional (empty key), not named `new`.
         assert_eq!(template.attribs[1].key.as_str(), Some(""));
-        // The value is `Tokens` (text runs interleaved with `Nl` tokens). The
-        // content still contains `=== test ===` (never split as `name=value`).
+        // The value is `Tokens`: a text run, an `Nl`, the heading token, an
+        // `Nl`, and the trailing text run.
         match &template.attribs[1].value {
             KeyValue::Tokens(items) => {
-                let s = crate::wikitext::token_utils::tokens_to_string_with_nls(items);
-                assert_eq!(s, "new\n=== test ===\nline");
+                assert!(
+                    items.iter().any(|it| matches!(
+                        it,
+                        Item::Tok(ParsoidToken::Tag(t)) if t.name == "h3"
+                    )),
+                    "expected an h3 heading token, got {items:?}"
+                );
             }
             other => panic!("expected Tokens value, got {other:?}"),
         }
