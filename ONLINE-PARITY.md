@@ -8722,3 +8722,44 @@ The difference at 12711 is `typeof="mw:Error mw:File"` where the service has
 cache, because the width bug meant it was never requested before. That one is a
 cache-completeness artefact rather than a parser defect; an online run would
 populate it.
+
+## Backfilling file metadata without re-pinning anything
+
+The `mw:Error mw:File` at 12711 was a cache gap: the width fix made rustoid
+request a thumbnail size (`…@w171`) that no earlier run had ever asked for, so
+the offline cache had no entry and the media processor fell back to broken-media
+markup. The obvious fill — an online page run — is the one thing not to do here:
+wikitext bodies are re-fetchable in the cache model (only `Rendered` baselines
+are guarded), so an online page run would silently re-pin `page:World War II`
+and every template it touches to *current* revisions, orphaning the pinned
+oracle.
+
+File metadata does not have that hazard: a thumbnail is a revision-stable fact,
+so a miss can be filled without touching any page. `CachedDataSource` therefore
+grew one gated field, `fill_files` (set by `RUSTOID_FILL_FILES`), which lets
+`get_file_info` fetch and cache a miss *even when the run is offline* — and only
+that method. Every page/template/module/page-info fetch keeps its `offline`
+guard, so the run still cannot touch a body.
+
+Filling is one paced (120 ms) request per file, and additive: the WW2 render
+added 13 `file:` entries and changed no other entry kind. Corpus-wide it moved
+exactly the two pages that had a file-info miss ahead of their difference:
+
+```
+World War II   12617 -> 14983  (+2366)
+Zebro           1495 ->  5358  (+3863)
+```
+
+and nothing else. A second run, now purely offline, reproduced every page's
+first difference byte-for-byte, so the cache is complete for this corpus; its
+total differed by 182 bytes, all *after* the first differences (a file fetched
+for one page mid-run changes the id allotment in another, which is downstream of
+content that already diverges).
+
+World War II's difference at 14983 is the next defect and is *not* a cache gap:
+rustoid emits `<span typeof="mw:File" data-mw='{"attribs":[["alt",{"txt":"in
+the"}]]}' id="mwEw">` where the service has a bare `<span typeof="mw:File">`.
+The media span's `alt`, built from a template argument the module passed through,
+is being marked `mw:ExpandedAttrs` — the same over-marking the gate fixes for
+template bodies, but on a span the media handler builds, which no `synthesized`
+flag reaches.

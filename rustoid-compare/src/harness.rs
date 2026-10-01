@@ -300,6 +300,14 @@ pub struct CachedDataSource {
     /// expansion can trigger many fetches, so this is what keeps an offline run
     /// genuinely offline.
     offline: bool,
+    /// Fetch file info even when `offline`, and cache it.
+    ///
+    /// File metadata is a revision-stable fact (a thumbnail does not change), so
+    /// backfilling it cannot orphan the pinned baseline an online *page* run
+    /// would — that is why this is not just `!offline`. Set by
+    /// `RUSTOID_FILL_FILES`; off by default, so a plain offline run still
+    /// touches no network.
+    fill_files: bool,
     /// Entries stored since the manifest was last written, so the manifest is
     /// not re-serialised on every one of hundreds of template fetches.
     pending: std::sync::atomic::AtomicUsize,
@@ -328,6 +336,7 @@ impl CachedDataSource {
             cache,
             entities: None,
             offline,
+            fill_files: std::env::var_os("RUSTOID_FILL_FILES").is_some(),
             pending: std::sync::atomic::AtomicUsize::new(0),
             facts: Arc::new(std::sync::Mutex::new(FactAges::default())),
         }
@@ -750,8 +759,13 @@ impl DataSource for CachedDataSource {
         }
         // Offline, an uncached file is simply unknown; that renders as the
         // broken-media markup the wiki itself would not serve, which is the
-        // honest answer rather than a fabricated size.
-        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
+        // honest answer rather than a fabricated size. With `RUSTOID_FILL_FILES`
+        // the miss is filled from the wiki instead — see the `fill_files` field.
+        let Some(client) = self
+            .client
+            .as_ref()
+            .filter(|_| !self.offline || self.fill_files)
+        else {
             return Ok(None);
         };
         // A transport failure answers conservatively but is **not** written, for
