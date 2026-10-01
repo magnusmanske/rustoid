@@ -8511,9 +8511,19 @@ the indicator spend (`#mwt6` on `World War II`) that the service makes. So
 
 ### What is left
 
-`Stack/styles.css` — the second stylesheet in the oracle, `#mwt13` — is still
-misplaced (it was `#mwt90`, now `#mwt66`), so the deferral propagates past the
-splice in that one path: the infobox passes a `{{stack begin}}` argument through
-`#invoke`, and the marker is not re-numbered where the module output places it.
-The next reduction is that path (`expand_invoke_args` text rendering → module
-output re-parse), not the numbering model itself.
+The ids now match the service through the whole infobox — `STYLE-NUM` shows
+`frag15` infobox `#mwt12`, `frag16` Stack `#mwt13`, `frag17` Multiple image
+`#mwt14`, exactly the oracle's sequence. But `Stack/styles.css` is **created
+twice**: the `#mwt13` fragment is spent and then never emitted (`about="#mwt13"`
+appears zero times in rustoid's output), and a second fragment is built and
+emitted at `#mwt64`. So this is no longer a numbering error — the value is
+expanded once, rendered back to text (losing the placeholder), and its *source*
+is re-expanded later.
+
+Preserving the first fragment in the arg-text renderer was tried: route a value
+that holds an `mw:DOMFragment` through `render_answer_markers` so the module's
+output re-splices the same fragment. It is the wrong lever —
+`render_answer_markers` renders the whole value through `render_answer`, which
+knows fewer constructs than `argument_value_text`, and the corpus lost ~18 KB.
+Reverted. The next reduction is why the `{{stack begin}}` argument's value is
+expanded twice (the `#invoke` arg round-trip), not the marker renderer itself.
