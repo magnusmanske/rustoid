@@ -8474,19 +8474,28 @@ transclusion ids). The change was reverted; `DEFERRED_ABOUT` stays unused.
 
 ### Where the divergence actually is
 
-The per-chunk rule is right; the infobox is a case where rustoid's *chunking*
-differs from Parsoid's. `Module:Infobox` emits its stylesheets from
-`loadTemplateStyles()` through `frame:extensionTag{name='templatestyles', …}`
-(checked in the cached module). Parsoid **executes the extension then and
-there**, at module-run time, so those styles are created and numbered before the
-module's output wikitext (`{{stack}}`, `{{multiple image}}`, …) is re-parsed and
-expanded. rustoid defers the `extensionTag` and the resulting `<templatestyles>`
-token is numbered by the post-pass of the *output* chunk — after the nested
-templates. The `STYLE-NEW` trace agrees: `Module:Infobox military
-conflict/styles.css` is the 15th stylesheet *created*, after 14 nested-template
-ones, so numbering at creation time would not fix the order either.
+The per-chunk rule is right, and `frame:extensionTag` for `templatestyles` is
+*not* deferred the way the first guess here had it. Instrumenting
+`expand_one_templatestyles` with the Lua nesting depth shows the infobox's
+stylesheets are created with `lua_expansion_depth > 0` — i.e. inside
+`expand_lua_request`, at request time, which is the eager behaviour Parsoid has.
+So "resolve the `extensionTag` eagerly" is not the fix either; it already is.
 
-The next attempt should start at `frame:extensionTag` for `templatestyles` being
-resolved eagerly with the document's `about_counter` at request time —
-`expand_lua_request` already has the counter — which is where the ordering is
-lost. Recorded rather than guessed at.
+The creation order is what is interleaved. A `STYLE-NEW` trace of `World War II`
+shows `frame:extensionTag`-created styles (`lua_expansion_depth > 0`) and
+output-chunk styles (`= 0`) alternating — `Multiple image` frag 3 at depth 1,
+`Hlist` frag 4 at depth 0, `Plainlist` frag 5 at depth 1, `Crossreference` frag 6
+at depth 0, … — and only then `Module:Infobox military conflict/styles.css` at
+frag 15. So the ids are lost not in one place but in how rustoid interleaves the
+nested modules'/templates' creation *and* their per-chunk post-passes; the
+`Stack` stylesheet is 2nd in the oracle but 9th here even after the constant
+shift is discounted, which is a second ordering error under the same cause.
+
+That is why neither cheap fix works: the post-pass is required (numbering at
+creation would put `<templatestyles/>` before `{{Center}}`, contradicting the
+probe table above), and deferring to the tree builder breaks the interleaving
+entirely. What is needed is for the whole nested structure's extension tokens to
+be numbered in the order Parsoid's token flow reaches them — the extension IDs
+and the transclusion IDs interleaved per chunk at every nesting level. Recorded
+as the shape of the work, with the two measured wrong turns above, rather than
+guessed at again.
