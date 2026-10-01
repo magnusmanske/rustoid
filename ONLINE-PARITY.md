@@ -8968,3 +8968,38 @@ subtrees rustoid renders incompletely — its navbox carries an unresolved
 `aria-labelledby="[[File:…]]_[[Olympic_Games]]8788"`, its medal table has the
 same row count but a third of the `INA` cells. Fixing those is a
 `Module:Navbox`/expansion investigation, not a Cite one.
+
+### The `about` drift is a `<ref>` body that is never expanded
+
+`2024 Summer Olympics`'s first difference at 8910 is `about="#mwt10"` (service)
+vs `#mwt8` (rustoid) on the first ref marker. The gap is not in Cite: it is that
+**rustoid never expands a `<ref>`'s body**. A `<ref>`'s content is opaque to the
+tokenizer, and the port renders it from the raw wikitext at the note list
+without running the template pipeline, so:
+
+- the note shows the literal token — 252 `<template cite …="">` elements leak
+  into the page where the service has `<cite class="citation">` (5 vs 257);
+- the citation's own templates never take their `about` ids, and the ids they do
+  take (templatestyles, the `cite` wrapper) are spent when Cite renders the list
+  — after every other id — instead of at the ref site, where the service spends
+  them (its note-1 content is `#mwt9`, *before* the marker's `#mwt10`).
+
+Two placements were tried and both were **reverted**:
+
+- expand every body before Cite's render (walk the DOM, expand each distinct
+  body through `expand_templates`). Content is fixed — 0 leaked `<template>`, 253
+  citations, `2024 Summer Olympics` grows 1.28 MB → 1.72 MB against the service's
+  1.90 MB — but the ids are still spent after the main expansion, so ref1's
+  marker stays `#mwt8`, and the extra ~1000 template expansions make the
+  ref-heavy `France`/`India`/`Israel` exceed the stall cap (they render nothing in
+  120 s).
+- expand at the ref site, inside `expand_templates`' walk (the service's order).
+  Same stall, and the marker ids still did not move, because a template argument's
+  extensions are numbered where the value lands, not where it expands.
+
+The correct fix — expand the content at the ref site — is therefore not enough
+on its own: rustoid's expansion is too slow to afford ~1000 more template
+expansions on a ref-heavy page, and the first difference does not move until the
+ids interleave exactly. Landing it needs the expansion made cheap (a per-page
+share of whatever the service caches) first. Recorded rather than shipped, and
+the working tree is back to the three commits above.
