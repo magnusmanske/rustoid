@@ -5419,7 +5419,16 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
     while i < inner.len() {
         // A `-{ … }-` language-variant construct is balanced: its internal `|`
         // (e.g. `-{R|caption:}-`) must not split the option/argument list.
-        if inner[i..].starts_with("-{") {
+        //
+        // The `-{` must be the variant opener and not the tail of a brace
+        // construct: in `{{{flag alias-{{{variant}}}|default}}}` the `-{` is the
+        // hyphen that ends the parameter name followed by the nested `{{{`, and
+        // treating it as an opener left `dash_brace` at 1 forever (there is no
+        // `}-`), so the outer `|` no longer split and the whole
+        // `name|default` became the parameter *name*. That is what leaked
+        // `Template:Flag icon/core`'s `[[File:{{{flag alias-{{{variant}}}|…}}}…]]`
+        // as literal text on `World War II` and 13 sibling call sites.
+        if inner[i..].starts_with("-{") && !inner[i + 2..].starts_with('{') {
             dash_brace += 1;
             current.push_str("-{");
             i += 2;

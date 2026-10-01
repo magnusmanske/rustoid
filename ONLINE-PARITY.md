@@ -8278,3 +8278,64 @@ No page regressed, and the byte total *rising* is the point: the extra 2.0 M
 bytes are templates and stylesheets that were previously literal `{{…}}` and
 `<extension>` placeholders. The first differences that moved did so because the
 cache (or the parser) stopped being the limit, not because a rule changed.
+
+## The `{{…}}` counter was lying, and `-{{{` is not a variant opener
+
+Continuing the populate hit the rate limit again (a fifth pass moved nothing at
+all), so the next step was to look at *what* the 38/42 literal-`{{…}}` pages
+actually contained. The first thing that came out is that the metric itself is
+contaminated.
+
+`Unexpanded::count` decides "inside a tag" by toggling on every `<` and `>`. A
+`data-mw` attribute may contain a raw `>` — HTML allows it, and Parsoid emits it
+(it escapes `<` as `&lt;` but leaves `>` alone, and so does rustoid) — so the
+first raw `>` inside a large attribute ends the alleged tag and the rest of the
+attribute is counted as document text. `World War II`'s navbox `data-mw` is
+241 KB with 518 raw `>`, and the harness counted the whole thing. Re-counting
+with an HTML-aware scan gives rustoid **18** literal `{{` in real text against
+the oracle's **2** — not 882, and not "raw wikitext": the page prose rendered
+fine.
+
+### The 17 were one template: `Template:Flag icon/core`
+
+They were all the same construct, leaked as `<templatearg>` elements:
+
+```
+[[File:{{{flag alias-{{{variant}}}|{{safesubst:#if:{{{flag alias|}}}|{{{flag alias}}}|Flag placeholder.svg}}}}}|…]]
+```
+
+The parameter **name** is itself a nested argument (`flag alias-<variant>`) and
+the part after the top-level `|` is its default. rustoid's splitter never split
+it, so the token came out as one `Str` key with no default — printable, but
+unmatchable, so `{{flagicon|Soviet Union}}` rendered literal `[[File:…]]` where
+the service renders a flag `<img>`.
+
+The cause is a one-character confusion in `split_template_args_impl_offsets`: the
+`-{` of `alias-{{{variant}}}` was read as a `-{ … }-` language-variant opener.
+Nothing ever closes it (there is no `}-`), so `dash_brace` stayed at 1 and every
+later top-level `|` counted as protected.
+
+The fix keeps the variant case working and only stops `-{` from firing when it is
+the tail of a brace run — `-{` immediately followed by `{` is the hyphen that
+ends a parameter name followed by a nested `{{{`, not a variant opener.
+
+### Verified against the service, not against the fixture
+
+| input | service | rustoid before | rustoid now |
+| --- | --- | --- | --- |
+| `{{#if:1|-{x\|y}-\|z}}` | `-{x\|y}-` | `-{x\|y}-` | `-{x\|y}-` |
+| `{{#if:1\|p-{{{l\|q}}}\|D}}` | `p-q` | `p-q\|D` | `p-q` |
+| `{{flag icon/core\|alias=Soviet Union\|flag alias=…}}` | flag `<img>` | literal `[[File:<templatearg…>` | flag `<img>` |
+
+- `World War II` real-text literals **18 → 4** (the oracle has 2; one of the four
+  is the `{{cite journal}}` the oracle has as well).
+- Corpus total 30 527 733 → **30 564 312** bytes (+36.6 KB of flags that were
+  placeholders). **No first difference moved** — the flags sit after each page's
+  first difference — and the fixture guard stays **877/896**.
+- What is left on `World War II` is the **navbox**: three literals, and they come
+  with raw CSS text (`…crossreference{padding-left:0}{{{content}}}Belligerents…`)
+  and `{{{name}}}`, i.e. a navbox emitting a stylesheet's *content* without its
+  element and leaving its own `content`/`name` parameters unsubstituted. That is
+  a `Module:Navbox` output bug and the next thing to reduce.
+- `World War II`'s first difference is now `about="#mwt12"` vs `#mwt31` on the
+  infobox's leading `<style>` — the extension/encapsulation numbering thread.
