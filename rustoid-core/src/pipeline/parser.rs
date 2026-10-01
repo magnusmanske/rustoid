@@ -4880,7 +4880,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut info = template_info_from(Some("invoke"), None, vec![]);
         info.target_wt = Some("#invoke".to_string());
         let encapped = encap.encap_tokens(expanded, &info);
-        crate::pipeline::lua_deferred::render_answer(&encapped)
+        // Markers, not the plain renderer: a `frame:expandTemplate` answer that
+        // carries an extension — `Module:Infobox` builds the infobox with
+        // `frame:expandTemplate('stack begin')`, and `Template:Stack` opens with a
+        // literal `<templatestyles>` — has a fragment placeholder inside it, and
+        // `render_answer` has no textual form for one and drops it. The fragment
+        // was spent (`Stack/styles.css` `#mwt13`) and then lost, and the output
+        // re-expanded the template's source, building a second fragment at
+        // `#mwt64`. The marker keeps the first.
+        self.render_answer_markers(&encapped)
     }
 }
 
