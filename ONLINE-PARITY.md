@@ -8337,8 +8337,10 @@ ends a parameter name followed by a nested `{{{`, not a variant opener.
   and `{{{name}}}`, i.e. a navbox emitting a stylesheet's *content* without its
   element and leaving its own `content`/`name` parameters unsubstituted. That is
   a `Module:Navbox` output bug and the next thing to reduce.
-- `World War II`'s first difference is now `about="#mwt12"` vs `#mwt31` on the
+- `World War II`'s first difference is now `about="#mwt12"` vs `#mwt25` on the
   infobox's leading `<style>` — the extension/encapsulation numbering thread.
+  (The handoff's end-of-session note had `#mwt31`; on the current tree and cache
+  the same first difference reads `#mwt25`.)
 
 ## A live HTML element in a module argument, and the stale source range it exposed
 
@@ -8398,5 +8400,75 @@ value the source range and the per-token `src` are the same text. Unit test
 - `World War II` `{{{` literals **3 → 0**.
 - Fixture guard unchanged at **877/896**; workspace tests, `clippy
   --workspace --all-targets` and `cargo fmt --all --check` all clean.
-- The page's *first* difference does not move — it is the `#mwt12`/`#mwt31`
+- The page's *first* difference does not move — it is the `#mwt12`/`#mwt25`
   numbering above, which sits earlier in the document than the navbox.
+
+## The extension-numbering order: a nested chunk outranks its enclosing one
+
+With the literals gone, `World War II`'s first difference is the `about` id on
+the infobox's leading `<style>`: the oracle writes `about="#mwt12"`, rustoid
+`about="#mwt25"`. The ids before it are identical on both sides
+(`1,2,3,4,5,7,9,10,11` — the gaps are ids spent on things that do not render), so
+rustoid has spent **13 extra ids** between the 11th and this stylesheet.
+
+### Measured how
+
+`RUSTOID_TRACE_ABOUT=1` makes `new_about_id` log every allocation, and
+`examples/render` (with `RUSTOID_WRAP_SECTIONS=1`, the harness's options) then
+reproduces the corpus render offline. Extracting `about="#mwtN"` from each side
+*in document order* is the comparison that matters, because the two orderings
+can differ while the totals look plausible:
+
+```
+oracle  styles by id: 12 Infobox-mc, 13 Stack, 14 Multiple-image, 15 Hlist,
+                     18 Plainlist, 19 Crossreference, 26 Navbox, 28 Navbar, 32 Sidebar
+rustoid styles by id: 25 Infobox-mc, 27 Multiple-image, 28 Hlist, 30 Plainlist,
+                      32 Crossreference, 37 Navbox, 39 Navbar, 46 Sidebar, 90 Stack
+```
+
+Two things fall out. Every rustoid id is shifted by the 13, and `Stack/styles.css`
+— the second stylesheet in the document — is drained 90th by rustoid.
+
+### What the oracle actually does
+
+The obvious theory, "the oracle dedupes before numbering and rustoid numbers the
+duplicates", is **wrong**: the oracle's dedup placeholders keep their id. It emits
+399 `mw-deduplicated-inline-style` links on this page and each carries an `about`
+(`#mwt20`, `#mwt21`, …), so it spends ids on the duplicates too. The divergence is
+**order**, not count.
+
+`src/Wt2Html/TT/ExtensionHandler.php::onDocumentFragment` allocates
+`$env->newAboutId()` for every extension but `nowiki` as that extension's DOM
+fragment is *produced* — i.e. as the token flow reaches it, in source order — and
+`src/Wt2Html/DOM/Handlers/DedupeStyles.php` later replaces a duplicate `<style>`
+with a `<link>` that copies the original's `about` (line 44). So the oracle's
+ids follow document order.
+
+### Why rustoid diverges
+
+rustoid cannot number during the flow, because within one chunk a *transclusion*
+must take its id before an extension that precedes it in source
+(`<templatestyles/>{{Center|b}}` is `#mwt2`/`#mwt1` on the service). So it defers
+all of a chunk's extensions to `number_style_placeholders` at the end of the
+chunk.
+
+That is correct within a chunk and wrong across them. A nested `expand_templates`
+(one template, one module output) completes — and drains *its* stylesheets —
+before the enclosing chunk's post-pass runs. So a nested stylesheet that sits
+**later** in the document takes an id **before** the enclosing chunk's own, which
+sits earlier. The infobox is exactly this shape: `Module:Infobox military
+conflict/styles.css` is the first child of the invoke span, but 13 nested
+stylesheets are drained before it.
+
+### Why it is not fixed here
+
+The faithful fix is to number extensions in **document order across chunks**, which
+is what Parsoid's DOM post-processing gives it for free. The code already records
+why that is not a small patch — the fragment map is not threaded to the tree
+builder, so a single document-order pass would have to run *outside*
+`expand_templates` and still reach the stashed `<style>` fragments
+(13 recursive call sites). Changing the per-chunk drain order directly risks the
+pinned `a_stylesheet_before_a_template_is_numbered_after_it` test without first
+pinning Parsoid's handler *priority* (why the transclusion wins inside a chunk),
+which the source above does not by itself settle. Recorded as the shape of the
+next pass rather than guessed at.
