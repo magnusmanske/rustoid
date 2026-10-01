@@ -835,11 +835,28 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         .unwrap_or_default()
         .remove(title)
         .unwrap_or_default();
+    // A `File:` title also answers `title.file`, so its dimensions are part of
+    // its facts. `None` sizes are deliberate — the natural dimensions are what
+    // `Module:Multiple image` needs, not a thumbnail's.
+    let file = if parsed.namespace_id == crate::lua::engine::FILE_NAMESPACE_ID {
+        source
+            .get_file_info(&parsed, None, None)
+            .await
+            .ok()
+            .flatten()
+            .map(|f| crate::lua::engine::FileDims {
+                width: f.width,
+                height: f.height,
+            })
+    } else {
+        None
+    };
     TitleFacts {
         exists,
         is_redirect,
         content,
         protection,
+        file,
     }
 }
 

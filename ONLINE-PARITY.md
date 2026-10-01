@@ -8685,3 +8685,37 @@ only `World War II` and `Zebro` change first-difference kind, both moving forwar
 past the stylesheet. Fixture guard **877/896**; workspace tests, clippy and fmt
 clean.
 
+
+## The multiple-image width, and `mw.html.create('')`
+
+The 12542 difference is `Module:Multiple image`'s row width: rustoid wrote
+`width:100px` where the service has `292px`, and `width:nanpx` on every cell.
+
+`getdimensions` (the `total_width` path) reads the file's natural size from
+`mw.title.new('File:…').file`, whose `width`/`height` rustoid did not implement —
+so every width was `0`, the aspect-ratio division was `0/0`, and `nan`/`inf`
+propagated into the style attributes.
+
+`TitleFacts` now carries `file: Option<FileDims>`, filled by `title_facts_of`
+for a `File:` title (the same place, and the same retry signal, as `exists`: a
+file the host was never asked about is requested and answered next round).
+`title_derived_field` answers `"file"` only in the File namespace, so a
+non-file title has no `file` and asks for none.
+
+Then the cells still carried `&lt;>` … `&lt;/&gt;`: `renderImageCell` builds its
+cells with `root = mw.html.create('')`, a tagless *container*, and `Node:_render`
+tested `self._tag ~= nil` — the empty string is not nil, so it emitted a literal
+`<>` around every image cell. Scribunto documents the blank tag name as an empty
+node; `_render` now treats `''` as no tag.
+
+Measured: the widths match (`292px`, `171px`, `115px`), the `<>` wrappers are
+gone, and World War II's first difference moves **12542 → 12652 → 12711**.
+Corpus (offline, 48 titles) 30 408 898 → **30 377 979** bytes — the `</>` pairs
+were pure invention, so the total moves toward the service. Fixture guard
+**877/896**; workspace tests, clippy and fmt clean.
+
+The difference at 12711 is `typeof="mw:Error mw:File"` where the service has
+`typeof="mw:File"`: the *sized* thumbnail entry (`…@w171`) is not in the offline
+cache, because the width bug meant it was never requested before. That one is a
+cache-completeness artefact rather than a parser defect; an online run would
+populate it.

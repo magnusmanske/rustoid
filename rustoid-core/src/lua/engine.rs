@@ -314,7 +314,22 @@ pub struct TitleFacts {
     /// Empty for a title that was never looked up, which reads as "unprotected" —
     /// the same conservative answer `exists` gives.
     pub protection: crate::traits::ProtectionEntry,
+    /// A `File:` title's natural dimensions, for `title.file`. `None` means
+    /// either "not a file" or "not fetched"; [`title_derived_field`] tells
+    /// them apart by the title's namespace.
+    pub file: Option<FileDims>,
 }
+
+/// The dimensions `title.file` answers, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileDims {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// MediaWiki's File namespace, the same on every wiki: `title.file` is
+/// answered only there.
+pub(crate) const FILE_NAMESPACE_ID: i32 = 6;
 
 pub struct LuaContext {
     pub site: LuaSite,
@@ -2283,7 +2298,14 @@ fn luafn_title_new(
     table.raw_set(
         TITLE_FACTS_KEY,
         lua.create_function(move |lua, (_this, key): (Value, String)| {
-            title_derived_field(lua, &key, &facts_for_lookup, is_current, &full_for_lookup)
+            title_derived_field(
+                lua,
+                &key,
+                &facts_for_lookup,
+                is_current,
+                &full_for_lookup,
+                ns_id,
+            )
         })?,
     )?;
 
@@ -2398,6 +2420,7 @@ fn title_derived_field(
     facts: &Option<TitleFacts>,
     is_current: bool,
     full: &str,
+    ns_id: i32,
 ) -> mlua::Result<Value> {
     match key {
         "exists" => {
@@ -2462,6 +2485,26 @@ fn title_derived_field(
             cp.set("sources", lua.create_table()?)?;
             Ok(Value::Table(cp))
         }
+        // `title.file` — a `File:` title's metadata. Modules read `width` and
+        // `height` from it; `Module:Multiple image` sizes each row from the
+        // file's aspect ratio, and with no `file` it divided by zero and wrote
+        // `width:nanpx`. A file the host was never asked about is requested and
+        // answered next round, exactly like `exists`; a title outside the File
+        // namespace has no `file` at all.
+        "file" if ns_id == FILE_NAMESPACE_ID => match facts.as_ref().and_then(|f| f.file) {
+            Some(d) => {
+                let t = lua.create_table()?;
+                t.set("width", d.width)?;
+                t.set("height", d.height)?;
+                Ok(Value::Table(t))
+            }
+            None => {
+                if !full.is_empty() {
+                    note_missing_title(lua, full)?;
+                }
+                Ok(Value::Nil)
+            }
+        },
         "fullUrl" => Ok(full_url_closure(lua, full)?),
         _ => Ok(Value::Nil),
     }
@@ -3138,8 +3181,14 @@ end
 
 function Node:_render()
     local out = {}
-    if self._tag ~= nil then
-        table.insert(out, '<' .. self._tag)
+    -- An empty tag name renders the children and nothing else. Scribunto
+    -- documents `mw.html.create('')` as a bare *container*, and `Module:Multiple
+    -- image` uses exactly that: left as a tag it emitted a literal `<>` … `</>`
+    -- around every image cell.
+    local tag = self._tag
+    if tag == '' then tag = nil end
+    if tag ~= nil then
+        table.insert(out, '<' .. tag)
         for _, attr in ipairs(self._attributes) do
             table.insert(out, ' ' .. attr.name .. '="' .. htmlEncode(attr.val) .. '"')
         end
@@ -3172,7 +3221,7 @@ function Node:_render()
             table.insert(out, child)
         end
     end
-    if self._tag ~= nil then table.insert(out, '</' .. self._tag .. '>') end
+    if tag ~= nil then table.insert(out, '</' .. tag .. '>') end
     return table.concat(out)
 end
 
@@ -8343,6 +8392,62 @@ mod tests {
         let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
         let src = module_source(r#"'Module:Known'"#);
         assert_eq!(engine.execute(&src, "main", &[]).unwrap(), "true");
+        assert!(engine.take_missing_titles().is_empty());
+    }
+
+    /// `title.file` answers a `File:` title's dimensions from its facts, and
+    /// requests the file when its metadata was never fetched. `Module:Multiple
+    /// image` sizes each row from `title.file.width`/`.height`, and with no
+    /// `file` it divided by zero and wrote `width:nanpx`.
+    #[test]
+    fn a_file_title_answers_its_dimensions() {
+        let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test");
+        ctx.titles.insert(
+            "File:Known.jpg".to_string(),
+            TitleFacts {
+                exists: true,
+                file: Some(FileDims {
+                    width: 798,
+                    height: 544,
+                }),
+                ..Default::default()
+            },
+        );
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+        let known = r#"
+            local p = {}
+            function p.main(frame)
+                local f = mw.title.new('File:Known.jpg').file
+                return f.width .. 'x' .. f.height
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(known, "main", &[]).unwrap(), "798x544");
+        assert!(engine.take_missing_titles().is_empty());
+
+        // An unknown file is requested, so the next round can answer it.
+        let unknown = r#"
+            local p = {}
+            function p.main(frame)
+                return tostring(mw.title.new('File:Unknown.jpg').file)
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(unknown, "main", &[]).unwrap(), "nil");
+        assert_eq!(
+            engine.take_missing_titles(),
+            vec!["File:Unknown.jpg".to_string()]
+        );
+
+        // A title outside the File namespace has no `file` and asks for none.
+        let other = r#"
+            local p = {}
+            function p.main(frame)
+                return tostring(mw.title.new('Some page').file)
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(other, "main", &[]).unwrap(), "nil");
         assert!(engine.take_missing_titles().is_empty());
     }
 }
