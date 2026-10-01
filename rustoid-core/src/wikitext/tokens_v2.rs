@@ -733,6 +733,15 @@ pub struct TempData {
     /// Set by `TreeBuilderStage` while inside a transclusion (mirrors
     /// `TempData::IN_TRANSCLUSION`).
     pub in_transclusion: bool,
+    /// Set on a token that came out of expanding a template body or a module
+    /// output — i.e. it was not written in the page's own wikitext.
+    ///
+    /// Parsoid's `AttributeExpander` runs inside each chunk's pipeline, so a
+    /// body's `inTemplate` is true and its attributes are not marked
+    /// `mw:ExpandedAttrs`; only the page chunk marks. rustoid flattens every
+    /// transclusion into one token stream and runs `expand_attributes` once at
+    /// the page level, so it has lost the chunk — this flag carries the fact.
+    pub synthesized: bool,
     /// Set by `MarkFosteredContent` on the transclusion start meta of a fostered
     /// transclusion (mirrors `TempData::FROM_FOSTER`).
     pub from_foster: bool,

@@ -3844,6 +3844,12 @@ attributes inside the body pipeline (a structural change that also moves the
 skip them. Both are bigger than they look; the reduction stays
 `{{Short description|X}}` on any article.
 
+**Resolved** (the last section of this file): the tagging route was taken —
+`TempData::synthesized`, set on a body's/module's top-level tokens and checked in
+`build_expanded_attrs`. The `Short description` case above also carried a second,
+unrelated difference (`Pages_…` vs `Articles_…` from `Module:Pagetype`), which by
+that point had already been fixed separately.
+
 ## `Module:Pagetype`: `getCurrentTitle()` was the invoking frame
 
 Scoreboard from the corpus run that opened the session (`/tmp/corpusC.txt`, the
@@ -8547,15 +8553,57 @@ guard 877/896.
 
 ### What is left
 
-The new first difference at 9924 is not numbering. The service emits
-`<div class="stack mw-stack stack-clear-right" about="#mwt1" id="mwAw">`, rustoid
-`<div class="stack mw-stack stack-clear-right" about="#mwt1"
-typeof="mw:ExpandedAttrs">` plus an inner `<div about=… typeof="mw:ExpandedAttrs">`
-wrapper. That is the **`mw:ExpandedAttrs` gate** — a template *body*'s attribute
-(`class="stack mw-stack {{#switch:…}}"`) is marked here but not on the service,
-while the same attribute at the top level *is* marked on both. rustoid flattens
-the body into one token stream and runs `expand_attributes` once at the page
-level, so it has lost the fact that the token came from a template body; the gate
-needs that fact as a per-token flag (the section on this gap earlier in this file
-has the shape). The minimal reduction is the `{{stack begin|clear=true}}` probe
-above.
+The new first difference at 9924 is not the gate. It is the Stack class:
+
+```
+service: <div class="stack mw-stack stack-clear-right" about="#mwt11" …
+rustoid: <div class="stack mw-stack stack-right"        about="#mwt11" …
+```
+
+`Template:Stack` writes `class="stack mw-stack {{#switch:{{{clear|}}}|left|true=clear-}}right"`,
+and rustoid reads `clear` as unset where the service sees `true`.
+
+### The `mw:ExpandedAttrs` gate, finished
+
+The gate is a per-token flag, as the earlier section planned, and not more
+`in_template` plumbing. `TempData::synthesized` is set on the top-level items a
+template body or a module output produces (`mark_synthesized`, called at the end
+of `expand_one_template` and on the `#invoke` output), and `build_expanded_attrs`
+skips the marking when it is set — Parsoid's `AttributeExpander` runs *per chunk*
+and a body's `inTemplate` suppresses the marking, while rustoid's
+`expand_attributes` runs once over the flattened page stream.
+
+That the coarse marking (every top-level item of the body, including a tag that
+arrived as a template *argument*) is faithful was checked, not assumed: the
+service does not mark a page-authored tag that travels through a passthrough
+either. `{{Plain list|1=<div class="{{#if:1|a}}">y</div>}}` renders
+`<div class="a">` on both sides, unmarked.
+
+Measured:
+
+- The minimal probe matches the service: no `typeof="mw:ExpandedAttrs"`, no inner
+  wrapper `<div>`.
+- `World War II` emits **18 → 7** `mw:ExpandedAttrs` (the oracle has 4). The 11
+  removed were all body attributes — `.stack`, `.hlist`, `.plainlist` divs whose
+  `class` was written literally with a nested template in a template body. The 7
+  that remain are all `typeof="mw:Error mw:File mw:ExpandedAttrs"`, a *different*
+  and pre-existing gap (a missing-file lookup), and the oracle's own 4 came from
+  attributes holding a `<span typeof="mw:Nowiki">` or a chosen external-link
+  `href` — cases rustoid did not produce before the gate either.
+- Corpus (offline, 48 titles): **30 565 629 → 30 401 269** bytes, i.e. −164 KB of
+  body markup the service does not emit either.
+- Fixture guard **877/896**; workspace tests, `clippy --workspace --all-targets`
+  and `cargo fmt --all --check` clean.
+
+### The wrong diagnosis this section used to carry
+
+The paragraph that stood here said the first difference at 9924 *was* the gate,
+and — worse — that the gate had introduced the class mismatch. Both were wrong,
+and a `git stash` of the gate settled it: **with and without the change**,
+`World War II`'s first difference is at byte 9924 and it is the
+`stack-clear-right` / `stack-right` class. The class bug was simply masked in the
+harness's scoreboard, whose classifier scans the ±400-byte context for keywords:
+before the gate that context still contained `mw:ExpandedAttrs` (the wrapper on
+the very next bytes), so the report said `expanded-attrs`; after the gate the
+context no longer does, and the same byte is now reported as `table`. The kinds in
+`/tmp/wide_markers.txt` vs `/tmp/wide_ea.txt` are that artefact, not a regression.

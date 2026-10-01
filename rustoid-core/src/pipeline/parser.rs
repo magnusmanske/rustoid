@@ -4178,6 +4178,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .into_iter()
             .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
             .collect();
+        // A body's tags are not the page's: `expand_attributes` must not mark
+        // their attributes `mw:ExpandedAttrs`. See [`mark_synthesized`].
+        let mut expanded = expanded;
+        mark_synthesized(&mut expanded);
 
         if !wrap || target_has_comment {
             // Nested/extension-content context, or a comment in the template
@@ -4369,7 +4373,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `frame:extensionTag` — and that stylesheet's `about` id belongs to the
         // page's sequence. A fresh counter started it at 1, so the `<style>`
         // reused the id the enclosing `#invoke` wrapper had just been given.
-        let expanded = Box::pin(self.expand_templates(
+        let mut expanded = Box::pin(self.expand_templates(
             &child,
             items,
             source,
@@ -4379,6 +4383,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             /* src_text */ "",
         ))
         .await;
+        // A module's output is not the page's own wikitext: `expand_attributes`
+        // must not mark its tags `mw:ExpandedAttrs`. See [`mark_synthesized`].
+        mark_synthesized(&mut expanded);
 
         // A module that reaches `<templatestyles>` through `frame:extensionTag`
         // lowers it to `#tag`, whose extension token is built during the
@@ -4992,6 +4999,25 @@ fn expandable_content(items: &[Item]) -> ExpandableContent {
         }
     }
     found
+}
+
+/// Mark the top-level tags of a chunk that came out of expanding a template body
+/// or a module output.
+///
+/// `expand_attributes` runs once, at the page level, over a stream into which
+/// every transclusion has already been flattened, so it cannot tell a page's own
+/// tag from a body's. The `mw:ExpandedAttrs` marking belongs to the page chunk
+/// only — Parsoid's `AttributeExpander` runs per chunk and a body's `inTemplate`
+/// suppresses it — so the fact is carried on the token. See
+/// [`crate::wikitext::tokens_v2::TempData::synthesized`].
+fn mark_synthesized(items: &mut [Item]) {
+    for item in items.iter_mut() {
+        if let Item::Tok(tok) = item
+            && let Some(dp) = tok.data_parsoid_mut()
+        {
+            dp.tmp.synthesized = true;
+        }
+    }
 }
 
 /// How many `#ifexist` titles one render may resolve.

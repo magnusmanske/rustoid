@@ -664,10 +664,16 @@ pub fn build_expanded_attrs(
         .data_parsoid()
         .and_then(|dp| dp.tmp.in_text_branch)
         .unwrap_or(false);
+    // Nor when the token came out of expanding a template body or a module
+    // output: Parsoid's `AttributeExpander` runs per chunk and a body's
+    // `inTemplate` suppresses the marking, while rustoid's `expand_attributes`
+    // runs once over the flattened stream. See `TempData::synthesized`.
+    let synthesized = token.data_parsoid().is_some_and(|dp| dp.tmp.synthesized);
     if token.get_attribute_v("about").is_none()
         && !tmp_data_mw.is_empty()
         && token_name != "template"
         && !branch_text
+        && !synthesized
     {
         let about_id = new_about_id(about_counter, "expanded-attrs");
         token.set_attribute("about", &about_id);
@@ -932,5 +938,50 @@ mod tests {
             .and_then(|kv| kv.value.as_str())
             .expect("expected data-mw attribute");
         assert!(data_mw.contains("\"attribs\""), "got: {data_mw}");
+    }
+
+    #[test]
+    fn test_build_expanded_attrs_skips_synthesized() {
+        use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
+
+        // The same templated attribute as above, but the token came out of a
+        // template body / module output (`TempData::synthesized`): the service
+        // does not mark it, so neither may rustoid.
+        let mut dp = DataParsoid::default();
+        dp.tmp.synthesized = true;
+        let token = ParsoidToken::Tag(TagTk::new("div", vec![], dp));
+
+        let old_attrs = vec![KV {
+            key: KeyValue::Str("style".to_string()),
+            value: KeyValue::Tokens(vec![
+                meta_token("mw:Transclusion"),
+                Item::Str("color:red".to_string()),
+                meta_token("mw:Transclusion/End"),
+            ]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        let expanded_attrs = old_attrs.clone();
+
+        let counter = std::cell::Cell::new(0usize);
+        let out = build_expanded_attrs(
+            token,
+            &old_attrs,
+            expanded_attrs,
+            &counter,
+            false,
+            &|kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            None,
+        );
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Item::Tok(ParsoidToken::Tag(div)) = &out[0] else {
+            panic!("expected a Tag, got: {out:?}");
+        };
+        let about = ParsoidToken::Tag(div.clone())
+            .get_attribute_v("about")
+            .map(str::to_string);
+        assert_eq!(about, None, "synthesized tokens must not be marked");
     }
 }
