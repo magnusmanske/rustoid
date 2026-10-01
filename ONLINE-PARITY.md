@@ -8946,3 +8946,25 @@ scheme now matches the service id-for-id on the page; the *numbers* still drift
 remains, and `2024 Summer Olympics`'s first difference is upstream of all of it —
 an `about="#mwt10"` where rustoid has `#mwt8`, i.e. the document-order `about`
 counter, not Cite.
+
+### The `cite_*` id number is global, the label is per group
+
+That "collection gap" was mostly a second id bug. Cite's `RefGroupItem` carries
+two counters: `numberInGroup` (per group, drives the `[1]`/`[a]` label) and
+`globalId` (one sequence across every group, drives the `cite_*` ids). rustoid
+has one `number` doing both, so on a page with `{{efn}}` notes every grouped
+ref got the wrong id: `cite_note-ANI_medal_table_inclusion-1` where the service
+has `-187`, and every subsequent id shifted.
+
+`Reference` now carries `global_id` beside `number`; the ids read `global_id`,
+the labels still read `number`. On `2024 Summer Olympics` the id sets went from
+528/275 to 534/281 matched notes/markers, with 518 ids common (from far fewer).
+
+What is left is **not** a collection gap but an under-rendered transclusion: the
+10 remaining notes (`WW1`, `WW2`, `COVID2021` in `Template:Olympic Games`'s
+navbox; `Who_is_INA`, `ANI_medal_table_inclusion` in the transcluded
+`{{:2024 Summer Olympics medal table}}`; and anons `189`/`191`/`257`) sit in
+subtrees rustoid renders incompletely — its navbox carries an unresolved
+`aria-labelledby="[[File:…]]_[[Olympic_Games]]8788"`, its medal table has the
+same row count but a third of the `INA` cells. Fixing those is a
+`Module:Navbox`/expansion investigation, not a Cite one.

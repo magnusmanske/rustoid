@@ -62,8 +62,13 @@ pub struct Reference {
     /// A self-closing ref (`<ref name="x" />`) contributes a back-link and no
     /// content of its own.
     pub self_closing: bool,
-    /// The 1-based footnote number, assigned at first use in document order.
+    /// The **per-group** sequence (`numberInGroup`), starting from 1: the label
+    /// shown in the marker and the note list (`[1]`, `[a]`, …).
     pub number: usize,
+    /// The **global** sequence (`globalId`) across every group, starting from 1.
+    /// The `cite_*` ids are keyed on this, not on `number`: an `upper-alpha` note's
+    /// id is `cite_note-187` even though its label is `[c]`.
+    pub global_id: usize,
     /// One entry per use site, in document order: the `id` Cite gave that marker.
     ///
     /// A note used once renders its single back-link *without* an enclosing
@@ -87,12 +92,12 @@ impl Reference {
     /// when the ref is anonymous.
     pub fn note_id(&self) -> String {
         if self.name.is_empty() {
-            format!("cite_note-{}", self.number)
+            format!("cite_note-{}", self.global_id)
         } else {
             format!(
                 "cite_note-{}-{}",
                 normalize_fragment_identifier(&self.name),
-                self.number
+                self.global_id
             )
         }
     }
@@ -100,7 +105,7 @@ impl Reference {
     /// The marker `id` for the first use, e.g. `cite_ref-Badenhorst2019_1-0`,
     /// or `cite_ref-1` when the ref is anonymous.
     pub fn ref_id(&self) -> String {
-        marker_id(&self.name, self.number, 0)
+        marker_id(&self.name, self.global_id, 0)
     }
 
     /// The anchor the inline marker links to.
@@ -149,6 +154,8 @@ pub struct CiteState {
     index: HashMap<(String, String), usize>,
     /// The next footnote number, *per group*: numbering restarts for each group.
     next_number: HashMap<String, usize>,
+    /// The next global id (`globalId`), one sequence shared by every group.
+    next_global: usize,
 }
 
 impl CiteState {
@@ -181,12 +188,15 @@ impl CiteState {
                 let counter = self.next_number.entry(group.to_string()).or_insert(1);
                 let number = *counter;
                 *counter += 1;
+                let global_id = self.next_global + 1;
+                self.next_global = global_id;
                 self.references.push(Reference {
                     name: name.to_string(),
                     group: group.to_string(),
                     body: String::new(),
                     self_closing,
                     number,
+                    global_id,
                     uses: Vec::new(),
                     body_use: None,
                 });
@@ -211,7 +221,7 @@ impl CiteState {
         let use_index = self.references[idx].uses.len();
         let id = marker_id(
             &self.references[idx].name,
-            self.references[idx].number,
+            self.references[idx].global_id,
             use_index,
         );
         self.references[idx].uses.push(id.clone());
