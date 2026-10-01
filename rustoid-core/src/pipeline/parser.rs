@@ -5149,9 +5149,16 @@ fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 ///   value the tokenizer left with an unexpanded call inside it is handed to the
 ///   module as that call, so the module's output re-expands it where the module
 ///   put it.
+/// - a live HTML element — start tag, content and end tag are separate items and
+///   each is written as it was, which is the wikitext a module receives for one.
+///   `Template:Nowrap` is the case that pins it: `{{nowrap|SEE}}` reaches a
+///   module as `<span class="nowrap">SEE</span>`. Declining the `<span>` made the
+///   whole value fall back to its *source range* — which the frame's substitution
+///   had already made stale, so the module was handed the raw
+///   `{{{1|{{{text|{{{content}}}}}}}}}` the argument was written as.
 ///
-/// Anything else — a bare `<div>`, a live HTML element — returns `None`, so the
-/// value keeps to its source range rather than losing the construct.
+/// Anything else returns `None`, so the value keeps to its source range rather
+/// than losing the construct.
 fn argument_value_text(items: &[Item]) -> Option<String> {
     use crate::wikitext::tokens_v2::ParsoidToken;
     let mut out = String::new();
@@ -5214,6 +5221,10 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                     i += 2;
                 }
             }
+            // A live HTML element: the start tag, the content (which follows as
+            // separate items) and the end tag are each written as they were.
+            Item::Tok(ParsoidToken::Tag(t)) => out.push_str(t.data_parsoid.src.as_deref()?),
+            Item::Tok(ParsoidToken::EndTag(t)) => out.push_str(t.data_parsoid.src.as_deref()?),
             _ => return None,
         }
         i += 1;
@@ -5496,10 +5507,35 @@ mod tests {
     }
 
     #[test]
+    fn an_argument_value_renders_a_live_element_from_its_source() {
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, TagTk};
+
+        // A live element is written as it was: `{{nowrap|SEE}}` reaches a module
+        // as `<span class="nowrap">SEE</span>`. The substitution that produced it
+        // left the value's recorded *source range* spelling the unexpanded
+        // `{{{1|…}}}`, so the tag has to render itself rather than fall back to
+        // that stale range.
+        let mut span = TagTk::new("span", vec![], DataParsoid::default());
+        span.data_parsoid.src = Some("<span class=\"nowrap\">".to_string());
+        let mut end = EndTagTk::new("span", vec![], DataParsoid::default());
+        end.data_parsoid.src = Some("</span>".to_string());
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str("SEE".to_string()),
+            Item::Tok(ParsoidToken::EndTag(end)),
+        ];
+        assert_eq!(
+            argument_value_text(&items).as_deref(),
+            Some("<span class=\"nowrap\">SEE</span>")
+        );
+    }
+
+    #[test]
     fn an_argument_value_the_renderer_cannot_represent_is_declined() {
         use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
-        // A real tag has no faithful text, so the renderer must return `None` and
-        // let the caller keep to the source range rather than drop the tag.
+        // A token with no source of its own has no faithful text, so the renderer
+        // must return `None` and let the caller keep to the source range rather
+        // than drop the token.
         let div = TagTk::new("div", vec![], DataParsoid::default());
         let items = vec![Item::Tok(ParsoidToken::Tag(div))];
         assert_eq!(argument_value_text(&items), None);

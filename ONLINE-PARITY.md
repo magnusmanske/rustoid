@@ -8339,3 +8339,64 @@ ends a parameter name followed by a nested `{{{`, not a variant opener.
   a `Module:Navbox` output bug and the next thing to reduce.
 - `World War II`'s first difference is now `about="#mwt12"` vs `#mwt31` on the
   infobox's leading `<style>` — the extension/encapsulation numbering thread.
+
+## A live HTML element in a module argument, and the stale source range it exposed
+
+The last `World War II` literals were `{{{content}}}` inside a crossreference
+hatnote. The reduction is exact and small:
+
+| input | service | rustoid before | rustoid now |
+| --- | --- | --- | --- |
+| `{{hatnote inline\|1=PLAIN}}` | `PLAIN` | `PLAIN` | `PLAIN` |
+| `{{hatnote inline\|1={{nowrap\|SEE}}}}` | `<span class="nowrap">SEE</span>` | `{{{content}}}` | `<span class="nowrap">SEE</span>` |
+| `{{hatnote inline\|1={{lc:SEE}}}}` | `see` | `see` | `see` |
+
+### The chain
+
+`Template:Hatnote inline` is `{{#invoke:Hatnote inline|hatnoteInline|1={{{1|{{{text|{{{content}}}}}}}}}|…}}`.
+`Module:Hatnote inline` passes `frame:newChild{ args = args }` to `Module:Hatnote`,
+whose own `getArgs` uses `{ parentOnly = true }` — so what matters is the frame's
+arguments, handed to the module as *strings*.
+
+The `#invoke` argument `1` reaches `expand_invoke_args` **already substituted**:
+`Frame::expand` on the template body replaced the `{{{1|…}}}` reference with the
+caller's value (the `{{nowrap|SEE}}` tokens, in turn expanded to
+`<span class="nowrap">`, `SEE`, `</span>`). So `expandable_content` reports no
+template and no argument reference, and `expand_invoke_args` leaves the value
+alone. Then `expanded_arg_pair` → `argument_value_or_source` →
+`argument_value_text([span, "SEE", endspan])` returns **`None`**, because a live
+HTML element was deliberately declined — and `kv_value_source` falls back to the
+value's `src_offsets`, which still spell the **unsubstituted**
+`{{{1|{{{text|{{{content}}}}}}}}}`. `Frame::expand`'s `expand_in_attributes`
+replaced the value's *tokens* but kept the recorded range, so the two no longer
+agree. The module was handed the raw reference.
+
+### What was misleading
+
+The first instrumentation printed `TAKEYS miss name="1" … keys=[]` from a frame
+titled `Template:Hatnote inline`, which read as "the body frame has no
+arguments" and sent the search after `new_child`. The frames the module actually
+reads all had `keys=["1"]`; the empty-args frame was the **module-output** frame
+re-expanding the literal `{{{content}}}` the module had already echoed back. Once
+the *call* argument's resolved text (`READ src=Call idx=0` →
+`"{{{1|{{{text|{{{content}}}}}}}}}"`) and its rendered input (`INVKV key="1"
+text="SEE "`) were printed side by side, the stale range was the only
+possibility left.
+
+### The fix
+
+`argument_value_text` renders a live `Tag`/`EndTag` from its `data_parsoid.src`,
+which is what every other token→source path in rustoid does
+(`token_to_source`, `tag_content_source`, `tokens_to_string`). A token with no
+`src` still declines, so the `<div>X</div>` fallback the docstring describes is
+unchanged, and nothing that used to render can render worse: for an *unmodified*
+value the source range and the per-token `src` are the same text. Unit test
+`an_argument_value_renders_a_live_element_from_its_source`.
+
+### Measured
+
+- `World War II` `{{{` literals **3 → 0**.
+- Fixture guard unchanged at **877/896**; workspace tests, `clippy
+  --workspace --all-targets` and `cargo fmt --all --check` all clean.
+- The page's *first* difference does not move — it is the `#mwt12`/`#mwt31`
+  numbering above, which sits earlier in the document than the navbox.
