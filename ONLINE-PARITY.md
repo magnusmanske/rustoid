@@ -8439,36 +8439,54 @@ duplicates", is **wrong**: the oracle's dedup placeholders keep their id. It emi
 
 `src/Wt2Html/TT/ExtensionHandler.php::onDocumentFragment` allocates
 `$env->newAboutId()` for every extension but `nowiki` as that extension's DOM
-fragment is *produced* — i.e. as the token flow reaches it, in source order — and
-`src/Wt2Html/DOM/Handlers/DedupeStyles.php` later replaces a duplicate `<style>`
-with a `<link>` that copies the original's `about` (line 44). So the oracle's
-ids follow document order.
+fragment is produced, and `src/Wt2Html/DOM/Handlers/DedupeStyles.php` replaces a
+duplicate `<style>` with a `<link>` that copies the original's `about` (line 44)
+— so the duplicates spend ids too, exactly as the first occurrences do.
 
-### Why rustoid diverges
+### The rule, measured against the live endpoint
 
-rustoid cannot number during the flow, because within one chunk a *transclusion*
-must take its id before an extension that precedes it in source
-(`<templatestyles/>{{Center|b}}` is `#mwt2`/`#mwt1` on the service). So it defers
-all of a chunk's extensions to `number_style_placeholders` at the end of the
-chunk.
+The oracle is **not** pure document order, and the paragraph that used to stand
+here (claiming it was) was wrong. Probed through `--wikitext` against the
+transform endpoint:
 
-That is correct within a chunk and wrong across them. A nested `expand_templates`
-(one template, one module output) completes — and drains *its* stylesheets —
-before the enclosing chunk's post-pass runs. So a nested stylesheet that sits
-**later** in the document takes an id **before** the enclosing chunk's own, which
-sits earlier. The infobox is exactly this shape: `Module:Infobox military
-conflict/styles.css` is the first child of the invoke span, but 13 nested
-stylesheets are drained before it.
+| input | ids (service) |
+| --- | --- |
+| `<templatestyles …/>{{Center\|b}}` | templatestyles `#mwt2`, Center `#mwt1` |
+| `{{Center\|b}}<templatestyles …/>` | Center `#mwt1`, templatestyles `#mwt2` |
+| `<templatestyles …/>{{Center\|b}}{{Center\|c}}` | Center `#mwt1`, Center `#mwt2`, templatestyles `#mwt3` |
+| `{{#if:1\|<templatestyles …/>{{Center\|b}}}}` | Center `#mwt1`, templatestyles `#mwt2` |
+| `{{Hatnote\|SEE}}<templatestyles …/>` | Hatnote `#mwt1`, `Module:Hatnote/styles.css` `#mwt2`, Plainlist `#mwt3` |
 
-### Why it is not fixed here
+So the rule is **per chunk: the chunk's transclusions take their ids first (in
+document order), then that chunk's extensions** — and it holds for nested chunks
+(the `#if` branch obeys it too). That is what `number_style_placeholders`
+implements at the end of `expand_templates`, and it is why the cheap fix below is
+not one.
 
-The faithful fix is to number extensions in **document order across chunks**, which
-is what Parsoid's DOM post-processing gives it for free. The code already records
-why that is not a small patch — the fragment map is not threaded to the tree
-builder, so a single document-order pass would have to run *outside*
-`expand_templates` and still reach the stashed `<style>` fragments
-(13 recursive call sites). Changing the per-chunk drain order directly risks the
-pinned `a_stylesheet_before_a_template_is_numbered_after_it` test without first
-pinning Parsoid's handler *priority* (why the transclusion wins inside a chunk),
-which the source above does not by itself settle. Recorded as the shape of the
-next pass rather than guessed at.
+### The wrong turn: deferring styles to the tree builder
+
+`DEFERRED_ABOUT` in `tree_builder_html.rs` looked like the fix — stash each
+`<style>` with the marker and let `resolve_deferred_about_ids` take the id in
+document order at the splice point. It was implemented and measured, and it is
+**wrong**: it places every stylesheet after *all* transclusions, so `World War
+II`'s first stylesheet moved from `#mwt4` to `#mwt1360` (the page spends ~1359
+transclusion ids). The change was reverted; `DEFERRED_ABOUT` stays unused.
+
+### Where the divergence actually is
+
+The per-chunk rule is right; the infobox is a case where rustoid's *chunking*
+differs from Parsoid's. `Module:Infobox` emits its stylesheets from
+`loadTemplateStyles()` through `frame:extensionTag{name='templatestyles', …}`
+(checked in the cached module). Parsoid **executes the extension then and
+there**, at module-run time, so those styles are created and numbered before the
+module's output wikitext (`{{stack}}`, `{{multiple image}}`, …) is re-parsed and
+expanded. rustoid defers the `extensionTag` and the resulting `<templatestyles>`
+token is numbered by the post-pass of the *output* chunk — after the nested
+templates. The `STYLE-NEW` trace agrees: `Module:Infobox military
+conflict/styles.css` is the 15th stylesheet *created*, after 14 nested-template
+ones, so numbering at creation time would not fix the order either.
+
+The next attempt should start at `frame:extensionTag` for `templatestyles` being
+resolved eagerly with the document's `about_counter` at request time —
+`expand_lua_request` already has the counter — which is where the ordering is
+lost. Recorded rather than guessed at.
