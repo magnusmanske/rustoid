@@ -760,6 +760,17 @@ fn apply_media_info(
             lang: lang.as_deref(),
         },
     );
+
+    // `AddMediaInfo` *consumes* the options it folds into the element. For an
+    // image it reads `alt` with `$keepAltInDataMw = !$isImage || $errs`, and
+    // this is the error-free image path, so the option is dropped from
+    // `data-mw` (and the whole blob when nothing else remains). Keeping it left
+    // the container carrying a `data-mw` — and an `id` with it — that the
+    // service does not emit: `Module:Multiple image`'s cells, whose `alt` came
+    // from a plain template argument.
+    if let Some(container) = node_at(root, &job.path) {
+        remove_data_mw_attrib(container, "alt");
+    }
 }
 
 /// The `txt` value of a named option in the container's `data-mw.attribs`, if
@@ -769,25 +780,59 @@ fn data_mw_attrib(root: &Node, path: &[usize], key: &str) -> Option<String> {
     data_mw_txt(container, key)
 }
 
+/// The key of one `data-mw.attribs` entry: `["alt", …]` or
+/// `[{"txt": "alt"}, …]`.
+fn option_key(pair: &serde_json::Value) -> Option<&str> {
+    let key = pair.as_array()?.first()?;
+    key.as_str()
+        .or_else(|| key.get("txt").and_then(|t| t.as_str()))
+}
+
 /// The `txt` value of a named option in a node's `data-mw.attribs`, if present.
 fn data_mw_txt(node: &Node, key: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(node.data_mw.as_deref()?).ok()?;
     let attribs = json.get("attribs")?.as_array()?;
     for pair in attribs {
-        let arr = pair.as_array()?;
-        let k = arr
-            .first()?
-            .as_str()
-            .or_else(|| arr.first()?.get("txt").and_then(|t| t.as_str()))?;
-        if k == key {
-            let v = arr.get(1)?;
-            if let Some(txt) = v.get("txt").and_then(|t| t.as_str()) {
-                return Some(txt.to_string());
-            }
-            return v.as_str().map(str::to_string);
+        if option_key(pair) != Some(key) {
+            continue;
         }
+        let v = pair.as_array()?.get(1)?;
+        if let Some(txt) = v.get("txt").and_then(|t| t.as_str()) {
+            return Some(txt.to_string());
+        }
+        return v.as_str().map(str::to_string);
     }
     None
+}
+
+/// Drop a named option from a node's `data-mw.attribs`.
+///
+/// The equivalent of `WTSUtils::getAttrFromDataMw($dataMw, $key, /* keep */
+/// false)`: the option is consumed into an element attribute, so leaving it in
+/// `data-mw` as well would serialise a blob the service does not emit. When the
+/// attribute list is left empty the field is removed (mirrors
+/// `AddMediaInfo::run`'s `unset( $dataMw->attribs )`), and when the whole blob is
+/// empty the attribute is dropped entirely.
+fn remove_data_mw_attrib(node: &mut Node, key: &str) {
+    let Some(raw) = node.data_mw.as_deref() else {
+        return;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let empty = {
+        let Some(obj) = json.as_object_mut() else {
+            return;
+        };
+        if let Some(attribs) = obj.get_mut("attribs").and_then(|a| a.as_array_mut()) {
+            attribs.retain(|pair| option_key(pair) != Some(key));
+            if attribs.is_empty() {
+                obj.remove("attribs");
+            }
+        }
+        obj.is_empty()
+    };
+    node.data_mw = if empty { None } else { Some(json.to_string()) };
 }
 
 /// Whether a media container has a *visible* caption (Thumb/Frame formats).
@@ -1498,6 +1543,27 @@ mod tests {
         assert_eq!(img.get_attr("data-file-type"), Some("bitmap"));
         assert_eq!(img.get_attr("width"), Some("1941"));
         assert_eq!(img.get_attr("height"), Some("220"));
+    }
+
+    /// `AddMediaInfo` *consumes* `alt` out of `data-mw.attribs` — it becomes the
+    /// `<img>`'s — and an emptied `attribs` takes the whole `data-mw` with it.
+    /// Keeping it there made the container carry a blob, and an `id`, that the
+    /// service does not emit (`Module:Multiple image`'s cells, where the `alt`
+    /// came from a plain template argument).
+    #[tokio::test]
+    async fn test_alt_is_consumed_from_data_mw() {
+        let mut c = container(None);
+        c.data_mw = Some(r#"{"attribs":[["alt",{"txt":"in the"}]]}"#.to_string());
+        let mut doc = Node::document();
+        doc.push_child(c);
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        assert_eq!(c.data_mw, None, "the consumed alt must not leave a data-mw");
+        assert_eq!(c.children[0].children[0].get_attr("alt"), Some("in the"));
     }
 
     #[tokio::test]

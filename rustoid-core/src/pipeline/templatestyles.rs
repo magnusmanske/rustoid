@@ -258,8 +258,28 @@ fn normalise_value(value: &str) -> String {
     let mut chars = value.chars().peekable();
     // Nesting depth of `calc(`, whose contents are passed through untouched.
     let mut calc_depth = 0usize;
+    // Inside a string literal every character is content — whitespace included —
+    // so the separators the arms below drop do not apply there. A string's
+    // *closing* quote is self-delimiting, though, and the whitespace after it
+    // goes: the sanitiser writes `content:" "counter(listitem)"\a0 "`.
+    let mut in_string = false;
 
     while let Some(c) = chars.next() {
+        if in_string {
+            match c {
+                '\\' => push_css_escape(&mut out, &mut chars),
+                '"' => {
+                    in_string = false;
+                    out.push('"');
+                    while chars.peek().is_some_and(|n| *n == ' ') {
+                        chars.next();
+                    }
+                }
+                _ => out.push(c),
+            }
+            continue;
+        }
+
         if calc_depth > 0 {
             match c {
                 '(' => calc_depth += 1,
@@ -271,7 +291,12 @@ fn normalise_value(value: &str) -> String {
         }
 
         match c {
+            '"' => {
+                in_string = true;
+                out.push('"');
+            }
             '\'' => out.push('"'),
+            '\\' => push_css_escape(&mut out, &mut chars),
             ',' | '/' | '%' => {
                 // The spaces on either side of a joining punctuation mark go.
                 while out.ends_with(' ') {
@@ -287,11 +312,19 @@ fn normalise_value(value: &str) -> String {
                     out.pop();
                 }
                 out.push(')');
-                // A function chained to the next one loses the separating space.
+                // A function chained to the next component loses the separating
+                // space; `)` is self-delimiting, so an identifier or a string
+                // follows it directly.
                 let mut lookahead = chars.clone();
-                let spaces = lookahead.by_ref().take_while(|n| *n == ' ').count();
+                let mut spaces = 0usize;
+                while lookahead.peek().is_some_and(|n| *n == ' ') {
+                    lookahead.next();
+                    spaces += 1;
+                }
                 let next = lookahead.next();
-                if spaces > 0 && next.is_some_and(|n| n.is_ascii_alphabetic() || n == '-') {
+                if spaces > 0
+                    && next.is_some_and(|n| n.is_ascii_alphabetic() || n == '-' || n == '"')
+                {
                     for _ in 0..spaces {
                         chars.next();
                     }
@@ -307,6 +340,37 @@ fn normalise_value(value: &str) -> String {
         }
     }
     out
+}
+
+/// Copy a CSS escape — `\a0`, `\:`, `\"` — applying the sanitiser's hex-escape
+/// serialisation: the digits are kept and a single terminating space follows
+/// them.
+///
+/// The sanitiser's tokeniser consumes the whitespace that *ends* a hex escape,
+/// and its serialiser writes one back, so `content:"\a0· "` reaches the page as
+/// `content:"\a0 · "`. Passing the escape through verbatim left every
+/// `Hlist`-styled page a byte short at its first such declaration.
+fn push_css_escape(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    out.push('\\');
+    let mut digits = 0usize;
+    while digits < 6 {
+        match chars.peek() {
+            Some(n) if n.is_ascii_hexdigit() => {
+                out.push(*n);
+                digits += 1;
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+    if digits > 0 {
+        // Exactly one terminating space, whether or not the source had one (the
+        // first whitespace after the digits *is* the terminator).
+        if chars.peek().is_some_and(|n| n.is_whitespace()) {
+            chars.next();
+        }
+        out.push(' ');
+    }
 }
 
 /// Prefix a selector list with the scope, following TemplateStyles' rules.
@@ -637,6 +701,33 @@ div.hatnote {
         assert_eq!(
             plain.get_attr("data-mw"),
             Some(r#"{"name":"templatestyles","attrs":{"src":"X/styles.css"}}"#)
+        );
+    }
+
+    /// A hex escape is re-serialised with its terminating space: the sanitiser
+    /// consumes the whitespace that ends the escape and writes one back, so
+    /// `Hlist/styles.css`'s `content:"\a0· "` reaches the page as
+    /// `content:"\a0 · "`. A non-hex escape is untouched.
+    #[test]
+    fn a_hex_escape_keeps_its_terminating_space() {
+        assert_eq!(
+            render(r#"a{content:"\a0· "}"#, None),
+            ".mw-parser-output a{content:\"\\a0 · \"}"
+        );
+        assert_eq!(
+            render(r#"a{content:"x\:y"}"#, None),
+            ".mw-parser-output a{content:\"x\\:y\"}"
+        );
+    }
+
+    /// A string and a function are both self-delimiting, so the sanitiser's
+    /// serialiser glues them: `content: " " counter(listitem) "\a0"` reaches
+    /// the page as `content:" "counter(listitem)"\a0 "` (`Hlist/styles.css`).
+    #[test]
+    fn a_string_glues_to_a_function() {
+        assert_eq!(
+            render(r#"a{content: " " counter(listitem) "\a0"}"#, None),
+            r#".mw-parser-output a{content:" "counter(listitem)"\a0 "}"#
         );
     }
 

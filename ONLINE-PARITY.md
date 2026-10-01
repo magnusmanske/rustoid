@@ -8763,3 +8763,77 @@ The media span's `alt`, built from a template argument the module passed through
 is being marked `mw:ExpandedAttrs` — the same over-marking the gate fixes for
 template bodies, but on a span the media handler builds, which no `synthesized`
 flag reaches.
+
+## The media span's `data-mw`: an option is consumed, not copied
+
+At 14983 rustoid emitted
+`<span typeof="mw:File" data-mw='{"attribs":[["alt",{"txt":"in the"}]]}' id="mwEw">`
+where the service has a bare `<span typeof="mw:File">`. A live probe made the
+rule plain (`[[File:Example.jpg|alt=in the]]` on `Sandbox`):
+
+```
+parsoid: <span typeof="mw:File" id="mwAw" data-parsoid='{"optList":[{"ck":"alt","ak":"alt=in the"}],…}'>
+rustoid: <span typeof="mw:File" data-mw='{"attribs":[["alt",{"txt":"in the"}]]}' id="mwAw">
+```
+
+The service records a plain option in `data-parsoid.optList` — which the harness
+strips — and reserves `data-mw.attribs` for *expanded* options. `AddMediaInfo`
+then **consumes** the options it folds into the element:
+`WTSUtils::getAttrFromDataMw( $dataMw, 'alt', $keepAltInDataMw )` with
+`$keepAltInDataMw = !$isImage || $errs` — so for an error-free image the `alt`
+is read *and removed*, and `unset( $dataMw->attribs )` drops the field when the
+list is left empty.
+
+rustoid read `data-mw.attribs` but never wrote the consumption back, so the
+container kept a blob — and an `id` with it — that the service does not emit.
+`remove_data_mw_attrib` now mirrors the removal, at the end of the error-free
+image path.
+
+Measured: World War II 14983 → **19807**; corpus 30 558 484 → 30 488 901 bytes
+(the removed `data-mw`/`id` pairs are pure invention). Six pages advance.
+
+## Two CSS normaliser rules, and a bug in the guard they hid behind
+
+The next difference at 19807 is inside `Hlist/styles.css`, in three shapes:
+
+| source | rustoid | service |
+| --- | --- | --- |
+| `content:"\a0· "` | `content:"\a0· "` | `content:"\a0 · "` |
+| `content:" " counter(listitem) "\a0"` | `…" " counter(listitem) "\a0"` | `…" "counter(listitem)"\a0 "` |
+| `content:" (" counter(listitem) "\a0"` | `…" (" counter(listitem) "\a0"` | `…" ("counter(listitem)"\a0 "` |
+
+- **A hex escape is re-serialised with its terminating space.** The sanitiser's
+  tokeniser consumes the whitespace that *ends* `\a0`; its serialiser writes one
+  back, so `\a0· ` becomes `\a0 · ` and `\a0"` becomes `\a0 "`.
+- **A string and a function are self-delimiting**, so the serialiser glues them:
+  `" " counter(…)` → `" "counter(…)`, `counter(…) "\a0 "` → `counter(…)` + `"\a0 "`.
+  The second half is why `normalise_value` now tracks string state — its arms
+  drop separators, and inside a string every character is content.
+
+Chasing the second half exposed a **latent bug** in the first: the `)` arm found
+the next non-space with `lookahead.by_ref().take_while(|n| *n == ' ').count()`,
+and `take_while` *consumes* the first item that fails the predicate — so the
+`next` it read was one character too far. It happened to work for the alphabetic
+case it was written for (the char after the spaces was alphabetic too), and the
+lookahead now uses `peek` so it cannot.
+
+Measured: World War II 19807 → 21103 → **21353**; the `Hlist` sheet now matches
+on all three. Fixture guard **877/896**; workspace tests, clippy and fmt clean.
+
+### The first-difference report now carries a percentage
+
+`first difference at byte 21353 of 1783587 (1.20% of parsoid) / …`. The offset
+alone says nothing about how far into a page the two sides still agree, and the
+percentage is what makes the scoreboard scannable.
+
+After this run: `World War II` 1.20%, `Zebro` 6.79%, `Anarchism` 0.77%,
+`List of sovereign states` 0.50%, `Tropical cyclone` 0.36%, `The Beatles` 0.47%;
+the smallest remaining divergence is still `Help:Introduction` at 22.73% of a
+22 KB page.
+
+### What is left at 21353
+
+The `<div class="hlist ">` content: the service emits `\n<ul><li>…`, rustoid the
+literal `* German …`. A `* ` list inside that div was never recognised as a
+list, which is a list-parsing issue in a value that arrives from a template, not
+another stylesheet detail.

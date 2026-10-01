@@ -1693,8 +1693,16 @@ fn first_difference(a: &str, b: &str) -> String {
     if diverged_at {
         return format!("length-identical but differing at the end: {expected:?}");
     }
+    // The percentage of the parsoid total is what makes the offset readable at a
+    // glance: 21353 is uninformative, `1.2%` says how far into the page the two
+    // sides still agree. `a` is the parsoid side here (see `compare_html`).
+    let pct = if a.is_empty() {
+        0.0
+    } else {
+        100.0 * i as f64 / a.len() as f64
+    };
     format!(
-        "first difference at byte {i} of {} (parsoid) / {} (rustoid):\n  parsoid: {expected:?}\n  rustoid: {actual:?}",
+        "first difference at byte {i} of {} ({pct:.2}% of parsoid) / {} (rustoid):\n  parsoid: {expected:?}\n  rustoid: {actual:?}",
         a.len(),
         b.len()
     )
