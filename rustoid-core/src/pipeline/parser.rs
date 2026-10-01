@@ -902,9 +902,23 @@ struct PendingStyle {
 ///
 /// A guard so every return path — including an error unwinding out of an
 /// `await` — decrements it. See [`Parser::arg_expansion`].
-struct ArgExpansion<'a>(&'a std::cell::Cell<u32>);
+struct ArgExpansion<'a> {
+    arg: &'a std::cell::Cell<u32>,
+    style: &'a std::cell::Cell<u32>,
+}
 
 impl Drop for ArgExpansion<'_> {
+    fn drop(&mut self) {
+        self.arg.set(self.arg.get().saturating_sub(1));
+        self.style.set(self.style.get().saturating_sub(1));
+    }
+}
+
+/// RAII guard for [`Parser::style_defer`]: constructing it increments the
+/// counter, dropping it decrements it.
+struct StyleDefer<'a>(&'a std::cell::Cell<u32>);
+
+impl Drop for StyleDefer<'_> {
     fn drop(&mut self) {
         self.0.set(self.0.get().saturating_sub(1));
     }
@@ -1020,7 +1034,24 @@ pub struct Parser<'a, C: SiteConfig> {
     /// here spends ids the service never spends (three on `Nobel Prize`).
     /// Resolving is left alone: the rendered text is the argument's source
     /// fallback either way.
+    ///
+    /// This also implies [`Self::style_defer`]: an `#invoke` argument defers
+    /// *and* re-creates its extensions, so both the id and the indicator spend
+    /// move to the output.
     arg_expansion: std::cell::Cell<u32>,
+    /// Non-zero while a *template's* argument values are being expanded.
+    ///
+    /// The value is spliced into the callee's body rather than rendered back to
+    /// text, so its extensions must still be numbered — but at the position the
+    /// value lands in the output, not at expansion time. Numbering at expansion
+    /// time put a value's stylesheets before the extensions the *callee* emits,
+    /// which are earlier in the output: `Template:Infobox military conflict`'s
+    /// args carry `{{multiple image}}`, so Multiple image's stylesheet took
+    /// `#mwt12` and the infobox's own `#mwt25`, where the service has the
+    /// infobox's first. Unlike [`Self::arg_expansion`] this does **not** defer
+    /// the indicator spend — a template argument's `<indicator>` is numbered
+    /// with its transclusion, as the service does.
+    style_defer: std::cell::Cell<u32>,
     /// Sundered extension output, addressed by a `UNIQ…QINU` strip marker.
     ///
     /// A `frame:extensionTag('templatestyles', …)` answer is the extension's
@@ -1052,6 +1083,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             ext_next_id: std::cell::Cell::new(0),
             pending_styles: std::cell::RefCell::new(std::collections::HashMap::new()),
             arg_expansion: std::cell::Cell::new(0),
+            style_defer: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
@@ -1164,13 +1196,30 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// it on drop. See [`Parser::arg_expansion`].
     fn begin_arg_expansion(&self) -> ArgExpansion<'_> {
         self.arg_expansion.set(self.arg_expansion.get() + 1);
-        ArgExpansion(&self.arg_expansion)
+        self.style_defer.set(self.style_defer.get() + 1);
+        ArgExpansion {
+            arg: &self.arg_expansion,
+            style: &self.style_defer,
+        }
+    }
+
+    /// Enter one level of *template*-argument expansion; the returned guard leaves
+    /// it on drop. See [`Parser::style_defer`].
+    fn begin_style_defer(&self) -> StyleDefer<'_> {
+        self.style_defer.set(self.style_defer.get() + 1);
+        StyleDefer(&self.style_defer)
     }
 
     /// Whether an `#invoke` argument is currently being expanded, in which case
     /// extension ids must not be spent. See [`Parser::arg_expansion`].
     fn in_arg_expansion(&self) -> bool {
         self.arg_expansion.get() > 0
+    }
+
+    /// Whether an argument whose extensions are numbered where it lands in the
+    /// output is being expanded. See [`Parser::style_defer`].
+    fn in_style_defer(&self) -> bool {
+        self.style_defer.get() > 0
     }
 
     /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
@@ -3104,11 +3153,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             out.push(item);
         }
 
-        // Extension ids are not spent while an `#invoke` argument is being
-        // expanded: the argument's tokens are rendered back to text and
-        // discarded, and the service numbers the extensions only where the
-        // module's output places them. See [`Parser::arg_expansion`].
-        if self.in_arg_expansion() {
+        // Extension ids are not spent while an argument whose extensions are
+        // numbered where it lands in the output is being expanded. See
+        // [`Parser::arg_expansion`] and [`Parser::style_defer`].
+        if self.in_arg_expansion() || self.in_style_defer() {
             return out;
         }
         // TT2's `ExtensionHandler` numbers every extension token with
@@ -4449,9 +4497,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// look like a loop. PHP's equivalent frame has a null title, which can never
     /// match.
     ///
-    /// Unlike [`Self::expand_invoke_args`], extension tags inside the value are
-    /// numbered here: the value is rendered where it is spliced into the body, not
-    /// by a module that returns text.
+    /// Unlike [`Self::expand_invoke_args`], extension ids **are** spent here —
+    /// but not at expansion time: the guard defers them to the post-pass of the
+    /// chunk the value is spliced into, which is its document position. Numbering
+    /// them at expansion time put a value's stylesheets before the extensions the
+    /// *callee* emits, which are earlier in the output: `Template:Infobox
+    /// military conflict`'s args carry `{{multiple image}}`, so Multiple image's
+    /// stylesheet took `#mwt12` and the infobox's own `#mwt25`, where the service
+    /// has the infobox's at `#mwt12` and Multiple image's at `#mwt14`.
     async fn expand_template_arg_values(
         &self,
         frame: &Frame,
@@ -4461,6 +4514,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         in_template: bool,
         page_source: &str,
     ) {
+        // The value's extensions are numbered where the value lands in the
+        // output, not here — see the note above and [`Parser::style_defer`].
+        let _guard = self.begin_style_defer();
         for kv in args.iter_mut() {
             let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value else {
                 continue;

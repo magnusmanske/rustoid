@@ -8403,7 +8403,7 @@ value the source range and the per-token `src` are the same text. Unit test
 - The page's *first* difference does not move — it is the `#mwt12`/`#mwt25`
   numbering above, which sits earlier in the document than the navbox.
 
-## The extension-numbering order: a nested chunk outranks its enclosing one
+## The extension-numbering order: the probes, and the template-argument fix
 
 With the literals gone, `World War II`'s first difference is the `about` id on
 the infobox's leading `<style>`: the oracle writes `about="#mwt12"`, rustoid
@@ -8472,30 +8472,48 @@ document order at the splice point. It was implemented and measured, and it is
 II`'s first stylesheet moved from `#mwt4` to `#mwt1360` (the page spends ~1359
 transclusion ids). The change was reverted; `DEFERRED_ABOUT` stays unused.
 
-### Where the divergence actually is
+### The fix: a template argument's extensions are numbered where the value lands
 
-The per-chunk rule is right, and `frame:extensionTag` for `templatestyles` is
-*not* deferred the way the first guess here had it. Instrumenting
-`expand_one_templatestyles` with the Lua nesting depth shows the infobox's
-stylesheets are created with `lua_expansion_depth > 0` — i.e. inside
-`expand_lua_request`, at request time, which is the eager behaviour Parsoid has.
-So "resolve the `extensionTag` eagerly" is not the fix either; it already is.
+The trace does not stop at "interleaved"; it names the interleave. rustoid
+numbered a value's stylesheets while expanding the value — in the *caller's*
+frame, before the callee runs — so they took ids ahead of the extensions the
+callee emits, which are earlier in the output. The guard that already existed for
+`#invoke` arguments (`expand_invoke_args`, `Parser::arg_expansion`) was simply
+missing for a *template's* argument values (`expand_template_arg_values`).
 
-The creation order is what is interleaved. A `STYLE-NEW` trace of `World War II`
-shows `frame:extensionTag`-created styles (`lua_expansion_depth > 0`) and
-output-chunk styles (`= 0`) alternating — `Multiple image` frag 3 at depth 1,
-`Hlist` frag 4 at depth 0, `Plainlist` frag 5 at depth 1, `Crossreference` frag 6
-at depth 0, … — and only then `Module:Infobox military conflict/styles.css` at
-frag 15. So the ids are lost not in one place but in how rustoid interleaves the
-nested modules'/templates' creation *and* their per-chunk post-passes; the
-`Stack` stylesheet is 2nd in the oracle but 9th here even after the constant
-shift is discounted, which is a second ordering error under the same cause.
+It is not the same guard, though. An `#invoke` argument is rendered back to
+text and its extensions re-created where the module's output places them, so
+both the id and the *indicator* spend move. A template argument is spliced into
+the callee's body, so its extensions are numbered where the value lands — using
+the one `.saturating_sub(1)`-guarded counter for both was wrong: it also dropped
+the indicator spend (`#mwt6` on `World War II`) that the service makes. So
+`Parser::style_defer` is a separate counter, and `ArgExpansion` decrements both.
 
-That is why neither cheap fix works: the post-pass is required (numbering at
-creation would put `<templatestyles/>` before `{{Center}}`, contradicting the
-probe table above), and deferring to the tree builder breaks the interleaving
-entirely. What is needed is for the whole nested structure's extension tokens to
-be numbered in the order Parsoid's token flow reaches them — the extension IDs
-and the transclusion IDs interleaved per chunk at every nesting level. Recorded
-as the shape of the work, with the two measured wrong turns above, rather than
-guessed at again.
+- One counter for "extensions numbered where the value lands" (`style_defer`),
+  set by `expand_template_arg_values` (`begin_style_defer`) and implied by
+  `begin_arg_expansion`; `expand_templates` skips its extension post-pass while
+  it is non-zero.
+- The indicator spend stays tied to `arg_expansion` alone, so a template
+  argument's `<indicator>` is still numbered with its transclusion.
+
+### Measured
+
+- `World War II`'s first difference moves **8709 → 9061**: the infobox's
+  `Module:Infobox military conflict/styles.css` is now `#mwt12` (the service's
+  value), where it was `#mwt25`.
+- Corpus (offline, 48 titles): rustoid **30 495 534 → 30 502 198** bytes
+  (+6 664 of previously mis-numbered/mis-placed markup), and eight pages advance
+  their first difference past the old one (`COVID-19 pandemic`, `Megadeth`,
+  `The Beatles` → `expanded-attrs`; `Chess`, `France`, `Nigeria`, `Nobel Prize`,
+  `Quicksilver (film)` → `media`).
+- Fixture guard **877/896**, workspace tests, `clippy --workspace --all-targets`
+  and `cargo fmt --all --check` all clean.
+
+### What is left
+
+`Stack/styles.css` — the second stylesheet in the oracle, `#mwt13` — is still
+misplaced (it was `#mwt90`, now `#mwt66`), so the deferral propagates past the
+splice in that one path: the infobox passes a `{{stack begin}}` argument through
+`#invoke`, and the marker is not re-numbered where the module output places it.
+The next reduction is that path (`expand_invoke_args` text rendering → module
+output re-parse), not the numbering model itself.
