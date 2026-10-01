@@ -33,11 +33,17 @@ pub struct Stylesheet {
 
 /// Scope `css` to the page content and normalise it the way Parsoid does.
 ///
-/// `wrapper` is the `wrapper` attribute's value, if the tag carried one: it
-/// replaces `.mw-parser-output` as the scope, which is how a template's sandbox
-/// copy can be compared side by side with the live one.
+/// `wrapper` is the `wrapper` attribute's value, if the tag carried one. It is
+/// inserted *under* the default scope, not instead of it —
+/// `wrapper=".tmulti"` scopes to `.mw-parser-output .tmulti`, which is how
+/// `Module:Multiple image` constrains its stylesheet to the `<div
+/// class="tmulti">` it wraps its output in. Verified against the transform
+/// endpoint with `wrapper=".foo"`.
 pub fn render(css: &str, wrapper: Option<&str>) -> String {
-    let scope = wrapper.unwrap_or(".mw-parser-output");
+    let scope = match wrapper {
+        Some(w) => format!(".mw-parser-output {w}"),
+        None => ".mw-parser-output".to_string(),
+    };
     let stripped = strip_comments(css);
     let mut out = String::with_capacity(stripped.len());
     // Nesting depth of `@`-rules. A declaration is only normalised inside a
@@ -56,7 +62,7 @@ pub fn render(css: &str, wrapper: Option<&str>) -> String {
                     out.push_str(&normalise_at_prelude(&head));
                     out.push('{');
                 } else {
-                    out.push_str(&scope_selector(&head, scope));
+                    out.push_str(&scope_selector(&head, &scope));
                     out.push('{');
                 }
                 depth += 1;
@@ -445,6 +451,7 @@ pub fn style_node(
     css: &str,
     revid: u64,
     src: &str,
+    wrapper: Option<&str>,
     about: &str,
     has_body: bool,
 ) -> crate::dom::node::Node {
@@ -452,18 +459,26 @@ pub fn style_node(
 
     let mut style = Node::element(ElementKind::Other("style".to_string()));
     // Attribute order matters for a byte comparison, and this is the order the
-    // cached Parsoid output uses.
-    style.set_attr("data-mw-deduplicate", format!("TemplateStyles:r{revid}"));
+    // cached Parsoid output uses. A `wrapper` is part of the dedup key — the
+    // endpoint answers `TemplateStyles:r…/mw-parser-output/.tmulti` for one —
+    // because the same sheet scoped two ways is two different stylesheets.
+    let dedup = match wrapper {
+        Some(w) => format!("TemplateStyles:r{revid}/mw-parser-output/{w}"),
+        None => format!("TemplateStyles:r{revid}"),
+    };
+    style.set_attr("data-mw-deduplicate", dedup);
     style.set_attr("typeof", "mw:Extension/templatestyles");
     style.set_attr("about", about);
+    let attrs = match wrapper {
+        Some(w) => format!(r#""src":"{src}","wrapper":"{w}""#),
+        None => format!(r#""src":"{src}""#),
+    };
     style.set_attr(
         "data-mw",
         if has_body {
-            format!(
-                r#"{{"name":"templatestyles","attrs":{{"src":"{src}"}},"body":{{"extsrc":""}}}}"#
-            )
+            format!(r#"{{"name":"templatestyles","attrs":{{{attrs}}},"body":{{"extsrc":""}}}}"#)
         } else {
-            format!(r#"{{"name":"templatestyles","attrs":{{"src":"{src}"}}}}"#)
+            format!(r#"{{"name":"templatestyles","attrs":{{{attrs}}}}}"#)
         },
     );
     style.push_child(Node::text(css));
@@ -572,16 +587,56 @@ div.hatnote {
         );
     }
 
-    /// The `wrapper` attribute replaces the scope, which is how a sandbox copy
-    /// of a stylesheet is kept separate from the live one.
+    /// The `wrapper` attribute is inserted *under* the default scope:
+    /// `.mw-parser-output <wrapper>`, which is how a module constrains its
+    /// styles to the element it wraps its output in. Verified against the
+    /// transform endpoint (`wrapper=".foo"` scopes to `.mw-parser-output .foo`).
     #[test]
-    fn a_wrapper_replaces_the_scope() {
-        assert_eq!(render(".a{b:1}", Some(".sandbox")), ".sandbox .a{b:1}");
+    fn a_wrapper_is_inserted_under_the_scope() {
+        assert_eq!(
+            render(".a{b:1}", Some(".sandbox")),
+            ".mw-parser-output .sandbox .a{b:1}"
+        );
         // The `html`/`body` prefix is left alone and the scope follows it: the
         // exception is for the document element, not for what comes after it.
         assert_eq!(
             render("body .a{b:1}", Some(".sandbox")),
-            "body .sandbox .a{b:1}"
+            "body .mw-parser-output .sandbox .a{b:1}"
+        );
+    }
+
+    /// The stashed `<style>` carries the wrapper into the dedup key and the
+    /// `data-mw` attrs, which is the cached output's exact shape for
+    /// `Multiple image/styles.css`: the endpoint answers
+    /// `TemplateStyles:r…/mw-parser-output/.tmulti`.
+    #[test]
+    fn style_node_records_the_wrapper() {
+        let node = style_node(
+            "a{b:1}",
+            42,
+            "X/styles.css",
+            Some(".tmulti"),
+            "#mwt7",
+            false,
+        );
+        assert_eq!(
+            node.get_attr("data-mw-deduplicate"),
+            Some("TemplateStyles:r42/mw-parser-output/.tmulti")
+        );
+        assert_eq!(
+            node.get_attr("data-mw"),
+            Some(r#"{"name":"templatestyles","attrs":{"src":"X/styles.css","wrapper":".tmulti"}}"#)
+        );
+        // Without a wrapper the key is the bare revision, as every cached
+        // stylesheet but that one shows.
+        let plain = style_node("a{b:1}", 42, "X/styles.css", None, "#mwt7", false);
+        assert_eq!(
+            plain.get_attr("data-mw-deduplicate"),
+            Some("TemplateStyles:r42")
+        );
+        assert_eq!(
+            plain.get_attr("data-mw"),
+            Some(r#"{"name":"templatestyles","attrs":{"src":"X/styles.css"}}"#)
         );
     }
 

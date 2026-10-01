@@ -8607,3 +8607,81 @@ before the gate that context still contained `mw:ExpandedAttrs` (the wrapper on
 the very next bytes), so the report said `expanded-attrs`; after the gate the
 context no longer does, and the same byte is now reported as `table`. The kinds in
 `/tmp/wide_markers.txt` vs `/tmp/wide_ea.txt` are that artefact, not a regression.
+
+## The Stack class: a module answer is rendered from stale source
+
+With the gate in, `World War II`'s first difference is the Stack class —
+`stack-right` where the service has `stack-clear-right` — and a `git stash` of
+the gate proved it pre-existing, not introduced by it (the classifier had merely
+been reading the adjacent `mw:ExpandedAttrs`).
+
+`Template:Stack` writes `class="stack mw-stack {{#switch:{{{clear|}}}|…}}"`, and
+the infobox reaches it through `Module:Infobox military conflict`:
+`frame:expandTemplate{ title = 'stack begin', args = { clear = 'true' } }`. Two
+independent defects sat on that path, and the reduction that separated them was a
+pair of throwaway templates read through a throwaway module (cached under a
+scratch `RUSTOID_CACHE_DIR`, so the real cache is untouched):
+
+| module call | rustoid before | expected |
+| --- | --- | --- |
+| `{{Echotop}}` (top-level `{{{foo}}}` and `{{#switch:{{{foo}}}}}`) | `BAR/YES` | `BAR/YES` |
+| `{{Echoattr}}` (`<div class="x{{{foo\|MISSING}}}">`) | `xMISSING` | `xBAR` |
+| `{{Echoswitch}}` (`<div class="{{#switch:{{{foo\|MISSING}}}\|BAR=YES\|NOPE}}">`) | `NOPE` | `YES` |
+
+So a *top-level* reference in a body resolved, but a reference **inside an
+attribute** did not — and one that sat inside a parser function in that
+attribute did not either.
+
+**Defect one — the attribute's templates were never expanded.** `Frame::expand`
+substitutes `{{{…}}}` everywhere in the body, attributes included, so the
+`{{#switch:…}}` became `{{#switch:BAR|…}}` — but the switch itself is a
+*template*, and on a page the templates inside attributes are expanded by the
+one `expand_attributes` pass at the end of `build_ast`. The module is handed the
+body's wikitext *before* that pass, so the answer still spelled
+`{{#switch:BAR|BAR=YES|NOPE}}`, and re-parsing it — with no frame — answered
+`NOPE`. The fix is the pass the analogous argument paths already run
+(`expand_invoke_args`, `expand_template_arg_values`): `expand_lua_request` now
+calls `expand_attrib_templates` on the expansion before rendering it.
+
+**Defect two — the answer was rendered from the source, not the expansion.**
+`render_answer` renders each token through `tokens_to_source`, which uses
+`data_parsoid.src` — the source *as written*. After the first fix the switch was
+expanded to `YES`, but the tag's `src` still read
+`<div class="{{#switch:{{{foo|MISSING}}}|…}}">`, so the module got the
+unexpanded form back. Each attribute carries the source it was written as
+(`vsrc`/`ksrc`), so
+[`rewrite_expanded_attrs`] replaces that text with the attribute's *current*
+value and leaves the rest of the tag alone. Where the old text is not unique in
+the tag the rewrite is declined rather than guessed, so nothing is corrupted.
+
+The probes now answer `xBAR` / `YES` / `stack-clear-right`, and on `World War II`
+the first difference moves **9924 → 10413**.
+
+## The templatestyles `wrapper`
+
+The next difference at 10413 is the `Multiple image/styles.css` stylesheet. The
+service scopes it to `.mw-parser-output .tmulti`, adds `"wrapper":".tmulti"` to
+its `data-mw` attrs, and keys it
+`TemplateStyles:r1349637415/mw-parser-output/.tmulti`; rustoid did none of the
+three. `templatestyles::render` already took a `wrapper`, but used it to
+**replace** `.mw-parser-output` — a guess, and wrong.
+
+The rule was read off the transform endpoint rather than the CSS spec
+(`<templatestyles src="Plainlist/styles.css" wrapper=".foo"/>`):
+
+- the scope is `.mw-parser-output` **plus** the wrapper (`.mw-parser-output .foo`),
+- the dedup key gains `/mw-parser-output/{wrapper}`,
+- the `data-mw` attrs carry `wrapper` after `src`.
+
+`Module:Multiple image` passes `wrapper = ".tmulti"` and wraps its output in
+`<div class="tmulti">`, which is what the extra scope is for. The change touches
+`render`, `style_node` (now takes the wrapper) and `PendingStyle`, which carries
+it from the `<templatestyles>` tag to the stashed `<style>`.
+
+Measured together: `World War II` moves **10413 → 12542** (the new difference is
+the multiple-image width, `100px` against the service's `292px` — a separate,
+image-metric bug). Corpus (offline, 48 titles) 30 401 269 → **30 408 898** bytes;
+only `World War II` and `Zebro` change first-difference kind, both moving forward
+past the stylesheet. Fixture guard **877/896**; workspace tests, clippy and fmt
+clean.
+

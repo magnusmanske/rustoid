@@ -893,6 +893,10 @@ struct PendingStyle {
     css: String,
     revid: u64,
     src: String,
+    /// The `wrapper` attribute, if the tag carried one: it scopes the CSS under
+    /// the wrapper and joins the stylesheet's dedup key. See
+    /// [`crate::pipeline::templatestyles::render`] and `style_node`.
+    wrapper: Option<String>,
     /// Whether the extension tag had content, which the `<style>`'s `data-mw`
     /// records as a `body` field. See [`Parser::expand_one_templatestyles`].
     has_body: bool,
@@ -2271,7 +2275,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             return vec![item.clone()];
         };
 
-        let css = crate::pipeline::templatestyles::render(&body, attr("wrapper").as_deref());
+        let wrapper = attr("wrapper").map(|s| s.to_string());
+        let css = crate::pipeline::templatestyles::render(&body, wrapper.as_deref());
         // Whether the tag had content, which decides whether the resolved `<style>`
         // records `body` in its `data-mw`. A literal `<templatestyles src="…"/>`
         // has none, while the `frame:extensionTag{name='templatestyles', …}` form
@@ -2291,6 +2296,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 css,
                 revid,
                 src,
+                wrapper,
                 has_body,
             },
         );
@@ -2344,6 +2350,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &pending.css,
                 pending.revid,
                 &pending.src,
+                pending.wrapper.as_deref(),
                 &about,
                 pending.has_body,
             );
@@ -4858,6 +4865,24 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let expanded = Box::pin(self.expand_templates(
             &child,
             items,
+            Some(source),
+            about_counter,
+            /* in_template */ true,
+            /* body */ false,
+            &text,
+        ))
+        .await;
+        // The body's *attributes* are expanded one pass later on a page
+        // (`expand_attributes` at the end of `build_ast`), but the module is
+        // handed the body's wikitext now, so resolve them here.
+        // `Template:Stack` writes its class as
+        // `class="stack mw-stack {{#switch:…}}"`, and the preprocessor's
+        // `$frame->expand` hands the module the resolved `stack-clear-right`;
+        // left unexpanded, the module returned the switch and the answer
+        // re-parsed it with the argument gone (`stack-right`).
+        let expanded = Box::pin(self.expand_attrib_templates(
+            &child,
+            expanded,
             Some(source),
             about_counter,
             /* in_template */ true,

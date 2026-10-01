@@ -384,6 +384,62 @@ pub fn tokens_to_source(tokens: &[Item]) -> String {
     out
 }
 
+/// A token's own source with substituted attributes written back.
+///
+/// `data_parsoid.src` is the source *as written*, while the token's attributes
+/// are the *expanded* ones. A module receives the expansion's wikitext —
+/// `frame:expandTemplate` hands back what the preprocessor's `$frame->expand`
+/// produced — so a substituted attribute would otherwise reach the module
+/// spelled the old way: `class="x{{{foo|MISSING}}}"` where the service answers
+/// `class="xBAR"`.
+///
+/// Each attribute carries the source it was written as (`ksrc`/`vsrc`), so the
+/// rewrite is a text replacement and every other byte of the tag — quoting,
+/// spacing, attributes that were not templated — is kept. `None` means the
+/// source was declined (the old text is not unique within the tag, or an
+/// attribute was expanded without a recorded source), and the caller should use
+/// the source as it stands rather than guess.
+pub fn rewrite_expanded_attrs(
+    src: &str,
+    attribs: &[crate::wikitext::tokens_v2::KV],
+) -> Option<String> {
+    let mut out = src.to_string();
+    let mut patched = false;
+    for kv in attribs {
+        for (old_src, new_src) in [
+            (kv.ksrc.as_deref(), key_value_source_text(&kv.key)),
+            (kv.vsrc.as_deref(), key_value_source_text(&kv.value)),
+        ] {
+            let Some(old_src) = old_src.filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if new_src == old_src {
+                continue;
+            }
+            let Some(pos) = out.find(old_src) else {
+                continue;
+            };
+            if out[pos + old_src.len()..].contains(old_src) {
+                // Present twice in one tag: which occurrence is the attribute's
+                // is not knowable here, and guessing could corrupt an unrelated
+                // value, so the whole rewrite is declined.
+                return None;
+            }
+            out.replace_range(pos..pos + old_src.len(), &new_src);
+            patched = true;
+        }
+    }
+    patched.then_some(out)
+}
+
+/// The source text an attribute key or value now stands for.
+fn key_value_source_text(value: &KeyValue) -> String {
+    match value {
+        KeyValue::Str(s) => s.clone(),
+        KeyValue::Tokens(items) => tokens_to_source(items),
+    }
+}
+
 /// Create an `mw:IndentPreWS` meta token (used by PreHandler).
 pub fn new_indent_pre_ws() -> ParsoidToken {
     let mut tk = SelfclosingTagTk::new("meta", vec![], Default::default());
@@ -413,5 +469,53 @@ pub fn get_bullets(token: &ParsoidToken) -> Vec<char> {
             .map(|s| s.chars().collect())
             .unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wikitext::tokens_v2::KV;
+
+    fn kv(value: KeyValue, vsrc: Option<&str>) -> KV {
+        KV {
+            key: KeyValue::Str("class".to_string()),
+            value,
+            src_offsets: None,
+            ksrc: None,
+            vsrc: vsrc.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn rewrite_expanded_attrs_writes_a_substituted_value_back() {
+        let src = r#"<div class="x{{{foo|MISSING}}}">"#;
+        let attribs = vec![kv(
+            KeyValue::Tokens(vec![
+                Item::Str("x".to_string()),
+                Item::Str("BAR".to_string()),
+            ]),
+            Some("x{{{foo|MISSING}}}"),
+        )];
+        assert_eq!(
+            rewrite_expanded_attrs(src, &attribs).as_deref(),
+            Some(r#"<div class="xBAR">"#)
+        );
+    }
+
+    #[test]
+    fn rewrite_expanded_attrs_declines_when_the_old_text_is_not_unique() {
+        let src = r#"<div class="a{{b}}" id="a{{b}}">"#;
+        let attribs = vec![kv(KeyValue::Str("aBAR".to_string()), Some("a{{b}}"))];
+        // The old text appears twice in the tag, so the rewrite is declined
+        // rather than corrupting the unrelated value.
+        assert_eq!(rewrite_expanded_attrs(src, &attribs), None);
+    }
+
+    #[test]
+    fn rewrite_expanded_attrs_is_a_no_op_without_a_change() {
+        let src = r#"<div class="a">"#;
+        let attribs = vec![kv(KeyValue::Str("a".to_string()), Some("a"))];
+        assert_eq!(rewrite_expanded_attrs(src, &attribs), None);
     }
 }

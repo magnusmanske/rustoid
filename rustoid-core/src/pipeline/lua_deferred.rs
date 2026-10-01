@@ -583,9 +583,19 @@ pub fn render_answer(items: &[Item]) -> String {
                 {
                     continue;
                 }
-                out.push_str(&crate::wikitext::token_utils::tokens_to_source(
-                    std::slice::from_ref(item),
-                ));
+                // The token's own source is the source *as written*; an
+                // attribute substituted during expansion has to be written back
+                // so the module is handed the expansion, not the template. See
+                // [`crate::wikitext::token_utils::rewrite_expanded_attrs`].
+                if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
+                    out.push_str(
+                        &crate::wikitext::token_utils::rewrite_expanded_attrs(
+                            src,
+                            tok.get_attribs(),
+                        )
+                        .unwrap_or_else(|| src.to_string()),
+                    );
+                }
             }
             Item::Str(s) => out.push_str(s),
         }
