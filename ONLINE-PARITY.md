@@ -8509,21 +8509,53 @@ the indicator spend (`#mwt6` on `World War II`) that the service makes. So
 - Fixture guard **877/896**, workspace tests, `clippy --workspace --all-targets`
   and `cargo fmt --all --check` all clean.
 
+### The Stack fragment, at first
+
+The ids match the service through the whole infobox — `STYLE-NUM` shows `frag15`
+infobox `#mwt12`, `frag16` Stack `#mwt13`, `frag17` Multiple image `#mwt14`. But
+`Stack/styles.css` was **created twice**: the `#mwt13` fragment was spent and then
+never emitted, and a second fragment was built at `#mwt64`.
+
+### That double creation, and its fix
+
+The first reduction is exact: `{{stack begin|clear=true}}A{{stack end}}` emitted
+one Stack stylesheet on the service and two on rustoid. `Stack/styles.css` is a
+**literal** `<templatestyles>` at the top of `Template:Stack`, and the template is
+reached not from the page but from a module — `Module:Infobox` builds the infobox
+with `frame:expandTemplate('stack begin')`. So the fragment was built while the
+request was answered, and then **dropped from the answer**: the `ExpandTemplate`
+branch of `expand_lua_request` rendered it with
+`lua_deferred::render_answer`, which has no textual form for an `mw:DOMFragment`
+placeholder, while the `CallParserFunction` branch two arms above already used
+`render_answer_markers`. The answer lost the stylesheet, the module put the
+*unresolved* source back in its output, and the output re-expanded it — a second
+fragment, a second id.
+
+One line: the `ExpandTemplate` branch now returns
+`self.render_answer_markers(&encapped)`, matching the parser-function branch.
+
+The first attempt at this was the wrong lever and is recorded above: routing a
+*value* that holds a fragment through `render_answer_markers` in the arg-text
+renderer, which renders the whole value through the weaker `render_answer` and
+lost ~18 KB. The placeholder has to be preserved where it is *produced* (the
+answer), not where the value is later flattened.
+
+Measured: `stack begin` emits one stylesheet again; World War II's first
+difference moves **9061 → 9924**; corpus 30 502 198 → **30 565 629** bytes
+(+63 KB of fragments that were being dropped), three pages advancing. Fixture
+guard 877/896.
+
 ### What is left
 
-The ids now match the service through the whole infobox — `STYLE-NUM` shows
-`frag15` infobox `#mwt12`, `frag16` Stack `#mwt13`, `frag17` Multiple image
-`#mwt14`, exactly the oracle's sequence. But `Stack/styles.css` is **created
-twice**: the `#mwt13` fragment is spent and then never emitted (`about="#mwt13"`
-appears zero times in rustoid's output), and a second fragment is built and
-emitted at `#mwt64`. So this is no longer a numbering error — the value is
-expanded once, rendered back to text (losing the placeholder), and its *source*
-is re-expanded later.
-
-Preserving the first fragment in the arg-text renderer was tried: route a value
-that holds an `mw:DOMFragment` through `render_answer_markers` so the module's
-output re-splices the same fragment. It is the wrong lever —
-`render_answer_markers` renders the whole value through `render_answer`, which
-knows fewer constructs than `argument_value_text`, and the corpus lost ~18 KB.
-Reverted. The next reduction is why the `{{stack begin}}` argument's value is
-expanded twice (the `#invoke` arg round-trip), not the marker renderer itself.
+The new first difference at 9924 is not numbering. The service emits
+`<div class="stack mw-stack stack-clear-right" about="#mwt1" id="mwAw">`, rustoid
+`<div class="stack mw-stack stack-clear-right" about="#mwt1"
+typeof="mw:ExpandedAttrs">` plus an inner `<div about=… typeof="mw:ExpandedAttrs">`
+wrapper. That is the **`mw:ExpandedAttrs` gate** — a template *body*'s attribute
+(`class="stack mw-stack {{#switch:…}}"`) is marked here but not on the service,
+while the same attribute at the top level *is* marked on both. rustoid flattens
+the body into one token stream and runs `expand_attributes` once at the page
+level, so it has lost the fact that the token came from a template body; the gate
+needs that fact as a per-token flag (the section on this gap earlier in this file
+has the shape). The minimal reduction is the `{{stack begin|clear=true}}` probe
+above.
