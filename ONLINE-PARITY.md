@@ -9199,3 +9199,58 @@ nor matches, which is why the id suffix reads `8789` where the service reads
 module strip it — the templatestyles post-pass the earlier sections keep pointing
 at — not to render the `<style>` here. Recorded rather than hacked around, since a
 `<style>` emitted here would diverge in exactly the opposite direction.
+
+## Offline first differences are half fact drift; `Zebro` after the facts
+
+The offline corpus is a pessimistic, and *misleading*, instrument for finding
+parser bugs. `get_page_info` — link existence, `mw-redirect`, `mw-disambig` — is
+answered by the harness's `prop=info` and cached under `PageInfo`, but a title no
+online run has looked up is guessed offline as `existing()`: the page exists, the
+link is blue, and **no link class** is emitted. Parsoid's oracle, rendered when
+the facts were live, does emit `class="mw-redirect"`.
+
+`Zebro`'s first difference was exactly that: `[[Asiatic wild ass]]` hotlinked in
+the service (`class="mw-redirect"`) and plain in rustoid. It is **not a parser
+bug**. One online run of the page (`rustoid-compare --page Zebro` with no
+`--offline`) populated `info:Asiatic wild ass` and the other targets, and the
+first difference moved **9294 → 11052 (6.79% → 8.07%)**:
+
+```
+<sup about="#mwt16" …>   rustoid
+<sup about="#mwt10" …>   parsoid
+```
+
+So the *real* first difference on this small page is the same one
+`2024 Summer Olympics` has at 8910: the extension id the ref marker gets. The
+`about="#mwtN"` sequence confirms it — both agree up to `#mwt6`, then parsoid
+spends `8,9` on the first ref body's extensions before numbering the marker `10`,
+while rustoid numbers the marker `16`. That is the extension-numbering phase
+(§"The extension-numbering phase"), from the ref-body side: rustoid never expands
+a `<ref>` body at the ref site, so the ids it *does* spend there fall in a
+different order.
+
+Practical consequence for the methodology: a page whose first difference is a
+link class has not been tested at all. Running it online once to warm `PageInfo`
+(and then comparing offline, as above) is what makes its scoreboard entry
+meaningful. The alternative — populating the whole corpus online — is what the
+429 rule forbids, so this is a per-page step.
+
+### `Help:Introduction`'s first difference: a stray empty nowiki
+
+The smallest page fails at 5161 on the `{{pp-semi-indef}}` protection indicator.
+rustoid emits an extra attribute-less nowiki span before the indicator meta:
+
+```
+…id="mwBA"><span typeof="mw:Nowiki"></span><meta typeof="mw:Extension/indicator" …>   rustoid
+…id="mwBA"><meta typeof="mw:Extension/indicator" about="#mwt3" …>                    parsoid
+```
+
+It is not the `<noinclude>` handling — a direct probe of
+`A<noinclude>{{Pp-semi-indef|small=yes}}</noinclude>B` matches the service exactly,
+`<span typeof="mw:Nowiki mw:Transclusion" about="#mwt1">…</span>` and all. On the
+page, the pp transclusion is *merged into the enclosing transclusion's `parts`*
+(the `<p about="#mwt4">`'s `data-mw` lists `Pp-semi-indef` as part `i:0` and the
+literal `</noinclude>` as its own part), and in that state Parsoid drops the
+redirect's nowiki wrapper while rustoid keeps an empty one — and the meta loses
+its `about`. So the bug is in the interaction between the redirect-nowiki wrapper
+and the transclusion merge, not in include limits. Recorded, not reduced further.
