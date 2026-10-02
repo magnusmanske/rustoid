@@ -1072,6 +1072,31 @@ fn merge_encap_data_mw(encap: Option<String>, target: Option<String>) -> Option<
     Some(splice_into_object(&encap, extra))
 }
 
+/// PHP `DOMRangeBuilder::encapsulateTemplates` sets `$encapDataMw->parts = $parts`
+/// on the encapsulation target: the transclusion `parts` are *appended* to the
+/// target's own `data-mw`, keeping its keys (`name`/`attrs`/`body`) and their
+/// order. A `<templatestyles>` sheet that is itself the target — a `<style>`
+/// whose next sibling shares the transclusion's `about` — is served this way:
+/// `{"name":"templatestyles","attrs":{…},"body":{…},"parts":[…]}`.
+fn append_parts_to_data_mw(parts: Option<String>, target: Option<String>) -> Option<String> {
+    let parts = parts?;
+    let Some(target) = target else {
+        return Some(parts);
+    };
+    // `parts` is a whole `{"parts":[…]}` envelope; its members go last inside
+    // the target's object. Trimmed textually so the byte order survives (a
+    // `serde_json::Value` round trip would sort the keys).
+    let extra = parts
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim();
+    if extra.is_empty() {
+        return Some(target);
+    }
+    Some(splice_into_object(&target, extra))
+}
+
 /// The value of `key` in a flat JSON object, or `None`. Used to pull `parts`
 /// out of a `data-mw` envelope without reparsing and losing key order.
 fn data_mw_key_span(json: &str, key: &str) -> Option<(usize, usize)> {
@@ -2206,31 +2231,19 @@ fn wrap_transclusion_children(
         // (mirrors `DOMUtils::addTypeOf`'s multivalue handling).
         if let Some(et) = encap_target {
             // If the encapsulation target is rendering-transparent (a
-            // category/redirect/language link, comment, or non-HTML meta), it
-            // cannot carry content; wrap it in a `<span class="mw-empty-elt">`
-            // that becomes the encapsulation target instead (mirrors PHP
-            // `DOMRangeBuilder::handleFirstRenderingTransparentNode`, which
-            // stashes such nodes into an `mw-empty-elt` span at a range
-            // boundary and moves the transclusion metadata onto the span).
+            // category/redirect/language link, a `<style>`, comment, or non-HTML
+            // meta), PHP stashes it — together with any contiguous run of
+            // stashable siblings — into a `<span class="mw-empty-elt">` at a
+            // *block boundary*, moving the transclusion metadata onto the span
+            // (`DOMRangeBuilder::handleFirstRenderingTransparentNode`). When the
+            // boundary test fails — the next element shares the target's `about`,
+            // e.g. a `<style>` followed by the transclusion's own `<cite>` — the
+            // metadata stays on the target itself, which is what the service
+            // serves.
+            let mut unfolded = false;
             if crate::html::wts_utils::is_rendering_transparent_node(&new_content[et]) {
-                let mut inner = new_content.remove(et);
-                // The `about` id was stamped on the transparent node during
-                // range stamping; move it onto the wrapper span.
-                let about_id = inner.get_attr("about").map(str::to_string);
-                inner.attrs.retain(|a| a.key != "about");
-                let mut span = Node::element(ElementKind::Span);
-                span.set_attr("class", "mw-empty-elt");
-                if let Some(id) = about_id {
-                    span.set_attr("about", id);
-                }
-                span.children.push(inner);
-                new_content.insert(et, span);
-                // PHP's `handleFirstRenderingTransparentNode` migrates the whole
-                // contiguous run of stashable siblings, not just the target: a
-                // template expanding to `<meta property="mw:PageProp/…"/>[[Category:X]]`
-                // serves both inside one span. Gated on the same boundary test the
-                // trailing-run stash uses, so an interior run is still left alone.
                 let is_elt = |n: &Node| matches!(n.kind, NodeKind::Element(_));
+                // The maximal run of stashable elements starting at `et`.
                 let mut last = et;
                 while let Some(k) = (last + 1..new_content.len()).find(|&k| is_elt(&new_content[k]))
                 {
@@ -2239,15 +2252,30 @@ fn wrap_transclusion_children(
                     }
                     last = k;
                 }
-                if last > et {
-                    let prev = (0..et)
-                        .rev()
-                        .find(|&k| is_elt(&new_content[k]))
-                        .map(|k| &new_content[k]);
-                    let next = (last + 1..new_content.len())
-                        .find(|&k| is_elt(&new_content[k]))
-                        .map(|k| &new_content[k]);
-                    if should_stash(prev, next, &new_content[et].children[0]) {
+                let prev = (0..et)
+                    .rev()
+                    .find(|&k| is_elt(&new_content[k]))
+                    .map(|k| &new_content[k]);
+                let next = (last + 1..new_content.len())
+                    .find(|&k| is_elt(&new_content[k]))
+                    .map(|k| &new_content[k]);
+                if should_stash(prev, next, &new_content[et]) {
+                    let mut inner = new_content.remove(et);
+                    // The `about` id was stamped on the transparent node during
+                    // range stamping; move it onto the wrapper span.
+                    let about_id = inner.get_attr("about").map(str::to_string);
+                    inner.attrs.retain(|a| a.key != "about");
+                    let mut span = Node::element(ElementKind::Span);
+                    span.set_attr("class", "mw-empty-elt");
+                    if let Some(id) = about_id {
+                        span.set_attr("about", id);
+                    }
+                    span.children.push(inner);
+                    new_content.insert(et, span);
+                    // `migrateElements` moves the rest of the run into the span,
+                    // dropping non-elements and nested `span`s (a newline span)
+                    // and stripping `about` (the span owns it now).
+                    if last > et {
                         let mut moved = Vec::new();
                         for node in new_content.splice(et + 1..=last, std::iter::empty()) {
                             if !is_elt(&node) || crate::html::wts_utils::node_name(&node) == "span"
@@ -2259,6 +2287,38 @@ fn wrap_transclusion_children(
                             moved.push(node);
                         }
                         new_content[et].children.extend(moved);
+                    }
+                } else if let Some(mut fragment) = new_content[et].fragment.take() {
+                    if fragment.children.is_empty() {
+                        // Nothing to unfold; leave the placeholder in place.
+                        new_content[et].fragment = Some(fragment);
+                    } else {
+                        // No boundary: PHP's encapsulation target is the real
+                        // element, which rustoid carries behind a `mw:DOMFragment`
+                        // placeholder (a `<templatestyles>`). Unfold it so the
+                        // transclusion metadata lands on the stylesheet itself, as
+                        // the service serves it.
+                        let mut kids = std::mem::take(&mut fragment.children);
+                        for kid in kids.iter_mut() {
+                            if let Some(about) = &about {
+                                kid.set_attr("about", about.clone());
+                            }
+                            // The extension's `data-mw` is still an attribute (a
+                            // style node is built outside the tree builder); move
+                            // it to the field so the append below reads it and the
+                            // serializer does not emit it twice.
+                            if let Some(dmw) = kid
+                                .attrs
+                                .iter()
+                                .find(|a| a.key == "data-mw")
+                                .map(|a| a.value.clone())
+                            {
+                                kid.attrs.retain(|a| a.key != "data-mw");
+                                kid.data_mw = Some(dmw);
+                            }
+                        }
+                        new_content.splice(et..=et, kids);
+                        unfolded = true;
                     }
                 }
             }
@@ -2318,19 +2378,22 @@ fn wrap_transclusion_children(
                 tdp.dsr = mdp.dsr.clone();
             }
             // Merge the transclusion's `data-mw` (its `parts` envelope) with any
-            // `data-mw` already on the encapsulation target (e.g. a media
-            // container's `attribs`/`errors`), rather than overwriting it. This
-            // mirrors PHP, where `DOMDataUtils::setDataMw` on the encapsulation
-            // target preserves the target's own `attribs` while attaching the
-            // transclusion `parts`. Losing the target's `data-mw` here would
-            // drop e.g. a `link=` option and break `AddMediaInfo`.
+            // `data-mw` already on the encapsulation target. At a block boundary
+            // the `mw-empty-elt` span took the metadata, so the target has none
+            // and the `parts` are the whole envelope. When the metadata stays on
+            // the target (the stylesheet case above) the target's own `data-mw`
+            // keeps its keys (`name`/`attrs`/`body`) and gains `parts` *appended*,
+            // mirroring PHP `$encapDataMw->parts = $parts`. Media containers keep
+            // their `attribs`/`errors` the same way.
             let plan_mw = about
                 .as_deref()
-                .and_then(|a| plan.compound_data_mw(a, source, None));
-            new_content[et].data_mw = merge_encap_data_mw(
-                plan_mw.or_else(|| build_compound_data_mw(&start_meta, source, None)),
-                new_content[et].data_mw.clone(),
-            );
+                .and_then(|a| plan.compound_data_mw(a, source, None))
+                .or_else(|| build_compound_data_mw(&start_meta, source, None));
+            new_content[et].data_mw = if unfolded {
+                append_parts_to_data_mw(plan_mw, new_content[et].data_mw.clone())
+            } else {
+                merge_encap_data_mw(plan_mw, new_content[et].data_mw.clone())
+            };
             // A templated *table* whose range encloses nested transclusion ranges
             // gets a compound `data-mw` listing every constituent template plus
             // the intervening wikitext (mirrors `DOMRangeBuilder::recordTemplateInfo`
