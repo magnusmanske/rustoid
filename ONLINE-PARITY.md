@@ -9584,3 +9584,16 @@ difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
 5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
 sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
 the workspace is green.
+
+### The next `Zebro` difference: a `<ref>` in a caption is numbered late
+At 37 308 the difference is the `about` of a `<ref>` inside the Altamira image
+caption: parsoid `#mwt68`, rustoid `#mwt130`. The reduced form
+`A [[File:Example.jpg|thumb|caption<ref>Note text</ref>]] B` is off by exactly
+one (parsoid `#mwt1`, rustoid `#mwt2`), so the minimal probe does not reproduce
+the magnitude — the page case is about *when* the caption is numbered relative to
+the surrounding chunks, not a fixed offset. Parsoid numbers the ref when the
+media token is handled in its own chunk; rustoid's id is 62 later, i.e. after
+later chunks. Worth checking whether the caption's `mw:maybeContent` is still
+reached by a pass that runs after the chunk loop (`render_file` expands a caption
+too), rather than by the in-chunk `expand_attributes` the previous fix relied on.
+Recorded for the next session.
