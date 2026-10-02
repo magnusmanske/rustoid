@@ -1007,11 +1007,13 @@ impl SiteConfig for MockSiteConfig {
 
     fn external_link_attribs(&self, href: &str) -> Vec<(String, Vec<String>)> {
         // `wgNoFollowDomainExceptions` exempts matching domains from `nofollow`.
-        let nofollow = self.no_follow_links
-            && !self
-                .no_follow_domain_exceptions
-                .iter()
-                .any(|d| href.contains(d));
+        let exceptions: Vec<&str> = self
+            .no_follow_domain_exceptions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let nofollow =
+            self.no_follow_links && !crate::links::url_host_matches_domain_list(href, &exceptions);
 
         let mut attribs: Vec<(String, Vec<String>)> = Vec::new();
         if nofollow {

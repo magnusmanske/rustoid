@@ -336,7 +336,44 @@ impl SiteConfig for WikiSiteConfig {
     fn width_option(&self) -> u32 {
         self.width_option
     }
+
+    /// `Parser::getExternalLinkRel` — `rel="nofollow"` unless the link's host is
+    /// exempt. `$wgNoFollowLinks` is true on Wikimedia and
+    /// `$wgNoFollowNsExceptions` is empty, so the only escape is
+    /// [`WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS`], which `siteinfo` does not expose.
+    fn external_link_attribs(&self, href: &str) -> Vec<(String, Vec<String>)> {
+        if rustoid_core::links::url_host_matches_domain_list(href, WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS)
+        {
+            Vec::new()
+        } else {
+            vec![("rel".to_string(), vec!["nofollow".to_string()])]
+        }
+    }
 }
+
+/// Wikimedia's `$wgNoFollowDomainExceptions`
+/// (`wmf-config/InitialiseSettings.php`). Hard-coded here because the value is
+/// not part of `action=query&meta=siteinfo`; the compare harness only targets
+/// Wikimedia wikis, and it is a site configuration value, so it lives with the
+/// site config rather than in the parser.
+const WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS: &[&str] = &[
+    "mediawiki.org",
+    "wikibooks.org",
+    "wikimedia.com",
+    "wikimedia.org",
+    "wikinews.org",
+    "wikipedia.org",
+    "wikiquote.org",
+    "wikisource.org",
+    "wikiversity.org",
+    "wiktionary.org",
+    "wikivoyage.org",
+    "wikidata.org",
+    "wikifunctions.org",
+    "tools.wmflabs.org",
+    "toolforge.org",
+    "etherpad.wmflabs.org",
+];
 
 // ---- wire types ----
 
