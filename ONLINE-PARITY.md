@@ -9469,3 +9469,34 @@ sovereign states` 8409, `Quicksilver (film)` 4213 — all unchanged. The fixture
 guard holds at 877/896 (it cannot see ids), and the whole workspace is green.
 Recorded here rather than shipped as a no-op: it is a real id drift, and it is
 the difference between the per-chunk experiment regressing and not.
+
+### The interleave, finished for `AttributeExpander` only
+With the synthesized-attribute rule in place, splitting `build_ast` into per-line
+chunks and running `TemplateHandler → ExtensionHandler → AttributeExpander`
+inside the loop no longer regresses. It is also where the caption id actually
+comes from: a media caption is the link token's `mw:maybeContent` KV, and
+`expand_attributes` — not `render_links` — expands a KV's token array. So the
+one pass that had to move was `expand_attributes`; the caption's nested
+transclusion is now numbered in its own chunk and lands at parsoid's `#mwt36`.
+
+Moving `render_links` into the loop too (as the doc above proposed) **drops
+`{{citation}}`'s CS1 `<style>`**: the stylesheet placeholder is a top-level
+`<style typeof="mw:DOMFragment">` token, and a per-chunk `render_links` reached
+it before the fragment it names had been resolved, so the first citation emitted
+no style and the second — the only survivor — became a full `<style>` instead of
+a `mw-deduplicated-inline-style` link. The first-difference metric did not see
+it (the drop is at 123 952, past the 24 039 difference), which is exactly why it
+was checked by counting: `31` templatestyles / `25` dedup links in parsoid,
+`5`/`1` in rustoid both before and after, but `4`/`0` with `render_links`
+interleaved. `render_links` stays a global pass. Recorded because the metric
+alone would have shipped it.
+
+### Effect
+`Zebro`: 23 570 → **24 039** (17.22% → 17.56%). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
+5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
+sovereign states` 8409), the fixture guard holds at 877/896, and the workspace
+is green. The next `Zebro` difference is a `<style data-mw-deduplicate>` for
+`Plainlist/styles.css` that parsoid emits inside the transclusion span and
+rustoid omits — the same missing-in-content-styles gap (31 vs 5) that the
+citation case exposed, now the leading one.

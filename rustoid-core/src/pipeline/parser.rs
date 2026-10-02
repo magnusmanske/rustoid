@@ -50,6 +50,29 @@ fn track_table(item: &Item, depth: &mut usize) {
     }
 }
 
+/// Split a top-level token stream into TT2 chunks at block boundaries.
+///
+/// PHP's `PegTokenizer::processChunkily` yields one top-level block per chunk —
+/// one line — and `TokenHandlerPipeline::processChunk` runs every transformer
+/// over the whole chunk, so the id order resets at each block. The flat token
+/// stream carries the boundary on every top-level `Nl`. The leading `Nl` of a
+/// chunk stays with it, exactly as `try_parse_sol` consumes it into the chunk it
+/// opens.
+fn split_into_chunks(tokens: Vec<Item>) -> Vec<Vec<Item>> {
+    let mut chunks: Vec<Vec<Item>> = Vec::new();
+    let mut chunk: Vec<Item> = Vec::new();
+    for item in tokens {
+        if !chunk.is_empty() && matches!(&item, Item::Tok(ParsoidToken::Nl(_))) {
+            chunks.push(std::mem::take(&mut chunk));
+        }
+        chunk.push(item);
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
 /// Flag a text-returning parser function's branch as such, in place.
 ///
 /// See [`crate::wikitext::tokens_v2::TempData::in_text_branch`]: core answers
@@ -2701,21 +2724,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         self.reset_expansion();
         let frame = Frame::new(title.clone(), vec![]);
 
-        let tokens = self
-            .expand_templates(
-                &frame,
-                tokens,
-                source,
-                about_counter,
-                false,
-                false,
-                page_source,
-            )
-            .await;
-        // TT2 order: ExtensionHandler runs after TemplateHandler and before
-        // AttributeExpander (PHP `ParserPipelineFactory::STAGES`). Attribute
-        // values are sub-pipelines, so the extension handler must reach inside
-        // them before attributes are expanded.
+        // TT2 is per chunk: PHP's `TokenHandlerPipeline` runs `TemplateHandler`,
+        // `ExtensionHandler`, and `AttributeExpander` over one block at a time
+        // (PHP `ParserPipelineFactory::STAGES`), so every id a handler spends
+        // belongs to its chunk. rustoid used to run these as global passes, which
+        // put a media *caption's* nested expansion after the whole page's
+        // templates: the caption lives in the link's `mw:maybeContent` KV, which
+        // `expand_attributes` expands (`Zebro`: parsoid `#mwt36`, rustoid
+        // `#mwt119`). `fragments`/`next_id` are one document-wide space, so they
+        // persist across the chunks.
+        //
+        // Only these three interleave. `render_links` stays a global pass: its
+        // own id allocators (a media option's templatestyles) were already late
+        // before, and interleaving it dropped the first `{{citation}}`'s CS1
+        // `<style>` (the placeholder is a top-level token that a per-chunk pass
+        // reached before the fragment was resolved).
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
         // One fragment-id space for the whole document, exactly as PHP's
@@ -2725,23 +2748,43 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `expand_one_templatestyles` allocates from this same counter while
         // expansion is still running.
         let next_id = &self.ext_next_id;
-        let tokens = crate::pipeline::extension_handler::expand_in_attributes(
-            tokens,
-            self.config,
-            &mut fragments,
-            next_id,
-        );
-        let tokens = self
-            .expand_attributes(
-                &frame,
-                tokens,
-                source,
-                about_counter,
-                Some(page_source),
+        let mut chunked: Vec<Item> = Vec::new();
+        for chunk in split_into_chunks(tokens) {
+            let chunk = self
+                .expand_templates(
+                    &frame,
+                    chunk,
+                    source,
+                    about_counter,
+                    false,
+                    false,
+                    page_source,
+                )
+                .await;
+            // TT2 order: ExtensionHandler runs after TemplateHandler and before
+            // AttributeExpander. Attribute values are sub-pipelines, so the
+            // extension handler must reach inside them before attributes are
+            // expanded.
+            let chunk = crate::pipeline::extension_handler::expand_in_attributes(
+                chunk,
+                self.config,
                 &mut fragments,
                 next_id,
-            )
-            .await;
+            );
+            let chunk = self
+                .expand_attributes(
+                    &frame,
+                    chunk,
+                    source,
+                    about_counter,
+                    Some(page_source),
+                    &mut fragments,
+                    next_id,
+                )
+                .await;
+            chunked.extend(chunk);
+        }
+        let tokens = chunked;
         let tokens = self.render_links(tokens, &mut fragments, next_id, Some(&title));
         let tokens = self.render_external_links(tokens, &mut fragments, next_id);
         let tokens = self.render_behavior_switches(tokens);
