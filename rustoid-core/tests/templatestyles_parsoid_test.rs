@@ -39,14 +39,21 @@ fn tag_end(text: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Every `(src, css)` Parsoid emitted, keyed by the `src` attribute.
+/// One stylesheet as Parsoid rendered it: the revision it was rendered from
+/// and the minified CSS body.
+struct Sheet {
+    revid: u64,
+    css: String,
+}
+
+/// Every stylesheet Parsoid emitted, keyed by `(src, wrapper)`.
 ///
 /// Parsoid renders a given stylesheet identically wherever it appears, except
 /// that an empty stylesheet yields an empty `<style>`. Asserting the first part
 /// guards the extraction: if a `src` were read from the wrong node, every
 /// comparison below would be meaningless.
-fn parsoid_stylesheets(pages: &Path) -> BTreeMap<String, String> {
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+fn parsoid_stylesheets(pages: &Path) -> BTreeMap<(String, Option<String>), Sheet> {
+    let mut out: BTreeMap<(String, Option<String>), Sheet> = BTreeMap::new();
     let mut files = std::fs::read_dir(pages)
         .expect("cache dir")
         .flatten()
@@ -59,7 +66,9 @@ fn parsoid_stylesheets(pages: &Path) -> BTreeMap<String, String> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        if !name.starts_with("html__") {
+        // The oracle bodies have been written under several filename schemes
+        // (`html__…`, `html:…`); every `html*` file is a Parsoid rendering.
+        if !name.starts_with("html") {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -68,6 +77,21 @@ fn parsoid_stylesheets(pages: &Path) -> BTreeMap<String, String> {
         let mut rest = text.as_str();
         while let Some(start) = rest.find("data-mw-deduplicate=\"TemplateStyles:r") {
             let after = &rest[start..];
+            // The dedup key is `TemplateStyles:r<revid>` optionally followed by
+            // `/mw-parser-output/<wrapper>`.
+            let key_start = "data-mw-deduplicate=\"".len();
+            let Some(key_end) = after[key_start..].find('"') else {
+                break;
+            };
+            let key = &after[key_start..key_start + key_end];
+            let Some(rest_key) = key.strip_prefix("TemplateStyles:r") else {
+                rest = &after[1..];
+                continue;
+            };
+            let (revid, wrapper) = match rest_key.split_once("/mw-parser-output/") {
+                Some((r, w)) => (r.parse::<u64>().ok(), Some(w.to_string())),
+                None => (rest_key.parse::<u64>().ok(), None),
+            };
             let Some(src_at) = after.find("\"attrs\":{\"src\":\"") else {
                 rest = &after[1..];
                 continue;
@@ -88,11 +112,14 @@ fn parsoid_stylesheets(pages: &Path) -> BTreeMap<String, String> {
             // Prefer a non-empty rendering: an empty stylesheet legitimately
             // yields an empty `<style>`, which would otherwise shadow the real
             // body and make the comparison below vacuous.
-            if !css.is_empty() {
-                if let Some(seen) = out.get(&src) {
-                    assert_eq!(seen, &css, "{src} rendered differently on {name}");
+            if !css.is_empty()
+                && let Some(revid) = revid
+            {
+                let sheet = Sheet { revid, css };
+                if let Some(seen) = out.get(&(src.clone(), wrapper.clone())) {
+                    assert_eq!(seen.css, sheet.css, "{src} rendered differently on {name}");
                 } else {
-                    out.insert(src.clone(), css);
+                    out.insert((src, wrapper), sheet);
                 }
             }
             rest = &after[gt + close..];
@@ -101,20 +128,67 @@ fn parsoid_stylesheets(pages: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// The revision the cache holds a stylesheet page's source at, read from the
+/// cache manifest. `None` when the page is not cached or carries no revision.
+fn cached_revid(pages: &Path, src: &str) -> Option<u64> {
+    let (ns, rest) = match src.split_once(':') {
+        Some((ns, rest)) => (ns, rest),
+        None => ("Template", src),
+    };
+    let index = pages.parent()?.join("index.json");
+    let text = std::fs::read_to_string(index).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("entries")?
+        .get(format!("page:{ns}:{rest}"))?
+        .get("revid")?
+        .as_u64()
+}
+
 /// The cached source of a stylesheet page, addressed by its `src` value.
 ///
 /// A bare `src` lives in the Template namespace (`$wgTemplateStylesDefaultNamespace`).
+/// The compare crate encodes cache keys into filenames with one of three
+/// schemes (a corpus cache is hours of rate-limited fetching, so older names are
+/// still read); this crate does not depend on it, so the schemes are mirrored
+/// here.
 fn cached_source(pages: &Path, src: &str) -> Option<String> {
     let (ns, rest) = match src.split_once(':') {
         Some((ns, rest)) => (ns, rest),
         None => ("Template", src),
     };
-    let file = format!(
-        "page__{}__{}.txt",
-        ns.replace(' ', "_"),
-        rest.replace([' ', '/'], "_")
-    );
-    std::fs::read_to_string(pages.join(file)).ok()
+    let key = format!("page:{ns}:{rest}");
+    for stem in candidate_stems(&key) {
+        if let Ok(s) = std::fs::read_to_string(pages.join(format!("{stem}.txt"))) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// The three filename stems the cache may have written for `key`, in priority
+/// order: the injective `escape_body_stem`, then `sanitize_path_separators`, then
+/// the `:`-doubling legacy layout.
+fn candidate_stems(key: &str) -> Vec<String> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut escaped = String::with_capacity(key.len());
+    for &b in key.as_bytes() {
+        if b.is_ascii()
+            && !b.is_ascii_uppercase()
+            && !matches!(b, b'%' | b'/' | b'\\' | b'\0' | b'~')
+        {
+            escaped.push(b as char);
+        } else {
+            escaped.push('%');
+            escaped.push(HEX[(b >> 4) as usize] as char);
+            escaped.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    vec![
+        escaped,
+        key.replace(['/', '\\', '\0'], "_").replace("..", "__"),
+        key.replace(':', "__"),
+    ]
 }
 
 /// The largest char boundary at or below `i`, for slicing non-ASCII CSS.
@@ -134,21 +208,32 @@ fn render_matches_parsoid_for_every_cached_stylesheet() {
     };
     let expected = parsoid_stylesheets(&pages);
     let mut checked = 0usize;
+    let mut drift = 0usize;
     let mut failures = Vec::new();
-    for (src, want) in &expected {
+    for ((src, wrapper), want) in &expected {
         let Some(source) = cached_source(&pages, src) else {
             continue;
         };
+        // The wiki edits a stylesheet after an article's oracle was captured.
+        // The cache holds only the *latest* source, so comparing it against an
+        // older rendering would report the wiki's own edit as a render
+        // difference. Skip those rather than pretend to measure them.
+        if let Some(src_revid) = cached_revid(&pages, src)
+            && src_revid != want.revid
+        {
+            drift += 1;
+            continue;
+        }
         checked += 1;
-        let got = render(&source, None);
-        if got == *want {
+        let got = render(&source, wrapper.as_deref());
+        if got == want.css {
             continue;
         }
         let at = got
             .bytes()
-            .zip(want.bytes())
+            .zip(want.css.bytes())
             .position(|(a, b)| a != b)
-            .unwrap_or(got.len().min(want.len()));
+            .unwrap_or(got.len().min(want.css.len()));
         let window = |s: &str| {
             let start = floor_char(s, at.saturating_sub(40));
             let end = floor_char(s, (at + 80).min(s.len()));
@@ -156,11 +241,14 @@ fn render_matches_parsoid_for_every_cached_stylesheet() {
         };
         failures.push(format!(
             "{src} differs at byte {at}\n  want: {}\n  got:  {}",
-            window(want),
+            window(&want.css),
             window(&got),
         ));
     }
     assert!(checked > 0, "cache holds no stylesheet sources");
+    if drift > 0 {
+        eprintln!("skipped {drift} stylesheet(s): cached source is newer than the oracle");
+    }
     assert!(
         failures.is_empty(),
         "{} of {checked} stylesheet(s) mismatch:\n{}",

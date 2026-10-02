@@ -12,6 +12,7 @@ pub mod auto_toc;
 pub mod behavior_switch_handler;
 pub mod cleanup;
 pub mod compute_dsr;
+pub mod css;
 pub mod dedupe_styles;
 pub mod display_space;
 pub mod extension_handler;

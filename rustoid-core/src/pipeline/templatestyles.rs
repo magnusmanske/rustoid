@@ -59,10 +59,10 @@ pub fn render(css: &str, wrapper: Option<&str>) -> String {
                 let head = buf.trim().to_string();
                 buf.clear();
                 if head.starts_with('@') {
-                    out.push_str(&normalise_at_prelude(&head));
+                    out.push_str(&crate::pipeline::css::value(&head));
                     out.push('{');
                 } else {
-                    out.push_str(&scope_selector(&head, &scope));
+                    out.push_str(&crate::pipeline::css::scope_selector(&head, &scope));
                     out.push('{');
                 }
                 depth += 1;
@@ -121,12 +121,9 @@ fn strip_comments(css: &str) -> String {
 
 /// Normalise one declaration: `font-style: italic` → `font-style:italic`.
 ///
-/// Whitespace around `:` and at either end goes; `! important` becomes
-/// `!important`. Inside the value, whitespace is *also* removed after commas
-/// (`rect(0, 0, 0, 0)` → `rect(0,0,0,0)`, `var(--x, #fff)` → `var(--x,#fff)`),
-/// but a value's other internal spacing (`margin: 0 auto`, `12px/1.5`) is
-/// meaningful and kept. Single quotes become double, which is what the
-/// sanitiser emits for a font family.
+/// The value is re-serialised by the CSS tokeniser ([`crate::pipeline::css`]),
+/// which is where the spaces around `:`, after `,`, around a chained function
+/// and inside `! important` go, and where strings are re-quoted.
 fn normalise_declaration(raw: &str) -> String {
     let text = raw.trim();
     if text.is_empty() {
@@ -137,349 +134,13 @@ fn normalise_declaration(raw: &str) -> String {
         // pass it through trimmed rather than mangling it.
         return text.to_string();
     };
-    let value = value.trim();
-    let value = match value.find('!') {
-        Some(bang) => format!("{}!{}", value[..bang].trim_end(), value[bang + 1..].trim()),
-        None => value.to_string(),
-    };
-    format!("{}:{}", property.trim(), normalise_value(&value))
+    format!(
+        "{}:{}",
+        property.trim(),
+        crate::pipeline::css::value(value.trim())
+    )
 }
 
-/// Tidy an at-rule prelude: `@media (max-width: 720px)` → `@media(max-width:720px)`.
-///
-/// A media *type* (`all`, `screen`, `print`) keeps the space that follows the
-/// at-rule name; a bare parenthesised condition does not. Within a condition,
-/// spaces after `:`, after `,` and before `)` go, and `and` loses the space
-/// before it when it follows a `)`.
-///
-/// The rules are transcribed from every at-rule prelude in the cached Parsoid
-/// output, where all of these appear:
-///
-/// ```text
-/// @media all and (max-width:500px){
-/// @media print{
-/// @media(max-width:640px){
-/// @media(min-width:640px)and (hover:hover)and (pointer:fine){
-/// ```
-fn normalise_at_prelude(prelude: &str) -> String {
-    // The at-rule name (`@media`) ends at the first space or `(`. What follows
-    // decides how the prelude is spaced, so split it off up front instead of
-    // threading a flag through a character loop.
-    let name_end = prelude.find([' ', '(']).unwrap_or(prelude.len());
-    let (name, remainder) = prelude.split_at(name_end);
-    let mut out = String::with_capacity(prelude.len());
-    out.push_str(name);
-
-    // A condition (a `(…)`) joins the name; a media *type* keeps a single space.
-    // Runs of whitespace collapse either way, so `@media  screen` cannot leak a
-    // double space into the output.
-    let rest = remainder.trim_start_matches(' ');
-    if !rest.starts_with('(') {
-        // A media type follows, so the separating space is significant. The
-        // remainder is non-empty whenever that is the case.
-        out.push(' ');
-    }
-
-    // Within what remains, spaces after `:` and `,` go, a space before `)`
-    // goes, and `and` loses the space before it when it follows a `)` so that
-    // `…) and (` becomes `…)and (`. The space before `and` is the only place
-    // `and` is special: after a media type it is significant, as in
-    // `@media screen and (…)`.
-    let mut after_paren = false;
-    let mut chars = rest.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '(' => {
-                out.push('(');
-                after_paren = false;
-                // Drop the spaces that follow an opening parenthesis.
-                while chars.peek().is_some_and(|n| *n == ' ') {
-                    chars.next();
-                }
-            }
-            ')' => {
-                // A space before `)` goes, mirroring `normalise_value`. Parsoid
-                // closes every condition tightly: the cached output holds
-                // `(max-width:500px)` and `(prefers-color-scheme:dark)`, and not
-                // a single space before a `)` in any at-rule prelude.
-                while out.ends_with(' ') {
-                    out.pop();
-                }
-                out.push(')');
-                after_paren = true;
-            }
-            ':' | ',' => {
-                out.push(c);
-                while chars.peek().is_some_and(|n| *n == ' ') {
-                    chars.next();
-                }
-            }
-            ' ' => {
-                // A space after `)` is dropped only when `and` follows.
-                let mut lookahead = chars.clone();
-                let is_and = lookahead.by_ref().take(3).collect::<String>() == "and";
-                if !(after_paren && is_and) {
-                    out.push(' ');
-                }
-            }
-            _ => {
-                after_paren = false;
-                out.push(c);
-            }
-        }
-    }
-    out.trim_end().to_string()
-}
-
-/// Tidy a declaration's value: drop whitespace around `,`, `/`, `%` and `)`,
-/// and prefer double quotes.
-///
-/// None of this is cosmetic — the comparison is byte-for-byte — and the rules
-/// were read off Parsoid's own output rather than assumed:
-///
-/// ```text
-/// rect(0, 0, 0, 0)         -> rect(0,0,0,0)
-/// invert(1) brightness(…)  -> invert(1)brightness(…)
-/// 0 100% 100% 0 / 50%      -> 0 100%100%0/50%
-/// ```
-///
-/// A space that separates two *values* is meaningful and is kept:
-/// `0.5em 0 1em`, `1px solid #aaa`, `0 auto`. The distinction is that `,`, `/`,
-/// `%` and `)` end or join a component, while a space between two values is the
-/// component separator itself.
-///
-/// `calc()` is the exception, and it is not a special case bolted on: its
-/// arguments are an arithmetic expression in which the spaces *are* the
-/// operators, so `calc(100% - 0.7em)` cannot lose them. It is the only function
-/// with that property, and every space that survives next to a `%` in the
-/// corpus is inside one.
-fn normalise_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    // Nesting depth of `calc(`, whose contents are passed through untouched.
-    let mut calc_depth = 0usize;
-    // Inside a string literal every character is content — whitespace included —
-    // so the separators the arms below drop do not apply there. A string's
-    // *closing* quote is self-delimiting, though, and the whitespace after it
-    // goes: the sanitiser writes `content:" "counter(listitem)"\a0 "`.
-    let mut in_string = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            match c {
-                '\\' => push_css_escape(&mut out, &mut chars),
-                '"' => {
-                    in_string = false;
-                    out.push('"');
-                    while chars.peek().is_some_and(|n| *n == ' ') {
-                        chars.next();
-                    }
-                }
-                _ => out.push(c),
-            }
-            continue;
-        }
-
-        if calc_depth > 0 {
-            match c {
-                '(' => calc_depth += 1,
-                ')' => calc_depth -= 1,
-                _ => {}
-            }
-            out.push(c);
-            continue;
-        }
-
-        match c {
-            '"' => {
-                in_string = true;
-                out.push('"');
-            }
-            '\'' => out.push('"'),
-            '\\' => push_css_escape(&mut out, &mut chars),
-            ',' | '/' | '%' => {
-                // The spaces on either side of a joining punctuation mark go.
-                while out.ends_with(' ') {
-                    out.pop();
-                }
-                out.push(c);
-                while chars.peek().is_some_and(|n| *n == ' ') {
-                    chars.next();
-                }
-            }
-            ')' => {
-                while out.ends_with(' ') {
-                    out.pop();
-                }
-                out.push(')');
-                // A function chained to the next component loses the separating
-                // space; `)` is self-delimiting, so an identifier or a string
-                // follows it directly.
-                let mut lookahead = chars.clone();
-                let mut spaces = 0usize;
-                while lookahead.peek().is_some_and(|n| *n == ' ') {
-                    lookahead.next();
-                    spaces += 1;
-                }
-                let next = lookahead.next();
-                if spaces > 0
-                    && next.is_some_and(|n| n.is_ascii_alphabetic() || n == '-' || n == '"')
-                {
-                    for _ in 0..spaces {
-                        chars.next();
-                    }
-                }
-            }
-            _ => out.push(c),
-        }
-
-        // `calc(` opens a pass-through region. Detected after the character is
-        // emitted so the `(` itself is handled by the branch above.
-        if c == '(' && out.ends_with("calc(") {
-            calc_depth = 1;
-        }
-    }
-    out
-}
-
-/// Copy a CSS escape — `\a0`, `\:`, `\"` — applying the sanitiser's hex-escape
-/// serialisation: the digits are kept and a single terminating space follows
-/// them.
-///
-/// The sanitiser's tokeniser consumes the whitespace that *ends* a hex escape,
-/// and its serialiser writes one back, so `content:"\a0· "` reaches the page as
-/// `content:"\a0 · "`. Passing the escape through verbatim left every
-/// `Hlist`-styled page a byte short at its first such declaration.
-fn push_css_escape(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    out.push('\\');
-    let mut digits = 0usize;
-    while digits < 6 {
-        match chars.peek() {
-            Some(n) if n.is_ascii_hexdigit() => {
-                out.push(*n);
-                digits += 1;
-                chars.next();
-            }
-            _ => break,
-        }
-    }
-    if digits > 0 {
-        // Exactly one terminating space, whether or not the source had one (the
-        // first whitespace after the digits *is* the terminator).
-        if chars.peek().is_some_and(|n| n.is_whitespace()) {
-            chars.next();
-        }
-        out.push(' ');
-    }
-}
-
-/// Prefix a selector list with the scope, following TemplateStyles' rules.
-///
-/// Every simple selector is scoped, *except* one that begins with `html` or
-/// `body` followed by a descendant combinator. That exception is documented in
-/// Extension:TemplateStyles ("to target styles based on skins, use a selector
-/// such as `body.skin-vector .myClass`; specification of the `body` element is
-/// required") and is what lets a skin-dependent rule escape the content scope.
-///
-/// Within an at-rule the selector is still scoped — `@media print{body.ns-0
-/// .mw-parser-output .hatnote{…}}` — so this is applied at every depth.
-fn scope_selector(selector: &str, scope: &str) -> String {
-    selector
-        .split(',')
-        .map(|part| scope_one(part.trim(), scope))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Scope a single selector.
-///
-/// The scope goes on the *subject* of the selector — the last compound — which
-/// is where it lands for an ordinary rule. For a document selector
-/// (`body.ns-0 .hatnote`) the `body` prefix is left alone and the scope is
-/// inserted after it, giving `body.ns-0 .mw-parser-output .hatnote`: the escape
-/// hatch is for the `body`/`html` element, not for everything downstream of it.
-fn scope_one(selector: &str, scope: &str) -> String {
-    if selector.is_empty() || selector.starts_with('@') {
-        return selector.to_string();
-    }
-    let normalised = normalise_combinators(selector);
-    match document_prefix(&normalised) {
-        // `body.ns-0 .hatnote` → `body.ns-0 .mw-parser-output .hatnote`
-        Some(prefix_len) => {
-            let (prefix, rest) = normalised.split_at(prefix_len);
-            let rest = rest.trim_start();
-            if rest.is_empty() {
-                return prefix.trim_end().to_string();
-            }
-            format!("{prefix}{scope} {rest}")
-        }
-        None => format!("{scope} {normalised}"),
-    }
-}
-
-/// If `selector` opens with the documented `html`/`body` escape hatch, return
-/// the byte length of the prefix up to and including its descendant combinator.
-///
-/// The requirement is a `html` or `body` element followed by a *descendant*
-/// combinator, so `body.ns-0 .hatnote` matches while a bare `body` or
-/// `body > .x` does not. Qualifiers before the space are part of the prefix
-/// (`body:not(.skin-minerva) .infobox` is in the cached output), which is why
-/// the search skips over balanced parentheses.
-fn document_prefix(selector: &str) -> Option<usize> {
-    let rest = selector
-        .strip_prefix("html")
-        .or_else(|| selector.strip_prefix("body"))?;
-    let head = selector.len() - rest.len();
-    let mut depth = 0usize;
-    for (offset, c) in rest.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ' ' if depth == 0 => return Some(head + offset + 1),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Tighten the combinators: `.a + .b` → `.a+.b`.
-///
-/// Parsoid's output is `.mw-parser-output .hatnote+.mw-empty-elt+.hatnote` for
-/// a source of `.hatnote + .mw-empty-elt + .hatnote`, so the whitespace around
-/// `+` and `~` goes. A descendant combinator is a single space and is kept,
-/// since removing it would change the selector's meaning.
-fn normalise_combinators(selector: &str) -> String {
-    let mut out = String::with_capacity(selector.len());
-    let mut pending_space = false;
-    let mut chars = selector.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_whitespace() {
-            pending_space = !out.is_empty();
-            continue;
-        }
-        let is_compound_combinator = matches!(c, '+' | '~' | '>');
-        if is_compound_combinator {
-            // Drop any space before it, then skip the spaces after it.
-            while out.ends_with(' ') {
-                out.pop();
-            }
-            out.push(c);
-            while chars.peek().is_some_and(|n| n.is_whitespace()) {
-                chars.next();
-            }
-            pending_space = false;
-            continue;
-        }
-        if pending_space && !out.ends_with(['+', '~', '>']) {
-            out.push(' ');
-        }
-        pending_space = false;
-        out.push(c);
-    }
-    out
-}
-
-/// If `selector` opens with the documented `html`/`body` escape hatch, return
 /// Build the `<style>` element Parsoid emits for a stylesheet.
 ///
 /// The attributes are not decorative — the comparison is byte-for-byte, so they
@@ -707,7 +368,8 @@ div.hatnote {
     /// A hex escape is re-serialised with its terminating space: the sanitiser
     /// consumes the whitespace that ends the escape and writes one back, so
     /// `Hlist/styles.css`'s `content:"\a0· "` reaches the page as
-    /// `content:"\a0 · "`. A non-hex escape is untouched.
+    /// `content:"\a0 · "`. A non-hex escape decodes to its character, which the
+    /// string serialiser then writes literally (`:` needs no escape).
     #[test]
     fn a_hex_escape_keeps_its_terminating_space() {
         assert_eq!(
@@ -716,7 +378,7 @@ div.hatnote {
         );
         assert_eq!(
             render(r#"a{content:"x\:y"}"#, None),
-            ".mw-parser-output a{content:\"x\\:y\"}"
+            ".mw-parser-output a{content:\"x:y\"}"
         );
     }
 
@@ -783,8 +445,9 @@ div.hatnote {
         );
     }
 
-    /// `calc()` keeps its spaces: inside it they are the operators, so dropping
-    /// them changes the value. It is the one place a space next to `%` survives.
+    /// `calc()` keeps the spaces around its operators — inside it they are the
+    /// operators, so dropping them changes the value. Whitespace elsewhere in the
+    /// function (after `(`, before `)`, around a comma) is insignificant.
     #[test]
     fn calc_keeps_its_spaces() {
         assert_eq!(
@@ -793,7 +456,7 @@ div.hatnote {
         );
         assert_eq!(
             render(".a{width:calc( 1px + 2px )}", None),
-            ".mw-parser-output .a{width:calc( 1px + 2px )}"
+            ".mw-parser-output .a{width:calc(1px + 2px)}"
         );
     }
 
