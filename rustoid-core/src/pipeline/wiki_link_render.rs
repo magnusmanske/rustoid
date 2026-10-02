@@ -19,7 +19,11 @@ use crate::wikitext::tokens_v2::{
 /// tunneled media captions (mirrors PHP's `processContentInPipeline` with
 /// `inlineContext => true`). The caller (the `Parser`) wires this to its
 /// `renderLinks` + `renderExternalLinks` + inline tree-builder pipeline.
-pub type CaptionFragmentBuilder<'a> = &'a mut dyn FnMut(Vec<Item>) -> crate::dom::node::Node;
+pub type CaptionFragmentBuilder<'a> = &'a mut dyn FnMut(
+    Vec<Item>,
+    &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    &std::cell::Cell<usize>,
+) -> crate::dom::node::Node;
 
 use super::wiki_link_handler::{build_link_attrs, string_kv};
 
@@ -496,7 +500,7 @@ fn render_wiki_link_with_fragment(
     if let (Some(build), Some(frags), Some(id)) = (build_fragment, fragments, next_id)
         && !content.is_empty()
     {
-        let frag = build(content);
+        let frag = build(content, frags, id);
         out.push(dom_fragment_token(frag, token, frags, id));
     } else {
         out.extend(content);
@@ -1285,7 +1289,7 @@ pub fn render_file(
             // The inline context disables the ParagraphWrapper so newlines stay
             // literal rather than breaking the caption into `<p>` runs.
             let items = tokenize_caption_items(cap, ctx.config);
-            let frag = build_fragment(items);
+            let frag = build_fragment(items, fragments, next_id);
             out.push(dom_fragment_token(frag, token, fragments, next_id));
         }
         out.push(Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
@@ -1750,7 +1754,7 @@ pub fn render_redirect(ctx: &mut WikiLinkContext, token: &ParsoidToken) -> Vec<I
         true,
         &mut std::collections::HashMap::new(),
         &std::cell::Cell::new(0usize),
-        &mut |_| crate::dom::node::Node::document(),
+        &mut |_, _, _| crate::dom::node::Node::document(),
     );
 
     // Extract the normalized href from the rendered first token (an `<a>` or
@@ -1856,13 +1860,8 @@ mod tests {
             false,
             &mut fragments,
             &next_id,
-            &mut |items| {
-                crate::pipeline::parser::render_inline_fragment(
-                    config_static(),
-                    items,
-                    &mut std::collections::HashMap::new(),
-                    &std::cell::Cell::new(0usize),
-                )
+            &mut |items, frags, id| {
+                crate::pipeline::parser::render_inline_fragment(config_static(), items, frags, id)
             },
         );
 
@@ -2064,7 +2063,7 @@ mod tests {
             &target,
             &mut std::collections::HashMap::new(),
             &std::cell::Cell::new(0usize),
-            &mut |_| crate::dom::node::Node::document(),
+            &mut |_, _, _| crate::dom::node::Node::document(),
         );
 
         // With 'thumb' (thumbnail format), the container should be a <figure>
@@ -2099,7 +2098,7 @@ mod tests {
             &target,
             &mut std::collections::HashMap::new(),
             &std::cell::Cell::new(0usize),
-            &mut |_| crate::dom::node::Node::document(),
+            &mut |_, _, _| crate::dom::node::Node::document(),
         );
 
         // Container is <span typeof="mw:File" class="mw-default-size">.

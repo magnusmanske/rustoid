@@ -694,11 +694,7 @@ pub fn render_inline_fragment(
                 false,
                 fragments,
                 next_id,
-                &mut |items| {
-                    let mut f = std::collections::HashMap::new();
-                    let id = std::cell::Cell::new(0usize);
-                    render_inline_fragment(config, items, &mut f, &id)
-                },
+                &mut |items, f, id| render_inline_fragment(config, items, f, id),
             )
         })
         .collect();
@@ -1399,12 +1395,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 false,
                 fragments,
                 next_id,
-                &mut |items| {
-                    // Build the caption fragment with a fresh sub-pipeline context
-                    // (nested captions resolve their own nested fragments locally).
-                    let mut f = std::collections::HashMap::new();
-                    let id = std::cell::Cell::new(0usize);
-                    self.build_inline_fragment(items, &mut f, &id)
+                &mut |items, frags, id| {
+                    // The caption's own nested fragments (a `<templatestyles>`
+                    // resolved while the caption was expanded) live in the same
+                    // document-wide fragment space, so they are resolved against
+                    // the caller's map and counter, not a fresh local one.
+                    self.build_inline_fragment(items, frags, id)
                 },
             );
             out.extend(rendered);
@@ -2189,11 +2185,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     false,
                     &mut fragments,
                     &next_id,
-                    &mut |items| {
-                        let mut f = std::collections::HashMap::new();
-                        let id = std::cell::Cell::new(0usize);
-                        render_inline_fragment(self.config, items, &mut f, &id)
-                    },
+                    &mut |items, f, id| render_inline_fragment(self.config, items, f, id),
                 )
             })
             .collect();
@@ -2785,6 +2777,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             chunked.extend(chunk);
         }
         let tokens = chunked;
+        // `<templatestyles>` (and other pre-built sub-fragments) are stashed in
+        // `ext_fragments` while expansion runs. `render_links` renders a media
+        // *caption* through its own sub-pipeline, which resolves placeholders
+        // against the fragment map, so fold the stash in before it runs (a later
+        // fold at the end of `build_ast` would leave the caption's `<style>`
+        // unresolved: `[[File:…|thumb|{{#invoke:list|…}}]]`).
+        fragments.extend(std::mem::take(&mut *self.ext_fragments.borrow_mut()));
         let tokens = self.render_links(tokens, &mut fragments, next_id, Some(&title));
         let tokens = self.render_external_links(tokens, &mut fragments, next_id);
         let tokens = self.render_behavior_switches(tokens);

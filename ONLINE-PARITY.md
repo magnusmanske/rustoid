@@ -9500,3 +9500,42 @@ is green. The next `Zebro` difference is a `<style data-mw-deduplicate>` for
 `Plainlist/styles.css` that parsoid emits inside the transclusion span and
 rustoid omits — the same missing-in-content-styles gap (31 vs 5) that the
 citation case exposed, now the leading one.
+
+## A caption's `<templatestyles>` is resolved against the document fragment space
+The difference the interleave exposed is now gone: rustoid emitted a
+`mw:Transclusion` span with *no* `<style>` where parsoid had the
+`Plainlist/styles.css` (and `Legend/styles.css`) sheet. Reduced to
+`[[File:Example.jpg|thumb|{{#invoke:list|unbulleted|a|b}}]]`: rustoid's
+`<figcaption>` carried the `plainlist` `<div>` but not the sheet.
+
+The sheet is resolved while the caption's `mw:maybeContent` value is expanded
+(`expand_attributes`), and `number_style_placeholders` stashes it in
+`self.ext_fragments`. But a caption is rendered by its own sub-pipeline, and that
+pipeline was handed a **fresh** fragment map and a **fresh** id counter:
+
+```
+&mut |items| { let mut f = HashMap::new(); let id = Cell::new(0); … }
+```
+
+so the placeholder's `data-fragment-id` (a slot in the document-wide
+`Env::newFragmentId` space) named nothing and the `<style>` vanished. The
+`CaptionFragmentBuilder` now takes the map and counter as arguments, and every
+call site passes the real ones, so a caption resolves the same fragments as the
+page. `WikiLinkHandler` likewise renders a caption through `PipelineUtils`, never
+a private fragment space.
+
+The other half is *when* the stash becomes visible: `build_ast` folded
+`ext_fragments` into `fragments` only at the very end, after `render_links` had
+already rendered the captions. The fold now happens once, right before
+`render_links`. Doing the fold *per token* inside `expand_attributes` instead
+**dropped every hatnote `<style>`** (Zebra 2172 → 795): a value rendered there
+resolved the page's style fragments into its own `data-mw` html, orphaning the
+placeholders that still needed them at tree-build time. One fold, after the
+chunk loop, has neither problem.
+
+### Effect
+`Zebro`: 24 039 → **25 089** (17.56% → 18.33%). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
+5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
+sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
+the workspace is green.

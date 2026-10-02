@@ -305,11 +305,7 @@ fn render_media_sync(title_str: &str, opts_str: &str, config: &dyn SiteConfig) -
                 false,
                 &mut fragments,
                 &next_id,
-                &mut |items| {
-                    let mut f = std::collections::HashMap::new();
-                    let id = std::cell::Cell::new(0usize);
-                    render_inline_fragment(config, items, &mut f, &id)
-                },
+                &mut |items, f, id| render_inline_fragment(config, items, f, id),
             )
         })
         .collect();
