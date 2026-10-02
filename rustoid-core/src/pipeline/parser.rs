@@ -3995,6 +3995,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
 
             // Expand each templated key/value (template args and templates).
+            //
+            // A token that came out of a template body (`synthesized`) has its
+            // attribute values expanded the way that body's pipeline did: with
+            // `inTemplate = true`, so a template in the value is *not* wrapped in
+            // its own `mw:Transclusion` markers. Parsoid gets the same result
+            // because the preprocessor expanded the body before Parsoid saw it;
+            // rustoid emulates that by not spending an `about` id here (a
+            // category link whose target is `{{{pagetype|{{pagetype}}}…}}`
+            // otherwise burned one id per page — see `Template:Short
+            // description`).
+            let in_tpl = tok.data_parsoid().is_some_and(|dp| dp.tmp.synthesized);
             let outer_fragments = &mut *fragments;
             let fragments = std::cell::RefCell::new(std::mem::take(outer_fragments));
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
@@ -4006,8 +4017,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             toks.clone(),
                             source,
                             about_counter,
-                            false,
-                            false,
+                            in_tpl,
+                            in_tpl,
                             page_source.unwrap_or(""),
                         )
                         .await;
@@ -4027,8 +4038,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             toks.clone(),
                             source,
                             about_counter,
-                            false,
-                            false,
+                            in_tpl,
+                            in_tpl,
                             page_source.unwrap_or(""),
                         )
                         .await;

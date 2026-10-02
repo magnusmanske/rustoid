@@ -9412,3 +9412,60 @@ chunk's `TemplateHandler`. So a caption's nested expansion lands after the whole
 page's templates here rather than after its own chunk's. Moving the link/media
 pass into the per-chunk flow is a larger refactor than the ref-body fix was;
 recorded, not attempted.
+
+## A body's attribute values are expanded with `inTemplate`
+At 2172 on `Zebro`'s sibling `Zebra`, and independently at 5161 on
+`Help:Introduction`, the id sequence is short a spurious expansion. The cause
+turned out to be a rule rustoid was missing, exposed by an experiment that was
+reverted.
+
+### The reverted experiment: interleaving `expand_attributes` per chunk
+The previous session left an uncommitted change that split `build_ast` into
+per-line chunks and ran `expand_templates → expand_in_attributes →
+expand_attributes` inside the loop, mirroring Parsoid's
+`TokenHandlerPipeline::processChunk`. It was never compiled or tested. Compiling
+and running it **regressed `Zebra` from 2172 to 621**: parsoid's `distinguish`
+transclusion is `#mwt2`, rustoid's `#mwt3`. One `about` id was spent between the
+`{{Short description}}` wrapper (`#mwt1`) and `distinguish` — and the id was
+never emitted, so the trace (`RUSTOID_TRACE_ABOUT`) was the only way to see it.
+
+`RUSTOID_TRACE_ABOUT=bt` named the allocator: chunk 1's `expand_attributes`
+itself, via `expand_templates → expand_template_token`. The chunk-1 token is the
+short-description output, and its `[[Category:{{{pagetype|{{pagetype…}}}}} with
+short description]]` is a wikilink whose `href` is a *token array* (the
+`{{{pagetype}}}` default is a template). `expand_attributes` expanded that array
+with `in_template = false`, so the nested `{{pagetype}}` took an `about` id.
+Moving `expand_attributes` into the loop only moved that id earlier; it did not
+create it. The change was reverted uncommitted.
+
+### The rule
+Parsoid's `AttributeExpander::buildExpandedAttrs` passes
+`$wrapTemplates = !$this->options['inTemplate']` to `stripMetaTags`, and the
+`mw:ExpandedAttrs` `about` is added only when a meta in the value set
+`hasGeneratedContent` — which `stripMetaTags` does only under `$wrapTemplates`.
+So when the token belongs to a **template body** (`inTemplate = true`), an
+attribute value that expands to a transclusion gets **no** `about` and **no**
+`mw:ExpandedAttrs`. rustoid already suppresses the *marking* for such tokens
+(`TempData::synthesized`, `build_expanded_attrs`), but it still ran the nested
+`expand_templates` with `in_template = false`, so the expansion inside the value
+was wrapped and spent an id anyway.
+
+`expand_attributes` now reads `synthesized` off the token and expands that
+token's key/value arrays with `in_template = true` — the body-pipeline value — so a template reached through a body's attribute is unwrapped. On
+`{{Short description|…}}` the trace drops from `#mwt1, #mwt2` to `#mwt1`; the
+rendered category link is byte-identical either way.
+
+This is the prerequisite the reverted experiment needed: the spurious id is what
+made interleaving look like a regression. Whether the interleave is worth
+finishing (the caption id at 23 570 needs `render_links` moved per chunk, not
+`expand_attributes`) is the next question, but it is now separable.
+
+### Effect
+No measured first difference moves: the id was spent late (after every
+top-level template) and was swallowed by `stripMetaTags` before rendering, so it
+only ever shifted ids *after* it. `Zebra` 2172, `Bicycle` 11836,
+`Help:Introduction` 5161, `Nobel Prize` 5926, `Sundial` 3934, `List of
+sovereign states` 8409, `Quicksilver (film)` 4213 — all unchanged. The fixture
+guard holds at 877/896 (it cannot see ids), and the whole workspace is green.
+Recorded here rather than shipped as a no-op: it is a real id drift, and it is
+the difference between the per-chunk experiment regressing and not.
