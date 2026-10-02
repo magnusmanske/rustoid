@@ -707,6 +707,11 @@ fn apply_media_info(
             dp.set_sa("resource", href_src);
         }
     }
+    // Serialize the shadow info into `data-parsoid`. PHP's `AddMediaInfo`
+    // leaves the img with a `data-parsoid` (the transform endpoint shows
+    // `{"a":{…},"sa":{…}}` and no `dsr`), which is both the round-trip payload
+    // and what makes the id pass stamp the img an id.
+    img.data_parsoid = img.dp.as_ref().and_then(|dp| dp.to_data_parsoid_json());
     // `src` comes from `thumbattribs`, whose first key it is; PHP then overwrites
     // it with `getPath` (the same URL), so it stays in place.
     img.set_attr("src", &src);

@@ -251,21 +251,25 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
     let mut assigned = 0;
 
     if node.kind.is_element() {
-        // A node takes an id when the reference has something to key it by: a
-        // `data-mw`, or a `data-parsoid` that says where the node came from.
-        // "Where it came from" is the source range — a link whose target was
-        // resolved inside a `#if`/`#ifeq` branch has none, and the service gives
-        // it no id (see `mark_in_text_branch`). The `empty_dp_slot` case is the
-        // same distinction from the other side; a `<section>` has no
-        // `data-parsoid` yet still takes the document's first id.
+        // A node takes an id when it has metadata to key it by: a `data-mw`, a
+        // *non-empty* `data-parsoid`, or the empty-dp-slot case. Parsoid's rule
+        // is `!$dp->isEmpty()`, and `DataParsoid::isEmpty` is false as soon as
+        // any serializable field is present — a source range, but equally a
+        // rendered/source attribute pair, an `stx`, a `pi`. A media `<img>` is
+        // the common case: its `data-parsoid` carries `a`/`sa` and no `dsr`, and
+        // the service still stamps it an id, which a source-range-only test
+        // missed. Only `tmp` is discounted, as Parsoid discounts it — it is
+        // transient and never serialized. The `empty_dp_slot` case is the
+        // distinction from the other side; a `<section>` has no `data-parsoid`
+        // yet still takes the document's first id.
         //
         // An empty `id=""` is treated as absent, as Parsoid does ("Forcibly
         // reset the ID if it is invalid").
-        let has_source_range = node
+        let has_dp = node
             .data_parsoid
             .as_deref()
-            .is_some_and(|json| json.contains("\"tsr\"") || json.contains("\"dsr\""));
-        let has_metadata = has_source_range || node.data_mw.is_some() || node.empty_dp_slot;
+            .is_some_and(data_parsoid_draws_an_id);
+        let has_metadata = has_dp || node.data_mw.is_some() || node.empty_dp_slot;
         let has_id = node.get_attr("id").is_some_and(|v| !v.is_empty());
         if has_metadata && !has_id {
             let id = alloc.next_id();
@@ -278,6 +282,20 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
         assigned += assign_walk(child, alloc);
     }
     assigned
+}
+
+/// Whether a `data-parsoid` makes its node take a generated id.
+///
+/// Mirrors `DataParsoid::isEmpty`: any serializable field counts, but a
+/// `tmp`-only object does not (`tmp` is transient and dropped before
+/// serialization, so it would have been `{}`).
+fn data_parsoid_draws_an_id(json: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Object(map)) => {
+            !map.is_empty() && !(map.len() == 1 && map.contains_key("tmp"))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -378,24 +396,33 @@ mod tests {
         n
     }
 
-    /// A `data-parsoid` with no source range is not something to key a node by.
+    /// A `data-parsoid` with only the transient `tmp` is not something to key a
+    /// node by; anything serializable is.
     ///
-    /// A link whose target was resolved inside an `#if`/`#ifeq` branch carries
-    /// one — `stx`, but no `tsr`/`dsr` — and the service gives that link no id, so
-    /// an element holding it must not consume a counter either.
+    /// Parsoid's rule is `!$dp->isEmpty()`, and `isEmpty` is false as soon as a
+    /// serializable field exists — a source range, but equally the `a`/`sa`
+    /// attribute pair a media `<img>` carries with no `dsr`. A `tmp`-only object
+    /// serializes to `{}`, so it draws no id.
     #[test]
-    fn a_data_parsoid_without_a_source_range_takes_no_id() {
+    fn a_data_parsoid_draws_an_id_unless_it_is_empty() {
         let mut root = Node::document();
-        for json in ["{}", "{\"stx\":\"simple\"}"] {
+        for json in [
+            "{}",
+            r#"{"tmp":{"inTextBranch":true}}"#,
+            r#"{"stx":"simple"}"#,
+            r#"{"a":{"resource":"./File:X.jpg"},"sa":{"resource":"X.jpg"}}"#,
+        ] {
             let mut n = Node::element(ElementKind::Other("span".to_string()));
             n.data_parsoid = Some(json.to_string());
             root.push_child(n);
         }
         root.push_child(storable());
         assign_node_ids(&mut root);
-        assert_eq!(root.children[0].get_attr("id"), None);
-        assert_eq!(root.children[1].get_attr("id"), None);
-        assert_eq!(root.children[2].get_attr("id"), Some("mwAQ"));
+        assert_eq!(root.children[0].get_attr("id"), None, "an empty dp");
+        assert_eq!(root.children[1].get_attr("id"), None, "a tmp-only dp");
+        assert_eq!(root.children[2].get_attr("id"), Some("mwAQ"), "stx");
+        assert_eq!(root.children[3].get_attr("id"), Some("mwAg"), "a/sa");
+        assert_eq!(root.children[4].get_attr("id"), Some("mwAw"), "dsr");
     }
 
     /// An element with no metadata to key, which must not consume a counter.
