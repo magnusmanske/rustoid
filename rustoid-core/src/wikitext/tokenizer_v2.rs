@@ -2383,6 +2383,25 @@ impl<'a> PegTokenizer<'a> {
     }
 
     /// Try an HTML tag: `<tag attr="val">` or `</tag>`
+    /// Whether the literal HTML tag at the cursor is one the sanitizer allows
+    /// (`Consts::$Sanitizer['AllowedLiteralTags']`).
+    fn peek_allowed_html_tag(&self) -> bool {
+        let rest = self.remaining();
+        let name = rest
+            .strip_prefix("</")
+            .or_else(|| rest.strip_prefix('<'))
+            .map(|r| {
+                r.split(|c: char| c.is_whitespace() || matches!(c, '>' | '/'))
+                    .next()
+                    .unwrap_or("")
+            })
+            .unwrap_or("");
+        !name.is_empty()
+            && crate::pipeline::sanitizer_handler::allowed_literal_tags()
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(name))
+    }
+
     fn try_html_tag(&mut self) -> bool {
         if !self.starts_with("<") {
             return false;
@@ -5286,6 +5305,29 @@ fn tokenize_directives_and_quotes(
             items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
             continue;
         }
+        // Literal HTML tags in link *content* (`[https://… <i>Title</i>]`, the
+        // shape CS1 emits for an archive link's italicised title) are markup, not
+        // text. They carry `stx: "html"`, which is also what makes the tree
+        // builder draw them a node id. Link *targets* have no HTML production
+        // (`wikilink_preprocessor_text`), so this stays inside `quotes`.
+        //
+        // Only tags the sanitizer allows: a disallowed tag (`<script>`) must stay
+        // text. Parsoid's `SanitizerHandler` turns it back into text anyway, but
+        // it runs on the token stream and never visits tokens nested inside an
+        // attribute value — which is where link content sits when it runs.
+        if quotes && tk.starts_with("<") && tk.peek_allowed_html_tag() {
+            let out_len = tk.output_len();
+            if tk.try_html_tag() {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                items.extend(tk.drain_output(out_len).into_iter().map(|e| match e {
+                    Either::Left(s) => Item::Str(s),
+                    Either::Right(t) => Item::Tok(t),
+                }));
+                continue;
+            }
+        }
         let Some(ch) = tk.peek_char() else {
             break;
         };
@@ -6938,14 +6980,38 @@ mod tests {
                 _ => None,
             })
             .expect("wikilink token");
-        // One `mw:maybeContent` KV (a single pipe), with the tag intact.
-        let content: Vec<&str> = link
+        // One `mw:maybeContent` KV (a single pipe), with the tag intact. The
+        // value is a token array rather than a string because link content is
+        // tokenized as `inlineline`: an HTML tag in it is markup (it carries
+        // `stx: "html"`), not text.
+        let maybe: Vec<_> = link
             .attribs
             .iter()
             .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
-            .filter_map(|kv| kv.value.as_str())
             .collect();
-        assert_eq!(content, vec!["<span class=\"a|b\">c</span>"]);
+        assert_eq!(
+            maybe.len(),
+            1,
+            "the `|` inside the attribute must not split the link text"
+        );
+        let tokens = match &maybe[0].value {
+            crate::wikitext::tokens_v2::KeyValue::Tokens(t) => t,
+            other => panic!("expected a token array, got {other:?}"),
+        };
+        let span = tokens
+            .iter()
+            .find_map(|it| match it {
+                Item::Tok(ParsoidToken::Tag(tk)) if tk.name == "span" => Some(tk),
+                _ => None,
+            })
+            .expect("the <span> tag is intact");
+        assert_eq!(
+            span.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("class"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("a|b")
+        );
     }
 
     #[test]

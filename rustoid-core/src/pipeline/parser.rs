@@ -2922,18 +2922,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::display_space::run(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
-        // AddRedLinks: resolve which wikilink targets exist, marking missing
-        // ones as red links. Gather the relevant page titles, batch-check their
-        // existence via the data source, then apply the pass.
-        let mut titles = Vec::new();
-        crate::pipeline::add_red_links::collect_wikilink_titles(&ast, &mut titles);
-        if !titles.is_empty() {
-            let page_info = match source {
-                Some(source) => source.get_page_info(&titles).await.unwrap_or_default(),
-                None => std::collections::HashMap::new(),
-            };
-            crate::pipeline::add_red_links::run(&mut ast, &page_info, &page_title_prefixed);
-        }
         // AddMediaInfo: resolve file metadata for `mw:File` containers and
         // replace broken-media placeholders with real `<img>` elements (or mark
         // missing files as `mw:Error`). Mirrors PHP's `AddMediaInfo` pass.
@@ -2985,6 +2973,24 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // Hand the advanced counter back: ids are allocated in document
             // order, so anything numbered after Cite must continue from here.
             about_counter.set(ids.about_counter());
+        }
+        // AddRedLinks: resolve which wikilink targets exist, marking missing
+        // ones as red links and redirect targets with `mw-redirect`. It runs
+        // *after* Cite because a note's body only reaches the DOM when Cite
+        // renders the reference list, and Parsoid's AddRedLinks sees the final
+        // DOM: a `{{cite journal}}` note's `[[Doi (identifier)|doi]]` link
+        // carries `mw-redirect` on the served page.
+        //
+        // `titles` are gathered from the final tree, so the notes' targets are
+        // batch-checked with everything else.
+        let mut titles = Vec::new();
+        crate::pipeline::add_red_links::collect_wikilink_titles(&ast, &mut titles);
+        if !titles.is_empty() {
+            let page_info = match source {
+                Some(source) => source.get_page_info(&titles).await.unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            };
+            crate::pipeline::add_red_links::run(&mut ast, &page_info, &page_title_prefixed);
         }
         // DedupeStyles runs over the tree just made final by Cite: a note's
         // `<templatestyles>` is emitted full at its first occurrence and as a

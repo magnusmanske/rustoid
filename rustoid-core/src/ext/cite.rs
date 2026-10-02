@@ -899,6 +899,10 @@ pub fn references_list_nodes(
             li.push_child(text);
         }
         ol.push_child(li);
+        // Backward-compatibility: a newline follows every note (T372889, PHP
+        // `RefGroup::renderReferenceListElement`). It is a real text node child
+        // of the `<ol>`, so it is serialized as `</li>\n<li …` and `</li>\n</ol>`.
+        ol.push_child(Node::text("\n"));
     }
     ol
 }
