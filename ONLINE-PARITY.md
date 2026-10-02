@@ -9091,3 +9091,64 @@ trim — invisible while `tokens_to_string` dropped it, fatal once
   no longer merge.
 - Fixture guard **877/896**, workspace tests green. `trim_items` has a unit test
   that asserts the edge `Nl` tokens are gone.
+
+## The navbox `Template loop detected`, and the stale `src` under it
+
+After the `above` list fix the Olympic Games navbox still diverged structurally:
+**13 of the service's 16 `navbox-subgroup` tables**, 50 of 63 `navbox-group`
+cells, and `INA` 3 against 20 — the medal table's rows are among the missing
+output. The cause reduced to one line against the transform endpoint:
+
+```
+{{Navbox
+| name = Test
+| title = Test
+| list1 = {{Navbox|child
+  | group1 = G
+  | list1 = * A
+  }}
+}}
+```
+
+Rustoid renders `<span class="error">Template loop detected: Template:Navbox</span>`
+where the service renders the nested navbox. The service's `Module:Navbox` is
+*not* looping: rustoid is.
+
+### The chain, and the stale `src` that builds it
+
+Tracing the expansion (`RUSTOID_DBG_FRAME`) gives it exactly. The `list1` value
+is expanded — correctly, in the caller's frame — to real HTML; its tokens are
+`div`/`table`/`tr`/`th`/`td`/`listItem`/`wikilink`, and `expandable_content`
+finds no template in them, so `expand_invoke_args` leaves the value alone. The
+text the module then receives is built by `argument_value_text`, whose live-tag
+arm reads each token's `data_parsoid.src` — and for these expanded tokens that
+`src` is the **stale template call**, `{{Navbox|child…}}`. So `frame.args.list1`
+is the raw call, `Module:Navbox` echoes it with `:wikitext()`, and the `#invoke`
+output re-expansion meets `{{Navbox}}` again in a frame whose chain is
+`["Template:Navbox", "Template:Navbox", "Sandbox"]` (the output runs in a child
+of the `Template:Navbox` frame) — a genuine-looking loop, replaced by the error
+span.
+
+So the navbox gap is the *same* missing piece the docs already name for the
+`about` drift: a faithful token→**expanded-wikitext** serializer. `argument_value_text`
+covers every token shape for values whose `src` is the written text, but an
+already-expanded value needs its HTML/wikitext rebuilt from the tokens
+(each tag from its attributes), not read back from a `src` that still holds the
+call that produced it. `{{Main other|{{Main other|X}}}}` works because that
+value goes through `{{{1}}}` substitution, which splices the tokens directly;
+the `#invoke` path renders to text first, and that is where the `src` is stale.
+
+### Reverted, not shipped
+
+`expand_invoke`'s `frame:getParent().args` are expanded in the invoke frame;
+MediaWiki expands them in the *caller* (`PPTemplateFrame_Hash::getNamedArgument`
+uses `$this->parent`), so a first attempt routed `ArgSource::Parent` slots
+through `frame.parent()`. It changed no output here — because the values arrive
+already expanded, `expand_invoke_args` skips them — so it was reverted rather
+than shipped as a no-op, and the node reverted with it. The correct fix is the
+expanded-value serializer above; recorded so the next session starts at it.
+
+Effect of the `above`/trim commits on this page, for the record: rustoid
+1 282 656 → 1 288 905 bytes, first difference unchanged at **byte 8910
+(0.47% of parsoid)**, corpus output 30 492 786 → 30 557 367 bytes at the same
+0.61x, still 0/41 pages passing.
