@@ -2888,6 +2888,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             about_counter.set(ids.about_counter());
         }
         wrap_sections_in_ast(&mut ast, options.wrap_sections);
+        // Core appends the table-of-contents placeholder to section 0 of a
+        // main-namespace page that has enough headings and no `__TOC__`/
+        // `__NOTOC__`. It needs the sections to already exist, so it runs here.
+        crate::pipeline::auto_toc::insert(&mut ast, title.namespace_id == 0);
         // PHP marks the `data-parsoid` a transclusion's interior nodes may not
         // keep as its cleanup traverser stores them, i.e. just before the ids are
         // handed out. Doing it here leaves every earlier pass its `dp`.

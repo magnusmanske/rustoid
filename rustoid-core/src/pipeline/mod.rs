@@ -8,6 +8,7 @@ pub mod add_media_info;
 pub mod add_red_links;
 pub mod attribute_expander;
 pub mod attribute_transform_manager;
+pub mod auto_toc;
 pub mod behavior_switch_handler;
 pub mod cleanup;
 pub mod compute_dsr;
