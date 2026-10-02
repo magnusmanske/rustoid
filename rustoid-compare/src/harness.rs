@@ -1279,6 +1279,13 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     };
 
     let outcome = compare_html(&parsoid_html, &rustoid_html);
+    // Optional side-by-side dump, for reducing a difference: both renderings
+    // written verbatim under `$RUSTOID_DUMP_DIR`.
+    if let Ok(dir) = std::env::var("RUSTOID_DUMP_DIR") {
+        let dir = std::path::Path::new(&dir);
+        let _ = std::fs::write(dir.join("parsoid.html"), &parsoid_html);
+        let _ = std::fs::write(dir.join("rustoid.html"), &rustoid_html);
+    }
     // Only a difference can be misattributed; a match is a match whatever the
     // facts' age. Naming the drifted fact here keeps a wiki-drift difference from
     // being chased as a parser bug.

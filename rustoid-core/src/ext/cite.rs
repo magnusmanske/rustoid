@@ -85,6 +85,16 @@ pub struct Reference {
     /// merely fills in the text. The `data-mw` `body` pointer follows the text,
     /// so it lands on the defining use rather than on use zero.
     pub body_use: Option<usize>,
+    /// The `about` id of the use that supplied this note's body.
+    ///
+    /// A `<ref>` body is expanded *at the ref site* during template expansion
+    /// (`Parser::expand_templates`), and the resulting DOM is stashed under that
+    /// about. The list renderer looks the body up by this key instead of
+    /// re-tokenizing the wikitext, which is what gets the body's own extension
+    /// ids (its `<templatestyles>`, say) spent in the position the service spends
+    /// them — before the marker's id, and after the templates of the enclosing
+    /// chunk.
+    pub body_about: Option<String>,
 }
 
 impl Reference {
@@ -171,7 +181,16 @@ impl CiteState {
     ///
     /// `body` is the ref's wikitext content; `self_closing` marks the
     /// `<ref name="x" />` form. A named ref seen before reuses the existing note.
-    pub fn add(&mut self, name: &str, group: &str, body: &str, self_closing: bool) -> String {
+    /// `about` is the id the expansion spent on this use, which the body renderer
+    /// uses to find the pre-expanded note content.
+    pub fn add(
+        &mut self,
+        name: &str,
+        group: &str,
+        body: &str,
+        self_closing: bool,
+        about: Option<&str>,
+    ) -> String {
         // A named ref is identified by its *name*, so `<ref name="x" />` finds the
         // note that `<ref name="x">…</ref>` defined. An anonymous one is identified
         // by its content, so the same text twice shares a note — which is what Cite
@@ -199,6 +218,7 @@ impl CiteState {
                     global_id,
                     uses: Vec::new(),
                     body_use: None,
+                    body_about: None,
                 });
                 let i = self.references.len() - 1;
                 self.index.insert(key, i);
@@ -213,6 +233,7 @@ impl CiteState {
         if defines {
             self.references[idx].body = body.to_string();
             self.references[idx].self_closing = false;
+            self.references[idx].body_about = about.map(str::to_string);
         }
 
         // The id is keyed on the note the ref *resolved to*, not on this call's
@@ -432,7 +453,7 @@ pub fn run(
     root: &mut crate::dom::node::Node,
     page_title: &str,
     ids: &mut DocIds,
-    body_of: &dyn Fn(&str) -> crate::dom::node::Node,
+    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
 ) -> usize {
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
@@ -451,7 +472,8 @@ pub fn run(
 /// state only this walk can build, so it is handled during substitution.
 fn collect(node: &crate::dom::node::Node, state: &mut CiteState, use_ids: &mut Vec<String>) {
     if let Some((name, group, body, self_closing)) = read_ref(node) {
-        use_ids.push(state.add(&name, &group, &body, self_closing));
+        let about = node.get_attr("about");
+        use_ids.push(state.add(&name, &group, &body, self_closing, about));
     }
     for child in &node.children {
         collect(child, state, use_ids);
@@ -564,7 +586,7 @@ fn render(
     state: &CiteState,
     page_title: &str,
     ids: &mut DocIds,
-    body_of: &dyn Fn(&str) -> crate::dom::node::Node,
+    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
     use_ids: &mut [String],
 ) -> usize {
     let mut rendered = 0usize;
@@ -589,7 +611,7 @@ fn walk_render(
     state: &CiteState,
     page_title: &str,
     ids: &mut DocIds,
-    body_of: &dyn Fn(&str) -> crate::dom::node::Node,
+    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
     use_ids: &mut [String],
     next_use: &mut usize,
     rendered: &mut usize,
@@ -606,7 +628,7 @@ fn walk_render(
         // caller supplied works in terms of wikitext. Bridging here keeps the
         // renderer's signature about what it needs rather than about what happens to
         // be available.
-        let body = |r: &Reference| body_of(&r.body);
+        let body = |r: &Reference| body_of(r);
         let list = references_list_nodes(&refs, &group, page_title, &body);
         let mut wrap = crate::dom::node::Node::element(crate::dom::node::ElementKind::Other(
             "div".to_string(),
@@ -896,9 +918,9 @@ mod tests {
     #[test]
     fn numbering_follows_first_use_order() {
         let mut st = CiteState::new();
-        st.add("", "", "first", false);
-        st.add("", "", "second", false);
-        st.add("", "", "first", false);
+        st.add("", "", "first", false, None);
+        st.add("", "", "second", false, None);
+        st.add("", "", "first", false, None);
         assert_eq!(st.references.len(), 2, "the repeat must not add a note");
         assert_eq!(st.references[0].number, 1);
         assert_eq!(st.references[1].number, 2);
@@ -910,8 +932,8 @@ mod tests {
     #[test]
     fn a_named_ref_is_shared_between_uses() {
         let mut st = CiteState::new();
-        st.add("x", "", "body", false);
-        st.add("x", "", "", true);
+        st.add("x", "", "body", false, None);
+        st.add("x", "", "", true, None);
         assert_eq!(st.references.len(), 1);
         assert_eq!(st.references[0].uses.len(), 2);
         assert_eq!(st.references[0].uses[1], "cite_ref-x_1-1");
@@ -921,8 +943,8 @@ mod tests {
     #[test]
     fn groups_number_independently() {
         let mut st = CiteState::new();
-        st.add("", "lower-alpha", "a", false);
-        st.add("", "", "main", false);
+        st.add("", "lower-alpha", "a", false, None);
+        st.add("", "", "main", false, None);
         assert_eq!(st.references[0].group, "lower-alpha");
         assert_eq!(st.references[0].number, 1);
         assert_eq!(
@@ -938,12 +960,12 @@ mod tests {
     #[test]
     fn ids_match_cites_scheme() {
         let mut st = CiteState::new();
-        let id = st.add("Badenhorst2019", "", "body", false);
+        let id = st.add("Badenhorst2019", "", "body", false, None);
         assert_eq!(id, "cite_ref-Badenhorst2019_1-0");
         assert_eq!(st.references[0].note_id(), "cite_note-Badenhorst2019-1");
 
         let mut st = CiteState::new();
-        let id = st.add("", "", "anon", false);
+        let id = st.add("", "", "anon", false, None);
         assert_eq!(id, "cite_ref-1");
         assert_eq!(st.references[0].note_id(), "cite_note-1");
     }
@@ -953,8 +975,8 @@ mod tests {
         // Cite cannot know at the first use whether the ref will be reused, so
         // the marker is `cite_ref-1`; the reuse appends `-1`.
         let mut st = CiteState::new();
-        let first = st.add("", "", "same", false);
-        let second = st.add("", "", "same", true);
+        let first = st.add("", "", "same", false, None);
+        let second = st.add("", "", "same", true, None);
         assert_eq!(first, "cite_ref-1");
         assert_eq!(second, "cite_ref-1-1");
         assert_eq!(st.references[0].note_id(), "cite_note-1");
@@ -972,8 +994,8 @@ mod tests {
     #[test]
     fn an_anonymous_repeat_shares_by_body() {
         let mut st = CiteState::new();
-        st.add("", "", "same", false);
-        st.add("", "", "same", false);
+        st.add("", "", "same", false, None);
+        st.add("", "", "same", false, None);
         assert_eq!(
             st.references.len(),
             1,
@@ -994,7 +1016,7 @@ mod tests {
     #[test]
     fn ref_data_mw_matches_the_cached_shape() {
         let mut st = CiteState::new();
-        st.add("Badenhorst2019", "", "", true);
+        st.add("Badenhorst2019", "", "", true, None);
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{"name":"Badenhorst2019"}}"#
@@ -1004,7 +1026,7 @@ mod tests {
         // the text is rendered into the reference list, and `extsrc` is not what
         // the served page carries.
         let mut st = CiteState::new();
-        st.add("", "", "some text", false);
+        st.add("", "", "some text", false, None);
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{},"body":{"id":"mw-reference-text-cite_note-1"}}"#
@@ -1026,7 +1048,7 @@ mod tests {
     #[test]
     fn ref_marker_has_the_cached_structure() {
         let mut st = CiteState::new();
-        st.add("Badenhorst2019", "", "", true);
+        st.add("Badenhorst2019", "", "", true, None);
         let mut ids = DocIds::new();
         let sup = ref_marker_nodes(
             &st.references[0],
@@ -1082,7 +1104,7 @@ mod tests {
     #[test]
     fn a_single_use_note_has_a_bare_backlink() {
         let mut st = CiteState::new();
-        st.add("", "", "body", false);
+        st.add("", "", "body", false, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
         let ol = references_list_nodes(&refs, "", "Zebra", &|_| {
             crate::dom::node::Node::text("BODY")
@@ -1125,8 +1147,8 @@ mod tests {
     #[test]
     fn several_uses_are_wrapped_and_numbered() {
         let mut st = CiteState::new();
-        st.add("Badenhorst2019", "", "body", false);
-        st.add("Badenhorst2019", "", "", true);
+        st.add("Badenhorst2019", "", "body", false, None);
+        st.add("Badenhorst2019", "", "", true, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
         let ol = references_list_nodes(&refs, "", "Zebra", &|_| crate::dom::node::Node::text("B"));
         let li = &ol.children[0];
@@ -1161,7 +1183,7 @@ mod tests {
     #[test]
     fn a_group_adds_the_group_attributes() {
         let mut st = CiteState::new();
-        st.add("", "lower-alpha", "a", false);
+        st.add("", "lower-alpha", "a", false, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
         let ol = references_list_nodes(&refs, "lower-alpha", "Zebra", &|_| {
             crate::dom::node::Node::text("A")
@@ -1201,7 +1223,7 @@ mod tests {
     #[test]
     fn ref_data_mw_points_at_the_defining_use_not_the_first() {
         let mut st = CiteState::new();
-        st.add("x", "", "hello", false);
+        st.add("x", "", "hello", false, None);
         // Only use, and it defines: the pointer is here.
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
@@ -1211,8 +1233,8 @@ mod tests {
         // Reuse first, then the definition: the pointer moves to use 1, and use 0
         // carries none. This is the shape `Zebra` opens with.
         let mut st = CiteState::new();
-        st.add("x", "", "", true);
-        st.add("x", "", "hello", false);
+        st.add("x", "", "", true, None);
+        st.add("x", "", "hello", false, None);
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{"name":"x"}}"#

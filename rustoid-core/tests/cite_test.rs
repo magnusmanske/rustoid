@@ -75,7 +75,7 @@ async fn render(wikitext: &str) -> String {
 #[test]
 fn the_pages_first_reference_yields_cites_ids() {
     let mut st = CiteState::new();
-    let marker = st.add("Badenhorst2019", "", "", true);
+    let marker = st.add("Badenhorst2019", "", "", true, None);
     assert_eq!(marker, "cite_ref-Badenhorst2019_1-0");
     assert_eq!(st.references[0].note_id(), "cite_note-Badenhorst2019-1");
     // The number is 1 because it is the first ref *used*, not because it is first

@@ -215,6 +215,15 @@ fn templatestyles_title(config: &dyn crate::traits::SiteConfig, src: &str) -> cr
     crate::title::Title::new(ns_id, name.replace('_', " "))
 }
 
+/// The `name` attribute of an `extension` token, lower-cased by the tokenizer.
+fn extension_name(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> Option<String> {
+    stt.attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("name"))
+        .and_then(|kv| kv.value.as_str())
+        .map(str::to_string)
+}
+
 /// Extract the raw body source from a `<pre format="wikitext">` extension token.
 fn extension_body(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String {
     let ext_src = stt
@@ -1068,6 +1077,18 @@ pub struct Parser<'a, C: SiteConfig> {
     /// marker: text the module may hold and move, mapped back to the placeholder
     /// tokens to splice when the output is re-expanded.
     strip_markers: std::cell::RefCell<std::collections::HashMap<String, Vec<Item>>>,
+    /// `<ref>` bodies expanded at the ref site, keyed by the `about` id the
+    /// chunk's extension pass assigned to the use that supplied the body.
+    ///
+    /// A `<ref>`'s content is wikitext that PHP expands while it handles the
+    /// extension token (`RefTagHandler::sourceToDom` → `extTagToDOM`), i.e. in
+    /// TT2 after the chunk's templates and before the marker's own `about` id is
+    /// allocated (`ExtensionHandler::onDocumentFragment`). Cite's DOM pass then
+    /// *moves* the already-rendered nodes; it never re-parses the body. rustoid
+    /// keeps Cite as a late DOM pass, so it has to hand the expanded body over:
+    /// [`Parser::expand_templates`] renders it in that same position and stashes
+    /// it here for the list renderer to pick up.
+    ref_bodies: std::cell::RefCell<std::collections::HashMap<String, Node>>,
 }
 
 impl<'a, C: SiteConfig> Parser<'a, C> {
@@ -1089,6 +1110,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             arg_expansion: std::cell::Cell::new(0),
             style_defer: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
+            ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1528,12 +1550,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// When a data source and frame are supplied, nested templates/parser
     /// functions in the body are expanded first (mirroring the
     /// `expandTemplates` parse option of the PHP fragment pipeline).
+    /// `in_template` is that pipeline's `inTemplate` option: PHP's
+    /// `wikitextToDOM` forwards the *enclosing* pipeline's flag, so a body
+    /// reached from a template keeps it and one reached from the page does not
+    /// (its nested transclusions are wrapped).
     async fn process_fragment_body(
         &self,
         body: &str,
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Node {
         let mut tokens = match self.tokenize(body) {
             Ok(t) => t,
@@ -1546,7 +1573,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, true, false, body)
+                .expand_templates(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    in_template,
+                    false,
+                    body,
+                )
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
@@ -1973,7 +2008,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
             let body = extension_body(pre_stt);
             let sub = self
-                .process_fragment_body(&body, source, frame, about_counter)
+                .process_fragment_body(&body, source, frame, about_counter, true)
                 .await;
             let id = next_id.get();
             next_id.set(id + 1);
@@ -2827,11 +2862,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // the Cite module to hold a mutable borrow of state it does not own.
             let note_fragments = std::cell::RefCell::new(std::collections::HashMap::new());
             let next_note_id = std::cell::Cell::new(0usize);
-            let render_body = |body: &str| -> Node {
+            let render_body = |r: &crate::ext::cite::Reference| -> Node {
+                // A body expanded at the ref site (see `expand_templates`) is the
+                // faithful one: its templates were expanded there, and its own
+                // extension ids were spent in the right place. Only a body that
+                // never reached that pass — one built outside expansion, or
+                // deferred inside an `#invoke` argument — falls back to the
+                // synchronous inline render, which expands nothing.
+                if let Some(about) = &r.body_about
+                    && let Some(node) = self.ref_bodies.borrow().get(about)
+                {
+                    return node.clone();
+                }
                 let mut fragments = note_fragments.borrow_mut();
                 render_inline_fragment(
                     self.config,
-                    self.tokenize(body).unwrap_or_default(),
+                    self.tokenize(&r.body).unwrap_or_default(),
                     &mut fragments,
                     &next_note_id,
                 )
@@ -3035,182 +3081,272 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // A marker a module held and moved becomes the fragment placeholder it
         // stood for, in the position the module left it.
         let tokens = self.substitute_strip_markers(tokens);
-        let mut out = Vec::new();
-        // PHP's `tableDataBlock` context for the token being expanded: true while
-        // the walk sits inside an unclosed `table` tag. A template body expanded
-        // here inherits it, which is what lets the body's `|` split cells when the
-        // governing `{|` came from an *earlier* expansion (`{{start}}\n|a\n{{end}}`
-        // with `Template:start` = `{|`).
+        // PHP's TT2 (`TokenHandlerPipeline::processChunk`) processes the page
+        // **one top-level block at a time** — the tokenizer's `processChunkily`
+        // yields one block per chunk — and runs each transformer over the whole
+        // chunk, so a chunk's `TemplateHandler` precedes its `ExtensionHandler`.
+        // The id order therefore resets per block: a template after a ref on the
+        // *same* line still takes the lower id (`<ref>a</ref>{{1x|b}}` numbers the
+        // template `#mwt1`), while a template on a *later* line does not (Zebro's
+        // `{{reflist}}` takes `#mwt122`, not `#mwt8`). The flat token stream
+        // carries the boundary on every top-level `Nl`.
         //
-        // Tracked over *both* the input stream and the tokens emitted so far: a
-        // `{|` produced by expanding a previous template (`{{tbl-start}}`) opens
-        // the table for the tokens after it, exactly as a literal `{|` would.
+        // `table_depth` is deliberately *not* chunk state: a table spans lines,
+        // so it is carried across the chunks here.
+        let mut result = Vec::with_capacity(tokens.len());
         let mut table_depth = 0usize;
+        // Extension ids are not spent while an argument whose extensions are
+        // numbered where it lands in the output is being expanded. See
+        // [`Parser::arg_expansion`] and [`Parser::style_defer`]. The flags are
+        // constant across one `expand_templates` call, so this is read once.
+        let gated = self.in_arg_expansion() || self.in_style_defer();
+        let mut chunks: Vec<Vec<Item>> = Vec::new();
+        let mut chunk: Vec<Item> = Vec::new();
         for item in tokens {
-            track_table(&item, &mut table_depth);
-            let Item::Tok(tok) = &item else {
-                out.push(item);
-                continue;
-            };
-            let ParsoidToken::SelfclosingTag(stt) = tok else {
-                out.push(item);
-                continue;
-            };
-
-            // A `<templatestyles>` is resolved here so the CSS is fetched while
-            // the expansion is running, but its `about` id is *not* taken yet:
-            // this chunk's transclusions are numbered during the walk below, and
-            // Parsoid numbers a chunk's extensions only after them. The id is
-            // assigned by the `number_style_placeholders` post-pass at the end of
-            // the chunk.
-            if templatestyles_target(&item).is_some() {
-                let emitted = self.expand_one_templatestyles(&item, source).await;
-                out.extend(emitted);
-                continue;
+            if !chunk.is_empty() && matches!(&item, Item::Tok(ParsoidToken::Nl(_))) {
+                chunks.push(std::mem::take(&mut chunk));
             }
+            chunk.push(item);
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        for chunk in chunks {
+            let mut out = Vec::new();
+            for item in chunk {
+                track_table(&item, &mut table_depth);
+                let Item::Tok(tok) = &item else {
+                    out.push(item);
+                    continue;
+                };
+                let ParsoidToken::SelfclosingTag(stt) = tok else {
+                    out.push(item);
+                    continue;
+                };
 
-            if stt.name == "template" || stt.name == "template3" {
-                // Charge one preprocessor node for this expansion. On a limit
-                // trip PHP substitutes an error span here and returns, leaving
-                // the rest of the chunk to expand normally.
-                if let Some(error) = self.enter_pp_node() {
-                    out.extend(error);
+                // A `<templatestyles>` is resolved here so the CSS is fetched while
+                // the expansion is running, but its `about` id is *not* taken yet:
+                // this chunk's transclusions are numbered during the walk below, and
+                // Parsoid numbers a chunk's extensions only after them. The id is
+                // assigned by the `number_style_placeholders` post-pass at the end of
+                // the chunk.
+                if templatestyles_target(&item).is_some() {
+                    let emitted = self.expand_one_templatestyles(&item, source).await;
+                    out.extend(emitted);
                     continue;
                 }
-                let expanded = self
-                    .expand_template_token(
+
+                if stt.name == "template" || stt.name == "template3" {
+                    // Charge one preprocessor node for this expansion. On a limit
+                    // trip PHP substitutes an error span here and returns, leaving
+                    // the rest of the chunk to expand normally.
+                    if let Some(error) = self.enter_pp_node() {
+                        out.extend(error);
+                        continue;
+                    }
+                    let expanded = self
+                        .expand_template_token(
+                            frame,
+                            &item,
+                            stt,
+                            source,
+                            about_counter,
+                            in_template,
+                            body,
+                            src_text,
+                            &mut table_depth,
+                        )
+                        .await;
+                    self.leave_pp_node();
+                    for e in &expanded {
+                        track_table(e, &mut table_depth);
+                    }
+                    out.extend(expanded);
+                    continue;
+                }
+
+                if stt.name == "templatearg" {
+                    if let Some(error) = self.enter_pp_node() {
+                        out.extend(error);
+                        continue;
+                    }
+                    // PHP builds the `TemplateEncapsulator` for a template argument
+                    // only when it wraps it (`onTemplateArg`'s `wrapTemplates &&
+                    // expandTemplates`), so a `{{{…}}}` inside a template body takes no
+                    // about id at all. Taking one anyway advanced the page's counter
+                    // for every argument in an expansion — `Template:Short description`
+                    // has a dozen — and put the next transclusion's `about` far ahead
+                    // of the service's (11 where the service has 2).
+                    let wrap = !in_template;
+                    let about_id = if wrap {
+                        self.new_about_id(about_counter, "templatearg")
+                    } else {
+                        String::new()
+                    };
+                    let produced =
+                        TemplateHandler.handle_template_arg_token(frame, tok, about_id, wrap);
+                    self.leave_pp_node();
+                    // The default is wikitext, and PHP's `Frame::expand` runs the
+                    // chunk it comes from through the whole pipeline — so a template
+                    // in a default expands: `{{{p|{{T}}}}}` answers `T`'s expansion,
+                    // not its source. Re-walking is what expands it here.
+                    let expanded = Box::pin(self.expand_templates(
                         frame,
-                        &item,
-                        stt,
+                        produced,
                         source,
                         about_counter,
                         in_template,
                         body,
                         src_text,
-                        &mut table_depth,
-                    )
+                    ))
                     .await;
-                self.leave_pp_node();
-                for e in &expanded {
-                    track_table(e, &mut table_depth);
-                }
-                out.extend(expanded);
-                continue;
-            }
-
-            if stt.name == "templatearg" {
-                if let Some(error) = self.enter_pp_node() {
-                    out.extend(error);
+                    for e in &expanded {
+                        track_table(e, &mut table_depth);
+                    }
+                    out.extend(expanded);
                     continue;
                 }
-                // PHP builds the `TemplateEncapsulator` for a template argument
-                // only when it wraps it (`onTemplateArg`'s `wrapTemplates &&
-                // expandTemplates`), so a `{{{…}}}` inside a template body takes no
-                // about id at all. Taking one anyway advanced the page's counter
-                // for every argument in an expansion — `Template:Short description`
-                // has a dozen — and put the next transclusion's `about` far ahead
-                // of the service's (11 where the service has 2).
-                let wrap = !in_template;
-                let about_id = if wrap {
-                    self.new_about_id(about_counter, "templatearg")
-                } else {
-                    String::new()
-                };
-                let produced =
-                    TemplateHandler.handle_template_arg_token(frame, tok, about_id, wrap);
-                self.leave_pp_node();
-                // The default is wikitext, and PHP's `Frame::expand` runs the
-                // chunk it comes from through the whole pipeline — so a template
-                // in a default expands: `{{{p|{{T}}}}}` answers `T`'s expansion,
-                // not its source. Re-walking is what expands it here.
-                let expanded = Box::pin(self.expand_templates(
-                    frame,
-                    produced,
-                    source,
-                    about_counter,
-                    in_template,
-                    body,
-                    src_text,
-                ))
-                .await;
-                for e in &expanded {
-                    track_table(e, &mut table_depth);
+
+                // An `<indicator>` is resolved *here*, in document order, for the
+                // same reason as `<templatestyles>` above: the extension spends an
+                // `about` id (PHP's `ExtensionHandler::onDocumentFragment` calls
+                // `newAboutId` for every tag except `nowiki`), and a module emits
+                // the indicator from *inside* a template, so a pass running after
+                // expansion would number it too late — the transclusion following
+                // the template would take the id the indicator should have spent.
+                if let Some(emitted) = self.expand_one_indicator(&item, about_counter) {
+                    out.extend(emitted);
+                    continue;
                 }
-                out.extend(expanded);
+
+                {
+                    let mut d = table_depth;
+                    track_table(&item, &mut d);
+                    table_depth = d;
+                }
+                out.push(item);
+            }
+
+            // Extension ids are not spent while an argument whose extensions are
+            // numbered where it lands in the output is being expanded. See
+            // [`Parser::arg_expansion`] and [`Parser::style_defer`].
+            if gated {
+                result.extend(out);
                 continue;
             }
-
-            // An `<indicator>` is resolved *here*, in document order, for the
-            // same reason as `<templatestyles>` above: the extension spends an
-            // `about` id (PHP's `ExtensionHandler::onDocumentFragment` calls
-            // `newAboutId` for every tag except `nowiki`), and a module emits
-            // the indicator from *inside* a template, so a pass running after
-            // expansion would number it too late — the transclusion following
-            // the template would take the id the indicator should have spent.
-            if let Some(emitted) = self.expand_one_indicator(&item, about_counter) {
-                out.extend(emitted);
-                continue;
+            // TT2's `ExtensionHandler` numbers every extension token with
+            // `$env->newAboutId()`, and `TokenHandlerPipeline::processChunk` runs each
+            // transformer over the *whole* chunk — `TemplateHandler` then
+            // `ExtensionHandler` — so the chunk's templates are expanded and
+            // numbered first, the extensions after. The id has to be spent here,
+            // inside the expansion, because a pass that runs once the tree is
+            // built cannot reproduce that order: `Bicycle`'s infobox `<ref>` is
+            // `#mwt11` in the service and `#mwt199` here, the 188 in between being
+            // infobox rows the late Cite pass ran past before numbering the ref.
+            //
+            // A `<ref>` with content also has its body expanded here, before the
+            // marker's id is taken, because that is the order `onExtension`
+            // produces: `sourceToDom` parses the body (spending the ids of any
+            // extension it contains) and only then does `onDocumentFragment`
+            // allocate the wrapper's. The body is stashed for Cite's list
+            // renderer to move into the note.
+            //
+            // Only the extensions whose output consumes the id are numbered here.
+            // `<ref>`/`<references>` keep it on the `<extension>` element the Cite
+            // pass later reads; `<pre>` keeps it on the `<pre>` element (see
+            // `extension_handler::pre_items`). `<nowiki>` is lean markup with no
+            // `about` at all. The remaining extensions are rebuilt from their rich
+            // `data-mw` attribs (`extension_kv_attrs`), which do not carry a token
+            // attribute, so numbering them here would spend an id the output never
+            // shows — a second, different drift. They are left to a follow-up.
+            //
+            // A token that already carries an `about` — one the nested expansion
+            // that produced it already numbered — is left alone.
+            for item in out.iter_mut() {
+                self.number_extension_token(item, source, frame, about_counter, in_template)
+                    .await;
             }
-
-            {
-                let mut d = table_depth;
-                track_table(&item, &mut d);
-                table_depth = d;
-            }
-            out.push(item);
+            // TT2's `ExtensionHandler` numbers the chunk's extensions after its
+            // templates; `<templatestyles>` is the extension whose id belongs on a
+            // stashed fragment rather than on a token, so it is numbered here.
+            self.number_style_placeholders(&mut out, about_counter);
+            result.extend(out);
         }
+        result
+    }
 
-        // Extension ids are not spent while an argument whose extensions are
-        // numbered where it lands in the output is being expanded. See
-        // [`Parser::arg_expansion`] and [`Parser::style_defer`].
-        if self.in_arg_expansion() || self.in_style_defer() {
-            return out;
-        }
-        // TT2's `ExtensionHandler` numbers every extension token with
-        // `$env->newAboutId()`, and `TokenHandlerPipeline::processChunk` runs each
-        // transformer over the *whole* chunk — `TemplateHandler` then
-        // `ExtensionHandler` — so at each level the chunk's templates are
-        // expanded and numbered first, the extensions after. The id has to be
-        // spent here, inside the expansion, because a pass that runs once the
-        // tree is built cannot reproduce that order: `Bicycle`'s infobox `<ref>`
-        // is `#mwt11` in the service and `#mwt199` here, the 188 in between
-        // being infobox rows the late Cite pass ran past before numbering the
-        // ref.
-        //
-        // Only the extensions whose output consumes the id are numbered here.
-        // `<ref>`/`<references>` keep it on the `<extension>` element the Cite
-        // pass later reads; `<pre>` keeps it on the `<pre>` element (see
-        // `extension_handler::pre_items`). `<nowiki>` is lean markup with no
-        // `about` at all. The remaining extensions are rebuilt from their rich
-        // `data-mw` attribs (`extension_kv_attrs`), which do not carry a token
-        // attribute, so numbering them here would spend an id the output never
-        // shows — a second, different drift. They are left to a follow-up.
-        for item in out.iter_mut() {
+    /// Number one extension token in place, if it is a kind that carries an
+    /// `about` and does not have one yet. A `<ref>`'s body is expanded (and
+    /// stashed for Cite) before the about is taken, which is PHP's order:
+    /// `ExtensionHandler::onExtension` calls `sourceToDom` first and only then
+    /// allocates the wrapper's id in `onDocumentFragment`.
+    ///
+    /// `<nowiki>` is excluded (lean markup, no `about`), and so are the
+    /// extensions rebuilt from rich `data-mw` attribs: their about would spend
+    /// an id the output never shows.
+    async fn number_extension_token(
+        &self,
+        item: &mut Item,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+    ) {
+        let body = {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
-                continue;
+                return;
             };
             if t.name != "extension" {
-                continue;
+                return;
             }
-            let name = t
-                .attribs
-                .iter()
-                .find(|kv| kv.key.as_str() == Some("name"))
-                .and_then(|kv| kv.value.as_str());
-            if !matches!(name, Some("ref") | Some("references") | Some("pre")) {
-                continue;
+            let name = extension_name(t);
+            if !matches!(
+                name.as_deref(),
+                Some("ref") | Some("references") | Some("pre")
+            ) {
+                return;
             }
             if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
-                continue;
+                return;
             }
-            let about = self.new_about_id(about_counter, "extension-id");
+            // PHP parses the body in the pipeline the extension sits in, so
+            // `inTemplate` is the *caller's* value (usually false: the templates
+            // inside a note are top-level transclusions and are wrapped).
+            if name.as_deref() == Some("ref") {
+                extension_body(t)
+            } else {
+                String::new()
+            }
+        };
+        // Pre-rendering a body costs a full expansion. Only a body that can spend
+        // an `about` id of its own needs it: a template (which may emit a
+        // `<templatestyles>`, an `<indicator>`, …) or a literal extension tag.
+        // A body with neither renders identically through Cite's synchronous
+        // inline fallback, and leaves the id sequence untouched, so the expensive
+        // path is skipped for the plain-text and bare-URL notes that large pages
+        // carry in bulk.
+        let needs_expansion = body.contains("{{") || body.contains('<');
+        let rendered = if needs_expansion {
+            Some(
+                Box::pin(self.process_fragment_body(
+                    &body,
+                    source,
+                    frame,
+                    about_counter,
+                    in_template,
+                ))
+                .await,
+            )
+        } else {
+            None
+        };
+        let about = self.new_about_id(about_counter, "extension-id");
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item {
             t.add_attribute_str("about", &about);
         }
-        // TT2's `ExtensionHandler` numbers the chunk's extensions after its
-        // templates; `<templatestyles>` is the extension whose id belongs on a
-        // stashed fragment rather than on a token, so it is numbered here.
-        self.number_style_placeholders(&mut out, about_counter);
-        out
+        if let Some(node) = rendered {
+            self.ref_bodies.borrow_mut().insert(about, node);
+        }
     }
 
     /// Expand one `template` token, whose preprocessor node has already been
@@ -6841,6 +6977,16 @@ mod tests {
         assert!(
             nested.contains(r##"<span about="#mwt4""##),
             "the reference is numbered before the two following templates: {nested}"
+        );
+
+        // The reset is per *block*, not per line of the same paragraph: the
+        // tokenizer yields one chunk per block line, so a template on the next
+        // line is numbered after the previous line's extensions. This is the
+        // shape that put `Zebro`'s `{{reflist}}` at `#mwt122` rather than `#mwt8`.
+        let next_line = render("<ref name=\"r\">b</ref>{{1x|a}}\n{{1x|c}}").await;
+        assert!(
+            next_line.contains(r##"<span about="#mwt3""##),
+            "the next line's template is numbered after the previous block: {next_line}"
         );
     }
 
