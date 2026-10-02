@@ -105,11 +105,23 @@ impl TreeBuilderStage {
         about_counter: Option<std::rc::Rc<std::cell::Cell<usize>>>,
     ) -> Node {
         // Continue fragment-id allocation after any pre-built fragments (from
-        // `format="wikitext"` pre, etc.).
-        let next_id = std::cell::Cell::new(fragments.len());
+        // `format="wikitext"` pre, etc.). The start must be past the *highest*
+        // id, not `fragments.len()`: ids have gaps (a wikilink content fragment,
+        // then a stylesheet, …), so `len()` can equal an id already in the map and
+        // a `<nowiki>` expanded here would take it — the `mw:DOMFragment` span for
+        // the nowiki then consumed the wikilink's fragment, and the wikilink
+        // rendered empty (`[[onager]]s` came out as `s`).
+        let next_id = std::cell::Cell::new(next_fragment_id(&fragments));
         let tokens = self.process(tokens, config, &mut fragments, &next_id);
         token_stream_to_ast_html_with_fragments(&tokens, source, fragments, about_counter)
     }
+}
+
+/// The first free fragment id, given the pre-built fragments: one past the
+/// highest key, because the ids are allocated by several passes and have gaps
+/// (so `len()` is not a safe start).
+fn next_fragment_id(fragments: &std::collections::HashMap<usize, crate::dom::node::Node>) -> usize {
+    fragments.keys().copied().max().map_or(0, |max| max + 1)
 }
 
 impl Default for TreeBuilderStage {
@@ -286,5 +298,16 @@ mod tests {
         // Isolate: tokenizer alone (no TT3) must not hang.
         let toks = tokenize("<div>foo</div>");
         assert!(!toks.is_empty());
+    }
+
+    #[test]
+    fn test_next_fragment_id_is_past_highest_key() {
+        use std::collections::HashMap;
+        let mut fragments: HashMap<usize, crate::dom::node::Node> = HashMap::new();
+        assert_eq!(next_fragment_id(&fragments), 0);
+        fragments.insert(0, crate::dom::node::Node::document());
+        fragments.insert(5, crate::dom::node::Node::document());
+        // A gap (len() == 2) must not make 2 a candidate: 5 is taken.
+        assert_eq!(next_fragment_id(&fragments), 6);
     }
 }

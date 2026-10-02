@@ -9622,3 +9622,40 @@ difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
 5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
 sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
 the workspace is green.
+
+## The tree stage restarted the fragment ids at a taken value
+The next difference was a wikilink that rendered as its own link trail: parsoid's
+`called <a …>onagers</a>` (from `[[onager]]s`), rustoid's
+`called <a …>s</a>` — the link text gone, only the moved trail left. It reduced to
+nothing on its own; the page needed the surrounding content, which is the tell
+that it was a fragment-**id collision**.
+
+`TreeBuilderStage::to_ast_with_fragments` starts its fragment counter at
+`fragments.len()` so a `<nowiki>` expanded *during tree building* continues after
+the pre-built fragments. But the fragment ids come from several passes and have
+gaps, so `len()` is not the next free id. On `Zebro` the map held 114 entries with
+ids up to 117; the counter restarted at 114, and a `<nowiki>`'s
+`<span typeof="mw:DOMFragment" data-fragment-id=114>` took the slot the second
+`[[onager]]`'s link-text fragment already occupied. The tree builder resolves a
+start-tag-tunnel (the nowiki span) before the self-closing placeholder, so the
+span consumed the wikilink's fragment and the placeholder then found nothing:
+`Node::document()` fallback, an empty `<a>`, and the trail `s` appended on its own.
+
+The trace that pinned it: `insert fragment id=114 token=wikilink` (the link text,
+from `dom_fragment_token`), then `nowiki_fragment_items id=114 cell=0x…e80`
+(a *different* `Cell`, the tree stage's), then
+`start_tag remove fragment id=114 name=span` and
+`resolve dom-fragment id=Some(114) present=false`.
+
+The counter now starts one past the highest key (`next_fragment_id`), so it can
+never name a pre-built fragment. (Parsoid has no such bug because `Env`
+allocates every fragment id from one `newFragmentId` counter; rustoid's tree
+stage runs after the others and only needs not to collide.)
+
+### Effect
+`Zebro`: 59 383 → **62 583** (43.39% → 45.72%), with `[[onager]]s` correct.
+Every other page's first difference is unchanged (`Zebra` 2172, `Bicycle` 11836,
+`Help:Introduction` 5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver
+(film)` 4213, `List of sovereign states` 8409, `Unix` 4772; the byte totals move
+slightly because a `<nowiki>` fragment no longer replaces a link), the fixture
+guard holds at 877/896, and the workspace is green.
