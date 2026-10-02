@@ -746,14 +746,23 @@ fn tokenize_caption_items_sol(
     // surrounding wikilink across several items (`tokenize_link_content` only
     // recognizes `{{…}}`/`-{…}-`/`<nowiki>` directives, so `[[A|…directive…]]` is
     // fragmented); otherwise keep the per-chunk path to preserve transclusion
-    // markers. `extension` (nowiki) and `language-variant` tokens carry their exact
-    // wikitext in `data-parsoid.src`, so the full caption source can be re-assembled.
-    let needs_reconstruction = items.iter().any(|item| {
-        matches!(
-            item,
-            Item::Tok(ParsoidToken::SelfclosingTag(tk))
-                if tk.name == "language-variant" || tk.name == "extension"
-        )
+    // markers.
+    //
+    // Only a `<nowiki>` extension can do that. Reconstructing for *any*
+    // `extension` would re-tokenize a caption that holds an already-expanded
+    // `<ref>` from its `data-parsoid.src`, discarding the expansion (and the
+    // `about` id the extension handler spent on it), so Cite then renumbered the
+    // ref from its own counter, too late (`[[File:…|thumb|caption<ref>…]]`).
+    let needs_reconstruction = items.iter().any(|item| match item {
+        Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant" => true,
+        Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extension" => {
+            tk.attribs
+                .iter()
+                .find(|a| a.key.as_str() == Some("name"))
+                .and_then(|a| a.value.as_str())
+                == Some("nowiki")
+        }
+        _ => false,
     });
     if !needs_reconstruction {
         let mut out = Vec::with_capacity(items.len());
@@ -2126,6 +2135,29 @@ mod tests {
 
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem"));
         assert!(matches!(&out[1], Item::Str(s) if s == "REDIRECT [[]]"));
+    }
+
+    #[test]
+    fn test_tokenize_caption_keeps_expanded_extension() {
+        // A caption that already holds an expanded `<ref>` must not be re-tokenized
+        // from its source: that would drop the expansion and the `about` id the
+        // extension handler spent on it, so Cite renumbered the ref late.
+        let mut ext = SelfclosingTagTk::new("extension", vec![], DataParsoid::default());
+        ext.add_attribute_str("name", "ref");
+        ext.data_parsoid.src = Some("<ref>Note text</ref>".to_string());
+        let ext = Item::Tok(ParsoidToken::SelfclosingTag(ext));
+
+        let items = vec![Item::Str("caption".to_string()), ext];
+        let out = tokenize_caption_items(&items, config_static());
+
+        // The extension token survives (identity of shape, not re-tokenized into
+        // a fresh `<ref>`), and the text before it is kept.
+        assert!(
+            out.iter().any(
+                |it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension")
+            ),
+            "expanded extension must survive: {out:?}"
+        );
     }
 
     #[test]

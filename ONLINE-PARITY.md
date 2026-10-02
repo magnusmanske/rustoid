@@ -9597,3 +9597,28 @@ later chunks. Worth checking whether the caption's `mw:maybeContent` is still
 reached by a pass that runs after the chunk loop (`render_file` expands a caption
 too), rather than by the in-chunk `expand_attributes` the previous fix relied on.
 Recorded for the next session.
+
+### A caption is only re-tokenized for a `<nowiki>`, not for any extension
+The `<ref>` in the Altamira caption is now `#mwt1` in both. `render_file`'s
+block path runs `tokenize_caption_items` over the already-expanded caption, and
+that function had one rule for two jobs: it re-tokenized the caption from source
+whenever *any* `language-variant` or `extension` token was present. For a
+`language-variant` (or a `<nowiki>`) that is needed — those can split a
+surrounding `[[…]]` across items, and their `data-parsoid.src` reassembles it.
+For a `<ref>` it is destructive: the caption holds the *expanded* ref (with the
+`about` id the extension handler spent on it and the body stashed for Cite), and
+reconstructing `caption<ref>Note text</ref>` from source replaced it with a fresh
+unexpanded ref. Cite then fell back to its own counter (`take_about`) and
+numbered the ref late — the `#mwt130`/`#mwt68` gap, and the single-id gap
+(`#mwt2`/`#mwt1`) that the minimal `A [[File:…|thumb|caption<ref>…</ref>]] B`
+showed. The rule now reconstructs only for `language-variant` and for an
+`extension` whose `name` is `nowiki`; the per-chunk path keeps every other token,
+as Parsoid's block caption does (`getDOMFragmentToken` on the tokens, no
+re-tokenization).
+
+### Effect
+`Zebro`: 37 308 → **59 383** (27.26% → 43.39%). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
+5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
+sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
+the workspace is green.
