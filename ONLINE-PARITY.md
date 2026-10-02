@@ -9788,3 +9788,57 @@ instead), and the CS1 `<style>` is not emitted at this note at all (rustoid's
 range's `about`/`typeof`/`data-mw` on the range's first element, and a stylesheet
 is a rendering-transparent node — crossed with the templatestyles dedup ordering
 inside a `<ref>` body. Left for the next session; noted rather than guessed at.
+
+## A ref body's stylesheet, and where DedupeStyles runs
+Chasing the "transclusion whose first child is a stylesheet" item turned up two
+independent bugs, neither actually the encapsulation merge.
+
+### A body expanded by `process_fragment_body` dropped its stylesheets
+`process_fragment_body` built the body's DOM with a **private** fragment map and a
+counter starting at 0. A `<templatestyles>` inside the body is resolved during the
+expansion below it and stashed in `ext_fragments` (drained into the page's map only
+at the end of `build_ast`), so the body's `mw:DOMFragment` placeholder named
+nothing and the `<style>` vanished — the same shape as the media-caption bug, one
+pipeline further in. Reduced: `A<ref>{{#invoke:list|unbulleted|a|b}}</ref>` left
+the note with the `plainlist` `<div>` and no `Plainlist/styles.css`.
+
+The body now allocates fragment ids from the document counter (`self.ext_next_id`)
+and folds a **clone** of `ext_fragments` into its local map before building, so the
+placeholder resolves while the page's own copies survive (a `take` would strand
+them — the mistake recorded under the caption fix).
+
+### Cite moves the notes in after DedupeStyles had already run
+With the styles present, the byte totals jumped by ~180 KB on `Zebra`: rustoid
+emitted a full `<style>` in every note where parsoid emits one plus
+`mw-deduplicated-inline-style` links (21 vs 118 links). `dedupe_styles` ran
+*before* Cite, so the stylesheets Cite moves out of the stashed ref bodies into the
+reference list were never seen. Parsoid's `DedupeStyles` sees the final DOM, so the
+pass now runs after the Cite block. `Zebra` returns to 534 KB against parsoid's
+563 KB (was 511 KB with the styles simply missing).
+
+### The single-use back-link is wrapped too
+While reducing, `A<ref>text</ref>` showed parsoid wrapping **every** back-link in
+`<span class="mw-cite-backlink">` — the `referencedBy` relation is on the `<a>` for
+a single use and on the wrapping span for several. rustoid rendered the single-use
+form bare (a comment claimed it had been "verified against a cached page"; the
+transform endpoint and the served pages both wrap it). Fixed, with the two unit
+tests that asserted the bare form updated.
+
+### Effect
+`Zebro`'s first difference is unchanged at 66 780 — the divergence there is a
+different thing (see below) — but the reference lists now carry their stylesheets
+and dedup links, and every page's byte total moves toward parsoid's (e.g. `Zebra`
+510 675 → 534 265 against 562 730). Every first difference is unchanged, the
+fixture guard holds at 877/896, and the workspace is green.
+
+## What the 66 780 divergence actually is
+It is *not* the merge of a transclusion onto its first element. Parsoid's
+`{{cite journal}}` output puts the CS1 `<style>` first, then the `<cite>`; the
+served `<style>` carries both `mw:Extension/templatestyles` **and**
+`mw:Transclusion`, and its `data-mw` has the extension's `name`/`attrs`/`body`
+*and* the transclusion's `parts`. rustoid emits the transclusion on an empty
+`<span class="mw-empty-elt">` and the `<style>` separately. The `#invoke:list`
+case (`<span class="mw-empty-elt" about="#mwt1" typeof="mw:Transclusion"><style
+…/></span>`) matches parsoid exactly, so the difference is specific to a
+template whose body begins with a `<templatestyles>` *written literally* rather
+than returned by a module — the next thing to look at.

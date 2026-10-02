@@ -196,13 +196,13 @@ async fn a_repeated_named_ref_shares_one_note() {
     );
 }
 
-/// A single use renders a bare back-link with an arrow, not a wrapped numbered one.
+/// A single use wraps its back-link in the back-link span, with an arrow.
 #[tokio::test]
-async fn a_single_use_has_a_bare_arrow_backlink() {
+async fn a_single_use_wraps_its_arrow_backlink() {
     let html = render("A<ref name=\"s\">body</ref>\n<references/>").await;
     assert!(
-        !html.contains("mw-cite-backlink"),
-        "one use must not be wrapped: {html}"
+        html.contains("mw-cite-backlink"),
+        "one use is wrapped too: {html}"
     );
     assert!(
         html.contains("\u{2191}"),

@@ -1615,7 +1615,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // available (the synchronous `wikitext_to_ast` path has none).
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let next_id = std::cell::Cell::new(0usize);
+        // Allocate from the document-wide fragment id counter, like Parsoid's
+        // `Env::newFragmentId`: a `<templatestyles>` inside the body is resolved
+        // during the expansion below and its placeholder must name a fragment the
+        // body build can resolve.
+        let next_id = &self.ext_next_id;
         if source.is_some() {
             tokens = self
                 .expand_templates(
@@ -1633,7 +1637,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 tokens,
                 self.config,
                 &mut fragments,
-                &next_id,
+                next_id,
             );
             tokens = self
                 .expand_attributes(
@@ -1643,16 +1647,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     None,
                     &mut fragments,
-                    &next_id,
+                    next_id,
                 )
                 .await;
         }
+        // A `<templatestyles>` the body expanded stashes its `<style>` in
+        // `ext_fragments` (drained into the page's map only at the end of
+        // `build_ast`). The body is built *here*, so fold a copy in — a clone,
+        // not a take, so the page's own placeholders still resolve later. Without
+        // it the note's stylesheet vanished (`<ref>{{cite journal|…}}</ref>`).
+        fragments.extend(
+            self.ext_fragments
+                .borrow()
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
         // The quote transformer flushes pending quotes only on a newline or EOF
         // token; append a synthetic EOF so quotes (`'''bold'''`) flush.
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
-        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &next_id);
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, next_id);
         flatten_nowiki_spans(&mut frag);
         frag
     }
@@ -2899,7 +2914,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // DedupeStyles: the third handler of the `fixups` traverser
         // (`MigrateTrailingCategories,TableFixups,DedupeStyles`). It replaces
         // every repeat of an already-emitted `<templatestyles>` with a `<link>`.
-        crate::pipeline::dedupe_styles::run(&mut ast);
+        // It runs *after* Cite here (see below), because a note's stylesheet is
+        // moved out of the stashed ref body into the reference list by Cite, and
+        // Parsoid's DedupeStyles sees the final DOM.
         // DisplaySpace (`displayspace`): armor French spaces. PHP runs it as a
         // global DOM pass after extension post-processing and before `cleanup`.
         crate::pipeline::display_space::run(&mut ast);
@@ -2969,6 +2986,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // order, so anything numbered after Cite must continue from here.
             about_counter.set(ids.about_counter());
         }
+        // DedupeStyles runs over the tree just made final by Cite: a note's
+        // `<templatestyles>` is emitted full at its first occurrence and as a
+        // `mw-deduplicated-inline-style` link afterwards.
+        crate::pipeline::dedupe_styles::run(&mut ast);
         wrap_sections_in_ast(&mut ast, options.wrap_sections);
         // Core appends the table-of-contents placeholder to section 0 of a
         // main-namespace page that has enough headings and no `__TOC__`/

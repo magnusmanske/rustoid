@@ -868,27 +868,24 @@ pub fn references_list_nodes(
         li.set_attr("id", note_id.clone());
         li.set_attr("data-mw-footnote-number", r.label());
 
-        // A single use renders its back-link bare; two or more are wrapped in
-        // `<span rel="mw:referencedBy" class="mw-cite-backlink">` and separated by
-        // a space. That asymmetry is Cite's actual output, verified against a
-        // cached page.
-        if r.uses.len() == 1 {
-            li.push_child(backlink_node(&r.uses[0], &page, group, None));
-        } else {
-            let mut wrap = Node::element(ElementKind::Other("span".to_string()));
-            // The relation sits on the wrapping span here, and on the `<a>` in
-            // the single-use form.
+        // Cite always wraps the back-links in `<span class="mw-cite-backlink">`,
+        // even for a single use. The `referencedBy` relation sits on the wrapping
+        // span when a note has several uses, and on the `<a>` when it has one.
+        let multi = r.uses.len() > 1;
+        let mut wrap = Node::element(ElementKind::Other("span".to_string()));
+        if multi {
             wrap.set_attr("rel", "mw:referencedBy");
-            wrap.set_attr("class", "mw-cite-backlink");
-            mark_for_id(&mut wrap);
-            for (n, use_id) in r.uses.iter().enumerate() {
-                if n > 0 {
-                    wrap.push_child(Node::text(" "));
-                }
-                wrap.push_child(backlink_node(use_id, &page, group, Some(n + 1)));
-            }
-            li.push_child(wrap);
         }
+        wrap.set_attr("class", "mw-cite-backlink");
+        mark_for_id(&mut wrap);
+        for (n, use_id) in r.uses.iter().enumerate() {
+            if n > 0 {
+                wrap.push_child(Node::text(" "));
+            }
+            let label = if multi { Some(n + 1) } else { None };
+            wrap.push_child(backlink_node(use_id, &page, group, label));
+        }
+        li.push_child(wrap);
         li.push_child(Node::text(" "));
 
         if !r.self_closing {
@@ -1128,9 +1125,10 @@ mod tests {
         );
     }
 
-    /// A single-use note renders a bare back-link whose text is an arrow.
+    /// A single-use note wraps its back-link in `mw-cite-backlink` too, with the
+    /// `referencedBy` relation on the `<a>` and an arrow as the text.
     #[test]
-    fn a_single_use_note_has_a_bare_backlink() {
+    fn a_single_use_note_wraps_its_backlink() {
         let mut st = CiteState::new();
         st.add("", "", "body", false, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
@@ -1142,19 +1140,17 @@ mod tests {
         assert_eq!(li.get_attr("id"), Some("cite_note-1"));
         assert_eq!(li.get_attr("data-mw-footnote-number"), Some("1"));
 
-        let a = &li.children[0];
+        // The wrapping span, with no `rel` (that is on the `<a>` here).
+        let wrap = &li.children[0];
+        assert_eq!(wrap.get_attr("class"), Some("mw-cite-backlink"));
+        assert_eq!(wrap.get_attr("rel"), None);
+        let a = &wrap.children[0];
         assert_eq!(a.get_attr("href"), Some("./Zebra#cite_ref-1"));
         assert_eq!(a.get_attr("rel"), Some("mw:referencedBy"));
         assert_eq!(
             a.children[0].children[0].kind,
             crate::dom::node::NodeKind::Text("\u{2191}".to_string()),
             "a single use is an arrow"
-        );
-        assert!(
-            li.children
-                .iter()
-                .all(|c| c.get_attr("class") != Some("mw-cite-backlink")),
-            "one use must not be wrapped in the back-link span"
         );
 
         // The note text span, which carries the body.
