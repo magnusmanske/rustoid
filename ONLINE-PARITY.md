@@ -9659,3 +9659,32 @@ Every other page's first difference is unchanged (`Zebra` 2172, `Bicycle` 11836,
 (film)` 4213, `List of sovereign states` 8409, `Unix` 4772; the byte totals move
 slightly because a `<nowiki>` fragment no longer replaces a link), the fixture
 guard holds at 877/896, and the workspace is green.
+
+## The next `Zebro` difference: a `<references>` from `#tag` is numbered before the reflist's `<templatestyles>`
+At 62 583 the difference is the `about` of `Template:Reflist`'s stylesheet:
+parsoid `#mwt123` on the `<style>`, `#mwt124` on the `<references>`; rustoid the
+reverse (`#mwt123` references, `#mwt124` style). `Template:Reflist` is
+`<templatestyles src="Reflist/styles.css"/>…{{#tag:references|…}}`, so document
+order is style first and parsoid numbers them in that order.
+
+The cause is the order in which the two ids are taken. The style is resolved
+during the expansion walk but its id is deferred to the chunk's post-pass
+(`number_style_placeholders`, "templates take ids, then extensions in source
+order" — the rule the transform endpoint pinned with
+`<templatestyles/>{{Center|b}}`). The `<references>`, however, is produced by
+`#tag:references` *inside* a parser-function branch, and its nested expansion's
+own post-pass numbers it immediately. So it takes its id before the outer chunk
+reaches its style pass, and the two come out swapped.
+
+### The attempted fix, reverted
+Interleaving the two in the chunk post-pass — one source-order loop numbering a
+style placeholder or an extension per item — reads as the faithful fix, and was
+tried. It is a no-op here: the `number-order` trace (`RUSTOID_TRACE_NUMORDER`,
+removed) shows the `<references>` already carrying `about="#mwt123"` when the
+`style(frag=32)` item reaches the pass, because a *nested* expansion numbered
+it. The real shape is that an extension a nested expansion produces should be
+numbered in the outer chunk's post-pass, at its document position relative to
+the styles and other extensions — the same deferral `style_defer` already
+applies to extensions inside a template argument. That is a larger change and
+is left for the next session; the interleave was reverted rather than shipped as
+a no-op.
