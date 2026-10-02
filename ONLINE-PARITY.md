@@ -9734,3 +9734,30 @@ difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
 5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
 sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
 the workspace is green.
+
+## Cite's `<references>` wrapper: the body, the columns class, the id, the rel
+Four small differences in the reference list, each against PHP Cite's
+`References::insertReferencesIntoDOM`:
+
+- **`data-mw.body`** — a *tag pair* `<references>…</references>` records
+  `"body":{"extsrc":""}`; a self-closing `<references/>` records no body.
+  `Template:Reflist` builds its list with `{{#tag:references|…}}` (a tag pair),
+  so the served output carries the empty body. `read_references` now reports
+  whether the tag was self-closing (from the source's trailing `/>`) and
+  `references_data_mw` emits the body accordingly.
+- **`mw-references-columns`** — Cite adds it to the responsive wrapper when the
+  group holds more than `CiteResponsiveReferencesThreshold` (10) notes.
+- **The wrapper's node id** — Cite's `$refsNode` *is* the extension element, so
+  it draws an id; rustoid built a fresh `<div>` without one, which shifted every
+  id after it. `mark_for_id` (the empty-`data-parsoid` marker) is now applied to
+  the wrapper.
+- **`rel="mw:referencedBy"` on the multi-use back-link span** — Cite puts the
+  relation on the `<a>` in the single-use form and on the wrapping `<span>` when
+  a note has several uses.
+
+### Effect
+`Zebro`: 63 888 → **66 780** (46.68% → 48.79%). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
+5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
+sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
+the workspace is green.
