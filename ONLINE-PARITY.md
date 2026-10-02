@@ -9539,3 +9539,37 @@ difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
 5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
 sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
 the workspace is green.
+
+## The next `Zebro` difference: a caption's nested expansion is not attribute-expanded
+At 25 089 the difference is `Template:Legend` inside the media caption: parsoid's
+`<span class="legend-color mw-no-invert" style="background-color:#188fad;
+color:black;…">`, rustoid's bare `<span class="legend-color " style="…">`. Both
+missing pieces come from the template's *attribute* values —
+`class="legend-color {{#if:{{{invert|}}}|skin-invert|mw-no-invert}}"` and
+`style="…{{greater color contrast ratio|{{{1}}}|white|black|css=y}}…"`.
+
+Reduced:
+```
+[[File:Example.jpg|thumb|{{legend|#188fad|X}}]]   rustoid 0 no-invert / 0 color, parsoid 1/1
+{{unbulleted list|{{legend|#188fad|X}}}}          both 1/1  (a page-level legend)
+```
+
+So the difference is the *context*, not `Template:Legend`: the caption is the
+link token's `mw:maybeContent` KV, expanded by `expand_attributes` →
+`expand_templates`. That nested expansion produces `Template:Legend`'s
+`<span>` — whose `class`/`style` are themselves templated — but nothing runs the
+`AttributeExpander` over the nested output, so those attribute templates stay
+literal and the span comes out with an empty class and no background. On the
+page level the span is produced by the *outer* `expand_templates` and the
+per-chunk `expand_attributes` then reaches it, which is why `{{unbulleted
+list|…}}` matches.
+
+Parsoid has no gap here because `AttributeTransformManager::process` expands a
+value with `Frame::expand(… 'attrExpansion' => true …)` and
+`buildExpandedAttrs`'s `expandAttrValuesToDOM` runs the value through a pipeline
+that includes its own `AttributeExpander`. The faithful fix is to run
+`expand_in_attributes` + `expand_attributes` over the tokens a value's nested
+expansion produced (a recursive sub-pipeline), not only over the page's
+top-level tokens. Left for the next session: it is async-recursive and wants a
+measured cap, and it touches every attribute value, so it is not a change to
+slip in at the end of a session.
