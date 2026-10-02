@@ -9152,3 +9152,50 @@ Effect of the `above`/trim commits on this page, for the record: rustoid
 1 282 656 → 1 288 905 bytes, first difference unchanged at **byte 8910
 (0.47% of parsoid)**, corpus output 30 492 786 → 30 557 367 bytes at the same
 0.61x, still 0/41 pages passing.
+
+## The expanded-value renderer: `listItem` and the self-closing tokens
+
+The section above named the navbox loop's prerequisite — a faithful renderer for a
+module argument whose tokens came out of *expansion* — and left it open. It turned
+out to be two missing arms in `argument_value_text`, not a general serializer.
+
+`RUSTOID_DBG_ARG` on the smallest reproduction
+(`{{Navbox|…|list1={{Navbox|child|…}}}}`) showed the value declining on exactly
+one token: a `listItem` with no `src`. A list item's marker lives in its `bullets`
+attribute — `tokens_to_string` already renders it that way — and a value that
+holds a list is otherwise plain HTML. So the first arm reads `bullets`. That alone
+fixed the nested navbox: loop 0, `navbox-subgroup` 6 = 6, and on
+`2024 Summer Olympics` the navbox groups came back (50 → 59 of 63).
+
+A second `RUSTOID_DBG_ARG` pass over the page then found the only remaining
+declines: self-closing tokens that *do* have a `src` — a bare `urllink` (a
+citation `url`), an `extlink`, a `<br>`, a behavior switch. Each reaches the module
+as its own source, so the renderer now emits `src` for any self-closing token it
+has no special arm for. That fixed a wrong citation URL on the page (the `url`
+argument had fallen back to a stale source range and `Module:Citation` rendered
+`…/olympic-games/` instead of `…/olympic-games/paris-2024`) and removed a
+`CITEREF_temp_preview…` id.
+
+### Effect
+
+`2024 Summer Olympics` 1 288 905 → **1 291 183 bytes**, first difference unchanged
+at byte 8910 (0.47% of parsoid). Corpus output 30 557 367 → **31 214 541 bytes**.
+No page's *first* difference moved — the navbox and the citation are both past it
+— and none regressed; three pages shrank by 4–557 bytes, which is the citation fix
+removing an unexpanded span rather than a loss. Guard **877/896**, all unit tests
+green (the renderer has a test for each new arm).
+
+### What is left in the navbox: a templatestyles element in an argument
+
+With those two arms, the nested `{{Navbox|child}}`s that still loop are the ones
+whose value holds a `<style>` element with no `src` — the templatestyles
+`Module:Navbox` emits through `frame:extensionTag`. Rustoid has already
+*substituted* the strip marker into that `<style>` by the time the outer module
+reads its argument, so the renderer declines and the value falls back to the raw
+call. `Module:Navbox` strips templatestyles markers from its arguments and sums
+the *remaining* lengths into `args.argHash`; a resolved `<style>` neither strips
+nor matches, which is why the id suffix reads `8789` where the service reads
+`12164`. The faithful shape is to keep the marker in the argument and let the
+module strip it — the templatestyles post-pass the earlier sections keep pointing
+at — not to render the `<style>` here. Recorded rather than hacked around, since a
+`<style>` emitted here would diverge in exactly the opposite direction.

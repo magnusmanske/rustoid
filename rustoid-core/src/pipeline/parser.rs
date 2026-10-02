@@ -5334,6 +5334,23 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 out.push_str("]]");
             }
             Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
+            // A `listItem` token: its `bullets` attribute holds the `*`/`#`/`;`
+            // marker, and the item content follows as separate items. A module
+            // argument that contains a list — `Module:Navbox`'s nested
+            // `|list1 = * A` — arrives as these, with no `src` to read (the token
+            // was built during expansion), so declining on it dropped the whole
+            // value to its stale source range and the nested navbox came back as
+            // the literal call `{{Navbox|child…}}`. Mirrors `tokens_to_string`.
+            Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem" => {
+                if let Some(bullets) = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("bullets"))
+                    .and_then(|kv| kv.value.as_str())
+                {
+                    out.push_str(bullets);
+                }
+            }
             Item::Tok(tok) if crate::wikitext::token_utils::is_entity_span_token(tok) => {
                 let ParsoidToken::Tag(t) = tok else {
                     return None;
@@ -5350,6 +5367,15 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
             // separate items) and the end tag are each written as they were.
             Item::Tok(ParsoidToken::Tag(t)) => out.push_str(t.data_parsoid.src.as_deref()?),
             Item::Tok(ParsoidToken::EndTag(t)) => out.push_str(t.data_parsoid.src.as_deref()?),
+            // Every other self-closing token — `<br>`, an `extlink`/`urllink`, a
+            // behavior switch like `__DATE__` — reaches the module as its own
+            // source, so a value made of one is not a reason to decline. Without
+            // this arm a citation `url` that expanded to a bare `urllink`
+            // declined, fell back to a stale source range, and `Module:Citation`
+            // rendered the wrong URL.
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) => {
+                out.push_str(t.data_parsoid.src.as_deref()?);
+            }
             _ => return None,
         }
         i += 1;
@@ -5653,6 +5679,42 @@ mod tests {
             argument_value_text(&items).as_deref(),
             Some("<span class=\"nowrap\">SEE</span>")
         );
+    }
+
+    /// A `listItem` carries its marker in `bullets` and has no `src`, so the
+    /// renderer must read the attribute rather than decline. A module argument
+    /// that holds a list — the nested navbox's `|list1 = * A` — arrives this way,
+    /// and declining dropped the whole value to a stale source range, which made
+    /// the nested `{{Navbox|child…}}` come back as literal text and loop.
+    #[test]
+    fn an_argument_value_renders_a_list_item_from_its_bullets() {
+        use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue, TagTk};
+        let bullets = KV {
+            key: KeyValue::Str("bullets".to_string()),
+            value: KeyValue::Str("*".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let item = TagTk::new("listItem", vec![bullets], DataParsoid::default());
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(item)),
+            Item::Str(" A".to_string()),
+        ];
+        assert_eq!(argument_value_text(&items).as_deref(), Some("* A"));
+    }
+
+    /// Any other self-closing token is handed to the module as its own source:
+    /// a bare `urllink` is a citation's `url` (declining it made
+    /// `Module:Citation` render the wrong URL), and a `br`/behavior switch is
+    /// likewise representable.
+    #[test]
+    fn an_argument_value_renders_a_self_closing_token_from_its_source() {
+        use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk};
+        let mut br = SelfclosingTagTk::new("br", vec![], DataParsoid::default());
+        br.data_parsoid.src = Some("<br>".to_string());
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(br))];
+        assert_eq!(argument_value_text(&items).as_deref(), Some("<br>"));
     }
 
     #[test]
