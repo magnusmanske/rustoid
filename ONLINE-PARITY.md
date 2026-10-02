@@ -9848,3 +9848,112 @@ one `data-mw`, and rustoid instead emits the transclusion on an empty
 `<span class="mw-empty-elt">` with the `<style>` beside it. So the wrapper must
 merge onto a stylesheet that a *nested* expansion produced, not onto one written
 in the body. Next to look at.
+
+## 48.79% → 55.68%: the stylesheet renderer, the stylesheet merge, and Cite's note list
+The 66 780 divergence — the previous section's "next to look at" — was not a
+"nested expansion" difference at all. It was the rendering-transparent stash.
+`DOMRangeBuilder::encapsulateTemplates` puts the transclusion metadata on the
+range's first element (the CS1 `<style>`), and only *then*
+`handleRenderingTransparentEltsBetweenBlocks` decides whether to move it into an
+`mw-empty-elt` span. It refuses when the next element shares the target's `about`
+— a `<style>` followed by the transclusion's own `<cite>` — which is exactly
+`{{cite journal}}`. rustoid wrapped unconditionally, so the metadata landed on a
+fresh span and the `<style>` stayed beside it with its own `about`.
+
+The fix is in `tree_builder_html`: compute the stashable run and gate the wrap on
+the same `should_stash` boundary test the trailing-run stash already used. When
+the test fails *and* the target is a `mw:DOMFragment` placeholder (rustoid's
+representation of a `<templatestyles>`), unfold it so the metadata lands on the
+real `<style>` — merging the extension's `data-mw` (`name`/`attrs`/`body`) with
+the transclusion's `parts` *appended*, the way `$encapDataMw->parts = $parts`
+appends them. `Zebro`: 66 780 → 67 790.
+
+### The stylesheet renderer was an approximation; it is now a port
+Next came the CS1 stylesheet's *text*. rustoid rendered declaration values with a
+hand-rolled walk (`normalise_value`), and it got strings, urls and whitespace
+wrong: `quotes:'"' '"'` stayed single-quoted, `url(//…)` was left unquoted, and a
+value split across a newline kept its tab. Parsoid does none of that — it
+tokenizes with `Wikimedia\CSS\Parser\DataSourceTokenizer`, serializes each token
+with `Token::__toString` (re-quoting strings and urls, escaping idents), marks
+whitespace insignificant, and re-inserts a space only where `Token::separate`
+says the neighbours would otherwise merge, `Util::stringify(minify)`.
+
+So `pipeline/css.rs` is now that port: the tokeniser, `Token::__toString`,
+`Token::separate`, and `stringify(minify)` (insignificant whitespace, `/**/`
+between adjacent significant tokens, `calc()`-operator whitespace significant).
+It replaces `normalise_value`, `normalise_at_prelude` and the selector scoper.
+The scoper is now faithful too: `StyleRuleSanitizer` with
+`hoistableComponentMatcher` hoists the longest leading run of `html`/`body`-led
+compound selectors before the prepended `.mw-parser-output`, which is why
+`html body.mediawiki .ambox` becomes `html body.mediawiki .mw-parser-output
+.ambox` rather than rustoid's old `html .mw-parser-output body.mediawiki …`.
+
+The differential test (`templatestyles_parsoid_test`) compares `render` against
+the `<style>` body of every cached Parsoid rendering. It had been unusable: the
+cache had been written under a different filename scheme than the test looked
+for, so it skipped everything. It now reads the three schemes the cache has used
+(`escape_body_stem`, `sanitize_path_separators`, the `:`-doubling legacy one),
+keys each sheet by `(src, wrapper)`, and skips a sheet whose cached source
+revision differs from the oracle's — otherwise the wiki's own later edit reads
+as a render difference. That last one is real: `Module:Portal bar/styles.css`
+was edited (a `var()` added) after every oracle was captured at r1371903450, and
+comparing the newer source against the older rendering reports a difference that
+is not rustoid's. **84 sheets checked, 83 byte-identical, 1 skipped as drift**
+(was 77 of 84 matching).
+
+### Three more divergences, each a byte of structure
+- **Cite appends a newline after every note.** `RefGroup::renderReferenceListElement`
+  ends with `$refsList->appendChild($ownerDoc->createTextNode("\n"))` (T372889),
+  so the `<ol>` reads `<li>…</li>\n<li>…</li>\n</ol>`. rustoid built the list
+  without the separator.
+- **AddRedLinks must run after Cite.** A note's body only reaches the DOM when
+  Cite renders the reference list, and Parsoid's `AddRedLinks` sees the final
+  DOM: `{{cite journal}}`'s `[[Doi (identifier)|doi]]` carries `mw-redirect` on
+  the served page. rustoid ran the pass before Cite, so the note links were never
+  marked (34 `mw-redirect` on `Zebro` against rustoid's 10). Moving the
+  collect-and-apply block after Cite fixes it; nothing between depends on it
+  having run.
+- **A literal HTML tag in link content is markup, not text.** CS1 renders an
+  archive link as `[url <i>Title</i>]`; rustoid's `tokenize_link_content` only
+  walked `{{…}}`/`-{…}-`/quotes, so the `<i>` became escaped text
+  (`&lt;i>Title&lt;/i>`) in `[https://… <i>Title</i>]` and, inside a template,
+  lost the `stx: "html"` that draws its node id. Adding a `try_html_tag` branch
+  fixes the direct case. It is gated on the sanitizer's `AllowedLiteralTags`, not
+  on `try_html_tag` alone: a disallowed tag (`<script>`) must stay text, and the
+  sanitizer that would turn it back into text never visits tokens nested inside
+  an attribute value, which is where link content sits when it runs. Ungated, it
+  broke `media.txt`'s "Broken image links with HTML captions".
+
+### Effect
+`Zebro`: 66 780 → **76 212** (48.79% → **55.68%**). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction` 5161,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign
+states` 8409, `Unix` 4772), the fixture guard holds at **877/896**, the workspace,
+clippy and fmt are clean.
+
+## The next `Zebro` difference: a quote-generated `<i>` in link content has no DSR
+At 76 212, inside the same CS1 note: parsoid's `<a rel="mw:ExtLink" …><i
+id="mwAgs" data-parsoid='{"stx":"html"}'>Equids in Time and Space…</i></a>` has a
+node id, rustoid's `<i>` does not, so every id after it is one behind.
+
+The `<i>` is CS1's italicised book title (`utilities.wrap_style('italic-title',
+…)`), i.e. wikitext `''…''` inside the link text. Minimal reproductions, both
+against the transform endpoint:
+
+```
+A [https://example.com ''italic''] B   →  rustoid <i>italic</i>,  parsoid <i id="mwBA" data-parsoid='{"dsr":[23,33,2,2]}'>
+A [[Foo|''italic'']] B                 →  rustoid <i>italic</i>,  parsoid <i id="mwBA" data-parsoid='{"dsr":[8,18,2,2]}'>
+```
+
+A page-level `A ''italic'' B` is correct (both give the `<i>` an id and a dsr),
+so the gap is specific to link content. The cause is that rustoid re-tokenizes
+link content with a *sub*-tokenizer (`tokenize_link_content`, and
+`tokenize_caption_sol` for a wikilink caption) whose offsets are relative to the
+content substring: the `mw-quote` tokens carry a `tsr` of `0..len(content)`, so
+`QuoteTransformer` gives the `<i>` a `tsr` in the wrong coordinate space and
+`ComputeDSR` (which ignores `tsr.source` and treats every offset as ambient)
+cannot turn it into a page `dsr`. Parsoid tokenizes the link content in the
+single grammar pass, so its offsets are absolute. The fix is to re-base the
+content tokens' `tsr` by the content's start offset (and to the enclosing
+source); it will want care because the same sub-tokenization feeds template
+expansion, which currently relies on `tsr.source` to recover the argument text.
