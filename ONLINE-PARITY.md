@@ -9832,13 +9832,19 @@ and dedup links, and every page's byte total moves toward parsoid's (e.g. `Zebra
 fixture guard holds at 877/896, and the workspace is green.
 
 ## What the 66 780 divergence actually is
-It is *not* the merge of a transclusion onto its first element. Parsoid's
-`{{cite journal}}` output puts the CS1 `<style>` first, then the `<cite>`; the
-served `<style>` carries both `mw:Extension/templatestyles` **and**
-`mw:Transclusion`, and its `data-mw` has the extension's `name`/`attrs`/`body`
-*and* the transclusion's `parts`. rustoid emits the transclusion on an empty
-`<span class="mw-empty-elt">` and the `<style>` separately. The `#invoke:list`
-case (`<span class="mw-empty-elt" about="#mwt1" typeof="mw:Transclusion"><style
-…/></span>`) matches parsoid exactly, so the difference is specific to a
-template whose body begins with a `<templatestyles>` *written literally* rather
-than returned by a module — the next thing to look at.
+It is *not* the merge of a transclusion onto its first element, and not the
+literal `<templatestyles>` case: `A<ref>{{plain list|a}}</ref>` (a template body
+beginning with a literal `<templatestyles>`) matches parsoid, which wraps the
+sheet in `<span class="mw-empty-elt" about=… typeof="mw:Transclusion">` just as
+rustoid does. Parsoid's `shouldStashRenderingTransparentNodes` refuses to wrap
+when the node's *next* sibling carries the same `about`, which is why the plain
+list is wrapped (the `<div>` follows) and the `#invoke:list`-only case is not.
+
+The 66 780 case is `{{cite journal}}`, whose body is `<includeonly>{{#invoke:Citation/CS1|citation|…}}</includeonly>`
+— the stylesheet is emitted by a nested *module* expansion. There the served
+`<style>` carries both `mw:Extension/templatestyles` **and** `mw:Transclusion`,
+with the extension's `name`/`attrs`/`body` *and* the transclusion's `parts` in
+one `data-mw`, and rustoid instead emits the transclusion on an empty
+`<span class="mw-empty-elt">` with the `<style>` beside it. So the wrapper must
+merge onto a stylesheet that a *nested* expansion produced, not onto one written
+in the body. Next to look at.
