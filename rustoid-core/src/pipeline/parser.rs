@@ -73,6 +73,32 @@ fn split_into_chunks(tokens: Vec<Item>) -> Vec<Vec<Item>> {
     chunks
 }
 
+/// How deep the attribute sub-pipeline recurses. Each level expands the
+/// templated attributes of what the level above produced; the bound only guards
+/// against a pathological value that reproduces itself.
+const MAX_ATTR_EXPANSION_DEPTH: u8 = 8;
+
+/// Whether any token in `items` carries a templated (token-array) attribute, so
+/// that [`Parser::expand_attributes_at`] would do work over it. Lets
+/// [`Parser::expand_attr_tokens`] skip the recursive sub-pipeline in the common
+/// case where a value expands to plain strings.
+fn has_token_attributes(items: &[Item]) -> bool {
+    use crate::wikitext::tokens_v2::KeyValue;
+    items.iter().any(|it| {
+        let Item::Tok(tok) = it else {
+            return false;
+        };
+        if !matches!(tok, ParsoidToken::Tag(_) | ParsoidToken::SelfclosingTag(_))
+            || tok.get_name() == "mw:dom-fragment-token"
+        {
+            return false;
+        }
+        tok.get_attribs().iter().any(|kv| {
+            matches!(kv.key, KeyValue::Tokens(_)) || matches!(kv.value, KeyValue::Tokens(_))
+        })
+    })
+}
+
 /// Flag a text-returning parser function's branch as such, in place.
 ///
 /// See [`crate::wikitext::tokens_v2::TempData::in_text_branch`]: core answers
@@ -4010,6 +4036,39 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
+        self.expand_attributes_at(
+            frame,
+            tokens,
+            source,
+            about_counter,
+            page_source,
+            fragments,
+            next_id,
+            0,
+        )
+        .await
+    }
+
+    /// The body of [`Self::expand_attributes`], carrying the sub-pipeline depth.
+    ///
+    /// A value that expands to markup with *its own* templated attributes (a
+    /// `Template:Legend` inside a media caption) needs the attribute expander run
+    /// over the expansion, not only over the page's top level: Parsoid's
+    /// `AttributeTransformManager` expands a value with `attrExpansion` and
+    /// `buildExpandedAttrs` runs it through a pipeline that includes the
+    /// `AttributeExpander`. `depth` bounds the recursion.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_attributes_at(
+        &self,
+        frame: &Frame,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        page_source: Option<&str>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+        depth: u8,
+    ) -> Vec<Item> {
         use crate::wikitext::tokens_v2::{KV, KeyValue};
 
         let mut out = Vec::new();
@@ -4048,44 +4107,40 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // otherwise burned one id per page — see `Template:Short
             // description`).
             let in_tpl = tok.data_parsoid().is_some_and(|dp| dp.tmp.synthesized);
-            let outer_fragments = &mut *fragments;
-            let fragments = std::cell::RefCell::new(std::mem::take(outer_fragments));
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
-                    let mut expanded = self
-                        .expand_templates(
+                    let expanded = self
+                        .expand_attr_tokens(
                             frame,
                             toks.clone(),
                             source,
                             about_counter,
+                            page_source,
+                            fragments,
+                            next_id,
                             in_tpl,
-                            in_tpl,
-                            page_source.unwrap_or(""),
+                            depth,
                         )
                         .await;
-                    // Attribute contents are template output: an expansion
-                    // marker here carries a source range relative to the
-                    // expanded sub-source, not the page (PHP's
-                    // `processTemplateTokens` clears these).
-                    crate::wikitext::token_utils::clear_tsr(&mut expanded);
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
                     kv.key.clone()
                 };
                 let new_value = if let KeyValue::Tokens(toks) = &kv.value {
-                    let mut expanded = self
-                        .expand_templates(
+                    let expanded = self
+                        .expand_attr_tokens(
                             frame,
                             toks.clone(),
                             source,
                             about_counter,
+                            page_source,
+                            fragments,
+                            next_id,
                             in_tpl,
-                            in_tpl,
-                            page_source.unwrap_or(""),
+                            depth,
                         )
                         .await;
-                    crate::wikitext::token_utils::clear_tsr(&mut expanded);
                     crate::pipeline::attribute_transform_manager::items_to_key_value(expanded)
                 } else {
                     kv.value.clone()
@@ -4105,13 +4160,70 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 expanded_attrs,
                 about_counter,
                 false,
-                &|kv| self.value_to_dom_html(kv, &mut fragments.borrow_mut(), next_id),
+                &mut |kv| self.value_to_dom_html(kv, fragments, next_id),
                 page_source,
             );
             out.extend(result);
-            *outer_fragments = fragments.into_inner();
         }
         out
+    }
+
+    /// Expand one attribute key/value token array the way Parsoid's attribute
+    /// sub-pipeline does: templates, then the extension handler over the value's
+    /// attributes, then the attribute expander over what the expansion produced.
+    /// The last step is what reaches a `Template:Legend`'s templated `class`/
+    /// `style` when the legend sits inside a caption.
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_attr_tokens(
+        &self,
+        frame: &Frame,
+        toks: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        page_source: Option<&str>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+        in_tpl: bool,
+        depth: u8,
+    ) -> Vec<Item> {
+        let mut expanded = self
+            .expand_templates(
+                frame,
+                toks,
+                source,
+                about_counter,
+                in_tpl,
+                in_tpl,
+                page_source.unwrap_or(""),
+            )
+            .await;
+        // Attribute contents are template output: an expansion marker here
+        // carries a source range relative to the expanded sub-source, not the
+        // page (PHP's `processTemplateTokens` clears these).
+        crate::wikitext::token_utils::clear_tsr(&mut expanded);
+        // TT2 order inside the value's sub-pipeline: ExtensionHandler before
+        // AttributeExpander.
+        let expanded = crate::pipeline::extension_handler::expand_in_attributes(
+            expanded,
+            self.config,
+            fragments,
+            next_id,
+        );
+        if depth < MAX_ATTR_EXPANSION_DEPTH && has_token_attributes(&expanded) {
+            Box::pin(self.expand_attributes_at(
+                frame,
+                expanded,
+                source,
+                about_counter,
+                page_source,
+                fragments,
+                next_id,
+                depth + 1,
+            ))
+            .await
+        } else {
+            expanded
+        }
     }
 
     /// Fetch, expand, and recursively re-process a single template. Mirrors the
@@ -5813,6 +5925,37 @@ mod tests {
     use super::*;
     use crate::mock::MockSiteConfig;
     use crate::options::ParserOptions;
+
+    #[test]
+    fn test_has_token_attributes() {
+        use crate::wikitext::tokens_v2::{KeyValue, SelfclosingTagTk};
+
+        // A plain-string attribute and a token-array attribute.
+        let tok = |value: KeyValue| {
+            let mut stt = SelfclosingTagTk::new(
+                "span",
+                vec![],
+                crate::wikitext::tokens_v2::DataParsoid::default(),
+            );
+            stt.attribs.push(crate::wikitext::tokens_v2::KV {
+                key: KeyValue::Str("style".to_string()),
+                value,
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
+            Item::Tok(ParsoidToken::SelfclosingTag(stt))
+        };
+
+        assert!(!has_token_attributes(&[tok(KeyValue::Str(
+            "x".to_string()
+        ))]));
+        assert!(has_token_attributes(&[tok(KeyValue::Tokens(vec![
+            Item::Str("x".to_string())
+        ]))]));
+        // A bare string item never counts.
+        assert!(!has_token_attributes(&[Item::Str("x".to_string())]));
+    }
 
     #[test]
     fn test_wikitext_to_html_heading() {

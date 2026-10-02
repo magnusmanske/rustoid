@@ -393,7 +393,7 @@ struct TmpDataMwPart {
 impl TmpDataMwPart {
     fn into_data_mw_value(
         self,
-        value_to_html: &dyn Fn(&KeyValue) -> String,
+        value_to_html: &mut dyn FnMut(&KeyValue) -> String,
     ) -> crate::wikitext::tokens_v2::DataMwValue {
         use crate::wikitext::tokens_v2::DataMwValue;
         let html = self.html_src.map(|kv| value_to_html(&kv));
@@ -429,7 +429,7 @@ pub fn build_expanded_attrs(
     expanded_attrs: Vec<KV>,
     about_counter: &std::cell::Cell<usize>,
     in_template: bool,
-    value_to_html: &dyn Fn(&KeyValue) -> String,
+    value_to_html: &mut dyn FnMut(&KeyValue) -> String,
     source: Option<&str>,
 ) -> Vec<Item> {
     use super::attribute_transform_manager::{items_to_key_value, key_value_to_items};
@@ -686,15 +686,14 @@ pub fn build_expanded_attrs(
         //
         // Each `html` source is converted to a serialized DOM fragment via the
         // caller-provided `value_to_html` (mirrors `expandAttrValuesToDOM`).
-        let attribs: Vec<crate::wikitext::tokens_v2::DataMwAttrib> = tmp_data_mw
-            .into_iter()
-            .map(|t| {
-                crate::wikitext::tokens_v2::DataMwAttrib::new(
-                    t.k.into_data_mw_value(value_to_html),
-                    t.v.into_data_mw_value(value_to_html),
-                )
-            })
-            .collect();
+        let mut attribs: Vec<crate::wikitext::tokens_v2::DataMwAttrib> =
+            Vec::with_capacity(tmp_data_mw.len());
+        for t in tmp_data_mw {
+            attribs.push(crate::wikitext::tokens_v2::DataMwAttrib::new(
+                t.k.into_data_mw_value(&mut *value_to_html),
+                t.v.into_data_mw_value(&mut *value_to_html),
+            ));
+        }
         let data_mw_attribs = serialize_data_mw_attribs(&attribs);
         let data_mw_json = format!("{{\"attribs\":{data_mw_attribs}}}");
         token.set_attribute("data-mw", &data_mw_json);
@@ -913,7 +912,7 @@ mod tests {
             expanded_attrs,
             &counter,
             false,
-            &|kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            &mut |kv| crate::wikitext::token_utils::key_value_to_string(kv),
             None,
         );
 
@@ -971,7 +970,7 @@ mod tests {
             expanded_attrs,
             &counter,
             false,
-            &|kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            &mut |kv| crate::wikitext::token_utils::key_value_to_string(kv),
             None,
         );
 
