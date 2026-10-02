@@ -9761,3 +9761,30 @@ difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
 5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
 sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
 the workspace is green.
+
+## The next `Zebro` difference: a transclusion whose first child is a stylesheet
+At 66 780, inside the `C. Nores et al.` note, `{{cite journal}}`'s transclusion is
+placed differently. Parsoid puts it on the template's first rendered element, the
+CS1 stylesheet:
+
+```
+<style data-mw-deduplicate="TemplateStyles:r1333433106"
+       typeof="mw:Extension/templatestyles mw:Transclusion" about="#mwt8"
+       data-mw='{"name":"templatestyles",…,"parts":[{"template":{"target":{"wt":"cite journal"…'
+```
+
+rustoid emits an empty wrapper and drops the sheet here:
+
+```
+<span class="mw-empty-elt" about="#mwt8" typeof="mw:Transclusion"
+      data-mw='{"parts":[…cite journal…]}'></span><cite … about="#mwt8">
+```
+
+Two things are visible: the transclusion's `typeof`/`data-mw` did not merge onto
+the stylesheet element (rustoid wrapped nothing in an `mw-empty-elt` span
+instead), and the CS1 `<style>` is not emitted at this note at all (rustoid's
+`TemplateStyles:r1333433106` first appears at a later note, with a different
+`about`). This is the encapsulation merge again — `encapsulateTemplates` puts the
+range's `about`/`typeof`/`data-mw` on the range's first element, and a stylesheet
+is a rendering-transparent node — crossed with the templatestyles dedup ordering
+inside a `<ref>` body. Left for the next session; noted rather than guessed at.
