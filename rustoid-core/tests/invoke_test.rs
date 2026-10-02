@@ -1369,3 +1369,41 @@ async fn current_title_is_the_page_not_the_invoking_template() {
         "getCurrentTitle() or frame:getTitle() named the wrong title: {html}"
     );
 }
+
+/// `getCurrentTitle():getContent()` answers with the *page* source even when the
+/// `#invoke` sits inside a template's body.
+///
+/// The frame's `page_source` used to be the chunk that held the call — the
+/// template body — while it was asked to describe the page.
+/// `Module:Citation/CS1/Configuration` reads the page's wikitext through it to
+/// detect `{{Use dmy dates}}`, so reached through a `{{cite …}}` template it saw
+/// the CS1 template instead of the article and picked the wrong date format.
+#[tokio::test]
+async fn get_content_of_the_current_title_is_the_page_not_the_template_body() {
+    const MODULE: &str = r#"
+        local p = {}
+        function p.main(frame)
+            local src = mw.title.getCurrentTitle():getContent() or ''
+            if src:find('PAGEMARKER555', 1, true) then return 'SAW-PAGE' end
+            return 'SAW-' .. #src
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:R", MODULE);
+    source.add_template("Template:Read", "{{#invoke:R|main}}");
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "PAGEMARKER555 {{Read}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(
+        text_only(&html).contains("SAW-PAGE"),
+        "getContent() did not answer with the page source: {html}"
+    );
+}

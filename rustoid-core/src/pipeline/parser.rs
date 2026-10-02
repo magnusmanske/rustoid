@@ -1000,6 +1000,15 @@ pub struct Parser<'a, C: SiteConfig> {
     /// expansion call would touch a dozen signatures to serve one caller, so it
     /// is recorded once per parse like the expansion depth above.
     page_title: std::cell::RefCell<String>,
+    /// Wikitext of the page being parsed, recorded by `build_ast`.
+    ///
+    /// Distinct from the `src_text` threaded through expansion: that is the
+    /// source of the *chunk* currently being expanded — a template body, a
+    /// module output — while `mw.title.getCurrentTitle():getContent()` must
+    /// always answer with the *page* (`Module:Citation/CS1/Configuration` reads
+    /// it to detect `{{Use dmy dates}}`). Living here for the same reason as
+    /// `page_title`: one reader, reached from several expansion paths.
+    page_source: std::cell::RefCell<String>,
     /// Whether `data-parsoid` is omitted from output, recorded by `build_ast`
     /// from the options.
     ///
@@ -1142,6 +1151,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             config,
             lua_expansion_depth: std::cell::Cell::new(0),
             page_title: std::cell::RefCell::new(String::new()),
+            page_source: std::cell::RefCell::new(String::new()),
             pp_node_count: std::cell::Cell::new(0),
             expansion_depth: std::cell::Cell::new(0),
             strip_data_parsoid: std::cell::Cell::new(false),
@@ -2710,6 +2720,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // Recorded for `expand_invoke`, which needs the root page's title for
         // `mw.wikibase`; see the field's own comment.
         *self.page_title.borrow_mut() = title.get_prefixed_text();
+        *self.page_source.borrow_mut() = page_source.to_string();
         self.strip_data_parsoid.set(options.strip_data_parsoid);
         // The protection of the page being parsed, for `{{PROTECTIONLEVEL:action}}`
         // with no title argument. Fetched once here rather than on demand because
@@ -4604,7 +4615,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // pipeline that runs the module's output inherits.
         wrap: bool,
         body: bool,
-        _page_source: &str,
+        // The wikitext of the chunk that holds this call. It is *not* the page
+        // source: a `#invoke` inside a template expands its arguments against
+        // the template body, while `getCurrentTitle():getContent()` must answer
+        // with the page (see `Parser::page_source`).
+        src_text: &str,
         // The call's own arguments and the calling frame's, both raw. Scribunto
         // expands an argument when the module first reads it, so the module is
         // handed lazy [`ArgSlot`](crate::pipeline::lua_deferred::ArgSlot)s that
@@ -4647,7 +4662,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             parent_args: lazy_parent,
             parent_title: Some(parent_title),
             has_parent: true,
-            page_source: _page_source.to_string(),
+            page_source: self.page_source.borrow().clone(),
             page_title: Some(self.page_title.borrow().clone()),
             // Seed the frame with every title already resolved this render, so
             // `preload_titles` does not re-fetch them; see `title_facts`.
@@ -4701,7 +4716,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                             source,
                                             about_counter,
                                             body,
-                                            _page_source,
+                                            src_text,
                                         )
                                         .await
                                     }
