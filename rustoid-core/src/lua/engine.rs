@@ -5187,13 +5187,27 @@ fn build_args_table(
                         }
                     }
                     // Not materialized: an argument the host has not expanded
-                    // yet. Its text comes back on the next round.
-                    if let Some(slot) = lazy
-                        .iter()
-                        .find(|(key, _)| spellings.contains(key))
-                        .map(|(_, slot)| slot.clone())
-                    {
-                        return Err(raise_for_slot(&pending, slot));
+                    // yet. Its text comes back on the next round — but *every*
+                    // remaining argument is requested with it, not just the one
+                    // read. A round re-runs the whole module from scratch (the
+                    // engine cannot resume a call that raised), so requesting one
+                    // key at a time costs a full module execution per argument:
+                    // `Module:Citation/CS1` walking ten `frame.args` ran ten times
+                    // per `{{cite}}`. Scribunto has no such cost — its `frame.args`
+                    // is backed by arguments the preprocessor already expanded —
+                    // and the arguments' templates spend their `about` ids in the
+                    // frame's own slot order here, which is the order the request
+                    // lists them in.
+                    if !lazy.is_empty() {
+                        if pending.borrow().is_empty() {
+                            pending.borrow_mut().push(FrameRequest::ExpandArgs {
+                                slots: lazy.iter().map(|(_, slot)| slot.clone()).collect(),
+                            });
+                        }
+                        return Err(mlua::Error::runtime(format!(
+                            "{NOT_CACHED}{}",
+                            lazy[0].1.key()
+                        )));
                     }
                     Ok(Value::Nil)
                 })
@@ -7768,6 +7782,36 @@ mod tests {
             Some(FrameRequest::ExpandArgs { slots }) => {
                 assert_eq!(slots.len(), 1);
                 assert_eq!(slots[0].key(), slot(0).key());
+            }
+            other => panic!("expected one argument request, got {other:?}"),
+        }
+    }
+
+    /// Reading a single lazy argument requests *every* remaining slot, not just
+    /// the one read. A round re-runs the module from scratch, so one key at a
+    /// time would cost a full module execution per `frame.args` read;
+    /// Scribunto expands the frame's arguments as a set, in `getArguments`
+    /// order (numbered before named), which is the order the request lists them
+    /// in.
+    #[test]
+    fn reading_one_lazy_argument_requests_them_all() {
+        let engine = make_engine();
+        let lazy = |index, name: &str| {
+            Arg::Lazy(ArgSlot {
+                source: ArgSource::Call,
+                index,
+                name: Some(name.to_string()),
+                raw: String::new(),
+            })
+        };
+        let src = "local p = {} function p.main(frame) return frame.args.a end return p";
+        let args = vec![lazy(0, "a"), lazy(1, "b"), lazy(2, "c")];
+        let err = engine.execute(src, "main", &args).unwrap_err();
+        assert!(err.to_string().contains(NOT_CACHED), "{err}");
+        match engine.take_pending() {
+            Some(FrameRequest::ExpandArgs { slots }) => {
+                let keys: Vec<Option<&str>> = slots.iter().map(|s| s.name.as_deref()).collect();
+                assert_eq!(keys, vec![Some("a"), Some("b"), Some("c")]);
             }
             other => panic!("expected one argument request, got {other:?}"),
         }

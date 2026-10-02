@@ -6832,9 +6832,9 @@ the raw `KV` lists beside them.
 three metamethods for the rest:
 
 - `__index` resolves the read key (both spellings, `1` and `"1"`) against the
-  unresolved slots. A hit records `FrameRequest::ExpandArgs { slots: [one] }`
-  and raises the `NOT_CACHED` signal; the host expands that single argument (the
-  same code the eager path used, now per key) and the module is re-run.
+  unresolved slots. A hit records `FrameRequest::ExpandArgs` for **every**
+  still-unresolved slot (see below) and raises the `NOT_CACHED` signal; the host
+  expands them (the same code the eager path used) and the module is re-run.
 - `__pairs` — reachable because rustoid already back-ports `__pairs`/`__ipairs`
   — records **every** still-unresolved slot at once, numbered before named as
   `getArguments` does, so `pairs(frame.args)` costs one round rather than one per
@@ -6846,7 +6846,34 @@ three metamethods for the rest:
 carry several answers — and the round guard is keyed per answer, so a `pairs`
 over 108 arguments is still one settled round.
 
+#### One read expands the whole argument set
+
+The first version of `__index` raised for the *one* key that was read. That is
+faithful to Scribunto's observable `argCache` behaviour, but it is ruinous here:
+rustoid cannot resume a call that raised an error, so `run_once` builds a fresh
+`LuaEngine` and re-executes the module from the top for every round. A module
+that walks `frame.args` therefore ran its whole body once per argument —
+`Module:Citation/CS1` does exactly that for the ten fields of a `{{cite}}`.
+`2024 Summer Olympics` paid **2406 `ExpandArgs` rounds** out of 3154, and the
+page rendered in **47.7 s**.
+
+Scribunto has no such cost, and not because of continuation magic: it never
+*reads* argument by argument. `getArguments()` expands the frame's whole
+argument list as a set (numbered before named), so the analogue of "the host
+expands on first read" is "the host expands *all of them* on the first miss".
+`__index` now records every remaining slot at once, in `getArguments` order,
+and raises. Later reads of the same round are already covered because the request
+is recorded once (`pending.borrow().is_empty()`), and the errors after the first
+unwind the call anyway.
+
 ### Effect
+
+The same page now takes **1032 rounds (786 `ExpandArgs`) and 15.4 s** — a 3.1×
+round reduction and a 3.1× wall-time speed-up, with the first difference
+*unmoved* at byte 8910 (`0.47%` of parsoid), because that difference is the
+unexpanded-`<ref>`-body `about` drift, not id ordering. The fixture guard holds
+at 877/896 and the `about` ids for the page's first marker are unchanged
+(`#mwt8`, against the service's `#mwt10`).
 
 `Nobel Prize`'s infobox templatestyles moved from `#mwt15` to `#mwt9`: the
 nine-id gap the trace found is down to **three** at that point (the last three
