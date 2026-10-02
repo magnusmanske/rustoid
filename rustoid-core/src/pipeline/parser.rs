@@ -2397,43 +2397,57 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// drained and spends nothing.
     fn number_style_placeholders(&self, out: &mut [Item], about_counter: &std::cell::Cell<usize>) {
         for item in out.iter_mut() {
-            let Item::Tok(ParsoidToken::Tag(t)) = item else {
-                continue;
-            };
-            if t.name != "style" {
-                continue;
-            }
-            let is_fragment = t.attribs.iter().any(|kv| {
-                kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:DOMFragment")
-            });
-            if !is_fragment {
-                continue;
-            }
-            let Some(id) = t
-                .attribs
-                .iter()
-                .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
-                .and_then(|kv| kv.value.as_str())
-                .and_then(|v| v.parse::<usize>().ok())
-            else {
-                continue;
-            };
-            let Some(pending) = self.pending_styles.borrow_mut().remove(&id) else {
-                continue;
-            };
-            let about = self.new_about_id(about_counter, "templatestyles");
-            let node = crate::pipeline::templatestyles::style_node(
-                &pending.css,
-                pending.revid,
-                &pending.src,
-                pending.wrapper.as_deref(),
-                &about,
-                pending.has_body,
-            );
-            self.ext_fragments
-                .borrow_mut()
-                .insert(id, Node::document_with_child(node));
+            self.number_style_placeholder(item, about_counter);
         }
+    }
+
+    /// Number one `<templatestyles>` placeholder in place, draining its pending
+    /// stylesheet into `ext_fragments`. Returns whether `item` was such a
+    /// placeholder, so the caller can number extensions and styles in one
+    /// source-order pass (a reflist's `<templatestyles>` precedes its
+    /// `<references>`, and the two ids must follow that order).
+    fn number_style_placeholder(
+        &self,
+        item: &mut Item,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> bool {
+        let Item::Tok(ParsoidToken::Tag(t)) = item else {
+            return false;
+        };
+        if t.name != "style" {
+            return false;
+        }
+        let is_fragment = t.attribs.iter().any(|kv| {
+            kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:DOMFragment")
+        });
+        if !is_fragment {
+            return false;
+        }
+        let Some(id) = t
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+            .and_then(|kv| kv.value.as_str())
+            .and_then(|v| v.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        let Some(pending) = self.pending_styles.borrow_mut().remove(&id) else {
+            return true;
+        };
+        let about = self.new_about_id(about_counter, "templatestyles");
+        let node = crate::pipeline::templatestyles::style_node(
+            &pending.css,
+            pending.revid,
+            &pending.src,
+            pending.wrapper.as_deref(),
+            &about,
+            pending.has_body,
+        );
+        self.ext_fragments
+            .borrow_mut()
+            .insert(id, Node::document_with_child(node));
+        true
     }
 
     /// Resolve one `<indicator>` extension token into a placeholder plus a
@@ -3334,14 +3348,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             //
             // A token that already carries an `about` — one the nested expansion
             // that produced it already numbered — is left alone.
+            //
+            // A `<templatestyles>` is numbered in the same source-order pass: a
+            // chunk's extensions take ids in document order, so a reflist's
+            // `<templatestyles>` (written before its `<references>`) takes the
+            // lower id. (The `<references>` reaches this pass only because the
+            // parser-function branch that produces it deferred its numbering —
+            // see the `begin_style_defer` around the branch expansion.)
             for item in out.iter_mut() {
+                if self.number_style_placeholder(item, about_counter) {
+                    continue;
+                }
                 self.number_extension_token(item, source, frame, about_counter, in_template)
                     .await;
             }
-            // TT2's `ExtensionHandler` numbers the chunk's extensions after its
-            // templates; `<templatestyles>` is the extension whose id belongs on a
-            // stashed fragment rather than on a token, so it is numbered here.
-            self.number_style_placeholders(&mut out, about_counter);
             result.extend(out);
         }
         result
@@ -3812,18 +3832,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // family of `Help:Introduction`'s first difference, which is a
                 // `{{SHORTDESC:…}}` inside `Template:Short description`'s
                 // `#ifeq` branch. Expansion happens *after* the wrapper is built,
+                // Expansion happens *after* the wrapper is built,
                 // so the wrapper's own id still precedes its children's, as on
                 // the service.
-                let expanded = Box::pin(self.expand_templates(
-                    frame,
-                    produced,
-                    source,
-                    about_counter,
-                    in_tpl,
-                    body,
-                    src_text,
-                ))
-                .await;
+                //
+                // The branch is spliced into the *enclosing* chunk, so any
+                // extension it produces must be numbered there, in document
+                // order, not by this nested expansion's own post-pass. Numbering
+                // it here put `Template:Reflist`'s `<references>` (from
+                // `#tag:references` inside an `#if`) before the reflist's
+                // `<templatestyles>`, which precedes it in the source. The frame
+                // is the same — a parser function expands its branch in the
+                // caller's frame — so deferring loses nothing.
+                let expanded = {
+                    let _defer = self.begin_style_defer();
+                    Box::pin(self.expand_templates(
+                        frame,
+                        produced,
+                        source,
+                        about_counter,
+                        in_tpl,
+                        body,
+                        src_text,
+                    ))
+                    .await
+                };
                 let mut expanded = expanded;
                 if branch_is_text {
                     // The branch is text in the service, so nothing in it is a

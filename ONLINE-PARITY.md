@@ -9688,3 +9688,49 @@ the styles and other extensions — the same deferral `style_defer` already
 applies to extensions inside a template argument. That is a larger change and
 is left for the next session; the interleave was reverted rather than shipped as
 a no-op.
+
+## Reflist: a branch now defers its extensions, and styles interleave
+The difference at 62 583 is fixed, and it needed both halves, which is why the
+earlier interleave on its own was a no-op.
+
+`Template:Reflist` is `<templatestyles src="Reflist/styles.css"/>…{{#tag:references|…}}`.
+Two things put the ids in the wrong order:
+
+1. The `<references>` comes from `#tag:references` inside an `#if`/`#switch`
+   branch. rustoid re-expands a parser-function branch with its own
+   `expand_templates`, whose post-pass numbered the extension *then* — before
+   the reflist body's own post-pass reached the `<templatestyles>`. The branch
+   is spliced into the enclosing chunk, so its extensions belong to that chunk's
+   source-order pass. The branch expansion is now wrapped in
+   `begin_style_defer()` (the same deferral `style_defer` already provides for a
+   template argument's value), and the frame is unchanged — a parser function
+   expands its branch in the caller's frame — so nothing is lost.
+
+2. With both in one chunk's post-pass, the pass still ran every extension before
+   every style, so source order did not decide. `number_style_placeholders` is
+   split into a per-item `number_style_placeholder`, and the post-pass is now one
+   loop that numbers a style placeholder or an extension per item, in document
+   order:
+
+   ```
+   for item in out.iter_mut() {
+       if self.number_style_placeholder(item, about_counter) { continue; }
+       self.number_extension_token(item, …).await;
+   }
+   ```
+
+   Templates still take their ids during the walk, so the pinned
+   `<templatestyles/>{{Center|b}}` → style `#mwt2`/template `#mwt1` rule holds;
+   the change is only *among* a chunk's extensions.
+
+Half 1 alone changed nothing measurable (the extension was still numbered before
+the style pass); half 2 alone was the earlier no-op (the extension was already
+numbered by the nested pass). Together they give `Reflist` `#mwt123` style /
+`#mwt124` references, as parsoid.
+
+### Effect
+`Zebro`: 62 583 → **63 888** (45.72% → 46.68%). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction`
+5161, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
+sovereign states` 8409, `Unix` 4772), the fixture guard holds at 877/896, and
+the workspace is green.
