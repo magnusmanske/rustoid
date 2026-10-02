@@ -10030,3 +10030,69 @@ sources (es)`); Parsoid renders it as an inline `<link rel="mw:PageProp/Category
 inside the reference (the reference list is rendered in place, so the category
 link stays inline rather than moving to the category section), and rustoid drops
 it. The ids after it are one behind. That is the next difference to chase.
+
+## Fixed: `mw.site.talkNamespaces` held every namespace
+
+The missing `<link>` was not a Cite or category bug at all — it was a Lua table
+that was too large. `Module:Citation/CS1/Configuration` builds its
+`uncategorized_namespaces` set with
+
+```lua
+local uncategorized_namespaces_t = {[2]=true};
+for k, _ in pairs (mw.site.talkNamespaces) do    -- add all talk namespace ids
+    uncategorized_namespaces_t[k] = true;
+end
+```
+
+and CS1 then reads `cfg.uncategorized_namespaces[this_page.namespace]` to decide
+`no_tracking_cats`. rustoid answered `mw.site.talkNamespaces` (and
+`subjectNamespaces`) with `luafn_site_namespaces`, i.e. **the full namespace
+table**, so the main namespace 0 landed in that set, CS1 took the
+"don't categorize this page" branch, and every CS1 tracking category —
+`CS1 Spanish-language sources (es)`, `CS1: long volume value`, `CS1 Brazilian
+Portuguese-language sources (pt-br)` — was dropped. Non-CS1 categories (from
+wikitext templates) were unaffected, which is what made this look like a Cite
+problem.
+
+`luafn_site_namespaces` now takes a `NamespaceSet` (`All`/`Subject`/`Talk`) and
+filters on `is_talk_namespace_id` (positive odd id, so `Special`/`Media` are
+neither). `mw.site.namespaces` stays complete; `subjectNamespaces` keeps
+`!talk && id >= 0`; `talkNamespaces` keeps the talk ids only.
+
+### Also fixed here: the red-link attribute order
+
+With the categories in, the next difference was a red link whose attributes were
+ordered `class data-mw-i18n typeof` where Parsoid has `class typeof
+data-mw-i18n`. `WTUtils::addPageContentI18nAttribute` sets `typeof` before
+`data-mw-i18n`; `AddRedLinks` now does too.
+
+### A cache-fill, not a bug: red links offline
+
+Between those two, the first difference was the red link
+`[[Universidad de Castilla - La Mancha]]` itself: rustoid rendered it blue.
+That is the offline fallback — `lookup_page_info` assumes "exists" for a title
+it cannot look up, so nothing is painted red — and the title was not in the
+facts cache. A single pinned online run (`--page Zebro --revision 1376497498`)
+warms those facts (the API still reports `missing: true`, so this is not drift)
+and the link goes red. The generic lesson: **offline, a red link can only match
+if its target's existence fact was fetched**, and the fact is only fetched on a
+run that reaches `get_page_info` with the link present in the tree.
+
+### Effect
+`Zebro`: 86 997 → 89 372 (65.24% → 65.30%) after the red-link fetch, then →
+**106 639** (65.30% → **77.91%**) after the category + attribute-order fixes.
+Every other page's first difference is unchanged; the fixture guard holds at
+**877/896**; clippy and fmt are clean.
+
+### The next `Zebro` difference: a CS1 access date is not reformatted
+At 106 639, inside a CS1 note:
+
+```
+parsoid: …<span class="reference-accessdate" id="mwAq8">. Retrieved <span class="nowrap" id="mwArA">12 August</span> 2025</span>…
+rustoid: …<span class="reference-accessdate" id="mwAq8">. Retrieved <span class="nowrap" id="mwArA">2025-08-12</span></span>…
+```
+
+Parsoid's CS1 reformats the `access-date` to `12 August 2025` with the
+`<span class="nowrap">` around the day and month; rustoid leaves the raw ISO
+`2025-08-12`. This is CS1's date formatting (`Module:Citation/CS1/Date_validation`
+/ the `df` handling), and the next thing to chase.

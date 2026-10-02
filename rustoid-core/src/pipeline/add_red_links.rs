@@ -55,8 +55,11 @@ pub fn run(node: &mut Node, page_info: &HashMap<String, PageInfo>, page_title: &
         let i18n = format!(
             "{{\"title\":{{\"lang\":\"x-page\",\"key\":\"red-link-title\",\"params\":[{title_json}]}}}}"
         );
-        node.set_attr("data-mw-i18n", i18n);
+        // `WTUtils::addPageContentI18nAttribute` sets `typeof` before
+        // `data-mw-i18n`; the serializer keeps insertion order, so the two must
+        // be added in that order.
         add_typeof(node, "mw:LocalizedAttrs");
+        node.set_attr("data-mw-i18n", i18n);
 
         // Append `?action=edit&redlink=1` to the href query string, keeping the
         // fragment *after* the query (PHP reassembles the URL correctly).

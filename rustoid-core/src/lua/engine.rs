@@ -1566,12 +1566,27 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // `mw.site.namespaces` is indexed by id and by name, and modules read
     // properties off the entries (Hatnote indexes it directly, which is why a
     // missing table stops the module with "attempt to index a nil value").
-    site.set("namespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
+    site.set(
+        "namespaces",
+        luafn_site_namespaces(lua, &ctx.site, NamespaceSet::All)?,
+    )?;
     // `subjectNamespaces`/`talkNamespaces` are the same entries under a second
     // index; modules cross-reference them (Namespace detect reads
-    // `subjectNamespaces`).
-    site.set("subjectNamespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
-    site.set("talkNamespaces", luafn_site_namespaces(lua, &ctx.site)?)?;
+    // `subjectNamespaces`). They are *filtered*: `talkNamespaces` holds only the
+    // talk namespaces, because a module iterates it to build a set of namespace
+    // ids — `Module:Citation/CS1/Configuration` does
+    // `for k in pairs(mw.site.talkNamespaces) do uncategorized_namespaces_t[k]=true end`
+    // — and handing back every namespace put the main namespace (0) in that set,
+    // so CS1 read `cfg.uncategorized_namespaces[0]` as true, set
+    // `no_tracking_cats`, and dropped every CS1 tracking category.
+    site.set(
+        "subjectNamespaces",
+        luafn_site_namespaces(lua, &ctx.site, NamespaceSet::Subject)?,
+    )?;
+    site.set(
+        "talkNamespaces",
+        luafn_site_namespaces(lua, &ctx.site, NamespaceSet::Talk)?,
+    )?;
     // `mw.site.interwikiMap(filter)` — `Module:Citation/CS1/Configuration` spins
     // through the local entries to learn which prefixes are language codes, and
     // stops with "attempt to call a nil value (field 'interwikiMap')" without it.
@@ -5580,7 +5595,22 @@ fn html_unescape(s: &str) -> String {
 ///
 /// Modules read properties (`id`, `name`, `canonicalName`, `isContent`, …) off
 /// the entries, so each is a table rather than a bare string.
-fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
+/// Which entries [`luafn_site_namespaces`] keeps, for `mw.site.namespaces` (all),
+/// `.subjectNamespaces` and `.talkNamespaces`.
+#[derive(Clone, Copy, PartialEq)]
+enum NamespaceSet {
+    All,
+    Subject,
+    Talk,
+}
+
+/// `MWNamespace::isTalk` — a positive, odd namespace id. Negative ids (Special,
+/// Media) are not talk namespaces even when odd.
+fn is_talk_namespace_id(id: i32) -> bool {
+    id > 0 && id % 2 == 1
+}
+
+fn luafn_site_namespaces(lua: &Lua, site: &LuaSite, set: NamespaceSet) -> Result<Table> {
     let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let namespaces = lua.create_table().map_err(err)?;
     // The main namespace is id 0 with the empty name, which the snapshot drops
@@ -5592,6 +5622,14 @@ fn luafn_site_namespaces(lua: &Lua, site: &LuaSite) -> Result<Table> {
     all.sort_by_key(|(id, _, _)| *id);
 
     for (id, canonical, aliases) in all {
+        let keep = match set {
+            NamespaceSet::All => true,
+            NamespaceSet::Subject => !is_talk_namespace_id(id) && id >= 0,
+            NamespaceSet::Talk => is_talk_namespace_id(id),
+        };
+        if !keep {
+            continue;
+        }
         let entry = lua.create_table().map_err(err)?;
         entry.set("id", id).map_err(err)?;
         entry.set("name", canonical.clone()).map_err(err)?;
