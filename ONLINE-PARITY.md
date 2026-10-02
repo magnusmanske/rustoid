@@ -9030,3 +9030,64 @@ expansions on a ref-heavy page, and the first difference does not move until the
 ids interleave exactly. Landing it needs the expansion made cheap (a per-page
 share of whatever the service caches) first. Recorded rather than shipped, and
 the working tree is back to the three commits above.
+
+## The navbox `above` list, and the `Nl`-trim it exposed
+
+The navbox investigation from the previous section's last paragraph (rustoid's
+`Template:Olympic Games` navbox lost list structure) reduced to a one-line
+reproduction against the live transform endpoint:
+
+```
+{{Navbox
+| name = Olympic Games
+| title = [[File:Olympic rings without rims.svg|30px]] [[Olympic Games]]
+| above =
+* '''[[Olympic sports]]'''
+* '''[[Olympism]]'''
+}}
+```
+
+Rustoid emitted `<li><b>Olympic sports</b>* <b>Olympism</b></li>` where the
+service emits two `<li>`s. The `* ` is literal, so the value `Module:Navbox`
+received from `frame.args.above` had lost the newline between the items.
+
+### The two bugs, and the wrong turn between them
+
+The value is expanded by `expand_invoke_arg_text` → `argument_value_text`, which
+covered `Str`, `mw-quote`, `{{!}}`, wikilinks, tags and entities — and **dropped
+`Nl` tokens**, with a comment claiming `tokensToString` drops them. That is true
+in *attribute* context, but a module's argument is expanded wikitext and
+MediaWiki's preprocessor keeps the line break. Rendering `Nl` as `\n` fixed the
+navbox (and every navbox `above`/`below`/list).
+
+It also moved `2024 Summer Olympics`'s first difference *earlier*, from 8910 to
+**2077 (0.11%)** — a regression, on `{{Use British English}}`. That template is
+`{{safesubst:<noinclude />#invoke:Unsubst||…|$B=\n{{DMCA|Use British English
+…}}}}`, and `Module:Unsubst` returns `$B`. The newlines leaked into a category
+name: `[[Category:Use British English\n from\n July 2024\n]]` stopped parsing as
+a link and rendered as literal text, and the two adjacent transclusions merged.
+
+### The real cause: a named argument is trimmed, newline tokens included
+
+The category's newlines came from `Template:Dated maintenance category
+(articles)`, whose body passes `|1={{{1|}}}` — one argument per line, so each
+value ends in `\n `. MediaWiki trims a named argument's value **after
+expansion** (`PPTemplateFrame_Hash::getNamedArgument` runs `trim()`; a truly
+positional argument is not trimmed). Rustoid models that in `Frame`'s argument
+lookup, but `trim_items` only trimmed the outermost `Item::Str`. A value like
+`|1=A\n` expands to `[Str("A"), Nl]`, so the trailing newline token survived the
+trim — invisible while `tokens_to_string` dropped it, fatal once
+`argument_value_text` kept it and spliced it into a link target.
+
+`trim_items` now drops edge `Nl` tokens and whitespace-only `Str`s as well.
+
+### Effect
+
+- `2024 Summer Olympics`'s first difference returns to **8910 (0.47% of
+  parsoid)**, unchanged from before — the navbox is far past it — while rustoid's
+  output grows 1 282 656 → 1 288 905 bytes: the lists are real now.
+- The `{{Use British English}}`/`{{Use dmy dates}}` categories are byte-identical
+  again (`Category:Use_British_English_from_July_2024`), and the two transclusions
+  no longer merge.
+- Fixture guard **877/896**, workspace tests green. `trim_items` has a unit test
+  that asserts the edge `Nl` tokens are gone.

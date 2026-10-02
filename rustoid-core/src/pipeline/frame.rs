@@ -295,15 +295,50 @@ fn key_value_to_items(value: &KeyValue) -> Vec<Item> {
 
 /// Trim leading/trailing whitespace from a token chunk (mirrors
 /// `TokenUtils::tokenTrim` for the string-token subset).
-fn trim_items(items: &mut [Item]) {
-    if items.is_empty() {
-        return;
+fn trim_items(items: &mut Vec<Item>) {
+    // MediaWiki trims the *expanded string* of a named argument
+    // (`PPTemplateFrame_Hash::getNamedArgument` runs `trim()`), so edge
+    // whitespace that is a token rather than a `Str` has to go too. `|1=A\n`
+    // expands to `[Str("A"), Nl]`, and trimming only the outermost `Str` left
+    // the newline behind — which is observable once the value is spliced into
+    // a link target or a category name, where the break turns a clean
+    // `[[Category:X]]` into literal text.
+    while let Some(first) = items.first() {
+        match first {
+            Item::Tok(ParsoidToken::Nl(_)) => {
+                items.remove(0);
+            }
+            Item::Str(s) if s.trim().is_empty() => {
+                items.remove(0);
+            }
+            Item::Str(s) => {
+                let trimmed = s.trim_start();
+                if trimmed.len() != s.len() {
+                    items[0] = Item::Str(trimmed.to_string());
+                }
+                break;
+            }
+            _ => break,
+        }
     }
-    if let Some(Item::Str(first)) = items.first_mut() {
-        *first = first.trim_start().to_string();
-    }
-    if let Some(Item::Str(last)) = items.last_mut() {
-        *last = last.trim_end().to_string();
+    while let Some(last) = items.last() {
+        match last {
+            Item::Tok(ParsoidToken::Nl(_)) => {
+                items.pop();
+            }
+            Item::Str(s) if s.trim().is_empty() => {
+                items.pop();
+            }
+            Item::Str(s) => {
+                let trimmed = s.trim_end();
+                if trimmed.len() != s.len() {
+                    let n = items.len();
+                    items[n - 1] = Item::Str(trimmed.to_string());
+                }
+                break;
+            }
+            _ => break,
+        }
     }
 }
 
@@ -399,5 +434,43 @@ mod tests {
         // Undefined arg becomes a literal `{{{missing}}}` marker.
         let items = frame.expand_template_arg("missing");
         assert_eq!(tokens_to_string(&items), "{{{missing}}}");
+    }
+
+    /// A named argument is trimmed on its *expanded string*, so edge whitespace
+    /// that is a token rather than a `Str` has to go too. `|1=A\n` expands to
+    /// `[Str("A"), Nl]`, and the leftover newline token broke a link target the
+    /// value was spliced into — the category in `[[Category:{{{1}}} …]]` came
+    /// out with a line break and stopped parsing as a link.
+    #[test]
+    fn test_expand_template_arg_trims_newline_tokens() {
+        use crate::wikitext::tokens_v2::{NlTk, ParsoidToken, SourceRange};
+        let config = MockSiteConfig::new();
+        let title = TitleParser::parse("Template:Foo", &config);
+        let nl = || {
+            Item::Tok(ParsoidToken::Nl(NlTk::new(SourceRange {
+                start: None,
+                end: 0,
+                source: None,
+            })))
+        };
+        let frame = Frame::new(
+            title,
+            vec![KV {
+                key: KeyValue::Str("1".to_string()),
+                value: KeyValue::Tokens(vec![nl(), Item::Str("Alice".to_string()), nl()]),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }],
+        );
+
+        let items = frame.expand_template_arg("1");
+        assert_eq!(tokens_to_string(&items), "Alice");
+        assert!(
+            !items
+                .iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::Nl(_)))),
+            "a named argument's edge newline tokens must be trimmed: {items:?}"
+        );
     }
 }

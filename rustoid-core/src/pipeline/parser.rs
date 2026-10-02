@@ -5231,8 +5231,10 @@ fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 /// The shapes handled, each with an exact textual form:
 ///
 /// - `Item::Str` — the text itself.
-/// - comments and newlines — dropped, as `tokensToString` drops them (MediaWiki's
-///   preprocessor strips comments before a module sees an argument).
+/// - comments — dropped, as MediaWiki's preprocessor strips them before a
+///   module sees an argument. A newline is *not* dropped: it is kept, because
+///   the argument is expanded wikitext and the preprocessor preserves line
+///   breaks (a navbox `above` value is a multi-line list).
 /// - `mw-quote` — its delimiter (`''`/`'''`) is in its `value` attribute, and in
 ///   Scribunto's string view `''x''` is quite literally `''x''`.
 /// - the `{{!}}` marker — a `<td>` carrying an empty `attrSrc` and the
@@ -5281,7 +5283,15 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
     while i < items.len() {
         match &items[i] {
             Item::Str(s) => out.push_str(s),
-            Item::Tok(ParsoidToken::Comment(_) | ParsoidToken::Nl(_)) => {}
+            // Newlines are dropped in *attribute* context (`tokensToString`),
+            // but a module's argument is expanded wikitext and MediaWiki's
+            // preprocessor keeps the newline: `|above=\n* a\n* b` reaches
+            // `Module:Navbox` with the line break intact, which is what makes
+            // the value a two-item list. Dropping it here merged the items into
+            // one (`<li>a* b</li>`), so every navbox `above`/`below`/list lost
+            // its list structure.
+            Item::Tok(ParsoidToken::Nl(_)) => out.push('\n'),
+            Item::Tok(ParsoidToken::Comment(_)) => {}
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
                 let value = t.attribs.iter().find(|kv| kv.key.as_str() == Some("value"));
                 out.push_str(
