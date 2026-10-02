@@ -7280,6 +7280,14 @@ mod tests {
                 .unwrap(),
             "ok"
         );
+        // MediaWiki's full English list, not a hand-picked subset: CS1 inverts it
+        // for `|language=`, so a code it omits loses its friendly name.
+        assert_eq!(
+            engine
+                .eval("return mw.language.fetchLanguageNames('en', 'all').gsw")
+                .unwrap(),
+            "Alemannic"
+        );
     }
 
     #[test]
