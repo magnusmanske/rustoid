@@ -182,6 +182,16 @@ pub struct PegTokenizer<'a> {
     /// template will produce; true wherever a caller supplies the context
     /// explicitly (PHP's `tableDataBlock` parameter proper).
     enforce_table_data_block: bool,
+    /// Byte offset of `input` within the ambient source.
+    ///
+    /// Zero for a top-level pass, where `input` *is* the ambient source. A
+    /// sub-tokenizer that parses a slice of a larger input (link content, a link
+    /// target, a template argument value) sets this to the slice's start so the
+    /// tokens it emits carry the same coordinate space the surrounding pass
+    /// uses — PHP has a single grammar pass, so `tsr` offsets are always
+    /// ambient. Without the shift a `mw-quote` inside `[url ''x'']` produced an
+    /// `<i>` with a link-relative `tsr` that `ComputeDSR` read as a page offset.
+    base_offset: usize,
 }
 
 impl<'a> PegTokenizer<'a> {
@@ -210,7 +220,16 @@ impl<'a> PegTokenizer<'a> {
             in_table_cell: false,
             table_data_depth: usize::from(options.table_data_block),
             enforce_table_data_block: options.enforce_table_data_block,
+            base_offset: 0,
         }
+    }
+
+    /// Builder: shift every emitted TSR into the ambient coordinate space (see
+    /// [`Self::base_offset`]). Used by the sub-tokenizers that parse a slice of
+    /// a larger input.
+    pub(crate) fn with_base_offset(mut self, base_offset: usize) -> Self {
+        self.base_offset = base_offset;
+        self
     }
 
     /// Tokenize the entire input, returning chunks of (tokens + text).
@@ -285,8 +304,8 @@ impl<'a> PegTokenizer<'a> {
     /// the downstream reader happens to be holding.
     fn tsr(&self, start: usize, end: usize) -> SourceRange {
         SourceRange {
-            start: Some(start),
-            end,
+            start: Some(self.base_offset + start),
+            end: self.base_offset + end,
             source: Some(std::sync::Arc::clone(&self.source)),
         }
     }
@@ -321,9 +340,9 @@ impl<'a> PegTokenizer<'a> {
         self.output.drain(from..).collect()
     }
 
-    /// Emit a DataParsoid with a TSR.
+    /// Emit a DataParsoid with a TSR (in the ambient coordinate space).
     fn make_dp(&self, start: usize, end: usize) -> DataParsoid {
-        DataParsoid::with_tsr(start, end)
+        DataParsoid::with_tsr(self.base_offset + start, self.base_offset + end)
     }
 
     fn make_dp_tsr(&self, tsr: SourceRange) -> DataParsoid {
@@ -1237,7 +1256,12 @@ impl<'a> PegTokenizer<'a> {
         let mut redirect = SelfclosingTagTk::new("mw:redirect", vec![], dp);
         redirect.attribs.push(KV {
             key: KeyValue::Str("href".to_string()),
-            value: tokenize_link_target(target, self.lang_conv_enabled, &self.ext_tags),
+            value: tokenize_link_target(
+                target,
+                self.lang_conv_enabled,
+                &self.ext_tags,
+                target_start,
+            ),
             src_offsets: None,
             ksrc: None,
             vsrc: None,
@@ -2319,7 +2343,10 @@ impl<'a> PegTokenizer<'a> {
             // The token TSR spans the full extension (start..end), not just the
             // open tag (mirrors PHP, whose extension token `tsr` covers the whole
             // `<gallery>…</gallery>` so ComputeDSR stamps a correct DSR).
-            dp.tsr = Some(SourceRange::new(saved, end));
+            dp.tsr = Some(SourceRange::new(
+                self.base_offset + saved,
+                self.base_offset + end,
+            ));
             self.pos = end;
         } else {
             // Unmatched start tag (no end tag) or self-closed: the sanitizer falls
@@ -3220,8 +3247,14 @@ impl<'a> PegTokenizer<'a> {
             // part becomes its own `mw:maybeContent` KV (with its own token
             // array), so `renderFile` can distinguish options from the caption
             // without flattening the caption's transclusion/table structure.
-            let parts = split_wikilink_content(content);
-            let target = parts.first().map(|s| s.as_str()).unwrap_or("");
+            //
+            // The parts are tokenized by a sub-tokenizer whose offsets are
+            // relative to the part; the part's own offset within `content` (plus
+            // `saved + 2`, where `content` starts) rebases them onto the page so
+            // a quote inside the caption earns the right `dsr` (PHP parses the
+            // caption inline, so its `tsr` is already page-absolute).
+            let parts = split_wikilink_content_offsets(content);
+            let target = parts.first().map(|(_, s)| s.as_str()).unwrap_or("");
 
             self.advance(end + 2);
 
@@ -3231,12 +3264,13 @@ impl<'a> PegTokenizer<'a> {
             // `wikilink_preproc_internal`, which bails to `$textTokens` when
             // `$target === null || $pipeTrick` where `$pipeTrick` is a single
             // `mw:maybeContent` with an empty value).
-            let is_pipe_trick = parts.len() == 2 && parts[1].is_empty();
+            let is_pipe_trick = parts.len() == 2 && parts[1].1.is_empty();
             if target.trim().is_empty() || is_pipe_trick {
                 self.emit_text(self.input[saved..self.pos].to_string());
                 return true;
             }
 
+            let content_base = saved + 2;
             let dp = self.make_dp(saved, self.pos);
             let mut stt = SelfclosingTagTk::new("wikilink", vec![], dp);
             // The target is tokenized (templates become `template` tokens),
@@ -3246,7 +3280,12 @@ impl<'a> PegTokenizer<'a> {
             // (mirrors PHP's `$oContent->vsrc`).
             stt.attribs.push(KV {
                 key: KeyValue::Str("href".to_string()),
-                value: tokenize_link_target(target, self.lang_conv_enabled, &self.ext_tags),
+                value: tokenize_link_target(
+                    target,
+                    self.lang_conv_enabled,
+                    &self.ext_tags,
+                    content_base + parts.first().map(|(o, _)| *o).unwrap_or(0),
+                ),
                 src_offsets: None,
                 ksrc: None,
                 vsrc: Some(target.to_string()),
@@ -3254,10 +3293,15 @@ impl<'a> PegTokenizer<'a> {
             // Emit one `mw:maybeContent` KV per pipe-separated content part
             // (mirrors PHP's `wikilink_content`, whose `(pipe link_text?)*`
             // produces a `mw:maybeContent` KV for each `|`-separated segment).
-            for part in parts.iter().skip(1) {
+            for (off, part) in parts.iter().skip(1) {
                 stt.attribs.push(KV {
                     key: KeyValue::Str("mw:maybeContent".to_string()),
-                    value: tokenize_link_content(part, self.lang_conv_enabled, &self.ext_tags),
+                    value: tokenize_link_content(
+                        part,
+                        self.lang_conv_enabled,
+                        &self.ext_tags,
+                        content_base + off,
+                    ),
                     src_offsets: None,
                     ksrc: None,
                     vsrc: Some(part.to_string()),
@@ -3353,7 +3397,12 @@ impl<'a> PegTokenizer<'a> {
                 ));
             stt.attribs.push(KV {
                 key: KeyValue::Str("mw:content".to_string()),
-                value: tokenize_link_content(text, self.lang_conv_enabled, &self.ext_tags),
+                value: tokenize_link_content(
+                    text,
+                    self.lang_conv_enabled,
+                    &self.ext_tags,
+                    saved + 1 + content_src_start,
+                ),
                 src_offsets: None,
                 ksrc: None,
                 vsrc: None,
@@ -5214,8 +5263,13 @@ fn tokenize_template_arg_value(
 ///
 /// Returns `Str` for a pure-text target and `Tokens` (a mixed string/token
 /// array) when a directive is present.
-fn tokenize_link_target(target: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
-    tokenize_directives(target, lang_conv_enabled, ext_tags)
+fn tokenize_link_target(
+    target: &str,
+    lang_conv_enabled: bool,
+    ext_tags: &[String],
+    base_offset: usize,
+) -> KeyValue {
+    tokenize_directives(target, lang_conv_enabled, ext_tags, base_offset)
 }
 
 /// Tokenize inline link *content* (e.g. wikilink text, extlink text) into a
@@ -5223,8 +5277,13 @@ fn tokenize_link_target(target: &str, lang_conv_enabled: bool, ext_tags: &[Strin
 /// when the content contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`/quote runs.
 /// Mirrors the PHP tokenizer's `inlineline` production for extlink content and
 /// `link_text` for wikilink text.
-fn tokenize_link_content(content: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
-    tokenize_directives_and_quotes(content, lang_conv_enabled, ext_tags, true)
+fn tokenize_link_content(
+    content: &str,
+    lang_conv_enabled: bool,
+    ext_tags: &[String],
+    base_offset: usize,
+) -> KeyValue {
+    tokenize_directives_and_quotes(content, lang_conv_enabled, ext_tags, true, base_offset)
 }
 
 /// Shared directive-tokenization used for both link targets and link content.
@@ -5234,8 +5293,13 @@ fn tokenize_link_content(content: &str, lang_conv_enabled: bool, ext_tags: &[Str
 /// `lang_conv_enabled`, a `-{ … }-` construct is also emitted as a
 /// `language-variant` self-closing token (mirrors the PHP tokenizer's
 /// `url_directive` → `lang_variant_or_tpl` inside `wikilink_preprocessor_text`).
-fn tokenize_directives(input: &str, lang_conv_enabled: bool, ext_tags: &[String]) -> KeyValue {
-    tokenize_directives_and_quotes(input, lang_conv_enabled, ext_tags, false)
+fn tokenize_directives(
+    input: &str,
+    lang_conv_enabled: bool,
+    ext_tags: &[String],
+    base_offset: usize,
+) -> KeyValue {
+    tokenize_directives_and_quotes(input, lang_conv_enabled, ext_tags, false, base_offset)
 }
 
 /// Shared walk over a link target/content string.
@@ -5248,13 +5312,14 @@ fn tokenize_directives_and_quotes(
     lang_conv_enabled: bool,
     ext_tags: &[String],
     quotes: bool,
+    base_offset: usize,
 ) -> KeyValue {
     let options = TokenizerOptions {
         lang_conv_enabled,
         ext_tags: ext_tags.to_vec(),
         ..TokenizerOptions::default()
     };
-    let mut tk = PegTokenizer::new(input, &options);
+    let mut tk = PegTokenizer::new(input, &options).with_base_offset(base_offset);
     let mut items: Vec<Item> = Vec::new();
     let mut buf = String::new();
 
@@ -5454,8 +5519,16 @@ pub(crate) fn raw_template_target(src: &str) -> Option<String> {
 
 /// Variant that also treats `{{!}}` as a pipe separator (for wikilink content,
 /// where the PEG `pipe = "|" / "{{!}}"` rule applies).
+#[cfg(test)]
 fn split_wikilink_content(inner: &str) -> Vec<String> {
     split_template_args_impl(inner, true)
+}
+
+/// Offset-carrying variant of [`split_wikilink_content`]: each part is paired
+/// with its byte offset within `inner`, so a caller can rebase the part's
+/// tokens onto the ambient source (see `PegTokenizer::base_offset`).
+fn split_wikilink_content_offsets(inner: &str) -> Vec<(usize, String)> {
+    split_template_args_impl_offsets(inner, true)
 }
 
 fn split_template_args_impl(inner: &str, magic_pipe: bool) -> Vec<String> {
@@ -6011,6 +6084,38 @@ mod tests {
     fn tokenize(input: &str) -> Vec<Either<String, ParsoidToken>> {
         let mut tokenizer = PegTokenizer::new(input, &TokenizerOptions::default());
         tokenizer.tokenize().unwrap()
+    }
+
+    #[test]
+    fn extlink_content_quote_carries_page_absolute_tsr() {
+        // A quote run inside link content is tokenized by a sub-tokenizer whose
+        // offsets are rebased onto the page (mirrors PHP, which parses the
+        // content in the main grammar pass). Without the rebase the `mw-quote`
+        // TSR is relative to the link text, `ComputeDSR` reads it as a page
+        // offset, and the `<i>` never earns a `dsr`/node id — `A [url ''x''] B`
+        // for the 76 212-byte `Zebro` divergence.
+        let tokens = tokenize("A [https://example.com ''italic''] B");
+        let quotes: Vec<(Option<usize>, usize)> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink" => Some(tk),
+                _ => None,
+            })
+            .flat_map(|tk| tk.attribs.iter())
+            .filter(|kv| kv.key.as_str() == Some("mw:content"))
+            .filter_map(|kv| match &kv.value {
+                crate::wikitext::tokens_v2::KeyValue::Tokens(items) => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|it| match it {
+                Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote" => {
+                    tk.data_parsoid.tsr.as_ref().map(|tsr| (tsr.start, tsr.end))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quotes, vec![(Some(23), 25), (Some(31), 33)]);
     }
 
     #[test]

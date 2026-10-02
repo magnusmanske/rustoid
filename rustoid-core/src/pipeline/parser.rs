@@ -4246,7 +4246,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         in_tpl: bool,
         depth: u8,
     ) -> Vec<Item> {
-        let mut expanded = self
+        let expanded = self
             .expand_templates(
                 frame,
                 toks,
@@ -4257,10 +4257,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 page_source.unwrap_or(""),
             )
             .await;
-        // Attribute contents are template output: an expansion marker here
-        // carries a source range relative to the expanded sub-source, not the
-        // page (PHP's `processTemplateTokens` clears these).
-        crate::wikitext::token_utils::clear_tsr(&mut expanded);
+        // The tokens already in the value keep their page-absolute `tsr`: PHP's
+        // `Frame::expand` runs the chunk through the expansion pipeline, which
+        // only *replaces* template/variable tokens and clears the `tsr` of what
+        // they produce (`processTemplateTokens`). A blanket `clear_tsr` over the
+        // whole value would also wipe a `mw-quote` token's `tsr`, leaving the
+        // extlink `[url ''italic'']` with an `<i>` that has no `dsr`.
+
         // TT2 order inside the value's sub-pipeline: ExtensionHandler before
         // AttributeExpander.
         let expanded = crate::pipeline::extension_handler::expand_in_attributes(

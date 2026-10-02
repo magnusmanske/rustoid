@@ -9957,3 +9957,76 @@ single grammar pass, so its offsets are absolute. The fix is to re-base the
 content tokens' `tsr` by the content's start offset (and to the enclosing
 source); it will want care because the same sub-tokenization feeds template
 expansion, which currently relies on `tsr.source` to recover the argument text.
+
+## Fixed: the sub-tokenizer's offsets now live in the page's coordinate space
+
+Two independent faults produced the missing `<i>` id, and the second is the more
+interesting one because the first hid it.
+
+### Fault 1: the sub-tokenizer's `tsr` was link-relative
+
+The hypothesis above was right about the mechanism and wrong to worry about
+`tsr.source`. `PegTokenizer` already carries a `SourceRange`-per-token `source`,
+but `make_dp` (used by `try_quote`, the template/tplarg parsers, the HTML-tag
+parser and the extension parser) built a source-less `SourceRange::new`. The
+sub-tokenizer that parses link content (`tokenize_directives_and_quotes`) ran with
+`pos` starting at 0 over the content slice, so its `mw-quote` tokens carried
+`tsr` `0..2` and `8..10` — the offsets *within the link text*.
+
+The fix adds `PegTokenizer::base_offset`, set to the slice's start in the ambient
+input by `with_base_offset`, and applies it in `tsr` and `make_dp` (and the one
+hand-built `SourceRange::new` in the extension parser). The offset is threaded
+from the three call sites that produce a slice of a larger input:
+
+- `try_extlink` — the extlink text starts at `saved + 1 + content_src_start`;
+- `try_wikilink` — the target and each `mw:maybeContent` part, at
+  `saved + 2 + part_offset` (`split_wikilink_content_offsets` is the new
+  offset-carrying variant of `split_wikilink_content`);
+- `try_redirect` — the redirect target, at its own `target_start`.
+
+A regression test (`extlink_content_quote_carries_page_absolute_tsr`) pins the
+`mw-quote` `tsr` of `A [https://example.com ''italic''] B` to `(23,25)`/`(31,33)`.
+
+### Fault 2: a blanket `clear_tsr` wiped the `mw-quote` anyway
+
+With the offsets rebased, the tokenizer produced the right `mw-quote`, but
+`on_ext_link` still saw a `mw-quote` with `tsr: None`. `Parser::expand_attr_tokens`
+
+ran `token_utils::clear_tsr` over the whole expanded attribute value. That helper
+recurses through attribute values (it was written for the `Israel` trap, where a
+`{{PAGENAME}}` *inside a wikilink `href`* kept a `tsr` relative to the 12-character
+sub-source and `DOMRangeBuilder` mistook the resulting marker for a top-level
+transclusion at page offset 0). But it cleared *everything* in the value, not just
+what an expansion produced — including the `mw-quote` tokens that were already
+there. PHP's `Frame::expand` runs the chunk through the expansion pipeline, which
+only *replaces* template/variable tokens and clears the `tsr` of what they produce
+(`TemplateHandler::processTemplateTokens`); the untouched tokens keep theirs.
+
+So the blanket `clear_tsr` is gone. It is safe to remove because Fault 1 was also
+the root cause of the `Israel` trap: the `{{PAGENAME}}` in the wikilink `href` is
+tokenized by `tokenize_link_target`, which now rebases, so the expansion marker's
+`tsr` is page-absolute and can no longer masquerade as a top-level range. (`Israel`
+itself still does not render — it hits the 60 s stall cap — so this is argued from
+the mechanism, not measured on that page; every other page's first difference is
+unchanged.)
+
+### Effect
+`Zebro`: 76 212 → **86 997** (55.68% → **63.56%**). Every other page's first
+difference is unchanged (`Zebra` 2172, `Bicycle` 11836, `Help:Introduction` 5161,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign
+states` 8409, `Unix` 4772). The fixture guard holds at **877/896**, the CSS
+differential at 83/1-skip, and the workspace, clippy and fmt are clean.
+
+### The next `Zebro` difference: a CS1 tracking category `<link>`
+At 86 997, still in the notes list:
+
+```
+parsoid: …class="Z3988" about="#mwt115" id="mwAko"></span><link rel="mw:PageProp/Category" href="./Category:CS1_Spanish-language_sources_(es)" about="#mwt115" id="mwAks"/></span></li>
+rustoid: …class="Z3988" about="#mwt115" id="mwAko"></span></span></li>
+```
+
+The CS1 module emits a tracking category (`Category:CS1 Spanish-language
+sources (es)`); Parsoid renders it as an inline `<link rel="mw:PageProp/Category">`
+inside the reference (the reference list is rendered in place, so the category
+link stays inline rather than moving to the category section), and rustoid drops
+it. The ids after it are one behind. That is the next difference to chase.

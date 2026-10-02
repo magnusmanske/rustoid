@@ -1340,7 +1340,7 @@ impl OwnedRenderInput {
         // wrappers take the first node ids on the page.
         let options = rustoid_core::ParserOptions {
             node_ids: true,
-            strip_data_parsoid: true,
+            strip_data_parsoid: std::env::var_os("RUSTOID_KEEP_DP").is_none(),
             wrap_sections: true,
             ..rustoid_core::ParserOptions::for_page(&self.title)
         };
