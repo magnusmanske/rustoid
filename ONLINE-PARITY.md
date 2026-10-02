@@ -10096,3 +10096,63 @@ Parsoid's CS1 reformats the `access-date` to `12 August 2025` with the
 `<span class="nowrap">` around the day and month; rustoid leaves the raw ISO
 `2025-08-12`. This is CS1's date formatting (`Module:Citation/CS1/Date_validation`
 / the `df` handling), and the next thing to chase.
+
+## Fixed: `getContent()` on the current title returned the chunk, not the page
+
+The date was not reformatted because CS1 never learned the page's date style.
+`Module:Citation/CS1/Configuration` reads
+`mw.title.getCurrentTitle():getContent()` to detect `{{Use dmy dates}}`, and
+rustoid fed that call the **chunk** being expanded — the `{{cite …}}` template
+body — because `expand_invoke` built the frame's `page_source` from the
+`src_text` threaded through expansion. On a page whose date style comes from a
+template the module saw the CS1 template instead, so it left the ISO date alone.
+
+`build_ast` now records the page's wikitext in `Parser::page_source` beside
+`page_title`, and `expand_invoke` hands *that* to the frame. The chunk source
+(`src_text`) still reaches argument expansion, where it belongs — a `#invoke`
+inside a template really does expand its arguments against the template body.
+
+### Two companion answers the same page needed
+
+`Zebro` did not match on the date alone; two site-config answers were behind it
+too, each a smaller instance of the same "the host knew the wrong thing" shape,
+and each confirmed by reverting it alone and watching the relevant difference
+reappear:
+
+- **`fetchLanguageNames` was a partial table.** The hand-written table in
+  `language.rs` had the common languages but not the region/script variants, so
+  `isKnownLanguageTag('pt-br')` was false and CS1 left
+  `cs1-prop-foreign-lang-source` off a Brazilian-Portuguese citation. It is
+  replaced by MediaWiki's full English name table (`lua/language_names.rs`,
+  generated from `action=query&meta=languageinfo&liprop=name`), which also makes
+  the tag→name inversion CS1 uses faithful rather than merely close.
+- **`$wgNoFollowDomainExceptions` was ignored.** The compare harness's
+  `WikiSiteConfig` took the trait default, so every external link got
+  `rel="nofollow"`; Wikimedia exempts its own domains and a
+  `commons.m.wikimedia.org` link inside a citation therefore gained a `nofollow`
+  Parsoid does not emit. `external_link_attribs` now honours the exemption list,
+  matching on the URL's **host** (`UrlUtils::matchesDomainList`) rather than a
+  substring — which also fixes the fixture mock's `href.contains(domain)`, under
+  which `notwikimedia.org` would have been exempted.
+
+### Effect
+
+`Zebro`: 106 639 → **MATCH** (`r1376497498`; Parsoid 138 950 bytes, rustoid
+137 384 after normalisation). Every other page's first difference is unchanged
+(`Zebra` 2172, `Bicycle` 11836, `Help:Introduction` 5161, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772). The fixture guard holds at **877/896**; clippy and fmt are clean.
+
+### The next difference: `Zebra`'s empty-elt transclusion
+
+At 2172, the `{{Featured article}}` / `{{pp-semi}}` / `{{Use British English}}`
+run at the top of `Zebra`:
+
+```
+parsoid: <p about="#mwt12" typeof="mw:Transclusion" class="mw-empty-elt" data-mw='{"parts":[{"template":{"target":{"wt":"Featured article"}…
+rustoid: <p class="mw-empty-elt" id="mwBw"><span typeof="mw:Nowiki mw:Transclusion" about="#mwt6" data-mw='…
+```
+
+Parsoid keeps the wrapper on the `<p>` (`about`/`typeof`/`data-mw` naming the
+three templates), while rustoid wraps each template in a `Nowiki` span inside
+it. That is the next difference to chase.
