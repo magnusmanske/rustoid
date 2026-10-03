@@ -10515,5 +10515,81 @@ Two things show up there, plus one the earlier fix left behind:
 - The T2529 newline landed as a literal `\n` between `</p>` and `<table>`
   (`</p>\n<table>`), where the service has `</p><table>`: the newline forced the
   table onto its own line for the merge, but Parsoid consumes it before
-  output. That is a small regression of the T2529 fix that still has to be
+  output. That is a small regression of the T2529 fix that still had to be
   closed.
+
+## Fixed: the T2529 newline is consumed before tree building
+
+The newline the T2529 rule prepends to a module answer whose table is not at SOL
+(see [`Parser::expand_invoke`]) does its work in the **ParagraphWrapper**: it
+moves the enclosing transclusion's marker into the paragraph buffer so the `<p>`
+closes after it. It was then kept, so it reached the output as a literal `\n`
+between `</p>` and `<table>` where the service has none.
+
+Mark it (`TempData::synthetic_sol_newline`) and drop it right after the
+ParagraphWrapper in `tree_builder_stage.rs`. Putting the newline at the
+*template-body* level instead regressed two `tables.txt` fixtures (`{{tbl-start}}`
+at page SOL is pinned to *no* leading newline), which is why it lives at the
+splice point.
+
+### Effect: byte 4923 moves to 5008
+
+`Zebra`'s first difference is now **5008**. The eight subset offsets are
+otherwise unchanged, `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 942 lib tests pass with clippy clean.
+
+## Fixed: the flipped-range stamp is withheld only on the marker's ancestor
+
+The taxobox table (produced by `Template:Automatic taxobox` → `Module:Automatic
+taxobox`) is a `<table>` sibling of the merged `<p about="#mwt12">` that holds
+the transclusion's start marker, with the end marker after the table. That is
+`WrapTemplates`' *flipped* case: the start marker is nested in an ancestor
+(`wrap_flipped_children`'s common-ancestor branch), because the end marker is
+outside the `<p>` the start marker sits in.
+
+A guard there, `sibling_starts_before`, keeps an ancestor that *begins before*
+the transclusion in the source from being stamped with the range's `about` (the
+`AAA{{If empty|<div>X</div>|b}}` case, where the `<p>` holds the marker yet
+starts at offset 0). It was applied to **every** element in the range, so the
+table lost its stamp too: a template-generated table carries a *fragment-
+relative* `dsr` (`{"tsr":[0,80],"startTagSrc":"{|","dsr":[0,8298,80,2]}`), so
+its `dsr.start` of `0` read as "begins before" the marker at 209 even though the
+table lies between the markers by document order.
+
+`PHP`'s `DOMRangeBuilder::ensureElementsInRangeAndAddAboutIds` stamps every
+element in the range unconditionally; only the range computation decides what is
+in it. So the guard now applies to the ancestor that holds the start marker
+only — every other element in `[lo, hi]` is stamped.
+
+Without the `about` the table was not recognized as an interior member of the
+`#mwt12` range, so `CleanUp::markDiscardableDataParsoid` kept its
+`data-parsoid`, and the id pass (`assign_node_ids`) then gave the table, its
+`<tbody>`, `<tr>` and `<th>` generated ids (`mwCg`, `mwCw`, `mwDA`, `mwDQ`, …)
+that the service does not serve. With the `about` restored the table is interior,
+its `data-parsoid` is discarded, it takes no id — matching the served bytes.
+
+### Effect: byte 5008 moves to 5093
+
+`Zebra`'s first difference is now **5093**, and the taxobox table region matches
+Parsoid's byte for byte:
+
+    </p><table class="infobox biota" style="text-align: left; width: 200px; font-size: 100%" about="#mwt12">
+    <tbody><tr>
+    <th colspan="2" style="…">Zebra…
+
+with no generated ids on the table, `<tbody>`, `<tr>` or `<th>`, and the table no
+longer missing `about="#mwt12"` (rustoid's output drops from 537913 to 535912
+bytes). The eight subset offsets are otherwise unchanged (`Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837),
+`Zebro` still MATCHes, the fixture guard holds at **877/896**, and 943 lib tests
+pass with clippy clean.
+
+### The next difference at 5093
+
+Inside the `<th>` the `style` attribute differs: Parsoid serves
+`color:inherit; text-align: center; background-color: rgb(235,235,210)`, rustoid
+`color:inherit; text-align: center;; background-color: transparent` — a doubled
+`;` and the taxobox background colour not applied (the `{{Taxobox/…}}` colour
+argument). Beyond that the taxonomy `<td>`s are empty where Parsoid has the
+`Animalia`/`Chordata`/… links. That is the next target.
