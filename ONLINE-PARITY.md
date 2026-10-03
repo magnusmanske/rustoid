@@ -10471,3 +10471,49 @@ gives the following `<meta typeof="mw:Extension/indicator">` no `about`,
 where Parsoid drops the nowiki and attributes the meta `about="#mwt7"`. That
 is the next target: the nowiki wrapper's removal and the indicator's range
 attribution inside the transclusion.
+
+## Fixed: the nowiki spans and the indicator's about
+
+Both halves came from the same two Parsoid passes.
+
+**Nowiki spans.** Parsoid's `CleanUp::finalCleanup` strips an `mw:Nowiki` span
+from encapsulated content when it is not itself a forest root (`about` is not a
+transclusion id), migrating its children in place first. rustoid had only
+ported the `handleEmptyElements` half of the `cleanup` stage, so every
+`<nowiki/>` a template opens with survived as an empty
+`<span typeof="mw:Nowiki">` — `Zebra` had five, the live page none. The pass
+now runs in the same traversal, which carries Parsoid's `$state->tplInfo`
+(set at a first encapsulation wrapper, and also used by `handleEmptyElements`
+for its template-wrapper attribute tolerance).
+
+**The indicator's `about`.** `expand_one_indicator` allocated the extension's
+`about` id and then discarded it (`let _ =`), so the id *sequence* stayed
+aligned but the `<meta>` reached the output without `about`. Parsoid's
+`ExtensionHandler::onDocumentFragment` sets the id on every non-nowiki
+extension's fragment; the indicator's
+placeholder is what reaches the output (it carries `mw:Extension/indicator`, so
+`unpack_dom_fragments` leaves it in place), so the id goes on the placeholder,
+in the attribute order the served bytes use (after `typeof`, before `data-mw`).
+
+### Effect: byte 3890 moves to 4923 (and Help:Introduction to 7837)
+
+`Zebra`'s first difference is now **4923**, and `Help:Introduction`'s moved from
+5161 to **7837**. The merged `<p>` and its contents up to the taxobox table now
+match. The eight subset offsets are otherwise unchanged (`Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772), `Zebro` still MATCHes, the
+fixture guard holds at **877/896**, and 942 lib tests pass with clippy clean.
+
+### The next difference at 4923, and a side effect to fix
+
+Two things show up there, plus one the earlier fix left behind:
+
+- Parsoid's taxobox table is `<table ... about="#mwt12">`; rustoid's is
+  `<table ... id="mwCg">` — the transclusion's `about` is missing from the
+  table, and rustoid adds generated `id`s to the table/tbody/tr/th that the
+  service does not.
+- The T2529 newline landed as a literal `\n` between `</p>` and `<table>`
+  (`</p>\n<table>`), where the service has `</p><table>`: the newline forced the
+  table onto its own line for the merge, but Parsoid consumes it before
+  output. That is a small regression of the T2529 fix that still has to be
+  closed.
