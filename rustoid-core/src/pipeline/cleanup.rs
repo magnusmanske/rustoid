@@ -170,8 +170,19 @@ fn handle_empty_element(node: &mut Node) {
     // "empty" (and hence marked) if it carries no meaningful attributes.
     // For `<p>` this mirrors the legacy parser: an empty `<p>` with only
     // `data-parsoid`/`stx` (parsoid-added) attributes is still markable.
+    //
+    // A node that is itself a transclusion/extension wrapper (Parsoid's
+    // `$state->tplInfo`) additionally tolerates the template-wrapping
+    // attributes (`ALLOWED_TPL_WRAPPER_ATTRS`): the merged empty `<p>`
+    // `about="#mwt…" typeof="mw:Transclusion" data-mw='…'` is exactly this
+    // case, and the live service marks it `mw-empty-elt`.
+    let in_tpl = is_first_encapsulation_wrapper(node);
     for attr in &node.attrs {
-        if attr.key != "data-parsoid" && attr.key != "stx" {
+        let wrapper_attr = matches!(
+            attr.key.as_str(),
+            "about" | "typeof" | "data-parsoid" | "data-mw"
+        );
+        if !(attr.key == "data-parsoid" || attr.key == "stx" || (in_tpl && wrapper_attr)) {
             return;
         }
     }
