@@ -10641,5 +10641,61 @@ Inside the temporal-range line rustoid emits an extra nested
 second `display:inline-block` span, where Parsoid has only the one
 `<span class="noprint"><span style="display:inline-block;"></span><span
 style="display:inline-block;">2–0…`. Beyond that the taxonomy `<td>`s are still
-empty where Parsoid has the `Animalia`/`Chordata`/… links. That is the next
-target.
+empty where Parsoid has the `Animalia`/`Chordata`/… links.
+
+## Fixed: the nested `Geological range`, and the `#expr` error it hid
+
+Zebra's taxobox passes
+`fossil_range = {{Fossil range|2|0|earliest=2.3|ref=<ref …/>|PS=[[Pleistocene]]–[[Holocene|present]]}}`.
+`Template:Fossil range` is `Template:Geological range`, so the argument the
+module holds already *is* a completed `Geological range` rendering.
+`setfossilRange` then decides whether to run `Geological range` again:
+
+```lua
+if mw.ustring.find( frame:expandTemplate{ title = 'Period start', args = { fossilRange } }, '[Ee]rror' ) then
+    res = fossilRange                       -- already rendered; leave it
+else
+    res = frame:expandTemplate{ title = 'Geological range', args = { fossilRange } }
+end
+```
+
+In PHP, `Period start` of an HTML fragment errors —
+`Period start` is `{{#expr:{{#switch:{{Period id|…}}|…}} round {{{2|5}}}}}`, the
+`#switch` falls through to its default, and `#expr` reports the unrecognised
+word. So the guard fires and the argument is left alone (one `noprint`).
+
+rustoid's `tokenize_expr` **silently dropped** any alphabetic word it did not
+know, so `{{#expr:abc}}` answered `0`/a number instead of
+`<strong class="error">Expression error: Unrecognized word "abc".</strong>`;
+the guard did not fire and `Geological range` ran a second time, nesting a
+whole rendering inside the first. The error is load-bearing for every
+`{{#iferror:{{#expr:…}}}}` too, not just this template.
+
+`tokenize_expr` now returns the extension parser's "Unrecognized word" error
+for an unknown word. The function and constant words (`abs`, `ceil`, `round`,
+`sqrt`, `pi`, `e`, …) are recognised so they do not read as garbage — the
+evaluator still does not implement them, but erroring on them would be *more*
+wrong than the previous silent answer.
+
+### Effect: byte 5286 moves to 5433
+
+The temporal-range line now matches Parsoid's byte for byte:
+
+    <span class="noprint"><span style="display:inline-block;"></span><span style="display:inline-block;">2–0<span typeof="mw:Entity"> </span><a …>Ma</a></span>
+
+`Zebra`'s first difference is now **5433**. The eight subset offsets are
+otherwise unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 947 lib tests pass with clippy clean.
+
+### The next difference at 5433
+
+The `<sup about="#mwt13">` reference marker: Parsoid numbers it `#mwt13`,
+rustoid `#mwt16` — the transclusion `about` counter has drifted three ahead by
+the taxobox. The ids are positional, so a transclusion rustoid spends earlier
+in the module's output (a re-run, or a construct Parsoid does not wrap) shifted
+every later `#mwt`. The generated element `id`s (`mwCg`, `mwCw`, …) still match,
+because they come from a separate pass. That is the next target. Also still
+open: the taxonomy `<td>`s are empty where Parsoid has the
+`Animalia`/`Chordata`/… links.
