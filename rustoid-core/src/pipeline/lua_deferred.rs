@@ -573,18 +573,24 @@ fn render_invocation(target: &str, args: &[FrameArg]) -> String {
 /// dropped.
 pub fn render_answer(items: &[Item]) -> String {
     let mut out = String::new();
-    for item in items {
-        match item {
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
+            Item::Str(s) => out.push_str(s),
             // Both the opening marker and its `mw:Transclusion/End` partner are
             // bookkeeping, not output, and a comment never reaches a module.
             Item::Tok(tok) => {
                 if is_transclusion_marker(tok) {
+                    i += 1;
                     continue;
                 }
                 match tok {
                     // A comment never reaches a module; a newline is source the
                     // module can see (and table syntax needs it on its own line).
-                    crate::wikitext::tokens_v2::ParsoidToken::Comment(_) => continue,
+                    crate::wikitext::tokens_v2::ParsoidToken::Comment(_) => {
+                        i += 1;
+                        continue;
+                    }
                     crate::wikitext::tokens_v2::ParsoidToken::Nl(_) => out.push('\n'),
                     _ => {}
                 }
@@ -601,12 +607,18 @@ pub fn render_answer(items: &[Item]) -> String {
                         )
                         .unwrap_or_else(|| src.to_string()),
                     );
+                    // An `mw:Entity` span's `src` already spells the entity, so
+                    // its decoded text child is skipped rather than emitted too.
+                    if crate::wikitext::token_utils::skip_entity_decoded_text(tok, items.get(i + 1))
+                    {
+                        i += 1;
+                    }
                 } else if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
                     out.push_str(&src);
                 }
             }
-            Item::Str(s) => out.push_str(s),
         }
+        i += 1;
     }
     out
 }
@@ -657,6 +669,31 @@ mod tests {
     #[test]
     fn different_titles_differ() {
         assert_ne!(request("T", &[]).key(), request("U", &[]).key());
+    }
+
+    #[test]
+    fn render_answer_skips_an_entitys_decoded_text() {
+        // `&#59;` is an `mw:Entity` span (src `&#59;`), the decoded `;`, and an
+        // end tag. The `src` already spells the entity, so the decoded text must
+        // be skipped or the answer carries `&#59;;` (which reparses to `;;`).
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, Item, ParsoidToken, TagTk};
+        let dp = DataParsoid {
+            src: Some("&#59;".to_string()),
+            src_content: Some(";".to_string()),
+            ..Default::default()
+        };
+        let mut span = TagTk::new("span", vec![], dp);
+        span.add_attribute_str("typeof", "mw:Entity");
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str(";".to_string()),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "span",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ];
+        assert_eq!(render_answer(&items), "&#59;");
     }
 
     #[test]

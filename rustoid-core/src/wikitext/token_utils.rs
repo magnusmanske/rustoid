@@ -366,24 +366,61 @@ pub fn tokens_to_string_with_nls(tokens: &[Item]) -> String {
 /// name only when it has one, so nothing is invented.
 pub fn tokens_to_source(tokens: &[Item]) -> String {
     let mut out = String::new();
-    for token in tokens {
-        match token {
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
             Item::Str(s) => out.push_str(s),
             Item::Tok(t) => {
                 // A comment is stripped by the preprocessor before a module sees
                 // anything, so it is not part of the answer.
                 if matches!(t, ParsoidToken::Comment(_)) {
+                    i += 1;
                     continue;
                 }
                 if let Some(src) = t.data_parsoid().and_then(|dp| dp.src.as_deref()) {
                     out.push_str(src);
+                    // An `mw:Entity` span is spelled out by its `src`; the decoded
+                    // text it is followed by is redundant (see
+                    // [`skip_entity_decoded_text`]).
+                    if skip_entity_decoded_text(t, tokens.get(i + 1)) {
+                        i += 1;
+                    }
                 } else if let Some(src) = table_token_wikitext(t) {
                     out.push_str(&src);
                 }
             }
         }
+        i += 1;
     }
     out
+}
+
+/// Whether the item after an `mw:Entity` span is its decoded text child, which a
+/// source reconstruction must skip.
+///
+/// An entity is a three-token sequence — `<span typeof="mw:Entity"
+/// src="&#59;">`, the decoded text (`;`), `</span>` — and the span's `src`
+/// already spells the entity. Emitting both the `src` and the decoded text turns
+/// `&#59;` into `&#59;;`, which reparses to `;;`: a doubled character on the
+/// served page (`Template:;` in `Template:Taxobox core`'s style).
+pub fn skip_entity_decoded_text(token: &ParsoidToken, next: Option<&Item>) -> bool {
+    let is_entity = matches!(
+        token,
+        ParsoidToken::Tag(t) if t.name == "span"
+            && t.attribs.iter().any(|kv| {
+                kv.key.as_str() == Some("typeof")
+                    && kv.value.as_str().is_some_and(|v| {
+                        v.split_whitespace().any(|x| x == "mw:Entity")
+                    })
+            })
+    );
+    if !is_entity {
+        return false;
+    }
+    let src_content = token
+        .data_parsoid()
+        .and_then(|dp| dp.src_content.as_deref());
+    matches!(next, Some(Item::Str(s)) if Some(s.as_str()) == src_content)
 }
 
 /// The wikitext spelling of a table-structure token (`table`/`tr`/`caption`/
@@ -541,7 +578,7 @@ pub fn get_bullets(token: &ParsoidToken) -> Vec<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wikitext::tokens_v2::KV;
+    use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, KV, TagTk};
 
     fn kv(value: KeyValue, vsrc: Option<&str>) -> KV {
         KV {
@@ -551,6 +588,31 @@ mod tests {
             ksrc: None,
             vsrc: vsrc.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn tokens_to_source_skips_an_entitys_decoded_text() {
+        // `&#59;` tokenizes as `<span typeof="mw:Entity" src="&#59;">`, the
+        // decoded `;`, and `</span>`. Emitting both the src and the text gives
+        // `&#59;;`, which reparses to `;;` — a doubled character the service
+        // never serves (`Template:;` in `Template:Taxobox core`'s style).
+        let dp = DataParsoid {
+            src: Some("&#59;".to_string()),
+            src_content: Some(";".to_string()),
+            ..Default::default()
+        };
+        let mut span = TagTk::new("span", vec![], dp);
+        span.add_attribute_str("typeof", "mw:Entity");
+        let tokens = vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str(";".to_string()),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "span",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ];
+        assert_eq!(tokens_to_source(&tokens), "&#59;");
     }
 
     #[test]
