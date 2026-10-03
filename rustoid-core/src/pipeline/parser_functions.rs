@@ -987,7 +987,16 @@ pub(crate) fn evaluate_expression(expr: &str) -> String {
     }
 
     // Try to parse as a simple integer expression.
-    let tokens = tokenize_expr(expr);
+    let tokens = match tokenize_expr(expr) {
+        Ok(tokens) => tokens,
+        // MediaWiki's `ExprParser` errors on a word it does not know, and the
+        // error is load-bearing: `{{#iferror:{{#expr:…}}|…}}` and templates that
+        // test their own output for `[Ee]rror` (`Template:Period start`) rely on
+        // it. Silently dropping the word answered a number instead.
+        Err(message) => {
+            return format!("<strong class=\"error\">Expression error: {message}</strong>");
+        }
+    };
     match eval_simple(&tokens) {
         Ok(val) => {
             if val == val.trunc() {
@@ -1020,7 +1029,7 @@ enum ExprToken {
     RParen,
 }
 
-fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
+fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
     let mut tokens = Vec::new();
     let bytes = expr.as_bytes();
     let lower = expr.to_ascii_lowercase();
@@ -1032,8 +1041,12 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             i += 1;
             continue;
         }
-        // Word operators. Anything else alphabetic is not part of the language
-        // (a bare word is not a value), so it is skipped as before.
+        // Word operators, functions and constants. A bare word is not a value,
+        // so anything not in this set is the parser's "Unrecognized word" error
+        // (mirrors `ExprParser::doExpression`). The functions/constants are
+        // recognised so they do not read as garbage; the evaluator does not
+        // implement them, but dropping them was already wrong and erroring on
+        // them would be more wrong.
         if b.is_ascii_alphabetic() {
             let start = i;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -1045,7 +1058,9 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
                 "not" => tokens.push(ExprToken::Not),
                 "div" => tokens.push(ExprToken::Op('D')),
                 "mod" => tokens.push(ExprToken::Op('%')),
-                _ => {}
+                "abs" | "ceil" | "floor" | "trunc" | "round" | "sqrt" | "exp" | "ln" | "log"
+                | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "e" | "pi" => {}
+                _ => return Err(format!("Unrecognized word \"{}\".", &expr[start..i])),
             }
             continue;
         }
@@ -1120,7 +1135,7 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             } // Skip unknown chars
         }
     }
-    tokens
+    Ok(tokens)
 }
 
 /// Simple precedence-climbing expression evaluator.
@@ -1310,6 +1325,30 @@ mod tests {
             let out = ParserFunctions::pf_titleparts(&config, &params(args.clone()));
             assert_eq!(out, vec![Item::Str(want.to_string())], "{args:?}");
         }
+    }
+
+    #[test]
+    fn test_pf_expr_errors_on_an_unrecognized_word() {
+        // MediaWiki's `ExprParser` errors on a word it does not know, and the
+        // error is load-bearing: `{{#iferror:{{#expr:…}}}}` and templates that
+        // test their own output for `[Ee]rror` (`Template:Period start`)
+        // depend on it. Silently dropping the word answered a number instead.
+        let out = ParserFunctions::pf_expr(&params(vec![("abc", "")]));
+        let Item::Str(s) = &out[0] else {
+            panic!("expected a string item: {out:?}")
+        };
+        assert!(s.contains("class=\"error\""), "{s}");
+        assert!(s.contains("Unrecognized word \"abc\""), "{s}");
+
+        // A recognized function word must not error, and arithmetic still works.
+        assert_eq!(
+            ParserFunctions::pf_expr(&params(vec![("1234", "")])),
+            vec![Item::Str("1234".to_string())]
+        );
+        assert_eq!(
+            ParserFunctions::pf_expr(&params(vec![("1+2", "")])),
+            vec![Item::Str("3".to_string())]
+        );
     }
 
     #[test]
