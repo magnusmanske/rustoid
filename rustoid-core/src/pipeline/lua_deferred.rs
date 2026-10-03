@@ -578,15 +578,21 @@ pub fn render_answer(items: &[Item]) -> String {
             // Both the opening marker and its `mw:Transclusion/End` partner are
             // bookkeeping, not output, and a comment never reaches a module.
             Item::Tok(tok) => {
-                if is_transclusion_marker(tok)
-                    || matches!(tok, crate::wikitext::tokens_v2::ParsoidToken::Comment(_))
-                {
+                if is_transclusion_marker(tok) {
                     continue;
+                }
+                match tok {
+                    // A comment never reaches a module; a newline is source the
+                    // module can see (and table syntax needs it on its own line).
+                    crate::wikitext::tokens_v2::ParsoidToken::Comment(_) => continue,
+                    crate::wikitext::tokens_v2::ParsoidToken::Nl(_) => out.push('\n'),
+                    _ => {}
                 }
                 // The token's own source is the source *as written*; an
                 // attribute substituted during expansion has to be written back
                 // so the module is handed the expansion, not the template. See
                 // [`crate::wikitext::token_utils::rewrite_expanded_attrs`].
+                // Table-structure tokens have no `src` and are rebuilt instead.
                 if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
                     out.push_str(
                         &crate::wikitext::token_utils::rewrite_expanded_attrs(
@@ -595,6 +601,8 @@ pub fn render_answer(items: &[Item]) -> String {
                         )
                         .unwrap_or_else(|| src.to_string()),
                     );
+                } else if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
+                    out.push_str(&src);
                 }
             }
             Item::Str(s) => out.push_str(s),

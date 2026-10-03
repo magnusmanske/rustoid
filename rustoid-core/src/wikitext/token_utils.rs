@@ -377,11 +377,77 @@ pub fn tokens_to_source(tokens: &[Item]) -> String {
                 }
                 if let Some(src) = t.data_parsoid().and_then(|dp| dp.src.as_deref()) {
                     out.push_str(src);
+                } else if let Some(src) = table_token_wikitext(t) {
+                    out.push_str(&src);
                 }
             }
         }
     }
     out
+}
+
+/// The wikitext spelling of a table-structure token (`table`/`tr`/`caption`/
+/// `td`/`th`), rebuilt from its `dataParsoid`.
+///
+/// The tokenizer records a table token's spelling in pieces — `start_tag_src`
+/// for the `{|`/`|-`/`|`/`!` marker, `tmp.attr_src` for the attribute box,
+/// `attr_sep_src` for a non-default separator, `end_tag_src` for `|}` — and never
+/// in `src` (which is set only on transclusion/extension tokens). A renderer that
+/// reconstructs wikitext from `src` therefore drops the whole table: a
+/// `frame:expandTemplate` answer loses every `{|` and cell, so a template that
+/// builds a table (every taxobox, infobox and navbox) hands the module flat text
+/// instead. Mirrors PHP `TokenStreamPatcher::convertNonHTMLTokenToString`.
+///
+/// The attribute box is rebuilt from the token's *expanded* attributes, not from
+/// `tmp.attr_src`: that field holds the source as written, still carrying the
+/// templates the expansion substituted (`{{{colour}}}` in a taxobox), and the
+/// module must receive the answer rather than the template. A table's `|}` uses
+/// `end_tag_src`; other end tags carry no wikitext and answer `None`.
+pub fn table_token_wikitext(tok: &ParsoidToken) -> Option<String> {
+    let (name, dp, is_end) = match tok {
+        ParsoidToken::Tag(t) => (t.name.as_str(), &t.data_parsoid, false),
+        ParsoidToken::EndTag(t) => (t.name.as_str(), &t.data_parsoid, true),
+        _ => return None,
+    };
+    let default_marker = match (name, is_end) {
+        ("table", false) => "{|",
+        ("table", true) => "|}",
+        ("tr", false) => "|-",
+        ("caption", false) => "|+",
+        ("caption", true) => return Some(String::new()),
+        ("td", false) if dp.stx.as_deref() == Some("row") => "||",
+        ("td", false) => "|",
+        ("th", false) if dp.stx.as_deref() == Some("row") => "!!",
+        ("th", false) => "!",
+        _ => return None,
+    };
+    let marker = if is_end {
+        dp.end_tag_src.as_deref().unwrap_or(default_marker)
+    } else {
+        dp.start_tag_src.as_deref().unwrap_or(default_marker)
+    };
+    let mut out = marker.to_string();
+    // The attribute box from the *expanded* attributes, not `attr_src`: the box
+    // source still holds the templates the expansion substituted (`{{{colour}}}`
+    // in a taxobox), and the module must receive the answer, not the template.
+    let attrs = tok.get_attribs();
+    if attrs.is_empty() {
+        if let Some(sep) = dp.attr_sep_src.as_deref() {
+            out.push_str(sep);
+        }
+    } else {
+        for kv in attrs {
+            out.push(' ');
+            out.push_str(&key_value_source_text(&kv.key));
+            out.push_str("=\"");
+            out.push_str(&key_value_source_text(&kv.value));
+            out.push('"');
+        }
+        if matches!(name, "caption" | "td" | "th") {
+            out.push_str(dp.attr_sep_src.as_deref().unwrap_or("|"));
+        }
+    }
+    Some(out)
 }
 
 /// A token's own source with substituted attributes written back.

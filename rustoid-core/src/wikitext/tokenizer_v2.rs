@@ -1375,7 +1375,7 @@ impl<'a> PegTokenizer<'a> {
             return false;
         };
 
-        let _attr_start = self.pos;
+        let attr_start = self.pos;
         let attrs = self.parse_table_attributes(false);
         let ts_end = self.pos;
 
@@ -1391,6 +1391,14 @@ impl<'a> PegTokenizer<'a> {
         let mut start_tag_src = String::from("{");
         start_tag_src.push_str(&pipe);
         dp.start_tag_src = Some(start_tag_src);
+        // The attribute box, excluding the `{|` marker, so the token can be
+        // rendered back to wikitext (see `token_utils::table_token_wikitext`).
+        dp.tmp.attr_src = Some(
+            self.input
+                .get(attr_start..ts_end)
+                .unwrap_or_default()
+                .to_string(),
+        );
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("table", attrs, dp)));
         // From here on the table's content is a data block, so row/cell/caption
