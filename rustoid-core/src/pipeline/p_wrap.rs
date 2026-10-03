@@ -1,5 +1,5 @@
 //! `PWrap` — DOM-level paragraph wrapper/fix-up pass, a faithful port of PHP
-//! Parsoid's `src/Wt2Html/DOM/Processors/PWrap.php`.
+//! Parsoid's `src/Wt2Html/DOM/Processors/PWrap.php` and `PWrapState.php`.
 //!
 //! After the HTML5 tree builder produces a DOM, this pass re-wraps the children
 //! of block containers in `<p>` elements, splitting splittable inline elements
@@ -7,6 +7,11 @@
 //! text, comments, metadata tags) out of paragraph boundaries. This normalizes
 //! the `<p>` contents that the token-level ParagraphWrapper leaves imperfect
 //! (e.g. leading/trailing newlines and `<br/>` placement).
+//!
+//! Closing a paragraph first unwraps a run of trailing optional nodes via
+//! [`PWrapState::reset`], mirroring `PWrapState::unwrapTrailingPWrapOptionalNodes`
+//! — without it a template/annotation range at a paragraph boundary would be
+//! expanded unnecessarily.
 
 use crate::dom::node::{ElementKind, Node, NodeKind};
 
@@ -237,20 +242,108 @@ fn merge_runs(_wrapper: &Node, splits: Vec<Split>) -> Vec<Split> {
     ret
 }
 
+/// A transclusion/param/annotation `typeof` match on a `meta` element, from
+/// `DOMUtils::matchNameAndTypeOf($n, 'meta', RANGE_TYPE_RE)`.
+struct RangeMeta {
+    /// The matched token ends in `/End` (a range close marker).
+    is_end: bool,
+    /// The marker's `about` id, when it carries one.
+    about: Option<String>,
+}
+
+/// `!^mw:(Transclusion(/|$)|Param(/|$)|Annotation/)!` — one `typeof` token.
+fn is_range_type(token: &str) -> bool {
+    token == "mw:Transclusion"
+        || token.starts_with("mw:Transclusion/")
+        || token == "mw:Param"
+        || token.starts_with("mw:Param/")
+        || token.starts_with("mw:Annotation/")
+}
+
+/// The range-type `typeof` token of a `meta` element, if it has one.
+fn range_meta(node: &Node) -> Option<RangeMeta> {
+    let NodeKind::Element(kind) = &node.kind else {
+        return None;
+    };
+    if element_tag(kind) != "meta" {
+        return None;
+    }
+    let typeof_attr = node.get_attr("typeof")?;
+    let token = typeof_attr.split_whitespace().find(|t| is_range_type(t))?;
+    Some(RangeMeta {
+        is_end: token.ends_with("/End"),
+        about: node.get_attr("about").map(str::to_string),
+    })
+}
+
 /// Holds the currently-open `<p>` element during p-wrapping, plus its index
 /// in the output vector so children can be appended into it in place.
 struct PWrapState {
     /// Index of the open `<p>` in the caller's output vector, if any.
     p_idx: Option<usize>,
+    /// Whether a p-wrap-optional range marker was seen since the paragraph
+    /// opened (`PWrapState::$hasOptionalNode`).
+    has_optional_node: bool,
+    /// `about` ids of range starts seen in the open paragraph
+    /// (`PWrapState::$seenStarts`).
+    seen_starts: std::collections::HashSet<String>,
 }
 
 impl PWrapState {
     fn new() -> Self {
-        Self { p_idx: None }
+        Self {
+            p_idx: None,
+            has_optional_node: false,
+            seen_starts: std::collections::HashSet::new(),
+        }
     }
 
-    fn reset(&mut self) {
+    /// Record a p-wrap-optional node appended to the open paragraph. Mirrors
+    /// `PWrapState::processOptionalNode`.
+    fn process_optional_node(&mut self, node: &Node) {
+        if let Some(meta) = range_meta(node) {
+            self.has_optional_node = true;
+            if !meta.is_end
+                && let Some(about) = meta.about
+            {
+                self.seen_starts.insert(about);
+            }
+        }
+    }
+
+    /// Close the open paragraph, first moving a run of trailing p-wrap-optional
+    /// nodes back out of it. Mirrors `PWrapState::reset` +
+    /// `unwrapTrailingPWrapOptionalNodes`; the unwrap is what stops a trailing
+    /// template/annotation marker from being pulled inside and expanding a range
+    /// that does not need to be.
+    fn reset(&mut self, out: &mut Vec<Node>) {
+        if self.has_optional_node
+            && let Some(p_idx) = self.p_idx
+        {
+            loop {
+                // Decide before mutating, so the borrow of `out` ends here.
+                let unwrap = match out[p_idx].children.last() {
+                    Some(last) if p_wrap_optional(last) => {
+                        // A closing marker whose matching start is still inside
+                        // the paragraph is left in place, not hoisted alone.
+                        !matches!(range_meta(last), Some(meta)
+                            if meta.is_end
+                                && meta.about.as_deref().is_some_and(|a| self.seen_starts.contains(a)))
+                    }
+                    _ => false,
+                };
+                if !unwrap {
+                    break;
+                }
+                let node = out[p_idx].children.pop().expect("last checked above");
+                // Insert immediately after the `<p>`, so repeated unwraps keep
+                // the original order (`$p->nextSibling` in PHP).
+                out.insert(p_idx + 1, node);
+            }
+        }
         self.p_idx = None;
+        self.has_optional_node = false;
+        self.seen_starts.clear();
     }
 }
 
@@ -264,17 +357,18 @@ fn p_wrap_dom(root: &mut Node) {
     for c in children {
         if is_block_node(&c) {
             // Block node: reset the open paragraph and pass through.
-            state.reset();
+            state.reset(&mut out);
             out.push(c);
         } else {
             for v in split(&c) {
                 match v.pwrap {
                     Some(false) => {
-                        state.reset();
+                        state.reset(&mut out);
                         out.push(v.node);
                     }
                     None => {
                         if let Some(idx) = state.p_idx {
+                            state.process_optional_node(&v.node);
                             push_into_paragraph(&mut out, idx, v.node);
                         } else {
                             out.push(v.node);
@@ -294,6 +388,7 @@ fn p_wrap_dom(root: &mut Node) {
         }
     }
 
+    state.reset(&mut out);
     root.children = out;
 }
 
@@ -388,6 +483,57 @@ mod tests {
         assert!(matches!(
             &root.children[0].kind,
             NodeKind::Element(ElementKind::Paragraph)
+        ));
+    }
+
+    /// A trailing range start marker is hoisted back out of the paragraph it
+    /// was buffered into, so a following block does not expand its range.
+    #[test]
+    fn test_trailing_range_marker_is_unwrapped() {
+        let mut body = Node::element(ElementKind::Other("body".to_string()));
+        body.push_child(Node::text("hello"));
+        let mut start = Node::element(ElementKind::Transclusion);
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt1");
+        body.push_child(start);
+        body.push_child(Node::element(ElementKind::Div));
+
+        p_wrap_dom(&mut body);
+
+        assert_eq!(body.children.len(), 3, "{body:?}");
+        assert!(matches!(
+            body.children[0].kind,
+            NodeKind::Element(ElementKind::Paragraph)
+        ));
+        assert_eq!(body.children[1].get_attr("about"), Some("#mwt1"));
+        assert!(matches!(
+            body.children[2].kind,
+            NodeKind::Element(ElementKind::Div)
+        ));
+    }
+
+    /// A trailing `/End` marker whose matching start is still inside the
+    /// paragraph stays in place, so a lone closing tag is never hoisted.
+    #[test]
+    fn test_trailing_end_marker_is_kept_with_its_start() {
+        let mut body = Node::element(ElementKind::Other("body".to_string()));
+        body.push_child(Node::text("hello"));
+        for ty in ["mw:Transclusion", "mw:Transclusion/End"] {
+            let mut m = Node::element(ElementKind::Transclusion);
+            m.set_attr("typeof", ty);
+            m.set_attr("about", "#mwt1");
+            body.push_child(m);
+        }
+        body.push_child(Node::element(ElementKind::Div));
+
+        p_wrap_dom(&mut body);
+
+        // The paragraph keeps both markers; only the div follows it.
+        assert_eq!(body.children.len(), 2, "{body:?}");
+        assert_eq!(body.children[0].children.len(), 3);
+        assert!(matches!(
+            body.children[1].kind,
+            NodeKind::Element(ElementKind::Div)
         ));
     }
 }
