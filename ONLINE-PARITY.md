@@ -10428,3 +10428,46 @@ added by the rendering-transparent-elts pass (`DOMRangeBuilder::
 handleRenderingTransparentEltsBetweenBlocks`, which wraps stashable nodes in a
 `mw-empty-elt` span); rustoid has the merge but not that stashing step here.
 That is the next target.
+
+## Fixed: the `mw-empty-elt` class on the merged paragraph
+
+The guess above (the range builder's stashing span) was wrong. The class comes
+from **`CleanUp::handleEmptyElements`**: an empty flagged element (`p`, `li`,
+`tbody`, `tr`) whose children are all comments, whitespace, rendering-
+transparent nodes or empty nowiki/wrapper nodes is marked `class="mw-empty-elt"`.
+rustoid's `cleanup.rs` already ports that — but its last step, "the element must
+carry no meaningful attributes", accepted only `data-parsoid`/`stx`:
+
+    for attr in &node.attrs {
+        if attr.key != "data-parsoid" && attr.key != "stx" { return; }
+    }
+
+Parsoid accepts the template-wrapping attributes as well while it is inside
+template content (`$state->tplInfo`, the `ALLOWED_TPL_WRAPPER_ATTRS` set
+`about`/`typeof`/`data-parsoid`/`data-mw`). The merged empty paragraph is exactly
+that node — it *is* the first encapsulation wrapper — so Parsoid marks it and
+rustoid did not.
+
+### Effect: byte 2212 moves to 3890
+
+The fix gates the tolerance on the node being a first encapsulation wrapper
+(`is_first_encapsulation_wrapper`, the same predicate the span-deletion branch
+already uses), so a plain empty `<p class="…">` is still left alone. `Zebra`'s
+first difference is now **3890**; the merged tag matches Parsoid's byte for
+byte:
+
+    <p about="#mwt12" typeof="mw:Transclusion" class="mw-empty-elt" data-mw='…'>
+
+The eight subset offsets are otherwise unchanged (`Help:Introduction` 5161,
+`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772), `Zebro` still MATCHes, the
+fixture guard holds at **877/896**, and 942 lib tests pass with clippy clean.
+
+### The next difference at 3890
+
+Inside the merged `<p>`, rustoid emits an empty `<span typeof="mw:Nowiki">`
+left over from `Template:Automatic taxobox`'s `<includeonly><nowiki/>` and
+gives the following `<meta typeof="mw:Extension/indicator">` no `about`,
+where Parsoid drops the nowiki and attributes the meta `about="#mwt7"`. That
+is the next target: the nowiki wrapper's removal and the indicator's range
+attribution inside the transclusion.
