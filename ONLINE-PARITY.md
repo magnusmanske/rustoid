@@ -10217,3 +10217,58 @@ because each round has a fresh `Lua` state. Reusing one engine across a call's
 rounds — rebuilding only when the frame or registry changes — would compile each
 module once, but it is behaviour-sensitive (module state would persist between
 rounds where it currently cannot), so it wants its own measured change.
+
+## `Zebra`'s merge: the PHP, read end to end
+
+The `Zebra` difference at 2172 is the transclusion-range merge: Parsoid folds
+`{{Featured article}}`, `{{pp-semi}}`, `{{use British English}}`, `{{use dmy dates}}`
+and the taxobox into one compound on the auto-inserted empty paragraph
+(`<p about="#mwt12" typeof="mw:Transclusion" data-mw='{five parts}'>`); rustoid
+keeps five sibling wrappers. A range dump gives the mechanism precisely: the four
+empties live *inside* the paragraph `[0,16]`, while the taxobox range starts
+*after* it (`[0,18]..[0,22]`). In Parsoid the taxobox range starts **at** the
+paragraph, so the four empties are **nested** in it — and nesting is what
+`recordTemplateInfo` folds into one `data-mw.parts`.
+
+The PHP was read end to end to find where that happens:
+
+- **`ParagraphWrapper.php` (token level) is a faithful port.** `openPTag` and
+  `closeOpenPTag`, including the `tplStartIndex`/`tplEndIndex` bookkeeping, match
+  `paragraph_wrapper_v2.rs` line for line.
+- **`PWrap.php` + `PWrapState.php` (DOM level) were only half ported.** `p_wrap.rs`
+  had `pWrapDOM`/`split`/`mergeRuns` but not
+  `PWrapState::processOptionalNode`/`unwrapTrailingPWrapOptionalNodes`. That is now
+  closed (below).
+- `DOMUtils::isMetaDataTag` is tag-name-based, so rustoid's `METADATA_TAGS`
+  (which includes `link`/`meta`/`style`) matches; another suspected cause ruled
+  out.
+
+That leaves the merge itself unexplained by any single pass: the missing
+`PWrapState` handling deliberately moves trailing markers *out* of a paragraph,
+which is the opposite of what `Zebra` needs. Without a Parsoid `tplwrap`/`p-wrap`
+trace of the page, the exact step that lands the taxobox marker inside the
+paragraph cannot be read off the source, so no speculative change was made.
+
+## Fixed: the missing `PWrapState` unwrap
+
+`p_wrap.rs` now ports `PWrapState::processOptionalNode` and
+`unwrapTrailingPWrapOptionalNodes`. When a paragraph closes, a run of trailing
+p-wrap-optional nodes (transclusion/param/annotation markers, whitespace,
+metadata tags) is moved back out of it; a trailing `/End` whose matching start
+is still inside stays put, so a lone closing tag is never hoisted. This is the
+PHP behaviour that stops a trailing marker from pulling a block inside a range
+and expanding it unnecessarily.
+
+### Effect: faithful, but neutral on the measured first differences
+
+On the near-complete subset, every first-difference offset is byte-identical
+(`Zebra` 2172, `Help:Introduction` 5161, `Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772), `Zebro` still MATCHes, and the fixture guard holds at **877/896**.
+Output sizes shift — `Zebra` −7.6 KB, `Unix`/`Sundial`/`Nobel Prize`/`List of
+sovereign states` +0.1–1.5 KB — which is the expected removal of boundary
+wrappers. By the balance of this log's standard (no scoreboard effect plus mixed
+size deltas) this is *not* yet a demonstrated improvement; it is kept because it
+closes a real gap against the PHP source and the fixtures encode that core. A
+full-corpus before/after could not settle it: two offline runs compared different
+counts (36 vs 41) because the wall-clock stall cap is load-dependent.
