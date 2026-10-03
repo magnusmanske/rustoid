@@ -4756,6 +4756,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             /* in_template */ true,
             self.config.extension_tags(),
         );
+        // A module whose output begins with a table (`{|`) is spliced into the
+        // caller right after the transclusion's marker span, which is not the
+        // start of a line — so the table is not at SOL. Parsoid inserts a newline
+        // to force it there (T2529: "for *#:; (lists) and {| (table start),
+        // newlines are added"), and the inserted newline is what lets a
+        // transclusion that follows merge with the ones before it (see
+        // ONLINE-PARITY.md). A module that is already at SOL is left alone.
+        let mut items = items;
+        if output.starts_with("{|") {
+            items.insert(
+                0,
+                Item::Tok(ParsoidToken::Nl(crate::wikitext::tokens_v2::NlTk::new(
+                    crate::wikitext::tokens_v2::SourceRange::new(0, 0),
+                ))),
+            );
+        }
 
         let child = frame.new_child(frame.title().clone(), vec![]);
         // The document's counter, not a fresh one. A module's output can carry a
