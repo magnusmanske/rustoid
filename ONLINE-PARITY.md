@@ -10388,3 +10388,43 @@ during preprocessing. Ex: `{{1x|1=\nx\n}}` strips the newlines." Finding
 where that NL is produced — and whether rustoid's `TokenStreamPatcher` port
 drops it — is the next step. Until then the merge cannot fire and byte 2172
 stands.
+
+## Fixed: the T2529 newline before a module's table
+
+The newline is Parsoid's T2529 insertion. A module's output is tokenized and
+spliced into the caller immediately after the transclusion's marker span — not
+at the start of a line — so a table the module returns is not in SOL state.
+Parsoid's own comment states the rule: "for `*#:;` (lists) and `{|` (table
+start), newlines are added". `{{Automatic taxobox}}` returns a `{|`-leading
+table, so the newline is exactly the missing token.
+
+First attempt put it at the template-body level (a body beginning with `{|`
+gets a leading `NlTk`). That fixed the merge but regressed two `tables.txt`
+fixtures: `{{tbl-start}}` has the body `{|` and sits at page SOL, and the
+fixtures pin it to *no* leading newline. The rule is about the splice point,
+not the body, so the insertion moved to `expand_invoke`: a module whose output
+begins with `{|` gets an `NlTk` prepended to the tokens it returns.
+
+### Effect: the merge fires; byte 2172 moves to 2212
+
+`Zebra`'s first difference is now **2212**, and the compound paragraph matches
+Parsoid's:
+
+    <p about="#mwt12" typeof="mw:Transclusion" data-mw='{"parts":[
+      {…Featured article…},"\n",{…pp-semi…},"\n",{…use British English…},
+      "\n",{…use dmy dates…},"\n",{…Automatic taxobox…}]}'>
+
+`reduce2.wt` shows the same merge of all three templates into one `<p>` with a
+three-part `data-mw`. The eight subset offsets are otherwise unchanged
+(`Help:Introduction` 5161, `Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772),
+`Zebro` still MATCHes, the fixture guard holds at **877/896**, and 942 lib
+tests pass with clippy clean.
+
+### The next difference at 2212
+
+The merged `<p>` is missing Parsoid's `class="mw-empty-elt"`. That class is
+added by the rendering-transparent-elts pass (`DOMRangeBuilder::
+handleRenderingTransparentEltsBetweenBlocks`, which wraps stashable nodes in a
+`mw-empty-elt` span); rustoid has the merge but not that stashing step here.
+That is the next target.
