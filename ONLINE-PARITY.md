@@ -10156,3 +10156,64 @@ rustoid: <p class="mw-empty-elt" id="mwBw"><span typeof="mw:Nowiki mw:Transclusi
 Parsoid keeps the wrapper on the `<p>` (`about`/`typeof`/`data-mw` naming the
 three templates), while rustoid wraps each template in a `Nowiki` span inside
 it. That is the next difference to chase.
+
+## Performance: the entity tables were parsed on every round
+
+Before chasing `Zebra`'s merge further, the render cost was measured, because a
+page that should render in well under a second was taking tens of seconds — and a
+symptom like that can be a non-terminating loop rather than merely slow work. It
+is **not** a loop: `Zebra` terminates, is CPU-bound (26.1 s user, single
+threaded), and produces byte-identical output on every run. The cost is the
+**lazy `#invoke` round loop**, and it is quantifiable:
+
+- `Zebra` makes **1627 deferred rounds** across ~164 `#invoke` calls, i.e.
+  **3295 `run_once` calls**.
+- Each `run_once` builds a fresh `LuaEngine`, and `LuaEngine::new` measured
+  **10.8 s of the 26 s** (42%), ~3.3 ms each.
+- Most of that was `entity_table`: it parsed *every* preloaded entity's JSON —
+  and `by_title_arg` parsed them all a second time — on every construction. On
+  `Zebra` the entity set was 21 entities / 1.66 MB, so ~3.3 GB of JSON was
+  parsed for one page. (`cargo build` — no; `/usr/bin/time -l` attribute it to
+  `entity_table` → `json_to_lua` in a `sample` call graph.)
+
+### The fix: index entities lazily
+
+The Lua side only ever *indexes* `byId[id]` and `byTitle[title]`; it never
+enumerates them. Both are now tables with an `__index` that parses the one
+entity a module actually names and caches it with `raw_set`
+(`engine::lazy_index_table`). `byTitle` needs no parsing at all — it answers from
+`Entities::id_for_title`. `entity_table` takes an `Arc<LuaContext>` to capture in
+the accessor, and `Entities::get` exposes the raw JSON by id.
+
+The result is that construction no longer depends on how many entities the
+render happens to hold, only on how many a module reads.
+
+### Effect
+
+`Zebra`: **26.4 s → 18.6 s** (~30% faster), output **byte-identical** to before.
+Every page in the near-complete subset keeps its exact first-difference offset
+(`Zebra` 2172, `Help:Introduction` 5161, `Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772), `Zebro` still MATCHes, the fixture guard holds at **877/896**, and
+clippy/fmt are clean.
+
+### A reverted attempt, recorded
+
+A render-wide, incremental entity *preload* was tried first (dedupe the entity
+fetches, which were issued 1609 times for the page's own entity). It cut data
+source requests from 7718 to 6108, but **doubled** retired instructions
+(458 G → 987 G) for reasons that were not pinned down — the extra work was not
+the clone that was first suspected. It was reverted rather than shipped on the
+strength of a request-count metric that did not correspond to wall time. The
+lesson is the same one the balance of this log keeps relearning: **measure the
+cost, not the proxy.**
+
+### The next performance lever
+
+The profile after the fix is dominated by Lua **compilation** (`llex`,
+`luaK_*`, `luaS_newlstr`, GC), not execution (`luaV_execute` is a rounding
+error): every round recompiles the entry module and everything it `require`s,
+because each round has a fresh `Lua` state. Reusing one engine across a call's
+rounds — rebuilding only when the frame or registry changes — would compile each
+module once, but it is behaviour-sensitive (module state would persist between
+rounds where it currently cannot), so it wants its own measured change.
