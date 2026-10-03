@@ -10272,3 +10272,119 @@ size deltas) this is *not* yet a demonstrated improvement; it is kept because it
 closes a real gap against the PHP source and the fixtures encode that core. A
 full-corpus before/after could not settle it: two offline runs compared different
 counts (36 vs 41) because the wall-clock stall cap is load-dependent.
+
+## Generating the Parsoid trace, and what it found: the module answer lost every table
+
+The section above ended by saying the merge could not be read off the source
+without a Parsoid `tplwrap`/`p-wrap` trace. The trace was generated (the oracle
+at `/tmp/parsoid`, `php bin/parse.php --standalone --domain en.wikipedia.org
+--title Zebra --inputfile … --trace 'tplwrap' --logFile …`), and it overturned
+the hypothesis the whole investigation had been built on. The merge is not a
+range-planning defect at all; it is downstream of a much larger one.
+
+### The trace
+
+`tplwrap/findranges` for `#mwt12` shows Parsoid's range `start` is the `<p>`
+itself, containing the `#mwt6`…`#mwt12` markers:
+
+    start : [TAG_ID 16]: <p data-object-id="46"><meta … about="#mwt6"/> …
+        … <meta … about="#mwt12"/><span typeof="mw:DOMFragment"/></p>
+
+So in Parsoid the four empties are *nested* in `#mwt12` and `recordTemplateInfo`
+folds them into one `data-mw.parts`. A `RUSTOID_TRACE_RANGES` dump of rustoid's
+plan showed the opposite: `#mwt6`…`#mwt11` have paths `[0,16,*]` (inside the
+`<p>`) but `#mwt12` is `[0,18]` — the taxobox's start meta is a **body sibling
+after the `<p>`**, not inside it. `compute_range_plan` was correctly computing
+the LCA of a start meta that was already in the wrong place, so it was innocent.
+The DOM at range-plan time made it concrete:
+
+    CHILD[0,16] <Paragraph>           # the auto-inserted empty paragraph
+    CHILD[0,18] <meta about="#mwt12"> # the taxobox start marker, outside it
+
+### The cause
+
+The `RUSTOID_TRACE_PWRAP` token trace then showed the paragraph *close* being
+emitted while the buffer was empty (`PWRAP CLOSE len=0 insert_at=0`), at the
+first block token after the marker. Rustoid's `ParagraphWrapper` is a faithful
+port of `ParagraphWrapper.php` — but it is fed a different token stream than
+Parsoid's. Parsoid's stream around the taxobox is
+
+    meta #mwt12 · <span mw:DOMFragment> · </span> · NL · table
+
+while rustoid's was
+
+    meta #mwt12 · <span mw:DOMFragment> · </span> · "" · br · div
+
+The taxobox expansion came out as an inline `div`/`br` pile with **no table at
+all**: `grep -c '<table'` on the full page was 8 for rustoid, 20 for Parsoid,
+and there was no `infobox biota` anywhere. `Template:Automatic taxobox` is
+`{{#invoke:Automated taxobox}}`, whose module builds the table by
+`frame:expandTemplate{ title = 'Taxobox/core' }` — so the loss is in the string
+the module receives back. Instrumenting the answer confirmed it: the module
+returned
+
+    " Zebra [[Taxonomy (biology)|Scientific classification]] … Kingdom:Phylum:…"
+
+— every `{|`, `|-`, `|`, `!` gone, cell contents flattened. The module was
+faithful; the *answer* was not.
+
+### The fix
+
+`render_answer` (and `tokens_to_source`) reconstruct wikitext from each token's
+`dataParsoid.src`. Table tokens never carry `src` — the tokenizer stores their
+spelling in `start_tag_src` (`{|`/`|-`/`|`/`!`), `attr_sep_src`, `tmp.attr_src`
+and `end_tag_src` — so they were dropped, and with them every table a template
+or module built. Three changes:
+
+- `token_utils::table_token_wikitext` rebuilds a table-structure token from
+  those fields (PHP `TokenStreamPatcher::convertNonHTMLTokenToString`). The
+  attribute box is rebuilt from the token's **expanded** attributes, not
+  `tmp.attr_src`: that field holds the source as written and still carries the
+  templates the expansion substituted (`{{{colour}}}` in a taxobox).
+  `try_table_start_tag` now records `tmp.attr_src` so its box is not lost.
+- `render_answer` emits `\n` for an `NlTk` (a module can see newlines, and table
+  syntax needs them on their own line; they were silently dropped before).
+- Both `render_answer` and `tokens_to_source` fall back to
+  `table_token_wikitext` when a token has no `src`.
+
+### Effect: the taxobox is a table again; the merge still does not fire
+
+`reduce2.wt` (`{{use dmy dates}}`, `{{use British English}}`, a minimal
+`{{Automatic taxobox}}`) now renders a real table, byte-identical to Parsoid's
+opening tag:
+
+    <table class="infobox biota" style="text-align: left; width: 200px; font-size: 100%" about="#mwt3">
+
+Full `Zebra` gains the `infobox biota` table (`<table>` count 8 → 9; offline
+output 513305 → 515096 bytes, 536855 once the templates the taxobox needs are
+online). The taxonomy *values* are still empty (`<td></td>` where Parsoid has
+`Animalia`) and a stray `;` appears in the header style — both separate, deeper
+issues in the taxonomy modules, not the reconstruction.
+
+The measured first differences are **unchanged**: all eight subset offsets are
+byte-identical (`Zebra` 2172, `Help:Introduction` 5161, `Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772), `Zebro` still MATCHes, the
+fixture guard holds at **877/896**, and 942 lib tests pass with clippy clean.
+This is kept on the same basis as the `PWrapState` port: it closes a real gap
+against the PHP source, and it is a prerequisite for the merge.
+
+### What still blocks the merge
+
+With the table present, `PWRAP CLOSE` is still emitted into an empty buffer, so
+`</p>` still lands before `#mwt12`. The trace shows why: Parsoid's stream has a
+*synthesised* `NlTk` (`"dataParsoid":{}`) between the taxobox's dom-fragment
+span and the `<table>`, and rustoid's does not:
+
+    Parsoid : meta #mwt12 · span · /span · NL · table
+    rustoid : meta #mwt12 · span · /span · table
+
+PHP's `ParagraphWrapper` would place `</p>` before the held current-line tokens
+too, given rustoid's stream — the newline is what moves `#mwt12` into
+`tokenBuffer` first, so that `closeOpenPTag` finds it. Parsoid names the missing
+newline itself in `TokenStreamPatcher`: encountering a table tag while buffering
+"implies that we are missing a newline in the token stream … we lost a newline
+during preprocessing. Ex: `{{1x|1=\nx\n}}` strips the newlines." Finding
+where that NL is produced — and whether rustoid's `TokenStreamPatcher` port
+drops it — is the next step. Until then the merge cannot fire and byte 2172
+stands.
