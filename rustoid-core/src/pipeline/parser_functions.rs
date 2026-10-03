@@ -147,6 +147,25 @@ fn value_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// PHP's `(int)` cast applied to a string: trim leading whitespace, take an
+/// optional sign and the leading run of ASCII digits, and answer `0` when there
+/// are none. `(int)"2abc"` is `2`, `(int)"abc"` is `0`.
+fn php_int_cast(s: &str) -> i64 {
+    let t = s.trim_start();
+    let (negative, rest) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    match digits.parse::<i64>() {
+        Ok(v) if negative => -v,
+        Ok(v) => v,
+        // `0` for no digits; saturate rather than wrap on overflow, as PHP does.
+        Err(_) if digits.is_empty() => 0,
+        Err(_) => i64::MAX,
+    }
+}
+
 /// The ParserFunctions handler.
 pub struct ParserFunctions;
 
@@ -452,6 +471,77 @@ impl ParserFunctions {
             result.push_str(&pad.chars().take(remaining).collect::<String>());
         }
         vec![Item::Str(result)]
+    }
+
+    /// `#titleparts` — a port of the ParserFunctions extension's
+    /// `ParserFunctions::titleparts`. `{{#titleparts:Hello/World|1}}` is
+    /// `Hello`.
+    ///
+    /// ```php
+    /// $bits = explode( '/', $ntitle->getPrefixedText(), 25 );
+    /// if ( $offset > 0 ) { --$offset; }
+    /// return implode( '/', array_slice( $bits, $offset, $parts ?: null ) );
+    /// ```
+    ///
+    /// The title is split into at most 25 slash-separated parts (the 25th holds
+    /// the remainder). `$parts` is how many to keep (`0` = all; negative drops
+    /// that many from the end) and `$offset` the 1-based index of the first part
+    /// (`0` and `1` both mean the first; negative counts from the end). A title
+    /// `Title::newFromText` rejects is returned verbatim.
+    pub fn pf_titleparts(config: &dyn crate::traits::SiteConfig, params: &Params) -> Vec<Item> {
+        let args = &params.args;
+        let title = args
+            .first()
+            .map(|kv| key_value_to_string(&kv.key))
+            .unwrap_or_default();
+        let parts = args
+            .get(1)
+            .map(|kv| php_int_cast(&value_to_string(&kv.value)))
+            .unwrap_or(0);
+        let offset = args
+            .get(2)
+            .map(|kv| php_int_cast(&value_to_string(&kv.value)))
+            .unwrap_or(0);
+        // `if ( $offset > 0 ) { --$offset; }` — the function's offset is 1-based,
+        // `array_slice`'s 0-based. `0` and negative offsets are left alone.
+        let offset = if offset > 0 { offset - 1 } else { offset };
+
+        let Some(parsed) = crate::title::TitleParser::try_parse(&title, config) else {
+            return vec![Item::Str(title)];
+        };
+        let prefixed = parsed.get_prefixed_text();
+
+        // `explode( '/', $text, 25 )`: up to 24 splits, the rest in the last part.
+        let mut bits: Vec<&str> = Vec::new();
+        let mut rest = prefixed.as_str();
+        while bits.len() < 24 {
+            match rest.find('/') {
+                Some(i) => {
+                    bits.push(&rest[..i]);
+                    rest = &rest[i + 1..];
+                }
+                None => break,
+            }
+        }
+        bits.push(rest);
+
+        // `array_slice( $bits, $offset, $parts ?: null )`.
+        let n = bits.len() as i64;
+        let start = if offset >= 0 {
+            offset.min(n)
+        } else if -offset > n {
+            0
+        } else {
+            n + offset
+        };
+        let end = if parts == 0 {
+            n
+        } else if parts > 0 {
+            (start + parts).min(n)
+        } else {
+            (n + parts).max(start)
+        };
+        vec![Item::Str(bits[start as usize..end as usize].join("/"))]
     }
 
     /// `#tag` — mirrors `pf_tag` / `tag_worker`, plus the extension-tag branch
@@ -1190,6 +1280,36 @@ mod tests {
 
     fn params(args: Vec<(&str, &str)>) -> Params {
         Params::new(args.into_iter().map(|(k, v)| kv(k, v)).collect())
+    }
+
+    #[test]
+    fn test_pf_titleparts_matches_the_extension() {
+        // Values probed from the live wiki (the ParserFunctions extension's
+        // `titleparts`), so a rewrite that invents its own `array_slice`
+        // semantics fails loudly rather than subtly.
+        let config = crate::mock::MockSiteConfig::new();
+        let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+            (vec![("A/B/C/D", ""), ("", "2"), ("", "2")], "B/C"),
+            (vec![("A/B/C/D", "")], "A/B/C/D"),
+            (vec![("A/B/C/D", ""), ("", "-1")], "A/B/C"),
+            (vec![("A/B/C/D", ""), ("", "2"), ("", "-2")], "C/D"),
+            (vec![("foo/bar/baz", ""), ("", "0"), ("", "2")], "bar/baz"),
+            (
+                vec![("foo/bar/baz", ""), ("", "0"), ("", "0")],
+                "Foo/bar/baz",
+            ),
+            (vec![("foo/bar/baz", ""), ("", "2"), ("", "5")], ""),
+            (vec![("foo/bar/baz", ""), ("", "-2")], "Foo"),
+            (vec![("foo/bar/baz", ""), ("", "2"), ("", "-1")], "baz"),
+            (vec![("Template:Foo/Bar", ""), ("", "1"), ("", "2")], "Bar"),
+            (vec![("a/b/c", ""), ("", "1"), ("", "-9")], "A"),
+            (vec![("a/b/c", ""), ("", "-1"), ("", "-1")], ""),
+            (vec![("foo/bar baz", ""), ("", "1"), ("", "1")], "Foo"),
+        ];
+        for (args, want) in cases {
+            let out = ParserFunctions::pf_titleparts(&config, &params(args.clone()));
+            assert_eq!(out, vec![Item::Str(want.to_string())], "{args:?}");
+        }
     }
 
     #[test]

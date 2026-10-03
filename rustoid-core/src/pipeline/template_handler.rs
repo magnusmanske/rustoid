@@ -1299,6 +1299,7 @@ impl TemplateHandler {
             "lcfirst" => ParserFunctions::pf_lcfirst(params),
             "padleft" => ParserFunctions::pf_padleft(params),
             "padright" => ParserFunctions::pf_padright(params),
+            "titleparts" => ParserFunctions::pf_titleparts(config, params),
             "tag" => ParserFunctions::pf_tag(config, params),
             "urlencode" => ParserFunctions::pf_urlencode(params),
             "anchorencode" => ParserFunctions::pf_anchorencode(params),
