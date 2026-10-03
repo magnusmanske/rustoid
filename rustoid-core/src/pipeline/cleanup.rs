@@ -136,7 +136,11 @@ fn is_first_encapsulation_wrapper(node: &Node) -> bool {
 
 /// Handle an empty element, adding the `mw-empty-elt` class or removing
 /// deletable `mw-empty-elt` spans. Mirrors `CleanUp::handleEmptyElements`.
-fn handle_empty_element(node: &mut Node) {
+///
+/// `in_tpl` is Parsoid's `$state->tplInfo`: true when the node is inside (or is
+/// the root of) a transclusion forest. It only widens the attribute tolerance
+/// below.
+fn handle_empty_element(node: &mut Node, in_tpl: bool) {
     let tag = match &node.kind {
         NodeKind::Element(kind) => element_tag(kind),
         _ => return,
@@ -171,12 +175,11 @@ fn handle_empty_element(node: &mut Node) {
     // For `<p>` this mirrors the legacy parser: an empty `<p>` with only
     // `data-parsoid`/`stx` (parsoid-added) attributes is still markable.
     //
-    // A node that is itself a transclusion/extension wrapper (Parsoid's
-    // `$state->tplInfo`) additionally tolerates the template-wrapping
-    // attributes (`ALLOWED_TPL_WRAPPER_ATTRS`): the merged empty `<p>`
-    // `about="#mwt…" typeof="mw:Transclusion" data-mw='…'` is exactly this
-    // case, and the live service marks it `mw-empty-elt`.
-    let in_tpl = is_first_encapsulation_wrapper(node);
+    // A node inside a transclusion (Parsoid's `$state->tplInfo`) additionally
+    // tolerates the template-wrapping attributes (`ALLOWED_TPL_WRAPPER_ATTRS`):
+    // the merged empty `<p>` `about="#mwt…" typeof="mw:Transclusion"
+    // data-mw='…'` is exactly this case, and the live service marks it
+    // `mw-empty-elt`.
     for attr in &node.attrs {
         let wrapper_attr = matches!(
             attr.key.as_str(),
@@ -199,13 +202,55 @@ fn handle_empty_element(node: &mut Node) {
     node.set_attr("class", merged);
 }
 
-/// Run the `CleanUp` empty-element pass over the document.
+/// Whether a node is the root of an encapsulated DOM forest — an element whose
+/// `about` is a transclusion id (`WTUtils::isEncapsulatedDOMForestRoot`). Such a
+/// wrapper must be kept even when it is a nowiki span, because it anchors the
+/// about-chain.
+fn is_encapsulated_dom_forest_root(node: &Node) -> bool {
+    node.get_attr("about")
+        .is_some_and(|a| a.starts_with("#mwt"))
+}
+
+/// Whether a node is an `mw:Nowiki` span.
+fn is_nowiki_span(node: &Node) -> bool {
+    node.get_attr("typeof")
+        .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:Nowiki"))
+}
+
+/// Run the `CleanUp` pass over the document.
+///
+/// Both handlers of Parsoid's `cleanup` pipeline run in one traversal, which
+/// tracks the enclosing template (`$state->tplInfo`): set when a first
+/// encapsulation wrapper is entered, carried down its subtree. That tracking is
+/// what `handleEmptyElements` reads for its attribute tolerance and what
+/// `finalCleanup` reads to strip nowiki spans.
 pub fn run(root: &mut Node) {
-    handle_empty_element(root);
-    trim_whitespace(root);
-    for child in &mut root.children {
-        run(child);
+    cleanup_node(root, false);
+}
+
+fn cleanup_node(node: &mut Node, in_tpl: bool) {
+    let in_tpl = in_tpl || is_first_encapsulation_wrapper(node);
+    handle_empty_element(node, in_tpl);
+    trim_whitespace(node);
+
+    // `finalCleanup`: strip `mw:Nowiki` spans from encapsulated content, but
+    // keep a wrapper that is a forest root (its `about` anchors the about
+    // chain). Its children are migrated in place first. Mirrors
+    // `DOMUtils::migrateChildren` + `removeChild`.
+    let children = std::mem::take(&mut node.children);
+    let mut out = Vec::with_capacity(children.len());
+    for mut child in children {
+        if in_tpl && is_nowiki_span(&child) && !is_encapsulated_dom_forest_root(&child) {
+            for mut grandchild in std::mem::take(&mut child.children) {
+                cleanup_node(&mut grandchild, in_tpl);
+                out.push(grandchild);
+            }
+        } else {
+            cleanup_node(&mut child, in_tpl);
+            out.push(child);
+        }
     }
+    node.children = out;
 }
 
 /// Drop the `data-parsoid` of nodes inside a transclusion that the service keeps
