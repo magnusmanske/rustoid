@@ -2759,19 +2759,21 @@ fn wrap_flipped_children(
         // non-meta element becomes the encapsulation target.
         let (lo, hi) = if t < i { (t, i) } else { (i, t) };
         let mut encap_target = None;
+        // When the start marker is nested inside `children[i]` (PHP's
+        // common-ancestor/flipped case), that ancestor may *begin before* the
+        // transclusion — a `<p>` holding the start marker of a template in its
+        // text. It must not be stamped with the transclusion's `about` (the
+        // service serves it unkeyed), so its stamp is withheld. Every other
+        // element in the range genuinely lies between the markers and is stamped
+        // unconditionally, as `ensureElementsInRangeAndAddAboutIds` does. Applying
+        // the guard to the whole range wrongly withheld the stamp from a
+        // template-generated `<table>` whose fragment-relative `dsr.start` is 0.
+        let start_ancestor = if start_is_sibling { None } else { Some(i) };
         for (j, child) in children.iter_mut().enumerate().skip(lo).take(hi - lo + 1) {
             if matches!(child.kind, NodeKind::Element(_)) && !is_transclusion_start(child) {
-                // A sibling that begins *before* the transclusion cannot be in it,
-                // whatever the nesting says. This is the paragraph-wrapper case:
-                // on `AAA{{If empty|<div>X</div>|b}}` the `<p>` holds the start
-                // marker yet begins at offset 0, before the template at 3, so
-                // stamping it gave the `<p>` the same transclusion id as the
-                // `<div>` — two elements sharing one id where the service serves
-                // one. Narrowing the *range* to drop the sibling, and moving the
-                // encapsulation *target* off it, were each tried and each cost
-                // five fixtures; only the stamp can be withheld without
-                // disturbing the span-wrapping and deletability steps below.
-                if !sibling_starts_before(child, transclusion_start_offset(&start_meta)) {
+                let withholds = start_ancestor == Some(j)
+                    && sibling_starts_before(child, transclusion_start_offset(&start_meta));
+                if !withholds {
                     child.set_attr("about", start_meta.get_attr("about").unwrap_or(""));
                 }
                 if encap_target.is_none() {
@@ -4077,6 +4079,72 @@ mod tests {
         assert_eq!(doc.children.len(), 2, "{doc:?}");
         assert_eq!(doc.children[0].get_attr("about"), Some("#mwt2"));
         assert_eq!(doc.children[1].get_attr("about"), Some("#mwt2"));
+    }
+
+    #[test]
+    fn test_flipped_range_stamps_interior_table_not_the_ancestor() {
+        // The taxobox case: the transclusion's start marker sits inside a `<p>`
+        // that begins *before* the transclusion (`dsr.start` precedes the
+        // marker), and the module's generated `<table>` follows as a sibling.
+        // The `<table>`'s `dsr.start` is a fragment-relative `0`, which must not
+        // be read as "begins before the transclusion": the table genuinely lies
+        // between the markers and takes the `about` id. Without it the table
+        // keeps its `data-parsoid` and the id pass wrongly gives it an `id`.
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt2");
+        start.data_parsoid = Some("{\"tsr\":[100,200]}".to_string());
+        start.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(100),
+                end: Some(200),
+                ..Default::default()
+            }),
+            ..DataParsoid::default()
+        });
+
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.set_attr("about", "#mwt2");
+
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(50),
+                end: Some(99),
+                ..Default::default()
+            }),
+            ..DataParsoid::default()
+        });
+        p.push_child(start);
+
+        let mut table = Node::element(ElementKind::Table);
+        table.dp = Some(DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(41),
+                ..Default::default()
+            }),
+            ..DataParsoid::default()
+        });
+
+        let mut doc = Node::document();
+        doc.push_child(p);
+        doc.push_child(table);
+        doc.push_child(end);
+
+        encapsulate_transclusions(&mut doc, None);
+
+        // The end marker is dropped later (by the cleanup pass); here the `<p>`
+        // is the encapsulation target and the `<table>` takes the range's
+        // `about` id as a sibling.
+        let table = doc
+            .children
+            .iter()
+            .find(|c| matches!(c.kind, NodeKind::Element(ElementKind::Table)))
+            .expect("table survives");
+        assert_eq!(table.get_attr("about"), Some("#mwt2"), "{doc:?}");
+        assert_eq!(doc.children[0].get_attr("about"), Some("#mwt2"));
     }
 
     #[test]
