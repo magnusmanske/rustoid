@@ -10587,9 +10587,59 @@ pass with clippy clean.
 
 ### The next difference at 5093
 
-Inside the `<th>` the `style` attribute differs: Parsoid serves
-`color:inherit; text-align: center; background-color: rgb(235,235,210)`, rustoid
-`color:inherit; text-align: center;; background-color: transparent` — a doubled
-`;` and the taxobox background colour not applied (the `{{Taxobox/…}}` colour
-argument). Beyond that the taxonomy `<td>`s are empty where Parsoid has the
-`Animalia`/`Chordata`/… links. That is the next target.
+Inside the `<th>` the `style` attribute differs in two ways at once: Parsoid
+serves `color:inherit; text-align: center; background-color: rgb(235,235,210)`,
+rustoid `color:inherit; text-align: center;; background-color: transparent` — a
+doubled `;`, and the taxobox background colour not applied (the `{{Taxobox/…}}`
+colour argument). They are independent, and the `;` comes first.
+
+## Fixed: the `;;`, and the colour it hid
+
+The `<th>` is `Template:Taxobox core`'s header row:
+
+    ! colspan=2 style="color:inherit; text-align: center{{#if:{{{colour|}}}|{{;}} background-color: {{{colour}}}| }}" | …
+
+**The `;;`.** `{{;}}` is `Template:;`, whose body is `&#59;`. An entity
+tokenizes as an `mw:Entity` span (its `src` is `&#59;`), the decoded `;`, and an
+end tag. `render_answer` and `tokens_to_source` — the two functions that hand a
+module the wikitext a `frame:expandTemplate` answer produced — emitted the
+span's `src` *and* the decoded text, so the module received `&#59;;`, which
+reparsed to `;;`. `skip_entity_decoded_text` now drops the decoded text when it
+matches the span's `srcContent`; the `src` already spells the whole entity.
+
+**The colour.** The argument is
+`colour = frame:expandTemplate{ title = 'Taxobox colour', args = { … } }`, and
+`Template:Taxobox colour` matches the taxon with
+`{{lc:{{#titleparts:{{Delink|{{{1|}}}}}|1|1}} }}`. `#titleparts` is a
+**ParserFunctions extension** function (not a Parsoid-native one; Parsoid's own
+`ParserFunctions.php` has it as a `TODO`), so rustoid's unknown-function
+fallback returned the source verbatim, `#switch` matched no case and answered
+`#default` (`Template:Taxobox/Error colour`), and the module passed that on.
+`ParserFunctions::titleparts` is now ported: split
+`Title::newFromText($title)`'s prefixed text on `/` (at most 25 parts, the last
+holding the remainder), then `array_slice` with a 1-based offset
+(`if ( $offset > 0 ) --$offset`) and a length that is 0 (all), positive (that
+many) or negative (drop that many from the end); a title `newFromText` rejects
+is returned verbatim.
+
+### Effect: byte 5093 moves to 5286
+
+The `<th>` now matches Parsoid's byte for byte:
+
+    <th colspan="2" style="color:inherit; text-align: center; background-color: rgb(235,235,210)">
+
+`Zebra`'s first difference is now **5286**. The eight subset offsets are
+otherwise unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 946 lib tests pass with clippy clean.
+
+### The next difference at 5286
+
+Inside the temporal-range line rustoid emits an extra nested
+`<span class="noprint"><span style="display:inline-block;"></span>` before the
+second `display:inline-block` span, where Parsoid has only the one
+`<span class="noprint"><span style="display:inline-block;"></span><span
+style="display:inline-block;">2–0…`. Beyond that the taxonomy `<td>`s are still
+empty where Parsoid has the `Animalia`/`Chordata`/… links. That is the next
+target.
