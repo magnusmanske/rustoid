@@ -589,6 +589,7 @@ fn emit_wrapper_placeholder(
 fn emit_indicator_placeholder(
     stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
     id: usize,
+    about: Option<&str>,
 ) -> Vec<Item> {
     use crate::wikitext::tokens_v2::{KV, SelfclosingTagTk};
 
@@ -607,6 +608,11 @@ fn emit_indicator_placeholder(
     };
     frag.attribs
         .push(kv("typeof", "mw:Extension/indicator".to_string()));
+    // The extension's `about` id, placed where the served bytes have it (after
+    // `typeof`, before `data-mw`).
+    if let Some(about) = about {
+        frag.attribs.push(kv("about", about.to_string()));
+    }
     frag.attribs
         .push(kv("data-mw", indicator_placeholder_data_mw(stt)));
     frag.attribs.push(kv("data-fragment-id", id.to_string()));
@@ -1937,7 +1943,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let id = next_id.get();
             next_id.set(id + 1);
             fragments.insert(id, build(body, attrs));
-            out.extend(emit_indicator_placeholder(stt, id));
+            out.extend(emit_indicator_placeholder(stt, id, None));
         }
 
         (out, fragments)
@@ -2508,13 +2514,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `#invoke` argument the id is not spent — the placeholder is rendered
         // back to text and the indicator re-created where the module's output
         // places it (see [`Parser::arg_expansion`]).
-        if !self.in_arg_expansion() {
-            let _ = self.new_about_id(about_counter, "indicator");
-        }
+        //
+        // The id is the indicator's `about`: Parsoid's
+        // `ExtensionHandler::onDocumentFragment` sets it on the fragment so the
+        // extension is one about-chain (`<meta typeof="mw:Extension/indicator"
+        // about="#mwt7">`), and the placeholder — which is what reaches the
+        // output — carries it. Discarding it left the meta with no `about`.
+        let about = if self.in_arg_expansion() {
+            None
+        } else {
+            Some(self.new_about_id(about_counter, "indicator"))
+        };
         let id = self.ext_next_id.get();
         self.ext_next_id.set(id + 1);
         self.ext_fragments.borrow_mut().insert(id, node);
-        Some(emit_indicator_placeholder(stt, id))
+        Some(emit_indicator_placeholder(stt, id, about.as_deref()))
     }
 
     /// Inline every `<templatestyles>` stylesheet.
