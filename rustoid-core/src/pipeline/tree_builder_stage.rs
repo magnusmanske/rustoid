@@ -9,7 +9,7 @@
 //!   PreHandler → QuoteTransformer → ListHandler → ParagraphWrapper
 
 use crate::dom::node::Node;
-use crate::wikitext::tokens_v2::Item;
+use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 
 use super::list_handler::ListHandler;
 use super::paragraph_wrapper_v2::ParagraphWrapper;
@@ -63,6 +63,17 @@ impl TreeBuilderStage {
         // 4. ParagraphWrapper (wrap content in <p>).
         let mut pw = ParagraphWrapper::with_options(self.inline_context);
         out = pw.wrap(out);
+        // Drop the synthetic newline that forced a module's table onto its own
+        // line (see [`Parser::expand_invoke`]). It has done its work in the
+        // ParagraphWrapper — it moved the enclosing transclusion's marker into
+        // the paragraph buffer, so the `<p>` closes after it — and Parsoid's
+        // equivalent newline never reaches the output, so it is not kept either.
+        out.retain(|it| {
+            !matches!(
+                it,
+                Item::Tok(ParsoidToken::Nl(nl)) if nl.data_parsoid.tmp.synthetic_sol_newline
+            )
+        });
 
         // 5. SanitizerHandler (drop disallowed tags/attributes; runs last).
         let mut sanitizer = crate::pipeline::sanitizer_handler::SanitizerHandler::new(false);

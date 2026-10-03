@@ -773,6 +773,11 @@ pub struct TempData {
     /// values together with the template body, so it marks them here and reads the
     /// mark back in `expand_templates`.
     pub in_arg_value: bool,
+    /// A newline inserted only to force a module's table onto its own line (the
+    /// T2529 rule; see `Parser::expand_invoke`). It does its work in the
+    /// ParagraphWrapper and is dropped before tree building, because Parsoid's
+    /// equivalent newline never reaches the output.
+    pub synthetic_sol_newline: bool,
 }
 
 /// The parsed structure of a `-{ … }-` language-variant construct (mirrors PHP's

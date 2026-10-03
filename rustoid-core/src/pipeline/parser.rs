@@ -4779,12 +4779,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // ONLINE-PARITY.md). A module that is already at SOL is left alone.
         let mut items = items;
         if output.starts_with("{|") {
-            items.insert(
-                0,
-                Item::Tok(ParsoidToken::Nl(crate::wikitext::tokens_v2::NlTk::new(
-                    crate::wikitext::tokens_v2::SourceRange::new(0, 0),
-                ))),
+            let mut nl = crate::wikitext::tokens_v2::NlTk::new(
+                crate::wikitext::tokens_v2::SourceRange::new(0, 0),
             );
+            nl.data_parsoid.tmp.synthetic_sol_newline = true;
+            items.insert(0, Item::Tok(ParsoidToken::Nl(nl)));
         }
 
         let child = frame.new_child(frame.title().clone(), vec![]);
