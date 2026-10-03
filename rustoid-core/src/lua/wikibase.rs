@@ -56,6 +56,13 @@ impl Entities {
         self.by_id.is_empty()
     }
 
+    /// An entity's raw JSON by id, case-insensitively.
+    pub fn get(&self, id: &str) -> Option<&str> {
+        self.by_id
+            .get(&id.trim().to_ascii_uppercase())
+            .map(String::as_str)
+    }
+
     /// The id for a page title, when the title is some entity's sitelink.
     pub fn id_for_title(&self, title: &str) -> Option<&str> {
         let key = title.trim().replace('_', " ");

@@ -722,30 +722,33 @@ impl LuaEngine {
 /// per entity. An entity that does not parse is skipped: a single bad entity
 /// must not take the page down, and an absent one is already a state the API
 /// handles.
-fn entity_table(lua: &Lua, ctx: &LuaContext) -> Result<Table> {
+fn entity_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
-    let by_id = lua.create_table().map_err(lua_err)?;
 
-    for (id, json) in ctx.entities.iter() {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
-            continue;
-        };
-        // `Special:EntityData/<id>.json` wraps the entity in an `entities` map;
-        // accept a bare entity too.
-        let entity = parsed
-            .get("entities")
-            .and_then(|e| e.as_object())
-            .and_then(|o| o.values().next())
-            .unwrap_or(&parsed)
-            .clone();
-        let value = json_to_lua(lua, &entity)?;
-        by_id.set(id, value).map_err(lua_err)?;
-    }
+    // Entities are parsed on first access rather than all up front. A fresh Lua
+    // state is built for every `#invoke` round — thousands of them on a dense
+    // page — and eagerly parsing every entity's JSON *twice* (once for `byId`,
+    // once for `byTitle`) dominated such pages. A module reads only the few
+    // entities it names, so the tables index lazily and cache what they parse.
+    let by_id_ctx = ctx.clone();
+    let by_id = lazy_index_table(lua, move |lua, key| match by_id_ctx.entities.get(key) {
+        Some(json) => entity_value(lua, json),
+        None => Ok(Value::Nil),
+    })?;
+    let by_title_ctx = ctx.clone();
+    let by_title = lazy_index_table(lua, move |lua, key| {
+        match by_title_ctx.entities.id_for_title(key) {
+            Some(id) => Ok(Value::String(
+                lua.create_string(id)
+                    .map_err(|e| RustoidError::Lua(e.to_string()))?,
+            )),
+            None => Ok(Value::Nil),
+        }
+    })?;
 
     let out = lua.create_table().map_err(lua_err)?;
     out.set("byId", by_id).map_err(lua_err)?;
-    out.set("byTitle", by_title_arg(lua, ctx)?)
-        .map_err(lua_err)?;
+    out.set("byTitle", by_title).map_err(lua_err)?;
     out.set("current", ctx.entities.current().map(str::to_string))
         .map_err(lua_err)?;
     // `wfEscapeWikiText`, for `mw.wikibase.renderSnak`'s plain-text escaping.
@@ -758,28 +761,52 @@ fn entity_table(lua: &Lua, ctx: &LuaContext) -> Result<Table> {
     Ok(out)
 }
 
-/// The title→id index as a Lua table.
-fn by_title_arg(lua: &Lua, ctx: &LuaContext) -> Result<Table> {
+/// One entity's JSON as the Lua table `mw.wikibase` exposes.
+fn entity_value(lua: &Lua, json: &str) -> Result<Value> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| RustoidError::Lua(e.to_string()))?;
+    // `Special:EntityData/<id>.json` wraps the entity in an `entities` map;
+    // accept a bare entity too.
+    let entity = parsed
+        .get("entities")
+        .and_then(|e| e.as_object())
+        .and_then(|o| o.values().next())
+        .unwrap_or(&parsed);
+    json_to_lua(lua, entity)
+}
+
+/// A Lua table whose entries are computed on first access and cached.
+///
+/// `index` maps a string key to its value; a non-nil result is stored with
+/// `raw_set`, so a repeated access within one run is a plain table lookup.
+fn lazy_index_table<F>(lua: &Lua, index: F) -> Result<Table>
+where
+    F: Fn(&Lua, &str) -> Result<Value> + 'static,
+{
     let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let table = lua.create_table().map_err(lua_err)?;
-    for (id, json) in ctx.entities.iter() {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
-            continue;
-        };
-        let entity = parsed
-            .get("entities")
-            .and_then(|e| e.as_object())
-            .and_then(|o| o.values().next())
-            .unwrap_or(&parsed);
-        if let Some(title) = entity
-            .get("sitelinks")
-            .and_then(|s| s.get("enwiki"))
-            .and_then(|s| s.get("title"))
-            .and_then(|t| t.as_str())
-        {
-            table.set(title.replace('_', " "), id).map_err(lua_err)?;
-        }
-    }
+    let mt = lua.create_table().map_err(lua_err)?;
+    mt.set(
+        "__index",
+        lua.create_function(move |lua, (table, key): (Table, Value)| {
+            // A plain table answers `nil` for any non-string key; keep that rather
+            // than raising on a coercion the Lua side never makes anyway.
+            let Value::String(key) = &key else {
+                return Ok(Value::Nil);
+            };
+            let key = key.to_string_lossy().to_string();
+            let value = index(lua, &key).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            if !matches!(value, Value::Nil) {
+                table
+                    .raw_set(key.as_str(), value.clone())
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            }
+            Ok(value)
+        })
+        .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
+    table.set_metatable(Some(mt));
     Ok(table)
 }
 
@@ -1963,7 +1990,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // closures.
     let entities: Table = {
         let args =
-            entity_table(lua, ctx.as_ref()).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            entity_table(lua, ctx.clone()).map_err(|e| mlua::Error::runtime(e.to_string()))?;
         lua.load(WIKIBASE_LIB)
             .set_name("mw.wikibase")
             .eval::<Function>()
