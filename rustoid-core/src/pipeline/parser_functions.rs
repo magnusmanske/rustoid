@@ -998,17 +998,79 @@ pub(crate) fn evaluate_expression(expr: &str) -> String {
         }
     };
     match eval_simple(&tokens) {
-        Ok(val) => {
-            if val == val.trunc() {
-                val.to_string()
-            } else {
-                format!("{val:.6}")
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_string()
-            }
+        Ok(val) => format_expr_number(val),
+        Err(RustoidError::Parse(message)) => {
+            format!("<strong class=\"error\">Expression error: {message}</strong>")
         }
         Err(_) => format!("<strong class=\"error\">Expression error: {expr}</strong>"),
+    }
+}
+
+/// Format an `#expr` result the way MediaWiki does: `sprintf( '%.14G', $result )`
+/// — 14 significant digits, exponential when the decimal exponent is below `-4`
+/// or at least `14`, fixed otherwise, trailing zeros dropped. MediaWiki's PHP
+/// `%G` keeps one fractional digit in the exponential form (`1.0E-5`) and does
+/// not zero-pad the exponent, so this is not C's `%G`.
+fn format_expr_number(val: f64) -> String {
+    if val == 0.0 {
+        return "0".to_string();
+    }
+    if !val.is_finite() {
+        // A non-finite result is not something `%.14G` renders; keep the value
+        // legible rather than panicking.
+        return val.to_string();
+    }
+    // `{:.13e}` is exactly 14 significant digits, correctly rounded.
+    let sci = format!("{:.13e}", val);
+    let Some((mant, exp)) = sci.split_once('e') else {
+        return val.to_string();
+    };
+    let Ok(e10) = exp.parse::<i32>() else {
+        return val.to_string();
+    };
+    let neg = mant.starts_with('-');
+    let mant = mant.trim_start_matches('-');
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let sign = if neg { "-" } else { "" };
+
+    if (-4..14).contains(&e10) {
+        // Fixed notation. `digits[0]` is the `10^e10` place.
+        let mut s = String::from(sign);
+        if e10 >= 0 {
+            let int_len = (e10 + 1) as usize;
+            s.push_str(&digits[..int_len]);
+            let frac = &digits[int_len..];
+            let frac = frac.trim_end_matches('0');
+            if !frac.is_empty() {
+                s.push('.');
+                s.push_str(frac);
+            }
+        } else {
+            s.push_str("0.");
+            for _ in 0..(-e10 - 1) {
+                s.push('0');
+            }
+            let frac = digits.trim_end_matches('0');
+            s.push_str(frac);
+        }
+        s
+    } else {
+        // Exponential notation: one digit, then a trimmed fractional part that
+        // keeps at least one digit.
+        let frac = mant.split_once('.').map(|(_, f)| f).unwrap_or("");
+        let frac = frac.trim_end_matches('0');
+        let mut s = String::from(sign);
+        s.push_str(&mant[..1]);
+        s.push('.');
+        if frac.is_empty() {
+            s.push('0');
+        } else {
+            s.push_str(frac);
+        }
+        s.push('E');
+        s.push(if e10 < 0 { '-' } else { '+' });
+        s.push_str(&e10.abs().to_string());
+        s
     }
 }
 
@@ -1025,6 +1087,10 @@ enum ExprToken {
     Not,
     /// `^` — exponentiation, right-associative.
     Caret,
+    /// `round` — `lhs round rhs`, rounding `lhs` to `rhs` decimal places. A
+    /// *binary* operator (lower precedence than `+ -`), so a leading `round`
+    /// with no left operand is the parser's error, not a dropped word.
+    Round,
     LParen,
     RParen,
 }
@@ -1043,10 +1109,10 @@ fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
         }
         // Word operators, functions and constants. A bare word is not a value,
         // so anything not in this set is the parser's "Unrecognized word" error
-        // (mirrors `ExprParser::doExpression`). The functions/constants are
-        // recognised so they do not read as garbage; the evaluator does not
-        // implement them, but dropping them was already wrong and erroring on
-        // them would be more wrong.
+        // (mirrors `ExprParser::doExpression`). `round` is a binary operator
+        // and stays a token; the other functions/constants are recognised so
+        // they do not read as garbage, but the evaluator does not implement
+        // them, so they are dropped.
         if b.is_ascii_alphabetic() {
             let start = i;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -1058,8 +1124,14 @@ fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
                 "not" => tokens.push(ExprToken::Not),
                 "div" => tokens.push(ExprToken::Op('D')),
                 "mod" => tokens.push(ExprToken::Op('%')),
-                "abs" | "ceil" | "floor" | "trunc" | "round" | "sqrt" | "exp" | "ln" | "log"
-                | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "e" | "pi" => {}
+                // `round` is a binary operator, not a value: keep it as a token
+                // so a missing left operand becomes the parser's error. The
+                // remaining functions and constants are recognised (so they do
+                // not read as garbage) but dropped; the evaluator does not
+                // implement them, and erroring on them would be *more* wrong.
+                "round" => tokens.push(ExprToken::Round),
+                "abs" | "ceil" | "floor" | "trunc" | "sqrt" | "exp" | "ln" | "log" | "sin"
+                | "cos" | "tan" | "asin" | "acos" | "atan" | "e" | "pi" => {}
                 _ => return Err(format!("Unrecognized word \"{}\".", &expr[start..i])),
             }
             continue;
@@ -1126,6 +1198,24 @@ fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
                 while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
                     i += 1;
                 }
+                // Scientific notation: `e`/`E`, an optional sign, then digits.
+                // A standalone `e` (the constant) starts with a letter and is
+                // handled above, so this only ever consumes an exponent that
+                // hangs off a numeric literal.
+                if let Some(&e) = bytes.get(i)
+                    && (e == b'e' || e == b'E')
+                {
+                    let mut j = i + 1;
+                    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+                        j += 1;
+                    }
+                    if bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                        while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                            j += 1;
+                        }
+                        i = j;
+                    }
+                }
                 if let Ok(num) = expr[start..i].parse::<f64>() {
                     tokens.push(ExprToken::Num(num));
                 }
@@ -1176,19 +1266,19 @@ fn expr_parse(
             ExprToken::Op('*') => lhs * rhs,
             ExprToken::Op('/') => {
                 if rhs == 0.0 {
-                    return Err(RustoidError::Parse("division by zero".to_string()));
+                    return Err(RustoidError::Parse("Division by zero".to_string()));
                 }
                 lhs / rhs
             }
             ExprToken::Op('D') => {
                 if rhs == 0.0 {
-                    return Err(RustoidError::Parse("division by zero".to_string()));
+                    return Err(RustoidError::Parse("Division by zero".to_string()));
                 }
                 (lhs / rhs).trunc()
             }
             ExprToken::Op('%') => {
                 if rhs == 0.0 {
-                    return Err(RustoidError::Parse("modulo by zero".to_string()));
+                    return Err(RustoidError::Parse("Division by zero".to_string()));
                 }
                 lhs - rhs * (lhs / rhs).trunc()
             }
@@ -1202,6 +1292,7 @@ fn expr_parse(
             ExprToken::And => bool_num(truthy(lhs) && truthy(rhs)),
             ExprToken::Or => bool_num(truthy(lhs) || truthy(rhs)),
             ExprToken::Cmp(cmp) => compare(cmp, lhs, rhs),
+            ExprToken::Round => round_to(lhs, rhs),
             _ => lhs,
         };
     }
@@ -1228,6 +1319,16 @@ fn compare(cmp: &str, lhs: f64, rhs: f64) -> f64 {
         ">=" => lhs >= rhs,
         _ => false,
     })
+}
+
+/// `value round digits` — MediaWiki's `round`, which rounds to `digits` decimal
+/// places (a negative `digits` rounds to tens, hundreds, …), half away from zero
+/// as PHP's `round` does. `{{#expr: 1234.5678 round 2}}` is `1234.57` and
+/// `{{#expr: 1234 round -2}}` is `1200`.
+fn round_to(value: f64, digits: f64) -> f64 {
+    let factor = 10f64.powi(digits as i32);
+    let rounded = (value * factor).round() / factor;
+    if rounded.is_finite() { rounded } else { value }
 }
 
 fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f64, RustoidError> {
@@ -1261,6 +1362,9 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
             }
             Ok(val)
         }
+        // `round` needs a left operand; where a value is expected it is the
+        // parser's error (`{{#expr: round 5}}`).
+        ExprToken::Round => Err(RustoidError::Parse("Unexpected round operator".to_string())),
         _ => Ok(0.0),
     }
 }
@@ -1272,9 +1376,13 @@ fn precedence(t: &ExprToken) -> u8 {
         ExprToken::Or => 1,
         ExprToken::And => 2,
         ExprToken::Cmp(_) => 3,
-        ExprToken::Op('+' | '-') => 4,
-        ExprToken::Op('*' | '/' | '%' | 'D') => 5,
-        ExprToken::Caret => 6,
+        // `round` binds looser than `+ -` (its second operand is a plain
+        // number) but tighter than a comparison: `1.234 + 1 round 1` is
+        // `(1.234 + 1) round 1`.
+        ExprToken::Round => 4,
+        ExprToken::Op('+' | '-') => 5,
+        ExprToken::Op('*' | '/' | '%' | 'D') => 6,
+        ExprToken::Caret => 7,
         _ => 0,
     }
 }
@@ -1435,6 +1543,40 @@ mod tests {
         ] {
             assert_eq!(evaluate_expression(expr), want, "expr {expr:?}");
         }
+    }
+
+    /// `round` is a *binary* operator (rounding to N decimal places, negatives
+    /// rounding left), so a leading `round` with no left operand is an error and
+    /// not a dropped word — which is load-bearing for `Template:Period start`'s
+    /// guard. The result is formatted as MediaWiki's `sprintf('%.14G')`: 14
+    /// significant digits, exponential outside `[-4, 14)`, no zero-padded
+    /// exponent and at least one fractional digit in the exponential form.
+    #[test]
+    fn test_expr_round_and_number_formatting() {
+        for (expr, want) in [
+            ("5 round 2", "5"),
+            ("1234.5678 round 2", "1234.57"),
+            ("1234 round -2", "1200"),
+            ("1.234 + 1 round 1", "2.2"),
+            ("538.8/650*250", "207.23076923077"),
+            ("1/3", "0.33333333333333"),
+            ("1e13", "10000000000000"),
+            ("1e14", "1.0E+14"),
+            ("1e-5", "1.0E-5"),
+            ("0.0001", "0.0001"),
+            ("1.0", "1"),
+            ("0.1+0.2", "0.3"),
+        ] {
+            assert_eq!(evaluate_expression(expr), want, "expr {expr:?}");
+        }
+        assert!(
+            evaluate_expression("round 5").contains("Unexpected round operator"),
+            "a prefix `round` is the parser's error"
+        );
+        assert!(
+            evaluate_expression("1/0").contains("Division by zero"),
+            "division by zero is MediaWiki's message"
+        );
     }
 
     /// `|2|3|12|=exclude` is a fall-through group: the cases 2, 3 and 12 all
