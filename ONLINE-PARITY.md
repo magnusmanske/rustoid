@@ -10894,3 +10894,58 @@ image row's cell attributes were left as literal text instead of parsed as HTML
 attributes, and the image the cell should hold is missing. That is the next
 target. Also still open: the taxonomy `<td>`s are empty where Parsoid has the
 `Animalia`/`Chordata`/… links.
+
+## Fixed: a `{{!}}` inside an `#if` branch in a table cell
+
+The image row is `Template:Taxobox/core`'s
+
+    {{#if:{{{image|}}}|
+    {{!}} colspan=2 style="text-align: center" {{!}} {{#invoke:InfoboxImage|…}}
+    {{!}}-
+    }}
+
+Two divergences stacked up, and each hid the other.
+
+**The `=` in `colspan=2` splits the `#if` argument.** Parsoid tokenizes *both*
+halves of a `key=value` split (`template_param_name` and `template_param_value`
+are both `template_param_text`), so `{{!}} colspan` is a `Tokens` key holding a
+`{{!}}` template and `expandKV`'s `rejoinKV` answers *tokens* — `[key…, '=',
+…value]`. rustoid tokenized only the value, left the key a plain string with a
+literal `{{!}}`, and **stringified** the rejoined `k=v`; the templates in the
+value vanished and the key's `{{!}}` never expanded. `{{!}} colspan=2 style=…
+{{!}} …` reached the row as `{{!}} colspan=2 style=…  -`.
+
+The tokenizer now tokenizes the key too, and `ParserFunctions::expand_kv`
+rejoins key + `=` + value as tokens (mirroring `rejoinKV`), so the `{{!}}` in
+the key expands like any other template.
+
+**A text-returning parser function's branch is re-tokenized in core.** `#if`,
+`#ifeq`, `#ifexpr` and `#iferror` answer a *string*, which the parser
+re-tokenizes, so the `|` a `{{!}}` expands to becomes a real cell separator.
+rustoid expands the branch in place and splices tokens, leaving the `|` as text;
+the tree builder then foster-parents the text out of the row, ahead of the
+table. A branch of plain text whose lines begin table syntax (`|`, `!`, `{|`) is
+now re-tokenized, with the `mw:Transclusion` wrapper markers kept around the
+result so the row still carries the transclusion.
+
+### Effect: byte 10058 moves to 10099
+
+The image row matches Parsoid's structure:
+
+    <td colspan="2" style="text-align: center">…</td>
+
+`Zebra`'s first difference is now **10099**. The eight subset offsets are
+otherwise unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 953 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 10099
+
+The image cell is now empty where Parsoid holds the `<img>`. That is an offline
+gap: the cached data has no `imageinfo` for
+`File:Plains Zebra Equus quagga cropped.jpg`, so `#invoke:InfoboxImage` answers
+`mw:Error` / `apierror-filedoesnotexist` (a standalone `{{#invoke:InfoboxImage|…}}`
+probe shows the same). An online run fetches the file info; the difference
+should close there. Also still open: the taxonomy `<td>`s are empty where
+Parsoid has the `Animalia`/`Chordata`/… links.
