@@ -778,38 +778,62 @@ impl ParserFunctions {
     ///
     /// A `Str` value still becomes `Item::Str`, which is what an ordinary text
     /// branch needs.
+    ///
+    /// When either half of a named argument holds tokens, the two are rejoined as
+    /// *tokens* (Parsoid's `rejoinKV`), never stringified: a `{{!}}` inside a
+    /// `#if` branch sits in the **key** half of a `k=v` split
+    /// (`{{!}} colspan=…`), and stringifying dropped it — so
+    /// `Template:Taxobox/core`'s image row lost its cell.
     fn expand_kv(kv: Option<&KV>, default: Option<&str>) -> Vec<Item> {
-        match kv {
-            None => vec![Item::Str(default.unwrap_or("").to_string())],
-            Some(kv) => {
-                let k = key_value_to_string(&kv.key);
-                let value = match &kv.value {
-                    KeyValue::Tokens(tokens) => tokens.clone(),
-                    KeyValue::Str(v) => vec![Item::Str(v.clone())],
-                };
-                if k.is_empty() {
-                    // `$frame->expand` removes HTML comments wherever they
-                    // appear (`PPFrame_Hash::expand`'s `comment` arm appends the
-                    // empty string in HTML output mode), so a comment in a
-                    // branch value is gone *before* the caller trims. Dropping
-                    // it here is not cosmetic: `trim_item_edges` stops at any
-                    // token that is not a newline, so a comment keeps the blanks
-                    // around it alive — and that leftover whitespace is the
-                    // stray `<span about="#mwtN"> </span>` that
-                    // `Template:Redirect-several` leaves on `Polio vaccine`
-                    // (its `#switch` default is `<!-- … -->\n     {{#switch:…}}`).
-                    value
-                        .into_iter()
-                        .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
-                        .collect()
-                } else {
-                    // A named entry keeps its `k=v` spelling; the value is text
-                    // in that position, so stringify as before (`tokens_to_string`
-                    // already drops comments).
-                    vec![Item::Str(format!("{k}={}", value_to_string(&kv.value)))]
-                }
-            }
+        // `$frame->expand` removes HTML comments wherever they appear
+        // (`PPFrame_Hash::expand`'s `comment` arm appends the empty string in
+        // HTML output mode), so a comment in a branch value is gone *before* the
+        // caller trims. Dropping it here is not cosmetic: `trim_item_edges`
+        // stops at any token that is not a newline, so a comment keeps the
+        // blanks around it alive — and that leftover whitespace is the stray
+        // `<span about="#mwtN"> </span>` that `Template:Redirect-several`
+        // leaves on `Polio vaccine` (its `#switch` default is
+        // `<!-- … -->\n     {{#switch:…}}`).
+        let no_comments = |items: Vec<Item>| -> Vec<Item> {
+            items
+                .into_iter()
+                .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
+                .collect()
+        };
+        let value_items = |value: &KeyValue| -> Vec<Item> {
+            no_comments(match value {
+                KeyValue::Str(v) => vec![Item::Str(v.clone())],
+                KeyValue::Tokens(t) => t.clone(),
+            })
+        };
+
+        let Some(kv) = kv else {
+            return vec![Item::Str(default.unwrap_or("").to_string())];
+        };
+        // `expandKV`: both sides plain strings → the `k=v` (or `v`) string.
+        if let (KeyValue::Str(k), KeyValue::Str(v)) = (&kv.key, &kv.value) {
+            return if k.is_empty() {
+                vec![Item::Str(v.clone())]
+            } else {
+                vec![Item::Str(format!("{k}={v}"))]
+            };
         }
+        // Otherwise `rejoinKV`: key + `=` + value, all as tokens.
+        let mut items = match &kv.key {
+            KeyValue::Str(k) if k.is_empty() => Vec::new(),
+            KeyValue::Str(k) => vec![Item::Str(k.clone()), Item::Str("=".to_string())],
+            KeyValue::Tokens(t) if t.is_empty() => Vec::new(),
+            KeyValue::Tokens(t) => {
+                let mut items = no_comments(t.clone());
+                items.push(Item::Str("=".to_string()));
+                items
+            }
+        };
+        if items.is_empty() {
+            return value_items(&kv.value);
+        }
+        items.extend(value_items(&kv.value));
+        items
     }
 }
 
@@ -1403,6 +1427,37 @@ mod tests {
 
     fn params(args: Vec<(&str, &str)>) -> Params {
         Params::new(args.into_iter().map(|(k, v)| kv(k, v)).collect())
+    }
+
+    /// `expandKV`: when either half of a named argument holds tokens, the two are
+    /// rejoined as *tokens* (Parsoid's `rejoinKV`), never stringified. A `{{!}}`
+    /// inside a `#if` branch sits in the **key** half of a `k=v` split, so
+    /// stringifying dropped it and `Template:Taxobox/core`'s image row lost its
+    /// cell.
+    #[test]
+    fn test_expand_kv_rejoins_a_tokenized_named_argument() {
+        use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk};
+        let tok = || {
+            Item::Tok(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
+                "template",
+                vec![],
+                DataParsoid::default(),
+            )))
+        };
+        let kv = KV {
+            key: KeyValue::Tokens(vec![tok(), Item::Str(" colspan".to_string())]),
+            value: KeyValue::Tokens(vec![Item::Str("2".to_string()), tok()]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let items = ParserFunctions::expand_kv(Some(&kv), None);
+        assert_eq!(items.len(), 5, "{items:?}");
+        assert!(matches!(items[0], Item::Tok(_)));
+        assert_eq!(items[1], Item::Str(" colspan".to_string()));
+        assert_eq!(items[2], Item::Str("=".to_string()));
+        assert_eq!(items[3], Item::Str("2".to_string()));
+        assert!(matches!(items[4], Item::Tok(_)));
     }
 
     #[test]

@@ -817,6 +817,63 @@ pub fn render_inline_fragment(
     frag
 }
 
+/// Re-tokenize an expanded text-returning parser function's branch.
+///
+/// `#if`/`#ifeq`/`#ifexpr`/`#iferror` answer a *string* in core and the parser
+/// re-tokenizes it, so `{{!}}` or `|-` in a branch becomes real table syntax
+/// (`Template:Taxobox/core`'s image row is `{{!}} colspan=2 … {{!}} … {{!}}-`).
+/// rustoid expands the branch in place, leaving those as text; when every item has
+/// a plain textual form and a line begins table syntax, re-tokenize so the
+/// construct is recognized. A branch holding any other token (a link, a tag) is
+/// left alone.
+fn re_tokenize_text_branch(items: Vec<Item>, ext_tags: &[String]) -> Vec<Item> {
+    // A parser function's answer is wrapped in `mw:Transclusion` marker metas;
+    // the branch content sits between them. Re-tokenize the content and keep the
+    // markers, so the tree builder still wraps the result.
+    fn is_wrapper(it: &Item) -> bool {
+        matches!(
+            it,
+            Item::Tok(ParsoidToken::SelfclosingTag(t))
+                if t.name == "meta"
+                    && t.attribs.iter().any(|kv| {
+                        kv.key.as_str() == Some("typeof")
+                            && kv.value.as_str().is_some_and(|v| v.starts_with("mw:Transclusion"))
+                    })
+        )
+    }
+    let start = items
+        .iter()
+        .position(|it| !is_wrapper(it))
+        .unwrap_or(items.len());
+    let end = items
+        .iter()
+        .rposition(|it| !is_wrapper(it))
+        .map(|i| i + 1)
+        .unwrap_or(start);
+    let mut text = String::new();
+    for it in &items[start..end] {
+        match it {
+            Item::Str(s) => text.push_str(s),
+            Item::Tok(ParsoidToken::Nl(_)) => text.push('\n'),
+            _ => return items,
+        }
+    }
+    if !text.lines().any(|line| {
+        let t = line.trim_start_matches(' ');
+        t.starts_with('|') || t.starts_with('!') || t.starts_with("{|")
+    }) {
+        return items;
+    }
+    let mut out: Vec<Item> = items[..start].to_vec();
+    out.extend(
+        crate::pipeline::template_handler::tokenize_wikitext_to_items(
+            &text, /* in_template */ true, ext_tags,
+        ),
+    );
+    out.extend_from_slice(&items[end..]);
+    out
+}
+
 /// Mark the `{{…}}` template tokens inside an argument value as "expand in
 /// template context".
 ///
@@ -3917,13 +3974,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 };
                 let mut expanded = expanded;
                 if branch_is_text {
-                    // The branch is text in the service, so nothing in it is a
-                    // templated *attribute* by the time it is spliced in — see
-                    // [`TemplateHandler::expands_branch_to_text`]. rustoid expands
-                    // the branch in place, which leaves the templates of a
-                    // wikitext target unexpanded until `expand_attributes` looks
-                    // at them; flagging them here is what keeps that difference
-                    // from turning into a marking the service does not have.
+                    // The branch answers a *string* in core, which the parser
+                    // re-tokenizes: table/list syntax it produces must be
+                    // recognized, and its wikitext targets were resolved before
+                    // any attribute pass saw them. Re-tokenize the plain-text
+                    // case so a `{{!}}`-born `|` becomes a real cell, then flag
+                    // what is left — see
+                    // [`TemplateHandler::expands_branch_to_text`] and
+                    // [`crate::wikitext::tokens_v2::TempData::in_text_branch`].
+                    expanded = re_tokenize_text_branch(expanded, self.config.extension_tags());
                     mark_in_text_branch(&mut expanded);
                 }
                 for e in &expanded {

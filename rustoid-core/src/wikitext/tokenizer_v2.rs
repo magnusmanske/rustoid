@@ -3110,7 +3110,14 @@ impl<'a> PegTokenizer<'a> {
                 );
             match find_arg_separator_eq(part, starts_line) {
                 Some(eq) => {
-                    let k = part[..eq].trim().to_string();
+                    // Both halves are inline-tokenized (Parsoid's
+                    // `template_param_name`/`template_param_value` are both
+                    // `template_param_text`), so a `{{!}}` in the *key* half is a
+                    // template token, not literal text: `{{!}} colspan=2` splits
+                    // on the `=` and `expandKV` rejoins the tokenized key.
+                    let k = part[..eq].trim();
+                    let key =
+                        tokenize_template_arg_value(k, self.lang_conv_enabled, &self.ext_tags);
                     let v = part[eq + 1..].to_string();
                     let v = tokenize_template_arg_value(&v, self.lang_conv_enabled, &self.ext_tags);
                     // `key` spans the part up to `=` (trailing spaces are
@@ -3120,7 +3127,7 @@ impl<'a> PegTokenizer<'a> {
                     let key_end = part_start + eq;
                     let value_start = part_start + eq + 1;
                     stt.attribs.push(KV {
-                        key: KeyValue::Str(k),
+                        key,
                         value: v,
                         src_offsets: Some(KVSourceRange {
                             key_start,
@@ -6433,6 +6440,32 @@ mod tests {
             .expect("expected template token");
         assert_eq!(template.attribs[1].key.as_str(), Some("key"));
         assert_eq!(template.attribs[1].value.as_str(), Some(" value"));
+    }
+
+    #[test]
+    fn test_template_arg_key_is_tokenized() {
+        // The *key* half of `{{!}} colspan=2` is inline-tokenized too (Parsoid's
+        // `template_param_name`), so the `{{!}}` is a `template` token, not
+        // literal text. `expandKV` rejoins the tokenized key and the value.
+        let tokens = tokenize("{{t|{{!}} colspan=2 style=x}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected template token");
+        assert_eq!(template.attribs.len(), 2);
+        let KeyValue::Tokens(key) = &template.attribs[1].key else {
+            panic!("expected tokenized key, got {:?}", template.attribs[1].key);
+        };
+        assert!(
+            matches!(key.first(), Some(Item::Tok(ParsoidToken::SelfclosingTag(tk))) if tk.name == "template"),
+            "expected a `{{{{!}}}}` template token in the key, got {key:?}"
+        );
+        assert_eq!(template.attribs[1].value.as_str(), Some("2 style=x"));
     }
 
     #[test]
