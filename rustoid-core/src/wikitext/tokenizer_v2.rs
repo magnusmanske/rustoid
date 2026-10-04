@@ -5087,9 +5087,21 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
         match b {
             b'=' => {
                 if at_sol {
-                    // A `=` at start-of-line opens a heading; the rest of the
-                    // line (including any closing `=`) is heading content.
-                    in_heading = true;
+                    // A `=` at start-of-line opens a heading only when it
+                    // begins a run of two or more (`==`): `heading` in the PEG
+                    // grammar requires `==`. A *lone* `=` at SOL is an ordinary
+                    // name/value separator, exactly as a mid-line one is, so
+                    // the multiline `| key\n = value` fall-through groups in
+                    // `Template:Period start` name their argument. Treating
+                    // every SOL `=` as a heading left `cambrian` unnamed, and
+                    // `#switch` fell through to `atdabanian = 521` instead of
+                    // `538.8`.
+                    at_sol = false;
+                    if bytes.get(i + 1) == Some(&b'=') {
+                        in_heading = true;
+                    } else {
+                        return Some(i);
+                    }
                 } else if !in_heading {
                     return Some(i);
                 }
@@ -6400,6 +6412,27 @@ mod tests {
         // Third arg is named `format`.
         assert_eq!(template.attribs[2].key.as_str(), Some("format"));
         assert_eq!(template.attribs[2].value.as_str(), Some("\"wikitext\""));
+    }
+
+    #[test]
+    fn test_template_arg_lone_equals_on_a_later_line_names_the_arg() {
+        // A *lone* `=` at start of line is a name/value separator, not a
+        // heading: the PEG `heading` rule needs `==`. `Template:Period start`
+        // writes its fall-through groups as `| key\n = value`, so reading the
+        // `=` as a heading left the argument positional and `#switch` fell
+        // through to the wrong case (Cambrian answered `521`, not `538.8`).
+        let tokens = tokenize("{{T|key\n= value}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected template token");
+        assert_eq!(template.attribs[1].key.as_str(), Some("key"));
+        assert_eq!(template.attribs[1].value.as_str(), Some(" value"));
     }
 
     #[test]
