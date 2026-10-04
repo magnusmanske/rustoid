@@ -5787,10 +5787,7 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 }
             }
             Item::Tok(tok) if crate::wikitext::token_utils::is_entity_span_token(tok) => {
-                let ParsoidToken::Tag(t) = tok else {
-                    return None;
-                };
-                out.push_str(t.data_parsoid.src.as_deref()?);
+                out.push_str(&token_source_for_module(tok)?);
                 // Mirrors PHP's `$i += 2` — skip the decoded character and the
                 // end tag, which the entity source stands in for.
                 if matches!(items.get(i + 2), Some(Item::Tok(ParsoidToken::EndTag(e))) if e.name == "span")
@@ -5800,22 +5797,45 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
             }
             // A live HTML element: the start tag, the content (which follows as
             // separate items) and the end tag are each written as they were.
-            Item::Tok(ParsoidToken::Tag(t)) => out.push_str(t.data_parsoid.src.as_deref()?),
-            Item::Tok(ParsoidToken::EndTag(t)) => out.push_str(t.data_parsoid.src.as_deref()?),
+            Item::Tok(tok @ ParsoidToken::Tag(_)) => out.push_str(&token_source_for_module(tok)?),
+            Item::Tok(tok @ ParsoidToken::EndTag(_)) => {
+                out.push_str(&token_source_for_module(tok)?)
+            }
             // Every other self-closing token — `<br>`, an `extlink`/`urllink`, a
             // behavior switch like `__DATE__` — reaches the module as its own
             // source, so a value made of one is not a reason to decline. Without
             // this arm a citation `url` that expanded to a bare `urllink`
             // declined, fell back to a stale source range, and `Module:Citation`
             // rendered the wrong URL.
-            Item::Tok(ParsoidToken::SelfclosingTag(t)) => {
-                out.push_str(t.data_parsoid.src.as_deref()?);
+            Item::Tok(tok @ ParsoidToken::SelfclosingTag(_)) => {
+                out.push_str(&token_source_for_module(tok)?);
             }
             _ => return None,
         }
         i += 1;
     }
     Some(strip_html_comments(&out))
+}
+
+/// A token's own source with any substituted attribute written back.
+///
+/// `data_parsoid.src` is the source *as written*, but the token's attributes are
+/// the expanded ones — a module is handed the expansion (see
+/// [`crate::wikitext::token_utils::rewrite_expanded_attrs`]), so an attribute the
+/// template's frame substituted would otherwise reach the module spelled the old
+/// way. `Template:Fossil range/bar`'s `style` carries
+/// `{{period color|{{{1}}}}}` and `{{#expr:…{{period start|{{{1}}}}}…}}`, and its
+/// caller's frame substitutes `{{{1}}}` before the value is flattened; without
+/// this the bar reaches a module as the unexpanded reference, and the module's
+/// own `#iferror` check answers an error instead of the computed colour and
+/// offsets. Falls back to the source as written when there is nothing to
+/// rewrite.
+fn token_source_for_module(tok: &ParsoidToken) -> Option<String> {
+    let src = tok.data_parsoid()?.src.as_deref()?;
+    Some(
+        crate::wikitext::token_utils::rewrite_expanded_attrs(src, tok.get_attribs())
+            .unwrap_or_else(|| src.to_string()),
+    )
 }
 
 /// A single key/value field rendered to text, for [`argument_value_text`].
@@ -6144,6 +6164,33 @@ mod tests {
         assert_eq!(
             argument_value_text(&items).as_deref(),
             Some("<span class=\"nowrap\">SEE</span>")
+        );
+    }
+
+    /// A live element whose attribute a template frame substituted must render
+    /// the *expanded* value, not the source as written: the tag's `src` still
+    /// spells `{{{1}}}` inside `Template:Fossil range/bar`'s `style`, and a module
+    /// handed that reaches its `#iferror` check as an error instead of the
+    /// computed colour. Mirrors `render_answer` in `lua_deferred`, which writes
+    /// substituted attributes back for the same reason.
+    #[test]
+    fn an_argument_value_writes_a_substituted_attribute_back() {
+        use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue, TagTk};
+        let written = r"background-color:{{period color|{{{1}}}}};";
+        let expanded = "background-color:rgb(127,160,86);";
+        let style = KV {
+            key: KeyValue::Str("style".to_string()),
+            value: KeyValue::Str(expanded.to_string()),
+            src_offsets: None,
+            ksrc: Some("style".to_string()),
+            vsrc: Some(written.to_string()),
+        };
+        let mut div = TagTk::new("div", vec![style], DataParsoid::default());
+        div.data_parsoid.src = Some(format!(r#"<div style="{written}">"#));
+        let items = vec![Item::Tok(ParsoidToken::Tag(div))];
+        assert_eq!(
+            argument_value_text(&items).as_deref(),
+            Some(r#"<div style="background-color:rgb(127,160,86);">"#)
         );
     }
 
