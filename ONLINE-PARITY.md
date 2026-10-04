@@ -10841,3 +10841,56 @@ The eight subset offsets are otherwise unchanged (`Bicycle` 11836,
 `List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837),
 `Zebro` still MATCHes, the fixture guard holds at **877/896**, and 950 lib tests
 pass with clippy and `cargo fmt` clean.
+
+## Fixed: a substituted attribute was missing from a module argument
+
+With the `#expr` error restored, `setfossilRange`'s guard fires and the module
+returns `fossilRange` — the already-rendered `Geological range` — so the single
+remaining copy of the timeline should be correct. It was not: every bar after
+the first came back with an empty `background-color:` and the same
+`Expression error: Unrecognized word "strong".` cascade, and the Cambrian bar's
+`{{{1}}}` never resolved.
+
+The *rendering* was right. `Template:Phanerozoic 250px` calls
+`{{fossil range/bar|Cambrian|{{font color|white|Ꞓ}}}}`; `Frame::expand`
+substituted `{{{1}}}` in the `<div>`'s `style` (through `expand_in_attributes`),
+and `expand_attrib_templates` then expanded `{{period color|Cambrian}}`,
+`{{period start|Cambrian}}` and the `#expr` around them — a trace showed the
+`style` resolving to exactly Parsoid's
+`background-color:rgb(127,160,86); left:42.769230769231px; width:19.980769230769px;`.
+
+The value was lost one step later, when it was flattened to the *text a module
+receives*. `argument_value_text` renders a live HTML element from
+`data_parsoid.src`, the tag **as written**, which still spells
+`background-color:{{period color|{{{1}}}}}`. `render_answer` — the
+`frame:expandTemplate` half — already writes a substituted attribute back with
+`rewrite_expanded_attrs`; the `frame.args` half did not. The module was therefore
+handed the unexpanded tag, its `#iferror` guard saw an error, and the whole bar
+was dropped on re-parse.
+
+`argument_value_text` now writes the expanded attributes back too, through a new
+`token_source_for_module` helper that mirrors `render_answer`, for the `Tag`,
+`EndTag` and generic `SelfclosingTag` arms — the shapes that carry HTML
+attributes.
+
+### Effect: byte 6673 moves to 10058
+
+The Cambrian bar now matches Parsoid byte for byte:
+
+    <div style="position:absolute; height:100%; text-align:center;  color:inherit; background-color:rgb(127,160,86); left:42.769230769231px; width:19.980769230769px;">
+
+`Zebra`'s first difference is now **10058**. The eight subset offsets are
+otherwise unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 951 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 10058
+
+Parsoid has
+`<td colspan="2" style="text-align: center"><span class="mw-default-size" …>`
+where rustoid has `<td>colspan=2 style="text-align: center"  -</td>` — the
+image row's cell attributes were left as literal text instead of parsed as HTML
+attributes, and the image the cell should hold is missing. That is the next
+target. Also still open: the taxonomy `<td>`s are empty where Parsoid has the
+`Animalia`/`Chordata`/… links.
