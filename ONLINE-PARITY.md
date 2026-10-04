@@ -10699,3 +10699,72 @@ every later `#mwt`. The generated element `id`s (`mwCg`, `mwCw`, …) still matc
 because they come from a separate pass. That is the next target. Also still
 open: the taxonomy `<td>`s are empty where Parsoid has the
 `Animalia`/`Chordata`/… links.
+
+## The `#mwt` drift at 5433: a stringified Lua answer re-numbers at the output parse
+
+The `<sup about="#mwt13">` reference marker was `#mwt16` here, three ahead of
+Parsoid. All three extra ids are spent **while `Module:Automated taxobox` runs**,
+in an answer to the module's `frame:expandTemplate`:
+
+| id | kind | note |
+| --- | --- | --- |
+| 13 | `extension-id` (ref) | `expand_templates` inside `lua::invoke::invoke` |
+| 14 | `extension-id` (ref) | same |
+| 15 | `templatestyles` | `number_style_placeholder` inside `lua::invoke::invoke` |
+| **16** | `extension-id` (ref) | the one the output shows |
+
+The answer is rendered back to the module as a *string* (`render_answer_markers`
+/ `render_answer`), so the `<ref>`s become source text and their ids die. The
+`<ref>` then reaches the module's **output**, is re-parsed, and is numbered
+there — a second time, at 16.
+
+### The oracle says where the id belongs
+
+Patching `Wikimedia\Parsoid\NodeData\DataBag::newAboutId` to log its call stack
+(`PARSOID_TRACE_ABOUT=1`) settles the model. On both `Zebra` and the tight
+`Automatic taxobox` reduction, the ref and the `Taxobox/core` stylesheet are
+numbered by `ExtensionHandler.php:280` (`onDocumentFragment`, from
+`onExtension`), in the **ExtensionHandler pass of the pipeline that re-parses
+the answer** (`ParserPipeline.php:127`), in document order:
+
+    about #mwt13 Env.php:648 <- ExtensionHandler.php:280 <- ExtensionHandler.php:191 <- … <- ParserPipeline.php:127
+    about #mwt14 Env.php:648 <- ExtensionHandler.php:280 <- ExtensionHandler.php:191 <- … <- ParserPipeline.php:127
+
+So a `frame:expandTemplate` answer is **wikitext**: Scribunto returns the
+preprocessor's expansion, extensions and all, and the caller's re-parse numbers
+them. An answer expansion must therefore *not* number its extensions.
+
+### The exception that makes it delicate
+
+`frame:extensionTag` is lowered to `frame:callParserFunction('#tag', …)`, and
+`#tag` is not wikitext — it **runs** the extension and returns its output. That
+fragment is numbered at the call. So the gate cannot cover every
+call-parser-function answer. Applying it to all of them moved `Zebro`'s
+`Module:…` `#tag:templatestyles` (the `Plainlist/styles.css` stylesheet) from
+`#mwt37` to `#mwt41`: deferred, the carried fragment was renumbered after the
+four `Legend` stylesheets the module emitted after it.
+
+### The fix
+
+`Parser::expand_lua_request` now raises the existing `style_defer` guard for a
+`frame:expandTemplate`/`preprocess` answer — the counter whose meaning is
+already "this content's extensions are numbered where it lands in the output" —
+but **not** for `frame:callParserFunction`, whose `#tag` answers number at the
+call. `expand_templates` already skips its extension post-pass while
+`style_defer` is set, so the two zombie refs and the stashed stylesheet stop
+spending ids; they are spent by the output re-parse instead, in document order.
+
+### Effect: byte 5433 moves to 6221
+
+`Zebra`'s reference marker is now `#mwt13`, matching Parsoid, and its first
+difference moves **5433 → 6221**. The next difference is in the taxobox's
+`Timeline-row`: Parsoid has `width:207.23076923077px` where rustoid computes
+`width:200.384615px`, and Parsoid opens the row with one newline where rustoid
+emits two — a `Module:Automated taxobox` number/render difference, the next
+target.
+
+The eight subset offsets are otherwise unchanged (`Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837),
+`Zebro` still MATCHes, the fixture guard holds at **877/896**, and 947 lib tests
+pass with clippy and `cargo fmt` clean.
