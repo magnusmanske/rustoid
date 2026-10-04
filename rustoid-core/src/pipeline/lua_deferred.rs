@@ -591,7 +591,18 @@ pub fn render_answer(items: &[Item]) -> String {
                         i += 1;
                         continue;
                     }
-                    crate::wikitext::tokens_v2::ParsoidToken::Nl(_) => out.push('\n'),
+                    // A `Nl` whose source is recorded writes that source below;
+                    // emitting the bare `\n` here too doubled the newline
+                    // (`...>\n<div...` became `...>\n\n<div...`). Only a `Nl`
+                    // that carries no source needs the newline here.
+                    crate::wikitext::tokens_v2::ParsoidToken::Nl(_)
+                        if tok
+                            .data_parsoid()
+                            .and_then(|dp| dp.src.as_deref())
+                            .is_none() =>
+                    {
+                        out.push('\n');
+                    }
                     _ => {}
                 }
                 // The token's own source is the source *as written*; an
@@ -694,6 +705,24 @@ mod tests {
             ))),
         ];
         assert_eq!(render_answer(&items), "&#59;");
+    }
+
+    #[test]
+    fn render_answer_does_not_double_a_newline() {
+        // A `Nl` token carries the source newline in `src`; emitting the bare
+        // `\n` as well turned a source `...>\n<div...` into `...>\n\n<div...`
+        // in every module answer that held one (the taxobox's timeline row).
+        use crate::wikitext::tokens_v2::{Item, NlTk, ParsoidToken, SourceRange};
+        let mut nl = NlTk::new(SourceRange::new(0, 1));
+        nl.data_parsoid.src = Some("\n".to_string());
+        let with_src = vec![Item::Tok(ParsoidToken::Nl(nl))];
+        assert_eq!(render_answer(&with_src), "\n");
+
+        // A `Nl` with no recorded source still renders as one newline.
+        let bare = vec![Item::Tok(ParsoidToken::Nl(NlTk::new(SourceRange::new(
+            0, 0,
+        ))))];
+        assert_eq!(render_answer(&bare), "\n");
     }
 
     #[test]
