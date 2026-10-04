@@ -10768,3 +10768,76 @@ The eight subset offsets are otherwise unchanged (`Bicycle` 11836,
 `List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837),
 `Zebro` still MATCHes, the fixture guard holds at **877/896**, and 947 lib tests
 pass with clippy and `cargo fmt` clean.
+
+## The timeline row: three bugs between 6221 and 6673
+
+Moving past the `#mwt` drift exposed the Phanerozoic timeline row, and fixing
+it took three separate defects. Each was measured against the oracle
+(`php bin/parse.php`) and the live reference.
+
+### A lone `=` at start of line names a template argument
+
+`Template:Period start` writes its `#switch` fall-through groups as
+
+    |       cambrian
+    |        lower cambrian <!-- … -->
+    |         terreneuvian | lowest cambrian | earliest cambrian
+    |           fortunian
+    |             manykaian | nemakit daldynian
+                             = 538.8
+
+The `=` sits at the start of a line. rustoid's `find_arg_separator_eq` treated
+*any* SOL `=` as a heading opener, so the argument stayed positional and
+`#switch` fell through to the next named case, `atdabanian = 521`. The oracle
+settles the rule: a **lone** SOL `=` is an ordinary name/value separator
+(`{{#switch: x | x | a\n= 5 | y = 9}}` → `5`), while `==` is a heading
+(`{{#switch: x | x |\n== 5 == | y = 9}}` renders the call literally). Parsoid's
+PEG says the same — `heading = heading_preproc<&preproc="==">`. rustoid now
+splits on a lone SOL `=` and only treats a run of two or more as a heading.
+
+### `round` is a binary operator, and `#expr` formats as `%.14G`
+
+With the `#switch` fixed, `Period start|Cambrian` is `538.8` — and the module's
+guard needs `Period start` to answer an **error** for a period that is not
+numeric. It is `{{#expr:{{#switch:…}} round 5}}`; for an unmatched input the
+switch is now (correctly) empty, so the expression is ` round 5`. rustoid
+dropped `round` as an unimplemented word and answered `5`; MediaWiki errors
+`Unexpected round operator`. So `Module:Automated taxobox` re-rendered
+`Geological range`, nesting a whole timeline inside the taxobox.
+
+`round` is now a real binary operator — precedence between comparisons and
+`+ -`, so `1.234 + 1 round 1` is `(1.234 + 1) round 1`, and a leading `round`
+is the parser's error. Alongside it, `#expr` now parses scientific notation
+(`1e20`, `1e-5`) and formats results as MediaWiki's `sprintf('%.14G')`: 14
+significant digits, exponential outside `[-4, 14)`, no zero-padded exponent,
+at least one fractional digit in the exponential form (`1.0E-5`), trailing
+zeros dropped. Eval errors report their message, and division/modulo by zero
+share MediaWiki's `Division by zero`.
+
+The width that had been `200.384615px` is now Parsoid's `207.23076923077px`.
+
+### A module answer doubled every newline
+
+With the number matching, the first difference became an extra blank line
+between the row `<div>` and the first bar. `render_answer` pushed `'\n'` for a
+`Nl` token and *then* pushed the token's `src`, which for a `Nl` is the
+newline itself — so a source `...>\n<div...` came back `...>\n\n<div...`. The
+rule is now: emit the bare newline only when the `Nl` records no source.
+
+### Effect: byte 6221 moves to 6673
+
+`Zebra`'s first difference is now **6673**. The next difference is the Cambrian
+bar itself: rustoid has `background-color:` empty and
+`Expression error: Unrecognized word "strong".` where Parsoid has
+`rgb(127,160,86); left:42.769230769231px; width:19.980769230769px;`. That error
+is a *cascade* — an earlier `#expr` error's `<strong …>` HTML reached another
+`#expr`. Both templates answer correctly in isolation and in
+`{{Phanerozoic 250px}}`; only the taxobox path fails, so the next target is why
+`Period start`/`Period color` return an error there (a re-expansion or argument
+mix-up in `Module:Automated taxobox`'s `setfossilRange` chain).
+
+The eight subset offsets are otherwise unchanged (`Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837),
+`Zebro` still MATCHes, the fixture guard holds at **877/896**, and 950 lib tests
+pass with clippy and `cargo fmt` clean.
