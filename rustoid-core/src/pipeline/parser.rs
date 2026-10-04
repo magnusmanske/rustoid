@@ -1124,6 +1124,12 @@ pub struct Parser<'a, C: SiteConfig> {
     /// infobox's first. Unlike [`Self::arg_expansion`] this does **not** defer
     /// the indicator spend — a template argument's `<indicator>` is numbered
     /// with its transclusion, as the service does.
+    ///
+    /// A Lua `frame:expandTemplate`/`preprocess` answer sets it too: that answer
+    /// is wikitext the caller re-parses, so the same "numbered where it lands"
+    /// rule applies (`frame:callParserFunction` does not — `#tag` runs its
+    /// extension and is numbered at the call; see
+    /// [`Parser::expand_lua_request`]).
     style_defer: std::cell::Cell<u32>,
     /// Sundered extension output, addressed by a `UNIQ…QINU` strip marker.
     ///
@@ -5274,6 +5280,23 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // A parser function's own expansion carries no wrapper, but its
         // arguments can still contain other transclusions, so it must share the
         // sequence as well.
+        // A `frame:expandTemplate`/`preprocess` answer is *wikitext*: Scribunto
+        // returns the preprocessor's expansion, extensions and all, and the
+        // caller re-parses it — so an extension's `about` id belongs to that
+        // parse, not here (Parsoid's `ExtensionHandler` numbers it there, in
+        // document order). Deferring the answer's extensions is what stops the
+        // ids a stringified answer would otherwise spend.
+        //
+        // A `#tag` call is the exception: `frame:extensionTag` lowers to it, and
+        // `#tag` *runs* the extension, so its fragment is numbered here, where
+        // the call is. Deferring it too would move a module's
+        // `#tag:templatestyles` past the fragments it emitted after it
+        // (`Zebro`'s Plainlist stylesheet, `#mwt37` → `#mwt41`).
+        let defer = !matches!(
+            request,
+            crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { .. }
+        );
+        let _answer_gate = defer.then(|| self.begin_style_defer());
         let expanded = Box::pin(self.expand_templates(
             &child,
             items,
