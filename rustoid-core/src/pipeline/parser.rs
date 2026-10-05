@@ -3193,11 +3193,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// module emitted through `frame:extensionTag`; the marker is Scribunto's
     /// own answer shape and keeps the output alive through the module's string
     /// handling.
+    ///
+    /// A *numbered* extension token (`#tag:ref` reached through
+    /// `frame:extensionTag`) is carried the same way. Its `about` was spent
+    /// during this answer's expansion, so rendering it back to wikitext and
+    /// re-tokenizing it in the module's output would spend a second id for the
+    /// same ref — the double-walk the `<indicator>` had (see
+    /// `expand_one_indicator`). The marker keeps the numbered token, which
+    /// `substitute_strip_markers` splices back unchanged.
     fn render_answer_markers(&self, items: &[Item]) -> String {
         let mut replaced: Vec<Item> = Vec::with_capacity(items.len());
         let mut i = 0;
         while i < items.len() {
-            match placeholder_span(items, i) {
+            let span = placeholder_span(items, i).or_else(|| {
+                let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &items[i] else {
+                    return None;
+                };
+                if t.name != "extension"
+                    || !t.attribs.iter().any(|kv| kv.key.as_str() == Some("about"))
+                {
+                    return None;
+                }
+                let tag = extension_name(t).unwrap_or_else(|| "extension".to_string());
+                Some((i + 1, vec![items[i].clone()], tag))
+            });
+            match span {
                 Some((end, tokens, tag)) => {
                     let marker = format!(
                         "\u{7f}UNIQ--{tag}-{:08X}-QINU\u{7f}",
