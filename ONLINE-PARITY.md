@@ -11444,3 +11444,60 @@ while rustoid hoists a single `about="#mwt16"` onto the whole `<p>` and records
 *both* `IPAc-en` calls in its `data-mw` parts. Two adjacent transclusions on the
 same line must stay separate wrappers here; rustoid's merge pass joined them.
 That is the next target.
+
+## Fixed: the T2529 at-start flag survives an intervening token
+
+### Cause
+
+That 16342 difference was not the fusion the note above guessed, but a spurious
+`<dl>`: `X {{IPAc-en|US}}` rendered as
+
+```
+<p …>X <span class="rt-commentedText nowrap">…<span class="IPA-label">US</span></span></p>
+<span about="#mwt1">\n</span><dl about="#mwt1"><dd>…</dd></dl>
+```
+
+where the oracle keeps it all inside one `<p>`. The trigger is
+`[[wikilink]]:` — a colon right after a link — in a *module's* output; the same
+wikitext at page level is fine.
+
+`Module:IPAc-en` labels a pronunciation with `[[American English|US]]:` (the
+colon is part of `Module:IPAc-en/pronunciation`'s `us` text). rustoid hands the
+module's answer back through the token stream, and `TokenStreamPatcher`'s T2529
+rule re-tokenizes a list- or table-syntax string that follows a transclusion
+start meta — that is how `{{1x|*bar}}` becomes a `<ul>`. PHP clears
+`$tplInfo['atStart']` in an `onAny` **`finally`** for every token but the start
+meta itself, so the reparse fires only for the string *immediately* after the
+transclusion. rustoid cleared the flag only inside the string branch, so the
+`[[American English|US]]` link in between left it set, and the label's `:` was
+re-tokenized as a `<dl>`.
+
+### Fix
+
+`TokenStreamPatcher::run` now clears `tpl_info_at_start` after every token
+unless that token *is* the transclusion start meta
+(`is_transclusion_start_meta`), mirroring PHP's `finally`. The positive T2529
+case (`{{1x|*bar}}`) still fires; a new unit test pins the negative case (a link
+between the meta and the `:` string).
+
+### Effect: byte 16342 moves to 25123
+
+`Zebra`'s first difference is now **25123**, and the whole lead paragraph
+(IPAc-en spans, labels, `Module:IPA` stylesheet) matches the oracle exactly.
+Every other subset offset is unchanged (`Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard
+holds at **877/896**, and 961 lib tests pass with clippy and `cargo fmt` clean.
+(A few pages lose a little rendered length because the same spurious `<dl>` is
+removed from them; their first-difference bytes are unchanged.)
+
+### The next difference at 25123
+
+The Etymology paragraph's first `<ref>` is `about="#mwt30"` where the oracle has
+`#mwt28` — a **+2** drift that starts inside a `<ref>` body. The oracle numbers
+the `{{cite web}}` inside `<ref name="etymology">` as `#mwt26` and the ref as
+`#mwt28`; rustoid numbers the `{{cite web}}` `#mwt28` and the ref `#mwt30`, i.e.
+two extra `about` ids are spent while the ref body is rendered. The bodies are
+expanded at the ref site (`number_extension_token` → `process_fragment_body`),
+which is PHP's order, so the extra spends are in that pre-render — likely the
+same class as the phantom-id fix above. Next target.
