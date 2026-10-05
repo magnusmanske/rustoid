@@ -286,7 +286,31 @@ fn cleanup_node(node: &mut Node, in_tpl: bool) -> bool {
     }
 
     let mut active_until: Option<usize> = None;
+    // A deleted empty `<tr>` leaves behind the spaces its row-tag line carried
+    // (`table_row_tag`'s `s2`): the tree builder fosters them out of the row
+    // before the row is removed. Parsoid's tree never creates the row in the
+    // encapsulated case, so the spaces go with it — drop the same leading
+    // spaces here, keeping the newlines around them.
+    let mut trim_after_deleted_tr = false;
     for (idx, mut child) in children.into_iter().enumerate() {
+        if trim_after_deleted_tr {
+            trim_after_deleted_tr = false;
+            if let NodeKind::Text(t) = &mut child.kind {
+                // Drop the row-tag line's trailing spaces (`s2`), which the tree
+                // fostered out of the row it opened.
+                let after_spaces = t.trim_start_matches([' ', '\t']);
+                let had_spaces = after_spaces.len() != t.len();
+                let kept = if had_spaces {
+                    after_spaces
+                        .strip_prefix("\r\n")
+                        .or_else(|| after_spaces.strip_prefix('\n'))
+                        .unwrap_or(after_spaces)
+                } else {
+                    after_spaces
+                };
+                *t = kept.to_string();
+            }
+        }
         if let Some(last) = range_end[idx] {
             active_until = Some(last);
         }
@@ -297,7 +321,10 @@ fn cleanup_node(node: &mut Node, in_tpl: bool) -> bool {
                     out.push(grandchild);
                 }
             }
-        } else if !cleanup_node(&mut child, child_in_tpl) {
+        } else if cleanup_node(&mut child, child_in_tpl) {
+            trim_after_deleted_tr =
+                matches!(&child.kind, NodeKind::Element(k) if element_tag(k) == "tr");
+        } else {
             out.push(child);
         }
         if active_until == Some(idx) {
@@ -572,6 +599,41 @@ mod tests {
             "got: {:?}",
             root.children[0]
         );
+    }
+
+    /// A deleted empty `<tr>` takes the spaces its row-tag line fostered out of it
+    /// (Parsoid never creates the row in the encapsulated case, so its `s2` goes
+    /// with it) — but the newline around them stays.
+    #[test]
+    fn deleting_an_empty_row_drops_its_trailing_spaces() {
+        let mut wrapper = Node::element(ElementKind::Transclusion);
+        wrapper.set_attr("about", "#mwt1");
+        wrapper.set_attr("typeof", "mw:Transclusion");
+        let mut tr = Node::element(ElementKind::TableRow);
+        tr.push_child(Node::element(ElementKind::TableCell));
+        wrapper.push_child(Node::element(ElementKind::TableRow)); // empty row
+        wrapper.push_child(Node::text(" \n"));
+        wrapper.push_child(tr);
+        let mut root = Node::document();
+        root.push_child(wrapper);
+
+        run(&mut root);
+
+        let wrapper = &root.children[0];
+        assert_eq!(wrapper.children.len(), 2, "the empty row is gone");
+        match &wrapper.children[0].kind {
+            NodeKind::Text(t) => {
+                assert!(
+                    t.is_empty(),
+                    "the row-tag space and line ending are dropped"
+                )
+            }
+            other => panic!("expected the following text, got {other:?}"),
+        }
+        assert!(matches!(
+            wrapper.children[1].kind,
+            NodeKind::Element(ElementKind::TableRow)
+        ));
     }
 
     /// Inside a transclusion range, an interior `stx`-bearing node loses its
