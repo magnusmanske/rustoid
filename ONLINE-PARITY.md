@@ -11289,7 +11289,26 @@ unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
 
 ### The next difference at 15139
 
-After the closing table tag, Parsoid wraps the row's templatestyles in
-`<span class="mw-empty-elt" about="#mwt12"><style … about="#mwt15">…`; rustoid
-emits the `<style … about="#mwt12">` bare, without the wrapper span and with the
-`about` id one lower. That is the next target.
+After the closing table tag, Parsoid wraps the taxobox's templatestyles in
+`<span class="mw-empty-elt" about="#mwt12"><style … about="#mwt15">…</style>
+<link rel="mw:PageProp/Category" …/></span>`; rustoid emits the
+`<style … about="#mwt12">` bare (then the category link with the same `about`),
+with no wrapper span and with the `about` id lower by three.
+
+The wrapper is `DOMRangeBuilder::handleRenderingTransparentEltsBetweenBlocks`
+(rustoid's `stash_stashable_runs` in `tree_builder_html.rs`), and the same shape
+works elsewhere on the page: the Hatnote `{{distinguish}}` at the top emits
+`<span class="mw-empty-elt" about="#mwt2" typeof="mw:Transclusion">` with its
+`<style about="#mwt3">` inside, in both engines. Instrumenting the stash call
+showed it *does* evaluate a `[style(DOMFragment), …, table]` run with
+`should_stash == true`, yet no wrapper reaches the output — so either that run is
+not the taxobox's, or the wrapper is created and then lost/never applied on the
+path the taxobox takes.
+
+The taxobox is built by `Module:Automated taxobox`, which reaches `Taxobox/core`
+through `frame:expandTemplate` — the answer is stringified by `render_answer_markers`
+and re-parsed, and rustoid *defers* the answer's extensions (see the note on
+`begin_style_defer` in `parser.rs`) so a stringified answer spends no id. The
+templatestyles' own `about` (`#mwt15`) and the `#mwt13`/`#mwt14` the service
+spends before it are what rustoid is missing, so the fix likely lives in that
+deferral/re-parse path rather than in `should_stash` itself. Start there.
