@@ -11261,3 +11261,35 @@ empty element still carries it in the encapsulated case). rustoid deletes the
 row but leaves the space as a `tbody` sibling — `</td></tr>\n \n…` where Parsoid
 has `</td></tr>\n\n…`. Pinpointing where the space should sit relative to the
 row is the next target.
+
+## Fixed: a deleted empty row drops its fostered-out row-tag spacing
+
+`Module:Autotaxobox` ends the taxobox rows with a dangling `|- class="taxonrow" \n`.
+Inside the `Taxobox/core` transclusion the row it opens is empty, so
+`handleEmptyElements` removes it. The row-tag's trailing spaces (`table_row_tag`'s
+`s2:space*`) and its line ending are part of the row, so Parsoid removes them
+too — its tree never even creates the row in the encapsulated case, and the run
+of newlines before the next section is one shorter.
+
+rustoid's tree keeps the row until the cleanup pass, by which point the s2 spaces
+and the line ending have been fostered out of it as a following text node; the
+deletion left them behind as a `tbody` sibling. `cleanup_node` now drops, from
+the text node that follows a *deleted* `tr`, the leading spaces/tabs and — only
+when any were present — one following line ending. The `only when spaces were
+present` guard matters: removing the ending unconditionally regressed the
+taxobox header at byte 11348, where the same shape keeps its newline.
+
+### Effect: byte 13441 moves to 15139
+
+`Zebra`'s first difference is now **15139**. Every other subset offset is
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 959 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 15139
+
+After the closing table tag, Parsoid wraps the row's templatestyles in
+`<span class="mw-empty-elt" about="#mwt12"><style … about="#mwt15">…`; rustoid
+emits the `<style … about="#mwt12">` bare, without the wrapper span and with the
+`about` id one lower. That is the next target.
