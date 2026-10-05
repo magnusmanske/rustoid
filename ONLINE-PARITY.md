@@ -11361,3 +11361,17 @@ defers (`mark_fostered_content.rs` has an explicit FIXME for the
 `newAboutId` + `transclusionMetaTagDepthMap` pair). Finding which extension the
 service numbers here — the ids `#mwt6`, `#mwt8`, `#mwt10`, `#mwt11` are likewise
 spent and discarded earlier in the page — is the next target.
+
+#### Follow-up on the 15284 id offset
+
+Standalone Parsoid disagrees with the pinned oracle here, which points away from a
+rustoid bug. `php bin/parse.php --pageBundle … --inputfile page__Zebra.txt`
+(which reproduces the live node ids, unlike `--standalone`) puts the taxobox
+`<style>` at `about="#mwt14"` — **the same as rustoid** — while the oracle at
+`r1375105737` has `#mwt15`. The cached `Template:Taxobox/core` is byte-identical
+to the current one on-wiki, so the template did not drift. That leaves a live
+MediaWiki extension that spends an `about` id the standalone Parsoid mocks away;
+rustoid, targeting the live service, would need to model that same spend. The
+discarded id (`#mwt14`) emits nothing, so its owner has to be identified from the
+id sequence (`RUSTOID_TRACE_ABOUT=1`) against the service's extension set, not
+from the DOM. Parked here rather than guessed at.
