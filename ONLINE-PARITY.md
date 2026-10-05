@@ -11745,3 +11745,43 @@ whole value. The service hands markup, and the module embeds it; rustoid hands
 the raw call, which re-expands (and loops). The decline is deliberately
 conservative (`?` on `token_source_for_module`), so widening it needs care: it
 covers `Tag`, `EndTag` and the catch-all `SelfclosingTag` arms.
+
+### The straightforward widening is wrong (attempted, reverted)
+
+Rendering every generated tag as `<name attrs>` does fix the clade — no loop,
+and the nested table renders — but it regresses three subset pages, so it is not
+the answer:
+
+- `Zebro` MATCH → byte 24518 (17.91%) and `Zebra` 45480 (8.12%) → 29668,
+  `Quicksilver (film)` 4213 → 5671.
+- The cause is visible in the `Zebro` diff: a generated `<style
+  typeof="mw:DOMFragment" data-fragment-id="16">` placeholder got written out
+  literally (`&lt;style …&gt;&lt;/style&gt;`). A module-argument value can hold
+  `mw:DOMFragment` placeholders, whose content is *stashed*, not in the token
+  stream — the token-level renderer cannot unpack them, so it must keep
+declining (and let the caller fall back), not invent a tag.
+
+The correct shape is therefore narrower: render a generated element only when it
+is a real element (`div`, `table`, `tr`, `td`, …), never a marker/placeholder
+(`mw:DOMFragment`, `meta`, …).
+
+### The narrowed widening is also insufficient (attempted, reverted)
+
+Declining `mw:DOMFragment` placeholders and rendering the rest fixes the
+standalone reproduction (`{{clade|1={{clade|1=a|2=b}}|2=c}}` — no loop, the
+nested table renders) and is *net-neutral* on the subset: `Zebro` stays MATCH,
+`Quicksilver (film)`/`Unix`/etc. keep their offsets, and no lib/fixture/compare
+test regresses (they were re-run). But **`Zebra`'s clade still loops**, so the
+first difference does not move.
+
+The reason is the same placeholder problem in the other direction: `Zebra`'s
+clade value *contains* a `mw:DOMFragment` placeholder (a tunnelled
+`<templatestyles>`), so the value still declines as a whole and the module is
+handed the raw call again. Unpacking that placeholder needs the stashed
+fragment, which is not in the token stream at `argument_value_text` time — it is
+held for the tree builder. So the real fix has to render module arguments from a
+DOM (after `UnpackDOMFragments`), or thread the fragment map into the token-level
+renderer, rather than widen `argument_value_text`.
+
+Both attempts are reverted; `ONLINE-PARITY.md` records them so the next pass
+starts from the DOM-rendering shape rather than the token-level one.
