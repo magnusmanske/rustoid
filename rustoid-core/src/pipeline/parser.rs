@@ -5265,11 +5265,35 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 src_text,
             )
             .await;
-        expanded
-            .first()
-            .map(expanded_arg_pair)
-            .map(|(_, value)| value)
-            .unwrap_or_default()
+        let Some(mut kv) = expanded.into_iter().next() else {
+            return String::new();
+        };
+        if let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value
+            && argument_value_text(items).is_none()
+            && items.iter().any(|it| {
+                matches!(it, Item::Tok(t)
+                    if crate::wikitext::token_utils::table_token_wikitext(t).is_some())
+            })
+        {
+            // The exact renderer declined a construct it cannot spell — a
+            // generated element, or a `mw:DOMFragment` placeholder (a tunnelled
+            // `<templatestyles>`, whose content is stashed). When the value holds
+            // a **table** the module answer renderer can spell it: `{|` tables
+            // are rebuilt from their token data, and every placeholder becomes a
+            // `UNIQ…QINU` strip marker that `substitute_strip_markers` splices
+            // back when the module's output is re-parsed. Falling back to the
+            // recorded source instead hands the module the *unexpanded* call —
+            // which `Module:Clade` string-matches against `{|class="clade"`, so
+            // it stripped its own outer class and wrapped the wrong div.
+            //
+            // The gate is the table: `render_answer` rebuilds table syntax but
+            // not other generated markup (`<ul>`/`<li>`, which a value like an
+            // infobox's `starring = {{Plainlist|…}}` carries), so those keep the
+            // source fallback and the module re-expands the call where the
+            // re-expansion is faithful.
+            kv.value = crate::wikitext::tokens_v2::KeyValue::Str(self.render_answer_markers(items));
+        }
+        expanded_arg_pair(&kv).1
     }
 
     /// Expand the templates a chunk holds in its tokens' *attributes*.
@@ -6371,6 +6395,58 @@ mod tests {
             Item::Str(" A".to_string()),
         ];
         assert_eq!(argument_value_text(&items).as_deref(), Some("* A"));
+    }
+
+    /// A value the exact renderer declines but that holds a **table** is rendered
+    /// like a module answer: the `{|` table is rebuilt from its token data and a
+    /// `mw:DOMFragment` placeholder becomes a `UNIQ…QINU` strip marker (so the
+    /// module's output re-splices it). `Module:Clade`'s
+    /// `1={{clade|1=a|2=b}}` is the case that needs it — the module
+    /// string-matches the value for `{|class="clade"`.
+    #[test]
+    fn render_answer_markers_carries_a_table_and_a_placeholder() {
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, KV, KeyValue, TagTk};
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let attr = |k: &str, v: &str| KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let style = TagTk::new(
+            "style",
+            vec![
+                attr("typeof", "mw:DOMFragment"),
+                attr("data-fragment-id", "3"),
+            ],
+            DataParsoid::default(),
+        );
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(TagTk::new(
+                "table",
+                vec![],
+                DataParsoid::default(),
+            ))),
+            Item::Tok(ParsoidToken::Tag(style)),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "style",
+                vec![],
+                DataParsoid::default(),
+            ))),
+            Item::Str("a".to_string()),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "table",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ];
+        let s = parser.render_answer_markers(&items);
+        assert!(s.contains("{|"), "got: {s}");
+        assert!(s.contains("|}"), "got: {s}");
+        assert!(s.contains("UNIQ--templatestyles-"), "got: {s}");
+        assert!(s.contains('a'), "got: {s}");
     }
 
     /// Any other self-closing token is handed to the module as its own source:
