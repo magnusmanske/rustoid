@@ -11714,11 +11714,34 @@ The clade's first nested row renders as
 <span class="error">Template loop detected: Template:Clade</span>
 ```
 
-where the oracle renders the nested table. A module's output is expanded in a
-child of the calling frame, and that frame keeps the calling template's title
-(`frame.new_child(frame.title(), …)` in `Parser::expand_invoke`), so a nested
-`{{clade}}` in `Module:Clade`'s output sees a `Template:Clade` ancestor and
-`Frame::loop_and_depth_check` stops it. The oracle expands the same wikitext
-without looping, so its module-output frame must not carry that title. This is
-**pre-existing** — reverting the argument-frame fix above reproduces it — and
-is the next target.
+where the oracle renders the nested table. This is **pre-existing** — reverting
+the argument-frame fix reproduces it — and is the next target.
+
+Traced this session (a local Parsoid against the live API, `Frame.php`
+instrumented). Parsoid expands the recursive `{{clade}}` in a **fresh root
+frame** — `loopAndDepthCheck(Template:Clade, ignoreLoop=true)` with the frame
+chain `T(0)`, i.e. just the page. It is the *argument* that is expanded, in the
+frame that wrote it, not the template's own frame; and it arrives at the module
+already rendered (`Parser::expand_template_arg_values` exists for exactly this).
+
+In rustoid the recursion instead happens in the module **output**:
+
+- `Module:Clade` reads `pargs['1']` (its parent template's arg
+  `1={{clade|1=a|2=b}}`).
+- The argument *is* expanded (`Parser::expand_template_arg_values` runs), but the
+  expansion is a **generated** `<div class="clade">`, whose token has no
+  `data-parsoid.src`. `argument_value_text`'s element arm asks
+  `token_source_for_module` for the token's source, which returns `None`, so the
+  whole renderer declines and `argument_value_or_source` falls back to
+  `kv_value_source` — the argument's recorded source range, i.e. the raw
+  `{{clade|1=a|2=b}}`.
+- The module echoes that call into its output; the output is expanded in
+  `Parser::expand_invoke`'s child frame (title `Template:Clade`), whose parent is
+  the calling `Template:Clade` frame, so `loop_and_depth_check` trips.
+
+So the fix is not the frame title but `argument_value_text`: a *generated* token
+must be handed to the module as markup (its tag/attrs) rather than declining the
+whole value. The service hands markup, and the module embeds it; rustoid hands
+the raw call, which re-expands (and loops). The decline is deliberately
+conservative (`?` on `token_source_for_module`), so widening it needs care: it
+covers `Tag`, `EndTag` and the catch-all `SelfclosingTag` arms.
