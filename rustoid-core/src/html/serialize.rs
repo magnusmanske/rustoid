@@ -194,10 +194,14 @@ impl HtmlSerializer {
                         buf.push_str("</span>");
                     }
                     ElementKind::LineBreak => {
-                        buf.push_str("<br/>");
+                        buf.push_str("<br");
+                        self.serialize_attrs(node, buf);
+                        buf.push_str("/>");
                     }
                     ElementKind::HorizontalRule => {
-                        buf.push_str("<hr/>");
+                        buf.push_str("<hr");
+                        self.serialize_attrs(node, buf);
+                        buf.push_str("/>");
                     }
                     ElementKind::Wikilink => {
                         buf.push_str("<a");
@@ -600,6 +604,27 @@ mod tests {
         let html = serializer.serialize(&doc).unwrap();
         assert!(html.contains("<b>bold</b>"));
         assert!(html.contains("<i>italic</i>"));
+    }
+
+    #[test]
+    fn test_line_break_keeps_its_attributes() {
+        // A `<br />` that takes a generated node id must serve it
+        // (`<br id="mw8A"/>`), as every other element does; the id pass runs on
+        // the DOM, so the serializer has to emit it rather than hardcode
+        // `<br/>`.
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        let mut br = Node::element(ElementKind::LineBreak);
+        br.set_attr("id", "mw8A");
+        p.push_child(br);
+        doc.push_child(p);
+
+        let opts = ParserOptions {
+            body_only: true,
+            ..ParserOptions::default()
+        };
+        let html = HtmlSerializer::new(opts).serialize(&doc).unwrap();
+        assert!(html.contains(r#"<br id="mw8A"/>"#), "got: {html}");
     }
 
     #[test]
