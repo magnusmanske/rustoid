@@ -12083,3 +12083,69 @@ html contains never spends its id (`mwAbM`) and the figure takes it instead. The
 `alt=` value here carries wikitext markup (`''Equus mauritanicus''`), which
 Parsoid keeps as a serialized fragment in `data-mw.attribs` rather than
 flattening to the `txt`.
+
+## Fixed: an expandable media option numbers its fragment and serializes it
+
+### Cause
+
+`WikiLinkHandler::renderFile` gives an option whose value is a token array its
+own treatment. `$expOpt = is_array($origOptSrc)`; the option is rendered through
+`PipelineUtils::expandAttrValueToDOM`, which runs the fragment through
+`DOMDataUtils::visitAndStoreDataAttribs` and **numbers its nodes**, and the
+serialized DOM is stored as `data-mw.attribs[i].value.html` alongside the `txt`.
+The same `$hasExpandableOpt` flag adds a fresh `about` id (`$env->newAboutId()`)
+and `mw:ExpandedAttrs` to the container.
+
+rustoid had none of that: it stored only the `txt` and never rendered a
+fragment, so the alt's `<i>` never spent an id and the figure took it instead.
+Two smaller biases compounded the `txt`: `getOptionInfo` trims only the whole
+option string (`trim($optStr)`), so the space after `= ` survives into
+`$optInfo['v']`; and `TokenUtils::tokensToString` drops comments *before* the
+option is recognized.
+
+### Fix
+
+`render_file` renders a token-array option to a DOM fragment and tunnels it as a
+marked `mw:dom-fragment-token` instead of splicing it into view.
+`attr_mw_fragments::collect` moves it onto the container's `attr_mw_fragments`
+before `post_pwrap_transforms` can unpack it, `assign_walk` numbers it ahead of
+the container's own id (Parsoid serializes a node's `data-mw` inside
+`storeRichAttributes`, before `storeInPageBundle`), and `serialize_into_data_mw`
+writes it back as `html` once the ids are final. `has_expandable_opt` gives the
+container its `about` and `mw:ExpandedAttrs`.
+
+The `about` is allocated in document order. The per-chunk expansion loop asks
+`has_expandable_option` (the option parse factored out of `render_file`) whether
+each file link will spend an id, stamps that id, and advances the counter past
+them — so the `<ref>` that follows the figure numbers after it, instead of
+colliding.
+
+`prefix_option_info` now returns the captured value verbatim, `strip_html_comments`
+(shared with `strip_quote_markers`) removes comments before recognition, and the
+`width` handler normalizes dimensions with `parse_media_dimension` so the
+untrimmed capture stays correct.
+
+### Effect: byte 84252 moves to 90688
+
+`Zebra`'s first difference is now **90688 (16.19% of the oracle)**. No subset
+first-difference offset regresses (`Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds
+at **877/896**, and 970 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 90688: a gallery's `about` is allocated too late
+
+A `<gallery mode="packed" heights="150px">` is served as
+
+```
+<ul class="gallery mw-gallery-packed" typeof="mw:Extension/gallery" about="#mwt198" data-mw='{"name":"gallery","attrs":{"mode":"packed","heights":"150px"},"body":{}}' id="mwAeY">
+```
+
+where rustoid serves `about="#mwt552"` and `data-mw='{"name":"gallery","attrs":{},"body":{}}'`.
+Two things are wrong at once: the gallery's extension `about` is taken from the
+counter at render time, long after the templates that should have numbered after
+it, and the gallery's own `attrs` (`mode`, `heights`) are dropped, so we cannot
+rule out that the same pass is what loses them. The gallerybox also carries a
+stray `data-mw="{}"` and prints the width as `243.3333333333` where the oracle
+has `243.33333333333`.
