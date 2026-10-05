@@ -12149,3 +12149,56 @@ it, and the gallery's own `attrs` (`mode`, `heights`) are dropped, so we cannot
 rule out that the same pass is what loses them. The gallerybox also carries a
 stray `data-mw="{}"` and prints the width as `243.3333333333` where the oracle
 has `243.33333333333`.
+
+## Fixed: a gallery's ids, attrs and line breaks
+
+### Cause
+
+`Gallery::sourceToDom` builds the `<ul>` during the extension handling at the
+gallery's own position, so its `about` (added by `ExtensionHandler`) is allocated
+in document order. rustoid built and numbered the gallery in a global pass after
+every other `about` had been spent, so the `<ul>` took the page-end id `#mwt552`
+instead of `#mwt198`.
+
+The same pass lost or invented the rest of the served DOM:
+
+- `data-mw.attrs` was hardcoded `{}`; Parsoid records the parsed tag attributes
+  (`Utils::getExtArgInfo`), minus `caption` (`Gallery::sourceToDom` calls
+  `setExtAttrib('caption', null)`).
+- Each line is preceded by a `\n` text node and the list ends with one
+  (`TraditionalMode::line`/`render`); rustoid emitted none.
+- Widths were printed with 10 fractional digits, where PHP's default
+  `precision=14` is 14 *significant* digits.
+- The `<li>` carried a stray `data-mw="{}"`, and the box, `.thumb` and
+  `.gallerytext` divs had nothing to key them, so they took no id where the
+  service gives every one of them one (Parsoid stamps `getDataParsoid($box)->dsr`
+  and transfers the wrapper data onto the two divs).
+
+### Fix
+
+The per-chunk expansion loop now stamps a `gallery` extension token's `about`
+from the same document-order checkpoint the media abouts use, and the gallery
+pass reads it. `gallery_data_mw` records the parsed attributes minus `caption`,
+the line builders emit the `\n` separators, `fmt_gallery_width` formats 14
+significant digits, and the box/`.thumb`/`.gallerytext` are marked with an empty
+`data-parsoid` slot in place of the stray `data-mw`.
+
+### Effect: byte 90688 moves to 123582
+
+`Zebra`'s first difference is now **123582 (22.06% of the oracle)**. No subset
+first-difference offset regresses (`Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds
+at **877/896**, and 970 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 123582: a ref anchor without its group
+
+A grouped ref (`{{efn}}`, `group="lower-alpha"`) is served as
+
+```
+<a href="./Zebra#cite_note-61" data-mw-group="lower-alpha" id="mwAq8">
+```
+
+where rustoid omits `data-mw-group`. The `data-mw.attrs.group` is already correct
+on the `<sup>`; only the anchor's `data-mw-group` mirror is missing.
