@@ -11312,3 +11312,52 @@ and re-parsed, and rustoid *defers* the answer's extensions (see the note on
 templatestyles' own `about` (`#mwt15`) and the `#mwt13`/`#mwt14` the service
 spends before it are what rustoid is missing, so the fix likely lives in that
 deferral/re-parse path rather than in `should_stash` itself. Start there.
+
+## Fixed: the flipped path stashes a range's rendering-transparent run
+
+`DOMRangeBuilder::encapsulateTemplates` runs
+`handleRenderingTransparentEltsBetweenBlocks($range)` for *every* range, which
+moves a trailing run of rendering-transparent nodes (a template's
+`<templatestyles>` and category links) into an `mw-empty-elt` span. rustoid had
+that in `wrap_transclusion_children` (the sibling path) but not in
+`wrap_flipped_children` (the common-ancestor / fostered-table path), so a
+transclusion that reached the tree builder flipped never got its trailing run
+stashed. The taxobox is exactly that shape, and its `<style>` came out bare
+while the Hatnote `{{distinguish}}` at the top of the same page (a sibling
+range) was wrapped correctly — which is why the difference looked
+range-specific.
+
+Two changes:
+
+- `wrap_flipped_children` now stashes its range after encapsulation, using the
+  bounds of the just-processed range (`stash_range` drains them, stashes, and
+  splices back).
+- `stash_stashable_runs` no longer treats a left-over transclusion marker meta
+  as the run's neighbouring block. Parsoid removes the start/end markers before
+  it stashes, so they must not count — and the flipped path leaves the end meta
+  in place when it is a direct sibling, whose matching `about` otherwise failed
+  `shouldStashRenderingTransparentNodes`' "next shares the about" test.
+
+### Effect: byte 15139 moves to 15284
+
+`Zebra`'s first difference is now **15284**. Every other subset offset is
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 960 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 15284
+
+The wrapper span now matches; the taxobox `<style>` takes `about="#mwt14"` where
+Parsoid has `#mwt15` — rustoid's `about` counter is one spend behind at that
+point, and every following `#mwt…` (the `IPAc-en` span, its templatestyles) is
+off by the same one. Everything before the `<style>` matches byte-for-byte, so
+the missing spend is an `about` id allocated and *discarded* between the
+temporal-range `<ref>` (`#mwt13`) and the templatestyles. The likely candidates
+are the passes that allocate an id whose marker is removed before output —
+`ExtensionHandler` for an indicator-like extension, or
+`MarkFosteredContent::insertTransclusionMetas`, which rustoid deliberately
+defers (`mark_fostered_content.rs` has an explicit FIXME for the
+`newAboutId` + `transclusionMetaTagDepthMap` pair). Finding which extension the
+service numbers here — the ids `#mwt6`, `#mwt8`, `#mwt10`, `#mwt11` are likewise
+spent and discarded earlier in the page — is the next target.
