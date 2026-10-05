@@ -11375,3 +11375,72 @@ rustoid, targeting the live service, would need to model that same spend. The
 discarded id (`#mwt14`) emits nothing, so its owner has to be identified from the
 id sequence (`RUSTOID_TRACE_ABOUT=1`) against the service's extension set, not
 from the DOM. Parked here rather than guessed at.
+
+**Resolved** in the section below: the extension is Cite, the phantom id is one
+per `<ref>` rendered inside a transclusion, and the live REST transform endpoint
+reproduces it directly.
+
+## Fixed: a `<ref>` inside a transclusion spends an extra `about` id
+
+### Cause
+
+The taxobox `<style>` took `about="#mwt14"` where the pinned oracle has
+`#mwt15`, and every following `#mwt…` was off by the same one. The missing spend
+sits between the temporal-range `<ref>` (`#mwt13`) and the stylesheet, and —
+unlike every other difference chased so far — it emits nothing at all.
+
+The spend belongs to the *live* Cite extension, and the REST transform endpoint
+reproduces it without touching a wiki page:
+
+```
+curl -s -X POST 'https://en.wikipedia.org/api/rest_v1/transform/wikitext/to/html/Zebra' \
+  --data-urlencode 'wikitext={{Geological range|2|0|ref=<ref>abc</ref>|PS=a}}'
+```
+
+That gives `#mwt1` (transclusion), `#mwt2` (ref), **`#mwt3` (nothing)**,
+`#mwt4` (references). Dropping `ref=` drops the phantom; a *top-level* ref
+(`Hello<ref>abc</ref> world`) has no phantom either; two refs inside one
+transclusion give two phantoms, one per ref, interleaved with the refs. `<pre>`,
+`<math>` and `<gallery>` inside a transclusion add none, so the spend is Cite's,
+not `ExtensionHandler`'s.
+
+The local standalone install mocks `<ref>` through Parsoid's parser-test
+handler, which shares one `about` between the ref and the list and never
+allocates the phantom — that is why the earlier note read "not reproducible".
+The REST transform above *is* the repro, and it is the live oracle's behaviour
+rustoid has to match.
+
+### Fix
+
+`Parser::number_extension_token` now spends one extra id after a `<ref>`'s own
+when the ref is numbered from inside another expansion. A new
+`Parser::expansion_nesting` counter, held by an RAII guard for the duration of
+each `expand_templates` call, is 1 for the page-level call and >1 for anything
+spliced into it, so "inside a transclusion" is `expansion_nesting > 1`. A
+top-level ref spends nothing extra; one reached through a template — directly,
+through a template argument, or through a `frame:expandTemplate` answer — spends
+one, which is what the oracle shows.
+
+### Effect: byte 15284 moves to 16342
+
+`Zebra`'s first difference is now **16342**. The taxobox `<style>` is `#mwt15`
+and the `IPAc-en` transclusion `#mwt16`, matching the oracle. Every other subset
+offset is unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 960 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 16342
+
+The lead paragraph's first `{{IPAc-en}}` is fused with the one that follows it.
+The oracle emits
+
+```
+<p id="mwDg"><b id="mwDw">Zebras</b> (<span class="rt-commentedText nowrap"
+about="#mwt16" typeof="mw:Transclusion" data-mw='{"parts":[…one IPAc-en…]}'>
+```
+
+while rustoid hoists a single `about="#mwt16"` onto the whole `<p>` and records
+*both* `IPAc-en` calls in its `data-mw` parts. Two adjacent transclusions on the
+same line must stay separate wrappers here; rustoid's merge pass joined them.
+That is the next target.
