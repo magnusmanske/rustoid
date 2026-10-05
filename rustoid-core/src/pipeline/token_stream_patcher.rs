@@ -47,6 +47,23 @@ fn is_whitespace_string(item: &Item) -> bool {
     matches!(item, Item::Str(s) if !s.is_empty() && s.chars().all(|c| c == ' ' || c == '\t'))
 }
 
+/// Whether `item` is a `mw:Transclusion` start meta (PHP's `$tplInfo['startMeta']`).
+/// It is the one token after which `atStart` survives; every other token clears
+/// it (see [`TokenStreamPatcher::on_any`]).
+fn is_transclusion_start_meta(item: &Item) -> bool {
+    let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+        return false;
+    };
+    if t.name != "meta" || t.data_parsoid.stx.as_deref() == Some("html") {
+        return false;
+    }
+    t.attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("typeof"))
+        .and_then(|kv| kv.value.as_str())
+        .is_some_and(|ty| ty.split_whitespace().any(|c| c == "mw:Transclusion"))
+}
+
 /// Whether a string begins with list/table syntax that triggers the T2529
 /// reparse: `{|` (table start) or a list character `*`/`#`/`;`/`:`. Mirrors
 /// PHP's `preg_match( '/^(?:{\\|[:;#*])/', $token )`.
@@ -138,8 +155,18 @@ impl TokenStreamPatcher {
                     out.extend(self.get_result_tokens(vec![token]));
                 }
                 _ => {
+                    let is_start_meta = is_transclusion_start_meta(&token);
                     if let Some(items) = self.on_any(token) {
                         out.extend(items);
+                    }
+                    // PHP's `onAny` clears `$tplInfo['atStart']` in a `finally`
+                    // for every token *but* the start meta itself, so the T2529
+                    // reparse fires only for the string immediately after a
+                    // transclusion start. Clearing it only inside the string
+                    // branch (as before) left it set across an intervening link,
+                    // which turned the `:` in an `IPAc-en` label into a `<dl>`.
+                    if !is_start_meta {
+                        self.tpl_info_at_start = false;
                     }
                 }
             }
@@ -579,6 +606,27 @@ mod tests {
                 matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem")
             }),
             "expected a listItem token, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_t2529_no_reparse_after_intervening_token() {
+        // PHP's `onAny` clears `atStart` in a `finally` for every token but the
+        // start meta, so T2529 fires only for the string *immediately* after a
+        // transclusion. An intervening link must disable it — otherwise the
+        // `:` in an `IPAc-en` label (`[[American English|US]]: `) became a
+        // spurious `<dl>`.
+        let mut tsp = TokenStreamPatcher::new();
+        let out = tsp.run(vec![
+            meta("mw:Transclusion"),
+            link("mw:WikiLink"),
+            Item::Str(":text".to_string()),
+        ]);
+        assert!(
+            !out.iter().any(|it| {
+                matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem")
+            }),
+            "did not expect a listItem token, got {out:?}"
         );
     }
 
