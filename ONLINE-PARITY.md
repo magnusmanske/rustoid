@@ -11836,3 +11836,27 @@ raw `{{clade|1=a|2=b}}`, so the module instead strips its own outer class.
 Rendering the value through `tokens_to_source`/`table_token_wikitext` (wikitext)
 rather than HTML markup looks like the shape — the earlier HTML attempts failed
 because the Lua depends on wikitext, not tags.
+
+### The wikitext rendering is also lossy (attempted, reverted)
+
+Using `tokens_to_source` as the fallback does render the clade's tables as
+`{|…`, but it regresses the same three pages: `Zebro` MATCH → 24519 (17.91%),
+`Zebra` 45483 → 29668 (5.30%), `Nobel Prize` 5926 → 4269 (0.57%). The `Zebro`
+diff shows why — the `<div class="legend">` is rendered but its
+`<span class="mw-empty-elt"><style …>Legend/styles.css</style></span>` is gone.
+A generated `mw:DOMFragment` placeholder (a tunnelled `<templatestyles>`) has no
+`src`, and `tokens_to_source` emits nothing for it.
+
+The placeholder is *deferred* rather than resolved here: `expand_invoke_args`
+raises `style_defer`, so the stylesheet is numbered where the value lands, not
+where it is read. That is why falling back to the recorded source works for
+`Zebro`: the module re-emits the call, and the re-expansion resolves the
+stylesheet at the right place. The clade cannot use that because `Module:Clade`
+**string-matches** its argument.
+
+So the value must be the expansion *with the placeholder spelled as a strip
+marker* — `\x7fUNIQ--templatestyles-…-QINU\x7f`, the same device
+`render_answer_markers` already uses to carry a Lua answer's extension output
+through the module's string handling (see the `#tag`-ref section). Rendering the
+value as a strip-marker-bearing wikitext string, rather than dropping the
+placeholder or falling back to the unexpanded call, is the next step.
