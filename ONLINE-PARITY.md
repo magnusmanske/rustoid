@@ -12202,3 +12202,39 @@ A grouped ref (`{{efn}}`, `group="lower-alpha"`) is served as
 
 where rustoid omits `data-mw-group`. The `data-mw.attrs.group` is already correct
 on the `<sup>`; only the anchor's `data-mw-group` mirror is missing.
+
+## Fixed: a grouped ref citation link carries data-mw-group
+
+### Cause
+
+`References::renderRef` puts `data-mw-group` on the citation link — the in-text
+anchor — when the ref is grouped (`if ( $ref->group )`), alongside the
+`References` list's backlinks and note text. rustoid set it on those two but not
+on the citation link.
+
+### Fix
+
+`ref_use_node` adds `data-mw-group` right after the `href` (the order the service
+emits it) when `Reference::group` is non-empty.
+
+### Effect: byte 123582 moves to 128376
+
+`Zebra`'s first difference is now **128376 (22.92% of the oracle)**. No subset
+first-difference offset regresses (`Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds
+at **877/896**, and 970 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 128376: a category link a template emits
+
+The `{{Dead link}}` note body's transclusion is served as
+
+```
+<link rel="mw:PageProp/Category" href="./Category:All_articles_with_dead_external_links" about="#mwt294" typeof="mw:Transclusion" data-mw='…Dead link…' id="mwCS4"/>
+```
+
+where rustoid serves `<span about="#mwt294" typeof="mw:Transclusion" …>nil</span>`
+and moves the `<link>` after it. The template's whole output is a category link,
+so the transclusion wrapper has to merge onto the `<link>`; rustoid wraps it in a
+placeholder span carrying the literal text `nil`.
