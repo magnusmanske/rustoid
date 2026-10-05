@@ -408,6 +408,15 @@ pub fn run_once(
             if let Some(missing) = engine.take_missing_modules().into_iter().next() {
                 return Ok(Outcome::MissingModule(missing));
             }
+            // A `pcall` around a frame method swallows the deferred-call marker,
+            // so a run can finish "successfully" while still having asked the host
+            // to expand something — `Module:Autotaxobox`'s `getTaxonInfoItem`
+            // wraps `frame:expandTemplate` in `pcall` and fell back to its error
+            // indicator. The engine recorded the request regardless, so consult it
+            // here too and re-run with the answer.
+            if let Some(request) = engine.take_pending() {
+                return Ok(Outcome::Deferred(request));
+            }
             Ok(Outcome::Done(out))
         }
         Err(RustoidError::Lua(msg)) => {

@@ -7910,6 +7910,28 @@ mod tests {
         assert!(engine.take_pending().is_none());
     }
 
+    /// A module may wrap `frame:expandTemplate` in `pcall`, as `Module:Autotaxobox`
+    /// does. The deferred-call marker is then caught by the module, the call
+    /// returns "successfully" with its fallback — and the request has to be
+    /// visible to the host anyway, or the answer is never expanded and the
+    /// fallback is taken as final.
+    #[test]
+    fn a_pcall_wrapped_template_call_still_reports_its_request() {
+        let engine = make_engine();
+        let src = "local p = {} function p.main(frame) \
+            local ok, v = pcall(frame.expandTemplate, frame, { title = 'T' }) \
+            if ok then return v else return 'fallback' end end return p";
+        let out = engine.execute(src, "main", &[]).unwrap();
+        assert_eq!(out, "fallback");
+        assert!(
+            matches!(
+                engine.take_pending(),
+                Some(FrameRequest::ExpandTemplate { .. })
+            ),
+            "the swallowed request must still be reported"
+        );
+    }
+
     /// A `pairs` over a lazy `args` requests every argument at once, in the
     /// frame's order (`getArguments` merges numbered before named).
     #[test]
