@@ -11857,6 +11857,145 @@ stylesheet at the right place. The clade cannot use that because `Module:Clade`
 So the value must be the expansion *with the placeholder spelled as a strip
 marker* — `\x7fUNIQ--templatestyles-…-QINU\x7f`, the same device
 `render_answer_markers` already uses to carry a Lua answer's extension output
-through the module's string handling (see the `#tag`-ref section). Rendering the
-value as a strip-marker-bearing wikitext string, rather than dropping the
-placeholder or falling back to the unexpanded call, is the next step.
+through the module's string handling (see the `#tag`-ref section). That is the
+shape the fix took.
+
+## Fixed: a table-bearing module argument renders like a module answer
+
+### Cause
+
+A module that **string-matches** the wikitext of an argument cannot be handed the
+raw call. `Module:Clade` reads its nested `{{clade|…}}` and strips a fixed
+substring from it, so the service hands it the *expansion*, and the module's
+string operations see the nested table. rustoid's `argument_value_text` declined
+the value — the expansion holds a `mw:DOMFragment` placeholder (a tunnelled
+`<templatestyles>`) whose content is stashed, not in the token stream — so
+`argument_value_or_source` fell back to the recorded source: the *unexpanded*
+call. `Module:Clade` then found nothing to strip and wrapped the wrong div, and
+the echoed call re-expanded (looping, until the loop-check fix).
+
+The service avoids this because the preprocessor spells an extension tag's output
+as a `UNIQ…QINU` strip marker before the module sees it; the module's string
+handling passes the marker through, and it is unpacked afterwards.
+
+### Fix
+
+`Parser::expand_invoke_arg_text` renders the value with `render_answer_markers`
+— Scribunto's own answer shape — when `argument_value_text` declines **and** the
+value holds a table token. `render_answer` rebuilds `{|` tables from their token
+data and spells every placeholder as a strip marker that
+`substitute_strip_markers` splices back when the module's output is re-parsed.
+
+The table gate is what keeps this narrow enough to be safe: `render_answer`
+rebuilds table syntax but not other generated markup (`<ul>`/`<li>`, which an
+infobox's `starring = {{Plainlist|…}}` carries), so those keep the source
+fallback and the module re-expands the call where the re-expansion is faithful.
+
+### Effect: byte 45483 moves to 45762
+
+`Zebra`'s first difference is now **45762 (8.17% of the oracle)**. The clade's
+nested rows render from the answer rather than the raw call. No subset offset
+regresses (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds at
+**877/896**, and 965 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 45762: the table's attribute separator
+
+The nested clade's table is served `<table class="clade">`; rustoid served
+`<table>`. `Module:Clade` builds its own outer table as `{|class="clade"` — no
+space after the marker — and, before wrapping it in `<div class="clade">`, strips
+every occurrence of `' class="clade"'` (**with** a leading space) so only the
+outer clade keeps its styling. The nested clade's value is the module's own
+return wikitext, `<div class="clade">\n{|class="clade"…`; the `<div>` carries the
+space and is stripped, but the table does not, so it keeps its class.
+
+rustoid rendered the nested table's wikitext with a space — `{| class="clade"` —
+so the module's pattern matched and the class was stripped. The space came from
+`token_utils::table_token_wikitext`, which rebuilds a table's attribute box from
+the *expanded* attributes and prefixed the first with one.
+
+## Fixed: a table token keeps its source attribute separator
+
+### Cause
+
+`token_utils::table_token_wikitext` reconstructs the attribute box rather than
+copying the source, because the source still spells the templates the expansion
+substituted (`{{{colour}}}` in a taxobox) and the module must receive the answer.
+That reconstruction always pushed a space before each attribute, so a table
+written `{|class="clade"` came back as `{| class="clade"`.
+
+Parsoid never invents the separator: `TokenStreamPatcher::convertNonHTMLTokenToString`
+appends the source attribute box (`$dp->getTemp()->attrSrc`) verbatim, and
+`TableFixups::convertAttribsToContent` uses the same `attrSrc`. For `table` and
+`tr` tokens rustoid's `attr_src` is exactly that box — the source after the
+marker — so its leading whitespace is the separator to keep.
+
+### Fix
+
+The separator before the first attribute is the source's leading whitespace for
+`table`/`tr` tokens, and a single space elsewhere. Cells keep the space because
+their `attr_src` still carries the `|` marker (`apply_build_table_tokens_attrs`),
+so its leading whitespace is not the cell's separator; changing the cells is out
+of scope here.
+
+### Effect: byte 45762 moves to 59383
+
+`Zebra`'s first difference is now **59383 (10.60% of the oracle)**, after
+backfilling one file the fix exposed — `File:The book of the animal kingdom
+(Plate XVII) (white background).jpg`, whose `imageinfo` was absent from the
+offline cache and rendered as broken media — with `RUSTOID_FILL_FILES=1`. No
+subset offset regresses (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds at
+**877/896**, and 966 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 59383: a `<br>` without an id
+
+The oracle serves `<br id="mw8A"/>` where rustoid served `<br/>`, in the
+`Extant species` table's dimension cells (`{{cvt|…}}<br />'''…'''`). The ids told
+the story: both sides gave the following `<b>` the same id (`mw8Q`), and the
+next cell's `<br>`/`<b>` pair likewise (`mw9g`/`mw9A`). rustoid therefore *did*
+consume the br's ids (240, 243) — `assign_node_ids` keyed the br — but emitted
+none, which only the serializer could explain.
+
+## Fixed: a br or hr serializes its attributes
+
+### Cause
+
+The HTML serializer special-cased `ElementKind::LineBreak` and
+`HorizontalRule` as bare `<br/>`/`<hr/>`, dropping every attribute. The id pass
+runs on the DOM, so a `<br>` that earned a generated id lost it in the output
+while still spending the counter — the next element matched the oracle in both
+renderings, which is what made the omission easy to misread as an id-rule
+problem. Only nine of the page's twenty-three `<br>`s take an id; those are the
+page's own table cells. The other fourteen (from navbox/taxobox templates) carry
+none on either side, so they were unaffected.
+
+### Fix
+
+Both arms emit the element's attributes via `serialize_attrs`, exactly as the
+table/div/span arms do. A `<br>` with no attributes still renders `<br/>`; one
+with a generated id renders `<br id="mw8A"/>`.
+
+### Effect: byte 59383 moves to 60966
+
+`Zebra`'s first difference is now **60966 (10.88% of the oracle)**. No subset
+first-difference offset regresses (only the rustoid byte totals grow, by the
+recovered ids); `Zebro` MATCHes, the fixture guard holds at **877/896**, and 967
+lib tests and 115 compare tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 60966: a ref `data-mw` without `body`
+
+Inside the `Extant species` table, an `{{sfn}}` ref's `data-mw` is served with a
+`body` pointing at the note:
+
+```
+"body":{"id":"mw-reference-text-cite_note-FOOTNOTECaro20169-24"}
+```
+
+and rustoid omits it. The `parts` (the `sfn` template) match; only `body.id` is
+missing, so this is the Cite ref's `data-mw`, which names where the ref's
+rendered content lives, rather than the template transclusion it wraps.
