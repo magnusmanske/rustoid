@@ -134,23 +134,24 @@ fn is_first_encapsulation_wrapper(node: &Node) -> bool {
         })
 }
 
-/// Handle an empty element, adding the `mw-empty-elt` class or removing
-/// deletable `mw-empty-elt` spans. Mirrors `CleanUp::handleEmptyElements`.
+/// Handle an empty element: add the `mw-empty-elt` class, remove a deletable
+/// `mw-empty-elt` span, or delete the element outright. Mirrors
+/// `CleanUp::handleEmptyElements`; returns `true` when the node is to be deleted.
 ///
 /// `in_tpl` is Parsoid's `$state->tplInfo`: true when the node is inside (or is
-/// the root of) a transclusion forest. It only widens the attribute tolerance
-/// below.
-fn handle_empty_element(node: &mut Node, in_tpl: bool) {
+/// the root of) a transclusion forest. It widens the attribute tolerance below
+/// and, together with the first-wrapper test, is what decides deletion.
+fn handle_empty_element(node: &mut Node, in_tpl: bool) -> bool {
     let tag = match &node.kind {
         NodeKind::Element(kind) => element_tag(kind),
-        _ => return,
+        _ => return false,
     };
 
     // Remove deletable `mw-empty-elt` wrapper spans (those which are empty, or
     // carry only a single IEW child), unless they anchor an about-chain.
     if tag == "span" && has_class(node, "mw-empty-elt") {
         if is_first_encapsulation_wrapper(node) {
-            return;
+            return false;
         }
         let deletable = node.children.is_empty()
             || (node.children.len() == 1
@@ -158,36 +159,47 @@ fn handle_empty_element(node: &mut Node, in_tpl: bool) {
         if deletable {
             node.children.clear();
         }
-        return;
+        return false;
     }
 
     if !flagged_empty_elts().contains(&tag.as_str()) {
-        return;
+        return false;
     }
 
     let mut has_rt_nodes = false;
     if !is_empty_node(node, &mut has_rt_nodes) {
-        return;
+        return false;
     }
 
-    // After removing the empty-element class, a flagged element is only
-    // "empty" (and hence marked) if it carries no meaningful attributes.
-    // For `<p>` this mirrors the legacy parser: an empty `<p>` with only
-    // `data-parsoid`/`stx` (parsoid-added) attributes is still markable.
-    //
-    // A node inside a transclusion (Parsoid's `$state->tplInfo`) additionally
-    // tolerates the template-wrapping attributes (`ALLOWED_TPL_WRAPPER_ATTRS`):
-    // the merged empty `<p>` `about="#mwt…" typeof="mw:Transclusion"
-    // data-mw='…'` is exactly this case, and the live service marks it
-    // `mw-empty-elt`.
-    for attr in &node.attrs {
-        let wrapper_attr = matches!(
-            attr.key.as_str(),
-            "about" | "typeof" | "data-parsoid" | "data-mw"
-        );
-        if !(attr.key == "data-parsoid" || attr.key == "stx" || (in_tpl && wrapper_attr)) {
-            return;
+    // A wikitext-syntax `<tr>` is not subject to the attribute check: the legacy
+    // parser's `handleTables` drops an empty row whatever its attributes
+    // (`<tr style="…">` with no cells included). Every other flagged element, and
+    // a *literal* `<tr>`, is only "empty" when it carries no meaningful
+    // attributes.
+    let is_literal_html_tr = tag == "tr" && has_literal_html_marker(node.dp.as_ref());
+    if tag != "tr" || is_literal_html_tr {
+        // An empty `<p>` with only `data-parsoid`/`stx` (parsoid-added) is still
+        // markable. A node inside a transclusion additionally tolerates the
+        // template-wrapping attributes (`ALLOWED_TPL_WRAPPER_ATTRS`): the merged
+        // empty `<p about="#mwt…" typeof="mw:Transclusion" data-mw='…'>` is
+        // exactly that case, and the live service marks it `mw-empty-elt`.
+        for attr in &node.attrs {
+            let wrapper_attr = matches!(
+                attr.key.as_str(),
+                "about" | "typeof" | "data-parsoid" | "data-mw"
+            );
+            if !(attr.key == "data-parsoid" || attr.key == "stx" || (in_tpl && wrapper_attr)) {
+                return false;
+            }
         }
+    }
+
+    // An empty flagged element inside a transclusion that is not the range's
+    // first node is deleted; otherwise it is marked, so a wiki can style it. The
+    // deleted rows are exactly the blank `{{!}}-` rows a template leaves between
+    // its cells — Parsoid keeps the intervening newlines, not empty rows.
+    if in_tpl && !is_first_encapsulation_wrapper(node) && !has_rt_nodes {
+        return true;
     }
 
     // Add the `mw-empty-elt` class (merging with any existing `class`).
@@ -200,6 +212,7 @@ fn handle_empty_element(node: &mut Node, in_tpl: bool) {
         None => "mw-empty-elt".to_string(),
     };
     node.set_attr("class", merged);
+    false
 }
 
 /// Whether a node is the root of an encapsulated DOM forest — an element whose
@@ -228,9 +241,13 @@ pub fn run(root: &mut Node) {
     cleanup_node(root, false);
 }
 
-fn cleanup_node(node: &mut Node, in_tpl: bool) {
+/// Clean one node's subtree. Returns `true` when the node itself was deleted by
+/// [`handle_empty_element`], so the caller drops it instead of emitting it.
+fn cleanup_node(node: &mut Node, in_tpl: bool) -> bool {
     let in_tpl = in_tpl || is_first_encapsulation_wrapper(node);
-    handle_empty_element(node, in_tpl);
+    if handle_empty_element(node, in_tpl) {
+        return true;
+    }
     trim_whitespace(node);
 
     // `finalCleanup`: strip `mw:Nowiki` spans from encapsulated content, but
@@ -239,18 +256,56 @@ fn cleanup_node(node: &mut Node, in_tpl: bool) {
     // `DOMUtils::migrateChildren` + `removeChild`.
     let children = std::mem::take(&mut node.children);
     let mut out = Vec::with_capacity(children.len());
-    for mut child in children {
-        if in_tpl && is_nowiki_span(&child) && !is_encapsulated_dom_forest_root(&child) {
-            for mut grandchild in std::mem::take(&mut child.children) {
-                cleanup_node(&mut grandchild, in_tpl);
-                out.push(grandchild);
+
+    // Parsoid's `tplInfo` (`DOMTraverser` + `WTUtils::getAboutSiblings`) spans a
+    // first encapsulation wrapper and the run of consecutive about-siblings that
+    // follow it, so every node in that range counts as "inside a transclusion" —
+    // even when the wrapper is a *sibling* of the content, as with the taxobox's
+    // empty `<p about="#mwt1">` and the `<table about="#mwt1">` after it. Record
+    // each range's end index up front, since the loop consumes the children.
+    let mut range_end: Vec<Option<usize>> = vec![None; children.len()];
+    let mut i = 0;
+    while i < children.len() {
+        if is_first_encapsulation_wrapper(&children[i])
+            && let Some(about) = children[i].get_attr("about")
+        {
+            let mut last = i;
+            let mut k = i + 1;
+            while k < children.len()
+                && matches!(children[k].kind, NodeKind::Element(_))
+                && children[k].get_attr("about") == Some(about)
+            {
+                last = k;
+                k += 1;
             }
+            range_end[i] = Some(last);
+            i = last + 1;
         } else {
-            cleanup_node(&mut child, in_tpl);
+            i += 1;
+        }
+    }
+
+    let mut active_until: Option<usize> = None;
+    for (idx, mut child) in children.into_iter().enumerate() {
+        if let Some(last) = range_end[idx] {
+            active_until = Some(last);
+        }
+        let child_in_tpl = in_tpl || active_until.is_some();
+        if child_in_tpl && is_nowiki_span(&child) && !is_encapsulated_dom_forest_root(&child) {
+            for mut grandchild in std::mem::take(&mut child.children) {
+                if !cleanup_node(&mut grandchild, child_in_tpl) {
+                    out.push(grandchild);
+                }
+            }
+        } else if !cleanup_node(&mut child, child_in_tpl) {
             out.push(child);
+        }
+        if active_until == Some(idx) {
+            active_until = None;
         }
     }
     node.children = out;
+    false
 }
 
 /// Drop the `data-parsoid` of nodes inside a transclusion that the service keeps
