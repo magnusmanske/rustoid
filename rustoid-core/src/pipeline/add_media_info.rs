@@ -1192,6 +1192,9 @@ fn mark_error_with_description_link(
         .position(|c| matches!(c.kind, NodeKind::Element(_)))
     {
         let anchor = &mut container.children[anchor_idx];
+        // `replaceAnchor` runs for the error case too, so the fresh anchor takes
+        // an empty `data-parsoid` slot (see `rewrite_structure`).
+        anchor.empty_dp_slot = true;
         anchor
             .attrs
             .retain(|a| a.key != "class" && a.key != "title" && a.key != "href");
@@ -1276,6 +1279,9 @@ fn mark_bad_file(
         .position(|c| matches!(c.kind, NodeKind::Element(_)))
     {
         let anchor = &mut container.children[anchor_idx];
+        // `replaceAnchor` runs for the error case too, so the fresh anchor takes
+        // an empty `data-parsoid` slot (see `rewrite_structure`).
+        anchor.empty_dp_slot = true;
         anchor
             .attrs
             .retain(|a| a.key != "class" && a.key != "title" && a.key != "href");
@@ -1329,6 +1335,12 @@ fn rewrite_structure(
 
     {
         let anchor = &mut container.children[anchor_idx];
+        // `AddMediaInfo::replaceAnchor` builds the anchor fresh
+        // (`$doc->createElement('a')`), so it carries an empty `data-parsoid`
+        // slot and takes a node id — unless the discard of an enclosing
+        // encapsulation wins (see `assign_walk`). Marking the slot is what makes
+        // a page-content media anchor serve `<a … id="mwXXX">`.
+        anchor.empty_dp_slot = true;
         // Strip the red-link markers left by `renderFile` (class="new",
         // title=file-name, href=upload-url). They are replaced below.
         anchor

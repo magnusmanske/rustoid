@@ -269,9 +269,13 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
         // side; a `<section>` has no `data-parsoid` yet still takes the
         // document's first id.
         //
-        // `discardable_dp` is the exception that a plain `data-mw` test misses:
-        // inside an encapsulation range Parsoid stores no `data-parsoid`, so the
-        // node takes no id even though it carries a `data-mw`.
+        // `discardable_dp` is the exception both keyed-by-slot and keyed-by-`data-mw`
+        // tests miss: inside an encapsulation range Parsoid stores no
+        // `data-parsoid` (`TempData::DISCARDABLE_DP`), so the node takes no id
+        // even though it carries a `data-mw` or a slot. The media `<a>` a
+        // template builds is the case that matters: `AddMediaInfo` creates it
+        // fresh, so it is keyed by a slot like any page-content media anchor —
+        // but inside a transclusion the discard wins and it stays unkeyed.
         //
         // An empty `id=""` is treated as absent, as Parsoid does ("Forcibly
         // reset the ID if it is invalid").
@@ -280,7 +284,7 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
             .as_deref()
             .is_some_and(data_parsoid_draws_an_id);
         let has_metadata =
-            has_dp || node.empty_dp_slot || (node.data_mw.is_some() && !node.discardable_dp);
+            has_dp || ((node.empty_dp_slot || node.data_mw.is_some()) && !node.discardable_dp);
         let has_id = node.get_attr("id").is_some_and(|v| !v.is_empty());
         if has_metadata && !has_id {
             let id = alloc.next_id();
@@ -393,6 +397,30 @@ mod tests {
         assert_eq!(assign_node_ids(&mut root), 1, "only the wrapper is keyed");
         assert_eq!(root.children[0].get_attr("id"), Some("mwAQ"));
         assert_eq!(root.children[0].children[0].get_attr("id"), None);
+    }
+
+    #[test]
+    fn a_slot_is_keyed_unless_the_dp_was_discarded() {
+        use crate::dom::node::{ElementKind, Node};
+        // A page-content media anchor is keyed by its empty `data-parsoid` slot
+        // (`AddMediaInfo` builds it fresh), so it serves an id. The same anchor
+        // inside a transclusion has its dp discarded and stays unkeyed.
+        let mut root = Node::document();
+        let mut page_anchor = Node::element(ElementKind::Other("a".into()));
+        page_anchor.empty_dp_slot = true;
+        root.push_child(page_anchor);
+        let mut tpl_anchor = Node::element(ElementKind::Other("a".into()));
+        tpl_anchor.empty_dp_slot = true;
+        tpl_anchor.discardable_dp = true;
+        root.push_child(tpl_anchor);
+
+        assert_eq!(
+            assign_node_ids(&mut root),
+            1,
+            "only the page anchor is keyed"
+        );
+        assert_eq!(root.children[0].get_attr("id"), Some("mwAQ"));
+        assert_eq!(root.children[1].get_attr("id"), None);
     }
 
     #[test]
