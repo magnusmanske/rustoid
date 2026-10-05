@@ -82,15 +82,17 @@ pub struct Reference {
     /// trimmed — `TokenUtils::kvToHash`), which is why a `<ref group="">` keeps
     /// its empty `group` where a `<ref name="x">` has none.
     pub use_attrs: Vec<Vec<(String, String)>>,
-    /// Which use supplied this note's wikitext, as an index into `uses`.
+    /// One entry per use site, parallel to `uses`: whether that use carried its
+    /// own non-empty body (`<ref name="x">…</ref>`) rather than being a bare
+    /// `<ref name="x"/>` reuse.
     ///
-    /// **Not** necessarily the first. A reuse can precede the definition —
-    /// `A<ref name="x"/>B<ref name="x">body</ref>` is a real page shape, and
-    /// `Zebra` opens with one inside an infobox — in which case Cite allocates
-    /// the number and the first `id` from the *reuse*, and the later definition
-    /// merely fills in the text. The `data-mw` `body` pointer follows the text,
-    /// so it lands on the defining use rather than on use zero.
-    pub body_use: Option<usize>,
+    /// Parsoid points every such use at the note's text, not only the one that
+    /// supplied it: `References::renderReference` sets `$refDataMw->body->id`
+    /// whenever the use's own body is non-empty, and only a bare self-closing
+    /// reuse (empty body) gets none. An `{{sfn}}` footnote, which repeats the
+    /// same content at every occurrence, therefore carries a `data-mw.body` on
+    /// each — a shape that a `body_use`-only rule got wrong.
+    pub use_has_body: Vec<bool>,
     /// The `about` id of the use that supplied this note's body.
     ///
     /// A `<ref>` body is expanded *at the ref site* during template expansion
@@ -254,7 +256,7 @@ impl CiteState {
                     global_id,
                     uses: Vec::new(),
                     use_attrs: Vec::new(),
-                    body_use: None,
+                    use_has_body: Vec::new(),
                     body_about: None,
                 });
                 let i = self.references.len() - 1;
@@ -284,11 +286,9 @@ impl CiteState {
         );
         self.references[idx].uses.push(id.clone());
         self.references[idx].use_attrs.push(attrs);
-        // The pointer belongs to the use that supplied the text, which is this one
-        // whenever it defines.
-        if defines {
-            self.references[idx].body_use = Some(self.references[idx].uses.len() - 1);
-        }
+        // Whether *this* use carried its own body drives its `data-mw.body`
+        // pointer, not which use defined the note (see `use_has_body`).
+        self.references[idx].use_has_body.push(defines);
         id
     }
 
@@ -439,15 +439,18 @@ pub fn ref_data_mw(reference: &Reference, use_index: usize) -> String {
             .collect::<Vec<_>>()
             .join(",")
     );
-    // Only the use that supplied the note's text points at it. That is *not*
-    // necessarily the first use: a reuse may precede the definition
-    // (`A<ref name="x"/>B<ref name="x">body</ref>`), and `Zebra` opens with
-    // exactly that shape inside an infobox. Every other use carries no `body` at
-    // all, because its text already lives in the note the list renders.
+    // Every use that carried its own body points at the note's text; only a bare
+    // reuse (empty body) carries none. That is *not* the same as "the defining
+    // use": an `{{sfn}}` footnote repeats its content at every occurrence, so
+    // each of its uses has a `body`, and a reuse may precede the definition —
+    // `A<ref name="x"/>B<ref name="x">body</ref>` is a real page shape, and
+    // `Zebra` opens with one inside an infobox — where the bare reuse carries
+    // none and the defining use,
+    // [`use_has_body`](Reference::use_has_body), does.
     //
     // `attrs` is emitted even when empty, which is Cite's shape for a bare
     // `<ref>`.
-    if reference.body_use != Some(use_index) {
+    if reference.use_has_body.get(use_index) != Some(&true) {
         return format!("{{\"name\":\"ref\",\"attrs\":{attrs}}}");
     }
     format!(
@@ -1452,21 +1455,35 @@ mod tests {
         );
     }
 
-    /// The `body` pointer follows the *defining* use, which need not be the
-    /// first — and on a real page often is not, because a reuse can appear
-    /// earlier (inside an infobox, say) than the prose that carries the text.
+    /// The `body` pointer follows the use's *own* content, so an `{{sfn}}`
+    /// footnote — whose every occurrence repeats the same body — carries a
+    /// `data-mw.body` on each use, while a bare reuse carries none. A reuse can
+    /// also appear earlier than the definition (inside an infobox, say), which is
+    /// why the pointer is not simply "use zero".
     #[test]
-    fn ref_data_mw_points_at_the_defining_use_not_the_first() {
+    fn ref_data_mw_points_every_body_carrying_use_at_the_note() {
         let mut st = CiteState::new();
         st.add("x", "", "hello", false, None);
-        // Only use, and it defines: the pointer is here.
+        // The only use, and it carries a body: the pointer is here.
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{"name":"x"},"body":{"id":"mw-reference-text-cite_note-x-1"}}"#
         );
 
-        // Reuse first, then the definition: the pointer moves to use 1, and use 0
-        // carries none. This is the shape `Zebra` opens with.
+        // Every occurrence of a repeated body points at the same note — the
+        // `{{sfn}}` shape, where each use repeats the identical content.
+        let mut st = CiteState::new();
+        st.add("x", "", "hello", false, None);
+        st.add("x", "", "hello", false, None);
+        for use_index in 0..2 {
+            assert_eq!(
+                ref_data_mw(&st.references[0], use_index),
+                r#"{"name":"ref","attrs":{"name":"x"},"body":{"id":"mw-reference-text-cite_note-x-1"}}"#
+            );
+        }
+
+        // Reuse first, then the definition: the bare reuse carries no body, and
+        // the defining use does. This is the shape `Zebra` opens with.
         let mut st = CiteState::new();
         st.add("x", "", "", true, None);
         st.add("x", "", "hello", false, None);
