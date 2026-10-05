@@ -11094,3 +11094,81 @@ adds an `attribs` entry for the `link=` option
 (`{"attribs":[["link",{"txt":"Template:Taxonomy/Equus (Hippotigris)"}]],…}`).
 The rendered `<a href>` matches, so this is a shape difference in the media
 `data-mw`'s options. That is the next target.
+
+## Fixed: `link=` is dropped from a media `data-mw` once it is applied
+
+`AddMediaInfo::replaceAnchor` reads the `link` option and, having applied it,
+removes it again — but only when `$discard` is true. `$discard` starts at
+`!$errs` (true on this error-free image path) and is cleared to false in exactly
+one place, the invalid-title fallback, which keeps the option so the edit can
+round-trip:
+
+```php
+$discard = !$errs;
+…
+$link = $env->makeTitleFromText( $val, null, true );
+if ( $link !== null ) {
+    $anchor->setAttribute( 'href', $env->makeLink( $link ) );
+} else {
+    $addDescriptionLink( $attrs['title'] );
+    $discard = false;            // preserve for roundtripping
+}
+…
+if ( $discard ) {
+    WTSUtils::getAttrFromDataMw( $dataMw, 'link', /* keep */ false );
+}
+```
+
+rustoid only dropped `alt`, never `link`. The rendered `<a href>` already
+matched, so the difference was purely the leftover `attribs` entry. `rewrite_
+structure` now returns whether the option was consumed (false on its early
+returns and in the invalid-title arm) and `apply_media_info` removes `link` from
+the container's `data-mw` when it was.
+
+### Effect: byte 11745 moves to 11782
+
+`Zebra`'s first difference is now **11782**. The subset is unchanged (`Zebro`
+MATCHes, the fixture guard holds at **877/896**, 954 lib tests pass, `cargo fmt`
+and clippy are clean).
+
+### The next difference at 11782
+
+The taxonomy edit span is `<span typeof="mw:File" data-mw='{"caption":"Edit this
+classification"}' id="mwDg">` in rustoid; Parsoid gives it no `id`. That is the
+next target.
+
+## Fixed: a discarded `data-parsoid` also suppresses the `data-mw` id
+
+The id pass keys a node when Parsoid *stores* its `data-parsoid`. rustoid models
+that as "has a non-empty `data-parsoid`", "has a `data-parsoid` slot" (the
+`serializeNewEmptyDp` case a `<section>` shows), or "has a `data-mw`". The last
+clause is a proxy — a transclusion wrapper keeps its metadata as `data-mw` — but
+it is too broad: inside an encapsulation range Parsoid stores no `data-parsoid`
+for a node that is neither the range's first nor its last, so the node takes no
+id **even when it carries a `data-mw`**. That is the media span a template builds
+(`<span typeof="mw:File" data-mw='{"caption":…}'>`) inside the taxobox: the
+wrapper around it is keyed, the span is not.
+
+`CleanUp::markDiscardableDataParsoid` already clears the blob; it now also sets a
+`discardable_dp` node flag, mirroring `TempData::DISCARDABLE_DP`, and the id rule
+becomes `has_dp || empty_dp_slot || (data_mw && !discardable_dp)`. Nodes the
+range exempts (its first/last, native extension content, an `stx`-bearing last
+node or heading) are not flagged, so they keep their `data-mw`-derived id — which
+is why the fix is narrow: 55 bytes on `Zebra`, against the 1001 a blanket
+"`data_mw` no longer keys" test removed while regressing most of the subset.
+
+### Effect: byte 11782 moves to 12644
+
+`Zebra`'s first difference is now **12644**, and every other subset offset is
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 955 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 12644
+
+After the taxonomy header, Parsoid's taxobox rows carry a stray space:
+`<tr class="taxonrow"> \n<td>Phylum:</td>`, where rustoid emits
+`<tr class="taxonrow">\n<td>`. The space is inside the `<tr>`, before the
+newline — a whitespace/foster-point difference in the `{{!}}`-built rows of
+`Template:Taxobox/core`. That is the next target.
