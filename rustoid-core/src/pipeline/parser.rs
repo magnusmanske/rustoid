@@ -4912,7 +4912,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             items.insert(0, Item::Tok(ParsoidToken::Nl(nl)));
         }
 
-        let child = frame.new_child(frame.title().clone(), vec![]);
+        // The module's output is expanded in a child of the calling frame. It
+        // carries the calling frame's arguments so that a nested `#invoke` in
+        // the output sees them through `frame:getParent()`: `Module:Unsubst`
+        // returns a template body verbatim, and the `#invoke` inside it needs
+        // the enclosing template's arguments. The title is the calling frame's
+        // too, so a genuine self-invocation still trips the loop guard.
+        let child = frame.new_child(frame.title().clone(), frame.args().args.clone());
         // The document's counter, not a fresh one. A module's output can carry a
         // `<templatestyles>` — `Module:Infobox` emits one through
         // `frame:extensionTag` — and that stylesheet's `about` id belongs to the
@@ -5151,9 +5157,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if !has_template && !has_arg_ref {
                 continue;
             }
-            // The argument reference is substituted from the **parent** frame, as
-            // MediaWiki does: the value was written in the calling template, and
-            // the child frame built below has no arguments of its own.
+            // The argument reference is substituted from the **calling** frame, as
+            // MediaWiki does: the value was written in the calling template. The
+            // child below inherits that frame's arguments so that a nested
+            // `#invoke` in the value sees them through `frame:getParent()` —
+            // `{{Further|…}}`'s body is returned verbatim by `Module:Unsubst`,
+            // and its inner `#invoke:labelled list hatnote` reads the enclosing
+            // template's arguments to learn which pages to name.
             let substituted = if has_arg_ref {
                 frame.expand(items)
             } else {
@@ -5171,7 +5181,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if let Some(text) = argument_value_text(&substituted) {
                 kv.vsrc = Some(text);
             }
-            let child = frame.new_child(frame.title().clone(), vec![]);
+            let child = frame.new_child(frame.title().clone(), frame.args().args.clone());
             let expanded = Box::pin(self.expand_templates(
                 &child,
                 substituted,
