@@ -11999,3 +11999,87 @@ Inside the `Extant species` table, an `{{sfn}}` ref's `data-mw` is served with a
 and rustoid omits it. The `parts` (the `sfn` template) match; only `body.id` is
 missing, so this is the Cite ref's `data-mw`, which names where the ref's
 rendered content lives, rather than the template transclusion it wraps.
+
+## Fixed: every ref use with its own body points at the note
+
+### Cause
+
+Parsoid sets `data-mw.body.id` on **each** use whose own body is non-empty
+(`References::renderReference`: `$refDataMw->body->id = ParsoidAnchorFormatter::getNoteTextIdentifier($ref)`),
+not only on the use that supplied the text. rustoid emitted it for one use per
+note — `body_use`, the last use that "defined" the note — so an `{{sfn}}`
+footnote, which repeats the same content at every occurrence, served `body` on
+its last use alone and the first difference moved to the first occurrence.
+
+### Fix
+
+`Reference::use_has_body` records, per use, whether that use carried its own
+non-empty body (`!self_closing && !body.is_empty()`), parallel to `uses` and
+`use_attrs`. `ref_data_mw` emits `body.id` for every use whose flag is set. A
+bare self-closing reuse still carries none, which is the shape `Zebra` opens
+with — a reuse inside an infobox — so that stays correct.
+
+### Effect: byte 60966 moves to 65912
+
+`Zebra`'s first difference is now **65912 (11.77% of the oracle)**. No subset
+first-difference offset regresses (only rustoid's byte totals grow, by the
+recovered `body` pointers); `Zebro` MATCHes, the fixture guard holds at
+**877/896**, and 967 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 65912: a media anchor without an id
+
+An inline `[[File:Grevy's Zebra Stallion.jpg|120px]]` in the `Extant species`
+table is served by the oracle as
+`<span typeof="mw:File" id="mwASQ"><a … id="mwASU"><img … id="mwASY"/>`.
+rustoid served the span and the img, but not the anchor — so the img took
+`mwASU` (the anchor's id in the oracle) and every id after it drifted by one.
+The anchor was the only element of the three with no metadata to key it by.
+
+## Fixed: a media anchor is keyed by its empty data-parsoid slot
+
+### Cause
+
+`AddMediaInfo::replaceAnchor` builds the anchor fresh (`$doc->createElement('a')`),
+so it carries an empty `data-parsoid` **slot** and takes a node id, even though
+nothing is emitted for it. rustoid created the anchor from a token whose
+`DataParsoid` was empty, which becomes *no* dp and *no* slot — so it took no id.
+
+The discard still wins inside a transclusion: there Parsoid stores no
+`data-parsoid` at all (`TempData::DISCARDABLE_DP`), which is why the taxobox and
+navbox media anchors carry no id on either side.
+
+### Fix
+
+`add_media_info` marks the rewritten anchor `empty_dp_slot`, and `assign_walk`
+gates **both** the slot and the `data-mw` key on `!discardable_dp` — Parsoid's
+`storeRichAttributes` returns nothing to key a node by when the dp was discarded,
+so neither path may fire. The gate is a no-op for a node with a real
+dp, because the discard clears the blob (`has_dp` and `discardable_dp` are
+mutually exclusive).
+
+### Effect: byte 65912 moves to 84252
+
+`Zebra`'s first difference is now **84252 (15.04% of the oracle)**. Every
+page-content media anchor gains its id and the drift they caused disappears at
+once, so the first difference clears the whole `Extant species` table. No subset
+first-difference offset regresses (`Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds
+at **877/896**, and 968 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 84252: a media `alt=` with markup in `data-mw`
+
+In the `Fossil record` section the oracle serves the thumbnail's `<figure>` with
+an `about` and a `data-mw` whose `attribs` record the rendered `alt`:
+
+```
+<figure … about="#mwt173" data-mw='{"attribs":[["alt",{"html":"alt= A fossil skull of &lt;i id=\"mwAbM\">Equus mauritanicu&lt;/i> ","txt":" A fossil skull of Equus mauritanicu"}]]}' id="mwAbQ">
+```
+
+rustoid serves the figure with no `about` and no `data-mw`, so the `<i>` the alt
+html contains never spends its id (`mwAbM`) and the figure takes it instead. The
+`alt=` value here carries wikitext markup (`''Equus mauritanicus''`), which
+Parsoid keeps as a serialized fragment in `data-mw.attribs` rather than
+flattening to the `txt`.
