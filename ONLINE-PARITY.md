@@ -12279,3 +12279,45 @@ The `{{Listen}}` call in the Communication section is served with an
 `Module:Listen` fails at line 126 with `attempt to index field 'file' (a nil
 value)`: `mw.title.makeTitle(-2, filename)` answers `exists = true` but
 `file = nil`, so a file whose page exists answers no imageinfo.
+
+## Fixed: a module's hashed call to a no-hash parser function
+
+### Cause
+
+`frame:callParserFunction` is served by rendering the call back to wikitext and
+re-expanding it, and `render_call` always wrote the `#` form. MediaWiki registers
+some functions *without* a hash (Parsoid's `ApiSiteConfig::updateFunctionSynonym`
+consults core's `$noHashFunctions`), and for those `{{#name:…}}` is a **broken**
+parser function that the service renders literally. So
+`frame:callParserFunction('DISPLAYTITLE', …)` — reached from `Module:Italic
+title`, which `{{Infobox film}}` calls — came out as a literal
+`{{#DISPLAYTITLE:…}}` inside a `<p>` instead of the empty expansion. That stray
+`<p>` also sat inside the `{{Infobox film}}` transclusion range, so the range no
+longer began at the stylesheet and the wrapper landed on the wrong node (the
+`nil` fix below exposed this).
+
+### Fix
+
+`render_call` writes the hashless spelling when the function is in the
+`noHashFunctions` set, ported from Parsoid's own list; every other function keeps
+its hash. `#tag` (how `frame:extensionTag` is lowered) and `#if` are unaffected.
+
+### Effect: no first-difference offset moves
+
+No subset first-difference offset changes and the fixture guard holds at
+**877/896**; the fix removes the literal `{{#DISPLAYTITLE:…}}` paragraph from
+`Quicksilver (film)` (and any other page whose module calls a no-hash function),
+which is a prerequisite for the Scribunto `nil` fix below. 971 lib tests and 115
+compare tests pass with clippy and `cargo fmt` clean.
+
+### Held: Scribunto returns `nil` as the string `nil`
+
+`LuaEngine::execute_in` runs the module's return through `tostring`, which turns
+`nil` into `"nil"`. Scribunto collects the return values into `{ func() }`,
+`tostring`s only what `ipairs` visits, and concatenates them (`mw.executeModule`),
+so a `nil` or absent return is `""`. The fix is measured and correct, but it is
+**held**: it exposes two separate bugs whose content differs *before* the current
+first difference on other pages — `Quicksilver (film)`'s `mw-empty-elt` wrapper
+(fixed by the no-hash change above) and `Nobel Prize`'s image rendering, where an
+empty caption makes rustoid answer `mw:Error … filedoesnotexist` instead of the
+file. Land it once the image case is fixed.
