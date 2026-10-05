@@ -2489,6 +2489,14 @@ fn stash_stashable_runs(content: &mut Vec<Node>, fostered: bool) {
         return;
     }
     let is_elt = |n: &Node| matches!(n.kind, NodeKind::Element(_));
+    // A transclusion marker meta is bookkeeping Parsoid removes before it stashes
+    // (`encapsulateTemplates` drops the start/end metas, then
+    // `handleRenderingTransparentEltsBetweenBlocks` runs), so it must not count as
+    // the block neighbouring a run. The flipped path leaves the end meta in place
+    // when it is a direct sibling, and the marker's matching `about` otherwise
+    // blocked the stash with `shouldStashRenderingTransparentNodes`' "next has the
+    // same about" test.
+    let is_boundary_elt = |n: &Node| is_elt(n) && !is_transclusion_marker_meta(n);
     let mut i = 0;
     while i < content.len() {
         if !is_elt(&content[i]) || !is_stashable_elt(&content[i]) {
@@ -2509,10 +2517,10 @@ fn stash_stashable_runs(content: &mut Vec<Node>, fostered: bool) {
         }
         let prev = (0..start)
             .rev()
-            .find(|&k| is_elt(&content[k]))
+            .find(|&k| is_boundary_elt(&content[k]))
             .map(|k| &content[k]);
         let next = (last + 1..content.len())
-            .find(|&k| is_elt(&content[k]))
+            .find(|&k| is_boundary_elt(&content[k]))
             .map(|k| &content[k]);
         if !should_stash(prev, next, &content[start]) {
             i += 1;
@@ -2917,8 +2925,45 @@ fn wrap_flipped_children(
             remove_start_meta(&mut children[i], about.as_deref());
             i += 1;
         }
+
+        // `handleRenderingTransparentEltsBetweenBlocks` runs for *every* range,
+        // flipped or not: a trailing rendering-transparent run — a template's
+        // `<templatestyles>` and category links — is stashed into an
+        // `mw-empty-elt` span. The sibling path does this on the range's
+        // `new_content`; the flipped path edits its range in place, so its
+        // bounds are computed here and that span of `children` is stashed.
+        let (rlo, mut rhi) = if start_is_sibling {
+            if t > i { (i, t - 1) } else { (t, i - 1) }
+        } else {
+            (lo, hi)
+        };
+        // The range also covers the `about`-sharing siblings the adoption pass
+        // stamped after the end holder.
+        while rhi + 1 < children.len()
+            && about.is_some()
+            && children[rhi + 1].get_attr("about") == about.as_deref()
+        {
+            rhi += 1;
+        }
+        stash_range(&mut children, rlo, rhi);
     }
     children
+}
+
+/// Stash the rendering-transparent runs inside one already-encapsulated range.
+///
+/// Mirrors the sibling path's direct `stash_rendering_transparent_elts` call on
+/// the range's `new_content`. The flipped path edits its range in place among
+/// its siblings, so the range is drained, stashed, and spliced back.
+fn stash_range(children: &mut Vec<Node>, lo: usize, hi: usize) {
+    if lo > hi || hi >= children.len() {
+        return;
+    }
+    let mut seg: Vec<Node> = children.drain(lo..=hi).collect();
+    stash_rendering_transparent_elts(&mut seg, false);
+    for (offset, node) in seg.into_iter().enumerate() {
+        children.insert(lo + offset, node);
+    }
 }
 
 /// Resolve the actual encapsulation target for a fostered table range.
@@ -3177,6 +3222,26 @@ mod tests {
             content[1].children[0].get_attr("about").is_none(),
             "the span carries the about, the moved links do not"
         );
+    }
+
+    /// A run whose following sibling is a left-over transclusion end-marker meta
+    /// (matching `about`) is still stashed. Parsoid drops the marker before it
+    /// stashes, so the marker must not count as the run's boundary block; the
+    /// flipped path leaves the end meta in place, which is where this arises.
+    #[test]
+    fn stashes_a_run_before_a_leftover_end_marker() {
+        let mut div = Node::element(ElementKind::Div);
+        div.set_attr("about", "#mwt1");
+        let mut end_meta = Node::element(ElementKind::Other("meta".to_string()));
+        end_meta.set_attr("typeof", "mw:Transclusion/End");
+        end_meta.set_attr("about", "#mwt1");
+        let mut content = vec![div, category_link("#mwt1"), end_meta];
+        stash_rendering_transparent_elts(&mut content, false);
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(crate::html::wts_utils::node_name(&content[1]), "span");
+        assert_eq!(content[1].get_attr("class"), Some("mw-empty-elt"));
+        assert_eq!(content[1].get_attr("about"), Some("#mwt1"));
     }
 
     /// A `<templatestyles>` reaches the tree builder as a `mw:DOMFragment`
