@@ -11785,3 +11785,54 @@ renderer, rather than widen `argument_value_text`.
 
 Both attempts are reverted; `ONLINE-PARITY.md` records them so the next pass
 starts from the DOM-rendering shape rather than the token-level one.
+
+## Fixed: a module's output expands without the title-chain loop check
+
+### Cause
+
+Rendering the argument value was the wrong lever. The value-rendering attempts
+above regressed `Zebro`/`Zebra`/`Quicksilver (film)` because the **fallback to
+the recorded source is intended**: a module is handed the wikitext of a call it
+can re-emit, and the output re-expands it. `Zebro` matches because its
+re-expansion (`{{legend|…}}`) has no ancestor to loop against.
+
+Instrumenting local Parsoid against the live API showed the real difference:
+`Frame::loopAndDepthCheck` is called with **`ignoreLoop = true`** for the
+recursive `{{clade}}`. Production Parsoid expands templates through MediaWiki's
+legacy preprocessor (`TemplateHandler.php`), and that path passes
+`ignoreLoop => true`; Parsoid's own title-chain check is bypassed there, so
+recursion is bounded only by depth. Rustoid's check is the only one it has, so
+`Module:Clade`'s output — which echoes the nested `{{clade}}` calls its Lua
+builds, since the argument reaches it as wikitext — read a `Template:Clade`
+ancestor and stopped.
+
+### Fix
+
+`Parser::module_scope` is raised (an RAII guard, like `expansion_nesting`) while
+a module's output expands, and `expand_one_template` passes it as `ignore_loop`.
+A template echoed by a module now expands on depth alone, as the service does.
+(Overturning an earlier guess: the output frame's *parent* is not the lever —
+rooting the output one frame up fixes the clade but badly breaks `{{Further}}`.)
+
+### Effect: byte 45480 moves to 45483
+
+`Zebra`'s first difference is now **45483**. The loop error is gone; the clade's
+nested rows render, and the rendered length grows by ~17KB toward the oracle's
+(540567 → 557965, against 560188). No subset offset regresses (`Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837), `Zebro`
+MATCHes, the fixture guard holds at **877/896**, and 964 lib tests pass with
+clippy and `cargo fmt` clean.
+
+### The next difference at 45483: the wrapper's class
+
+The nested clade's wrapper is `<div class="clade">` where the oracle has
+`<div>`. This is the module-argument rendering again, but the value must be
+**wikitext**, not HTML: `Module:Clade` string-matches the argument it is handed
+(`string.find(nodeLeaf, '{|class="clade"')`, then `string.gsub` it away and wrap
+in `<div class="clade">`). Live hands it the nested clade's expanded *wikitext*
+(`{|class="clade"…`), so the module strips the inner class; rustoid hands it the
+raw `{{clade|1=a|2=b}}`, so the module instead strips its own outer class.
+Rendering the value through `tokens_to_source`/`table_token_wikitext` (wikitext)
+rather than HTML markup looks like the shape — the earlier HTML attempts failed
+because the Lua depends on wikitext, not tags.
