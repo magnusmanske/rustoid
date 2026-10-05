@@ -935,6 +935,11 @@ pub fn ref_marker_nodes(
     let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
     let mut a = Node::element(ElementKind::Other("a".to_string()));
     a.set_attr("href", href);
+    // The citation link carries the group marker when the ref is grouped
+    // (mirrors `References::renderRef`'s `if ($ref->group)`).
+    if !reference.group.is_empty() {
+        a.set_attr("data-mw-group", &reference.group);
+    }
     mark_for_id(&mut a);
 
     let mut text = Node::element(ElementKind::Other("span".to_string()));
