@@ -324,18 +324,12 @@ impl HtmlSerializer {
             buf.push_str(&format!(" data-parsoid='{escaped}'"));
         }
         if let Some(ref dm) = node.data_mw {
-            // `&apos;` rather than `&#39;`: a `data-mw` value is JSON, and
-            // Parsoid writes the JSON entity for a quote — `&#39;` (which
-            // `data-parsoid` above uses) is another spelling of the same
-            // character and would differ byte-for-byte. `<` is escaped for a
-            // sharper reason: it is what ends an attribute in a lenient HTML
-            // parser, so a value carrying `<div class="…">` would otherwise
-            // truncate `data-mw` and spill the rest of the document as markup.
-            let escaped = dm
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('\'', "&apos;");
-            buf.push_str(&format!(" data-mw='{escaped}'"));
+            // A `data-mw` value is JSON, and Parsoid serializes it with the same
+            // `smartQuote` rule as any other attribute: single quotes when the
+            // value contains `"` and no more `'` than `"`, else double quotes.
+            // A `parts` blob carrying an apostrophe (clade labels, italic
+            // captions) therefore flips to double quotes with `&quot;`.
+            serialize_attr_kv("data-mw", dm, buf);
         }
     }
 
@@ -387,11 +381,7 @@ impl HtmlSerializer {
             buf.push_str(&format!(" data-parsoid='{escaped}'"));
         }
         if let Some(ref dm) = node.data_mw {
-            let escaped = dm
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('\'', "&apos;");
-            buf.push_str(&format!(" data-mw='{escaped}'"));
+            serialize_attr_kv("data-mw", dm, buf);
         }
         if let Some(id) = generated_id {
             serialize_attr(id, buf);
@@ -512,9 +502,9 @@ fn is_void_element(tag: &str) -> bool {
 }
 
 /// Serialize a single attribute. JSON data attributes set via `DOMDataUtils`
-/// (`data-mw-i18n`, and the `data-parsoid`/`data-mw` fields handled separately)
-/// are emitted single-quoted with raw inner quotes, matching PHP's
-/// `XHtmlSerializer`. All other attributes follow PHP's `smartQuote` rule:
+/// (`data-mw-i18n`, and the `data-parsoid` field handled separately) are emitted
+/// single-quoted with raw inner quotes, matching PHP's `XHtmlSerializer`. All
+/// other attributes — `data-mw` included — follow PHP's `smartQuote` rule:
 /// single quotes when the value contains `"` and (no `'` or more `"` than `'`),
 /// else double quotes, with the value escaped for the chosen quote.
 fn serialize_attr(attr: &crate::dom::node::Attribute, buf: &mut String) {
