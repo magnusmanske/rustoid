@@ -10949,3 +10949,49 @@ gap: the cached data has no `imageinfo` for
 probe shows the same). An online run fetches the file info; the difference
 should close there. Also still open: the taxonomy `<td>`s are empty where
 Parsoid has the `Animalia`/`Chordata`/… links.
+
+## Fixed: a module `[[File:…]]` lost through `frame:expandTemplate`
+
+The empty image cell was not only the missing `imageinfo`. A second bug hid
+behind it, visible in the *direct* `{{Taxobox/core|…}}` rendering, which showed
+the broken-media placeholder where the Lua path showed nothing at all.
+
+`Template:Taxobox/core` builds its image cell with
+`{{!}} colspan=2 … {{!}} {{#invoke:InfoboxImage|…}}`; the module answers
+`[[File:Plains Zebra Equus quagga cropped.jpg|frameless]]`. When `Taxobox/core`
+is expanded through a module's `frame:expandTemplate`, the answer is stringified
+by `render_answer`, and that function renders a token from its
+`data_parsoid.src` or, for table syntax, rebuilds it. A `wikilink` tokenized from
+a page or template body carries `src`, but one tokenized from a *module's
+output* does not — so `render_answer` dropped it, and the cell came back empty.
+
+`render_answer` now rebuilds a `wikilink` without `src` from its `href` and
+`mw:maybeContent` parts (the same reconstruction `argument_value_text` already
+uses), so the link survives the stringify-and-reparse.
+
+With the link restored, `AddMediaInfo` reaches the file, and the missing
+`imageinfo` was filled with `RUSTOID_FILL_FILES=1` on the offline run — the
+harness's designed backfill, which writes only the absent `FileInfo` entries
+(`File:Plains Zebra Equus quagga cropped.jpg@w250`, `File:Zebra range.png@w250`)
+and leaves the rest of the cache untouched.
+
+### Effect: byte 10099 moves to 11221
+
+The image matches Parsoid byte for byte:
+
+    <img … data-file-width="938" data-file-height="1209" data-file-type="bitmap" height="322" width="250" class="mw-file-element"/>
+
+`Zebra`'s first difference is now **11221**. The eight subset offsets are
+otherwise unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837) — several byte totals grew, because the restored links
+now render — `Zebro` still MATCHes, the fixture guard holds at **877/896**, and
+954 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 11221
+
+Parsoid gives the `Ngorongoro Crater` link `class="mw-redirect"`, rustoid does
+not: the cached `PageInfo` says the title is not a redirect, so the link stays
+blue. The redirect fact is page-scoped and stable; the next target is either a
+stale cache entry or a resolution gap. Also still open: the taxonomy `<td>`s are
+empty where Parsoid has the `Animalia`/`Chordata`/… links.
