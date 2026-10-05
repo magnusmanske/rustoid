@@ -624,6 +624,13 @@ pub fn render_answer(items: &[Item]) -> String {
                     {
                         i += 1;
                     }
+                } else if let Some(src) = wikilink_token_wikitext(tok) {
+                    // A `[[…]]` the tokenizer did not stamp with `src` — a link a
+                    // module returned, tokenized from the module's output — is
+                    // rebuilt from its parts, so a `frame:expandTemplate` answer
+                    // keeps it (`[[File:…]]` otherwise vanished and the taxobox
+                    // image row came back empty).
+                    out.push_str(&src);
                 } else if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
                     out.push_str(&src);
                 }
@@ -641,9 +648,60 @@ fn is_transclusion_marker(token: &crate::wikitext::tokens_v2::ParsoidToken) -> b
         .is_some_and(|ty| ty.starts_with("mw:Transclusion"))
 }
 
+/// Rebuild a `wikilink` token's `[[target|…]]` wikitext from its attributes.
+///
+/// A link tokenized from a page or template body carries `data_parsoid.src`, but
+/// one tokenized from a *module's output* does not, and `render_answer` would
+/// drop it — so a `[[File:…]]` a module emitted through `frame:expandTemplate`
+/// never reached the DOM. `href` is the target and each `mw:maybeContent` is a
+/// `|`-separated part; a part this cannot spell declines the whole link.
+fn wikilink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    let crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(t) = token else {
+        return None;
+    };
+    if t.name != "wikilink" {
+        return None;
+    }
+    let href = t
+        .attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("href"))?
+        .value
+        .as_str()?;
+    let mut out = String::from("[[");
+    out.push_str(href);
+    for part in t
+        .attribs
+        .iter()
+        .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+    {
+        out.push('|');
+        out.push_str(part.value.as_str()?);
+    }
+    out.push_str("]]");
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[[File:…]]` a module emits through `frame:expandTemplate` is tokenized
+    /// without `data_parsoid.src`, so `render_answer` must rebuild it from the
+    /// token's parts instead of dropping it (the taxobox image row came back
+    /// empty otherwise).
+    #[test]
+    fn render_answer_rebuilds_a_module_wikilink_without_src() {
+        use crate::wikitext::tokens_v2::{DataParsoid, Item, ParsoidToken, SelfclosingTagTk};
+        let mut link = SelfclosingTagTk::new("wikilink", vec![], DataParsoid::default());
+        link.add_attribute_str("href", "File:Plains Zebra Equus quagga cropped.jpg");
+        link.add_attribute_str("mw:maybeContent", "frameless");
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(link))];
+        assert_eq!(
+            render_answer(&items),
+            "[[File:Plains Zebra Equus quagga cropped.jpg|frameless]]"
+        );
+    }
 
     fn request(title: &str, args: &[(&str, &str)]) -> FrameRequest {
         FrameRequest::ExpandTemplate {
