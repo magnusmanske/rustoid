@@ -656,27 +656,33 @@ fn is_transclusion_marker(token: &crate::wikitext::tokens_v2::ParsoidToken) -> b
 /// never reached the DOM. `href` is the target and each `mw:maybeContent` is a
 /// `|`-separated part; a part this cannot spell declines the whole link.
 fn wikilink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::KeyValue;
     let crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(t) = token else {
         return None;
     };
     if t.name != "wikilink" {
         return None;
     }
+    // A part may be a `Tokens` list even when it holds no real token — a
+    // substituted `{{{1}}}` leaves several `Str` runs (`link=Template:Taxonomy/`
+    // + the value) — so render it rather than declining the whole link.
+    let part_text = |v: &KeyValue| match v {
+        KeyValue::Str(s) => s.clone(),
+        KeyValue::Tokens(items) => render_answer(items),
+    };
     let href = t
         .attribs
         .iter()
-        .find(|kv| kv.key.as_str() == Some("href"))?
-        .value
-        .as_str()?;
+        .find(|kv| kv.key.as_str() == Some("href"))?;
     let mut out = String::from("[[");
-    out.push_str(href);
+    out.push_str(&part_text(&href.value));
     for part in t
         .attribs
         .iter()
         .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
     {
         out.push('|');
-        out.push_str(part.value.as_str()?);
+        out.push_str(&part_text(&part.value));
     }
     out.push_str("]]");
     Some(out)
