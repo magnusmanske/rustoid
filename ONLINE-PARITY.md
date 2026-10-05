@@ -11380,7 +11380,7 @@ from the DOM. Parked here rather than guessed at.
 per `<ref>` rendered inside a transclusion, and the live REST transform endpoint
 reproduces it directly.
 
-## A `<ref>` inside a transclusion spends an extra `about` id — attempt reverted
+## Fixed: a `<ref>` inside a transclusion spends an extra `about` id
 
 ### Cause
 
@@ -11410,28 +11410,45 @@ allocates the phantom — that is why the earlier note read "not reproducible".
 The REST transform above *is* the repro, and it is the live oracle's behaviour
 rustoid has to match.
 
-### First attempt, reverted
+### Fix, and the double-walk it exposed
 
-The first attempt spent one extra id after a `<ref>`'s own whenever the ref was
-numbered below the page level (a new `Parser::expansion_nesting` counter). That
-matched live for a literal `<ref>` in a template (the taxobox, and the minimal
-`{{Geological range|2|0|ref=<ref>abc</ref>|PS=a}}`), but it is **wrong for a
-`<ref>` reached through `frame:extensionTag`**. rustoid walks such a token twice
-— once in the `#tag` answer's own `expand_templates` and again when the module
-output is re-parsed — so the rule fired twice. `A{{sfn|…}}B<ref>plain</ref>C`
-shows it: live numbers the transclusion+ref and two phantom ids (`#mwt1..#mwt4`),
-the heuristic gives three. A precise fix has to make the `#tag`-answer ref number
-*once*, the way `<templatestyles>` (inline placeholder) and the `<indicator>`
-(`expand_one_indicator`) already do; the heuristic only masked that the answer is
-re-serialized as a token and re-walked. Reverted.
+The rule is the one the transform endpoint shows: a `<ref>` rendered from *inside
+a transclusion* spends one extra, discarded id after its own. A first attempt
+spent it for any ref numbered below the page level (`Parser::expansion_nesting`),
+which matched live for a literal ref in a template but **over-fired for a ref
+reached through `frame:extensionTag`**: rustoid walked that token twice — once in
+the `#tag` answer's own `expand_templates`, once when the module output was
+re-parsed — so the rule fired twice (`A{{sfn|…}}B<ref>plain</ref>C` gave three
+spends where live gives two).
 
-### Effect measured with the heuristic (for the record)
+The real bug was the double-walk. `render_answer_markers` already carried an
+`mw:DOMFragment` placeholder (a `#tag:templatestyles`, an `<indicator>`) under a
+`UNIQ…QINU` strip marker so the answer survives as a marker rather than being
+re-serialized; a `#tag:ref` was not a placeholder, so it was rendered back to
+wikitext and renumbered. It now carries any *numbered* extension token
+(`extension` self-closing with an `about`) the same way. The ref numbers once, and
+the phantom rule lands once — the same shape `<templatestyles>` and the
+`<indicator>` already had.
 
-`Zebra`'s first difference moved to **16342** with the heuristic in place. With
-it reverted (the current state) that difference is masked again and the first byte
-is back at **15284**; the finding stands, the fix does not yet. Every other subset
-offset is unchanged, `Zebro` MATCHes, the fixture guard holds at **877/896**, and
-961 lib tests pass with clippy and `cargo fmt` clean.
+### Effect: byte 15284 moves to 27843
+
+`Zebra`'s first difference is now **27843**. The lead paragraph, the taxobox
+`<style>` (`#mwt15`), the `IPAc-en` span and the Etymology refs all match the
+oracle. Every other subset offset is unchanged (`Bicycle` 11836, `Nobel Prize`
+5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds
+at **877/896**, and 961 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 27843
+
+The `{{sfn}}` ref now takes the right id (`#mwt23`), but its wrapper is leaner
+than the oracle's. The oracle serves `typeof="mw:Transclusion mw:Extension/ref"`
+with a `group` attr and the sfn call recorded in `data-mw.parts`; rustoid serves
+`typeof="mw:Extension/ref"` with neither. The `frame:extensionTag` output that is
+the *sole* content of a module call merges into that call's `mw:Transclusion`
+wrapper — the `#mwt1` in `A{{sfn|…}}B` carries both — so the ref inherits the
+transclusion's `typeof`, `parts`, and the empty `group` the module passed. Rustoid
+keeps the ref and the transclusion separate. Next target.
 
 ### The next difference at 16342
 
@@ -11485,26 +11502,21 @@ between the meta and the `:` string).
 
 ### Effect: the spurious `<dl>` is gone
 
-With the `<ref>` heuristic above in place `Zebra`'s first difference moved to
-**25123** and the whole lead paragraph (IPAc-en spans, labels, `Module:IPA`
-stylesheet) matched the oracle exactly. With that heuristic reverted the first
-byte is masked again at **15284** (the taxobox `<style>` phantom), but the `<dl>`
-is gone and the lead paragraph is right. Every other subset offset is unchanged
-(`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+With the `<ref>` fix below also in place `Zebra`'s first difference is now
+**27843**. On this fix alone it moved to **25123** and the whole lead paragraph
+(IPAc-en spans, labels, `Module:IPA` stylesheet) matches the oracle exactly; the
+`<dl>` is gone. Every other subset offset is unchanged (`Bicycle` 11836,
+`Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
 `List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837), `Zebro`
 MATCHes, the fixture guard holds at **877/896**, and 961 lib tests pass with
 clippy and `cargo fmt` clean. (A few pages lose a little rendered length because
 the same spurious `<dl>` is removed from them; their first-difference bytes are
 unchanged.)
 
-### The ref-body +2, next after the phantom is fixed
+### The ref-body +2 that follows it
 
-Once the taxobox phantom is resolved, the next difference is a **+2** drift in
-the Etymology paragraph: its first `<ref>` is `about="#mwt30"` where the oracle
-has `#mwt28`. It reduces to the `{{sfn}}` on the preceding line: with
-`A{{sfn|…}}B<ref>plain</ref>C`, live numbers the sfn's transclusion+ref and two
-phantom ids, rustoid numbers the transclusion, the ref **twice** and one more —
-the `#tag`-answer ref double-walk described in the reverted section above. So the
-same fix (`frame:extensionTag` answers must spend their `about` once, inline, like
-`<templatestyles>` and `<indicator>`) closes both this drift and the phantom. That
-is the next target.
+Once the taxobox phantom was resolved, the next difference was a **+2** drift in
+the Etymology paragraph: its first `<ref>` was `about="#mwt30"` where the oracle
+has `#mwt28`. It reduced to the `{{sfn}}` on the preceding line:
+`A{{sfn|…}}B<ref>plain</ref>C` numbers the ref **twice** in rustoid. The
+`render_answer_markers` fix in the section above closes it.
