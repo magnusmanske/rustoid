@@ -405,6 +405,11 @@ fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool)
         return;
     }
     node.data_parsoid = None;
+    // Parsoid records the discard on the data-parsoid it keeps a slot for
+    // (`TempData::DISCARDABLE_DP`); a node keyed by `data-mw` alone must then not
+    // take a generated id. The flag is on the node, not the blob, because the
+    // blob is what goes away.
+    node.discardable_dp = true;
 }
 
 /// Whether the node is an extension's tag. Used for `CleanUp::inNativeContent`,

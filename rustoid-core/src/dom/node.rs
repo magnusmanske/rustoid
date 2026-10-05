@@ -157,6 +157,15 @@ pub struct Node {
     /// "takes an id" and "emits `data-parsoid`" are genuinely different questions,
     /// and this flag is the difference.
     pub empty_dp_slot: bool,
+    /// This element's `data-parsoid` was discarded as transclusion-internal
+    /// content. Mirrors `TempData::DISCARDABLE_DP`.
+    ///
+    /// Inside an encapsulation range Parsoid stores no `data-parsoid` for a node
+    /// that is neither the range's first nor its last, so such a node takes no
+    /// generated id — even when it carries a `data-mw`. The media span a template
+    /// builds (`<span typeof="mw:File" data-mw='{"caption":…}'>`) is the case
+    /// that matters: the wrapper is keyed, the span inside it is not.
+    pub discardable_dp: bool,
 }
 
 impl Node {
@@ -171,6 +180,7 @@ impl Node {
             data_mw: None,
             fragment: None,
             empty_dp_slot: false,
+            discardable_dp: false,
         }
     }
 
@@ -185,6 +195,7 @@ impl Node {
             data_mw: None,
             fragment: None,
             empty_dp_slot: false,
+            discardable_dp: false,
         }
     }
 
@@ -210,6 +221,7 @@ impl Node {
             data_mw: None,
             fragment: None,
             empty_dp_slot: false,
+            discardable_dp: false,
         }
     }
 
@@ -224,6 +236,7 @@ impl Node {
             data_mw: None,
             fragment: None,
             empty_dp_slot: false,
+            discardable_dp: false,
         }
     }
 

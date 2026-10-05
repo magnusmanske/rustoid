@@ -251,17 +251,27 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
     let mut assigned = 0;
 
     if node.kind.is_element() {
-        // A node takes an id when it has metadata to key it by: a `data-mw`, a
-        // *non-empty* `data-parsoid`, or the empty-dp-slot case. Parsoid's rule
-        // is `!$dp->isEmpty()`, and `DataParsoid::isEmpty` is false as soon as
-        // any serializable field is present — a source range, but equally a
-        // rendered/source attribute pair, an `stx`, a `pi`. A media `<img>` is
-        // the common case: its `data-parsoid` carries `a`/`sa` and no `dsr`, and
-        // the service still stamps it an id, which a source-range-only test
-        // missed. Only `tmp` is discounted, as Parsoid discounts it — it is
-        // transient and never serialized. The `empty_dp_slot` case is the
-        // distinction from the other side; a `<section>` has no `data-parsoid`
-        // yet still takes the document's first id.
+        // A node takes an id when it has metadata to key it by: a
+        // *non-empty* `data-parsoid`, the empty-dp-slot case, or a `data-mw`
+        // whose `data-parsoid` was not discarded as transclusion-internal
+        // content. Parsoid's rule is that the node's `data-parsoid` is stored:
+        // covered by the first two clauses directly, and by the third for a
+        // node whose metadata is only a `data-mw` (Parsoid keeps a
+        // `data-parsoid` slot for it internally even though it emits none).
+        //
+        // `DataParsoid::isEmpty` is false as soon as any serializable field is
+        // present — a source range, but equally a rendered/source attribute
+        // pair, an `stx`, a `pi`. A media `<img>` is the common case: its
+        // `data-parsoid` carries `a`/`sa` and no `dsr`, and the service still
+        // stamps it an id, which a source-range-only test missed. Only `tmp` is
+        // discounted, as Parsoid discounts it — it is transient and never
+        // serialized. The `empty_dp_slot` case is the distinction from the other
+        // side; a `<section>` has no `data-parsoid` yet still takes the
+        // document's first id.
+        //
+        // `discardable_dp` is the exception that a plain `data-mw` test misses:
+        // inside an encapsulation range Parsoid stores no `data-parsoid`, so the
+        // node takes no id even though it carries a `data-mw`.
         //
         // An empty `id=""` is treated as absent, as Parsoid does ("Forcibly
         // reset the ID if it is invalid").
@@ -269,7 +279,8 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
             .data_parsoid
             .as_deref()
             .is_some_and(data_parsoid_draws_an_id);
-        let has_metadata = has_dp || node.data_mw.is_some() || node.empty_dp_slot;
+        let has_metadata =
+            has_dp || node.empty_dp_slot || (node.data_mw.is_some() && !node.discardable_dp);
         let has_id = node.get_attr("id").is_some_and(|v| !v.is_empty());
         if has_metadata && !has_id {
             let id = alloc.next_id();
@@ -361,6 +372,27 @@ mod tests {
         assert_eq!(id_to_counter("#mwt1"), None);
         assert_eq!(id_to_counter("mw"), None);
         assert_eq!(id_to_counter("cite_ref-x_1-0"), None);
+    }
+
+    #[test]
+    fn a_discarded_dp_node_is_not_keyed_by_its_data_mw() {
+        use crate::dom::node::{ElementKind, Node};
+        // A transclusion wrapper is keyed by its `data-mw`; a child whose
+        // `data-parsoid` was discarded (transclusion-internal) is not, even
+        // though it too carries a `data-mw` — the media span a template builds.
+        let mut root = Node::document();
+        let mut wrapper = Node::element(ElementKind::Span);
+        wrapper.data_mw = Some("{}".into());
+        wrapper.set_attr("about", "#mwt1");
+        let mut media = Node::element(ElementKind::Span);
+        media.data_mw = Some(r#"{"caption":"x"}"#.into());
+        media.discardable_dp = true;
+        wrapper.push_child(media);
+        root.push_child(wrapper);
+
+        assert_eq!(assign_node_ids(&mut root), 1, "only the wrapper is keyed");
+        assert_eq!(root.children[0].get_attr("id"), Some("mwAQ"));
+        assert_eq!(root.children[0].children[0].get_attr("id"), None);
     }
 
     #[test]
