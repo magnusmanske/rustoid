@@ -633,12 +633,41 @@ pub fn render_answer(items: &[Item]) -> String {
                     out.push_str(&src);
                 } else if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
                     out.push_str(&src);
+                } else if let Some(src) = quote_token_wikitext(tok) {
+                    // An `mw-quote` a module's output produced has no `src` (the
+                    // quote transformer has not run, nor can it — the answer is
+                    // wikitext), so it too is rebuilt: without this a link's
+                    // italic markup was dropped and `[[Equus (genus)|''Equus'']]`
+                    // came back as `[[Equus (genus)|Equus]]`.
+                    out.push_str(&src);
                 }
             }
         }
         i += 1;
     }
     out
+}
+
+/// An `mw-quote` token's wikitext: the apostrophe run it stands for.
+///
+/// A quote token carries its run in the `value` attribute and no `src`, so the
+/// only way to stringify it as wikitext is to spell the run back out.
+fn quote_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::{KeyValue, ParsoidToken};
+    let ParsoidToken::SelfclosingTag(t) = token else {
+        return None;
+    };
+    if t.name != "mw-quote" {
+        return None;
+    }
+    let value = t
+        .attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("value"))?;
+    Some(match &value.value {
+        KeyValue::Str(s) => s.clone(),
+        KeyValue::Tokens(items) => render_answer(items),
+    })
 }
 
 /// Whether a token is a `mw:Transclusion` marker or its `/End` partner.
@@ -707,6 +736,32 @@ mod tests {
             render_answer(&items),
             "[[File:Plains Zebra Equus quagga cropped.jpg|frameless]]"
         );
+    }
+
+    /// A module's `[[Genus|''Name'']]` tokenizes its italic run into `mw-quote`
+    /// tokens that carry no `src`, so `render_answer` must spell the run back out:
+    /// without it the rebuilt link lost its italics (`[[Equus (genus)|Equus]]`).
+    #[test]
+    fn render_answer_rebuilds_a_module_wikilinks_quote_markup() {
+        use crate::wikitext::tokens_v2::{
+            DataParsoid, Item, KeyValue, ParsoidToken, SelfclosingTagTk,
+        };
+        let quote = |run: &str| {
+            let mut q = SelfclosingTagTk::new("mw-quote", vec![], DataParsoid::default());
+            q.add_attribute_str("value", run);
+            Item::Tok(ParsoidToken::SelfclosingTag(q))
+        };
+        let mut link = SelfclosingTagTk::new("wikilink", vec![], DataParsoid::default());
+        link.add_attribute_str("href", "Equus (genus)");
+        link.attribs.push(crate::wikitext::tokens_v2::KV {
+            key: KeyValue::Str("mw:maybeContent".into()),
+            value: KeyValue::Tokens(vec![quote("''"), Item::Str("Equus".into()), quote("''")]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(link))];
+        assert_eq!(render_answer(&items), "[[Equus (genus)|''Equus'']]");
     }
 
     fn request(title: &str, args: &[(&str, &str)]) -> FrameRequest {
