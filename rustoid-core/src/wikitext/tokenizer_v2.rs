@@ -1595,7 +1595,12 @@ impl<'a> PegTokenizer<'a> {
         let attrs = self.parse_table_attributes(false);
         let tag_end = self.pos;
 
+        // `s2:space*` — the trailing spaces on the attribute line are returned as
+        // tokens (a text node in the row), not discarded. A row-separator line
+        // `|- class="taxonrow" \n` therefore renders `<tr class="taxonrow"> \n`.
+        let spaces_start = self.pos;
         self.consume_spaces();
+        let spaces = self.input[spaces_start..self.pos].to_string();
         // A bare trailing `|` on the row-tag line is a valueless first cell,
         // dropped by the tree builder (see `try_table_start_tag`).
         self.consume_empty_cell_pipe();
@@ -1616,6 +1621,7 @@ impl<'a> PegTokenizer<'a> {
         dp.start_tag_src = Some(start_tag_src);
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("tr", attrs, dp)));
+        self.emit_text(spaces);
 
         self.at_sol = false;
         true
@@ -1805,8 +1811,14 @@ impl<'a> PegTokenizer<'a> {
     fn parse_table_attributes(&mut self, cell_arg: bool) -> Vec<KV> {
         let mut attrs = Vec::new();
         loop {
+            // `table_attribute` starts with `optional_spaces`, but a failed match
+            // rolls them back — so trailing spaces before a terminator are left for
+            // the caller (`table_row_tag`'s `s2:space*`). Only consume them once an
+            // attribute (or a broken-name char) is known to follow.
+            let before_spaces = self.pos;
             self.consume_spaces();
             if self.pos >= self.input_len {
+                self.pos = before_spaces;
                 break;
             }
 
@@ -1824,6 +1836,7 @@ impl<'a> PegTokenizer<'a> {
                 || ch == '\r'
                 || (cell_arg && (ch == '|' || self.starts_with("{{!}}") || self.starts_with("!!")))
             {
+                self.pos = before_spaces;
                 break;
             }
 
@@ -1850,6 +1863,7 @@ impl<'a> PegTokenizer<'a> {
                     self.advance(ch.len_utf8());
                     attrs.push(kv);
                 } else {
+                    self.pos = before_spaces;
                     break;
                 }
             }
@@ -6977,6 +6991,23 @@ mod tests {
         // mean "nothing to reparse").
         let (attrs, _sep) = tokenize_table_cell_attributes("class=\"foo\"{{!}}bar");
         assert!(attrs.is_empty());
+    }
+
+    #[test]
+    fn test_table_row_trailing_spaces_are_emitted() {
+        // `|- class="taxonrow" \n` — the spaces on the row-tag line after the
+        // attributes are returned as tokens (`table_row_tag`'s `s2:space*`), so
+        // they render as a text node after the `<tr>` and before the newline.
+        let tokens = tokenize("{|\n|- class=\"taxonrow\" \n|A\n|}");
+        let tr = tokens
+            .iter()
+            .position(|t| matches!(t, Either::Right(ParsoidToken::Tag(t)) if t.name == "tr"))
+            .expect("a tr tag");
+        assert!(
+            matches!(tokens.get(tr + 1), Some(Either::Left(s)) if s == " "),
+            "expected the trailing space after the tr tag, got {:?}",
+            tokens.get(tr + 1)
+        );
     }
 
     #[test]
