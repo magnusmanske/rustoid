@@ -11380,7 +11380,7 @@ from the DOM. Parked here rather than guessed at.
 per `<ref>` rendered inside a transclusion, and the live REST transform endpoint
 reproduces it directly.
 
-## Fixed: a `<ref>` inside a transclusion spends an extra `about` id
+## A `<ref>` inside a transclusion spends an extra `about` id — attempt reverted
 
 ### Cause
 
@@ -11410,25 +11410,28 @@ allocates the phantom — that is why the earlier note read "not reproducible".
 The REST transform above *is* the repro, and it is the live oracle's behaviour
 rustoid has to match.
 
-### Fix
+### First attempt, reverted
 
-`Parser::number_extension_token` now spends one extra id after a `<ref>`'s own
-when the ref is numbered from inside another expansion. A new
-`Parser::expansion_nesting` counter, held by an RAII guard for the duration of
-each `expand_templates` call, is 1 for the page-level call and >1 for anything
-spliced into it, so "inside a transclusion" is `expansion_nesting > 1`. A
-top-level ref spends nothing extra; one reached through a template — directly,
-through a template argument, or through a `frame:expandTemplate` answer — spends
-one, which is what the oracle shows.
+The first attempt spent one extra id after a `<ref>`'s own whenever the ref was
+numbered below the page level (a new `Parser::expansion_nesting` counter). That
+matched live for a literal `<ref>` in a template (the taxobox, and the minimal
+`{{Geological range|2|0|ref=<ref>abc</ref>|PS=a}}`), but it is **wrong for a
+`<ref>` reached through `frame:extensionTag`**. rustoid walks such a token twice
+— once in the `#tag` answer's own `expand_templates` and again when the module
+output is re-parsed — so the rule fired twice. `A{{sfn|…}}B<ref>plain</ref>C`
+shows it: live numbers the transclusion+ref and two phantom ids (`#mwt1..#mwt4`),
+the heuristic gives three. A precise fix has to make the `#tag`-answer ref number
+*once*, the way `<templatestyles>` (inline placeholder) and the `<indicator>`
+(`expand_one_indicator`) already do; the heuristic only masked that the answer is
+re-serialized as a token and re-walked. Reverted.
 
-### Effect: byte 15284 moves to 16342
+### Effect measured with the heuristic (for the record)
 
-`Zebra`'s first difference is now **16342**. The taxobox `<style>` is `#mwt15`
-and the `IPAc-en` transclusion `#mwt16`, matching the oracle. Every other subset
-offset is unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
-`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
-`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
-**877/896**, and 960 lib tests pass with clippy and `cargo fmt` clean.
+`Zebra`'s first difference moved to **16342** with the heuristic in place. With
+it reverted (the current state) that difference is masked again and the first byte
+is back at **15284**; the finding stands, the fix does not yet. Every other subset
+offset is unchanged, `Zebro` MATCHes, the fixture guard holds at **877/896**, and
+961 lib tests pass with clippy and `cargo fmt` clean.
 
 ### The next difference at 16342
 
@@ -11480,24 +11483,28 @@ unless that token *is* the transclusion start meta
 case (`{{1x|*bar}}`) still fires; a new unit test pins the negative case (a link
 between the meta and the `:` string).
 
-### Effect: byte 16342 moves to 25123
+### Effect: the spurious `<dl>` is gone
 
-`Zebra`'s first difference is now **25123**, and the whole lead paragraph
-(IPAc-en spans, labels, `Module:IPA` stylesheet) matches the oracle exactly.
-Every other subset offset is unchanged (`Bicycle` 11836, `Nobel Prize` 5926,
-`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
-`Unix` 4772, `Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard
-holds at **877/896**, and 961 lib tests pass with clippy and `cargo fmt` clean.
-(A few pages lose a little rendered length because the same spurious `<dl>` is
-removed from them; their first-difference bytes are unchanged.)
+With the `<ref>` heuristic above in place `Zebra`'s first difference moved to
+**25123** and the whole lead paragraph (IPAc-en spans, labels, `Module:IPA`
+stylesheet) matched the oracle exactly. With that heuristic reverted the first
+byte is masked again at **15284** (the taxobox `<style>` phantom), but the `<dl>`
+is gone and the lead paragraph is right. Every other subset offset is unchanged
+(`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213,
+`List of sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837), `Zebro`
+MATCHes, the fixture guard holds at **877/896**, and 961 lib tests pass with
+clippy and `cargo fmt` clean. (A few pages lose a little rendered length because
+the same spurious `<dl>` is removed from them; their first-difference bytes are
+unchanged.)
 
-### The next difference at 25123
+### The ref-body +2, next after the phantom is fixed
 
-The Etymology paragraph's first `<ref>` is `about="#mwt30"` where the oracle has
-`#mwt28` — a **+2** drift that starts inside a `<ref>` body. The oracle numbers
-the `{{cite web}}` inside `<ref name="etymology">` as `#mwt26` and the ref as
-`#mwt28`; rustoid numbers the `{{cite web}}` `#mwt28` and the ref `#mwt30`, i.e.
-two extra `about` ids are spent while the ref body is rendered. The bodies are
-expanded at the ref site (`number_extension_token` → `process_fragment_body`),
-which is PHP's order, so the extra spends are in that pre-render — likely the
-same class as the phantom-id fix above. Next target.
+Once the taxobox phantom is resolved, the next difference is a **+2** drift in
+the Etymology paragraph: its first `<ref>` is `about="#mwt30"` where the oracle
+has `#mwt28`. It reduces to the `{{sfn}}` on the preceding line: with
+`A{{sfn|…}}B<ref>plain</ref>C`, live numbers the sfn's transclusion+ref and two
+phantom ids, rustoid numbers the transclusion, the ref **twice** and one more —
+the `#tag`-answer ref double-walk described in the reverted section above. So the
+same fix (`frame:extensionTag` answers must spend their `about` once, inline, like
+`<templatestyles>` and `<indicator>`) closes both this drift and the phantom. That
+is the next target.
