@@ -11172,3 +11172,38 @@ After the taxonomy header, Parsoid's taxobox rows carry a stray space:
 `<tr class="taxonrow">\n<td>`. The space is inside the `<tr>`, before the
 newline — a whitespace/foster-point difference in the `{{!}}`-built rows of
 `Template:Taxobox/core`. That is the next target.
+
+## Fixed: a table row's trailing spaces are preserved
+
+`table_row_tag` ends `a:(table_attributes) tagEndPos:POSITION s2:space*` and
+returns `array_merge( [ $trToken ], …, $s2 )` — the spaces after the row
+attributes are tokens, so a row-separator line with a trailing space renders
+`<tr …> \n`. `Module:Autotaxobox` builds its rows as
+`'|- class="taxonrow" \n'`, so every taxonomy row was missing a byte.
+
+Two changes were needed, both faithful to the grammar:
+
+- `try_table_row_tag` now captures the spaces it consumes and emits them as a
+  text token after the `<tr>`.
+- `parse_table_attributes` must stop *before* those spaces. Its
+  `table_attribute` alternative is guarded by `optional_spaces`, but a failed
+  match rolls them back; rustoid consumed them eagerly and lost them. The loop
+  now records the position ahead of `consume_spaces` and restores it when the
+  next character is a terminator, an unparseable bare word, or EOF — the cases
+  where Parsoid's star matches zero times.
+
+### Effect: byte 12644 moves to 13233
+
+`Zebra`'s first difference is now **13233**. Every other subset offset is
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 956 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 13233
+
+Parsoid italicises the rank's taxon name (`<i>Equus</i>`), rustoid leaves it
+plain; the subgenus row then diverges further, rustoid emitting a literal
+`[[…]]` around a `Template:Taxonomy/…` link where Parsoid emits
+`<i>Hippotigris</i>`. Both come from the `Module:Autotaxobox` link construction.
+That is the next target.
