@@ -11066,3 +11066,31 @@ rustoid emits an empty `<span class="plainlinks taxobox-edit-taxonomy">`. The
 `{{edit taxonomy|…}}` call produced the wrapper but not its link. That is the
 next target (and the taxonomy `<td>`s now hold their `Animalia`/`Chordata`/…
 links, so that older note is closed).
+
+## Fixed: a wikilink part that is `Tokens` but holds no token
+
+`wikilink_token_wikitext` rebuilt a module-emitted `[[…]]` from its parts, but
+required every part to be a plain `Str`. `{{edit taxonomy}}`'s
+`[[File:OOjs UI icon edit-ltr.svg|15px|link=Template:Taxonomy/{{{1}}}|Edit this classification]]`
+has a part that is a `Tokens` list — the substituted `{{{1}}}` splits it into
+`link=Template:Taxonomy/` + the value + a trailing blank — so the whole link was
+declined and the taxonomy header's edit link came back empty. A `Tokens` part is
+now rendered, while a real token in one still round-trips through
+`render_answer`.
+
+With the link restored, `AddMediaInfo` reaches the icon, and its `imageinfo` was
+backfilled with `RUSTOID_FILL_FILES=1` as before.
+
+### Effect: byte 11712 moves to 11745
+
+`Zebra`'s first difference is now **11745**. The subset is unchanged (`Zebro`
+still MATCHes, the fixture guard holds at **877/896**, 954 lib tests pass, and
+`cargo fmt`/clippy are clean).
+
+### The next difference at 11745
+
+Parsoid's media `data-mw` is `{"caption":"Edit this classification"}`; rustoid
+adds an `attribs` entry for the `link=` option
+(`{"attribs":[["link",{"txt":"Template:Taxonomy/Equus (Hippotigris)"}]],…}`).
+The rendered `<a href>` matches, so this is a shape difference in the media
+`data-mw`'s options. That is the next target.
