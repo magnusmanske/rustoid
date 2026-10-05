@@ -473,8 +473,27 @@ pub fn table_token_wikitext(tok: &ParsoidToken) -> Option<String> {
             out.push_str(sep);
         }
     } else {
-        for kv in attrs {
-            out.push(' ');
+        // The separator before the box is the source's, as Parsoid keeps it
+        // (`TokenStreamPatcher::convertNonHTMLTokenToString` appends `attrSrc`
+        // verbatim; `TableFixups::convertAttribsToContent` likewise). For a
+        // table/row token `attr_src` is the box after the marker, so its leading
+        // whitespace is that separator: `{|class="clade"` keeps no space while
+        // `{| class="clade"` keeps one. Adding one unconditionally turned the
+        // nested clade's `{|class="clade"` into `{| class="clade"`, which
+        // `Module:Clade`'s `' class="clade"'` match then stripped — the service
+        // keeps the class. A cell's `attr_src` still carries its `|` marker, so
+        // cells keep the space (see `apply_build_table_tokens_attrs`).
+        let box_sep = if matches!(name, "table" | "tr") {
+            dp.tmp
+                .attr_src
+                .as_deref()
+                .map(leading_whitespace)
+                .unwrap_or("")
+        } else {
+            " "
+        };
+        for (i, kv) in attrs.iter().enumerate() {
+            out.push_str(if i == 0 { box_sep } else { " " });
             out.push_str(&key_value_source_text(&kv.key));
             out.push_str("=\"");
             out.push_str(&key_value_source_text(&kv.value));
@@ -485,6 +504,11 @@ pub fn table_token_wikitext(tok: &ParsoidToken) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// The leading whitespace of `s` (the prefix before its first non-space).
+fn leading_whitespace(s: &str) -> &str {
+    &s[..s.len() - s.trim_start().len()]
 }
 
 /// A token's own source with substituted attributes written back.
@@ -645,5 +669,38 @@ mod tests {
         let src = r#"<div class="a">"#;
         let attribs = vec![kv(KeyValue::Str("a".to_string()), Some("a"))];
         assert_eq!(rewrite_expanded_attrs(src, &attribs), None);
+    }
+
+    #[test]
+    fn table_token_wikitext_keeps_the_sources_attribute_separator() {
+        // Parsoid appends the source attribute box verbatim
+        // (`TokenStreamPatcher::convertNonHTMLTokenToString`), so the separator
+        // before the first attribute is whatever the source wrote.
+        // Reconstructing from the expanded attributes must not add one:
+        // `Module:Clade` string-matches `{|class="clade"`, and a spurious space
+        // made its `' class="clade"'` pattern strip a class the service keeps.
+        let spaced = table_token_with_attr_src(" class=\"clade\"");
+        assert_eq!(
+            table_token_wikitext(&spaced).as_deref(),
+            Some("{| class=\"clade\"")
+        );
+        let unspaced = table_token_with_attr_src("class=\"clade\"");
+        assert_eq!(
+            table_token_wikitext(&unspaced).as_deref(),
+            Some("{|class=\"clade\"")
+        );
+    }
+
+    /// A table start token with the source spelling `attr_src` (the box after
+    /// the `{|` marker) and one expanded `class="clade"` attribute.
+    fn table_token_with_attr_src(attr_src: &str) -> ParsoidToken {
+        let mut dp = DataParsoid {
+            start_tag_src: Some("{|".to_string()),
+            ..Default::default()
+        };
+        dp.tmp.attr_src = Some(attr_src.to_string());
+        let mut table = TagTk::new("table", vec![], dp);
+        table.add_attribute_str("class", "clade");
+        ParsoidToken::Tag(table)
     }
 }
