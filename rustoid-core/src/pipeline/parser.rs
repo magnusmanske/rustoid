@@ -1205,6 +1205,17 @@ pub struct Parser<'a, C: SiteConfig> {
     /// additional (discarded) `about` id for every `<ref>` that is rendered from
     /// inside a transclusion, which a standalone Parsoid does not reproduce.
     expansion_nesting: std::cell::Cell<u32>,
+    /// Nonzero while a module's *output* (or its arguments) is being expanded.
+    ///
+    /// Production Parsoid expands templates through MediaWiki's legacy
+    /// preprocessor, whose `TemplateHandler` passes `ignoreLoop => true`
+    /// (`TemplateHandler.php`), so Parsoid's own title-chain loop check is
+    /// bypassed there and recursion is bounded only by depth. rustoid's check is
+    /// the only one it has, so it must stand down inside a module — otherwise a
+    /// recursive template like `Template:Clade` (whose `Module:Clade` echoes
+    /// nested `{{clade}}` calls into its output) reads a `Template:Clade`
+    /// ancestor and is stopped. See [`Parser::expand_one_template`].
+    module_scope: std::cell::Cell<u32>,
     /// Sundered extension output, addressed by a `UNIQ…QINU` strip marker.
     ///
     /// A `frame:extensionTag('templatestyles', …)` answer is the extension's
@@ -1251,6 +1262,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             arg_expansion: std::cell::Cell::new(0),
             style_defer: std::cell::Cell::new(0),
             expansion_nesting: std::cell::Cell::new(0),
+            module_scope: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
@@ -1376,6 +1388,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn begin_style_defer(&self) -> StyleDefer<'_> {
         self.style_defer.set(self.style_defer.get() + 1);
         StyleDefer(&self.style_defer)
+    }
+
+    /// Enter one level of module output/argument expansion; the returned guard
+    /// leaves it on drop. While nonzero, [`Parser::expand_one_template`] passes
+    /// `ignore_loop = true`. See [`Parser::module_scope`].
+    fn enter_module_scope(&self) -> ExpansionNesting<'_> {
+        self.module_scope.set(self.module_scope.get() + 1);
+        ExpansionNesting(&self.module_scope)
     }
 
     /// Enter one level of [`Parser::expand_templates`]; the returned guard leaves
@@ -4485,7 +4505,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             name,
             title,
             MAX_TEMPLATE_DEPTH,
-            false,
+            self.module_scope.get() > 0,
         ) {
             return err;
         }
@@ -4919,6 +4939,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // the enclosing template's arguments. The title is the calling frame's
         // too, so a genuine self-invocation still trips the loop guard.
         let child = frame.new_child(frame.title().clone(), frame.args().args.clone());
+        // A module's output is wikitext in the calling frame's context, and a
+        // template it echoes (`Module:Clade` emits nested `{{clade}}` calls) is
+        // expanded with the title-chain loop check stood down: production
+        // Parsoid's preprocessor passes `ignoreLoop => true`, and the recursion
+        // is bounded by depth instead. See [`Parser::module_scope`].
+        let _module_scope = self.enter_module_scope();
         // The document's counter, not a fresh one. A module's output can carry a
         // `<templatestyles>` — `Module:Infobox` emits one through
         // `frame:extensionTag` — and that stylesheet's `about` id belongs to the
