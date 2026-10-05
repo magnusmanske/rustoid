@@ -166,6 +166,17 @@ pub struct Node {
     /// builds (`<span typeof="mw:File" data-mw='{"caption":…}'>`) is the case
     /// that matters: the wrapper is keyed, the span inside it is not.
     pub discardable_dp: bool,
+    /// Expanded `data-mw` attribute fragments awaiting serialization.
+    ///
+    /// Each entry is `(option canonical key, fragment)`. A media option whose
+    /// value is a token array (`alt= …''x''…`) is rendered to a DOM fragment by
+    /// `WikiLinkHandler::renderFile`'s `expandAttrValueToDOM`, and the fragment's
+    /// nodes are numbered by the id pass *before* the container's own id (Parsoid
+    /// serializes a node's `data-mw` — numbering its embedded fragments — before
+    /// it numbers the node). The id walk numbers them here; a post-pass then
+    /// serializes each fragment into the matching `data-mw.attribs` entry's
+    /// `html`.
+    pub attr_mw_fragments: Vec<(String, Box<Node>)>,
 }
 
 impl Node {
@@ -181,6 +192,7 @@ impl Node {
             fragment: None,
             empty_dp_slot: false,
             discardable_dp: false,
+            attr_mw_fragments: Vec::new(),
         }
     }
 
@@ -196,6 +208,7 @@ impl Node {
             fragment: None,
             empty_dp_slot: false,
             discardable_dp: false,
+            attr_mw_fragments: Vec::new(),
         }
     }
 
@@ -222,6 +235,7 @@ impl Node {
             fragment: None,
             empty_dp_slot: false,
             discardable_dp: false,
+            attr_mw_fragments: Vec::new(),
         }
     }
 
@@ -237,6 +251,7 @@ impl Node {
             fragment: None,
             empty_dp_slot: false,
             discardable_dp: false,
+            attr_mw_fragments: Vec::new(),
         }
     }
 

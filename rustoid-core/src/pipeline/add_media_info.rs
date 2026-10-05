@@ -835,7 +835,10 @@ fn remove_data_mw_attrib(node: &mut Node, key: &str) {
             return;
         };
         if let Some(attribs) = obj.get_mut("attribs").and_then(|a| a.as_array_mut()) {
-            attribs.retain(|pair| option_key(pair) != Some(key));
+            // An option carrying an `html` is kept even when consumed: Parsoid
+            // only drops it when it has no `html` to round-trip
+            // (`WTSUtils::getAttrFromDataMw`: `!$keep && !isset($ret->value['html'])`).
+            attribs.retain(|pair| option_key(pair) != Some(key) || value_has_html(pair));
             if attribs.is_empty() {
                 obj.remove("attribs");
             }
@@ -843,6 +846,14 @@ fn remove_data_mw_attrib(node: &mut Node, key: &str) {
         obj.is_empty()
     };
     node.data_mw = if empty { None } else { Some(json.to_string()) };
+}
+
+/// Whether a `data-mw.attribs` pair's value carries an `html` field.
+fn value_has_html(pair: &serde_json::Value) -> bool {
+    pair.as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_object())
+        .is_some_and(|o| o.contains_key("html"))
 }
 
 /// Whether a media container has a *visible* caption (Thumb/Frame formats).

@@ -10,8 +10,7 @@
 use crate::title::{Title, TitleParser, make_link};
 use crate::traits::SiteConfig;
 use crate::wikitext::tokens_v2::{
-    DataMwAttrib, DataMwValue, DataParsoid, EndTagTk, Item, KV, ParsoidToken, SelfclosingTagTk,
-    TagTk,
+    DataParsoid, EndTagTk, Item, KV, ParsoidToken, SelfclosingTagTk, TagTk,
 };
 
 /// A callback that builds an inline DOM fragment document from an
@@ -32,6 +31,11 @@ use super::wiki_link_handler::{build_link_attrs, string_kv};
 pub struct WikiLinkContext<'a> {
     pub config: &'a dyn SiteConfig,
     about_id_counter: usize,
+    /// The document's `about` counter, when the caller has it. A media option
+    /// whose value is a token array earns the container a fresh `about` id
+    /// (`renderFile`'s `$env->newAboutId()`), which must come out of the same
+    /// sequence as the transclusion markers.
+    document_about: Option<&'a std::cell::Cell<usize>>,
     metadata: MetadataCollector,
     /// The context title (the page being parsed), used for subpage/relative link
     /// resolution. `None` disables subpage resolution (fragment/nested contexts).
@@ -75,10 +79,16 @@ impl<'a> WikiLinkContext<'a> {
         Self {
             config,
             about_id_counter: 0,
+            document_about: None,
             metadata: MetadataCollector::new(),
             context_title: None,
             suppress_media_formats: false,
         }
+    }
+
+    /// Continue `about` ids from the document's transclusion sequence.
+    pub fn set_document_about(&mut self, counter: &'a std::cell::Cell<usize>) {
+        self.document_about = Some(counter);
     }
 
     /// Set the context title (enable subpage/relative link resolution).
@@ -104,6 +114,10 @@ impl<'a> WikiLinkContext<'a> {
     /// Generate a fresh about id (mirrors `Env::newAboutId`). In PHP these are
     /// global DOM ids; we approximate with a per-parse counter.
     pub fn new_about_id(&mut self) -> String {
+        if let Some(counter) = self.document_about {
+            counter.set(counter.get() + 1);
+            return format!("#mwt{}", counter.get());
+        }
         self.about_id_counter += 1;
         let id = format!("#mwt{}", self.about_id_counter);
         if std::env::var_os("RUSTOID_TRACE_ABOUT").is_some() {
@@ -962,27 +976,24 @@ pub fn link_to_media(
     out
 }
 
-/// Render a file link, parsing image options. Mirrors `WikiLinkHandler::renderFile`
-/// for the common simple-option and width cases (full media info fetching and
-/// complex option stringification are deferred).
-pub fn render_file(
-    ctx: &mut WikiLinkContext,
-    token: &ParsoidToken,
-    target: &WikiLinkTargetInfo,
-    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
-    next_id: &std::cell::Cell<usize>,
-    build_fragment: CaptionFragmentBuilder,
-) -> Vec<Item> {
-    use super::media_options::{MediaOpts, get_format, get_wrapper_info};
+/// The options parsed from a file link's `mw:maybeContent` KVs.
+struct MediaOptionParse {
+    opts: super::media_options::MediaOpts,
+    opt_list: Vec<crate::wikitext::tokens_v2::OptListEntry>,
+    caption: Option<Vec<Item>>,
+    caption_ak: Option<String>,
+    caption_pos: usize,
+}
 
-    let title = target.title.as_ref().expect("file title");
-
-    // Extract options from the pipe-separated `mw:maybeContent` KVs (the
-    // tokenizer emits one KV per top-level `|`-separated segment). Each part is
-    // stringified for option recognition, but the caption part keeps its raw
-    // token array so transclusions/tables round-trip (mirrors PHP `renderFile`'s
-    // `buildLinkAttrs` content-KV loop).
-    let mut opts = MediaOpts::default();
+/// Parse a file link's options (the pipe-separated `mw:maybeContent` KVs).
+///
+/// Each part is stringified for option recognition, but a caption part keeps its
+/// raw token array so transclusions/tables round-trip (mirrors PHP `renderFile`'s
+/// `buildLinkAttrs` content-KV loop). Factored out of `render_file` so the
+/// per-chunk expansion loop can ask whether a media will spend an `about` id
+/// (`$hasExpandableOpt`) without rendering it.
+fn parse_media_options(ctx: &WikiLinkContext, token: &ParsoidToken) -> MediaOptionParse {
+    let mut opts = super::media_options::MediaOpts::default();
     let mut opt_list: Vec<crate::wikitext::tokens_v2::OptListEntry> = Vec::new();
     let mut caption: Option<Vec<Item>> = None;
     let mut caption_ak: Option<String> = None;
@@ -1095,6 +1106,50 @@ pub fn render_file(
             caption = Some(raw_items);
         }
     }
+    MediaOptionParse {
+        opts,
+        opt_list,
+        caption,
+        caption_ak,
+        caption_pos,
+    }
+}
+
+/// Whether a file link has any option whose value is a token array, i.e. whether
+/// its container will spend an `about` id (mirrors `renderFile`'s
+/// `$hasExpandableOpt`). Used by the per-chunk expansion loop to number those
+/// ids in document order, before the media is rendered.
+pub(crate) fn has_expandable_option(ctx: &WikiLinkContext, token: &ParsoidToken) -> bool {
+    parse_media_options(ctx, token).opts.has_expandable_opt
+}
+
+/// Render a file link, parsing image options. Mirrors `WikiLinkHandler::renderFile`
+/// for the common simple-option and width cases (full media info fetching and
+/// complex option stringification are deferred).
+pub fn render_file(
+    ctx: &mut WikiLinkContext,
+    token: &ParsoidToken,
+    target: &WikiLinkTargetInfo,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &std::cell::Cell<usize>,
+    build_fragment: CaptionFragmentBuilder,
+) -> Vec<Item> {
+    use super::media_options::{get_format, get_wrapper_info};
+
+    let title = target.title.as_ref().expect("file title");
+
+    // Extract options from the pipe-separated `mw:maybeContent` KVs (the
+    // tokenizer emits one KV per top-level `|`-separated segment). Each part is
+    // stringified for option recognition, but the caption part keeps its raw
+    // token array so transclusions/tables round-trip (mirrors PHP `renderFile`'s
+    // `buildLinkAttrs` content-KV loop).
+    let MediaOptionParse {
+        mut opts,
+        mut opt_list,
+        caption,
+        caption_ak,
+        mut caption_pos,
+    } = parse_media_options(ctx, token);
 
     let format = get_format(&opts);
     let (classes, is_inline) = get_wrapper_info(&opts);
@@ -1158,30 +1213,66 @@ pub fn render_file(
             crate::pipeline::wiki_link_handler::string_kv("class", &classes.join(" ")),
         );
     }
+    // A value that is a token array (an "expandable option") earns the container a
+    // fresh `about` id (mirrors `renderFile`'s `$hasExpandableOpt` branch).
+    if opts.has_expandable_opt {
+        // The per-chunk expansion loop stamped the id the media's chunk reached
+        // (`data-mw-about-base`), which is where `renderFile` allocates it; a
+        // render outside that loop (gallery, tests) allocates fresh.
+        let about = token
+            .get_attribute_v(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| ctx.new_about_id());
+        container_attribs.push(crate::pipeline::wiki_link_handler::string_kv(
+            "about", &about,
+        ));
+    }
 
     // Non-`getUsed()` options (`link`, `alt`, `manualthumb`, `page`, `class`,
     // etc.) are stored in `data-mw.attribs` so `AddMediaInfo` can apply them
     // after file-info retrieval (mirrors `renderFile`'s `dataMw->attribs`).
-    let data_mw_attribs: Vec<DataMwAttrib> = [
+    //
+    // A value that was a token array is rendered to a DOM fragment
+    // (`expandAttrValueToDOM`), tunneled by a marked `mw:dom-fragment-token` so
+    // its nodes can be numbered and serialized into `html` after the id pass. A
+    // value carrying a transclusion marker keeps the direct serializer, which
+    // knows the `mw:Transclusion` shape the sub-pipeline would build.
+    let mut mw_attr_frag_tokens: Vec<Item> = Vec::new();
+    // The value object is built by hand rather than via
+    // `serialize_data_mw_attribs`, because Parsoid's `renderFile` sets `html`
+    // before `txt` (`expandAttrValueToDOM` runs first), while the attribute
+    // expander sets `txt` first. Only the media path has both keys.
+    let mut mw_attribs_json: Vec<serde_json::Value> = Vec::new();
+    for (key, val) in [
         ("link", opts.link.as_ref()),
         ("alt", opts.alt.as_ref()),
         ("manualthumb", opts.manualthumb.as_ref()),
         ("page", opts.page.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(key, val)| {
-        val.map(|v| {
-            DataMwAttrib::new(
-                DataMwValue::Str(key.to_string()),
-                DataMwValue::Object {
-                    txt: Some(v.clone()),
-                    html: opts.expanded_html.get(key).cloned(),
-                    uneditable: false,
-                },
-            )
-        })
-    })
-    .collect();
+    ] {
+        let Some(v) = val else {
+            continue;
+        };
+        let html = match opts.expanded_src.get(key) {
+            Some(items) if contains_transclusion(items) => Some(tokens_to_attribute_html(items)),
+            Some(items) => {
+                let frag = build_fragment(items.clone(), fragments, next_id);
+                mw_attr_frag_tokens.push(attr_mw_fragment_token(key, frag, fragments, next_id));
+                // Filled by the post-pass that runs after id assignment.
+                Some(String::new())
+            }
+            None => None,
+        };
+        let mut value = serde_json::Map::new();
+        if let Some(html) = html {
+            value.insert("html".to_string(), serde_json::Value::String(html));
+        }
+        value.insert("txt".to_string(), serde_json::Value::String(v.clone()));
+        mw_attribs_json.push(serde_json::Value::Array(vec![
+            serde_json::Value::String(key.to_string()),
+            serde_json::Value::Object(value),
+        ]));
+    }
 
     let mut container = TagTk::new(container_name, container_attribs, DataParsoid::default());
 
@@ -1206,14 +1297,12 @@ pub fn render_file(
         dp.opt_list = Some(opt_list);
         container.data_parsoid = dp;
     }
-    if !data_mw_attribs.is_empty() || (is_inline && caption.is_some()) {
+    if !mw_attribs_json.is_empty() || (is_inline && caption.is_some()) {
         let mut obj = serde_json::Map::new();
-        if !data_mw_attribs.is_empty() {
-            let json =
-                crate::pipeline::attribute_expander::serialize_data_mw_attribs(&data_mw_attribs);
+        if !mw_attribs_json.is_empty() {
             obj.insert(
                 "attribs".to_string(),
-                serde_json::from_str(&json).unwrap_or(serde_json::Value::Array(vec![])),
+                serde_json::Value::Array(mw_attribs_json),
             );
         }
         // Inline-media captions are stored in `data-mw.caption` (mirrors PHP's
@@ -1265,8 +1354,12 @@ pub fn render_file(
         span.add_attribute_str("lang", lang);
     }
 
-    let mut out = vec![
-        Item::Tok(ParsoidToken::Tag(container)),
+    let mut out = vec![Item::Tok(ParsoidToken::Tag(container))];
+    // The expandable-option fragments ride as the container's first children (the
+    // tree builder stashes each as a placeholder, and `collect_attr_mw_fragments`
+    // moves it onto the container before it could be unpacked into view).
+    out.extend(mw_attr_frag_tokens);
+    out.extend([
         Item::Tok(ParsoidToken::Tag(anchor)),
         Item::Tok(ParsoidToken::Tag(span)),
         Item::Str(title.get_prefixed_text()),
@@ -1280,7 +1373,7 @@ pub fn render_file(
             vec![],
             DataParsoid::default(),
         ))),
-    ];
+    ]);
 
     // For block formats, add a figcaption holding the caption (or empty).
     if !is_inline {
@@ -1398,6 +1491,58 @@ fn tokens_to_attribute_html(items: &[Item]) -> String {
     out
 }
 
+/// The attribute marking a `mw:dom-fragment-token` as a *data-mw* attribute
+/// fragment rather than a rendered one.
+///
+/// `render_file` tunnels an expandable media option's DOM through the same
+/// placeholder mechanism a caption uses, but the option fragment must not be
+/// spliced into the visible tree: `collect_attr_mw_fragments` moves it onto the
+/// container's `attr_mw_fragments`, where the id pass numbers it and a post-pass
+/// serializes it into `data-mw.attribs`.
+pub(crate) const MW_ATTR_KEY_ATTR: &str = "data-mw-attr-key";
+
+/// Carries the `about` id a file link's container should use, stamped on the
+/// `wikilink` token by the per-chunk expansion loop.
+///
+/// `renderFile` allocates the id where the media sits; rustoid renders media in a
+/// global post-expansion pass, when the document's `about` counter is already at
+/// the page's end. The chunk loop records instead the counter the chunk reached,
+/// so a media that is the chunk's last `about`-spender gets the id the service
+/// gives it. A chunk whose media is followed by a template can still differ, and
+/// a chunk with several expandable media numbers them in file order.
+pub(crate) const MW_ABOUT_BASE_ATTR: &str = "data-mw-about-base";
+
+/// A `mw:dom-fragment-token` placeholder carrying an expandable media option.
+fn attr_mw_fragment_token(
+    ck: &str,
+    frag: crate::dom::node::Node,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &std::cell::Cell<usize>,
+) -> Item {
+    let id = next_id.get();
+    next_id.set(id + 1);
+    fragments.insert(id, frag);
+
+    let mut tok = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+        "mw:dom-fragment-token",
+        vec![],
+        crate::wikitext::tokens_v2::DataParsoid::default(),
+    );
+    for (k, v) in [
+        ("data-fragment-id", id.to_string()),
+        (MW_ATTR_KEY_ATTR, ck.to_string()),
+    ] {
+        tok.attribs.push(KV {
+            key: crate::wikitext::tokens_v2::KeyValue::Str(k.to_string()),
+            value: crate::wikitext::tokens_v2::KeyValue::Str(v),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+    }
+    Item::Tok(ParsoidToken::SelfclosingTag(tok))
+}
+
 /// Faithful port of `WikiLinkHandler::stringifyOptionTokens`, limited to the
 /// cases rustoid's token stream can produce at this point.
 ///
@@ -1435,6 +1580,11 @@ fn stringify_option_tokens(ctx: &WikiLinkContext, items: &[Item], prefix: &str) 
                 }
                 return None;
             }
+            Item::Tok(ParsoidToken::Comment(_)) => {
+                // A comment contributes nothing: PHP's `TokenUtils::tokensToString`
+                // drops it, so `alt=  <!--x-->  ` stringifies to `alt=` — not to a
+                // value holding the comment (which `$optInfo['v']` must not).
+            }
             Item::Tok(_) => {
                 // Any other token contributes its stringification.
                 let single = std::slice::from_ref(item);
@@ -1466,10 +1616,16 @@ fn record_media_option(
     raw_items: &[Item],
 ) -> bool {
     use super::media_options::{
-        get_option_info, has_wikitext_markup, is_valid_internal_lang, strip_quote_markers,
+        get_option_info, has_wikitext_markup, is_valid_internal_lang, parse_media_dimension,
+        strip_html_comments, strip_quote_markers,
     };
 
-    let Some(info) = get_option_info(ctx.config, part) else {
+    // `TokenUtils::tokensToString` drops comments before an option is recognized,
+    // so `alt=  <!--x-->  ` captures an empty value, not the comment's surrounding
+    // whitespace. The tokenizer holds a link's comment as text, so strip comments
+    // for recognition while keeping `part` (with the comment) for the markup check.
+    let recognized = strip_html_comments(part);
+    let Some(info) = get_option_info(ctx.config, &recognized) else {
         return false;
     };
     // Whether this option is "expanded" (marks the container `mw:ExpandedAttrs`
@@ -1489,15 +1645,17 @@ fn record_media_option(
     };
     if exp_opt {
         opts.expanded_attrs = true;
-        // For `data-mw.attribs` options, stash the serialized (HTML) expanded
-        // attribute source so it round-trips a template (e.g. `page {{1x|2}}`).
-        // Only the options that `renderFile` stores in `data-mw.attribs` need it.
+        opts.has_expandable_opt = true;
+        // For the options `renderFile` stores in `data-mw.attribs`, keep the
+        // value's token array so `render_file` can render it to a DOM fragment
+        // (`expandAttrValueToDOM`) and store the serialized HTML as the option's
+        // `html`.
         if matches!(
             info.ck.as_str(),
             "page" | "link" | "alt" | "manualthumb" | "class"
         ) {
-            let html = tokens_to_attribute_html(raw_items);
-            opts.expanded_html.insert(info.ck.clone(), html);
+            opts.expanded_src
+                .insert(info.ck.clone(), raw_items.to_vec());
         }
     }
 
@@ -1545,7 +1703,7 @@ fn record_media_option(
             opts.link = Some(strip_quote_markers(&resolved));
         }
         "alt" => {
-            opts.expanded_attrs |= has_wikitext_markup(&info.v);
+            opts.expanded_attrs |= has_wikitext_markup(part);
             if opts.alt.is_none() {
                 let resolved = resolve_wikilink_option(&info.v, false);
                 opts.alt = Some(strip_quote_markers(&resolved));
@@ -1565,11 +1723,15 @@ fn record_media_option(
                     break;
                 }
             }
-            if let Some((w, h)) = info.v.split_once('x') {
+            // `getOptionInfo` only trims the whole option string, so the captured
+            // value may still carry whitespace around the dimensions (e.g.
+            // `40 px`). Normalize it the way `Utils::parseMediaDimensions` does.
+            let dim = parse_media_dimension(&info.v).unwrap_or_else(|| info.v.clone());
+            if let Some((w, h)) = dim.split_once('x') {
                 opts.width = Some(w.to_string());
                 opts.height = Some(h.to_string());
             } else {
-                opts.width = Some(info.v);
+                opts.width = Some(dim);
             }
         }
         // A duplicate (or invalid-lang) option becomes a `bogus` optList entry.

@@ -6,6 +6,7 @@
 pub mod add_link_attributes;
 pub mod add_media_info;
 pub mod add_red_links;
+pub mod attr_mw_fragments;
 pub mod attribute_expander;
 pub mod attribute_transform_manager;
 pub mod auto_toc;

@@ -401,6 +401,16 @@ fn reconstruct_link_src(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, href
     src
 }
 
+/// Whether a `wikilink` token's `href` names the File (or Media) namespace, the
+/// targets whose rendering can allocate an `about` id.
+fn is_file_link_target(href: &str) -> bool {
+    let href = href.trim_start_matches("./");
+    let ns = href.split(':').next().unwrap_or("");
+    ns.eq_ignore_ascii_case("file")
+        || ns.eq_ignore_ascii_case("image")
+        || ns.eq_ignore_ascii_case("media")
+}
+
 /// The `mw:DOMFragment` placeholder starting at `items[i]`, if there is one:
 /// the exclusive end index, the placeholder's tokens, and the name its strip
 /// marker carries.
@@ -806,6 +816,11 @@ pub fn render_inline_fragment(
         fragments.clone(),
         None,
     ));
+    // Move expandable media-option fragments onto their containers before
+    // `post_pwrap_transforms` unpacks placeholders into view. A gallery renders
+    // each line through this fragment builder, so its media must be collected
+    // here rather than only in `build_ast`.
+    crate::pipeline::attr_mw_fragments::collect(&mut frag);
     let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
     crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
     // AddLinkAttributes also runs in the nested fragment pipeline (mirrors PHP's
@@ -1427,6 +1442,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
         next_id: &std::cell::Cell<usize>,
         context_title: Option<&crate::title::Title>,
+        about_counter: Option<&std::cell::Cell<usize>>,
     ) -> Vec<Item> {
         use crate::pipeline::wiki_link_render::{
             WikiLinkContext, get_wiki_link_target_info, render_redirect,
@@ -1437,6 +1453,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut ctx = WikiLinkContext::new(self.config);
         if let Some(title) = context_title {
             ctx.set_context_title(title);
+        }
+        if let Some(counter) = about_counter {
+            ctx.set_document_about(counter);
         }
         let mut out: Vec<Item> = Vec::new();
 
@@ -1492,7 +1511,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
                 let sub = self.tokenize(&src[1..]).unwrap_or_default();
-                let sub = self.render_links(sub, fragments, next_id, context_title);
+                let sub = self.render_links(sub, fragments, next_id, context_title, about_counter);
                 out.extend(sub);
                 continue;
             }
@@ -1506,7 +1525,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     let src = reconstruct_link_src(stt, &href);
                     out.push(Item::Str("[".to_string()));
                     let sub = self.tokenize(&src[1..]).unwrap_or_default();
-                    let sub = self.render_links(sub, fragments, next_id, context_title);
+                    let sub =
+                        self.render_links(sub, fragments, next_id, context_title, about_counter);
                     out.extend(sub);
                     continue;
                 }
@@ -1534,7 +1554,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
                 let sub = self.tokenize(&src[1..]).unwrap_or_default();
-                let sub = self.render_links(sub, fragments, next_id, context_title);
+                let sub = self.render_links(sub, fragments, next_id, context_title, about_counter);
                 out.extend(sub);
                 continue;
             }
@@ -1609,6 +1629,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens: Vec<Item>,
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
         next_id: &std::cell::Cell<usize>,
+        about_counter: Option<&std::cell::Cell<usize>>,
     ) -> Vec<Item> {
         use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
 
@@ -1649,7 +1670,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                 match it {
                                     Item::Str(s) if s.contains("[[") => {
                                         let sub = self.tokenize_inline(&s).unwrap_or_default();
-                                        let sub = self.render_links(sub, fragments, next_id, None);
+                                        let sub = self.render_links(
+                                            sub,
+                                            fragments,
+                                            next_id,
+                                            None,
+                                            about_counter,
+                                        );
                                         expanded.extend(sub);
                                     }
                                     other => expanded.push(other),
@@ -2156,8 +2183,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // (the token-level stages that run before tree building on the main page).
         let mut fragments = std::collections::HashMap::new();
         let next_id = std::cell::Cell::new(0usize);
-        let tokens = self.render_links(tokens, &mut fragments, &next_id, None);
-        let tokens = self.render_external_links(tokens, &mut fragments, &next_id);
+        let tokens = self.render_links(tokens, &mut fragments, &next_id, None, None);
+        let tokens = self.render_external_links(tokens, &mut fragments, &next_id, None);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
 
@@ -2355,7 +2382,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 )
             })
             .collect();
-        let tokens = self.render_external_links(tokens, &mut fragments, &next_id);
+        let tokens = self.render_external_links(tokens, &mut fragments, &next_id, None);
         let mut tokens = self.render_behavior_switches(tokens);
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
@@ -2365,6 +2392,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let stage = TreeBuilderStage::new(true);
         let frag = stage.to_ast_with_fragments(tokens, None, self.config, fragments, None);
         let mut frag = extract_fragment_children(&frag);
+        // Move the expandable media-option fragments onto their containers before
+        // `post_pwrap_transforms` unpacks the placeholders into view.
+        crate::pipeline::attr_mw_fragments::collect(&mut frag);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
         crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
 
@@ -2735,8 +2765,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut fragments: std::collections::HashMap<usize, crate::dom::node::Node> =
             std::collections::HashMap::new();
         let next_id = std::cell::Cell::new(0usize);
-        let tokens = self.render_links(tokens, &mut fragments, &next_id, context_title);
-        let tokens = self.render_external_links(tokens, &mut fragments, &next_id);
+        let tokens = self.render_links(tokens, &mut fragments, &next_id, context_title, None);
+        let tokens = self.render_external_links(tokens, &mut fragments, &next_id, None);
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
         let (tokens, pre_fragments) = self.expand_wikitext_pre_sync(tokens, &next_id);
@@ -2754,6 +2784,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let stage = TreeBuilderStage::new(false);
         let mut ast =
             stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments, None);
+        // Move expandable media-option fragments onto their containers before
+        // `post_pwrap_transforms` unpacks placeholders into the tree.
+        crate::pipeline::attr_mw_fragments::collect(&mut ast);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::p_wrap::run(&mut ast);
         // AddLinkAttributes runs *before* `dom-unpack` (mirrors PHP's
@@ -2775,6 +2808,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // DOM transforms here; the async `build_ast` runs it after `AddMediaInfo`.)
         crate::pipeline::unpack_dom_fragments::fix_bad_nesting(&mut ast);
         wrap_sections_in_ast(&mut ast, wrap_sections);
+        // Serialize the expandable media-option fragments into `data-mw.attribs`
+        // (no id pass here, so their nodes carry no ids).
+        crate::pipeline::attr_mw_fragments::serialize_into_data_mw(
+            &mut ast,
+            self.strip_data_parsoid.get(),
+        );
         Ok(ast)
     }
 
@@ -2963,6 +3002,47 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     next_id,
                 )
                 .await;
+            // A media option that is a token array earns its container a fresh
+            // `about` id (`renderFile`'s `$hasExpandableOpt`), allocated where the
+            // media sits. rustoid renders media in a global post-expansion pass,
+            // so the counter there is past the whole page; stamp the id the media
+            // would have been given onto the file link instead (see
+            // `MW_ABOUT_BASE_ATTR`), and advance the counter past it.
+            let mut chunk = chunk;
+            {
+                let base = about_counter.get();
+                let media_ctx =
+                    crate::pipeline::wiki_link_render::WikiLinkContext::new(self.config);
+                let mut media_index = 0usize;
+                for item in &mut chunk {
+                    if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item
+                        && t.name == "wikilink"
+                        && is_file_link_target(
+                            t.attribs
+                                .iter()
+                                .find(|kv| kv.key.as_str() == Some("href"))
+                                .and_then(|kv| kv.value.as_str())
+                                .unwrap_or_default(),
+                        )
+                        && crate::pipeline::wiki_link_render::has_expandable_option(
+                            &media_ctx,
+                            &ParsoidToken::SelfclosingTag(t.clone()),
+                        )
+                    {
+                        t.add_attribute_str(
+                            crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR,
+                            (base + 1 + media_index).to_string(),
+                        );
+                        media_index += 1;
+                    }
+                }
+                // Those `about`s are real allocations at this point in the
+                // document, ahead of the next chunk: advance the counter so a
+                // later id (e.g. a following `<ref>`) continues after them.
+                if media_index > 0 {
+                    about_counter.set(base + media_index);
+                }
+            }
             chunked.extend(chunk);
         }
         let tokens = chunked;
@@ -2973,8 +3053,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // fold at the end of `build_ast` would leave the caption's `<style>`
         // unresolved: `[[File:…|thumb|{{#invoke:list|…}}]]`).
         fragments.extend(std::mem::take(&mut *self.ext_fragments.borrow_mut()));
-        let tokens = self.render_links(tokens, &mut fragments, next_id, Some(&title));
-        let tokens = self.render_external_links(tokens, &mut fragments, next_id);
+        let tokens = self.render_links(
+            tokens,
+            &mut fragments,
+            next_id,
+            Some(&title),
+            Some(about_counter),
+        );
+        let tokens =
+            self.render_external_links(tokens, &mut fragments, next_id, Some(about_counter));
         let tokens = self.render_behavior_switches(tokens);
         let tokens = self.render_language_variants(tokens);
         // Route `format="wikitext"` extension bodies through the inline
@@ -3025,6 +3112,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // so a later transclusion must not reuse those ids.
         about_counter.set(tree_about_counter.get());
         drop(tree_about_counter);
+        // Move expandable media-option fragments onto their containers (and out of
+        // view) before `post_pwrap_transforms` unpacks placeholders into the tree.
+        crate::pipeline::attr_mw_fragments::collect(&mut ast);
         // Capture transclusion marker depth map over the freshly-built DOM
         // (before p-wrapping restructures it), mirroring PHP's
         // `transclusionMetaTagDepthMap` recorded at tree-build time.
@@ -3151,6 +3241,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         if options.node_ids {
             crate::pagebundle::assign_node_ids(&mut ast);
         }
+        // Serialize the expandable media-option fragments into `data-mw.attribs`
+        // (after the id pass, which numbers them; without it in standalone mode,
+        // where their nodes carry no ids).
+        crate::pipeline::attr_mw_fragments::serialize_into_data_mw(
+            &mut ast,
+            self.strip_data_parsoid.get(),
+        );
         ast
     }
 

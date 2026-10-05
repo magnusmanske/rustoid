@@ -107,6 +107,26 @@ fn short_canonical_option(canonical: &str) -> String {
         .to_string()
 }
 
+/// Remove every HTML comment (`<!-- … -->`) from a string.
+///
+/// Mirrors `TokenUtils::tokensToString`, which drops each `CommentTk`: an option
+/// part is stringified *after* comments are removed, so `alt=  <!--x-->  `
+/// captures an empty value rather than the comment's surrounding whitespace.
+pub fn strip_html_comments(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(rel) => rest = &rest[start + rel + 3..],
+            // An unterminated comment swallows the rest of the string.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Strip wikitext quote markers (`'''`/`''`) from a media option value, so the
 /// text content of `link=`/`alt=` is the plain form (`Foo''s bar''s` → `Foos bars`,
 /// `''x''` → `x`). A `<nowiki>` wrapper is also unwrapped, with its inner content
@@ -131,22 +151,9 @@ pub fn strip_quote_markers(value: &str) -> String {
         }
     }
 
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
     // Strip HTML comments (`<!-- … -->`) so their content contributes no text
     // (mirrors `textContent`, which ignores comment nodes).
-    while let Some(start) = rest.find("<!--") {
-        out.push_str(&rest[..start]);
-        match rest[start..].find("-->") {
-            Some(rel) => rest = &rest[start + rel + 3..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-
+    let mut out = strip_html_comments(value);
     let chars: Vec<char> = out.chars().collect();
     out.clear();
     let mut i = 0;
@@ -238,6 +245,12 @@ pub fn get_option_info(config: &dyn SiteConfig, opt_str: &str) -> Option<OptionI
 /// option-text prefix, returning the option group and the captured value.
 /// Mirrors `SiteConfig::getMediaPrefixParameterizedAliasMatcher` + the
 /// `key=value`/`$1` placeholder extraction.
+///
+/// The captured value is returned verbatim: Parsoid trims only the whole option
+/// string (`getOptionInfo`'s `trim($optStr)`), so whitespace *after* the
+/// `=`/prefix survives into `$optInfo['v']` — and thence the served `alt`
+/// attribute and `data-mw.attribs` `txt`. A consumer needing a normalized value
+/// parses it (the `width` handler runs `parse_media_dimension`).
 fn prefix_option_info(
     magic_words: &MagicWordMap,
     opt_text: &str,
@@ -264,9 +277,9 @@ fn prefix_option_info(
                     let Some(value) = after_prefix.strip_suffix(literal_suffix) else {
                         continue;
                     };
-                    return Some((group, value.trim().to_string()));
+                    return Some((group, value.to_string()));
                 }
-                return Some((group, after_prefix.trim().to_string()));
+                return Some((group, after_prefix.to_string()));
             }
             // A non-parameterized alias only matches as a bare prefix when
             // followed by `=` (e.g. `thumb=` implies `thumb=<value>`).
@@ -276,7 +289,7 @@ fn prefix_option_info(
             }
             if let Some(rest) = opt_text.strip_prefix(literal) {
                 let value = rest.strip_prefix('=').unwrap_or(rest);
-                return Some((group, value.trim().to_string()));
+                return Some((group, value.to_string()));
             }
         }
     }
@@ -352,10 +365,14 @@ pub struct MediaOpts {
     /// Whether an `alt=` (or similarly rich) option value carries wikitext
     /// markup, marking the container `mw:ExpandedAttrs`.
     pub expanded_attrs: bool,
-    /// For `data-mw.attribs` options with a template-generated value, the
-    /// serialized (HTML) expanded attribute source, keyed by option canonical
-    /// key (e.g. `"page"`). Mirrors `dataMw->attribs[i]->value->html`.
-    pub expanded_html: std::collections::HashMap<String, String>,
+    /// Whether a `data-mw.attribs` option's value was a token array
+    /// (`$expOpt`), the condition that also earns the container an `about`.
+    pub has_expandable_opt: bool,
+    /// For `data-mw.attribs` options whose value is a token array, the option's
+    /// tokens, keyed by option canonical key (e.g. `"alt"`). `render_file`
+    /// renders each to a DOM fragment (`expandAttrValueToDOM`) and stores its
+    /// serialization as `dataMw->attribs[i]->value->html`.
+    pub expanded_src: std::collections::HashMap<String, Vec<crate::wikitext::tokens_v2::Item>>,
     /// Whether a template expanded to a `|`-separated option string (no editing
     /// support), marking the container `mw:Placeholder`.
     pub placeholder: bool,

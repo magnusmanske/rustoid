@@ -251,6 +251,13 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
     let mut assigned = 0;
 
     if node.kind.is_element() {
+        // An element's embedded `data-mw` fragments are numbered before the
+        // element itself: Parsoid serializes a node's `data-mw` (numbering the
+        // fragments it embeds) inside `storeRichAttributes`, ahead of
+        // `storeInPageBundle`, which assigns the node's own id.
+        for (_ck, fragment) in node.attr_mw_fragments.iter_mut() {
+            assigned += assign_walk(fragment, alloc);
+        }
         // A node takes an id when it has metadata to key it by: a
         // *non-empty* `data-parsoid`, the empty-dp-slot case, or a `data-mw`
         // whose `data-parsoid` was not discarded as transclusion-internal
