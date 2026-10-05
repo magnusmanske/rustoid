@@ -586,7 +586,12 @@ fn start_tag_attrs<'s>(source: &'s str, name: &str) -> Option<&'s str> {
         return None;
     }
     let end = rest.find('>')?;
-    Some(&rest[..end])
+    let attrs = &rest[..end];
+    // A trailing `/` is the self-close marker, not part of the last value. An
+    // *unquoted* value keeps slashes generally (`name=a/b`), but Parsoid's
+    // `attribute_preprocessor_text` refuses a `/` immediately followed by `>`,
+    // so `<ref name=X/>` names the ref `X`, not `X/`.
+    Some(attrs.strip_suffix('/').unwrap_or(attrs))
 }
 
 /// The text between `>` and `</name>`, which is an extension's raw body.
@@ -1244,6 +1249,20 @@ mod tests {
         apply_transclusion_encapsulation(&mut plain, &plain_source);
         assert_eq!(plain.get_attr("typeof"), Some("mw:Extension/ref"));
         assert!(!plain.get_attr("data-mw").unwrap().contains("parts"));
+    }
+
+    /// A trailing `/` before `>` is the self-close marker, not part of an
+    /// unquoted value: `<ref name=a/b/>` names the ref `a/b`, while an internal
+    /// slash or one before whitespace is kept.
+    #[test]
+    fn a_trailing_solidus_is_the_self_close_marker() {
+        let pairs = |s: &str| tag_attrs(start_tag_attrs(s, "ref").unwrap());
+        let name = |s: &str| pairs(s)[0].1.clone();
+        assert_eq!(name("<ref name=a/b>x</ref>"), "a/b");
+        assert_eq!(name("<ref name=a/b/>"), "a/b");
+        assert_eq!(name("<ref name=a/b//>"), "a/b/");
+        assert_eq!(name("<ref name=a/b/ >x</ref>"), "a/b/");
+        assert_eq!(name("<ref name=ab/>"), "ab");
     }
 
     #[test]
