@@ -12238,3 +12238,44 @@ where rustoid serves `<span about="#mwt294" typeof="mw:Transclusion" …>nil</sp
 and moves the `<link>` after it. The template's whole output is a category link,
 so the transclusion wrapper has to merge onto the `<link>`; rustoid wraps it in a
 placeholder span carrying the literal text `nil`.
+
+## Fixed: a template nested inside an attribute value
+
+### Cause
+
+An `#invoke` argument value is expanded before the module sees it. rustoid did
+that with `expand_templates` (a chunk's top level) followed by
+`expand_attrib_templates` (one attribute level). A token *inside* an attribute
+value can carry attributes of its own, and that pass did not recurse, so a
+template nested two attribute levels down survived. `Template:Dead link` is the
+case: its `{{Fix|special=<span title="{{#if:…}}">}}` puts the `<span>` inside
+the display text of a `wikilink`, i.e. an attribute of a token that is itself an
+attribute value. The `#if` was left unexpanded, so the `{{Fix}}` call's recorded
+source still spelled `{{{date|}}}`; the module was handed that stale text, and
+the page-level `expand_attributes` later resolved `{{{date|}}}` in the *root*
+frame — where a template's arguments do not exist — so the title came out empty
+and the span was marked `mw:ExpandedAttrs`, spending two extra `about` ids.
+
+### Fix
+
+`expand_attrib_templates` recurses: after expanding an attribute value's tokens
+with `expand_templates`, it runs itself over the result. PHP's `Frame::expand`
+walks the whole node tree in one call, so recursing is what makes the two
+equivalent.
+
+### Effect: byte 128376 moves to 171606
+
+`Zebra`'s first difference is now **171606 (30.63% of the oracle)**. No subset
+first-difference offset regresses (`Bicycle` 11836, `Nobel Prize` 5926,
+`Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409,
+`Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds
+at **877/896**, and 970 lib tests and 115 compare tests pass with clippy and
+`cargo fmt` clean.
+
+### The next difference at 171606: `Module:Listen` cannot read a file's metadata
+
+The `{{Listen}}` call in the Communication section is served with an
+`mw-empty-elt` wrapper span; rustoid serves a Lua error paragraph instead.
+`Module:Listen` fails at line 126 with `attempt to index field 'file' (a nil
+value)`: `mw.title.makeTitle(-2, filename)` answers `exists = true` but
+`file = nil`, so a file whose page exists answers no imageinfo.
