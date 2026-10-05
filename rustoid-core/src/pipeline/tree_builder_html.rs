@@ -1078,7 +1078,10 @@ fn merge_encap_data_mw(encap: Option<String>, target: Option<String>) -> Option<
 /// order. A `<templatestyles>` sheet that is itself the target — a `<style>`
 /// whose next sibling shares the transclusion's `about` — is served this way:
 /// `{"name":"templatestyles","attrs":{…},"body":{…},"parts":[…]}`.
-fn append_parts_to_data_mw(parts: Option<String>, target: Option<String>) -> Option<String> {
+pub(crate) fn append_parts_to_data_mw(
+    parts: Option<String>,
+    target: Option<String>,
+) -> Option<String> {
     let parts = parts?;
     let Some(target) = target else {
         return Some(parts);

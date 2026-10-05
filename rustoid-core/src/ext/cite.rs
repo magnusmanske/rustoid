@@ -76,6 +76,12 @@ pub struct Reference {
     /// are separated by a space. That asymmetry is real and verified against the
     /// cached output.
     pub uses: Vec<String>,
+    /// One entry per use site, parallel to `uses`: the `<ref>` tag's own
+    /// attributes, in source order, with empty values preserved. Parsoid echoes
+    /// them verbatim into each use's `data-mw.attrs` (keys lowercased, values
+    /// trimmed — `TokenUtils::kvToHash`), which is why a `<ref group="">` keeps
+    /// its empty `group` where a `<ref name="x">` has none.
+    pub use_attrs: Vec<Vec<(String, String)>>,
     /// Which use supplied this note's wikitext, as an index into `uses`.
     ///
     /// **Not** necessarily the first. A reuse can precede the definition —
@@ -191,6 +197,36 @@ impl CiteState {
         self_closing: bool,
         about: Option<&str>,
     ) -> String {
+        // Build the `data-mw.attrs` list Parsoid would echo for this tag: the
+        // name when set, then the group when set. The real pipeline parses the
+        // tag's attributes directly (see `add_with_attrs`) so that an explicit
+        // empty value survives; this convenience form is for callers that only
+        // have the parsed name and group.
+        let mut attrs = Vec::new();
+        if !name.is_empty() {
+            attrs.push(("name".to_string(), name.to_string()));
+        }
+        if !group.is_empty() {
+            attrs.push(("group".to_string(), group.to_string()));
+        }
+        self.add_with_attrs(name, group, attrs, body, self_closing, about)
+    }
+
+    /// Record a `<ref>` use, keeping its parsed attributes for `data-mw`.
+    ///
+    /// `attrs` are the tag's attributes in source order, empty values included
+    /// (`TokenUtils::kvToHash` semantics); they are echoed verbatim into this
+    /// use's `data-mw.attrs`. `name`/`group` are passed separately because they
+    /// drive the note's identity and numbering.
+    pub fn add_with_attrs(
+        &mut self,
+        name: &str,
+        group: &str,
+        attrs: Vec<(String, String)>,
+        body: &str,
+        self_closing: bool,
+        about: Option<&str>,
+    ) -> String {
         // A named ref is identified by its *name*, so `<ref name="x" />` finds the
         // note that `<ref name="x">…</ref>` defined. An anonymous one is identified
         // by its content, so the same text twice shares a note — which is what Cite
@@ -217,6 +253,7 @@ impl CiteState {
                     number,
                     global_id,
                     uses: Vec::new(),
+                    use_attrs: Vec::new(),
                     body_use: None,
                     body_about: None,
                 });
@@ -246,6 +283,7 @@ impl CiteState {
             use_index,
         );
         self.references[idx].uses.push(id.clone());
+        self.references[idx].use_attrs.push(attrs);
         // The pointer belongs to the use that supplied the text, which is this one
         // whenever it defines.
         if defines {
@@ -381,18 +419,26 @@ impl Default for DocIds {
 
 /// The `data-mw` JSON for a `<ref>` marker.
 ///
-/// A named ref records its name; the group is recorded only when set. A ref with
-/// content records the body's wikitext as `extsrc`. Rendered in the attribute
-/// order the cached Parsoid output uses.
+/// The `attrs` come from the use's own tag attributes, in source order, empty
+/// values included (`TokenUtils::kvToHash`), because Parsoid echoes them
+/// verbatim — a `<ref group="" name="x">` records `{"group":"","name":"x"}`.
+/// A ref with content records the body's wikitext as `extsrc`.
+///
+/// Rendered in the attribute order the cached Parsoid output uses.
 pub fn ref_data_mw(reference: &Reference, use_index: usize) -> String {
-    let mut attrs = Vec::new();
-    if !reference.name.is_empty() {
-        attrs.push(format!("\"name\":{}", json_string(&reference.name)));
-    }
-    if !reference.group.is_empty() {
-        attrs.push(format!("\"group\":{}", json_string(&reference.group)));
-    }
-    let attrs = format!("{{{}}}", attrs.join(","));
+    let attrs = reference
+        .use_attrs
+        .get(use_index)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let attrs = format!(
+        "{{{}}}",
+        attrs
+            .iter()
+            .map(|(k, v)| format!("{}:{}", json_string(k), json_string(v)))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     // Only the use that supplied the note's text points at it. That is *not*
     // necessarily the first use: a reuse may precede the definition
     // (`A<ref name="x"/>B<ref name="x">body</ref>`), and `Zebra` opens with
@@ -479,9 +525,9 @@ pub fn run(
 /// `<references>` is deliberately not collected here: it renders in place, from
 /// state only this walk can build, so it is handled during substitution.
 fn collect(node: &crate::dom::node::Node, state: &mut CiteState, use_ids: &mut Vec<String>) {
-    if let Some((name, group, body, self_closing)) = read_ref(node) {
+    if let Some((name, group, body, self_closing, attrs)) = read_ref(node) {
         let about = node.get_attr("about");
-        use_ids.push(state.add(&name, &group, &body, self_closing, about));
+        use_ids.push(state.add_with_attrs(&name, &group, attrs, &body, self_closing, about));
     }
     for child in &node.children {
         collect(child, state, use_ids);
@@ -494,7 +540,11 @@ fn collect(node: &crate::dom::node::Node, state: &mut CiteState, use_ids: &mut V
 /// `source` attribute holds the raw text, because it does not parse an extension's
 /// interior. So the attributes are recovered from that source rather than read from
 /// the element.
-fn read_ref(node: &crate::dom::node::Node) -> Option<(String, String, String, bool)> {
+/// What a `<ref>` tag's source yields: its name, group, body wikitext,
+/// self-closing flag, and the raw attributes echoed into `data-mw.attrs`.
+type RefTag = (String, String, String, bool, Vec<(String, String)>);
+
+fn read_ref(node: &crate::dom::node::Node) -> Option<RefTag> {
     if !typeof_contains(node, "mw:Extension") || node.get_attr("name") != Some("ref") {
         return None;
     }
@@ -502,6 +552,7 @@ fn read_ref(node: &crate::dom::node::Node) -> Option<(String, String, String, bo
     let attrs = start_tag_attrs(source, "ref")?;
     // A self-closing ref carries no body, and its `source` is just the start tag.
     let self_closing = source.trim_end().ends_with("/>");
+    let pairs = tag_attrs(attrs);
     let name = attr_value(attrs, "name").unwrap_or_default();
     let group = attr_value(attrs, "group").unwrap_or_default();
     let body = if self_closing {
@@ -509,7 +560,22 @@ fn read_ref(node: &crate::dom::node::Node) -> Option<(String, String, String, bo
     } else {
         body_between(source).unwrap_or_default()
     };
-    Some((name, group, body, self_closing))
+    Some((name, group, body, self_closing, pairs))
+}
+
+/// The tag's attributes as ordered `(key, value)` pairs, empty values kept.
+///
+/// The keys are lowercased and the values trimmed, matching
+/// `TokenUtils::kvToHash` — the shape Parsoid stores in an extension's
+/// `data-mw.attrs`.
+fn tag_attrs(attrs: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = attrs;
+    while let Some((key, value, consumed)) = next_attr(rest) {
+        out.push((key.to_lowercase(), value.trim().to_string()));
+        rest = &rest[consumed..];
+    }
+    out
 }
 
 /// The attribute text of `<name …>` (or `<name …/>`), without the brackets.
@@ -674,9 +740,55 @@ fn walk_render(
             return;
         };
         let about = node.get_attr("about").map(str::to_string);
-        let marker = ref_marker_nodes(reference, &ref_id, page_title, ids, about);
+        let mut marker = ref_marker_nodes(reference, &ref_id, page_title, ids, about);
+        // A `<ref>` that is the sole content of a template call is that
+        // transclusion's encapsulation target. In Parsoid the ref travels as a
+        // *sealed* fragment (`mw:DOMFragment/sealed/ref`), so `tplwrap` stamps
+        // it before Cite swaps the sealed type for `mw:Extension/ref`: the
+        // `typeof` keeps `mw:Transclusion` first and the template's `parts`
+        // stay in `data-mw`. An *unpacked* fragment instead gets the type
+        // appended by `UnpackDOMFragments`, which is why `<pre>` and the ref
+        // differ.
+        apply_transclusion_encapsulation(&mut marker, node);
         *node = marker;
         *rendered += 1;
+    }
+}
+
+/// Carry a transclusion's encapsulation onto a Cite marker.
+///
+/// `source` is the encapsulation target the tree builder produced for the
+/// enclosing `{{…}}` (the ref placeholder). Its `about` already sits on the
+/// marker; the `typeof` and `data-mw` are merged here so the marker reports the
+/// template it came from, as the service serves it.
+fn apply_transclusion_encapsulation(
+    marker: &mut crate::dom::node::Node,
+    source: &crate::dom::node::Node,
+) {
+    let in_transclusion = source
+        .get_attr("typeof")
+        .is_some_and(|t| t.split_whitespace().any(|x| x == "mw:Transclusion"));
+    if !in_transclusion {
+        return;
+    }
+    // `mw:Transclusion` leads the list (Parsoid prepends it while the ref is
+    // still a sealed fragment).
+    let typeof_attr = marker.get_attr("typeof").unwrap_or_default().to_string();
+    if !typeof_attr
+        .split_whitespace()
+        .any(|x| x == "mw:Transclusion")
+    {
+        marker.set_attr("typeof", format!("mw:Transclusion {typeof_attr}"));
+    }
+    // Append the via-template wikitext to the ref's own `data-mw`.
+    let parts = source
+        .data_mw
+        .clone()
+        .or_else(|| source.get_attr("data-mw").map(str::to_string));
+    let target = marker.get_attr("data-mw").map(str::to_string);
+    if let Some(merged) = crate::pipeline::tree_builder_html::append_parts_to_data_mw(parts, target)
+    {
+        marker.set_attr("data-mw", merged);
     }
 }
 
@@ -1060,6 +1172,78 @@ mod tests {
             ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{},"body":{"id":"mw-reference-text-cite_note-1"}}"#
         );
+    }
+
+    /// A `<ref group="" name="…">` keeps the empty `group`, in the order it was
+    /// written. `Module:Footnotes` emits exactly this through
+    /// `frame:extensionTag`, and the served `attrs` record both keys — unlike a
+    /// `<ref name="x">`, where `group` is absent.
+    #[test]
+    fn ref_data_mw_keeps_an_explicit_empty_group_in_source_order() {
+        let mut st = CiteState::new();
+        st.add_with_attrs(
+            "FOOTNOTEPlumbShaw201854",
+            "",
+            vec![
+                ("group".to_string(), String::new()),
+                ("name".to_string(), "FOOTNOTEPlumbShaw201854".to_string()),
+            ],
+            "body",
+            false,
+            None,
+        );
+        assert_eq!(
+            ref_data_mw(&st.references[0], 0),
+            r#"{"name":"ref","attrs":{"group":"","name":"FOOTNOTEPlumbShaw201854"},"body":{"id":"mw-reference-text-cite_note-FOOTNOTEPlumbShaw201854-1"}}"#
+        );
+    }
+
+    /// A ref that is the sole content of a template call is that transclusion's
+    /// encapsulation target: its marker gains a leading `mw:Transclusion` and the
+    /// template's `parts`. A ref with no enclosing transclusion keeps a bare
+    /// `mw:Extension/ref` and no `parts`.
+    #[test]
+    fn a_ref_inherits_its_enclosing_transclusion() {
+        use crate::dom::node::{ElementKind, Node};
+
+        let mut st = CiteState::new();
+        st.add("x", "", "body", false, None);
+        let mut ids = DocIds::new();
+        let build = |ids: &mut DocIds| {
+            ref_marker_nodes(
+                &st.references[0],
+                "cite_ref-x_1-0",
+                "Zebra",
+                ids,
+                Some("#mwt1".to_string()),
+            )
+        };
+
+        // Inside a transclusion: `mw:Transclusion` leads, `parts` are appended.
+        let mut marker = build(&mut ids);
+        let mut source = Node::element(ElementKind::Other("extension".to_string()));
+        source.set_attr("typeof", "mw:Extension mw:Transclusion");
+        source.data_mw =
+            Some(r#"{"parts":[{"template":{"target":{"wt":"sfn"}},"i":0}]}"#.to_string());
+        apply_transclusion_encapsulation(&mut marker, &source);
+        assert_eq!(
+            marker.get_attr("typeof"),
+            Some("mw:Transclusion mw:Extension/ref")
+        );
+        assert_eq!(
+            marker.get_attr("data-mw"),
+            Some(
+                r#"{"name":"ref","attrs":{"name":"x"},"body":{"id":"mw-reference-text-cite_note-x-1"},"parts":[{"template":{"target":{"wt":"sfn"}},"i":0}]}"#
+            )
+        );
+
+        // At the page level (no `mw:Transclusion`): unchanged.
+        let mut plain = build(&mut ids);
+        let mut plain_source = Node::element(ElementKind::Other("extension".to_string()));
+        plain_source.set_attr("typeof", "mw:Extension");
+        apply_transclusion_encapsulation(&mut plain, &plain_source);
+        assert_eq!(plain.get_attr("typeof"), Some("mw:Extension/ref"));
+        assert!(!plain.get_attr("data-mw").unwrap().contains("parts"));
     }
 
     #[test]
