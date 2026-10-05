@@ -10995,3 +10995,32 @@ not: the cached `PageInfo` says the title is not a redirect, so the link stays
 blue. The redirect fact is page-scoped and stable; the next target is either a
 stale cache entry or a resolution gap. Also still open: the taxonomy `<td>`s are
 empty where Parsoid has the `Animalia`/`Chordata`/… links.
+
+## Filled: the missing link facts, via a `page_info` backfill
+
+The link stayed blue because the offline cache held no `PageInfo` for
+`Ngorongoro Crater`, and `lookup_page_info` only fetches when online — offline it
+guesses "exists, not a redirect", which is the honest answer for a run that
+cannot see the wiki. The fact is real (`Ngorongoro Crater` *is* a redirect to
+`Ngorongoro Conservation Area`), so this is a cache gap, not a bug.
+
+`RUSTOID_FILL_FILES` already backfills file metadata on an offline run;
+`RUSTOID_FILL_PAGE_INFO` is the same mechanism for link facts. Both write only
+the absent entries and leave the rest of the cache untouched, and both rest on a
+*stable* fact — a thumbnail's size and a page's redirect-ness do not change, so
+the backfill cannot orphan the pinned baseline an online page run produces.
+
+### Effect: byte 11221 moves to 11346
+
+`Zebra`'s first difference is now **11346**. The subset is unchanged (`Zebro`
+still MATCHes, the fixture guard holds at **877/896**, 954 lib tests pass, and
+`cargo fmt`/clippy are clean).
+
+### The next difference at 11346
+
+Between the image-caption row and the taxonomy header Parsoid has a run of
+literal newlines where rustoid emits `<tr class="mw-empty-elt"></tr>` rows: the
+blank lines the module leaves between the taxobox's `{{!}}-` row separators are
+built into empty rows rather than folded to whitespace. That is the next target.
+Also still open: the taxonomy `<td>`s are empty where Parsoid has the
+`Animalia`/`Chordata`/… links.
