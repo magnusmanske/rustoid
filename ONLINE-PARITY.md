@@ -11024,3 +11024,45 @@ blank lines the module leaves between the taxobox's `{{!}}-` row separators are
 built into empty rows rather than folded to whitespace. That is the next target.
 Also still open: the taxonomy `<td>`s are empty where Parsoid has the
 `Animalia`/`Chordata`/… links.
+
+## Fixed: empty elements inside a transclusion are deleted, not marked
+
+`CleanUp::handleEmptyElements` has two arms, and rustoid only had one. An empty
+flagged element (`p`, `li`, `tbody`, `tr`) inside a transclusion that is *not* the
+range's first node and holds no rendering-transparent nodes is **removed**; only
+otherwise is it marked `mw-empty-elt`:
+
+```php
+if ( $state->tplInfo && $state->tplInfo->first !== $node && !$hasRTNodes ) {
+    $node->parentNode->removeChild( $node );   // the empty taxobox rows
+} else {
+    DOMCompat::getClassList( $node )->add( 'mw-empty-elt' );
+}
+```
+
+rustoid had the marking arm and the deletable-`span` arm but not the deletion, so
+`Template:Taxobox/core`'s blank `{{!}}-` rows survived as `<tr class="mw-empty-elt">`
+where Parsoid keeps only the intervening newlines. Two details go with the arm:
+a wikitext-syntax `<tr>` is not subject to the attribute check (the legacy
+parser drops an empty row whatever its attributes, so `<tr style="…">` with no
+cells is deleted too), and `in_tpl` spans Parsoid's whole `tplInfo` range — a
+first encapsulation wrapper *and its consecutive about-siblings* — not just a
+wrapper's descendants. That last part is what makes the taxobox work: the
+wrapper is an empty `<p about="#mwt1">` and the `<table about="#mwt1">` holding
+the rows is its **sibling**, not its child.
+
+### Effect: byte 11346 moves to 11712
+
+`Zebra`'s first difference is now **11712**. The eight subset offsets are
+otherwise unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 954 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 11712
+
+Parsoid renders the "Edit this classification" link in the taxonomy header;
+rustoid emits an empty `<span class="plainlinks taxobox-edit-taxonomy">`. The
+`{{edit taxonomy|…}}` call produced the wrapper but not its link. That is the
+next target (and the taxonomy `<td>`s now hold their `Animalia`/`Chordata`/…
+links, so that older note is closed).
