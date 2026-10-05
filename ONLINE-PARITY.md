@@ -11520,3 +11520,82 @@ the Etymology paragraph: its first `<ref>` was `about="#mwt30"` where the oracle
 has `#mwt28`. It reduced to the `{{sfn}}` on the preceding line:
 `A{{sfn|…}}B<ref>plain</ref>C` numbers the ref **twice** in rustoid. The
 `render_answer_markers` fix in the section above closes it.
+
+## Fixed: a ref that is a template's sole content keeps the transclusion
+
+### Cause
+
+Once the `#tag`-ref double walk was closed, the next difference was at byte
+27843: the `{{sfn}}` ref took the right id (`#mwt23`) but its element was
+leaner than the oracle's.
+
+| | live | rustoid |
+|---|---|---|
+| `typeof` | `mw:Transclusion mw:Extension/ref` | `mw:Extension/ref` |
+| `data-mw` | `{"name":"ref","attrs":{"group":"","name":"FOOTNOTE…"},"body":{…},"parts":[…]}` | `{"name":"ref","attrs":{"name":"FOOTNOTE…"},"body":{…}}` |
+
+A `<ref>` produced as the **sole content of a template call** is that
+transclusion's encapsulation target. In Parsoid the ref does not travel as a
+plain element but as a *sealed* fragment (`mw:DOMFragment/sealed/ref`,
+`PipelineUtils::tunnelDOMThroughTokens` with `unpackOutput => false`). `tplwrap`
+therefore stamps the sealed placeholder — `DOMRangeBuilder::encapsulateTemplates`
+*prepends* `mw:Transclusion` (`DOMUtils::addTypeOf(…, true)`) and sets
+`data-parsoid.pi`/`data-mw.parts` on it — and Cite later replaces only the sealed
+type with `mw:Extension/ref` (`References.php:782`). An *unpacked* fragment
+takes the opposite order: `UnpackDOMFragments::onDocumentFragment` **appends**
+`mw:Transclusion` to the fragment content, which is why `<pre>` reads
+`mw:Extension/pre mw:Transclusion` while a ref reads the reverse.
+
+Rustoid does not model the sealed-fragment distinction for refs, and its Cite
+pass rebuilds the marker from scratch, so the `mw:Transclusion` type and `parts`
+the tree builder had merged onto the ref placeholder were discarded. The
+`attrs` were rebuilt from the parsed name and group instead of the tag's own
+attributes, so `Module:Footnotes`' `<ref group="" name="…">` lost its empty
+`group`.
+
+### Fix
+
+`Cite::walk_render` no longer drops the encapsulation: after building the marker
+it calls `apply_transclusion_encapsulation`, which, when the replaced node
+carries `mw:Transclusion`, prepends that type to the marker and appends the
+placeholder's `data-mw.parts` (via `tree_builder_html::append_parts_to_data_mw`,
+now `pub(crate)`).
+
+`data-mw.attrs` now comes from the `<ref>` tag's own attributes in source order,
+empty values kept (`TokenUtils::kvToHash` semantics): `read_ref` returns the
+ordered pairs, `Reference` keeps them per use, and `ref_data_mw` emits them. A
+plain `<ref name="x">` still records only `name` (no `group` key), while
+`<ref group="" name="x">` records both.
+
+(An earlier note in this file recorded the live fragment's `data-parsoid` with
+`dsr`/`pi` on the sfn ref. The pinned oracle — a full `page/html` render —
+carries **no** `data-parsoid` on any ref; only the `transform` endpoint, which
+keeps `tplarginfo`, does. Rustoid already matched the oracle there, so none was
+added.)
+
+### Effect: byte 27843 moves to 29668
+
+`Zebra`'s first difference is now **29668**. The `{{sfn}}` marker at `#mwt23`
+matches the oracle byte for byte, as does every later sfn ref. Every other
+subset offset is unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial`
+3934, `Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds at
+**877/896**, and 963 lib tests pass (was 961; two new tests pin the empty-group
+serialization and the transclusion merge) with clippy and `cargo fmt` clean.
+
+### The next difference at 29668
+
+`{{Further|Evolution of the horse}}` (the `#mwt42` transclusion at the head of
+the Taxonomy section). The oracle renders the hatnote
+
+```
+<span class="mw-empty-elt" about="#mwt42" typeof="mw:Transclusion" …>
+  <style … data-mw-deduplicate="TemplateStyles:r1368532237" …>
+</span>
+<div role="note" class="hatnote navigation-not-searchable" about="#mwt42" …>Further information: …</div>
+```
+
+while rustoid emits `<p …><strong class="error" …>Error: no page names
+specified …</strong>`. The template call's argument reaches `data-mw`
+(`params:{"1":{"wt":"Evolution of the horse"}}`), so `Module:Further` receives
+an empty argument table: the next target.
