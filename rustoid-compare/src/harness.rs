@@ -308,6 +308,13 @@ pub struct CachedDataSource {
     /// `RUSTOID_FILL_FILES`; off by default, so a plain offline run still
     /// touches no network.
     fill_files: bool,
+    /// Fetch page facts (existence, redirect-ness, protection) even when
+    /// `offline`, and cache them.
+    ///
+    /// Same reasoning as [`fill_files`](Self::fill_files): a page's
+    /// redirect-ness is a stable fact, so backfilling a link fact cannot orphan
+    /// the pinned baseline. Set by `RUSTOID_FILL_PAGE_INFO`; off by default.
+    fill_page_info: bool,
     /// Entries stored since the manifest was last written, so the manifest is
     /// not re-serialised on every one of hundreds of template fetches.
     pending: std::sync::atomic::AtomicUsize,
@@ -337,6 +344,7 @@ impl CachedDataSource {
             entities: None,
             offline,
             fill_files: std::env::var_os("RUSTOID_FILL_FILES").is_some(),
+            fill_page_info: std::env::var_os("RUSTOID_FILL_PAGE_INFO").is_some(),
             pending: std::sync::atomic::AtomicUsize::new(0),
             facts: Arc::new(std::sync::Mutex::new(FactAges::default())),
         }
@@ -831,7 +839,11 @@ async fn lookup_page_info(
         return out;
     }
 
-    let Some(client) = source.client.as_ref().filter(|_| !source.offline) else {
+    let Some(client) = source
+        .client
+        .as_ref()
+        .filter(|_| !source.offline || source.fill_page_info)
+    else {
         // Offline and not cached. Link resolution assumes everything exists,
         // which marks nothing as a red link; a module probe gets nothing,
         // because claiming a page it cannot see exists would send it into a load
