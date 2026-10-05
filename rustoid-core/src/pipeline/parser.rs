@@ -5424,6 +5424,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `mw:ExpandedAttrs` marking: that marking describes the DOM a link
     /// eventually becomes, and here the tokens are about to be flattened to the
     /// string a module is handed.
+    ///
+    /// The pass recurses: an attribute value can hold a token with attributes of
+    /// its own (a `wikilink`'s display text is an attribute value, and that text
+    /// can be a `<span title="{{…}}">`), and `expand_templates` only walks a
+    /// chunk's top level. PHP's `Frame::expand` walks the whole tree in one call,
+    /// so recursing here is what keeps the two equivalent.
     #[allow(clippy::too_many_arguments)]
     async fn expand_attrib_templates(
         &self,
@@ -5472,6 +5478,29 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             src_text,
                         )
                         .await;
+                    // A token in an attribute value can carry attributes of its
+                    // own, and `expand_templates` only walks the *top level* of a
+                    // chunk, so a template nested one attribute deeper survives
+                    // unless this pass recurses. PHP's `Frame::expand` walks the
+                    // whole node tree in one call; rustoid splits that into the
+                    // top-level pass and this attribute pass, so the attribute
+                    // pass has to recurse to match it. `Template:Dead link` is the
+                    // case that pins it: its `<span title="{{#if:…}}">` is the
+                    // *display text* of a `wikilink`, i.e. a span inside the
+                    // link's content attribute, so the `#if` is two attribute
+                    // levels down and stayed unexpanded — leaving a literal
+                    // `{{{date|}}}` to be resolved later in the root frame, which
+                    // has no `date`.
+                    let expanded = Box::pin(self.expand_attrib_templates(
+                        frame,
+                        expanded,
+                        source,
+                        about_counter,
+                        in_template,
+                        body,
+                        src_text,
+                    ))
+                    .await;
                     *field =
                         crate::pipeline::attribute_transform_manager::items_to_key_value(expanded);
                 }
