@@ -194,30 +194,37 @@ where
         );
     }
 
-    // data-mw names the extension (stripped in harness comparison, but set for
-    // round-trip fidelity).
-    ul.data_mw = Some(r#"{"name":"gallery","attrs":{},"body":{}}"#.to_string());
+    // data-mw names the extension and records its parsed start-tag attributes
+    // (mirrors `Utils::getExtArgInfo`, whose `extAttribs` hash serializes as
+    // `attrs`), with an empty `body`.
+    ul.data_mw = Some(gallery_data_mw(token));
 
     // A non-empty `caption=` renders a leading `<li class="gallerycaption">`
-    // (mirrors `TraditionalMode::caption`).
+    // (mirrors `TraditionalMode::caption`, which prepends a `\n` text node).
     if !opts.caption.is_empty() {
         let mut li = Node::element(ElementKind::ListItem);
         li.set_attr("class", "gallerycaption");
         for node in render_caption(&opts.caption).await {
             li.push_child(node);
         }
+        ul.push_child(Node::text("\n"));
         ul.push_child(li);
     }
 
-    // Parse and render each line.
+    // Parse and render each line. Each is preceded by a `\n` text node
+    // (mirrors `TraditionalMode::line`).
     for line in body.lines() {
         if line.trim().is_empty() {
             continue;
         }
         if let Some(li) = render_line_with(&opts, line, config, &mut render_media).await {
+            ul.push_child(Node::text("\n"));
             ul.push_child(li);
         }
     }
+
+    // A trailing `\n` closes the `<ul>` (mirrors `TraditionalMode::render`).
+    ul.push_child(Node::text("\n"));
 
     ul
 }
@@ -404,20 +411,24 @@ where
     let thumb_height = opts.image_height + padding.thumb;
     let box_width = thumb_width + padding.box_padding as f64;
 
-    // `<li class="gallerybox" style="width: <boxWidth>px;">`
+    // `<li class="gallerybox" style="width: <boxWidth>px;">`. Parsoid stamps the
+    // box (and the `.thumb`/`.gallerytext` divs below) with an empty
+    // `data-parsoid` slot (`getDataParsoid($box)->dsr = …` and the wrapper data
+    // transfer), so each takes an id; we model the slot directly.
     let mut li = Node::element(ElementKind::ListItem);
     li.set_attr("class", "gallerybox");
     li.set_attr(
         "style",
         format!("width: {}px;", fmt_gallery_width(box_width)),
     );
-    li.data_mw = Some("{}".to_string());
+    li.empty_dp_slot = true;
 
     // `<div class="thumb" style="…">` — the width is omitted for an error thumb
     // (mirrors `TraditionalMode::thumbStyle`), and the height only appears in
     // `traditional` mode or when there is an error.
     let mut thumb = Node::element(ElementKind::Div);
     thumb.set_attr("class", "thumb");
+    thumb.empty_dp_slot = true;
     let mut style = String::new();
     if !has_error {
         style.push_str(&format!("width: {}px; ", fmt_gallery_width(thumb_width)));
@@ -438,6 +449,7 @@ where
     // content, plus the optional `showfilename` filename link.
     let mut gallerytext = Node::element(ElementKind::Div);
     gallerytext.set_attr("class", "gallerytext");
+    gallerytext.empty_dp_slot = true;
     if opts.showfilename {
         gallerytext.push_child(showfilename_anchor(&title, config));
     }
@@ -517,10 +529,17 @@ fn gallery_thumb_width(width: f64, padding: &Padding) -> f64 {
 }
 
 /// Format a gallery `style` width like PHP's default `precision=14`
-/// float-to-string: up to 10 fractional digits, trimming trailing zeros (so
-/// `618.0` becomes `618`).
+/// float-to-string: 14 *significant* digits, trailing zeros trimmed (so
+/// `618.0` becomes `618`, and `243.33333333333334` becomes `243.33333333333`).
 fn fmt_gallery_width(w: f64) -> String {
-    let s = format!("{w:.10}");
+    if !w.is_finite() {
+        return format!("{w}");
+    }
+    // For a value in `[10^exp, 10^(exp+1))`, `13 - exp` fractional digits give
+    // 14 significant digits. Negative/zero values do not occur for a width.
+    let exp = w.abs().log10().floor() as i32;
+    let frac = (13 - exp).max(0) as usize;
+    let s = format!("{w:.frac$}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     s.to_string()
 }
@@ -656,6 +675,40 @@ fn parse_opts(
     opts
 }
 
+/// The `data-mw` for a gallery `<ul>`.
+///
+/// Mirrors `Utils::getExtArgInfo`: the extension name, its parsed start-tag
+/// attributes as the `attrs` hash (the same options `parse_opts` reads), and an
+/// empty `body`.
+fn gallery_data_mw(token: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String {
+    let attrs = crate::pipeline::extension_handler::extension_kv_attrs(token);
+    let pairs: Vec<String> = attrs
+        .iter()
+        .filter_map(|kv| {
+            let key = kv.key.as_str()?;
+            // The caption is removed from `extAttribs` once the DOM is built
+            // (mirrors `Gallery::sourceToDom`'s `setExtAttrib('caption', null)`).
+            if key == "caption" {
+                return None;
+            }
+            let value = kv.value.as_str().unwrap_or_default();
+            Some(format!(
+                "{}:{}",
+                serde_json::Value::String(key.to_string()),
+                serde_json::Value::String(value.to_string())
+            ))
+        })
+        .collect();
+    if pairs.is_empty() {
+        r#"{"name":"gallery","attrs":{},"body":{}}"#.to_string()
+    } else {
+        format!(
+            r#"{{"name":"gallery","attrs":{{{}}},"body":{{}}}}"#,
+            pairs.join(",")
+        )
+    }
+}
+
 /// Parse a gallery `widths`/`heights` value following PHP's
 /// `Utils::parseMediaDimensions(siteConfig, str, onlyOne=true, localized=false)`.
 ///
@@ -779,9 +832,14 @@ mod tests {
         assert_eq!(ul.get_attr("class"), Some("gallery mw-gallery-traditional"));
         assert_eq!(ul.get_attr("typeof"), Some("mw:Extension/gallery"));
         assert!(!ul.children.is_empty());
-        // First child is a gallerybox li.
+        // The first element child is a gallerybox li (a `\n` text node precedes it).
+        let first_element = ul
+            .children
+            .iter()
+            .find(|c| c.kind.is_element())
+            .expect("a gallerybox li");
         assert!(matches!(
-            ul.children[0].kind,
+            first_element.kind,
             crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::ListItem)
         ));
     }

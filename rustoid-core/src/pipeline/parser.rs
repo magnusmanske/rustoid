@@ -2454,8 +2454,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // carry an `about` id (mirrors PHP's `ExtensionHandler` adding
             // `about` to extension top-level nodes) so the html2wt serializer
             // recognizes it as `mw:Extension/gallery` rather than a plain list.
+            // The per-chunk expansion loop stamped the id the gallery would have
+            // been given at its position in the document (see `MW_ABOUT_BASE_ATTR`);
+            // a gallery rendered outside that loop still allocates fresh.
             if let crate::dom::node::NodeKind::Element(_) = ul.kind {
-                ul.set_attr("about", self.new_about_id(about_counter, "gallery"));
+                let about = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| {
+                        kv.key.as_str()
+                            == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+                    })
+                    .and_then(|kv| kv.value.as_str())
+                    .filter(|b| !b.is_empty())
+                    .map(|b| format!("#mwt{b}"))
+                    .unwrap_or_else(|| self.new_about_id(about_counter, "gallery"));
+                ul.set_attr("about", about);
             }
             let mut frag = crate::dom::node::Node::document();
             frag.push_child(ul);
@@ -3013,10 +3027,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 let base = about_counter.get();
                 let media_ctx =
                     crate::pipeline::wiki_link_render::WikiLinkContext::new(self.config);
-                let mut media_index = 0usize;
+                let mut index = 0usize;
                 for item in &mut chunk {
-                    if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item
-                        && t.name == "wikilink"
+                    let is_gallery = gallery_target(item).is_some();
+                    let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+                        continue;
+                    };
+                    let is_media = t.name == "wikilink"
                         && is_file_link_target(
                             t.attribs
                                 .iter()
@@ -3027,20 +3044,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         && crate::pipeline::wiki_link_render::has_expandable_option(
                             &media_ctx,
                             &ParsoidToken::SelfclosingTag(t.clone()),
-                        )
-                    {
+                        );
+                    if is_media || is_gallery {
                         t.add_attribute_str(
                             crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR,
-                            (base + 1 + media_index).to_string(),
+                            (base + 1 + index).to_string(),
                         );
-                        media_index += 1;
+                        index += 1;
                     }
                 }
                 // Those `about`s are real allocations at this point in the
                 // document, ahead of the next chunk: advance the counter so a
                 // later id (e.g. a following `<ref>`) continues after them.
-                if media_index > 0 {
-                    about_counter.set(base + media_index);
+                if index > 0 {
+                    about_counter.set(base + index);
                 }
             }
             chunked.extend(chunk);
