@@ -507,8 +507,16 @@ pub fn render_call(request: &FrameRequest) -> String {
             // `frame:extensionTag` is lowered, to `"#tag"` — would otherwise
             // render as `{{##tag:…}}`, which is not a call at all and silently
             // failed to expand.
+            //
+            // Whether the hash belongs there at all follows MediaWiki's
+            // registration: a function in Parsoid's `noHashFunctions` set is
+            // written bare (`{{DISPLAYTITLE:…}}`), every other one carries a
+            // hash (`{{#if:…}}`). Rendering `{{#DISPLAYTITLE:…}}` would be a
+            // *broken* parser function — the service renders it literally — so a
+            // `frame:callParserFunction('DISPLAYTITLE', …)` has to come out bare.
             let bare = name.strip_prefix('#').unwrap_or(name);
-            let mut out = format!("{{{{#{bare}");
+            let hash = if is_no_hash_function(bare) { "" } else { "#" };
+            let mut out = format!("{{{{{hash}{bare}");
             if let Some(first) = args.next() {
                 out.push(':');
                 out.push_str(&first.value);
@@ -529,6 +537,97 @@ pub fn render_call(request: &FrameRequest) -> String {
         // expanding the slots directly, not by rendering wikitext.
         FrameRequest::ExpandArgs { .. } => String::new(),
     }
+}
+
+/// Whether a parser function is registered *without* a leading `#`.
+///
+/// MediaWiki's `Parser::setFunctionHook` prepends the hash unless the function
+/// is listed in core's `$noHashFunctions`; Parsoid mirrors that in
+/// `ApiSiteConfig::updateFunctionSynonym`. The set below is Parsoid's own
+/// approximation list (it carries the same caveat in its source), kept in the
+/// order and spelling it uses. It decides how a module's
+/// `frame:callParserFunction` is written back to wikitext: `{{DISPLAYTITLE:…}}`
+/// and `{{#if:…}}` are the two ends of it.
+fn is_no_hash_function(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    const NO_HASH_FUNCTIONS: &[&str] = &[
+        "ns",
+        "nse",
+        "urlencode",
+        "lcfirst",
+        "ucfirst",
+        "lc",
+        "uc",
+        "localurl",
+        "localurle",
+        "fullurl",
+        "fullurle",
+        "canonicalurl",
+        "canonicalurle",
+        "formatnum",
+        "grammar",
+        "gender",
+        "plural",
+        "formal",
+        "bidi",
+        "numberingroup",
+        "language",
+        "padleft",
+        "padright",
+        "anchorencode",
+        "defaultsort",
+        "filepath",
+        "pagesincategory",
+        "pagesize",
+        "protectionlevel",
+        "protectionexpiry",
+        "pagename",
+        "pagenamee",
+        "fullpagename",
+        "fullpagenamee",
+        "subpagename",
+        "subpagenamee",
+        "rootpagename",
+        "rootpagenamee",
+        "basepagename",
+        "basepagenamee",
+        "talkpagename",
+        "talkpagenamee",
+        "subjectpagename",
+        "subjectpagenamee",
+        "pageid",
+        "revisionid",
+        "revisionday",
+        "revisionday2",
+        "revisionmonth",
+        "revisionmonth1",
+        "revisionyear",
+        "revisiontimestamp",
+        "revisionuser",
+        "cascadingsources",
+        "namespace",
+        "namespacee",
+        "namespacenumber",
+        "talkspace",
+        "talkspacee",
+        "subjectspace",
+        "subjectspacee",
+        "numberofarticles",
+        "numberoffiles",
+        "numberofusers",
+        "numberofactiveusers",
+        "numberofpages",
+        "numberofadmins",
+        "numberofedits",
+        "bcp47",
+        "dir",
+        "interwikilink",
+        "interlanguagelink",
+        "int",
+        "displaytitle",
+        "pagesinnamespace",
+    ];
+    NO_HASH_FUNCTIONS.contains(&lower.as_str())
 }
 
 /// The wikitext a template or parser-function call with these arguments is.
@@ -720,6 +819,26 @@ fn wikilink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `frame:callParserFunction` for a function MediaWiki registers without a
+    /// hash must be written without one: `{{DISPLAYTITLE:…}}` resolves, while
+    /// `{{#DISPLAYTITLE:…}}` is a broken parser function the service renders
+    /// literally. `#tag` and `#if` keep their hash.
+    #[test]
+    fn render_call_writes_a_no_hash_function_without_the_hash() {
+        let call = |name: &str| FrameRequest::CallParserFunction {
+            name: name.to_string(),
+            args: vec![FrameArg::positional("X")],
+        };
+        assert_eq!(render_call(&call("DISPLAYTITLE")), "{{DISPLAYTITLE:X}}");
+        assert_eq!(
+            render_call(&call("PROTECTIONEXPIRY")),
+            "{{PROTECTIONEXPIRY:X}}"
+        );
+        // `frame:extensionTag` lowers to `#tag`; the hash must survive.
+        assert_eq!(render_call(&call("#tag")), "{{#tag:X}}");
+        assert_eq!(render_call(&call("if")), "{{#if:X}}");
+    }
 
     /// A `[[File:…]]` a module emits through `frame:expandTemplate` is tokenized
     /// without `data_parsoid.src`, so `render_answer` must rebuild it from the
