@@ -11599,3 +11599,59 @@ while rustoid emits `<p …><strong class="error" …>Error: no page names
 specified …</strong>`. The template call's argument reaches `data-mw`
 (`params:{"1":{"wt":"Evolution of the horse"}}`), so `Module:Further` receives
 an empty argument table: the next target.
+
+## Fixed: a module's arguments expand in the calling frame
+
+### Cause
+
+That next difference was `{{Further|Evolution of the horse}}`. The oracle
+renders the hatnote; rustoid rendered
+`Error: no page names specified`, which is
+`Module:Labelled list hatnote`'s `noInputWarning` — the module had been handed
+an empty `frame:getParent().args`.
+
+`Template:Further` is the `Unsubst` idiom:
+`{{safesubst:<noinclude />#invoke: Unsubst||$B=<body>}}`. Because rustoid never
+substitutes, `Module:Unsubst` returns `$B` verbatim (the template body, holding
+`{{#invoke:labelled list hatnote|labelledList|Further information…}}`), and that
+string is expanded after the outer `#invoke` returns.
+
+Two frames run that nested `#invoke`, and **both** were built with empty
+arguments:
+
+- `Parser::expand_invoke_args` expands an argument value in
+  `frame.new_child(frame.title(), vec![])`.
+- `Parser::expand_invoke` expands a module's output in
+  `frame.new_child(frame.title(), vec![])`.
+
+`#invoke`'s parent frame is the frame it was written in, and `frame` is exactly
+that frame (the calling template). With an empty child, `frame:getParent()`
+returned no arguments, so `Module:Arguments.getArgs(…, {parentOnly = true})` —
+which `Module:Labelled list hatnote` uses — read no pages.
+
+### Fix
+
+Both children now keep the calling frame's title *and* its arguments
+(`frame.args().args.clone()`). A value written in the calling template expands
+as if it sat there: `{{{…}}}` resolves (still pre-substituted where it was), and
+a nested `#invoke` sees the enclosing template's arguments. The title is
+unchanged, so a genuine self-invocation still trips `loop_and_depth_check`.
+
+### Effect: byte 29668 moves to 40866
+
+`Zebra`'s first difference is now **40866**. The remaining subset offsets are
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds at
+**877/896**, and 963 lib tests pass with clippy and `cargo fmt` clean. A few
+pages' rendered lengths grow toward the oracle's, since module output that used
+to render as an error now renders its content.
+
+### The next difference at 40866
+
+A `<ref name=Jónsson2014/>` (an *unquoted* attribute value with a self-closing
+slash). The oracle records `name` as `Jónsson2014`; rustoid keeps the trailing
+slash (`Jónsson2014/`), in both the `cite_ref-…` id and
+`data-mw.attrs.name`. MediaWiki's attribute scanner ends an unquoted value at
+`/` as well as whitespace, so the slash is the self-close marker, not part of
+the value. Next target.
