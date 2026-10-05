@@ -751,7 +751,7 @@ fn apply_media_info(
         img.set_attr("class", "mw-file-element");
     }
 
-    rewrite_structure(
+    let discard_link = rewrite_structure(
         root,
         &job.path,
         &job.title,
@@ -773,8 +773,13 @@ fn apply_media_info(
     // the container carrying a `data-mw` — and an `id` with it — that the
     // service does not emit: `Module:Multiple image`'s cells, whose `alt` came
     // from a plain template argument.
+    // `link` is likewise dropped once `replaceAnchor` applies it, except in its
+    // invalid-title fallback, which preserves it for round-tripping.
     if let Some(container) = node_at(root, &job.path) {
         remove_data_mw_attrib(container, "alt");
+        if discard_link {
+            remove_data_mw_attrib(container, "link");
+        }
     }
 }
 
@@ -1304,9 +1309,11 @@ fn rewrite_structure(
     img: Node,
     config: &dyn SiteConfig,
     opts: &AnchorOpts,
-) {
+) -> bool {
+    // Returns whether the `link=` option was consumed and must be dropped from
+    // the container's `data-mw.attribs` (mirrors `replaceAnchor`'s `$discard`).
     let Some(container) = node_at(root, path) else {
-        return;
+        return false;
     };
     // The anchor is the first element child of the container; the span is its
     // first element child.
@@ -1316,8 +1323,9 @@ fn rewrite_structure(
         .position(|c| matches!(c.kind, NodeKind::Element(_)))
     {
         Some(i) => i,
-        None => return,
+        None => return false,
     };
+    let mut discard_link = false;
 
     {
         let anchor = &mut container.children[anchor_idx];
@@ -1328,6 +1336,10 @@ fn rewrite_structure(
             .retain(|a| a.key != "class" && a.key != "title" && a.key != "href" && a.key != "rel");
 
         if let Some(link) = opts.link_target {
+            // The `link=` option is consumed unless the title is invalid (the
+            // fallback keeps it for round-tripping). This is the error-free
+            // image path, so `$discard` starts true.
+            discard_link = true;
             if link.is_empty() {
                 // `link=` (empty): no link at all → a bare `<span>`.
                 anchor.kind = NodeKind::Element(ElementKind::Span);
@@ -1366,6 +1378,9 @@ fn rewrite_structure(
                     if !opts.is_manual_thumb {
                         anchor.set_attr("class", "mw-file-description");
                     }
+                    // An invalid title falls back to the description link but
+                    // keeps `link` for round-tripping (mirrors `replaceAnchor`).
+                    discard_link = false;
                 } else if let Some(iw) = &link_title.interwiki
                     && let Some(info) = config.interwiki_map().get(iw)
                 {
@@ -1431,6 +1446,7 @@ fn rewrite_structure(
             anchor.children[span_idx] = img;
         }
     }
+    discard_link
 }
 
 /// Whether a `link=` value is an external URL (has a scheme or is
