@@ -1045,16 +1045,6 @@ impl Drop for StyleDefer<'_> {
     }
 }
 
-/// RAII guard for [`Parser::expansion_nesting`]: constructing it increments the
-/// counter, dropping it decrements it. See [`Parser::expand_templates`].
-struct ExpansionNesting<'a>(&'a std::cell::Cell<u32>);
-
-impl Drop for ExpansionNesting<'_> {
-    fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
-    }
-}
-
 /// The wikitext parser, bound to a site configuration.
 pub struct Parser<'a, C: SiteConfig> {
     config: &'a C,
@@ -1198,13 +1188,6 @@ pub struct Parser<'a, C: SiteConfig> {
     /// extension and is numbered at the call; see
     /// [`Parser::expand_lua_request`]).
     style_defer: std::cell::Cell<u32>,
-    /// How many [`Parser::expand_templates`] calls are on the stack. The
-    /// page-level call is depth 1; anything deeper is being spliced into another
-    /// expansion, i.e. the item is inside a transclusion. See
-    /// [`Parser::number_extension_token`]: the live Cite extension spends an
-    /// additional (discarded) `about` id for every `<ref>` that is rendered from
-    /// inside a transclusion, which a standalone Parsoid does not reproduce.
-    expansion_nesting: std::cell::Cell<u32>,
     /// Sundered extension output, addressed by a `UNIQ…QINU` strip marker.
     ///
     /// A `frame:extensionTag('templatestyles', …)` answer is the extension's
@@ -1250,7 +1233,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             pending_styles: std::cell::RefCell::new(std::collections::HashMap::new()),
             arg_expansion: std::cell::Cell::new(0),
             style_defer: std::cell::Cell::new(0),
-            expansion_nesting: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
@@ -1376,14 +1358,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn begin_style_defer(&self) -> StyleDefer<'_> {
         self.style_defer.set(self.style_defer.get() + 1);
         StyleDefer(&self.style_defer)
-    }
-
-    /// Enter one level of [`Parser::expand_templates`]; the returned guard leaves
-    /// it on drop. The page-level call is level 1. See
-    /// [`Parser::expansion_nesting`].
-    fn enter_expansion(&self) -> ExpansionNesting<'_> {
-        self.expansion_nesting.set(self.expansion_nesting.get() + 1);
-        ExpansionNesting(&self.expansion_nesting)
     }
 
     /// Whether an `#invoke` argument is currently being expanded, in which case
@@ -3305,7 +3279,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         body: bool,
         src_text: &str,
     ) -> Vec<Item> {
-        let _nesting = self.enter_expansion();
         // A marker a module held and moved becomes the fragment placeholder it
         // stood for, in the position the module left it.
         let tokens = self.substitute_strip_markers(tokens);
@@ -3526,7 +3499,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
     ) {
-        let (body, is_ref) = {
+        let body = {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                 return;
             };
@@ -3543,16 +3516,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
                 return;
             }
-            let is_ref = name.as_deref() == Some("ref");
             // PHP parses the body in the pipeline the extension sits in, so
             // `inTemplate` is the *caller's* value (usually false: the templates
             // inside a note are top-level transclusions and are wrapped).
-            let body = if is_ref {
+            if name.as_deref() == Some("ref") {
                 extension_body(t)
             } else {
                 String::new()
-            };
-            (body, is_ref)
+            }
         };
         // Pre-rendering a body costs a full expansion. Only a body that can spend
         // an `about` id of its own needs it: a template (which may emit a
@@ -3577,18 +3548,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             None
         };
         let about = self.new_about_id(about_counter, "extension-id");
-        // A `<ref>` rendered from *inside a transclusion* makes the live Cite
-        // extension spend a second, discarded `about` id, immediately after its
-        // own. The live service shows it as a gap in the id sequence (`{{Geo|
-        // ref=<ref>…</ref>}}` numbers the transclusion, the ref, a phantom id,
-        // then the references list), and every later element is shifted by it.
-        // A standalone Parsoid does not reproduce the spend, but the online
-        // oracle is the target. [`Parser::expansion_nesting`] is what "inside a
-        // transclusion" means here: a top-level ref sits at depth 1 and spends
-        // nothing extra, one reached through any nested expansion spends one.
-        if is_ref && self.expansion_nesting.get() > 1 {
-            let _ = self.new_about_id(about_counter, "extension-id");
-        }
         if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item {
             t.add_attribute_str("about", &about);
         }
