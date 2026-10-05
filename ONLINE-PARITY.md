@@ -11207,3 +11207,57 @@ plain; the subgenus row then diverges further, rustoid emitting a literal
 `[[…]]` around a `Template:Taxonomy/…` link where Parsoid emits
 `<i>Hippotigris</i>`. Both come from the `Module:Autotaxobox` link construction.
 That is the next target.
+
+## Fixed: a deferred frame call survives a module's `pcall`
+
+A frame method signals "this call must be expanded by the host" by raising an
+error; `invoke`'s retry loop turns that into a fetch-and-re-run. `Module:
+Autotaxobox`'s `getTaxonInfoItem` wraps its call in exactly the pattern that
+breaks this:
+
+```lua
+ok, info = pcall(frame.expandTemplate, frame, { title = 'Taxonomy/' .. taxon, … })
+```
+
+The `pcall` catches the deferred marker, the module takes its `ok == false`
+fallback — the literal `[[Template:Taxonomy/…]]` error indicator — and returns
+*successfully*. The engine had recorded the request all the same, but `run_once`
+only consulted it in the error arm, so the run was taken as final and the answer
+was never expanded. The subgenus row rendered the error indicator where Parsoid
+renders the linked taxon.
+
+The `Ok` arm now checks `take_pending()` too, exactly as it already checks the
+missing-module and missing-title records for the same reason.
+
+## Fixed: an `mw-quote` is spelled back out when stringifying module output
+
+`render_answer` rebuilds the tokens a module produced that carry no
+`data_parsoid.src`, but it only knew the wikilink and table shapes. A quote run
+is an `mw-quote` self-closing token whose apostrophes live in a `value`
+attribute, so it was dropped: the taxobox's `[[Equus (genus)|''Equus'']]` came
+back as `[[Equus (genus)|Equus]]` and the taxon name rendered unitalicized. A
+`quote_token_wikitext` arm now emits the `value`, which is enough because the
+answer is re-parsed and the quote transformer then runs on it.
+
+This only shows through `frame:expandTemplate`/`preprocess`: a module's return
+value that is *not* handed to another Lua caller has its `''…''` converted to
+`<i>` before it is serialized.
+
+### Effect: byte 13233 moves to 13441
+
+`Zebra`'s first difference is now **13441**. Every other subset offset is
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` still MATCHes, the fixture guard holds at
+**877/896**, and 958 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 13441
+
+After the subgenus row, the dangling `|- class="taxonrow" \n` that
+`Module:Autotaxobox` appends leaves an empty row. Inside the `Taxobox/core`
+transclusion Parsoid deletes that row, and its trailing `s2` space goes with it
+(the row's `dsr` shows the space *outside* the row in a top-level table, but the
+empty element still carries it in the encapsulated case). rustoid deletes the
+row but leaves the space as a `tbody` sibling — `</td></tr>\n \n…` where Parsoid
+has `</td></tr>\n\n…`. Pinpointing where the space should sit relative to the
+row is the next target.
