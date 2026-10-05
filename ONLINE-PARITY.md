@@ -11649,9 +11649,76 @@ to render as an error now renders its content.
 
 ### The next difference at 40866
 
-A `<ref name=Jónsson2014/>` (an *unquoted* attribute value with a self-closing
-slash). The oracle records `name` as `Jónsson2014`; rustoid keeps the trailing
-slash (`Jónsson2014/`), in both the `cite_ref-…` id and
-`data-mw.attrs.name`. MediaWiki's attribute scanner ends an unquoted value at
-`/` as well as whitespace, so the slash is the self-close marker, not part of
-the value. Next target.
+A `<ref name=Jónsson2014/>` (an *unquoted* attribute value with a
+self-closing slash). The oracle records `name` as `Jónsson2014`; rustoid keeps
+the trailing slash (`Jónsson2014/`), in both the `cite_ref-…` id and
+`data-mw.attrs.name`.
+
+## Fixed: an unquoted value stops before the self-close solidus
+
+### Cause
+
+Parsoid's `attribute_preprocessor_text` keeps `/` in an unquoted value unless
+it is *immediately followed by* `>` (`!'/>'`), so in `<ref name=a/b/>` the
+final `/` is the self-close marker, not part of the value. Rustoid's
+`start_tag_attrs` handed the raw text through, so the value came out `a/b/`.
+An internal slash (`name=a/b`) and one before whitespace (`name=a/b/ >`) stay
+part of the value in both implementations.
+
+### Fix
+
+`start_tag_attrs` drops one trailing `/` — exactly the character the grammar
+assigns to `selfclose`. Both readers (`attr_value` for name/group, `next_attr`
+for the ordered `data-mw.attrs`) then see the correct text.
+
+### Effect: byte 40866 moves to 41251
+
+### Cause and fix of the next byte: `data-mw` and `smartQuote`
+
+The clade at `#mwt90` then differed on its `data-mw` *quoting*. The oracle
+serves it double-quoted with `&quot;` inside and the apostrophes literal:
+
+```
+data-mw="{&quot;parts&quot;:[…&quot;wt&quot;:&quot;''Equus''&quot;…]}"
+```
+
+rustoid single-quoted and escaped the apostrophes:
+
+```
+data-mw='{"parts":[…"wt":"&apos;&apos;Equus&apos;&apos;"…]}'
+```
+
+A `data-mw` is an ordinary attribute, so Parsoid runs it through the same
+`smartQuote` choice as everything else (`XHtmlSerializer`): single quotes when
+the value contains `"` and either no `'` or more `"` than `'`, else double
+quotes. The clade `parts` blob is full of apostrophes (labels, italic
+captions), tipping it to double quotes. Rustoid always emitted `data-mw`
+single-quoted with `&apos;`, an earlier shortcut that happened to match every
+previous `parts` blob. `data-mw` now goes through `serialize_attr_kv`, which
+already implements `smartQuote` for other attributes. (`data-parsoid` keeps
+its own single-quote/`&#39;` spelling, which the service confirms.)
+
+### Effect: byte 41251 moves to 45480
+
+`Zebra`'s first difference is now **45480**. Every other subset offset is
+unchanged (`Bicycle` 11836, `Nobel Prize` 5926, `Sundial` 3934,
+`Quicksilver (film)` 4213, `List of sovereign states` 8409, `Unix` 4772,
+`Help:Introduction` 7837), `Zebro` MATCHes, the fixture guard holds at
+**877/896**, and 964 lib tests pass with clippy and `cargo fmt` clean.
+
+### The next difference at 45480: a nested `Template:Clade` loops
+
+The clade's first nested row renders as
+
+```
+<span class="error">Template loop detected: Template:Clade</span>
+```
+
+where the oracle renders the nested table. A module's output is expanded in a
+child of the calling frame, and that frame keeps the calling template's title
+(`frame.new_child(frame.title(), …)` in `Parser::expand_invoke`), so a nested
+`{{clade}}` in `Module:Clade`'s output sees a `Template:Clade` ancestor and
+`Frame::loop_and_depth_check` stops it. The oracle expands the same wikitext
+without looping, so its module-output frame must not carry that title. This is
+**pre-existing** — reverting the argument-frame fix above reproduces it — and
+is the next target.
