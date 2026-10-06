@@ -403,6 +403,11 @@ impl DataSource for MockDataSource {
         // thumbnail-URL rules). A source that stored one fixed `FileInfo` would
         // answer the media processor's `handleSize` with natural dimensions.
         Ok(base.map(|mut info| {
+            // The wiki reports the media class per file; the mock derives it from
+            // the MIME type, as `MockApiHelper` does.
+            if info.media_type.is_none() {
+                info.media_type = Some(mock_mediatype(&info.mime_type).to_string());
+            }
             mock_image_transform(&mut info, width, height);
             info
         }))

@@ -221,6 +221,24 @@ pub struct PageInfo {
     pub linkclasses: Vec<String>,
 }
 
+/// One derivative of an audio/video file (`videoinfo.derivatives`), the source
+/// of one `<source>` element in `AddMediaInfo::addSources`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileDerivative {
+    /// URL of the derivative (the original file, or a transcode).
+    pub src: String,
+    /// The derivative's MIME type, including its codecs (e.g.
+    /// `audio/ogg; codecs="vorbis"`), which is what the `<source>` carries.
+    #[serde(rename = "type")]
+    pub mime: String,
+    pub width: u32,
+    pub height: u32,
+    /// Present for a transcode; its presence is what drops the `-file` infix on
+    /// `data-*-width`/`height` and adds `data-transcodekey`.
+    #[serde(default)]
+    pub transcodekey: Option<String>,
+}
+
 /// Metadata for a file (image, audio, video).
 ///
 /// `Serialize`/`Deserialize` so a data source can cache the answer at a
@@ -232,6 +250,19 @@ pub struct FileInfo {
     pub title: String,
     /// MIME type, e.g. `"image/jpeg"`.
     pub mime_type: String,
+    /// MediaWiki's media class for the file: `BITMAP`, `DRAWING`, `AUDIO`,
+    /// `VIDEO`, … The API's `imageinfo.mediatype` is the same value Parsoid reads
+    /// from `File::getMediaType()`, and it is what picks the media handler (an
+    /// `application/ogg` file can be either audio or video, so the MIME alone
+    /// cannot). `None` for a source that does not report it (the mock, a cache
+    /// written before the field existed).
+    #[serde(default)]
+    pub media_type: Option<String>,
+    /// The file's derived renditions (`videoinfo.derivatives`), the `<source>`
+    /// list an audio/video element is built from. Empty for a still image and for
+    /// a source that does not fetch them.
+    #[serde(default)]
+    pub derivatives: Vec<FileDerivative>,
     /// File size in bytes.
     pub size: u64,
     /// Image width in pixels.
@@ -279,13 +310,14 @@ impl FileInfo {
     /// mock keeps its own URLs, so the media processor never has to know which
     /// source supplied the answer.
     pub fn normalize_api_urls(&mut self) {
-        fn normalize(url: &str) -> String {
-            let url = url
-                .strip_prefix("https://")
+        fn strip_proto(url: &str) -> String {
+            url.strip_prefix("https://")
                 .or_else(|| url.strip_prefix("http://"))
                 .map(|rest| format!("//{rest}"))
-                .unwrap_or_else(|| url.to_string());
-            url.replace("utm_campaign=imageinfo", "utm_campaign=parser")
+                .unwrap_or_else(|| url.to_string())
+        }
+        fn normalize(url: &str) -> String {
+            strip_proto(url).replace("utm_campaign=imageinfo", "utm_campaign=parser")
         }
         self.file_url = normalize(&self.file_url);
         if let Some(u) = self.thumb_url.take() {
@@ -293,6 +325,16 @@ impl FileInfo {
         }
         for url in self.responsive_urls.values_mut() {
             *url = normalize(url);
+        }
+        // A derivative URL is built by a different caller again, and the wiki
+        // does not use one campaign for it: the pinned oracles carry `index` for
+        // some files and `rest` for others, for the *same* media type, so there is
+        // no single faithful value. The API's own is `api`; `index` is the
+        // plurality, so that is what is emitted. This is a known imprecision (see
+        // ONLINE-PARITY.md); a page whose oracle happens to carry `rest` will
+        // still differ at its `<source src>`.
+        for d in &mut self.derivatives {
+            d.src = strip_proto(&d.src).replace("utm_campaign=api", "utm_campaign=index");
         }
     }
 }

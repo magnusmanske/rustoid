@@ -429,7 +429,7 @@ impl WikiClient {
         height: Option<u32>,
     ) -> Result<String> {
         let mut url = format!(
-            "{}?action=query&prop=imageinfo&iiprop=url%7Csize%7Cmime&format=json&formatversion=2&titles={}",
+            "{}?action=query&prop=imageinfo%7Cvideoinfo&iiprop=url%7Csize%7Cmime%7Cmediatype&viprop=derivatives&format=json&formatversion=2&titles={}",
             self.wiki.api_url(),
             urlencode(title)
         );

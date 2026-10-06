@@ -669,6 +669,23 @@ fn apply_media_info(
         return;
     }
 
+    // Audio and video are their own handler in PHP, chosen by the file's media
+    // class (`File::getMediaType`), not by the MIME alone: an `application/ogg`
+    // file can be either. Only a bitmap/drawing reaches the `<img>` path below.
+    let media_type = media_kind(&media_info);
+    if media_type == "AUDIO" || media_type == "VIDEO" {
+        apply_av_media(
+            root,
+            job,
+            &media_info,
+            &media_type,
+            config,
+            caption_text.as_deref(),
+            lang.as_deref(),
+        );
+        return;
+    }
+
     // Compute the rendered size (mirrors `handleSize` for bitmaps). The manual
     // thumb is unscaled, so `data-width` (if any) is ignored for it. Any packed-
     // gallery re-scaling is applied later by `TraditionalMode::line`'s
@@ -1162,6 +1179,251 @@ fn media_type_from_mime(mime: &str) -> String {
         }
         _ => mime.rsplit('/').next().unwrap_or("").to_string(),
     }
+}
+
+/// The media class that selects the handler.
+///
+/// PHP reads `File::getMediaType()`, which the action API mirrors as
+/// `imageinfo.mediatype`; that is authoritative because the MIME alone cannot
+/// tell an `application/ogg` audio file from a video one. The MIME fallback is
+/// for a source that does not report it (the mock, a cache written before the
+/// field existed).
+fn media_kind(info: &FileInfo) -> String {
+    if let Some(t) = &info.media_type {
+        return t.clone();
+    }
+    match info.mime_type.as_str() {
+        m if m.starts_with("audio/") => "AUDIO".to_string(),
+        m if m.starts_with("video/") => "VIDEO".to_string(),
+        // An `application/ogg` stream is audio unless the file has a video
+        // stream, which only the API's `mediatype` can tell.
+        "application/ogg" | "application/oga" => "AUDIO".to_string(),
+        _ => "BITMAP".to_string(),
+    }
+}
+
+/// `handleSize`'s AUDIO override: audio has no dimensions, so the height is a
+/// fixed 32 and the width is the returned thumbnail's, or the site's default
+/// thumb width when none was returned, floored at 35.
+fn audio_size(info: &FileInfo, width_option: u32) -> (u32, u32) {
+    let mut width = info.width;
+    if info.thumb_url.is_some()
+        && let Some(w) = info.thumb_width.filter(|w| *w > 0)
+    {
+        width = w;
+    }
+    let chosen = if width != 0 { width } else { width_option };
+    (chosen.max(35), 32)
+}
+
+/// Build an audio/video element from the file's derivatives and swap the broken
+/// anchor for the bare `<span>` PHP uses for non-image media. Mirrors
+/// `AddMediaInfo::handleAudio`/`handleVideo` plus `replaceAnchor`'s `else`
+/// branch (a non-image with no errors is always a `<span>`, with no link).
+fn apply_av_media(
+    root: &mut Node,
+    job: &ContainerJob,
+    info: &FileInfo,
+    media_type: &str,
+    config: &dyn SiteConfig,
+    caption_text: Option<&str>,
+    lang: Option<&str>,
+) {
+    let is_audio = media_type == "AUDIO";
+    let tag = if is_audio { "audio" } else { "video" };
+    let mut elt = Node::element(ElementKind::Other(tag.to_string()));
+
+    if !is_audio && info.thumb_url.is_some() {
+        elt.set_attr("poster", image_src(info));
+    }
+    elt.set_attr("controls", "");
+    elt.set_attr("preload", "none");
+    // `muted`/`loop` are read with `getAttrFromDataMw(..., keep=false)`, so the
+    // option is consumed from `data-mw` whether or not it is present.
+    if data_mw_attrib(root, &job.path, "muted").is_some() {
+        elt.set_attr("muted", "");
+    }
+    if data_mw_attrib(root, &job.path, "loop").is_some() {
+        elt.set_attr("loop", "");
+    }
+    if let Some(container) = node_at(root, &job.path) {
+        remove_data_mw_attrib(container, "muted");
+        remove_data_mw_attrib(container, "loop");
+    }
+    // HACK(T295514), still emitted by the service.
+    elt.set_attr("data-mw-tmh", "");
+
+    let (width, height) = if is_audio {
+        audio_size(info, config.width_option())
+    } else {
+        handle_size(job, info)
+    };
+
+    // `addNormalizedAttribute(height/width, null, skipOrig=true)`: records the
+    // pair in `a` (which is what makes the element take an id) and sets the
+    // attributes, in that order.
+    let mut dp = crate::wikitext::tokens_v2::DataParsoid::default();
+    dp.set_a("height", &height.to_string());
+    dp.set_a("width", &width.to_string());
+    elt.set_attr("height", height.to_string());
+    elt.set_attr("width", width.to_string());
+
+    if is_audio {
+        // T133673: the inline style matches TMH.
+        elt.set_attr("style", format!("width: {width}px;"));
+        if let Some(container) = node_at(root, &job.path) {
+            let mut classes = class_list(container);
+            classes.push("mw-default-audio-height".to_string());
+            container.set_attr("class", classes.join(" "));
+        }
+    }
+
+    // `copyOverAttribute($elt, $span, 'resource')`: the canonical link as the
+    // value, the broken span's own resource source as the shadow.
+    let canonical_resource = crate::title::make_link(&job.title, config);
+    elt.set_attr("resource", &canonical_resource);
+    dp.set_a("resource", &canonical_resource);
+    if let Some(href_src) = &job.href_src {
+        dp.set_sa("resource", href_src);
+    }
+
+    if let Some(l) = lang {
+        elt.set_attr("lang", l);
+    }
+    if let Some(d) = info.duration.filter(|d| *d != 0.0) {
+        elt.set_attr("data-durationhint", format!("{}", d.ceil() as i64));
+    }
+
+    let frag = parse_frag(root, &job.path, info);
+    add_sources(&mut elt, info, &frag, !is_audio);
+
+    // `mw-file-element` (added by `AddMediaInfo::run` after the handler), then
+    // the upright class/style, which `AddMediaInfo` applies to any media element.
+    elt.set_attr("class", "mw-file-element");
+    if let Some(factor) = job.upright {
+        elt.set_attr("class", "mw-file-element mw-file-upright");
+        elt.set_attr("style", format!("--mw-file-upright: {factor}"));
+    }
+
+    elt.dp = Some(dp);
+    elt.data_parsoid = elt.dp.as_ref().and_then(|dp| dp.to_data_parsoid_json());
+
+    rewrite_av_structure(root, &job.path, elt, caption_text);
+}
+
+/// The `<source>` children of an audio/video element (mirrors `addSources`).
+///
+/// PHP reads `thumbdata.derivatives ?? derivatives`, and falls back to one source
+/// built from the file itself when the answer carries none (a source that does
+/// not fetch them). `has_dimension` is true for video, where each source also
+/// carries its own dimensions (`data-file-*` for the original, `data-*` for a
+/// transcode).
+fn add_sources(elt: &mut Node, info: &FileInfo, frag: &str, has_dimension: bool) {
+    let single;
+    let derivatives: &[crate::traits::FileDerivative] = if info.derivatives.is_empty() {
+        single = [crate::traits::FileDerivative {
+            src: info.file_url.clone(),
+            mime: info.mime_type.clone(),
+            width: info.width,
+            height: info.height,
+            transcodekey: None,
+        }];
+        &single
+    } else {
+        &info.derivatives
+    };
+    for d in derivatives {
+        let mut source = Node::element(ElementKind::Other("source".to_string()));
+        source.set_attr("src", format!("{}{frag}", d.src));
+        source.set_attr("type", &d.mime);
+        if has_dimension {
+            let infix = if d.transcodekey.is_some() {
+                ""
+            } else {
+                "-file"
+            };
+            source.set_attr(format!("data{infix}-width"), d.width.to_string());
+            source.set_attr(format!("data{infix}-height"), d.height.to_string());
+        }
+        if let Some(tk) = &d.transcodekey {
+            source.set_attr("data-transcodekey", tk);
+        }
+        // A fresh element, so it carries an empty `data-parsoid` slot and takes
+        // an id (mirrors PHP's `createElement('source')`).
+        source.empty_dp_slot = true;
+        elt.push_child(source);
+    }
+}
+
+/// The media-fragment suffix for `starttime`/`endtime` (mirrors `parseFrag`,
+/// https://www.w3.org/TR/media-frags/). Empty when neither option is present.
+fn parse_frag(root: &Node, path: &[usize], info: &FileInfo) -> String {
+    let start = data_mw_attrib(root, path, "starttime");
+    let end = data_mw_attrib(root, path, "endtime");
+    if start.is_none() && end.is_none() {
+        return String::new();
+    }
+    let mut frag = String::from("#t=");
+    if let Some(s) = start
+        && let Some(t) = parse_time_string(&s, info.duration)
+    {
+        frag.push_str(&t.to_string());
+    }
+    if let Some(e) = end
+        && let Some(t) = parse_time_string(&e, info.duration)
+    {
+        frag.push(',');
+        frag.push_str(&t.to_string());
+    }
+    frag
+}
+
+/// A `[h:]mm:ss` timestring as seconds (mirrors `parseTimeString`, itself a port
+/// of TMH's `parseTimeString`). `None` for anything non-numeric or over three
+/// parts; clamped to `[0, length - 1]` when a length is known.
+fn parse_time_string(s: &str, length: Option<f64>) -> Option<f64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    let mut time = 0.0f64;
+    for (i, part) in parts.iter().enumerate() {
+        let v: f64 = part.trim().parse().ok()?;
+        time += v * 60f64.powi((parts.len() - 1 - i) as i32);
+    }
+    if time < 0.0 {
+        time = 0.0;
+    } else if let Some(len) = length
+        && time > len
+    {
+        time = len - 1.0;
+    }
+    Some(time)
+}
+
+/// Replace the broken anchor with a fresh `<span>` holding `elt` (mirrors
+/// `replaceAnchor`'s non-image branch: `$doc->createElement('span')` replaces the
+/// anchor, and the old anchor's children are discarded). The `<figcaption>`
+/// sibling, if any, is left in place.
+fn rewrite_av_structure(root: &mut Node, path: &[usize], elt: Node, caption_text: Option<&str>) {
+    let Some(container) = node_at(root, path) else {
+        return;
+    };
+    let Some(anchor_idx) = container
+        .children
+        .iter()
+        .position(|c| matches!(c.kind, NodeKind::Element(_)))
+    else {
+        return;
+    };
+    let mut span = Node::element(ElementKind::Span);
+    // A fresh element, so it carries an empty `data-parsoid` slot.
+    span.empty_dp_slot = true;
+    if let Some(cap) = caption_text {
+        span.set_attr("title", cap);
+    }
+    span.push_child(elt);
+    container.children[anchor_idx] = span;
 }
 
 /// Mark a media container as `mw:Error` and keep the broken markup (mirrors
@@ -1817,5 +2079,118 @@ mod tests {
         let a = &c.children[0];
         let img = &a.children[0];
         assert_eq!(img.get_attr("alt"), Some("alttext"));
+    }
+
+    /// A broken-media container for `File:Foobar.ogg`, plus an optional
+    /// `data-width` (the requested display size).
+    fn audio_container(data_width: Option<&str>) -> Node {
+        let mut span = Node::element(ElementKind::Span);
+        span.set_attr("class", "mw-file-element mw-broken-media");
+        span.set_attr("resource", "./File:Foobar.ogg");
+        if let Some(w) = data_width {
+            span.set_attr("data-width", w);
+        }
+        span.push_child(Node::text("File:Foobar.ogg"));
+
+        let mut a = Node::element(ElementKind::Other("a".to_string()));
+        a.set_attr(
+            "href",
+            "https://en.wikipedia.org/index.php?title=Special:Upload",
+        );
+        a.set_attr("class", "new");
+        a.set_attr("title", "File:Foobar.ogg");
+        a.push_child(span);
+
+        let mut c = Node::element(ElementKind::Span);
+        c.set_attr("typeof", "mw:File");
+        c.push_child(a);
+        c
+    }
+
+    /// An audio file renders as `<audio>`, not an `<img>`: the handler is chosen
+    /// by the file's media class, the anchor is replaced by a bare `<span>` (PHP's
+    /// non-image branch of `replaceAnchor`), and the container gains
+    /// `mw-default-audio-height`.
+    #[tokio::test]
+    async fn test_audio_file_becomes_audio_element() {
+        let mut doc = Node::document();
+        doc.push_child(audio_container(Some("232")));
+        let ds = MockDataSource::new();
+        ds.add_file(
+            "File:Foobar.ogg",
+            FileInfo {
+                title: "Foobar.ogg".to_string(),
+                mime_type: "application/ogg".to_string(),
+                media_type: Some("AUDIO".to_string()),
+                size: 100,
+                width: 0,
+                height: 0,
+                duration: Some(12.5),
+                file_url: "http://example.com/images/3/3a/Foobar.ogg".to_string(),
+                ..FileInfo::default()
+            },
+        );
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        assert!(
+            c.get_attr("class")
+                .unwrap_or("")
+                .contains("mw-default-audio-height"),
+            "the container takes the audio-height class"
+        );
+        let span = &c.children[0];
+        assert!(
+            matches!(span.kind, NodeKind::Element(ElementKind::Span)),
+            "a non-image media anchor is replaced by a <span>"
+        );
+        let audio = &span.children[0];
+        assert!(
+            matches!(&audio.kind, NodeKind::Element(ElementKind::Other(t)) if t == "audio"),
+            "the element is an <audio>"
+        );
+        assert_eq!(audio.get_attr("controls"), Some(""));
+        assert_eq!(audio.get_attr("preload"), Some("none"));
+        assert_eq!(audio.get_attr("data-mw-tmh"), Some(""));
+        assert_eq!(audio.get_attr("width"), Some("232"));
+        assert_eq!(audio.get_attr("height"), Some("32"));
+        assert_eq!(audio.get_attr("style"), Some("width: 232px;"));
+        assert_eq!(audio.get_attr("data-durationhint"), Some("13"));
+        assert_eq!(audio.get_attr("class"), Some("mw-file-element"));
+        let source = &audio.children[0];
+        assert_eq!(source.get_attr("type"), Some("application/ogg"));
+        assert!(source.get_attr("src").unwrap_or("").ends_with("Foobar.ogg"));
+    }
+
+    #[test]
+    fn audio_size_is_the_thumb_or_the_default_width() {
+        let info = FileInfo {
+            width: 0,
+            thumb_url: Some("t".to_string()),
+            thumb_width: Some(232),
+            ..FileInfo::default()
+        };
+        assert_eq!(audio_size(&info, 250), (232, 32));
+        // No returned thumbnail: the site's default width, floored at 35.
+        let bare = FileInfo {
+            width: 0,
+            ..FileInfo::default()
+        };
+        assert_eq!(audio_size(&bare, 250), (250, 32));
+        assert_eq!(audio_size(&bare, 10), (35, 32));
+    }
+
+    #[test]
+    fn parse_time_string_reads_a_colon_time() {
+        assert_eq!(parse_time_string("90", None), Some(90.0));
+        assert_eq!(parse_time_string("1:30", None), Some(90.0));
+        assert_eq!(parse_time_string("1:00:00", None), Some(3600.0));
+        // Over three parts, or non-numeric, is no time at all.
+        assert_eq!(parse_time_string("1:2:3:4", None), None);
+        assert_eq!(parse_time_string("x", None), None);
+        // Clamped to the file's length, and never negative.
+        assert_eq!(parse_time_string("100", Some(60.0)), Some(59.0));
+        assert_eq!(parse_time_string("-5", None), Some(0.0));
     }
 }

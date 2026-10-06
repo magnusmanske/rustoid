@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use rustoid_core::traits::FileInfo;
+use rustoid_core::traits::{FileDerivative, FileInfo};
 
 use crate::error::{CompareError, Result};
 use crate::wire::WikiClient;
@@ -52,9 +52,28 @@ pub async fn file_info(
         .into_iter()
         .filter_map(|(density, url)| url.map(|u| (density, u)))
         .collect();
+    // The derivative list is a `videoinfo` answer; for a still image the prop is
+    // absent (or empty), so this stays empty and the caller falls back to one
+    // source built from the file itself.
+    let derivatives = page
+        .videoinfo
+        .and_then(|mut v| v.drain(..).next())
+        .map(|v| v.derivatives)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| FileDerivative {
+            src: d.src,
+            mime: d.mime.unwrap_or_default(),
+            width: d.width.unwrap_or(0) as u32,
+            height: d.height.unwrap_or(0) as u32,
+            transcodekey: d.transcodekey,
+        })
+        .collect();
     let mut result = FileInfo {
         title: page.title.unwrap_or_default(),
         mime_type: info.mime.unwrap_or_default(),
+        media_type: info.mediatype,
+        derivatives,
         size: info.size.unwrap_or(0),
         width: info.width.unwrap_or(0) as u32,
         height: info.height.unwrap_or(0) as u32,
@@ -93,6 +112,29 @@ struct ImageInfoPage {
     badfile: Option<bool>,
     #[serde(default)]
     imageinfo: Option<Vec<ImageInfo>>,
+    /// `prop=videoinfo` — present only for an audio/video file.
+    #[serde(default)]
+    videoinfo: Option<Vec<VideoInfo>>,
+}
+
+#[derive(serde::Deserialize)]
+struct VideoInfo {
+    #[serde(default)]
+    derivatives: Vec<Derivative>,
+}
+
+#[derive(serde::Deserialize)]
+struct Derivative {
+    #[serde(default)]
+    src: String,
+    #[serde(default, rename = "type")]
+    mime: Option<String>,
+    #[serde(default)]
+    width: Option<u64>,
+    #[serde(default)]
+    height: Option<u64>,
+    #[serde(default)]
+    transcodekey: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -103,6 +145,9 @@ struct ImageInfo {
     descriptionurl: Option<String>,
     #[serde(default)]
     mime: Option<String>,
+    /// MediaWiki's media class (`AUDIO`, `VIDEO`, `BITMAP`, `DRAWING`, …).
+    #[serde(default)]
+    mediatype: Option<String>,
     #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
@@ -137,7 +182,7 @@ mod tests {
     fn a_thumb_is_read_with_its_returned_dimensions() {
         let json = r#"{"query":{"pages":[{"ns":6,"title":"File:X.jpg","imageinfo":[
             {"url":"https://u/X.jpg","descriptionurl":"https://d/X.jpg",
-             "mime":"image/jpeg","size":100,"width":1000,"height":800,
+             "mime":"image/jpeg","mediatype":"BITMAP","size":100,"width":1000,"height":800,
              "thumburl":"https://t/250px-X.jpg","thumbwidth":250,"thumbheight":200,
              "responsiveUrls":{"2":"https://t/500px-X.jpg"}}]}]}}"#;
         let parsed: ImageInfoResponse = serde_json::from_str(json).unwrap();
@@ -148,10 +193,29 @@ mod tests {
             .unwrap();
         assert_eq!(info.thumbwidth, Some(250));
         assert_eq!(info.thumbheight, Some(200));
+        assert_eq!(info.mediatype.as_deref(), Some("BITMAP"));
         assert_eq!(info.url.as_deref(), Some("https://u/X.jpg"));
         assert_eq!(
             info.responsive_urls.get("2").and_then(|u| u.as_deref()),
             Some("https://t/500px-X.jpg")
         );
+    }
+
+    /// `prop=videoinfo` rides alongside `imageinfo` for an audio/video file; its
+    /// `derivatives` are the `<source>` list, and a transcode carries its key.
+    #[test]
+    fn derivatives_are_read_from_videoinfo() {
+        let json = r#"{"query":{"pages":[{"ns":6,"title":"File:X.ogg",
+            "imageinfo":[{"mime":"application/ogg","mediatype":"AUDIO"}],
+            "videoinfo":[{"derivatives":[
+                {"src":"https://u/X.ogg","type":"audio/ogg; codecs=\"vorbis\"","width":0,"height":0},
+                {"src":"https://t/X.mp3","type":"audio/mpeg","transcodekey":"mp3","width":0,"height":0}
+            ]}]}]}}"#;
+        let parsed: ImageInfoResponse = serde_json::from_str(json).unwrap();
+        let d = &parsed.query.pages[0].videoinfo.as_ref().unwrap()[0].derivatives;
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].mime.as_deref(), Some("audio/ogg; codecs=\"vorbis\""));
+        assert!(d[0].transcodekey.is_none());
+        assert_eq!(d[1].transcodekey.as_deref(), Some("mp3"));
     }
 }

@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::error::{Result, RustoidError};
 use crate::title::Title;
-use crate::traits::{DataSource, FileInfo};
+use crate::traits::{DataSource, FileDerivative, FileInfo};
 
 /// A DataSource backed by the MediaWiki Action API.
 ///
@@ -223,8 +223,9 @@ impl MediaWikiApiDataSource {
         let height_s = height.map(|h| h.to_string());
         let mut params: Vec<(&str, &str)> = vec![
             ("action", "query"),
-            ("prop", "imageinfo"),
-            ("iiprop", "url|size|mime"),
+            ("prop", "imageinfo|videoinfo"),
+            ("iiprop", "url|size|mime|mediatype"),
+            ("viprop", "derivatives"),
             ("titles", title),
             ("format", "json"),
             ("formatversion", "2"),
@@ -271,6 +272,25 @@ impl MediaWikiApiDataSource {
                     let mut result = FileInfo {
                         title: page["title"].as_str().unwrap_or("").to_string(),
                         mime_type: info["mime"].as_str().unwrap_or("").to_string(),
+                        media_type: info["mediatype"].as_str().map(str::to_string),
+                        derivatives: page["videoinfo"]
+                            .as_array()
+                            .and_then(|v| v.first())
+                            .and_then(|v| v["derivatives"].as_array())
+                            .map(|list| {
+                                list.iter()
+                                    .map(|d| FileDerivative {
+                                        src: d["src"].as_str().unwrap_or("").to_string(),
+                                        mime: d["type"].as_str().unwrap_or("").to_string(),
+                                        width: d["width"].as_u64().unwrap_or(0) as u32,
+                                        height: d["height"].as_u64().unwrap_or(0) as u32,
+                                        transcodekey: d["transcodekey"]
+                                            .as_str()
+                                            .map(str::to_string),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         size: info["size"].as_u64().unwrap_or(0),
                         width: info["width"].as_u64().unwrap_or(0) as u32,
                         height: info["height"].as_u64().unwrap_or(0) as u32,
