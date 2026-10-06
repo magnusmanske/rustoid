@@ -12522,3 +12522,31 @@ remains right for the one thing it really is in PHP — an extension's output
 
 That is the next target. The working tree is back at the known-good state:
 `Zebra` **172090**, `Zebro` MATCH, fixture guard **877/896**.
+
+### The follow-up — spell no-`src` elements as HTML — also regressed, elsewhere
+
+The obvious repair for the missing `src` is to spell a no-`src` live element as its
+HTML (open tag with its attributes, or `</name>`), so the module's output
+re-tokenizes it into a keyed node. It was implemented in the shared renderer
+(`lua_deferred::answer_item_text`, which `render_answer` and
+`render_answer_markers` both use) and measured:
+
+    Template:Infobox        6533 →  6533   fixed
+    Albert Einstein        10966 →  4274   still regressed
+    COVID-19 pandemic      20572 → 16761   still regressed
+    Zebra                 172090 → 13618   regressed
+    Zebro                  MATCH  → 25286   regressed
+
+The new failure is a leak: `Zebra` byte 13618 is a taxobox `<th>` whose `style`
+reads `color:inherit; text-align: center;&lt;/span> background-color: …` — the
+spelled `</span>` was injected into an *attribute value*. `render_answer` is called
+recursively from the table and wikilink rebuilders (`table_token_wikitext`,
+`wikilink_token_wikitext`) to render the token-lists inside attribute values, so
+putting the element spelling in the shared renderer puts it where an attribute is
+being rebuilt, not where an argument value is being handed to a module.
+
+So the element spelling belongs in the **argument-value** path only, not in
+`render_answer`, and it has to be reconciled with `argument_value_text` (which is
+the renderer that path actually prefers). That is a narrower change than the last
+two, and it is the one to make next — with the two measurements above as the guard.
+The working tree is back at `Zebra` **172090**, `Zebro` MATCH.
