@@ -463,6 +463,35 @@ fn placeholder_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, Strin
     }
 }
 
+/// The tag name of a numbered `extension` token — `#tag:ref` reached through
+/// `frame:extensionTag` — which the answer renderers carry on its own.
+///
+/// Its `about` was spent during the answer's expansion, so rendering it back to
+/// wikitext and re-tokenizing it in the module's output would spend a second id
+/// for the same ref; the marker keeps the numbered token.
+fn numbered_extension_tag(item: &Item) -> Option<String> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+        return None;
+    };
+    if t.name != "extension" || !t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
+        return None;
+    }
+    Some(extension_name(t).unwrap_or_else(|| "extension".to_string()))
+}
+
+/// The span a marker-carrying renderer must carry as one strip marker starting at
+/// `items[i]`: the exclusive end index, the items, and the marker's name.
+///
+/// Only a `mw:DOMFragment` placeholder (see [`placeholder_span`]) and a numbered
+/// extension token are carried. Everything else the answer renderer writes itself
+/// or drops, under its own policy.
+fn answer_marker_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, String)> {
+    if let Some(span) = placeholder_span(items, i) {
+        return Some(span);
+    }
+    numbered_extension_tag(&items[i]).map(|tag| (i + 1, vec![items[i].clone()], tag))
+}
+
 /// Emit the `mw:dom-fragment-token` placeholder for a `<gallery>` extension,
 /// referencing the pre-built gallery fragment by `id` (mirrors the generic
 /// extension encapsulation in `extension_handler::gallery_items`).
@@ -3336,22 +3365,36 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `expand_one_indicator`). The marker keeps the numbered token, which
     /// `substitute_strip_markers` splices back unchanged.
     fn render_answer_markers(&self, items: &[Item]) -> String {
+        self.render_markers(items, crate::pipeline::lua_deferred::MissingSrc::Drop)
+    }
+
+    /// Render an `#invoke` argument value as the text Scribunto receives: the
+    /// same as [`Self::render_answer_markers`], except that a live element with
+    /// no `src` is *spelled as HTML* and a *stale* recorded source is rebuilt from
+    /// the token's expanded attributes.
+    ///
+    /// Scribunto is handed the expansion's text, and PHP's module output is that
+    /// text — so a spelled element comes back, when the module's output is
+    /// re-parsed, as a node with a `src` that is keyed and takes an id. A carried
+    /// marker skips that, and every id after it shifts; rebuilding instead is what
+    /// keeps `Template:Infobox`'s `id="mwCA"`. A stale source (one that still
+    /// spells a `{{…}}` the frame expanded) is rebuilt for the same reason: the
+    /// module must be handed the expansion, not the construct.
+    fn render_argument_markers(&self, items: &[Item]) -> String {
+        self.render_markers(items, crate::pipeline::lua_deferred::MissingSrc::Html)
+    }
+
+    /// Shared body of the two renderers: marker each placeholder (or numbered
+    /// extension) and hand the rest to the answer renderer under `missing_src`.
+    fn render_markers(
+        &self,
+        items: &[Item],
+        missing_src: crate::pipeline::lua_deferred::MissingSrc,
+    ) -> String {
         let mut replaced: Vec<Item> = Vec::with_capacity(items.len());
         let mut i = 0;
         while i < items.len() {
-            let span = placeholder_span(items, i).or_else(|| {
-                let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &items[i] else {
-                    return None;
-                };
-                if t.name != "extension"
-                    || !t.attribs.iter().any(|kv| kv.key.as_str() == Some("about"))
-                {
-                    return None;
-                }
-                let tag = extension_name(t).unwrap_or_else(|| "extension".to_string());
-                Some((i + 1, vec![items[i].clone()], tag))
-            });
-            match span {
+            match answer_marker_span(items, i) {
                 Some((end, tokens, tag)) => {
                     let marker = format!(
                         "\u{7f}UNIQ--{tag}-{:08X}-QINU\u{7f}",
@@ -3369,7 +3412,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 }
             }
         }
-        crate::pipeline::lua_deferred::render_answer(&replaced)
+        crate::pipeline::lua_deferred::render_answer_with(&replaced, missing_src)
     }
 
     /// Splice remembered strip markers back into their placeholder tokens.
@@ -5384,28 +5427,35 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         if let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value
             && argument_value_text(items).is_none()
-            && items.iter().any(|it| {
-                matches!(it, Item::Tok(t)
-                    if crate::wikitext::token_utils::table_token_wikitext(t).is_some())
-            })
         {
             // The exact renderer declined a construct it cannot spell — a
-            // generated element, or a `mw:DOMFragment` placeholder (a tunnelled
-            // `<templatestyles>`, whose content is stashed). When the value holds
-            // a **table** the module answer renderer can spell it: `{|` tables
-            // are rebuilt from their token data, and every placeholder becomes a
+            // generated element, a `mw:DOMFragment` placeholder (a tunnelled
+            // `<templatestyles>`, whose content is stashed), or a `{|` table.
+            // The module answer renderer is the right answer for all of them: it
+            // writes the source of what has one, rebuilds a `{|` table and a
+            // `[[…]]` from their token data, and turns a placeholder into a
             // `UNIQ…QINU` strip marker that `substitute_strip_markers` splices
-            // back when the module's output is re-parsed. Falling back to the
-            // recorded source instead hands the module the *unexpanded* call —
-            // which `Module:Clade` string-matches against `{|class="clade"`, so
-            // it stripped its own outer class and wrapped the wrong div.
+            // back when the module's output is re-parsed.
             //
-            // The gate is the table: `render_answer` rebuilds table syntax but
-            // not other generated markup (`<ul>`/`<li>`, which a value like an
-            // infobox's `starring = {{Plainlist|…}}` carries), so those keep the
-            // source fallback and the module re-expands the call where the
-            // re-expansion is faithful.
-            kv.value = crate::wikitext::tokens_v2::KeyValue::Str(self.render_answer_markers(items));
+            // The renderer drops a token that has no source at all, and that is
+            // right: Scribunto is handed the expansion's *text*, so a node the
+            // pipeline *synthesised* is not in it. `Template:Legend` is the case
+            // that pins it — its `{{#if:}}` leaves an auto-inserted `</span>`
+            // with no source, and spelling it produced an unbalanced tag the tree
+            // builder then marked `mw:Placeholder/StrippedTag`.
+            //
+            // A live element with no source *is* spelled, and a stale source is
+            // rebuilt from the token's expanded attributes: see
+            // [`Self::render_argument_markers`].
+            //
+            // Falling back to the recorded source instead hands the module the
+            // *unexpanded* call — which `Module:Clade` string-matches against
+            // `{|class="clade"`, so it stripped its own outer class and wrapped
+            // the wrong div — and the module's output then re-expands the call,
+            // numbering its extensions in a nested pipeline where the service
+            // numbers the expansion's own tokens in place.
+            kv.value =
+                crate::wikitext::tokens_v2::KeyValue::Str(self.render_argument_markers(items));
         }
         expanded_arg_pair(&kv).1
     }
@@ -5610,16 +5660,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // document order). Deferring the answer's extensions is what stops the
         // ids a stringified answer would otherwise spend.
         //
-        // A `#tag` call is the exception here: `frame:extensionTag` lowers to
-        // it, and rustoid numbers its fragment where the call is. That is an
-        // approximation — Parsoid's `pf_tag` returns a plain `<tag>` token and
-        // numbers it where the module's output places it — and it cannot be
-        // corrected locally: see "The templatestyles order at 172090 is not a
-        // numbering-order bug" in `ONLINE-PARITY.md`.
+        // A `#tag` call (`frame:extensionTag` lowers to it) is the same story as
+        // its input suggests: Parsoid's `pf_tag` returns a plain `<tag>` token,
+        // which the pipeline that re-parses the module's output numbers where the
+        // module left it, in document order — *not* at the call. So a
+        // `#tag:templatestyles` answer is deferred like any other; the resolved
+        // stylesheet is carried to the module's output by a strip marker and
+        // numbered there, in the chunk's document order. Only that tag is
+        // deferred: its answer is a `mw:DOMFragment` placeholder a marker carries.
         let defer = !matches!(
             request,
             crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { .. }
-        );
+        ) || is_templatestyles_extension_tag(&request);
         let _answer_gate = defer.then(|| self.begin_style_defer());
         let expanded = Box::pin(self.expand_templates(
             &child,
@@ -5681,6 +5733,23 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `#mwt64`. The marker keeps the first.
         self.render_answer_markers(&encapped)
     }
+}
+
+/// Whether a deferred request is a `frame:extensionTag('templatestyles', …)` —
+/// lowered to `#tag` with `templatestyles` as its first argument.
+///
+/// Only that tag's answer is a `mw:DOMFragment` placeholder the module's output
+/// can carry, so the id it spends waits for the position the module left it in.
+/// See [`Parser::expand_lua_request`].
+fn is_templatestyles_extension_tag(request: &crate::pipeline::lua_deferred::FrameRequest) -> bool {
+    let crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { name, args } = request
+    else {
+        return false;
+    };
+    name == "#tag"
+        && args
+            .first()
+            .is_some_and(|a| a.name.is_none() && a.value == "templatestyles")
 }
 
 /// Convert a frame's raw parameters into Scribunto `Arg`s.

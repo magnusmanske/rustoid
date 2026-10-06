@@ -671,80 +671,203 @@ fn render_invocation(target: &str, args: &[FrameArg]) -> String {
 /// A `mw:Transclusion` marker is Parsoid bookkeeping rather than output and is
 /// dropped.
 pub fn render_answer(items: &[Item]) -> String {
+    render_answer_with(items, MissingSrc::Drop)
+}
+
+/// How the answer renderer treats a token it cannot spell: what to do with a live
+/// element that has no `src`, and whether a *stale* source may be reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingSrc {
+    /// Drop a source-less element, and write a recorded source verbatim.
+    /// [`render_answer`]'s behaviour, for an answer that goes back to Lua as
+    /// wikitext and for a token-list rebuilt into an attribute value.
+    Drop,
+    /// An `#invoke` argument value, which is the expansion's *text*.
+    Html,
+}
+
+/// [`render_answer`] with a policy for what it cannot spell as written.
+pub fn render_answer_with(items: &[Item], missing_src: MissingSrc) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < items.len() {
-        match &items[i] {
-            Item::Str(s) => out.push_str(s),
-            // Both the opening marker and its `mw:Transclusion/End` partner are
-            // bookkeeping, not output, and a comment never reaches a module.
-            Item::Tok(tok) => {
-                if is_transclusion_marker(tok) {
-                    i += 1;
-                    continue;
-                }
-                match tok {
-                    // A comment never reaches a module; a newline is source the
-                    // module can see (and table syntax needs it on its own line).
-                    crate::wikitext::tokens_v2::ParsoidToken::Comment(_) => {
-                        i += 1;
-                        continue;
-                    }
-                    // A `Nl` whose source is recorded writes that source below;
-                    // emitting the bare `\n` here too doubled the newline
-                    // (`...>\n<div...` became `...>\n\n<div...`). Only a `Nl`
-                    // that carries no source needs the newline here.
-                    crate::wikitext::tokens_v2::ParsoidToken::Nl(_)
-                        if tok
-                            .data_parsoid()
-                            .and_then(|dp| dp.src.as_deref())
-                            .is_none() =>
-                    {
-                        out.push('\n');
-                    }
-                    _ => {}
-                }
-                // The token's own source is the source *as written*; an
-                // attribute substituted during expansion has to be written back
-                // so the module is handed the expansion, not the template. See
-                // [`crate::wikitext::token_utils::rewrite_expanded_attrs`].
-                // Table-structure tokens have no `src` and are rebuilt instead.
-                if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
-                    out.push_str(
-                        &crate::wikitext::token_utils::rewrite_expanded_attrs(
-                            src,
-                            tok.get_attribs(),
-                        )
-                        .unwrap_or_else(|| src.to_string()),
-                    );
-                    // An `mw:Entity` span's `src` already spells the entity, so
-                    // its decoded text child is skipped rather than emitted too.
-                    if crate::wikitext::token_utils::skip_entity_decoded_text(tok, items.get(i + 1))
-                    {
-                        i += 1;
-                    }
-                } else if let Some(src) = wikilink_token_wikitext(tok) {
-                    // A `[[…]]` the tokenizer did not stamp with `src` — a link a
-                    // module returned, tokenized from the module's output — is
-                    // rebuilt from its parts, so a `frame:expandTemplate` answer
-                    // keeps it (`[[File:…]]` otherwise vanished and the taxobox
-                    // image row came back empty).
-                    out.push_str(&src);
-                } else if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
-                    out.push_str(&src);
-                } else if let Some(src) = quote_token_wikitext(tok) {
-                    // An `mw-quote` a module's output produced has no `src` (the
-                    // quote transformer has not run, nor can it — the answer is
-                    // wikitext), so it too is rebuilt: without this a link's
-                    // italic markup was dropped and `[[Equus (genus)|''Equus'']]`
-                    // came back as `[[Equus (genus)|Equus]]`.
-                    out.push_str(&src);
-                }
-            }
+        if let Some((text, next)) = answer_item_text(items, i, missing_src) {
+            out.push_str(&text);
+            i = next;
+        } else {
+            i += 1;
         }
-        i += 1;
     }
     out
+}
+
+/// The wikitext of the item at `i`, and the index to continue at — or `None` when
+/// the item has no textual form at all.
+///
+/// [`render_answer`]'s arms, with the `missing_src` policy for the two cases its
+/// doc block does not cover. An `mw:Entity` span consumes its decoded character
+/// and its end tag with its source, which is why the index is returned.
+pub fn answer_item_text(
+    items: &[Item],
+    i: usize,
+    missing_src: MissingSrc,
+) -> Option<(String, usize)> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    match &items[i] {
+        Item::Str(s) => Some((s.clone(), i + 1)),
+        Item::Tok(tok) => {
+            // Both the opening marker and its `mw:Transclusion/End` partner are
+            // bookkeeping, not output, and a comment never reaches a module.
+            if is_transclusion_marker(tok) {
+                return Some((String::new(), i + 1));
+            }
+            match tok {
+                // A comment never reaches a module; a newline is source the
+                // module can see (and table syntax needs it on its own line).
+                ParsoidToken::Comment(_) => return Some((String::new(), i + 1)),
+                // A `Nl` whose source is recorded writes that source below;
+                // emitting the bare `\n` here too doubled the newline
+                // (`...>\n<div...` became `...>\n\n<div...`). Only a `Nl` that
+                // carries no source needs the newline here.
+                ParsoidToken::Nl(_)
+                    if tok
+                        .data_parsoid()
+                        .and_then(|dp| dp.src.as_deref())
+                        .is_none() =>
+                {
+                    return Some(("\n".to_string(), i + 1));
+                }
+                _ => {}
+            }
+            // The token's own source is the source *as written*; an attribute
+            // substituted during expansion has to be written back so the module is
+            // handed the expansion, not the template. See
+            // [`crate::wikitext::token_utils::rewrite_expanded_attrs`].
+            // Table-structure tokens have no `src` and are rebuilt instead.
+            if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
+                let rewritten =
+                    crate::wikitext::token_utils::rewrite_expanded_attrs(src, tok.get_attribs())
+                        .unwrap_or_else(|| src.to_string());
+                let text = stale_tag_html(tok, &rewritten, missing_src).unwrap_or(rewritten);
+                // An `mw:Entity` span's `src` already spells the entity, so its
+                // decoded text child is skipped rather than emitted too.
+                let next = if crate::wikitext::token_utils::skip_entity_decoded_text(
+                    tok,
+                    items.get(i + 1),
+                ) {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                return Some((text, next));
+            }
+            if let Some(src) = wikilink_token_wikitext(tok) {
+                // A `[[…]]` the tokenizer did not stamp with `src` — a link a
+                // module returned, tokenized from the module's output — is
+                // rebuilt from its parts, so a `frame:expandTemplate` answer keeps
+                // it (`[[File:…]]` otherwise vanished and the taxobox image row
+                // came back empty).
+                return Some((src, i + 1));
+            }
+            if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
+                return Some((src, i + 1));
+            }
+            if let Some(src) = quote_token_wikitext(tok) {
+                // An `mw-quote` a module's output produced has no `src` (the quote
+                // transformer has not run, nor can it — the answer is wikitext), so
+                // it too is rebuilt: without this a link's italic markup was
+                // dropped and `[[Equus (genus)|''Equus'']]` came back as
+                // `[[Equus (genus)|Equus]]`.
+                return Some((src, i + 1));
+            }
+            None
+        }
+    }
+}
+
+/// Rebuild an element from its *expanded* attributes when a construct survives the
+/// source rewrite, or `None` to keep the rewritten source.
+///
+/// `Template:Plainlist` writes its body's open tag as
+/// `<div class="plainlist {{{class|}}}" {{safesubst<noinclude />:#if:…}}>`. The
+/// frame expanded both, so the token's `attribs` hold the answer while its `src`
+/// still spells the constructs. `rewrite_expanded_attrs` fixes the attribute
+/// (`class`), but the second construct is not an attribute, so it survives — and
+/// the module is then handed the raw call. Rebuilding the tag from the attributes
+/// drops it. A rewritten source that no longer spells a `{{…}}` is left alone, so
+/// the ordinary case (a substituted attribute value) is unchanged. Only an
+/// `#invoke` argument value does this; an answer that goes back to Lua keeps its
+/// source.
+fn stale_tag_html(
+    tok: &crate::wikitext::tokens_v2::ParsoidToken,
+    rewritten: &str,
+    mode: MissingSrc,
+) -> Option<String> {
+    if mode != MissingSrc::Html || !rewritten.contains("{{") {
+        return None;
+    }
+    element_html_from_attribs(tok)
+}
+
+/// The HTML of a live element token built from its attributes — an open tag with
+/// its attributes, or a close tag.
+///
+/// Parsoid's own attributes are left out: `about`, a `typeof` in the `mw:`
+/// namespaces (encapsulation and extension types), and the `data-mw` bookkeeping
+/// keys are not HTML. A `mw:DOMFragment` placeholder declines — it is stashed
+/// output, carried as a strip marker rather than spelled.
+fn element_html_from_attribs(tok: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    match tok {
+        ParsoidToken::EndTag(t) => Some(format!("</{}>", t.name)),
+        ParsoidToken::Tag(t) if !is_dom_fragment(t) => {
+            Some(format!("<{}{}>", t.name, html_attributes(&t.attribs)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a tag token is a `mw:DOMFragment` placeholder — stashed output reached
+/// through a strip marker, not markup.
+fn is_dom_fragment(t: &crate::wikitext::tokens_v2::TagTk) -> bool {
+    t.attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("typeof"))
+        .and_then(|kv| kv.value.as_str())
+        .is_some_and(|ty| ty.contains("mw:DOMFragment"))
+}
+
+/// The attribute list of a generated element, as HTML.
+///
+/// The value is read with [`crate::wikitext::token_utils::key_value_source_text`],
+/// not `KeyValue::as_str`: `Template:Plain list` writes `class="plainlist
+/// {{{class|}}}"`, so the `class` a live element must keep is held as `Tokens`,
+/// and reading only `Str` dropped it (`<div>` where the service has
+/// `<div class="plainlist ">`).
+fn html_attributes(attribs: &[crate::wikitext::tokens_v2::KV]) -> String {
+    let mut out = String::new();
+    for kv in attribs {
+        let Some(key) = kv.key.as_str() else {
+            continue;
+        };
+        let value = crate::wikitext::token_utils::key_value_source_text(&kv.value);
+        if key == "about" || key.starts_with("data-mw") {
+            continue;
+        }
+        if key == "typeof" && value.split_whitespace().any(|t| t.starts_with("mw:")) {
+            continue;
+        }
+        out.push_str(&format!(" {key}=\"{}\"", escape_attribute(&value)));
+    }
+    out
+}
+
+/// Escape an attribute value for a double-quoted HTML attribute, as the
+/// serializer does (`&`, `<`, `"`; `'` is not the delimiter here).
+fn escape_attribute(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('"', "&quot;")
 }
 
 /// An `mw-quote` token's wikitext: the apostrophe run it stands for.
@@ -1001,6 +1124,38 @@ mod tests {
         assert_eq!(
             split_colon_name("#tag:ref"),
             ("#tag".to_string(), Some("ref".to_string()))
+        );
+    }
+
+    /// A live element rebuilt from its attributes must keep a value the expander
+    /// left as `Tokens`: `Template:Plain list` writes `class="plainlist
+    /// {{{class|}}}"`, so reading only `Str` dropped the class and the module's
+    /// output came back `<div>` where the service has `<div class="plainlist ">`.
+    #[test]
+    fn element_html_keeps_an_expanded_attribute_value() {
+        use crate::wikitext::tokens_v2::{DataParsoid, Item, KV, KeyValue, ParsoidToken, TagTk};
+        let kv = |k: &str, v: KeyValue| KV {
+            key: KeyValue::Str(k.into()),
+            value: v,
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let tag = TagTk::new(
+            "div",
+            vec![
+                // Parsoid bookkeeping, not HTML: must be left out.
+                kv("about", KeyValue::Str("#mwt1".into())),
+                kv(
+                    "class",
+                    KeyValue::Tokens(vec![Item::Str("plainlist ".into())]),
+                ),
+            ],
+            DataParsoid::default(),
+        );
+        assert_eq!(
+            element_html_from_attribs(&ParsoidToken::Tag(tag)).as_deref(),
+            Some(r#"<div class="plainlist ">"#)
         );
     }
 }

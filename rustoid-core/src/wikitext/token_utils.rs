@@ -560,7 +560,11 @@ pub fn rewrite_expanded_attrs(
 }
 
 /// The source text an attribute key or value now stands for.
-fn key_value_source_text(value: &KeyValue) -> String {
+///
+/// A value the expander touched is held as `Tokens` (the expanded result);
+/// anything reading an attribute's *text* must go through here rather than
+/// `KeyValue::as_str`, which sees only a plain `Str` and silently drops the rest.
+pub fn key_value_source_text(value: &KeyValue) -> String {
     match value {
         KeyValue::Str(s) => s.clone(),
         KeyValue::Tokens(items) => tokens_to_source(items),
