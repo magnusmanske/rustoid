@@ -651,22 +651,31 @@ impl LuaEngine {
         let module = self.load_module_value(module_source, Some(title))?;
         let func = self.module_function(&module, function_name)?;
 
-        let result: Value = func
-            .call::<Value>(frame)
+        let results: mlua::MultiValue = func
+            .call(frame)
             .map_err(|e| RustoidError::Lua(format!("execution error: {e}")))?;
 
-        // Scribunto runs the returned value through `tostring` before handing it
-        // to the parser, so a value with a `__tostring` metamethod — an `mw.html`
-        // node, for instance — renders rather than being dropped. Returning a
-        // table used to yield the empty string, which lost a module's whole
-        // output when it returned a builder.
-        let rendered: Value = self
-            .lua
-            .globals()
-            .get::<Function>("tostring")
-            .and_then(|tostring| tostring.call(result))
-            .unwrap_or(Value::Nil);
-        Ok(lua_value_to_string(&rendered))
+        // Scribunto collects the module's return values into a sequence,
+        // `tostring`s each one `ipairs` visits, and concatenates them
+        // (`mw.executeModule`: `local results = { callFunction( func, frame ) }
+        // … return 'ok', table.concat( results )`). A `nil` or absent return
+        // therefore yields `""`, and every value at or after the first `nil` is
+        // dropped — the literal string `"nil"` is never produced. Running each
+        // value through Lua's `tostring` keeps a `__tostring` metamethod
+        // working, so an `mw.html` node still renders rather than being dropped.
+        let tostring = self.lua.globals().get::<Function>("tostring").ok();
+        let mut rendered = String::new();
+        for value in results {
+            if matches!(value, Value::Nil) {
+                break;
+            }
+            let text = tostring
+                .as_ref()
+                .and_then(|f| f.call(value).ok())
+                .unwrap_or(Value::Nil);
+            rendered.push_str(&lua_value_to_string(&text));
+        }
+        Ok(rendered)
     }
 
     /// Run with no module title, for callers that have none (the engine's own
@@ -8676,5 +8685,28 @@ mod tests {
         "#;
         assert_eq!(engine.execute(other, "main", &[]).unwrap(), "nil");
         assert!(engine.take_missing_titles().is_empty());
+    }
+
+    /// `mw.executeModule` collects the module's return values into a sequence,
+    /// `tostring`s only what `ipairs` visits, and concatenates them. A `nil` (or
+    /// absent) return is therefore `""`, never the string `"nil"`, and any
+    /// value at or after the first `nil` is dropped.
+    #[test]
+    fn a_module_returning_nil_answers_the_empty_string() {
+        let engine = LuaEngine::new(
+            LuaEngineConfig::default(),
+            LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test"),
+        )
+        .unwrap();
+        let src = r#"
+            local p = {}
+            function p.nil_value() return nil end
+            function p.nothing() end
+            function p.mixed() return 'a', nil, 'b' end
+            return p
+        "#;
+        assert_eq!(engine.execute(src, "nil_value", &[]).unwrap(), "");
+        assert_eq!(engine.execute(src, "nothing", &[]).unwrap(), "");
+        assert_eq!(engine.execute(src, "mixed", &[]).unwrap(), "a");
     }
 }
