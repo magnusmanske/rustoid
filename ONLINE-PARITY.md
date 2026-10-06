@@ -12312,15 +12312,7 @@ compare tests pass with clippy and `cargo fmt` clean.
 
 ### Held: Scribunto returns `nil` as the string `nil`
 
-`LuaEngine::execute_in` runs the module's return through `tostring`, which turns
-`nil` into `"nil"`. Scribunto collects the return values into `{ func() }`,
-`tostring`s only what `ipairs` visits, and concatenates them (`mw.executeModule`),
-so a `nil` or absent return is `""`. The fix is measured and correct, but it is
-**held**: it exposes two separate bugs whose content differs *before* the current
-first difference on other pages — `Quicksilver (film)`'s `mw-empty-elt` wrapper
-(fixed by the no-hash change above) and `Nobel Prize`'s image rendering, where an
-empty caption makes rustoid answer `mw:Error … filedoesnotexist` instead of the
-file. Land it once the image case is fixed.
+Landed below once the file backfills made it a net win, not a regression.
 
 ## Fixed: a Media-namespace title's file, and the file table's shape
 
@@ -12369,3 +12361,36 @@ the document order Side box, Listen, Plainlist; rustoid assigns them 415/414/413
 the reverse. The wrapper correctly takes 412. This is the documented
 "`about` ids are allocated out of document order" problem: `expand_templatestyles`
 is a token pass, and the placeholders it numbers reach it in the wrong order.
+
+## Fixed: a module's `nil` return is the empty string, not `"nil"`
+
+### Cause
+
+`LuaEngine::execute_in` ran the module's return value through `tostring`, which
+turns `nil` into the string `"nil"`. Scribunto collects the return values into a
+sequence, `tostring`s only what `ipairs` visits, and concatenates them
+(`mw.executeModule`: `local results = { callFunction( func, frame ) } … return
+'ok', table.concat( results )`), so a `nil` or absent return is `""`, and any
+value at or after the first `nil` is dropped. `{{#invoke:Category handler|main|nocat=true}}`
+rendered the literal `nil` where the service renders nothing.
+
+### Fix
+
+`execute_in` iterates the module's `MultiValue` of return values, stops at the
+first `nil`, and concatenates `tostring` of the rest — a faithful port of
+`mw.executeModule`.
+
+### Effect: `Nobel Prize` moves from 5926 to 7813
+
+`Zebra`'s first difference is unchanged at **172090** (no `nil` appeared before
+it). On the subset `Nobel Prize` moves **5926 → 7813**; nothing regresses
+(`Bicycle` 11836, `Sundial` 3934, `Quicksilver (film)` 4213, `List of sovereign
+states` 8409, `Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes, the
+fixture guard holds at **877/896**, and 972 lib tests and 115 compare tests pass
+with clippy and `cargo fmt` clean.
+
+Getting the improvement needed the file backfills that are part of the harness
+workflow (`RUSTOID_FILL_FILES=1`). With the `nil` gone, `Nobel Prize`'s infobox
+image asked the wiki for a size the offline cache lacked (`File:Nobel Prize.png@w250`),
+which had rendered as `mw:Error … filedoesnotexist`; before the backfill the
+change looked like a 4-byte regression (5926 → 5922) for exactly that reason.
