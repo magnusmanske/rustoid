@@ -54,15 +54,11 @@ pub async fn page_info(
         }
 
         for info in parsed.query.pages {
-            let Some(title) = info.title else { continue };
-            let missing = info.missing.unwrap_or(false);
-            let key = normalise(&title);
-            let entry = PageInfo {
-                missing,
-                known: !missing,
-                redirect: info.redirect.is_some(),
-                linkclasses: link_classes(&info.pageprops),
+            let Some(title) = info.title.clone() else {
+                continue;
             };
+            let key = normalise(&title);
+            let entry = info.to_page_info();
             if let Some(original) = asked.get(&key) {
                 out.insert(original.clone(), entry.clone());
             }
@@ -247,6 +243,10 @@ struct PageEntry {
     title: Option<String>,
     #[serde(default)]
     missing: Option<bool>,
+    /// Present only when true: a title known through a repository even though
+    /// its local page is absent (a shared file), which suppresses the red link.
+    #[serde(default)]
+    known: Option<bool>,
     /// Present only for redirects; its presence is the signal.
     #[serde(default)]
     redirect: Option<serde_json::Value>,
@@ -259,6 +259,23 @@ struct PageEntry {
     /// `type` field rather than a map key.
     #[serde(default)]
     protection: Option<Vec<Protection>>,
+}
+
+impl PageEntry {
+    /// The [`PageInfo`] this API entry stands for.
+    ///
+    /// `known` is a separate answer from `missing`, not its negation: a file whose
+    /// description page is absent locally but which exists on a shared repository
+    /// comes back `{"missing":true,"known":true}`. Deriving it as `!missing` reddened
+    /// every such link (Zebra's `{{Listen}}` file link).
+    fn to_page_info(&self) -> PageInfo {
+        PageInfo {
+            missing: self.missing.unwrap_or(false),
+            known: self.known.unwrap_or(false),
+            redirect: self.redirect.is_some(),
+            linkclasses: link_classes(&self.pageprops),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -345,6 +362,36 @@ mod tests {
         assert_eq!(parsed.query.pages.len(), 2);
         assert_eq!(parsed.query.pages[1].missing, Some(true));
         assert!(parsed.query.pages[0].missing.is_none());
+    }
+
+    /// A file whose description page is absent locally but which exists on a
+    /// shared repository answers `{"missing":true,"known":true}`. `known` is a
+    /// separate answer, not `!missing`; deriving it as `!missing` reddened every
+    /// such link (`Zebra`'s `{{Listen}}` file link).
+    #[test]
+    fn a_shared_file_is_known_even_though_its_local_page_is_missing() {
+        let json = r#"{"query":{"pages":[
+            {"ns":6,"title":"File:Shared.ogg","missing":true,"known":true},
+            {"ns":0,"title":"Absent","missing":true}
+        ]}}"#;
+        let parsed: InfoResponse = serde_json::from_str(json).unwrap();
+        let shared = parsed.query.pages[0].to_page_info();
+        assert!(shared.missing && shared.known, "a shared file is known");
+        let absent = parsed.query.pages[1].to_page_info();
+        assert!(
+            absent.missing && !absent.known,
+            "an absent page is not known"
+        );
+        let exists = PageEntry {
+            title: Some("Exists".to_string()),
+            missing: None,
+            known: None,
+            redirect: None,
+            pageprops: None,
+            protection: None,
+        }
+        .to_page_info();
+        assert!(!exists.missing, "an existing page is not a red link");
     }
 
     #[test]
