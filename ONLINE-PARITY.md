@@ -12550,3 +12550,80 @@ So the element spelling belongs in the **argument-value** path only, not in
 the renderer that path actually prefers). That is a narrower change than the last
 two, and it is the one to make next — with the two measurements above as the guard.
 The working tree is back at `Zebra` **172090**, `Zebro` MATCH.
+
+## Fixed: an `#invoke` argument renders as the expansion's text
+
+The two attempts above failed for two separable reasons, and the fix landed by
+addressing each in the place it belongs.
+
+### The element spelling belongs to the argument path
+
+The spelling was put in the shared `render_answer`, which `table_token_wikitext`
+and `wikilink_token_wikitext` call recursively to render the token-lists inside
+**attribute values** — so a spelled `</span>` landed inside a taxobox `style=`.
+The argument-value path now has its own renderer, `Parser::render_argument_markers`,
+and `render_answer` keeps its old "no text, no output" behaviour. The difference
+is a policy parameter — `lua_deferred::MissingSrc::Drop` for an answer,
+`MissingSrc::Html` for an argument value — threaded through the one shared
+`answer_item_text`, not a second copy of the renderer.
+
+### A carried marker is not re-keyed, so only the real markers are carried
+
+The general "blind run" carriage was dropped. `answer_marker_span` carries only an
+`mw:DOMFragment` placeholder and a numbered `extension` token — the two things
+Parsoid really stows as a marker. Everything else the argument renderer **spells**,
+so the module receives text that re-tokenizes into keyed nodes exactly as PHP gets.
+
+### The element spelling, under the `Html` policy
+
+`lua_deferred::answer_item_text` grew the `MissingSrc` policy. Under `Html` a live
+element token with no `src` is spelled from its attributes as HTML
+(`element_html_from_attribs`), so the module output re-tokenizes it into a keyed
+node. A no-`src` token under `Drop` — and any token that is neither — stays dropped.
+`Template:Legend`'s auto-inserted `</span>` is the pinned case: it is not in the
+expansion's text, and spelling it produced an unbalanced tag the tree builder then
+marked `mw:Placeholder/StrippedTag`.
+
+### A stale recorded source is rebuilt from the expanded attributes
+
+`Template:Plain list` writes its open tag as
+`<div class="plainlist {{{class|}}}" {{safesubst<noinclude />:#if:…}}>`. The frame
+expanded both constructs, so `rewrite_expanded_attrs` patches the `class`, but the
+`{{safesubst…}}` is not an attribute and survives. `stale_tag_html` fires when the
+*rewritten* source still spells a `{{…}}` and rebuilds the tag from the token's
+expanded attributes instead. The `{{…}}` gate is on the **rewritten** source on
+purpose: gating on the source *as written* is too broad — `Zebro`'s `{{Legend}}`
+`src` legitimately contains `{{`.
+
+### An expanded attribute value is `Tokens`, not `Str`
+
+`element_html_from_attribs` reads each attribute with the shared
+`key_value_source_text`, not `KeyValue::as_str`. `Plain list`'s
+`class="plainlist {{{class|}}}"` is held as `Tokens` once expanded, so `as_str`
+saw `None` and **dropped the class** — `<div>` where the service has
+`<div class="plainlist ">`. That single attribute was the whole
+`COVID-19 pandemic` regression (20572 → 15352); reading it correctly restores
+the page to its 20572 baseline.
+
+### Effect
+
+    Zebra                 172090 → 175539  (31.34% of the oracle)
+    Zebro                  MATCH  → MATCH
+    Quicksilver (film)      4213 →  6691
+    Nobel Prize             7813 →  8312
+
+On the 48-page corpus **sixteen pages improved and none regressed**:
+`Tropical cyclone` +10737, `Periodic table` +8706, `Doom` +6243, `Anarchism`
++5602, `The Beatles` +4801, `France` +4741, `Nigeria` +4371, `Chess` +4161,
+`Grand Theft Auto V` +3303, `Zebra` +3449, `Quicksilver` +2478, `World War II`
++1168, `Association football` +453, `Nobel Prize` +499, `Chernobyl disaster`
++118, `Megadeth` +1. `COVID-19 pandemic` was the one numeric regression (above),
+now back at its 20572 baseline. Per-page render times are unchanged (measured
+before and after on seven of these pages; within noise, some marginally faster).
+
+### The next difference at 175539
+
+`{{Listen}}`'s file link: rustoid renders `File:Grévys zebra (Sound Effects).ogg`
+as a **red link** (`?action=edit&redlink=1`, `class="new"`) where the service has
+an existing file and a `<audio>` element. The file exists; rustoid's link facts
+for that title are not being found.
