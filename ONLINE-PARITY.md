@@ -12627,3 +12627,46 @@ before and after on seven of these pages; within noise, some marginally faster).
 as a **red link** (`?action=edit&redlink=1`, `class="new"`) where the service has
 an existing file and a `<audio>` element. The file exists; rustoid's link facts
 for that title are not being found.
+
+## Fixed: a shared file is `known`, so its link is not red
+
+The red link above was the whole difference, and it was the harness, not the
+parser. The file is on Commons with no local description page, and
+`rustoid-compare`'s `page_info` derived `known` as `!missing`, discarding the
+API's own `known` field.
+
+`action=query&prop=info` answers a shared file with **both** flags —
+`{"missing":true,"known":true}` — because the local page is absent but the file
+exists on the repository. `AddRedLinks` already reads it correctly
+(`missing && !known`); only the harness's fetch collapsed it. `PageEntry` now
+parses `known` and `to_page_info` uses it, so the link is left alone.
+
+Effect: `Zebra` **175539 → 175645**. On the 48-page corpus only `Zebra` moved,
+and it improved; nothing regressed. The cached `info:` entries written under the
+old rule were corrected in place, by the rule: an `info:` entry that is `missing`
+while a `file:` entry exists for the same title is a shared file, so its `known`
+is true (17 entries).
+
+### The next difference at 175645 is audio, and the oracle's URL campaign blocks it
+
+`{{Listen}}`'s media is an `.ogg`, so the service renders `<audio>` (two
+`<source>` children built from the file's derivatives, `mw-default-audio-height`
+on the container); rustoid's `AddMediaInfo` implements only the bitmap branch and
+renders the file-type icon as an `<img>`. The port is understood — PHP's
+`handleAudio`/`handleVideo`, `addSources` (derivatives, `data-transcodekey`),
+`addTracks`, the container class, and the `ext.tmh.player` module metadata — and
+the file-info fields it needs (`mediatype`, `derivatives`, `timedtext`) are all
+in the action API (`prop=videoinfo&viprop=derivatives|timedtext`).
+
+It is not landed because the oracle's derivative URL is **not reproducible**. The
+API's `videoinfo.derivatives[].src` carries `utm_campaign=api`; the pinned
+oracles carry `utm_campaign=index` for `Zebra.ogg`, `Chess.ogg` and
+`En-titanic.ogg`, and `utm_campaign=rest` for the *same media type* on `Titanic`
+and `Earth`. The campaign is a fetch-time value of the wiki's URL builder rather
+than a property of the file, so it differs across the pinned baselines and no
+port can match all of them. Thumbnails have no such problem — every oracle uses
+`utm_campaign=parser` for a bitmap `src`, which is why `normalize_api_urls` maps
+`imageinfo` → `parser` — so the divergence is specific to the derivative URLs.
+
+Deferred, with the measurements above as the guard. The working tree is at
+`Zebra` **175645**, `Zebro` MATCH, fixture guard **877/896**.
