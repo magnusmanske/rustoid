@@ -12776,17 +12776,44 @@ tag. Two variants were tried:
 The blocker is the second tag. `Template:Div col` puts its comments **inside**
 the `#if` expansion — `<div … <!--\n-->{{#if:…|<!--\n-->style="…"<!--\n-->}}>` —
 so the construct is a bare `{{…}}` in attribute position whose branch is
-comments plus `style="…"`. Pre-fix that tag came out *correct*: with the raw tag
-rejected, the attribute expander reconstructed it from its expanded attributes
-and the `style` survived. Accepting the comment changes which path handles it,
-and the expander now drops the bare-construct attribute. So the tokenizer fix
-cannot land alone; the attribute expander's handling of a bare construct in
-attribute position has to be reconciled first (PHP's `generic_attribute_name`
-reads it as a `directive` name, and the expanded name is reparsed into
-attributes).
+comments plus `style="…"`.
 
-Reverted, working tree clean, with the two measurements above as the guard.
+### Why the second tag still fails: a module expansion expands it in the wrong frame
+
+The reduced tag is fine. With the comment accepted,
+`<div class="div-col {{#ifeq:1|1|small}}" <!--\n-->{{#if:1|<!--\n-->style="s"<!--\n-->}}>`
+and `<div class="div-col   " <!--\n-->{{#if:1|<!--\n-->style="s"<!--\n-->}}>` both
+render `<div … style="s" …>` — the expander reparses the expanded directive name
+(which contains `=`) into attributes exactly as PHP's `reparse-KV-string` path
+does. `x\n{{Div col|colwidth=10em|gap=0}}` and
+`{{Div col|content=hello|colwidth=10em|gap=0}}` also render the `style`.
+
+The page that regresses does not call the template directly. It calls
+`{{Columns list|colwidth=10em|gap=0}}`, and `Template:Columns list` is
+`{{#invoke:Template wrapper|wrap|_template=div col|_alias-map=1:content|colwidth=30em}}`.
+The chain is `#invoke` → `Module:Template wrapper` → `frame:expandTemplate('div col')`.
+There, the tag's `{{#if:{{{colwidth|}}}{{{gap|}}}{{{style|}}}|…}}` expands to the
+**empty string**: the debugged expansion of that directive is `""`, so the
+`style` never appears and a stray empty-named attribute (`=""`) takes its place.
+The condition reads `{{{colwidth|}}}` against a frame where it is unset — the
+Div col arguments `Module:Template wrapper` passed to `frame:expandTemplate` do
+not reach the attribute-position construct. Called directly, the same tag has
+`colwidth` in scope and expands to `style="column-width: 10em;column-gap: 0;"`.
+
+So the tokenizer fix cannot land alone for a second reason: it routes this tag
+into the page-level `expand_attributes` pass, which runs once over the flattened
+stream with one frame (the source's), instead of leaving the attribute-position
+`#if` to be resolved in the template's own frame as before. Revealing a
+`style`-bearing tag to that pass is what surfaces the frame bug.
+
+Reverted, working tree clean, with the measurements above as the guard.
 `Zebra` stays at **230803**, `Zebro` MATCH, fixture guard **877/896**.
+
+The next target is therefore the frame, not the attribute expander:
+`Module:Template wrapper` → `frame:expandTemplate` must let a template body's
+attribute-position `{{#if:{{{arg|}}}…}}` see the template's arguments (the direct
+call already does), after which the comment-in-tag tokenizer fix can be
+re-applied and should advance `Zebra` to ~231276 without the COVID-19 regression.
 
 The next target is therefore the attribute expander:
 `<div class="a" {{#if:1|style="s"}}>` must keep the `style` whether or not a
