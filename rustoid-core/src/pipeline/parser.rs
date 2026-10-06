@@ -5610,11 +5610,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // document order). Deferring the answer's extensions is what stops the
         // ids a stringified answer would otherwise spend.
         //
-        // A `#tag` call is the exception: `frame:extensionTag` lowers to it, and
-        // `#tag` *runs* the extension, so its fragment is numbered here, where
-        // the call is. Deferring it too would move a module's
-        // `#tag:templatestyles` past the fragments it emitted after it
-        // (`Zebro`'s Plainlist stylesheet, `#mwt37` → `#mwt41`).
+        // A `#tag` call is the exception here: `frame:extensionTag` lowers to
+        // it, and rustoid numbers its fragment where the call is. That is an
+        // approximation — Parsoid's `pf_tag` returns a plain `<tag>` token and
+        // numbers it where the module's output places it — and it cannot be
+        // corrected locally: see "The templatestyles order at 172090 is not a
+        // numbering-order bug" in `ONLINE-PARITY.md`.
         let defer = !matches!(
             request,
             crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { .. }
