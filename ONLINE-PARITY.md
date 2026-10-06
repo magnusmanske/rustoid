@@ -12730,11 +12730,64 @@ cache entries (43) were refetched to carry `media_type`/`derivatives`.
   where PHP preserves insertion order. Invisible in the corpus comparison, which
   discards `data-parsoid`.
 
-### The next difference at 230803
+### The next difference at 230803: it is a comment inside a tag
 
-`{{reflist|30em}}`'s output is a single `<templatestyles>` `<link>`. The service
-wraps it in `<span class="mw-empty-elt" about="#mwt514" typeof="mw:Transclusion"
-data-mw='{"parts":[…"reflist"…]}'>`, keeping the transclusion marker separate;
-rustoid merges the transclusion metadata onto the `<link>`
-(`typeof="mw:Extension/templatestyles mw:Transclusion"`). The same
-encapsulation-head shape as `Template:Infobox`/`Unix`/`Bicycle`.
+`{{reflist|30em}}`'s output is a `<templatestyles>` plus a `<references>` list.
+The service wraps the stylesheet in `<span class="mw-empty-elt" about="#mwt514"
+typeof="mw:Transclusion" data-mw='{"parts":[…"reflist"…]}'>`, keeping the
+marker separate; rustoid merged the metadata onto the `<link>`
+(`typeof="mw:Extension/templatestyles mw:Transclusion"`).
+
+The cause is not encapsulation, though. At `--wikitext`/transform level the whole
+`{{reflist}}` output is entity-escaped inside a `<p about="#mwt2">`
+(`&lt;div class="mw-references-wrap …" >`). The reason is `Template:Reflist`'s
+tag:
+
+    <div class="mw-references-wrap {{#iferror:…}}" <!-- end class
+    -->{{#if:…}}>
+
+A **comment in attribute position**. `try_html_tag` calls
+`parse_html_attributes(false)`, and `parse_one_attribute` stops when the next
+character is `<` (PHP's `less_than` guard, `html_or_empty`), so the attribute
+list ends at the comment, the tag never reaches its `>`, and the whole thing is
+emitted as text. The escaped text is then wrapped by the paragraph wrapper in a
+`<p about="#mwt2">`, and that `<p>` shares the transclusion's `about`, so
+`should_stash`'s boundary test (`next` is a `<p>`, not a `div`/`table`, and its
+`about` matches) answers false and the stylesheet is not stashed. One bug at the
+tokenizer produced the encapsulation difference three stages later.
+
+### The fix was implemented and reverted
+
+PHP parses a comment in attribute position as an attribute named literally
+`<!--…-->` with an empty value (`<div class="a" <!--x-->>` yields
+`data-parsoid.a = {"&lt;!--x-->": null}`), and drops the name from the serialized
+tag. Two variants were tried:
+
+1. **Emit the comment as an attribute** (PHP-faithful). `Zebra` moves
+   **230803 → 231276** and the stash is taken, but `COVID-19 pandemic` regresses
+   (20572 → 15374) and `Template:Infobox` too (6533 → 4371): the escaped `div`
+   gains a bogus `=""` attribute and stays escaped.
+2. **Skip the comment** (consume it, emit no attribute). `Template:Infobox`
+   recovers to 6533 and `Zebra` keeps 231276, but `COVID-19 pandemic` still
+   regresses (20572 → 16001): `Template:Div col`'s tag now parses, yet loses its
+   `#if`-derived `style` attribute (`<div class="div-col   ">` where the service
+   has `<div class="div-col   " style="column-width: 10em;column-gap: 0;">`).
+
+The blocker is the second tag. `Template:Div col` puts its comments **inside**
+the `#if` expansion — `<div … <!--\n-->{{#if:…|<!--\n-->style="…"<!--\n-->}}>` —
+so the construct is a bare `{{…}}` in attribute position whose branch is
+comments plus `style="…"`. Pre-fix that tag came out *correct*: with the raw tag
+rejected, the attribute expander reconstructed it from its expanded attributes
+and the `style` survived. Accepting the comment changes which path handles it,
+and the expander now drops the bare-construct attribute. So the tokenizer fix
+cannot land alone; the attribute expander's handling of a bare construct in
+attribute position has to be reconciled first (PHP's `generic_attribute_name`
+reads it as a `directive` name, and the expanded name is reparsed into
+attributes).
+
+Reverted, working tree clean, with the two measurements above as the guard.
+`Zebra` stays at **230803**, `Zebro` MATCH, fixture guard **877/896**.
+
+The next target is therefore the attribute expander:
+`<div class="a" {{#if:1|style="s"}}>` must keep the `style` whether or not a
+comment precedes the construct.
