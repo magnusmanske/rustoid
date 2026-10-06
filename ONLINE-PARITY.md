@@ -12465,3 +12465,60 @@ document order — so the module output holds one array and one pass numbers it.
 placeholders; it needs the general "unspellable run" case. Recorded rather than
 hacked: the two experiments above were reverted, and the working tree is back at
 `Zebra` **172090**, `Zebro` MATCH.
+
+## The fix was implemented and reverted: a carried marker is not re-keyed
+
+The fix the previous section calls for was written and measured. It works for the
+two pages it targets and regresses three others, so it is not shipped. The reason
+is worth recording, because it is the difference between "carry the tokens" and
+what Parsoid actually does.
+
+### What was tried
+
+1. `render_answer_markers` learned to carry a maximal run of items that
+   `lua_deferred::answer_item_text` (a new shared spellability rule, also used by
+   `render_answer`) cannot spell, so the answer renderer no longer dropped an
+   element it had no text for. `listItem`'s bullets and the `{{!}}` marker moved
+   into that shared renderer out of `argument_value_text`.
+2. `expand_invoke_arg_text` used it for any value the exact renderer declined,
+   instead of only for a value holding a table.
+3. A `#tag:templatestyles` answer was deferred like every other answer, so its
+   fragment is numbered where the module's output puts it rather than at the call.
+
+### What it gave, and what it cost
+
+`Zebra` moved **172090 → 175539 (31.34%)** — the three `{{Listen}}` stylesheets
+became `#mwt413`/`#mwt414`/`#mwt415` — and `Zebro` still MATCHed. On the 48-page
+corpus fifteen pages improved (`Tropical cyclone` +10737, `Periodic table` +8706,
+`Doom` +6243, `Anarchism` +5602, `The Beatles` +4801, `France` +4741, and others).
+
+Three regressed:
+
+    Albert Einstein        10966 →  4274   `<span class="mw-empty-elt" about="#mwt11">`
+                                             then `<style typeof="mw:Transclusion" …>`
+    COVID-19 pandemic      20572 → 15374
+    Template:Infobox        6533 →  4371   a `<div … about="#mwt3">` lost its `id="mwCA"`
+
+Narrowing the gate — route a value only when its unspellable items are
+placeholders or tables, not a "blind run" of generated markup — fixed
+`Albert Einstein` but broke `Zebro` again (`{{Legend}}`'s expansion holds an
+auto-inserted `</span>` with no `src`, which is exactly such a run).
+
+### Why it regresses: a marker is not re-tokenized
+
+The two lost `id`s are the whole story. PHP hands a module **HTML text** for
+generated markup, so when the module's output is re-parsed the markup is
+tokenized afresh — every token gets a `src`, so it is keyed and takes an id. A
+strip marker skips that: `substitute_strip_markers` splices back the *original*
+tokens, which have no `src` and so are never keyed. The ids are positional, and
+losing one shifts every id that follows — which is exactly `Template:Infobox`'s
+`id="mwCA"` and `Albert Einstein`'s mis-assigned wrapper metadata.
+
+So the faithful fix is not "carry the tokens"; it is to **spell an element token
+that has no `src` as its HTML**, the way the serializer would, so the module output
+carries text that re-tokenizes into the same keyed nodes PHP gets. A strip marker
+remains right for the one thing it really is in PHP — an extension's output
+(`mw:DOMFragment` placeholder, `#tag` answer).
+
+That is the next target. The working tree is back at the known-good state:
+`Zebra` **172090**, `Zebro` MATCH, fixture guard **877/896**.
