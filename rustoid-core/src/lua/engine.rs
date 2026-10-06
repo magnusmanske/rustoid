@@ -297,7 +297,7 @@ pub struct FrameContext {
 }
 
 /// What Lua can observe about a page other than the one being parsed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TitleFacts {
     /// The page exists.
     pub exists: bool,
@@ -314,22 +314,39 @@ pub struct TitleFacts {
     /// Empty for a title that was never looked up, which reads as "unprotected" —
     /// the same conservative answer `exists` gives.
     pub protection: crate::traits::ProtectionEntry,
-    /// A `File:` title's natural dimensions, for `title.file`. `None` means
-    /// either "not a file" or "not fetched"; [`title_derived_field`] tells
-    /// them apart by the title's namespace.
-    pub file: Option<FileDims>,
+    /// A file title's metadata, for `title.file`. `None` means either "not a
+    /// file", "the file does not exist", or "not fetched";
+    /// [`title_derived_field`] tells them apart by the title's namespace and
+    /// whether the facts are known at all.
+    pub file: Option<FileFacts>,
 }
 
-/// The dimensions `title.file` answers, in pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FileDims {
+/// The metadata `title.file` answers for a file.
+///
+/// Scribunto's `mw.title` file table carries more than dimensions —
+/// `Module:Listen` reads `width`, `height` and `length` — so this mirrors the
+/// fields of `TitleLibrary::getFileInfo` that rustoid has an answer for.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FileFacts {
     pub width: u32,
     pub height: u32,
+    /// MIME type, e.g. `"image/jpeg"` or `"application/ogg"`.
+    pub mime_type: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Media length in seconds, for audio/video; `None` for a still image.
+    pub duration: Option<f64>,
 }
 
-/// MediaWiki's File namespace, the same on every wiki: `title.file` is
-/// answered only there.
+/// MediaWiki's File namespace, the same on every wiki: `title.file` is answered
+/// there and in its Media twin.
 pub(crate) const FILE_NAMESPACE_ID: i32 = 6;
+
+/// MediaWiki's Media namespace — the same file as the File namespace title, used
+/// to link the file itself rather than its description page. `mw.title.makeTitle(-2, …)`
+/// builds one, and `title.file`/`title.exists` answer from the *file*, not from a
+/// description page.
+pub(crate) const MEDIA_NAMESPACE_ID: i32 = -2;
 
 pub struct LuaContext {
     pub site: LuaSite,
@@ -2465,6 +2482,19 @@ fn title_derived_field(
     ns_id: i32,
 ) -> mlua::Result<Value> {
     match key {
+        "exists" if ns_id == MEDIA_NAMESPACE_ID => {
+            // A Media title's `.exists` is `.fileExists` in Scribunto
+            // (`mw.title.lua` rewrites `exists` to `fileExists` for `NS_MEDIA`),
+            // which is `t.file and t.file.exists` — the description-page facts
+            // are not consulted at all. So a fetched Media title answers whether
+            // the *file* exists, and an unknown one is requested like any other.
+            if facts.is_none() && !full.is_empty() {
+                note_missing_title(lua, full)?;
+            }
+            Ok(Value::Boolean(
+                facts.as_ref().is_some_and(|f| f.file.is_some()),
+            ))
+        }
         "exists" => {
             // A title the host was never asked about is *unknown*, not absent.
             // Scribunto answers this from the wiki's database, so the faithful
@@ -2527,26 +2557,44 @@ fn title_derived_field(
             cp.set("sources", lua.create_table()?)?;
             Ok(Value::Table(cp))
         }
-        // `title.file` — a `File:` title's metadata. Modules read `width` and
-        // `height` from it; `Module:Multiple image` sizes each row from the
-        // file's aspect ratio, and with no `file` it divided by zero and wrote
-        // `width:nanpx`. A file the host was never asked about is requested and
-        // answered next round, exactly like `exists`; a title outside the File
-        // namespace has no `file` at all.
-        "file" if ns_id == FILE_NAMESPACE_ID => match facts.as_ref().and_then(|f| f.file) {
-            Some(d) => {
-                let t = lua.create_table()?;
-                t.set("width", d.width)?;
-                t.set("height", d.height)?;
-                Ok(Value::Table(t))
-            }
-            None => {
-                if !full.is_empty() {
-                    note_missing_title(lua, full)?;
+        // `title.file` — a file title's metadata. Modules read `width`,
+        // `height` and `length` from it; `Module:Multiple image` sizes each row
+        // from the file's aspect ratio, and with no `file` it divided by zero
+        // and wrote `width:nanpx`, while `Module:Listen` indexes
+        // `obj.file.width` and errors on a nil. Answered for both the File and
+        // Media namespaces (they name the same file). A title the host was never
+        // asked about is requested and answered next round; a title that was
+        // fetched and has no file answers `{ exists = false }`, which is what
+        // `TitleLibrary::getFileInfo` returns for a missing file (Scribunto's
+        // `file` is therefore a table, never nil, in these namespaces).
+        "file" if ns_id == FILE_NAMESPACE_ID || ns_id == MEDIA_NAMESPACE_ID => {
+            match facts.as_ref() {
+                Some(f) => {
+                    let t = lua.create_table()?;
+                    match f.file.as_ref() {
+                        Some(d) => {
+                            t.set("exists", true)?;
+                            t.set("width", d.width)?;
+                            t.set("height", d.height)?;
+                            t.set("mimeType", d.mime_type.as_str())?;
+                            t.set("size", d.size)?;
+                            // `File::getLength()` is 0 for a still image.
+                            t.set("length", d.duration.unwrap_or(0.0))?;
+                        }
+                        None => {
+                            t.set("exists", false)?;
+                        }
+                    }
+                    Ok(Value::Table(t))
                 }
-                Ok(Value::Nil)
+                None => {
+                    if !full.is_empty() {
+                        note_missing_title(lua, full)?;
+                    }
+                    Ok(Value::Nil)
+                }
             }
-        },
+        }
         "fullUrl" => Ok(full_url_closure(lua, full)?),
         _ => Ok(Value::Nil),
     }
@@ -8534,25 +8582,38 @@ mod tests {
         assert!(engine.take_missing_titles().is_empty());
     }
 
-    /// `title.file` answers a `File:` title's dimensions from its facts, and
-    /// requests the file when its metadata was never fetched. `Module:Multiple
-    /// image` sizes each row from `title.file.width`/`.height`, and with no
-    /// `file` it divided by zero and wrote `width:nanpx`.
+    /// `title.file` answers a file title's metadata from its facts, and requests
+    /// the file when it was never fetched. `Module:Multiple image` sizes each row
+    /// from `title.file.width`/`.height`, and with no `file` it divided by zero
+    /// and wrote `width:nanpx`; `Module:Listen` indexes `obj.file.width` on a
+    /// `Media:` title and errors on a nil.
     #[test]
     fn a_file_title_answers_its_dimensions() {
         let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test");
+        let facts = |w, h| TitleFacts {
+            exists: true,
+            file: Some(FileFacts {
+                width: w,
+                height: h,
+                mime_type: "image/jpeg".to_string(),
+                size: 1000,
+                duration: None,
+            }),
+            ..Default::default()
+        };
+        ctx.titles
+            .insert("File:Known.jpg".to_string(), facts(798, 544));
+        ctx.titles
+            .insert("Media:Known.jpg".to_string(), facts(798, 544));
         ctx.titles.insert(
-            "File:Known.jpg".to_string(),
+            "File:Gone.jpg".to_string(),
             TitleFacts {
-                exists: true,
-                file: Some(FileDims {
-                    width: 798,
-                    height: 544,
-                }),
+                exists: false,
                 ..Default::default()
             },
         );
         let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+
         let known = r#"
             local p = {}
             function p.main(frame)
@@ -8562,6 +8623,20 @@ mod tests {
             return p
         "#;
         assert_eq!(engine.execute(known, "main", &[]).unwrap(), "798x544");
+        assert!(engine.take_missing_titles().is_empty());
+
+        // A `Media:` title names the same file; `.exists` is `fileExists` there
+        // and `.file` is the same table, so a module that goes through
+        // `mw.title.makeTitle(-2, …)` does not index a nil.
+        let media = r#"
+            local p = {}
+            function p.main(frame)
+                local t = mw.title.makeTitle(-2, 'Known.jpg')
+                return tostring(t.exists) .. ':' .. t.file.width
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(media, "main", &[]).unwrap(), "true:798");
         assert!(engine.take_missing_titles().is_empty());
 
         // An unknown file is requested, so the next round can answer it.
@@ -8578,7 +8653,20 @@ mod tests {
             vec!["File:Unknown.jpg".to_string()]
         );
 
-        // A title outside the File namespace has no `file` and asks for none.
+        // A title fetched with no file answers a table carrying `exists = false`
+        // (what `TitleLibrary::getFileInfo` returns for a missing file) rather
+        // than a nil, and does not ask again.
+        let gone = r#"
+            local p = {}
+            function p.main(frame)
+                return tostring(mw.title.new('File:Gone.jpg').file.exists)
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(gone, "main", &[]).unwrap(), "false");
+        assert!(engine.take_missing_titles().is_empty());
+
+        // A title outside the File/Media namespaces has no `file` and asks for none.
         let other = r#"
             local p = {}
             function p.main(frame)

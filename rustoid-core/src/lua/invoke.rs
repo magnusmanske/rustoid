@@ -844,18 +844,27 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         .unwrap_or_default()
         .remove(title)
         .unwrap_or_default();
-    // A `File:` title also answers `title.file`, so its dimensions are part of
-    // its facts. `None` sizes are deliberate — the natural dimensions are what
-    // `Module:Multiple image` needs, not a thumbnail's.
-    let file = if parsed.namespace_id == crate::lua::engine::FILE_NAMESPACE_ID {
+    // A File or Media title also answers `title.file`, so the file's metadata is
+    // part of its facts. `None` sizes are deliberate — the natural dimensions
+    // are what `Module:Multiple image` needs, not a thumbnail's. A Media title
+    // names the same file as its File twin, but the wiki's `imageinfo` is
+    // attached to the *File* page (a `Media:` query carries none), so the lookup
+    // is always made under the File namespace.
+    let file = if parsed.namespace_id == crate::lua::engine::FILE_NAMESPACE_ID
+        || parsed.namespace_id == crate::lua::engine::MEDIA_NAMESPACE_ID
+    {
+        let file_title = file_namespace_title(site, &parsed);
         source
-            .get_file_info(&parsed, None, None)
+            .get_file_info(&file_title, None, None)
             .await
             .ok()
             .flatten()
-            .map(|f| crate::lua::engine::FileDims {
+            .map(|f| crate::lua::engine::FileFacts {
                 width: f.width,
                 height: f.height,
+                mime_type: f.mime_type,
+                size: f.size,
+                duration: f.duration,
             })
     } else {
         None
@@ -866,6 +875,24 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         content,
         protection,
         file,
+    }
+}
+
+/// The File-namespace twin of a file title.
+///
+/// `Media:X` and `File:X` name the same file, but the wiki attaches a file's
+/// `imageinfo` to the File page: a `Media:` query answers none. So `title.file`
+/// on either namespace is looked up under File.
+fn file_namespace_title(site: &LuaSite, title: &crate::title::Title) -> crate::title::Title {
+    if title.namespace_id == crate::lua::engine::FILE_NAMESPACE_ID {
+        return title.clone();
+    }
+    crate::title::Title {
+        interwiki: title.interwiki.clone(),
+        namespace_id: crate::lua::engine::FILE_NAMESPACE_ID,
+        text: title.text.clone(),
+        fragment: title.fragment.clone(),
+        namespace_name: Some(site.namespace_name(crate::lua::engine::FILE_NAMESPACE_ID)),
     }
 }
 

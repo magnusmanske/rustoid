@@ -226,7 +226,7 @@ pub struct PageInfo {
 /// `Serialize`/`Deserialize` so a data source can cache the answer at a
 /// requested display size: it is a fact the file's wikitext cannot supply, and
 /// without it an offline run renders every image as `mw-broken-media`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileInfo {
     /// Canonical file title (without namespace prefix).
     pub title: String,
@@ -238,6 +238,11 @@ pub struct FileInfo {
     pub width: u32,
     /// Image height in pixels.
     pub height: u32,
+    /// Media length in seconds, for audio/video; `None` for a still image.
+    /// The API returns it as `imageinfo.duration`. `title.file` exposes it as
+    /// `length`, which `Module:Listen` reads to label an audio clip.
+    #[serde(default)]
+    pub duration: Option<f64>,
     /// URL to the file's description page.
     pub description_url: String,
     /// URL to the raw file itself.

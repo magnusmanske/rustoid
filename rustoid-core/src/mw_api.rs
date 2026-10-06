@@ -274,6 +274,7 @@ impl MediaWikiApiDataSource {
                         size: info["size"].as_u64().unwrap_or(0),
                         width: info["width"].as_u64().unwrap_or(0) as u32,
                         height: info["height"].as_u64().unwrap_or(0) as u32,
+                        duration: info["duration"].as_f64(),
                         description_url: info["descriptionurl"].as_str().unwrap_or("").to_string(),
                         file_url: info["url"].as_str().unwrap_or("").to_string(),
                         thumb_url: info["thumburl"].as_str().map(str::to_string),

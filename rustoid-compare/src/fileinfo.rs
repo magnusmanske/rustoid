@@ -58,6 +58,7 @@ pub async fn file_info(
         size: info.size.unwrap_or(0),
         width: info.width.unwrap_or(0) as u32,
         height: info.height.unwrap_or(0) as u32,
+        duration: info.duration,
         description_url: info.descriptionurl.unwrap_or_default(),
         file_url: info.url.unwrap_or_default(),
         thumb_url: info.thumburl,
@@ -108,6 +109,9 @@ struct ImageInfo {
     width: Option<u64>,
     #[serde(default)]
     height: Option<u64>,
+    /// Present for audio/video only.
+    #[serde(default)]
+    duration: Option<f64>,
     /// Present only when a display size was requested.
     #[serde(default)]
     thumburl: Option<String>,
