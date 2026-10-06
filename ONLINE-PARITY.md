@@ -12321,3 +12321,51 @@ first difference on other pages — `Quicksilver (film)`'s `mw-empty-elt` wrappe
 (fixed by the no-hash change above) and `Nobel Prize`'s image rendering, where an
 empty caption makes rustoid answer `mw:Error … filedoesnotexist` instead of the
 file. Land it once the image case is fixed.
+
+## Fixed: a Media-namespace title's file, and the file table's shape
+
+### Cause
+
+`title.file` was answered only in namespace 6 (File) and carried only
+`width`/`height`. Scribunto answers it in the **Media** namespace (-2) too —
+`mw.title.makeTitle(-2, filename)` names the same file, and `mw.title.lua` maps
+its `.exists` to `fileExists` — and the table has `exists`, `mimeType`, `size`
+and `length`. So `Module:Listen`'s `local obj = mw.title.makeTitle(-2,
+filename)` then `if obj and obj.exists then … obj.file.width / obj.file.height`
+found `exists = true` (from the page-info record) but `obj.file` nil, and the
+whole `{{Listen}}` rendered as a Lua error paragraph instead of the side box.
+
+### Fix
+
+`title_facts_of` fetches a file's metadata for both namespaces, always under the
+*File* page (a `Media:` query carries no `imageinfo`), and `TitleFacts::file` is
+now a richer `FileFacts` (width, height, mimeType, size, duration) fed by a new
+`FileInfo::duration` parsed from `imageinfo.duration`. `title_derived_field`
+answers `exists` for a Media title as "the file exists", answers `file` in both
+namespaces, and returns `{ exists = false }` — not nil — for a fetched title with
+no file, matching `TitleLibrary::getFileInfo`. A title that was never fetched is
+still requested, but only when its facts are *unknown*, so a genuine miss no
+longer rounds.
+
+### Effect: byte 171606 moves to 172090
+
+The `{{Listen}}` Lua error is gone. `Zebra`'s first difference is now **172090
+(30.72% of the oracle)**. No subset first-difference offset regresses (`Bicycle`
+11836, `Nobel Prize` 5926, `Sundial` 3934, `Quicksilver (film)` 4213, `List of
+sovereign states` 8409, `Unix` 4772, `Help:Introduction` 7837), `Zebro` MATCHes,
+the fixture guard holds at **877/896**, and 971 lib tests and 115 compare tests
+pass with clippy and `cargo fmt` clean.
+
+Getting here needed one backfill: the module's `frame:extensionTag('templatestyles',
+…, {src = 'Module:Listen/styles.css'})` resolves against a page the offline cache
+lacked, which rendered as a literal `<extension>` placeholder and shifted the
+wrapper. One online `--page Zebra` run cached it (the page's live revision still
+matches the pinned baseline, so nothing was re-pinned).
+
+### The next difference at 172090: templatestyles ids are allocated in reverse
+
+In the `{{Listen}}` subtree the three stylesheets carry `about` ids 413/414/415 in
+the document order Side box, Listen, Plainlist; rustoid assigns them 415/414/413 —
+the reverse. The wrapper correctly takes 412. This is the documented
+"`about` ids are allocated out of document order" problem: `expand_templatestyles`
+is a token pass, and the placeholders it numbers reach it in the wrong order.
