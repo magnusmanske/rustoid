@@ -12394,3 +12394,74 @@ workflow (`RUSTOID_FILL_FILES=1`). With the `nil` gone, `Nobel Prize`'s infobox
 image asked the wiki for a size the offline cache lacked (`File:Nobel Prize.png@w250`),
 which had rendered as `mw:Error … filedoesnotexist`; before the backfill the
 change looked like a 4-byte regression (5926 → 5922) for exactly that reason.
+
+## The templatestyles order at 172090 is not a numbering-order bug
+
+`Zebra`'s first difference is in the `{{Listen}}` subtree: three stylesheets the
+service numbers 413/414/415 in the document order Side box, Listen, Plainlist, and
+rustoid numbers 415/414/413 — the reverse. Reading this as "the placeholders reach
+the numbering pass in the wrong order" is wrong, and two local fixes built on that
+reading each break another page.
+
+### What PHP Parsoid actually does (measured)
+
+`DataBag.php`'s `newAboutId` already logs with `PARSOID_TRACE_ABOUT=1`, and
+`php bin/parse.php --domain en.wikipedia.org --standalone --wt2html` on a `{{Listen}}`
+reduction gives
+
+    about #mwt2  ExtensionHandler::onDocumentFragment <- onExtension <- onTag
+                 <- XMLTagBasedHandler::process <- TokenHandlerPipeline::processChunk
+                 <- … <- TemplateHandler::onTemplate
+    about #mwt3  (identical backtrace)
+    about #mwt4  (identical backtrace)
+
+The output carries `#mwt2` `Module:Side box/styles.css`, `#mwt3`
+`Module:Listen/styles.css`, `#mwt4` `Plainlist/styles.css`. All three are numbered
+in **one** `ExtensionHandler` pass over the module's output, in document order.
+And `ParserFunctions::pf_tag` returns a plain `TagTk($target) … EndTagTk($target)`
+— `#tag` does *not* run the extension at the call; the tag token is placed where
+the module's output puts it and numbered there.
+
+rustoid numbers the `#tag` answer at the call (`expand_lua_request` leaves
+`defer = false` for `CallParserFunction`), so its ids follow the order the module
+*called* `frame:extensionTag` — Plainlist, Listen, Side box — which is the reverse
+of the order `Module:Side box` leaves them in.
+
+### Why deferring the `#tag` answer does not fix it
+
+Making the `#tag` answer deferred too moves `Zebra` to **175539**, but *breaks*
+`Zebro`. Its `Module:List` result is `#tag Plainlist` followed by `{{Legend}}`
+rows, and rustoid hands the module the **source** `{{legend|…}}` for an argument
+value it cannot spell (a generated `<div>` holding a templatestyles placeholder —
+see `expand_invoke_arg_text`'s table-only gate). The rows are then *re-expanded* in
+nested pipelines, and each nested pipeline numbers its Legend stylesheet before the
+outer chunk numbers the carried Plainlist (`#mwt37` → `#mwt41`).
+
+Parsoid does not re-expand. Its `{{Legend}}` arguments were expanded before the
+module ran, so their extension tokens are already *in* the module output array, and
+the one `ExtensionHandler` pass numbers them in array order. A reduction
+(`{{Unbulleted list|{{Legend|…}}|{{Legend|…}}}}`, `--trace thp:2`) shows exactly
+that: level-1 `OnlyInclude` sees `[Plainlist ext, div, ul, li, Legend ext, …]`, and
+the same level-1 `ExtensionHandler` numbers Plainlist(2), Legend(3), Legend(4).
+
+### Why eager-numbering the carried placeholders does not fix it either
+
+Numbering the carried placeholders at the start of `expand_templates` (before the
+walk expands the chunk's templates) restores `Zebro` to MATCH, but moves
+`Template:Taxobox/core/styles.css` from the service's `#mwt15` to `#mwt13` — the
+carried placeholder must keep its **document** position, and "before the walk" is
+not document order, so `Zebra` regresses to byte 5433.
+
+### What the fix has to be
+
+No local numbering rule satisfies both pages, because rustoid's infidelity is not in
+the numbering but in the **argument rendering**: an `#invoke` argument whose value
+is generated markup with an extension placeholder is rendered back to its *source*
+and re-expanded, where Parsoid passes the expanded tokens through. The faithful fix
+is to carry those tokens across the Lua boundary — a strip marker per run
+`render_answer` cannot spell, which `substitute_strip_markers` splices back in
+document order — so the module output holds one array and one pass numbers it.
+`render_answer_markers` already does this for tables and `mw:DOMFragment`
+placeholders; it needs the general "unspellable run" case. Recorded rather than
+hacked: the two experiments above were reverted, and the working tree is back at
+`Zebra` **172090**, `Zebro` MATCH.
