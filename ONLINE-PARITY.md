@@ -12658,15 +12658,83 @@ renders the file-type icon as an `<img>`. The port is understood — PHP's
 the file-info fields it needs (`mediatype`, `derivatives`, `timedtext`) are all
 in the action API (`prop=videoinfo&viprop=derivatives|timedtext`).
 
-It is not landed because the oracle's derivative URL is **not reproducible**. The
-API's `videoinfo.derivatives[].src` carries `utm_campaign=api`; the pinned
-oracles carry `utm_campaign=index` for `Zebra.ogg`, `Chess.ogg` and
-`En-titanic.ogg`, and `utm_campaign=rest` for the *same media type* on `Titanic`
-and `Earth`. The campaign is a fetch-time value of the wiki's URL builder rather
-than a property of the file, so it differs across the pinned baselines and no
-port can match all of them. Thumbnails have no such problem — every oracle uses
-`utm_campaign=parser` for a bitmap `src`, which is why `normalize_api_urls` maps
-`imageinfo` → `parser` — so the divergence is specific to the derivative URLs.
+It was first deferred because the oracle's derivative URL is **not fully
+reproducible**: the API's `videoinfo.derivatives[].src` carries
+`utm_campaign=api`, while the pinned oracles carry `utm_campaign=index` for
+`Zebra.ogg`, `Chess.ogg` and `En-titanic.ogg`, and `utm_campaign=rest` for the
+*same media type* on `Titanic` and `Earth`. The campaign is a fetch-time value of
+the wiki's URL builder rather than a property of the file, so it differs across
+the pinned baselines and no port can match all of them. Thumbnails have no such
+problem — every oracle uses `utm_campaign=parser` for a bitmap `src`, which is
+why `normalize_api_urls` maps `imageinfo` → `parser` — so the divergence is
+specific to derivative URLs.
 
-Deferred, with the measurements above as the guard. The working tree is at
-`Zebra` **175645**, `Zebro` MATCH, fixture guard **877/896**.
+It is landed anyway, because the campaign is one attribute of one `<source>` and
+the rest of the media is faithfully reproducible. `normalize_api_urls` maps the
+derivative `api` to `index` (the plurality across the oracles); a page whose
+oracle happens to carry `rest` will still differ at its `<source src>`, which is
+the known imprecision. The port is in the next section.
+
+## Fixed: audio and video render as `<audio>`/`<video>`
+
+`AddMediaInfo` implemented only the bitmap branch; audio and video fell through
+to `handleImage` and were rendered as the file-type icon. They now take the
+handler PHP picks from the file's media class and build the element PHP builds.
+
+### The media class, from the API
+
+The handler is chosen by `File::getMediaType()`, which the action API mirrors as
+`imageinfo.mediatype`. `FileInfo` grew `media_type` (and `derivatives`), and the
+file-info request became `prop=imageinfo|videoinfo&iiprop=…|mediatype&
+viprop=derivatives`. The MIME alone cannot pick the handler — an `application/ogg`
+file is audio or video depending on its streams — so `media_type` is
+authoritative and the MIME map is only a fallback for a source that does not
+report it (the mock, a cache written before the field existed).
+
+### `handleAudio` / `handleVideo`
+
+`apply_av_media` ports both: `controls`/`preload`, the `muted`/`loop` options
+(read with `keep=false`, so consumed from `data-mw`), the `T295514`
+`data-mw-tmh`, the normalized `height`/`width` (`handleSize`'s AUDIO override: a
+fixed height 32 and the returned thumbnail's width, or the site default, floored
+at 35), the audio inline `style`, `resource`/`lang`, `data-durationhint`
+(`ceil`), and the `<source>` list from the derivatives (`data-transcodekey` on a
+transcode, `data-file-*`/`data-*` dimensions on video). A component of the
+fragment (`starttime`/`endtime`) is appended as `#t=…` (`parseFrag`, a port of
+TMH's `parseTimeString`). The container takes `mw-default-audio-height`, and the
+broken `<a>` anchor is replaced by a bare `<span>` — PHP's non-image branch of
+`replaceAnchor`, which also explains why an audio link is not a link.
+
+### Effect
+
+    Zebra                 175645 → 230803  (41.20% of the oracle)
+    Zebro                  MATCH  → MATCH
+    France                 23039 → 25184
+    Titanic                10186 → 11536
+    Isaac Newton           11689 → 12924
+    Albert Einstein        10966 → 11848
+
+On the 48-page corpus five pages improved and none regressed. The audio/video
+cache entries (43) were refetched to carry `media_type`/`derivatives`.
+
+### What is knowingly not faithful
+
+- The derivative `utm_campaign` (above).
+- `addTracks`/`timedtext` is not ported: `FileInfo` carries no timed-text list,
+  so a file with subtitles would omit its `<track>` elements. None of the cached
+  audio/video files has one, so this does not bite yet.
+- The `ext.tmh.player`/`ext.tmh.player.styles` output metadata is not emitted —
+  rustoid emits no head metadata at all, and the comparison harness strips the
+  head, so it is invisible here.
+- The `data-parsoid` `a`/`sa` key order is alphabetical (`serde_json`'s map),
+  where PHP preserves insertion order. Invisible in the corpus comparison, which
+  discards `data-parsoid`.
+
+### The next difference at 230803
+
+`{{reflist|30em}}`'s output is a single `<templatestyles>` `<link>`. The service
+wraps it in `<span class="mw-empty-elt" about="#mwt514" typeof="mw:Transclusion"
+data-mw='{"parts":[…"reflist"…]}'>`, keeping the transclusion marker separate;
+rustoid merges the transclusion metadata onto the `<link>`
+(`typeof="mw:Extension/templatestyles mw:Transclusion"`). The same
+encapsulation-head shape as `Template:Infobox`/`Unix`/`Bicycle`.
