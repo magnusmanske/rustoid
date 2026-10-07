@@ -13072,3 +13072,35 @@ stays **6691**, `Albert Einstein` **11848**. The next difference on `Zebra` is a
 
 State: fixture guard **877/896**, lib **979**, compare **117**, clippy and fmt
 clean.
+
+## A fragment-only link in an inline fragment resolves against the page
+
+The `Zebra` difference at 246809 is a Citation/CS1 footnote: `Template:Sfn` →
+`Module:Footnotes` returns `[[#CITEREFPlumbShaw2018|Plumb & Shaw 2018]], p. 54`,
+and the service renders the link as `./Zebra#CITEREFPlumbShaw2018` with
+`mw-selflink-fragment` while rustoid rendered a redlink
+(`./?action=edit&redlink=1#CITEREFPlumbShaw2018#CITEREFPlumbShaw2018`,
+`title="#CITEREFPlumbShaw2018"`).
+
+A wikilink whose target is only a fragment (`[[#Foo]]`) resolves against the
+*page* being parsed. rustoid's `resolve_subpage` does that, but only when it has
+a context title — and `render_inline_fragment`, the pipeline a `<ref>` body (and a
+caption, and a gallery line) is rendered through, built its `WikiLinkContext`
+with none, so `#Foo` was taken for a title. The function now takes an
+`Option<&Title>` context and `Parser::build_inline_fragment` passes the page
+title; the callers without one (gallery, a test) pass `None`.
+
+### Effect
+
+`Zebra` **246809 → 246994** (44.09%); no other corpus page's first difference
+moves. State: fixture guard **877/896**, lib **979**, compare **117**, clippy and
+fmt clean.
+
+### Next difference on `Zebra` (246994)
+
+`{{sfn|Plumb|Shaw|2018|p=54}}`'s rendered `p.&nbsp;54` — the service emits the
+non-breaking space as `<span typeof="mw:Entity"> </span>`, rustoid emits that
+span *and* a literal `U+00A0` after it (the `&nbsp;` in `Module:Footnotes`'s
+`page_sep = ", p.&nbsp;"` is doubled when the module's output is re-tokenized).
+A template body with the same `&nbsp;` renders correctly, so the duplication is
+specific to the `#invoke` output path.
