@@ -3934,6 +3934,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let mut out = Vec::new();
         let resolved = resolve_template_target(self.config, Some(frame.title()), &target_str);
+        // The parser function's name, lower-cased, when this call is one. The
+        // `#tag` and general argument-expansion passes below key off it.
+        let pf_name = match &resolved {
+            Some(ResolvedTarget::ParserFunction { name, .. }) => Some(name.to_ascii_lowercase()),
+            _ => None,
+        };
         // `#tag`'s arguments are expanded *eagerly*, unlike a template's. Core's
         // `CoreParserFunctions::tagObj` runs the inner (second) argument and every
         // named attribute's name and value through `$frame->expand` before it
@@ -3947,15 +3953,29 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // indicator name came out `" "` and its `extsrc` still spelled
         // `{{{image|…}}}` (the first difference on Grand Theft Auto V and, once
         // its other breaks were cleared, on COVID-19 pandemic).
-        let attribs = if matches!(
-            &resolved,
-            Some(ResolvedTarget::ParserFunction { name, .. })
-                if name.eq_ignore_ascii_case("tag")
-        ) {
+        let attribs = if pf_name.as_deref() == Some("tag") {
             self.expand_tag_args(frame, attribs, source, about_counter, src_text)
                 .await
         } else {
             attribs
+        };
+        // Every *other* parser function reads its value arguments as strings, so
+        // they are expanded in the calling frame before the call runs (see
+        // [`Self::expand_parser_function_args`]). `#tag` did its own pass above,
+        // and `#invoke` expands its arguments lazily inside Scribunto.
+        let attribs = match pf_name.as_deref() {
+            Some(name) if name != "tag" && name != "invoke" => {
+                self.expand_parser_function_args(
+                    frame,
+                    name,
+                    attribs,
+                    source,
+                    about_counter,
+                    src_text,
+                )
+                .await
+            }
+            _ => attribs,
         };
         // Whether this call's result is a *string* the token stream re-tokenizes,
         // rather than the branch's own tokens. See
@@ -4265,6 +4285,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             return attribs;
         }
         let items = items.clone();
+        // A `{{{…}}}` in the target is *substituted*, not wrapped: it belongs to
+        // the template's name expression, and the service never emits an
+        // `mw:Param` marker for one — PHP's `expandFirstAttribute` expands the
+        // target through `AttributeTransformManager`, whose `$frame->expand`
+        // substitutes the reference. Leaving it to `expand_templates` wrapped it
+        // and spent an `about` id the service does not: `Template:Str ≥ len`'s
+        // whole body is the five-brace `safesubst` idiom, so each of its two
+        // target references was numbered where the service has the infobox
+        // stylesheet.
+        let items = frame.expand(&items);
         let expanded = Box::pin(self.expand_templates(
             frame,
             items,
@@ -4360,6 +4390,78 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: &std::cell::Cell<usize>,
         src_text: &str,
     ) {
+        let child = frame.new_child(frame.title().clone(), vec![]);
+        self.expand_field_tokens(&child, field, source, about_counter, src_text)
+            .await;
+    }
+
+    /// Expand a parser function's argument values in the **calling** frame.
+    ///
+    /// Core's `ParserFunctions` implementations read each argument they use with
+    /// `$frame->expand( … )` — the `#time` date, `#ifeq`'s second comparison, every
+    /// `#switch` case name — and that call expands the argument's wikitext, nested
+    /// parser functions and templates alike, through the caller's frame. rustoid's
+    /// [`Frame::expand`] is synchronous and only substitutes `{{{…}}}`, so a nested
+    /// `{{…}}` in an argument reached the function as its own source. In
+    /// `Template:Film date`'s
+    /// `{{#ifexpr: {{#time:U|{{{1}}}-{{#if:…}}…}} …}}` the `#time` was handed the
+    /// literal `1986-{{#if:…}}-01`, answered `Error: Invalid time.`, and the film
+    /// infobox lost the `#ifexpr` cell's `id="mwCQ"`.
+    ///
+    /// A function's *branch* arguments are left alone: the caller re-expands a
+    /// returned branch in this same frame after the call, so expanding it here
+    /// would be redundant and would discard the tokens standalone Parsoid keeps
+    /// (the fixtures pin a `#switch` branch retaining a templated link target).
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_parser_function_args(
+        &self,
+        frame: &Frame,
+        name: &str,
+        attribs: Vec<crate::wikitext::tokens_v2::KV>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        src_text: &str,
+    ) -> Vec<crate::wikitext::tokens_v2::KV> {
+        use crate::wikitext::tokens_v2::KeyValue;
+
+        let mut out = attribs;
+        for (i, kv) in out.iter_mut().enumerate() {
+            if i == 0 {
+                // The target arg, `#name: first argument`, is already expanded by
+                // [`Self::expand_target_templates`].
+                continue;
+            }
+            let positional = matches!(&kv.key, KeyValue::Str(s) if s.is_empty());
+            if TemplateHandler::arg_is_branch(name, i, positional) {
+                continue;
+            }
+            // Expand both halves: a named argument's name is its case for
+            // `#switch` (`|case=result`) and is ignored elsewhere, and `{{{…}}}`
+            // inside a value was already substituted by the attribute pass.
+            self.expand_field_tokens(frame, &mut kv.key, source, about_counter, src_text)
+                .await;
+            self.expand_field_tokens(frame, &mut kv.value, source, about_counter, src_text)
+                .await;
+        }
+        out
+    }
+
+    /// Expand one field (a `KeyValue`'s item list) to the tokens `frame` produces
+    /// for it, resolving nested `{{…}}` and templated targets.
+    ///
+    /// Shared by `#tag`'s arguments and a parser function's argument values: both
+    /// expand in template context with no wrapper (`in_template => false`,
+    /// `body => true`) because the field is about to be flattened to a string. A
+    /// `mw:Transclusion` wrapper there would both leak its own source into the
+    /// text and spend an `about` id the service does not.
+    async fn expand_field_tokens(
+        &self,
+        frame: &Frame,
+        field: &mut crate::wikitext::tokens_v2::KeyValue,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        src_text: &str,
+    ) {
         use crate::wikitext::tokens_v2::KeyValue;
 
         let KeyValue::Tokens(items) = field else {
@@ -4374,9 +4476,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         } else {
             items.clone()
         };
-        let child = frame.new_child(frame.title().clone(), vec![]);
         let expanded = Box::pin(self.expand_templates(
-            &child,
+            frame,
             substituted,
             source,
             about_counter,
@@ -4394,9 +4495,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         .await;
         // A target the expansion left nested — `[[{{PAGENAME}}]]` — is resolved
         // here, because nothing else looks at these tokens: they are about to be
-        // flattened to the string the tag carries.
+        // flattened to the string the tag or function carries.
         let expanded = Box::pin(self.expand_attrib_templates(
-            &child,
+            frame,
             expanded,
             source,
             about_counter,

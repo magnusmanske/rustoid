@@ -3018,20 +3018,24 @@ impl<'a> PegTokenizer<'a> {
             .unwrap_or_default();
 
         // Mirrors `tplarg`: attribs[0] is KV(name, '') and each following
-        // attribute is KV('', default).
-        if !name.is_empty() {
-            stt.attribs.push(kv_str(&name, ""));
-            for (_, default) in parts.iter().skip(1) {
-                let value =
-                    tokenize_template_arg_value(default, self.lang_conv_enabled, &self.ext_tags);
-                stt.attribs.push(KV {
-                    key: KeyValue::Str(String::new()),
-                    value,
-                    src_offsets: None,
-                    ksrc: None,
-                    vsrc: None,
-                });
-            }
+        // attribute is KV('', default). The name may be empty — the `subst`
+        // idiom `{{{{{name|safesubst:}}}#invoke:…}}` writes `{{{|safesubst:}}}`
+        // with no name at all, and the default is what the argument reference
+        // yields. Dropping the default there left an attribute-less `templatearg`
+        // that `Frame::expand` cannot substitute, so it survived to the token
+        // stream and was wrapped in an `mw:Param` marker, spending an `about` id
+        // the service does not.
+        stt.attribs.push(kv_str(&name, ""));
+        for (_, default) in parts.iter().skip(1) {
+            let value =
+                tokenize_template_arg_value(default, self.lang_conv_enabled, &self.ext_tags);
+            stt.attribs.push(KV {
+                key: KeyValue::Str(String::new()),
+                value,
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
         }
         Some(stt)
     }
@@ -4541,27 +4545,41 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
                     return Some(i - 2);
                 }
             }
+            // A run of `{`: MediaWiki's precedence picks the first construct by
+            // `run % 3` — a template `{{` for 2, an argument `{{{` for 0, and one
+            // literal `{` for 1, with the rest of the run reconsidered. Five
+            // braces are therefore `{{` + `{{{` (the `subst`/`safesubst` idiom
+            // `{{{{{name|safesubst:}}}#invoke:…}}`), not `{{{` + `{{`. Taking the
+            // argument first left a stray `}` and the transclusion never closed,
+            // so `{{Str count|…}}` — whose whole body is that idiom — leaked its
+            // source instead of expanding.
+            //
             // A well-formed `{{{…}}}` argument reference is skipped whole; one
             // that PHP would reject leaves the `{` as ordinary content, so the
             // following `{{…}}` is then read as a template.
-            (Some(&TPL), _) if input[i..].starts_with("{{{") => {
-                match skip_tplarg_memo(input, i, memo) {
-                    Some(end) => i = end,
-                    None => i += 1,
+            _ if bytes[i] == b'{' => {
+                let run = input[i..].bytes().take_while(|&b| b == b'{').count();
+                if run % 3 == 0 && stack.last() == Some(&TPL) {
+                    match skip_tplarg_memo(input, i, memo) {
+                        Some(end) => i = end,
+                        None => i += 1,
+                    }
+                } else if run % 3 != 1 {
+                    // A nested transclusion pushes its own `}}` closer. This
+                    // happens even inside an open `[[`: PHP's preproc stack is
+                    // document-order — "once you see `[[ {{` you are looking only
+                    // for `}}`" (`Grammar.pegphp`'s `broken_template` comment) —
+                    // so a template in a wikilink target is a token like any
+                    // other. Guarding this on the top closer being `}}` made
+                    // `{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}` unable to close
+                    // at all: the inner `}}` hit the "`}}` under an open `[[`"
+                    // arm above and abandoned the whole scan, so the call was
+                    // emitted as literal text with only its arguments parsed.
+                    stack.push(TPL);
+                    i += 2;
+                } else {
+                    i += 1;
                 }
-            }
-            // A nested transclusion pushes its own `}}` closer. This happens
-            // even inside an open `[[`: PHP's preproc stack is document-order —
-            // "once you see `[[ {{` you are looking only for `}}`"
-            // (`Grammar.pegphp`'s `broken_template` comment) — so a template in a
-            // wikilink target is a token like any other. Guarding this on the top
-            // closer being `}}` made `{{#ifeq:S|exclude||[[Category:{{P|d}}]]}}`
-            // unable to close at all: the inner `}}` hit the "`}}` under an open
-            // `[[`" arm above and abandoned the whole scan, so the call was
-            // emitted as literal text with only its arguments parsed.
-            _ if input[i..].starts_with("{{") => {
-                stack.push(TPL);
-                i += 2;
             }
             // Only a `[[` seen while looking for `}}` becomes the pending closer;
             // one nested inside an already-open `[[` is ordinary text (PHP tests
@@ -6949,6 +6967,21 @@ mod tests {
         );
         // Nothing to close at all.
         assert_eq!(find_template_closing("1x|foo"), None);
+    }
+
+    /// Five braces are `{{` + `{{{` (MediaWiki picks the first construct of a run
+    /// by `braces % 3`), the `subst` idiom `{{{{{name|safesubst:}}}#invoke:…}}`.
+    /// Scanning the argument first swallowed one `}` of the closer and left a
+    /// stray `}`, so the transclusion never closed — `Template:Str count`'s whole
+    /// body is this idiom, and it leaked its source instead of expanding.
+    #[test]
+    fn test_find_template_closing_handles_a_five_brace_run() {
+        // The input is what follows the template's opening `{{`.
+        let input = "{{{|safesubst:}}}#if:1|x}}";
+        assert_eq!(find_template_closing(input), Some(input.len() - 2));
+        // A five-brace run nested in an argument of another one.
+        let nested = "{{{|safesubst:}}}#if:1|plain={{{{{|safesubst:}}}#if:1|x|y}}}}";
+        assert_eq!(find_template_closing(nested), Some(nested.len() - 2));
     }
 
     /// The two scanners must share one memo, and a failed `{{{` must be

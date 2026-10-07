@@ -322,6 +322,15 @@ impl ParserFunctions {
     }
 
     /// `#ifexpr` — mirrors `pf_ifexpr`.
+    ///
+    /// Core catches the expression error and answers the error markup *itself*,
+    /// rather than picking a branch: the `try` around `doExpression` returns
+    /// `<strong class="error">…</strong>`. That propagation is load-bearing —
+    /// `{{#iferror:{{#ifexpr: 30em>1}}|ERR|OK}}` is `ERR` on the service — but it
+    /// only became safe once a parser function's arguments expand in the calling
+    /// frame (see [`crate::pipeline::parser`]'s `expand_parser_function_args`):
+    /// shipping it earlier made a `#time` inside an `#ifexpr` condition error and
+    /// lose `Quicksilver (film)`'s infobox cell id.
     pub fn pf_ifexpr(params: &Params) -> Vec<Item> {
         let args = &params.args;
         let target = args
@@ -329,7 +338,12 @@ impl ParserFunctions {
             .map(|kv| key_value_to_string(&kv.key))
             .unwrap_or_default();
         let res = evaluate_expression(&target);
-        if res != "0" && !res.is_empty() && !res.contains("error") {
+        // The only non-numeric answer `evaluate_expression` can give is the error
+        // markup, and core returns it unchanged instead of a branch.
+        if res.contains("class=\"error\"") {
+            return vec![Item::Str(res)];
+        }
+        if res != "0" && !res.is_empty() {
             Self::trimmed_branch(args.get(1))
         } else {
             Self::trimmed_branch(args.get(2))
@@ -1511,6 +1525,25 @@ mod tests {
         assert_eq!(
             ParserFunctions::pf_expr(&params(vec![("1+2", "")])),
             vec![Item::Str("3".to_string())]
+        );
+    }
+
+    /// Core's `#ifexpr` catches the expression error and answers the error
+    /// markup itself rather than a branch, which is what makes
+    /// `{{#iferror:{{#ifexpr: 30em>1}}|ERR|OK}}` answer `ERR`.
+    #[test]
+    fn test_pf_ifexpr_propagates_an_expression_error() {
+        let out =
+            ParserFunctions::pf_ifexpr(&params(vec![("30em>1", ""), ("then", ""), ("else", "")]));
+        let Item::Str(s) = &out[0] else {
+            panic!("expected a string item: {out:?}")
+        };
+        assert!(s.contains("class=\"error\""), "{s}");
+
+        // A valid expression still selects a branch.
+        assert_eq!(
+            ParserFunctions::pf_ifexpr(&params(vec![("1", ""), ("", "yes"), ("", "no")])),
+            vec![Item::Str("yes".to_string())]
         );
     }
 

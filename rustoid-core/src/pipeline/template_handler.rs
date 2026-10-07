@@ -1239,6 +1239,27 @@ impl TemplateHandler {
         )
     }
 
+    /// Is argument `index` of parser function `name` the *branch* the function
+    /// hands back, rather than a value it reads as a string?
+    ///
+    /// Core's `ParserFunctions` reads its value arguments with `$frame->expand`
+    /// but returns a branch unexpanded for the caller to expand in the calling
+    /// frame (the `trim($frame->expand(…))` on the way out happens in the same
+    /// frame). rustoid mirrors that split: [`crate::pipeline::parser`] expands the
+    /// value arguments up front (see `expand_parser_function_args`) but leaves a
+    /// branch alone, because the returned branch is re-expanded by the caller and
+    /// standalone Parsoid keeps its tokens. `positional` is the argument's shape
+    /// (`|value` rather than `|name=value`); only `#switch` reads it — a named
+    /// entry's value is its result, a positional one is another case.
+    pub fn arg_is_branch(name: &str, index: usize, positional: bool) -> bool {
+        match name.to_ascii_lowercase().as_str() {
+            "if" | "ifexpr" | "iferror" | "ifexist" => index == 1 || index == 2,
+            "ifeq" => index == 2 || index == 3,
+            "switch" => !positional,
+            _ => false,
+        }
+    }
+
     /// Dispatch a parser function name to the `ParserFunctions` implementation.
     ///
     /// `token_src` is the original `{{#name:...}}` source. For an unknown

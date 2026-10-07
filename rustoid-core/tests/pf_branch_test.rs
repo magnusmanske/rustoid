@@ -187,6 +187,55 @@ async fn only_non_text_branches_are_marked_as_expanded_attributes() {
     }
 }
 
+/// A run of five braces is `{{` + `{{{`, not `{{{` + `{{`: MediaWiki picks the
+/// first construct of a run by `braces % 3`, and so must the closers' scan.
+/// `Template:Str count` and its relatives are written as the `subst` idiom
+/// `{{{{{name|safesubst:}}}#invoke:…}}`; scanning the argument first left a stray
+/// `}` so the transclusion never closed and the whole call leaked its source
+/// instead of expanding. That was invisible until `#ifexpr` stopped swallowing
+/// the expression error the leaked source produced (see
+/// [`an_ifexpr_error_reaches_iferror`]).
+#[tokio::test]
+async fn a_five_brace_transclusion_expands() {
+    let body = "<includeonly>{{{{{|safesubst:}}}#if:1|plain={{{{{|safesubst:}}}#if:1|x|y}}}}</includeonly>";
+    let html = render(&[("Template:T", body)], "{{T}}").await;
+    assert!(!html.contains("safesubst"), "source leaked: {html}");
+    assert!(
+        !visible_text(&html).contains("{{"),
+        "did not expand: {html}"
+    );
+    assert!(visible_text(&html).contains('x'), "branch lost: {html}");
+}
+
+/// A parser function reads its value arguments as strings, so a nested `{{…}}` in
+/// one must be expanded in the *calling* frame before the function runs — core's
+/// `ParserFunctions` reach every value argument through `$frame->expand`.
+/// `Template:Film date` nests a `#time` (whose date is a `#if`) inside an
+/// `#ifexpr`; without the expansion the `#if` never ran, the date reached `#time`
+/// as `1986-{{#if:…}}-01`, and the film infobox lost the `#ifexpr` cell's id.
+#[tokio::test]
+async fn a_parser_function_argument_expands_in_the_calling_frame() {
+    let html = render(
+        &[(
+            "Template:T",
+            "[{{#time:Y-m-d|{{{1}}}-{{#if:{{{2|}}}|{{{2}}}|01}}-01}}]",
+        )],
+        "{{T|1986|2}}",
+    )
+    .await;
+    assert!(html.contains("[1986-02-01]"), "got: {html}");
+}
+
+/// Core's `#ifexpr` answers the expression error *itself* rather than a branch,
+/// so `#iferror` sees it and selects its own branch. Shipping that propagation
+/// before a parser function's arguments expanded in the calling frame regressed
+/// `Quicksilver (film)`; the two fixes belong together.
+#[tokio::test]
+async fn an_ifexpr_error_reaches_iferror() {
+    let html = render(&[], "{{#iferror:{{#ifexpr: 30em>1}}|ERR|OK}}").await;
+    assert!(visible_text(&html).contains("ERR"), "{html}");
+}
+
 /// `#time` formats a date with `Language::sprintfDate`, the same routine
 /// Scribunto exposes as `mw.language:formatDate`, so the parser function and the
 /// module method share one implementation. The values are the service's:
