@@ -15,24 +15,6 @@ use crate::dom::node::{ElementKind, Node, NodeKind};
 use super::element::{Attributes, Element};
 use super::tree_handler::{Preposition, TreeHandler};
 
-/// Normalize an attribute value per the HTML5 tree-construction algorithm: any
-/// U+000A LF, U+000C FF, U+000D CR, or U+0009 TAB is replaced with U+0020 SPACE.
-fn normalize_attr_value(value: &str) -> String {
-    if !value
-        .chars()
-        .any(|c| matches!(c, '\n' | '\u{000C}' | '\r' | '\t'))
-    {
-        return value.to_string();
-    }
-    value
-        .chars()
-        .map(|c| match c {
-            '\n' | '\u{000C}' | '\r' | '\t' => ' ',
-            other => other,
-        })
-        .collect()
-}
-
 /// A node reference within the arena.
 type DomNode = Rc<RefCell<Node>>;
 
@@ -344,10 +326,12 @@ impl TreeHandler for NodeTreeHandler {
             };
             let mut node = Node::element(kind);
             for (k, v) in element.attrs.get_values() {
-                // HTML5 tree-construction attribute-value normalization
-                // ("create an element for a token"): replace LF/FF/CR/TAB with
-                // U+0020 SPACE, so `<pre class="one\ntwo">` yields `one two`.
-                node.set_attr(k.clone(), normalize_attr_value(v));
+                // A value is kept verbatim. Parsoid's HTML5 library (RemexHTML) preserves
+                // LF in attribute values — only CR is preprocessed to LF — so a
+                // transclusion's `<div class="refbegin  \n    ">` serves the newline.
+                // Whitespace normalization is an *extension* concern; see
+                // `pipeline::extension_handler::normalize_ext_options`.
+                node.set_attr(k.clone(), v.clone());
             }
             let dom = Rc::new(RefCell::new(node));
             let idx = self.arena.len();
@@ -438,16 +422,6 @@ impl TreeHandler for NodeTreeHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_normalize_attr_value() {
-        // Newlines, tabs, form feeds, and carriage returns become spaces
-        // (HTML5 tree-construction attribute-value normalization).
-        assert_eq!(normalize_attr_value("one\ntwo"), "one two");
-        assert_eq!(normalize_attr_value("one\t two"), "one  two");
-        assert_eq!(normalize_attr_value("plain"), "plain");
-        assert_eq!(normalize_attr_value("a\rb\u{000C}c"), "a b c");
-    }
 
     #[test]
     fn test_data_object_id() {

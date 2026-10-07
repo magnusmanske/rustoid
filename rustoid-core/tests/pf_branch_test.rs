@@ -203,6 +203,24 @@ async fn a_fragment_only_link_in_a_ref_body_is_a_self_link() {
     assert!(!html.contains("redlink"), "rendered as a redlink: {html}");
 }
 
+/// An extension tag's attribute values are whitespace-normalized
+/// (`ExtensionHandler::normalizeExtOptions`: collapse runs of `\r\n\t ` to one
+/// space, trim, decode character references), but a plain HTML tag's are not —
+/// Parsoid's HTML5 library (RemexHTML) keeps LF in attribute values. Getting this
+/// backwards either lost `Template:Refbegin`'s newline (`class="refbegin  \n    "`)
+/// or failed the `preTags` fixture's `<pre class="one\ntwo">` → `class="one two"`.
+#[tokio::test]
+async fn extension_attributes_normalize_whitespace_but_html_ones_do_not() {
+    let html = render(&[], "<div class=\"a\nb\">x</div>").await;
+    assert!(html.contains("class=\"a\nb\""), "plain tag changed: {html}");
+
+    let pre = render(&[], "<pre class=\"one\ntwo\">hi</pre>").await;
+    assert!(
+        pre.contains("class=\"one two\""),
+        "extension not normalized: {pre}"
+    );
+}
+
 /// A `#tag` body is rebuilt from its content's *source* before it is re-parsed,
 /// and that reconstruction must not emit an `mw:Entity` span's `src` **and** its
 /// decoded text child: `{{#tag:ref|p.&nbsp;54|name=x}}` came out `p.&nbsp;<NBSP>54`

@@ -11,7 +11,7 @@
 
 use crate::wikitext::tokenizer_v2::decode_wt_entities;
 use crate::wikitext::tokens_v2::{
-    DataParsoid, EndTagTk, Item, ParsoidToken, SelfclosingTagTk, TagTk,
+    DataMwValue, DataParsoid, EndTagTk, Item, ParsoidToken, SelfclosingTagTk, TagTk,
 };
 
 /// Expand a single `extension` self-closing token into its token sequence.
@@ -681,7 +681,12 @@ pub fn run(
     next_id: &std::cell::Cell<usize>,
 ) -> Vec<Item> {
     let mut out = Vec::with_capacity(tokens.len());
-    for item in tokens {
+    for mut item in tokens {
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &mut item
+            && t.name == "extension"
+        {
+            normalize_ext_options(t);
+        }
         match &item {
             Item::Tok(ParsoidToken::SelfclosingTag(t)) => {
                 if let Some(expanded) = expand_extension(t, config, fragments, next_id) {
@@ -694,6 +699,54 @@ pub fn run(
         }
     }
     out
+}
+
+/// Normalize an extension token's option values, mirroring PHP's
+/// `ExtensionHandler::normalizeExtOptions`.
+///
+/// Each value is run through `trim(preg_replace('/[\r\n\t ]+/', ' ', $v))` — the
+/// default `normalize` mode — and then has its character references decoded.
+/// This is what makes `<pre class="one\ntwo">` serve `class="one two"` (and the
+/// same value in `data-mw.attrs`).
+///
+/// It runs only for **extension** tags: a plain HTML tag keeps its newlines, so
+/// `Template:Refbegin`'s `<div class="refbegin  \n    ">` on `Zebra` serves the
+/// newline. (Parsoid also honours per-extension `keepspaces`/`trim` exceptions;
+/// rustoid has no per-extension option config, so every extension takes the
+/// default mode.)
+fn normalize_ext_options(token: &mut SelfclosingTagTk) {
+    let Some(data_mw) = &mut token.data_mw else {
+        return;
+    };
+    for a in &mut data_mw.attribs {
+        let normalized = match &a.value {
+            DataMwValue::Str(v) => normalize_ext_option_value(v),
+            DataMwValue::Object { txt: Some(txt), .. } => normalize_ext_option_value(txt),
+            _ => continue,
+        };
+        a.value = DataMwValue::Str(normalized);
+    }
+}
+
+/// One extension option value: collapse runs of `\r`/`\n`/`\t`/space to a single
+/// space, trim the PHP `trim` set, then decode wikitext entities (PHP
+/// `normalizeExtOptions`, default mode).
+fn normalize_ext_option_value(v: &str) -> String {
+    let mut collapsed = String::with_capacity(v.len());
+    let mut in_ws = false;
+    for c in v.chars() {
+        if matches!(c, '\r' | '\n' | '\t' | ' ') {
+            if !in_ws {
+                collapsed.push(' ');
+                in_ws = true;
+            }
+        } else {
+            collapsed.push(c);
+            in_ws = false;
+        }
+    }
+    let trimmed = collapsed.trim_matches([' ', '\t', '\n', '\r', '\u{0b}', '\0']);
+    decode_wt_entities_all(trimmed)
 }
 
 /// Expand extension tokens *inside* tag attribute values.
