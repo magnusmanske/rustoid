@@ -13007,3 +13007,68 @@ the frame bug. `Zebra` **231276** (41.29%), COVID-19 pandemic **20572**,
 `Template:Infobox` **6533**, `Zebro` MATCH, fixture guard 877/896, lib 977,
 compare 117, clippy and fmt clean. The next target is parser-function argument
 expansion in the calling frame.
+
+## Parser-function arguments expand in the calling frame — and the five-brace idiom
+
+### Parser-function argument expansion
+
+Core's `ParserFunctions` implementations read every argument they use with
+`$frame->expand( … )` (`#time`'s date, `#ifeq`'s second comparison, each
+`#switch` case name), and that call expands the argument's wikitext — nested
+parser functions *and* templates — through the caller's frame. rustoid's
+`Frame::expand` is synchronous and substitutes only `{{{…}}}`, so a nested
+`{{…}}` in an argument reached the function as its own source. In
+`Template:Film date`'s
+`{{#ifexpr: {{#time:U|{{{1}}}-{{#if:…}}…}} …}}` the `#time` was handed the
+literal `1986-{{#if:…}}-01`, answered `Error: Invalid time.`, and the film
+infobox lost the `#ifexpr` cell's `id`.
+
+`expand_template_token` now runs every non-target argument of a parser function
+through `expand_parser_function_args` in the **calling** frame before the call,
+except `#tag` (its own pass) and `#invoke` (Scribunto's lazy arguments). A
+function's *branch* arguments are left alone — the caller re-expands a returned
+branch in the same frame, and standalone Parsoid keeps the branch's tokens, which
+the fixtures pin (a `#switch` branch keeps a templated link target). Which
+argument positions are branches is [`TemplateHandler::arg_is_branch`]; for
+`#switch` a named entry's value is a result and a positional one another case.
+
+### `#ifexpr` propagates the expression error
+
+With that in place the earlier `pf_ifexpr` change could land: core's `#ifexpr`
+catches the `ExprParser` error and answers the error markup itself rather than a
+branch, so `{{#iferror:{{#ifexpr: 30em>1}}|ERR|OK}}` is `ERR`. Shipping it alone
+had regressed `Quicksilver (film)` (6691 → 4213) because the `#time` inside the
+`#ifexpr` condition still failed; now it does not.
+
+### A five-brace run is `{{` + `{{{`, not `{{{` + `{{`
+
+Turning off the error-swallowing exposed a tokenizer bug that had been invisible:
+`{{Str count|…}}` leaked its source. `Template:Str count`'s whole body is the
+`subst` idiom `{{{{{name|safesubst:}}}#invoke:…}}`, and MediaWiki resolves a run
+of braces by `run % 3` — a template `{{` for 2, an argument `{{{` for 0, one
+literal `{` for 1. `find_template_closing_memo` took the argument whenever three
+braces were present, so it read the five-brace form as `{{{` + `{{`, swallowed
+one `}` of the closer and left a stray `}`, and the transclusion never closed. It
+now chooses the first construct by the run length, matching the tokenizer's own
+`parse_directive`.
+
+Two supporting fixes followed. `parse_templatearg_token` dropped an argument's
+default when its name was empty, which the idiom writes (`{{{|safesubst:}}}`):
+the resulting attribute-less `templatearg` cannot be substituted, so it survived
+to the token stream and was wrapped in an `mw:Param` marker, spending an `about`
+id the service does not (`Module:Infobox`'s stylesheet came out `#mwt22` where the
+service has `#mwt12` on `Albert Einstein`). And `expand_target_templates` now
+substitutes the target's `{{{…}}}` before expanding its templates, so a target
+reference is substituted rather than wrapped — the same
+`Template:Str ≥ len`-style idiom is the case.
+
+### Effect
+
+`Zebra` **231276 → 246809** (41.29% → 44.06%). No other corpus page's first
+difference moves (checked against `/tmp/full_fix_v2.log`), and `Quicksilver (film)`
+stays **6691**, `Albert Einstein` **11848**. The next difference on `Zebra` is at
+246809: a Citation/CS1 footnote's back-link, where the service renders
+`Plumb <span typeof="mw:Entity">&</span> Shaw 2018` as a `mw-selflink-fragment`.
+
+State: fixture guard **877/896**, lib **979**, compare **117**, clippy and fmt
+clean.
