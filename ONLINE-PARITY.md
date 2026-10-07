@@ -12954,3 +12954,56 @@ expects a rounded `#expr` (`left:23.076923px`) where the parser now produces the
 full `23.076923076923px`; it fails identically before these changes. The next
 difference is still the reflist class/style, which needs `#time` before the
 `#ifexpr` error-propagation can ship.
+
+## `#time` lands, and the `#ifexpr` fix turns out to need one more thing
+
+### `#time`
+
+`#time` was never implemented — the name is a registered function hook with no
+arm in `call_parser_function` (template_handler), so it fell through to the
+unknown-parser-function fallback and rendered its own source. It formats a date
+with `Language::sprintfDate`, the *same* routine Scribunto exposes as
+`mw.language:formatDate` and already ported as `lua::engine::format_date`, so the
+parser function now dispatches there (`#timel` too — the site timezone is UTC).
+`parse_date` also gained the fourteen-digit `YYYYMMDDHHMMSS` form. Measured
+against the transform endpoint: `{{#time:U|1986-02-14}}` is 508723200,
+`{{#time:Y|2020-01-01}}` is 2020, `{{#time:U|20261007120000}}` is 1791374400,
+`{{#time:U|@508896000}}` is 508896000, and `{{#time:U|nonsense}}` is the
+documented `Error: Invalid time.` — without the service's tracking-category link,
+a known gap. No corpus first difference moves.
+
+### The `#ifexpr` fix is still blocked — now by a nested-expansion frame bug
+
+With `#time` in, `pf_ifexpr`'s error propagation was re-applied and measured:
+`Zebra` **231276 → 246809** (+15533) — but `Quicksilver (film)` still regresses
+**6691 → 4213** (the infobox table loses `id="mwCQ"`). The cause is no longer
+`#time`. The `#ifexpr` that runs sees the argument
+
+    <strong class="error">Error: Invalid time.</strong> > 1791369996
+
+so a `#time` still failed, with date `1986--`. That is `Template:Film date`:
+
+    {{#ifexpr: {{#time:U|{{{1}}}-{{#if:{{{2|}}}|{{{2}}}|01}}-{{#if:{{{3|}}}|{{{3}}}|01}}}} > … }}
+
+With `{{Film date|1986|2|14}}` the two inner `#if`s resolve to the **empty
+string** instead of `2`/`14`, giving `1986--`. The condition `{{{2|}}}` is truthy
+while the selected branch is empty, so the branch's `{{{2}}}` was expanded in a
+frame without argument 2. Reduced: a template whose body is
+`[{{#if:{{{2|}}}|[{{{2}}}]|01}}]` renders `[2]` (no bug), but
+`[{{#time:Y-m-d|{{{1}}}-{{#if:{{{2|}}}|{{{2}}}|01}}-01}}]` does not even *run*
+the `#if` — a nested `{{…}}` inside a parser function's argument is not expanded
+when the call is at the template body's top level. It *is* expanded when the call
+sits inside another parser function's argument (as `#ifexpr`'s does), but then in
+the wrong frame. The fix is general — a parser function's arguments must be fully
+expanded in the *calling* frame, the way PHP's `callParserFunction` does (rustoid
+expands the target and the `{{{…}}}` template args, but not nested `{{…}}`
+parser functions in the other arguments) — and is bigger than the reflist.
+
+### State
+
+`#time` is committed (`parser: implement #time, …`); the `#ifexpr`
+error-propagation is reverted, since it is correct per the service but exposes
+the frame bug. `Zebra` **231276** (41.29%), COVID-19 pandemic **20572**,
+`Template:Infobox` **6533**, `Zebro` MATCH, fixture guard 877/896, lib 977,
+compare 117, clippy and fmt clean. The next target is parser-function argument
+expansion in the calling frame.
