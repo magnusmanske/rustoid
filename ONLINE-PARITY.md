@@ -12898,3 +12898,59 @@ rustoid adds a spurious `reflist-columns-3` class, drops the `column-width`
 style, and nests the `<references>` extension in an extra `<div>` where Parsoid
 emits the `<ol>` directly. That is `Template:Reflist`'s columns handling, a
 separate bug from the tokenizer comment fix that exposed it.
+
+## The reflist difference is two bugs, and the second needs `#ifexpr` to error
+
+### `#ifexpr` must propagate a malformed expression
+
+`Template:Reflist`'s class is
+`{{#iferror:{{#ifexpr: 30em > 1 }}|mw-references-columns|{{#switch:30em|…}}}}`.
+For `{{reflist|30em}}` the expression `30em > 1` is malformed (`em` is an
+unrecognized word), so PHP's `#ifexpr` *returns the error* and `#iferror` takes
+the then-branch. rustoid's `pf_ifexpr` swallowed the error and took the else
+branch, producing the spurious `reflist-columns-3` class and dropping the
+`column-width` style.
+
+Probed against the live transform endpoint: `{{#ifexpr: 30em > 1 }}` is empty,
+`{{#iferror:{{#ifexpr: 30em > 1 }}|ERR|OK}}` is `ERR`, and `{{#ifexpr: 2>1 }}`
+(no branch, well formed) is *empty* — **not** `1`. So the fix is to return the
+error HTML when `evaluate_expression` reports one, and leave the branch selection
+exactly as it is. (`#expr` already errors; only `#ifexpr` swallowed it.)
+
+### Why it cannot land alone: `#time`
+
+With that change a full run improves `Zebra` **231276 → 246809** (+15533) but
+regresses `Quicksilver (film)` **6691 → 4213**. The regression is the infobox
+table losing its `id="mwCQ"`, and the trace names the cause: `Template:Film date`
+writes
+
+    {{#ifexpr: {{#time:U|{{{1}}}-{{{2}}}-{{{3}}}}} > {{#time:U|{{CURRENTTIMESTAMP}}}} | … }}
+
+rustoid does not implement `#time`, so it renders `{{#time:U|…}}` as *literal
+text*; the expression then contains the word `time`, `evaluate_expression` errors,
+and — with the error now propagated — an error span appears where the oracle has
+a timestamp comparison. The old swallowing hid the missing function. Closing this
+needs `#time`, a core parser function rustoid has never implemented; that is the
+next target, not a heuristic about the expression text.
+
+### The other half, landed: the responsive wrapper
+
+The reflist's inner element was wrong too. For `responsive=0` the `<ol>` *is* the
+extension element and Cite adds no wrapper, but rustoid always wrapped and spent
+an id the oracle does not. `read_references` now reports the `responsive` flag
+(absent is on; `""`/`"0"` are off, matching Cite's PHP truth test) and the wrapper
+is built only when it is set. It moves no page's first difference on its own —
+the class above is still the earlier difference — but it is the shape the
+`#ifexpr` fix will reveal. Committed as `cite: the responsive wrapper exists only
+when responsive is not falsy`.
+
+### State
+
+Working tree clean at `f4e147c`. `Zebra` **231276** (41.29%), COVID-19 pandemic
+**20572**, `Template:Infobox` **6533**, `Zebro` MATCH, fixture guard 877/896, lib
+977, compare 117, clippy and fmt clean. One pre-existing failure is unrelated to
+this work: `attribute_argument_test::the_real_geological_style_resolves_its_arguments`
+expects a rounded `#expr` (`left:23.076923px`) where the parser now produces the
+full `23.076923076923px`; it fails identically before these changes. The next
+difference is still the reflist class/style, which needs `#time` before the
+`#ifexpr` error-propagation can ship.
