@@ -13127,3 +13127,49 @@ clippy and fmt clean.
 
 Past the reflist. (The fragment-only-link sibling of this fix is above; the
 remaining `Zebra` difference is at 91% of the page.)
+
+## Whitespace in attribute values is normalized for extensions, not for HTML tags
+
+The `Zebra` difference at 510098 is `Template:Refbegin`, whose `<div class="refbegin
+<!--\n-->{{#if:…}} <!--\n-->{{#if:…}}\n    ">` serves `class="refbegin  \n    "` — the
+trailing newline of the template body kept verbatim. rustoid collapsed it to
+spaces, because its HTML5 tree handler ran a `normalize_attr_value` over every
+element, replacing LF/FF/CR/TAB with a space (added for
+`php/preTags.txt`'s `<pre class="one\ntwo">`).
+
+That rule belongs to extensions, not to the tree builder. Parsoid's HTML5 library
+(RemexHTML) keeps LF in attribute values — only CR is preprocessed to LF, and
+`<pre class="one\ntwo">` is served as `one two` because `ExtensionHandler::
+normalizeExtOptions` collapses runs of `\r\n\t ` in an *extension* tag's options
+to one space, trims, and decodes character references before the handler sees
+them. The tree handler now keeps values verbatim and that normalization lives in
+`extension_handler::run`, mirroring the PHP. Per-extension `keepspaces`/`trim`
+exceptions are not ported — rustoid has no per-extension option config, so every
+extension takes the default `normalize` mode.
+
+### Effect
+
+`Zebra` **510098 → 512757** (91.53%); no other corpus page's first difference
+moves. State: fixture guard **877/896**, lib **978**, compare **117**, clippy and
+fmt clean.
+
+### Next difference on `Zebra` (512757)
+
+The `=== General bibliography ===` block: `{{Refbegin}}`, two `{{Cite book}}`
+items, `{{Refend}}` (`Template:Refend` is just `<div>`-closer — `<includeonly></div>
+</includeonly>`). The service emits one `mw:Transclusion` range whose `data-mw`
+parts are `{Refbegin i:0}, …, {Refend i:2}` and puts `about="#mwt…"` on the
+`<div>` — nothing else. rustoid produces the *same* merged range **and** a
+spurious `<meta typeof="mw:Transclusion" about="#mwtN" data-mw='{…Refend…i:0}'
+/>` inside the `<div>` (so `"wt":"Refend"` appears twice where the service has
+it once).
+
+Reduced to `{{Refbegin}}x{{Refend}}` (compare against the live transform with
+`--wikitext`; the corpus's cached oracle shows the same). rustoid's output:
+`<span class="mw-empty-elt" about="#mwt1" … data-mw='{Refbegin i:0}, "x",
+{Refend i:1}'>…</span><div class="refbegin…" about="#mwt1">x<meta
+about="#mwt3" data-mw='{Refend i:0}'/></div>`. The service has the same span and
+div but no meta — the `Refend` call's own `mw:Transclusion` placeholder is not
+emitted once the call is merged into the enclosing range. Not yet traced to a
+function (the merge/encapsulation path is untouched by the fixes in this
+section, so this is pre-existing and merely newly exposed).
