@@ -12818,3 +12818,83 @@ re-applied and should advance `Zebra` to ~231276 without the COVID-19 regression
 The next target is therefore the attribute expander:
 `<div class="a" {{#if:1|style="s"}}>` must keep the `style` whether or not a
 comment precedes the construct.
+
+## Fixed: a construct in attribute position survives a deferred `frame:expandTemplate`
+
+### The "frame" hypothesis was wrong: the arguments do reach
+
+The section above concluded that `Module:Template wrapper` →
+`frame:expandTemplate('div col')` expands the attribute-position `#if` in a frame
+without `colwidth`. That reading came from the *rendered* answer, which spells the
+tag's recorded `src` — and `src` is the source **as written**, so it still shows
+`{{{colwidth|}}}` after the arguments were substituted. Instrumenting the spliced
+body settled it: `child_frame.expand` (in `expand_one_template`) does substitute,
+and the `#if`'s live condition is `10em` on both the direct and the `#invoke`
+paths. Same title, same args, same substituted token.
+
+### Cause: the deferred answer never ran the reparse-KV step
+
+The two paths diverge one stage later, in *finalization*, not in expansion.
+
+`Template:Div col` puts the construct in attribute **key** position —
+`<div class="div-col {{#ifeq:…}}" {{#if:…|style="…"}}>` — so the frame's `#if`
+expands the key tokens into the string `style="column-width: 10em;"`. PHP's
+`AttributeExpander::buildExpandedAttrs` has a reparse-KV step for exactly this: a
+templated key that expanded into `k="v"` text (with an empty value) is
+re-tokenized as attributes, so the `style` becomes a real attribute.
+
+The page-level `expand_attributes` pass runs that step
+(`Parser::expand_attributes_at` calls `build_expanded_attrs`), which is why the
+*direct* `{{Div col|…}}` is right. But a deferred `frame:expandTemplate` body is
+resolved early by `Parser::expand_attrib_templates` — the answer must be a string
+before the module can see it — and that pass expanded each key/value with
+`expand_templates` and stopped there. The generated attribute stayed a
+`KeyValue::Tokens` *key* whose text spells `style="…"`, with an empty value, so:
+
+- `rewrite_expanded_attrs` could not patch the tag's `src`,
+- `element_html_from_attribs` (the rebuild path) skips a non-`Str` key, and
+- the answer handed to the module was `<div class="div-col   ">`, the `style`
+  gone.
+
+The module returned that unstyled div, and the pipeline re-parsed it: the
+attribute was simply absent, not a construct. That is why the tag's own `src`
+spelling the construct was a red herring — the token reaching the renderer had
+lost the attribute already.
+
+### Fix
+
+- Extract PHP's reparse-KV into `attribute_expander::reparse_attr_key_string`
+  (shared with `build_expanded_attrs`, which previously inlined it).
+- Run it in `expand_attrib_templates` after expanding each attribute: a `Tokens`
+  key with an empty value whose text contains `=` is replaced by the attributes it
+  spells.
+- `Parser::render_answer_markers` now uses `MissingSrc::Html` — the same policy as
+  an `#invoke` argument value — so a deferred answer whose recorded source still
+  spells a construct is rebuilt from the live attributes. The recursive
+  `render_answer` (the token lists inside `quote_token_wikitext` /
+  `wikilink_token_wikitext`, rebuilt into attribute *values*) keeps `Drop`, so the
+  spelling cannot leak there.
+
+### Effect
+
+`Zebra` **231276** (41.29%), COVID-19 pandemic **20572** (the comment fix's
+regression to 16001 is gone), `Template:Infobox` **6533**, `Zebro` MATCH. A full
+48-page corpus run against the pre-session baseline changes **only Zebra**
+(+473 bytes) and regresses no page; the six pages that stall (`Cristiano Ronaldo`,
+`Lionel Messi`, `Taylor Swift`, `Israel`, `United States`, `India`) are the usual
+60s-cap stalls. Fixture guard 877/896, lib 977, compare 117, clippy and fmt clean.
+
+### The next difference (Zebra @ 231276, 41.29%)
+
+`{{reflist|30em}}`'s references wrapper:
+
+    parsoid: <div class="mw-references-wrap mw-references-columns"
+                   style="column-width: calc( 0.9 * 30em );" about="#mwt514">
+               <ol class="mw-references references" typeof="mw:Extension/references" …>
+    rustoid: <div class="mw-references-wrap mw-references-columns reflist-columns-3" about="#mwt514">
+               <div class="mw-references-wrap mw-references-columns" typeof="mw:Extension/references" …>
+
+rustoid adds a spurious `reflist-columns-3` class, drops the `column-width`
+style, and nests the `<references>` extension in an extra `<div>` where Parsoid
+emits the `<ol>` directly. That is `Template:Reflist`'s columns handling, a
+separate bug from the tokenizer comment fix that exposed it.
