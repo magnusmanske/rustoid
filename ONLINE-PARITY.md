@@ -13104,3 +13104,26 @@ span *and* a literal `U+00A0` after it (the `&nbsp;` in `Module:Footnotes`'s
 `page_sep = ", p.&nbsp;"` is doubled when the module's output is re-tokenized).
 A template body with the same `&nbsp;` renders correctly, so the duplication is
 specific to the `#invoke` output path.
+
+## A `#tag` body must not double an `mw:Entity`
+
+`Template:Sfn` calls `frame:extensionTag`, which rustoid lowers to `#tag`. A
+`#tag` body is rebuilt from its content's *source* (`tag_content_source`, or the
+per-token `src` when that returns `None`) and then re-parsed by the extension.
+The reconstruction emitted an `mw:Entity` span's `src` **and** the decoded text
+child it is followed by, so every `&nbsp;` in a footnote body — `…, p.&nbsp;54`
+from `Module:Footnotes`'s `page_sep` — became `&nbsp;` plus a literal NBSP. Both
+the recognized path and the stringify fallback now skip the decoded text (and the
+matching `</span>`), mirroring `tokens_to_string`'s existing
+`skip_entity_decoded_text`.
+
+### Effect
+
+`Zebra` **246994 → 510098** (44.09% → **91.06%**); no other corpus page's first
+difference moves. State: fixture guard **877/896**, lib **979**, compare **117**,
+clippy and fmt clean.
+
+### Next difference on `Zebra` (510098)
+
+Past the reflist. (The fragment-only-link sibling of this fix is above; the
+remaining `Zebra` difference is at 91% of the page.)
