@@ -2032,7 +2032,13 @@ mod tests {
             &mut fragments,
             &next_id,
             &mut |items, frags, id| {
-                crate::pipeline::parser::render_inline_fragment(config_static(), items, frags, id)
+                crate::pipeline::parser::render_inline_fragment(
+                    config_static(),
+                    items,
+                    frags,
+                    id,
+                    None,
+                )
             },
         );
 

@@ -312,11 +312,11 @@ fn render_media_sync(title_str: &str, opts_str: &str, config: &dyn SiteConfig) -
                 false,
                 &mut fragments,
                 &next_id,
-                &mut |items, f, id| render_inline_fragment(config, items, f, id),
+                &mut |items, f, id| render_inline_fragment(config, items, f, id, None),
             )
         })
         .collect();
-    let frag = render_inline_fragment(config, tokens, &mut fragments, &next_id);
+    let frag = render_inline_fragment(config, tokens, &mut fragments, &next_id, None);
     frag.children.into_iter().next()
 }
 
@@ -785,8 +785,13 @@ fn caption_to_nodes(caption: &str, config: &dyn SiteConfig) -> Vec<Node> {
 
     let mut fragments = std::collections::HashMap::new();
     let next_id = std::cell::Cell::new(0usize);
-    let frag =
-        crate::pipeline::parser::render_inline_fragment(config, items, &mut fragments, &next_id);
+    let frag = crate::pipeline::parser::render_inline_fragment(
+        config,
+        items,
+        &mut fragments,
+        &next_id,
+        None,
+    );
     frag.children
 }
 

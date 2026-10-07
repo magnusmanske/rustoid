@@ -700,6 +700,7 @@ pub fn render_inline_fragment(
     tokens: Vec<Item>,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
     next_id: &std::cell::Cell<usize>,
+    context_title: Option<&crate::title::Title>,
 ) -> Node {
     use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
     use crate::pipeline::wiki_link_render::{
@@ -709,6 +710,9 @@ pub fn render_inline_fragment(
 
     // Step 1: render wikilinks (`[[…]]` → `<a>`/`<link>` tags).
     let mut link_ctx = WikiLinkContext::new(config);
+    if let Some(title) = context_title {
+        link_ctx.set_context_title(title);
+    }
     let tokens: Vec<Item> = tokens
         .into_iter()
         .flat_map(|item| {
@@ -765,7 +769,7 @@ pub fn render_inline_fragment(
                 false,
                 fragments,
                 next_id,
-                &mut |items, f, id| render_inline_fragment(config, items, f, id),
+                &mut |items, f, id| render_inline_fragment(config, items, f, id, context_title),
             )
         })
         .collect();
@@ -790,7 +794,8 @@ pub fn render_inline_fragment(
                     // Re-render link content (nested `[[…]]`) inline and wrap the
                     // result in a DOM-fragment token (mirrors PHP's
                     // `getDOMFragmentToken`).
-                    let frag = render_inline_fragment(config, items, fragments, next_id);
+                    let frag =
+                        render_inline_fragment(config, items, fragments, next_id, context_title);
                     crate::pipeline::wiki_link_render::dom_fragment_token(
                         frag, &token, fragments, next_id,
                     )
@@ -1873,7 +1878,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
         next_id: &std::cell::Cell<usize>,
     ) -> crate::dom::node::Node {
-        render_inline_fragment(self.config, tokens, fragments, next_id)
+        // The page title is the context a fragment-only link (`[[#Foo]]`) resolves
+        // against: a ref body or caption carrying one renders as
+        // `./Page#Foo` with `mw-selflink-fragment`, not a redlink.
+        let context_title =
+            crate::title::TitleParser::parse(&self.page_title.borrow(), self.config);
+        render_inline_fragment(
+            self.config,
+            tokens,
+            fragments,
+            next_id,
+            Some(&context_title),
+        )
     }
 
     /// Serialize an attribute key/value source (a token array or plain string)
@@ -2407,7 +2423,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     false,
                     &mut fragments,
                     &next_id,
-                    &mut |items, f, id| render_inline_fragment(self.config, items, f, id),
+                    &mut |items, f, id| {
+                        render_inline_fragment(
+                            self.config,
+                            items,
+                            f,
+                            id,
+                            Some(&crate::title::TitleParser::parse(
+                                &self.page_title.borrow(),
+                                self.config,
+                            )),
+                        )
+                    },
                 )
             })
             .collect();
@@ -3237,6 +3264,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     self.tokenize(&r.body).unwrap_or_default(),
                     &mut fragments,
                     &next_note_id,
+                    Some(&crate::title::TitleParser::parse(
+                        &self.page_title.borrow(),
+                        self.config,
+                    )),
                 )
             };
             crate::ext::cite::run(&mut ast, &page_title_prefixed, &mut ids, &render_body);

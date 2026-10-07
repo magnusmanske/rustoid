@@ -187,6 +187,22 @@ async fn only_non_text_branches_are_marked_as_expanded_attributes() {
     }
 }
 
+/// A fragment-only wikilink (`[[#Foo]]`) resolves against the *page*, even in a
+/// context that renders through the inline-fragment path — a `<ref>` body, a
+/// caption, a gallery line. That path built its link context without the page
+/// title, so `#Foo` was taken for a title and the link came out a redlink
+/// (`./?action=edit&redlink=1#Foo#Foo`) where the service renders
+/// `./Page#Foo` with `mw-selflink-fragment`.
+#[tokio::test]
+async fn a_fragment_only_link_in_a_ref_body_is_a_self_link() {
+    let html = render(&[], "<ref>[[#Foo|bar]]</ref>\n<references/>").await;
+    assert!(
+        html.contains("mw-selflink-fragment"),
+        "not a self-link: {html}"
+    );
+    assert!(!html.contains("redlink"), "rendered as a redlink: {html}");
+}
+
 /// A run of five braces is `{{` + `{{{`, not `{{{` + `{{`: MediaWiki picks the
 /// first construct of a run by `braces % 3`, and so must the closers' scan.
 /// `Template:Str count` and its relatives are written as the `subst` idiom
