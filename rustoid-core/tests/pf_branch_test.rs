@@ -203,6 +203,22 @@ async fn a_fragment_only_link_in_a_ref_body_is_a_self_link() {
     assert!(!html.contains("redlink"), "rendered as a redlink: {html}");
 }
 
+/// A `#tag` body is rebuilt from its content's *source* before it is re-parsed,
+/// and that reconstruction must not emit an `mw:Entity` span's `src` **and** its
+/// decoded text child: `{{#tag:ref|p.&nbsp;54|name=x}}` came out `p.&nbsp;<NBSP>54`
+/// (the entity duplicated). `Module:Footnotes` hands every `{{sfn}}` footnote
+/// body — `…, p.&nbsp;54` — to `frame:extensionTag`, so the whole reflist of
+/// `Zebra` hit this.
+#[tokio::test]
+async fn a_tag_body_does_not_double_an_entity() {
+    let html = render(&[], "{{#tag:ref|p.&nbsp;54|name=x}}\n<references/>").await;
+    assert_eq!(
+        visible_text(&html).matches('\u{a0}').count(),
+        1,
+        "the entity was doubled: {html}"
+    );
+}
+
 /// A run of five braces is `{{` + `{{{`, not `{{{` + `{{`: MediaWiki picks the
 /// first construct of a run by `braces % 3`, and so must the closers' scan.
 /// `Template:Str count` and its relatives are written as the `subst` idiom

@@ -637,13 +637,28 @@ impl ParserFunctions {
         // token-level `processSpecialMagicWord`/`!` magic-variable handling).
         let content_src: String = crate::expand::tpl_args::replace_magic_pipe(
             &crate::pipeline::parser::tag_content_source(content).unwrap_or_else(|| {
-                content
-                    .iter()
-                    .map(|it| match it {
-                        Item::Str(s) => s.clone(),
-                        Item::Tok(t) => token_to_source(t),
-                    })
-                    .collect::<String>()
+                // A token `tag_content_source` cannot rebuild (an external link,
+                // say) drops to each token's own `src`. The decoded text after an
+                // `mw:Entity` span is skipped: the span's `src` already spells the
+                // entity, and emitting both doubles it (`&nbsp;` + a literal NBSP).
+                let mut s = String::new();
+                let mut i = 0;
+                while i < content.len() {
+                    match &content[i] {
+                        Item::Str(text) => s.push_str(text),
+                        Item::Tok(t) => {
+                            s.push_str(&token_to_source(t));
+                            if crate::wikitext::token_utils::skip_entity_decoded_text(
+                                t,
+                                content.get(i + 1),
+                            ) {
+                                i += 1;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                s
             }),
         );
         let attr_src = serialize_tag_attribs(display_target, tag_attribs);

@@ -6425,8 +6425,9 @@ fn is_bang_marker(t: &crate::wikitext::tokens_v2::TagTk) -> bool {
 pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
     use crate::wikitext::tokens_v2::ParsoidToken;
     let mut out = String::new();
-    for item in items {
-        match item {
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
             Item::Str(s) => out.push_str(s),
             // A comment is stripped by the preprocessor; a newline is content.
             Item::Tok(ParsoidToken::Comment(_)) => {}
@@ -6441,6 +6442,24 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
             }
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension" => {
                 out.push_str(t.data_parsoid.src.as_deref()?);
+            }
+            // An `mw:Entity` span is spelled out by its `src`; the decoded text
+            // it is followed by — and the `</span>` — carry no source of their
+            // own (see `skip_entity_decoded_text`). Without this the stringify
+            // fallback emitted the `src` *and* the decoded text, so a `&nbsp;` in
+            // a `#tag` body became `&nbsp;` plus a literal NBSP: the doubled
+            // `p.&nbsp;54` that `Module:Footnotes` hands `frame:extensionTag`.
+            Item::Tok(tok) if crate::wikitext::token_utils::is_entity_span_token(tok) => {
+                if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
+                    out.push_str(src);
+                }
+                if crate::wikitext::token_utils::skip_entity_decoded_text(tok, items.get(i + 1)) {
+                    i += 1;
+                }
+                if matches!(items.get(i + 1), Some(Item::Tok(ParsoidToken::EndTag(e))) if e.name == "span")
+                {
+                    i += 1;
+                }
             }
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "wikilink" => {
                 let href = t
@@ -6462,6 +6481,7 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
             Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
             _ => return None,
         }
+        i += 1;
     }
     Some(strip_html_comments(&out))
 }
