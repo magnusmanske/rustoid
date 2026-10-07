@@ -3364,22 +3364,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// same ref — the double-walk the `<indicator>` had (see
     /// `expand_one_indicator`). The marker keeps the numbered token, which
     /// `substitute_strip_markers` splices back unchanged.
+    ///
+    /// The answer is the expansion's *text*, so a stale recorded source (one that
+    /// still spells a `{{…}}` the frame expanded, like `Template:Div col`'s
+    /// `<div class="div-col {{#ifeq:…}}" {{#if:…}}>`) is rebuilt from the token's
+    /// live attributes — the module must be handed the expansion, not the
+    /// construct. See [`crate::pipeline::lua_deferred::MissingSrc`].
     fn render_answer_markers(&self, items: &[Item]) -> String {
-        self.render_markers(items, crate::pipeline::lua_deferred::MissingSrc::Drop)
+        self.render_markers(items, crate::pipeline::lua_deferred::MissingSrc::Html)
     }
 
-    /// Render an `#invoke` argument value as the text Scribunto receives: the
-    /// same as [`Self::render_answer_markers`], except that a live element with
-    /// no `src` is *spelled as HTML* and a *stale* recorded source is rebuilt from
-    /// the token's expanded attributes.
-    ///
-    /// Scribunto is handed the expansion's text, and PHP's module output is that
-    /// text — so a spelled element comes back, when the module's output is
-    /// re-parsed, as a node with a `src` that is keyed and takes an id. A carried
-    /// marker skips that, and every id after it shifts; rebuilding instead is what
-    /// keeps `Template:Infobox`'s `id="mwCA"`. A stale source (one that still
-    /// spells a `{{…}}` the frame expanded) is rebuilt for the same reason: the
-    /// module must be handed the expansion, not the construct.
+    /// Render an `#invoke` argument value as the text Scribunto receives. Shares
+    /// [`Self::render_answer_markers`]'s policy: Scribunto is handed the
+    /// expansion's text either way, and a spelled element or rebuilt stale source
+    /// comes back, when the module's output is re-parsed, as a keyed node with an
+    /// id. Rebuilding instead is what keeps `Template:Infobox`'s `id="mwCA"`.
     fn render_argument_markers(&self, items: &[Item]) -> String {
         self.render_markers(items, crate::pipeline::lua_deferred::MissingSrc::Html)
     }
@@ -5554,7 +5553,28 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     *field =
                         crate::pipeline::attribute_transform_manager::items_to_key_value(expanded);
                 }
-                expanded_attrs.push(new_kv);
+                // A templated key can expand into whole attributes —
+                // `Template:Div col`'s `<div … {{#if:…|style="…"}}>` — which the
+                // page-level `expand_attributes` pass resolves in
+                // `build_expanded_attrs`' reparse-KV step. This pass has to do the
+                // same, or the generated attribute stays a key that merely spells
+                // it (and the module is handed a tag without it).
+                let reparsed = (new_kv.value.is_empty()
+                    && matches!(new_kv.key, KeyValue::Tokens(_)))
+                .then(|| {
+                    crate::pipeline::attribute_expander::reparse_attr_key_string(
+                        &crate::wikitext::token_utils::tokens_to_string(
+                            &crate::pipeline::attribute_transform_manager::key_value_to_items(
+                                &new_kv.key,
+                            ),
+                        ),
+                    )
+                })
+                .flatten();
+                match reparsed {
+                    Some(clean) => expanded_attrs.extend(clean),
+                    None => expanded_attrs.push(new_kv),
+                }
             }
             let mut new_tok = tok.clone();
             new_tok.set_attribs(expanded_attrs);

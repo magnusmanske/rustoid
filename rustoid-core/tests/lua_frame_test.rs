@@ -102,6 +102,44 @@ async fn expand_template_passes_named_arguments() {
     assert!(html.contains("1-2"), "got: {html}");
 }
 
+/// A construct in *attribute position* expands into a whole attribute, and the
+/// module must receive the expansion, not the construct.
+///
+/// `Template:Div col` writes `<div class="div-col {{#ifeq:…}}" {{#if:…|style="…"}}>`.
+/// The frame resolves the `#if` into a `style` attribute, but the answer string
+/// handed back to Lua is rebuilt from the tag's *source* — which still spells the
+/// `#if`. Unless the generated attribute is reparsed (PHP's reparse-KV), the
+/// module's output re-parses the raw construct and the attribute is lost, so
+/// `{{div col|colwidth=10em}}` renders an unstyled div.
+#[tokio::test]
+async fn expand_template_resolves_a_construct_in_attribute_position() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame:expandTemplate{ title = "Box", args = { w = "10em" } }
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[(
+            "Template:Box",
+            r#"<div class="box" {{#if:{{{w|}}}|style="width:{{{w}}};"}}>content</div>"#,
+        )],
+        "{{#invoke:T|main}}",
+    )
+    .await;
+    let html = without_node_ids(&html);
+    assert!(
+        html.contains(r#"style="width:10em;""#),
+        "the attribute-position construct must resolve into the style attribute: {html}"
+    );
+    assert!(
+        !html.contains("{{#if"),
+        "no construct may survive into the module's output: {html}"
+    );
+}
+
 /// A module may reach `expandTemplate` many times; each call must get its own
 /// answer, which is what the request keying is for.
 #[tokio::test]

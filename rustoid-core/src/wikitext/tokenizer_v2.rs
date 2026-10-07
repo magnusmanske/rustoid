@@ -2598,6 +2598,18 @@ impl<'a> PegTokenizer<'a> {
             return None;
         }
 
+        // A comment in attribute position is consumed as part of the tag, not a
+        // reason for the whole tag to fail. Without this the tag is emitted as
+        // text — `{{reflist}}`'s `<div … <!--\n-->…>` came out entity-escaped
+        // inside a `<p>`. (PHP records the comment as an attribute named
+        // literally `<!--…-->`; that name is dropped from the serialized tag
+        // anyway, and emitting it here perturbed the attribute expander, so the
+        // comment is simply skipped.)
+        if let Some(len) = self.comment_len() {
+            self.advance(len);
+            return self.parse_one_attribute(allow_less_than);
+        }
+
         // Parse attribute name.
         let name_start = self.pos;
         let name = self.parse_attr_name(allow_less_than);
@@ -2650,6 +2662,14 @@ impl<'a> PegTokenizer<'a> {
                 vsrc: None,
             })
         }
+    }
+
+    /// The length of a `<!--…-->` comment at the cursor, if one starts here.
+    /// Used in attribute position, where a comment is part of the tag's syntax.
+    fn comment_len(&self) -> Option<usize> {
+        let rem = self.remaining();
+        rem.starts_with("<!--")
+            .then(|| rem.find("-->").map(|i| i + 3))?
     }
 
     /// Parse a generic HTML tag attribute name, recognizing template
@@ -6597,6 +6617,24 @@ mod tests {
             assert_eq!(tk.attribs[0].value.as_str(), Some("x"));
             assert_eq!(tk.attribs[1].key.as_str(), Some("style"));
             assert_eq!(tk.attribs[1].value.as_str(), Some("y"));
+        }
+    }
+
+    /// A comment in attribute position is consumed as part of the tag, not a tag
+    /// terminator. Treating the `<` as an illegal attribute-name character failed
+    /// the whole tag, which was then emitted as text — `{{reflist}}`'s
+    /// `<div … <!--\n-->…>` came out entity-escaped inside a `<p>`.
+    #[test]
+    fn test_html_tag_with_a_comment_between_attributes() {
+        let tokens = tokenize("<div class=\"a\" <!--x--> id=\"b\">y</div>");
+        let div_opts: Vec<_> = tokens
+            .iter()
+            .filter(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "div"))
+            .collect();
+        assert_eq!(div_opts.len(), 1, "expected one <div>, got: {:?}", tokens);
+        if let Either::Right(ParsoidToken::Tag(tk)) = div_opts[0] {
+            let keys: Vec<_> = tk.attribs.iter().filter_map(|kv| kv.key.as_str()).collect();
+            assert_eq!(keys, vec!["class", "id"]);
         }
     }
 

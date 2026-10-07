@@ -679,10 +679,14 @@ pub fn render_answer(items: &[Item]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingSrc {
     /// Drop a source-less element, and write a recorded source verbatim.
-    /// [`render_answer`]'s behaviour, for an answer that goes back to Lua as
-    /// wikitext and for a token-list rebuilt into an attribute value.
+    /// [`render_answer`]'s behaviour, for a token-list rebuilt into an attribute
+    /// value (the recursive case inside `quote_token_wikitext` and
+    /// `wikilink_token_wikitext`).
     Drop,
-    /// An `#invoke` argument value, which is the expansion's *text*.
+    /// An expansion's *text* handed across the Lua boundary — a `frame` call's
+    /// answer or an `#invoke` argument value. A stale recorded source (one that
+    /// still spells a `{{…}}` the frame expanded) is rebuilt from the token's live
+    /// attributes, so the module receives the expansion, not the construct.
     Html,
 }
 
@@ -788,16 +792,16 @@ pub fn answer_item_text(
 /// Rebuild an element from its *expanded* attributes when a construct survives the
 /// source rewrite, or `None` to keep the rewritten source.
 ///
-/// `Template:Plainlist` writes its body's open tag as
-/// `<div class="plainlist {{{class|}}}" {{safesubst<noinclude />:#if:…}}>`. The
-/// frame expanded both, so the token's `attribs` hold the answer while its `src`
-/// still spells the constructs. `rewrite_expanded_attrs` fixes the attribute
-/// (`class`), but the second construct is not an attribute, so it survives — and
-/// the module is then handed the raw call. Rebuilding the tag from the attributes
-/// drops it. A rewritten source that no longer spells a `{{…}}` is left alone, so
-/// the ordinary case (a substituted attribute value) is unchanged. Only an
-/// `#invoke` argument value does this; an answer that goes back to Lua keeps its
-/// source.
+/// A template construct can sit in attribute position and expand into whole
+/// attributes rather than a value. `Template:Plainlist` writes its body's open tag
+/// as `<div class="plainlist {{{class|}}}" {{safesubst<noinclude />:#if:…}}>`, and
+/// `Template:Div col` as `<div class="div-col {{#ifeq:…}}" {{#if:…}}>`; the frame
+/// expands both, so the token's `attribs` hold the answer while its `src` still
+/// spells the constructs. `rewrite_expanded_attrs` fixes the attribute (`class`),
+/// but the construct itself is not an attribute, so it survives — and the module is
+/// handed the raw call. Rebuilding the tag from the attributes resolves it. A
+/// rewritten source that no longer spells a `{{…}}` is left alone, so the ordinary
+/// case (a substituted attribute value) is unchanged.
 fn stale_tag_html(
     tok: &crate::wikitext::tokens_v2::ParsoidToken,
     rewritten: &str,

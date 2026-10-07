@@ -409,6 +409,43 @@ impl TmpDataMwPart {
     }
 }
 
+/// Reparse a templated attribute *key* that expanded into one or more `k="v"`
+/// strings, mirroring PHP's reparse-KV step in
+/// `AttributeExpander::buildExpandedAttrs`.
+///
+/// A construct in attribute position — `Template:Div col` writes
+/// `<div class="…" {{#if:…|style="…"}}>` — expands to a whole attribute, so the
+/// expanded key text is re-tokenized as attributes: `style="column-width: 10em;"`
+/// becomes a real `style` attribute rather than a key that merely spells it.
+/// `None` when the text is not such a construct (no `=`, or nothing parses).
+pub fn reparse_attr_key_string(k_str: &str) -> Option<Vec<KV>> {
+    use super::attribute_transform_manager::{items_to_key_value, key_value_to_items};
+
+    let k_str = k_str.trim();
+    if !k_str.contains('=') {
+        return None;
+    }
+    let kvs = crate::wikitext::tokenizer_v2::tokenize_as_attributes(k_str);
+    if kvs.is_empty() {
+        return None;
+    }
+    Some(
+        kvs.into_iter()
+            .map(|kv| KV {
+                key: items_to_key_value(vec![Item::Str(tpl_toks_to_string(&key_value_to_items(
+                    &kv.key,
+                )))]),
+                value: items_to_key_value(vec![Item::Str(tpl_toks_to_string(
+                    &key_value_to_items(&kv.value),
+                ))]),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            })
+            .collect(),
+    )
+}
+
 /// Expand a token's already-expanded attribute KVs into its final attributes,
 /// handling the reparse-KV-string and (scenario 1) mixed-content cases, and
 /// marking templated attributes with `mw:ExpandedAttrs`. Mirrors PHP
@@ -515,41 +552,22 @@ pub fn build_expanded_attrs(
 
             // Reparse-KV-string: a template that generates one or more `k=v`
             // strings is retokenized to recover the individual attributes.
-            if expanded_a.value.is_empty() {
-                let k_str = tokens_to_string(&expanded_k_items).trim().to_string();
-                if k_str.contains('=') {
-                    let kvs = crate::wikitext::tokenizer_v2::tokenize_as_attributes(&k_str);
-                    if !kvs.is_empty() {
-                        // At this point templates should have been expanded;
-                        // any leftovers are converted to plain strings.
-                        let clean_kvs: Vec<KV> = kvs
-                            .into_iter()
-                            .map(|kv| KV {
-                                key: items_to_key_value(vec![Item::Str(tpl_toks_to_string(
-                                    &key_value_to_items(&kv.key),
-                                ))]),
-                                value: items_to_key_value(vec![Item::Str(tpl_toks_to_string(
-                                    &key_value_to_items(&kv.value),
-                                ))]),
-                                src_offsets: None,
-                                ksrc: None,
-                                vsrc: None,
-                            })
-                            .collect();
-                        expanded_k = clean_kvs[0].key.clone();
-                        expanded_a.key = clean_kvs[0].key.clone();
-                        reparsed_kv = true;
-                        if new_attrs.is_none() {
-                            new_attrs = Some(if i == 0 {
-                                Vec::new()
-                            } else {
-                                expanded_attrs[..i].to_vec()
-                            });
-                        }
-                        if let Some(na) = new_attrs.as_mut() {
-                            na.extend(clean_kvs);
-                        }
-                    }
+            if expanded_a.value.is_empty()
+                && let Some(clean_kvs) =
+                    reparse_attr_key_string(&tokens_to_string(&expanded_k_items))
+            {
+                expanded_k = clean_kvs[0].key.clone();
+                expanded_a.key = clean_kvs[0].key.clone();
+                reparsed_kv = true;
+                if new_attrs.is_none() {
+                    new_attrs = Some(if i == 0 {
+                        Vec::new()
+                    } else {
+                        expanded_attrs[..i].to_vec()
+                    });
+                }
+                if let Some(na) = new_attrs.as_mut() {
+                    na.extend(clean_kvs);
                 }
             }
         }
