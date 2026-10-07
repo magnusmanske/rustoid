@@ -187,6 +187,32 @@ async fn only_non_text_branches_are_marked_as_expanded_attributes() {
     }
 }
 
+/// `#time` formats a date with `Language::sprintfDate`, the same routine
+/// Scribunto exposes as `mw.language:formatDate`, so the parser function and the
+/// module method share one implementation. The values are the service's:
+/// `{{#time:U|1986-02-14}}` is the release-date comparison `Template:Film date`
+/// builds, and the service answers 508723200.
+#[tokio::test]
+async fn time_formats_a_date() {
+    let html = render(
+        &[],
+        "{{#time:U|1986-02-14}} {{#time:Y-m-d|2020-01-02}} {{#time:n|2020-03-04}}",
+    )
+    .await;
+    assert!(html.contains("508723200"), "{html}");
+    assert!(html.contains("2020-01-02"), "{html}");
+    assert!(html.contains("3"), "{html}");
+}
+
+/// An unparseable date is an error, not the epoch: `#time` answers the
+/// documented `Error: Invalid time.` so a caller such as `Module:Time ago` can
+/// react to it.
+#[tokio::test]
+async fn time_reports_an_invalid_date() {
+    let html = render(&[], "{{#time:U|nonsense}}").await;
+    assert!(html.contains("Error: Invalid time."), "{html}");
+}
+
 /// The text outside tags. A `data-mw`/`data-parsoid` attribute legitimately
 /// carries source wikitext, so a whole-document search for `{{` reports every
 /// correctly-rendered transclusion as unexpanded.

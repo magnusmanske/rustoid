@@ -1272,6 +1272,31 @@ impl TemplateHandler {
             "expr" => ParserFunctions::pf_expr(params),
             "ifexpr" => ParserFunctions::pf_ifexpr(params),
             "iferror" => ParserFunctions::pf_iferror(params),
+            // `{{#time: format | date | language }}` — MediaWiki formats a date
+            // with `Language::sprintfDate`, the same routine Scribunto exposes as
+            // `mw.language:formatDate`, so the two share one implementation
+            // (`lua::engine::format_date`). `#timel` uses the site timezone, which
+            // is UTC on this wiki, so it answers the same.
+            "time" | "timel" => {
+                let format = params
+                    .args
+                    .first()
+                    .map(|kv| key_value_to_string(&kv.key))
+                    .unwrap_or_default();
+                let date = params
+                    .args
+                    .get(1)
+                    .map(|kv| key_value_to_string(&kv.value))
+                    .unwrap_or_default();
+                match crate::lua::engine::format_date(&format, &date) {
+                    Ok(s) => vec![Item::Str(s)],
+                    Err(message) => {
+                        vec![Item::Str(format!(
+                            "<strong class=\"error\">{message}</strong>"
+                        ))]
+                    }
+                }
+            }
             // `{{#ifexist:TITLE|then|else}}` — core `ParserFunctions::ifexist`,
             // which answers `then` when the title exists and `else` otherwise,
             // and does **not** trim its branch (unlike `#if`). The existence

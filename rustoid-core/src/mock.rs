@@ -671,6 +671,8 @@ impl MockSiteConfig {
             "ifexpr",
             "switch",
             "expr",
+            "time",
+            "timel",
             "tag",
             "anchorencode",
         ] {

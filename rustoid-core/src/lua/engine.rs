@@ -4249,6 +4249,19 @@ fn parse_date(stamp: &str) -> Option<(i32, usize, u32, u32, u32, u32)> {
         ));
     }
 
+    // The fourteen-digit `YYYYMMDDHHMMSS` form, which `{{CURRENTTIMESTAMP}}`
+    // produces and `#time` reads as a full timestamp.
+    if date_part.len() == 14 && date_part.bytes().all(|b| b.is_ascii_digit()) {
+        return Some((
+            date_part[..4].parse().ok()?,
+            date_part[4..6].parse().ok()?,
+            date_part[6..8].parse().ok()?,
+            date_part[8..10].parse().ok()?,
+            date_part[10..12].parse().ok()?,
+            date_part[12..14].parse().ok()?,
+        ));
+    }
+
     // `<month name> <year>` and `<year> <month name>`, the two orders that occur.
     let words: Vec<&str> = date_part.split_whitespace().collect();
     if words.len() == 2 {
@@ -8378,6 +8391,10 @@ mod tests {
         assert_eq!(ts("2020-1-1"), "1577836800");
         // Eight digits, same instant.
         assert_eq!(ts("2020-01-01"), ts("20200101"));
+        // Fourteen digits, the `{{CURRENTTIMESTAMP}}` shape: `#time` reads it as
+        // a full timestamp. The service gave 1791374400 for
+        // `{{#time:U|20261007120000}}`.
+        assert_eq!(ts("20261007120000"), "1791374400");
         // A time of day is accepted, and the date half still matches.
         assert_eq!(format_date("H:i", "2020-01-01 07:30").unwrap(), "07:30");
         // A month name in either order; the service gives 2020-01-01 for both.
