@@ -127,6 +127,30 @@ async fn references_renders_the_note_list() {
     );
 }
 
+/// `responsive=0` drops Cite's responsive wrapper: the `<ol>` *is* the extension
+/// element, so `typeof`/`about`/`data-mw` land on it and no `mw-references-wrap`
+/// div appears. `Template:Reflist` passes `responsive=0` for a fixed-width
+/// reflist, and the wrapper would draw a node id the oracle does not spend. An
+/// absent attribute (the default) keeps the wrapper.
+#[tokio::test]
+async fn a_non_responsive_references_list_is_the_extension_element() {
+    let fixed = render("A<ref>Body</ref>\n<references responsive=\"0\"/>").await;
+    assert!(
+        fixed.contains("<ol class=\"mw-references references\" typeof=\"mw:Extension/references\""),
+        "the ol itself must be the extension element: {fixed}"
+    );
+    assert!(
+        !fixed.contains("mw-references-wrap"),
+        "responsive=0 must not add the wrapper: {fixed}"
+    );
+
+    let responsive = render("A<ref>Body</ref>\n<references/>").await;
+    assert!(
+        responsive.contains("<div class=\"mw-references-wrap\" typeof=\"mw:Extension/references\""),
+        "an absent attribute keeps the wrapper: {responsive}"
+    );
+}
+
 /// A note's body must not appear as *text* at the call site — only its marker does.
 ///
 /// This is the property that makes Cite a two-part feature: a `<ref>`'s content is

@@ -704,7 +704,7 @@ fn walk_render(
         );
     }
 
-    if let Some((group, attrs_json, has_body)) = read_references(node) {
+    if let Some((group, attrs_json, has_body, responsive)) = read_references(node) {
         let refs = state.group(&group);
         // The list renderer works in terms of the `Reference`; the body renderer the
         // caller supplied works in terms of wikitext. Bridging here keeps the
@@ -712,30 +712,47 @@ fn walk_render(
         // be available.
         let body = |r: &Reference| body_of(r);
         let list = references_list_nodes(&refs, &group, page_title, &body);
-        let mut wrap = crate::dom::node::Node::element(crate::dom::node::ElementKind::Other(
-            "div".to_string(),
-        ));
-        // Cite adds `mw-references-columns` when the responsive wrapper holds more
-        // than `CiteResponsiveReferencesThreshold` (10) notes.
-        const RESPONSIVE_THRESHOLD: usize = 10;
-        let class = if refs.len() > RESPONSIVE_THRESHOLD {
-            "mw-references-wrap mw-references-columns"
-        } else {
-            "mw-references-wrap"
-        };
-        wrap.set_attr("class", class);
-        wrap.set_attr("typeof", "mw:Extension/references");
-        // The wrapper is the element Cite leaves behind, so it draws a node id
-        // here (Cite's `$refsNode` is the extension element itself).
-        mark_for_id(&mut wrap);
-        // The id was spent during expansion (see `expand_templates`), where the
-        // service spends it; only a tag that somehow reached here unnumbered
-        // takes a fresh one.
+        // Cite wraps the list in a responsive container unless `responsive` is
+        // falsy (`Template:Reflist` passes `responsive=0` for a fixed-width
+        // reflist). Either way the *container* is the extension element — the
+        // wrapper when there is one, the `<ol>` otherwise — so it is the node
+        // that carries `typeof`/`about`/`data-mw` and draws an id.
         let about = node.get_attr("about").map(str::to_string);
-        wrap.set_attr("about", about.unwrap_or_else(|| ids.take_about()));
-        wrap.set_attr("data-mw", references_data_mw(&attrs_json, false, has_body));
-        wrap.push_child(list);
-        *node = wrap;
+        let data_mw = references_data_mw(&attrs_json, false, has_body);
+        if responsive {
+            let mut wrap = crate::dom::node::Node::element(crate::dom::node::ElementKind::Other(
+                "div".to_string(),
+            ));
+            // Cite adds `mw-references-columns` when the responsive wrapper holds
+            // more than `CiteResponsiveReferencesThreshold` (10) notes.
+            const RESPONSIVE_THRESHOLD: usize = 10;
+            let class = if refs.len() > RESPONSIVE_THRESHOLD {
+                "mw-references-wrap mw-references-columns"
+            } else {
+                "mw-references-wrap"
+            };
+            wrap.set_attr("class", class);
+            wrap.set_attr("typeof", "mw:Extension/references");
+            // The wrapper is the element Cite leaves behind, so it draws a node id
+            // here (Cite's `$refsNode` is the extension element itself).
+            mark_for_id(&mut wrap);
+            // The id was spent during expansion (see `expand_templates`), where the
+            // service spends it; only a tag that somehow reached here unnumbered
+            // takes a fresh one.
+            wrap.set_attr("about", about.unwrap_or_else(|| ids.take_about()));
+            wrap.set_attr("data-mw", data_mw);
+            wrap.push_child(list);
+            *node = wrap;
+        } else {
+            // No wrapper: the `<ol>` is the extension element, so the extension's
+            // `typeof`/`about`/`data-mw` land on it (the `<ol>` already drew its id
+            // in `references_list_nodes`).
+            let mut list = list;
+            list.set_attr("typeof", "mw:Extension/references");
+            list.set_attr("about", about.unwrap_or_else(|| ids.take_about()));
+            list.set_attr("data-mw", data_mw);
+            *node = list;
+        }
         return;
     }
 
@@ -823,7 +840,13 @@ fn typeof_contains(node: &crate::dom::node::Node, value: &str) -> bool {
 /// `has_body` is false for a self-closing `<references/>` and true for a tag
 /// pair (which records an empty `data-mw.body`), matching the `selfClose` flag
 /// Cite reads.
-fn read_references(node: &crate::dom::node::Node) -> Option<(String, String, bool)> {
+///
+/// `responsive` is whether Cite wraps the list in its responsive container.
+/// Cite treats the attribute as a PHP boolean-style switch, so an absent
+/// attribute is *on* (the default) and only a falsy value (`""`/`"0"`)
+/// turns it off — `Template:Reflist` passes `responsive=0` for a fixed-width
+/// reflist, and the `<ol>` is then the extension element with no wrapper.
+fn read_references(node: &crate::dom::node::Node) -> Option<(String, String, bool, bool)> {
     if !typeof_contains(node, "mw:Extension") || node.get_attr("name") != Some("references") {
         return None;
     }
@@ -831,13 +854,19 @@ fn read_references(node: &crate::dom::node::Node) -> Option<(String, String, boo
     let has_body = !source.trim_end().ends_with("/>");
     let attrs = start_tag_attrs(source, "references")?;
     let group = attr_value(attrs, "group").unwrap_or_default();
+    let responsive = attr_value(attrs, "responsive").is_none_or(|v| !(v.is_empty() || v == "0"));
     let mut pairs = Vec::new();
     let mut rest = attrs;
     while let Some((key, value, consumed)) = next_attr(rest) {
         pairs.push(format!("{}:{}", json_string(key), json_string(value)));
         rest = &rest[consumed..];
     }
-    Some((group, format!("{{{}}}", pairs.join(",")), has_body))
+    Some((
+        group,
+        format!("{{{}}}", pairs.join(",")),
+        has_body,
+        responsive,
+    ))
 }
 
 /// Read one `key=value` (or bare `key`) pair from the front of an attribute run.
