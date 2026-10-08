@@ -327,6 +327,11 @@ pub enum Outcome {
     /// `Module:Location map` does — never reaches the load, so the module case
     /// never fires and the fact is the only signal there is.
     MissingTitle(String),
+    /// Wikidata entities the run asked `mw.wikibase` for and the host had never
+    /// fetched. Like a missing title, fetched into the frame's entity table and
+    /// the module re-run: an id built at runtime (`'P'..property`) is invisible
+    /// to the literal preload scan.
+    MissingEntities(Vec<String>),
 }
 
 /// How many times one `#invoke` may be re-run for deferred frame calls.
@@ -364,6 +369,7 @@ pub fn run_once(
     args: &[Arg],
     answers: &crate::pipeline::lua_deferred::DeferredAnswers,
     unfetchable: &std::collections::HashSet<String>,
+    unfetchable_entities: &std::collections::HashSet<String>,
 ) -> Result<Outcome> {
     // Scribunto's entry module must be present; a `#invoke` of a non-existent
     // module is an error, and the caller turns it into MediaWiki's message.
@@ -377,6 +383,9 @@ pub fn run_once(
     // Titles already proven absent travel with the run, so `require` reports them
     // as missing pages rather than as preload misses.
     frame.unfetchable = unfetchable.clone();
+    // Likewise the entities already proven absent: `mw.wikibase` answers `nil`
+    // for them without asking the host to fetch again.
+    frame.unfetchable_entities = unfetchable_entities.clone();
     // `mw.title.getCurrentTitle()` answers about the *page being parsed*, not the
     // frame that made this `#invoke` call: a module invoked from inside a template
     // still asks about the article. `page_title` here is the invoking frame's
@@ -408,6 +417,10 @@ pub fn run_once(
             if let Some(missing) = engine.take_missing_modules().into_iter().next() {
                 return Ok(Outcome::MissingModule(missing));
             }
+            let missing_entities = engine.take_missing_entities();
+            if !missing_entities.is_empty() {
+                return Ok(Outcome::MissingEntities(missing_entities));
+            }
             // A `pcall` around a frame method swallows the deferred-call marker,
             // so a run can finish "successfully" while still having asked the host
             // to expand something — `Module:Autotaxobox`'s `getTaxonInfoItem`
@@ -431,6 +444,10 @@ pub fn run_once(
             }
             if let Some(missing) = engine.take_missing_modules().into_iter().next() {
                 return Ok(Outcome::MissingModule(missing));
+            }
+            let missing_entities = engine.take_missing_entities();
+            if !missing_entities.is_empty() {
+                return Ok(Outcome::MissingEntities(missing_entities));
             }
             match engine.take_pending() {
                 // The module asked the host to expand something. `take_pending` is
@@ -548,6 +565,14 @@ where
     // takes its own fallback, rather than the whole render aborting on a page
     // that was never going to arrive.
     let mut unfetchable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Entity ids the loop tried to fetch and could not get; the engine answers
+    // `nil` for them without asking again, so a runtime-built id that names no
+    // entity cannot be re-requested every round.
+    let mut unfetchable_entities: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Entities fetched on demand for a runtime-built id, kept so a later module
+    // preload refresh (which replaces `frame.entities`) does not drop them.
+    let mut on_demand_entities: Vec<(String, String)> = Vec::new();
 
     for _ in 0..MAX_PRELOAD_ROUNDS + MAX_FRAME_ROUNDS {
         // A title to fetch this round, from whichever signal reported it: an
@@ -562,6 +587,7 @@ where
             args,
             &answers,
             &unfetchable,
+            &unfetchable_entities,
         ) {
             Ok(Outcome::MissingModule(title)) => Err(RustoidError::Lua(format!(
                 "module {title} was not preloaded"
@@ -606,6 +632,13 @@ where
                         ),
                     )
                     .await;
+                    // An on-demand entity survives this refresh: the refresh only
+                    // knows the literals in the wider registry, so assigning it
+                    // wholesale would drop an entity already fetched for a
+                    // runtime-built id. Re-insert anything the refresh lost.
+                    for (id, json) in on_demand_entities.iter() {
+                        frame.entities.insert(id, json.clone());
+                    }
                     continue;
                 }
                 _ => return Err(RustoidError::Lua(with_page(msg, &entity_page))),
@@ -632,6 +665,25 @@ where
                 frame
                     .titles
                     .insert(title.clone(), title_facts_of(source, &site, &title).await);
+                continue;
+            }
+            // Entities a module named that the host had never fetched. Fetched
+            // into the frame's entity table; an id that yields nothing is
+            // recorded so the next round answers `nil` without re-requesting.
+            Outcome::MissingEntities(ids) => {
+                for id in ids {
+                    match source.get_entity(&id).await {
+                        Ok(Some(json)) => {
+                            frame.entities.insert(&id, json.clone());
+                            if !on_demand_entities.iter().any(|(k, _)| k == &id) {
+                                on_demand_entities.push((id, json));
+                            }
+                        }
+                        _ => {
+                            unfetchable_entities.insert(id);
+                        }
+                    }
+                }
                 continue;
             }
             Outcome::Deferred(request) => {

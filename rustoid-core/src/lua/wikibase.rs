@@ -154,6 +154,22 @@ fn entity_id_in(text: &str) -> Option<String> {
     Some(format!("{}{digits}", kind.to_ascii_uppercase()))
 }
 
+/// Whether `text` is a well-formed entity id.
+///
+/// The rule `mw.wikibase.isValidEntityId` enforces: `Q`/`P` followed by digits
+/// with no leading zero. Used to decide whether a `mw.wikibase` lookup that
+/// missed is worth fetching — a module may index the entity table with an
+/// arbitrary key, and only a real id can name an entity.
+pub(crate) fn is_entity_id(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some('Q' | 'q' | 'P' | 'p') => {}
+        _ => return false,
+    }
+    let digits: String = chars.collect();
+    !digits.is_empty() && !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +236,21 @@ mod tests {
             local d = 'not-an-id'
         "#;
         assert_eq!(referenced_entity_ids(src), vec!["P31", "Q42"]);
+    }
+
+    #[test]
+    fn a_well_formed_id_is_recognized_whatever_its_case() {
+        // The rule `mw.wikibase.isValidEntityId` uses: `Q`/`P` then digits, no
+        // leading zero. Only a real id can name an entity, so anything else must
+        // not trigger a fetch.
+        for id in ["Q42", "p31", "Q1", "P9999"] {
+            assert!(is_entity_id(id), "{id} should be valid");
+        }
+        for id in [
+            "", "Q", "P", "Q0", "P01", "q", "42", "Q4x", "Foo", "Q42/doc",
+        ] {
+            assert!(!is_entity_id(id), "{id} should be invalid");
+        }
     }
 
     #[test]

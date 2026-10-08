@@ -441,12 +441,23 @@ impl CachedDataSource {
     }
 
     /// Persist the manifest, covering entries not yet written out.
+    ///
+    /// The entity wiki has its own cache handle, so its manifest is written too:
+    /// without that, entities fetched during this render are on disk but
+    /// unindexed, and an offline run (or `--reindex`) would not find them.
     pub fn flush(&self) -> Result<()> {
         self.pending.store(0, std::sync::atomic::Ordering::Relaxed);
         self.cache
             .lock()
             .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
-            .write_index()
+            .write_index()?;
+        if let Some(wiki) = &self.entities {
+            wiki.cache
+                .lock()
+                .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+                .write_index()?;
+        }
+        Ok(())
     }
 
     /// Look up a cached body, or fetch it via the client and store it.

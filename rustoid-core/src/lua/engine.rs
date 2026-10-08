@@ -279,6 +279,12 @@ pub struct FrameContext {
     /// second asks the host to fetch again — which for a page that genuinely does
     /// not exist means the whole render aborts.
     pub unfetchable: std::collections::HashSet<String>,
+    /// Entity ids the host has already tried to fetch without success.
+    ///
+    /// A `mw.wikibase` lookup of an id in here is *known* to be absent, so it
+    /// must not ask the host to fetch it again — otherwise a module that builds
+    /// an id at runtime would re-request a nonexistent entity on every round.
+    pub unfetchable_entities: std::collections::HashSet<String>,
     /// Arguments of the invoking template's frame.
     pub parent_args: Vec<Arg>,
     /// Its title.
@@ -392,6 +398,9 @@ pub struct LuaContext {
     /// Titles the host already tried and failed to fetch; see
     /// [`FrameContext::unfetchable`].
     pub unfetchable: std::collections::HashSet<String>,
+    /// Entity ids the host already tried and failed to fetch; see
+    /// [`FrameContext::unfetchable_entities`].
+    pub unfetchable_entities: std::collections::HashSet<String>,
     /// Wikidata entities available to `mw.wikibase`, keyed by upper-cased id
     /// (`Q42`), with the page title each id is the sitelink of when known.
     ///
@@ -413,6 +422,7 @@ impl LuaContext {
             titles: std::collections::HashMap::new(),
             modules: std::collections::HashMap::new(),
             unfetchable: std::collections::HashSet::new(),
+            unfetchable_entities: std::collections::HashSet::new(),
             entities: crate::lua::wikibase::Entities::default(),
         }
     }
@@ -433,6 +443,7 @@ impl LuaContext {
             titles: std::collections::HashMap::new(),
             modules,
             unfetchable: std::collections::HashSet::new(),
+            unfetchable_entities: std::collections::HashSet::new(),
             entities: crate::lua::wikibase::Entities::default(),
         }
     }
@@ -453,6 +464,7 @@ impl LuaContext {
             current_title: current_title.into(),
             modules: frame.modules,
             unfetchable: frame.unfetchable,
+            unfetchable_entities: frame.unfetchable_entities,
             parent_args: frame.parent_args,
             parent_title: frame.parent_title,
             has_parent: frame.has_parent,
@@ -571,6 +583,16 @@ impl LuaEngine {
         self.take_registry_titles(MISSING_TITLES)
     }
 
+    /// Entities a run asked `mw.wikibase` for and the host had never fetched,
+    /// taken and cleared.
+    ///
+    /// The counterpart of [`take_missing_titles`](Self::take_missing_titles) for
+    /// Wikidata: an id built at runtime (`'P'..property`) cannot be preloaded, so
+    /// the caller fetches it and runs the module again.
+    pub fn take_missing_entities(&self) -> Vec<String> {
+        self.take_registry_titles(MISSING_ENTITIES)
+    }
+
     /// Drain a named registry list of titles, de-duplicated.
     fn take_registry_titles(&self, slot: &str) -> Vec<String> {
         let Ok(t) = self.lua.named_registry_value::<mlua::Table>(slot) else {
@@ -654,6 +676,12 @@ impl LuaEngine {
         // the consequence, and `title.exists` never raises at all.
         self.lua
             .set_named_registry_value(MISSING_TITLES, self.lua.create_table()?)
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        // And a fresh collector for entities looked up but never fetched. A
+        // runtime-built id is reported here rather than as a miss, since a
+        // missing entity is a state `mw.wikibase` handles.
+        self.lua
+            .set_named_registry_value(MISSING_ENTITIES, self.lua.create_table()?)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
         let module = self.load_module_value(module_source, Some(title))?;
@@ -767,7 +795,19 @@ fn entity_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let by_id_ctx = ctx.clone();
     let by_id = lazy_index_table(lua, move |lua, key| match by_id_ctx.entities.get(key) {
         Some(json) => entity_value(lua, json),
-        None => Ok(Value::Nil),
+        None => {
+            // A valid id that was not fetched is worth fetching: the id may have
+            // been built at runtime (`'P'..property`), which the literal preload
+            // scan cannot see. An id already tried and found absent is left
+            // alone, so a module cannot re-request it forever.
+            let upper = key.to_ascii_uppercase();
+            if crate::lua::wikibase::is_entity_id(key)
+                && !by_id_ctx.unfetchable_entities.contains(&upper)
+            {
+                note_missing_entity(lua, &upper).map_err(|e| RustoidError::Lua(e.to_string()))?;
+            }
+            Ok(Value::Nil)
+        }
     })?;
     let by_title_ctx = ctx.clone();
     let by_title = lazy_index_table(lua, move |lua, key| {
@@ -915,6 +955,15 @@ const MISSING_MODULES: &str = "rustoid_missing_modules";
 /// wrong — it is not a module and could be in any namespace.
 const MISSING_TITLES: &str = "rustoid_missing_titles";
 
+/// Named registry slot holding the Wikidata entities a run asked `mw.wikibase`
+/// for and the host had never fetched. See [`LuaEngine::take_missing_entities`].
+///
+/// A module can build an entity id at runtime — `Module:Taxonbar` reads a
+/// property number from its configuration and asks for `'P'..property` — and
+/// such an id is invisible to the literal preload scan, so it has to be
+/// reported the way a runtime-built module name is.
+const MISSING_ENTITIES: &str = "rustoid_missing_entities";
+
 /// Record that the current run needed a title the host was not asked about.
 ///
 /// Appends to [`MISSING_TITLES`], which the caller drains after the run and
@@ -934,6 +983,25 @@ fn note_missing_title(lua: &Lua, title: &str) -> mlua::Result<()> {
         }
     }
     missing.raw_set(len + 1, title.to_string())
+}
+
+/// Record that the current run needed an entity the host has not fetched.
+///
+/// Appends to [`MISSING_ENTITIES`], de-duplicated so a module that looks the
+/// same id up repeatedly does not grow the list on every retry round.
+fn note_missing_entity(lua: &Lua, id: &str) -> mlua::Result<()> {
+    let Ok(missing) = lua.named_registry_value::<Table>(MISSING_ENTITIES) else {
+        // No collector installed (a bare engine in a unit test): the lookup
+        // still answers `nil`, which is a state `mw.wikibase` supports.
+        return Ok(());
+    };
+    let len = missing.raw_len();
+    for i in 1..=len {
+        if missing.raw_get::<Option<String>>(i)?.as_deref() == Some(id) {
+            return Ok(());
+        }
+    }
+    missing.raw_set(len + 1, id.to_string())
 }
 
 const WIKIBASE_LIB: &str = r#"
