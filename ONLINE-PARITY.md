@@ -13227,3 +13227,68 @@ serves `Extant_[[Perissodactyla|Perissodactyla_<small>(Odd-toed_ungulates)
 </small>]]_species_by_suborder5182`. The attribute value's wikitext (a link with
 nested markup) is served unexpanded, and the trailing counter differs with it —
 the navbox's label attribute is the next target.
+
+## `mw.uri.anchorEncode` is core's `anchorencode`, not a bare replace
+
+The difference at 523335 was the same navbox `aria-labelledby`: the service
+served `Extant_Perissodactyla_(Odd-toed_ungulates)_species_by_suborder4974`,
+rustoid `Extant_[[Perissodactyla|Perissodactyla_<small>(Odd-toed_ungulates)
+</small>]]_species_by_suborder5182`. Reduced to `{{Perissodactyla}}`, and then to
+`{{Navbox|title=…}}`.
+
+`Module:Navbox` builds that attribute from `mw.uri.anchorEncode(args.title) ..
+args.argHash`. rustoid's `mw.uri.anchorEncode` was a bare `' '` → `'_'` replace
+plus `?`/`#` escapes. In MediaWiki it is not a string helper at all — Scribunto's
+`UriLibrary::anchorEncode` calls `CoreParserFunctions::anchorencode`:
+
+```php
+$text = $parser->killMarkers( $text );
+$section = substr( $parser->guessSectionNameFromWikiText( $text ), 1 );
+$encodedSection = Sanitizer::safeEncodeAttribute( $section );
+return str_replace( '&#95;', '_', $encodedSection );
+```
+
+and `guessSectionNameFromWikiText` is `'#' . Sanitizer::escapeIdForLink(
+getSectionNameFromStrippedText( stripSectionName( $text ) ) )`. The decisive step
+is `Parser::stripSectionName`, which removes wikitext links (`[[a|b]]` → `b`),
+external links (`[url label]` → `label`), quote markup (`''`/`'''`), and HTML
+tags — which is why the served anchor carries neither the link nor the
+`<small>`.
+
+This is **not** Parsoid's standalone `ParserFunctions::pf_anchorencode`, which
+rustoid already ports and the fixture suite pins (`wikiLinks.txt`, T179544):
+standalone Parsoid leaves the markup and protects the delimiters with `mw:Entity`
+spans. Core's is the integrated-mode behaviour a live wiki serves, so
+`mw.uri.anchorEncode` gets its own port, `pipeline::anchor_encode::AnchorEncoder`.
+
+Two fidelity notes. The steps that need a `Parser`/`TitleCodec` are reduced to
+their observable effect: `killMarkers` has nothing to remove on an
+already-expanded Lua string, and `normalizeSectionName` (which makes `#$text`
+the whole fragment, so the illegal-character and `~~~` checks never fire)
+collapses to the title-whitespace collapse plus the fragment's `_` → ` ` swap,
+including the no-break space an `&nbsp;` decodes to. `Parser::doQuotes` is ported
+verbatim. And the protocol-derived patterns are compiled **once per engine**,
+not per call: `Module:Citation/CS1` calls `anchorEncode` once per citation
+(~150 000 times on `World War II`), and compiling two regexes per call pushed
+that page past the 60 s per-page cap and tripped the corpus's stuck-render
+breaker.
+
+### Effect
+
+`Zebra` **523335 → 523667** (93.42% → **93.48%**); the reduced `{{Perissodactyla}}`
+navbox's `aria-labelledby` and `argHash` now match the service byte-for-byte
+(checked against the live transform endpoint). No other corpus page's first
+difference moves — including the five `lua, cite` pages (`Cristiano Ronaldo`,
+`Lionel Messi`, `Taylor Swift`, `Israel`, `India`), which were baseline-compared
+against the pre-change binary and agree exactly (they simply need a per-page cap
+above 60 s, which the corpus default masks as a stall). State: fixture guard
+**877/896**, lib **984**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (523667)
+
+Still `{{Perissodactyla}}`'s navbox title, in the `mw-empty-elt` span: the
+service serves a deduplicated `<link rel="mw-deduplicated-inline-style"
+href="mw-data:TemplateStyles:r1374427404" … Hlist/styles.css …/>` *before* the
+`<style>`, while rustoid starts straight at the `<style>` for
+`Module:Navbar/styles.css`. The templatestyles dedup/ordering inside the navbox
+title is the next target.
