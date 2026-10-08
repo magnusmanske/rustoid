@@ -3426,10 +3426,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         while i < items.len() {
             match answer_marker_span(items, i) {
                 Some((end, tokens, tag)) => {
-                    let marker = format!(
-                        "\u{7f}UNIQ--{tag}-{:08X}-QINU\u{7f}",
-                        self.strip_markers.borrow().len()
-                    );
+                    let marker = strip_marker(&tag, self.strip_markers.borrow().len());
                     self.strip_markers
                         .borrow_mut()
                         .insert(marker.clone(), tokens);
@@ -5887,6 +5884,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 }
 
+/// MediaWiki's strip-marker format — `Parser::MARKER_PREFIX`/`MARKER_SUFFIX`:
+/// `\x7f'"`UNIQ--<tag>-<8 hex>-QINU`"'\x7f`.
+///
+/// The `'"`` characters are MediaWiki's, not decoration: a marker smuggled into
+/// an attribute must be escaped, or it could break out of the attribute. They
+/// also make the marker six bytes longer, which is observable wherever the
+/// marker text is *measured* rather than resolved — `Module:Navbox` sums its
+/// arguments' lengths into the navbox `id`'s `argHash`, and an argument holding
+/// a `{{Nobold}}` (which carries a `Nobold/styles.css` marker) then counted six
+/// bytes short.
+fn strip_marker(tag: &str, id: usize) -> String {
+    format!("\u{7f}'\"`UNIQ--{tag}-{id:08X}-QINU`\"'\u{7f}")
+}
+
 /// Whether a deferred request is a `frame:extensionTag('templatestyles', …)` —
 /// lowered to `#tag` with `templatestyles` as its first argument.
 ///
@@ -6831,6 +6842,13 @@ mod tests {
         assert!(s.contains("{|"), "got: {s}");
         assert!(s.contains("|}"), "got: {s}");
         assert!(s.contains("UNIQ--templatestyles-"), "got: {s}");
+        // The markers carry MediaWiki's `'"`` armoring around `UNIQ-`/`-QINU`,
+        // which makes them 42 bytes rather than 36 — a length a module can
+        // *measure* (Module:Navbox's `argHash`). See [`strip_marker`].
+        assert!(
+            s.contains("\u{7f}'\"`UNIQ--templatestyles-00000000-QINU`\"'\u{7f}"),
+            "got: {s}"
+        );
         assert!(s.contains('a'), "got: {s}");
     }
 
