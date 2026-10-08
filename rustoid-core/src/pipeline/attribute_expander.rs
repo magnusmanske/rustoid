@@ -391,20 +391,24 @@ struct TmpDataMwPart {
 }
 
 impl TmpDataMwPart {
+    /// Finish one half of a `data-mw.attribs` pair.
+    ///
+    /// Both halves are always objects: PHP builds the key as `[ 'txt' => …,
+    /// 'srcOffsets' => … ]` and the value as `[ 'html' => … ]`, and
+    /// `expandAttrValueToDOM` strips `srcOffsets` without collapsing a
+    /// txt-only array back to a string. A key therefore serializes as
+    /// `{"txt":"title"}` even when the key itself was not templated, not as a
+    /// bare `"title"`.
     fn into_data_mw_value(
         self,
         value_to_html: &mut dyn FnMut(&KeyValue) -> String,
     ) -> crate::wikitext::tokens_v2::DataMwValue {
         use crate::wikitext::tokens_v2::DataMwValue;
         let html = self.html_src.map(|kv| value_to_html(&kv));
-        if html.is_some() || self.uneditable {
-            DataMwValue::Object {
-                txt: self.txt,
-                html,
-                uneditable: self.uneditable,
-            }
-        } else {
-            DataMwValue::Str(self.txt.unwrap_or_default())
+        DataMwValue::Object {
+            txt: self.txt,
+            html,
+            uneditable: self.uneditable,
         }
     }
 }
