@@ -13292,3 +13292,58 @@ href="mw-data:TemplateStyles:r1374427404" … Hlist/styles.css …/>` *before* t
 `<style>`, while rustoid starts straight at the `<style>` for
 `Module:Navbar/styles.css`. The templatestyles dedup/ordering inside the navbox
 title is the next target.
+
+## A repeated frame call must get its own answer
+
+The 523667 difference was that missing dedup link: the service served `<style…
+Hlist/styles.css>` … `<link rel="mw-deduplicated-inline-style" href="mw-data:
+TemplateStyles:r1374427404" …>` … `<style… Module:Navbar/styles.css>`, rustoid only
+the two `<style>`s. Reduced to `{{Navbox|name=Foo|title=Bar}}`, then traced.
+
+`Module:Navbar._navbar` returns `frame:extensionTag{name='templatestyles',
+args={src='Hlist/styles.css'}} .. frame:extensionTag{name='templatestyles',
+args={src='Module:Navbar/styles.css'}} .. <div>`, and `Module:Navbox` also emits
+`Hlist/styles.css` (its `has_navbar()` fallback). Both are `frame:extensionTag`
+with identical arguments.
+
+MediaWiki evaluates every `frame:` call independently, so the two calls return
+two distinct `UNIQ…QINU` strip markers, and `DedupeStyles` then turns the second
+node into a `<link>`. rustoid's re-run model caches each frame answer by *call
+identity* (`FrameRequest::key`), so the second identical call was served the
+first call's marker. The module's output then carried the same marker twice; the
+fragment id is drained once, so the second occurrence produced no `<style>` at
+all — not even a link.
+
+### Fix
+
+Number each call of a request identity: the first is cached at `base`, the n-th
+repeat at `base#n`. Both sides apply the same numbering — the engine's
+`frame_method` counts the calls it makes, the host counts the answers it stores —
+and they stay in step because the module re-runs deterministically and answers
+at most one new request per round (`FrameCallOrdinals`, `next_call_key`).
+`frame.args` batches (`ExpandArgs`) already key each argument separately and are
+left alone.
+
+The ordinals are shared by every frame in a run (the `frame` is built once per
+`#invoke`, and a `require`d module like `Module:Navbar` calls
+`mw.getCurrentFrame()` on the same one), so the numbering is global to the run,
+matching the host's. This adds rounds only for calls that are genuinely repeated;
+the `MAX_FRAME_ROUNDS` bound and the `did not settle` guard are unchanged, and no
+corpus page produced either.
+
+### Effect
+
+`Zebra` **523667 → 526865** (93.48% → **94.05%**); `Tropical cyclone` **19003 →
+44036**; `United States` is now within the per-page cap and compares at 1690. No
+other corpus page's first difference moves, and no page gained a round/script
+error (`lua failures` 25 → 26, the one extra being `United States`, which now
+compares). State: fixture guard **877/896**, lib **984**, compare **117**, clippy
+and fmt clean.
+
+### Next difference on `Zebra` (526865)
+
+A navbox *subgroup* id: the service serves `id="Hippomorpha1409"`, rustoid
+`id="Hippomorpha1403"`. That is `mw.uri.anchorEncode(group1) .. args.argHash`
+again (the earlier section), so `argHash` — the sum of the argument lengths
+`Module:Navbox` computes — still differs by 6 on this subgroup. One of its
+arguments is six bytes off, which the next reduction should pin down.
