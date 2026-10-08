@@ -13347,3 +13347,54 @@ A navbox *subgroup* id: the service serves `id="Hippomorpha1409"`, rustoid
 again (the earlier section), so `argHash` — the sum of the argument lengths
 `Module:Navbox` computes — still differs by 6 on this subgroup. One of its
 arguments is six bytes off, which the next reduction should pin down.
+
+## Strip markers must be MediaWiki's exact bytes
+
+The 526865 difference was a navbox *subgroup* id: the service served
+`id="Hippomorpha1409"`, rustoid `id="Hippomorpha1403"`. That id is
+`mw.uri.anchorEncode(group1 or above or title) .. args.argHash`, and
+`Module:Navbox` computes `argHash` as the **sum of its arguments' lengths**
+(after removing templatestyles strip markers from them, but *before* measuring).
+So a six-byte difference in one argument moves the id — and only the id, which is
+why the reduced `{{Navbox|subgroup|above='''[[Hippomorpha]]'''}}` matched while
+adding `group2` did not.
+
+Reduced further: `group2={{Nobold|X}}` alone reproduces the six-byte gap.
+`Template:Nobold` is `<templatestyles src="Nobold/styles.css"/><span
+class="nobold">{{{1}}}</span>`, so the argument the module receives is a
+`UNIQ…QINU` strip marker followed by the span — and the *marker* was the wrong
+length.
+
+MediaWiki builds it as `Parser::MARKER_PREFIX . "-" . $name . "-" .
+sprintf( '%08X', $id ) . Parser::MARKER_SUFFIX`, whose two ends are:
+
+```text
+MARKER_PREFIX = "\x7f'\"`UNIQ-"
+MARKER_SUFFIX = "-QINU`\"'\x7f"
+```
+
+rustoid emitted `\x7fUNIQ--…-QINU\x7f` — without the single-quote,
+double-quote, and backtick armoring on either end — which is six bytes shorter
+(36 vs 42).
+
+### Fix
+
+`strip_marker` now emits MediaWiki's exact bytes. The armor characters are not
+decoration: they must be escaped in an attribute, which is what stops a marker
+smuggled into one from breaking out of it. Their absence is invisible wherever a
+marker is *resolved*, but not wherever a module *measures* it — and `argHash`
+sums lengths.
+
+### Effect
+
+`Zebra` **526865 → 535277** (94.05% → **95.55%**); `World War II` **10297 →
+21353**. No other corpus page's first difference moves, and no page gained a
+script or round error (`lua failures` stays 26 across 14). State: fixture guard
+**877/896**, lib **984**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (535277)
+
+The navbox `<div role="navigation" class="navbox" … about="#mwt537">`: the
+service adds `id="mwC84"`, rustoid emits the `about` with no `id` at all. So the
+pagebundle id pass skipped this element where it numbered its siblings — the
+`aria-labelledby` (`Species_of_the_genus_Equus5310`) already agrees.
