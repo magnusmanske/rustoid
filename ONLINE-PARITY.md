@@ -13636,7 +13636,56 @@ rustoid:   class="… tooltip-dotted " title="&lt;nowiki>Zebras&lt;/nowiki>">
 ```
 
 PHP's `$frame->expand` instead substitutes each construct with its expanded
-*text*, keeping both. Making the answer expansion substitute the leftover
-constructs (and only then fall back to rebuilding) is the next step; the
-templatestyles representation (a `UNIQ--templatestyles-…` marker against the
-literal tag the API shows) needs checking alongside it.
+*text*, keeping both.
+
+## A construct that expands to nothing keeps its spaces
+
+The module answer for `Template:Tooltip` — the string `frame:expandTemplate`
+hands `Module:Authority control`, which the module *measures* into the navbox
+`argHash` — served the span as
+
+```
+rustoid (before): … tooltip-dotted " title="&lt;nowiki>Zebras&lt;/nowiki>">
+mediawiki:        … tooltip-dotted "   title="<nowiki>Zebras</nowiki>">
+```
+
+`Template:Tooltip` writes the span as
+`… " {{#if:{{{id|}}}|id="{{{id}}}"}} {{#if:{{{style|}}}|style="{{{style}}}"}} title=…`.
+With an empty `id`/`style` both constructs expand to the empty string, and the
+preprocessor keeps the three spaces around them. rustoid held each construct as
+a `KV` whose key was still a token list, left it in the rewritten source, and so
+let `stale_tag_html` rebuild the tag from its attributes — which dropped the
+constructs' spaces and HTML-escaped the `<nowiki>` it substituted.
+
+### Fix
+
+`rewrite_expanded_attrs` now also substitutes a *construct* — a `KV` whose key
+is a token list, with no `ksrc` — using the range `src_offsets` records and the
+key's expanded text. An empty construct becomes nothing and leaves its spaces,
+and the rewritten source no longer spells a `{{…}}`, so `stale_tag_html` does
+not fire.
+
+### Effect
+
+The answer's content now matches MediaWiki's, and the served tooltip `title`
+matches. `Zebra`'s first difference is unchanged at **555114**, `Unix` at
+`11270` and `Polio vaccine` at `7815`, and the corpus moved no page. State:
+fixture guard **877/896**, lib **989**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (555114)
+
+The `Authority control` `argHash`, now `…1952` against `…1898`. The tooltip's
+*content* is no longer the cause — an isolated
+`{{#invoke:Navbox|navbox|name=Test|title=Title|list1={{Tooltip|…}}}}` shows
+MediaWiki's answer is exactly 16 bytes longer than rustoid's
+(`{{#invoke:String|len|{{Tooltip|[https://x Y]|Z}}}}` answers **162** against
+**146**), and the `<templatestyles>` is a 42-byte `UNIQ…QINU` marker in both
+(`find` for `QINU` answers 35). The extra 16 are content, not the marker, and
+`find` places them around the `title` attribute: MediaWiki's `title` sits at
+byte 100 with its `nowiki` at 117, where rustoid's reconstruction of the same
+answer puts them at 99 and 107. MediaWiki's title value therefore holds nine
+more bytes between `title=` and `nowiki` than the raw
+`title="<nowiki>Z</nowiki>"` rustoid reconstructs — a difference in the title
+value still to be identified. The tooltip spans are also missing their
+`mw:ExpandedAttrs` marking on the page — `typeof` + a `data-mw` `attribs`
+fragment — which is the next difference behind the `argHash`.
