@@ -2112,13 +2112,22 @@ fn wrap_transclusion_children(
         // metas in `findTopLevelNonOverlappingRanges` and leaves the content
         // bare. Its `data-mw` lives in the enclosing range's compound parts, and
         // its nodes keep whatever `about` their own expansion gave them.
+        //
+        // The end marker need not sit in this sibling list: in the
+        // common-ancestor case the start marker lives inside a content element
+        // (e.g. `{{Refbegin}}`'s `<div>`) while the end marker is a top-level
+        // sibling. The start marker is dropped here regardless; a sibling end
+        // marker is dropped with it, and one elsewhere is dropped when its own
+        // sibling list reaches it.
         if let Some(about) = children[i].get_attr("about").map(str::to_string)
             && plan.is_nested(&about)
-            && let Some(j) = children[i..]
+        {
+            if let Some(j) = children[i..]
                 .iter()
                 .position(|c| is_transclusion_end(c) && c.get_attr("about") == Some(about.as_str()))
-        {
-            children.remove(i + j);
+            {
+                children.remove(i + j);
+            }
             children.remove(i);
             continue;
         }
@@ -4510,5 +4519,58 @@ mod tests {
         // The template indices are renumbered across the merged list.
         assert!(parts[0].contains("\"i\":0"), "{parts:?}");
         assert!(parts[2].contains("\"i\":1"), "{parts:?}");
+    }
+
+    /// `{{Refbegin}}x{{Refend}}`: `Refend` is just the `</div>` closer, so its
+    /// range is absorbed into `Refbegin`'s. Its start marker sits inside
+    /// `Refbegin`'s `<div>` while its end marker is a top-level sibling, so the
+    /// two never share a sibling list — but the start marker must still be
+    /// removed, because PHP's `findTopLevelNonOverlappingRanges` strips an
+    /// absorbed range's markers before `encapsulateTemplates`. Leaving it
+    /// produced a stray `<meta typeof="mw:Transclusion" about="#mwt3">`.
+    #[test]
+    fn nested_range_start_marker_inside_content_is_dropped() {
+        let start = tpl_meta(false, "#mwt1", (0, 23), "Refbegin");
+        let style = Node::element(ElementKind::Other("style".to_string()));
+
+        let mut div = Node::element(ElementKind::Div);
+        div.push_child(tpl_meta(true, "#mwt1", (23, 23), "Refbegin"));
+        div.push_child(Node::text("x"));
+        div.push_child(tpl_meta(false, "#mwt3", (23, 31), "Refend"));
+
+        let end = tpl_meta(true, "#mwt3", (31, 31), "Refend");
+
+        let mut doc = Node::document();
+        doc.push_child(start);
+        doc.push_child(style);
+        doc.push_child(div);
+        doc.push_child(end);
+
+        encapsulate_transclusions(&mut doc, None);
+
+        fn find_div(node: &Node) -> Option<&Node> {
+            if matches!(node.kind, NodeKind::Element(ElementKind::Div)) {
+                return Some(node);
+            }
+            node.children.iter().find_map(find_div)
+        }
+        fn has_marker_about(node: &Node, about: &str) -> bool {
+            (is_transclusion_marker_meta(node) && node.get_attr("about") == Some(about))
+                || node.children.iter().any(|c| has_marker_about(c, about))
+        }
+
+        assert!(
+            !has_marker_about(&doc, "#mwt3"),
+            "the absorbed range's marker must be gone: {doc:?}"
+        );
+        let span = doc
+            .children
+            .iter()
+            .find(|c| c.get_attr("class") == Some("mw-empty-elt"))
+            .expect("the rendering-transparent style is stashed in an mw-empty-elt span");
+        assert_eq!(span.get_attr("about"), Some("#mwt1"), "{doc:?}");
+        let div = find_div(&doc).expect("the Refbegin <div> survives");
+        assert_eq!(div.get_attr("about"), Some("#mwt1"), "{doc:?}");
+        assert!(contains_text(div, "x"), "{doc:?}");
     }
 }
