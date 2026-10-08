@@ -1407,3 +1407,45 @@ async fn get_content_of_the_current_title_is_the_page_not_the_template_body() {
         "getContent() did not answer with the page source: {html}"
     );
 }
+
+/// A module that emits the *same* `<templatestyles>` from two call sites must
+/// reach Parsoid as two nodes — a `<style>` and a `mw-deduplicated-inline-style`
+/// `<link>`. MediaWiki evaluates each `frame:extensionTag` call independently,
+/// so the two answers carry distinct `UNIQ…QINU` strip markers; rustoid cached
+/// its answers by call identity, served the first marker twice, and the second
+/// occurrence then drained no stylesheet. `Module:Navbar` and `Module:Navbox`
+/// both ask for `Hlist/styles.css`, which is how `Zebra`'s navbox lost it.
+#[tokio::test]
+async fn repeated_extension_tag_calls_both_reach_the_document() {
+    const MODULE: &str = r#"
+        local p = {}
+        function p.main(frame)
+            local a = frame:extensionTag{ name = 'templatestyles', args = { src = 'X/styles.css' } }
+            local b = frame:extensionTag{ name = 'templatestyles', args = { src = 'X/styles.css' } }
+            return a .. b
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Twice", MODULE);
+    source.add_page("Template:X/styles.css", ".x{color:red}");
+    source.set_revision("Template:X/styles.css", 1);
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{#invoke:Twice|main}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("parse failed: {e}"));
+    assert!(
+        html.contains("data-mw-deduplicate"),
+        "the first occurrence is inlined: {html}"
+    );
+    assert!(
+        html.contains("mw-deduplicated-inline-style"),
+        "the second must be a dedup link, not dropped: {html}"
+    );
+}

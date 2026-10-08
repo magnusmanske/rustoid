@@ -255,6 +255,38 @@ fn stringify(value: &Value) -> mlua::Result<String> {
     }
 }
 
+/// Per-run call ordinals, for the frame methods that must answer each call
+/// independently.
+///
+/// MediaWiki evaluates every `frame:…` call on its own, so a module that makes
+/// the same call twice gets two answers. That matters when the answer carries a
+/// `UNIQ…QINU` strip marker: `Module:Navbar` emits `<templatestyles
+/// src="Hlist/styles.css">` and `Module:Navbox` emits the same tag, and only
+/// two distinct markers let `DedupeStyles` turn the second into a
+/// `mw-deduplicated-inline-style` link. Caching by call identity alone served
+/// the first marker twice, and the second occurrence then drained no stylesheet.
+///
+/// [`next_call_key`] numbers the repeats; the host applies the same numbering to
+/// the answer it stores, so the two stay in step.
+pub type FrameCallOrdinals =
+    std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, usize>>>;
+
+/// The cache key for the next call of the request identified by `base`: `base`
+/// itself for the first call, `base#n` for the n-th repeat.
+pub fn next_call_key(
+    ordinals: &mut std::collections::HashMap<String, usize>,
+    base: &str,
+) -> String {
+    let n = ordinals.entry(base.to_string()).or_insert(0);
+    let key = if *n == 0 {
+        base.to_string()
+    } else {
+        format!("{base}#{n}")
+    };
+    *n += 1;
+    key
+}
+
 /// Build an `mlua` function implementing one [`FrameRequest`].
 ///
 /// The returned function looks the call up in `answers`; on a miss it records
@@ -265,10 +297,13 @@ pub fn frame_method(
     method: &'static str,
     answers: DeferredAnswers,
     pending: std::rc::Rc<std::cell::RefCell<Vec<FrameRequest>>>,
+    ordinals: FrameCallOrdinals,
 ) -> Result<mlua::Function> {
     lua.create_function(move |lua, args: mlua::MultiValue| {
         let request = build_request(method, args)?;
-        let key = request.key();
+        // The n-th call of this identity: `next_call_key` counts it the way the
+        // host numbers the answers it hands back.
+        let key = next_call_key(&mut ordinals.borrow_mut(), &request.key());
         // Answers are strings, so nothing has to be re-created per run:
         // mlua clones them directly.
         if let Some(answer) = answers.get(&key) {

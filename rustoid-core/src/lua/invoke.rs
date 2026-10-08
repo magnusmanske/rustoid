@@ -521,6 +521,11 @@ where
     };
     let mut answers = crate::pipeline::lua_deferred::DeferredAnswers::new();
     let mut asked: Vec<String> = Vec::new();
+    // Per-call ordinals, matching the engine's [frame method
+    // ordinals](crate::pipeline::lua_deferred::FrameCallOrdinals): a module that
+    // makes the same call twice gets two answers, at `base` and `base#1`. Only
+    // the engine's actual calls are counted, so the two stay in step.
+    let mut ordinals: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     // Modules the loop has already tried to fetch. Without this, a missing
     // module that `preload` cannot load — a title outside the module namespace,
     // or one past `MAX_MODULES` — made the loop re-request it every round and
@@ -635,8 +640,21 @@ where
                 }
                 // A request may carry several answers at once (a `pairs` over a
                 // lazy `frame.args`), and each answer is keyed by the thing it
-                // expands, so the loop can hand them out together.
-                for (key, text) in expand(request).await {
+                // expands, so the loop can hand them out together. A single frame
+                // method's answer is numbered by call occurrence, so the second
+                // `frame:extensionTag('templatestyles', …)` for one stylesheet —
+                // which must reach Parsoid as its own node — is cached apart from
+                // the first.
+                let per_call = !matches!(
+                    request,
+                    crate::pipeline::lua_deferred::FrameRequest::ExpandArgs { .. }
+                );
+                for (base, text) in expand(request).await {
+                    let key = if per_call {
+                        crate::pipeline::lua_deferred::next_call_key(&mut ordinals, &base)
+                    } else {
+                        base
+                    };
                     // Re-running with an answer the module already has would
                     // reproduce the same request forever, so a repeat is a loop.
                     if asked.contains(&key) {

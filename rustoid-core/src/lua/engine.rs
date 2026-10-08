@@ -634,6 +634,9 @@ impl LuaEngine {
             // The engine's own collector: `take_pending` reads what this run
             // asked for, so a fresh one per run would lose it.
             self.pending.clone(),
+            // Per-run call ordinals, shared by every frame in the run so a
+            // repeated call gets a distinct answer wherever it is made.
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
         )?;
         self.pending.replace(Vec::new());
         // `mw.getCurrentFrame()` reads this.
@@ -5481,6 +5484,7 @@ fn frame_common(
     args: &[Arg],
     answers: &DeferredAnswers,
     pending: &std::rc::Rc<std::cell::RefCell<Vec<FrameRequest>>>,
+    ordinals: &crate::pipeline::lua_deferred::FrameCallOrdinals,
 ) -> Result<Table> {
     let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let frame = lua.create_table().map_err(err)?;
@@ -5523,6 +5527,7 @@ fn frame_common(
                     method,
                     answers.clone(),
                     pending.clone(),
+                    ordinals.clone(),
                 )?,
             )
             .map_err(err)?;
@@ -5541,6 +5546,7 @@ fn frame_common(
     // "optional arguments and title" means.
     let parent_answers = answers.clone();
     let parent_pending = pending.clone();
+    let parent_ordinals = ordinals.clone();
     frame
         .set(
             "newChild",
@@ -5554,8 +5560,14 @@ fn frame_common(
                     // mean "no arguments".
                     _ => Vec::new(),
                 };
-                let child = frame_common(lua, &child_args, &parent_answers, &parent_pending)
-                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let child = frame_common(
+                    lua,
+                    &child_args,
+                    &parent_answers,
+                    &parent_pending,
+                    &parent_ordinals,
+                )
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                 let child_title = title.unwrap_or_else(|| {
                     // The creating frame's own title, which `create_frame` stores
                     // alongside the method for exactly this purpose.
@@ -5619,6 +5631,9 @@ fn args_from_table(t: &Table) -> mlua::Result<Vec<Arg>> {
     Ok(out)
 }
 
+// The frame is assembled from the pieces the host already has in hand; bundling
+// them into a struct would only move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 fn create_frame(
     lua: &Lua,
     args: &[Arg],
@@ -5627,8 +5642,9 @@ fn create_frame(
     parent_title: &str,
     answers: crate::pipeline::lua_deferred::DeferredAnswers,
     pending: std::rc::Rc<std::cell::RefCell<Vec<crate::pipeline::lua_deferred::FrameRequest>>>,
+    ordinals: crate::pipeline::lua_deferred::FrameCallOrdinals,
 ) -> Result<Value> {
-    let frame = frame_common(lua, args, &answers, &pending)?;
+    let frame = frame_common(lua, args, &answers, &pending, &ordinals)?;
 
     // `frame:getTitle()` — the title the frame stands for: the module for the
     // `{{#invoke:}}` frame, the calling template for its parent.
@@ -5654,7 +5670,7 @@ fn create_frame(
         Some(parent_args) => {
             // The parent is a frame like any other, so it is built by the same
             // code; only its title and its own (absent) parent differ.
-            let p = frame_common(lua, parent_args, &answers, &pending)?;
+            let p = frame_common(lua, parent_args, &answers, &pending, &ordinals)?;
             let parent_name = parent_title.to_string();
             p.set(
                 "getTitle",
