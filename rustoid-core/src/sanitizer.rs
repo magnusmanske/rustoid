@@ -1166,10 +1166,16 @@ const LINK: &[&str] = &["itemprop", "href", "title"];
 /// Whether an attribute name is a reserved data attribute (`data-mw*`,
 /// `data-parsoid*`, `data-ooui*`), mirroring `isReservedDataAttribute`.
 fn is_reserved_data_attribute(attr: &str) -> bool {
+    // `data-mw…` and `data-parsoid…` are reserved *for Parsoid*, so they are not
+    // treated as reserved (PHP's early `PARSOID SPECIFIC` return). The check is
+    // case-sensitive there, mirroring `/^data-(mw|parsoid)/`.
+    if attr.starts_with("data-mw") || attr.starts_with("data-parsoid") {
+        return false;
+    }
     let lower = attr.to_lowercase();
-    lower.starts_with("data-mw")
+    lower.starts_with("data-ooui")
+        || lower.starts_with("data-mw")
         || lower.starts_with("data-parsoid")
-        || lower.starts_with("data-ooui")
 }
 
 /// Whether an attribute is a Parsoid-inserted attribute (bypasses the allowed

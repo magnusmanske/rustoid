@@ -98,10 +98,20 @@ impl SanitizerHandler {
     }
 
     /// Run the sanitizer over a token stream.
-    pub fn run(&mut self, tokens: Vec<Item>) -> Vec<Item> {
+    ///
+    /// `fragments` is the stashed DOM-fragment map, needed so a token-valued
+    /// attribute can resolve its `mw:DOMFragment` placeholder — PHP's
+    /// `sanitizeTagAttrs` does the equivalent via
+    /// `$token->fetchExpandedAttrValue()`, taking the fragment's `textContent`
+    /// (T280115).
+    pub fn run(
+        &mut self,
+        tokens: Vec<Item>,
+        fragments: &std::collections::HashMap<usize, crate::dom::node::Node>,
+    ) -> Vec<Item> {
         let mut output = Vec::new();
         for token in tokens {
-            let res = self.on_any(token);
+            let res = self.on_any(token, fragments);
             match res {
                 Some(mut items) => output.append(&mut items),
                 None => {
@@ -114,12 +124,16 @@ impl SanitizerHandler {
     }
 
     /// Handle a single token.
-    fn on_any(&mut self, token: Item) -> Option<Vec<Item>> {
+    fn on_any(
+        &mut self,
+        token: Item,
+        fragments: &std::collections::HashMap<usize, crate::dom::node::Node>,
+    ) -> Option<Vec<Item>> {
         if let Item::Str(_) = &token {
             return Some(vec![token]);
         }
 
-        let new_token = self.sanitize_token(&token);
+        let new_token = self.sanitize_token(&token, fragments);
         match new_token {
             Some(new) if new != token => Some(vec![new]),
             _ => Some(vec![token]),
@@ -127,7 +141,11 @@ impl SanitizerHandler {
     }
 
     /// Sanitize a single token. Returns None if unchanged.
-    fn sanitize_token(&mut self, token: &Item) -> Option<Item> {
+    fn sanitize_token(
+        &mut self,
+        token: &Item,
+        fragments: &std::collections::HashMap<usize, crate::dom::node::Node>,
+    ) -> Option<Item> {
         let Item::Tok(tok) = token else {
             return None;
         };
@@ -166,7 +184,12 @@ impl SanitizerHandler {
         // Sanitize attributes (faithful `sanitizeTagAttrs` whitelist).
         if !attribs.is_empty() {
             if matches!(tok, ParsoidToken::Tag(_) | ParsoidToken::SelfclosingTag(_)) {
-                let sanitized = crate::sanitizer::sanitize_tag_attrs(name, attribs, |_proto| true);
+                let sanitized = crate::sanitizer::sanitize_tag_attrs_with_fragments(
+                    name,
+                    attribs,
+                    |_proto| true,
+                    fragments,
+                );
                 let mut new_tok = tok.clone();
                 new_tok.set_attribs(sanitized);
                 return Some(Item::Tok(new_tok));
@@ -232,10 +255,16 @@ mod tests {
         Item::Str(s.to_string())
     }
 
+    /// Run the sanitizer with no stashed fragments (none of these cases carry a
+    /// `mw:DOMFragment` placeholder).
+    fn run(handler: &mut SanitizerHandler, items: Vec<Item>) -> Vec<Item> {
+        handler.run(items, &std::collections::HashMap::new())
+    }
+
     #[test]
     fn test_plain_text_passthrough() {
         let mut handler = SanitizerHandler::new(false);
-        let out = handler.run(vec![text("hello")]);
+        let out = run(&mut handler, vec![text("hello")]);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Item::Str(s) if s == "hello"));
     }
@@ -248,7 +277,7 @@ mod tests {
         let token = Item::Tok(ParsoidToken::Tag(tk));
 
         let mut handler = SanitizerHandler::new(false);
-        let out = handler.run(vec![token]);
+        let out = run(&mut handler, vec![token]);
 
         // Should have been converted to "<unknown>" text.
         let has_text = out
@@ -265,7 +294,7 @@ mod tests {
         let token = Item::Tok(ParsoidToken::Tag(tk.clone()));
 
         let mut handler = SanitizerHandler::new(false);
-        let out = handler.run(vec![token]);
+        let out = run(&mut handler, vec![token]);
 
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "b"));
@@ -282,7 +311,7 @@ mod tests {
         let token = Item::Tok(ParsoidToken::Tag(tk));
 
         let mut handler = SanitizerHandler::new(false);
-        let out = handler.run(vec![token]);
+        let out = run(&mut handler, vec![token]);
 
         let has_text = out
             .iter()
