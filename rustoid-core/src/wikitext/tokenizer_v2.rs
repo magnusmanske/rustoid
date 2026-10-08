@@ -4825,6 +4825,61 @@ fn skip_template(input: &str, i: usize) -> Option<(usize, bool)> {
     None
 }
 
+/// If `input[at..]` starts a `{{…}}`/`{{{…}}}` directive, return the index just
+/// past its matching close.
+///
+/// Used by the tag scanners: PHP parses an attribute value through `directive`,
+/// so a whole `{{…}}` is one atom there — a `"` or `>` inside it is neither a
+/// quote nor a tag end, and a `|` inside it is not an argument separator. The
+/// nesting follows the same run-of-braces rule the argument splitter uses, so
+/// `{{a|{{b|x}}}}` closes as two `}}`.
+fn skip_directive(input: &str, at: usize) -> Option<usize> {
+    if !input[at..].starts_with("{{") {
+        return None;
+    }
+    #[derive(Clone, Copy)]
+    enum Brace {
+        Template,
+        Tplarg,
+    }
+    let bytes = input.as_bytes();
+    let mut braces: Vec<Brace> = Vec::new();
+    let mut i = at;
+    while i < input.len() {
+        if input[i..].starts_with("{{{") {
+            braces.push(Brace::Tplarg);
+            i += 3;
+            continue;
+        }
+        if input[i..].starts_with("{{") {
+            braces.push(Brace::Template);
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            let run = bytes[i..].iter().take_while(|&&b| b == b'}').count();
+            let mut consumed = 0usize;
+            while consumed < run {
+                let remaining = run - consumed;
+                let close = match braces.last() {
+                    Some(Brace::Tplarg) if remaining >= 3 => 3,
+                    Some(Brace::Template) if remaining >= 2 => 2,
+                    _ => break,
+                };
+                braces.pop();
+                consumed += close;
+            }
+            if braces.is_empty() && consumed > 0 {
+                return Some(i + consumed);
+            }
+            i += consumed.max(1);
+            continue;
+        }
+        i += input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    None
+}
+
 /// If `input[at..]` starts a *recognized* HTML tag (`<tag …>`, `</tag>`, or
 /// `<tag …/>`), return the byte index just past its closing `>`. Quoted
 /// attribute values are skipped, so a `|`, `]`, or `>` inside them is not
@@ -4860,9 +4915,18 @@ fn skip_recognized_html_tag(lower: &str, input: &str, at: usize) -> Option<usize
         return None;
     }
 
-    // Skip to the tag's `>`, honoring quoted attribute values.
+    // Skip to the tag's `>`, honoring quoted attribute values. A `{{…}}` is an
+    // atom: a `"` inside one neither opens nor closes a quoted value, which is
+    // what lets `<span title="{{#invoke:…|\"|…}}">` scan to its own `>`.
     let mut in_quote: Option<u8> = None;
     while j < bytes.len() {
+        if bytes[j] == b'{'
+            && bytes.get(j + 1) == Some(&b'{')
+            && let Some(end) = skip_directive(input, j)
+        {
+            j = end;
+            continue;
+        }
         let b = bytes[j];
         match in_quote {
             Some(q) => {
@@ -5088,7 +5152,7 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
         // Without this, `{{#if:1|<div class="x">hi</div>|no}}` split at
         // `class=` and the branch value became the nonsense `<div class`.
         if b == b'<' {
-            match html_tag_len(bytes, i) {
+            match html_tag_len(part, i) {
                 Some(len) => {
                     i += len;
                     at_sol = false;
@@ -5208,7 +5272,8 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
 /// quoted attribute value does not close the tag. A `<` that does not begin a
 /// tag (a bare less-than, or a comment, which `template_param_name` treats
 /// separately) yields `None`, so the caller falls back to treating it as text.
-fn html_tag_len(bytes: &[u8], start: usize) -> Option<usize> {
+fn html_tag_len(part: &str, start: usize) -> Option<usize> {
+    let bytes = part.as_bytes();
     let mut i = start + 1;
     if bytes.get(i) == Some(&b'/') {
         i += 1;
@@ -5216,21 +5281,30 @@ fn html_tag_len(bytes: &[u8], start: usize) -> Option<usize> {
     if !bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
         return None;
     }
+    let mut in_quote: Option<u8> = None;
     while i < bytes.len() {
-        match bytes[i] {
-            b'>' => return Some(i + 1 - start),
-            b'"' | b'\'' => {
-                // Skip a quoted attribute value; `>` inside it is content.
-                let quote = bytes[i];
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
-                }
-                if i >= bytes.len() {
-                    return None;
+        // A `{{…}}` is an atom wherever it sits in the tag: a `"` inside it must
+        // not open or close a quoted attribute value, and a `>` inside it must
+        // not end the tag. Without this, `<span title="{{echo|"}}">` ended its
+        // quoted value at the directive's `"` — so the `=` of `title=` looked
+        // like a template argument's `name=value` separator and the whole tag
+        // was torn apart.
+        if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
+            i = skip_directive(part, i)?;
+            continue;
+        }
+        let b = bytes[i];
+        match in_quote {
+            Some(q) => {
+                if b == q {
+                    in_quote = None;
                 }
             }
-            _ => {}
+            None => match b {
+                b'"' | b'\'' => in_quote = Some(b),
+                b'>' => return Some(i + 1 - start),
+                _ => {}
+            },
         }
         i += 1;
     }
@@ -7184,6 +7258,36 @@ mod tests {
         // A paired nowiki protects its whole body, pipes included.
         let parts = split_template_args("thumb|caption <nowiki>a|b</nowiki> tail");
         assert_eq!(parts, vec!["thumb", "caption <nowiki>a|b</nowiki> tail"]);
+    }
+
+    #[test]
+    fn a_quote_inside_a_directive_neither_ends_a_tag_nor_splits_an_arg() {
+        // PHP parses an attribute value through `directive`, so a whole `{{…}}`
+        // is one atom there. The `"` in `{{echo|"}}` must therefore *not*
+        // close `title="…"`: without that, the tag's `=` looked like a template
+        // argument's `name=value` separator and the tag was torn apart, which is
+        // how `Template:Tooltip`'s identifier spans came out empty.
+        let s = "<span title=\"{{echo|\"}}\">d</span>";
+        assert_eq!(html_tag_len(s, 0), Some(s.find('>').unwrap() + 1));
+        assert_eq!(find_arg_separator_eq(s, false), None);
+
+        let parts = split_template_args("1|<span title=\"{{echo|\"}}\">d</span>");
+        assert_eq!(parts, vec!["1", "<span title=\"{{echo|\"}}\">d</span>"]);
+
+        // And the same inside a wikilink, which is how the tooltip's first
+        // branch is written.
+        let parts = split_template_args(
+            "#ifeq:no|yes|[[a|<span title=\"{{echo|\"}}\">c</span>]]|<span title=\"{{echo|\"}}\">d</span>",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                "#ifeq:no",
+                "yes",
+                "[[a|<span title=\"{{echo|\"}}\">c</span>]]",
+                "<span title=\"{{echo|\"}}\">d</span>",
+            ]
+        );
     }
 
     #[test]
