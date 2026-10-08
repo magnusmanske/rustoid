@@ -2474,6 +2474,24 @@ impl<'a> PegTokenizer<'a> {
                     return false;
                 }
 
+                // PHP `xmlish_tag`'s "Support </br>": a closing `br` is
+                // tokenized as a `<br>` *start* tag (`$end = null`), so the void
+                // element gets `noClose` rather than an end tag. Without this the
+                // sanitizer would see an `EndTagTk` for a no-end-tag element and
+                // turn `</br>` into literal text.
+                if name == "br" {
+                    let mut dp = self.make_dp(saved, self.pos);
+                    dp.stx = Some("html".to_string());
+                    dp.src = Some(self.input[saved..self.pos].to_string());
+                    dp.no_close = true;
+                    self.emit_token(ParsoidToken::SelfclosingTag(SelfclosingTagTk::new(
+                        name,
+                        vec![],
+                        dp,
+                    )));
+                    return true;
+                }
+
                 let mut dp = self.make_dp(saved, self.pos);
                 dp.stx = Some("html".to_string());
                 // Preserve the original source so disallowed tags round-trip with
@@ -6711,6 +6729,27 @@ mod tests {
         assert!(
             !non_html_tag,
             "unexpected HTML tag token for a non-HTML5 tag: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_closing_br_is_tokenized_as_a_start_tag() {
+        // PHP `xmlish_tag`: "Support </br>" — a closing `br` becomes a `<br>`
+        // start tag (the end flag is cleared), so it is a void element with
+        // `noClose`, never an end tag the sanitizer would turn into text.
+        let tokens = tokenize("a</br>b");
+        let br = tokens.iter().find_map(|t| match t {
+            Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "br" => Some(tk),
+            _ => None,
+        });
+        let br = br.expect("expected a self-closing <br> token");
+        assert_eq!(br.data_parsoid.stx.as_deref(), Some("html"));
+        assert!(br.data_parsoid.no_close, "</br> is a no-close void element");
+        assert!(
+            !tokens
+                .iter()
+                .any(|t| matches!(t, Either::Right(ParsoidToken::EndTag(tk)) if tk.name == "br")),
+            "</br> must not emit a `br` end tag: {tokens:?}"
         );
     }
 
