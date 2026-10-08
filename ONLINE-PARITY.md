@@ -13573,3 +13573,70 @@ lowered to an `mw:Nowiki` span in attribute position), and its body —
 `{{Encodefirst|{{trim|1=[url GND]}}}}` — is dropped by
 `render_answer_markers` when `frame:expandTemplate` renders the answer back to
 wikitext.
+
+## A `#tag` extension an attribute value gained
+
+The tooltip span's `title` served `&lt;nowiki>Zebras&lt;/nowiki>` where the
+service serves `Zebras`, and the span carried no `typeof="mw:ExpandedAttrs"`
+and no `data-mw`. Both trace back to `{{#tag:nowiki|…}}` in **attribute
+position** never being lowered to an `mw:Nowiki` span. Four separate gaps were
+in the way, `frame:expandTemplate` and the page path alike.
+
+### Fix
+
+* **An `extension` token an attribute value gained.** A literal `<nowiki>` in
+the source is already an `extension` token when `expand_in_attributes` runs over
+the page chunk; a `{{#tag:nowiki|…}}` only becomes one once `expand_templates`
+has run *inside* the value, by which point that pass is behind it. So
+`expand_attr_tokens` now runs the extension handler over a value that gained an
+`extension` token (`chunk_has_extension_token` distinguishes the two). A value
+that already carried one is left alone: a link target and a media caption read
+the raw token, and `<nowiki> inside a link` / `T107474` pin that.
+
+* **`data-mw.attribs` halves are always objects.** PHP builds the key as
+`[ 'txt' => …, 'srcOffsets' => … ]` and never collapses a txt-only array back to
+a string, so a plain key serializes as `{"txt":"title"}`, not `"title"`.
+`TmpDataMwPart::into_data_mw_value` now always emits the object.
+
+* **The sanitizer keeps `data-mw`/`data-parsoid`.** They are reserved *for
+Parsoid* — PHP's `isReservedDataAttribute` returns false for them — but rustoid
+treated them as reserved and dropped them, so the element lost the `data-mw`
+describing its generated attributes. And a token-valued attribute holding an
+`mw:DOMFragment` must resolve against the stashed fragments
+(`$token->fetchExpandedAttrValue()`); `SanitizerHandler::run` now takes the
+fragment map instead of flattening against an empty one.
+
+* **An `extlink` a module returned is rebuilt.** `render_answer` had no textual
+form for a bracketed external link a module produced through
+`frame:expandTemplate`, so it dropped it and `Template:Tooltip`'s body lost the
+link it displays.
+
+### Effect
+
+`Zebra`'s first difference reaches **555115** (`99.09%`); the tooltip span now
+serves its `title` and its body. `Polio vaccine` moves `7801 → 7815`, `Unix` is
+unchanged at `11270`, and the corpus moved no other page's first difference.
+State: fixture guard **877/896**, lib **988**, compare **117**, clippy and fmt
+clean.
+
+### Next difference on `Zebra` (555115)
+
+Still the `Authority control` `argHash`, now `…1952` served against `…1918` — 34
+short. The module measures the string `frame:expandTemplate` hands it, and that
+answer still differs from MediaWiki's `action=expandtemplates` answer for
+`Template:Tooltip`. Two of the differences are byte-counted and both come from
+`stale_tag_html`: when the rewritten tag source still holds a `{{…}}` construct
+— here the empty `{{#if:{{{id|}}}|…}} {{#if:{{{style|}}}|…}}` branches of the
+class — it rebuilds the tag from its attributes, which drops the spaces those
+branches leave and HTML-escapes the substituted `<nowiki>`:
+
+```
+mediawiki: class="… tooltip-dotted "   title="<nowiki>Zebras</nowiki>">
+rustoid:   class="… tooltip-dotted " title="&lt;nowiki>Zebras&lt;/nowiki>">
+```
+
+PHP's `$frame->expand` instead substitutes each construct with its expanded
+*text*, keeping both. Making the answer expansion substitute the leftover
+constructs (and only then fall back to rebuilding) is the next step; the
+templatestyles representation (a `UNIQ--templatestyles-…` marker against the
+literal tag the API shows) needs checking alongside it.
