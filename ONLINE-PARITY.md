@@ -13173,3 +13173,57 @@ div but no meta — the `Refend` call's own `mw:Transclusion` placeholder is not
 emitted once the call is merged into the enclosing range. Not yet traced to a
 function (the merge/encapsulation path is untouched by the fixes in this
 section, so this is pre-existing and merely newly exposed).
+
+## An absorbed range's start marker is dropped wherever it sits
+
+The `=== General bibliography ===` difference is `{{Refbegin}}x{{Refend}}`:
+`Template:Refend` is `<includeonly></div></includeonly>`, so its `</div>` closes
+the `<div>` that `Template:Refbegin` opened. The tree builder leaves the
+`Refend` marker metas on two different planes:
+
+```
+meta #mwt1 mw:Transclusion          (Refbegin start)
+style                               (Refbegin's templatestyles)
+div
+  meta #mwt1 mw:Transclusion/End    (Refbegin end)
+  "x"
+  meta #mwt3 mw:Transclusion        (Refend start)
+meta #mwt3 mw:Transclusion/End      (Refend end)
+```
+
+`compute_range_plan` absorbs `Refend` into `Refbegin`'s compound range (via the
+ordering rule), so `plan.is_nested("#mwt3")` is true. `wrap_transclusion_children`
+dropped an absorbed range's marker pair only when **both** markers were direct
+siblings of one parent; here `#mwt3`'s start marker is nested in the `<div>`
+while its end marker is a top-level sibling, so the two never share a list. The
+start marker fell through to the "unmatched start" branch and survived to be
+served as a stray `<meta typeof="mw:Transclusion" about="#mwt3"
+data-mw='{…Refend…i:0}'/>` inside the div.
+
+### Fix
+
+PHP removes an absorbed range's markers in `findTopLevelNonOverlappingRanges`,
+*before* `encapsulateTemplates`: both the nested branch and the overlap-merge
+branch set `$startTagToStrip = $r->startElem` and `$endTagToRemove =
+$r->endElem`, and the tail of the loop removes them. rustoid's sibling walk
+mirrors that piecemeal rather than as a whole-DOM pre-pass (that pre-pass was
+tried and reverted; see the encapsulation-merge section above). The start marker
+is now dropped whenever its `about` is absorbed, whether or not its end marker is
+in the same list; a sibling end marker is dropped with it, and one in another
+list is dropped when that list reaches it (or by the cleanup pass — the
+`Refbegin` end marker inside the `<div>` was already removed that way).
+
+### Effect
+
+`Zebra` **512757 → 523335** (91.53% → **93.42%**); no other corpus page's first
+difference moves. State: fixture guard **877/896**, lib **979**, compare **117**,
+clippy and fmt clean.
+
+### Next difference on `Zebra` (523335)
+
+A navbox `aria-labelledby`: the service serves
+`Extant_Perissodactyla_(Odd-toed_ungulates)_species_by_suborder4974`, rustoid
+serves `Extant_[[Perissodactyla|Perissodactyla_<small>(Odd-toed_ungulates)
+</small>]]_species_by_suborder5182`. The attribute value's wikitext (a link with
+nested markup) is served unexpanded, and the trailing counter differs with it —
+the navbox's label attribute is the next target.
