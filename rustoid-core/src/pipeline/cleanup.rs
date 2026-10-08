@@ -148,18 +148,17 @@ fn handle_empty_element(node: &mut Node, in_tpl: bool) -> bool {
     };
 
     // Remove deletable `mw-empty-elt` wrapper spans (those which are empty, or
-    // carry only a single IEW child), unless they anchor an about-chain.
+    // carry only a single IEW child), unless they anchor an about-chain. PHP
+    // removes the node itself (`DOMCompat::remove`), so the caller must drop it
+    // rather than keep an emptied span — a stashed newline span leaves the
+    // wrapper empty, and an empty one is precisely what must vanish.
     if tag == "span" && has_class(node, "mw-empty-elt") {
         if is_first_encapsulation_wrapper(node) {
             return false;
         }
-        let deletable = node.children.is_empty()
+        return node.children.is_empty()
             || (node.children.len() == 1
                 && matches!(&node.children[0].kind, NodeKind::Text(t) if t.trim().is_empty()));
-        if deletable {
-            node.children.clear();
-        }
-        return false;
     }
 
     if !flagged_empty_elts().contains(&tag.as_str()) {

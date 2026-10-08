@@ -2170,7 +2170,8 @@ fn wrap_transclusion_children(
         //
         // Whitespace-only text that sits *between* two non-marker elements is
         // significant (it preserves a block boundary inside the transclusion),
-        // so it is wrapped in a single-space `about` span rather than dropped.
+        // so it is wrapped in an `about` span (keeping its own text) rather than
+        // dropped.
         let mut new_content: Vec<Node> = Vec::with_capacity(content.len());
         let mut encap_target = None;
         for (idx, child) in content.iter().enumerate() {
@@ -2193,18 +2194,22 @@ fn wrap_transclusion_children(
                         // narrowly-targeted cases (it separates a wikitext
                         // block from a following wikitext list/table, or it
                         // sits between two sol-transparent links); otherwise
-                        // wrap it in a single-space `about` span so the range
-                        // stays contiguous and editable.
+                        // wrap it in an `about` span so the range stays
+                        // contiguous and editable.
                         if is_deletable_in_range(&content, idx, parent) {
                             continue;
                         }
-                        // Span-wrap the newline (single space) to keep the
-                        // transclusion boundary inside the paragraph.
+                        // Span-wrap the whitespace to keep the transclusion
+                        // boundary inside the paragraph. The original text is
+                        // kept verbatim (PHP wraps the existing text node, not a
+                        // normalised one), which is what lets
+                        // `isNewlineWrappingSpan` recognise and remove it between
+                        // blocks or at a range boundary.
                         let mut span = Node::element(ElementKind::Span);
                         if let Some(about) = &about {
                             span.set_attr("about", about.clone());
                         }
-                        span.push_child(Node::text(" "));
+                        span.push_child(Node::text(s.clone()));
                         span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
                         new_content.push(span);
                         continue;
@@ -2644,7 +2649,7 @@ fn should_stash(prev: Option<&Node>, next: Option<&Node>, node: &Node) -> bool {
 }
 
 /// Whether a whitespace-only text node inside a transclusion range should be
-/// deleted (rather than wrapped in a single-space `about` span). Faithful port
+/// deleted (rather than wrapped in an `about` span). Faithful port
 /// of PHP `DOMRangeBuilder::isDeletableNode`.
 ///
 /// The first check is the important one for tables: a text node in a *fosterable*
@@ -4294,12 +4299,14 @@ mod tests {
     }
 
     #[test]
-    fn test_transclusion_trailing_newline_span_wrapped() {
+    fn test_transclusion_trailing_newline_is_stashed_then_removed() {
         // A newline-only text inside a transclusion range (e.g. the trailing
-        // `\n` of `{{1x|<div/>\n}}`) must be span-wrapped as a single-space
-        // `about` span (WRAPPER flag), not dropped — mirrors PHP
-        // `isDeletableNode` (a newline between a block and a following
-        // non-list/table sibling is *not* deletable).
+        // `\n` of `{{1x|<div/>\n}}`) is span-wrapped with its *own* text
+        // (`ensureElementsInRangeAndAddAboutIds` wraps the existing node). The
+        // span is then a newline-wrapping span, so
+        // `handleRenderingTransparentEltsBetweenBlocks` stashes it into an empty
+        // `<span class="mw-empty-elt">`, and `CleanUp` removes that — the live
+        // service serves the div alone, with no trailing span.
         let mut start = Node::element(ElementKind::Other("meta".to_string()));
         start.set_attr("typeof", "mw:Transclusion");
         start.set_attr("about", "#mwt1");
@@ -4319,26 +4326,19 @@ mod tests {
 
         encapsulate_transclusions(&mut doc, None);
 
-        // The trailing newline is preserved as a single-space wrapper span
-        // (a sibling of the encapsulated div, since it is part of the same
-        // transclusion range).
+        // Encapsulation leaves the stashed wrapper span (empty) beside the div;
+        // the wrapper has taken the newline span's `about`.
         assert_eq!(doc.children.len(), 2, "{doc:?}");
-        let div = &doc.children[0];
-        assert_eq!(div.get_attr("typeof"), Some("mw:Transclusion"), "{doc:?}");
-        let wrapper = &doc.children[1];
-        assert_eq!(wrapper.get_attr("about"), Some("#mwt1"), "{doc:?}");
-        assert!(
-            wrapper
-                .data_parsoid
-                .as_deref()
-                .is_some_and(|d| d.contains("wrapper")),
-            "{doc:?}"
-        );
-        assert_eq!(wrapper.children.len(), 1);
-        assert!(matches!(
-            &wrapper.children[0].kind,
-            NodeKind::Text(t) if t == " "
-        ));
+        assert_eq!(doc.children[0].get_attr("typeof"), Some("mw:Transclusion"));
+        assert_eq!(crate::html::wts_utils::node_name(&doc.children[1]), "span");
+        assert_eq!(doc.children[1].get_attr("class"), Some("mw-empty-elt"));
+        assert_eq!(doc.children[1].get_attr("about"), Some("#mwt1"));
+        assert!(doc.children[1].children.is_empty(), "{doc:?}");
+
+        // `CleanUp` deletes the empty wrapper, leaving the encapsulated div.
+        crate::pipeline::cleanup::run(&mut doc);
+        assert_eq!(doc.children.len(), 1, "{doc:?}");
+        assert_eq!(doc.children[0].get_attr("typeof"), Some("mw:Transclusion"));
     }
 
     #[test]
