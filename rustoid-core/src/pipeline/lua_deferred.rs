@@ -811,6 +811,12 @@ pub fn answer_item_text(
             if let Some(src) = crate::wikitext::token_utils::table_token_wikitext(tok) {
                 return Some((src, i + 1));
             }
+            if let Some(src) = extlink_token_wikitext(tok) {
+                // A `[url text]` the tokenizer did not stamp with `src` — a link a
+                // module returned — is rebuilt from its parts, so a
+                // `frame:expandTemplate` answer keeps it.
+                return Some((src, i + 1));
+            }
             if let Some(src) = quote_token_wikitext(tok) {
                 // An `mw-quote` a module's output produced has no `src` (the quote
                 // transformer has not run, nor can it — the answer is wikitext), so
@@ -978,6 +984,44 @@ fn wikilink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> 
     Some(out)
 }
 
+/// Rebuild an `extlink` token as `[href content]`.
+///
+/// The same trade as [`wikilink_token_wikitext`], for the bracketed external
+/// link: one a module's output produced has no `src`, so `render_answer` would
+/// drop it and a `frame:expandTemplate` answer would lose the link.
+/// `Template:Tooltip`'s body is exactly such a link — the `Encodefirst`-wrapped
+/// identifier the tooltip displays — and the service serves it inside the
+/// tooltip span.
+fn extlink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::KeyValue;
+    let crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(t) = token else {
+        return None;
+    };
+    if t.name != "extlink" {
+        return None;
+    }
+    let part_text = |v: &KeyValue| match v {
+        KeyValue::Str(s) => s.clone(),
+        KeyValue::Tokens(items) => render_answer(items),
+    };
+    let href = t
+        .attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("href"))?;
+    let mut out = String::from("[");
+    out.push_str(&part_text(&href.value));
+    if let Some(content) = t
+        .attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("mw:content"))
+    {
+        out.push(' ');
+        out.push_str(&part_text(&content.value));
+    }
+    out.push(']');
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1060,31 @@ mod tests {
         assert_eq!(
             render_answer(&items),
             "[[File:Plains Zebra Equus quagga cropped.jpg|frameless]]"
+        );
+    }
+
+    /// A `[url text]` a module emits through `frame:expandTemplate` is likewise
+    /// tokenized without `data_parsoid.src`, so `render_answer` must rebuild it
+    /// from `href` and `mw:content` instead of dropping it (`Template:Tooltip`'s
+    /// body is exactly such a link).
+    #[test]
+    fn render_answer_rebuilds_a_module_extlink_without_src() {
+        use crate::wikitext::tokens_v2::{
+            DataParsoid, Item, KeyValue, ParsoidToken, SelfclosingTagTk,
+        };
+        let mut link = SelfclosingTagTk::new("extlink", vec![], DataParsoid::default());
+        link.add_attribute_str("href", "https://d-nb.info/gnd/4190555-6");
+        link.attribs.push(crate::wikitext::tokens_v2::KV {
+            key: KeyValue::Str("mw:content".into()),
+            value: KeyValue::Tokens(vec![Item::Str("GND".into())]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(link))];
+        assert_eq!(
+            render_answer(&items),
+            "[https://d-nb.info/gnd/4190555-6 GND]"
         );
     }
 
