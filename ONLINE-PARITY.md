@@ -13488,3 +13488,88 @@ where rustoid serves `<span class="uid">35506</span>`. So `link` — filled from
 the identifier property's `formatterURL` (`P1630`, read off Wikidata) — is empty
 in rustoid, the argument is shorter, and `argHash` follows. The next reduction is
 `getBestStatements('P1630')` on that Wikibase entity.
+
+## `mw.wikibase` fetches an entity a module names at runtime
+
+That reduction was right about the mechanism and wrong about the cause. The
+entity was never missing from Wikidata: rustoid had simply never *asked* for it.
+Entities are preloaded by scanning the loaded modules for entity-id **string
+literals**, and `Module:Taxonbar`'s `getLink` builds the id it needs —
+`mw.wikibase.getEntity('P'..property)`, with `property` read from
+`Module:Taxonbar/conf`. `P685` (NCBI) is a number in a data table, not a
+literal, so it was invisible to the scan and `getEntity` answered `nil`. The
+module then took its `link == ''` branch and rendered the bare value.
+
+No entity is missing in a different sense either: rustoid already had the
+machinery to fetch one, and to report a lookup the host was never asked about —
+the `MISSING_TITLES` collector that makes a runtime-built *page* name fetchable.
+
+### Fix
+
+`mw.wikibase`'s entity table records a miss the same way. A lookup of a
+well-formed id that is not loaded appends to a `MISSING_ENTITIES` registry slot;
+`run_once` turns a non-empty slot into `Outcome::MissingEntities`, and the invoke
+loop fetches each id through the data source and runs the module again. An id
+already fetched and still absent is answered `nil` without re-requesting, so a
+runtime-built name that is not an entity cannot round forever.
+
+`CachedDataSource::flush` also writes the *entity* wiki's manifest. The entity
+cache is a second `WikiCache` handle, and without this its bodies were on disk
+but unindexed — so an entity fetched during an online render was gone again on
+the offline run that followed.
+
+### Effect
+
+`Zebra` **550965 → 555114** (98.35% → **99.09%**). The 48-page corpus moved only
+that one first difference, forward; none moved backward. State: fixture guard
+**877/896**, lib **987**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (555114)
+
+The `Authority control` navbox's `argHash`: the service serves
+`…Edit_this_at_Wikidata1952`, rustoid `…1113`. This time the identifier *links*
+are present; what differs is inside the tooltip-wrapped ones.
+
+## A `{{…}}` is atomic when scanning a tag
+
+The tooltip-wrapped Authority control identifiers served
+`<span class="rt-commentedText tooltip tooltip-dotted " title="Zebras" …><a …>GND</a></span>`,
+while rustoid served the same span with an **empty body** and a title of
+`&lt;nowiki>Zebras&lt;/nowiki>`. Both symptoms came from one place: the span was
+torn apart before it was ever tokenized.
+
+`Template:Tooltip`'s span is written
+`title="{{#tag:nowiki|{{#invoke:String|replace|{{{2|}}}|\"|&quot;}}}}"` — a
+literal `"` inside a `{{…}}` inside a quoted attribute value. PHP parses an
+attribute value through the `directive` rule, so a whole `{{…}}` is one atom
+there; rustoid's lighter scanners (`skip_recognized_html_tag`, `html_tag_len`)
+walked the bytes one at a time, so the directive's `"` *closed* the quoted value.
+The tag then looked malformed, and — because `html_tag_len` also feeds
+`find_arg_separator_eq` — the `=` of `title=` was taken for a template
+argument's `name=value` separator. The argument became the nonsense
+`<span title` plus a value beginning `"{{…`, which is why the span arrived empty.
+
+### Fix
+
+Both scanners skip a whole `{{…}}`/`{{{…}}}` (a shared `skip_directive`, using
+the same run-of-braces rule as the argument splitter) wherever it sits in the
+tag and whatever the quote state. The `{{` test is on a byte equal to `b'{'`, so
+the slice is always on a character boundary.
+
+### Effect
+
+`Zebra`'s first difference stays at **555114** — the same navbox, so the same
+byte — but inside it the gap closes: the `argHash` goes from 839 short to 338,
+and every tooltip-wrapped identifier now renders its link. The corpus moved no
+page's first difference backward. State: fixture guard **877/896**, lib **987**,
+compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (555114)
+
+Still the `Authority control` `argHash`, now 338 short. The remaining gap is in
+the tooltip span's two halves: its `title` is `&lt;nowiki>Zebras&lt;/nowiki>` in
+rustoid where the service serves `Zebras` (the `#tag:nowiki` expansion is not
+lowered to an `mw:Nowiki` span in attribute position), and its body —
+`{{Encodefirst|{{trim|1=[url GND]}}}}` — is dropped by
+`render_answer_markers` when `frame:expandTemplate` renders the answer back to
+wikitext.
