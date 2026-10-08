@@ -530,6 +530,7 @@ pub fn rewrite_expanded_attrs(
     src: &str,
     attribs: &[crate::wikitext::tokens_v2::KV],
 ) -> Option<String> {
+    use crate::wikitext::tokens_v2::KeyValue;
     let mut out = src.to_string();
     let mut patched = false;
     for kv in attribs {
@@ -554,6 +555,35 @@ pub fn rewrite_expanded_attrs(
             }
             out.replace_range(pos..pos + old_src.len(), &new_src);
             patched = true;
+        }
+
+        // A construct that sits in attribute position and expands to *nothing*
+        // leaves no attribute, so it is held as a `KV` whose key is still a
+        // token list and whose `ksrc` is unset. `Template:Tooltip` writes its
+        // span as `… " {{#if:{{{id|}}}|…}} {{#if:{{{style|}}}|…}} title=…`; with
+        // an empty `id`/`style` the two constructs expand to the empty string,
+        // and the preprocessor keeps the spaces around them. Rebuilding the tag
+        // from its attributes drops those spaces (and HTML-escapes what it
+        // substitutes), so the construct is substituted here instead: its
+        // source is the range `src_offsets` records, its expansion the key's
+        // text.
+        if matches!(kv.key, KeyValue::Tokens(_))
+            && kv.ksrc.is_none()
+            && let Some(so) = &kv.src_offsets
+            && let Some(old_src) = src.get(so.key_start..so.key_end)
+            && old_src.starts_with("{{")
+        {
+            let new_src = key_value_source_text(&kv.key);
+            if new_src != old_src {
+                let Some(pos) = out.find(old_src) else {
+                    continue;
+                };
+                if out[pos + old_src.len()..].contains(old_src) {
+                    return None;
+                }
+                out.replace_range(pos..pos + old_src.len(), &new_src);
+                patched = true;
+            }
         }
     }
     patched.then_some(out)
@@ -656,6 +686,41 @@ mod tests {
         assert_eq!(
             rewrite_expanded_attrs(src, &attribs).as_deref(),
             Some(r#"<div class="xBAR">"#)
+        );
+    }
+
+    #[test]
+    fn rewrite_expanded_attrs_drops_a_construct_that_expanded_to_nothing() {
+        // `Template:Tooltip` writes its span as
+        // `… " {{#if:{{{id|}}}|…}} title=…`; with an empty `id` the construct
+        // expands to the empty string, and the preprocessor keeps the spaces
+        // around it. The construct is a `KV` whose key is still a token list and
+        // which carries no `ksrc`, so its source is the `src_offsets` range.
+        let src = r#"<span class="a" {{#if:1|x}} title="t">"#;
+        let plain = |k: &str, v: &str| KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let construct = KV {
+            key: KeyValue::Tokens(vec![]),
+            value: KeyValue::Str(String::new()),
+            src_offsets: Some(crate::wikitext::tokens_v2::KVSourceRange {
+                key_start: 16,
+                key_end: 27,
+                value_start: 27,
+                value_end: 27,
+                source: None,
+            }),
+            ksrc: None,
+            vsrc: None,
+        };
+        assert_eq!(
+            rewrite_expanded_attrs(src, &[plain("class", "a"), construct, plain("title", "t")])
+                .as_deref(),
+            Some(r#"<span class="a"  title="t">"#)
         );
     }
 
