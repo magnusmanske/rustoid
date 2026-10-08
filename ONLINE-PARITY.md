@@ -13398,3 +13398,93 @@ The navbox `<div role="navigation" class="navbox" … about="#mwt537">`: the
 service adds `id="mwC84"`, rustoid emits the `about` with no `id` at all. So the
 pagebundle id pass skipped this element where it numbered its siblings — the
 `aria-labelledby` (`Species_of_the_genus_Equus5310`) already agrees.
+
+## A transclusion's trailing whitespace span keeps its own text
+
+The 535277 difference was that navbox div: the service adds `id="mwC84"`,
+rustoid emitted the `about` with no `id`. `markDiscardableDataParsoid` keeps a
+node's `data-parsoid` when it carries `stx` **and** is the range's last node, and
+the navbox div *is* the last node — yet it lost its dp.
+
+The cause was a stray `<span about="#mwt537"> </span>` sitting *after* the div,
+so the div was no longer the range's last node. The span comes from
+`DOMRangeBuilder::ensureElementsInRangeAndAddAboutIds`, which wraps a range's
+trailing whitespace text node **verbatim**: the span holds the original `\n`,
+which makes it a `DOMUtils::isNewlineWrappingSpan`, which
+`handleRenderingTransparentEltsBetweenBlocks` then stashes — `migrateElements`
+drops the span, leaving an empty `<span class="mw-empty-elt">`, which `CleanUp`
+removes. rustoid wrapped a single space, so the span was neither recognised nor
+removed; it survived and pushed the navbox div off the boundary.
+
+Reduced to `{{1x|<div>x</div>\n}}`: the service serves the div alone, rustoid the
+div plus `<span about="#mwt1"> </span>`. `{{1x|<span>a</span>\n<span>b</span>}}`
+(the inline case, where the span is *kept*) shows the other half of the same bug:
+the service serves `<span about="#mwt1">\n</span>`, rustoid
+`<span about="#mwt1"> </span>`.
+
+### Fix
+
+`wrap_transclusion_children` now pushes the original whitespace text, as
+`wrap_flipped_children` already did. And `CleanUp::handleEmptyElements` now
+*removes* a deletable `mw-empty-elt` span (PHP `DOMCompat::remove`) instead of
+clearing its children and keeping it.
+
+### Effect
+
+`Zebra` **535277 → 537340** (95.56% → **95.92%**). State: fixture guard
+**877/896**, lib **985**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (537340)
+
+`African wild ass<br/>(<i>Equus africanus</i>)` in the service against
+`African wild ass&lt;/br>…` in rustoid: `Template:Equus` writes `</br>`.
+
+## `</br>` is a `<br>` start tag
+
+At 537340 the difference was `Template:Equus`'s `</br>`: the service renders a
+`<br/>`, rustoid escaped it as literal `&lt;/br>`.
+
+Parsoid's tokenizer grammar (`src/Wt2Html/Grammar.pegphp`, rule `xmlish_tag`)
+has an explicit
+
+```php
+// Support </br>
+if ( $lcName === 'br' && $end ) {
+    $end = null;
+}
+```
+
+so a closing `br` is built as a `<br>` *start* tag — a void element, hence
+`noClose`. rustoid's `try_html_tag` emitted an `EndTag("br")` instead, and the
+sanitizer's `NO_END_TAG_SET` (`SanitizerHandler`) turns an end tag for a
+no-end-tag element into its literal text, so the tag came out escaped.
+
+Reduced to `a</br>b`: the service serves `a<br id="mwAw" …/>b`, rustoid served
+`a&lt;/br>b`.
+
+### Fix
+
+`try_html_tag`'s closing branch now emits a self-closing `<br>` with `no_close`
+when the closing name is `br`, mirroring the grammar.
+
+### Effect
+
+`Zebra` **537340 → 550965** (95.92% → **98.35%**). The whole 48-page corpus was
+re-run with both this and the preceding fix; the only first differences that move
+are forward — `Unix` 4772 → 11270, `Polio vaccine` 5350 → 7801, `Zebra`
+535277 → 550965 — and none backward. State: fixture guard **877/896**, lib
+**985**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (550965)
+
+The `Taxonbar` navbox's `aria-labelledby`: the service serves
+`Taxon_identifiers793`, rustoid `Taxon_identifiers586`. That is
+`anchorEncode(title) .. args.argHash`, and it is downstream of what the navbox
+renders. `Module:Taxonbar`'s `makeLink` wraps an identifier value in `[`…`]`
+when its `link` contains `//` and leaves it as plain text when `link` is empty;
+the service serves
+`<span class="uid"><a rel="mw:ExtLink nofollow" href="https://www.ncbi.nlm.nih.gov/datasets/taxonomy/35506/" …>35506</a></span>`
+where rustoid serves `<span class="uid">35506</span>`. So `link` — filled from
+the identifier property's `formatterURL` (`P1630`, read off Wikidata) — is empty
+in rustoid, the argument is shorter, and `argHash` follows. The next reduction is
+`getBestStatements('P1630')` on that Wikibase entity.
