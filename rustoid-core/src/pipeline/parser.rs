@@ -401,6 +401,17 @@ fn reconstruct_link_src(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, href
     src
 }
 
+/// Whether a token chunk holds an unexpanded `extension` self-closing token.
+///
+/// Used to tell an `extension` a value already carried (a literal `<nowiki>` in
+/// the source) from one an expansion produced (`{{#tag:nowiki|…}}`) — see
+/// [`Parser::expand_attr_tokens`].
+fn chunk_has_extension_token(items: &[Item]) -> bool {
+    items
+        .iter()
+        .any(|i| matches!(i, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension"))
+}
+
 /// Whether a `wikilink` token's `href` names the File (or Media) namespace, the
 /// targets whose rendering can allocate an `about` id.
 fn is_file_link_target(href: &str) -> bool {
@@ -4702,6 +4713,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         in_tpl: bool,
         depth: u8,
     ) -> Vec<Item> {
+        // An `extension` token the value already carries keeps rustoid's existing
+        // handling: `expand_in_attributes` on the enclosing page chunk expands
+        // one nested in a *tag's* attribute, and a link target or a media caption
+        // reads the raw token directly. One that only appears *after* the
+        // expansion below is a `{{#tag:…}}` result. rustoid's TT2 sub-pipeline for
+        // an attribute value only approximates PHP's `Frame::expand` (which runs
+        // the whole pipeline, ExtensionHandler included), so that token is
+        // expanded here — otherwise the tree builder flattens it to its raw
+        // `src` (`<nowiki>A</nowiki>` where the service serves `A`).
+        let had_extension = chunk_has_extension_token(&toks);
         let expanded = self
             .expand_templates(
                 frame,
@@ -4719,7 +4740,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // they produce (`processTemplateTokens`). A blanket `clear_tsr` over the
         // whole value would also wipe a `mw-quote` token's `tsr`, leaving the
         // extlink `[url ''italic'']` with an `<i>` that has no `dsr`.
-
+        let expanded = if !had_extension && chunk_has_extension_token(&expanded) {
+            crate::pipeline::extension_handler::run(expanded, self.config, fragments, next_id)
+        } else {
+            expanded
+        };
         // TT2 order inside the value's sub-pipeline: ExtensionHandler before
         // AttributeExpander.
         let expanded = crate::pipeline::extension_handler::expand_in_attributes(
