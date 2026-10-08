@@ -62,6 +62,10 @@ pub struct LuaSite {
     pub messages: std::collections::HashMap<String, String>,
     /// `mw.site.stats` — the wiki-wide counters, for the modules that read them.
     pub stats: SiteStats,
+    /// The wiki's URL protocol schemes, for `mw.uri.anchorEncode`. Its
+    /// `CoreParserFunctions::anchorencode` strips external links, which needs the
+    /// site's protocol list.
+    pub protocols: Vec<String>,
 }
 
 /// The counters `mw.site.stats` exposes.
@@ -136,6 +140,7 @@ impl LuaSite {
             // "not loaded" answer, and they keep `mw.site.stats.edits` from
             // raising `attempt to index a nil value`.
             stats: config.site_stats(),
+            protocols: config.protocols().iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -1739,9 +1744,16 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     uri.set("encode", lua.create_function(luafn_uri_encode)?)?;
     uri.set("decode", lua.create_function(luafn_uri_decode)?)?;
+    // `mw.uri.anchorEncode` delegates to core's `anchorencode`, which strips
+    // wikitext links and HTML tags from the argument (Scribunto's
+    // `UriLibrary::anchorEncode` calls `CoreParserFunctions::anchorencode`).
+    let encoder = crate::pipeline::anchor_encode::AnchorEncoder::new(&ctx.site.protocols);
     uri.set(
         "anchorEncode",
-        lua.create_function(luafn_uri_anchor_encode)?,
+        lua.create_function(move |_, s: Value| {
+            let s = coerce_string(&s, "anchorEncode")?;
+            Ok(encoder.anchorencode(&s))
+        })?,
     )?;
     mw.set("uri", uri)?;
 
@@ -3104,11 +3116,6 @@ fn luafn_uri_encode(_: &Lua, s: Value) -> mlua::Result<String> {
 
 fn luafn_uri_decode(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(url_decode(&coerce_string(&s, "decode")?))
-}
-
-fn luafn_uri_anchor_encode(_: &Lua, s: Value) -> mlua::Result<String> {
-    let s = coerce_string(&s, "anchorEncode")?;
-    Ok(s.replace(' ', "_").replace('?', "%3F").replace('#', "%23"))
 }
 
 /// `formatNum` that accepts both call styles.
@@ -7180,11 +7187,22 @@ mod tests {
     #[test]
     fn test_mw_uri_anchor_encode() {
         let engine = make_engine();
+        // `mw.uri.anchorEncode` is core's `anchorencode`: spaces become `_`, and
+        // a `?` is left as-is (it is not an encoded character, and `?`/`#` are
+        // not the fragment delimiters here).
         assert_eq!(
             engine
                 .eval("return mw.uri.anchorEncode('Hello World?')")
                 .unwrap(),
-            "Hello_World%3F"
+            "Hello_World?"
+        );
+        // Links and tags in the argument are stripped, mirroring
+        // `Parser::stripSectionName`.
+        assert_eq!(
+            engine
+                .eval("return mw.uri.anchorEncode('[[Foo|Bar]] <small>baz</small>')")
+                .unwrap(),
+            "Bar_baz"
         );
     }
 
