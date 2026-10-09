@@ -200,6 +200,24 @@ pub trait DataSource: Send + Sync {
         let _ = titles;
         Ok(HashMap::new())
     }
+
+    /// The categories a page belongs to, keyed by the title as asked — for
+    /// `title.categories`.
+    ///
+    /// Mirrors Scribunto's `TitleLibrary::getCategories`: the page's *own*
+    /// category links (not those of templates it transcludes) as member names
+    /// with the `Category:` prefix stripped. A live wiki answers it from
+    /// `prop=categories`, so it is a separate call, needed only by `mw.title`.
+    ///
+    /// A title absent from the map is *unknown* and is re-asked next round; an
+    /// entry present with an empty list means "fetched, no categories".
+    async fn get_title_categories(
+        &self,
+        titles: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let _ = titles;
+        Ok(HashMap::new())
+    }
 }
 
 /// Page metadata used for link resolution (mirrors the per-title map returned

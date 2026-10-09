@@ -911,6 +911,14 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         .unwrap_or_default()
         .remove(title)
         .unwrap_or_default();
+    // The page's own categories, for `title.categories`. Like `protection` this
+    // is a separate call, and a title absent from the answer stays `None` so the
+    // next round re-asks; a present-but-empty list is a fetched "no categories".
+    let categories = source
+        .get_title_categories(std::slice::from_ref(&title.to_string()))
+        .await
+        .ok()
+        .and_then(|mut m| m.remove(title));
     // A File or Media title also answers `title.file`, so the file's metadata is
     // part of its facts. `None` sizes are deliberate — the natural dimensions
     // are what `Module:Multiple image` needs, not a thumbnail's. A Media title
@@ -941,6 +949,7 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         is_redirect,
         content,
         protection,
+        categories,
         file,
     }
 }

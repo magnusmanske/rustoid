@@ -259,6 +259,16 @@ struct PageEntry {
     /// `type` field rather than a map key.
     #[serde(default)]
     protection: Option<Vec<Protection>>,
+    /// `prop=categories` output: the page's own category links, each a
+    /// `{ns, title}` with `title` carrying the `Category:` prefix.
+    #[serde(default)]
+    categories: Option<Vec<CategoryEntry>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CategoryEntry {
+    #[serde(default)]
+    title: Option<String>,
 }
 
 impl PageEntry {
@@ -299,6 +309,72 @@ struct ProtectionResponse {
 struct ProtectionQuery {
     #[serde(default)]
     pages: Vec<PageEntry>,
+}
+
+/// The `prop=categories` response, using the same `pages` shape as the others.
+#[derive(serde::Deserialize)]
+struct CategoriesResponse {
+    query: ProtectionQuery,
+}
+
+/// The categories a set of pages belong to, for `title.categories`.
+///
+/// Mirrors Scribunto's `TitleLibrary::getCategories`: the page's *own* category
+/// links, as member names with the `Category:` prefix stripped (that is
+/// `Title::getText()`). Keyed by the title *as requested*, like
+/// [`title_protection`], so a caller looks its answer up by the string it asked
+/// with.
+///
+/// Every requested title is present in the result, empty when the wiki did not
+/// mention it — `getCategories` answers `[[]]` for a page with none, so a caller
+/// never has to tell "no categories" from "no such page". A request failure
+/// therefore leaves the titles empty rather than absent, matching the wire.
+pub async fn title_categories(
+    client: &WikiClient,
+    titles: &[String],
+) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for chunk in titles.chunks(TITLES_PER_QUERY) {
+        let Ok(body) = client.categories_json(chunk).await else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<CategoriesResponse>(&body) else {
+            continue;
+        };
+        let mut asked: HashMap<String, String> = HashMap::new();
+        for t in chunk {
+            asked.insert(normalise(t), t.clone());
+        }
+        for page in parsed.query.pages {
+            let Some(title) = page.title else { continue };
+            let names: Vec<String> = page
+                .categories
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|c| c.title)
+                .map(|t| category_member_name(&t))
+                .collect();
+            match asked.get(&normalise(&title)) {
+                Some(original) => out.insert(original.clone(), names.clone()),
+                None => out.insert(title.clone(), names.clone()),
+            };
+            out.insert(title, names);
+        }
+    }
+    for t in titles {
+        out.entry(t.clone()).or_default();
+    }
+    out
+}
+
+/// A category link's member name: `Category:Foo` → `Foo`, as `Title::getText()`
+/// reports it. The namespace prefix is localized, so it is stripped by the first
+/// colon rather than by matching `Category`.
+fn category_member_name(title: &str) -> String {
+    match title.split_once(':') {
+        Some((_, rest)) => rest.to_string(),
+        None => title.to_string(),
+    }
 }
 
 /// Existence checks that fail soft, for use from the parser.
@@ -389,6 +465,7 @@ mod tests {
             redirect: None,
             pageprops: None,
             protection: None,
+            categories: None,
         }
         .to_page_info();
         assert!(!exists.missing, "an existing page is not a red link");
@@ -447,5 +524,49 @@ mod tests {
         let json = r#"{"query":{"pages":[{"ns":0,"title":"Plain","pageid":1}]}}"#;
         let parsed: ProtectionResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.query.pages[0].protection.is_none());
+    }
+
+    /// `prop=categories` sends each link with its full prefixed title, and
+    /// `getCategories` reports the member name only (`Title::getText()`), so the
+    /// namespace prefix has to come off. It is the *localized* prefix, so it is
+    /// stripped by the first colon rather than by matching `Category`.
+    #[test]
+    fn a_category_link_is_reduced_to_its_member_name() {
+        assert_eq!(category_member_name("Category:Zebra"), "Zebra");
+        // A colon inside the member name survives: only the first is the prefix.
+        assert_eq!(category_member_name("Category:A: B"), "A: B");
+        // A localized prefix (`Kategorie`, `Catégorie`) is stripped the same way.
+        assert_eq!(category_member_name("Kategorie:Zebra"), "Zebra");
+        // No prefix at all is left alone rather than mangled.
+        assert_eq!(category_member_name("Zebra"), "Zebra");
+    }
+
+    /// The live `prop=categories` shape parses, and the member names lose their
+    /// prefix. A page with none omits the field, which reads as an empty list
+    /// (`getCategories` answers `[[]]`).
+    #[test]
+    fn categories_are_read_from_the_array_with_prefixes_stripped() {
+        let json = r#"{"query":{"pages":[
+            {"ns":0,"title":"Israel","categories":[
+                {"ns":14,"title":"Category:Countries in Asia"},
+                {"ns":14,"title":"Category:Republics"}
+            ]}]}}"#;
+        let parsed: CategoriesResponse = serde_json::from_str(json).unwrap();
+        let names: Vec<String> = parsed.query.pages[0]
+            .categories
+            .as_ref()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|c| c.title.as_deref())
+                    .map(category_member_name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(names, vec!["Countries in Asia", "Republics"]);
+
+        let none = r#"{"query":{"pages":[{"ns":0,"title":"Plain"}]}}"#;
+        let parsed: CategoriesResponse = serde_json::from_str(none).unwrap();
+        assert!(parsed.query.pages[0].categories.is_none());
     }
 }

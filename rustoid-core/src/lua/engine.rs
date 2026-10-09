@@ -325,6 +325,11 @@ pub struct TitleFacts {
     /// Empty for a title that was never looked up, which reads as "unprotected" —
     /// the same conservative answer `exists` gives.
     pub protection: crate::traits::ProtectionEntry,
+    /// The page's own category member names (the `Category:` prefix stripped), for
+    /// `title.categories`. `None` means "not fetched"; `Some(vec![])` means
+    /// "fetched, no categories" — the distinction Scribunto draws between an
+    /// unknown page and one with no categories.
+    pub categories: Option<Vec<String>>,
     /// A file title's metadata, for `title.file`. `None` means either "not a
     /// file", "the file does not exist", or "not fetched";
     /// [`title_derived_field`] tells them apart by the title's namespace and
@@ -522,6 +527,14 @@ impl LuaEngine {
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
         let ctx = Arc::new(ctx);
+        // The round's page facts, so a *derived* title (`talkPageTitle`,
+        // `subPageTitle`) answers `categories` and friends from the same map
+        // `mw.title.new` reads. The shared metatable's `__index` has no context,
+        // so the map is stashed in Lua app data.
+        lua.set_app_data(TitleFactsDb {
+            titles: ctx.titles.clone(),
+            current_title: ctx.current_title.clone(),
+        });
         let mw = setup_mw_table(&lua, ctx.clone())?;
         lua.globals()
             .set("mw", mw)
@@ -2435,10 +2448,7 @@ fn luafn_title_new(
     // never looks at `talkPageTitle` should not pay for building it, and eager
     // construction would recurse (a title's talk page is itself a title).
     let facts = title_facts_for(ctx, &ns_id, &title_text);
-    let is_current = {
-        let current = ctx.current_title.replace('_', " ");
-        full.eq_ignore_ascii_case(&current) || title_text.eq_ignore_ascii_case(&current)
-    };
+    let is_current = is_current_title(&ctx.current_title, &full, &title_text);
     let current_source = ctx.page_source.clone();
 
     // The shared metatable's `__index` is generic — it cannot capture this
@@ -2638,6 +2648,32 @@ fn title_derived_field(
             }
             Ok(Value::Table(levels))
         }
+        // `title.categories` — the page's own category member names, as a
+        // 1-based array (Scribunto's `TitleLibrary::getCategories` strips the
+        // `Category:` prefix). It is always a table, never nil: an unknown title
+        // is requested and answered with an empty table meanwhile, so a module
+        // that does `inArray(title.categories, …)` sees `[]` rather than erroring
+        // on a nil.
+        "categories" => {
+            let cats = lua.create_table()?;
+            match facts.as_ref().and_then(|f| f.categories.as_ref()) {
+                Some(names) => {
+                    for (i, name) in names.iter().enumerate() {
+                        cats.set(i + 1, name.as_str())?;
+                    }
+                }
+                None => {
+                    // Only an entirely-unknown title is requested; a title whose
+                    // facts were fetched but whose categories the wiki did not
+                    // answer (an offline cache miss) stays an empty table, which
+                    // is also how Scribunto reports a page with no categories.
+                    if facts.is_none() && !full.is_empty() {
+                        note_missing_title(lua, full)?;
+                    }
+                }
+            }
+            Ok(Value::Table(cats))
+        }
         // No cascading restrictions can be observed, and the documented shape is
         // a table with empty `restrictions` and `sources` rather than nil — a
         // module indexing `cascadingProtection.restrictions` on the live wiki
@@ -2807,6 +2843,14 @@ fn site_for_titles(lua: &Lua) -> mlua::Result<LuaSite> {
 /// Wrapper making the site snapshot storable in Lua app data.
 struct TitleSite(LuaSite);
 
+/// The round's page facts, storable in Lua app data so a derived title built by
+/// the shared metatable's `__index` can answer `categories` and the other
+/// facts-dependent fields. See [`LuaEngine::new`].
+struct TitleFactsDb {
+    titles: std::collections::HashMap<String, TitleFacts>,
+    current_title: String,
+}
+
 /// Resolve a namespace argument that may be an id or a name.
 fn given_namespace_id(site: &LuaSite, ns: &Value) -> Option<i32> {
     match ns {
@@ -2817,12 +2861,23 @@ fn given_namespace_id(site: &LuaSite, ns: &Value) -> Option<i32> {
     }
 }
 
+/// Whether a title names the page being parsed, as both construction paths must
+/// agree on: an underscored spelling and the bare text each count, since
+/// `mw.title.getCurrentTitle()` and a `mw.title.new(currentTitle.text)` have to
+/// compare equal for `exists` and `getContent`.
+fn is_current_title(current: &str, full: &str, title_text: &str) -> bool {
+    let current = current.replace('_', " ");
+    full.eq_ignore_ascii_case(&current) || title_text.eq_ignore_ascii_case(&current)
+}
+
 /// Build the title object for a full `Ns:Text` string, with no external data.
 ///
 /// `subPageTitle` and the `*PageTitle` accessors need to *construct* a title,
 /// not merely describe one, and that construction is the same work
 /// [`luafn_title_new`] does — minus the `LuaContext`, since these titles are
-/// derived rather than looked up, so none of the preloaded page facts apply.
+/// derived rather than looked up. Their facts-dependent fields (`exists`,
+/// `categories`, …) are answered from the round's page facts, which
+/// [`LuaEngine::new`] stashes in Lua app data for exactly this path.
 fn title_from_full_text(lua: &Lua, site: &LuaSite, full: &str) -> mlua::Result<Value> {
     let (ns_id, title_text) = split_title(site, full);
     title_object(lua, site, ns_id, &title_text, full)
@@ -2866,6 +2921,25 @@ fn title_object(
         }
         None => table.set("canTalk", false)?,
     }
+    // A derived title answers the facts-dependent fields (`categories`, `exists`,
+    // …) from the round's page facts, exactly as `mw.title.new` does — a
+    // `talkPageTitle` whose `categories` is read must trigger the same
+    // fetch-and-retry. The metatable is shared, so the facts travel on the
+    // instance as the same lookup closure `luafn_title_new` installs.
+    let db = lua.app_data_ref::<TitleFactsDb>();
+    let facts = db
+        .as_ref()
+        .and_then(|db| title_facts_in(&db.titles, site, ns_id, title_text));
+    let is_current = db
+        .as_ref()
+        .is_some_and(|db| is_current_title(&db.current_title, full, title_text));
+    let full_for_lookup = full.to_string();
+    table.raw_set(
+        TITLE_FACTS_KEY,
+        lua.create_function(move |lua, (_this, key): (Value, String)| {
+            title_derived_field(lua, &key, &facts, is_current, &full_for_lookup, ns_id)
+        })?,
+    )?;
     let mt = title_metatable(lua, site)?;
     mark_instance(&mt, &table)?;
     table.set_metatable(Some(mt));
@@ -3145,13 +3219,24 @@ impl NamespaceFacts {
 
 /// Look up the preloaded facts for a title, by full text and by bare text.
 fn title_facts_for(ctx: &LuaContext, ns_id: &i32, title_text: &str) -> Option<TitleFacts> {
-    let key = prefix_title(&ctx.site, *ns_id, title_text);
-    if let Some(facts) = ctx.titles.get(&key) {
+    title_facts_in(&ctx.titles, &ctx.site, *ns_id, title_text)
+}
+
+/// [`title_facts_for`] against a bare map, for the app-data snapshot a derived
+/// title reads.
+fn title_facts_in(
+    titles: &std::collections::HashMap<String, TitleFacts>,
+    site: &LuaSite,
+    ns_id: i32,
+    title_text: &str,
+) -> Option<TitleFacts> {
+    let key = prefix_title(site, ns_id, title_text);
+    if let Some(facts) = titles.get(&key) {
         return Some(facts.clone());
     }
     // Titles are keyed as written in `mw.title.new`, which may omit the
     // namespace when the module passed one separately.
-    ctx.titles
+    titles
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(title_text))
         .map(|(_, v)| v.clone())
@@ -8708,6 +8793,66 @@ mod tests {
         let src = module_source(r#"'Module:Known'"#);
         assert_eq!(engine.execute(&src, "main", &[]).unwrap(), "true");
         assert!(engine.take_missing_titles().is_empty());
+    }
+
+    /// `title.categories` is the page's own category member names, as a 1-based
+    /// array (`TitleLibrary::getCategories`, which strips the `Category:`
+    /// prefix). `Module:Protected page` reads
+    /// `inArray(title.talkPageTitle.categories, …)`, so answering `nil` — the
+    /// pre-fix behaviour, when the field was not handled at all — is a hard
+    /// error there.
+    #[test]
+    fn a_title_answers_its_categories() {
+        let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test");
+        let cats = |names: &[&str]| TitleFacts {
+            exists: true,
+            categories: Some(names.iter().map(|s| (*s).to_string()).collect()),
+            ..Default::default()
+        };
+        ctx.titles
+            .insert("Module:Known".to_string(), cats(&["Alpha", "Beta"]));
+        // The facts of a *derived* title (a talk page) have to reach it through
+        // the shared metatable too, since `talkPageTitle` builds a fresh object.
+        ctx.titles
+            .insert("Module talk:Known".to_string(), cats(&["Gamma"]));
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+
+        let src = r#"
+            local p = {}
+            function p.main()
+                local t = mw.title.new('Module:Known')
+                return #t.categories .. ':' .. t.categories[1] .. t.categories[2]
+                    .. ':' .. t.talkPageTitle.categories[1]
+            end
+            return p
+        "#;
+        assert_eq!(
+            engine.execute(src, "main", &[]).unwrap(),
+            "2:AlphaBeta:Gamma"
+        );
+        assert!(engine.take_missing_titles().is_empty());
+    }
+
+    /// A title the host was never asked about answers an *empty table* for
+    /// `categories`, never `nil`, and is requested so the next round can answer
+    /// the real list. `inArray` errors on a `nil`, so an unknown title must not
+    /// be able to take a module down.
+    #[test]
+    fn an_unknown_title_answers_empty_categories_and_is_requested() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main()
+                local cats = mw.title.new('Module:Unknown').categories
+                return type(cats) .. ':' .. #cats
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(src, "main", &[]).unwrap(), "table:0");
+        assert_eq!(
+            engine.take_missing_titles(),
+            vec!["Module:Unknown".to_string()]
+        );
     }
 
     /// `title.file` answers a file title's metadata from its facts, and requests

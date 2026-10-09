@@ -766,6 +766,38 @@ impl DataSource for CachedDataSource {
         Ok(out)
     }
 
+    async fn get_title_categories(
+        &self,
+        titles: &[String],
+    ) -> rustoid_core::Result<std::collections::HashMap<String, Vec<String>>> {
+        // Same shape as `get_title_protection`: cached answers serve offline runs,
+        // and an uncached title stays absent (unknown) so the retry loop re-asks
+        // rather than reading a fabricated empty list as "no categories".
+        let mut out = std::collections::HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for title in titles {
+            match self.cached_categories(title) {
+                Some(cats) => {
+                    out.insert(title.clone(), cats);
+                }
+                None => missing.push(title.clone()),
+            }
+        }
+        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
+            return Ok(out);
+        };
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let fetched = crate::pageinfo::title_categories(client, &missing).await;
+        for title in missing {
+            let cats = fetched.get(&title).cloned().unwrap_or_default();
+            self.store_categories(&title, &cats);
+            out.insert(title, cats);
+        }
+        Ok(out)
+    }
+
     async fn get_file_info(
         &self,
         title: &rustoid_core::Title,
@@ -918,6 +950,36 @@ impl CachedDataSource {
         };
         if let Ok(mut guard) = self.cache.lock() {
             let _ = guard.put(EntryKind::Protection, title, &body, meta);
+        }
+        let _ = self.note_written();
+    }
+
+    /// A title's cached categories, if this cache holds them.
+    fn cached_categories(&self, title: &str) -> Option<Vec<String>> {
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(EntryKind::Categories, title).ok().flatten());
+        let hit = cached?;
+        self.observe(&hit.meta);
+        serde_json::from_str(&hit.body).ok()
+    }
+
+    /// Write a title's categories to the cache. A failure is swallowed, like
+    /// [`Self::store_protection`].
+    fn store_categories(&self, title: &str, categories: &[String]) {
+        let Ok(body) = serde_json::to_string(categories) else {
+            return;
+        };
+        let meta = EntryMeta {
+            kind: EntryKind::Categories,
+            title: title.to_string(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        if let Ok(mut guard) = self.cache.lock() {
+            let _ = guard.put(EntryKind::Categories, title, &body, meta);
         }
         let _ = self.note_written();
     }

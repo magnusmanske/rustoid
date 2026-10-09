@@ -416,6 +416,27 @@ impl WikiClient {
         self.get_text(&url).await
     }
 
+    /// The categories a page belongs to, for up to 50 titles.
+    ///
+    /// `prop=categories` is what `mw.title`'s `categories` reads: the page's *own*
+    /// category links, not those of templates it transcludes. `cllimit=max` lifts
+    /// the default 10-category cap so a heavily categorised page is not silently
+    /// truncated. A separate request from the others because only `mw.title`
+    /// needs it.
+    pub async fn categories_json(&self, titles: &[String]) -> Result<String> {
+        let joined = titles
+            .iter()
+            .map(|t| urlencode(t))
+            .collect::<Vec<_>>()
+            .join("%7C");
+        let url = format!(
+            "{}?action=query&prop=categories&cllimit=max&format=json&formatversion=2&titles={}",
+            self.wiki.api_url(),
+            joined
+        );
+        self.get_text(&url).await
+    }
+
     /// `imageinfo` for one file, optionally at a requested display size.
     ///
     /// `iiurlwidth`/`iiurlheight` make the wiki generate a thumbnail at that

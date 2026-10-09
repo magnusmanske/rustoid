@@ -76,6 +76,12 @@ pub enum EntryKind {
     /// fact the body cannot supply: without it offline media is always
     /// `mw-broken-media`.
     FileInfo,
+    /// A page's own category member names, as a JSON array, for
+    /// `title.categories`.
+    ///
+    /// Same reasoning as [`Protection`](Self::Protection): a fact the body
+    /// cannot supply, needed by an offline run that has the wikitext.
+    Categories,
 }
 
 impl EntryKind {
@@ -100,6 +106,7 @@ impl EntryKind {
             Self::Protection => "prot",
             Self::PageInfo => "info",
             Self::FileInfo => "file",
+            Self::Categories => "cat",
         }
     }
 
@@ -115,6 +122,7 @@ impl EntryKind {
             "prot" => Some(Self::Protection),
             "info" => Some(Self::PageInfo),
             "file" => Some(Self::FileInfo),
+            "cat" => Some(Self::Categories),
             _ => None,
         }
     }
