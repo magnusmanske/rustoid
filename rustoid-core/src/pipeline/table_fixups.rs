@@ -397,11 +397,14 @@ fn hoist_transclusion_info(cell: &mut Node, transclusions: &[Node], source: Opti
         fill_dsr_gap(&mut parts, source, a, b);
     }
 
-    // Hoist the transclusion info onto the cell.
+    // Hoist the transclusion info onto the cell. The `typeof` goes on first:
+    // the service sets it while the cell is still a plain tree node and adds
+    // `about` later, during encapsulation, and the serializer keeps that order
+    // (`<td … typeof="mw:Transclusion" about="#mwtN">`).
+    add_type_of(cell, "mw:Transclusion");
     if let Some(about) = last_about {
         cell.set_attr("about", about);
     }
-    add_type_of(cell, "mw:Transclusion");
     cell.data_mw = Some(serde_json::json!({ "parts": parts }).to_string());
     if !pi.is_empty()
         && let Some(dp) = cell.dp.as_mut()
