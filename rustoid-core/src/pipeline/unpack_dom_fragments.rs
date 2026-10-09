@@ -254,7 +254,16 @@ fn transfer_metadata(placeholder: &Node, kids: &mut [Node]) {
                 }
             }
         }
-        if let Some(ab) = &about {
+        // The placeholder's `about` is the *enclosing* range's id, stamped during
+        // encapsulation. A fragment child may already carry an id of its own — a
+        // `<templatestyles>` was numbered when its fragment was built and the
+        // `DEFERRED_ABOUT` marker was resolved at splice time — and that id must
+        // win: it is the extension's, not the transclusion's. Overwriting it made
+        // `{{no result|{{mono|AB}}}}` serve `<style about="">` (`TableFixups`
+        // then strips the wrongly-transferred cell `about` because it matches).
+        if let Some(ab) = &about
+            && child.get_attr("about").is_none()
+        {
             child.set_attr("about", ab.clone());
         }
     }
@@ -430,6 +439,34 @@ mod tests {
                 .contains("mw:Transclusion")
         );
         assert_eq!(child.data_mw.as_deref(), Some("{\"name\":\"pre\"}"));
+    }
+
+    /// A fragment child that already carries its own `about` keeps it. The
+    /// placeholder's `about` is the enclosing transclusion range's id, stamped
+    /// during encapsulation; a `<templatestyles>` child was numbered separately,
+    /// so the two differ and the child's own id must win (else `TableFixups`
+    /// strips it as the cell's, and `{{no result|{{mono|AB}}}}` serves
+    /// `<style about="">`).
+    #[test]
+    fn test_keeps_the_fragment_childs_own_about() {
+        let mut frag = Node::document();
+        let mut style = Node::element(ElementKind::Other("style".into()));
+        style.set_attr("about", "#mwt2");
+        frag.push_child(style);
+
+        let mut ph = fragment_placeholder(ElementKind::Other("style".into()));
+        ph.set_attr("about", "#mwt1");
+        ph.fragment = Some(Box::new(frag));
+
+        let mut doc = Node::document();
+        doc.push_child(ph);
+        run(&mut doc);
+
+        assert_eq!(
+            doc.children[0].get_attr("about"),
+            Some("#mwt2"),
+            "the fragment child's own about is kept, not overwritten"
+        );
     }
 
     #[test]
