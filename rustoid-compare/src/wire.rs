@@ -437,6 +437,26 @@ impl WikiClient {
         self.get_text(&url).await
     }
 
+    /// FlaggedRevs stability settings for up to 50 titles.
+    ///
+    /// `prop=flagged` serves the `flaggedpage_config` row that
+    /// `mw.ext.FlaggedRevs.getStabilitySettings` reads (`protection_level` is the
+    /// `autoreview` restriction, `protection_expiry` its expiry). A page with no
+    /// configuration omits both fields, which reads as the default settings.
+    pub async fn flagged_json(&self, titles: &[String]) -> Result<String> {
+        let joined = titles
+            .iter()
+            .map(|t| urlencode(t))
+            .collect::<Vec<_>>()
+            .join("%7C");
+        let url = format!(
+            "{}?action=query&prop=flagged&format=json&formatversion=2&titles={}",
+            self.wiki.api_url(),
+            joined
+        );
+        self.get_text(&url).await
+    }
+
     /// `imageinfo` for one file, optionally at a requested display size.
     ///
     /// `iiurlwidth`/`iiurlheight` make the wiki generate a thumbnail at that

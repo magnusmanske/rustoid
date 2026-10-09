@@ -919,6 +919,15 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         .await
         .ok()
         .and_then(|mut m| m.remove(title));
+    // The page's FlaggedRevs stability settings, for
+    // `mw.ext.FlaggedRevs.getStabilitySettings`. Absent from the answer stays
+    // `None` (unknown), which the caller re-asks; a present entry carries the
+    // default settings for a page with no configuration.
+    let stability = source
+        .get_title_stability(std::slice::from_ref(&title.to_string()))
+        .await
+        .ok()
+        .and_then(|mut m| m.remove(title));
     // A File or Media title also answers `title.file`, so the file's metadata is
     // part of its facts. `None` sizes are deliberate — the natural dimensions
     // are what `Module:Multiple image` needs, not a thumbnail's. A Media title
@@ -950,6 +959,7 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         content,
         protection,
         categories,
+        stability,
         file,
     }
 }

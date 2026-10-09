@@ -798,6 +798,40 @@ impl DataSource for CachedDataSource {
         Ok(out)
     }
 
+    async fn get_title_stability(
+        &self,
+        titles: &[String],
+    ) -> rustoid_core::Result<
+        std::collections::HashMap<String, rustoid_core::traits::StabilitySettings>,
+    > {
+        // Same shape as `get_title_protection`: cached answers serve offline runs,
+        // and an uncached title stays absent (unknown) so the retry loop re-asks
+        // rather than reading a fabricated "no configuration".
+        let mut out = std::collections::HashMap::new();
+        let mut missing: Vec<String> = Vec::new();
+        for title in titles {
+            match self.cached_stability(title) {
+                Some(settings) => {
+                    out.insert(title.clone(), settings);
+                }
+                None => missing.push(title.clone()),
+            }
+        }
+        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
+            return Ok(out);
+        };
+        if missing.is_empty() {
+            return Ok(out);
+        }
+        let fetched = crate::pageinfo::title_stability(client, &missing).await;
+        for title in missing {
+            let settings = fetched.get(&title).cloned().unwrap_or_default();
+            self.store_stability(&title, &settings);
+            out.insert(title, settings);
+        }
+        Ok(out)
+    }
+
     async fn get_file_info(
         &self,
         title: &rustoid_core::Title,
@@ -980,6 +1014,36 @@ impl CachedDataSource {
         };
         if let Ok(mut guard) = self.cache.lock() {
             let _ = guard.put(EntryKind::Categories, title, &body, meta);
+        }
+        let _ = self.note_written();
+    }
+
+    /// A title's cached FlaggedRevs stability settings, if this cache holds them.
+    fn cached_stability(&self, title: &str) -> Option<rustoid_core::traits::StabilitySettings> {
+        let cached = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(EntryKind::Stability, title).ok().flatten());
+        let hit = cached?;
+        self.observe(&hit.meta);
+        serde_json::from_str(&hit.body).ok()
+    }
+
+    /// Write a title's stability settings to the cache. A failure is swallowed,
+    /// like [`Self::store_protection`].
+    fn store_stability(&self, title: &str, settings: &rustoid_core::traits::StabilitySettings) {
+        let Ok(body) = serde_json::to_string(settings) else {
+            return;
+        };
+        let meta = EntryMeta {
+            kind: EntryKind::Stability,
+            title: title.to_string(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        if let Ok(mut guard) = self.cache.lock() {
+            let _ = guard.put(EntryKind::Stability, title, &body, meta);
         }
         let _ = self.note_written();
     }

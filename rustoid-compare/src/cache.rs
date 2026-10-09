@@ -82,6 +82,13 @@ pub enum EntryKind {
     /// Same reasoning as [`Protection`](Self::Protection): a fact the body
     /// cannot supply, needed by an offline run that has the wikitext.
     Categories,
+    /// A page's FlaggedRevs stability settings, as a JSON object, for
+    /// `mw.ext.FlaggedRevs.getStabilitySettings`.
+    ///
+    /// Same reasoning as [`Protection`](Self::Protection): the pending-changes
+    /// configuration lives in a DB table the body cannot supply, and without it
+    /// every article reads "not pending-changes protected".
+    Stability,
 }
 
 impl EntryKind {
@@ -107,6 +114,7 @@ impl EntryKind {
             Self::PageInfo => "info",
             Self::FileInfo => "file",
             Self::Categories => "cat",
+            Self::Stability => "flag",
         }
     }
 
@@ -123,6 +131,7 @@ impl EntryKind {
             "info" => Some(Self::PageInfo),
             "file" => Some(Self::FileInfo),
             "cat" => Some(Self::Categories),
+            "flag" => Some(Self::Stability),
             _ => None,
         }
     }

@@ -263,12 +263,28 @@ struct PageEntry {
     /// `{ns, title}` with `title` carrying the `Category:` prefix.
     #[serde(default)]
     categories: Option<Vec<CategoryEntry>>,
+    /// `prop=flagged` output: the page's FlaggedRevs state. Present when the page
+    /// has a `flaggedpages` row; `protection_level`/`protection_expiry` only when
+    /// it also has a `flaggedpage_config` row.
+    #[serde(default)]
+    flagged: Option<FlaggedEntry>,
 }
 
 #[derive(serde::Deserialize)]
 struct CategoryEntry {
     #[serde(default)]
     title: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct FlaggedEntry {
+    /// The `autoreview` restriction (`fpc_level`).
+    #[serde(default)]
+    protection_level: Option<String>,
+    /// The restriction's expiry (`fpc_expiry`), MediaWiki's ISO form or
+    /// `"infinity"`.
+    #[serde(default)]
+    protection_expiry: Option<String>,
 }
 
 impl PageEntry {
@@ -377,6 +393,72 @@ fn category_member_name(title: &str) -> String {
     }
 }
 
+/// The `prop=flagged` response, using the same `pages` shape as the others.
+#[derive(serde::Deserialize)]
+struct FlaggedResponse {
+    query: ProtectionQuery,
+}
+
+/// The FlaggedRevs stability settings a set of pages carry, for
+/// `mw.ext.FlaggedRevs.getStabilitySettings`.
+///
+/// Mirrors `FRPageConfig::getVisibilitySettingsFromRow`: `protection_level` is
+/// the `autoreview` restriction and `protection_expiry` its expiry. A page with
+/// no `flaggedpage_config` row (or a non-`flagged` page) answers the default
+/// settings — an empty `autoreview` and `infinity`. Every requested title is
+/// present in the result, keyed by the title *as asked*, like
+/// [`title_protection`].
+pub async fn title_stability(
+    client: &WikiClient,
+    titles: &[String],
+) -> HashMap<String, rustoid_core::traits::StabilitySettings> {
+    use rustoid_core::traits::StabilitySettings;
+
+    let mut out = HashMap::new();
+    for chunk in titles.chunks(TITLES_PER_QUERY) {
+        let Ok(body) = client.flagged_json(chunk).await else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<FlaggedResponse>(&body) else {
+            continue;
+        };
+        let mut asked: HashMap<String, String> = HashMap::new();
+        for t in chunk {
+            asked.insert(normalise(t), t.clone());
+        }
+        for page in parsed.query.pages {
+            let Some(title) = page.title else { continue };
+            let flagged = page.flagged;
+            let settings = StabilitySettings {
+                // `fpc_level` is stored from a validated `autoreview`, so it is
+                // used verbatim (the empty string is "no restriction").
+                autoreview: flagged
+                    .as_ref()
+                    .and_then(|f| f.protection_level.clone())
+                    .unwrap_or_default(),
+                // An absent expiry is the DB default, `infinity`.
+                expiry: flagged
+                    .as_ref()
+                    .and_then(|f| f.protection_expiry.as_deref())
+                    .map(to_wiki_expiry)
+                    .unwrap_or_else(|| "infinity".to_string()),
+            };
+            match asked.get(&normalise(&title)) {
+                Some(original) => out.insert(original.clone(), settings.clone()),
+                None => out.insert(title.clone(), settings.clone()),
+            };
+            out.insert(title, settings);
+        }
+    }
+    // Anything the wiki never mentioned has the default settings, so a caller
+    // cannot mistake "unknown" for "configured". A title the host did not fetch
+    // at all stays absent (the caller re-asks).
+    for t in titles {
+        out.entry(t.clone()).or_default();
+    }
+    out
+}
+
 /// Existence checks that fail soft, for use from the parser.
 ///
 /// A failure here would abort the whole parse, and red-link marking is cosmetic
@@ -466,6 +548,7 @@ mod tests {
             pageprops: None,
             protection: None,
             categories: None,
+            flagged: None,
         }
         .to_page_info();
         assert!(!exists.missing, "an existing page is not a red link");
@@ -524,6 +607,25 @@ mod tests {
         let json = r#"{"query":{"pages":[{"ns":0,"title":"Plain","pageid":1}]}}"#;
         let parsed: ProtectionResponse = serde_json::from_str(json).unwrap();
         assert!(parsed.query.pages[0].protection.is_none());
+    }
+
+    /// `prop=flagged` serves the stability configuration; a page without one
+    /// omits the `protection_*` fields (which read as the DB defaults).
+    #[test]
+    fn flagged_reads_the_stability_configuration() {
+        let json = r#"{"query":{"pages":[{"ns":0,"title":"ISO 3166-1 alpha-2",
+            "flagged":{"stable_revid":1,"level":0,"level_text":"stable",
+                "protection_level":"autoconfirmed","protection_expiry":"infinity"}}]}}"#;
+        let parsed: FlaggedResponse = serde_json::from_str(json).unwrap();
+        let flagged = parsed.query.pages[0].flagged.as_ref().expect("flagged");
+        assert_eq!(flagged.protection_level.as_deref(), Some("autoconfirmed"));
+        assert_eq!(flagged.protection_expiry.as_deref(), Some("infinity"));
+
+        let plain = r#"{"query":{"pages":[{"ns":0,"title":"Plain",
+            "flagged":{"stable_revid":1,"level":0,"level_text":"stable"}}]}}"#;
+        let parsed: FlaggedResponse = serde_json::from_str(plain).unwrap();
+        let flagged = parsed.query.pages[0].flagged.as_ref().expect("flagged");
+        assert!(flagged.protection_level.is_none());
     }
 
     /// `prop=categories` sends each link with its full prefixed title, and

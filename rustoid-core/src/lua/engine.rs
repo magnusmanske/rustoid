@@ -330,6 +330,11 @@ pub struct TitleFacts {
     /// "fetched, no categories" — the distinction Scribunto draws between an
     /// unknown page and one with no categories.
     pub categories: Option<Vec<String>>,
+    /// The page's FlaggedRevs stability settings, for
+    /// `mw.ext.FlaggedRevs.getStabilitySettings`. `None` means "not fetched" (or
+    /// "the wiki did not answer"); the settings themselves carry the default
+    /// `autoreview = ""` for a page with no configuration.
+    pub stability: Option<crate::traits::StabilitySettings>,
     /// A file title's metadata, for `title.file`. `None` means either "not a
     /// file", "the file does not exist", or "not fetched";
     /// [`title_derived_field`] tells them apart by the title's namespace and
@@ -2067,22 +2072,26 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
     // `mw.ext.FlaggedRevs.getStabilitySettings(title)` — a page's pending-changes
-    // (FlaggedRevs) configuration. Returns `nil`: that is how the wiki answers for
-    // a page with no stability configuration, and `Module:Effective protection
-    // level` reads it as `level and level.autoreview`, so `nil` takes the branch
-    // that reports no extra review requirement. A table would invent a review
-    // level the wiki does not apply. Its absence was "attempt to index field
-    // 'FlaggedRevs' (a nil value)", which aborted `Template:Pp-pc` (reached from
-    // `{{pp-pc}}`) and so left every `mw-empty-elt` paragraph that wrapped it
-    // unmarked.
+    // (FlaggedRevs) configuration. `Module:Effective protection level` reads
+    // `level.autoreview` and `Module:Effective protection expiry` reads
+    // `level.expiry`; with the field absent the call was a Lua error, and with it
+    // always `nil` every article read "not pending-changes protected", so the
+    // padlock indicator was replaced by the "incorrect protection template"
+    // category — which is what left every `mw-empty-elt` paragraph that wrapped a
+    // `{{pp-pc}}` unmarked. The settings come from `prop=flagged` (see
+    // [`crate::traits::DataSource::get_title_stability`]); outside the wiki's
+    // review namespaces the call answers `nil`, as `inReviewNamespace` does.
     let ext_flagged = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    let flagged_ctx = ctx.clone();
     ext_flagged
         .set(
             "getStabilitySettings",
-            lua.create_function(|_, _title: Value| Ok(Value::Nil))
-                .map_err(|e| RustoidError::Lua(e.to_string()))?,
+            lua.create_function(move |lua, pagename: Value| {
+                stability_settings(lua, &flagged_ctx, pagename)
+            })
+            .map_err(|e| RustoidError::Lua(e.to_string()))?,
         )
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     ext.set("FlaggedRevs", ext_flagged)
@@ -2471,7 +2480,7 @@ fn luafn_title_new(
     // never looks at `talkPageTitle` should not pay for building it, and eager
     // construction would recurse (a title's talk page is itself a title).
     let facts = title_facts_for(ctx, &ns_id, &title_text);
-    let is_current = is_current_title(&ctx.current_title, &full, &title_text);
+    let is_current = is_current_title(&ctx.current_title, &full, &title_text, ns_id);
     let current_source = ctx.page_source.clone();
 
     // The shared metatable's `__index` is generic — it cannot capture this
@@ -2885,12 +2894,14 @@ fn given_namespace_id(site: &LuaSite, ns: &Value) -> Option<i32> {
 }
 
 /// Whether a title names the page being parsed, as both construction paths must
-/// agree on: an underscored spelling and the bare text each count, since
-/// `mw.title.getCurrentTitle()` and a `mw.title.new(currentTitle.text)` have to
-/// compare equal for `exists` and `getContent`.
-fn is_current_title(current: &str, full: &str, title_text: &str) -> bool {
+/// agree on: an underscored spelling and the bare text of a main-namespace title
+/// each count, since `mw.title.getCurrentTitle()` and a
+/// `mw.title.new(currentTitle.text)` have to compare equal for `exists` and
+/// `getContent`. The bare-text arm is main-namespace only: a `Talk:` title shares
+/// its text with its subject page and must not read as current.
+fn is_current_title(current: &str, full: &str, title_text: &str, ns_id: i32) -> bool {
     let current = current.replace('_', " ");
-    full.eq_ignore_ascii_case(&current) || title_text.eq_ignore_ascii_case(&current)
+    full.eq_ignore_ascii_case(&current) || (ns_id == 0 && title_text.eq_ignore_ascii_case(&current))
 }
 
 /// Build the title object for a full `Ns:Text` string, with no external data.
@@ -2955,7 +2966,7 @@ fn title_object(
         .and_then(|db| title_facts_in(&db.titles, site, ns_id, title_text));
     let is_current = db
         .as_ref()
-        .is_some_and(|db| is_current_title(&db.current_title, full, title_text));
+        .is_some_and(|db| is_current_title(&db.current_title, full, title_text, ns_id));
     let full_for_lookup = full.to_string();
     table.raw_set(
         TITLE_FACTS_KEY,
@@ -3257,12 +3268,78 @@ fn title_facts_in(
     if let Some(facts) = titles.get(&key) {
         return Some(facts.clone());
     }
-    // Titles are keyed as written in `mw.title.new`, which may omit the
-    // namespace when the module passed one separately.
+    // Titles are keyed as written in `mw.title.new`, which may differ from the
+    // canonical spelling only by case or underscore. The namespace must match
+    // too: without that check a derived title in another namespace
+    // (`Talk:Israel`) matched the bare key of its subject page (`Israel`) and
+    // read *its* facts — which is why `Talk:Israel`'s `categories` were never
+    // fetched.
     titles
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(title_text))
+        .find(|(k, _)| {
+            let (found_ns, found_text) = split_title(site, k);
+            found_ns == ns_id && found_text.eq_ignore_ascii_case(title_text)
+        })
         .map(|(_, v)| v.clone())
+}
+
+/// Whether a namespace has FlaggedRevs review enabled —
+/// `FlaggedRevs::inReviewNamespace`.
+///
+/// `mw.ext.FlaggedRevs.getStabilitySettings` answers `nil` outside it. The set is
+/// the wiki's `$wgFlaggedRevsNamespaces`, which the read API does not expose; on
+/// enwiki it is the main and project namespaces (read off the wiki's own
+/// `Module:Effective protection expiry`, which returns `unknown` for a
+/// non-reviewed title and `infinity` for a reviewed one). `Media:` shares
+/// `File:`'s namespace, as in PHP.
+fn in_review_namespace(ns_id: i32) -> bool {
+    matches!(ns_id, 0 | 4)
+}
+
+/// `mw.ext.FlaggedRevs.getStabilitySettings(pagename)`, for
+/// [`setup_mw_table`].
+///
+/// Resolves the argument (a title object's `prefixedText`, a string, or nothing
+/// for the current title), answers `nil` outside a review namespace, and reads
+/// the settings from the round's page facts. A title whose settings were not
+/// fetched is requested so the next round can answer it.
+fn stability_settings(lua: &Lua, ctx: &LuaContext, pagename: Value) -> mlua::Result<Value> {
+    let full = match &pagename {
+        Value::Nil => ctx.current_title.clone(),
+        Value::String(s) => s.to_str()?.to_string(),
+        Value::Table(t) => t.get::<Option<String>>("prefixedText")?.unwrap_or_default(),
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "getStabilitySettings expects a title, got a {}",
+                other.type_name()
+            )));
+        }
+    };
+    let site = &ctx.site;
+    let (ns_id, title_text) = split_title(site, &full);
+    if !in_review_namespace(ns_id) {
+        return Ok(Value::Nil);
+    }
+    // An unknown title is requested; a fetched one whose settings the wiki did
+    // not answer (an offline cache miss) reads as "no configuration", which is
+    // the module's permissive branch and never a loop.
+    match title_facts_for(ctx, &ns_id, &title_text) {
+        Some(facts) => match facts.stability {
+            Some(settings) => {
+                let table = lua.create_table()?;
+                table.set("autoreview", settings.autoreview)?;
+                table.set("expiry", settings.expiry)?;
+                Ok(Value::Table(table))
+            }
+            None => Ok(Value::Nil),
+        },
+        None => {
+            if !full.is_empty() {
+                note_missing_title(lua, &full)?;
+            }
+            Ok(Value::Nil)
+        }
+    }
 }
 
 /// `Namespace:Text`, or just `Text` for the main namespace.
@@ -8875,6 +8952,82 @@ mod tests {
         assert_eq!(
             engine.take_missing_titles(),
             vec!["Module:Unknown".to_string()]
+        );
+    }
+
+    /// A derived title in another namespace must read *its own* facts, not its
+    /// subject page's. `Talk:X` shares the bare text `X` with its subject, and the
+    /// case-insensitive key fallback used to match the subject's entry — which is
+    /// why `Talk:Israel`'s `categories` were never fetched and
+    /// `Module:Protected page`'s PIA flag went missing.
+    #[test]
+    fn a_derived_title_reads_its_own_namespace_facts() {
+        let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "X");
+        let cats = |name: &str| TitleFacts {
+            exists: true,
+            categories: Some(vec![name.to_string()]),
+            ..Default::default()
+        };
+        ctx.titles.insert("X".to_string(), cats("Subject"));
+        ctx.titles.insert("Talk:X".to_string(), cats("Discussion"));
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+
+        assert_eq!(
+            engine
+                .eval("return mw.title.new('X').talkPageTitle.categories[1]")
+                .unwrap(),
+            "Discussion"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.title.new('Talk:X').subjectPageTitle.categories[1]")
+                .unwrap(),
+            "Subject"
+        );
+    }
+
+    /// `mw.ext.FlaggedRevs.getStabilitySettings` answers the pending-changes
+    /// configuration from the round's facts — `Module:Effective protection level`
+    /// reads `autoreview` and `Module:Effective protection expiry` reads `expiry`.
+    /// Outside the review namespaces the wiki answers `nil`.
+    #[test]
+    fn mw_ext_flaggedrevs_answers_the_stability_settings() {
+        let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test Page");
+        ctx.titles.insert(
+            "Test Page".to_string(),
+            TitleFacts {
+                exists: true,
+                stability: Some(crate::traits::StabilitySettings {
+                    autoreview: "autoconfirmed".to_string(),
+                    expiry: "infinity".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+
+        assert_eq!(
+            engine
+                .eval("return mw.ext.FlaggedRevs.getStabilitySettings('Test Page').autoreview")
+                .unwrap(),
+            "autoconfirmed"
+        );
+        assert_eq!(
+            engine
+                .eval(
+                    "return tostring(mw.ext.FlaggedRevs.getStabilitySettings('Test Page').expiry)"
+                )
+                .unwrap(),
+            "infinity"
+        );
+        // A namespace without review enabled (the wiki's `inReviewNamespace`).
+        assert_eq!(
+            engine
+                .eval(
+                    "return tostring(mw.ext.FlaggedRevs.getStabilitySettings('Template:Infobox'))"
+                )
+                .unwrap(),
+            "nil"
         );
     }
 

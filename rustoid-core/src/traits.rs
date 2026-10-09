@@ -218,6 +218,41 @@ pub trait DataSource: Send + Sync {
         let _ = titles;
         Ok(HashMap::new())
     }
+
+    /// A page's FlaggedRevs stability settings, keyed by the title as asked — for
+    /// `mw.ext.FlaggedRevs.getStabilitySettings`.
+    ///
+    /// Mirrors `FRPageConfig::getVisibilitySettingsFromRow`: an entry is present
+    /// for every title the wiki answered, with the default settings
+    /// (`autoreview` empty) for a page that has no stability configuration. A
+    /// title absent from the map is *unknown* and is re-asked next round.
+    async fn get_title_stability(
+        &self,
+        titles: &[String],
+    ) -> Result<HashMap<String, StabilitySettings>> {
+        let _ = titles;
+        Ok(HashMap::new())
+    }
+}
+
+/// A page's FlaggedRevs stability settings, as
+/// `mw.ext.FlaggedRevs.getStabilitySettings` reports them.
+///
+/// `FlaggedRevsScribuntoLuaLibrary::getStabilitySettings` returns
+/// `FlaggableWikiPage::getStabilitySettings()`, which is
+/// `FRPageConfig`'s visibility settings: the `autoreview` restriction and its
+/// `expiry`. `Module:Effective protection level` reads `autoreview` and
+/// `Module:Effective protection expiry` reads `expiry`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StabilitySettings {
+    /// The `autoreview` restriction level, empty when the page has no stability
+    /// configuration. `Module:Effective protection level` maps `"review"` to
+    /// `"reviewer"`, any other non-empty value to itself, and an empty one to
+    /// `nil` ("not pending-changes protected").
+    pub autoreview: String,
+    /// The configuration's expiry in MediaWiki's DB form (`YYYYMMDDHHMMSS`) or
+    /// the literal `"infinity"`.
+    pub expiry: String,
 }
 
 /// Page metadata used for link resolution (mirrors the per-title map returned
