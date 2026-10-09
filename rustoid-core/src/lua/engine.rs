@@ -750,16 +750,9 @@ impl LuaEngine {
     /// return p`), not a set of globals, so the *returned* value is what carries
     /// the entry points. `title` names it for error messages.
     pub fn load_module_value(&self, module_source: &str, title: Option<&str>) -> Result<Value> {
-        self.lua
-            .load(module_source)
-            .set_name(title.unwrap_or("module"))
-            .eval::<Value>()
-            .map_err(|e| {
-                RustoidError::Lua(format!(
-                    "module load error in {}: {e}",
-                    title.unwrap_or("module")
-                ))
-            })
+        let name = title.unwrap_or("module");
+        eval_module(&self.lua, module_source, name)
+            .map_err(|e| RustoidError::Lua(format!("module load error in {name}: {e}")))
     }
 
     /// Fetch a module's entry point: `module[function_name]`, falling back to a
@@ -1267,6 +1260,49 @@ fn install_frame_results(lua: &Lua) -> Result<()> {
 
 // ---- module loader ----
 
+/// Compiled module bytecode, keyed by the module's source text.
+///
+/// An `#invoke` re-runs its module from the top on every round of the
+/// fetch/expand loop (see [`crate::lua::invoke::invoke`]), and each round hands
+/// the loader a fresh [`LuaEngine`] — so without this, `require` re-lexes and
+/// re-parses every module on every round. For a module such as
+/// `Module:Autotaxobox` that loop runs 300+ rounds, and the parsing dominates
+/// the whole page's render time. The bytecode depends only on the source (the
+/// Lua version and platform are fixed within a process), so it is cached once
+/// and reloaded — a deserialization, not a parse — on every later round.
+///
+/// Thread-local rather than shared: a page's render runs on one thread (its own
+/// current-thread runtime), so this needs no lock, and a corpus run has one
+/// worker thread per core, each reusing what it compiled for its earlier pages.
+fn module_bytecode_cache(f: impl FnOnce(&mut std::collections::HashMap<String, Vec<u8>>)) {
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<String, Vec<u8>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|cache| f(&mut cache.borrow_mut()));
+}
+
+/// Compile and run a chunk, reusing cached bytecode when this source was loaded
+/// before. Debug info is kept (`dump(false)`) so a raised error still names the
+/// module and its line, which modules' `pcall` branches read.
+fn eval_module<R: mlua::FromLuaMulti>(lua: &Lua, source: &str, title: &str) -> mlua::Result<R> {
+    let mut cached = None;
+    module_bytecode_cache(|cache| cached = cache.get(source).cloned());
+    if let Some(bytes) = cached {
+        return lua.load(bytes).set_name(title.to_string()).call(());
+    }
+    let function = lua
+        .load(source)
+        .set_name(title.to_string())
+        .into_function()?;
+    // The cache borrow is released before the call below: running a chunk can
+    // call back into the loader, and the borrow is re-entered then.
+    module_bytecode_cache(|cache| {
+        cache.insert(source.to_string(), function.dump(false));
+    });
+    function.call(())
+}
+
 /// Install `require`, `mw.loadData` and a `package` stub.
 ///
 /// Scribunto's `require` is synchronous inside Lua, so it cannot fetch: the
@@ -1362,7 +1398,7 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
             };
 
             loading.set(title.clone(), true)?;
-            let value = lua.load(source).set_name(title.clone()).eval::<Value>();
+            let value = eval_module::<Value>(lua, source, &title);
             loading.set(title.clone(), Value::Nil)?;
 
             let value = value?;
@@ -1562,10 +1598,7 @@ fn builtin_library(lua: &Lua, name: &str) -> Option<Value> {
         return mw.get::<Value>("ustring").ok();
     }
     let (_, source) = BUILTIN_LIBRARIES.iter().find(|(n, _)| *n == name)?;
-    lua.load(*source)
-        .set_name((*name).to_string())
-        .eval::<Value>()
-        .ok()
+    eval_module::<Value>(lua, source, name).ok()
 }
 
 /// Look a module up by title, tolerating case and underscore/space differences.
@@ -2098,11 +2131,8 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
             .set(key.as_str(), text.as_str())
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
     }
-    let message: Table = lua
-        .load(MESSAGE_LIB)
-        .set_name("mw.message")
-        .eval::<Function>()
-        .and_then(|build| build.call(messages))
+    let message: Table = eval_module(lua, MESSAGE_LIB, "mw.message")
+        .and_then(|build: Function| build.call(messages))
         .map_err(|e| RustoidError::Lua(format!("mw.message setup: {e}")))?;
     mw.set("message", message)?;
 
@@ -2113,19 +2143,14 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     let entities: Table = {
         let args =
             entity_table(lua, ctx.clone()).map_err(|e| mlua::Error::runtime(e.to_string()))?;
-        lua.load(WIKIBASE_LIB)
-            .set_name("mw.wikibase")
-            .eval::<Function>()
-            .and_then(|build| build.call(args))
+        eval_module(lua, WIKIBASE_LIB, "mw.wikibase")
+            .and_then(|build: Function| build.call(args))
             .map_err(|e| RustoidError::Lua(format!("mw.wikibase setup: {e}")))?
     };
     mw.set("wikibase", entities)?;
 
     // mw.html — built from Lua source (see `HTML_LIB`).
-    let html: Table = lua
-        .load(HTML_LIB)
-        .set_name("mw.html")
-        .eval()
+    let html: Table = eval_module(lua, HTML_LIB, "mw.html")
         .map_err(|e| RustoidError::Lua(format!("mw.html setup: {e}")))?;
     mw.set("html", html)?;
 
@@ -2135,9 +2160,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     lua.globals()
         .set("__rustoid_mw", mw.clone())
         .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
-    lua.load(LUA_STDLIB_EXTRAS)
-        .set_name("lua stdlib extras")
-        .exec()
+    eval_module::<()>(lua, LUA_STDLIB_EXTRAS, "lua stdlib extras")
         .map_err(|e| RustoidError::Lua(format!("stdlib setup: {e}")))?;
     lua.globals()
         .set("__rustoid_mw", Value::Nil)
@@ -8853,6 +8876,25 @@ mod tests {
             engine.take_missing_titles(),
             vec!["Module:Unknown".to_string()]
         );
+    }
+
+    /// A module loaded a second time comes from cached bytecode, so the cache
+    /// must be behaviour-preserving — including the error text `pcall` branches
+    /// read. The line number survives because the dump keeps debug info.
+    #[test]
+    fn a_cached_module_reports_the_same_error() {
+        let engine = make_engine();
+        let source = "local x = {}\nreturn x.missing()\n";
+        let first = engine
+            .load_module_value(source, Some("Module:Cached"))
+            .unwrap_err()
+            .to_string();
+        let second = engine
+            .load_module_value(source, Some("Module:Cached"))
+            .unwrap_err()
+            .to_string();
+        assert!(first.contains(":2:"), "line number kept: {first}");
+        assert_eq!(first, second, "a cached load behaves like the first");
     }
 
     /// `title.file` answers a file title's metadata from its facts, and requests
