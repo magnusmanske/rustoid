@@ -13751,3 +13751,43 @@ becomes an `<span typeof="mw:Nowiki" id="mwC9M">` DOM fragment, recorded in a
 `data-mw` `attribs` part, and the served `title` is that span's text. That
 `mw:ExpandedAttrs` marking — `about`, `typeof`, and the fragment-carrying
 `data-mw` `attribs` — is the next difference.
+
+## A DOM fragment marks expanded attributes even in a body
+
+The tooltip span served `about="#mwt553"` but neither
+`typeof="mw:ExpandedAttrs"` nor a `data-mw`, so an editor would not have the
+expanded `title`. The span arrives through a module, and `mark_synthesized`
+flags a module's (or template body's) top-level tokens, which
+`build_expanded_attrs` used to skip outright.
+
+That skip is right for a *meta-tag*-generated attribute — Parsoid's per-chunk
+`AttributeExpander` suppresses the meta marking for a body's `inTemplate` — but
+too broad. PHP's `stripMetaTags` checks `hasDOMFragmentType` **before** the
+`wrapTemplates` gate, so an attribute value holding a `mw:DOMFragment` (from a
+`{{#tag:nowiki|…}}`) marks the token even in a body.
+
+### Fix
+
+`strip_meta_tags_in_cell` records `has_dom_fragment` (whether the generated
+content was a DOM fragment), and `build_expanded_attrs` marks a synthesized
+token when `saw_dom_fragment` is set.
+
+### Effect
+
+`Zebra` **556847** (99.40%); the tooltip span now carries `about`,
+`typeof="mw:ExpandedAttrs"` and the `data-mw` `attribs` fragment.
+`Polio vaccine` moves `7815 → 7827`; no other corpus page moves. State: fixture
+guard **877/896**, lib **992**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (556847)
+
+The `data-mw` `attribs` html is missing an attribute the service has:
+
+```text
+mediawiki: … title="Zebras" about="#mwt553" typeof="mw:ExpandedAttrs" data-mw='{"attribs":[[{"txt":"title"},{"html":"&lt;span typeof=\"mw:Nowiki\" id=\"mwC9M\">Zebras&lt;/span>"}]]}'
+rustoid:   … title="Zebras" about="#mwt553" typeof="mw:ExpandedAttrs" data-mw='{"attribs":[[{"txt":"title"},{"html":"&lt;span typeof=\"mw:Nowiki\">Zebras&lt;/span>"}]]}'
+```
+
+The `mw:Nowiki` span in the expanded-attribute fragment needs its pagebundle
+`id="mwC9M"`. `value_to_dom_html` serializes the fragment as soon as the
+attribute expander runs, before the page's id pass, so the node has none yet.
