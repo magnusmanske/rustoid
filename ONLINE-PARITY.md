@@ -14072,3 +14072,59 @@ A deduplicated templatestyles link carries an empty `about`:
 about="" typeof="mw:Extension/templatestyles">` where the service serves
 `about="#mwt70"` (`deduplicate_styles::deduplicated_link` copies the source
 `<style>`'s `about`, which is empty for that node).
+
+## The T2529 rule: a transclusion's expansion beginning with a marker starts a line
+
+A `{{Plainlist|* a\n* b\n* c}}` served as a real `<ul>` with three `<li>`s, but
+rustoid emitted the raw `* a\n* b\n* c` as text (and a literal `<pre>` on the
+next line). The marker was there; it just never became a list.
+
+MediaWiki core's `Parser::braceSubstitution` (`includes/parser/Parser.php`)
+has the rule filed as **T2529**:
+
+```php
+} elseif ( is_string( $text ) && !$piece['lineStart']
+    && preg_match( '/^(?:{\||:|;|#|\*)/', $text ) )
+{
+    // Only prepend an extra newline if we're in the middle of a line.
+    $text = "\n" . $text;
+}
+```
+
+A template or parser function whose expanded *string* begins with `{|`, `:`,
+`;`, `#` or `*` — and whose call did not already start a line — gets a `\n`
+in front of it, so the tokenizer sees the marker at the start of a line. The
+marker usually arrives out of a *substituted argument*: the argument's own
+text was tokenized where the argument sat (mid-line), so a bare `*` in it
+never started a list. The rule is in **core**, not Parsoid; Parsoid's
+equivalent (`TokenStreamPatcher`, the `$T2529hack` block) only runs when
+native template expansion is enabled, which the served path does not use.
+
+### Fix
+
+`expand_templates`' template/`template3` arm calls a new
+`t2529_force_line_start(expanded, at_line_start)`. It looks past the
+transclusion wrapper markers (`mw:Transclusion` start/end metas), takes the
+first content token's source, and — if it begins with a marker and the call
+was not already at a line start — pushes a synthetic newline **before** the
+wrapper marker (so it lands outside the div the encapsulation pass builds),
+re-tokenizing a leading *string* at the new line start. A marker that is
+already a token (a `listItem` from an argument that began its own line) only
+needed the newline in front.
+
+### Effect
+
+`World War II` **21353 → 25363**, `Cristiano Ronaldo` **14779 → 15142**,
+`Lionel Messi` **11427 → 11775**, `Association football` **9818 → 9968**,
+`Quicksilver (film)` **6691 → 8797** (its plainlist now matches
+byte-for-byte), `Nobel Prize` **8312 → 8314**; no corpus page regresses. lib
+**1000**, compare **120**, fixture guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+`Quicksilver (film)` at 8797: a missing `[[Category:1986 films]]` link inside a
+`<span class="mw-empty-elt">`. Separately, the plainlist above still keeps one
+space on its non-first items (`<li>a</li>\n<li> b</li>` vs `<li>b</li>`): the
+first item is re-tokenized at SOL here and drops its post-marker space, while
+items 2/3 arrive already tokenized from the argument and keep theirs — the fix
+belongs in list-item tokenization, not in the `#if` trim.
