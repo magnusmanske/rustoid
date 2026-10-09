@@ -13933,3 +13933,45 @@ wraps it in an empty paragraph:
 parsoid:  …</div>\n<span typeof="mw:Nowiki mw:Transclusion" about="#mwt4" … id="mwBQ"></span>…
 rustoid:  …</div>\n<p class="mw-empty-elt" id="mwBQ"><span … id="mwBg">…</span></p>…
 ```
+
+## A `#invoke` round re-compiled every module (performance)
+
+A page's render was slow — `Israel` ~104 s, `Zebra` ~19 s, `Hydrogen` ~30 s
+— and the user flagged that as a possible stuck loop. It is not: a profile
+(`sample`) of `Zebra` showed the top frames were the Lua **parser**
+(`luaX_next`, `llex`, `subexpr`), and instrumenting the round loop showed
+`Module:Autotaxobox` reaching **334** rounds, `Module:Citation/CS1` **324**,
+`Module:Automated taxobox` **81**.
+
+The loop that needs 334 rounds is not a bug. A `frame:expandTemplate` on a
+miss records its request and raises, which unwinds the whole call, so only
+one request can be outstanding per round (see
+`pipeline::lua_deferred::frame_method`); the module is re-run from the top
+and makes one more call of progress each time. Each round, though, built a
+fresh `LuaEngine`, and each `require` re-lexed and re-parsed the module
+source — 334 parses of a dozen files for one invoke. `Chunk::eval` made it
+worse still: for text it first prepends `return ` and tries to compile as an
+expression, so a module was parsed *twice* per load.
+
+### Fix
+
+`eval_module` compiles a chunk with `into_function` (one parse) and caches
+`Function::dump(false)` — bytecode with debug info — keyed by the source.
+Later rounds `lua.load` the bytecode, which is a deserialization, not a
+parse. Reached through the same helper: the module loader, `mw.loadData`,
+the built-in libraries, and the `mw.message`/`mw.wikibase`/`mw.html`/stdlib
+setup chunks (previously compiled on every engine construction). The cache
+is thread-local: a page renders on one thread (its own current-thread
+runtime), so it needs no lock, and a corpus worker reuses what it compiled
+for its earlier pages.
+
+Debug info is kept (`dump(false)`) so an error still names the module and
+its line number, which modules' `pcall` branches read; a test pins that a
+cached load raises the same error text as the first.
+
+### Effect
+
+`Zebra` 19 s → 14 s, `Hydrogen` 30 s → 23 s, `Israel` 104 s → 83 s; the
+offline corpus 327 s → 281 s. Output is byte-identical — every page's first
+difference is unchanged. State: fixture guard **877/896**, lib **997**,
+compare **119**, clippy and fmt clean.
