@@ -14252,6 +14252,42 @@ page regresses. Distinct pages gain markings the service has:
 
 ### Next difference
 
-`ISO 3166-1 alpha-2` at 496807: after `<tr id="mwA8s">` the service keeps
-newlines around the row's leading HTML comments, rustoid drops them — a
-comment/newline placement inside a table row.
+(Resolved by the next section.) The newlines around a table row's leading
+comments were pooled after them.
+
+## A comment flushes the pending table text
+
+Inside a table, character data is buffered: `in_table::characters` switches to
+the `in table text` insertion mode and accumulates the text in
+`pending_table_characters`, and a start/end tag flushes it (the `anything else`
+rule reprocesses the tag in `in table` after the pending characters land). A
+comment bypassed that flush, so a comment-only line inside a row served as
+
+```html
+<tr><!-- c1 --><!-- c2 -->\n\n\n<td>          rustoid
+<tr>\n<!-- c1 -->\n<!-- c2 -->\n<td>              service
+```
+
+A comment is one of the tokens that flushes the pending text, exactly like a
+start tag.
+
+### Fix
+
+`process_token`'s comment arm calls
+`dispatcher.flush_table_text(&mut builder)` before inserting the comment, as the
+start-tag path (`in_table_text::start_tag`) and `insert_unfostered_meta` already
+do.
+
+### Effect
+
+`ISO 3166-1 alpha-2` **496807 → 758200** (50.02% → 76.34% of the page). No corpus
+page regresses, and the fixture breakdown is byte-identical (the `comments.txt`
+fixture count does not move — the table case is not in it). lib **1004**,
+compare **120**, fixture guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+`ISO 3166-1 alpha-2` at 758200: on a `{{langx}}` transclusion `<a>`, the service
+orders `data-mw` before `id`:
+`… about="#mwt2119" typeof="mw:Transclusion" data-mw='…' id="mwD7s">`, rustoid
+`… typeof="mw:Transclusion" id="mwD7s" data-mw='…'>`.
