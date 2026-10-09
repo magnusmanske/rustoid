@@ -467,10 +467,12 @@ fn trim_whitespace(node: &mut Node) {
         return;
     }
 
-    // We need a DSR to record the trimmed widths on.
-    if node.dp.as_ref().and_then(|d| d.dsr.as_ref()).is_none() {
-        return;
-    }
+    // PHP calls `trimWhiteSpace($node, $dp->dsr ?? null)`: the trimming happens
+    // whatever the DSR, and the DSR is only where the trimmed widths are
+    // *recorded*. A node with no DSR (an argument's list item spliced into a
+    // template body, whose `tsr` never mapped onto the enclosing source) is
+    // therefore still trimmed; the widths are simply not kept. Bailing out here
+    // instead left `{{Plainlist|* a\n* b}}`'s later `<li>`s untrimmed.
 
     // --- Trim leading whitespace (first line) ---
     let mut trimmed_len = 0usize;
@@ -740,6 +742,35 @@ mod tests {
         run(&mut root);
 
         assert_eq!(root.children[0].get_attr("class"), Some("mw-empty-elt"));
+    }
+
+    /// PHP's `CleanUp::trimWhiteSpace` runs whatever the DSR — the DSR is only
+    /// where the trimmed widths are *recorded*. A list item whose leading space
+    /// survived (an argument's `* a` spliced into a template body, whose `tsr`
+    /// never mapped onto the enclosing source) must still be trimmed; bailing
+    /// out on the missing DSR left `{{Plainlist|* a\n* b}}`'s later items
+    /// untrimmed.
+    #[test]
+    fn test_list_item_trims_without_a_dsr() {
+        let mut li = Node::element(ElementKind::ListItem);
+        li.push_child(Node::text(" a"));
+
+        let mut root = Node::document();
+        root.push_child(li);
+        run(&mut root);
+
+        match &root.children[0].children[0].kind {
+            NodeKind::Text(t) => assert_eq!(t, "a", "the post-bullet space is trimmed"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert!(
+            root.children[0]
+                .dp
+                .as_ref()
+                .and_then(|d| d.dsr.as_ref())
+                .is_none(),
+            "the node still has no DSR to record the width on"
+        );
     }
 
     fn li_with_dsr(children: Vec<Node>, start: usize, end: usize) -> Node {
