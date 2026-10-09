@@ -13689,3 +13689,65 @@ more bytes between `title=` and `nowiki` than the raw
 value still to be identified. The tooltip spans are also missing their
 `mw:ExpandedAttrs` marking on the page — `typeof` + a `data-mw` `attribs`
 fragment — which is the next difference behind the `argHash`.
+
+## A `#tag` nested in an attribute is a strip marker to a module
+
+`Module:Authority control` measures the string `frame:expandTemplate('Tooltip')`
+hands it into the navbox `argHash`, and that answer's `title` attribute was
+still short. Isolated with `String|len` and a module-visible
+`String|replace`, the answer MediaWiki hands a module spells a `{{#tag:nowiki|Z}}`
+nested in `title` as a strip marker:
+
+```text
+mediawiki: title = "<UNIQ--nowiki-XXXXXXXX-QINU>"   34-byte marker
+rustoid:   title = "<nowiki>Z</nowiki>"             18 bytes, 16 short
+```
+
+MediaWiki's `frame->expand` **is** the preprocessor (`PPFrame_Hash::expand`),
+and it stashes *every* extension tag the expansion holds — wherever it sits,
+attribute values included — as a `Parser::MARKER_PREFIX … MARKER_SUFFIX` marker.
+rustoid spelled the tag's own source instead, so the module measured 16 bytes
+fewer than the service did.
+
+### Fix
+
+`render_markers` now replaces an extension token **nested in an attribute
+value** with the same strip marker the module would measure
+(`Parser::markerize_nested`, recursing through `markerize_value`). Only a
+*nested* extension is replaced: broadening `answer_marker_span` to mark every
+top-level extension as well moved `Titanic`'s infobox stylesheet, so a
+*numbered* top-level extension stays `answer_marker_span`'s and an unnumbered
+one is still spelled by the renderer.
+
+Two more pieces bring the marker back to a token after the module returns it:
+
+* the tokenizer consumes a strip marker **whole** inside an attribute value
+  (`strip_marker_len_at`). Its `'`/`"` armour would otherwise terminate the
+  value at the marker's second byte, leaving `title="'"`.
+* `substitute_strip_markers` recurses into a token's attributes
+  (`substitute_in_attribs`, `resolve_value_markers`), turning a plain-string
+  value that holds a marker into a token list.
+
+### Effect
+
+`Zebra` **555114 → 556728** (99.09% → **99.38%**); the `Authority control`
+`argHash` is now `…1952`, exactly the service's. `Titanic` is unchanged at
+`11536` and the corpus moved no other page. State: fixture guard **877/896**,
+lib **991**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Zebra` (556728)
+
+The tooltip span lacks its expansion marking. The service serves
+
+```text
+<span class="…tooltip-dotted " title="Zebras" about="#mwt553"
+  typeof="mw:ExpandedAttrs"
+  data-mw='{"attribs":[[{"txt":"title"},{"html":"&lt;span typeof=\"mw:Nowiki\" id=\"mwC9M\">Zebras&lt;/span>"}]]}'>
+```
+
+where rustoid serves the bare `title="Zebras"`. The `{{#tag:nowiki|…}}` in the
+attribute makes the AttributeExpander mark the value as expanded: the nowiki
+becomes an `<span typeof="mw:Nowiki" id="mwC9M">` DOM fragment, recorded in a
+`data-mw` `attribs` part, and the served `title` is that span's text. That
+`mw:ExpandedAttrs` marking — `about`, `typeof`, and the fragment-carrying
+`data-mw` `attribs` — is the next difference.
