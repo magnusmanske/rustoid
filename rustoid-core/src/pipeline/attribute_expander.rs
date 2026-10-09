@@ -75,6 +75,10 @@ pub struct StripMetaTagsResult {
     pub cell_attr_terminator_seen: bool,
     /// Annotation types encountered.
     pub annotation_types: Vec<String>,
+    /// Whether a `mw:DOMFragment` token was seen — generation that survives
+    /// `inTemplate` (PHP's `hasDOMFragmentType` check runs before the
+    /// `wrapTemplates` gate). See `mark_synthesized`.
+    pub has_dom_fragment: bool,
     /// The stripped token chunk.
     pub value: Vec<Item>,
 }
@@ -95,6 +99,7 @@ pub fn strip_meta_tags_in_cell(
 ) -> StripMetaTagsResult {
     let mut buf = Vec::new();
     let mut has_generated_content = false;
+    let mut has_dom_fragment = false;
     let mut cell_attr_terminator_seen = false;
     let mut annotation_types = Vec::new();
 
@@ -107,6 +112,7 @@ pub fn strip_meta_tags_in_cell(
                 // DOM fragments indicate generated attribute content.
                 if has_dom_fragment_type(tok) {
                     has_generated_content = true;
+                    has_dom_fragment = true;
                 }
 
                 // Images/links terminate table-cell attribute processing.
@@ -146,6 +152,7 @@ pub fn strip_meta_tags_in_cell(
         has_generated_content,
         cell_attr_terminator_seen,
         annotation_types,
+        has_dom_fragment,
         value: buf,
     }
 }
@@ -495,6 +502,9 @@ pub fn build_expanded_attrs(
     // attribute processing; `TableFixups` reads it to convert the attribute back
     // to content (mirrors `$token->dataParsoid->getTemp()->cellAttrTerminatorSeen`).
     let mut cell_attr_terminator_seen = false;
+    // Set when a generated attribute's content came from a `mw:DOMFragment` —
+    // generation that Parsoid marks even on a synthesized token (see below).
+    let mut saw_dom_fragment = false;
 
     for (i, old_a) in old_attrs.iter().enumerate() {
         let mut expanded_a = expanded_attrs[i].clone();
@@ -520,6 +530,8 @@ pub fn build_expanded_attrs(
         let mut val_uses_mixed_attr_content_tpl = false;
         let mut key_generated = false;
         let mut val_generated = false;
+        let mut key_dom_fragment = false;
+        let mut val_dom_fragment = false;
 
         // Expand a templated attribute key.
         if matches!(expanded_k, KeyValue::Tokens(_)) {
@@ -550,6 +562,7 @@ pub fn build_expanded_attrs(
                 // Scenario 2: strip meta markers from the expanded key.
                 let stripped = strip_meta_tags(&expanded_k_items, wrap_templates);
                 key_generated = stripped.has_generated_content;
+                key_dom_fragment = stripped.has_dom_fragment;
                 expanded_k_items = stripped.value;
             }
             expanded_a.key = items_to_key_value(expanded_k_items.clone());
@@ -608,6 +621,7 @@ pub fn build_expanded_attrs(
                     token_name == "td" || token_name == "th",
                 );
                 val_generated = stripped.has_generated_content;
+                val_dom_fragment = stripped.has_dom_fragment;
                 if stripped.cell_attr_terminator_seen {
                     cell_attr_terminator_seen = true;
                 }
@@ -659,6 +673,7 @@ pub fn build_expanded_attrs(
                     uneditable: val_uses_mixed_attr_content_tpl,
                 },
             });
+            saw_dom_fragment |= key_dom_fragment || val_dom_fragment;
         }
 
         if let Some(na) = new_attrs.as_mut()
@@ -688,14 +703,18 @@ pub fn build_expanded_attrs(
         .unwrap_or(false);
     // Nor when the token came out of expanding a template body or a module
     // output: Parsoid's `AttributeExpander` runs per chunk and a body's
-    // `inTemplate` suppresses the marking, while rustoid's `expand_attributes`
-    // runs once over the flattened stream. See `TempData::synthesized`.
+    // `inTemplate` suppresses the meta-tag marking, while rustoid's
+    // `expand_attributes` runs once over the flattened stream. That suppression
+    // is only for *meta-tag* generation, though: PHP's `hasDOMFragmentType`
+    // check in `stripMetaTags` runs *before* the `wrapTemplates` gate, so an
+    // attribute value holding a `mw:DOMFragment` — a `{{#tag:nowiki|…}}` — marks
+    // the token even in a body. See `TempData::synthesized`.
     let synthesized = token.data_parsoid().is_some_and(|dp| dp.tmp.synthesized);
     if token.get_attribute_v("about").is_none()
         && !tmp_data_mw.is_empty()
         && token_name != "template"
         && !branch_text
-        && !synthesized
+        && (!synthesized || saw_dom_fragment)
     {
         let about_id = new_about_id(about_counter, "expanded-attrs");
         token.set_attribute("about", &about_id);
@@ -1004,5 +1023,53 @@ mod tests {
             .get_attribute_v("about")
             .map(str::to_string);
         assert_eq!(about, None, "synthesized tokens must not be marked");
+    }
+
+    #[test]
+    fn test_build_expanded_attrs_marks_synthesized_dom_fragment() {
+        use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk, TagTk};
+
+        // A synthesized token whose attribute value holds a `mw:DOMFragment` —
+        // a `title="{{#tag:nowiki|…}}"` a module returned. PHP's
+        // `hasDOMFragmentType` check in `stripMetaTags` runs *before* the
+        // `wrapTemplates` gate, so this *is* marked even in a body where the
+        // meta-tag marking is suppressed.
+        let mut dp = DataParsoid::default();
+        dp.tmp.synthesized = true;
+        let token = ParsoidToken::Tag(TagTk::new("span", vec![], dp));
+
+        let mut fragment = SelfclosingTagTk::new("span", vec![], DataParsoid::default());
+        fragment.add_attribute_str("typeof", "mw:DOMFragment");
+        let old_attrs = vec![KV {
+            key: KeyValue::Str("title".to_string()),
+            value: KeyValue::Tokens(vec![Item::Tok(ParsoidToken::SelfclosingTag(fragment))]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        let expanded_attrs = old_attrs.clone();
+
+        let counter = std::cell::Cell::new(0usize);
+        let out = build_expanded_attrs(
+            token,
+            &old_attrs,
+            expanded_attrs,
+            &counter,
+            false,
+            &mut |kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            None,
+        );
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Item::Tok(ParsoidToken::Tag(span)) = &out[0] else {
+            panic!("expected a Tag, got: {out:?}");
+        };
+        assert_eq!(
+            ParsoidToken::Tag(span.clone())
+                .get_attribute_v("typeof")
+                .map(str::to_string)
+                .as_deref(),
+            Some("mw:ExpandedAttrs")
+        );
     }
 }
