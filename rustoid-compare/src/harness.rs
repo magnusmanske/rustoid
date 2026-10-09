@@ -1454,9 +1454,13 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     // thread to run in at all — `Template:Infobox` sat for 22 minutes with a 60s
     // cap, because its render never started. Tracking the live count turns that
     // into a clear refusal instead of a mystery hang.
-    let live = LIVE_STALLED_RENDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    //
+    // Only an *abandoned* render is counted, not an in-flight one: a concurrent
+    // corpus run has up to `--jobs` renders running at once, and counting those
+    // would refuse most of the corpus. The count is raised on the timeout below,
+    // so it only ever holds workers that cannot be cancelled.
+    let live = LIVE_STALLED_RENDERS.load(std::sync::atomic::Ordering::SeqCst);
     if live >= MAX_LIVE_STALLED_RENDERS {
-        LIVE_STALLED_RENDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         return Err(CompareError::Parse(format!(
             "{live} earlier renders are still stuck and cannot be cancelled; \
              not starting another. Fix the non-terminating expansion."
@@ -1465,16 +1469,16 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     let config = config.clone();
     let worker = tokio::task::spawn_blocking(move || input.render(&config));
     let finished = tokio::time::timeout(cap, worker).await;
-    if finished.is_ok() {
-        // The worker is done, so its slot is free again.
-        LIVE_STALLED_RENDERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
     match finished {
         Ok(Ok(res)) => res.map(Some),
         // The worker panicked.
         Ok(Err(e)) => Err(CompareError::Parse(e.to_string())),
-        // Abandoned mid-render: the thread stays alive, holding its count.
-        Err(_elapsed) => Ok(None),
+        // Abandoned mid-render: the thread stays alive, so it is counted until the
+        // process ends.
+        Err(_elapsed) => {
+            LIVE_STALLED_RENDERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
     }
 }
 
@@ -1508,10 +1512,25 @@ const MAX_LIVE_STALLED_RENDERS: usize = 8;
 /// Overridable with `RUSTOID_PAGE_STALL_SECS`, because the right value depends on
 /// whether the run is trying to score pages or to diagnose the one that stalls.
 fn page_stall_seconds() -> f64 {
-    std::env::var("RUSTOID_PAGE_STALL_SECS")
+    let base = std::env::var("RUSTOID_PAGE_STALL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60.0)
+        .unwrap_or(60.0);
+    // Concurrent corpus workers share the machine, so a page's wall time grows
+    // with the worker count; scaling the cap keeps the guard a *stall* detector
+    // rather than a concurrency penalty. One worker (the default) leaves it
+    // unchanged.
+    base * STALL_CONCURRENCY.load(std::sync::atomic::Ordering::Relaxed) as f64
+}
+
+/// Concurrency factor applied to [`page_stall_seconds`]; see
+/// [`set_stall_concurrency`].
+static STALL_CONCURRENCY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// Scale the per-page stall cap for a run of `jobs` concurrent workers. Set once
+/// by the corpus runner from its `--jobs` value.
+pub fn set_stall_concurrency(jobs: usize) {
+    STALL_CONCURRENCY.store(jobs.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Attach the entity wiki, so `mw.wikibase` has something to read.

@@ -116,6 +116,12 @@ struct Cli {
     #[arg(long)]
     show_wikitext: bool,
 
+    /// Compare this many corpus pages concurrently. `0` (the default) uses one
+    /// worker per available CPU on an `--offline` run, and one otherwise (an
+    /// online run is paced against the wiki's rate limiter).
+    #[arg(long, default_value_t = 0)]
+    jobs: usize,
+
     /// Print both renderings when they differ.
     #[arg(long, short = 'v')]
     verbose: bool,
@@ -368,9 +374,9 @@ fn report(
 
 /// Compare every entry in a corpus and print the scoreboard.
 ///
-/// Pages are compared sequentially, not concurrently. The bottleneck is the
-/// wiki's rate limiter, not the local work, so concurrency would buy little
-/// while making a mid-run failure much harder to attribute.
+/// Pages are compared `--jobs` at a time. Offline the work is pure CPU, so the
+/// default is one worker per available CPU; online the wiki's rate limiter is
+/// the bottleneck, so the default stays sequential.
 fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     cli: &Cli,
     client: &Arc<WikiClient>,
@@ -383,76 +389,9 @@ fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         return Err(format!("corpus {} is empty", corpus.name).into());
     }
 
-    let mut rows = Vec::with_capacity(corpus.len());
-    for (n, entry) in corpus.entries.iter().enumerate() {
-        let req = rustoid_compare::CompareRequest {
-            title: entry.title.clone(),
-            // A corpus entry may pin its own revision, which is what makes a
-            // scoreboard comparable across runs. `None` resolves the wiki's latest.
-            revid: entry.revid,
-            refresh: cli.refresh,
-            offline: cli.offline,
-        };
-        // Progress always goes to stderr, even under `--quiet`: `--quiet` means
-        // "scoreboard only" for stdout, not "show nothing". A cold corpus run is
-        // network-bound and can take minutes per page, and a run that looks
-        // frozen is indistinguishable from one that has hung.
-        eprint!("[{}/{}] {} … ", n + 1, corpus.len(), entry.title);
-
-        let comparison = rt.block_on(rustoid_compare::compare_page(client, config, cache, &req));
-
-        // A single failing page must not abort the run: a corpus is exactly the
-        // case where some pages are known-bad, and losing the other 30 results
-        // to one error would defeat the point.
-        let row = match comparison {
-            Ok(c) => Row {
-                title: entry.title.clone(),
-                tags: entry.tags.iter().cloned().collect(),
-                revid: Some(c.revid),
-                parsoid_bytes: c.parsoid_html.len(),
-                rustoid_bytes: c.rustoid_html.len(),
-                unexpanded_rustoid: c.unexpanded_rustoid,
-                unexpanded_parsoid: c.unexpanded_parsoid,
-                script_errors: rustoid_compare::harness::script_errors(&c.rustoid_html, 3),
-                outcome: c.outcome,
-                suspect: c.suspect,
-            },
-            Err(e) => Row {
-                title: entry.title.clone(),
-                tags: entry.tags.iter().cloned().collect(),
-                revid: None,
-                parsoid_bytes: 0,
-                rustoid_bytes: 0,
-                unexpanded_rustoid: Unexpanded::default(),
-                unexpanded_parsoid: Unexpanded::default(),
-                script_errors: Vec::new(),
-                outcome: Outcome::Skipped {
-                    reason: e.to_string(),
-                },
-                suspect: None,
-            },
-        };
-        // The category closes the progress line opened above. Under `--quiet`
-        // that is all that is printed per page; otherwise the title is repeated
-        // so a scrollback reads as a list.
-        if cli.quiet {
-            eprintln!("{}", row.category());
-        } else {
-            eprintln!(
-                "[{}/{}] {} — {}",
-                n + 1,
-                corpus.len(),
-                entry.title,
-                row.category()
-            );
-        }
-        rows.push(row);
-
-        // Only pace the run when we might actually hit the network.
-        if cli.delay_ms > 0 && !cli.offline && n + 1 < corpus.len() {
-            std::thread::sleep(std::time::Duration::from_millis(cli.delay_ms));
-        }
-    }
+    let jobs = resolve_jobs(cli);
+    rustoid_compare::harness::set_stall_concurrency(jobs);
+    let rows = rt.block_on(compare_corpus(cli, client, config, cache, corpus, jobs));
 
     let board = Scoreboard::new(corpus.name.clone(), rows);
     print!("{}", board.render(cli.verbose));
@@ -468,4 +407,97 @@ fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         return Err("nothing could be compared (all pages skipped)".into());
     }
     Ok(())
+}
+
+/// How many corpus pages to compare concurrently. `--jobs 0` means "auto": every
+/// available CPU offline, one online.
+fn resolve_jobs(cli: &Cli) -> usize {
+    if cli.jobs > 0 {
+        return cli.jobs;
+    }
+    if cli.offline {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        1
+    }
+}
+
+/// Compare every corpus entry, `jobs` at a time, and return one [`Row`] per
+/// entry in corpus order. Progress goes to stderr as each page finishes; a single
+/// failing page becomes a `Skipped` row rather than aborting the run.
+#[allow(clippy::too_many_arguments)]
+async fn compare_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
+    cli: &Cli,
+    client: &WikiClient,
+    config: &C,
+    cache: &Arc<Mutex<WikiCache>>,
+    corpus: &Corpus,
+    jobs: usize,
+) -> Vec<Row> {
+    use futures_util::stream::StreamExt;
+
+    let total = corpus.len();
+    futures_util::stream::iter(corpus.entries.iter().enumerate())
+        .map(|(n, entry)| {
+            let req = rustoid_compare::CompareRequest {
+                title: entry.title.clone(),
+                // A corpus entry may pin its own revision, which is what makes a
+                // scoreboard comparable across runs. `None` resolves the wiki's
+                // latest.
+                revid: entry.revid,
+                refresh: cli.refresh,
+                offline: cli.offline,
+            };
+            async move {
+                // A cold corpus run is network-bound and can take minutes per
+                // page, and a run that looks frozen is indistinguishable from one
+                // that has hung; under `--quiet` only the category is printed.
+                eprint!("[{}/{}] {} … ", n + 1, total, entry.title);
+                let row = match rustoid_compare::compare_page(client, config, cache, &req).await {
+                    Ok(c) => Row {
+                        title: entry.title.clone(),
+                        tags: entry.tags.iter().cloned().collect(),
+                        revid: Some(c.revid),
+                        parsoid_bytes: c.parsoid_html.len(),
+                        rustoid_bytes: c.rustoid_html.len(),
+                        unexpanded_rustoid: c.unexpanded_rustoid,
+                        unexpanded_parsoid: c.unexpanded_parsoid,
+                        script_errors: rustoid_compare::harness::script_errors(&c.rustoid_html, 3),
+                        outcome: c.outcome,
+                        suspect: c.suspect,
+                    },
+                    Err(e) => Row {
+                        title: entry.title.clone(),
+                        tags: entry.tags.iter().cloned().collect(),
+                        revid: None,
+                        parsoid_bytes: 0,
+                        rustoid_bytes: 0,
+                        unexpanded_rustoid: Unexpanded::default(),
+                        unexpanded_parsoid: Unexpanded::default(),
+                        script_errors: Vec::new(),
+                        outcome: Outcome::Skipped {
+                            reason: e.to_string(),
+                        },
+                        suspect: None,
+                    },
+                };
+                // The category closes the progress line opened above. Under
+                // `--quiet` that is all that is printed per page; otherwise the
+                // title is repeated so a scrollback reads as a list.
+                if cli.quiet {
+                    eprintln!("{}", row.category());
+                } else {
+                    eprintln!("[{}/{}] {} — {}", n + 1, total, entry.title, row.category());
+                }
+                // Only pace a sequential online run; concurrent workers cannot
+                // be paced per page anyway.
+                if cli.delay_ms > 0 && !cli.offline && jobs == 1 && n + 1 < total {
+                    tokio::time::sleep(std::time::Duration::from_millis(cli.delay_ms)).await;
+                }
+                row
+            }
+        })
+        .buffered(jobs.max(1))
+        .collect()
+        .await
 }

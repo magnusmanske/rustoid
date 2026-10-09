@@ -1482,6 +1482,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap",
+ "futures-util",
  "reqwest",
  "rustoid-core",
  "serde",

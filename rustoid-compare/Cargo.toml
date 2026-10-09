@@ -15,6 +15,7 @@ thiserror.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tracing.workspace = true
 clap.workspace = true
 
