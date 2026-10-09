@@ -14030,12 +14030,14 @@ only, since `Talk:X` shares its text with `X`.
 ### Effect
 
 After an online run populates the new facts: `ISO 3166-1 alpha-2` **598 →
-22762** and `Israel` **1918 → 3579**; no other corpus page moves. lib **999**,
-compare **120**, fixture guard **877/896**, clippy and fmt clean.
+22762**, `Israel` **1918 → 3579**, `Sundial` **3934 → 11702**, `The Beatles`
+**16238 → 41715**, `United States` **1690 → 2045**; no other corpus page moves.
+lib **999**, compare **120**, fixture guard **877/896**, clippy and fmt clean.
 
 The new facts are **not** in the corpus cache from the offline runs, so these
-two pages only move after a run that fetches them (`prop=flagged` and
-`prop=categories` are queried for every title `title_facts_of` looks up).
+pages only move after a run that fetches them (`prop=flagged` and
+`prop=categories` are queried for every title `title_facts_of` looks up; the
+first such run is slow because every one is a miss, later ones are fast).
 
 ### Next difference
 
