@@ -14170,7 +14170,47 @@ fixture guard **877/896**, clippy and fmt clean.
 
 ### Next difference
 
-`ISO 3166-1 alpha-2` at 23804: a deduplicated templatestyles link carries an
-empty `about` (`deduplicate_styles::deduplicated_link` copies the source
-`<style>`'s `about`, which is empty for that node) where the service serves
-`about="#mwt70"`.
+(Resolved by the next section.) A deduplicated templatestyles link carried an
+empty `about`: the fragment child's own id was being overwritten by the
+enclosing transclusion's during `unpack_dom_fragments`.
+
+## A fragment child keeps its own `about`, not the range's
+
+`ISO 3166-1 alpha-2` served `<link rel="mw-deduplicated-inline-style" … about="#mwt70">`
+where rustoid wrote `about=""`. The link copies the source `<style>`'s `about`
+(faithful to `DedupeStyles::dedupe`), so the `<style>` itself had lost it — and
+not only for the duplicate: every `<style>`/`<link>` for `Mono/styles.css` came
+out with no `about` at all, 335 of the page's occurrences.
+
+A `<templatestyles>` is resolved during expansion into a `mw:DOMFragment`
+placeholder plus a stashed `<style>` fragment. The fragment is built with
+`DEFERRED_ABOUT` and gets its real id at splice time
+(`resolve_deferred_about_ids`); encapsulation *then* stamps the enclosing range's
+`about` on the placeholder. `unpack_dom_fragments::transfer_metadata` copied the
+placeholder's `about` onto every fragment child unconditionally, so the `<style>`
+lost its own id to the cell's.
+
+`TableFixups::strip_inner_encapsulation` strips `about` from a cell child whose
+id is one of the absorbed range ids (PHP's `in_array(getAttribute($child,
+'about'), $aboutIdArray, true)`). With the cell's id wrongly copied on, the
+`<style>` matched and was stripped to nothing. A minimal repro is
+`{{no result|{{mono|AB}}}}` inside a table cell.
+
+### Fix
+
+`transfer_metadata` sets the placeholder's `about` only when the fragment child
+has none. A child that carries its own id (a `<templatestyles>`, whose id was
+already resolved) keeps it; a child with none (a gallery `<ul>`) still gets the
+placeholder's.
+
+### Effect
+
+`ISO 3166-1 alpha-2` **23804 → 486275** (2.4% → 48.96% of the page); no corpus
+page regresses. lib **1002**, compare **120**, fixture guard **877/896**, clippy
+and fmt clean.
+
+### Next difference
+
+`ISO 3166-1 alpha-2` at 486275: a `{{H:title|…}}` tooltip span is missing
+`typeof="mw:ExpandedAttrs"` and its `data-mw` — the expanded-attribute marker
+on a transclusion-wrapped attribute.
