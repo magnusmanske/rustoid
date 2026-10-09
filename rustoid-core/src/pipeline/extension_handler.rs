@@ -132,6 +132,17 @@ fn nowiki_items_to_fragment(items: &[Item]) -> crate::dom::node::Node {
                     }
                 }
                 el.dp = Some(t.data_parsoid.clone());
+                // A `<span typeof="mw:Nowiki">` is a node Parsoid keys in the page
+                // bundle: `Nowiki::sourceToDom` gives it a `DataParsoid` (its `dsr`
+                // on a page, empty when a module built the tag), so it draws a node
+                // id even with no serialized `data-parsoid`.
+                if t.name == "span"
+                    && t.attribs
+                        .iter()
+                        .any(|kv| kv.value.as_str() == Some("mw:Nowiki"))
+                {
+                    el.empty_dp_slot = true;
+                }
                 stack.push(el);
             }
             Item::Tok(ParsoidToken::EndTag(_)) => {

@@ -1,18 +1,20 @@
-//! Expanded media-option fragments for `data-mw`.
+//! Expanded-attribute fragments for `data-mw`.
 //!
 //! `WikiLinkHandler::renderFile` renders a media option whose value is a token
 //! array (`alt= …''x''…`) through `PipelineUtils::expandAttrValueToDOM` and
-//! stores the result as `data-mw.attribs[i].value.html`. That fragment's nodes
-//! are part of the document: the id pass numbers them, and Parsoid serializes a
-//! node's `data-mw` — numbering its embedded fragments — *before* numbering the
-//! node itself.
+//! stores the result as `data-mw.attribs[i].value.html`. The `AttributeExpander`
+//! does the same for a templated attribute of a page element
+//! (`title="{{#tag:nowiki|…}}"` in `data-mw.attribs[[{"txt":…},{"html":…}]]`).
+//! Either way the fragment's nodes are part of the document: the id pass numbers
+//! them, and Parsoid serializes a node's `data-mw` — numbering its embedded
+//! fragments — *before* numbering the node itself.
 //!
-//! `render_file` tunnels each such fragment as a `mw:dom-fragment-token`
-//! placeholder marked with [`MW_ATTR_KEY_ATTR`] instead of splicing it into
-//! view. This module moves those placeholders onto their container's
-//! [`Node::attr_mw_fragments`] ([`collect`]), and serializes each fragment back
-//! into the matching `data-mw.attribs` entry's `html` once the id pass has run
-//! ([`serialize_into_data_mw`]).
+//! `render_file` and `build_expanded_attrs` tunnel each such fragment as a
+//! `mw:dom-fragment-token` placeholder marked with [`MW_ATTR_KEY_ATTR`] instead
+//! of splicing it into view. This module moves those placeholders onto their
+//! container's [`Node::attr_mw_fragments`] ([`collect`]), and serializes each
+//! fragment back into the matching `data-mw.attribs` entry's `html` once the id
+//! pass has run ([`serialize_into_data_mw`]).
 
 use crate::dom::node::Node;
 use crate::pipeline::wiki_link_render::MW_ATTR_KEY_ATTR;
@@ -73,6 +75,9 @@ fn serialize_fragment(fragment: &Node, strip_data_parsoid: bool) -> String {
 }
 
 /// Set `html` on the `data-mw.attribs` entry keyed by `ck`.
+///
+/// The entry's key is a plain string for a media option (`["alt", {…}]`) and a
+/// `{"txt":…}` object for an expanded attribute (`[{"txt":"title"}, {…}]`).
 fn set_attrib_html(json: &mut serde_json::Value, ck: &str, html: &str) {
     let Some(attribs) = json.get_mut("attribs").and_then(|a| a.as_array_mut()) else {
         return;
@@ -81,7 +86,12 @@ fn set_attrib_html(json: &mut serde_json::Value, ck: &str, html: &str) {
         let Some(arr) = pair.as_array_mut() else {
             continue;
         };
-        if arr.first().and_then(|k| k.as_str()) != Some(ck) {
+        let key_matches = match arr.first() {
+            Some(serde_json::Value::String(s)) => s == ck,
+            Some(serde_json::Value::Object(o)) => o.get("txt").and_then(|t| t.as_str()) == Some(ck),
+            _ => false,
+        };
+        if !key_matches {
             continue;
         }
         if let Some(obj) = arr.get_mut(1).and_then(|v| v.as_object_mut()) {
@@ -138,5 +148,25 @@ mod tests {
         let dmw = root.children[0].data_mw.as_deref().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(dmw).unwrap();
         assert_eq!(parsed["attribs"][0][1]["html"], "A fossil skull");
+    }
+
+    #[test]
+    fn serialize_fills_an_expanded_attr_html() {
+        // An expanded attribute keys its `data-mw.attribs` entry by a
+        // `{"txt":…}` object rather than a bare string.
+        let mut span = Node::element(ElementKind::Span);
+        span.data_mw = Some(r#"{"attribs":[[{"txt":"title"},{"html":""}]]}"#.to_string());
+        span.attr_mw_fragments = vec![(
+            "title".to_string(),
+            Box::new(Node::document_with_child(Node::text("Zebras"))),
+        )];
+        let mut root = Node::document();
+        root.push_child(span);
+
+        serialize_into_data_mw(&mut root, false);
+
+        let dmw = root.children[0].data_mw.as_deref().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(dmw).unwrap();
+        assert_eq!(parsed["attribs"][0][1]["html"], "Zebras");
     }
 }

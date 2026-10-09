@@ -388,6 +388,11 @@ struct TmpDataMw {
     v: TmpDataMwPart,
 }
 
+/// Converts an attribute value source into its eager `html` string and, for the
+/// attribute key `ck`, a `mw:dom-fragment-token` placeholder that tunnels the
+/// same fragment for the id pass (see `attr_mw_fragments`).
+pub type AttrValueToHtml<'a> = &'a mut dyn FnMut(&KeyValue, &str) -> (String, Option<Item>);
+
 struct TmpDataMwPart {
     txt: Option<String>,
     /// The raw HTML source (a token array or string), converted to a serialized
@@ -406,12 +411,25 @@ impl TmpDataMwPart {
     /// txt-only array back to a string. A key therefore serializes as
     /// `{"txt":"title"}` even when the key itself was not templated, not as a
     /// bare `"title"`.
+    ///
+    /// `value_to_html` returns the eager serialization and, for `ck`'s attribute,
+    /// a `mw:dom-fragment-token` placeholder carrying the same fragment. The
+    /// placeholder is emitted as a child so the id pass numbers the fragment's
+    /// nodes and the post-pass re-serializes it — see `attr_mw_fragments`.
     fn into_data_mw_value(
         self,
-        value_to_html: &mut dyn FnMut(&KeyValue) -> String,
+        ck: &str,
+        value_to_html: AttrValueToHtml,
+        tunnels: &mut Vec<Item>,
     ) -> crate::wikitext::tokens_v2::DataMwValue {
         use crate::wikitext::tokens_v2::DataMwValue;
-        let html = self.html_src.map(|kv| value_to_html(&kv));
+        let html = self.html_src.map(|kv| {
+            let (html, placeholder) = value_to_html(&kv, ck);
+            if let Some(placeholder) = placeholder {
+                tunnels.push(placeholder);
+            }
+            html
+        });
         DataMwValue::Object {
             txt: self.txt,
             html,
@@ -463,13 +481,17 @@ pub fn reparse_attr_key_string(k_str: &str) -> Option<Vec<KV>> {
 /// `AttributeExpander::buildExpandedAttrs`.
 ///
 /// `value_to_html` converts an attribute key/value source (a token array or
-/// string) into a serialized DOM-fragment HTML string (the `html` value of a
-/// `data-mw.attribs` entry), mirroring PHP's `expandAttrValuesToDOM`.
-/// `source` is the full page source text (for `unwrappedWT` recovery in
-/// `split_tokens`).
+/// string) into the `html` value of a `data-mw.attribs` entry, mirroring PHP's
+/// `expandAttrValuesToDOM`. It also returns, for the attribute key `ck`, a
+/// `mw:dom-fragment-token` placeholder that tunnels the same fragment so its
+/// nodes join the document and are numbered by the id pass (see
+/// `attr_mw_fragments`); the eager serialization is the fallback for a path that
+/// never builds that fragment into the document. `source` is the full page source
+/// text (for `unwrappedWT` recovery in `split_tokens`).
 ///
-/// Returns `metaTokens ++ [token] ++ postNLToks` (hoisted transclusion markers
-/// before the token and, for scenario 1, content moved after it).
+/// Returns `metaTokens ++ [token] ++ attrFragments ++ postNLToks` (hoisted
+/// transclusion markers before the token and, for scenario 1, content moved after
+/// it).
 #[allow(clippy::too_many_lines)]
 pub fn build_expanded_attrs(
     mut token: ParsoidToken,
@@ -477,7 +499,7 @@ pub fn build_expanded_attrs(
     expanded_attrs: Vec<KV>,
     about_counter: &std::cell::Cell<usize>,
     in_template: bool,
-    value_to_html: &mut dyn FnMut(&KeyValue) -> String,
+    value_to_html: AttrValueToHtml,
     source: Option<&str>,
 ) -> Vec<Item> {
     use super::attribute_transform_manager::{items_to_key_value, key_value_to_items};
@@ -494,6 +516,10 @@ pub fn build_expanded_attrs(
 
     let mut meta_tokens: Vec<Item> = Vec::new();
     let mut post_nl_toks: Vec<Item> = Vec::new();
+    // `mw:dom-fragment-token` placeholders for the expanded attributes' fragments;
+    // emitted right after the token so they become its children (collected by
+    // `attr_mw_fragments`).
+    let mut attr_fragments: Vec<Item> = Vec::new();
     let mut new_attrs: Option<Vec<KV>> = None;
     // Accumulated rich-attribute metadata (mirrors PHP's `$tmpDataMW`): keyed
     // by attribute name, in source order.
@@ -730,9 +756,12 @@ pub fn build_expanded_attrs(
         let mut attribs: Vec<crate::wikitext::tokens_v2::DataMwAttrib> =
             Vec::with_capacity(tmp_data_mw.len());
         for t in tmp_data_mw {
+            // The tunnel's `ck` is the attribute key, which the key half carries
+            // as its `txt`.
+            let ck = t.k.txt.clone().unwrap_or_default();
             attribs.push(crate::wikitext::tokens_v2::DataMwAttrib::new(
-                t.k.into_data_mw_value(&mut *value_to_html),
-                t.v.into_data_mw_value(&mut *value_to_html),
+                t.k.into_data_mw_value(&ck, &mut *value_to_html, &mut attr_fragments),
+                t.v.into_data_mw_value(&ck, &mut *value_to_html, &mut attr_fragments),
             ));
         }
         let data_mw_attribs = serialize_data_mw_attribs(&attribs);
@@ -746,6 +775,10 @@ pub fn build_expanded_attrs(
 
     let mut out = meta_tokens;
     out.push(Item::Tok(token));
+    // The attribute-fragment placeholders are children of the token, so the tree
+    // builder stashes each and `attr_mw_fragments::collect` moves it onto the
+    // element before it could be unpacked into view.
+    out.extend(attr_fragments);
     out.extend(post_nl_toks);
     out
 }
@@ -953,7 +986,7 @@ mod tests {
             expanded_attrs,
             &counter,
             false,
-            &mut |kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            &mut |kv, _ck| (crate::wikitext::token_utils::key_value_to_string(kv), None),
             None,
         );
 
@@ -1011,7 +1044,7 @@ mod tests {
             expanded_attrs,
             &counter,
             false,
-            &mut |kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            &mut |kv, _ck| (crate::wikitext::token_utils::key_value_to_string(kv), None),
             None,
         );
 
@@ -1023,6 +1056,42 @@ mod tests {
             .get_attribute_v("about")
             .map(str::to_string);
         assert_eq!(about, None, "synthesized tokens must not be marked");
+    }
+
+    #[test]
+    fn test_build_expanded_attrs_emits_a_tunnel_placeholder() {
+        use crate::wikitext::tokens_v2::{DataParsoid, TagTk};
+
+        // A generated value's fragment is tunneled as a `mw:dom-fragment-token`
+        // child of the token, so the id pass numbers it and `attr_mw_fragments`
+        // re-serializes the `html` with those ids.
+        let token = ParsoidToken::Tag(TagTk::new("span", vec![], DataParsoid::default()));
+        let old_attrs = vec![KV {
+            key: KeyValue::Str("title".to_string()),
+            value: KeyValue::Tokens(vec![
+                meta_token("mw:Transclusion"),
+                Item::Str("Zebras".to_string()),
+                meta_token("mw:Transclusion/End"),
+            ]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        let expanded_attrs = old_attrs.clone();
+
+        let counter = std::cell::Cell::new(0usize);
+        let out = build_expanded_attrs(
+            token,
+            &old_attrs,
+            expanded_attrs,
+            &counter,
+            false,
+            &mut |_kv, _ck| (String::new(), Some(Item::Str("PLACEHOLDER".to_string()))),
+            None,
+        );
+
+        assert_eq!(out.len(), 2, "the token and its tunnel: {out:?}");
+        assert!(matches!(&out[1], Item::Str(s) if s == "PLACEHOLDER"));
     }
 
     #[test]
@@ -1056,7 +1125,7 @@ mod tests {
             expanded_attrs,
             &counter,
             false,
-            &mut |kv| crate::wikitext::token_utils::key_value_to_string(kv),
+            &mut |kv, _ck| (crate::wikitext::token_utils::key_value_to_string(kv), None),
             None,
         );
 

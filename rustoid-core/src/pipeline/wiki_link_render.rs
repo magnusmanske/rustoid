@@ -1513,7 +1513,7 @@ pub(crate) const MW_ATTR_KEY_ATTR: &str = "data-mw-attr-key";
 pub(crate) const MW_ABOUT_BASE_ATTR: &str = "data-mw-about-base";
 
 /// A `mw:dom-fragment-token` placeholder carrying an expandable media option.
-fn attr_mw_fragment_token(
+pub(crate) fn attr_mw_fragment_token(
     ck: &str,
     frag: crate::dom::node::Node,
     fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,

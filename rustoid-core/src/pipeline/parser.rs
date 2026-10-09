@@ -1920,12 +1920,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// carry a `mw:DOMFragment` placeholder (e.g. the `<nowiki>` in T280115's
     /// `title="foo<nowiki>|</nowiki>"`): the placeholder must resolve against
     /// the same map the extension handler registered it in.
+    ///
+    /// The second return value tunnels the same fragment (under attribute key
+    /// `ck`) as a `mw:dom-fragment-token` child of the token, so the id pass
+    /// numbers its nodes and `attr_mw_fragments` re-serializes the `html` with
+    /// those ids. The eager string above is the fallback for a path that never
+    /// builds the fragment into the document. See
+    /// [`crate::pipeline::attribute_expander::build_expanded_attrs`].
     fn value_to_dom_html(
         &self,
         kv: &crate::wikitext::tokens_v2::KeyValue,
+        ck: &str,
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &std::cell::Cell<usize>,
-    ) -> String {
+    ) -> (String, Option<Item>) {
         use crate::pipeline::attribute_transform_manager::key_value_to_items;
 
         let items = key_value_to_items(kv);
@@ -1937,7 +1945,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 strip_data_parsoid: self.strip_data_parsoid.get(),
                 ..crate::options::ParserOptions::for_page("")
             });
-        serializer.serialize(&frag).unwrap_or_default()
+        let html = serializer.serialize(&frag).unwrap_or_default();
+        let placeholder =
+            crate::pipeline::wiki_link_render::attr_mw_fragment_token(ck, frag, fragments, next_id);
+        (html, Some(placeholder))
     }
 
     /// Build an inline fragment document from raw body wikitext, without
@@ -4824,7 +4835,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 expanded_attrs,
                 about_counter,
                 false,
-                &mut |kv| self.value_to_dom_html(kv, fragments, next_id),
+                &mut |kv, ck| self.value_to_dom_html(kv, ck, fragments, next_id),
                 page_source,
             );
             out.extend(result);
@@ -7431,7 +7442,9 @@ mod tests {
         let kv = crate::wikitext::tokens_v2::KeyValue::Str("color:red".to_string());
         let mut fragments = std::collections::HashMap::new();
         let next_id = std::cell::Cell::new(0usize);
-        let html = parser.value_to_dom_html(&kv, &mut fragments, &next_id);
+        let html = parser
+            .value_to_dom_html(&kv, "title", &mut fragments, &next_id)
+            .0;
         assert_eq!(html, "color:red", "got: {html:?}");
     }
 
