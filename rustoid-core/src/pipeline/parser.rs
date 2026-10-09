@@ -1305,6 +1305,78 @@ pub struct Parser<'a, C: SiteConfig> {
     ref_bodies: std::cell::RefCell<std::collections::HashMap<String, Node>>,
 }
 
+/// Core `Parser::braceSubstitution`'s T2529 rule: a template's expansion that
+/// begins with a table or list marker begins a new line, so a `\n` is put in
+/// front of it. The marker came from a substituted argument and was tokenized
+/// where the argument sat (mid-line), so it never became a list: the leading
+/// string is re-tokenized here at SOL. `Parser.php` guards the rule with
+/// `preg_match( '/^(?:{\||:|;|#|\*)/', $text )` on the expanded string.
+fn t2529_force_line_start(expanded: Vec<Item>, at_line_start: bool) -> Vec<Item> {
+    if at_line_start {
+        return expanded;
+    }
+    // The expansion is wrapped in its transclusion marker(s); core checks the
+    // expansion *string*, which is the first content token's source here.
+    let start = expanded
+        .iter()
+        .position(|it| !is_wrapper_marker(it))
+        .unwrap_or(expanded.len());
+    let src = match expanded.get(start) {
+        Some(Item::Str(s)) => s.clone(),
+        Some(Item::Tok(t)) => t
+            .data_parsoid()
+            .and_then(|dp| dp.src.clone())
+            .unwrap_or_default(),
+        _ => return expanded,
+    };
+    if !(src.starts_with("{|") || src.starts_with([':', ';', '#', '*'])) {
+        return expanded;
+    }
+    // The newline goes *before* the transclusion's start marker, so it lands
+    // outside the wrapper the encapsulation pass builds (`<div>\n<ul about=…>`).
+    let mut out = Vec::with_capacity(expanded.len() + 1);
+    out.push(Item::Tok(ParsoidToken::Nl(
+        crate::wikitext::tokens_v2::NlTk::new(crate::wikitext::tokens_v2::SourceRange::new(0, 0)),
+    )));
+    for (i, it) in expanded.into_iter().enumerate() {
+        // A leading *string* was tokenized where the argument sat (mid-line),
+        // so it is re-tokenized at SOL; a marker that is already a token (a
+        // `listItem` from an argument that began its own line) only needed the
+        // newline in front of it.
+        if i == start
+            && let Item::Str(s) = &it
+        {
+            out.extend(
+                crate::pipeline::template_handler::tokenize_wikitext_to_items(
+                    s,
+                    /* in_template */ true,
+                    &[],
+                ),
+            );
+            continue;
+        }
+        out.push(it);
+    }
+    out
+}
+
+/// Whether `item` is a transclusion wrapper marker (`mw:Transclusion` start or
+/// end meta). `T2529` looks past these to the expansion's content.
+fn is_wrapper_marker(item: &Item) -> bool {
+    let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+        return false;
+    };
+    t.name == "meta"
+        && t.attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str())
+            .is_some_and(|ty| {
+                ty.split_whitespace()
+                    .any(|c| c.starts_with("mw:Transclusion"))
+            })
+}
+
 impl<'a, C: SiteConfig> Parser<'a, C> {
     pub fn new(config: &'a C) -> Self {
         Self {
@@ -3769,6 +3841,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         )
                         .await;
                     self.leave_pp_node();
+                    // Core `Parser::braceSubstitution`'s T2529: a template or
+                    // parser-function whose expansion (a *string* in PHP) begins
+                    // with a table or list marker is treated as beginning a new
+                    // line — unless the call was already at one. The tokenizer
+                    // never saw the marker at a line start (it came out of a
+                    // substituted argument), so the leading string is
+                    // re-tokenized at SOL with a newline in front.
+                    let expanded = t2529_force_line_start(
+                        expanded,
+                        out.is_empty()
+                            || matches!(out.last(), Some(Item::Tok(ParsoidToken::Nl(_)))),
+                    );
                     for e in &expanded {
                         track_table(e, &mut table_depth);
                     }
@@ -8111,6 +8195,47 @@ mod tests {
         );
         let item = Item::Tok(ParsoidToken::SelfclosingTag(stt));
         assert!(wrapper_tag_target(&item).is_none());
+    }
+
+    /// Core `Parser::braceSubstitution`'s T2529: a template whose expansion
+    /// begins with a list/table marker and does not start a line gets a newline
+    /// in front, so the marker is seen at SOL. The newline goes outside the
+    /// transclusion's wrapper marker.
+    #[test]
+    fn test_t2529_force_line_start() {
+        let marker = Item::Tok(ParsoidToken::SelfclosingTag(
+            crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+                "meta",
+                vec![crate::wikitext::tokens_v2::KV {
+                    key: crate::wikitext::tokens_v2::KeyValue::Str("typeof".to_string()),
+                    value: crate::wikitext::tokens_v2::KeyValue::Str("mw:Transclusion".to_string()),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                }],
+                crate::wikitext::tokens_v2::DataParsoid::default(),
+            ),
+        ));
+        // A list marker mid-line: newline first, then the re-tokenized content.
+        let out = t2529_force_line_start(vec![marker.clone(), Item::Str("* a".to_string())], false);
+        assert!(
+            matches!(out[0], Item::Tok(ParsoidToken::Nl(_))),
+            "newline first"
+        );
+        assert!(
+            !matches!(out[1], Item::Str(_)),
+            "`* a` re-tokenized into list syntax: {:?}",
+            out[1]
+        );
+        // At a line start, or for content that is not a marker, unchanged.
+        assert!(matches!(
+            t2529_force_line_start(vec![Item::Str("* a".to_string())], true)[0],
+            Item::Str(_)
+        ));
+        assert!(matches!(
+            t2529_force_line_start(vec![marker, Item::Str("plain".to_string())], false)[0],
+            Item::Tok(ParsoidToken::SelfclosingTag(_))
+        ));
     }
 
     /// A module receives an argument's *expanded* text, and that includes a link
