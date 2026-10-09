@@ -13871,3 +13871,65 @@ The cover image is reported missing. The service serves
 `typeof="mw:File/Frameless"`, rustoid `typeof="mw:Error mw:File/Frameless"` with
 `data-mw='{"errors":[{"key":"apierror-filedoesnotexist",…}]}'` — a media
 file-info lookup that did not resolve (`Charli XCX - Brat (album cover).png`).
+
+## `title.categories` is always a table, from the page's own links
+
+`Module:Protected page` reads
+`inArray(protectionObj.title.talkPageTitle.categories, …)` — for a page under
+`extendedconfirmed` protection it decides whether to emit the hidden PIA flag.
+`title_derived_field` did not handle `categories` at all, so it fell through to
+the `_ => Ok(Value::Nil)` arm and `inArray` raised
+`bad argument #1 (type table expected, got nil)`. The `Script error` it rendered
+made the holding paragraph non-empty, which also cost that paragraph its
+`mw-empty-elt` class. It hit `Israel`, `Wikipedia`, `Canada`,
+`Cristiano Ronaldo`, `Bitcoin` and several more.
+
+`protectionObj.title` is `mw.title.getCurrentTitle()` — a main-namespace article
+— so `talkPageTitle` is a *derived* title, built by the shared metatable's
+`__index`. That path had no access to the round's page facts, which is why a
+fix confined to `luafn_title_new` would not have reached it.
+
+### Scribunto ground truth
+
+`TitleLibrary::getCategories` (`TitleLibrary.php`): the page's **own** category
+links (`WikiPage::getCategories()`), as member names with the namespace prefix
+stripped (`Title::getText()`), returned as a 1-based array — `[[]]` for a page
+with none, **never nil**. `mw.title.lua` exposes it as the lazy field
+`categories`. The DB link table is what `prop=categories` serves, so the wire
+request is a faithful stand-in; `cllimit=max` lifts its default ten-category
+cap.
+
+### Fix
+
+`TitleFacts::categories: Option<Vec<String>>` (`None` = not fetched,
+`Some(vec![])` = fetched with none), a `DataSource::get_title_categories` call
+with an empty default, a `WikiClient::categories_json` request, a
+`pageinfo::title_categories` parser whose `category_member_name` strips the
+*localized* prefix by the first colon, and an `EntryKind::Categories` cache kind.
+`title_derived_field` answers `categories` as a 1-based table, noting the title
+for a fetch when its facts are entirely absent (a fetched-but-uncategorised title
+stays an empty table rather than re-requesting forever).
+
+The derived-title path reads the same facts: `LuaEngine::new` stashes the
+round's map in Lua app data (`TitleFactsDb`), and `title_object` consults it for
+`categories`, `exists` and the rest. Both construction paths now agree on
+`is_current_title`.
+
+### Effect
+
+The `inArray` error is gone (`0` occurrences, was `6`); four pages that carried
+it as their first difference move well past it — `Canada` **2176 → 19034**,
+`Wikipedia` **2109 → 12468**, `Cristiano Ronaldo` **2347 → 14779**, `Bitcoin`
+**3038 → 4520** — and `Israel` no longer errors at byte 1918. No page regresses.
+State: fixture guard **877/896**, lib **996**, compare **119**, clippy and fmt
+clean.
+
+### Next difference on `Israel` (1918)
+
+`{{pp-extended|small=yes}}`'s nowiki span reaches the service bare, but rustoid
+wraps it in an empty paragraph:
+
+```text
+parsoid:  …</div>\n<span typeof="mw:Nowiki mw:Transclusion" about="#mwt4" … id="mwBQ"></span>…
+rustoid:  …</div>\n<p class="mw-empty-elt" id="mwBQ"><span … id="mwBg">…</span></p>…
+```
