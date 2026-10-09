@@ -13832,3 +13832,42 @@ clippy and fmt clean.
 None on `Zebra` — the page is a full match. The corpus's other pages still open
 with their own first differences (several at a `Module:Protected page` Lua
 error; `Israel`, `Lionel Messi` and `Cristiano Ronaldo` in `mw-empty-elt`).
+
+## An empty `#invoke` function name is `p['']`, not `p.main`
+
+`Template:Infobox album` opens with
+`{{<includeonly>safesubst:</includeonly>#invoke:Unsubst-infobox||$params=…}}` —
+an `#invoke` whose function argument is **empty**. rustoid read an empty
+function name as Scribunto's `main` default, looked up `p.main`, found nil, and
+rendered `Script error: lua error: function not found: main`. Every page using
+`Template:Infobox album` (any album article) carried the error, which also made
+the paragraph holding it non-empty and cost that paragraph its `mw-empty-elt`
+class.
+
+Scribunto has no such default. `invokeHook` (`Hooks.php`) takes the *second*
+`#invoke` argument, trim-expands it, and errors only when the argument is
+*missing* (`scribunto-common-nofunction`); `mw.executeModule` then looks the name
+up as `module[name]` (`getModuleFunction`, `mw.lua`). An empty name is therefore
+`p['']`.
+
+### Fix
+
+`Invoke::from_parts` now uses the trimmed function name **verbatim**. The old
+rewrite was not obviously wrong because `Module:Unsubst` — the other caller of
+this form — defines `p[''] = p.main` for backwards compatibility, so
+`{{#invoke:Unsubst||date=…}}` (on hundreds of thousands of pages via
+`Template:Citation needed`) kept working either way. `Module:Unsubst-infobox`
+defines only `p['']`, which is what exposed the bug.
+
+### Effect
+
+`Brat (album)` **1621 → 10433**, `The Beatles` **16063 → 16238**; no other
+corpus page moves, and `Zebra` still matches. State: fixture guard **877/896**,
+lib **994**, compare **117**, clippy and fmt clean.
+
+### Next difference on `Brat (album)` (10433)
+
+The cover image is reported missing. The service serves
+`typeof="mw:File/Frameless"`, rustoid `typeof="mw:Error mw:File/Frameless"` with
+`data-mw='{"errors":[{"key":"apierror-filedoesnotexist",…}]}'` — a media
+file-info lookup that did not resolve (`Charli XCX - Brat (album cover).png`).
