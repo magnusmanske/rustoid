@@ -739,7 +739,7 @@ pub fn build_expanded_attrs(
     if token.get_attribute_v("about").is_none()
         && !tmp_data_mw.is_empty()
         && token_name != "template"
-        && !branch_text
+        && (!branch_text || saw_dom_fragment)
         && (!synthesized || saw_dom_fragment)
     {
         let about_id = new_about_id(about_counter, "expanded-attrs");
@@ -1105,6 +1105,57 @@ mod tests {
         // meta-tag marking is suppressed.
         let mut dp = DataParsoid::default();
         dp.tmp.synthesized = true;
+        let token = ParsoidToken::Tag(TagTk::new("span", vec![], dp));
+
+        let mut fragment = SelfclosingTagTk::new("span", vec![], DataParsoid::default());
+        fragment.add_attribute_str("typeof", "mw:DOMFragment");
+        let old_attrs = vec![KV {
+            key: KeyValue::Str("title".to_string()),
+            value: KeyValue::Tokens(vec![Item::Tok(ParsoidToken::SelfclosingTag(fragment))]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }];
+        let expanded_attrs = old_attrs.clone();
+
+        let counter = std::cell::Cell::new(0usize);
+        let out = build_expanded_attrs(
+            token,
+            &old_attrs,
+            expanded_attrs,
+            &counter,
+            false,
+            &mut |kv, _ck| (crate::wikitext::token_utils::key_value_to_string(kv), None),
+            None,
+        );
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        let Item::Tok(ParsoidToken::Tag(span)) = &out[0] else {
+            panic!("expected a Tag, got: {out:?}");
+        };
+        assert_eq!(
+            ParsoidToken::Tag(span.clone())
+                .get_attribute_v("typeof")
+                .map(str::to_string)
+                .as_deref(),
+            Some("mw:ExpandedAttrs")
+        );
+    }
+
+    #[test]
+    fn test_build_expanded_attrs_marks_text_branch_dom_fragment() {
+        use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk, TagTk};
+
+        // The same, one gate further out: the token also came out of an
+        // `#if`/`#ifeq` branch (`TempData::in_text_branch`). Core re-tokenizes
+        // such a branch to text, but the `{{#tag:nowiki|…}}` re-expands to a DOM
+        // fragment there too, and `hasDOMFragmentType` marks it — the token's own
+        // marking *is* what the service serves (`Template:Tooltip`'s
+        // `title="{{#tag:nowiki|…}}"`). So a dom fragment overrides this gate as
+        // well.
+        let mut dp = DataParsoid::default();
+        dp.tmp.synthesized = true;
+        dp.tmp.in_text_branch = Some(true);
         let token = ParsoidToken::Tag(TagTk::new("span", vec![], dp));
 
         let mut fragment = SelfclosingTagTk::new("span", vec![], DataParsoid::default());
