@@ -13791,3 +13791,44 @@ rustoid:   … title="Zebras" about="#mwt553" typeof="mw:ExpandedAttrs" data-mw=
 The `mw:Nowiki` span in the expanded-attribute fragment needs its pagebundle
 `id="mwC9M"`. `value_to_dom_html` serializes the fragment as soon as the
 attribute expander runs, before the page's id pass, so the node has none yet.
+
+## An expanded attribute's fragment is numbered before it is serialized
+
+An expanded attribute's `data-mw` `html` is a serialized DOM fragment, and its
+nodes belong to the document: Parsoid's `expandAttrValuesToDOM` builds the
+fragment *in* the pipeline, the id pass numbers its nodes, and only then is the
+`html` spelled. rustoid serialized it as soon as the attribute expander ran —
+so the `mw:Nowiki` span a `{{#tag:nowiki|…}}` produces had no id, and the
+`data-mw` read
+
+```text
+mediawiki: … data-mw='{"attribs":[[{"txt":"title"},{"html":"&lt;span typeof=\"mw:Nowiki\" id=\"mwC9M\">Zebras&lt;/span>"}]]}'
+rustoid:   … data-mw='{"attribs":[[{"txt":"title"},{"html":"&lt;span typeof=\"mw:Nowiki\">Zebras&lt;/span>"}]]}'
+```
+
+### Fix
+
+`build_expanded_attrs` tunnels each generated attribute's fragment as a
+`mw:dom-fragment-token` child — the mechanism the media-option path already used
+(`attr_mw_fragment_token`). `attr_mw_fragments::collect` moves the placeholder
+onto the element, the id pass numbers the fragment's nodes, and
+`serialize_into_data_mw` re-serializes the `html` with those ids. An expanded
+attribute keys its `data-mw.attribs` entry by a `{"txt":…}` object where a
+media option uses a plain string, so `set_attrib_html` matches both shapes.
+
+The `mw:Nowiki` span draws an id of its own: `Nowiki::sourceToDom` gives it a
+`DataParsoid` (a `dsr` on a page, empty when a module built the tag), so it is
+keyed in the page bundle while emitting no `data-parsoid` — `empty_dp_slot`.
+
+### Effect
+
+**`Zebra` matches the service byte for byte.** The first difference it carried
+from 555114 onward is gone. `Polio vaccine` moves `7815 → 7827`; no other corpus
+page moves. State: fixture guard **877/896**, lib **994**, compare **117**,
+clippy and fmt clean.
+
+### Next difference
+
+None on `Zebra` — the page is a full match. The corpus's other pages still open
+with their own first differences (several at a `Module:Protected page` Lua
+error; `Israel`, `Lionel Messi` and `Cristiano Ronaldo` in `mw-empty-elt`).
