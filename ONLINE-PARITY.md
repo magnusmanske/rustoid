@@ -14211,6 +14211,47 @@ and fmt clean.
 
 ### Next difference
 
-`ISO 3166-1 alpha-2` at 486275: a `{{H:title|…}}` tooltip span is missing
-`typeof="mw:ExpandedAttrs"` and its `data-mw` — the expanded-attribute marker
-on a transclusion-wrapped attribute.
+(Resolved by the next section.) The `{{H:title|…}}` tooltip span at 486275 was
+missing `typeof="mw:ExpandedAttrs"`.
+
+## A DOM fragment marks a text branch's attribute
+
+The next difference on `ISO 3166-1 alpha-2` was the tooltip span from
+`Template:Tooltip` (reached via `{{H:title|…}}`):
+
+```html
+<span class="rt-commentedText tooltip tooltip-dotted " title="assigned to a country"
+      about="#mwt1" typeof="mw:ExpandedAttrs" …>
+```
+
+rustoid served the `title` correctly but without `typeof="mw:ExpandedAttrs"` or
+the `data-mw`. The span sits in `Template:Tooltip`'s `#ifeq`, and
+`AttributeExpander::build_expanded_attrs` has a gate that skips marking for a
+token flagged `TempData::in_text_branch` — the flag rustoid sets on a
+`#if`/`#ifeq`/`#ifexpr`/`#iferror` branch because core re-tokenizes such a branch
+to text (so a templated-looking attribute in it is not one).
+
+But the tooltip's value is `title="{{#tag:nowiki|…}}"`. Core's re-tokenization
+re-expands that `#tag` into a DOM fragment, and PHP's `hasDOMFragmentType` check
+in `stripMetaTags` runs *before* the marking gate — so the token **is** marked.
+That is exactly the rule already recorded for the body (`synthesized`) gate, one
+gate further out; the branch gate was simply missing it.
+
+### Fix
+
+`saw_dom_fragment` overrides the branch gate as it already overrides the body
+gate (`(!branch_text || saw_dom_fragment)` beside the existing
+`(!synthesized || saw_dom_fragment)`).
+
+### Effect
+
+`ISO 3166-1 alpha-2` **486275 → 496807** (48.96% → 50.02% of the page); no corpus
+page regresses. Distinct pages gain markings the service has:
+`Anarchism`'s `mw:ExpandedAttrs` count goes 2 → 4 (the service has 10). lib
+**1003**, compare **120**, fixture guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+`ISO 3166-1 alpha-2` at 496807: after `<tr id="mwA8s">` the service keeps
+newlines around the row's leading HTML comments, rustoid drops them — a
+comment/newline placement inside a table row.
