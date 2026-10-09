@@ -14123,8 +14123,54 @@ byte-for-byte), `Nobel Prize` **8312 → 8314**; no corpus page regresses. lib
 ### Next difference
 
 `Quicksilver (film)` at 8797: a missing `[[Category:1986 films]]` link inside a
-`<span class="mw-empty-elt">`. Separately, the plainlist above still keeps one
-space on its non-first items (`<li>a</li>\n<li> b</li>` vs `<li>b</li>`): the
-first item is re-tokenized at SOL here and drops its post-marker space, while
-items 2/3 arrive already tokenized from the argument and keep theirs — the fix
-belongs in list-item tokenization, not in the `#if` trim.
+`<span class="mw-empty-elt">`. (The plainlist above it also kept a space on its
+non-first items; the next section fixes that.)
+
+## `CleanUp::trimWhiteSpace` trims whatever the DSR
+
+The plainlist's non-first items kept their post-bullet space. The tokenizer is
+right to keep it — a `listItem`'s content is `li = bullets:list_char+
+c:inlineline?`, so the space is the first content character, and
+`CleanUp::trimWhiteSpace` is what removes it (recording `leadingWS` for
+selser).
+
+But that trim never ran. rustoid's `trim_whitespace` bailed out early when the
+node had no DSR:
+
+```rust
+// We need a DSR to record the trimmed widths on.
+if node.dp.as_ref().and_then(|d| d.dsr.as_ref()).is_none() {
+    return;
+}
+```
+
+PHP does not: `CleanUp.php` calls
+`self::trimWhiteSpace( $node, $dp->dsr ?? null )` under
+`!WTUtils::hasLiteralHTMLMarker( $dp ) && isset( Consts::$WikitextTagsWithTrimmableWS[…] )`.
+The DSR is passed through `?? null` and is used **only** to record
+`leadingWS`/`trailingWS` — the trimming happens either way. A list item whose
+`tsr` never mapped onto the enclosing source (the argument's `* a\n* b\n* c`
+spliced into the template body, so it has `src:"*"` and no `dsr`) was
+left untrimmed as a result.
+
+### Fix
+
+`trim_whitespace` no longer returns early on a missing DSR. The widths are still
+written back only when `dp.dsr` is present, which is what the function already
+did at the end.
+
+### Effect
+
+The service emits **zero** `<li> ` (a space after the bullet) in the corpus;
+rustoid emitted them wherever a list came through an argument. `Anarchism` alone
+loses **964** of them and **996388 → 995422** bytes; ~20 pages shrink. No
+page's first difference moves (every recorded divergence is caused by an earlier
+bug), so the lengths are the honest measure here. lib **1001**, compare **120**,
+fixture guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+`ISO 3166-1 alpha-2` at 23804: a deduplicated templatestyles link carries an
+empty `about` (`deduplicate_styles::deduplicated_link` copies the source
+`<style>`'s `about`, which is empty for that node) where the service serves
+`about="#mwt70"`.
