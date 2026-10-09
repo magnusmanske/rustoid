@@ -49,12 +49,14 @@ pub struct Invoke {
 impl Invoke {
     /// Parse the text after `#invoke:` — `Module|func|arg|name=value`.
     ///
-    /// An omitted or *empty* function name resolves to `main`, which is
-    /// Scribunto's documented default. The empty form is not hypothetical:
-    /// `Template:Citation needed` calls `{{#invoke:Unsubst||date=…}}`, and that
-    /// template is on hundreds of thousands of pages, so the empty function has
-    /// to work. `Module:Unsubst` defines only `p.main`, which is the evidence
-    /// for the default.
+    /// The function name is used **verbatim** (trimmed). Scribunto's `#invoke`
+    /// takes the second argument as-is with no default: `invokeHook` throws
+    /// `scribunto-common-nofunction` when it is missing, and `mw.executeModule`
+    /// looks the name up as `module[name]` (`getModuleFunction`, mw.lua). An
+    /// *empty* name is therefore `p['']`, not `p.main` — `Template:Citation
+    /// needed` calls `{{#invoke:Unsubst||date=…}}` and `Module:Unsubst`
+    /// defines `p[''] = p.main` for backwards compatibility, while
+    /// `Module:Unsubst-infobox` defines only `p['']`.
     ///
     /// Returns `None` only when there is no module to invoke at all.
     pub fn parse(pf_arg: &str) -> Option<Self> {
@@ -90,7 +92,7 @@ impl Invoke {
     /// its `$B` value expands to a link whose text contains neither, but a
     /// positional value such as `[[Foo|a=b]]` contains both.
     ///
-    /// An omitted or empty function name defaults to `main`; see
+    /// An empty function name stays empty — it names `p['']`, not `p.main`; see
     /// [`Invoke::parse`].
     pub fn from_parts(
         module: &str,
@@ -101,14 +103,9 @@ impl Invoke {
         if module.is_empty() {
             return None;
         }
-        let function = if function.trim().is_empty() {
-            "main".to_string()
-        } else {
-            function.trim().to_string()
-        };
         Some(Self {
             module: module.to_string(),
-            function,
+            function: function.trim().to_string(),
             args,
         })
     }
@@ -1303,18 +1300,21 @@ mod tests {
         assert!(Invoke::parse("  ").is_none());
     }
 
-    /// An omitted or empty function name means `main`.
+    /// The function name is used verbatim; an empty one names `p['']`.
     ///
-    /// `Template:Citation needed` calls `{{#invoke:Unsubst||date=…}}` and is on
-    /// hundreds of thousands of pages, so this form has to expand.
+    /// `Template:Citation needed` calls `{{#invoke:Unsubst||date=…}}`; Scribunto
+    /// looks the name up as `module[name]` (`getModuleFunction`, mw.lua), and
+    /// `Module:Unsubst` defines `p[''] = p.main` for backwards compatibility.
+    /// `Module:Unsubst-infobox` defines only `p['']`, so rewriting the empty name
+    /// to `main` (as rustoid did) left `main` nil and the template erroring.
     #[test]
-    fn an_omitted_or_empty_function_defaults_to_main() {
+    fn an_empty_function_name_stays_empty() {
         let bare = Invoke::parse("Weather box").unwrap();
-        assert_eq!(bare.function, "main");
+        assert_eq!(bare.function, "");
 
         let empty = Invoke::parse("Unsubst||date=2024").unwrap();
         assert_eq!(empty.module, "Unsubst");
-        assert_eq!(empty.function, "main");
+        assert_eq!(empty.function, "");
         assert_eq!(
             empty.args,
             vec![(Some("date".to_string()), "2024".to_string())]
