@@ -479,7 +479,10 @@ fn placeholder_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, Strin
 ///
 /// Its `about` was spent during the answer's expansion, so rendering it back to
 /// wikitext and re-tokenizing it in the module's output would spend a second id
-/// for the same ref; the marker keeps the numbered token.
+/// for the same ref; the marker keeps the numbered token. An *unnumbered*
+/// extension (a `nowiki`, say) is left to the renderer: marking it would change
+/// the answer's shape where the service spells the tag (see
+/// [`Parser::markerize_nested`] for the nested case).
 fn numbered_extension_tag(item: &Item) -> Option<String> {
     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
         return None;
@@ -493,8 +496,8 @@ fn numbered_extension_tag(item: &Item) -> Option<String> {
 /// The span a marker-carrying renderer must carry as one strip marker starting at
 /// `items[i]`: the exclusive end index, the items, and the marker's name.
 ///
-/// Only a `mw:DOMFragment` placeholder (see [`placeholder_span`]) and a numbered
-/// extension token are carried. Everything else the answer renderer writes itself
+/// A `mw:DOMFragment` placeholder (see [`placeholder_span`]) and a numbered
+/// extension token are carried; everything else the answer renderer writes itself
 /// or drops, under its own policy.
 fn answer_marker_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, String)> {
     if let Some(span) = placeholder_span(items, i) {
@@ -3425,8 +3428,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         self.render_markers(items, crate::pipeline::lua_deferred::MissingSrc::Html)
     }
 
-    /// Shared body of the two renderers: marker each placeholder (or numbered
-    /// extension) and hand the rest to the answer renderer under `missing_src`.
+    /// Shared body of the two renderers: marker each placeholder (or extension)
+    /// and hand the rest to the answer renderer under `missing_src`.
     fn render_markers(
         &self,
         items: &[Item],
@@ -3437,15 +3440,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         while i < items.len() {
             match answer_marker_span(items, i) {
                 Some((end, tokens, tag)) => {
-                    let marker = strip_marker(&tag, self.strip_markers.borrow().len());
-                    self.strip_markers
-                        .borrow_mut()
-                        .insert(marker.clone(), tokens);
+                    let marker = self.record_marker(&tag, tokens);
                     replaced.push(Item::Str(marker));
                     i = end;
                 }
                 None => {
-                    replaced.push(items[i].clone());
+                    // An extension nested in an attribute value — a template
+                    // body's `title="{{#tag:nowiki|…}}"` — is stashed the same
+                    // way, inside the value.
+                    replaced.push(self.markerize_nested(&items[i]));
                     i += 1;
                 }
             }
@@ -3453,18 +3456,106 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::lua_deferred::render_answer_with(&replaced, missing_src)
     }
 
+    /// Record `tokens` under a freshly numbered strip marker and return its text.
+    fn record_marker(&self, tag: &str, tokens: Vec<Item>) -> String {
+        let marker = strip_marker(tag, self.strip_markers.borrow().len());
+        self.strip_markers
+            .borrow_mut()
+            .insert(marker.clone(), tokens);
+        marker
+    }
+
+    /// Replace an `extension` token nested in an attribute value with a strip
+    /// marker, at any depth.
+    ///
+    /// `PPFrame_Hash::expand` stashes *every* extension tag the expansion holds,
+    /// wherever it sits, so `title="{{#tag:nowiki|…}}"` reaches a module as
+    /// `title="<UNIQ--nowiki-…-QINU>"`. rustoid spelled the tag's own source
+    /// instead, which is both the wrong bytes and the wrong length — the module
+    /// measures the answer into the navbox `argHash`.
+    ///
+    /// Only a *nested* extension is replaced: one at the answer's top level is
+    /// [`answer_marker_span`]'s (when numbered) or is spelled by
+    /// [`crate::pipeline::lua_deferred::render_answer_with`].
+    fn markerize_nested(&self, item: &Item) -> Item {
+        let Item::Tok(tok) = item else {
+            return item.clone();
+        };
+        let attribs = tok.get_attribs();
+        if !attribs.iter().any(kv_holds_tokens) {
+            return item.clone();
+        }
+        let new_attribs: Vec<crate::wikitext::tokens_v2::KV> = attribs
+            .iter()
+            .map(|kv| crate::wikitext::tokens_v2::KV {
+                key: self.markerize_value(&kv.key),
+                value: self.markerize_value(&kv.value),
+                src_offsets: kv.src_offsets.clone(),
+                ksrc: kv.ksrc.clone(),
+                vsrc: kv.vsrc.clone(),
+            })
+            .collect();
+        let mut new_tok = tok.clone();
+        new_tok.set_attribs(new_attribs);
+        Item::Tok(new_tok)
+    }
+
+    /// [`Self::markerize_nested`] over a `KeyValue` that holds a token list.
+    fn markerize_value(
+        &self,
+        kv: &crate::wikitext::tokens_v2::KeyValue,
+    ) -> crate::wikitext::tokens_v2::KeyValue {
+        use crate::wikitext::tokens_v2::KeyValue;
+        let KeyValue::Tokens(items) = kv else {
+            return kv.clone();
+        };
+        KeyValue::Tokens(
+            items
+                .iter()
+                .map(|it| self.markerize_extension(it))
+                .collect(),
+        )
+    }
+
+    /// Replace an `extension` token with a strip marker, or recurse into a
+    /// token's attributes. Only reached from within an attribute value, where an
+    /// extension is nested by construction.
+    fn markerize_extension(&self, item: &Item) -> Item {
+        if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item
+            && t.name == "extension"
+        {
+            let tag = extension_name(t).unwrap_or_else(|| "extension".to_string());
+            return Item::Str(self.record_marker(&tag, vec![item.clone()]));
+        }
+        self.markerize_nested(item)
+    }
+
     /// Splice remembered strip markers back into their placeholder tokens.
     ///
     /// The counterpart to [`Parser::render_answer_markers`]: a module's output
     /// is parsed as wikitext, so a marker that reaches a token stream becomes
     /// the fragment placeholder it stood for, exactly where the module left it.
+    ///
+    /// A marker may sit *inside* an attribute value — a module's
+    /// `frame:expandTemplate('Tooltip')` answer spells the span's `title` as
+    /// `title="<UNIQ--nowiki-…-QINU>"` (see [`Self::markerize_extension`]) — so
+    /// the splice reaches into a token's attributes as well as its top level.
     fn substitute_strip_markers(&self, tokens: Vec<Item>) -> Vec<Item> {
-        if !tokens
-            .iter()
-            .any(|it| matches!(it, Item::Str(s) if s.contains('\u{7f}')))
-        {
+        // Fast path: nothing carries a marker — neither a top-level text run nor
+        // a token's attribute value — so the stream is returned untouched rather
+        // than cloned token by token.
+        if !items_carry_marker(&tokens) {
             return tokens;
         }
+        self.splice_marker_runs(tokens)
+            .into_iter()
+            .map(|it| self.substitute_in_attribs(it))
+            .collect()
+    }
+
+    /// Splice the *top-level* marker runs of `tokens`; the attribute recursion is
+    /// [`Self::substitute_strip_markers`]'s.
+    fn splice_marker_runs(&self, tokens: Vec<Item>) -> Vec<Item> {
         let mut out = Vec::with_capacity(tokens.len());
         let mut pending: Vec<String> = Vec::new();
         let flush = |pending: &mut Vec<String>, out: &mut Vec<Item>| {
@@ -3512,6 +3603,52 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         }
         flush(&mut pending, &mut out);
         out
+    }
+
+    /// Resolve markers a token carries in its attributes, at any depth.
+    fn substitute_in_attribs(&self, item: Item) -> Item {
+        let Item::Tok(mut tok) = item else {
+            return item;
+        };
+        if !tok.get_attribs().iter().any(kv_carries_marker) {
+            return Item::Tok(tok);
+        }
+        let resolved = tok
+            .get_attribs()
+            .iter()
+            .map(|kv| self.resolve_kv_markers(kv))
+            .collect();
+        tok.set_attribs(resolved);
+        Item::Tok(tok)
+    }
+
+    /// [`Self::substitute_in_attribs`] for one attribute (either half).
+    fn resolve_kv_markers(
+        &self,
+        kv: &crate::wikitext::tokens_v2::KV,
+    ) -> crate::wikitext::tokens_v2::KV {
+        let mut out = kv.clone();
+        out.key = self.resolve_value_markers(&kv.key);
+        out.value = self.resolve_value_markers(&kv.value);
+        out
+    }
+
+    /// [`Self::substitute_in_attribs`] for a `KeyValue`. A plain string that
+    /// holds a marker becomes a token list, so the marker can be spliced.
+    fn resolve_value_markers(
+        &self,
+        value: &crate::wikitext::tokens_v2::KeyValue,
+    ) -> crate::wikitext::tokens_v2::KeyValue {
+        use crate::wikitext::tokens_v2::KeyValue;
+        match value {
+            KeyValue::Str(s) if s.contains('\u{7f}') => {
+                KeyValue::Tokens(self.substitute_strip_markers(vec![Item::Str(s.clone())]))
+            }
+            KeyValue::Tokens(items) => {
+                KeyValue::Tokens(self.substitute_strip_markers(items.clone()))
+            }
+            _ => value.clone(),
+        }
     }
 
     /// Expand `template`/`templatearg` tokens in-place.
@@ -5923,6 +6060,35 @@ fn strip_marker(tag: &str, id: usize) -> String {
     format!("\u{7f}'\"`UNIQ--{tag}-{id:08X}-QINU`\"'\u{7f}")
 }
 
+/// Whether an attribute key or value holds a token list.
+fn kv_holds_tokens(kv: &crate::wikitext::tokens_v2::KV) -> bool {
+    use crate::wikitext::tokens_v2::KeyValue;
+    matches!(kv.key, KeyValue::Tokens(_)) || matches!(kv.value, KeyValue::Tokens(_))
+}
+
+/// Whether any item carries a strip marker — a top-level text run or, at any
+/// depth, a token's attribute value.
+fn items_carry_marker(items: &[Item]) -> bool {
+    items.iter().any(|it| match it {
+        Item::Str(s) => s.contains('\u{7f}'),
+        Item::Tok(t) => t.get_attribs().iter().any(kv_carries_marker),
+    })
+}
+
+/// Whether either half of an attribute carries a strip marker.
+fn kv_carries_marker(kv: &crate::wikitext::tokens_v2::KV) -> bool {
+    value_carries_marker(&kv.key) || value_carries_marker(&kv.value)
+}
+
+/// Whether an attribute key or value carries a strip marker.
+fn value_carries_marker(value: &crate::wikitext::tokens_v2::KeyValue) -> bool {
+    use crate::wikitext::tokens_v2::KeyValue;
+    match value {
+        KeyValue::Str(s) => s.contains('\u{7f}'),
+        KeyValue::Tokens(items) => items_carry_marker(items),
+    }
+}
+
 /// Whether a deferred request is a `frame:extensionTag('templatestyles', …)` —
 /// lowered to `#tag` with `templatestyles` as its first argument.
 ///
@@ -6706,6 +6872,58 @@ mod tests {
         ]))]));
         // A bare string item never counts.
         assert!(!has_token_attributes(&[Item::Str("x".to_string())]));
+    }
+
+    /// A marker a module returned inside an attribute is spliced back there:
+    /// [`Parser::render_answer_markers`] spells a nested `#tag` as a strip marker
+    /// (`title="<UNIQ--nowiki-…-QINU>"`), so the splice has to reach into the
+    /// attribute value, not only a top-level text run.
+    #[test]
+    fn substitute_strip_markers_reaches_inside_an_attribute() {
+        use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue, SelfclosingTagTk, TagTk};
+
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        // The nested extension the marker stands for — a nowiki.
+        let mut nowiki = SelfclosingTagTk::new("extension", vec![], DataParsoid::default());
+        nowiki.add_attribute_str("name", "nowiki");
+        let marker = parser.record_marker(
+            "nowiki",
+            vec![Item::Tok(ParsoidToken::SelfclosingTag(nowiki))],
+        );
+
+        // `title="<marker>"`, as a module's output re-tokenizes.
+        let span = TagTk::new(
+            "span",
+            vec![KV {
+                key: KeyValue::Str("title".to_string()),
+                value: KeyValue::Str(marker),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }],
+            DataParsoid::default(),
+        );
+        let out = parser.substitute_strip_markers(vec![Item::Tok(ParsoidToken::Tag(span))]);
+
+        let Item::Tok(ParsoidToken::Tag(t)) = &out[0] else {
+            panic!("expected a span tag, got {:?}", out[0]);
+        };
+        let title = t
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("title"))
+            .expect("the span keeps its title");
+        match &title.value {
+            KeyValue::Tokens(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(
+                    matches!(&items[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension")
+                );
+            }
+            other => panic!("expected the marker resolved to tokens, got {other:?}"),
+        }
     }
 
     #[test]

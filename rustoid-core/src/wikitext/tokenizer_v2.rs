@@ -2867,6 +2867,18 @@ impl<'a> PegTokenizer<'a> {
         let mut buf = String::new();
 
         loop {
+            // A strip marker is opaque: consume it whole so its `'`/`"` armour
+            // cannot terminate the value. A module's answer arrives this way —
+            // `frame:expandTemplate('Tooltip')` hands back
+            // `title="<UNIQ--nowiki-…-QINU>"` (see `pipeline::parser`'s
+            // `markerize_nested`).
+            if let Some(len) = strip_marker_len_at(self.remaining()) {
+                let end = self.pos + len;
+                buf.push_str(&self.input[self.pos..end]);
+                self.pos = end;
+                continue;
+            }
+
             // HTML comment.
             if self.starts_with("<!--")
                 && let Some(comment) = self.parse_comment_token()
@@ -4169,6 +4181,24 @@ fn is_space_or_nbsp(c: char) -> bool {
         ' ' | '\t' | '\u{00a0}' | '\u{1680}' | '\u{2000}'
             ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
+}
+
+/// MediaWiki's strip-marker armour, `Parser::MARKER_PREFIX`/`MARKER_SUFFIX`.
+///
+/// A marker is produced by `#tag`/the preprocessor (see `pipeline::parser`'s
+/// `strip_marker`) and is re-tokenized verbatim wherever a module returns an
+/// expansion holding one. Its `'`/`"` armour would otherwise terminate an
+/// attribute value, so the tokenizer must treat the whole marker as one opaque
+/// run. `\x7f` never appears in real wikitext (MediaWiki replaces it with `?`),
+/// so recognizing the prefix is safe.
+const STRIP_MARKER_PREFIX: &str = "\u{7f}'\"`UNIQ-";
+const STRIP_MARKER_SUFFIX: &str = "-QINU`\"'\u{7f}";
+
+/// The byte length of a strip marker at the start of `input`, if one is there.
+fn strip_marker_len_at(input: &str) -> Option<usize> {
+    let rest = input.strip_prefix(STRIP_MARKER_PREFIX)?;
+    let end = rest.find(STRIP_MARKER_SUFFIX)?;
+    Some(STRIP_MARKER_PREFIX.len() + end + STRIP_MARKER_SUFFIX.len())
 }
 
 /// Length of the URL at the start of `input`, per PHP's `extlink_nonipv6url`
@@ -6287,6 +6317,27 @@ mod tests {
             })
             .collect();
         assert_eq!(quotes, vec![(Some(23), 25), (Some(31), 33)]);
+    }
+
+    #[test]
+    fn strip_marker_inside_an_attribute_is_opaque() {
+        // MediaWiki's `#tag`/preprocessor stashes an extension tag as a strip
+        // marker, and a module's `frame:expandTemplate` answer spells one nested
+        // in an attribute as
+        // `title="\x7f'"`UNIQ--nowiki-00000001-QINU`"'\x7f"`. The marker's
+        // `'`/`"` armour must not terminate the value, or the attribute loses its
+        // content (`title="'"` for the whole tooltip title).
+        let marker = "\u{7f}'\"`UNIQ--nowiki-00000001-QINU`\"'\u{7f}";
+        let tokens = tokenize(&format!("<span title=\"{marker}\">x</span>"));
+        let title = tokens.iter().find_map(|t| match t {
+            Either::Right(ParsoidToken::Tag(tk)) if tk.name == "span" => tk
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("title"))
+                .map(|kv| kv.value.to_string()),
+            _ => None,
+        });
+        assert_eq!(title.as_deref(), Some(marker));
     }
 
     #[test]
