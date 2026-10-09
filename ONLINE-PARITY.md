@@ -14045,3 +14045,30 @@ first such run is slow because every one is a miss, later ones are fast).
 wrapper: the service serves `<td class="table-no" typeof="mw:Transclusion"
 about="#mwt67">` and rustoid `<td class="table-no" about="#mwt67"
 typeof="mw:Transclusion">`. `Israel` (3579) is the next unresolved shape.
+
+## A hoisted cell sets `typeof` before `about`
+
+That attribute order is not arbitrary. A table cell that absorbs a transclusion
+gets `typeof="mw:Transclusion"` while it is still a plain tree node and `about`
+later, during encapsulation, and the serializer keeps the insertion order — so
+the service serves `typeof` first. (Encapsulation-created `<span>` wrappers go
+the other way, `about` first; both orders are in the corpus, 22815 either way.)
+rustoid's cell-hoist set `about` first, so the two were swapped and everything
+from that attribute on differed.
+
+### Fix
+
+`table_fixups`' cell-hoist calls `add_type_of` before setting `about`.
+
+### Effect
+
+`ISO 3166-1 alpha-2` **22762 → 23804**; no other corpus page moves. lib **999**,
+compare **120**, fixture guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+A deduplicated templatestyles link carries an empty `about`:
+`<link rel="mw-deduplicated-inline-style" href="mw-data:TemplateStyles:r886049734"
+about="" typeof="mw:Extension/templatestyles">` where the service serves
+`about="#mwt70"` (`deduplicate_styles::deduplicated_link` copies the source
+`<style>`'s `about`, which is empty for that node).
