@@ -442,6 +442,14 @@ impl Html5TreeBuilder {
                     }
                 }
                 ParsoidToken::Comment(c) => {
+                    // A comment flushes any pending table text first, exactly as a
+                    // start tag does: in `in table text` mode the token is
+                    // reprocessed in `in table` after the pending characters are
+                    // inserted. Without this the newlines around a comment-only
+                    // line in a table row stay buffered and land *after* the
+                    // comments (`<tr><!--c--><!--c-->\n\n\n<td>` where the
+                    // service keeps `<tr>\n<!--c-->\n<!--c-->\n<td>`).
+                    self.dispatcher.flush_table_text(&mut self.builder);
                     self.builder.comment(None, &c.value, 0, 0);
                 }
                 ParsoidToken::Eof(_) => {
@@ -3645,6 +3653,60 @@ mod tests {
             c
         }
         assert_eq!(count_tables(&doc), 2, "expected 2 tables: {doc:?}");
+    }
+
+    #[test]
+    fn test_comment_flushes_pending_table_text() {
+        use crate::wikitext::tokens_v2::CommentTk;
+        // A comment-only line inside a table row: the newline before it must be
+        // inserted *before* the comment, not pooled after it. A comment flushes
+        // the pending table text exactly as a start tag does (the `in table text`
+        // token is reprocessed in `in table` after the pending characters land),
+        // so `<tr>\n<!--c1-->\n<!--c2-->\n<td>` stays in that order.
+        fn comment(v: &str) -> Item {
+            Item::Tok(ParsoidToken::Comment(CommentTk::new(
+                v,
+                DataParsoid::default(),
+            )))
+        }
+        let doc = token_stream_to_ast_html(&[
+            tag("table"),
+            tag("tbody"),
+            tag("tr"),
+            txt("\n"),
+            comment("c1"),
+            txt("\n"),
+            comment("c2"),
+            txt("\n"),
+            tag("td"),
+            txt("foo"),
+            end("td"),
+            end("tr"),
+            end("tbody"),
+            end("table"),
+        ]);
+        fn first_row(n: &Node) -> Option<&Node> {
+            if matches!(&n.kind, NodeKind::Element(ElementKind::TableRow)) {
+                return Some(n);
+            }
+            n.children.iter().find_map(first_row)
+        }
+        let tr = first_row(&doc).expect("a table row");
+        let kinds: Vec<&str> = tr
+            .children
+            .iter()
+            .map(|c| match &c.kind {
+                NodeKind::Text(_) => "text",
+                NodeKind::Comment(_) => "comment",
+                NodeKind::Element(_) => "element",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["text", "comment", "text", "comment", "text", "element"],
+            "the newlines must precede each comment: {tr:?}"
+        );
     }
 
     #[test]
