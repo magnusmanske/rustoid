@@ -13975,3 +13975,71 @@ cached load raises the same error text as the first.
 offline corpus 327 s → 281 s. Output is byte-identical — every page's first
 difference is unchanged. State: fixture guard **877/896**, lib **997**,
 compare **119**, clippy and fmt clean.
+
+## `mw.ext.FlaggedRevs` is `prop=flagged`, not unavailable
+
+The record above ("PWrap was a misdiagnosis…") concluded that the
+`mw-empty-elt` family was blocked on **pending-changes protection, which is not
+in the read API**, and listed `ISO 3166-1 alpha-2`, `Grand Theft Auto V`,
+`Polio vaccine`, `Python (programming language)` and `Chernobyl disaster` as
+blocked. That conclusion was wrong, and it is worth correcting because it
+closed off a whole extension's worth of data.
+
+`action=query&prop=info&inprop=protection` does return `[]` for a
+pending-changes-protected page, but the configuration FlaggedRevs exposes
+through `mw.ext.FlaggedRevs.getStabilitySettings` is served by a **different
+prop**:
+
+```text
+prop=flagged&titles=ISO 3166-1 alpha-2
+  → {"flagged":{"stable_revid":…,"level":0,"level_text":"stable",
+                "protection_level":"autoconfirmed","protection_expiry":"infinity"}}
+```
+
+That is the `flaggedpage_config` row (`ApiQueryFlagged`); `protection_level` is
+`fpc_level`, the `autoreview` restriction that
+`FlaggedRevsScribuntoLuaLibrary::getStabilitySettings →
+FRPageConfig::getVisibilitySettingsFromRow` reports. `Module:Effective
+protection level` reads it as `level and level.autoreview`, mapping `"review"`
+to `"reviewer"`, any other non-empty value to itself, and `""` to `nil`.
+
+### Fix
+
+A `DataSource::get_title_stability` call, a `WikiClient::flagged_json` request,
+a `pageinfo::title_stability` parser, an `EntryKind::Stability` cache kind, and
+`TitleFacts.stability`. `mw.ext.FlaggedRevs.getStabilitySettings` answers from
+the round's facts. Outside the wiki's review namespaces it answers `nil`, as
+`FlaggedRevs::inReviewNamespace` does; that set is `$wgFlaggedRevsNamespaces`,
+which the read API does not expose, so `in_review_namespace` carries enwiki's
+values (`{0, 4}` — read off the wiki's own `Module:Effective protection expiry`,
+which returns `unknown` for a non-reviewed title and `infinity` for a reviewed
+one). No consumer reads `override`, which `prop=flagged` does not expose.
+
+### The derived title read its subject page's facts
+
+With the indicator reachable, the next blocker on `Israel` was that
+`Talk:Israel.categories` was never fetched. `title_facts_in`'s case-insensitive
+fallback matched a title by its **bare text** and ignored the namespace, so
+`Talk:Israel` (ns 1, text `Israel`) matched the key `Israel` (ns 0) and read the
+article's facts — and `Module:Protected page`'s
+`inArray(title.talkPageTitle.categories, …)` therefore never saw the PIA
+category (which `Talk:Israel` really carries). The fallback now requires the
+namespace to match, and `is_current_title`'s bare-text arm is main-namespace
+only, since `Talk:X` shares its text with `X`.
+
+### Effect
+
+After an online run populates the new facts: `ISO 3166-1 alpha-2` **598 →
+22762** and `Israel` **1918 → 3579**; no other corpus page moves. lib **999**,
+compare **120**, fixture guard **877/896**, clippy and fmt clean.
+
+The new facts are **not** in the corpus cache from the offline runs, so these
+two pages only move after a run that fetches them (`prop=flagged` and
+`prop=categories` are queried for every title `title_facts_of` looks up).
+
+### Next difference
+
+`ISO 3166-1 alpha-2` (22762) is now an **attribute order** on a transclusion
+wrapper: the service serves `<td class="table-no" typeof="mw:Transclusion"
+about="#mwt67">` and rustoid `<td class="table-no" about="#mwt67"
+typeof="mw:Transclusion">`. `Israel` (3579) is the next unresolved shape.
