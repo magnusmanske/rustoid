@@ -14768,3 +14768,39 @@ session's starting point: `Isaac Newton` **0.89% → 2.60%**, `Taylor Swift`
 **0.62% → 0.65%**, **no page regresses**.
 
 lib **1014**, fixture guard **877/896**, compare **120**, clippy and fmt clean.
+
+## The page-name parser functions take a title argument
+
+The last session left this as a known gap: `{{PAGENAME:x}}`-style calls ignored
+their argument. That is the *parser-function* form of a magic variable
+(`CoreParserFunctions::pagename`), and its colon argument is a **title** —
+`Title::newFromText($title)`, or the current page when the parameter is absent.
+rustoid routed these through the *variable* arm, whose value comes from the page
+being parsed and takes no argument, so every one answered the page.
+
+Measured against the transform endpoint on `Albert Einstein`, all of
+`{{PAGENAME:Some Page}}`, `{{PAGENAME:Talk:Foo}}`, `{{NAMESPACE:Talk:Foo}}`,
+`{{FULLPAGENAME:Talk:Foo}}`, `{{BASEPAGENAME:Template:A/B/C}}`,
+`{{SUBPAGENAME:Template:A/B/C}}`, `{{ROOTPAGENAME:Template:A/B/C}}` and
+`{{NAMESPACENUMBER:Talk:Foo}}` came back `Albert Einstein`; the service gives
+`Some Page`, `Foo`, `Talk`, `Talk:Foo`, `A/B`, `C`, `A`, `1`.
+
+### Fix
+
+`call_parser_function` gains the page-name/namespace family. It parses the colon
+argument with `TitleParser::try_parse` and derives the value from
+`page_name_variable` — the one function that turns a `Title` into the family's
+values — so the variable and function spellings share one implementation instead
+of drifting. An empty or invalid argument is the empty string, exactly as
+`Title::newFromText('')` is `null`; there is deliberately no fall-back to the
+current page, because that *is* the variable form and it never reaches here (it
+needs a colon).
+
+### Effect
+
+No corpus page's first difference moves: on these 48 pages the construct sits
+past the first difference, or is unused. It is a correctness fix that removes a
+silent wrong value wherever a template asks about another title
+(`Template:Category link without namespace` is the common caller). Verified
+against the oracle; lib **1015**, fixture guard **877/896**, compare **120**,
+clippy and fmt clean.
