@@ -14364,5 +14364,45 @@ clippy and fmt clean.
 
 ### Next difference
 
-`Quicksilver (film)` at 10202: a Cite `<sup>` takes `about="#mwt11"` where the
-service has `#mwt12` — an id-counting difference on the reference mark.
+(Resolved by the next section.) A Cite `<sup>` took `about="#mwt11"` where the
+service has `#mwt12`.
+
+## A `<ref>` body is parsed in a fresh, non-template pipeline
+
+The ref's about id was one low from the first `<sup about>` on: `Quicksilver
+(film)` served `#mwt11` where the service has `#mwt12`.
+
+Reduced to `{{Infobox|name=Q|data1=<ref>{{tl|A}}</ref>}}` (rustoid `#mwt3`, the
+service `#mwt4`; a `<ref>` whose body is a *template* is needed, and it must sit
+in a template *argument*). Tracing the allocations shows the service spends an
+invisible id between the Infobox `<templatestyles>` and the ref, and rustoid's
+only extra id is the phantom it adds *after* the ref.
+
+`number_extension_token` expanded the ref body with the caller's `inTemplate`,
+so a ref inside a template argument expanded the body's `{{tl|A}}` unwrapped and
+spent no id. PHP's `ExtensionHandler::onExtension` parses the body with
+`sourceToDom` in a fresh pipeline, where `inTemplate` is false — the note's
+templates are top-level transclusions and are numbered, wherever the ref sits.
+
+### Fix
+
+Expand the ref body with `in_template = false` (and drop the now-unused
+parameter).
+
+### Effect
+
+Many pages' first difference moves forward, because an off-by-one shifts every
+later id: `Quicksilver (film)` **10202 → 10746** (30.29% → 31.91%), `Unix`
+**11270 → 11710**, `2024 Summer Olympics` **8910 → 9303**, `Association
+football` **9968 → 10360**, `COVID-19 pandemic` **20572 → 20974**, `Cristiano
+Ronaldo` **15142 → 15962**, `International Space Station` **14299 → 15058**,
+`Lionel Messi` **11775 → 12661**, `Megadeth` **9693 → 10523**. No page's first
+difference regresses; the fixture breakdown is byte-identical. lib **1006**,
+compare **120**, fixture guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+`Quicksilver (film)` at 10746: the *second* ref
+(`$7,246,979<ref>{{Mojo title|quicksilver}}</ref>`, in the `gross` argument) is
+still one low — `<sup about="#mwt15">` where the service has `#mwt16` — so one
+more id is missing between the two refs.
