@@ -1430,8 +1430,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// back into the output, which is what falling through to the
     /// unknown-parser-function arm did.
     async fn prime_ifexist(&self, title: &str, source: Option<&dyn DataSource>) {
-        let title = title.trim();
-        if title.is_empty() || self.ifexist.borrow().contains_key(title) {
+        // The wiki normalises the title (`Title::newFromText`): `Category:1986`
+        // with a doubled space is the category `Category:1986 films`, and asking
+        // about the raw spelling reads it as absent. Normalise so the question —
+        // and the map key the answer is read back with — is the wiki's own.
+        let Some(title) = crate::title::normalize_title_for_lookup(title, self.config) else {
+            // Not a valid title: it cannot exist.
+            return;
+        };
+        if title.is_empty() || self.ifexist.borrow().contains_key(&title) {
             return;
         }
         // MediaWiki bounds expensive parser functions (`#ifexist` is one of
@@ -1445,14 +1452,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let Some(source) = source else {
             return;
         };
-        let titles = [title.to_string()];
+        let titles = [title.clone()];
         let exists = source
             .get_page_info(&titles)
             .await
             .ok()
-            .and_then(|m| m.get(title).map(|i| !i.missing))
+            .and_then(|m| m.get(&title).map(|i| !i.missing))
             .unwrap_or(false);
-        self.ifexist.borrow_mut().insert(title.to_string(), exists);
+        self.ifexist.borrow_mut().insert(title, exists);
     }
 
     /// Tokenize raw wikitext into the V2 `Item` stream.

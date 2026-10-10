@@ -1327,12 +1327,18 @@ impl TemplateHandler {
             // never resolved — none, in a production run — reads as absent,
             // which is what MediaWiki answers for a page that does not exist.
             "ifexist" => {
-                let title = params
+                let raw = params
                     .args
                     .first()
                     .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
                     .unwrap_or_default();
-                let branch = if ifexist.get(title.trim()).copied().unwrap_or(false) {
+                // The wiki normalises the title it is asked about
+                // (`Title::newFromText`), and `prime_ifexist` keyed its answer
+                // under the same normalised spelling. An invalid title cannot
+                // exist, so it takes the else branch.
+                let exists = crate::title::normalize_title_for_lookup(&raw, config)
+                    .is_some_and(|key| ifexist.get(&key).copied().unwrap_or(false));
+                let branch = if exists {
                     params.args.get(1)
                 } else {
                     params.args.get(2)

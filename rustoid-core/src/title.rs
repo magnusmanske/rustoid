@@ -565,6 +565,20 @@ impl TitleParser {
     }
 }
 
+/// The normalised title a wiki lookup must use, mirroring `Title::newFromText`
+/// plus `getPrefixedText()`: whitespace collapsed, the namespace prefix resolved
+/// and first-letter capitalised. A parser function that receives a title as raw
+/// text and asks the wiki about it — `#ifexist` — must normalise it first, or a
+/// spelling the wiki normalises (`Category:1986  films`) is asked about verbatim
+/// and reads as absent.
+///
+/// `None` when the text is not a valid title (an empty string, an illegal
+/// character, `~~~`): MediaWiki's `#ifexist` answers its else branch for those,
+/// so they never exist.
+pub fn normalize_title_for_lookup(text: &str, config: &dyn SiteConfig) -> Option<String> {
+    TitleParser::try_parse(text, config).map(|t| t.full_text_with_config(config))
+}
+
 /// Config-aware relative link prefix. Mirrors PHP's
 /// `SiteConfig::relativeLinkPrefix()` (defaults to `"./"` on enwiki).
 pub fn relative_link_prefix(_config: &dyn SiteConfig) -> &'static str {
@@ -627,6 +641,24 @@ mod tests {
         assert_eq!(t.namespace_id, 0);
         assert_eq!(t.text, "Main Page");
         assert!(t.fragment.is_none());
+    }
+
+    /// A lookup key is normalised like the wiki normalises what `#ifexist`
+    /// asks about: whitespace collapsed, namespace resolved, first letter
+    /// capitalised. `{{#ifexist:Category:1986  films}}` must ask about
+    /// `Category:1986 films`, which is the page that exists.
+    #[test]
+    fn test_normalize_title_for_lookup() {
+        let config = test_config();
+        assert_eq!(
+            normalize_title_for_lookup("Category:1986  films", &config).as_deref(),
+            Some("Category:1986 films")
+        );
+        assert_eq!(
+            normalize_title_for_lookup("category:1986 films", &config).as_deref(),
+            Some("Category:1986 films")
+        );
+        assert_eq!(normalize_title_for_lookup("", &config), None);
     }
 
     #[test]
