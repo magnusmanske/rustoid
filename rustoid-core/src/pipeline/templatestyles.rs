@@ -206,6 +206,16 @@ pub fn style_node(
             format!(r#"{{"name":"templatestyles","attrs":{{{attrs}}}}}"#)
         },
     );
+    // Parsoid's `ExtensionHandler::onDocumentFragment` keeps a `data-parsoid`
+    // slot for the stylesheet (it records the tag `src` there), so the node takes
+    // a generated id *unless* it sits inside a transclusion range, where CleanUp
+    // discards the slot (`TempData::DISCARDABLE_DP`). rustoid emits no `data-parsoid`
+    // attribute for it — the served HTML does not in the corpus either — so the
+    // slot is recorded as the id-only `empty_dp_slot`; the discard flag it carries
+    // is what decides the id in [`crate::pagebundle::assign_node_ids`]. Without
+    // this a note body's stylesheet was the one node in the reference list the
+    // service ids and rustoid did not, shifting every later node id.
+    style.empty_dp_slot = true;
     style.push_child(Node::text(css));
     style
 }
@@ -554,5 +564,21 @@ div.hatnote {
             render("@media all and (min-width:720px){.a{b:1}}", None),
             "@media all and (min-width:720px){.mw-parser-output .a{b:1}}"
         );
+    }
+
+    /// The stylesheet node records an id-only `data-parsoid` slot, so that a
+    /// stylesheet outside a transclusion range takes a generated node id (as the
+    /// service's does) while one inside a range has the slot discarded. See
+    /// [`crate::pipeline::cleanup::is_native_ext`] and
+    /// [`crate::pagebundle::assign_node_ids`].
+    #[test]
+    fn style_node_records_an_id_slot() {
+        let node = style_node("a{}", 1, "X.css", None, "#mwt1", true);
+        assert!(
+            node.empty_dp_slot,
+            "the stylesheet must key an id through the empty dp slot"
+        );
+        assert_eq!(node.get_attr("about"), Some("#mwt1"));
+        assert_eq!(node.get_attr("id"), None);
     }
 }

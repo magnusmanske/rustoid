@@ -442,10 +442,18 @@ fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool)
 /// conservatively: rustoid's site config does not distinguish native from
 /// non-native extension tags, so *any* extension content is treated as native,
 /// which discards less than the reference rather than more.
+///
+/// The exception is `<templatestyles>`, which has no native Parsoid handler, so
+/// Parsoid's `inNativeContent` (which asks `getExtTagImpl` in the *native* ext
+/// list) is false for it and its `data-parsoid` is discarded inside a
+/// transclusion range — that is what keeps a template-emitted stylesheet from
+/// claiming a node id it should not. A stylesheet in the `<references>` list keeps
+/// its slot (the list is native `mw:Extension/references`), which is why the note
+/// body's stylesheet *does* take an id. See [`crate::pagebundle::assign_node_ids`].
 fn is_native_ext(node: &Node) -> bool {
     node.get_attr("typeof").is_some_and(|ty| {
         ty.split_whitespace()
-            .any(|t| t.starts_with("mw:Extension/"))
+            .any(|t| t.starts_with("mw:Extension/") && t != "mw:Extension/templatestyles")
     })
 }
 
