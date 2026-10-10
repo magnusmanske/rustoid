@@ -14406,3 +14406,59 @@ compare **120**, fixture guard **877/896**, clippy and fmt clean.
 (`$7,246,979<ref>{{Mojo title|quicksilver}}</ref>`, in the `gross` argument) is
 still one low — `<sup about="#mwt15">` where the service has `#mwt16` — so one
 more id is missing between the two refs.
+
+## A transcluded `<ref>` body's extensions are re-numbered
+
+That second ref was one low because the *first* ref's body had spent too few
+ids. Reduced to a note whose body holds a stylesheet, followed by a second note:
+
+```
+{{Infobox|name=Q|data1=<ref>{{#tag:templatestyles|src=Module:Citation/CS1/styles.css}}</ref>|data2=<ref>x</ref>}}
+```
+
+rustoid served `#mwt5` / `#mwt7`, the service `#mwt5` / `#mwt8`: one more
+invisible id is spent, after the ref's own, for every extension wrapper the note
+body rendered. Two `<templatestyles>` cost two ids, a literal `<pre>` one, and
+`<nowiki>` none (lean markup, no wrapper, no id); a body of plain text or a bare
+template spends none. The spend only happens when the ref is *inside a
+transclusion* — a top-level ref's body spends nothing whatever it contains
+(`<ref>{{…templatestyles…}}</ref><ref>x</ref>` matches at `#mwt3`/`#mwt4`).
+
+This is the integrated-mode body path. Parsoid does not re-parse the note body
+itself; it hands it to core, and each extension tag in it comes back as a
+parsoid-opaque fragment (`StripState::addParsoidOpaque`) rendered *again* by
+Parsoid at `unstripParsoid` time. The body is then spliced into the page, and
+`DOMDataUtils::dedupeNodeData` gives every encapsulation wrapper it copies a
+fresh `about` id (`newAboutId`) — the fragment's original id is released and a
+new one taken, so an extension in a transcluded note costs two ids. rustoid
+renders the body once and keeps the node, so it has to spend the discarded ids
+itself.
+
+### Fix
+
+`count_body_extensions` walks the rendered body and counts its `mw:Extension/*`
+wrappers (`<nowiki>` excluded); `number_extension_token` spends that many extra
+ids right after the ref's own, under the same "inside a transclusion" test as
+the existing phantom id (`expansion_nesting > 1`).
+
+### Effect
+
+`Quicksilver (film)` **10746 → 26251** (31.91% → 77.95%), `Association football`
+**10360 → 25886**, `Lionel Messi` **12661 → 22049**, `Megadeth` **10523 →
+18083**, `COVID-19 pandemic` **20974 → 22493**, `Cristiano Ronaldo` **15962 →
+16959**, `2024 Summer Olympics` **9303 → 13324**, `Polio vaccine` **7827 →
+7828**. No page's first difference regresses (39 unchanged, and the corpus score
+is unchanged at 1/48). lib **1007**, compare **120**, clippy and fmt clean.
+
+### Next difference
+
+`Quicksilver (film)` at 26251, in the reference *list* (not the body): the note
+body's `{{Cite web}}` render keeps its transclusion wrapper, so rustoid serves
+`<style … typeof="mw:Extension/templatestyles mw:Transclusion" about="#mwt10"
+data-mw='{…,"parts":[{…"Cite web"…}]}'>` and propagates `about="#mwt10"` onto
+the `<cite>` and the `Z3988` `<span>`. The service serves
+`typeof="mw:Extension/templatestyles" about="#mwt11"` with no `parts`, and no
+`about` on the citation content at all — the note body is embedded without its
+transclusion markers, and its stylesheet takes a fresh id. A second, unrelated
+byte in the same element: the service writes `AFI<span typeof="mw:Entity">|</span>Catalog`
+where rustoid leaves the entity literal (`AFI&amp;#124;Catalog`).
