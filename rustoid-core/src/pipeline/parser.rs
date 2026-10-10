@@ -3975,7 +3975,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 if self.number_style_placeholder(item, about_counter) {
                     continue;
                 }
-                self.number_extension_token(item, source, frame, about_counter, in_template)
+                self.number_extension_token(item, source, frame, about_counter)
                     .await;
             }
             result.extend(out);
@@ -3998,7 +3998,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
-        in_template: bool,
     ) {
         let (body, is_ref) = {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
@@ -4018,9 +4017,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 return;
             }
             let is_ref = name.as_deref() == Some("ref");
-            // PHP parses the body in the pipeline the extension sits in, so
-            // `inTemplate` is the *caller's* value (usually false: the templates
-            // inside a note are top-level transclusions and are wrapped).
+            // PHP parses the body in a *fresh* pipeline (`sourceToDom` on the
+            // extension body), so `inTemplate` is false and a template inside a
+            // note is a top-level transclusion that is wrapped — even when the
+            // ref itself sits in a template argument (`{{Infobox|data1=<ref>{{tl|A}}</ref>}}`
+            // numbers `{{tl}}`; the body is not the argument's body).
             let body = if is_ref {
                 extension_body(t)
             } else {
@@ -4043,7 +4044,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     frame,
                     about_counter,
-                    in_template,
+                    /* in_template */ false,
                 ))
                 .await,
             )
