@@ -1455,6 +1455,35 @@ impl TemplateHandler {
                     }
                 }))]
             }
+            // The parser-function forms of the page-name / namespace magic
+            // variables (`CoreParserFunctions::pagename`, `namespace`, …). The
+            // colon argument names a *title* (`Title::newFromText`), so
+            // `{{PAGENAME:Some Page}}` is `Some Page` — not the page this is
+            // rendered on, which is what the *variable* form answers because it
+            // ignores its argument. `page_name_variable` is the one place that
+            // derives the family from a `Title`, so both spellings share it.
+            "pagename" | "pagenamee" | "fullpagename" | "fullpagenamee" | "basepagename"
+            | "basepagenamee" | "subpagename" | "subpagenamee" | "rootpagename"
+            | "rootpagenamee" | "fullrootpagename" | "fullrootpagenamee" | "talkpagename"
+            | "talkpagenamee" | "subjectpagename" | "subjectpagenamee" | "articlepagename"
+            | "articlepagenamee" | "namespace" | "namespacee" | "namespacenumber" | "talkspace"
+            | "talkspacee" | "subjectspace" | "subjectspacee" | "articlespace"
+            | "articlespacee" => {
+                let arg = params
+                    .args
+                    .first()
+                    .map(|kv| key_value_to_string(&kv.key))
+                    .unwrap_or_default();
+                // An empty or invalid argument is `Title::newFromText('')` →
+                // `null` → the empty string. There is deliberately no fall-back to
+                // the current page: that is the *variable* form, which never
+                // reaches this arm (it needs no colon).
+                let value = TitleParser::try_parse(&arg, config)
+                    .as_ref()
+                    .and_then(|t| page_name_variable(config, name, t))
+                    .unwrap_or_default();
+                vec![Item::Str(value)]
+            }
             // Unknown parser function: preserve the original source verbatim —
             // unless the name is a magic word, whose parser-function form answers
             // the same as its variable form (MediaWiki registers these as
@@ -2396,6 +2425,56 @@ mod tests {
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "yes"))
         );
+    }
+
+    /// The parser-function forms of the page-name variables take a *title*
+    /// argument: `{{PAGENAME:Talk:Foo}}` is `Foo`, not the page being rendered.
+    /// The *variable* form ignores its argument, so before this arm existed the
+    /// name came from the page (`Albert Einstein` for every one of these).
+    #[test]
+    fn test_page_name_parser_function_forms() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let config = MockSiteConfig::new();
+        let page = TitleParser::parse("Albert Einstein", &config);
+        let page_protection = std::cell::RefCell::new(Default::default());
+        let titles_protection = std::cell::RefCell::new(HashMap::new());
+        let protection = ProtectionContext::new(&page_protection, &titles_protection);
+        let ifexist = HashMap::new();
+        let call = |name: &str, arg: &str| {
+            let params = Params::new(vec![KV {
+                key: KeyValue::Str(arg.to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }]);
+            let out = TemplateHandler::call_parser_function(
+                &config,
+                name,
+                &params,
+                None,
+                &protection,
+                &ifexist,
+                Some(&page),
+                true,
+            );
+            match out.as_slice() {
+                [Item::Str(s)] => s.clone(),
+                other => panic!("{name}({arg:?}): expected one string, got {other:?}"),
+            }
+        };
+        assert_eq!(call("pagename", "Some Page"), "Some Page");
+        assert_eq!(call("pagename", "Talk:Foo"), "Foo");
+        assert_eq!(call("namespace", "Talk:Foo"), "Talk");
+        assert_eq!(call("fullpagename", "Talk:Foo"), "Talk:Foo");
+        assert_eq!(call("basepagename", "Template:A/B/C"), "A/B");
+        assert_eq!(call("subpagename", "Template:A/B/C"), "C");
+        assert_eq!(call("rootpagename", "Template:A/B/C"), "A");
+        assert_eq!(call("namespacenumber", "Talk:Foo"), "1");
+        // An empty or invalid argument is `Title::newFromText('')` → the empty
+        // string, not the page.
+        assert_eq!(call("pagename", ""), "");
     }
 
     #[test]
