@@ -14452,13 +14452,55 @@ is unchanged at 1/48). lib **1007**, compare **120**, clippy and fmt clean.
 
 ### Next difference
 
-`Quicksilver (film)` at 26251, in the reference *list* (not the body): the note
-body's `{{Cite web}}` render keeps its transclusion wrapper, so rustoid serves
-`<style … typeof="mw:Extension/templatestyles mw:Transclusion" about="#mwt10"
-data-mw='{…,"parts":[{…"Cite web"…}]}'>` and propagates `about="#mwt10"` onto
-the `<cite>` and the `Z3988` `<span>`. The service serves
-`typeof="mw:Extension/templatestyles" about="#mwt11"` with no `parts`, and no
-`about` on the citation content at all — the note body is embedded without its
-transclusion markers, and its stylesheet takes a fresh id. A second, unrelated
-byte in the same element: the service writes `AFI<span typeof="mw:Entity">|</span>Catalog`
-where rustoid leaves the entity literal (`AFI&amp;#124;Catalog`).
+`Quicksilver (film)` at 26251: the note body's `{{Cite web}}` render kept its
+transclusion wrapper — `<style … typeof="mw:Extension/templatestyles
+mw:Transclusion" about="#mwt10" data-mw='{…,"parts":[{…"Cite web"…}]}'>` and
+`about="#mwt10"` propagated onto the `<cite>` and the `Z3988` `<span>` — where
+the service serves a bare `mw:Extension/templatestyles`.
+
+## A transcluded `<ref>` body keeps no transclusion markers
+
+The wrapper above is the note body's `{{Cite web}}` expansion. The service
+numbers it (the ids still line up) but does not wrap it: the note body is a
+*fresh* Parsoid pipeline, and `wikitextToDOM` forwards
+`inTemplate => $this->inTemplate()` from the enclosing pipeline, so the note
+body's `wrapTemplates` is `!inTemplate`. A note reached from inside a
+transclusion — `Quicksilver (film)`'s refs sit in Infobox arguments — is parsed
+with `inTemplate` true and is therefore unwrapped; a *top-level* note is parsed
+with it false and is wrapped. `Zebra`'s top-level `cite journal` notes keep
+`typeof="mw:Extension/templatestyles mw:Transclusion"` and their `parts`, which
+is exactly why this cannot be a blanket "strip the wrapper".
+
+The id is separate from the marker. PHP's `TemplateEncapsulator` constructor
+allocates an `about` id for *every* template token it processes, wrapped or not
+(the unused ones are simply not emitted), so a fresh note body must still spend
+one id per top-level `{{…}}` even though it emits no `mw:Transclusion`.
+
+### Fix
+
+`Parser::wrap_templates` (a `Cell<bool>`, guarded by `expand_unwrapped`) makes
+the `wrap` decision independent of the id: `expand_template_token` reads it for
+`wrap`, while `take_id` keeps its old `!in_tpl && !body` test. It is cleared
+only around a note body that is itself inside a transclusion
+(`expansion_nesting > 1`, the same test as the phantom id).
+`TemplateHandler::process` takes a separate `take_id` so a parser function's id
+follows the same rule — without it the `#tag:templatestyles` case lost the
+`#tag` id and the refs fell one low again.
+
+### Effect
+
+`Quicksilver (film)` **26251 → 26373** (77.95% → 78.31%); `Zebra` stays a
+**MATCH**. No page's first difference regresses and the corpus score is
+unchanged (1/48). A new `cite_integration_test::a_transcluded_ref_body_is_not_wrapped`
+pins both halves: a top-level note's body template keeps its wrapper, a note
+reached through a transclusion drops it. lib **1007**, compare **120**, fixture
+guard **877/896**, clippy and fmt clean.
+
+### Next difference
+
+`Quicksilver (film)` at 26373: the note body's stylesheet is now
+`typeof="mw:Extension/templatestyles" about="#mwt11"` in both, but the service
+carries a node id (`id="mweg"`) where rustoid emits none. A second, unrelated
+byte in the same element: the service writes
+`AFI<span typeof="mw:Entity">|</span>Catalog` where rustoid leaves the entity
+literal (`AFI&amp;#124;Catalog`).
