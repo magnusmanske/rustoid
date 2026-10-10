@@ -5721,6 +5721,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// look like a loop. PHP's equivalent frame has a null title, which can never
     /// match.
     ///
+    /// It carries the *caller's arguments*, though — that is the other half of
+    /// "expanded in the caller's scope", and a nested `#invoke` reads them as
+    /// `frame:getParent().args`. The preprocessor expands a template's argument
+    /// values in `$this->parent` (`PPTemplateFrame_Hash::getNumberedArgument`),
+    /// so a `{{#invoke:…}}` written in an argument sees the *call site's* frame:
+    /// `Template:Infobox person`'s `Born` row is
+    /// `{{br separated entries|2={{#invoke:person date|birth}}}}`, and `person
+    /// date` reads `birth_date` from the frame the infobox was called in. An
+    /// empty child frame made that lookup miss and the whole row empty.
+    ///
     /// Unlike [`Self::expand_invoke_args`], extension ids **are** spent here —
     /// but not at expansion time: the guard defers them to the post-pass of the
     /// chunk the value is spliced into, which is its document position. Numbering
@@ -5754,7 +5764,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             } else {
                 items.clone()
             };
-            let child = frame.new_child(frame.root_title().clone(), vec![]);
+            let child = frame.new_child(frame.root_title().clone(), frame.args().args.clone());
             let expanded = Box::pin(self.expand_templates(
                 &child,
                 substituted,

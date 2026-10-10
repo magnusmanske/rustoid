@@ -3810,15 +3810,27 @@ end
 -- text, which is how `gsub` is used as a filter.
 function mw.ustring.gsub(s, pattern, repl, n)
     local out = {}
-    local pos = 1
+    local src = 1
     local len = mw.ustring.len(s)
     local count = 0
     local max = n or math.huge
     -- An anchored pattern substitutes at most once: Lua's `str_gsub` does
-    -- `if (anchor) break;` at the end of its first iteration. Without this the
-    -- loop re-anchors at every position and replaces far too much —
+    -- `if (anchor) break;` at the end of every iteration. Without this the loop
+    -- re-anchors at every position and replaces far too much —
     -- `gsub('abc', '^(%a)', '<%1>')` gave `<a><b><c>` where Lua gives `<a>bc`.
     local anchored = type(pattern) == 'string' and pattern:sub(1, 1) == '^'
+    -- The scan matches *at* each position, as `str_gsub` does, rather than
+    -- searching ahead: `find` is asked for a match anchored at `init`. A pattern
+    -- that is already anchored must not get a second caret, which would be a
+    -- literal one.
+    local pat = anchored and pattern or ('^' .. pattern)
+    -- The end (exclusive) of the last accepted match. `str_gsub` compares each
+    -- candidate against it so an empty match does not repeat at the same
+    -- position; the guard copies one character and moves on instead. Without it
+    -- the empty match advanced the cursor past a character that was never
+    -- emitted, so `gsub('1 January', '^%s*', '')` ate the leading `1` —
+    -- `Module:Person date` trims a date that way and saw `January 1900`.
+    local lastmatch = -1
 
     local function append_replacement(whole, ncap, ...)
         local caps = { ... }
@@ -3867,30 +3879,37 @@ function mw.ustring.gsub(s, pattern, repl, n)
         end
     end
 
-    while pos <= len + 1 and count < max do
-        local a, b = mw.ustring.find(s, pattern, pos)
-        if not a then break end
-        out[#out + 1] = mw.ustring.sub(s, pos, a - 1)
-        -- The count comes first; see `__captures`. A capture list with a hole
-        -- gives an unspecified `#`, which is what made a valid replacement read
-        -- as "invalid capture index".
-        --
-        -- Lua 5.1 has no `local n, ... = f()` form, so the captures are gathered
-        -- into a table and the count taken from element 1.
-        local got = { mw.ustring.__captures(s, pattern, a) }
-        local ncap = got[1] or 0
-        local caps = {}
-        for i = 2, ncap + 1 do caps[i - 1] = got[i] end
-        if ncap > 0 then
-            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), ncap, unpack(caps, 1, ncap))
+    while count < max do
+        local a, b = mw.ustring.find(s, pat, src)
+        if a and b + 1 ~= lastmatch then
+            -- The count comes first; see `__captures`. A capture list with a
+            -- hole gives an unspecified `#`, which is what made a valid
+            -- replacement read as "invalid capture index".
+            --
+            -- Lua 5.1 has no `local n, ... = f()` form, so the captures are
+            -- gathered into a table and the count taken from element 1.
+            local got = { mw.ustring.__captures(s, pattern, a) }
+            local ncap = got[1] or 0
+            local caps = {}
+            for i = 2, ncap + 1 do caps[i - 1] = got[i] end
+            if ncap > 0 then
+                out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), ncap, unpack(caps, 1, ncap))
+            else
+                out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), 0)
+            end
+            count = count + 1
+            src = b + 1
+            lastmatch = src
+        elseif src <= len then
+            -- No match here: copy one character and move on.
+            out[#out + 1] = mw.ustring.sub(s, src, src)
+            src = src + 1
         else
-            out[#out + 1] = append_replacement(mw.ustring.sub(s, a, b), 0)
+            break
         end
-        count = count + 1
-        if b >= a then pos = b + 1 else pos = a + 1 end
         if anchored then break end
     end
-    out[#out + 1] = mw.ustring.sub(s, pos)
+    out[#out + 1] = mw.ustring.sub(s, src)
     return table.concat(out), count
 end
 
@@ -4350,10 +4369,18 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<Stri
         "Saturday",
         "Sunday",
     ];
+    const DAYS_ABBR: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-    // Day of week needs a real date calculation, which this does not attempt:
-    // the letters below are the ones the corpus asks for.
-    //
+    // The day-of-week and week-number codes need a real calendar calculation,
+    // which `chrono` supplies; the date is fully determined by the parsed parts.
+    use chrono::{Datelike, NaiveDate};
+    let date = NaiveDate::from_ymd_opt(
+        year.unwrap_or(1970),
+        u32::try_from(month.unwrap_or(1)).unwrap_or(1),
+        day.unwrap_or(1),
+    );
+    let weekday = date.map(|d| d.weekday().num_days_from_monday());
+
     // `x` is MediaWiki's "raw" prefix: it makes the next code literal (`xU`
     // renders a literal `U`). `n` is the exception, and the reason this is not a
     // two-line special case: on its own `n` is the *number format* modifier, not
@@ -4411,6 +4438,22 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<Stri
             ),
             'j' => out.push_str(&day.unwrap_or(0).to_string()),
             'd' => out.push_str(&format!("{:02}", day.unwrap_or(0))),
+            'l' => out.push_str(weekday.map(|w| DAYS[w as usize]).unwrap_or("")),
+            'D' => out.push_str(weekday.map(|w| DAYS_ABBR[w as usize]).unwrap_or("")),
+            // `w` counts from Sunday, `N` from Monday; `chrono` gives Monday-based.
+            'w' => out.push_str(&weekday.map(|w| (w + 1) % 7).unwrap_or(0).to_string()),
+            'N' => out.push_str(&(weekday.unwrap_or(0) + 1).to_string()),
+            'W' => out.push_str(
+                &date
+                    .map(|d| format!("{:02}", d.iso_week().week()))
+                    .unwrap_or_default(),
+            ),
+            // MediaWiki's `z` is the day of the year starting from 0 (PHP's `z`).
+            'z' => out.push_str(
+                &date
+                    .map(|d| (d.ordinal() - 1).to_string())
+                    .unwrap_or_default(),
+            ),
             'G' => out.push_str(&hour.unwrap_or(0).to_string()),
             'H' => out.push_str(&format!("{:02}", hour.unwrap_or(0))),
             'i' => out.push_str(&format!("{:02}", minute.unwrap_or(0))),
@@ -4425,7 +4468,6 @@ pub(crate) fn format_date(format: &str, stamp: &str) -> std::result::Result<Stri
             _ => out.push(c),
         }
     }
-    let _ = DAYS;
     Ok(out)
 }
 
@@ -5516,11 +5558,11 @@ fn build_args_table(
                 args_table.set(next_positional, v.clone()).map_err(err)?;
             }
             Arg::Named(k, v) => {
-                args_table.set(k.clone(), v.clone()).map_err(err)?;
+                set_arg_key(&args_table, &lua_arg_key(k), v.clone()).map_err(err)?;
             }
             Arg::Lazy(slot) => {
                 let key = match &slot.name {
-                    Some(name) => ArgKey::Str(name.clone()),
+                    Some(name) => lua_arg_key(name),
                     None => {
                         next_positional += 1;
                         ArgKey::Int(next_positional as i64)
@@ -5529,10 +5571,7 @@ fn build_args_table(
                 // An answer from an earlier round is materialized as a raw key,
                 // so a later read of it does not round-trip again.
                 match answers.get(&slot.key()) {
-                    Some(text) => match &key {
-                        ArgKey::Int(i) => args_table.set(*i, text.clone()).map_err(err)?,
-                        ArgKey::Str(s) => args_table.set(s.clone(), text.clone()).map_err(err)?,
-                    },
+                    Some(text) => set_arg_key(&args_table, &key, text.clone()).map_err(err)?,
                     None => match key {
                         ArgKey::Int(_) => lazy_positional.push((key, slot.clone())),
                         ArgKey::Str(_) => lazy_named.push((key, slot.clone())),
@@ -5669,6 +5708,29 @@ fn build_args_table(
 enum ArgKey {
     Int(i64),
     Str(String),
+}
+
+/// The Lua key an argument *name* is stored under.
+///
+/// Scribunto builds `frame.args` from a PHP array, and PHP coerces a string key
+/// that spells a canonical decimal integer to an `int` — so `{{t|1=a}}` reaches a
+/// module as `frame.args[1]`, not `frame.args["1"]`. Modules rely on it:
+/// `Module:Arguments`' `compressSparseArray` keeps only integer keys, so a string
+/// `"1"` silently dropped the argument. PHP's rule rejects `"08"`, `"+1"` and
+/// `"1.0"`, which round-tripping through `i64` reproduces.
+fn lua_arg_key(name: &str) -> ArgKey {
+    match name.parse::<i64>() {
+        Ok(i) if i.to_string() == name => ArgKey::Int(i),
+        _ => ArgKey::Str(name.to_string()),
+    }
+}
+
+/// Materialize a value under an [`ArgKey`].
+fn set_arg_key(table: &Table, key: &ArgKey, value: String) -> mlua::Result<()> {
+    match key {
+        ArgKey::Int(i) => table.set(*i, value),
+        ArgKey::Str(s) => table.set(s.clone(), value),
+    }
 }
 
 /// The spellings of a Lua key that address the same argument: `1` and `"1"`.
@@ -7824,6 +7886,63 @@ mod tests {
         );
     }
 
+    /// A zero-width match must not consume a character, and must not repeat at
+    /// the same position.
+    ///
+    /// `str_gsub` scans anchored at each position and keeps `lastmatch` (the
+    /// end of the previous accepted match) so an empty match advances by one
+    /// character instead of looping. Replacing the unmatched tail from the
+    /// advanced cursor dropped a character that was never emitted, so
+    /// `Module:Person date`'s `sanatize_date` — `gsub(str, '^%s*', '')` — turned
+    /// `1 January 1900` into ` January 1900`, and the infobox `Born` row came
+    /// back empty.
+    #[test]
+    fn gsub_does_not_consume_a_zero_width_match() {
+        let engine = make_engine();
+        // A leading-whitespace trim over a string with no leading whitespace is
+        // the exact shape that regressed.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('1 January 1900', '^%s*', ''))")
+                .unwrap(),
+            "1 January 1900"
+        );
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('abc', '^%s*', 'X'))")
+                .unwrap(),
+            "Xabc"
+        );
+        // With real leading whitespace the match is not empty.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('  abc', '^%s*', 'X'))")
+                .unwrap(),
+            "Xabc"
+        );
+        // A trailing-anchored pattern matches the trailing run once, including
+        // the empty match at the very end, which must not double up.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('abc ', '%s*$', 'Y'))")
+                .unwrap(),
+            "abcY"
+        );
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('abc', '%s*$', 'Y'))")
+                .unwrap(),
+            "abcY"
+        );
+        // `n` still caps the replacements and leaves the rest appended.
+        assert_eq!(
+            engine
+                .eval("return (mw.ustring.gsub('aaa', 'a', 'b', 2))")
+                .unwrap(),
+            "bba"
+        );
+    }
+
     /// The wrapped `pairs`/`ipairs` must name *themselves* in an error, not the
     /// raw iterators they delegate to.
     ///
@@ -8336,6 +8455,48 @@ mod tests {
         assert_eq!(result, "hello");
     }
 
+    /// A numeric argument name reaches Lua as an **integer** key, not a string.
+    ///
+    /// Scribunto builds `frame.args` from a PHP array, and PHP coerces a string
+    /// key that spells a canonical integer to `int`, so `{{t|1=a}}` is
+    /// `frame.args[1]`. Modules depend on the key *type*: `Module:Arguments`'
+    /// `getArgs` → `compressSparseArray` keeps only integer keys, so a string
+    /// `"1"` was silently dropped — which is what emptied the infobox `Born`
+    /// row (`{{br separated entries|1=…|2=…}}` reached the module as string
+    /// keys).
+    #[test]
+    fn a_numeric_argument_name_is_an_integer_key() {
+        let engine = make_engine();
+        let args = vec![
+            Arg::Named("1".to_string(), "a".to_string()),
+            Arg::Named("2".to_string(), "b".to_string()),
+        ];
+        // `pairs` yields the keys' real types.
+        let integers = engine
+            .execute(
+                "local p = {} function p.main(frame) local n = 0 \
+                 for k, _ in pairs(frame.args) do if type(k) == 'number' then n = n + 1 end end \
+                 return tostring(n) end return p",
+                "main",
+                &args,
+            )
+            .unwrap();
+        assert_eq!(integers, "2");
+        // Both spellings read the same argument.
+        for spelling in ["frame.args[1]", "frame.args['1']"] {
+            let got = engine
+                .execute(
+                    &format!(
+                        "local p = {{}} function p.main(frame) return {spelling} end return p"
+                    ),
+                    "main",
+                    &args,
+                )
+                .unwrap();
+            assert_eq!(got, "a", "{spelling}");
+        }
+    }
+
     /// A module returns its table (`local p = {} … return p`), so entry points
     /// live in the returned value, not in globals.
     #[test]
@@ -8667,6 +8828,25 @@ mod tests {
         assert_eq!(at("HxnU"), "001577836800");
         // A trailing `x` has nothing to make literal and adds nothing.
         assert_eq!(at("Ux"), "1577836800");
+    }
+
+    /// The day-of-week and week-number codes, which before fell through to the
+    /// literal-letter arm (`{{#time:l}}` rendered `l`).
+    ///
+    /// 2020-01-01 is a Wednesday, ISO week 1. The service gives `Wed`/`3`/`3`/
+    /// `01`/`0` for `D`/`w`/`N`/`W`/`z` on that date, which also pins the bases:
+    /// `w` counts from Sunday, `z` from zero.
+    #[test]
+    fn format_date_handles_day_and_week_codes() {
+        let at = |f: &str| format_date(f, "2020-01-01").unwrap();
+        assert_eq!(at("l"), "Wednesday");
+        assert_eq!(at("D"), "Wed");
+        assert_eq!(at("w"), "3");
+        assert_eq!(at("N"), "3");
+        assert_eq!(at("W"), "01");
+        assert_eq!(at("z"), "0");
+        // A Sunday is `0` on both counts (`w`) and `7` (`N`).
+        assert_eq!(format_date("w N l", "2020-01-05").unwrap(), "0 7 Sunday");
     }
 
     /// The input shapes MediaWiki accepts, each checked against the service.

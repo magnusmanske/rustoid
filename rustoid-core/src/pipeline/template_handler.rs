@@ -324,7 +324,15 @@ fn resolve_target_string(
     };
 
     // Check for a magic variable (in the site's magic-word map).
-    if let Some((canonical, true)) = magic_word_for_variable(config, &prefix) {
+    //
+    // The *whole* target is matched, not the piece before the colon: MediaWiki's
+    // `MagicWordArray::matchStartToEnd` requires the alias to consume the entire
+    // `$part1`, so a magic word that takes a colon argument — `{{padleft:…}}`,
+    // `{{formatnum:…}}` — is *not* a variable. Matching only the prefix treated
+    // `padleft` as a variable (its alias is `PADLEFT`, with no colon), which
+    // answered the empty string: `Template:Birth date`'s `{{padleft:{{MONTHNUMBER|…}}|2|0}}`
+    // came out empty and every infobox `Born`/`Died` microformat with it.
+    if let Some((canonical, true)) = magic_word_for_variable(config, &target) {
         let title = TitleParser::parse(&format!("Special:Variable/{canonical}"), config);
         return Some(ResolvedTarget::Variable {
             name: canonical.clone(),
@@ -536,6 +544,31 @@ pub fn parse_template_arg_src(src: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     Some((name, default))
+}
+
+/// The `#time` format code a `CURRENT*`/`LOCAL*` magic variable answers with.
+///
+/// MediaWiki defines these as thin wrappers over the clock (`CoreMagicVariables`
+/// formats "now"), so the value is produced by the same formatter `#time` uses.
+/// The `LOCAL*` twins are included: the wiki's timezone is UTC, so they answer
+/// identically.
+fn date_time_variable_code(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "currentyear" | "localyear" => "Y",
+        "currentmonth" | "localmonth" => "m",
+        "currentmonth1" | "localmonth1" => "n",
+        "currentmonthname" | "localmonthname" | "currentmonthnamegen" | "localmonthnamegen" => "F",
+        "currentmonthabbrev" | "localmonthabbrev" => "M",
+        "currentday" | "localday" => "j",
+        "currentday2" | "localday2" => "d",
+        "currentdayname" | "localdayname" => "l",
+        "currentdow" | "localdow" => "w",
+        "currenthour" | "localhour" => "H",
+        "currenttime" | "localtime" => "H:i",
+        "currenttimestamp" | "localtimestamp" => "YmdHis",
+        "currentweek" | "localweek" => "W",
+        _ => return None,
+    })
 }
 
 /// Find the page-name magic variable whose canonical name is `name`.
@@ -1039,6 +1072,7 @@ impl TemplateHandler {
                 name,
                 pf_arg,
                 colon,
+                local_name,
                 ..
             }) => {
                 // Rebuild params: args[0].k is the first argument (from the
@@ -1060,6 +1094,12 @@ impl TemplateHandler {
                     protection,
                     ifexist,
                     page_title,
+                    // Whether the call was written with a leading `#`. The
+                    // magic-word fallback for an unimplemented function is for
+                    // the *no-hash* spelling only: `{{PAGESIZE:…}}` is the magic
+                    // variable's function form, while `{{#property:…}}` is a
+                    // genuine extension call the service leaves as written.
+                    !local_name.starts_with(['#', '＃']),
                 );
                 if !wrap {
                     // `{{SHORTDESC:…}}` inside `Template:Short description` is
@@ -1186,6 +1226,14 @@ impl TemplateHandler {
         {
             return value;
         }
+        // The date/time variables answer from the wall clock, exactly as `#time`
+        // does (see [`crate::lua::engine::format_date`]). MediaWiki bakes its
+        // clock into the served HTML, and the comparison is against HTML fetched
+        // close enough to the run that the date agrees. `LOCAL*` mirrors its
+        // `CURRENT*` twin because this wiki's timezone is UTC.
+        if let Some(code) = date_time_variable_code(name) {
+            return crate::lua::engine::format_date(code, "now").unwrap_or_default();
+        }
         match name {
             "sitename" => "MediaWiki".to_string(),
             "server" => config.server_url().to_string(),
@@ -1285,6 +1333,9 @@ impl TemplateHandler {
         // [`TemplateHandler::process`].
         ifexist: &std::collections::HashMap<String, bool>,
         context_title: Option<&crate::title::Title>,
+        // The call was spelled without a leading `#` (a `SFH_NO_HASH` function).
+        // Only these may fall back to a magic word when unimplemented.
+        no_hash_spelling: bool,
     ) -> Vec<Item> {
         match name {
             "if" => ParserFunctions::pf_if(params),
@@ -1404,8 +1455,33 @@ impl TemplateHandler {
                     }
                 }))]
             }
-            // Unknown parser function: preserve the original source verbatim.
-            _ => vec![Item::Str(token_src.unwrap_or("").to_string())],
+            // Unknown parser function: preserve the original source verbatim —
+            // unless the name is a magic word, whose parser-function form answers
+            // the same as its variable form (MediaWiki registers these as
+            // `SFH_NO_HASH` hooks backed by a magic variable; `CoreParserFunctions`'
+            // own comment says so). The resolver now routes `{{padleft:…}}`-style
+            // calls here instead of to the variable arm, so a name it does not
+            // implement — `{{SHORTDESC:…}}`, `{{formatnum:…}}` — must still answer
+            // its magic word rather than spill its source text.
+            _ => match no_hash_spelling
+                .then(|| magic_word_for_variable(config, name).map(|(canonical, _)| canonical))
+                .flatten()
+            {
+                Some(canonical) => {
+                    let arg = params
+                        .args
+                        .first()
+                        .map(|kv| key_value_to_string(&kv.key))
+                        .unwrap_or_default();
+                    vec![Item::Str(Self::variable_value(
+                        config,
+                        &canonical,
+                        &arg,
+                        context_title,
+                    ))]
+                }
+                None => vec![Item::Str(token_src.unwrap_or("").to_string())],
+            },
         }
     }
 
@@ -2182,6 +2258,48 @@ mod tests {
             ResolvedTarget::Template { name, .. } => assert_eq!(name, "Template:NotAFunction:x"),
             other => panic!("expected template, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn a_colon_invocation_is_never_a_magic_variable() {
+        // The magic-word table lists parser-function words too, and their
+        // aliases carry no colon (`PADLEFT`). The variable matcher requires the
+        // alias to consume the *whole* target (`MagicWordArray::matchStartToEnd`),
+        // so `{{padleft:…}}` resolves as the function. Matching only the prefix
+        // made it a variable, which answered the empty string — that is what
+        // emptied `Template:Birth date`'s `{{padleft:…|2|0}}` microformat.
+        let mut config = MockSiteConfig::new();
+        config.add_magic_word("padleft", &["PADLEFT"]);
+        config.add_function_hook("padleft");
+        match resolve_template_target(&config, None, "padleft:7").unwrap() {
+            ResolvedTarget::ParserFunction { name, pf_arg, .. } => {
+                assert_eq!(name, "padleft");
+                assert_eq!(pf_arg, "7");
+            }
+            other => panic!("expected parser function, got {other:?}"),
+        }
+        // A genuine variable still matches, because its alias *is* the target.
+        match resolve_template_target(&config, None, "PAGENAME").unwrap() {
+            ResolvedTarget::Variable { name, .. } => assert_eq!(name, "pagename"),
+            other => panic!("expected variable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_date_time_variables_answer_from_the_clock() {
+        // `{{CURRENTYEAR}}` must not be empty: `Template:Birth date` compares it
+        // against a birth year, and an empty right-hand side made the `#ifexpr`
+        // take its true branch and print "invalid year" on every `Born` row.
+        let code = date_time_variable_code("currentyear").expect("it is a date variable");
+        let year = crate::lua::engine::format_date(code, "now").unwrap();
+        assert_eq!(year.len(), 4, "{year}");
+        assert!(year.chars().all(|c| c.is_ascii_digit()), "{year}");
+        // `LOCAL*` mirrors its `CURRENT*` twin (the wiki's timezone is UTC).
+        assert_eq!(
+            date_time_variable_code("localyear"),
+            date_time_variable_code("currentyear")
+        );
+        assert_eq!(date_time_variable_code("notavariable"), None);
     }
 
     #[test]

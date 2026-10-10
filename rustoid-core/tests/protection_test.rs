@@ -239,25 +239,31 @@ async fn the_hash_spelling_is_answered_too() {
 
 /// The routing is the thing that broke, and it is invisible in the output.
 ///
-/// On a real wiki these two are *magic words*, which sends them down the
-/// variable arm — not the parser-function arm — even though they take a colon
-/// argument. A mock that registered them the other way exercised different code
-/// and passed while every live answer was empty, so the routing is pinned here.
+/// These two look like magic words — `siteinfo` lists them under `magicwords` —
+/// but MediaWiki's *variable* set is `MagicWordFactory::$mVariableIDs`, which
+/// does not contain them: they are `SFH_NO_HASH` *function hooks* fixed to a
+/// colon argument. The variable matcher requires the alias to consume the whole
+/// `$part1` (`MagicWordArray::matchStartToEnd`), so `PROTECTIONLEVEL:edit` never
+/// matches the `PROTECTIONLEVEL` alias and the parser-function path answers it.
+/// The routing is pinned here because a wrong reading sent it to the variable
+/// arm, which answered the empty string.
 #[tokio::test]
 async fn the_magic_words_are_recognised_as_magic_words() {
     let mut config = MockSiteConfig::new();
     config.add_magic_word("protectionlevel", &["PROTECTIONLEVEL"]);
+    config.add_function_hook("protectionlevel");
     let target = rustoid_core::pipeline::template_handler::resolve_template_target(
         &config,
         None,
         "PROTECTIONLEVEL:edit|Canada",
     );
     match target {
-        Some(rustoid_core::pipeline::template_handler::ResolvedTarget::Variable {
-            name, ..
+        Some(rustoid_core::pipeline::template_handler::ResolvedTarget::ParserFunction {
+            name,
+            ..
         }) => {
             assert_eq!(name, "protectionlevel");
         }
-        other => panic!("expected a magic-variable resolution, got {other:?}"),
+        other => panic!("expected a parser-function resolution, got {other:?}"),
     }
 }

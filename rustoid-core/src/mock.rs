@@ -663,6 +663,19 @@ impl MockSiteConfig {
         // Parser functions core registers in `$noHashFunctions`: stored without a
         // leading hash, yet invoked as `{{#dir:en|bcp47}}`.
         config.add_function_hook("dir");
+        // The other no-hash functions core registers (invoked as `{{ns:0}}`,
+        // `{{padleft:7|3|0}}`, `{{PROTECTIONLEVEL:edit}}`), which the real
+        // `siteinfo` lists too.
+        for f in [
+            "padleft",
+            "padright",
+            "protectionlevel",
+            "protectionexpiry",
+            "ns",
+            "nse",
+        ] {
+            config.add_function_hook(f);
+        }
         // The `#`-prefixed parser functions, from the same `functionhooks` list.
         for f in [
             "if",
