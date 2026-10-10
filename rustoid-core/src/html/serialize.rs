@@ -296,7 +296,7 @@ impl HtmlSerializer {
     }
 
     fn serialize_attrs(&self, node: &Node, buf: &mut String) {
-        self.serialize_attrs_impl(node, buf, false);
+        self.serialize_attrs_impl(node, buf, false, false);
     }
 
     /// Serialize only the plain `node.attrs` (e.g. a literal HTML `<b style=…>`
@@ -314,37 +314,23 @@ impl HtmlSerializer {
     /// duplicated). Mirrors PHP, where `buildLinkAttrs` emits `rel` once and
     /// `addNormalizedAttribute` handles `href`.
     fn serialize_attrs_skip_rel(&self, node: &Node, buf: &mut String) {
-        let attrs = node
-            .attrs
-            .iter()
-            .filter(|a| a.key != "href" && a.key != "src" && a.key != "rel");
-        for attr in attrs {
-            serialize_attr(attr, buf);
-        }
-        if let Some(ref dp) = node.data_parsoid
-            && !self.options.strip_data_parsoid
-        {
-            let escaped = dp.replace('&', "&amp;").replace('\'', "&#39;");
-            buf.push_str(&format!(" data-parsoid='{escaped}'"));
-        }
-        if let Some(ref dm) = node.data_mw {
-            // A `data-mw` value is JSON, and Parsoid serializes it with the same
-            // `smartQuote` rule as any other attribute: single quotes when the
-            // value contains `"` and no more `'` than `"`, else double quotes.
-            // A `parts` blob carrying an apostrophe (clade labels, italic
-            // captions) therefore flips to double quotes with `&quot;`.
-            serialize_attr_kv("data-mw", dm, buf);
-        }
+        self.serialize_attrs_impl(node, buf, false, true);
     }
 
     /// Like [`serialize_attrs`], but keeps `href`/`src` attributes. Used for
     /// generic elements (e.g. `<link rel="mw:PageProp/redirect">`) where the
     /// attributes are not emitted inline by a special-cased arm.
     fn serialize_attrs_full(&self, node: &Node, buf: &mut String) {
-        self.serialize_attrs_impl(node, buf, true);
+        self.serialize_attrs_impl(node, buf, true, false);
     }
 
-    fn serialize_attrs_impl(&self, node: &Node, buf: &mut String, include_href_src: bool) {
+    fn serialize_attrs_impl(
+        &self,
+        node: &Node,
+        buf: &mut String,
+        include_href_src: bool,
+        skip_rel: bool,
+    ) {
         // Preserve attribute insertion order (PHP Parsoid emits attributes in
         // the order they were set, e.g. `rel` before `href` on redirect links).
         //
@@ -359,11 +345,16 @@ impl HtmlSerializer {
         // (`cite_ref-…`) rather than generated, so it keeps its own position.
         //
         // So: emit the metadata before a trailing generated id, and leave every
-        // other attribute where it was.
+        // other attribute where it was. `skip_rel` drops `rel`/`href`/`src`
+        // (emitted inline by the `<a>` arms); the other callers keep `href`/
+        // `src` (`include_href_src`) and only skip them for generic elements.
         let attrs: Vec<&crate::dom::node::Attribute> = node
             .attrs
             .iter()
-            .filter(|a| include_href_src || (a.key != "href" && a.key != "src"))
+            .filter(|a| {
+                (include_href_src || (a.key != "href" && a.key != "src"))
+                    && !(skip_rel && a.key == "rel")
+            })
             .collect();
         let (generated_id, head) = match attrs.last() {
             Some(last)
@@ -665,6 +656,37 @@ mod tests {
         let html = serializer.serialize(&doc).unwrap();
         assert!(!html.contains("<p> <"), "indentation leaked: {html}");
         assert!(html.contains("<small><em></em></small>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_link_metadata_precedes_a_generated_id() {
+        // A wikilink that absorbed a transclusion carries `about`/`typeof`/
+        // `data-mw` and then a generated `id`. The service serves the metadata
+        // *before* the trailing generated id (`… typeof="mw:Transclusion"
+        // data-mw='…' id="mwAw"`), as it does for every other element; the `<a>`
+        // arm shares the ordering rule.
+        let mut doc = Node::document();
+        let mut p = Node::element(ElementKind::Paragraph);
+        let mut a = Node::element(ElementKind::Wikilink);
+        a.set_attr("rel", "mw:WikiLink");
+        a.set_attr("href", "./Spanish_language");
+        a.set_attr("about", "#mwt1");
+        a.set_attr("typeof", "mw:Transclusion");
+        a.set_attr("id", "mwAw");
+        a.data_mw = Some(r#"{"parts":[]}"#.to_string());
+        a.push_child(Node::text("x"));
+        p.push_child(a);
+        doc.push_child(p);
+
+        let opts = ParserOptions {
+            body_only: true,
+            ..ParserOptions::default()
+        };
+        let html = HtmlSerializer::new(opts).serialize(&doc).unwrap();
+        assert!(
+            html.contains(r#"typeof="mw:Transclusion" data-mw='{"parts":[]}' id="mwAw""#),
+            "the metadata must precede the generated id: {html}"
+        );
     }
 
     #[test]
