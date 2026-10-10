@@ -14617,3 +14617,119 @@ facts are re-fetched, never guessed.
 **2.08% → 7.26%**, `United States` **2045 → 6591** (0.08% → 0.24%). No page's
 first difference regresses and the corpus score is unchanged (1/48, `Zebra`
 still a MATCH). compare **120**, clippy and fmt clean.
+
+## The infobox `Born`/`Died` row: five defects under one construct
+
+The largest clean cluster was the person infobox: on `Albert Einstein`,
+`Taylor Swift`, `Isaac Newton`, `Unix`, `Grand Theft Auto V` and `Doom`, the
+first `Born` (and `Died`) row was missing entirely. Reducing it to the wikitext
+`{{Infobox person|name=Q|birth_date=1 January 1900|occupation=Occ}}` narrowed
+the trigger to a *birth/death parameter*: every following row matched, and a
+non-birth parameter rendered fine.
+
+The chain is
+`Infobox person → br separated entries → #invoke:Separated entries` +
+`#invoke:person date|birth`, and **five independent defects** had to be cleared
+before the row rendered. Each is recorded below; four are general, one is the
+`Module:Person date`-specific symptom.
+
+### 1. `mw.ustring.gsub` consumed a zero-width match
+
+`Template:Birth date` (reached through `person date`) opens with
+`sanatize_date`, whose first step is `mw.ustring.gsub(str, '^%s*', '')` — the
+ordinary leading-whitespace trim. rustoid's `gsub` advanced the cursor one
+character past an *empty* match and then emitted the remaining tail from that
+advanced cursor, so the character it skipped was never written:
+`gsub('1 January 1900', '^%s*', '')` returned `' January 1900'`, and the
+leading `1` was gone. `is_valid_date` then failed on the mangled string and
+`person date` fell through to its `original` return, i.e. the raw date rather
+than the `Birth date and age` expansion.
+
+**Fix.** The Lua loop was rewritten to mirror `str_gsub`: it tries the pattern
+*anchored at each position* (a `^`-prefixed pattern handed to `find`, so an
+already-anchored pattern does not get a second, literal caret) and keeps a
+`lastmatch` (the end of the previous accepted match). An empty match at the same
+position is refused and one character is copied and skipped instead, which is
+what `lstrlib.c`'s `else if (src < ms.src_end) luaL_addchar(…)` does. The
+remainder is appended from the match end, not the advanced cursor.
+
+### 2. A template's argument values are expanded in the **caller's** frame
+
+MediaWiki expands a template's argument values in `$this->parent`
+(`PPTemplateFrame_Hash::getNumberedArgument`/`getNamedArgument`), i.e. the frame
+the call was written *in*, not the callee's own frame. rustoid's
+`expand_template_arg_values` used a synthetic child with **empty** arguments, so
+a `{{#invoke:…}}` written in an argument got an empty
+`frame:getParent().args`. That is exactly the `Born` row's shape —
+`{{br separated entries|…|2={{#invoke:person date|birth}}|…}}` — and
+`Module:Person date`'s `getArgs(frame, {parentFirst = true})` then saw no
+`birth_date`.
+
+**Fix.** The helper frame now carries the caller's arguments
+(`frame.args().args.clone()`), matching `expand_invoke_args`, which already did.
+The title stays the page (loop safety); only the arguments changed.
+
+### 3. A colon invocation is never a magic variable
+
+`resolve_target_string` matched the magic-word table against the piece *before*
+the colon. `padleft`'s alias is `PADLEFT` — no colon — so `{{padleft:…}}` was
+taken for a magic *variable* and answered the empty string. MediaWiki's
+`MagicWordArray::matchStartToEnd` requires the alias to consume the whole
+`$part1`, and the variable set is `MagicWordFactory::$mVariableIDs` (which
+contains no colon-taking name), so a colon invocation is always the
+function-hook path. That is why `Template:Birth date`'s
+`{{padleft:{{MONTHNUMBER|…}}|2|0}}` came out empty and the `bday` microformat
+with it.
+
+**Fix.** The variable check matches the **whole** target. `padleft`, `padright`,
+`anchorencode`, `titleparts` and the rest of the no-hash family now reach
+`call_parser_function` where they are implemented, and an unimplemented no-hash
+name (`{{SHORTDESC:…}}`, `{{formatnum:…}}`) falls back to its magic-word value
+rather than spilling its source — but only when the call was *not* `#`-spelled,
+so a genuine extension call like `{{#property:P247}}` keeps its source text as
+before. The mock config gained the no-hash hooks (`ns`, `nse`, `padleft`,
+`padright`, `protectionlevel`, `protectionexpiry`) the real `siteinfo` lists.
+
+### 4. The date/time magic variables were empty
+
+`variable_value` had no arm for the `current*`/`local*` family, so
+`{{CURRENTYEAR}}` answered `''`. `Template:Birth date` ends with
+`{{#ifexpr: ( {{{1}}} > {{CURRENTYEAR}} ) | …invalid year… }}`, and an empty
+right-hand side made the comparison malformed and the *true* branch run: every
+`Born` row grew a spurious `invalid year` error and an
+`age template with invalid date` category.
+
+**Fix.** They answer from `format_date(code, "now")`, the same wall clock `#time`
+already uses (`LOCAL*` mirrors `CURRENT*`, the wiki's timezone being UTC).
+`format_date` gained the `l`/`D`/`w`/`N`/`W`/`z` codes, which previously fell
+through to the literal-letter arm (`{{#time:l}}` rendered `l`).
+
+### 5. Lua `frame.args` numbers its integer keys
+
+Scribunto builds `frame.args` from a PHP array, and PHP coerces a string key
+that spells a canonical decimal integer to `int` — so `{{t|1=a}}` is
+`frame.args[1]`. rustoid's `lazy_args` keyed an explicit `1=` as a *string* name.
+`Module:Arguments`' `getArgs` → `compressSparseArray` keeps only integer keys,
+so the whole `{{br separated entries|1=…|2=…|3=…}}` argument list was dropped and
+the module returned the empty string.
+
+**Fix.** A numeric name becomes the integer key (`lua_arg_key`, round-tripping
+through `i64` to reject `08`/`+1`/`1.0`, as PHP does). Both `frame.args[1]` and
+`frame.args['1']` read it.
+
+### Effect
+
+The `Born`/`Died` rows render and match the service's microformat and age span.
+`Isaac Newton` **0.89% → 2.60%** (first difference +24695 bytes), `Taylor Swift`
+**0.38% → 0.54%**, `Albert Einstein` **0.76% → 0.88%**, `Berlin`
+**0.62% → 0.65%**.
+
+One page regresses: `Polio vaccine` **1.16% → 0.92%**. The cause is not the
+magic-word work but the three fixes below it (it is already at 0.92% before the
+magic-word change): the row's first difference is the `Module:Infobox/styles.css`
+`about` id, `#mwt8` in the service and `#mwt26` here — the same 18-extra-ids
+shape the templatestyles/`ExpandedAttrs` id-ordering family has, and the same
+construct the page already differed at, now reached earlier. Recorded, not
+chased; the corpus score is unchanged (1/48, `Zebra` still a MATCH).
+
+lib **1014**, fixture guard **877/896**, clippy and fmt clean.
