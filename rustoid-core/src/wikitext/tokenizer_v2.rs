@@ -3480,7 +3480,7 @@ impl<'a> PegTokenizer<'a> {
                 ));
             stt.attribs.push(KV {
                 key: KeyValue::Str("mw:content".to_string()),
-                value: tokenize_link_content(
+                value: tokenize_extlink_content(
                     text,
                     self.lang_conv_enabled,
                     &self.ext_tags,
@@ -5473,18 +5473,47 @@ fn tokenize_link_target(
     tokenize_directives(target, lang_conv_enabled, ext_tags, base_offset)
 }
 
-/// Tokenize inline link *content* (e.g. wikilink text, extlink text) into a
-/// `KeyValue`: plain text when no directives are present, or a `Tokens` array
-/// when the content contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`/quote runs.
-/// Mirrors the PHP tokenizer's `inlineline` production for extlink content and
-/// `link_text` for wikilink text.
+/// Tokenize inline link *content* (e.g. wikilink text) into a `KeyValue`: plain
+/// text when no directives are present, or a `Tokens` array when the content
+/// contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`/quote runs. Mirrors the PHP
+/// tokenizer's `link_text` for wikilink text.
 fn tokenize_link_content(
     content: &str,
     lang_conv_enabled: bool,
     ext_tags: &[String],
     base_offset: usize,
 ) -> KeyValue {
-    tokenize_directives_and_quotes(content, lang_conv_enabled, ext_tags, true, base_offset)
+    tokenize_directives_and_quotes(
+        content,
+        lang_conv_enabled,
+        ext_tags,
+        true,
+        false,
+        base_offset,
+    )
+}
+
+/// Tokenize bracketed external-link *content* (`[url text]`). Like
+/// [`tokenize_link_content`], but the text also decodes HTML entities into
+/// `mw:Entity` spans: Parsoid runs extlink content through the inline pipeline
+/// (`getDOMFragmentToken(..., inlineContext)`), where `link_text` alone —
+/// `tokenize_link_content` — leaves them. Wikilink/media content keeps its own
+/// entity handling (the caption re-tokenization in `wiki_link_render`), so a
+/// `&#124;` there must stay a source-level separator, not become a `|` token.
+fn tokenize_extlink_content(
+    content: &str,
+    lang_conv_enabled: bool,
+    ext_tags: &[String],
+    base_offset: usize,
+) -> KeyValue {
+    tokenize_directives_and_quotes(
+        content,
+        lang_conv_enabled,
+        ext_tags,
+        true,
+        true,
+        base_offset,
+    )
 }
 
 /// Shared directive-tokenization used for both link targets and link content.
@@ -5500,19 +5529,29 @@ fn tokenize_directives(
     ext_tags: &[String],
     base_offset: usize,
 ) -> KeyValue {
-    tokenize_directives_and_quotes(input, lang_conv_enabled, ext_tags, false, base_offset)
+    tokenize_directives_and_quotes(
+        input,
+        lang_conv_enabled,
+        ext_tags,
+        false,
+        false,
+        base_offset,
+    )
 }
 
 /// Shared walk over a link target/content string.
 ///
 /// `quotes` enables the `quote` rule (only valid where PHP's grammar uses
 /// `inlineline`/`link_text`, i.e. link *content* — link *targets* run
-/// `wikilink_preprocessor_text`, which has no quote production).
+/// `wikilink_preprocessor_text`, which has no quote production). `entities`
+/// additionally decodes HTML entities into `mw:Entity` spans, which only
+/// extlink content needs (see [`tokenize_extlink_content`]).
 fn tokenize_directives_and_quotes(
     input: &str,
     lang_conv_enabled: bool,
     ext_tags: &[String],
     quotes: bool,
+    entities: bool,
     base_offset: usize,
 ) -> KeyValue {
     let options = TokenizerOptions {
@@ -5548,6 +5587,24 @@ fn tokenize_directives_and_quotes(
         if quotes && tk.starts_with("''") {
             let out_len = tk.output_len();
             if tk.try_quote() {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                items.extend(tk.drain_output(out_len).into_iter().map(|e| match e {
+                    Either::Left(s) => Item::Str(s),
+                    Either::Right(t) => Item::Tok(t),
+                }));
+                continue;
+            }
+        }
+        // HTML entity (`&amp;`, `&#124;`, …) in *extlink* content: an
+        // `mw:Entity` span, exactly as the inline tokenizer emits for the rest
+        // of the page. Parsoid runs extlink content through the inline pipeline
+        // (`getDOMFragmentToken(..., inlineContext)`), so `[http://x A&#124;B]`
+        // decodes where before the raw reference was kept and the `&` escaped.
+        if entities && tk.starts_with("&") {
+            let out_len = tk.output_len();
+            if tk.try_html_entity() {
                 if !buf.is_empty() {
                     items.push(Item::Str(std::mem::take(&mut buf)));
                 }
@@ -7365,6 +7422,40 @@ mod tests {
         assert_eq!(scan_extlink_url_len("//x/y?a=b&c=d]"), 13);
         // An entity is link content, not URL.
         assert_eq!(scan_extlink_url_len("http://x&amp;]"), 8);
+    }
+
+    /// An entity in *extlink* content becomes an `mw:Entity` span, because
+    /// Parsoid runs the content through the inline pipeline
+    /// (`getDOMFragmentToken(..., inlineContext)`). A wikilink target/content
+    /// keeps its own entity handling, so `mw:content` here is the one place the
+    /// tokenizer decodes.
+    #[test]
+    fn test_extlink_content_decodes_entities() {
+        let toks = tokenize("[http://x A&#124;B]");
+        let extlink = toks
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(stt)) if stt.name == "extlink" => {
+                    Some(stt)
+                }
+                _ => None,
+            })
+            .expect("expected an extlink");
+        let content = extlink
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:content"))
+            .expect("extlink should carry mw:content");
+        let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &content.value else {
+            panic!("expected tokenized content, got {:?}", content.value);
+        };
+        assert!(
+            items.iter().any(|it| matches!(it,
+                Item::Tok(ParsoidToken::Tag(t))
+                    if t.attribs.iter().any(|kv| kv.key.as_str() == Some("typeof")
+                        && kv.value.as_str() == Some("mw:Entity")))),
+            "the entity must become an mw:Entity span: {items:?}"
+        );
     }
 
     #[test]
