@@ -14287,7 +14287,42 @@ compare **120**, fixture guard **877/896**, clippy and fmt clean.
 
 ### Next difference
 
-`ISO 3166-1 alpha-2` at 758200: on a `{{langx}}` transclusion `<a>`, the service
-orders `data-mw` before `id`:
-`… about="#mwt2119" typeof="mw:Transclusion" data-mw='…' id="mwD7s">`, rustoid
-`… typeof="mw:Transclusion" id="mwD7s" data-mw='…'>`.
+(Resolved by the next section.) On a `{{langx}}` transclusion `<a>`, `id` came
+before `data-mw`.
+
+## A link's `data-mw` precedes its generated `id` too
+
+`ISO 3166-1 alpha-2` at 758200 was an attribute order on a wikilink that had
+absorbed a `{{langx}}` transclusion:
+
+```html
+service  <a … typeof="mw:Transclusion" data-mw='…' id="mwD7s">
+rustoid  <a … typeof="mw:Transclusion" id="mwD7s" data-mw='…'>
+```
+
+`serialize::serialize_attrs_impl` already moves a trailing generated `id` after
+the emitted `data-parsoid`/`data-mw` — the id pass appends `id` after
+encapsulation set the metadata, and the service serves the metadata first (it
+reads that order for 1574 of 1576 such elements). But the `<a>` arm had its own
+copy of the attribute walk, `serialize_attrs_skip_rel`, which predated that rule
+and emitted the plain attribute list (including `id`) before the metadata.
+
+### Fix
+
+`serialize_attrs_impl` takes a `skip_rel` flag and all three callers route
+through it; the `<a>` arm now shares the ordering rule. (It also drops the
+duplicate `data-mw` quoting comment — `serialize_attr_kv` already applies the
+rule.)
+
+### Effect
+
+`ISO 3166-1 alpha-2` **758200 → 759261** (76.34% → 76.44%); `Chess`
+**11683 → 16704** (0.90% → 1.29%); no corpus page regresses. The fixture
+breakdown is byte-identical. lib **1005**, compare **120**, fixture guard
+**877/896**, clippy and fmt clean.
+
+### Next difference
+
+`ISO 3166-1 alpha-2` at 759261: a Cite reference's link text. The service serves
+`[note 1]` (the group name plus the number) where rustoid serves `[1]`, so the
+group is missing from the reflink text.
