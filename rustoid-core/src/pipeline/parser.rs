@@ -284,6 +284,27 @@ fn extension_body(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String 
     crate::pipeline::extension_handler::extract_ext_body(stt, ext_src)
 }
 
+/// Count the extension wrappers in a rendered `<ref>` body.
+///
+/// Each one carries its own `about` id, and the live Cite extension releases
+/// that id and takes a fresh one when it splices a *transcluded* note's body
+/// back into the page. rustoid renders the body once and keeps the node, so it
+/// has to spend the discarded ids itself (see
+/// [`Parser::number_extension_token`]). `<nowiki>` is lean markup with no
+/// wrapper and no id, so it is not counted.
+fn count_body_extensions(node: &Node) -> usize {
+    let is_wrapper = node.get_attr("typeof").is_some_and(|ty| {
+        ty.split_whitespace()
+            .any(|t| t.starts_with("mw:Extension/") && t != "mw:Extension/nowiki")
+    });
+    usize::from(is_wrapper)
+        + node
+            .children
+            .iter()
+            .map(count_body_extensions)
+            .sum::<usize>()
+}
+
 /// If `item` is a `<gallery>` extension token, return the self-closing token.
 fn gallery_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
     let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
@@ -4017,6 +4038,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 return;
             }
             let is_ref = name.as_deref() == Some("ref");
+
             // PHP parses the body in a *fresh* pipeline (`sourceToDom` on the
             // extension body), so `inTemplate` is false and a template inside a
             // note is a top-level transclusion that is wrapped — even when the
@@ -4063,6 +4085,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // nothing extra, one reached through any nested expansion spends one.
         if is_ref && self.expansion_nesting.get() > 1 {
             let _ = self.new_about_id(about_counter, "extension-id");
+            // Each extension wrapper in the note's rendered body spends a
+            // further discarded id: the live Cite extension re-numbers the body
+            // when it splices a *transcluded* note back into the page, so a
+            // stylesheet (`{{Cite web}}`, whose module emits a
+            // `<templatestyles>`) or a literal `<pre>` costs two ids where a
+            // standalone Parsoid charges one. See `Parser::count_body_extensions`
+            // for why the count is taken from the rendered body.
+            if let Some(node) = rendered.as_ref() {
+                for _ in 0..count_body_extensions(node) {
+                    let _ = self.new_about_id(about_counter, "extension-id");
+                }
+            }
         }
         if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item {
             t.add_attribute_str("about", &about);
@@ -6945,6 +6979,31 @@ mod tests {
     use super::*;
     use crate::mock::MockSiteConfig;
     use crate::options::ParserOptions;
+
+    /// A rendered `<ref>` body's discarded-id count is the number of extension
+    /// wrappers in it, with lean `<nowiki>` excluded. See
+    /// [`count_body_extensions`].
+    #[test]
+    fn count_body_extensions_counts_wrappers() {
+        use crate::dom::node::{ElementKind, Node};
+        let ext = |typeof_: &str| {
+            let mut n = Node::element(ElementKind::Other("style".to_string()));
+            n.set_attr("typeof", typeof_);
+            n
+        };
+        let mut body = Node::document();
+        // A plain element and a text run contribute nothing.
+        body.push_child(Node::element(ElementKind::Span));
+        body.push_child(Node::text("x"));
+        // A templatestyles and a `<pre>` (with a nested one) each count.
+        body.push_child(ext("mw:Extension/templatestyles"));
+        let mut pre = ext("mw:Extension/pre");
+        pre.push_child(ext("mw:Extension/templatestyles"));
+        body.push_child(pre);
+        // `<nowiki>` is lean markup and is not counted.
+        body.push_child(ext("mw:Extension/nowiki"));
+        assert_eq!(count_body_extensions(&body), 3);
+    }
 
     #[test]
     fn test_has_token_attributes() {
