@@ -14583,3 +14583,37 @@ serves `href="https://www.boxofficemojo.com/movies/?id=quicksilver.htm"` with
 the text `"<i>Quicksilver</i>"`, while rustoid serves
 `href="https://www.boxofficemojo.com/"` and pushes `movies/?id=quicksilver.htm`
 into the link text — the URL scan is ending early.
+
+## A link to a redirect carries its target's link classes
+
+The most common first difference in the corpus was a link class on an ambiguous
+target: `United States` served `<a … class="mw-redirect">US (disambiguation)</a>`
+where the service has `class="mw-redirect mw-disambig"`, and `Order of the
+British Empire` the same for `OBE (disambiguation)`. The class comes from
+`__DISAMBIG__` on the *resolved* page: `US (disambiguation)` is a redirect whose
+target is a disambiguation page, so MediaWiki's `LinkRenderer::getLinkClasses`
+adds `mw-disambig` even though the redirect page itself has no such property.
+
+rustoid's harness asked for `prop=pageprops&ppprop=disambiguation` and derived
+the class from the *redirect's own* pageprops, which is empty.
+
+### Fix
+
+The query is now `prop=info&inprop=linkclasses`: `inprop=linkclasses` is exactly
+`LinkRenderer::getLinkClasses` — the same source Parsoid's `AddRedLinks` reads
+(`DataAccess::getPageInfo`) — and the wiki resolves redirects for it, so a
+redirect to a disambiguation page arrives with `mw-disambig` already in it. The
+`pageprops` derivation and its helper are gone.
+
+Changing how the class is derived left the cached redirect facts stale (they had
+been recorded with the old query), so the `info:` entries for redirects with no
+classes were dropped once and refilled by the next run; the corpus after that
+reflects the fix. A user whose cache predates this change must do the same — the
+facts are re-fetched, never guessed.
+
+### Effect
+
+`Order of the British Empire` **1729 → 54557** (0.41% → 13.02%), `Sundial`
+**2.08% → 7.26%**, `United States` **2045 → 6591** (0.08% → 0.24%). No page's
+first difference regresses and the corpus score is unchanged (1/48, `Zebra`
+still a MATCH). compare **120**, clippy and fmt clean.
