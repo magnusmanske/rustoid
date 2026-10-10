@@ -14540,6 +14540,46 @@ clean.
 ### Next difference
 
 `Quicksilver (film)` at 28651: the node ids now line up, and the first byte is an
-entity in the note body's link text. The service renders the arrow's `&#124;` as
-`"AFI<span typeof="mw:Entity" id="mwfQ">|</span>Catalog"` where rustoid leaves
-it escaped as `"AFI&amp;#124;Catalog"`.
+entity in an external link's text. The service renders the note body's
+`&#124;` as `"AFI<span typeof="mw:Entity" id="mwfQ">|</span>Catalog"` where
+rustoid leaves it escaped as `"AFI&amp;#124;Catalog"`.
+
+## Extlink content decodes entities, wikilink content does not
+
+Reduced to `[http://x AFI&#124;Catalog]` at the page level: rustoid served
+`AFI&amp;#124;Catalog`, the service `AFI<span typeof="mw:Entity">|</span>Catalog`.
+Bracketed extlink content is tokenized by `tokenize_link_content`, which mirrors
+`link_text`: it recognizes templates, quotes, extensions, and HTML tags, but not
+HTML entities. Parsoid then runs the content through the inline pipeline
+(`ExternalLinkHandler` calls `PipelineUtils::getDOMFragmentToken($content, …,
+['inlineContext' => true])` unconditionally), and *there* the entity is decoded.
+Wikilinks do the same by a different route — `render_wiki_link_with_fragment`
+re-tokenizes a piped caption through `tokenize_caption_items_sol` — which is why
+`[[A|B&#124;C]]` already decoded and only the extlink path did not.
+
+### Fix
+
+`tokenize_extlink_content` is the extlink content tokenizer: like
+`tokenize_link_content`, plus a branch that turns `&…;` into an `mw:Entity` span
+with `try_html_entity`, exactly as the inline tokenizer does for the rest of the
+page. It is a separate entry point rather than a change to
+`tokenize_link_content` because a wikilink/media caption must keep `&#124;` a
+*source-level* separator, not a `|` token: routing those through the entity
+branch split a media caption at the entity inside it (`[[File:F…|thumb|one &#x7C;
+two]]` lost `one` and became `mw:Placeholder`), which the fixture suite caught.
+
+### Effect
+
+`Quicksilver (film)` **28651 → 29432** (85.08% → 87.40%). No page's first
+difference regresses and the corpus score is unchanged (1/48, `Zebra` still a
+MATCH). New `tokenizer_v2::tests::test_extlink_content_decodes_entities` pins the
+`mw:Entity` span. lib **1009**, compare **120**, fixture guard **877/896**, clippy
+and fmt clean.
+
+### Next difference
+
+`Quicksilver (film)` at 29432: an external link's URL stops short. The service
+serves `href="https://www.boxofficemojo.com/movies/?id=quicksilver.htm"` with
+the text `"<i>Quicksilver</i>"`, while rustoid serves
+`href="https://www.boxofficemojo.com/"` and pushes `movies/?id=quicksilver.htm`
+into the link text — the URL scan is ending early.
