@@ -14500,7 +14500,46 @@ guard **877/896**, clippy and fmt clean.
 
 `Quicksilver (film)` at 26373: the note body's stylesheet is now
 `typeof="mw:Extension/templatestyles" about="#mwt11"` in both, but the service
-carries a node id (`id="mweg"`) where rustoid emits none. A second, unrelated
-byte in the same element: the service writes
-`AFI<span typeof="mw:Entity">|</span>Catalog` where rustoid leaves the entity
-literal (`AFI&amp;#124;Catalog`).
+carries a node id (`id="mweg"`) where rustoid emits none — one node id too few,
+which shifts every later id.
+
+## A stylesheet keeps an id slot, and discards it inside a transclusion
+
+rustoid's `style_node` recorded only a `data-mw` *attribute* and no
+`data-parsoid` slot, so `assign_node_ids` gave a stylesheet no node id at all.
+That happened to match the service for the styles a template emits — they sit
+inside a transclusion range, where Parsoid's `CleanUp::markDiscardableDataParsoid`
+discards the slot (`TempData::DISCARDABLE_DP`) — but not for a stylesheet in a
+`<references>` note body, which is outside any transclusion range and therefore
+keeps its slot and takes an id. So the note body's stylesheet was the one node in
+the reference list the service ids and rustoid did not.
+
+Parsoid sets the slot on *every* stylesheet in
+`ExtensionHandler::onDocumentFragment` (it records the tag's `src` in the
+node's `data-parsoid`); whether it survives is the discard's decision, not the
+handler's.
+
+### Fix
+
+`style_node` marks the node with `empty_dp_slot` (the id-only slot the `<section>`
+also uses; the served HTML emits no `data-parsoid` for it in the corpus either),
+and `CleanUp`'s `is_native_ext` — rustoid's stand-in for Parsoid's
+`inNativeContent`, which asks the *native* extension list — no longer treats
+`mw:Extension/templatestyles` as native content. Templatestyles has no native
+Parsoid handler, so its slot is discarded inside a transclusion range; the
+`<references>` wrapper is native `mw:Extension/references`, so a note body's
+stylesheet keeps its slot and its id.
+
+### Effect
+
+`Quicksilver (film)` **26373 → 28651** (78.31% → 85.08%). No page's first
+difference regresses and the corpus score is unchanged (1/48, `Zebra` still a
+MATCH). lib **1008**, compare **120**, fixture guard **877/896**, clippy and fmt
+clean.
+
+### Next difference
+
+`Quicksilver (film)` at 28651: the node ids now line up, and the first byte is an
+entity in the note body's link text. The service renders the arrow's `&#124;` as
+`"AFI<span typeof="mw:Entity" id="mwfQ">|</span>Catalog"` where rustoid leaves
+it escaped as `"AFI&amp;#124;Catalog"`.
