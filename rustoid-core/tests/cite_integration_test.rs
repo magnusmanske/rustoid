@@ -312,3 +312,42 @@ async fn a_references_tag_with_no_refs_renders_an_empty_list() {
         "an empty list is still a list: {html}"
     );
 }
+
+/// A note reached from inside a transclusion has its body rendered *without*
+/// `mw:Transclusion` markers on its templates, while a top-level note keeps
+/// them — even though both spend the templates' `about` ids.
+///
+/// The note body is a fresh Parsoid pipeline, so every `{{…}}` in it reaches
+/// `TemplateHandler` and is numbered; but its `wrapTemplates` follows the ref's
+/// own context (`wikitextToDOM` forwards the enclosing `inTemplate`), so only a
+/// top-level note's templates are wrapped. `Zebra`'s top-level `cite journal`
+/// notes keep the markers; a note inside an Infobox argument drops them
+/// (`Quicksilver (film)`).
+#[tokio::test]
+async fn a_transcluded_ref_body_is_not_wrapped() {
+    let tpl = [("Template:Tpl", "{{{1}}}"), ("Template:Inner", "<b>x</b>")];
+    let top = render_with("A<ref name=\"a\">{{Inner}}</ref>\n<references/>", &tpl).await;
+    let nested = render_with(
+        "A{{Tpl|<ref name=\"a\">{{Inner}}</ref>}}\n<references/>",
+        &tpl,
+    )
+    .await;
+
+    // Isolate the note body: everything after the note-text span, up to the
+    // item's end. That is the only place `<b>x</b>` appears.
+    let note_body = |html: &str| {
+        let start = html.find("mw-reference-text-cite_note").expect("note body");
+        let end = html[start..].find("</li>").expect("note end");
+        html[start..start + end].to_string()
+    };
+    assert!(
+        note_body(&top).contains("mw:Transclusion"),
+        "a top-level note's body template keeps its wrapper: {}",
+        note_body(&top)
+    );
+    assert!(
+        !note_body(&nested).contains("mw:Transclusion"),
+        "a note reached from inside a transclusion is not wrapped: {}",
+        note_body(&nested)
+    );
+}

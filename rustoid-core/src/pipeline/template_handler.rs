@@ -1489,6 +1489,14 @@ impl TemplateHandler {
         // PHP's `wrapTemplates`: false when expanding a template *body*, whose
         // expansions are spliced into the caller's.
         wrap: bool,
+        // Whether this expansion still spends an `about` id. PHP's
+        // `TemplateEncapsulator` constructor allocates one for every token it
+        // processes, *whether or not* the result is wrapped; `wrap` here is
+        // additionally false for a fresh extension-body pipeline (a `<ref>`'s),
+        // where the token is still processed by Parsoid and so still spends an
+        // id. Only a PHP-pre-expanded body skips the id. See
+        // [`crate::pipeline::parser::Parser::wrap_templates`].
+        take_id: bool,
     ) -> Vec<Item> {
         let mut out = Vec::new();
         for item in tokens {
@@ -1509,7 +1517,7 @@ impl TemplateHandler {
                 // expands a body's templates and parser functions before Parsoid
                 // tokenizes the result. Allocating here anyway put rustoid at
                 // `#mwt90` on `Help:Introduction`, where the service reaches 12.
-                let about_id = if wrap {
+                let about_id = if take_id {
                     crate::pipeline::attribute_expander::new_about_id(about_counter, "template")
                 } else {
                     String::new()
@@ -1537,7 +1545,7 @@ impl TemplateHandler {
             if stt.name == "templatearg"
                 && let Some(name) = stt.attribs.first().and_then(|kv| kv.key.as_str())
             {
-                let about_id = if wrap {
+                let about_id = if take_id {
                     crate::pipeline::attribute_expander::new_about_id(about_counter, "templatearg")
                 } else {
                     String::new()
@@ -2513,6 +2521,7 @@ mod tests {
             &ProtectionContext::new(&page_protection, &titles_protection),
             &std::collections::HashMap::new(),
             input,
+            true,
             true,
         );
 

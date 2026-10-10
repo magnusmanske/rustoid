@@ -1139,6 +1139,19 @@ impl Drop for ExpansionNesting<'_> {
     }
 }
 
+/// RAII guard for [`Parser::wrap_templates`]: it saves the flag, sets it false,
+/// and restores it on drop. See [`Parser::expand_unwrapped`].
+struct UnwrappedTemplates<'a> {
+    flag: &'a std::cell::Cell<bool>,
+    saved: bool,
+}
+
+impl Drop for UnwrappedTemplates<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.saved);
+    }
+}
+
 /// The wikitext parser, bound to a site configuration.
 pub struct Parser<'a, C: SiteConfig> {
     config: &'a C,
@@ -1324,6 +1337,16 @@ pub struct Parser<'a, C: SiteConfig> {
     /// [`Parser::expand_templates`] renders it in that same position and stashes
     /// it here for the list renderer to pick up.
     ref_bodies: std::cell::RefCell<std::collections::HashMap<String, Node>>,
+    /// Whether the current chunk's template expansions are encapsulated in
+    /// `mw:Transclusion` markers. PHP derives that from its pipeline option
+    /// `wrapTemplates`, and it is false for a *fresh* extension-body pipeline
+    /// such as a `<ref>`'s: the note body is parsed by Parsoid itself (with
+    /// `expandTemplates` on), so every top-level `{{…}}` in it still reaches
+    /// `TemplateHandler::onTemplate` and spends an `about` id through the
+    /// `TemplateEncapsulator` constructor — but `encapTokens` never runs, so no
+    /// marker is emitted. `false` here models that: ids are still spent, the
+    /// `mw:Transclusion` wrapper is not.
+    wrap_templates: std::cell::Cell<bool>,
 }
 
 /// Core `Parser::braceSubstitution`'s T2529 rule: a template's expansion that
@@ -1421,6 +1444,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             module_scope: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
+            wrap_templates: std::cell::Cell::new(true),
         }
     }
 
@@ -1567,6 +1591,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn enter_expansion(&self) -> ExpansionNesting<'_> {
         self.expansion_nesting.set(self.expansion_nesting.get() + 1);
         ExpansionNesting(&self.expansion_nesting)
+    }
+
+    /// Suppress `mw:Transclusion` encapsulation for the chunk expanded while the
+    /// returned guard lives, without suppressing the `about` ids the expansions
+    /// still spend. This is a fresh extension-body pipeline (a `<ref>`'s), where
+    /// PHP's `wrapTemplates` is false. See [`Parser::wrap_templates`].
+    fn expand_unwrapped(&self) -> UnwrappedTemplates<'_> {
+        let saved = self.wrap_templates.replace(false);
+        UnwrappedTemplates {
+            flag: &self.wrap_templates,
+            saved,
+        }
     }
 
     /// Whether an `#invoke` argument is currently being expanded, in which case
@@ -4060,6 +4096,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // carry in bulk.
         let needs_expansion = body.contains("{{") || body.contains('<');
         let rendered = if needs_expansion {
+            // The note body is a *fresh* pipeline: its templates are numbered
+            // whether or not they are wrapped. Whether they are wrapped follows
+            // the ref's own context (`wikitextToDOM` forwards
+            // `inTemplate => $this->inTemplate()`): a top-level note's body is
+            // wrapped, one reached from inside a transclusion is not — the same
+            // "inside a transclusion" test as the phantom id below, and the
+            // service's output shows it (`Zebra`'s top-level `cite journal` note
+            // keeps `mw:Transclusion mw:Extension/templatestyles`, a note inside
+            // an Infobox argument does not). See [`Parser::wrap_templates`].
+            let _unwrapped =
+                (is_ref && self.expansion_nesting.get() > 1).then(|| self.expand_unwrapped());
             Some(
                 Box::pin(self.process_fragment_body(
                     &body,
@@ -4142,18 +4189,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // but hands them to `Frame::expand` inside the body, so
         // `{{1x|{{T}}}}` has *one* wrapper, around the `1x` call, and the fixture
         // suite pins that.
-        let wrap = !body && !in_tpl;
+        let wrap = !body && !in_tpl && self.wrap_templates.get();
 
-        // The id is taken exactly when the expansion is wrapped. PHP builds its
-        // `TemplateEncapsulator` — the object that owns the id — only where a
-        // wrapper is produced, and the service's `about` sequence shows it: a
-        // template's own expansion takes no id, so a `{{…}}` written in its source
-        // must not advance the counter either. `body` carries that context
-        // (the same pair of flags as `wrap` above). Taking an id for these instead
-        // put every transclusion after a busy template far ahead of the service:
-        // on `List of sovereign states` the Redirect2 hatnote was `#mwt11` where
-        // the service has `#mwt2`, because `Template:Short description`'s own
-        // expansion had consumed 2…10.
+        // The id is taken whenever Parsoid processes the token, i.e. outside a
+        // PHP-pre-expanded body. PHP's `TemplateEncapsulator` allocates one in
+        // its constructor for every template token it handles, wrapped or not,
+        // but on a *page* Parsoid never sees a body's nesting: the core
+        // preprocessor expands it first, so a `{{…}}` written in a template's
+        // source must not advance the counter. `body` (and `in_tpl` for exactly
+        // the argument-value tokens spliced in the same way) carries that
+        // context. Taking an id for these instead put every transclusion after a
+        // busy template far ahead of the service: on `List of sovereign states`
+        // the Redirect2 hatnote was `#mwt11` where the service has `#mwt2`,
+        // because `Template:Short description`'s own expansion had consumed
+        // 2…10. A fresh `<ref>` body is the opposite case: Parsoid *does* expand
+        // it, so its templates spend ids even though `wrap_templates` suppresses
+        // their wrappers — `take_id` deliberately ignores that flag.
         //
         // A variable or parser function takes its own id inside
         // `TemplateHandler::process`, which is a separate path.
@@ -4506,6 +4557,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     &self.ifexist.borrow(),
                     vec![expanded_item],
                     wrap,
+                    // The id is spent whenever Parsoid expands the token, i.e.
+                    // outside a PHP-pre-expanded body — even where `wrap` is
+                    // suppressed for a fresh `<ref>` body. See
+                    // [`Parser::wrap_templates`].
+                    !in_tpl && !body,
                 );
                 // A parser function hands back a *branch*, and a branch is
                 // wikitext: PHP's handlers return its tokens unexpanded and the
