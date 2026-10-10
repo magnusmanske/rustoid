@@ -379,9 +379,11 @@ impl WikiClient {
     ///
     /// `prop=info` answers "does this exist, and is it a redirect?" in one
     /// request, which is what link resolution needs. Fetching content instead
-    /// would be two requests per link. `prop=pageprops&ppprop=disambiguation`
-    /// rides along in the same request: a link to a disambiguation page carries
-    /// `mw-disambig`, and the property that says so is not in the target's body.
+    /// would be two requests per link. `inprop=linkclasses` rides along in the
+    /// same request: it is exactly `LinkRenderer::getLinkClasses`, which Parsoid's
+    /// `AddRedLinks` applies, so a link to a disambiguation page carries
+    /// `mw-disambig` — including one whose *redirect target* is a disambiguation
+    /// page, which the target's own `pageprops` cannot answer.
     pub async fn page_info_json(&self, titles: &[String]) -> Result<String> {
         let joined = titles
             .iter()
@@ -389,7 +391,7 @@ impl WikiClient {
             .collect::<Vec<_>>()
             .join("%7C");
         let url = format!(
-            "{}?action=query&prop=info%7Cpageprops&ppprop=disambiguation&format=json&formatversion=2&titles={}",
+            "{}?action=query&prop=info&inprop=linkclasses&format=json&formatversion=2&titles={}",
             self.wiki.api_url(),
             joined
         );

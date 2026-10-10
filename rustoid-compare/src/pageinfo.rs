@@ -159,25 +159,6 @@ pub async fn title_protection(
     out
 }
 
-/// The link classes a page's properties imply.
-///
-/// The wiki's `DataAccess` marks a link to a disambiguation page with
-/// `mw-disambig`, and that class reaches the output: the served
-/// `[[Bicycle (disambiguation)]]` is
-/// `<a … class="mw-disambig">`, while a link without it is not. The property
-/// comes from the `__DISAMBIG__` magic word and is *not* derivable from the
-/// target's body, which is why it is requested here rather than guessed.
-fn link_classes(pageprops: &Option<serde_json::Value>) -> Vec<String> {
-    let Some(props) = pageprops.as_ref().and_then(|p| p.as_object()) else {
-        return Vec::new();
-    };
-    let mut classes = Vec::new();
-    if props.contains_key("disambiguation") {
-        classes.push("mw-disambig".to_string());
-    }
-    classes
-}
-
 /// Convert a protection expiry to the form MediaWiki exposes to the parser.
 ///
 /// `action=query&prop=info&inprop=protection` reports the expiry as ISO 8601
@@ -250,10 +231,13 @@ struct PageEntry {
     /// Present only for redirects; its presence is the signal.
     #[serde(default)]
     redirect: Option<serde_json::Value>,
-    /// `prop=pageprops` output, e.g. `{"disambiguation": ""}`. An object of
-    /// property name to value (usually the empty string).
+    /// `inprop=linkclasses`: the extra classes `LinkRenderer::getLinkClasses`
+    /// gives a link, e.g. `["mw-disambig"]`. This is what Parsoid's
+    /// `AddRedLinks` applies, and the wiki resolves redirects for it, so a link
+    /// to a redirect whose target is a disambiguation page carries `mw-disambig`
+    /// here where the target's own `pageprops` cannot answer.
     #[serde(default)]
-    pageprops: Option<serde_json::Value>,
+    linkclasses: Option<Vec<String>>,
     /// Present as a flat list for an unprotected page is *absent*; for a
     /// protected one it is `[{type, level, expiry}, …]`, where the action is the
     /// `type` field rather than a map key.
@@ -299,7 +283,7 @@ impl PageEntry {
             missing: self.missing.unwrap_or(false),
             known: self.known.unwrap_or(false),
             redirect: self.redirect.is_some(),
-            linkclasses: link_classes(&self.pageprops),
+            linkclasses: self.linkclasses.clone().unwrap_or_default(),
         }
     }
 }
@@ -545,7 +529,7 @@ mod tests {
             missing: None,
             known: None,
             redirect: None,
-            pageprops: None,
+            linkclasses: None,
             protection: None,
             categories: None,
             flagged: None,
@@ -561,21 +545,28 @@ mod tests {
         assert!(parsed.query.pages[0].redirect.is_some());
     }
 
-    /// `disambiguation` is a page *property*, sent only when requested with
-    /// `prop=pageprops&ppprop=disambiguation`. A link to such a page carries
-    /// `mw-disambig`; reading anything else, or nothing, loses the class.
+    /// `inprop=linkclasses` is exactly `LinkRenderer::getLinkClasses`, which
+    /// Parsoid's `AddRedLinks` applies. A link to a disambiguation page carries
+    /// `mw-disambig`; the wiki resolves redirects for it, so a redirect to a
+    /// disambiguation page carries the class even though its own `pageprops`
+    /// says nothing.
     #[test]
-    fn a_disambiguation_page_property_becomes_the_link_class() {
+    fn linkclasses_become_the_link_classes() {
         let json = r#"{"query":{"pages":[
-            {"ns":0,"title":"Bicycle (disambiguation)","pageid":1,"pageprops":{"disambiguation":""}},
-            {"ns":0,"title":"Bicyclus","pageid":2}
+            {"ns":0,"title":"Bicycle (disambiguation)","pageid":1,"linkclasses":["mw-disambig"]},
+            {"ns":0,"title":"US (disambiguation)","pageid":2,"redirect":{},"linkclasses":["mw-disambig"]},
+            {"ns":0,"title":"Bicyclus","pageid":3}
         ]}}"#;
         let parsed: InfoResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            link_classes(&parsed.query.pages[0].pageprops),
+            parsed.query.pages[0].to_page_info().linkclasses,
             vec!["mw-disambig".to_string()]
         );
-        assert!(link_classes(&parsed.query.pages[1].pageprops).is_empty());
+        assert_eq!(
+            parsed.query.pages[1].to_page_info().linkclasses,
+            vec!["mw-disambig".to_string()]
+        );
+        assert!(parsed.query.pages[2].to_page_info().linkclasses.is_empty());
     }
 
     /// The protection field is a flat array of `{type, level, expiry}`, where
