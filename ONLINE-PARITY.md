@@ -14724,12 +14724,47 @@ The `Born`/`Died` rows render and match the service's microformat and age span.
 **0.38% → 0.54%**, `Albert Einstein` **0.76% → 0.88%**, `Berlin`
 **0.62% → 0.65%**.
 
-One page regresses: `Polio vaccine` **1.16% → 0.92%**. The cause is not the
-magic-word work but the three fixes below it (it is already at 0.92% before the
-magic-word change): the row's first difference is the `Module:Infobox/styles.css`
-`about` id, `#mwt8` in the service and `#mwt26` here — the same 18-extra-ids
-shape the templatestyles/`ExpandedAttrs` id-ordering family has, and the same
-construct the page already differed at, now reached earlier. Recorded, not
-chased; the corpus score is unchanged (1/48, `Zebra` still a MATCH).
+One page regressed in the first counts: `Polio vaccine` **1.16% → 0.92%**. The
+cause was not the magic-word work but the three fixes below it: the first
+difference there is the `Module:Infobox/styles.css` `about` id, `#mwt8` in the
+service and `#mwt26` here. It is chased and fixed in the next section; once that
+one line is corrected the page returns to 1.16% and **no page regresses**.
 
 lib **1014**, fixture guard **877/896**, clippy and fmt clean.
+
+## A template argument in a nested pipeline takes no `about` id
+
+The `Polio vaccine` regression above turned out to be one line. 18 ids were
+spent between `Template:Infobox drug`'s own `<templatestyles>` (`#mwt7`) and
+`Module:Infobox/styles.css` (service `#mwt8`, rustoid `#mwt26`), and the
+`RUSTOID_TRACE_ABOUT=bt` trace named them: every one was a **`templatearg`**
+(`{{{ATC_prefix}}}`, `{{{localValue}}}`, `{{{1}}}` …) — the template's argument
+references — wrapped with `mw:Param` and given an id.
+
+PHP wraps a template argument only when
+`wrapTemplates && expandTemplates` (`TemplateHandler::onTemplateArg`). On the
+*page* pipeline both are true (`inTemplate => false, expandTemplates => true`),
+but on a nested pipeline — a template body, an extension body, a module's output
+— MediaWiki runs it with `inTemplate => true, expandTemplates => false`, so both
+are false and the argument takes no wrapper at all. rustoid's guard read only the
+*caller's* `in_template` (`let wrap = !in_template`), which is `false` for a
+top-level transclusion like `{{Infobox drug}}`, so every `{{{…}}}` in the body was
+wrapped.
+
+### Fix
+
+The guard now mirrors the **template** token's own wrap a few lines below it:
+`!body && !in_template && wrap_templates.get()`. `body` is rustoid's name for
+"this chunk is a nested pipeline" — PHP's `inTemplate` — and the earlier comment
+that introduced the guard (`11 where the service has 2`) was right that the
+*caller's* flag alone is not enough; it is `body` that carries the nested-ness.
+
+### Effect
+
+`Polio vaccine`'s first difference returns to byte **7828 (1.16%)**, the position
+it held at the session's start, and the four `Born`/`Died` gains are kept. Versus the
+session's starting point: `Isaac Newton` **0.89% → 2.60%**, `Taylor Swift`
+**0.38% → 0.54%**, `Albert Einstein` **0.76% → 0.88%**, `Berlin`
+**0.62% → 0.65%**, **no page regresses**.
+
+lib **1014**, fixture guard **877/896**, compare **120**, clippy and fmt clean.
