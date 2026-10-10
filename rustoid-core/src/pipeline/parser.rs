@@ -3936,7 +3936,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // for every argument in an expansion — `Template:Short description`
                     // has a dozen — and put the next transclusion's `about` far ahead
                     // of the service's (11 where the service has 2).
-                    let wrap = !in_template;
+                    // PHP wraps the token with `mw:Param` only when
+                    // `wrapTemplates && expandTemplates` (`onTemplateArg`), and on a
+                    // nested pipeline (`body`) both are false — the body pipeline is
+                    // run with `inTemplate => true, expandTemplates => false`. This
+                    // mirrors the *template* token's own `wrap` below it. Reading
+                    // only the caller's `in_template` wrapped every `{{{…}}}` in a
+                    // template body, spending an `about` id each: `Template:Infobox
+                    // drug`'s arguments took `#mwt8`–`#mwt25`, and the
+                    // `Module:Infobox/styles.css` behind them landed at `#mwt26`
+                    // where the service has `#mwt8`.
+                    let wrap = !body && !in_template && self.wrap_templates.get();
                     let about_id = if wrap {
                         self.new_about_id(about_counter, "templatearg")
                     } else {
