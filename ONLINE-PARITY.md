@@ -14326,3 +14326,43 @@ breakdown is byte-identical. lib **1005**, compare **120**, fixture guard
 `ISO 3166-1 alpha-2` at 759261: a Cite reference's link text. The service serves
 `[note 1]` (the group name plus the number) where rustoid serves `[1]`, so the
 group is missing from the reflink text.
+
+## `#ifexist` asks about the normalised title
+
+`Quicksilver (film)` at 8797 was a missing category: the service serves
+`<span class="mw-empty-elt"><link rel="mw:PageProp/Category"
+href="./Category:1986_films"/>…`, rustoid the same span without the link.
+`Template:Film date` emits it conditionally:
+
+```
+{{#ifexist:Category:{{{fy|{{{1}}}}}} {{#if…}} films | [[Category:… films]] }}
+```
+
+With `{{{1}}}=1986` and the `#if` empty, that argument is `Category:1986  films`
+— two spaces. MediaWiki normalises it (`Title::newFromText`); the API confirms
+both `Category:1986  films` and `Category:1986_films` normalise to
+`Category:1986 films`, which exists. rustoid looked the raw title up, missed,
+and (offline) guessed; the cached fact is keyed by the normalised spelling, so
+the answer was wrong.
+
+### Fix
+
+`title::normalize_title_for_lookup` collapses whitespace, resolves the
+namespace and capitalises the first letter (via `TitleParser`), and returns
+`None` for a title that cannot exist. `prime_ifexist` fetches and keys the
+answer under it, and the `ifexist` arm reads the same key.
+
+### Effect
+
+`Quicksilver (film)` **8797 → 10202** (26.12% → 30.29%). The same fix removes
+leaked raw wikitext elsewhere: on `Israel` the Demonym row served
+`[[<a …>Israeli</a> people|<a …>Israeli</a>]]` and now serves
+`<a …>Israeli</a>`, matching the service. About fifteen pages change byte
+counts (a guessed answer replaced by the recorded one); no page's first
+difference regresses. lib **1006**, compare **120**, fixture guard **877/896**,
+clippy and fmt clean.
+
+### Next difference
+
+`Quicksilver (film)` at 10202: a Cite `<sup>` takes `about="#mwt11"` where the
+service has `#mwt12` — an id-counting difference on the reference mark.
