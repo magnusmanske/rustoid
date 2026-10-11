@@ -15229,18 +15229,48 @@ expanded at the ref site but never spliced, because Cite's `collect` walks the
 document *before* the stashed bodies are). And the service spends ~10 ids where
 rustoid spends 2.
 
-The count is the **re-parse**. `RefTagHandler::sourceToDom` (`mediawiki-extensions-Cite`)
-renders a transcluded `<ref>`'s body through a full `wikitext-to-fragment`
-pipeline *again* — `allowNestedRef` is `inTemplate()`, so a note reached through
-`{{#tag:ref}}` re-parses its nested `<ref>` too. re-parsing the EA-vs-EV body at
-top level costs four `{{mono}}` (a template id each) plus the nested ref's
-`{{cite web}}`, which is the observed 10. rustoid's `count_body_extensions`
-heuristic (`1 + extension wrappers`, from the *rendered* body) models the wrong
-thing. Matching it means spending what a top-level re-parse would spend — a
-re-expansion, not a count — and attaching it to the EA-vs-EV note (which is
-transcluded), not to the nested one (`expansion_nesting` is 2 there, 1 at the
-`#tag`). Left for a session with the Cite source at hand; recorded, not guessed
-at.
+The count is not the Cite re-parse. `ParsoidExtensionAPI::getContentDOM` only
+retrieves the stored fragment (`WTUtils::getDOMFragmentContents`), it never
+re-parses. What the service actually spends, measured against the transform
+endpoint on `x{{#tag:ref|BODY|name=o}}y\n\n{{reflist}}`, is:
+
+| `BODY` | extra ids |
+| --- | --- |
+| `AC` | 1 |
+| `A{{mono|M}}C` | 2 |
+| `A{{#expr:1}}C` | 1 |
+| `A<ref>B</ref>C` | 2 |
+| `A{{mono|M}}<ref>B</ref>C` | 3 |
+| `A<ref>{{mono|B}}</ref>C` | 3 |
+| `A<ref>{{cite web|…}}</ref>C` | 3 |
+| `A<pre>P</pre><ref>B</ref>C` | 3 |
+| the real EA-vs-EV body (4 `{{mono}}` + a nested `{{cite web}}`) | 7 |
+
+So the count is exactly
+
+```
+1 + <mw:Extension/* wrappers in the note, following nested refs into their notes>
+```
+
+A `{{#expr:}}` adds nothing; only an *extension wrapper* counts. The `+1` is for
+the note itself, and a nested `<ref>` contributes its own placeholder **and** the
+wrappers of its note, which Cite splices in the same pass. (An earlier reading of
+these probes, before the nested `<ref>` rendering fix below, had a different
+baseline and so a different table.)
+
+rustoid now spends this on a top-level `#tag`-produced ref, via
+[`Parser::count_note_extensions`](../rustoid-core/src/pipeline/parser.rs)
+(`count_body_extensions` over the body, plus a `ref_bodies` lookup for a nested
+ref's placeholder). The block is gated on `expansion_nesting <= 1`: a `#tag` call
+*inside a template* is already covered by the existing `expansion_nesting > 1`
+phantom-id rule, and Sundial — a page whose refs all come from template-internal
+`#tag` calls — spends nothing extra, which is what pinned the gate.
+
+`ISO 3166-1 alpha-2` **805013 → 842631** (81.05% → 84.84% of the page); the id
+gaps in the EA-vs-EV note are gone and the first difference is now a `<p>`
+wrapping an `<ol>`. Sundial, Order of the British Empire, Association football and
+The Beatles all regressed under an ungated version of this rule and recovered
+under the gate. No corpus page regresses.
 
 ## A nested `<ref>` renders (and is numbered before its note)
 
