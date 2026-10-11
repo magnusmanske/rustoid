@@ -174,10 +174,26 @@ impl ListHandler {
             Item::Tok(ParsoidToken::Tag(tk)) if tk.name == "listItem" => self.on_list_item(token),
             Item::Tok(ParsoidToken::Nl(_)) => self.on_newline(token),
             Item::Tok(ParsoidToken::Eof(_)) => self.on_end(token),
-            Item::Tok(ParsoidToken::EmptyLine(_)) | Item::Tok(ParsoidToken::IndentPre(_)) => {
-                // PHP's `onCompoundTk` returns `null` for EmptyLineTk / IndentPreTk,
-                // which routes them to `onAny`. An empty line is *not* SOL-transparent,
-                // so it closes the open list (a blank line terminates the list).
+            Item::Tok(ParsoidToken::EmptyLine(_)) => {
+                // A blank line terminates the open list, and a compound empty
+                // line is no different: the run of newlines it wraps is emitted
+                // after the closing tags. The token stream re-wraps the newlines
+                // before a SOL-transparent category link into one of these, so
+                // `* a\n[[Category:Foo]]` must still serve `</li></ul>` before the
+                // link, as the service does. A blank line that already set
+                // `at_eol` (a comment-only line) instead stays SOL-transparent and
+                // is held in `sol_tokens` by `on_any`, keeping the list open.
+                let idx = self.list_frame_stack.len().saturating_sub(1);
+                let at_eol = self.list_frame_stack.get(idx).is_some_and(|f| f.at_eol);
+                if self.on_any_enabled && self.have_active_list_frame && !at_eol {
+                    self.close_lists(idx, Some(token))
+                } else if self.on_any_enabled {
+                    self.on_any(token)
+                } else {
+                    Some(vec![token])
+                }
+            }
+            Item::Tok(ParsoidToken::IndentPre(_)) => {
                 if self.on_any_enabled {
                     self.on_any(token)
                 } else {
@@ -695,5 +711,44 @@ mod tests {
         let out = handler.run(vec![eof()]);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], Item::Tok(ParsoidToken::Eof(_))));
+    }
+
+    /// A compound empty line that did not follow a newline (the re-wrap the
+    /// token stream does for a category link after a list) closes the list,
+    /// emitting the empty line after the closing tags.
+    #[test]
+    fn test_empty_line_closes_list_before_category_link() {
+        use crate::wikitext::tokens_v2::{
+            DataParsoid, EmptyLineTk, KV, KeyValue, ParsoidToken, SelfclosingTagTk,
+        };
+        let empty = Item::Tok(ParsoidToken::EmptyLine(EmptyLineTk::new(
+            vec![ParsoidToken::Nl(crate::wikitext::tokens_v2::NlTk::new(
+                SourceRange::new(0, 1),
+            ))],
+            DataParsoid::default(),
+        )));
+        let mut link = SelfclosingTagTk::new("link", vec![], DataParsoid::default());
+        link.attribs.push(KV {
+            key: KeyValue::Str("rel".to_string()),
+            value: KeyValue::Str("mw:PageProp/Category".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+        let link = Item::Tok(ParsoidToken::SelfclosingTag(link));
+
+        let mut handler = ListHandler::new();
+        let out = handler.run(vec![
+            list_item("*"),
+            Item::Str("a".to_string()),
+            empty,
+            link,
+        ]);
+
+        assert!(matches!(out[0], Item::Tok(ParsoidToken::List(_))));
+        assert!(matches!(out[1], Item::Tok(ParsoidToken::EmptyLine(_))));
+        assert!(
+            matches!(out[2], Item::Tok(ParsoidToken::SelfclosingTag(ref t)) if t.name == "link")
+        );
     }
 }
