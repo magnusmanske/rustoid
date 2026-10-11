@@ -14981,3 +14981,34 @@ id="Honorary_knighthoods"></span></h2>`) and the first difference moves from
 byte 76757 (18.32 % of the oracle) to 76856 (18.34 %). `Association football`
 moves from 2.73 % to 3.48 % — a `{{citation needed}}` heading earlier on the page.
 No other page moves.
+
+## `subst:` is left literal; only `safesubst:` is stripped
+
+`{{unreferenced section|date=December 2025}}` rendered a red
+"Template {{Unreferenced section}} has been incorrectly substituted." error on
+`Order of the British Empire`, and similar errors wherever the Ambox family is
+transcluded.
+
+The cause is `Template:Unreferenced section`'s
+`|subst=<includeonly>{{subst:substcheck}}</includeonly>`, whose `Module:Message box`
+checks `args.subst == 'SUBST'`. MediaWiki only performs `subst:` when a page is
+being **saved**, not when it is rendered: a rendered `{{subst:X}}` is a plain
+transclusion of a page named `subst:X`, which does not exist, so it comes back as
+the literal `{{subst:X}}`. `safesubst:` is the render-time-safe spelling — it
+transcludes normally and is what the `{{ {{{|safesubst:}}}#invoke:…}}` idiom
+relies on. `rustoid` stripped both, so `{{subst:substcheck}}` expanded to `SUBST`
+and `args.subst` matched.
+
+### Fix
+
+`subst_name` still drops the `<noinclude/>`/`<includeonly/>` that can sit between
+the word and the colon, but only accepts the word `safesubst`; `subst` returns
+`None`, so the target is parsed as an ordinary (missing) title and the literal
+source is emitted, as the service does.
+
+### Effect
+
+`Association football` 3.48 % → 9.70 %, `Order of the British Empire` 18.34 % →
+20.76 %, `Israel` 0.13 % → 1.07 %. No page regresses. Verified against the live
+transform endpoint: `{{Substcheck}}` and `{{safesubst:Substcheck}}` both render
+`SUBST`, while `{{subst:Substcheck}}` renders the literal `{{subst:Substcheck}}`.
