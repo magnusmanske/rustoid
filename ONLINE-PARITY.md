@@ -15040,3 +15040,23 @@ primary id.
 `Sundial` 7.26 % → 11.59 %, `The Beatles` 2.09 % → 4.88 %, `Association football`
 9.70 % → 11.91 %. No page regresses. Verified against the transform endpoint on
 `== Women's association football ==`, `== a=b ==` and `== 1990s ==`.
+
+## A comment in extlink content is a comment, not escaped text
+
+`[http://x.example/ <!--c-->text]` rendered `&lt;!--c-->text`: the extlink-content
+tokenizer (`tokenize_directives_and_quotes`) handled templates, language variants,
+quotes and entities but not comments, so a `<!--…-->` in the link text (or in the
+URL, where a comment is a `url_directive`) fell through to plain text and was
+escaped. The service emits the comment verbatim.
+
+### Fix
+
+`tokenize_directives_and_quotes` now recognizes `<!--…-->` with
+`parse_comment_token` and emits a `ParsoidToken::Comment`, exactly as the
+page-level tokenizer does.
+
+### Effect
+
+No first difference moves on these 48 pages (the construct sits past every one),
+but the rendering matches the service for `[http://x.example/ <!--c-->text]` and
+`[http://x.example/ <!--\n-->text]`. It is a correctness fix, not a scoreboard one.
