@@ -4144,7 +4144,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // A `#tag` body is the call's argument value, expanded with
                     // `inTemplate`: its templates take no `about` of their own and
                     // are not wrapped. `arg_value` carries that (the ref token is
-                    // marked by `tag_extension_token`).
+                    // marked by `tag_extension_token`). A `<ref>` nested in such a
+                    // body keeps its own body's transclusion ids, though: Parsoid
+                    // allocates them (they show as gaps) even where it emits no
+                    // wrapper, which the `nest > 1` `expand_unwrapped` path above
+                    // reproduces by suppressing only `wrap_templates`.
                     /* in_template */
                     arg_value,
                 ))
