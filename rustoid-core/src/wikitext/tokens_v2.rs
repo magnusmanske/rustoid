@@ -772,6 +772,10 @@ pub struct TempData {
     /// for the `{{!}}` magic word (`processSpecialMagicWord`). rustoid expands the
     /// values together with the template body, so it marks them here and reads the
     /// mark back in `expand_templates`.
+    ///
+    /// Set on a `#tag`-produced extension token too: its content is the call's
+    /// argument value, so the ref-body expansion unwraps it
+    /// ([`crate::pipeline::parser::Parser`]'s `number_extension_token`).
     pub in_arg_value: bool,
     /// A newline inserted only to force a module's table onto its own line (the
     /// T2529 rule; see `Parser::expand_invoke`). It does its work in the

@@ -678,6 +678,12 @@ impl ParserFunctions {
             }),
             ..Default::default()
         };
+        // The content is this call's argument value, expanded with `inTemplate`;
+        // a nested template therefore is not `mw:Transclusion`-wrapped. Carried so
+        // the ref-body expansion picks the same context. See
+        // `Parser::number_extension_token`.
+        let mut dp = dp;
+        dp.tmp.in_arg_value = true;
 
         let mut stt = SelfclosingTagTk::new("extension", vec![], dp);
         stt.add_attribute_str("typeof", "mw:Extension");

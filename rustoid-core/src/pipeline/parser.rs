@@ -1337,6 +1337,13 @@ pub struct Parser<'a, C: SiteConfig> {
     /// [`Parser::expand_templates`] renders it in that same position and stashes
     /// it here for the list renderer to pick up.
     ref_bodies: std::cell::RefCell<std::collections::HashMap<String, Node>>,
+    /// The same pre-expanded `ref` bodies, keyed by their wikitext. A `#tag:ref`
+    /// whose ref token is wrapped in the `{{#tag:ref}}` transclusion has its
+    /// `about` overwritten by the encapsulation (the transclusion's id, not the
+    /// extension's), so the `about` key the body was stashed under is not the one
+    /// Cite later reads from the DOM node. The body text is what Cite itself
+    /// identifies a note by, so it is the stable key.
+    ref_bodies_by_body: std::cell::RefCell<std::collections::HashMap<String, Node>>,
     /// Whether the current chunk's template expansions are encapsulated in
     /// `mw:Transclusion` markers. PHP derives that from its pipeline option
     /// `wrapTemplates`, and it is false for a *fresh* extension-body pipeline
@@ -1444,6 +1451,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             module_scope: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
+            ref_bodies_by_body: std::cell::RefCell::new(std::collections::HashMap::new()),
             wrap_templates: std::cell::Cell::new(true),
         }
     }
@@ -3418,6 +3426,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 {
                     return node.clone();
                 }
+                // The `about` may have been overwritten by encapsulation; the body
+                // text survives it.
+                if let Some(node) = self.ref_bodies_by_body.borrow().get(&r.body) {
+                    return node.clone();
+                }
                 let mut fragments = note_fragments.borrow_mut();
                 render_inline_fragment(
                     self.config,
@@ -4065,7 +4078,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
     ) {
-        let (body, is_ref) = {
+        let (body, is_ref, arg_value) = {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                 return;
             };
@@ -4094,7 +4107,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             } else {
                 String::new()
             };
-            (body, is_ref)
+            // A `#tag`-produced ref's body is that call's argument value, which
+            // the preprocessor expands with `inTemplate`; Parsoid therefore does
+            // not wrap a template inside it (`{{#tag:ref|{{mono|EA}}}}` serves a
+            // bare `mw:Extension/templatestyles`, unlike a literal
+            // `<ref>{{mono|EA}}</ref>`). See [`crate::wikitext::tokens_v2::TempData::in_arg_value`].
+            let arg_value = t.data_parsoid.tmp.in_arg_value;
+            (body, is_ref, arg_value)
         };
         // Pre-rendering a body costs a full expansion. Only a body that can spend
         // an `about` id of its own needs it: a template (which may emit a
@@ -4114,8 +4133,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // service's output shows it (`Zebra`'s top-level `cite journal` note
             // keeps `mw:Transclusion mw:Extension/templatestyles`, a note inside
             // an Infobox argument does not). See [`Parser::wrap_templates`].
-            let _unwrapped =
-                (is_ref && self.expansion_nesting.get() > 1).then(|| self.expand_unwrapped());
+            let _unwrapped = (is_ref && (arg_value || self.expansion_nesting.get() > 1))
+                .then(|| self.expand_unwrapped());
             Some(
                 Box::pin(self.process_fragment_body(
                     &body,
@@ -4158,7 +4177,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             t.add_attribute_str("about", &about);
         }
         if let Some(node) = rendered {
-            self.ref_bodies.borrow_mut().insert(about, node);
+            self.ref_bodies.borrow_mut().insert(about, node.clone());
+            if !body.is_empty() {
+                self.ref_bodies_by_body
+                    .borrow_mut()
+                    .insert(body.clone(), node);
+            }
         }
     }
 
