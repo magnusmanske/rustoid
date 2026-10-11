@@ -15119,3 +15119,37 @@ autonumber`. The nested-fragment paths pass `None` and keep their own call.
 difference is separate: the `<!--\n-->` a template emits right before the link
 text survives in rustoid but not in the service, which is a distinct question
 about comments in synthesized extlink content.
+
+## A comment in a template's link content is dropped
+
+`{{IMDb title|id=0091814|title=Quicksilver}}` ends its extlink content with a
+`<!--\n-->` (a newline-eating comment written in the template source). The
+service drops it; rustoid kept it — `…id="mwnA"><!--\n--><i>Quicksilver</i></a>`.
+
+The mechanism is `TemplateHandler::processTemplateTokens`: the token chunk a
+template (or parser-function) expansion returns is the output of the *whole*
+`TokenTransform2` stage, so `ExternalLinkHandler::onExtLink` and
+`WikiLinkHandler` have already spliced each link's content into that chunk. When
+the body pipeline ran with `expandTemplates => false` — which it does on the
+preprocessor path — every top-level `CommentTk` of the chunk is then dropped.
+rustoid strips the body's own top-level comments at `expand_one_template` for the
+same reason (so `{{small|a<!--c-->b}}` already matched), but it renders links in a
+*later* pass, so a comment inside `mw:content` / `mw:maybeContent` is still nested
+in the link token's KV when that filter runs, and survives.
+
+### Fix
+
+`strip_link_content_comments` drops `Comment` items from an `extlink`'s
+`mw:content` and a non-file `wikilink`'s `mw:maybeContent`, called beside the
+existing top-level filter in `expand_one_template`. File links are skipped: their
+`mw:maybeContent` parts are media options and a caption, rendered through their
+own fragment pipeline.
+
+### Effect
+
+`Quicksilver (film)` 95.57 % → 96.11 %. No page regresses. Verified against the
+transform endpoint: `{{small|[http://x.example <!--c-->''y'']}}`,
+`{{small|[[Foo<!--c-->]]}}` and
+`{{small|[http://x.example/ <!--c-->{{Trim|''y''}}]}}` all drop the comment on
+both sides now, while the page-level `[http://x <!--c-->''b'']` and
+`[http://x.example/ <!--c-->{{Trim| text }}]` keep it on both.
