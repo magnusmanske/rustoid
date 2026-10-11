@@ -14804,3 +14804,33 @@ silent wrong value wherever a template asks about another title
 (`Template:Category link without namespace` is the common caller). Verified
 against the oracle; lib **1015**, fixture guard **877/896**, compare **120**,
 clippy and fmt clean.
+
+## A grouped `<ref>` marks its note with the group name
+
+The reflink text of a grouped reference (`<ref group="note">`) reads `[note 1]`,
+not `[1]`. Cite's `MarkSymbolRenderer::renderFootnoteMarkLabel` prepends the
+group name for any group that is not the default, *unless* the group has a
+custom label list — the `cite_link_label_group-<group>` message on the wiki. The
+standard alphabetic groups (`lower-alpha`, `upper-alpha`, `lower-greek`) ship
+such a message, so a `group="upper-alpha"` ref still reads `[A]`; the canonical
+group reads `[1]`.
+
+The note list is different: its `data-mw-footnote-number` attribute goes through
+`renderFootnoteNumber`, which never adds the prefix — so the number under the
+marker is `1` even when the marker reads `[note 1]`.
+
+### Fix
+
+`Reference::mark_label` returns the marker text (`group label`, or just the
+label for the default and the alphabetic groups). `ref_marker_nodes` uses it for
+the reflink text, while the `data-mw-footnote-number` path keeps the plain
+`label`. The alphabetic-group exemption is hard-coded to the three messages the
+enwiki install carries, which is the same set the wikitext `<references>`
+handling already assumes.
+
+### Effect
+
+On `ISO 3166-1 alpha-2`, whose `<references group="note">` block is the whole
+point of the page, the first difference moved from byte 759261 (76.44 % of the
+oracle) to byte 805014 (81.05 %). The next difference there is a `#mwt…` id off
+by three, the familiar templatestyles/ExpandedAttrs id-ordering family.
