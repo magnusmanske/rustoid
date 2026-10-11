@@ -4810,7 +4810,14 @@ fn subst_name(text: &str) -> Option<String> {
     // target belongs to what follows it, not to a prefix (`Foo:subst:Bar`).
     let colon = text.find(':')?;
     let word = text[..colon].trim();
-    if !word.eq_ignore_ascii_case("subst") && !word.eq_ignore_ascii_case("safesubst") {
+    // Only `safesubst:` is stripped. `subst:` is *not* performed while a page is
+    // being rendered (it only substitutes on a save), so MediaWiki treats
+    // `{{subst:X}}` as an ordinary transclusion of a page named `subst:X`,
+    // which does not exist and renders back as the literal `{{subst:X}}`.
+    // Stripping it made `Template:Unreferenced section`'s
+    // `<includeonly>{{subst:substcheck}}</includeonly>` expand to `SUBST` and
+    // tripped `Module:Message box`'s subst check on every normal transclusion.
+    if !word.eq_ignore_ascii_case("safesubst") {
         return None;
     }
     // Nothing may precede the word. `{{lc: y}}` reaching here means the prefix
@@ -7855,15 +7862,24 @@ mod tests {
     }
 
     #[test]
-    fn a_subst_prefix_is_stripped() {
-        assert_eq!(strip_subst_prefix("subst:Foo"), Some("Foo".to_string()));
+    fn a_safesubst_prefix_is_stripped() {
         assert_eq!(strip_subst_prefix("safesubst:Foo"), Some("Foo".to_string()));
         // Case and spacing both vary in real wikitext.
-        assert_eq!(strip_subst_prefix("Subst: Foo"), Some("Foo".to_string()));
         assert_eq!(
             strip_subst_prefix("SAFESUBST:  Foo"),
             Some("Foo".to_string())
         );
+    }
+
+    /// `subst:` is *not* a render-time prefix: MediaWiki only substitutes on a
+    /// save, so while rendering it treats `{{subst:Foo}}` as a transclusion of a
+    /// page named `subst:Foo`, which does not exist. Stripping it expanded
+    /// `Template:Unreferenced section`'s `<includeonly>{{subst:substcheck}}</includeonly>`
+    /// to `SUBST` and tripped `Module:Message box`'s subst check.
+    #[test]
+    fn a_plain_subst_prefix_is_not_stripped() {
+        assert_eq!(strip_subst_prefix("subst:Foo"), None);
+        assert_eq!(strip_subst_prefix("Subst: Foo"), None);
     }
 
     /// The form `Template:Country data X` is written in, where a `<noinclude />`
@@ -7874,10 +7890,8 @@ mod tests {
             strip_subst_prefix("safesubst<noinclude />: Foo"),
             Some("Foo".to_string())
         );
-        assert_eq!(
-            strip_subst_prefix("subst<includeonly/>: Foo"),
-            Some("Foo".to_string())
-        );
+        // A `subst:` with the same separator is still not a render-time prefix.
+        assert_eq!(strip_subst_prefix("subst<includeonly/>: Foo"), None);
     }
 
     /// A template whose name merely *starts* with the word is not a
