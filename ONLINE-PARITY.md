@@ -15060,3 +15060,29 @@ page-level tokenizer does.
 No first difference moves on these 48 pages (the construct sits past every one),
 but the rendering matches the service for `[http://x.example/ <!--c-->text]` and
 `[http://x.example/ <!--\n-->text]`. It is a correctness fix, not a scoreboard one.
+
+## Native content takes an empty `data-parsoid` slot, and so an id
+
+`<ref>{{Mojo title|quicksilver}}</ref>` renders its reference text as
+`<a … id="mwDA"><i id="mwDQ" data-parsoid="{}>Quicksilver</i></a>…`. rustoid gave
+the `<i>` no id: it sits inside the transclusion (so it is not the range head),
+and rustoid's transclusion-discard pass leaves its `data-parsoid` at `None`. But
+the node is inside the `<references>` list — **native** (extension) content —
+which `CleanUp::markDiscardableDataParsoid` never discards, and Parsoid's
+`serializeNewEmptyDp` then gives every un-discarded element an empty
+`data-parsoid` object, so the node takes a generated id even with no metadata of
+its own. (A node with no slot takes none, which is why the naive “give an id to
+every non-discarded element” change — tried and reverted — shifted 46 pages.)
+
+### Fix
+
+`cleanup::discard_node` still leaves native content alone, but now records an
+`empty_dp_slot` on a native-content element that carries neither a
+`data-parsoid` nor a `data-mw`, so `assign_node_ids` gives it the id the service
+does.
+
+### Effect
+
+`Quicksilver (film)` 87.58 % → 94.87 %, `Order of the British Empire` 20.76 % →
+25.87 %. No page regresses. Verified against the transform endpoint: without the
+`<ref>` the `<i>` takes no id on either side, with it the service gives it one.
