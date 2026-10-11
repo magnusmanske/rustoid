@@ -15202,20 +15202,35 @@ wrong.
    The stash is now also keyed by the body wikitext — the identity Cite itself
    uses for a note — and the renderer tries that when the `about` misses.
 
-2. **The body was wrapped when it should not be.** A `#tag` body is that call's
+2. **The body was expanded as a page chunk.** A `#tag` body is that call's
    *argument value*, which the preprocessor expands with `inTemplate`; Parsoid
    therefore serves a `{{mono}}` inside it as a bare
-   `mw:Extension/templatestyles` with no `mw:Transclusion` and no `parts` (unlike
-   a literal `<ref>{{mono|EA}}</ref>`, whose body *is* wrapped). rustoid expanded
-   the body as a top-level chunk and marked it. `tag_extension_token` now sets
-   `TempData::in_arg_value`, and `number_extension_token` expands such a body
-   unwrapped.
+   `mw:Extension/templatestyles` with no `mw:Transclusion`, no `parts`, and no
+   `about` of its own (`about` — the templatestyles id — is shared with the
+   span). Unlike a literal `<ref>{{mono|EA}}</ref>`, whose body *is* wrapped and
+   takes a `template` id per `{{…}}`. rustoid expanded the body as a top-level
+   chunk. `tag_extension_token` now sets `TempData::in_arg_value`, and
+   `number_extension_token` passes `in_template` for such a body, so its
+   templates spend no `about` and are not wrapped.
 
 ### Effect
 
-`ISO 3166-1 alpha-2`'s first difference does not move (81.05%): the note body
-now matches the service's content and `typeof`/`data-mw` (only the ids differ),
-but the counter is still ~3 low. That is a separate defect in how many ids the
-body's expansion spends: rustoid spends two per `{{mono}}` where the service
-spends one, and too few for the nested `<ref>`'s own body. Recorded, not guessed
-at. No page regresses; the fixture guard stays at 877/896.
+The argument-value fix is verified by a reduced probe: with
+`x{{#tag:ref|{{mono|EA}} {{mono|EV}}}}y` the note's `about`s are `#mwt2 #mwt3` on
+both sides now (rustoid used to spend two per `{{mono}}`, giving `#mwt3 #mwt5`);
+the literal-`<ref>` form still matches. It does not move `ISO 3166-1 alpha-2`'s
+first difference past 81.05%, because it exposes — rather than closes — the
+remaining defect: the id gap there grows from 3 to 7.
+
+That remaining gap is the **nested `<ref>`**, which rustoid neither renders nor
+numbers like the service. `x{{#tag:ref|A<ref>{{cite web|…}}</ref>B|…}}` shows it:
+the nested ref stays an `<extension>` element (its body — the citation — is
+expanded at the ref site but never spliced, because Cite's `collect` walks the
+document *before* the stashed bodies are), and the service spends ~10 ids
+re-numbering that note where rustoid spends 2 (its `count_body_extensions`
+heuristic, `1 + extension wrappers`). The live Cite re-parses a note when it
+splices a *transcluded* one back into the page, so the count follows the note's
+*transclusions*, not its rendering — deriving it needs the Cite extension's
+source, which is not in this checkout. Recorded, not guessed at.
+
+No page regresses; the fixture guard stays at 877/896.
