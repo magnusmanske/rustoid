@@ -891,7 +891,7 @@ pub fn render_inline_fragment(
     // here rather than only in `build_ast`.
     crate::pipeline::attr_mw_fragments::collect(&mut frag);
     let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
-    crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
+    crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None, None);
     // AddLinkAttributes also runs in the nested fragment pipeline (mirrors PHP's
     // `NESTED_PIPELINE_DOM_TRANSFORMS`, where `linkclasses` precedes
     // `linkneighbours+dom-unpack`): it assigns `class`/`rel` to links inside
@@ -2366,7 +2366,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 stage.to_ast_with_fragments(tokens, None, self.config, fragments.clone(), None);
             let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
             crate::pipeline::p_wrap::run(&mut ast);
-            crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None);
+            crate::pipeline::tree_builder_html::post_pwrap_transforms(
+                &mut ast, &depths, None, None,
+            );
             crate::pipeline::cleanup::run(&mut ast);
             crate::pipeline::unpack_dom_fragments::run(&mut ast);
             extract_fragment_children(&ast)
@@ -2400,7 +2402,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         if !inline {
             crate::pipeline::p_wrap::run(&mut ast);
         }
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut ast, &depths, None, None);
         crate::pipeline::cleanup::run(&mut ast);
         extract_fragment_children(&ast)
     }
@@ -2613,7 +2615,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `post_pwrap_transforms` unpacks the placeholders into view.
         crate::pipeline::attr_mw_fragments::collect(&mut frag);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&frag);
-        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None);
+        crate::pipeline::tree_builder_html::post_pwrap_transforms(&mut frag, &depths, None, None);
 
         // Resolve the file (replace the broken span with `<img>` and stamp
         // `title`/`alt` from the caption) before the figcaption is detached —
@@ -3020,17 +3022,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::attr_mw_fragments::collect(&mut ast);
         let depths = crate::pipeline::migrate_template_marker_metas::collect_depths(&ast);
         crate::pipeline::p_wrap::run(&mut ast);
-        // AddLinkAttributes runs *before* `dom-unpack` (mirrors PHP's
-        // `NESTED_PIPELINE_DOM_TRANSFORMS`, where `linkclasses` precedes
-        // `linkneighbours+dom-unpack`). The `<a>` still holds its
-        // `mw:DOMFragment` placeholder child at this point, so an extlink whose
-        // content is a nested link/media gets `external text` (reflecting
-        // wikitext intent) rather than `external autonumber` (empty DOM).
-        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
+        // AddLinkAttributes now runs inside `post_pwrap_transforms`, between
+        // tplwrap and `dom-unpack` (see that function).
         crate::pipeline::tree_builder_html::post_pwrap_transforms(
             &mut ast,
             &depths,
             Some(wikitext),
+            Some(self.config),
         );
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
@@ -3356,12 +3354,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // DOM-level p-wrapping runs before transclusion encapsulation (mirrors
         // PHP's `pwrap` … `tplwrap` order).
         crate::pipeline::p_wrap::run(&mut ast);
-        // AddLinkAttributes precedes `dom-unpack` (see `wikitext_to_ast`).
-        crate::pipeline::add_link_attributes::run(&mut ast, self.config);
+        // AddLinkAttributes now runs inside `post_pwrap_transforms` (see
+        // `wikitext_to_ast`).
         crate::pipeline::tree_builder_html::post_pwrap_transforms(
             &mut ast,
             &depths,
             Some(page_source),
+            Some(self.config),
         );
         // HandleLinkNeighbours (`linkneighbours`) runs after `tplwrap` so it can
         // merge link trail/prefix text that straddles a transclusion

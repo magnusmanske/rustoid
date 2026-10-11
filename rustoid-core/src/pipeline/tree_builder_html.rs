@@ -1420,6 +1420,7 @@ pub fn post_pwrap_transforms(
     node: &mut Node,
     depths: &std::collections::HashMap<String, (usize, usize)>,
     source: Option<&str>,
+    config: Option<&dyn crate::traits::SiteConfig>,
 ) {
     // Migrate transclusion marker metas toward a canonical position before
     // migrate-nls (mirrors PHP's `migrate-metas` … `migrate-nls` order).
@@ -1437,6 +1438,18 @@ pub fn post_pwrap_transforms(
     }
     // Encapsulate transclusion meta markers into wrapping `<span>` elements.
     encapsulate_transclusions(node, source);
+    // AddLinkAttributes (`linkclasses`) runs *after* tplwrap and *before*
+    // `dom-unpack` (mirrors PHP's `NESTED_PIPELINE_DOM_TRANSFORMS` order
+    // `… tplwrap … fixups … linkclasses … linkneighbours+dom-unpack`). Running it
+    // after tplwrap matters for the attribute order on a link that is itself a
+    // transclusion's encapsulation target: the `class` goes after the `about`/
+    // `typeof` tplwrap transferred. Running it before `dom-unpack` matters because
+    // the `<a>` still holds its `mw:DOMFragment` placeholder, so an extlink whose
+    // content is a nested link/media gets `external text` rather than `external
+    // autonumber`. The nested-fragment paths pass `None` and call it themselves.
+    if let Some(config) = config {
+        crate::pipeline::add_link_attributes::run(node, config);
+    }
     // Unpack `mw:DOMFragment` placeholders (extension/template sub-content)
     // into their stashed children. This runs *after* encapsulation (mirrors
     // PHP's `tplwrap` … `dom-unpack` order), so the transclusion range is first
