@@ -418,7 +418,22 @@ fn keep_in_range(children: &mut [Node], in_native: bool) {
 /// Discard `node`'s `data-parsoid` unless it is a boundary node, native content,
 /// or an `stx`-bearing last node or heading (which the serializer needs `stx` on).
 fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool) {
-    if !node.kind.is_element() || is_first || in_native {
+    if !node.kind.is_element() {
+        return;
+    }
+    if in_native {
+        // Native (extension) content is never discarded. Parsoid's
+        // `serializeNewEmptyDp` still gives such a node an empty `data-parsoid`
+        // slot, so it takes a generated id even when it carries no metadata of
+        // its own — the `<i>` a `''…''` makes inside a `<ref>` body is the case
+        // that mattered. Without the slot the node took no id and every later id
+        // on the page shifted down by one.
+        if node.data_parsoid.is_none() && node.data_mw.is_none() && !node.empty_dp_slot {
+            node.empty_dp_slot = true;
+        }
+        return;
+    }
+    if is_first {
         return;
     }
     let has_stx = node.dp.as_ref().is_some_and(|dp| dp.stx.is_some())
