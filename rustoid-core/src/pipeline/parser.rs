@@ -5369,13 +5369,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `Template:Short description`'s `<!-- Start tracking -->` markers never
         // reach the reader, and the same `if (!expandTemplates)` guard is what
         // makes them survive on a *page*.
-        let expanded: Vec<Item> = expanded
+        let mut expanded: Vec<Item> = expanded
             .into_iter()
             .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
             .collect();
+        strip_link_content_comments(&mut expanded);
         // A body's tags are not the page's: `expand_attributes` must not mark
         // their attributes `mw:ExpandedAttrs`. See [`mark_synthesized`].
-        let mut expanded = expanded;
         mark_synthesized(&mut expanded);
 
         if !wrap || target_has_comment {
@@ -6420,6 +6420,50 @@ fn expandable_content(items: &[Item]) -> ExpandableContent {
     found
 }
 
+/// Strip comments nested in a link's content.
+///
+/// PHP's `processTemplateTokens` filters a body's token chunk *after*
+/// `ExternalLinkHandler`/`WikiLinkHandler` have spliced a link's content into
+/// that chunk, so `[http://… <!--c--> text]` and `[[Foo<!--c-->]]` lose the
+/// comment alongside the body's own top-level ones. rustoid renders links in a
+/// later pass, so the content is still nested in the link token's `mw:content`
+/// / `mw:maybeContent` KV, out of the top-level filter's reach; remove it here.
+///
+/// File links are left alone: their `mw:maybeContent` parts are media options
+/// and a caption, rendered through their own fragment pipeline.
+fn strip_link_content_comments(items: &mut [Item]) {
+    for item in items.iter_mut() {
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+            continue;
+        };
+        let key = match stt.name.as_str() {
+            "extlink" => "mw:content",
+            "wikilink" => {
+                let href = stt
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .and_then(|kv| kv.value.as_str())
+                    .unwrap_or_default();
+                if is_file_link_target(href) {
+                    continue;
+                }
+                "mw:maybeContent"
+            }
+            _ => continue,
+        };
+        for kv in stt
+            .attribs
+            .iter_mut()
+            .filter(|kv| kv.key.as_str() == Some(key))
+        {
+            if let crate::wikitext::tokens_v2::KeyValue::Tokens(toks) = &mut kv.value {
+                toks.retain(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))));
+            }
+        }
+    }
+}
+
 /// Mark the top-level tags of a chunk that came out of expanding a template body
 /// or a module output.
 ///
@@ -7054,6 +7098,81 @@ mod tests {
     use super::*;
     use crate::mock::MockSiteConfig;
     use crate::options::ParserOptions;
+
+    /// A comment nested in a link's content is stripped (the body chunk filter
+    /// runs after the link handlers splice it in); a plain attribute value keeps
+    /// it, and a file link's options are left alone.
+    #[test]
+    fn strip_link_content_comments_drops_content_comments_only() {
+        use crate::wikitext::tokens_v2::{CommentTk, KV, KeyValue, ParsoidToken, SelfclosingTagTk};
+
+        let comment = || {
+            Item::Tok(ParsoidToken::Comment(CommentTk::new(
+                "c",
+                Default::default(),
+            )))
+        };
+        let s = |t: &str| Item::Str(t.to_string());
+        let kv = |key: &str, value: KeyValue| KV {
+            key: KeyValue::Str(key.to_string()),
+            value,
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+
+        let mut ext = SelfclosingTagTk::new("extlink", vec![], Default::default());
+        ext.attribs
+            .push(kv("href", KeyValue::Str("http://x".into())));
+        ext.attribs
+            .push(kv("mw:content", KeyValue::Tokens(vec![comment(), s("y")])));
+
+        let mut wl = SelfclosingTagTk::new("wikilink", vec![], Default::default());
+        wl.attribs.push(kv("href", KeyValue::Str("Foo".into())));
+        wl.attribs.push(kv(
+            "mw:maybeContent",
+            KeyValue::Tokens(vec![comment(), s("ar")]),
+        ));
+
+        let mut file = SelfclosingTagTk::new("wikilink", vec![], Default::default());
+        file.attribs
+            .push(kv("href", KeyValue::Str("File:X.jpg".into())));
+        file.attribs.push(kv(
+            "mw:maybeContent",
+            KeyValue::Tokens(vec![comment(), s("cap")]),
+        ));
+
+        let mut items = vec![
+            comment(), // a body-level comment is *not* this function's job
+            Item::Tok(ParsoidToken::SelfclosingTag(ext)),
+            Item::Tok(ParsoidToken::SelfclosingTag(wl)),
+            Item::Tok(ParsoidToken::SelfclosingTag(file)),
+        ];
+        strip_link_content_comments(&mut items);
+
+        let content = |it: &Item| {
+            match it {
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) => t
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("mw:content"))
+                .or_else(|| {
+                    t.attribs
+                        .iter()
+                        .find(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+                })
+                .map(|kv| matches!(kv.value, KeyValue::Tokens(ref v) if v.iter().any(|i| matches!(i, Item::Tok(ParsoidToken::Comment(_))))))
+                .unwrap_or(false),
+            _ => false,
+        }
+        };
+        // The body-level comment is untouched; the extlink and plain wikilink
+        // lost theirs; the file link kept its.
+        assert!(matches!(items[0], Item::Tok(ParsoidToken::Comment(_))));
+        assert!(!content(&items[1]));
+        assert!(!content(&items[2]));
+        assert!(content(&items[3]));
+    }
 
     /// A rendered `<ref>` body's discarded-id count is the number of extension
     /// wrappers in it, with lean `<nowiki>` excluded. See
