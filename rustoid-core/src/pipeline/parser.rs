@@ -3443,7 +3443,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     )),
                 )
             };
-            crate::ext::cite::run(&mut ast, &page_title_prefixed, &mut ids, &render_body);
+            // A `<ref>` nested in a transcluded note (a `#tag:ref` body) is rendered
+            // by Cite into the note body, so it needs the body's stashed node by
+            // wikitext — the same lookup `render_body` falls back to below.
+            let nested_body = |text: &str| -> Option<Node> {
+                self.ref_bodies_by_body.borrow().get(text).cloned()
+            };
+            crate::ext::cite::run(
+                &mut ast,
+                &page_title_prefixed,
+                &mut ids,
+                &render_body,
+                &nested_body,
+            );
             // Hand the advanced counter back: ids are allocated in document
             // order, so anything numbered after Cite must continue from here.
             about_counter.set(ids.about_counter());

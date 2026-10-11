@@ -528,29 +528,70 @@ pub fn run(
     page_title: &str,
     ids: &mut DocIds,
     body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
+    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
 ) -> usize {
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
-    collect(root, &mut state, &mut use_ids);
+    collect(root, &mut state, &mut use_ids, nested_body);
     // Deliberately **not** skipped when `state` is empty: a `<references>` tag with
     // no refs still renders its wrapper and an empty `<ol>`, which is what Parsoid
     // emits (verified against the cached output — the list structure is always
     // there, and only the `<li>`s vary). Returning early here left the raw
     // extension element in the output instead.
-    render(root, &state, page_title, ids, body_of, &mut use_ids)
+    //
+    // A note reached through a transclusion (`{{#tag:ref|…<ref>…</ref>…}}`) may
+    // itself hold a `<ref>`; Cite renders it into the note body before the body is
+    // spliced, so those converted bodies are stashed here and preferred over the
+    // raw ones.
+    let converted: std::cell::RefCell<std::collections::HashMap<String, crate::dom::node::Node>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    let body_for_list = |r: &Reference| -> crate::dom::node::Node {
+        if let Some(n) = converted.borrow().get(&r.body) {
+            return n.clone();
+        }
+        body_of(r)
+    };
+    render(
+        root,
+        &state,
+        page_title,
+        ids,
+        &body_for_list,
+        nested_body,
+        &converted,
+        &mut use_ids,
+    )
 }
 
 /// Walk once, recording every `<ref>` in document order.
 ///
 /// `<references>` is deliberately not collected here: it renders in place, from
 /// state only this walk can build, so it is handled during substitution.
-fn collect(node: &crate::dom::node::Node, state: &mut CiteState, use_ids: &mut Vec<String>) {
+fn collect(
+    node: &crate::dom::node::Node,
+    state: &mut CiteState,
+    use_ids: &mut Vec<String>,
+    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
+) {
     if let Some((name, group, body, self_closing, attrs)) = read_ref(node) {
+        // A ref nested in a transcluded note is processed *before* the note itself
+        // (Cite's `References::extractRefFromNode` calls `processNestedRefInRef`
+        // before `addRef`), so the nested refs take the lower numbers. It is only
+        // allowed when the note's pipeline ran `inTemplate` — `{{#tag:ref|…}}`,
+        // which the `mw:Transclusion` type records.
+        if !self_closing
+            && typeof_contains(node, "mw:Transclusion")
+            && let Some(body_node) = nested_body(&body)
+        {
+            for child in &body_node.children {
+                collect(child, state, use_ids, nested_body);
+            }
+        }
         let about = node.get_attr("about");
         use_ids.push(state.add_with_attrs(&name, &group, attrs, &body, self_closing, about));
     }
     for child in &node.children {
-        collect(child, state, use_ids);
+        collect(child, state, use_ids, nested_body);
     }
 }
 
@@ -680,12 +721,15 @@ fn attr_value(attrs: &str, key: &str) -> Option<String> {
 }
 
 /// Walk again, replacing refs with markers and `<references>` with the note list.
+#[allow(clippy::too_many_arguments)]
 fn render(
     root: &mut crate::dom::node::Node,
     state: &CiteState,
     page_title: &str,
     ids: &mut DocIds,
     body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
+    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
+    converted: &std::cell::RefCell<std::collections::HashMap<String, crate::dom::node::Node>>,
     use_ids: &mut [String],
 ) -> usize {
     let mut rendered = 0usize;
@@ -696,6 +740,8 @@ fn render(
         page_title,
         ids,
         body_of,
+        nested_body,
+        converted,
         use_ids,
         &mut next_use,
         &mut rendered,
@@ -711,13 +757,24 @@ fn walk_render(
     page_title: &str,
     ids: &mut DocIds,
     body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
+    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
+    converted: &std::cell::RefCell<std::collections::HashMap<String, crate::dom::node::Node>>,
     use_ids: &mut [String],
     next_use: &mut usize,
     rendered: &mut usize,
 ) {
     for child in &mut node.children {
         walk_render(
-            child, state, page_title, ids, body_of, use_ids, next_use, rendered,
+            child,
+            state,
+            page_title,
+            ids,
+            body_of,
+            nested_body,
+            converted,
+            use_ids,
+            next_use,
+            rendered,
         );
     }
 
@@ -773,7 +830,30 @@ fn walk_render(
         return;
     }
 
-    if read_ref(node).is_some() {
+    if let Some((_, _, body, self_closing, _)) = read_ref(node) {
+        // A note reached through a transclusion may hold a nested `<ref>`. Cite
+        // renders it into the body here, before the note's own marker is built,
+        // and the body renderer later prefers the converted body. The nested refs
+        // were collected first (`collect`), so they take the next ids.
+        if !self_closing
+            && typeof_contains(node, "mw:Transclusion")
+            && let Some(mut body_node) = nested_body(&body)
+            && has_ref(&body_node)
+        {
+            walk_render(
+                &mut body_node,
+                state,
+                page_title,
+                ids,
+                body_of,
+                nested_body,
+                converted,
+                use_ids,
+                next_use,
+                rendered,
+            );
+            converted.borrow_mut().insert(body, body_node);
+        }
         let Some(ref_id) = use_ids.get(*next_use).cloned() else {
             return;
         };
@@ -795,6 +875,15 @@ fn walk_render(
         *node = marker;
         *rendered += 1;
     }
+}
+
+/// Whether a node's subtree contains a `<ref>` element (Cite's
+/// `References::hasRef`, one fragment deep — a ref inside a nested ref's own body
+/// is reached by the recursion, not here).
+fn has_ref(node: &crate::dom::node::Node) -> bool {
+    node.children
+        .iter()
+        .any(|c| read_ref(c).is_some() || has_ref(c))
 }
 
 /// Carry a transclusion's encapsulation onto a Cite marker.
@@ -1318,6 +1407,45 @@ mod tests {
         apply_transclusion_encapsulation(&mut plain, &plain_source);
         assert_eq!(plain.get_attr("typeof"), Some("mw:Extension/ref"));
         assert!(!plain.get_attr("data-mw").unwrap().contains("parts"));
+    }
+
+    /// A `<ref>` inside a transcluded note's body is collected before the note
+    /// itself, so it takes the lower number: Cite's `extractRefFromNode` calls
+    /// `processNestedRefInRef` before `addRef`. The nested ref is only processed
+    /// when the note carries `mw:Transclusion` (the `inTemplate` gate).
+    #[test]
+    fn a_nested_ref_is_collected_before_its_note() {
+        use crate::dom::node::{ElementKind, Node};
+
+        let ref_node = |typeof_: &str, source: &str| {
+            let mut n = Node::element(ElementKind::Other("extension".to_string()));
+            n.set_attr("typeof", typeof_);
+            n.set_attr("name", "ref");
+            n.set_attr("source", source);
+            n
+        };
+
+        let mut body = Node::document();
+        body.push_child(Node::text("A"));
+        body.push_child(ref_node("mw:Extension", "<ref>B</ref>"));
+        let nested_body = move |text: &str| text.contains("A<ref>B</ref>C").then(|| body.clone());
+
+        let mut root = Node::document();
+        root.push_child(ref_node(
+            "mw:Transclusion mw:Extension",
+            "<ref name=\"o\">A<ref>B</ref>C</ref>",
+        ));
+
+        let mut state = CiteState::new();
+        let mut ids = Vec::new();
+        collect(&root, &mut state, &mut ids, &nested_body);
+
+        assert_eq!(state.references.len(), 2);
+        // The anonymous nested ref is numbered first; the named note follows.
+        assert_eq!(state.references[0].global_id, 1);
+        assert_eq!(state.references[0].body, "B");
+        assert_eq!(state.references[1].name, "o");
+        assert_eq!(state.references[1].global_id, 2);
     }
 
     /// A trailing `/` before `>` is the self-close marker, not part of an
