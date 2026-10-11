@@ -14888,3 +14888,41 @@ that `''…''` makes inside the extlink content keeps no `data-parsoid` slot in
 rustoid, so it takes no generated `id` (the service gives it one and the ids
 after it shift). Its sibling `COinS` comment `<!--\n-->` also survives as
 escaped text rather than vanishing; both reproduce on the pre-change tree.
+
+## A transclusion type precedes `mw:ExpandedAttrs`
+
+A template-generated element that also carries a templated attribute — the
+`<abbr title="…">` that `{{abbr|No.|Number}}` makes, since `title` comes from a
+parameter — came out with its two `typeof` values the wrong way round, and its
+`data-mw` keys likewise:
+
+- service: `typeof="mw:Transclusion mw:ExpandedAttrs"`,
+  `data-mw='{"attribs":[…],"parts":[…]}'`
+- rustoid: `typeof="mw:ExpandedAttrs mw:Transclusion"`,
+  `data-mw='{"parts":[…],"attribs":[…]}'`
+
+Parsoid adds `mw:ExpandedAttrs` in the `AttributeExpander` (TT2) and wraps the
+transclusion later, in the DOM `DOMRangeBuilder::encapsulateTemplates`, which
+*transfers the start marker's type with* `addTypeOf( $encapTgt, $t, true )` — the
+`true` is *prepend* (`DOMRangeBuilder.php:850`, looping
+`array_reverse(explode(' ', $t1))`). And it sets `$encapDataMw->parts = $parts`,
+which *appends* `parts` to a target that lacked it, keeping the target's own
+keys first.
+
+### Fix
+
+`encapsulate_transclusions` now prepends the transclusion type when the target
+already carries `mw:ExpandedAttrs` (the media case already prepended; extension
+targets still append, verified unchanged against the service for
+`{{#tag:pre|…}}` and `{{#tag:ref|…}}`). The non-unfolded `data-mw` merge uses
+`append_parts_to_data_mw` — target keys first, `parts` appended — whenever the
+target has no `parts` of its own; `merge_encap_data_mw` is kept only for a target
+that already carried `parts` (a compound/nested envelope), where its value is
+replaced rather than appended.
+
+### Effect
+
+On `Order of the British Empire` the first difference moved from byte 54557
+(13.02 % of the oracle) to 54663 (13.67 %); its `<abbr title="Number">` header
+now reads exactly as the service's. No other corpus page moves. Verified against
+the live transform endpoint on `{{abbr|No.|Number}}`.
