@@ -5682,6 +5682,19 @@ fn tokenize_directives_and_quotes(
             items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
             continue;
         }
+        // A comment is a `url_directive` inside an extlink, and inside link
+        // *content* it is `inlineline`; either way it survives as a comment
+        // node (`[http://x <!--c-->text]` keeps `<!--c-->`), not as escaped
+        // text. Without this the raw `<!--` was escaped to `&lt;!--`.
+        if tk.starts_with("<!--")
+            && let Some(tok) = tk.parse_comment_token()
+        {
+            if !buf.is_empty() {
+                items.push(Item::Str(std::mem::take(&mut buf)));
+            }
+            items.push(Item::Tok(ParsoidToken::Comment(tok)));
+            continue;
+        }
         // Quote runs (`''`/`'''`/`'''''`).
         if quotes && tk.starts_with("''") {
             let out_len = tk.output_len();
