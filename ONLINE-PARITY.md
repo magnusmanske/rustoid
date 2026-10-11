@@ -15226,11 +15226,20 @@ That remaining gap is the **nested `<ref>`**, which rustoid neither renders nor
 numbers like the service. `x{{#tag:ref|A<ref>{{cite web|…}}</ref>B|…}}` shows it:
 the nested ref stays an `<extension>` element (its body — the citation — is
 expanded at the ref site but never spliced, because Cite's `collect` walks the
-document *before* the stashed bodies are), and the service spends ~10 ids
-re-numbering that note where rustoid spends 2 (its `count_body_extensions`
-heuristic, `1 + extension wrappers`). The live Cite re-parses a note when it
-splices a *transcluded* one back into the page, so the count follows the note's
-*transclusions*, not its rendering — deriving it needs the Cite extension's
-source, which is not in this checkout. Recorded, not guessed at.
+document *before* the stashed bodies are). And the service spends ~10 ids where
+rustoid spends 2.
+
+The count is the **re-parse**. `RefTagHandler::sourceToDom` (`mediawiki-extensions-Cite`)
+renders a transcluded `<ref>`'s body through a full `wikitext-to-fragment`
+pipeline *again* — `allowNestedRef` is `inTemplate()`, so a note reached through
+`{{#tag:ref}}` re-parses its nested `<ref>` too. re-parsing the EA-vs-EV body at
+top level costs four `{{mono}}` (a template id each) plus the nested ref's
+`{{cite web}}`, which is the observed 10. rustoid's `count_body_extensions`
+heuristic (`1 + extension wrappers`, from the *rendered* body) models the wrong
+thing. Matching it means spending what a top-level re-parse would spend — a
+re-expansion, not a count — and attaching it to the EA-vs-EV note (which is
+transcluded), not to the nested one (`expansion_nesting` is 2 there, 1 at the
+`#tag`). Left for a session with the Cite source at hand; recorded, not guessed
+at.
 
 No page regresses; the fixture guard stays at 877/896.
