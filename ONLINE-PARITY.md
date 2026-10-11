@@ -15086,3 +15086,36 @@ does.
 `Quicksilver (film)` 87.58 % → 94.87 %, `Order of the British Empire` 20.76 % →
 25.87 %. No page regresses. Verified against the transform endpoint: without the
 `<ref>` the `<i>` takes no id on either side, with it the service gives it one.
+
+## AddLinkAttributes runs between tplwrap and dom-unpack
+
+A transclusion whose root is a link — `{{Mojo title|quicksilver}}`'s extlink,
+`{{IMDb title|…}}`'s — came out with `class="external text"` *before* the
+`about`/`typeof` the transclusion wrapping transfers onto it:
+
+- service: `<a rel="mw:ExtLink nofollow" href="…" about="#mwt29"
+  typeof="mw:Transclusion" class="external text" data-mw='…' id="mwnA">`
+- rustoid: `<a rel="mw:ExtLink nofollow" href="…" class="external text"
+  about="#mwt29" typeof="mw:Transclusion" data-mw='…' id="mwnA">`
+
+PHP's `NESTED_PIPELINE_DOM_TRANSFORMS` is `… tplwrap … fixups … linkclasses …
+linkneighbours+dom-unpack`, so `AddLinkAttributes` (`linkclasses`) adds the
+`class` *after* tplwrap transferred `about`/`typeof`. rustoid ran
+`add_link_attributes::run` before all of `post_pwrap_transforms`, so the `class`
+landed first.
+
+### Fix
+
+`post_pwrap_transforms` takes an optional `SiteConfig` and runs
+`add_link_attributes::run` between `encapsulate_transclusions` and
+`unpack_dom_fragments::run`; the two top-level call sites pass `Some(config)` and
+no longer run it themselves. It still precedes `dom-unpack`, so an extlink whose
+content is a nested link/media keeps `external text` rather than `external
+autonumber`. The nested-fragment paths pass `None` and keep their own call.
+
+### Effect
+
+`Quicksilver (film)` 94.87 % → 95.57 %. No page regresses. Its one remaining
+difference is separate: the `<!--\n-->` a template emits right before the link
+text survives in rustoid but not in the service, which is a distinct question
+about comments in synthesized extlink content.
