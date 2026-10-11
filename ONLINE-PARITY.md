@@ -15182,3 +15182,40 @@ service keeps inside the list — is still held by `on_any` as before.
 the fixture guard stays at 877/896. Verified against the transform endpoint:
 `* a\n[[Category:Foo]]` and `* a\n\n[[Category:Foo]]` now close the list before
 the link on both sides, while `* a\n<!--c-->\n* b` keeps a single list.
+
+## A `#tag:ref` body is expanded as its call's argument value
+
+`ISO 3166-1 alpha-2` renders
+`{{#tag:ref|WIPO Standard ST.3 actually uses {{mono|EA}}, … <ref>{{cite web|…}}</ref>|group=note|name=EA-vs-EV}}`,
+and rustoid served the note's body as literal placeholders — `<template
+mono="" ="EA">` for each `{{mono}}` and `<extension name="ref"
+source="<ref>…</ref>">` for the nested ref — instead of the expanded
+`<span class="monospaced">EA</span>` and the nested citation. Two things were
+wrong.
+
+1. **The stashed body was never found.** `number_extension_token` expands a
+   `<ref>`'s body at the ref site and stashes it in `ref_bodies` under the id it
+   allocates. But a `#tag`-produced ref token is wrapped in the `{{#tag:ref}}`
+   transclusion, and encapsulation overwrites the ref element's `about` with the
+   *transclusion's* id; Cite reads that overwritten `about` from the DOM, so the
+   lookup missed and the renderer fell back to the no-expansion inline render.
+   The stash is now also keyed by the body wikitext — the identity Cite itself
+   uses for a note — and the renderer tries that when the `about` misses.
+
+2. **The body was wrapped when it should not be.** A `#tag` body is that call's
+   *argument value*, which the preprocessor expands with `inTemplate`; Parsoid
+   therefore serves a `{{mono}}` inside it as a bare
+   `mw:Extension/templatestyles` with no `mw:Transclusion` and no `parts` (unlike
+   a literal `<ref>{{mono|EA}}</ref>`, whose body *is* wrapped). rustoid expanded
+   the body as a top-level chunk and marked it. `tag_extension_token` now sets
+   `TempData::in_arg_value`, and `number_extension_token` expands such a body
+   unwrapped.
+
+### Effect
+
+`ISO 3166-1 alpha-2`'s first difference does not move (81.05%): the note body
+now matches the service's content and `typeof`/`data-mw` (only the ids differ),
+but the counter is still ~3 low. That is a separate defect in how many ids the
+body's expansion spends: rustoid spends two per `{{mono}}` where the service
+spends one, and too few for the nested `<ref>`'s own body. Recorded, not guessed
+at. No page regresses; the fixture guard stays at 877/896.
