@@ -792,20 +792,44 @@ impl<'a> PegTokenizer<'a> {
         let content_start = self.pos;
         let mut content: Vec<Either<String, ParsoidToken>> = Vec::new();
 
-        // Look for the closing sequence.
+        // Look for the closing sequence: Parsoid's `heading_preproc` is
+        // `s:$'='+  ( inlineline<h>?  $'='+ )?  spc:( space / sol_transparent )*  &eolf`,
+        // so the closing `=` run is the last one on the line whose tail is only
+        // spaces and sol-transparent constructs (`space / sol_transparent` is
+        // what `consume_spaces`/`consume_sol_transparent` swallow — a comment
+        // counts, so `== X ====<!--c-->` still closes). Taking the first `=`
+        // anywhere split `== Honorary awards<span class="anchor">…</span> ==`
+        // at the `=` in `class="anchor"` and `== a=b ==` at the `=` in `a=b`,
+        // leaving an `<h1>` of the text up to that point.
         let rest = &self.input[self.pos..];
-        let mut close_pos = None;
-        let mut close_count = 0;
-
-        // Simple search: find `=+` followed by optional spaces and EOL/EOF.
-        if let Some(eq_pos) = rest.find('=') {
-            let after = &rest[eq_pos..];
-            let count = after.chars().take_while(|&c| c == '=').count();
-            if count > 0 {
-                close_pos = Some(self.pos + eq_pos);
-                close_count = count;
+        let line_len = rest.find(['\n', '\r']).unwrap_or(rest.len());
+        let line = &rest[..line_len];
+        let (close_pos, close_count) = match line.rfind('=') {
+            Some(last_eq) => {
+                let mut eq_start = last_eq;
+                while eq_start > 0 && line.as_bytes()[eq_start - 1] == b'=' {
+                    eq_start -= 1;
+                }
+                let close_count = last_eq - eq_start + 1;
+                // Validate the tail after the `=` run: spaces and sol-transparent
+                // constructs up to the line ending. Save and restore the
+                // tokenizer so the probe emits nothing.
+                let saved_pos = self.pos;
+                let out_len = self.output.len();
+                self.pos = saved_pos + last_eq + 1;
+                self.consume_spaces();
+                self.consume_sol_transparent();
+                let at_eol = self.eof() || matches!(self.peek_char(), Some('\n') | Some('\r'));
+                self.pos = saved_pos;
+                self.output.truncate(out_len);
+                if at_eol {
+                    (Some(saved_pos + eq_start), close_count)
+                } else {
+                    (None, 0)
+                }
             }
-        }
+            None => (None, 0),
+        };
 
         if let Some(cp) = close_pos {
             // Parse inline content between open and close, trimming the
