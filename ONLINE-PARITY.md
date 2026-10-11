@@ -15012,3 +15012,31 @@ source is emitted, as the service does.
 20.76 %, `Israel` 0.13 % → 1.07 %. No page regresses. Verified against the live
 transform endpoint: `{{Substcheck}}` and `{{safesubst:Substcheck}}` both render
 `SUBST`, while `{{subst:Substcheck}}` renders the literal `{{subst:Substcheck}}`.
+
+## A heading whose anchor escapes gets a `mw:FallbackId` span
+
+`== Women's association football ==` renders
+`<h3 id="Women's_association_football"><span
+id="Women.27s_association_football" typeof="mw:FallbackId"></span>Women's
+association football</h3>`. rustoid produced only the `id`, so any heading whose
+text holds a character that the html5 fragment mode keeps but the legacy mode
+escapes (`'`, `=`, …) was missing its fallback anchor.
+
+`Headings::genAnchors` computes three ids from the stripped heading text:
+`escapeIdForAttribute` (html5 → the `id`), `escapeIdForLink`, and
+`escapeIdForAttribute( …, ID_FALLBACK )` — whose mode is
+`$wgFragmentMode[ID_FALLBACK]` = `legacy`. When the primary and fallback ids
+differ it inserts an empty `<span typeof="mw:FallbackId">` with the fallback id
+as the heading's first child (with a zero-width `dsr`).
+
+### Fix
+
+`Sanitizer::escape_id_for_attribute_fallback` exposes the `legacy` escape, and
+`headings::assign_heading_id` inserts the fallback span when it differs from the
+primary id.
+
+### Effect
+
+`Sundial` 7.26 % → 11.59 %, `The Beatles` 2.09 % → 4.88 %, `Association football`
+9.70 % → 11.91 %. No page regresses. Verified against the transform endpoint on
+`== Women's association football ==`, `== a=b ==` and `== 1990s ==`.
