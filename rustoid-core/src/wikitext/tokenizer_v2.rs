@@ -3425,10 +3425,18 @@ impl<'a> PegTokenizer<'a> {
         // the `[&|{\-!}=]` fallback set, so `|` is part of the URL
         // (`[http://x|a]` → href `http://x|a`). That is why
         // `[http://example.com|[[Example]]]` yields href `http://example.com|`
-        // with `[[Example]]` as link *content*, not a longer href.
+        // with `[[Example]]` as link *content*, not a longer href. A `{{…}}`
+        // *directive* does not stop the URL: PHP's `extlink_nonipv6url`
+        // alternation admits a `url_directive`, so the template stays part of
+        // the `href` (as a token) and is expanded later.
         let rem = self.remaining();
-        let url_end = scan_extlink_url_len(rem);
-        let url = &rem[..url_end];
+        let url_start = self.pos;
+        let href_kv = self.scan_extlink_url();
+        let url_end = self.pos - url_start;
+        // `scan_extlink_url` consumed the URL; the content offsets below are
+        // relative to `rem` (i.e. to `url_start`), and the final `advance` adds
+        // them to `self.pos`, so rewind to keep the two from double-counting.
+        self.pos = url_start;
 
         // `sp:$( space / unispace )*` — the whitespace run before the content.
         let after_url = &rem[url_end..];
@@ -3466,7 +3474,16 @@ impl<'a> PegTokenizer<'a> {
 
         let dp = self.make_dp(saved, self.pos);
         let mut stt = SelfclosingTagTk::new("extlink", vec![], dp);
-        stt.add_attribute_str("href", url);
+        match href_kv {
+            KeyValue::Str(s) => stt.add_attribute_str("href", &s),
+            value => stt.attribs.push(KV {
+                key: KeyValue::Str("href".to_string()),
+                value,
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }),
+        }
 
         // Text content spans from just after the URL + separating spaces to the
         // closing `]`. `extLinkContentOffsets` covers "all spaces before content",
@@ -3494,6 +3511,57 @@ impl<'a> PegTokenizer<'a> {
 
         self.emit_token(ParsoidToken::SelfclosingTag(stt));
         true
+    }
+
+    /// Scan the URL of an extlink starting at the current position, mirroring
+    /// PHP's `extlink_nonipv6url_parameterized`: a run of URL characters, which
+    /// a `url_directive` (a `{{…}}` template or template argument, or a `-{…}-`
+    /// language variant) does **not** terminate but is *included* in. Advances
+    /// `self` past the URL and returns the `href` value: a plain string when the
+    /// URL held no directive, otherwise a token array that the attribute
+    /// expander later expands and concatenates.
+    ///
+    /// This is what makes `[https://x/{{#if:…}} text]` put the directive's
+    /// output *into* the href (`…/movies/?id=x.htm`) rather than into the link
+    /// text.
+    fn scan_extlink_url(&mut self) -> KeyValue {
+        let mut items: Vec<Item> = Vec::new();
+        let mut buf = String::new();
+        loop {
+            let rem = self.remaining();
+            if rem.starts_with("{{")
+                && let Some(tok) = self.parse_directive()
+            {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+                continue;
+            }
+            if rem.starts_with("-{")
+                && self.lang_conv_enabled
+                && let Some(tok) = self.parse_lang_variant()
+            {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                items.push(Item::Tok(ParsoidToken::SelfclosingTag(tok)));
+                continue;
+            }
+            let n = scan_extlink_url_len(rem);
+            if n == 0 {
+                break;
+            }
+            buf.push_str(&rem[..n]);
+            self.advance(n);
+        }
+        if !buf.is_empty() {
+            items.push(Item::Str(buf));
+        }
+        if let [Item::Str(s)] = items.as_slice() {
+            return KeyValue::Str(s.clone());
+        }
+        KeyValue::Tokens(items)
     }
 
     /// Try quote: `''`, `'''`, `'''''`
@@ -6548,6 +6616,41 @@ mod tests {
         let tokens = tokenize("[http://example.com link]");
         let has_extlink = tokens.iter().any(|t| matches!(t, Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink"));
         assert!(has_extlink, "Expected extlink, got: {:?}", tokens);
+    }
+
+    /// PHP's `extlink_nonipv6url` admits a `url_directive`, so a `{{…}}` inside
+    /// the URL is *part of the href* (as a token, expanded later), not a
+    /// terminator: the directive's output lands in the URL, and the link text is
+    /// only what follows the space.
+    #[test]
+    fn test_extlink_url_includes_a_template_directive() {
+        let tokens = tokenize("[https://x/{{#if:1|movies|no}} text]");
+        let extlink = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extlink" => Some(tk),
+                _ => None,
+            })
+            .expect("expected an extlink token");
+        let href = extlink
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("href"))
+            .expect("expected an href");
+        let KeyValue::Tokens(items) = &href.value else {
+            panic!("href should be a token array, got {:?}", href.value);
+        };
+        assert!(
+            items.iter().any(|it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "template")),
+            "href should carry the template token: {items:?}"
+        );
+        let content = extlink
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:content"))
+            .and_then(|kv| kv.value.as_str())
+            .expect("expected mw:content");
+        assert_eq!(content, "text");
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! `DataMw`/`TemplateInfo`/DOM-fragment infrastructure is available.
 
 use crate::pipeline::wiki_link_handler::{build_link_attrs, string_kv};
+use crate::wikitext::token_utils::key_value_to_string;
 use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, Item, ParsoidToken, TagTk};
 
 /// Is this file extension an image extension? Mirrors
@@ -115,7 +116,11 @@ pub fn on_ext_link(
     relative_link_prefix: &str,
     mut render_content: impl FnMut(Vec<Item>) -> Item,
 ) -> Option<Vec<Item>> {
-    let orig_href = token.get_attribute_v("href")?.to_string();
+    // The `href` is a plain string for a literal URL, or a token array once the
+    // tokenizer has admitted a `{{…}}` inside the URL (`extlink_nonipv6url`);
+    // the attribute expander expands it, and PHP's `tokensToString` flattens it
+    // to the string that becomes the `href`.
+    let orig_href = key_value_to_string(token.get_attribute("href")?);
     // `mw:content` may be a plain string, or (after the AttributeExpander has
     // expanded any embedded templates) a token array carrying `mw:Transclusion`
     // markers / `template` tokens. Render it faithfully rather than collapsing
