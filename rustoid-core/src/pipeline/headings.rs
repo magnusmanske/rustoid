@@ -43,8 +43,35 @@ fn assign_heading_id(node: &mut Node) {
     let normalized = crate::sanitizer::normalize_section_name_whitespace(&text);
     let anchor_id = crate::sanitizer::escape_id_for_attribute(&normalized);
     if !anchor_id.is_empty() {
-        node.set_attr("id", anchor_id);
+        node.set_attr("id", anchor_id.clone());
     }
+
+    // When the primary (html5) id differs from the legacy fallback — the text
+    // holds a character html5 keeps but legacy escapes, such as `'` or `=` —
+    // Parsoid inserts an empty `<span typeof="mw:FallbackId" id="…">` as the
+    // heading's first child, so old fragment links still resolve. Mirrors
+    // `Headings::genAnchors`'s `$fallbackId` handling.
+    let fallback_id = crate::sanitizer::escape_id_for_attribute_fallback(&normalized);
+    if fallback_id.is_empty() || fallback_id == anchor_id {
+        return;
+    }
+    let mut span = Node::element(ElementKind::Span);
+    span.set_attr("id", fallback_id);
+    span.set_attr("typeof", "mw:FallbackId");
+    // A zero-width `dsr` at the heading's inner start, so the span round-trips
+    // to the empty source range Parsoid gives it.
+    if let Some(dsr) = node.dp.as_ref().and_then(|dp| dp.dsr.as_ref()) {
+        let offset = dsr.inner_start();
+        span.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(offset),
+                end: Some(offset),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    node.children.insert(0, span);
 }
 
 /// Concatenate the text content of `node`, ignoring tags (mirrors `textContent`).

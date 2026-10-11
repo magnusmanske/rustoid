@@ -1425,6 +1425,15 @@ pub fn escape_id_for_attribute(id: &str) -> String {
     escape_id_internal(id, "html5")
 }
 
+/// Escape a title for use as the *fallback* HTML `id` attribute value. Mirrors
+/// PHP's `Sanitizer::escapeIdForAttribute( $id, Sanitizer::ID_FALLBACK )`, whose
+/// mode is `$wgFragmentMode[ID_FALLBACK]` = `legacy`. A heading whose primary
+/// (html5) id differs from this one — because the text holds a character html5
+/// keeps but legacy escapes, such as `'` or `=` — gets a `mw:FallbackId` span.
+pub fn escape_id_for_attribute_fallback(id: &str) -> String {
+    escape_id_internal(id, "legacy")
+}
+
 /// Normalize whitespace in a section name for use in an anchor id.
 /// Mirrors PHP's `Sanitizer::normalizeSectionNameWhitespace`: collapse runs of
 /// spaces/underscores to a single space and trim.
