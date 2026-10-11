@@ -15153,3 +15153,32 @@ transform endpoint: `{{small|[http://x.example <!--c-->''y'']}}`,
 `{{small|[http://x.example/ <!--c-->{{Trim|''y''}}]}}` all drop the comment on
 both sides now, while the page-level `[http://x <!--c-->''b'']` and
 `[http://x.example/ <!--c-->{{Trim| text }}]` keep it on both.
+
+## A list closes before a category link that follows it
+
+`Quicksilver (film)`'s External links section is a single-item list followed by
+the page's categories: `* {{IMDb title|…}}` then a blank line and the
+`[[Category:…]]` lines. The service serves
+`…IMDb</a></li></ul>\n\n<link rel="mw:PageProp/Category" …/>`; rustoid kept the
+list open to the end of the page — `…IMDb</a>\n\n<link …/>…</li></ul></section>`
+— so every category link sat inside the `<li>`.
+
+The blank line (or the single newline before the link) is re-wrapped into an
+`EmptyLineTk` by the token-stream patcher (its “buffered newlines before a
+SOL-transparent link” branch), so it reaches the `ListHandler` as a compound
+token that never set the frame's `at_eol`. `on_any` treats an `EmptyLineTk` as
+SOL-transparent and *adds* it to the open list, so the list never closes there.
+
+### Fix
+
+`ListHandler::on_token` closes an open list when an `EmptyLineTk` arrives without
+the frame already being at end-of-line (the compound is emitted after the closing
+tags); an `EmptyLineTk` that follows a newline — a comment-only line, which the
+service keeps inside the list — is still held by `on_any` as before.
+
+### Effect
+
+`Quicksilver (film)` 96.11 % → **MATCH** (corpus 1/48 → 2/48). No page regresses;
+the fixture guard stays at 877/896. Verified against the transform endpoint:
+`* a\n[[Category:Foo]]` and `* a\n\n[[Category:Foo]]` now close the list before
+the link on both sides, while `* a\n<!--c-->\n* b` keeps a single list.
