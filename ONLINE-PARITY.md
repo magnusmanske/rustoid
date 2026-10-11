@@ -14834,3 +14834,57 @@ On `ISO 3166-1 alpha-2`, whose `<references group="note">` block is the whole
 point of the page, the first difference moved from byte 759261 (76.44 % of the
 oracle) to byte 805014 (81.05 %). The next difference there is a `#mwt…` id off
 by three, the familiar templatestyles/ExpandedAttrs id-ordering family.
+
+## A template inside an extlink URL stays in the href
+
+A URL built by a template — `[https://www.boxofficemojo.com/{{#if:…}} ''Title'']`,
+which is what `Template:Mojo title` and `Template:IMDb title` emit — came out
+with the href cut at the template and the template's output leaking into the
+link *text*: `href="https://www.boxofficemojo.com/"` with
+`movies/?id=quicksilver.htm <i>Quicksilver</i>` as the text.
+
+PHP's grammar is explicit. `extlink` reads its URL as
+`extlink_nonipv6url_parameterized`, an alternation of plain URL characters and a
+`url_directive` — and a `url_directive` is a `tplarg_or_template` (also a
+comment, an annotation, `-{…}-` and `<include*>`). So a `{{…}}` inside the URL
+is *consumed into the URL*, not a terminator; the grammar even notes "There are
+templates present, alas", and the resulting `href` is a mixed
+`string|Token` array. `AttributeExpander::processComplexAttributes` then expands
+that array and flags `linkContainsTemplate`, and
+`ExternalLinkHandler::onUrlLink`/`onExtLink` flattens it with `tokensToString`.
+
+rustoid's `scan_extlink_url_len` stopped at a `{{`, and `try_extlink` stored the
+href as a plain string.
+
+### Fix
+
+`try_extlink` now scans the URL with a new `scan_extlink_url`, which mirrors the
+grammar's alternation: a run of URL characters (the old scan), interleaved with
+`{{…}}` directives parsed into tokens. When any directive is present the href
+becomes a `KeyValue::Tokens` array, so the existing attribute-expander and
+`TemplateHandler` machinery expands it in place; `ExternalLinkHandler` reads the
+href with `key_value_to_string` (PHP's `tokensToString`) instead of requiring a
+plain string.
+
+The scan had to rewind `self.pos` before the existing
+`advance(content_end + 1)`: that offset is measured from the URL start, while
+`scan_extlink_url` had already consumed the URL. Without the rewind every
+extlink advanced past its `]` by the URL length, which mangled the following
+token (a `<cite>` lost its `about` and swallowed its sibling `COinS` span).
+
+### Effect
+
+The `{{#if:…}}` output now lands in the href. On `Quicksilver (film)` the first
+difference moved from byte 29432 (87.40 % of the oracle) to byte 29494
+(87.58 %); the URL is now byte-identical to the service's. Verified against the
+live transform endpoint that a *page-level* templated URL
+(`[https://x/{{#if:1|movies}} ''t'']`) yields exactly the same
+`<a … typeof="mw:ExpandedAttrs" about="#mwt2">` rustoid now emits — the
+template is expanded by the AttributeExpander, not flattened by the
+preprocessor, in both.
+
+The remaining `Quicksilver` difference is separate and pre-existing: the `<i>`
+that `''…''` makes inside the extlink content keeps no `data-parsoid` slot in
+rustoid, so it takes no generated `id` (the service gives it one and the ids
+after it shift). Its sibling `COinS` comment `<!--\n-->` also survives as
+escaped text rather than vanishing; both reproduce on the pre-change tree.
