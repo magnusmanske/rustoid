@@ -2356,14 +2356,21 @@ fn wrap_transclusion_children(
                         // encapsulation target is a media container (`mw:File`),
                         // yielding `mw:Transclusion mw:File` (mirrors PHP's
                         // `AddMediaInfo`, which adds `mw:File` after the
-                        // transclusion marker). For all other targets
-                        // (extensions, `mw:Nowiki`, parser functions, …) the
-                        // transclusion type is *appended* (`mw:Extension/pre
-                        // mw:Transclusion`, etc.).
+                        // transclusion marker). It is also prepended when the
+                        // target already carries `mw:ExpandedAttrs` — that type is
+                        // added by the `AttributeExpander` (TT2), and PHP's
+                        // `DOMRangeBuilder::encapsulateTemplates` transfers the
+                        // start element's type with `addTypeOf( …, true )`
+                        // (prepend), giving `mw:Transclusion mw:ExpandedAttrs`.
+                        // For other targets (extensions, `mw:Nowiki`, parser
+                        // functions, …) the transclusion type is *appended*
+                        // (`mw:Extension/pre mw:Transclusion`, etc.).
                         let is_media = existing
                             .split_whitespace()
                             .any(|t| t == "mw:File" || t.starts_with("mw:File/"));
-                        if is_media {
+                        let has_expanded_attrs =
+                            existing.split_whitespace().any(|t| t == "mw:ExpandedAttrs");
+                        if is_media || has_expanded_attrs {
                             format!("{typeof_} {existing}")
                         } else {
                             format!("{existing} {typeof_}")
@@ -2414,10 +2421,22 @@ fn wrap_transclusion_children(
                 .as_deref()
                 .and_then(|a| plan.compound_data_mw(a, source, None))
                 .or_else(|| build_compound_data_mw(&start_meta, source, None));
-            new_content[et].data_mw = if unfolded {
-                append_parts_to_data_mw(plan_mw, new_content[et].data_mw.clone())
+            let target_dmw = new_content[et].data_mw.clone();
+            // PHP's `$encapDataMw->parts = $parts` *sets* the `parts` key on the
+            // target's own `data-mw`: a target that already had `parts` keeps its
+            // position (only the value changes), while one that did not gets
+            // `parts` appended after its other keys. So a target with no `parts`
+            // of its own keeps its keys first — the `<abbr>` with a templated
+            // `title` is `{"attribs":…,"parts":…}` — which is what
+            // `append_parts_to_data_mw` does; `merge_encap_data_mw` is only for the
+            // target that already carried `parts` (a compound/nested envelope).
+            let target_has_parts = target_dmw
+                .as_deref()
+                .is_some_and(|t| data_mw_key_span(t, "parts").is_some());
+            new_content[et].data_mw = if unfolded || !target_has_parts {
+                append_parts_to_data_mw(plan_mw, target_dmw)
             } else {
-                merge_encap_data_mw(plan_mw, new_content[et].data_mw.clone())
+                merge_encap_data_mw(plan_mw, target_dmw)
             };
             // A templated *table* whose range encloses nested transclusion ranges
             // gets a compound `data-mw` listing every constituent template plus
