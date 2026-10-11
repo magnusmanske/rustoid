@@ -4133,15 +4133,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // service's output shows it (`Zebra`'s top-level `cite journal` note
             // keeps `mw:Transclusion mw:Extension/templatestyles`, a note inside
             // an Infobox argument does not). See [`Parser::wrap_templates`].
-            let _unwrapped = (is_ref && (arg_value || self.expansion_nesting.get() > 1))
-                .then(|| self.expand_unwrapped());
+            let _unwrapped =
+                (is_ref && self.expansion_nesting.get() > 1).then(|| self.expand_unwrapped());
             Some(
                 Box::pin(self.process_fragment_body(
                     &body,
                     source,
                     frame,
                     about_counter,
-                    /* in_template */ false,
+                    // A `#tag` body is the call's argument value, expanded with
+                    // `inTemplate`: its templates take no `about` of their own and
+                    // are not wrapped. `arg_value` carries that (the ref token is
+                    // marked by `tag_extension_token`).
+                    /* in_template */
+                    arg_value,
                 ))
                 .await,
             )
