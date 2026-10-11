@@ -14950,3 +14950,34 @@ corpus needed one online fill (`RUSTOID_FILL_FILES`) because the harness keys th
 file-info cache on `Title::getFullText()`, which this fix changes: the old,
 untrimmed `File: Queenmary…` key was what earlier runs had cached. No other page
 moves.
+
+## A heading closes on the last `=` run of the line
+
+The heading parser found the *first* `=` after the opening run and used it as the
+closer. Parsoid's `heading_preproc` is
+`s:$'='+  ( inlineline<h>?  $'='+ )?  spc:( space / sol_transparent )*  &eolf`:
+the closing `=` run is the last one on the line whose tail is only spaces and
+sol-transparent constructs, before the line ending. So `== a=b ==` closes on the
+final `==` (not the `=` in `a=b`), `== Foo == Bar` is not a heading at all (no
+closer at the line end), and `== X ====<!--c-->` still closes (a comment counts as
+`sol_transparent`).
+
+The bug showed as `<h1 id="Honorary_awards<span_class">Honorary awards<span class</h1>`
+for `== Honorary awards<span class="anchor" id="Honorary knighthoods"></span> ==`:
+the `=` in `class="anchor"` was taken for the closer, so the level fell to 1 and
+the raw `<span` markup leaked into the id and the text.
+
+### Fix
+
+`try_heading` now takes the last `=` run on the line and validates its tail by
+probing with `consume_spaces`/`consume_sol_transparent` (saved and restored, so
+the probe emits nothing) up to the line ending.
+
+### Effect
+
+On `Order of the British Empire` the heading renders as the service's
+(`<h2 id="Honorary_awards">Honorary awards<span class="anchor"
+id="Honorary_knighthoods"></span></h2>`) and the first difference moves from
+byte 76757 (18.32 % of the oracle) to 76856 (18.34 %). `Association football`
+moves from 2.73 % to 3.48 % — a `{{citation needed}}` heading earlier on the page.
+No other page moves.
