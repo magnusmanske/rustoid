@@ -15242,4 +15242,34 @@ transcluded), not to the nested one (`expansion_nesting` is 2 there, 1 at the
 `#tag`). Left for a session with the Cite source at hand; recorded, not guessed
 at.
 
+## A nested `<ref>` renders (and is numbered before its note)
+
+`REFERENCES-OF-ABOVE`'s nested `<ref>` stayed an `<extension>` element; rustoid now
+renders it. Cite's `References::processRefs` walks the DOM and, for a `<ref>`,
+`extractRefFromNode` calls `processNestedRefInRef` — which recurses `processRefs`
+over the note's body — **before** `addRef`, so a nested ref takes the lower
+number. It only does so when `allowNestedRef`, which is the enclosing
+`inTemplate()`; a `<ref>` reached through a transclusion (`{{#tag:ref|…}}`) records
+that as `mw:Transclusion` on its element.
+
+rustoid's note bodies live in `ref_bodies`/`ref_bodies_by_body`, not the DOM, so
+`collect` and `walk_render` could not see them. `cite::run` gains a `nested_body`
+closure (a note's stashed body by its wikitext); `collect` scans a transcluded
+note's body for nested refs before adding the note, and `walk_render` renders them
+into the body with a nested walk, stashing the result so the note list uses it
+instead of the raw body.
+
+### Effect
+
+`ISO 3166-1 alpha-2`'s nested citation now renders identically
+(`<sup about="#mwt2252" id="cite_ref-40" …>` on both sides, and the note body is
+no longer a stray `<extension>`), and `Sundial` 11.59 % → 12.10 %. No page
+regresses; the fixture guard stays at 877/896. The first difference on ISO is
+unchanged — it is the id count above, not the rendering.
+
+**Not done.** When `allowNestedRef` is false (a literal non-transcluded `<ref>`
+holding a `<ref>`), the service *bails* the inner tag to literal text
+(`A<ref>…</ref>B` → `A&lt;ref>…`), while rustoid still leaves an `<extension>`
+element. Rare, and recorded rather than guessed at.
+
 No page regresses; the fixture guard stays at 877/896.
