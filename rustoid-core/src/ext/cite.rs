@@ -143,6 +143,23 @@ impl Reference {
             _ => self.number.to_string(),
         }
     }
+
+    /// The label in the marker's `mw-reflink-text`.
+    ///
+    /// Cite's `MarkSymbolRenderer::renderFootnoteMarkLabel` prepends the group
+    /// name for a non-default group, *unless* the group has a custom label list
+    /// (the `cite_link_label_group-<group>` message on the wiki — the standard
+    /// alphabetic groups ship one). So a `group="note"` ref reads `[note 1]`,
+    /// while a `group="upper-alpha"` one reads `[A]`; the default group reads
+    /// `[1]`. The note list's `data-mw-footnote-number` uses
+    /// [`renderFootnoteNumber`](Self::label) instead, which never adds the
+    /// prefix.
+    pub fn mark_label(&self) -> String {
+        match self.group.as_str() {
+            "" | "lower-alpha" | "upper-alpha" | "lower-greek" => self.label(),
+            group => format!("{group} {}", self.label()),
+        }
+    }
 }
 
 /// `a`, `b`, … `z`, `aa`, … — Cite's alphabetic group labelling.
@@ -986,7 +1003,7 @@ pub fn ref_marker_nodes(
     close.push_child(Node::text("]"));
 
     text.push_child(open);
-    text.push_child(Node::text(reference.label()));
+    text.push_child(Node::text(reference.mark_label()));
     text.push_child(close);
     a.push_child(text);
     sup.push_child(a);
@@ -1120,6 +1137,21 @@ mod tests {
         assert_eq!(st.references.len(), 1);
         assert_eq!(st.references[0].uses.len(), 2);
         assert_eq!(st.references[0].uses[1], "cite_ref-x_1-1");
+    }
+
+    /// The reflink text of a grouped ref carries the group name, unless the group
+    /// has its own label list (the alphabetic groups do). The note list's
+    /// `data-mw-footnote-number` never does.
+    #[test]
+    fn a_grouped_ref_marks_its_note_with_the_group_name() {
+        let mut st = CiteState::new();
+        st.add("", "note", "x", false, None);
+        st.add("", "upper-alpha", "y", false, None);
+        st.add("", "", "z", false, None);
+        assert_eq!(st.references[0].label(), "1");
+        assert_eq!(st.references[0].mark_label(), "note 1");
+        assert_eq!(st.references[1].mark_label(), "A");
+        assert_eq!(st.references[2].mark_label(), "1");
     }
 
     /// Numbering restarts per group: a `lower-alpha` group numbers from 1 again.
