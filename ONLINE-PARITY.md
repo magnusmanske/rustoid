@@ -14926,3 +14926,27 @@ On `Order of the British Empire` the first difference moved from byte 54557
 (13.02 % of the oracle) to 54663 (13.67 %); its `<abbr title="Number">` header
 now reads exactly as the service's. No other corpus page moves. Verified against
 the live transform endpoint on `{{abbr|No.|Number}}`.
+
+## A title part is trimmed on both sides
+
+`[[File: Queenmaryformalportrait edit3.jpg|80px]]` rendered its media link as
+`File:_Queenmaryformalportrait_edit3.jpg` — the space after the namespace colon
+became an underscore instead of being dropped. MediaWiki normalises a title part
+by trimming it (both ends) before mapping spaces to underscores, so the
+service's `href`/`resource` is `File:Queenmaryformalportrait_edit3.jpg`.
+
+### Fix
+
+`TitleParser::collapse_title_whitespace` collapsed a whitespace run to one space
+and `trim_end()`ed it, leaving a leading space (the `File: X` form — the whole
+input is trimmed first, so only the space *after* the colon survived). It now
+trims both ends, matching `splitTitleString`.
+
+### Effect
+
+On `Order of the British Empire` the media file resolves and the first
+difference moves from byte 57226 (13.67 % of the oracle) to 76757 (18.32 %). The
+corpus needed one online fill (`RUSTOID_FILL_FILES`) because the harness keys the
+file-info cache on `Title::getFullText()`, which this fix changes: the old,
+untrimmed `File: Queenmary…` key was what earlier runs had cached. No other page
+moves.
