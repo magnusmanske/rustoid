@@ -622,7 +622,10 @@ pub(crate) fn collapse_title_whitespace(text: &str) -> String {
             prev_space = false;
         }
     }
-    out.trim_end().to_string()
+    // Both ends are trimmed, as MediaWiki does: a title part after a namespace
+    // colon keeps none of its surrounding whitespace, so `[[File: Foo.jpg]]`
+    // resolves to `File:Foo.jpg`, not `File:_Foo.jpg`.
+    out.trim().to_string()
 }
 
 #[cfg(test)]
