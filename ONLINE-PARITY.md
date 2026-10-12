@@ -15312,7 +15312,43 @@ no longer p-wrapped. No corpus page regresses. The gain is small because most
 pages reach `<references>` through `{{reflist}}` (a transclusion, never
 p-wrapped); the direct form is what the page uses.
 
-The next difference is a missing `data-mw-group` on a backlink `<a>`.
+The next difference was a missing `data-mw-group` on a backlink `<a>`.
+
+## A grouped note stamps `data-mw-group` on every back-link
+
+At 843031 the difference was the reference list again, but on the back-links:
+
+```
+parsoid: <a href="…#cite_ref-EA-vs-EV_35-0" data-mw-group="note" id="mwEug">
+rustoid: <a href="…#cite_ref-EA-vs-EV_35-0" id="mwEug">
+```
+
+Cite's `RefGroup::createLinkback` sets `data-mw-group` whenever the group is
+non-empty, for a reused note exactly as for a single-use one; only the
+`referencedBy` relation is restricted to the single-use form (a reused note puts
+it on the wrapping `<span>`, per `renderReferenceListElement`). rustoid gated
+both on single-use, so every reused grouped back-link lost the attribute. The
+ref marker in the body already had it right.
+
+`ISO 3166-1 alpha-2` **843031 → 941456** (84.88% → 94.79%); no corpus page
+regresses.
+
+## The next ISO difference: `mw.uri.new` is missing
+
+At 941456 rustoid serves `Error in Webarchive template: Invalid URL` where the
+service serves the archive link. `Module:Webarchive` bails when
+
+```lua
+good, uri = pcall( mw.uri.new, ulx.url1.url )
+if not good or nil == uri.host then return inlineError( 'Invalid URL' ) end
+```
+
+rustoid's `mw.uri` is a native table with only `encode`/`decode`/`anchorEncode`,
+so `mw.uri.new` is `nil` and the `pcall` fails. Scribunto ships `mw.uri` as the
+pure-Lua `mw.uri.lua` (`UriLibrary` only provides `anchorEncode`, `localUrl`,
+`fullUrl`, `canonicalUrl` and the `defaultUrl` option), so the faithful fix is to
+embed that library the way `strict`/`libraryUtil` already are and wire its
+`mw_interface`. Left for its own session.
 
 ## A nested `<ref>` renders (and is numbered before its note)
 
