@@ -16,6 +16,53 @@ pub fn gen_anchors(ast: &mut Node) {
     }
 }
 
+/// Make ids unique across the document, mirroring PHP's `dedupeHeadingIds`.
+///
+/// Two headings can carry the same text — `Order of the British Empire` has two
+/// "Sovereign and Grand Master" sections — and `genAnchors` would give both the
+/// same id. The walk registers every `id` it meets (lower-cased) in document
+/// order, and a heading — or the `mw:FallbackId` span inside one — whose id is
+/// already taken is suffixed `_2`, `_3`, …. The case folding and the suffix
+/// search are kept verbatim from PHP, because they decide fragment URLs that
+/// exist outside the wiki.
+pub fn dedupe_heading_ids(ast: &mut Node) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for child in &mut ast.children {
+        dedupe_rec(child, &mut seen);
+    }
+}
+
+fn dedupe_rec(node: &mut Node, seen: &mut std::collections::HashMap<String, usize>) {
+    if let Some(orig) = node.get_attr("id").map(str::to_string) {
+        let key = orig.to_lowercase();
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key.clone()) {
+            e.insert(1);
+        } else {
+            // Only headings and legacy fallback spans are renamed; any other
+            // element that reuses an id is left as it is (`IE 7` uniqueness is
+            // only enforced for headings, so that external links keep working).
+            let heading = matches!(node.kind, NodeKind::Element(ElementKind::Heading(_)));
+            let fallback = node
+                .get_attr("typeof")
+                .is_some_and(|t| t.split_whitespace().any(|x| x == "mw:FallbackId"));
+            if heading || fallback {
+                let current = seen.get(&key).copied().unwrap_or(0);
+                let mut suffix = current + 1;
+                seen.insert(key.clone(), suffix);
+                while seen.contains_key(&format!("{key}_{suffix}")) {
+                    suffix += 1;
+                    seen.insert(key.clone(), suffix);
+                }
+                node.set_attr("id", format!("{orig}_{suffix}"));
+                seen.insert(format!("{key}_{suffix}"), 1);
+            }
+        }
+    }
+    for child in &mut node.children {
+        dedupe_rec(child, seen);
+    }
+}
+
 fn gen_anchors_rec(node: &mut Node) {
     if let NodeKind::Element(ElementKind::Heading(_)) = node.kind {
         assign_heading_id(node);
@@ -129,5 +176,45 @@ mod tests {
         ast.push_child(html_heading);
         gen_anchors(&mut ast);
         assert_eq!(ast.children[0].get_attr("id"), Some("already-set"));
+    }
+
+    #[test]
+    fn test_duplicate_heading_ids_are_suffixed() {
+        let mut ast = Node::document();
+        ast.push_child(heading("Foo"));
+        ast.push_child(heading("Foo"));
+        ast.push_child(heading("Foo"));
+        gen_anchors(&mut ast);
+        dedupe_heading_ids(&mut ast);
+        let ids: Vec<_> = ast
+            .children
+            .iter()
+            .map(|h| h.get_attr("id").map(str::to_string))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some("Foo".to_string()),
+                Some("Foo_2".to_string()),
+                Some("Foo_3".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_duplicate_heading_ids_skip_a_taken_suffix() {
+        // A `Foo_2` id elsewhere in the document pushes the heading's suffix to
+        // `_3`, which is why the suffix search has to consult every id, not just
+        // the heading counter.
+        let mut taken = Node::element(ElementKind::Span);
+        taken.set_attr("id", "Foo_2");
+        let mut ast = Node::document();
+        ast.push_child(heading("Foo"));
+        ast.push_child(taken);
+        ast.push_child(heading("Foo"));
+        gen_anchors(&mut ast);
+        dedupe_heading_ids(&mut ast);
+        assert_eq!(ast.children[0].get_attr("id"), Some("Foo"));
+        assert_eq!(ast.children[2].get_attr("id"), Some("Foo_3"));
     }
 }

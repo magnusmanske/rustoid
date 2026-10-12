@@ -3060,6 +3060,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         );
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
+        crate::pipeline::headings::dedupe_heading_ids(&mut ast);
         // Repair `<a>`-inside-`<a>` bad nesting created by DOM-fragment unpack.
         // (The sync path has no media resolution, so this runs after the other
         // DOM transforms here; the async `build_ast` runs it after `AddMediaInfo`.)
@@ -3407,6 +3408,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         crate::pipeline::display_space::run(&mut ast);
         crate::pipeline::cleanup::run(&mut ast);
         crate::pipeline::headings::gen_anchors(&mut ast);
+        crate::pipeline::headings::dedupe_heading_ids(&mut ast);
         // AddMediaInfo: resolve file metadata for `mw:File` containers and
         // replace broken-media placeholders with real `<img>` elements (or mark
         // missing files as `mw:Error`). Mirrors PHP's `AddMediaInfo` pass.
