@@ -15333,22 +15333,35 @@ ref marker in the body already had it right.
 `ISO 3166-1 alpha-2` **843031 → 941456** (84.88% → 94.79%); no corpus page
 regresses.
 
-## The next ISO difference: `mw.uri.new` is missing
+## `mw.uri` is Scribunto's Lua library
 
-At 941456 rustoid serves `Error in Webarchive template: Invalid URL` where the
-service serves the archive link. `Module:Webarchive` bails when
+At 941456 rustoid served `Error in Webarchive template: Invalid URL` where the
+service served the archive link. `Module:Webarchive` bails when
 
 ```lua
 good, uri = pcall( mw.uri.new, ulx.url1.url )
 if not good or nil == uri.host then return inlineError( 'Invalid URL' ) end
 ```
 
-rustoid's `mw.uri` is a native table with only `encode`/`decode`/`anchorEncode`,
-so `mw.uri.new` is `nil` and the `pcall` fails. Scribunto ships `mw.uri` as the
-pure-Lua `mw.uri.lua` (`UriLibrary` only provides `anchorEncode`, `localUrl`,
-`fullUrl`, `canonicalUrl` and the `defaultUrl` option), so the faithful fix is to
-embed that library the way `strict`/`libraryUtil` already are and wire its
-`mw_interface`. Left for its own session.
+rustoid's `mw.uri` was a native table with only `encode`/`decode`/`anchorEncode`,
+so `mw.uri.new` was `nil`. Scribunto's `mw.uri` is the pure-Lua `mw.uri.lua` —
+PHP's `UriLibrary` only supplies the interface it calls back into (`anchorEncode`,
+`localUrl`/`fullUrl`/`canonicalUrl`, and the `defaultUrl` option). rustoid now
+vendors `mw.uri.lua` verbatim (`rustoid-core/src/lua/mw_uri.lua`) and wires the
+same interface, installed after `install_module_loader` (the library `require`s
+`libraryUtil` at load time and registers itself in `package.loaded`).
+`package.loaded` is now the module cache itself, so that registration reaches
+`require`.
+
+`libraryUtil` was also missing `checkTypeForIndex`, which the URI object's
+`__newindex` calls — that was the second failure behind the first, and it would
+have looked like "Invalid port number in string".
+
+`ISO 3166-1 alpha-2` **941456 → 941968** (94.79% → 94.84%) and `Megadeth`
+**1.37% → 2.60%**; no corpus page regresses.
+
+The next ISO difference is an id: the service gives the module's ` 2013-11-01 at
+the ` `<span>` an `id` that rustoid omits, shifting the two elements after it.
 
 ## A nested `<ref>` renders (and is numbered before its note)
 
