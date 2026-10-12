@@ -251,15 +251,20 @@ fn unquote_attr_value(raw: &str) -> String {
 /// `Template:Hlist/styles.css`), while an explicit prefix is honoured as written
 /// (`Module:Hatnote/styles.css`). Mirrors `$wgTemplateStylesDefaultNamespace`.
 fn templatestyles_title(config: &dyn crate::traits::SiteConfig, src: &str) -> crate::title::Title {
-    let (namespace, rest) = match src.split_once(':') {
-        Some((head, rest)) if config.namespaces().values().any(|ns| ns.canonical == head) => {
-            (Some(head), rest)
-        }
-        _ => (None, src),
-    };
-    let (ns_id, name) = match namespace {
-        Some(ns) => (config.namespace_id(ns).unwrap_or(10), rest),
-        None => (10, rest),
+    // A `<templatestyles src=…>` names a page; an explicit namespace prefix is
+    // resolved through `namespace_id`, which matches case-insensitively (the
+    // prefix in `src="template:sticky header/styles.css"` is lower-cased, and
+    // the canonical name is `Template`). Comparing `canonical` directly left
+    // `Template:template:sticky header/styles.css` as the title, which does not
+    // exist — so the stylesheet was never fetched and the tag leaked into the
+    // output unresolved. Without a recognisable prefix the source is a page in
+    // the Template namespace, which is the extension's default.
+    let (ns_id, name) = match src.split_once(':') {
+        Some((head, rest)) => match config.namespace_id(head) {
+            Some(id) => (id, rest),
+            None => (10, src),
+        },
+        None => (10, src),
     };
     crate::title::Title::new(ns_id, name.replace('_', " "))
 }
