@@ -15807,3 +15807,31 @@ corpus matches                 3/48   (unchanged)
 fixture guard                877/896  (unchanged)
 lib tests                       1031  (+2, the new cases)
 ```
+
+## Whitespace around a ref attribute's `=`
+
+`Order of the British Empire` next parked at 49.73 % on a `<ref>` whose
+`data-mw` was `{"name":"ref","attrs":{"name":""}}` where the wiki has
+`{"name":"mcgavin"}` — and the note's own id (`cite_note-mcgavin-40`) was right,
+which pointed straight at the echo.
+
+The page writes its Gazette refs as `<ref name = mcgavin>{{Cite web|…}}</ref>`,
+with spaces around the `=`, which HTML allows. `read_ref` recovers a ref's
+attributes from the raw tag source with two hand-written scanners:
+`attr_value`, which drives the note's identity, and `next_attr`, which builds
+the `data-mw.attrs` list. `attr_value` skipped whitespace before looking for
+`=`, so the name it found was `mcgavin`; `next_attr` looked for `=` *immediately*
+after the name, found a space instead, and recorded the attribute as valueless —
+`("name", "")`. So the note was keyed correctly and only the echoed attribute was
+empty. `next_attr` now skips that whitespace, and also accepts a single-quoted
+value the way `attr_value` does (a `<ref name='x'>` used to echo `'x'` with its
+quotes).
+
+### Effect
+
+```
+Order of the British Empire   49.73 % ->  55.51 %
+corpus matches                 3/48   (unchanged)
+fixture guard                877/896  (unchanged)
+lib tests                       1032  (+1)
+```
