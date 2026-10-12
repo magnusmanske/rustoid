@@ -511,20 +511,19 @@ fn placeholder_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, Strin
     }
 }
 
-/// The tag name of a numbered `extension` token — `#tag:ref` reached through
-/// `frame:extensionTag` — which the answer renderers carry on its own.
+/// The tag name of a stashed `extension` token — a `<ref>`, `<nowiki>`, a
+/// `#tag:…` — which the answer renderers carry on its own.
 ///
-/// Its `about` was spent during the answer's expansion, so rendering it back to
-/// wikitext and re-tokenizing it in the module's output would spend a second id
-/// for the same ref; the marker keeps the numbered token. An *unnumbered*
-/// extension (a `nowiki`, say) is left to the renderer: marking it would change
-/// the answer's shape where the service spells the tag (see
-/// [`Parser::markerize_nested`] for the nested case).
-fn numbered_extension_tag(item: &Item) -> Option<String> {
+/// The preprocessor replaces every extension tag with a strip marker, so a module
+/// is handed `<UNIQ--ref-…-QINU>` and never the tag's source. Rendering the
+/// source instead leaked the tag's body into the module's view — a comma in a
+/// ref's note made `Module:Detect singular` call a singular label plural. The
+/// marker keeps the token, which `substitute_strip_markers` splices back.
+fn stashed_extension_tag(item: &Item) -> Option<String> {
     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
         return None;
     };
-    if t.name != "extension" || !t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
+    if t.name != "extension" {
         return None;
     }
     Some(extension_name(t).unwrap_or_else(|| "extension".to_string()))
@@ -533,14 +532,14 @@ fn numbered_extension_tag(item: &Item) -> Option<String> {
 /// The span a marker-carrying renderer must carry as one strip marker starting at
 /// `items[i]`: the exclusive end index, the items, and the marker's name.
 ///
-/// A `mw:DOMFragment` placeholder (see [`placeholder_span`]) and a numbered
+/// A `mw:DOMFragment` placeholder (see [`placeholder_span`]) and a stashed
 /// extension token are carried; everything else the answer renderer writes itself
 /// or drops, under its own policy.
 fn answer_marker_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, String)> {
     if let Some(span) = placeholder_span(items, i) {
         return Some(span);
     }
-    numbered_extension_tag(&items[i]).map(|tag| (i + 1, vec![items[i].clone()], tag))
+    stashed_extension_tag(&items[i]).map(|tag| (i + 1, vec![items[i].clone()], tag))
 }
 
 /// Emit the `mw:dom-fragment-token` placeholder for a `<gallery>` extension,
@@ -3589,13 +3588,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// own answer shape and keeps the output alive through the module's string
     /// handling.
     ///
-    /// A *numbered* extension token (`#tag:ref` reached through
-    /// `frame:extensionTag`) is carried the same way. Its `about` was spent
-    /// during this answer's expansion, so rendering it back to wikitext and
-    /// re-tokenizing it in the module's output would spend a second id for the
-    /// same ref — the double-walk the `<indicator>` had (see
-    /// `expand_one_indicator`). The marker keeps the numbered token, which
-    /// `substitute_strip_markers` splices back unchanged.
+    /// A stashed extension token (a `<ref>`, `<nowiki>`, `#tag:…`) is carried
+    /// the same way. The preprocessor hands a module a strip marker for every
+    /// extension, so rendering the source back and re-tokenizing it in the
+    /// module's output would both spell a tag the service stashed and spend a
+    /// second id for a `#tag:ref` whose `about` the expansion already spent —
+    /// the double-walk the `<indicator>` had (see `expand_one_indicator`). The
+    /// marker keeps the token, which `substitute_strip_markers` splices back
+    /// unchanged.
     ///
     /// The answer is the expansion's *text*, so a stale recorded source (one that
     /// still spells a `{{…}}` the frame expanded, like `Template:Div col`'s
@@ -6856,8 +6856,10 @@ fn argument_value_or_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 ///   `{{#invoke:Unsubst||$B={{DMCA|A|B|C}}}}` is the case that pins it: the `$B`
 ///   value expands to a `wikilink`, and rendering it without this arm produced
 ///   `[[]]`.
-/// - `extension` — the source of the tag (`<nowiki/>`), which is what a module
-///   receives for one.
+/// - `extension` — **declined**. The preprocessor stashes an extension tag as a
+///   strip marker, so a module receives `<UNIQ--ref-…-QINU>` and never the tag's
+///   source; returning `None` hands the value to the marker renderer, which
+///   keeps the token under a marker `substitute_strip_markers` splices back.
 /// - an `mw:Entity` span (`&#32;`, `&nbsp;`) — the entity *as written*, i.e. the
 ///   span's `src`. Its decoded character and its end tag are skipped: the source
 ///   stands for all three, and re-parsing the module's output rebuilds the same
@@ -6904,7 +6906,15 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 );
             }
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension" => {
-                out.push_str(t.data_parsoid.src.as_deref()?);
+                // An extension tag is *stashed* as a strip marker by the
+                // preprocessor, so a module is handed `<UNIQ--ref-…-QINU>`, never
+                // the tag's source. Spelling the source leaked the tag's body —
+                // and any comma or "and" in it — into the module's view:
+                // `{{#invoke:Detect singular|pluralize|<ref>a, b</ref>|plural=s}}`
+                // answered `s` where the service answers the empty string.
+                // Declining hands the value to the marker renderer, which keeps
+                // the token under a marker `substitute_strip_markers` splices back.
+                return None;
             }
             // A template or parser-function call left unexpanded. Its source is the
             // call, and a module is handed that text so its own output re-expands it
