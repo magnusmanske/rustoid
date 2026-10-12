@@ -15360,8 +15360,35 @@ have looked like "Invalid port number in string".
 `ISO 3166-1 alpha-2` **941456 → 941968** (94.79% → 94.84%) and `Megadeth`
 **1.37% → 2.60%**; no corpus page regresses.
 
-The next ISO difference is an id: the service gives the module's ` 2013-11-01 at
+The next ISO difference was an id: the service gives the module's ` 2013-11-01 at
 the ` `<span>` an `id` that rustoid omits, shifting the two elements after it.
+
+## `ISO 3166-1 alpha-2` reaches byte parity
+
+Two more defects sat between 941968 and the end of the page.
+
+**A `tmp`-only `data-parsoid` in native content was not keyed.** The span the
+service ids is the text-run wrapper of the `{{webarchive}}` fragment, inside the
+reference note — i.e. inside `mw:Extension/references`, which
+`CleanUp::inNativeContent` exempts from the discard. Its stored `data-parsoid` is
+`{"tmp":{"wrapper":true}}`, which serializes to `{}`; Parsoid keeps the
+page-bundle entry all the same, so the node takes an id. rustoid gave the
+empty-dp slot only to nodes with no `data-parsoid` at all. `discard_node`'s
+native branch now keys a node whose `data-parsoid` draws no id too.
+
+**`{{DEFAULTSORT:key}}` spilled its source.** The behavior switch has no visible
+output — its transclusion wrapper stays empty, and Parsoid's `pf_defaultsort`
+emits a `mw:PageProp/categorydefaultsort` meta that the final render no longer
+carries (the same as `{{DISPLAYTITLE:…}}`). Its magic-word alias spells the
+argument's colon (`DEFAULTSORT:`, where `displaytitle`'s alias has none), so
+`magic_word_for_variable` missed the bare name and the call fell through to the
+unknown-function fallback, which returns its own source. That text was also
+*wrappable*, so a line holding only the call was p-wrapped — the last structural
+difference on the page. `call_parser_function` now handles the name (and its two
+aliases).
+
+`ISO 3166-1 alpha-2` **941968 → matched**. The corpus goes **2/48 → 3/48** with no
+page regressing; `braces=4` becomes `braces=3`, the oracle's count.
 
 ## A nested `<ref>` renders (and is numbered before its note)
 
