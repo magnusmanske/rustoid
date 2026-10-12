@@ -1179,12 +1179,14 @@ fn backlink_node(
 
     let mut a = Node::element(ElementKind::Other("a".to_string()));
     a.set_attr("href", format!("./{page}#{use_id}"));
-    // The group marker and the `referencedBy` relation both appear only on the
-    // single-use form in Cite's output.
+    // Cite's `createLinkback` stamps `data-mw-group` on every back-link of a
+    // grouped note, single-use or not. The `referencedBy` relation, by contrast,
+    // is on the `<a>` only for the single-use form (a multi-use note puts it on
+    // the wrapping `<span>`).
+    if !group.is_empty() {
+        a.set_attr("data-mw-group", group);
+    }
     if label.is_none() {
-        if !group.is_empty() {
-            a.set_attr("data-mw-group", group);
-        }
         a.set_attr("rel", "mw:referencedBy");
     }
     mark_for_id(&mut a);
