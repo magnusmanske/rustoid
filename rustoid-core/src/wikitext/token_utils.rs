@@ -385,6 +385,23 @@ pub fn tokens_to_source(tokens: &[Item]) -> String {
                     if skip_entity_decoded_text(t, tokens.get(i + 1)) {
                         i += 1;
                     }
+                } else if let ParsoidToken::SelfclosingTag(tk) = t
+                    && tk.name == "mw-quote"
+                {
+                    // A quote token carries its apostrophe run in the `value`
+                    // attribute and has no `src`, so a source reconstruction has to
+                    // spell the run back out. Dropping it made this lossy, and
+                    // [`rewrite_expanded_attrs`] then mistook an unchanged value for
+                    // an expansion and patched the `src`, losing the italics: a
+                    // `[[x|''E''=''mc'']]` inside a module argument came back as
+                    // `[[x|E=mc]]`.
+                    out.push_str(
+                        &tk.attribs
+                            .iter()
+                            .find(|kv| kv.key.as_str() == Some("value"))
+                            .map(|kv| key_value_source_text(&kv.value))
+                            .unwrap_or_else(|| "''".to_string()),
+                    );
                 } else if let Some(src) = table_token_wikitext(t) {
                     out.push_str(&src);
                 }
@@ -671,6 +688,45 @@ mod tests {
             ))),
         ];
         assert_eq!(tokens_to_source(&tokens), "&#59;");
+    }
+
+    fn mw_quote(run: &str) -> Item {
+        let mut tk = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+            "mw-quote",
+            vec![],
+            DataParsoid::default(),
+        );
+        tk.add_attribute_str("value", run);
+        Item::Tok(ParsoidToken::SelfclosingTag(tk))
+    }
+
+    #[test]
+    fn tokens_to_source_spells_a_quote_run() {
+        // A quote token has no `src`; its apostrophe run lives in the `value`
+        // attribute. A source reconstruction that drops it is lossy.
+        let tokens = vec![mw_quote("''"), Item::Str("E".to_string()), mw_quote("''")];
+        assert_eq!(tokens_to_source(&tokens), "''E''");
+    }
+
+    #[test]
+    fn rewrite_expanded_attrs_keeps_a_value_whose_only_construct_is_a_quote() {
+        // The italics `''E''` are unchanged by expansion, so the recorded source
+        // must be left as written. A lossy reconstruction made the value look
+        // expanded and patched the `src`, stripping the quotes — which is how
+        // `[[x|''E'']]` inside a module argument came back as `[[x|E]]`.
+        let src = "[[x|''E'']]";
+        let attribs = vec![KV {
+            key: KeyValue::Str("mw:maybeContent".to_string()),
+            value: KeyValue::Tokens(vec![
+                mw_quote("''"),
+                Item::Str("E".to_string()),
+                mw_quote("''"),
+            ]),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: Some("''E''".to_string()),
+        }];
+        assert_eq!(rewrite_expanded_attrs(src, &attribs), None);
     }
 
     #[test]
