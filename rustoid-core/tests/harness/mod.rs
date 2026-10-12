@@ -2165,7 +2165,8 @@ fn wrap_table_rows_in_tbody(nodes: &mut [MNode]) {
 /// Strip only the round-trip metadata (`data-parsoid`, `data-mw`) and HTML
 /// comments, plus the parsoid-only "unnecessary" attributes that PHP's
 /// `normalizeOut` removes even in `parsoidOnly` mode (`about`, `prefix`, `rev`,
-/// `datatype`, `inlist`, `usemap`, `vocab`, `data-mw-original-href`). Structural
+/// `datatype`, `inlist`, `usemap`, `vocab`, `data-mw-original-href`,
+/// `data-mw-wikitext`). Structural
 /// attributes (`rel`, `href`, `title`, `class`, `typeof`) are kept, so the
 /// comparison is faithful to Parsoid's rendered HTML.
 fn strip_data_attrs(html: &str) -> String {
@@ -2185,6 +2186,7 @@ fn strip_data_attrs(html: &str) -> String {
         "data-mw-original-href",
         "data-parsoid",
         "data-mw",
+        "data-mw-wikitext",
         "prefix",
         "about",
         "rev",

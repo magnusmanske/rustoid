@@ -868,7 +868,13 @@ impl<'a> PegTokenizer<'a> {
             }
             self.emit_token(ParsoidToken::Tag(TagTk::new(
                 format!("h{level}"),
-                vec![],
+                vec![crate::wikitext::tokens_v2::KV {
+                    key: crate::wikitext::tokens_v2::KeyValue::Str("data-mw-wikitext".to_string()),
+                    value: crate::wikitext::tokens_v2::KeyValue::Str(String::new()),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                }],
                 dp,
             )));
 
