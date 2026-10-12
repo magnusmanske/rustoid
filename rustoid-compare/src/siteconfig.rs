@@ -21,7 +21,7 @@
 //! rather than a mutation of `MockSiteConfig`, so the fixture suite keeps its
 //! pinned configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustoid_core::lua::engine::SiteStats;
 use rustoid_core::traits::{
@@ -41,6 +41,12 @@ pub struct WikiSiteConfig {
     namespaces: HashMap<i32, NamespaceInfo>,
     interwiki_map: HashMap<String, InterwikiInfo>,
     magic_words: MagicWordMap,
+    /// The site's magic *variables* — the `variables` prop of `siteinfo`, which
+    /// MediaWiki derives from `MagicWordFactory::$mVariableIDs`. A magic word
+    /// that is not in this set is not a variable, so its no-colon, no-hash form
+    /// must fall through to a template call: `timef-both` (alias `both`) is a
+    /// parser function, so `{{both|…}}` is `Template:Both`.
+    magic_word_variables: HashSet<String>,
     function_hooks: Vec<String>,
     extension_tags: Vec<String>,
     server_url: String,
@@ -58,6 +64,7 @@ impl Default for WikiSiteConfig {
             namespaces: HashMap::new(),
             interwiki_map: HashMap::new(),
             magic_words: MagicWordMap::default(),
+            magic_word_variables: HashSet::new(),
             function_hooks: Vec::new(),
             extension_tags: Vec::new(),
             server_url: String::new(),
@@ -191,6 +198,10 @@ impl WikiSiteConfig {
             cfg.extension_tags.dedup();
         }
 
+        if let Some(vars) = q.variables {
+            cfg.magic_word_variables = vars.into_iter().map(|v| v.to_lowercase()).collect();
+        }
+
         if let Some(hooks) = q.functionhooks {
             cfg.function_hooks = hooks.into_iter().map(|h| h.to_lowercase()).collect();
             cfg.function_hooks.sort();
@@ -297,6 +308,12 @@ impl SiteConfig for WikiSiteConfig {
         &self.magic_words
     }
 
+    fn magic_word_variables(&self) -> Option<&HashSet<String>> {
+        // `None` means "the site did not tell us", which keeps the older
+        // alias-table heuristic; an empty set would mean "no variables at all".
+        (!self.magic_word_variables.is_empty()).then_some(&self.magic_word_variables)
+    }
+
     fn function_hooks(&self) -> &[String] {
         &self.function_hooks
     }
@@ -392,6 +409,9 @@ struct SiteInfoQuery {
     namespacealiases: Option<Vec<NamespaceAlias>>,
     #[serde(default)]
     magicwords: Option<Vec<MagicWord>>,
+    /// Canonical names of the magic *variables* (`MagicWordFactory::$mVariableIDs`).
+    #[serde(default)]
+    variables: Option<Vec<String>>,
     #[serde(default)]
     functionhooks: Option<Vec<String>>,
     #[serde(default)]

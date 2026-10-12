@@ -615,23 +615,42 @@ fn reserved_page_name_variable(name: &str) -> Option<String> {
     NAMES.contains(&lower.as_str()).then_some(lower)
 }
 
-/// Find a magic variable whose alias matches `name`. Mirrors
-/// `SiteConfig::getMagicWordForVariable`.
-/// Returns (canonical name, whether it's a variable). Variables are magic
-/// words without a `#` and without an `=`-style value.
-fn magic_word_for_variable(config: &dyn SiteConfig, name: &str) -> Option<(String, bool)> {
+/// The canonical name of the magic word whose alias is `name` (case-insensitively),
+/// or `None`. Mirrors the alias lookup in `MagicWordArray`. Media magic words
+/// (`img_*`, `timedmedia_*`) are not candidates: they are image options, not
+/// magic words a `{{…}}` construct can reach.
+fn magic_word_canonical(config: &dyn SiteConfig, name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     for (canonical, entry) in config.magic_words() {
-        // Skip media/parser-function magic words (img_*, timedmedia_*).
         if canonical.starts_with("img_") || canonical.starts_with("timedmedia_") {
             continue;
         }
         if entry.aliases.iter().any(|a| a.to_lowercase() == lower) {
-            return Some((canonical.clone(), true));
+            return Some(canonical.clone());
         }
     }
+    None
+}
+
+/// Find a magic **variable** whose alias matches `name`. Mirrors
+/// `SiteConfig::getMagicWordForVariable`.
+///
+/// The alias table is a superset of the variables: it also lists parser
+/// functions and behavior switches (`timef-both` with alias `both`, `notoc` with
+/// alias `NOTOC`), and those are only magic words when *invoked* as one — with a
+/// `#` or a colon. When the site reports its variable set, only a word in it may
+/// answer here; otherwise the caller falls back to the alias table.
+fn magic_word_for_variable(config: &dyn SiteConfig, name: &str) -> Option<(String, bool)> {
+    if let Some(canonical) = magic_word_canonical(config, name) {
+        if let Some(variables) = config.magic_word_variables()
+            && !variables.contains(&canonical.to_lowercase())
+        {
+            return None;
+        }
+        return Some((canonical, true));
+    }
     // The API's table is incomplete for these; see the helper's doc.
-    reserved_page_name_variable(&lower).map(|canonical| (canonical, true))
+    reserved_page_name_variable(&name.to_lowercase()).map(|canonical| (canonical, true))
 }
 
 /// The full `action|title` argument of a protection magic word.
@@ -1502,7 +1521,7 @@ impl TemplateHandler {
             // implement — `{{SHORTDESC:…}}`, `{{formatnum:…}}` — must still answer
             // its magic word rather than spill its source text.
             _ => match no_hash_spelling
-                .then(|| magic_word_for_variable(config, name).map(|(canonical, _)| canonical))
+                .then(|| magic_word_canonical(config, name))
                 .flatten()
             {
                 Some(canonical) => {
@@ -2260,6 +2279,31 @@ mod tests {
                 assert!(!broken);
             }
             other => panic!("expected parser function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_magic_word_that_is_not_a_variable_does_not_answer_as_one() {
+        // The alias table lists parser functions and behavior switches too —
+        // `timef-both` carries alias `both` — and a bare invocation of one is a
+        // template call (the legacy parser only reaches a "nohash" parser
+        // function through a `#` or a colon; otherwise the name must be a magic
+        // *variable*). The service renders `{{both|x|y}}` as `Template:Both`.
+        // Marking the variable set is what makes the mock report it.
+        let mut config = MockSiteConfig::new();
+        config.add_magic_word("timef-both", &["both"]);
+        config.add_function_hook("timef-both");
+        config.add_magic_word("pagename", &["PAGENAME"]);
+        config.add_magic_word_variable("pagename");
+
+        match resolve_template_target(&config, None, "both").unwrap() {
+            ResolvedTarget::Template { name, .. } => assert_eq!(name, "Template:Both"),
+            other => panic!("expected a template, got {other:?}"),
+        }
+        // A word that *is* a variable still answers as one.
+        match resolve_template_target(&config, None, "PAGENAME").unwrap() {
+            ResolvedTarget::Variable { name, .. } => assert_eq!(name, "pagename"),
+            other => panic!("expected a variable, got {other:?}"),
         }
     }
 

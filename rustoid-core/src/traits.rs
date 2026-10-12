@@ -410,6 +410,22 @@ pub trait SiteConfig: Send + Sync {
     /// Magic word aliases for this wiki (localized names like `"ANCHORENCODE"` etc.).
     fn magic_words(&self) -> &MagicWordMap;
 
+    /// Canonical names of the magic **variables** — the `variables` prop of
+    /// `siteinfo`, which MediaWiki derives from `MagicWordFactory::$mVariableIDs`.
+    ///
+    /// The alias table is a superset: it also lists parser functions and
+    /// behavior switches (`timef-both` with alias `both`, `notoc` with alias
+    /// `NOTOC`). Those are only magic words when *invoked* as one — with a `#`
+    /// or a colon — so without this set a bare `{{both}}` would answer the
+    /// variable path (the empty string) instead of transcluding `Template:Both`.
+    ///
+    /// `None` means the site did not report the set (a mock, or a `siteinfo`
+    /// fetched before MediaWiki exposed it), and the caller falls back to the
+    /// alias table.
+    fn magic_word_variables(&self) -> Option<&std::collections::HashSet<String>> {
+        None
+    }
+
     /// Names of the wiki's parser functions (`functionhooks`). Mirrors PHP's
     /// `SiteConfig::$apiFunctionHooks`, which `updateFunctionSynonym` uses to
     /// decide whether a synonym is stored with a leading `#`. Core registers

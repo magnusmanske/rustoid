@@ -475,6 +475,12 @@ pub struct MockSiteConfig {
     namespaces: HashMap<i32, NamespaceInfo>,
     interwiki_map: HashMap<String, InterwikiInfo>,
     magic_words: MagicWordMap,
+    /// Canonical names of the magic *variables* (PHP's
+    /// `MagicWordFactory::$mVariableIDs`, reported by `siteinfo`'s `variables`
+    /// prop). `None` means "not reported", which keeps the alias-table
+    /// fallback; a test that pins the routing opts in via
+    /// [`Self::add_magic_word_variable`].
+    magic_word_variables: Option<std::collections::HashSet<String>>,
     /// Parser-function names registered by the wiki (PHP's `functionhooks`).
     function_hooks: Vec<String>,
     extension_tags: Vec<String>,
@@ -507,6 +513,7 @@ impl MockSiteConfig {
             namespaces: HashMap::new(),
             interwiki_map: HashMap::new(),
             magic_words: HashMap::new(),
+            magic_word_variables: None,
             function_hooks: Vec::new(),
             extension_tags: vec![
                 "nowiki".to_string(),
@@ -776,6 +783,17 @@ impl MockSiteConfig {
         );
     }
 
+    /// Mark a magic word as a *variable* (PHP's `MagicWordFactory::$mVariableIDs`).
+    /// Once any word is marked, [`SiteConfig::magic_word_variables`] reports the
+    /// set and only marked words resolve as variables — the rest of the alias
+    /// table is parser functions and behavior switches, whose bare form is a
+    /// template call.
+    pub fn add_magic_word_variable(&mut self, canonical: &str) {
+        self.magic_word_variables
+            .get_or_insert_with(Default::default)
+            .insert(canonical.to_lowercase());
+    }
+
     /// Register a parser function (PHP's `functionhooks`). Needed for functions
     /// core lists in `$noHashFunctions`, which are stored without a leading `#`
     /// but invoked with one (`{{#dir:en}}`).
@@ -950,6 +968,10 @@ impl SiteConfig for MockSiteConfig {
 
     fn magic_words(&self) -> &MagicWordMap {
         &self.magic_words
+    }
+
+    fn magic_word_variables(&self) -> Option<&std::collections::HashSet<String>> {
+        self.magic_word_variables.as_ref()
     }
 
     fn function_hooks(&self) -> &[String] {
