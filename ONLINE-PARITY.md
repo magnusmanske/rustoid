@@ -15714,3 +15714,58 @@ corpus matches              3/48   (unchanged)
 fixture guard             877/896  (unchanged)
 lib tests                    1029  (unchanged)
 ```
+
+## A heading carries an empty `data-mw-wikitext`
+
+The wiki's current Parsoid emits every heading as
+`<h2 data-mw-wikitext="" id="…">`. The tokenizer's `heading` rule builds the
+tag with a `data-mw-wikitext` attribute — empty for a heading written in the
+page, filled by core's preprocessor for one that came through a template — and
+rustoid emitted nothing. So rustoid diverged at the *first heading* of every
+page that has one.
+
+This was invisible until the oracle cache was refreshed. The pinned oracle for
+`Zebra` had been fetched before Parsoid gained the attribute, so it carried no
+`data-mw-wikitext` either and rustoid "matched". A refresh of one page
+(`Order of the British Empire`) showed the attribute as the whole remaining
+difference, and the live `rest_v1` output for `Zebra` carries it 21 times.
+
+The fix emits it in `try_heading`, and adds it to the fixture harness's
+`strip_data_attrs` — Parsoid's own `TestUtils::$unnecessaryAttribs` already
+lists `data-mw-wikitext`, so the pinned fixtures (which predate the change)
+stay green.
+
+### A failed fact fetch must not be cached as "none"
+
+Refreshing the oracle exposed a second problem that was not rustoid's rendering:
+several pages served `Module:Protection banner`'s
+`Category:Wikipedia_pages_with_incorrect_protection_templates` where the wiki
+served the real protection category. The cause was in the comparison harness,
+not the parser. `pageinfo::title_protection` (and its `title_categories` /
+`title_stability` siblings) caught a transport error per chunk with
+`let Ok(body) = … else { continue }`, then fell through to the "the wiki never
+mentioned it" default for every title in the chunk. The harness caches what
+that function returns, so **one `HTTP 429` recorded 50 pages as unprotected** —
+and `{{pp-move}}` then read the page as having a wrong protection template.
+
+The fix is to return `Result` and propagate, so the caller's error path (which
+already exists for `page_info`) leaves the miss unfilled and a later run
+retries it. The three callers now `match` instead of assuming `Ok`.
+
+Note on the cache: refreshing the oracle cache is not enough to make a run
+consistent. The pinned oracle must be refreshed **together** with the template,
+module and fact caches, or rustoid renders the *old* template revisions the
+cached facts hold against the *new* revisions the oracle used. The `--refresh`
+flag drops only the page's own entries; the fact kinds (`tpl:`, `mod:`, `prot:`,
+`info:`, `cat:`, `flag:`) never expire, so they were deleted by hand and
+re-fetched with a paced online pass.
+
+### Effect
+
+```
+fixture guard             877/896  (unchanged)
+lib tests                    1029  (unchanged)
+corpus                       3/48  (against the refreshed oracle; the three
+                                   matches are ISO 3166-1 alpha-2, Zebra and
+                                   Quicksilver (film))
+```
