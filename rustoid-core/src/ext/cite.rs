@@ -995,22 +995,39 @@ fn next_attr(rest: &str) -> Option<(&str, &str, usize)> {
         return None;
     }
     let after_key = &trimmed[key_end..];
-    if !after_key.starts_with('=') {
+    // HTML allows whitespace around the `=`, and a ref may be written
+    // `<ref name = mcgavin>`; without skipping it here the `name` looked like a
+    // valueless attribute (`name=""`), so `data-mw.attrs` lost the name even
+    // though the note and its markers were keyed on it.
+    let after_ws = after_key.trim_start();
+    let ws_len = after_key.len() - after_ws.len();
+    if !after_ws.starts_with('=') {
         // A valueless attribute: Parsoid records it with an empty string.
-        return Some((key, "", skipped + key_end));
+        return Some((key, "", skipped + key_end + ws_len));
     }
-    let after_eq = after_key[1..].trim_start();
-    let eq_skip = after_key[1..].len() - after_eq.len();
-    let (value, value_len) = if let Some(stripped) = after_eq.strip_prefix('"') {
-        match stripped.find('"') {
-            Some(end) => (&stripped[..end], end + 2),
-            None => (stripped, stripped.len() + 1),
+    let after_eq = after_ws[1..].trim_start();
+    let eq_skip = after_ws[1..].len() - after_eq.len();
+    let (value, value_len) = match after_eq.chars().next() {
+        // A quoted value (double or single) ends at the matching quote; the
+        // quotes are not part of it. Mirrors `attr_value`.
+        Some(q @ ('"' | '\'')) => {
+            let stripped = &after_eq[1..];
+            match stripped.find(q) {
+                Some(end) => (&stripped[..end], end + 2),
+                None => (stripped, stripped.len() + 1),
+            }
         }
-    } else {
-        let end = after_eq.find(char::is_whitespace).unwrap_or(after_eq.len());
-        (&after_eq[..end], end)
+        // An unquoted value runs to the next whitespace.
+        _ => {
+            let end = after_eq.find(char::is_whitespace).unwrap_or(after_eq.len());
+            (&after_eq[..end], end)
+        }
     };
-    Some((key, value, skipped + key_end + 1 + eq_skip + value_len))
+    Some((
+        key,
+        value,
+        skipped + key_end + ws_len + 1 + eq_skip + value_len,
+    ))
 }
 
 /// A JSON string literal, escaped the way Parsoid's serializer does.
@@ -1462,6 +1479,33 @@ mod tests {
         assert_eq!(name("<ref name=a/b//>"), "a/b/");
         assert_eq!(name("<ref name=a/b/ >x</ref>"), "a/b/");
         assert_eq!(name("<ref name=ab/>"), "ab");
+    }
+
+    /// HTML allows whitespace around the `=`; `<ref name = mcgavin>` names the
+    /// ref — and `data-mw.attrs` — `mcgavin`, not the empty string. A genuinely
+    /// valueless attribute still records `""`.
+    #[test]
+    fn whitespace_around_the_equals_sign_is_allowed() {
+        let pairs = |s: &str| tag_attrs(start_tag_attrs(s, "ref").unwrap());
+        assert_eq!(
+            pairs("<ref name = mcgavin>x</ref>"),
+            vec![("name".to_string(), "mcgavin".to_string())]
+        );
+        assert_eq!(
+            pairs("<ref name =mcgavin group = note>x</ref>"),
+            vec![
+                ("name".to_string(), "mcgavin".to_string()),
+                ("group".to_string(), "note".to_string())
+            ]
+        );
+        assert_eq!(
+            pairs("<ref name = 'mcgavin'/>"),
+            vec![("name".to_string(), "mcgavin".to_string())]
+        );
+        assert_eq!(
+            pairs("<ref name>x</ref>"),
+            vec![("name".to_string(), String::new())]
+        );
     }
 
     #[test]
