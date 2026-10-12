@@ -133,7 +133,15 @@ async fn populate_protection(
     cache: &Arc<Mutex<WikiCache>>,
     titles: &[String],
 ) {
-    let fetched = rustoid_compare::pageinfo::title_protection(client, titles).await;
+    let fetched = match rustoid_compare::pageinfo::title_protection(client, titles).await {
+        Ok(fetched) => fetched,
+        // A transport failure must not be recorded as "unprotected", so leave the
+        // titles unanswered and let a later run retry them.
+        Err(e) => {
+            eprintln!("protection fetch failed: {e}");
+            return;
+        }
+    };
     for title in titles {
         let entry = fetched.get(title).cloned().unwrap_or_default();
         let body = serde_json::to_string(&entry).expect("serialize protection");

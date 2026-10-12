@@ -105,17 +105,23 @@ pub async fn page_info(
 pub async fn title_protection(
     client: &WikiClient,
     titles: &[String],
-) -> HashMap<String, rustoid_core::traits::ProtectionEntry> {
+) -> Result<HashMap<String, rustoid_core::traits::ProtectionEntry>> {
     use rustoid_core::traits::ProtectionEntry;
 
     let mut out = HashMap::new();
     for chunk in titles.chunks(TITLES_PER_QUERY) {
-        let Ok(body) = client.protection_json(chunk).await else {
-            continue;
-        };
-        let Ok(parsed) = serde_json::from_str::<ProtectionResponse>(&body) else {
-            continue;
-        };
+        // A transport failure must *not* fall through to the default (empty)
+        // entry below: the caller caches what this returns, so a rate-limited
+        // chunk would record 50 pages as unprotected, and `Module:Protection
+        // banner` would then emit its "incorrect protection template" category on
+        // every later offline run. Propagate instead, and let the caller leave
+        // the miss unfilled.
+        let body = client.protection_json(chunk).await?;
+        let parsed: ProtectionResponse =
+            serde_json::from_str(&body).map_err(|e| CompareError::Response {
+                url: client.wiki().api_url(),
+                message: format!("protection parse: {e}"),
+            })?;
         let mut asked: HashMap<String, String> = HashMap::new();
         for t in chunk {
             asked.insert(normalise(t), t.clone());
@@ -156,7 +162,7 @@ pub async fn title_protection(
     for t in titles {
         out.entry(t.clone()).or_default();
     }
-    out
+    Ok(out)
 }
 
 /// Convert a protection expiry to the form MediaWiki exposes to the parser.
@@ -332,15 +338,17 @@ struct CategoriesResponse {
 pub async fn title_categories(
     client: &WikiClient,
     titles: &[String],
-) -> HashMap<String, Vec<String>> {
+) -> Result<HashMap<String, Vec<String>>> {
     let mut out = HashMap::new();
     for chunk in titles.chunks(TITLES_PER_QUERY) {
-        let Ok(body) = client.categories_json(chunk).await else {
-            continue;
-        };
-        let Ok(parsed) = serde_json::from_str::<CategoriesResponse>(&body) else {
-            continue;
-        };
+        // Propagate a transport failure: the caller caches what this returns, so
+        // swallowing it would record "no categories" for the whole chunk.
+        let body = client.categories_json(chunk).await?;
+        let parsed: CategoriesResponse =
+            serde_json::from_str(&body).map_err(|e| CompareError::Response {
+                url: client.wiki().api_url(),
+                message: format!("categories parse: {e}"),
+            })?;
         let mut asked: HashMap<String, String> = HashMap::new();
         for t in chunk {
             asked.insert(normalise(t), t.clone());
@@ -364,7 +372,7 @@ pub async fn title_categories(
     for t in titles {
         out.entry(t.clone()).or_default();
     }
-    out
+    Ok(out)
 }
 
 /// A category link's member name: `Category:Foo` → `Foo`, as `Title::getText()`
@@ -395,17 +403,20 @@ struct FlaggedResponse {
 pub async fn title_stability(
     client: &WikiClient,
     titles: &[String],
-) -> HashMap<String, rustoid_core::traits::StabilitySettings> {
+) -> Result<HashMap<String, rustoid_core::traits::StabilitySettings>> {
     use rustoid_core::traits::StabilitySettings;
 
     let mut out = HashMap::new();
     for chunk in titles.chunks(TITLES_PER_QUERY) {
-        let Ok(body) = client.flagged_json(chunk).await else {
-            continue;
-        };
-        let Ok(parsed) = serde_json::from_str::<FlaggedResponse>(&body) else {
-            continue;
-        };
+        // Propagate a transport failure: the caller caches what this returns, so
+        // swallowing it would record "no pending-changes configuration" for the
+        // whole chunk.
+        let body = client.flagged_json(chunk).await?;
+        let parsed: FlaggedResponse =
+            serde_json::from_str(&body).map_err(|e| CompareError::Response {
+                url: client.wiki().api_url(),
+                message: format!("flagged parse: {e}"),
+            })?;
         let mut asked: HashMap<String, String> = HashMap::new();
         for t in chunk {
             asked.insert(normalise(t), t.clone());
@@ -436,11 +447,12 @@ pub async fn title_stability(
     }
     // Anything the wiki never mentioned has the default settings, so a caller
     // cannot mistake "unknown" for "configured". A title the host did not fetch
+    // configured". A title the host did not fetch
     // at all stays absent (the caller re-asks).
     for t in titles {
         out.entry(t.clone()).or_default();
     }
-    out
+    Ok(out)
 }
 
 /// Existence checks that fail soft, for use from the parser.

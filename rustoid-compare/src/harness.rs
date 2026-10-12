@@ -754,7 +754,15 @@ impl DataSource for CachedDataSource {
         if missing.is_empty() {
             return Ok(out);
         }
-        let fetched = crate::pageinfo::title_protection(client, &missing).await;
+        let fetched = match crate::pageinfo::title_protection(client, &missing).await {
+            Ok(fetched) => fetched,
+            // A transport failure must not be recorded as "unprotected": the
+            // caller caches what it gets back, so a rate-limited chunk would
+            // outlive the failure and paint every later offline run with
+            // `Module:Protection banner`'s "incorrect protection template"
+            // category. Leave the miss unfilled instead.
+            Err(_) => return Ok(out),
+        };
         for title in missing {
             // `title_protection` keys its answer by the request, falling back to
             // the wiki's spelling, so an exact lookup finds it; the fallback keeps
@@ -789,7 +797,12 @@ impl DataSource for CachedDataSource {
         if missing.is_empty() {
             return Ok(out);
         }
-        let fetched = crate::pageinfo::title_categories(client, &missing).await;
+        let fetched = match crate::pageinfo::title_categories(client, &missing).await {
+            Ok(fetched) => fetched,
+            // A transport failure must not be recorded as "no categories"; leave
+            // the miss unfilled so the next run re-fetches it.
+            Err(_) => return Ok(out),
+        };
         for title in missing {
             let cats = fetched.get(&title).cloned().unwrap_or_default();
             self.store_categories(&title, &cats);
@@ -823,7 +836,12 @@ impl DataSource for CachedDataSource {
         if missing.is_empty() {
             return Ok(out);
         }
-        let fetched = crate::pageinfo::title_stability(client, &missing).await;
+        let fetched = match crate::pageinfo::title_stability(client, &missing).await {
+            Ok(fetched) => fetched,
+            // A transport failure must not be recorded as "no pending-changes
+            // configuration"; leave the miss unfilled so the next run re-fetches it.
+            Err(_) => return Ok(out),
+        };
         for title in missing {
             let settings = fetched.get(&title).cloned().unwrap_or_default();
             self.store_stability(&title, &settings);
