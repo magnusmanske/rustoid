@@ -15662,3 +15662,55 @@ corpus matches              3/48   (unchanged)
 fixture guard             877/896  (unchanged)
 lib tests                    1029  (+2, the new cases)
 ```
+
+## A module argument stashes an extension as a strip marker
+
+`Doom (1993 video game)` served the infobox label `Composers` where the wiki
+serves `Composer` (`Grand Theft Auto V` likewise `Developers`/`Developer`). The
+label is `[[Video game composer|Composer]]{{pluralize from text|{{{composer|}}}|plural=s}}`,
+and `{{pluralize from text}}` is `{{#invoke:Detect singular|pluralize}}`, which
+counts a comma, a `;`, an "and", or a `&` in its argument to decide singular
+versus plural. The composer value is
+`[[Bobby Prince|Robert Prince]]{{efn|name=Composer|The music for the PlayStation
+and Sega Saturn ports of the game was composed by [[Aubrey Hodges]],<ref …>…}}`.
+
+The reduction needs no template at all, only the module:
+
+```
+{{#invoke:Detect singular|pluralize|<ref>a, b</ref>|plural=s}}
+service: (empty, singular)     rustoid: s (plural)
+```
+
+`Parser::expand_invoke_arg_text` renders the argument with `argument_value_text`,
+whose `extension` arm wrote the tag's **source** — the ref's body included — on
+the belief that "the source of the tag (`<nowiki/>`) ... is what a module
+receives for one". It is not. MediaWiki's preprocessor replaces every extension
+tag with a strip marker (`PPFrame_Hash::expand` over the `<ext>` node), so
+Scribunto is handed `<UNIQ--ref-…-QINU>`; the ref's text, with its comma, is
+never in the module's view. `Module:Detect singular` therefore reads a bare
+marker and answers singular.
+
+The fix is twofold, mirroring that stashing:
+
+- `argument_value_text` **declines** an `extension` token, so the value falls to
+  `render_argument_markers`, the marker renderer.
+- `answer_marker_span` now carries *any* extension token, not only one whose
+  `about` is already spent. `numbered_extension_tag` becomes
+  `stashed_extension_tag` and drops the `about` check: the preprocessor stashes
+  every extension, and the "<nowiki> is left to the renderer" carve-out was
+  simply wrong (a `<nowiki>a,b</nowiki>` argument answered `s`, the service
+  ''). The marker keeps the token, which `substitute_strip_markers` splices back,
+  so a `#tag:ref` still spends its `about` once rather than twice.
+
+A live HTML element is unaffected — `<span>a, b</span>` reaches the module as
+its text on both sides — because only an `extension` token is stashed.
+
+### Effect
+
+```
+Doom (1993 video game)      1.62 % ->  1.65 %
+Grand Theft Auto V          0.66 % ->  0.68 %
+corpus matches              3/48   (unchanged)
+fixture guard             877/896  (unchanged)
+lib tests                    1029  (unchanged)
+```
