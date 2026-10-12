@@ -423,12 +423,22 @@ fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool)
     }
     if in_native {
         // Native (extension) content is never discarded. Parsoid's
-        // `serializeNewEmptyDp` still gives such a node an empty `data-parsoid`
-        // slot, so it takes a generated id even when it carries no metadata of
-        // its own — the `<i>` a `''…''` makes inside a `<ref>` body is the case
-        // that mattered. Without the slot the node took no id and every later id
-        // on the page shifted down by one.
-        if node.data_parsoid.is_none() && node.data_mw.is_none() && !node.empty_dp_slot {
+        // `serializeNewEmptyDp` still gives such a node a page-bundle
+        // `data-parsoid` entry, so it takes a generated id even when it carries
+        // no metadata of its own — the `<i>` a `''…''` makes inside a `<ref>`
+        // body is the case that mattered. Without the slot the node took no id
+        // and every later id on the page shifted down by one.
+        //
+        // A node whose stored `data-parsoid` is only transient (`{"tmp":…}`,
+        // e.g. the `WRAPPER` flag on a fragment's text-run span) is the same
+        // case: Parsoid serializes it as `{}` and still stores the entry, so it
+        // also takes an id. The service shows it on a module's output span in
+        // the reference list.
+        let draws_an_id = node
+            .data_parsoid
+            .as_deref()
+            .is_some_and(crate::pagebundle::data_parsoid_draws_an_id);
+        if !draws_an_id && node.data_mw.is_none() && !node.empty_dp_slot {
             node.empty_dp_slot = true;
         }
         return;
@@ -725,6 +735,29 @@ mod tests {
         mark_discardable_data_parsoid(&mut root);
 
         assert!(root.children[1].children[0].data_parsoid.is_none());
+    }
+
+    /// Inside *native* (extension) content nothing is discarded, and a node whose
+    /// stored `data-parsoid` holds only transient flags (`{"tmp":…}`, e.g. the
+    /// `WRAPPER` flag on a fragment's text-run span) still takes an id: Parsoid
+    /// serializes that `data-parsoid` as `{}` and keeps the page-bundle entry.
+    /// The service shows it on a module's output span inside a reference note.
+    #[test]
+    fn native_content_keys_a_tmp_only_data_parsoid() {
+        let mut references = Node::element(ElementKind::Other("ol".to_string()));
+        references.set_attr("about", "#mwt9");
+        references.set_attr("typeof", "mw:Extension/references");
+        let mut span = Node::element(ElementKind::Span);
+        span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+        references.push_child(span);
+        let mut root = Node::document();
+        root.push_child(references);
+
+        mark_discardable_data_parsoid(&mut root);
+
+        let span = &root.children[0].children[0];
+        assert!(span.empty_dp_slot, "the tmp-only dp still draws an id");
+        assert!(!span.discardable_dp, "native content is never discarded");
     }
 
     /// Outside any range nothing is discarded.

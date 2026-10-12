@@ -311,7 +311,7 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
 /// Mirrors `DataParsoid::isEmpty`: any serializable field counts, but a
 /// `tmp`-only object does not (`tmp` is transient and dropped before
 /// serialization, so it would have been `{}`).
-fn data_parsoid_draws_an_id(json: &str) -> bool {
+pub(crate) fn data_parsoid_draws_an_id(json: &str) -> bool {
     match serde_json::from_str::<serde_json::Value>(json) {
         Ok(serde_json::Value::Object(map)) => {
             !map.is_empty() && !(map.len() == 1 && map.contains_key("tmp"))
