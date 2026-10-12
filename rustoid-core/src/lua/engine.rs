@@ -545,6 +545,7 @@ impl LuaEngine {
             .set("mw", mw)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
         install_module_loader(&lua, &ctx)?;
+        setup_uri_library(&lua, &ctx)?;
         install_frame_results(&lua)?;
 
         Ok(Self {
@@ -1308,6 +1309,133 @@ fn eval_module<R: mlua::FromLuaMulti>(lua: &Lua, source: &str, title: &str) -> m
     function.call(())
 }
 
+/// Install Scribunto's `mw.uri`, which is the pure-Lua `mw.uri.lua`.
+///
+/// PHP's `UriLibrary` contributes no URI logic: it registers `mw.uri.lua` and
+/// supplies the interface the library calls back into (`anchorEncode`, the three
+/// URL builders, and the `defaultUrl` option). rustoid embeds the same source
+/// (see [`MW_URI_LUA`]) and wires the same interface, so the URL object — `new`,
+/// `parse`, `validate`, the computed fields (`authority`, `queryString`, …) and
+/// `tostring` — is the library's own rather than a reimplementation.
+///
+/// Runs after `install_module_loader`, because the library `require`s
+/// `libraryUtil` at load time and registers itself in `package.loaded`.
+fn setup_uri_library(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
+    let lua_err = |e: mlua::Error| RustoidError::Lua(e.to_string());
+
+    let php = lua.create_table().map_err(lua_err)?;
+    // `mw.uri.anchorEncode` is core's `anchorencode`, which strips wikitext links
+    // and tags from the argument.
+    let encoder = crate::pipeline::anchor_encode::AnchorEncoder::new(&ctx.site.protocols);
+    php.set(
+        "anchorEncode",
+        lua.create_function(move |_, s: Value| {
+            Ok(encoder.anchorencode(&coerce_string(&s, "anchorEncode")?))
+        })
+        .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
+
+    // `php.localUrl`/`fullUrl`/`canonicalUrl` — `Title::getLocalURL`/
+    // `getFullURL`/`getCanonicalURL`. `luafn_title_new` resolves a `Ns:Page`
+    // argument the way the wiki would; the URL shapes are the ones `mw.title`
+    // already builds.
+    for (name, full, canonical) in [
+        ("localUrl", false, false),
+        ("fullUrl", true, false),
+        ("canonicalUrl", true, true),
+    ] {
+        let ctx = ctx.clone();
+        php.set(
+            name,
+            lua.create_function(move |lua, (page, query): (Value, Value)| {
+                let page = coerce_string(&page, name)?;
+                let title =
+                    luafn_title_new(lua, &ctx, Value::String(lua.create_string(&page)?), None)?;
+                let full_text: String = title.get("fullText").unwrap_or(page);
+                // A title's URL uses its DB key, so spaces become underscores
+                // (Scribunto's `Title::getPrefixedDBkey`).
+                let encoded = url_encode(&full_text.replace(' ', "_"));
+                let mut url = if canonical {
+                    let server = ctx.site.server.trim_start_matches("//");
+                    format!(
+                        "//{server}{}/index.php?title={encoded}",
+                        ctx.site.script_path
+                    )
+                } else {
+                    let path = ctx.site.article_path.replace("$1", &encoded);
+                    if full {
+                        format!("{}{path}", ctx.site.server)
+                    } else {
+                        path
+                    }
+                };
+                append_query(&mut url, &query)?;
+                Ok(Value::String(lua.create_string(&url)?))
+            })
+            .map_err(lua_err)?,
+        )
+        .map_err(lua_err)?;
+    }
+
+    let options = lua.create_table().map_err(lua_err)?;
+    options
+        .set(
+            "defaultUrl",
+            format!(
+                "{}{}",
+                ctx.site.server,
+                ctx.site
+                    .article_path
+                    .replace("$1", &url_encode(&ctx.current_title.replace(' ', "_")))
+            ),
+        )
+        .map_err(lua_err)?;
+    php.set("options", options.clone()).map_err(lua_err)?;
+
+    lua.globals().set("mw_interface", php).map_err(lua_err)?;
+    let uri: Table = eval_module(lua, MW_URI_LUA, "mw.uri").map_err(lua_err)?;
+    let setup: Function = uri.get("setupInterface").map_err(lua_err)?;
+    // `setupInterface` reads the global `mw_interface` into the library's `php`
+    // local, sets `php.options`, and publishes `mw.uri` (and `package.loaded`).
+    setup.call::<()>(options).map_err(lua_err)?;
+    Ok(())
+}
+
+/// Append a `?query` (string or key/value table) to a URL, the shape
+/// `Title::getLocalURL($query)` produces (`wfArrayToCgi` for a table).
+fn append_query(url: &mut String, query: &Value) -> mlua::Result<()> {
+    match query {
+        Value::String(s) => {
+            let q = s.to_str().map_err(mlua::Error::external)?;
+            if !q.is_empty() {
+                url.push('?');
+                url.push_str(&q);
+            }
+        }
+        Value::Table(t) => {
+            let mut first = true;
+            for pair in t.clone().pairs::<Value, Value>() {
+                let (k, v) = pair?;
+                let (Ok(k), Ok(v)) = (coerce_string(&k, "query"), coerce_string(&v, "query"))
+                else {
+                    continue;
+                };
+                url.push(if first { '?' } else { '&' });
+                first = false;
+                url.push_str(&url_encode(&k));
+                url.push('=');
+                url.push_str(&url_encode(&v));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Scribunto's `mw.uri.lua`, verbatim (its `UriLibrary` adds no URI logic).
+const MW_URI_LUA: &str = include_str!("mw_uri.lua");
+
 /// Install `require`, `mw.loadData` and a `package` stub.
 ///
 /// Scribunto's `require` is synchronous inside Lua, so it cannot fetch: the
@@ -1322,6 +1450,10 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     // Loaded modules are cached, as Scribunto caches them: a module is executed
     // once per render however many times it is required.
     let cache = lua.create_table().map_err(lua_err)?;
+    // `package.loaded` *is* this cache (see the `package` stub below), so a library
+    // that registers itself there — `mw.uri.lua` does — is visible to `require`.
+    // A separate handle, because `cache` is moved into the `require` closure.
+    let package_loaded = cache.clone();
     // Titles currently being loaded, so a `require` cycle reports instead of
     // recursing until the stack runs out.
     let loading = lua.create_table().map_err(lua_err)?;
@@ -1504,6 +1636,9 @@ fn install_module_loader(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
     package
         .set("loaders", lua.create_table().map_err(lua_err)?)
         .map_err(lua_err)?;
+    // Scribunto's `package.loaded` is the module cache; sharing it (see
+    // `package_loaded`) lets a library install itself there for `require`.
+    package.set("loaded", package_loaded).map_err(lua_err)?;
     lua.globals().set("package", package).map_err(lua_err)?;
 
     Ok(())
@@ -1560,6 +1695,13 @@ const BUILTIN_LIBRARIES: &[(&str, &str)] = &[
                 name, argIdx, table.concat(expectTypes, " or "), actual), 3)
         end
 
+        function libraryUtil.checkTypeForIndex(index, value, expectType)
+            if type(value) ~= expectType then
+                error(string.format("value for index '%s' must be %s, %s given",
+                    index, expectType, type(value)), 3)
+            end
+        end
+
         function libraryUtil.checkTypeForNamedArg(name, argName, arg, expectType, nilOk)
             if arg == nil and nilOk then return arg end
             local actual = type(arg)
@@ -1598,9 +1740,15 @@ const BUILTIN_LIBRARIES: &[(&str, &str)] = &[
 /// `ustring` is not Lua source: it is the same table `mw.ustring` exposes, so it
 /// is handed back directly.
 fn builtin_library(lua: &Lua, name: &str) -> Option<Value> {
-    if name == "ustring" {
+    // `ustring` and `mw.uri` are not Lua *sources* under this name: they are the
+    // tables `mw.ustring`/`mw.uri` already hold (`mw.uri` in particular must be
+    // the installed instance, whose `setupInterface` captured the host
+    // interface), so hand those back rather than evaluating a fresh copy.
+    if name == "ustring" || name == "mw.uri" {
         let mw: Table = lua.globals().get("mw").ok()?;
-        return mw.get::<Value>("ustring").ok();
+        return mw
+            .get::<Value>(name.strip_prefix("mw.").unwrap_or(name))
+            .ok();
     }
     let (_, source) = BUILTIN_LIBRARIES.iter().find(|(n, _)| *n == name)?;
     eval_module::<Value>(lua, source, name).ok()
@@ -1860,24 +2008,8 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
         })?,
     )?;
 
-    // mw.uri
-    let uri = lua
-        .create_table()
-        .map_err(|e| RustoidError::Lua(e.to_string()))?;
-    uri.set("encode", lua.create_function(luafn_uri_encode)?)?;
-    uri.set("decode", lua.create_function(luafn_uri_decode)?)?;
-    // `mw.uri.anchorEncode` delegates to core's `anchorencode`, which strips
-    // wikitext links and HTML tags from the argument (Scribunto's
-    // `UriLibrary::anchorEncode` calls `CoreParserFunctions::anchorencode`).
-    let encoder = crate::pipeline::anchor_encode::AnchorEncoder::new(&ctx.site.protocols);
-    uri.set(
-        "anchorEncode",
-        lua.create_function(move |_, s: Value| {
-            let s = coerce_string(&s, "anchorEncode")?;
-            Ok(encoder.anchorencode(&s))
-        })?,
-    )?;
-    mw.set("uri", uri)?;
+    // mw.uri is Scribunto's own Lua library (`mw.uri.lua`), installed by
+    // `setup_uri_library` after `require` exists (it loads `libraryUtil`).
 
     // mw.language — built by its own module, which also yields the content
     // language object the `mw.getContentLanguage` shorthand returns.
@@ -3364,14 +3496,6 @@ fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
         Value::String(lua.create_string(&ctx.current_title)?),
         None,
     )
-}
-
-fn luafn_uri_encode(_: &Lua, s: Value) -> mlua::Result<String> {
-    Ok(url_encode(&coerce_string(&s, "encode")?))
-}
-
-fn luafn_uri_decode(_: &Lua, s: Value) -> mlua::Result<String> {
-    Ok(url_decode(&coerce_string(&s, "decode")?))
 }
 
 /// `formatNum` that accepts both call styles.
@@ -6212,34 +6336,6 @@ fn url_encode(s: &str) -> String {
     result
 }
 
-fn url_decode(s: &str) -> String {
-    let mut result = String::new();
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                result.push(' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(hex) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    result.push(hex as char);
-                    i += 3;
-                } else {
-                    result.push('%');
-                    i += 1;
-                }
-            }
-            _ => {
-                result.push(bytes[i] as char);
-                i += 1;
-            }
-        }
-    }
-    result
-}
-
 pub(crate) fn lua_value_to_string(value: &Value) -> String {
     match value {
         Value::Nil => String::new(),
@@ -7512,6 +7608,29 @@ mod tests {
         assert_eq!(
             engine.eval("return mw.uri.encode('hello world')").unwrap(),
             "hello+world"
+        );
+    }
+
+    /// `mw.uri` is Scribunto's Lua library, so `mw.uri.new` must parse a URL and
+    /// answer its parts — `Module:Webarchive` bails with "Invalid URL" without
+    /// `uri.host`. The archived URL carries a second `//` (inside the path), which
+    /// a naive split would mis-read as the authority.
+    #[test]
+    fn test_mw_uri_new_parses_a_url() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval(
+                    "return mw.uri.new('https://web.archive.org/web/20131101223646/http://www.swift.com/x.pdf').host"
+                )
+                .unwrap(),
+            "web.archive.org"
+        );
+        assert_eq!(
+            engine
+                .eval("local u = mw.uri.new('https://example.org/a/b?x=1#f') return u.protocol .. '|' .. u.host .. '|' .. u.path .. '|' .. u.queryString .. '|' .. u.fragment .. '|' .. tostring(u)")
+                .unwrap(),
+            "https|example.org|/a/b|x=1|f|https://example.org/a/b?x=1#f"
         );
     }
 
