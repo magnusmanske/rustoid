@@ -6986,12 +6986,22 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
             Item::Tok(tok @ ParsoidToken::EndTag(_)) => {
                 out.push_str(&token_source_for_module(tok)?)
             }
-            // Every other self-closing token — `<br>`, an `extlink`/`urllink`, a
-            // behavior switch like `__DATE__` — reaches the module as its own
-            // source, so a value made of one is not a reason to decline. Without
-            // this arm a citation `url` that expanded to a bare `urllink`
-            // declined, fell back to a stale source range, and `Module:Citation`
-            // rendered the wrong URL.
+            // A bare URL the tokenizer turned into a `urllink` has no `src` when
+            // it came out of a *module's* output (only a page-source one is
+            // stamped), and its wikitext is exactly its `href`. Reading only `src`
+            // dropped it, so `Module:Citation/CS1`'s
+            // `url={{#invoke:London Gazette util|url_param|…}}` came back as a
+            // citation with no link where the wiki serves one.
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "urllink" => {
+                let href = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))?;
+                out.push_str(&key_value_text(&href.value)?);
+            }
+            // Every other self-closing token — `<br>`, an `extlink`, a behavior
+            // switch like `__DATE__` — reaches the module as its own source, so a
+            // value made of one is not a reason to decline.
             Item::Tok(tok @ ParsoidToken::SelfclosingTag(_)) => {
                 out.push_str(&token_source_for_module(tok)?);
             }

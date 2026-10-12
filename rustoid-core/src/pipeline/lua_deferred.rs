@@ -817,6 +817,12 @@ pub fn answer_item_text(
                 // `frame:expandTemplate` answer keeps it.
                 return Some((src, i + 1));
             }
+            if let Some(src) = urllink_token_wikitext(tok) {
+                // A bare URL a module's output produced is a `urllink` token with
+                // no `src` (only a page-source one is stamped), and its wikitext is
+                // its `href`.
+                return Some((src, i + 1));
+            }
             if let Some(src) = quote_token_wikitext(tok) {
                 // An `mw-quote` a module's output produced has no `src` (the quote
                 // transformer has not run, nor can it — the answer is wikitext), so
@@ -1041,6 +1047,29 @@ fn extlink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> O
     Some(out)
 }
 
+/// A bare URL token's wikitext: exactly its `href`.
+///
+/// One a page's source produced is stamped with `src`; one a *module's* output
+/// produced is not, so `render_answer` would drop it — a citation `url` that
+/// came from an `#invoke` then rendered without its link.
+fn urllink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::KeyValue;
+    let crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(t) = token else {
+        return None;
+    };
+    if t.name != "urllink" {
+        return None;
+    }
+    let href = t
+        .attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("href"))?;
+    Some(match &href.value {
+        KeyValue::Str(s) => s.clone(),
+        KeyValue::Tokens(items) => render_answer(items),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1134,18 @@ mod tests {
             render_answer(&items),
             "[https://d-nb.info/gnd/4190555-6 GND]"
         );
+    }
+
+    /// A bare URL a module emits is a `urllink` token with no `src`; its wikitext
+    /// is its `href`. Without this a citation `url={{#invoke:…}}` was rendered
+    /// without its link.
+    #[test]
+    fn render_answer_rebuilds_a_module_urllink_without_src() {
+        use crate::wikitext::tokens_v2::{DataParsoid, Item, ParsoidToken, SelfclosingTagTk};
+        let mut link = SelfclosingTagTk::new("urllink", vec![], DataParsoid::default());
+        link.add_attribute_str("href", "https://example.com/x");
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(link))];
+        assert_eq!(render_answer(&items), "https://example.com/x");
     }
 
     /// A module's `[[Genus|''Name'']]` tokenizes its italic run into `mw-quote`
