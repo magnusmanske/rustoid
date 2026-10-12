@@ -15272,10 +15272,10 @@ wrapping an `<ol>`. Sundial, Order of the British Empire, Association football a
 The Beatles all regressed under an ungated version of this rule and recovered
 under the gate. No corpus page regresses.
 
-## The next difference: a block extension on its own line is p-wrapped
+## A block extension on its own line was p-wrapped
 
-With the ids matching, `ISO 3166-1 alpha-2`'s first difference is at 842631, and
-it is not an id. The page has
+With the note ids matching, `ISO 3166-1 alpha-2`'s first difference was at 842631,
+and it was not an id. The page has
 
 ```
 ===== Notes =====
@@ -15283,8 +15283,8 @@ it is not an id. The page has
 ```
 
 and the service serves the list's `<ol>` directly after the heading, while
-rustoid puts an extra `<p>` around it (`<h5 …>Notes</h5>\n<p id="mwEuY"><ol …>`).
-It reproduces without a heading (`x<ref>n</ref>\n\n<references />`).
+rustoid put an extra `<p>` around it (`<h5 …>Notes</h5>\n<p id="mwEuY"><ol …>`).
+It reproduced without a heading (`x<ref>n</ref>\n\n<references />`).
 
 The cause is the p-wrap's view of the extension token. Parsoid tunnels an
 extension's DOM through wrapper tokens whose name comes from the rendered content
@@ -15293,12 +15293,26 @@ inline one keeps the first node's name (`sup` for a `<ref>`). A `div` is a wikit
 block element, so `ParagraphWrapper` never opens a `<p>` around it; a `sup` is
 wrappable, so a lone `<ref>` *is* p-wrapped — the oracle shows exactly that pair
 (`<ref>` gets a `<p>`, `<references>` does not). rustoid's placeholder token is a
-generic `extension`, which is neither, so it falls through to
-`curr_line_has_wrappable_tokens = true` and p-wraps.
+generic `extension`, which is neither, so it fell through to
+`curr_line_has_wrappable_tokens = true` and p-wrapped.
 
-A fix means naming the extension placeholder `div`/`sup`-style from the rendered
-fragment — the same block/inline decision `getWrapperTokens` makes — which is a
-change to the extension token, not the p-wrap. Left for its own session.
+rustoid's `<ref>`/`<references>` DOM is built by the Cite pass, *after*
+p-wrapping, so the fragment cannot be inspected where the name is needed. Their
+kinds are fixed, though, so `extension_handler::name_unexpanded_wrappers` names
+them directly — `sup` for a note, `div` for a reference list — in the same
+`tree_builder_stage` step as `extension_handler::run`, right before the
+`ParagraphWrapper`. `div` rather than Parsoid's `<ol>` for a non-responsive list,
+because the placeholder is a single self-closing token: a never-block element
+leaves `ParagraphWrapper`'s `in_block_elem` exactly as Parsoid's TagTk+EndTagTk
+pair does, while a stray `ol` start tag would leave it set. Cite replaces the
+element, so the name is not observable in the output.
+
+`ISO 3166-1 alpha-2` **842631 → 843031** (84.84% → 84.88%); the reference list is
+no longer p-wrapped. No corpus page regresses. The gain is small because most
+pages reach `<references>` through `{{reflist}}` (a transclusion, never
+p-wrapped); the direct form is what the page uses.
+
+The next difference is a missing `data-mw-group` on a backlink `<a>`.
 
 ## A nested `<ref>` renders (and is numbered before its note)
 
