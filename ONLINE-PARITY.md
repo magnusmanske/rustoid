@@ -15544,3 +15544,78 @@ the whole line before splitting. Only the title is trimmed now, which is what
 
 Effect: `Order of the British Empire` 25.87 % → 26.72 %, no page regresses, the
 fixture guard stays at 877/896.
+
+## A bare magic-word name is a variable or a template, never a parser function
+
+`Israel`'s infobox took the wrong `{{#if:{{both|…}}|…}}` branch in
+`Template:Infobox country/imagetable`, so the two-image branch (nested divs with
+`padding-left:5px`) rendered as the one-image branch. The minimal reduction is
+one line:
+
+```
+{{#if:{{both|x|y}}|YES|NO}}    service: YES    rustoid: NO
+{{#if:{{both|x|}}|YES|NO}}     service: NO     rustoid: NO
+```
+
+`both` is a magic word on this wiki — `siteinfo` lists
+`{"name":"timef-both","aliases":["both"],"case-sensitive":true}` — so rustoid
+matched the alias and answered the *variable* form, which is empty. The service
+renders `1`, i.e. it **transcluded `Template:Both`**. PHP's rule is in
+`TemplateHandler::resolveTemplateTarget`:
+
+```php
+[ 'key' => $canonicalFunctionName, 'isNative' => $isNative ] =
+      $siteConfig->getMagicWordForParserFunction( $prefix );
+if ( $canonicalFunctionName !== null && !$isNative ) {
+    // … in the legacy parser "nohash" parser functions without a colon must
+    // be magic variables; they won't be invoked as parser functions.
+    if ( ( !$hasHash ) && ( !$haveColon ) ) {
+        $canonicalFunctionName = null;
+    }
+}
+```
+
+and the variable lookup is `getMagicWordForVariable`, which reads
+`$this->variables` — the aliases whose canonical id is in
+`MagicWordFactory::$mVariableIDs` (the `variables` prop of `siteinfo`), *not* the
+whole alias table. `timef-both` is not in it, and is not in `functionhooks`
+either, so `{{both}}` falls all the way through to the template title.
+
+rustoid's `magic_word_for_variable` matched any alias in the table (skipping only
+`img_*`/`timedmedia_*`), so the fix is to require the canonical to be in the
+site's variable set. `SiteConfig::magic_word_variables` returns `None` when the
+site does not report one (the mock, or a cache fetched before the prop existed),
+which keeps the old fallback. The alias→canonical lookup is now its own helper,
+`magic_word_canonical`, because one other caller legitimately needs the whole
+table: `call_parser_function`'s no-hash fallback, which answers `{{SHORTDESC:x}}`
+and `{{formatnum:x}}` through their magic word — those *do* carry a colon, so
+they are parser functions and must keep resolving.
+
+The `variables` prop is not in a `siteinfo` fetched by an older rustoid, so the
+cached entry was refreshed in place (the cache index keys on kind/title only).
+That also made several previously-shadowed templates reachable again —
+`Template:Count` is called as `{{#expr:{{Count|…}} > 1}}`, and with `Count`
+wrongly answered as a variable the expression had no operand. A warm pass
+fetched it; `Isaac Newton`'s "Unrecognized word \"Template\"" came from the
+redlink standing in for it.
+
+### Effect
+
+```
+Israel                      1.07 % ->  1.18 %
+Nigeria                     1.09 % ->  1.11 %
+Commonwealth of Nations     1.13 % ->  1.15 %
+Brat (album)                1.30 % ->  1.53 %
+Chess                       1.29 % ->  1.30 %
+fixture guard             877/896  (unchanged)
+lib tests                    1027  (unchanged)
+```
+
+One caveat worth recording: `Hydrogen` moved 0.62 % → 0.35 %, and it is **not**
+this change. Removing the variable set again (which disables the new rule
+entirely) leaves the same 0.35 % first difference, and a self-consistent online
+run — fresh oracle, fresh templates — reports 0.35 % too. The *cached* oracle
+for `Hydrogen` was stale: the live page now wraps the two short-description
+category links in `<span class="mw-empty-elt" about="#mwt10">`, which the older
+cached bytes did not, and rustoid does not wrap them yet. The comparison is only
+as fresh as its oracle cache.
