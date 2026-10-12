@@ -825,6 +825,25 @@ pub fn answer_item_text(
                 // `[[Equus (genus)|Equus]]`.
                 return Some((src, i + 1));
             }
+            if let ParsoidToken::Tag(t) = tok
+                && t.name == "listItem"
+                && let Some(bullets) = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("bullets"))
+                    .and_then(|kv| kv.value.as_str())
+            {
+                // A `listItem` a module argument built during expansion has no
+                // source, but its `*`/`#`/`;` marker still has to be written:
+                // the module is handed the expansion's *text*, and the marker is
+                // what makes the value a list when the module's output is
+                // re-parsed. Dropping it turned `{{plainlist|\n* a\n* b\n}}`
+                // inside an infobox cell into one indented line per item — which
+                // re-tokenized as an indent-`<pre>` where the service serves a
+                // `<ul>`. Mirrors `TokenUtils::tokensToString`'s `listItem`
+                // arm.
+                return Some((bullets.to_string(), i + 1));
+            }
             None
         }
     }
