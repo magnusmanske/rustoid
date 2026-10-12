@@ -1396,6 +1396,15 @@ impl TemplateHandler {
                 };
                 ParserFunctions::untrimmed_branch(branch)
             }
+            // `{{DEFAULTSORT:key}}` — a behavior switch that sets the page's
+            // sort key and has no visible output. Parsoid's `pf_defaultsort`
+            // emits a `mw:PageProp/categorydefaultsort` meta, and the final
+            // render carries no more of it than it does of `{{DISPLAYTITLE:…}}`'s;
+            // the transclusion wrapper stays empty. Its magic-word alias spells
+            // the argument's colon (`DEFAULTSORT:`), so the magic-word lookup in
+            // the fallback arm below misses the bare name and the call would
+            // otherwise spill its own source text.
+            "defaultsort" | "defaultsortkey" | "defaultcategorysort" => Vec::new(),
             "lc" => ParserFunctions::pf_lc(params),
             "uc" => ParserFunctions::pf_uc(params),
             "ucfirst" => ParserFunctions::pf_ucfirst(params),
@@ -2475,6 +2484,42 @@ mod tests {
         // An empty or invalid argument is `Title::newFromText('')` → the empty
         // string, not the page.
         assert_eq!(call("pagename", ""), "");
+    }
+
+    /// `{{DEFAULTSORT:key}}` is a behavior switch with an argument, and has no
+    /// visible output (the transclusion wrapper stays empty). Its magic-word
+    /// alias spells the colon (`DEFAULTSORT:`), so the fallback arm's magic-word
+    /// lookup misses the bare name; without an explicit arm the call spilled its
+    /// own source text and p-wrapped the wrapper.
+    #[test]
+    fn test_defaultsort_has_no_output() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let config = MockSiteConfig::new();
+        let page_protection = std::cell::RefCell::new(Default::default());
+        let titles_protection = std::cell::RefCell::new(HashMap::new());
+        let protection = ProtectionContext::new(&page_protection, &titles_protection);
+        let ifexist = HashMap::new();
+        for name in ["defaultsort", "defaultsortkey", "defaultcategorysort"] {
+            let params = Params::new(vec![KV {
+                key: KeyValue::Str("Baz".to_string()),
+                value: KeyValue::Str(String::new()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            }]);
+            let out = TemplateHandler::call_parser_function(
+                &config,
+                name,
+                &params,
+                None,
+                &protection,
+                &ifexist,
+                None,
+                true,
+            );
+            assert!(out.is_empty(), "{name} should render nothing, got {out:?}");
+        }
     }
 
     #[test]
