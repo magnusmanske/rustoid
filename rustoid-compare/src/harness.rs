@@ -1429,9 +1429,18 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
 
     let outcome = compare_html(&parsoid_html, &rustoid_html);
     // Optional side-by-side dump, for reducing a difference: both renderings
-    // written verbatim under `$RUSTOID_DUMP_DIR`.
+    // written verbatim under `$RUSTOID_DUMP_DIR`. One file per side *per page*,
+    // so a parallel corpus run can dump every page; the plain `parsoid.html` /
+    // `rustoid.html` names are kept for the single-page workflow (they race
+    // under `--jobs`, which is harmless for a scratch directory).
     if let Ok(dir) = std::env::var("RUSTOID_DUMP_DIR") {
         let dir = std::path::Path::new(&dir);
+        let stem: String = title
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let _ = std::fs::write(dir.join(format!("{stem}.parsoid.html")), &parsoid_html);
+        let _ = std::fs::write(dir.join(format!("{stem}.rustoid.html")), &rustoid_html);
         let _ = std::fs::write(dir.join("parsoid.html"), &parsoid_html);
         let _ = std::fs::write(dir.join("rustoid.html"), &rustoid_html);
     }
