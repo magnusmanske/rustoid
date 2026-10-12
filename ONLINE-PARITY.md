@@ -15769,3 +15769,41 @@ corpus                       3/48  (against the refreshed oracle; the three
                                    matches are ISO 3166-1 alpha-2, Zebra and
                                    Quicksilver (film))
 ```
+
+## Duplicate heading ids get a `_2`, and a `template:` stylesheet src resolves
+
+`Order of the British Empire` parked at 26.75 % on a `<templatestyles>` that
+rustoid emitted as a literal `<extension name="templatestyles" …>` where the
+wiki served the inlined CSS. Two separate causes, both on the same page.
+
+**The stylesheet src prefix is case-insensitive.** `{{sticky header}}` is
+`<includeonly><templatestyles src="template:sticky header/styles.css"/></includeonly>`,
+and `templatestyles_title` recognised an explicit namespace prefix by comparing
+the *canonical* name directly — `"Template" == "template"` is false, so the
+prefix was folded into the page name and the title became
+`Template:template:sticky header/styles.css`. That page does not exist, so
+`get_page_with_revision` answered `None` and `expand_one_templatestyles` left the
+tag alone (deliberately, "to keep the unexpanded tag visible in the diff"). The
+prefix now goes through `namespace_id`, which matches case-insensitively and
+covers aliases.
+
+**Heading ids are deduplicated.** With the stylesheet resolved the page parked
+again, this time on `<h3 id="Sovereign_and_Grand_Master_2">` where rustoid had
+`Sovereign_and_Grand_Master` — the page has two sections of that name. PHP's
+`Headings::dedupeHeadingIds` is a DOM pass after `genAnchors`: it registers every
+`id` in document order (lower-cased) and suffixes a *heading* — or the
+`mw:FallbackId` span inside one — whose id is already taken, `_2`, `_3`, …. Any
+other element that reuses an id is left alone. `dedupe_heading_ids` ports it,
+called right after `gen_anchors` on both the sync and async paths. The case
+folding and the suffix search are kept verbatim, because they decide fragment
+URLs that exist outside the wiki (the PHP comment is explicit: "This case
+folding and matching algorithm has to stay exactly the same").
+
+### Effect
+
+```
+Order of the British Empire   26.75 % ->  49.73 %
+corpus matches                 3/48   (unchanged)
+fixture guard                877/896  (unchanged)
+lib tests                       1031  (+2, the new cases)
+```
