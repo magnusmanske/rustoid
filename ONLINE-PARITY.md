@@ -15421,3 +15421,107 @@ holding a `<ref>`), the service *bails* the inner tag to literal text
 element. Rare, and recorded rather than guessed at.
 
 No page regresses; the fixture guard stays at 877/896.
+
+## The preprocessor strips comments and include directives before the tokenizer sees them
+
+Three differences on `Help:Introduction` traced back to one thing: MediaWiki does
+not tokenize a transcluded template's *raw* source. `Wikitext::preprocessFragment`
+runs it through `Parser::preprocess` → `Preprocessor_Hash::preprocessToObj`, and the
+text that reaches Parsoid's tokenizer has comments and include directives already
+resolved. A local Parsoid (`--standalone --dump tplsrc`) prints that intermediate
+text directly, and it is decisive: `Template:Intro to single`'s four `<!-- … -->`
+markers are simply absent from it.
+
+### Comments, and the line they take with them
+
+`preprocessToObj`'s comment branch is explicit about the shape it removes:
+
+```php
+// To avoid leaving blank lines, when a sequence of
+// space-separated comments is both preceded and followed by
+// a newline (ignoring spaces), then
+// trim leading and trailing spaces and the trailing newline.
+…
+if ( $wsStart > 0 && substr( $text, $wsStart - 1, 1 ) == "\n"
+    && substr( $text, $wsEnd + 1, 1 ) == "\n"
+) {
+```
+
+so a comment is always dropped, and a comment that sits alone on its line — only
+whitespace around it, between newlines — takes that line's trailing newline too.
+The `$wsStart > 0` gate is the one asymmetry: a comment at the very start of the
+source keeps its newline. Measured against `action=expandtemplates`, which is the
+preprocessor with nothing in front of it:
+
+| input | output |
+|---|---|
+| `A<!--c-->B` | `AB` |
+| `A\n<!--c-->\nB` | `A\nB` |
+| `A\n\n<!--c-->\n\nB` | `A\n\n\nB` |
+| `A<!--c-->\nB` | `A\nB` |
+| `A\n<!--c-->B` | `A\nB` |
+| `<!--c-->\n` | `\n` |
+| `X<nowiki><!--c--></nowiki>Y` | unchanged |
+
+rustoid's body guard already dropped a bare `Comment`, and that is enough for a
+comment written inline. It is *not* enough for a comment on its own line, because
+rustoid's tokenizer has by then bundled exactly the run the PHP rule describes into
+one `EmptyLine` token (`try_empty_lines_with_comments`): the earlier
+`<!-- Main border -->` was
+`Tok(EmptyLine(EmptyLineTk { tokens: [Comment(" Main border "), Nl] }))`,
+preceded by a separate `Nl` — invisible to a filter that only looks at the chunk's
+top level. The guard now takes the whole `EmptyLine` when a newline precedes it
+(the line is eaten) and only its comments otherwise, which is `$wsStart > 0` at the
+token level. `nowiki`/`pre` need no special case: the tokenizer never turns their
+content into comments.
+
+The reasoning in the previous section — that this is `processTemplateTokens`'
+`if ( !$this->options['expandTemplates'] )` guard — was a plausible reading of the
+PHP but the wrong one: that guard would not eat a newline, and it would not leave
+an argument value's comments alone.
+
+### Include directives in an argument value
+
+`Preprocessor_Hash` also resolves `<noinclude>` / `<includeonly>` / `<onlyinclude>`
+while it scans. On a *page* the markers survive as `mw:Includes/*` metas — rustoid's
+tokenizer emits them, and both sides agree — but inside a template's **argument
+value** the preprocessor includes or skips the content and drops the marker. Asking
+the service for `{{Intro to single|lead=A<noinclude>B</noinclude>C}}` and reading
+the note's cell:
+
+| argument value | reaches the body as |
+|---|---|
+| `A<noinclude>B</noinclude>C` | `ABC` |
+| `A<includeonly>B</includeonly>C` | `AC` |
+| `A<onlyinclude>B</onlyinclude>C` | `ABC` |
+
+rustoid passed the markers straight through, so the cell held
+`A<span class="mw-empty-elt"><meta typeof="mw:Includes/NoInclude"/><meta
+typeof="mw:Includes/NoInclude/End"/></span>C` — the content gone *and* two stray
+metas. `expand_template_arg_values` now drops the markers before the value is
+expanded; the `includeonly` content is already inside its marker's `data-mw.src`,
+so removing the marker removes it too.
+
+### A blank-line `<br>` keeps the newline before it
+
+The third difference was not about the preprocessor at all. `A\n\n\nB` renders
+`<p>A</p>\n<p>\n<br/>\nB</p>`, and rustoid's ParagraphWrapper produced exactly
+that token sequence — but a pass called `migrate_br_newlines` then deleted the
+text node before the `<br>`, on the theory that the blank-line `<br>` "absorbs"
+its newline. It does not: Parsoid serves both newlines. Removing the pass (it was
+added without a test in `e6f5220`) makes all nine reduced `<br>` shapes match,
+including `A\n\n\n\nB` and a trailing `A\n\n\n`.
+
+### Effect
+
+```
+Help:Introduction          34.52 % -> 74.46 %
+List of sovereign states    0.86 % ->  0.91 %
+corpus matches                    3/48  (unchanged)
+fixture guard                  877/896  (unchanged)
+lib tests                         1026  (unchanged)
+```
+
+`Help:Introduction`'s first difference is now byte 16908, the unrendered
+`<inputbox>` extension — a missing extension implementation, not a preprocessor
+gap.
