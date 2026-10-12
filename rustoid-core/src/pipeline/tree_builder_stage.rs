@@ -56,6 +56,11 @@ impl TreeBuilderStage {
         // 2b. ExtensionHandler (expand built-in `<nowiki>` extension tokens).
         out = crate::pipeline::extension_handler::run(out, config, fragments, next_id);
 
+        // 2c. Name the remaining `extension` tokens after the wrapper tag their
+        //     content would produce (`PipelineUtils::getWrapperTokens`), so the
+        //     ParagraphWrapper below sees a block `<references>` as block.
+        out = crate::pipeline::extension_handler::name_unexpanded_wrappers(out);
+
         // 3. ListHandler (listItem → ul/ol/li).
         let mut list_handler = ListHandler::new();
         out = list_handler.run(out);

@@ -676,6 +676,48 @@ fn split_entities(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Give each remaining `extension` token the wrapper tag name its content would
+/// get from Parsoid's `PipelineUtils::getWrapperTokens`.
+///
+/// `ExtensionHandler::onExtension` tunnels an extension's rendered DOM through a
+/// *wrapper* token named after that DOM: a block fragment is represented by a
+/// `div`, an inline one keeps the first node's name (`sup` for a `<ref>`).
+/// `ParagraphWrapper` runs on the token stream right after this and reads exactly
+/// that name, so a block extension must not look like a generic inline token —
+/// otherwise a `<references>` at the start of a line is wrapped in a `<p>`.
+///
+/// rustoid builds the `<ref>`/`<references>` DOM in the Cite pass, *after*
+/// p-wrapping, so it cannot inspect the fragment here. Their kinds are fixed,
+/// though, so they can be named directly: a note is always an inline `<sup>`, a
+/// reference list always block. Cite replaces the element, and `div` (a
+/// never-block element) leaves `ParagraphWrapper`'s block state exactly as the
+/// `<ol>`/`<div>` TagTk+EndTagTk pair Parsoid would emit does.
+pub fn name_unexpanded_wrappers(tokens: Vec<Item>) -> Vec<Item> {
+    tokens
+        .into_iter()
+        .map(|item| {
+            let Item::Tok(ParsoidToken::SelfclosingTag(mut t)) = item else {
+                return item;
+            };
+            if t.name == "extension"
+                && let Some(wrapper) = attr_str(&t, "name").and_then(content_wrapper_tag)
+            {
+                t.name = wrapper.to_string();
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(t))
+        })
+        .collect()
+}
+
+/// The wrapper tag `getWrapperTokens` picks for an extension whose DOM rustoid
+/// renders in a later pass.
+fn content_wrapper_tag(extension: &str) -> Option<&'static str> {
+    match extension {
+        "ref" => Some("sup"),
+        "references" => Some("div"),
+        _ => None,
+    }
+}
 /// Expand extension tokens in a token stream. Runs before tree building,
 /// replacing `extension` self-closing tokens with their DOM token sequences.
 /// Faithful to the TT3 extension-handler stage in PHP Parsoid.
@@ -844,6 +886,26 @@ fn expand_key_value(
 mod tests {
     use super::*;
     use crate::wikitext::tokens_v2::{DataMw, KV, KeyValue};
+
+    #[test]
+    fn name_unexpanded_wrappers_names_only_known_block_inline_extensions() {
+        let ext = |name: &str| {
+            let mut t = SelfclosingTagTk::new("extension", vec![], DataParsoid::default());
+            t.add_attribute_str("name", name);
+            Item::Tok(ParsoidToken::SelfclosingTag(t))
+        };
+        let out = name_unexpanded_wrappers(vec![ext("ref"), ext("references"), ext("math")]);
+        let names: Vec<String> = out
+            .iter()
+            .map(|i| match i {
+                Item::Tok(ParsoidToken::SelfclosingTag(t)) => t.name.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // A note stays inline, a reference list becomes block, an unknown
+        // extension keeps its generic name.
+        assert_eq!(names, vec!["sup", "div", "extension"]);
+    }
 
     #[test]
     fn test_split_entities() {
