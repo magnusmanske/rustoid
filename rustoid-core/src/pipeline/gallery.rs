@@ -332,11 +332,15 @@ where
     G: FnMut(&str, &str) -> GFut,
     GFut: std::future::Future<Output = Option<Node>>,
 {
-    let line = line.trim();
+    // PHP's `Gallery::pLine` splits the line with `^([^|]+)(\|(?:.*))?$` and
+    // never trims it, so a caption keeps its trailing whitespace: the service
+    // serves `<div class="gallerytext">…of the Order </div>` for a line that
+    // ends in a space. Only the title is trimmed (MediaWiki's `makeTitle`
+    // trims it on the PHP side).
     // Split on the first `|` (title | caption+options).
     let (title_str, mut rest_str) = match line.split_once('|') {
         Some((t, r)) => (t.trim(), r.to_string()),
-        None => (line, String::new()),
+        None => (line.trim(), String::new()),
     };
 
     // A common editor mistake is closing a gallery line with `]]` (from a
