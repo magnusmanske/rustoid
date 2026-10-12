@@ -15835,3 +15835,37 @@ corpus matches                 3/48   (unchanged)
 fixture guard                877/896  (unchanged)
 lib tests                       1032  (+1)
 ```
+
+## A module-produced bare URL reaches the module as its href
+
+`Order of the British Empire` next parked at 55.51 % on its Gazette citations:
+the wiki wraps the sheet number in an external link to `thegazette.co.uk`, and
+rustoid rendered `"No. 30250"` as plain text. The reduction is one line:
+
+```
+{{cite magazine|url={{#invoke:London Gazette util|url_param|issue=30250|supp=2|pages=8791–8999}}|title=No. 30250}}
+service: <a href="https://www.thegazette.co.uk/…">"No. 30250"</a>
+rustoid: "No. 30250"
+```
+
+`url_param` itself is fine — invoked on its own it answers the URL. The value
+is what `Module:Citation/CS1` reads for `url`. A bare URL is tokenized into a
+`urllink` token carrying `href`; one taken from a *page's* source also carries a
+`src` (stamped somewhere in the page pipeline), but one produced by a *module's*
+output is re-tokenized with `href` and no `src`. Both argument renderers
+(`argument_value_text`, and `render_answer`'s `answer_item_text`) read `src` and
+only `src`, declined, and dropped the token — so CS1 saw `url=""`.
+
+A `urllink`'s wikitext is exactly its `href`, so `argument_value_text` renders
+that, and `render_answer` grows the same arm it already has for an `extlink`
+without `src`. The "record `src` on a page-source urllink" path is left alone;
+the two now agree in the module's view.
+
+### Effect
+
+```
+Order of the British Empire   55.51 % ->  58.50 %
+corpus matches                 3/48   (unchanged)
+fixture guard                877/896  (unchanged)
+lib tests                       1033  (+1)
+```
