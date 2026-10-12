@@ -15525,3 +15525,22 @@ lib tests                         1026  (unchanged)
 `Help:Introduction`'s first difference is now byte 16908, the unrendered
 `<inputbox>` extension — a missing extension implementation, not a preprocessor
 gap.
+
+## A gallery caption keeps its trailing whitespace
+
+`Order of the British Empire` diverged inside a `<gallery>`: the service served
+`<div class="gallerytext">Collar, badge and Star of a Knight or Dame Grand Cross\
+of the Order </div>` and rustoid the same without the trailing space. The source
+line is
+
+```
+File:Collar and star of the Order of the British Empire.jpg|Collar, badge and Star of a Knight or Dame Grand Cross of the Order 
+```
+
+and PHP's `Gallery::pLine` splits it with `^([^|]+)(\|(?:.*))?$` — no `trim()`
+on the line, so the caption keeps the space before the newline. rustoid trimmed
+the whole line before splitting. Only the title is trimmed now, which is what
+`makeTitle` does on the PHP side anyway.
+
+Effect: `Order of the British Empire` 25.87 % → 26.72 %, no page regresses, the
+fixture guard stays at 877/896.
