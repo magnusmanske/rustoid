@@ -5471,16 +5471,42 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         ))
         .await;
 
-        // A comment in a template body is dropped. PHP's `processTemplateTokens`
-        // strips top-level comments whenever the pipeline ran with
-        // `expandTemplates => false`, which is exactly the body pipeline — so
+        // A comment in a template body is dropped. MediaWiki's preprocessor
+        // strips comments out of a template's expanded source before it is
+        // tokenized (`Preprocessor_Hash::preprocessToObj`), so
         // `Template:Short description`'s `<!-- Start tracking -->` markers never
-        // reach the reader, and the same `if (!expandTemplates)` guard is what
-        // makes them survive on a *page*.
-        let mut expanded: Vec<Item> = expanded
-            .into_iter()
-            .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
-            .collect();
+        // reach the reader while a *page*'s comments survive. A comment that
+        // sits alone on its line — only whitespace around it, between newlines —
+        // additionally takes the line's trailing newline with it
+        // (`// To avoid leaving blank lines ... trim leading and trailing spaces
+        // and the trailing newline`, gated on `$wsStart > 0`), which is why the
+        // same guard is what makes them survive on a *page*. The tokenizer has
+        // already bundled exactly such a run into one `EmptyLine`, so that whole
+        // token goes when a newline precedes it, and only its comments go
+        // otherwise (the line is not eaten at the very start of the source).
+        let mut out: Vec<Item> = Vec::with_capacity(expanded.len());
+        for item in expanded {
+            match item {
+                Item::Tok(ParsoidToken::Comment(_)) => continue,
+                Item::Tok(ParsoidToken::EmptyLine(t))
+                    if t.tokens
+                        .iter()
+                        .any(|t| matches!(t, ParsoidToken::Comment(_))) =>
+                {
+                    if ends_with_newline(out.last()) {
+                        continue;
+                    }
+                    out.extend(
+                        t.tokens
+                            .into_iter()
+                            .filter(|t| !matches!(t, ParsoidToken::Comment(_)))
+                            .map(Item::Tok),
+                    );
+                }
+                other => out.push(other),
+            }
+        }
+        let mut expanded = out;
         strip_link_content_comments(&mut expanded);
         // A body's tags are not the page's: `expand_attributes` must not mark
         // their attributes `mw:ExpandedAttrs`. See [`mark_synthesized`].
@@ -5869,9 +5895,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // output, not here — see the note above and [`Parser::style_defer`].
         let _guard = self.begin_style_defer();
         for kv in args.iter_mut() {
-            let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value else {
+            let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &mut kv.value else {
                 continue;
             };
+            // MediaWiki's preprocessor resolves the include directives in an
+            // argument value before the callee's body is tokenized: the value
+            // `A<noinclude>B</noinclude>C` reaches the body as `ABC`, the
+            // `includeonly` form as `AC`, and the `onlyinclude` form as `ABC`.
+            // (`Preprocessor_Hash` includes or skips a directive's content and
+            // drops the marker; the page's own top-level markers stay, which is
+            // why this belongs to argument values and not to the page.)
+            strip_include_directive_metas(items);
             let found = expandable_content(items);
             if !found.template && !found.arg {
                 continue;
@@ -6526,6 +6560,29 @@ fn expandable_content(items: &[Item]) -> ExpandableContent {
         }
     }
     found
+}
+
+/// Drop the include-directive markers of a template argument value, keeping the
+/// content between them. `<includeonly>`'s content is already swallowed into
+/// its marker's `data-mw.src` by the tokenizer, so removing the marker removes
+/// the content with it — exactly the preprocessor's `includeonly` behaviour.
+fn strip_include_directive_metas(items: &mut Vec<Item>) {
+    items.retain(|it| {
+        !matches!(it, Item::Tok(t)
+            if crate::pipeline::template_handler::is_includes_meta(t))
+    });
+}
+
+/// Whether a token chunk ends at the start of a new line — a preceding `Nl`
+/// token or text whose last character is a newline. Used by the template-body
+/// comment strip to tell a comment-only line (eaten) from one at the source's
+/// very start (kept).
+fn ends_with_newline(last: Option<&Item>) -> bool {
+    match last {
+        Some(Item::Tok(ParsoidToken::Nl(_))) => true,
+        Some(Item::Str(s)) => s.ends_with('\n'),
+        _ => false,
+    }
 }
 
 /// Strip comments nested in a link's content.

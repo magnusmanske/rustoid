@@ -48,7 +48,7 @@ fn is_includes_meta_item(item: &Item) -> bool {
 
 /// Is this token an include-directive meta (`mw:Includes/IncludeOnly` etc.)?
 /// Mirrors the `#^mw:Includes/#` check in `processToString`.
-fn is_includes_meta(token: &ParsoidToken) -> bool {
+pub(crate) fn is_includes_meta(token: &ParsoidToken) -> bool {
     matches!(token, ParsoidToken::SelfclosingTag(t) if t.name == "meta")
         && match_type_of(token, "#^mw:Includes/#").is_some()
 }
