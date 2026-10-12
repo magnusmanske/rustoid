@@ -15619,3 +15619,46 @@ for `Hydrogen` was stale: the live page now wraps the two short-description
 category links in `<span class="mw-empty-elt" about="#mwt10">`, which the older
 cached bytes did not, and rustoid does not wrap them yet. The comparison is only
 as fresh as its oracle cache.
+
+## An apostrophe run survives a module argument's source reconstruction
+
+`Albert Einstein`'s "Known for" list item `[[Mass–energy equivalence|''E''=''mc''<sup>2</sup> …]]`
+rendered as `E=mc<sup>2</sup>` — both `<i>` pairs gone. The minimal reduction is
+a `{{Plainlist|…}}` (or any template) as an argument to an `#invoke`:
+
+```
+{{#invoke:infobox|infoboxTemplate|known_for={{Plainlist|* [[Mass–energy equivalence|''E''=''mc''<sup>2</sup> (x)]]}}}}
+```
+
+The wikilink token still carries its source as written
+(`[[Mass–energy equivalence|''E''=''mc''<sup>2</sup> (x)]]`) and its content
+tokens hold the four `mw-quote` tokens, yet the value handed to the module comes
+back with the apostrophes stripped. `Parser::expand_invoke_arg_text` renders the
+value with `argument_value_text`; when that declines (here, on a source-less tag
+later in the value) it falls back to `render_argument_markers`, whose
+`answer_item_text` writes a token's `src` through `rewrite_expanded_attrs`. That
+function patches the recorded `src` whenever an attribute's *current* text
+differs from the text as written — its way of writing a substituted `{{{…}}}`
+back. The current text comes from `token_utils::tokens_to_source`, which spelt a
+token from its `src` (or rebuilt a table) and **dropped a `mw-quote`**: an
+`''`-run token has no `src`, only a `value` attribute. So an unchanged
+`''E''=''mc''` was read as `E=mc`, the value looked expanded, and the patch
+rewrote the `src` without the apostrophes.
+
+The fix is to make `tokens_to_source` spell an `mw-quote` from its `value`
+attribute, exactly as `argument_value_text` and `tag_content_source` already do.
+With the reconstruction faithful, the as-written and current texts match, and
+`rewrite_expanded_attrs` correctly leaves the `src` alone. No `src` is invented;
+PHP's `QuoteTransformer::quoteToTag` gives a generated `i`/`b` only a `tsr`, and
+the ambiguity it would create is avoided because the quote tokens never reach the
+transformer in the *argument* text — the module is handed wikitext.
+
+### Effect
+
+```
+Periodic table              0.91 % ->  1.87 %
+Albert Einstein             1.12 % ->  1.22 %
+corpus matches              3/48   (unchanged)
+fixture guard             877/896  (unchanged)
+lib tests                    1029  (+2, the new cases)
+```
