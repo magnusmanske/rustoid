@@ -213,10 +213,12 @@ impl NodeIdAllocator {
 ///   `data-mw` being present, which is the marker for "Parsoid has something to key
 ///   this node by". An element with neither must not consume a counter, or every
 ///   later id shifts.
-/// - **An element that already has an `id` keeps it** and takes no counter. The
-///   exception in Parsoid is a collision, which is handled here by seeding the
-///   allocator with the document's existing ids: a *generated* id that happens to
-///   collide is skipped, leaving the hole a real page shows.
+/// - **An element that already has an `id` keeps it** and takes no counter —
+///   *unless another metadata-bearing element stored that same id earlier*, in
+///   which case the original id is preserved as `data-x-id` and the element takes
+///   a fresh generated id (Parsoid's T415477 rule). The allocator is also seeded
+///   with the document's existing ids, so a *generated* id that happens to collide
+///   is skipped, leaving the hole a real page shows.
 /// - **Pre-order depth-first from the body.** The body itself is visited first,
 ///   but carries no metadata, so it takes no id.
 ///
@@ -231,7 +233,8 @@ pub fn assign_node_ids(root: &mut crate::dom::node::Node) -> usize {
     let mut existing = Vec::new();
     collect_ids(root, &mut existing);
     let mut alloc = NodeIdAllocator::new(existing);
-    assign_walk(root, &mut alloc)
+    let mut stored = std::collections::HashSet::new();
+    assign_walk(root, &mut alloc, &mut stored)
 }
 
 /// Collect every `id` attribute already present, in document order.
@@ -247,7 +250,16 @@ fn collect_ids(node: &crate::dom::node::Node, out: &mut Vec<String>) {
 }
 
 /// Pre-order walk, assigning an id where the rules call for one.
-fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -> usize {
+///
+/// `stored` is the set of ids already claimed by a metadata-bearing element —
+/// Parsoid's `pb.parsoid.ids` map, whose *keys* are what the collision test reads.
+/// Only an element whose metadata is stored contributes, which is exactly the
+/// `has_metadata` test below.
+fn assign_walk(
+    node: &mut crate::dom::node::Node,
+    alloc: &mut NodeIdAllocator,
+    stored: &mut std::collections::HashSet<String>,
+) -> usize {
     let mut assigned = 0;
 
     if node.kind.is_element() {
@@ -256,7 +268,7 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
         // fragments it embeds) inside `storeRichAttributes`, ahead of
         // `storeInPageBundle`, which assigns the node's own id.
         for (_ck, fragment) in node.attr_mw_fragments.iter_mut() {
-            assigned += assign_walk(fragment, alloc);
+            assigned += assign_walk(fragment, alloc, stored);
         }
         // A node takes an id when it has metadata to key it by: a
         // *non-empty* `data-parsoid`, the empty-dp-slot case, or a `data-mw`
@@ -292,16 +304,39 @@ fn assign_walk(node: &mut crate::dom::node::Node, alloc: &mut NodeIdAllocator) -
             .is_some_and(data_parsoid_draws_an_id);
         let has_metadata =
             has_dp || ((node.empty_dp_slot || node.data_mw.is_some()) && !node.discardable_dp);
-        let has_id = node.get_attr("id").is_some_and(|v| !v.is_empty());
-        if has_metadata && !has_id {
-            let id = alloc.next_id();
-            node.set_attr("id", id);
-            assigned += 1;
+        let id = node
+            .get_attr("id")
+            .map(str::to_string)
+            .filter(|v| !v.is_empty());
+        if has_metadata {
+            match id {
+                // The id is already claimed by an earlier metadata-bearing
+                // element. Parsoid keeps the original under `data-x-id` and gives
+                // the element a fresh generated id: two citations of the same
+                // source both ask for `id="CITEREF…"`, and only the first may
+                // keep it.
+                Some(existing) if stored.contains(&existing) => {
+                    node.set_attr("data-x-id", existing);
+                    let fresh = alloc.next_id();
+                    node.set_attr("id", fresh.clone());
+                    stored.insert(fresh);
+                    assigned += 1;
+                }
+                Some(existing) => {
+                    stored.insert(existing);
+                }
+                None => {
+                    let fresh = alloc.next_id();
+                    node.set_attr("id", fresh.clone());
+                    stored.insert(fresh);
+                    assigned += 1;
+                }
+            }
         }
     }
 
     for child in &mut node.children {
-        assigned += assign_walk(child, alloc);
+        assigned += assign_walk(child, alloc, stored);
     }
     assigned
 }
@@ -428,6 +463,32 @@ mod tests {
         );
         assert_eq!(root.children[0].get_attr("id"), Some("mwAQ"));
         assert_eq!(root.children[1].get_attr("id"), None);
+    }
+
+    /// Two metadata-bearing elements that ask for the same id: the first keeps
+    /// it, the second preserves it as `data-x-id` and takes a fresh generated id
+    /// (Parsoid T415477). Two citations of one source both ask for
+    /// `id="CITEREF…"`, and only the first may keep it.
+    #[test]
+    fn a_duplicate_existing_id_moves_to_data_x_id() {
+        use crate::dom::node::{ElementKind, Node};
+        let cite = |root: &mut Node| {
+            let mut c = Node::element(ElementKind::Other("cite".into()));
+            c.data_mw = Some("{}".into());
+            c.set_attr("id", "CITEREFMalloch");
+            root.push_child(c);
+        };
+        let mut root = Node::document();
+        cite(&mut root);
+        cite(&mut root);
+        assign_node_ids(&mut root);
+        assert_eq!(root.children[0].get_attr("id"), Some("CITEREFMalloch"));
+        assert_eq!(root.children[0].get_attr("data-x-id"), None);
+        assert_eq!(root.children[1].get_attr("id"), Some("mwAQ"));
+        assert_eq!(
+            root.children[1].get_attr("data-x-id"),
+            Some("CITEREFMalloch")
+        );
     }
 
     #[test]
