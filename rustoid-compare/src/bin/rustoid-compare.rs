@@ -80,6 +80,12 @@ struct Cli {
     #[arg(long)]
     offline: bool,
 
+    /// Credit pages that differ only in nondeterministic output — a random
+    /// `<inputbox>` id, a media `utm_campaign` — as matches. The strict
+    /// byte-for-byte score is always reported alongside.
+    #[arg(long)]
+    ignore_nondeterministic: bool,
+
     /// Re-fetch this page, ignoring cached entries.
     #[arg(long)]
     refresh: bool,
@@ -320,7 +326,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let comparison = rt.block_on(rustoid_compare::compare_page(
         &client, &config, &cache, &req,
     ))?;
-    report(&comparison, cli.verbose)
+    report(&comparison, cli.verbose, cli.ignore_nondeterministic)
 }
 
 /// Print a comparison and return the exit status it implies.
@@ -331,12 +337,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn report(
     comparison: &rustoid_compare::Comparison,
     verbose: bool,
+    ignore_nondeterministic: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let status = match &comparison.outcome {
         Outcome::Match => "MATCH".to_string(),
         Outcome::Differ { detail } => format!("DIFFER\n{detail}"),
         Outcome::Skipped { reason } => format!("SKIP ({reason})"),
         Outcome::Stalled { seconds } => format!("STALLED (no render after {seconds:.0}s)"),
+        Outcome::Equivalent { detail } => format!("EQUIVALENT (nondeterministic only)\n{detail}"),
     };
     println!("{} @ r{} — {status}", comparison.title, comparison.revid);
     println!(
@@ -366,7 +374,14 @@ fn report(
         println!("\n--- parsoid ---\n{}", comparison.parsoid_html);
         println!("\n--- rustoid ---\n{}", comparison.rustoid_html);
     }
-    if !comparison.outcome.is_match() {
+    // An equivalent page is not a byte match; whether it is a *failure* depends
+    // on whether the caller asked to ignore nondeterministic output.
+    let failed = match &comparison.outcome {
+        Outcome::Match => false,
+        Outcome::Equivalent { .. } => !ignore_nondeterministic,
+        _ => true,
+    };
+    if failed {
         std::process::exit(1);
     }
     Ok(())
@@ -393,7 +408,8 @@ fn run_corpus<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     rustoid_compare::harness::set_stall_concurrency(jobs);
     let rows = rt.block_on(compare_corpus(cli, client, config, cache, corpus, jobs));
 
-    let board = Scoreboard::new(corpus.name.clone(), rows);
+    let board = Scoreboard::new(corpus.name.clone(), rows)
+        .ignoring_nondeterministic(cli.ignore_nondeterministic);
     print!("{}", board.render(cli.verbose));
 
     // The cache is written through on every put, but flushing makes the

@@ -45,6 +45,11 @@ impl Row {
         self.outcome.is_match()
     }
 
+    /// A page that differs only in nondeterministic output — no parser bug left.
+    pub fn is_equivalent(&self) -> bool {
+        self.outcome.is_equivalent()
+    }
+
     pub fn is_skipped(&self) -> bool {
         matches!(self.outcome, Outcome::Skipped { .. })
     }
@@ -82,6 +87,11 @@ pub struct ScriptErrorBucket {
 pub struct Scoreboard {
     pub corpus_name: String,
     pub rows: Vec<Row>,
+    /// Whether a [`Outcome::Equivalent`] page (byte-different only in
+    /// nondeterministic output) is credited as a match in the headline score.
+    /// The strict count is always reported alongside, so this only decides which
+    /// number is called "the score".
+    pub ignore_nondeterministic: bool,
 }
 
 impl Scoreboard {
@@ -89,7 +99,14 @@ impl Scoreboard {
         Self {
             corpus_name: corpus_name.into(),
             rows,
+            ignore_nondeterministic: false,
         }
+    }
+
+    /// Credit pages that differ only in nondeterministic output as matches.
+    pub fn ignoring_nondeterministic(mut self, on: bool) -> Self {
+        self.ignore_nondeterministic = on;
+        self
     }
 
     pub fn total(&self) -> usize {
@@ -98,6 +115,26 @@ impl Scoreboard {
 
     pub fn matches(&self) -> usize {
         self.rows.iter().filter(|r| r.is_match()).count()
+    }
+
+    /// Pages that agree once nondeterministic output is masked (but do not match
+    /// byte-for-byte).
+    pub fn equivalent(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.outcome.is_equivalent())
+            .count()
+    }
+
+    /// Matches credited for the headline score: strict matches, plus (when
+    /// `ignore_nondeterministic`) the equivalent pages.
+    pub fn credited_matches(&self) -> usize {
+        let n = self.matches();
+        if self.ignore_nondeterministic {
+            n + self.equivalent()
+        } else {
+            n
+        }
     }
 
     pub fn skipped(&self) -> usize {
@@ -139,6 +176,16 @@ impl Scoreboard {
         self.matches() as f64 * 100.0 / compared as f64
     }
 
+    /// Like [`Self::percent`], but crediting equivalent pages when the board is
+    /// set to ignore nondeterministic output.
+    pub fn credited_percent(&self) -> f64 {
+        let compared = self.compared();
+        if compared == 0 {
+            return 0.0;
+        }
+        self.credited_matches() as f64 * 100.0 / compared as f64
+    }
+
     /// Counts by [`Outcome::category`], most common first.
     pub fn by_category(&self) -> Vec<Bucket> {
         tally(self.rows.iter().map(|r| r.category().to_string()))
@@ -156,7 +203,7 @@ impl Scoreboard {
         tally(
             self.rows
                 .iter()
-                .filter(|r| !r.is_match() && !r.is_skipped())
+                .filter(|r| !r.is_match() && !r.is_equivalent() && !r.is_skipped())
                 .flat_map(|r| r.tags.iter().cloned()),
         )
     }
@@ -170,7 +217,7 @@ impl Scoreboard {
             for tag in &row.tags {
                 let e = counts.entry(tag.clone()).or_insert((0, 0));
                 e.1 += 1;
-                if row.is_match() {
+                if row.is_match() || row.is_equivalent() {
                     e.0 += 1;
                 }
             }
@@ -257,10 +304,31 @@ impl Scoreboard {
 
         out.push_str(&format!(
             "\nscore: {}/{} compared ({:.1}%)",
-            self.matches(),
+            self.credited_matches(),
             self.compared(),
-            self.percent()
+            self.credited_percent()
         ));
+        if self.equivalent() > 0 {
+            let strict = format!(
+                "strict {}/{} ({:.1}%)",
+                self.matches(),
+                self.compared(),
+                self.percent()
+            );
+            if self.ignore_nondeterministic {
+                out.push_str(&format!(
+                    ", {} of them nondeterministic only [{strict}]",
+                    self.equivalent()
+                ));
+            } else {
+                out.push_str(&format!(
+                    ", {} more nondeterministic only -> {:.1}% if ignored [{strict}]",
+                    self.equivalent(),
+                    (self.matches() + self.equivalent()) as f64 * 100.0
+                        / self.compared().max(1) as f64
+                ));
+            }
+        }
         if self.skipped() > 0 {
             out.push_str(&format!(", {} skipped", self.skipped()));
         }

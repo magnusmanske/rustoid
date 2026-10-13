@@ -454,7 +454,7 @@ fn section_items(token: &SelfclosingTagTk) -> Vec<Item> {
     if let Some(about) = attr_str(token, "about") {
         link.add_attribute_str("about", about);
     }
-    link.add_attribute_str("data-mw", &section_data_mw(token));
+    link.add_attribute_str("data-mw", section_data_mw(token));
 
     // A `<link>` is a void element, so there is no end tag to emit.
     vec![Item::Tok(ParsoidToken::Tag(link))]

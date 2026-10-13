@@ -36,6 +36,16 @@ pub enum Outcome {
     Differ { detail: String },
     /// The page could not be compared (missing, or a fetch failed).
     Skipped { reason: String },
+    /// The two sides agree once *nondeterministic* output is masked.
+    ///
+    /// Parsoid renders a handful of values fresh on every parse — an `<inputbox>`
+    /// id is `mw-inputbox-ns12-0.<mt_rand()>`, a media derivative URL carries a
+    /// per-request `utm_campaign` — so two renders of the *same* wikitext and
+    /// revision still differ there. Such a page is not a parser bug and cannot be
+    /// driven to a raw byte match, but the difference is not real either. Kept as
+    /// its own outcome so the strict score stays honest while the report still
+    /// names these pages.
+    Equivalent { detail: String },
     /// rustoid did not finish rendering within the per-page cap.
     ///
     /// Deliberately *not* a failure or a skip. A page that does not terminate is
@@ -51,6 +61,11 @@ impl Outcome {
         matches!(self, Self::Match)
     }
 
+    /// Whether the two sides differ only in nondeterministic output.
+    pub fn is_equivalent(&self) -> bool {
+        matches!(self, Self::Equivalent { .. })
+    }
+
     /// A coarse bucket for the scoreboard histogram, so a run reports *how* the
     /// differences cluster rather than only how many there were.
     ///
@@ -63,6 +78,7 @@ impl Outcome {
             Self::Match => "match",
             Self::Skipped { .. } => "skipped",
             Self::Stalled { .. } => "stalled",
+            Self::Equivalent { .. } => "nondeterministic",
             Self::Differ { detail } => classify(detail),
         }
     }
@@ -1746,9 +1762,131 @@ pub fn compare_html(parsoid: &str, rustoid: &str) -> Outcome {
             detail: SECTION_ONLY.to_string(),
         };
     }
+
+    // A difference that disappears once per-render values are masked is not a
+    // parser bug. Checked before reporting a byte offset so such a page is named
+    // as nondeterministic instead of sending someone after a phantom divergence.
+    let (ma, masks_a) = mask_nondeterministic_counted(&sa);
+    let (mb, masks_b) = mask_nondeterministic_counted(&sb);
+    if ma == mb {
+        return Outcome::Equivalent {
+            detail: format!(
+                "difference is nondeterministic output only ({} masked value(s) on the parsoid side, {} on rustoid's)",
+                masks_a, masks_b
+            ),
+        };
+    }
+
     Outcome::Differ {
         detail: first_difference(&sa, &sb),
     }
+}
+
+/// Mask values Parsoid generates fresh on *every* render, so two renders of the
+/// same revision can still be compared for the markup that matters.
+///
+/// Strict byte parity remains the corpus's headline score; this is the "is there
+/// a real difference underneath the noise" question, reported as
+/// [`Outcome::Equivalent`]. Each rule is a known generator, not a guess:
+///
+/// - **`utm_campaign=<token>`.** A media derivative URL's campaign reflects the
+///   endpoint that produced it (`parser` from the parser, `rest`/`index`/`api`
+///   from an API fetch), so the same file renders with a different campaign
+///   depending on who asked. Seen across the corpus: `parser` (10112),
+///   `rest` (46), `index` (3), `api` (2).
+/// - **`0.<8+ digits>`.** Parsoid appends `mt_rand()` (a float in `[0,1)` with
+///   ~10–15 significant digits) to some extension ids: an `<inputbox>` is
+///   `mw-inputbox-ns12-0.465146790607`, an OwidSlider caption
+///   `OWIDSlider-caption-0.020409186845836`. Requiring at least eight fractional
+///   digits keeps ordinary decimals (`0.4em`, a `110.141102`-style coordinate)
+///   out of the mask.
+/// - **A 14-digit MediaWiki timestamp** (`YYYYMMDDHHMMSS`), as `{{CURRENTTIMESTAMP}}`
+///   and friends emit. A render's `{{CURRENTYEAR}}`-style drift is a different,
+///   date-scale change and is left to the harness's `suspect drift` report.
+///
+/// The masking is textual and one pass; it never invents structure, only replaces
+/// a span with a fixed placeholder, so the masked forms of the two sides are
+/// directly comparable.
+pub fn mask_nondeterministic(html: &str) -> String {
+    mask_nondeterministic_counted(html).0
+}
+
+/// [`mask_nondeterministic`], also returning how many spans were masked.
+fn mask_nondeterministic_counted(html: &str) -> (String, usize) {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    let mut masked = 0usize;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("utm_campaign=") {
+            let end = after
+                .find(|c: char| !is_campaign_char(c))
+                .unwrap_or(after.len());
+            out.push_str("utm_campaign=@ND@");
+            rest = &after[end..];
+            masked += 1;
+            continue;
+        }
+        if let Some(after) = match_rand_id(rest) {
+            out.push_str("0.@ND@");
+            rest = after;
+            masked += 1;
+            continue;
+        }
+        // Consume a whole digit run at once, so a 14-digit timestamp inside a
+        // longer number is not re-matched from its second digit.
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if n == 14
+                && let Some(after) = match_timestamp(rest)
+            {
+                out.push_str("@NDTS@");
+                rest = after;
+                masked += 1;
+                continue;
+            }
+            out.push_str(&rest[..n]);
+            rest = &rest[n..];
+            continue;
+        }
+        let c = rest.chars().next().expect("rest is non-empty");
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    (out, masked)
+}
+
+/// Characters a `utm_campaign` value is built from (`parser`, `rest`, `index`,
+/// or a campaign string like `3701f6dc34-nature-briefing-daily-20260915`).
+fn is_campaign_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
+}
+
+/// Match `0.` followed by at least eight ASCII digits at the head of `s`,
+/// returning the remainder.
+fn match_rand_id(s: &str) -> Option<&str> {
+    let digits = s.strip_prefix("0.")?;
+    let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+    (n >= 8).then(|| &s[2 + n..])
+}
+
+/// Match a 14-digit `YYYYMMDDHHMMSS` MediaWiki timestamp at the head of `s`,
+/// returning the remainder. Field-range checks keep an arbitrary 14-digit number
+/// out of the mask.
+fn match_timestamp(s: &str) -> Option<&str> {
+    let num = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
+    let year = num(0..4)?;
+    let month = num(4..6)?;
+    let day = num(6..8)?;
+    let hour = num(8..10)?;
+    let minute = num(10..12)?;
+    let second = num(12..14)?;
+    let looks_like = (1900..=2099).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59;
+    looks_like.then(|| &s[14..])
 }
 
 /// Marker `detail` for a difference that is *only* section wrappers.
@@ -2013,6 +2151,72 @@ mod tests {
             revid: None,
             fetched_at: Some(format!("epoch:{epoch}")),
         }
+    }
+
+    #[test]
+    fn a_random_inputbox_id_is_masked() {
+        let masked = mask_nondeterministic(r#"id="mw-inputbox-ns12-0.465146790607""#);
+        assert_eq!(masked, r#"id="mw-inputbox-ns12-0.@ND@""#);
+    }
+
+    #[test]
+    fn an_ordinary_decimal_is_kept() {
+        // A CSS length and a coordinate share the `0.`/`digits.digits` shape and
+        // must survive: only Parsoid's ~10-significant-digit ids are masked.
+        assert_eq!(
+            mask_nondeterministic("line-height:0.4em"),
+            "line-height:0.4em"
+        );
+        assert_eq!(
+            mask_nondeterministic("lat 110.141102 lon 2020.1865463"),
+            "lat 110.141102 lon 2020.1865463"
+        );
+    }
+
+    #[test]
+    fn a_media_campaign_is_masked() {
+        assert_eq!(
+            mask_nondeterministic("x?utm_source=en.wikipedia.org&amp;utm_campaign=parser&amp;y"),
+            "x?utm_source=en.wikipedia.org&amp;utm_campaign=@ND@&amp;y"
+        );
+    }
+
+    #[test]
+    fn a_fourteen_digit_timestamp_is_masked_but_a_long_number_is_not() {
+        assert_eq!(
+            mask_nondeterministic("as of 20261013120000."),
+            "as of @NDTS@."
+        );
+        // A 15-digit run is not a timestamp, and must not be masked from its
+        // second digit on.
+        assert_eq!(
+            mask_nondeterministic("n=123456789012345"),
+            "n=123456789012345"
+        );
+        assert_eq!(
+            mask_nondeterministic("n=99999999999999"),
+            "n=99999999999999"
+        );
+    }
+
+    #[test]
+    fn a_nondeterministic_only_difference_is_equivalent() {
+        let parsoid = r#"<span id="mw-inputbox-ns12-0.111111111111">x</span>"#;
+        let rustoid = r#"<span id="mw-inputbox-ns12-0.999999999999">x</span>"#;
+        assert!(matches!(
+            compare_html(parsoid, rustoid),
+            Outcome::Equivalent { .. }
+        ));
+    }
+
+    #[test]
+    fn a_real_difference_is_still_a_difference() {
+        let parsoid = r#"<span id="mw-inputbox-ns12-0.111111111111">x</span>"#;
+        let rustoid = r#"<span id="mw-inputbox-ns12-0.999999999999">y</span>"#;
+        assert!(matches!(
+            compare_html(parsoid, rustoid),
+            Outcome::Differ { .. }
+        ));
     }
 
     #[test]
