@@ -2127,6 +2127,18 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // loops with. Double underscore marks it as internal, as elsewhere.
     ustring.set("__captures", lua.create_function(luafn_ustring_captures)?)?;
     ustring.set_metatable(Some(ustring_mt));
+
+    // Scribunto's `string` library carries `ulower`/`uupper`, documented aliases
+    // for `mw.ustring.lower`/`upper`. Modules call them on the `string` table
+    // (`Module:R` does `string.ulower(params.wrap)`), and our `string` is stock
+    // Lua, which lacks them: the call was "attempt to call field 'ulower' (a nil
+    // value)" and took down every page that transcludes `Module:R` — 24 of the
+    // corpus. Setting them here also serves `ustring.ulower`, which the ustring
+    // metatable resolves through `string`.
+    let string_lib: Table = lua.globals().get("string")?;
+    string_lib.set("ulower", ustring.get::<Function>("lower")?)?;
+    string_lib.set("uupper", ustring.get::<Function>("upper")?)?;
+
     mw.set("ustring", ustring)?;
 
     // `mw.ext.*` are extension-provided helpers; the one that matters in
@@ -2803,6 +2815,18 @@ fn title_derived_field(
         // string there would index a character instead.
         "protectionLevels" => {
             let levels = lua.create_table()?;
+            // Scribunto answers this from `RestrictionStore::getAllRestrictions`,
+            // which carries an entry for *every* restriction type
+            // (`$wgRestrictionTypes`: create/edit/move/upload), each an array that
+            // is empty when unrestricted. The key is present even then, and
+            // modules rely on it: `Module:Lua banner` reads
+            // `title.protectionLevels["edit"][1]` with no nil-guard, so an absent
+            // key was "attempt to index field 'edit' (a nil value)" on 2 corpus
+            // pages. An empty array keeps `Module:Effective protection level`'s
+            // `[action] and [action][1]` reading `nil` exactly as before.
+            for action in ["create", "edit", "move", "upload"] {
+                levels.set(action, lua.create_table()?)?;
+            }
             if let Some(entry) = facts.as_ref().map(|f| &f.protection) {
                 for (action, value) in &entry.levels {
                     let arr = lua.create_table()?;
@@ -2921,6 +2945,22 @@ fn title_derived_without_facts(lua: &Lua, t: &Table, key: &str) -> mlua::Result<
             }
             _ => Ok(Value::Nil),
         },
+        // Scribunto defines these as `mw.title.makeTitle(ns, text.baseText)` and
+        // `makeTitle(ns, text.rootText)`: the same namespace, with the subpage
+        // stripped to before the last (base) or first (root) slash. A title that
+        // is not a subpage has `baseText == rootText == text`, so both return the
+        // title itself. `Module:High-use` rewrites a `/doc`, `/sandbox` or
+        // `/testcases` subpage to `basePageTitle` and reads
+        // `basePageTitle.isSubpage` in a loop; the missing field was
+        // "attempt to index field 'basePageTitle' (a nil value)" on 4 corpus pages.
+        "basePageTitle" => {
+            let base: String = t.get("baseText").unwrap_or_default();
+            derived_page_title(lua, &site, t, ns_id, &base)
+        }
+        "rootPageTitle" => {
+            let root: String = t.get("rootText").unwrap_or_default();
+            derived_page_title(lua, &site, t, ns_id, &root)
+        }
         "fullUrl" => {
             let full: String = t.get("fullText").unwrap_or_default();
             full_url_closure(lua, &full)
@@ -3150,7 +3190,13 @@ fn derived_page_title(
     ns_id: i32,
     text: &str,
 ) -> mlua::Result<Value> {
-    if t.get::<i32>("namespace").unwrap_or(0) == ns_id {
+    // The title itself only when *both* the namespace and the text match. The
+    // text check matters for `basePageTitle`/`rootPageTitle`, which share the
+    // namespace but change the text for a subpage; `subjectPageTitle` and
+    // `talkPageTitle` always pass the same text, so they are unaffected.
+    if t.get::<i32>("namespace").unwrap_or(0) == ns_id
+        && t.get::<String>("text").unwrap_or_default() == text
+    {
         return Ok(Value::Table(t.clone()));
     }
     let full = prefix_title(site, ns_id, text);
