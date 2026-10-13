@@ -32,16 +32,144 @@ fn visit(node: &mut Node) {
         return;
     }
 
-    let mut out: Vec<Node> = Vec::with_capacity(node.children.len());
-    for mut child in std::mem::take(&mut node.children) {
-        if matches!(child.kind, NodeKind::Text(_)) {
-            out.extend(split_text_child(&mut child));
-        } else {
-            visit(&mut child);
-            out.push(child);
+    // Walk by index because a split inserts nodes: PHP's traverser visits the
+    // *suffix* text node next, so a second match in the same text is armored by a
+    // later traversal. Resuming at the suffix (and re-descending into the new
+    // span, whose only child holds a non-breaking space) reproduces that.
+    let mut i = 0;
+    while i < node.children.len() {
+        if !matches!(
+            node.children[i].kind,
+            NodeKind::Text(_) | NodeKind::Comment(_)
+        ) {
+            visit(&mut node.children[i]);
+        }
+        if let NodeKind::Text(_) = node.children[i].kind {
+            let text = match &node.children[i].kind {
+                NodeKind::Text(t) => t.clone(),
+                _ => unreachable!(),
+            };
+            if let Some(offset) = find_left_match(&text).or_else(|| find_right_match(&text)) {
+                let dsr_start = dsr_start_of_child(node, i);
+                i = splice_display_space(node, i, &text, offset, dsr_start);
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Replace `parent.children[index]` (a text node) with
+/// `[prefix?, span, suffix?]`, and return the index of the suffix when there is
+/// one (else the node that followed the original), so the caller resumes there.
+fn splice_display_space(
+    parent: &mut Node,
+    index: usize,
+    text: &str,
+    offset: usize,
+    dsr_start: Option<usize>,
+) -> usize {
+    let prefix = &text[..offset];
+    // `substr( $str, $offset + 1 )` — the armored space is one byte.
+    let suffix = &text[offset + 1..];
+
+    let mut span = Node::element(ElementKind::Other("span".to_string()));
+    span.push_child(Node::text("\u{00A0}"));
+    span.set_attr("typeof", "mw:DisplaySpace");
+    // The span's `data-parsoid` is the one-character source range of the space
+    // (`new DomSourceRange( $start, $start + 1, 0, 0 )`), or all-null when the
+    // text node's own start could not be recovered. Either way the metadata is
+    // present, which is what makes the node take a generated id.
+    let dsr = match dsr_start {
+        Some(s) => {
+            let start = s + prefix.len();
+            DomSourceRange {
+                start: Some(start),
+                end: Some(start + 1),
+                open_width: Some(0),
+                close_width: Some(0),
+                leading_ws: 0,
+                trailing_ws: 0,
+            }
+        }
+        None => DomSourceRange {
+            start: None,
+            end: None,
+            open_width: None,
+            close_width: None,
+            leading_ws: 0,
+            trailing_ws: 0,
+        },
+    };
+    let dp = DataParsoid {
+        dsr: Some(dsr),
+        ..Default::default()
+    };
+    span.data_parsoid = dp.to_data_parsoid_json();
+    span.dp = Some(dp);
+
+    let mut new_nodes = Vec::with_capacity(3);
+    if !prefix.is_empty() {
+        new_nodes.push(Node::text(prefix.to_string()));
+    }
+    let span_index = index + new_nodes.len();
+    new_nodes.push(span);
+    if !suffix.is_empty() {
+        new_nodes.push(Node::text(suffix.to_string()));
+    }
+    parent.children.splice(index..=index, new_nodes);
+    span_index + 1
+}
+
+/// The byte offset where `parent.children[index]` starts in the source, mirroring
+/// `DisplaySpace::getTextNodeDSRStart`. `None` when the parent's DSR is unusable,
+/// or a preceding sibling's is.
+fn dsr_start_of_child(parent: &Node, index: usize) -> Option<usize> {
+    let dsr = node_dsr(parent)?;
+    if !valid_dsr(&dsr, true) {
+        return None;
+    }
+    let mut start = dsr.inner_start();
+    for child in &parent.children[..index] {
+        match &child.kind {
+            NodeKind::Comment(c) => {
+                start += crate::html::wts_utils::decoded_comment_length(c, false);
+            }
+            NodeKind::Text(t) => start += t.len(),
+            _ => {
+                // An element stands for as many characters as its DSR spans; the
+                // scan restarts from its end, as PHP does.
+                let cdsr = node_dsr(child)?;
+                if !valid_dsr(&cdsr, false) {
+                    return None;
+                }
+                start = cdsr.end?;
+            }
         }
     }
-    node.children = out;
+    Some(start)
+}
+
+/// A node's source range: the structured `dp` when the tree still carries it,
+/// else the serialized `data-parsoid`.
+fn node_dsr(node: &Node) -> Option<DomSourceRange> {
+    if let Some(dp) = &node.dp
+        && let Some(dsr) = &dp.dsr
+    {
+        return Some(dsr.clone());
+    }
+    node.data_parsoid
+        .as_deref()
+        .and_then(DataParsoid::from_data_parsoid_json)
+        .and_then(|dp| dp.dsr)
+}
+
+/// `sanitizer::isValidDSR` for the tokenizer-side range: `start`/`end` must be
+/// set, and in `all` mode so must the container widths.
+fn valid_dsr(dsr: &DomSourceRange, all: bool) -> bool {
+    dsr.start.is_some()
+        && dsr.end.is_some()
+        && (!all || (dsr.open_width.is_some() && dsr.close_width.is_some()))
 }
 
 /// Whether `textHandler` bails out for this node (`pre`, `svg`, or a raw-text
@@ -52,67 +180,6 @@ fn skips_subtree(node: &Node) -> bool {
     }
     let name = crate::html::wts_utils::node_name(node);
     name == "pre" || name == "svg" || crate::html5::html_data::is_raw_text(&name)
-}
-
-/// Apply both French-space handlers to a text node, returning the replacement
-/// node sequence (`[prefix, span, suffix]` when a space was armored, else the
-/// node unchanged).
-///
-/// PHP runs `leftHandler` then `rightHandler` on the *same* node; each mutates
-/// the node in place and appends the suffix as a new sibling. Chaining them on
-/// one node is equivalent only for the first match, which is what PHP's
-/// non-global `preg_match` does too — so one replacement per handler invocation
-/// is correct.
-fn split_text_child(child: &mut Node) -> Vec<Node> {
-    let NodeKind::Text(text) = &child.kind else {
-        return vec![std::mem::replace(child, Node::text(""))];
-    };
-    let text = text.clone();
-
-    // `leftHandler` then `rightHandler`, both on the current node value; PHP
-    // replaces the node's value with the prefix, so a second match in the
-    // *suffix* is found lazily on a later traversal in PHP. We mirror that by
-    // only performing the first hit of each pattern on this node.
-    if let Some(offset) = find_left_match(&text) {
-        return build_split(&text, offset, &text);
-    }
-    if let Some(offset) = find_right_match(&text) {
-        return build_split(&text, offset, &text);
-    }
-    vec![std::mem::replace(child, Node::text(""))]
-}
-
-/// Split `text` at `offset` (dropping the single space byte there) into
-/// `[prefix, mw:DisplaySpace span, suffix]`.
-fn build_split(text: &str, offset: usize, _orig: &str) -> Vec<Node> {
-    let prefix = text[..offset].to_string();
-    // `substr( $str, $offset + 1 )` — the space is one byte.
-    let suffix = text[offset + 1..].to_string();
-
-    let mut span = Node::element(ElementKind::Other("span".to_string()));
-    span.push_child(Node::text("\u{00A0}"));
-    span.set_attr("typeof", "mw:DisplaySpace");
-    span.dp = Some(DataParsoid {
-        dsr: Some(DomSourceRange {
-            start: None,
-            end: None,
-            open_width: None,
-            close_width: None,
-            leading_ws: 0,
-            trailing_ws: 0,
-        }),
-        ..Default::default()
-    });
-
-    let mut out = Vec::with_capacity(3);
-    if !prefix.is_empty() {
-        out.push(Node::text(prefix));
-    }
-    out.push(span);
-    if !suffix.is_empty() {
-        out.push(Node::text(suffix));
-    }
-    out
 }
 
 /// Byte offset of the first `' '` matching `'/ (?=[?:;!%»›](?!\w))/u'`.
@@ -224,5 +291,35 @@ mod tests {
             &dt.children[2],
             "mw:DisplaySpace"
         ));
+    }
+
+    /// The span's `data-parsoid` is what makes it draw a node id — the live
+    /// output is `<span typeof="mw:DisplaySpace" id="mwX">`. Without a parent
+    /// `dsr` the range is all-null, but still present, which is Parsoid's
+    /// `getTextNodeDSRStart` returning `null`.
+    #[test]
+    fn the_span_carries_a_source_range() {
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("a b : c"));
+        run(&mut p);
+        let span = &p.children[1];
+        assert!(crate::html::dom_utils::has_type_of(span, "mw:DisplaySpace"));
+        let json = span.data_parsoid.as_deref().expect("data-parsoid");
+        assert!(json.contains("\"dsr\""), "got {json}");
+    }
+
+    /// A second French space in one text node is armored too: the walk resumes at
+    /// the suffix, which is what PHP's traverser does on its next step.
+    #[test]
+    fn armors_every_match_in_a_text_node() {
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("a : b ; c"));
+        run(&mut p);
+        let spans = p
+            .children
+            .iter()
+            .filter(|c| crate::html::dom_utils::has_type_of(c, "mw:DisplaySpace"))
+            .count();
+        assert_eq!(spans, 2);
     }
 }

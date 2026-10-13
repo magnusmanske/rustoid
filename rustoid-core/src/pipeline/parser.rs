@@ -3403,12 +3403,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // It runs *after* Cite here (see below), because a note's stylesheet is
         // moved out of the stashed ref body into the reference list by Cite, and
         // Parsoid's DedupeStyles sees the final DOM.
-        // DisplaySpace (`displayspace`): armor French spaces. PHP runs it as a
-        // global DOM pass after extension post-processing and before `cleanup`.
-        crate::pipeline::display_space::run(&mut ast);
+        // CleanUp (`cleanup`): drop empty elements and do the final fix-ups.
         crate::pipeline::cleanup::run(&mut ast);
-        crate::pipeline::headings::gen_anchors(&mut ast);
-        crate::pipeline::headings::dedupe_heading_ids(&mut ast);
         // AddMediaInfo: resolve file metadata for `mw:File` containers and
         // replace broken-media placeholders with real `<img>` elements (or mark
         // missing files as `mw:Error`). Mirrors PHP's `AddMediaInfo` pass.
@@ -3482,6 +3478,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // order, so anything numbered after Cite must continue from here.
             about_counter.set(ids.about_counter());
         }
+        // DisplaySpace (`displayspace`): armor French spaces. PHP runs it as a
+        // global DOM pass after extension post-processing (`extpp`) and before
+        // `gen-anchors`, which is why it is here and not before Cite: a note's
+        // body is spliced into the reference list by Cite, and only then does it
+        // exist to armor.
+        crate::pipeline::display_space::run(&mut ast);
+        crate::pipeline::headings::gen_anchors(&mut ast);
+        crate::pipeline::headings::dedupe_heading_ids(&mut ast);
         // AddRedLinks: resolve which wikilink targets exist, marking missing
         // ones as red links and redirect targets with `mw-redirect`. It runs
         // *after* Cite because a note's body only reaches the DOM when Cite
