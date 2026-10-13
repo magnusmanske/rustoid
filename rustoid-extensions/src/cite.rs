@@ -424,7 +424,7 @@ impl DocIds {
 /// emits, then `mwAQ`… — and the real allocator then skipped that whole range,
 /// which is why the first body element came out as `mwGg` instead of `mwAQ` on
 /// every page.
-fn mark_for_id(node: &mut crate::dom::node::Node) {
+fn mark_for_id(node: &mut rustoid_ast::dom::node::Node) {
     node.empty_dp_slot = true;
 }
 
@@ -524,11 +524,11 @@ pub fn references_data_mw(attrs_json: &str, auto_generated: bool, has_body: bool
 ///
 /// Returns the number of `<ref>` markers rendered.
 pub fn run(
-    root: &mut crate::dom::node::Node,
+    root: &mut rustoid_ast::dom::node::Node,
     page_title: &str,
     ids: &mut DocIds,
-    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
-    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
+    body_of: &dyn Fn(&Reference) -> rustoid_ast::dom::node::Node,
+    nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
 ) -> usize {
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
@@ -543,9 +543,10 @@ pub fn run(
     // itself hold a `<ref>`; Cite renders it into the note body before the body is
     // spliced, so those converted bodies are stashed here and preferred over the
     // raw ones.
-    let converted: std::cell::RefCell<std::collections::HashMap<String, crate::dom::node::Node>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    let body_for_list = |r: &Reference| -> crate::dom::node::Node {
+    let converted: std::cell::RefCell<
+        std::collections::HashMap<String, rustoid_ast::dom::node::Node>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    let body_for_list = |r: &Reference| -> rustoid_ast::dom::node::Node {
         if let Some(n) = converted.borrow().get(&r.body) {
             return n.clone();
         }
@@ -568,10 +569,10 @@ pub fn run(
 /// `<references>` is deliberately not collected here: it renders in place, from
 /// state only this walk can build, so it is handled during substitution.
 fn collect(
-    node: &crate::dom::node::Node,
+    node: &rustoid_ast::dom::node::Node,
     state: &mut CiteState,
     use_ids: &mut Vec<String>,
-    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
+    nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
 ) {
     if let Some((name, group, body, self_closing, attrs)) = read_ref(node) {
         // A ref nested in a transcluded note is processed *before* the note itself
@@ -605,7 +606,7 @@ fn collect(
 /// self-closing flag, and the raw attributes echoed into `data-mw.attrs`.
 type RefTag = (String, String, String, bool, Vec<(String, String)>);
 
-fn read_ref(node: &crate::dom::node::Node) -> Option<RefTag> {
+fn read_ref(node: &rustoid_ast::dom::node::Node) -> Option<RefTag> {
     if !typeof_contains(node, "mw:Extension") || node.get_attr("name") != Some("ref") {
         return None;
     }
@@ -723,13 +724,13 @@ fn attr_value(attrs: &str, key: &str) -> Option<String> {
 /// Walk again, replacing refs with markers and `<references>` with the note list.
 #[allow(clippy::too_many_arguments)]
 fn render(
-    root: &mut crate::dom::node::Node,
+    root: &mut rustoid_ast::dom::node::Node,
     state: &CiteState,
     page_title: &str,
     ids: &mut DocIds,
-    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
-    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
-    converted: &std::cell::RefCell<std::collections::HashMap<String, crate::dom::node::Node>>,
+    body_of: &dyn Fn(&Reference) -> rustoid_ast::dom::node::Node,
+    nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    converted: &std::cell::RefCell<std::collections::HashMap<String, rustoid_ast::dom::node::Node>>,
     use_ids: &mut [String],
 ) -> usize {
     let mut rendered = 0usize;
@@ -752,13 +753,13 @@ fn render(
 /// Transform one node's children, then the node itself.
 #[allow(clippy::too_many_arguments)]
 fn walk_render(
-    node: &mut crate::dom::node::Node,
+    node: &mut rustoid_ast::dom::node::Node,
     state: &CiteState,
     page_title: &str,
     ids: &mut DocIds,
-    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
-    nested_body: &dyn Fn(&str) -> Option<crate::dom::node::Node>,
-    converted: &std::cell::RefCell<std::collections::HashMap<String, crate::dom::node::Node>>,
+    body_of: &dyn Fn(&Reference) -> rustoid_ast::dom::node::Node,
+    nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    converted: &std::cell::RefCell<std::collections::HashMap<String, rustoid_ast::dom::node::Node>>,
     use_ids: &mut [String],
     next_use: &mut usize,
     rendered: &mut usize,
@@ -794,9 +795,9 @@ fn walk_render(
         let about = node.get_attr("about").map(str::to_string);
         let data_mw = references_data_mw(&attrs_json, false, has_body);
         if responsive {
-            let mut wrap = crate::dom::node::Node::element(crate::dom::node::ElementKind::Other(
-                "div".to_string(),
-            ));
+            let mut wrap = rustoid_ast::dom::node::Node::element(
+                rustoid_ast::dom::node::ElementKind::Other("div".to_string()),
+            );
             // Cite adds `mw-references-columns` when the responsive wrapper holds
             // more than `CiteResponsiveReferencesThreshold` (10) notes.
             const RESPONSIVE_THRESHOLD: usize = 10;
@@ -880,7 +881,7 @@ fn walk_render(
 /// Whether a node's subtree contains a `<ref>` element (Cite's
 /// `References::hasRef`, one fragment deep — a ref inside a nested ref's own body
 /// is reached by the recursion, not here).
-fn has_ref(node: &crate::dom::node::Node) -> bool {
+fn has_ref(node: &rustoid_ast::dom::node::Node) -> bool {
     node.children
         .iter()
         .any(|c| read_ref(c).is_some() || has_ref(c))
@@ -893,8 +894,8 @@ fn has_ref(node: &crate::dom::node::Node) -> bool {
 /// marker; the `typeof` and `data-mw` are merged here so the marker reports the
 /// template it came from, as the service serves it.
 fn apply_transclusion_encapsulation(
-    marker: &mut crate::dom::node::Node,
-    source: &crate::dom::node::Node,
+    marker: &mut rustoid_ast::dom::node::Node,
+    source: &rustoid_ast::dom::node::Node,
 ) {
     let in_transclusion = source
         .get_attr("typeof")
@@ -917,8 +918,7 @@ fn apply_transclusion_encapsulation(
         .clone()
         .or_else(|| source.get_attr("data-mw").map(str::to_string));
     let target = marker.get_attr("data-mw").map(str::to_string);
-    if let Some(merged) = crate::pipeline::tree_builder_html::append_parts_to_data_mw(parts, target)
-    {
+    if let Some(merged) = rustoid_ast::data_mw::append_parts_to_data_mw(parts, target) {
         marker.set_attr("data-mw", merged);
     }
 }
@@ -929,7 +929,7 @@ fn apply_transclusion_encapsulation(
 /// extension is `"mw:Extension mw:Transclusion"` — so an equality check misses the
 /// common case of an extension emitted by a template. The DOM spec says consumers
 /// must treat these like class names (`[typeof~=…]`).
-fn typeof_contains(node: &crate::dom::node::Node, value: &str) -> bool {
+fn typeof_contains(node: &rustoid_ast::dom::node::Node, value: &str) -> bool {
     node.get_attr("typeof")
         .is_some_and(|t| t.split_whitespace().any(|v| v == value))
 }
@@ -952,7 +952,7 @@ fn typeof_contains(node: &crate::dom::node::Node, value: &str) -> bool {
 /// attribute is *on* (the default) and only a falsy value (`""`/`"0"`)
 /// turns it off — `Template:Reflist` passes `responsive=0` for a fixed-width
 /// reflist, and the `<ol>` is then the extension element with no wrapper.
-fn read_references(node: &crate::dom::node::Node) -> Option<(String, String, bool, bool)> {
+fn read_references(node: &rustoid_ast::dom::node::Node) -> Option<(String, String, bool, bool)> {
     if !typeof_contains(node, "mw:Extension") || node.get_attr("name") != Some("references") {
         return None;
     }
@@ -1067,8 +1067,8 @@ pub fn ref_marker_nodes(
     page_title: &str,
     ids: &mut DocIds,
     about: Option<String>,
-) -> crate::dom::node::Node {
-    use crate::dom::node::{ElementKind, Node};
+) -> rustoid_ast::dom::node::Node {
+    use rustoid_ast::dom::node::{ElementKind, Node};
 
     // Whether this use is the one that supplied the note's text, which decides
     // the `data-mw` shape: only that use carries the note's `body` pointer.
@@ -1126,9 +1126,9 @@ pub fn references_list_nodes(
     refs: &[&Reference],
     group: &str,
     page_title: &str,
-    body_of: &dyn Fn(&Reference) -> crate::dom::node::Node,
-) -> crate::dom::node::Node {
-    use crate::dom::node::{ElementKind, Node};
+    body_of: &dyn Fn(&Reference) -> rustoid_ast::dom::node::Node,
+) -> rustoid_ast::dom::node::Node {
+    use rustoid_ast::dom::node::{ElementKind, Node};
 
     let page = page_title.replace(' ', "_");
     let mut ol = Node::element(ElementKind::Other("ol".to_string()));
@@ -1191,8 +1191,8 @@ fn backlink_node(
     page: &str,
     group: &str,
     label: Option<usize>,
-) -> crate::dom::node::Node {
-    use crate::dom::node::{ElementKind, Node};
+) -> rustoid_ast::dom::node::Node {
+    use rustoid_ast::dom::node::{ElementKind, Node};
 
     let mut a = Node::element(ElementKind::Other("a".to_string()));
     a.set_attr("href", format!("./{page}#{use_id}"));
@@ -1386,7 +1386,7 @@ mod tests {
     /// `mw:Extension/ref` and no `parts`.
     #[test]
     fn a_ref_inherits_its_enclosing_transclusion() {
-        use crate::dom::node::{ElementKind, Node};
+        use rustoid_ast::dom::node::{ElementKind, Node};
 
         let mut st = CiteState::new();
         st.add("x", "", "body", false, None);
@@ -1434,7 +1434,7 @@ mod tests {
     /// when the note carries `mw:Transclusion` (the `inTemplate` gate).
     #[test]
     fn a_nested_ref_is_collected_before_its_note() {
-        use crate::dom::node::{ElementKind, Node};
+        use rustoid_ast::dom::node::{ElementKind, Node};
 
         let ref_node = |typeof_: &str, source: &str| {
             let mut n = Node::element(ElementKind::Other("extension".to_string()));
@@ -1535,7 +1535,7 @@ mod tests {
 
         assert_eq!(
             sup.kind,
-            crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(
+            rustoid_ast::dom::node::NodeKind::Element(rustoid_ast::dom::node::ElementKind::Other(
                 "sup".to_string()
             ))
         );
@@ -1562,16 +1562,16 @@ mod tests {
         assert_eq!(text.children[0].get_attr("class"), Some("cite-bracket"));
         assert_eq!(
             text.children[0].children[0].kind,
-            crate::dom::node::NodeKind::Text("[".to_string())
+            rustoid_ast::dom::node::NodeKind::Text("[".to_string())
         );
         assert_eq!(
             text.children[1].kind,
-            crate::dom::node::NodeKind::Text("1".to_string())
+            rustoid_ast::dom::node::NodeKind::Text("1".to_string())
         );
         assert_eq!(text.children[2].get_attr("class"), Some("cite-bracket"));
         assert_eq!(
             text.children[2].children[0].kind,
-            crate::dom::node::NodeKind::Text("]".to_string())
+            rustoid_ast::dom::node::NodeKind::Text("]".to_string())
         );
     }
 
@@ -1583,7 +1583,7 @@ mod tests {
         st.add("", "", "body", false, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
         let ol = references_list_nodes(&refs, "", "Zebra", &|_| {
-            crate::dom::node::Node::text("BODY")
+            rustoid_ast::dom::node::Node::text("BODY")
         });
         assert_eq!(ol.get_attr("class"), Some("mw-references references"));
         let li = &ol.children[0];
@@ -1599,7 +1599,7 @@ mod tests {
         assert_eq!(a.get_attr("rel"), Some("mw:referencedBy"));
         assert_eq!(
             a.children[0].children[0].kind,
-            crate::dom::node::NodeKind::Text("\u{2191}".to_string()),
+            rustoid_ast::dom::node::NodeKind::Text("\u{2191}".to_string()),
             "a single use is an arrow"
         );
 
@@ -1612,7 +1612,7 @@ mod tests {
         );
         assert_eq!(
             text.children[0].kind,
-            crate::dom::node::NodeKind::Text("BODY".to_string())
+            rustoid_ast::dom::node::NodeKind::Text("BODY".to_string())
         );
     }
 
@@ -1624,7 +1624,9 @@ mod tests {
         st.add("Badenhorst2019", "", "body", false, None);
         st.add("Badenhorst2019", "", "", true, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
-        let ol = references_list_nodes(&refs, "", "Zebra", &|_| crate::dom::node::Node::text("B"));
+        let ol = references_list_nodes(&refs, "", "Zebra", &|_| {
+            rustoid_ast::dom::node::Node::text("B")
+        });
         let li = &ol.children[0];
         let wrap = &li.children[0];
         assert_eq!(wrap.get_attr("class"), Some("mw-cite-backlink"));
@@ -1646,11 +1648,11 @@ mod tests {
         // The labels count uses, not the note number.
         assert_eq!(
             links[0].children[0].children[0].kind,
-            crate::dom::node::NodeKind::Text("1".to_string())
+            rustoid_ast::dom::node::NodeKind::Text("1".to_string())
         );
         assert_eq!(
             links[1].children[0].children[0].kind,
-            crate::dom::node::NodeKind::Text("2".to_string())
+            rustoid_ast::dom::node::NodeKind::Text("2".to_string())
         );
     }
 
@@ -1660,7 +1662,7 @@ mod tests {
         st.add("", "lower-alpha", "a", false, None);
         let refs: Vec<&Reference> = st.references.iter().collect();
         let ol = references_list_nodes(&refs, "lower-alpha", "Zebra", &|_| {
-            crate::dom::node::Node::text("A")
+            rustoid_ast::dom::node::Node::text("A")
         });
         assert_eq!(ol.get_attr("data-mw-group"), Some("lower-alpha"));
         let li = &ol.children[0];

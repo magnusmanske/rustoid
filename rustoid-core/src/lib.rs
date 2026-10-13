@@ -37,12 +37,14 @@ pub mod resource_limits;
 pub mod title;
 pub mod traits;
 
-pub mod dom;
 pub mod expand;
 pub mod ext;
 pub mod lua;
 pub mod pipeline;
 pub mod wikitext;
+
+// The AST node types live in `rustoid-ast`, shared with `rustoid-extensions`.
+pub use rustoid_ast::dom;
 
 pub mod html;
 pub mod html5;

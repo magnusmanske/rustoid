@@ -722,7 +722,7 @@ pub struct TempData {
     pub first_wikitext_node: Option<String>,
     /// Set on tokens that came out of a parser function whose branch core
     /// expands to *text* — `#if`, `#ifeq`, `#ifexpr`, `#iferror`, i.e.
-    /// [`crate::pipeline::template_handler::TemplateHandler::expands_branch_to_text`].
+    /// `TemplateHandler::expands_branch_to_text`.
     ///
     /// Core hands that branch back to the parser as a string, which re-tokenizes
     /// it, so the wikitext targets inside it were resolved before anything looked
@@ -775,7 +775,7 @@ pub struct TempData {
     ///
     /// Set on a `#tag`-produced extension token too: its content is the call's
     /// argument value, so the ref-body expansion unwraps it
-    /// ([`crate::pipeline::parser::Parser`]'s `number_extension_token`).
+    /// (`Parser`'s `number_extension_token`).
     pub in_arg_value: bool,
     /// A newline inserted only to force a module's table onto its own line (the
     /// T2529 rule; see `Parser::expand_invoke`). It does its work in the
@@ -940,17 +940,14 @@ impl ParsoidToken {
     }
 
     /// Get a named attribute KV (analogous to PHP's getAttributeKV).
-    pub fn get_attribute_kv(&self, name: &str) -> Option<&crate::wikitext::tokens_v2::KV> {
+    pub fn get_attribute_kv(&self, name: &str) -> Option<&crate::tokens_v2::KV> {
         self.get_attribs()
             .iter()
             .find(|kv| kv.key.as_str() == Some(name))
     }
 
     /// Get a mutable named attribute KV.
-    pub fn get_attribute_kv_mut(
-        &mut self,
-        name: &str,
-    ) -> Option<&mut crate::wikitext::tokens_v2::KV> {
+    pub fn get_attribute_kv_mut(&mut self, name: &str) -> Option<&mut crate::tokens_v2::KV> {
         match self {
             ParsoidToken::Tag(t) => t
                 .attribs

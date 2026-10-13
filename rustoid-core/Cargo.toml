@@ -12,6 +12,8 @@ ruwex = ["dep:ruwex"]
 mwapi = ["dep:reqwest", "dep:tokio"]
 
 [dependencies]
+rustoid-ast = { path = "../rustoid-ast" }
+rustoid-extensions = { path = "../rustoid-extensions" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

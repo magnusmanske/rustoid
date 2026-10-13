@@ -1,0 +1,11 @@
+[package]
+name = "rustoid-ast"
+description = "Shared AST/DOM node and token types for rustoid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json.workspace = true

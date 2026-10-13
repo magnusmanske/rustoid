@@ -1,7 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "rustoid-ast",
     "rustoid-core",
+    "rustoid-extensions",
     "rustoid-cli",
     "rustoid-compare",
 ]

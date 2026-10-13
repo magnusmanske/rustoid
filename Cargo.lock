@@ -1465,6 +1465,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustoid-ast"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "rustoid-cli"
 version = "0.1.0"
 dependencies = [
@@ -1505,6 +1512,8 @@ dependencies = [
  "once_cell",
  "regex",
  "reqwest",
+ "rustoid-ast",
+ "rustoid-extensions",
  "ruwex",
  "serde",
  "serde_json",
@@ -1514,6 +1523,13 @@ dependencies = [
  "unicode-normalization",
  "unicode-properties",
  "url",
+]
+
+[[package]]
+name = "rustoid-extensions"
+version = "0.1.0"
+dependencies = [
+ "rustoid-ast",
 ]
 
 [[package]]

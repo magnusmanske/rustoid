@@ -7,7 +7,8 @@
 pub mod preproc_tokens;
 pub mod token_utils;
 pub mod tokenizer_v2;
-pub mod tokens_v2;
+// The token types live in `rustoid-ast`, shared with `rustoid-extensions`.
+pub use rustoid_ast::tokens_v2;
 
 // Wikitext constants (faithful PHP Parsoid Consts.php port).
 pub mod consts;

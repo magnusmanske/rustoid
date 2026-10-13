@@ -1,0 +1,11 @@
+[package]
+name = "rustoid-extensions"
+description = "MediaWiki parser extensions for rustoid, ported from Parsoid's native implementations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustoid-ast = { path = "../rustoid-ast" }

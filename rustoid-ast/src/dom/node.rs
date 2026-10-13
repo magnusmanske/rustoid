@@ -138,7 +138,7 @@ pub struct Node {
     /// building so the `ComputeDSR` pass can read `tsr`/`src`/`end_tsr`/etc. and
     /// write back `dsr`. This is the source of truth for DSR computation and
     /// is re-serialized into `data_parsoid` when DSR is finalized.
-    pub dp: Option<crate::wikitext::tokens_v2::DataParsoid>,
+    pub dp: Option<crate::tokens_v2::DataParsoid>,
     /// The `data-mw` JSON blob for transclusion/extension metadata.
     pub data_mw: Option<String>,
     /// A stashed sub-fragment carried by a `mw:DOMFragment` placeholder.
