@@ -15869,3 +15869,38 @@ corpus matches                 3/48   (unchanged)
 fixture guard                877/896  (unchanged)
 lib tests                       1033  (+1)
 ```
+
+## A duplicate id moves to `data-x-id`
+
+`Order of the British Empire` next parked at 58.50 % on its citations. Every
+citation of one source makes `Module:Citation/CS1` emit
+`id="CITEREF<author>"`, and the page cites Malloch five times, so five `<cite>`
+elements ask for `id="CITEREFMalloch"`:
+
+```
+parsoid: <cite id="CITEREFMalloch" …>          (first)
+         <cite id="mwBZ4" … data-x-id="CITEREFMalloch">   (each later one)
+rustoid: <cite id="CITEREFMalloch" …>          (all five)
+```
+
+This is Parsoid's `DOMDataUtils::storeInPageBundle` (T415477): a node whose `id`
+is already a key of the bundle's `parsoid.ids` map — that is, an *earlier*
+metadata-bearing element already stored it — has the original preserved as
+`data-x-id` and is given a fresh generated id, from the same `nodedata` counter
+as every other `mwXX` id. Missing it also shifted every later id by four.
+
+`assign_node_ids` already knew the other half of rule 2 (seed the allocator with
+the document's ids so a *generated* id collides with none); it now also tracks
+the ids claimed by metadata-bearing elements (`pb.parsoid.ids`' keys, which is
+what the collision test reads) and moves a later duplicate. Only elements whose
+metadata is stored participate — the same `has_metadata` test that decides
+whether an element is keyed at all.
+
+### Effect
+
+```
+Order of the British Empire   58.50 % ->  64.60 %
+corpus matches                 3/48   (unchanged)
+fixture guard                877/896  (unchanged)
+lib tests                       1034  (+1)
+```
