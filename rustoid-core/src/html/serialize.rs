@@ -51,6 +51,19 @@ impl HtmlSerializer {
         Ok(buf)
     }
 
+    /// Serialize a node's children with no wrapper of their own.
+    ///
+    /// Used where an attribute is computed from a subtree's serialization —
+    /// `<imagemap>` names its `<map>` from the md5 of its serialized `<area>`s
+    /// (`ParsoidImageMap::sourceToDom`).
+    pub fn serialize_children_to_string(&self, node: &Node) -> Result<String> {
+        let mut buf = String::new();
+        for child in &node.children {
+            self.serialize_node(child, &mut buf, 0)?;
+        }
+        Ok(buf)
+    }
+
     fn serialize_node(&self, node: &Node, buf: &mut String, depth: usize) -> Result<()> {
         self.serialize_node_esc(node, buf, depth, true)
     }

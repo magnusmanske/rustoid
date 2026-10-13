@@ -463,23 +463,7 @@ fn section_items(token: &SelfclosingTagTk) -> Vec<Item> {
 /// The `data-mw` for a `<section>` marker: `name`, then `attrs` in source order,
 /// with empty values kept (`{"begin":"Schools","of":"","thought":""}`).
 fn section_data_mw(token: &SelfclosingTagTk) -> String {
-    let attrs = extension_kv_attrs(token);
-    let mut out = String::from(r#"{"name":"section""#);
-    let pairs: Vec<String> = attrs
-        .iter()
-        .filter_map(|kv| {
-            let key = kv.key.as_str()?;
-            let value = kv.value.as_str()?;
-            (!key.is_empty()).then(|| format!("{}:{}", json_string(key), json_string(value)))
-        })
-        .collect();
-    if !pairs.is_empty() {
-        out.push_str(r#","attrs":{"#);
-        out.push_str(&pairs.join(","));
-        out.push('}');
-    }
-    out.push('}');
-    out
+    extension_data_mw("section", &extension_kv_attrs(token), None)
 }
 
 /// Build the token sequence for a `<style>` extension. Faithful port of
@@ -579,6 +563,39 @@ pub fn indicator_node(
         meta.set_attr("data-mw", indicator_data_mw(body, attrs));
     }
     meta
+}
+
+/// The `data-mw` blob for an extension tag: `name`, then `attrs` (always present,
+/// `{}` for a tag with no attributes, as `<imagemap>` serves), then
+/// `body.extsrc` when the tag captured a body.
+///
+/// `attrs` are the tag's own parsed start-tag attributes; an attribute with no
+/// value is dropped. `body` is `None` for a self-closing tag (`<section begin/>`),
+/// whose served `data-mw` has no `body` key at all.
+pub fn extension_data_mw(
+    name: &str,
+    attrs: &[crate::wikitext::tokens_v2::KV],
+    body: Option<&str>,
+) -> String {
+    let mut out = format!("{{\"name\":{}", json_string(name));
+    let pairs: Vec<String> = attrs
+        .iter()
+        .filter_map(|kv| {
+            let key = kv.key.as_str()?;
+            let value = kv.value.as_str()?;
+            (!key.is_empty()).then(|| format!("{}:{}", json_string(key), json_string(value)))
+        })
+        .collect();
+    out.push_str(",\"attrs\":{");
+    out.push_str(&pairs.join(","));
+    out.push('}');
+    if let Some(body) = body {
+        out.push_str(",\"body\":{\"extsrc\":");
+        out.push_str(&json_string(body));
+        out.push('}');
+    }
+    out.push('}');
+    out
 }
 
 /// The `data-mw` blob for an `<indicator>`, in the field order the served bytes

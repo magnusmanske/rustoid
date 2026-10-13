@@ -346,6 +346,84 @@ fn gallery_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosin
     }
 }
 
+/// If `item` is an `<imagemap>` extension token, return the self-closing token.
+fn imagemap_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    if stt.name != "extension" {
+        return None;
+    }
+    let name = stt
+        .attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str());
+    if name == Some("imagemap") {
+        Some(stt)
+    } else {
+        None
+    }
+}
+
+/// The first element named `name` in `node`'s subtree.
+fn find_element<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
+    if matches!(&node.kind, crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(t)) if t == name)
+    {
+        return Some(node);
+    }
+    node.children.iter().find_map(|c| find_element(c, name))
+}
+
+/// Whether `node` is an anchor — a literal `<a>`, or the DOM node a wikilink or
+/// external link is stored as (both serialize to `<a>`; see
+/// `HtmlSerializer::element_tag`).
+fn is_anchor(node: &Node) -> bool {
+    use crate::dom::node::{ElementKind, NodeKind};
+    match &node.kind {
+        NodeKind::Element(ElementKind::Wikilink | ElementKind::ExtLink) => true,
+        NodeKind::Element(ElementKind::Other(t)) => t == "a",
+        _ => false,
+    }
+}
+
+/// The first anchor in `node`'s subtree.
+fn find_anchor(node: &Node) -> Option<&Node> {
+    if is_anchor(node) {
+        return Some(node);
+    }
+    node.children.iter().find_map(find_anchor)
+}
+
+/// The first element named `name` in `node`'s subtree, mutably.
+fn find_element_mut<'a>(node: &'a mut Node, name: &str) -> Option<&'a mut Node> {
+    if matches!(&node.kind, crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(t)) if t == name)
+    {
+        return Some(node);
+    }
+    node.children
+        .iter_mut()
+        .find_map(|c| find_element_mut(c, name))
+}
+
+/// Whether `node` is an element named `name`.
+fn is_named(node: &Node, name: &str) -> bool {
+    matches!(&node.kind, crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(t)) if t == name)
+}
+
+/// Remove and return the first element named `name` in `node`'s subtree.
+fn take_element(node: &mut Node, name: &str) -> Option<Node> {
+    if let Some(i) = node.children.iter().position(|c| is_named(c, name)) {
+        return Some(node.children.remove(i));
+    }
+    node.children.iter_mut().find_map(|c| take_element(c, name))
+}
+
+/// Remove the first element named `name` in `node`'s subtree, if any.
+fn remove_element(node: &mut Node, name: &str) {
+    let _ = take_element(node, name);
+}
+
 /// If `item` is a `divtag`/`spantag` extension token, return the self-closing
 /// token, the extension tag name, and the wrapper tag name (`div`/`span`).
 /// Mirrors the `ParserHook` transparent-wrapper extensions.
@@ -547,10 +625,14 @@ fn answer_marker_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, Str
     stashed_extension_tag(&items[i]).map(|tag| (i + 1, vec![items[i].clone()], tag))
 }
 
-/// Emit the `mw:dom-fragment-token` placeholder for a `<gallery>` extension,
-/// referencing the pre-built gallery fragment by `id` (mirrors the generic
-/// extension encapsulation in `extension_handler::gallery_items`).
-fn emit_gallery_placeholder(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, id: usize) -> Item {
+/// Emit the `mw:dom-fragment-token` placeholder for an extension whose output is
+/// a pre-built DOM fragment (`<gallery>`, `<imagemap>`), referencing the stashed
+/// fragment by `id` (mirrors the generic extension encapsulation in
+/// `extension_handler::gallery_items`).
+fn emit_dom_fragment_placeholder(
+    stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+    id: usize,
+) -> Item {
     use crate::wikitext::tokens_v2::{KeyValue, SelfclosingTagTk};
 
     let mut dp = stt.data_parsoid.clone();
@@ -2542,28 +2624,40 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
     ) -> Option<Node> {
+        // The trailing `|none` forces the block figure, per `renderMedia`'s
+        // `$pieces[] = '|none'`.
+        let wikitext = format!("[[{title_str}|{opts_str}|none]]");
+        self.render_inline_wikitext_node(&wikitext, source, frame, about_counter)
+            .await
+    }
+
+    /// Render `wikitext` through the inline sub-pipeline and return its single
+    /// root node.
+    ///
+    /// Media formats are suppressed, so a media line comes back as the plain
+    /// block figure `<gallery>` and `<imagemap>` need rather than a thumbnail,
+    /// and a nested `AddMediaInfo` resolves the file, so the returned `<img>`
+    /// carries its `width`/`height` and `data-file-*` — `<imagemap>` reads those
+    /// to scale its coordinates. Mirrors PHP's `processContentInPipeline` with
+    /// `inlineContext => true`.
+    async fn render_inline_wikitext_node(
+        &self,
+        wikitext: &str,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
         use crate::pipeline::wiki_link_render::{
             WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
         };
         use crate::wikitext::token_utils::key_value_to_string;
 
-        // Assemble the wikitext `[[<title>|<opts>|none]]` (the trailing `|none`
-        // forces the block figure, per `renderMedia`'s `$pieces[] = '|none'`).
-        let wikitext = format!("[[{title_str}|{opts_str}|none]]");
-        let mut tokens = self.tokenize(&wikitext).ok()?;
+        let mut tokens = self.tokenize(wikitext).ok()?;
         let mut fragments = std::collections::HashMap::new();
         let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
-                .expand_templates(
-                    frame,
-                    tokens,
-                    source,
-                    about_counter,
-                    false,
-                    false,
-                    &wikitext,
-                )
+                .expand_templates(frame, tokens, source, about_counter, false, false, wikitext)
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -2723,9 +2817,267 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let id = next_id.get();
             next_id.set(id + 1);
             fragments.insert(id, frag);
-            out.push(emit_gallery_placeholder(stt, id));
+            out.push(emit_dom_fragment_placeholder(stt, id));
         }
 
+        out
+    }
+
+    /// Build the `<figure>` for one `<imagemap>` tag. Port of
+    /// `ParsoidImageMap::sourceToDom`: render the image, scale each area's
+    /// coordinates by the rendered size, build the `<map>`, and replace the
+    /// media's anchor with the default (whole-image) link or a `<span>`.
+    async fn build_imagemap(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::dom::node::{ElementKind, Node, NodeKind};
+        use crate::pipeline::imagemap::{self, Shape};
+
+        let ext_src = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let body_src = crate::pipeline::extension_handler::extract_ext_body(stt, &ext_src);
+        let parsed = imagemap::parse_body(&body_src).ok()?;
+
+        // The image as a block figure (`|none`) with formats suppressed.
+        let img_wt = format!("[[{}|{}|none]]", parsed.image, parsed.options);
+        let mut figure = self
+            .render_inline_wikitext_node(&img_wt, source, frame, about_counter)
+            .await?;
+        if !matches!(figure.kind, NodeKind::Element(_)) {
+            return None;
+        }
+
+        // `renderMedia(forceBlock=true)` appends `|none` to force the block
+        // (figure) form, then strips the `mw-halign-none` it produced — unless
+        // the source itself carried a `none` option (PHP's `$explicitNone`).
+        let explicit_none = parsed.options.split('|').any(|o| o.trim() == "none");
+        if !explicit_none && let Some(class) = figure.get_attr("class").map(str::to_string) {
+            let kept: Vec<&str> = class
+                .split_whitespace()
+                .filter(|c| *c != "mw-halign-none")
+                .collect();
+            if kept.is_empty() {
+                figure.attrs.retain(|a| a.key != "class");
+            } else {
+                figure.set_attr("class", kept.join(" "));
+            }
+        }
+
+        // The rendered sizes decide the coordinate scale.
+        let (thumb_w, thumb_h, file_w, file_h) = {
+            let img = find_element(&figure, "img")?;
+            let get = |k: &str| {
+                img.get_attr(k)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+            };
+            (
+                get("width"),
+                get("height"),
+                get("data-file-width"),
+                get("data-file-height"),
+            )
+        };
+        let denominator = file_w + file_h;
+        if denominator <= 0.0 || thumb_w + thumb_h <= 0.0 {
+            return None;
+        }
+        let scale = (thumb_w + thumb_h) / denominator;
+
+        // The media caption, if any (the imagemap's first line may carry one).
+        let caption_text = find_element(&figure, "figcaption")
+            .map(text_content)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let has_caption = !caption_text.is_empty();
+
+        // One `<area>` per shape line; `default` becomes the image's own link.
+        let mut areas: Vec<Node> = Vec::new();
+        let mut default_link: Option<Node> = None;
+        for line in &parsed.areas {
+            let link_dom = self
+                .render_inline_wikitext_node(&line.link, source, frame, about_counter)
+                .await?;
+            let a = find_anchor(&link_dom)?;
+            let href = a.get_attr("href")?.to_string();
+            let rel = a.get_attr("rel").unwrap_or_default().to_string();
+            let external = rel.split_whitespace().any(|t| t == "mw:ExtLink");
+            // `getExternalLinkAttribs` returns the module rels only, not `mw:ExtLink`.
+            let ext_rel = if external {
+                let joined = rel
+                    .split_whitespace()
+                    .filter(|t| !t.starts_with("mw:"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!joined.is_empty()).then_some(joined)
+            } else {
+                None
+            };
+            let ext_target = if external {
+                a.get_attr("target").map(str::to_string)
+            } else {
+                None
+            };
+            let alt = text_content(a).trim().to_string();
+            let coords: Vec<i64> = line
+                .coords
+                .iter()
+                .map(|c| (c * scale).round() as i64)
+                .collect();
+            if line.shape == Shape::Default {
+                let mut anchor = Node::element(ElementKind::Other("a".to_string()));
+                anchor.set_attr("href", href);
+                if external {
+                    anchor.set_attr("class", "plainlinks");
+                    if let Some(r) = &ext_rel {
+                        anchor.set_attr("rel", r.clone());
+                    }
+                    if let Some(t) = &ext_target {
+                        anchor.set_attr("target", t.clone());
+                    }
+                }
+                default_link = Some(anchor);
+            } else {
+                areas.push(imagemap::area_node(
+                    &href,
+                    external,
+                    ext_rel.as_deref(),
+                    ext_target.as_deref(),
+                    line.shape,
+                    &coords,
+                    &alt,
+                ));
+            }
+        }
+
+        // The `<map>`, named from the hash of its serialized areas, and the
+        // image's `usemap`.
+        if !areas.is_empty() {
+            let mut map = Node::element(ElementKind::Other("map".to_string()));
+            for area in areas {
+                map.push_child(area);
+            }
+            let inner = crate::html::serialize::HtmlSerializer::new(
+                crate::options::ParserOptions::for_page(""),
+            )
+            .serialize_children_to_string(&map)
+            .ok()?;
+            let name = imagemap::map_name(&inner);
+            if let Some(img) = find_element_mut(&mut figure, "img") {
+                img.set_attr("usemap", format!("#{name}"));
+            }
+            map.set_attr("name", name);
+            // Directly after the image's wrapper (the figure's first child).
+            figure.children.insert(1, map);
+        }
+
+        // `noresize`, and the `desc` placement class.
+        {
+            let existing = figure.get_attr("class").unwrap_or_default().to_string();
+            let mut classes: Vec<String> =
+                existing.split_whitespace().map(str::to_string).collect();
+            classes.push("noresize".to_string());
+            let is_thumb = figure
+                .get_attr("typeof")
+                .map(|t| t.split_whitespace().any(|x| x == "mw:File/Thumb"))
+                .unwrap_or(false);
+            if !is_thumb && let Some(suffix) = parsed.desc.class_suffix() {
+                classes.push(format!("mw-ext-imagemap-desc-{suffix}"));
+            }
+            figure.set_attr("class", classes.join(" "));
+            let ty = figure.get_attr("typeof").unwrap_or("mw:File").to_string();
+            figure.set_attr("typeof", format!("{ty} mw:Extension/imagemap"));
+        }
+
+        // Replace the media anchor with the default link (or a `<span>`),
+        // keeping the image.
+        let mut anchor = figure.children.remove(0);
+        let img = take_element(&mut anchor, "img")?;
+        let mut wrapper =
+            default_link.unwrap_or_else(|| Node::element(ElementKind::Other("span".to_string())));
+        // A caption that is not shown as a `<figcaption>` becomes the wrapper's
+        // `title` (PHP's `!hasVisibleCaption` branch).
+        if has_caption {
+            wrapper.set_attr("title", caption_text);
+        }
+        wrapper.push_child(img);
+        figure.children.insert(0, wrapper);
+
+        // The extension encapsulation: `about`, then `data-mw`.
+        let about = stt
+            .attribs
+            .iter()
+            .find(|kv| {
+                kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            })
+            .and_then(|kv| kv.value.as_str())
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| self.new_about_id(about_counter, "imagemap"));
+        figure.set_attr("about", about);
+        let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
+        figure.set_attr(
+            "data-mw",
+            crate::pipeline::extension_handler::extension_data_mw(
+                "imagemap",
+                &attrs,
+                Some(&body_src),
+            ),
+        );
+
+        // The media's own `<figcaption>` is not part of an imagemap's output when
+        // it carries no caption.
+        if !has_caption {
+            remove_element(&mut figure, "figcaption");
+        }
+
+        Some(figure)
+    }
+
+    /// Expand `<imagemap>` extension tokens in place, stashing each rendered
+    /// `<figure>` behind a `mw:dom-fragment-token` placeholder (mirrors
+    /// `expand_gallery`).
+    async fn expand_imagemap(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = imagemap_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            match self
+                .build_imagemap(&stt, source, frame, about_counter)
+                .await
+            {
+                Some(figure) => {
+                    let mut frag = crate::dom::node::Node::document();
+                    frag.push_child(figure);
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    fragments.insert(id, frag);
+                    out.push(emit_dom_fragment_placeholder(&stt, id));
+                }
+                None => out.push(item),
+            }
+        }
         out
     }
 
@@ -2999,7 +3351,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let id = next_id.get();
             next_id.set(id + 1);
             fragments.insert(id, frag);
-            out.push(emit_gallery_placeholder(stt, id));
+            out.push(emit_dom_fragment_placeholder(stt, id));
         }
         out
     }
@@ -3273,7 +3625,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     crate::pipeline::wiki_link_render::WikiLinkContext::new(self.config);
                 let mut index = 0usize;
                 for item in &mut chunk {
-                    let is_gallery = gallery_target(item).is_some();
+                    let is_gallery =
+                        gallery_target(item).is_some() || imagemap_target(item).is_some();
                     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                         continue;
                     };
@@ -3340,6 +3693,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments.extend(indicator_fragments);
         let tokens = self
             .expand_gallery(
+                tokens,
+                source,
+                &frame,
+                about_counter,
+                &mut fragments,
+                next_id,
+            )
+            .await;
+        let tokens = self
+            .expand_imagemap(
                 tokens,
                 source,
                 &frame,

@@ -23,6 +23,7 @@ pub mod frame;
 pub mod gallery;
 pub mod handle_link_neighbours;
 pub mod headings;
+pub mod imagemap;
 pub mod language_variant_handler;
 pub mod list_handler;
 pub mod lua_deferred;
