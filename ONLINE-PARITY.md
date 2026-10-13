@@ -15939,3 +15939,47 @@ corpus matches                 4/48
 fixture guard                877/896  (unchanged)
 lib tests                       1036  (+2)
 ```
+
+## A module's `string.ulower`, `title.basePageTitle`, and `title.protectionLevels`
+
+Three Lua-library gaps, each read off the failing module's own source rather
+than guessed. Together they were the corpus's single largest blocker.
+
+- **`string.ulower` / `string.uupper`.** Scribunto's `string` library carries
+these as documented aliases for `mw.ustring.lower`/`upper`. Our `string` is stock
+Lua, which has neither, so `Module:R`'s `string.ulower(params.wrap)` was
+"attempt to call field 'ulower' (a nil value)" — 24 of the 48 corpus pages
+transclude `Module:R`. Set them on the global `string` table, which also serves
+`ustring.ulower` through the ustring metatable's `__index` fallback.
+
+- **`title.basePageTitle` (and `rootPageTitle`).** `mw.title` derives these as
+`makeTitle(ns, text.baseText)` / `makeTitle(ns, text.rootText)`. `Module:High-use`
+rewrites a `/doc`, `/sandbox` or `/testcases` subpage to `basePageTitle` and
+reads `basePageTitle.isSubpage` in a loop; the missing field was "attempt to
+index field 'basePageTitle' (a nil value)" on 4 pages. The shared
+`derived_page_title` now returns the title *itself* only when both the namespace
+**and** the text match — `subject`/`talkPageTitle` always pass the same text, so
+they are unaffected, while a subpage's `basePageTitle` is a fresh title.
+
+- **`title.protectionLevels`.** Scribunto answers this from
+`RestrictionStore::getAllRestrictions`: a table with a key for **every**
+restriction type (`$wgRestrictionTypes`: create/edit/move/upload), each an array
+that is empty when unrestricted. `Module:Lua banner` reads
+`moduleTitle.protectionLevels["edit"][1]` with no nil-guard, so our absent key
+was "attempt to index field 'edit' (a nil value)". The keys are now always
+present as (possibly empty) arrays; `Module:Effective protection level`'s guarded
+`protectionLevels[action] and protectionLevels[action][1]` still reads `nil`
+exactly as before, so its pages are unchanged.
+
+### Effect
+
+```
+Lua failures                33 across 8 modules -> 4 across 3
+corpus matches               4/48  (no regressions)
+fixture guard              877/896  (unchanged)
+lib tests           core 1009, extensions 22, ast 5
+```
+
+The four remaining failures need data or real emulation rather than a library
+shim: `mw.wikibase`'s `formatPropertyValues` (`Module:Internet Archive`), and a
+non-numeric argument reaching `math.log10` (`Module:Math`) or `Module:High-use`.
