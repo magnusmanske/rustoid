@@ -495,11 +495,19 @@ fn build_request(method: &str, args: mlua::MultiValue) -> mlua::Result<FrameRequ
                 return Err(mlua::Error::runtime("extensionTag expects a tag name"));
             }
             let mut args = vec![FrameArg::positional(name)];
-            // The content is optional, and a nil one must not become the string
-            // "nil" — `frame:extensionTag{ name = 'ref' }` is a bare tag.
-            if let Value::String(content) = content {
-                args.push(FrameArg::positional(content.to_str()?.to_string()));
-            }
+            // The content is the *first* argument after the tag name, and `#tag`
+            // (core `tagObj`, Parsoid `pf_tag`) always reads it positionally; only
+            // the arguments after it become attributes. So the content slot must
+            // be present even when the module passed none — a nil content must
+            // not be omitted, or the first attribute slides into the content slot
+            // (`frame:extensionTag{ name = 'templatestyles', args = { src = … } }`
+            // lowered to `{{#tag:templatestyles|src=…}}` fed `src=…` as the body
+            // instead of as the `src` attribute, so the stylesheet never loaded).
+            let content = match content {
+                Value::String(s) => s.to_str()?.to_string(),
+                _ => String::new(),
+            };
+            args.push(FrameArg::positional(content));
             if let Value::Table(extra) = extra {
                 args.extend(args_from_table(&extra)?);
             }
