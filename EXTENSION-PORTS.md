@@ -13,6 +13,7 @@ The corpus numbers referenced here are from an `--offline` run of the built-in
 |---|---|---|
 | Cite (`ref`/`references`) | 44 | `rustoid-extensions` |
 | `section` (LabeledSectionTransclusion) | 4 | renders a void `<link typeof="mw:Extension/section" …/>` |
+| `imagemap` (ImageMap) | 4 | `pipeline/imagemap.rs` + `Parser::build_imagemap` |
 
 ### `section`
 
@@ -25,79 +26,21 @@ kept, because the served `data-mw` keeps them
 (`{"begin":"Schools","of":"","thought":""}`). Source: measured served bytes plus
 `LabeledSectionTransclusion`.
 
-## `imagemap` — next, but not bounded
+### `imagemap`
 
-4 corpus pages. Parsoid-native: the handler is
-`mediawiki-extensions-ImageMap/includes/ParsoidImageMap.php`. The **algorithm is
-small** (read below); the **integration is not**, which is the important finding.
+4 corpus pages. Parsoid-native handler `ParsoidImageMap::sourceToDom`. Ported as
+`pipeline/imagemap.rs` (the line grammar, the `desc` placement, the `<area>`
+construction, the `<map>` name) plus `Parser::build_imagemap` /
+`expand_imagemap` (rendering), modelled on `expand_gallery`. Two details the
+served bytes force: the media is rendered as a block (`|none`) and the
+`mw-halign-none` that produces is stripped unless the source asked for `none`
+(`renderMedia`'s `forceBlock` check); and the `<map>` name is `ImageMap_` + 16 hex
+of `md5(serialized <area> children)`, computed before the id pass runs. All four
+map names now match Parsoid's byte for byte.
 
-### Algorithm (`ParsoidImageMap::sourceToDom`)
-
-1. Line-split the tag body. Skip blank lines and lines starting with `#`.
-2. First real line is the image: `File:X.png | 100px | alt=…`. Everything after
-   the first `|` (re-prefixed with `|`) is passed to `renderMedia`, rendered as a
-   **block** (`|none`), giving a `<figure>` (`thumb`).
-3. `scale = (thumbWidth + thumbHeight) / (imageWidth + imageHeight)`, taken from
-   the rendered `<img>`'s `width`/`height` and `data-file-width`/`data-file-height`.
-4. For each further line:
-   - `desc <type>` sets the caption position (`top-right|bottom-right|bottom-left|top-left|none`).
-   - Otherwise the link is everything from the first `[`; the remainder is the
-     shape spec: `default` (no coords), `rect` (4), `circle` (3), `poly` (even).
-   - Coordinates are scaled by `scale` and rounded.
-   - One `<area>` per line with `href`, `shape` (unless `default`),
-     `coords`, `alt` (= link text, unless `default`), `title`; external links also
-     get `class="plainlinks"` + `rel`/`target`.
-5. If any areas: build `<map>`, name it
-   `ImageMap_` + first **16 hex of `md5(innerHTML of <map>)`**, set
-   `usemap="#<name>"` on the `<img>`, and insert the `<map>` after the image's
-   wrapper.
-6. Add `noresize` to the `<figure>`; unless it is a real thumbnail add
-   `mw-ext-imagemap-desc-<type>`.
-7. Replace the media `<a>` wrapper with an `<a>` (default-shape link) or a
-   `<span>`, containing the `<img>`; carry the caption text to its `title`.
-
-Served shape (Earth), abbreviated:
-
-```html
-<figure class="mw-default-size noresize" typeof="mw:File mw:Extension/imagemap"
-        about="#mwt1443" data-mw='{"name":"imagemap","attrs":{},"body":{"extsrc":"…"}}'>
-  <span><img resource="./File:…" … usemap="#ImageMap_818ebd24fd44a6df"/></span>
-  <map name="ImageMap_818ebd24fd44a6df"><area href="./Sun" shape="rect" coords="0,0,90,35" alt="The Sun" title="The Sun"/>…</map>
-</figure>
-```
-
-### Why it is larger than it looks
-
-- **Media dimensions aren't available where Parsoid has them.** Parsoid's
-  `renderMedia` is synchronous and returns the thumbnail with its size, so it can
-  compute `scale` inline. rustoid renders media to a `<span typeof="mw:File">`
-  *placeholder* and resolves sizes in the later async `add_media_info` pass. So
-  either (a) the tag is handled in a **post-`add_media_info` DOM pass** once the
-  `<img>` exists, or (b) it is handled at expansion time and the size is read from
-  `DataSource::get_file_info` instead of the rendered `<img>`. The common case has
-  no size option, so `scale == 1`; option (b) with `get_file_info` covers the rest.
-- **The map name needs `md5`.** rustoid does not compute md5 today (thumbnail URLs
-  come from the wiki's API). This adds a small pure-Rust dependency, or a ~100-line
-  MD5. Justified, but new.
-- **Each line's link is a nested render.** `[[Sun|The Sun]]` must go through the
-  wikilink/renderFile pipeline to get its `href` (and to know it is external), the
-  same nested-pipeline machinery `gallery::render_gallery_media` already uses.
-- **The figure is post-processed.** Insert the `<map>`, set `usemap`, replace the
-  `<a>` with the default `<a>`/`<span>`, add classes, and put
-  `mw:Extension/imagemap` on the figure's `typeof` alongside `mw:File`.
-
-### Plan
-
-1. Add `md5` (pure Rust) for the map name.
-2. Write `pipeline/imagemap.rs`: a tested `parse_body(&str) -> ImagemapSpec`
-   (`image`, `options`, `desc`, `areas`), ported field-for-field from the PHP above.
-3. Add `Parser::expand_imagemap`, modelled on `expand_gallery` (same call site, same
-   `mw:DOMFragment` placeholder + `about` handling), rendering the image through the
-   existing media path and each link through the existing wikilink path.
-4. Take `scale` from `DataSource::get_file_info` at expansion (option b), so it needs
-   no second pass.
-5. Verify against the Earth oracle; the `<map>` children are plain `<area>`s, so a
-   token-level compare (`tagdiff`) localises any mismatch quickly.
+Porting it surfaced two argument bugs *upstream* of the handler, both now fixed
+(see `ONLINE-PARITY.md`): `#tag` must take its content positionally, and the
+lowering of `frame:extensionTag` must keep the (possibly empty) content slot.
 
 ## OOUI foundation — gates `phonos` (10 pages), `templatedata` (3), `mapframe` (4)
 

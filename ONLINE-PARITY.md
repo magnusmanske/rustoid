@@ -15983,3 +15983,41 @@ lib tests           core 1009, extensions 22, ast 5
 The four remaining failures need data or real emulation rather than a library
 shim: `mw.wikibase`'s `formatPropertyValues` (`Module:Internet Archive`), and a
 non-numeric argument reaching `math.log10` (`Module:Math`) or `Module:High-use`.
+
+## The `#tag` content is positional, and `<imagemap>` renders
+
+The `<imagemap>` extension (ImageMap) is Parsoid-native, but its figure was never
+built, so the tag leaked as a raw `<extension …>`. Porting the handler
+(`ParsoidImageMap::sourceToDom`, in `pipeline/imagemap.rs` plus
+`Parser::build_imagemap`/`expand_imagemap`) surfaced two argument-handling bugs
+*upstream* of the handler itself, both in how a `#tag` call is read.
+
+- **`#tag` takes its content positionally.** Core's `tagObj` shifts the tag name
+  and then shifts `$inner`, so the argument right after the tag name is the
+  content *whatever it contains*, and only the arguments after it are attribute
+  candidates (`name=value`; a bare positional extra is dropped) — Parsoid's
+  `tag_worker` agrees (`{{#tag:pre|a=b|c=d}}` has body `a=b` and attribute
+  `c=d`). rustoid split the content argument on `=` like any parser function, so
+  `{{#tag:imagemap|File:X…|80px|alt=…}}` (whose `|` come from `{{!}}` in
+  `Template:NFPA 704 diamond`) read `…alt` as an attribute and dropped the body's
+  newlines. `pf_tag` now takes argument 1 as content, reassembling a split
+  `key=value` arg with its `=` back in place.
+
+- **`frame:extensionTag` must keep its empty content slot.** With the above
+  fixed, lowering `frame:extensionTag{ name = 'templatestyles', args = { src = … } }`
+  to `{{#tag:templatestyles|src=…}}` — with no content argument — put `src=…` in
+  the content position, so no `src` attribute reached the handler and every page
+  transcluding `Module:Hatnote` lost its stylesheet (`0/48` until fixed). The
+  lowering now always emits the content slot, empty when the module passed none.
+
+### Effect
+
+```
+imagemap leaks               4 pages -> 0
+map names                    Earth 818ebd24fd44a6df, Hydrogen 1cb7cf4601111aa1,
+                             India e29109aaa5160cf6, United States 2a337fdc07a377cf
+                             — each byte-identical to Parsoid's
+corpus matches               4/48  (no regressions; only the imagemap pages changed)
+fixture guard              877/896  (unchanged)
+lib tests           core 1015, extensions 22, ast 5, compare 126
+```
