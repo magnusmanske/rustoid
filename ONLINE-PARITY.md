@@ -15904,3 +15904,38 @@ corpus matches                 3/48   (unchanged)
 fixture guard                877/896  (unchanged)
 lib tests                       1034  (+1)
 ```
+
+## `Order of the British Empire` reaches byte parity
+
+The chain that got it from 26.75 % to 100 %, each fix exposing the next:
+
+1. `templatestyles` `src` prefix resolved case-insensitively (`62c9f7f`-era).
+2. Duplicate heading ids suffixed `_2` (`Headings::dedupeHeadingIds`).
+3. Whitespace around a ref attribute's `=` kept in `data-mw.attrs`.
+4. A module-produced bare URL rendered as its `href`.
+5. A duplicate id moved to `data-x-id` with a fresh generated id.
+6. DisplaySpace armored in a note body, with the span's DSR.
+
+The last two are the same *class* of bug — an element that draws a generated
+node id — and they are what moved the page off its final differences:
+
+**A duplicate id moves to `data-x-id`.** The page cites one source five times, so
+five `<cite>` elements ask for `id="CITEREFMalloch"`. Parsoid keeps it on the
+first and gives each later one `data-x-id` plus a fresh generated id
+(`DOMDataUtils::storeInPageBundle`).
+
+**DisplaySpace in a note body.** Two causes: the global pass ran *before* Cite
+(so a note, which Cite splices into the reference list, was not yet in the DOM),
+and the inserted `<span>` carried no `data-parsoid`, so it never drew the id the
+service gives it. Moving the pass after Cite — and, since `gen-anchors` must
+follow it, moving that too — plus computing the span's source range from its
+parent's DSR fixed both.
+
+### Effect
+
+```
+Order of the British Empire   26.75 % -> 100.00 %  (a match)
+corpus matches                 4/48
+fixture guard                877/896  (unchanged)
+lib tests                       1036  (+2)
+```
