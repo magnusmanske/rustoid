@@ -571,27 +571,42 @@ impl ParserFunctions {
             return vec![];
         }
 
-        // Collect the tag attributes (named args) and content (positional args),
-        // losing the attribute order like the legacy `tagObj`/`tag_worker` do.
-        // Attribute values have any surrounding single/double quotes stripped,
-        // mirroring `tagObj`'s `preg_match('/^(?:["'](.+)["']|""|\'\')$/s', …)`.
+        // Collect the tag attributes (named args) and content (the single
+        // positional-but-one arg), losing the attribute order like the legacy
+        // `tagObj`/`tag_worker` do. Attribute values have any surrounding
+        // single/double quotes stripped, mirroring `tagObj`'s
+        // `preg_match('/^(?:["'](.+)["']|""|\'\')$/s', …)`.
+        //
+        // The tag name and the inner content are taken *positionally*: the first
+        // argument after the tag name is the content whatever it contains, and
+        // only the remaining arguments are attribute candidates (`name=value`;
+        // a bare positional extra is dropped). Mirrors `tagObj`'s `array_shift`
+        // for the tag and for `$inner`, and Parsoid's `tag_worker`. Splitting the
+        // content arg on `=` as a generic parser function would misreads
+        // `…|80px|alt=…` in an `<imagemap>` body as an attribute and drops the
+        // line breaks (`{{#tag:imagemap|…}}`).
         let mut content: Vec<Item> = Vec::new();
         let mut tag_attribs: Vec<KV> = Vec::new();
-        for kv in &args[1..] {
+        if let Some(kv) = args.get(1) {
             if key_value_to_string(&kv.key).is_empty() {
                 content.extend(key_value_to_items(&kv.value));
             } else {
-                // Core's `tagObj` trims a named attribute's name and value
-                // (`trim($frame->expand(…))`) before storing them, then strips a
-                // surrounding pair of quotes. Without the trim, `name = {{#if:…}} `
-                // keeps the blanks the source wrote around the expression.
-                let name = key_value_to_string(&kv.key).trim().to_string();
-                let value = strip_attr_value_quotes(key_value_to_string(&kv.value).trim());
-                let mut kv = kv.clone();
-                kv.key = KeyValue::Str(name);
-                kv.value = KeyValue::Str(value);
-                tag_attribs.push(kv);
+                // A split `key=value` arg is reassembled with the `=` in place.
+                content.extend(key_value_to_items(&kv.key));
+                content.push(Item::Str("=".to_string()));
+                content.extend(key_value_to_items(&kv.value));
             }
+        }
+        for kv in args.get(2..).unwrap_or_default() {
+            if key_value_to_string(&kv.key).is_empty() {
+                continue;
+            }
+            let name = key_value_to_string(&kv.key).trim().to_string();
+            let value = strip_attr_value_quotes(key_value_to_string(&kv.value).trim());
+            let mut kv = kv.clone();
+            kv.key = KeyValue::Str(name);
+            kv.value = KeyValue::Str(value);
+            tag_attribs.push(kv);
         }
 
         let lc_target = target.to_lowercase();
