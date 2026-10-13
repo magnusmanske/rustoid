@@ -35,6 +35,7 @@ fn expand_extension(
         "pre" => Some(pre_items(token, config)),
         "style" => Some(style_items(token, fragments, next_id)),
         "i18ntag" | "i18nattr" => Some(i18n_items(token)),
+        "section" => Some(section_items(token)),
         "pwraptest" => Some(pwraptest_fragment_items(token, fragments, next_id)),
         // `gallery` is handled by the async `Parser::expand_gallery` step (which
         // needs a `Frame`/`DataSource` for caption template expansion), not here.
@@ -423,6 +424,62 @@ fn pre_items(token: &SelfclosingTagTk, _config: &dyn crate::traits::SiteConfig) 
     let decoded = decode_wt_entities_all(&body);
 
     vec![open, Item::Str(decoded), close]
+}
+
+/// Build the token sequence for a `<section>` extension (LabeledSectionTransclusion).
+///
+/// LST's `<section begin="X"/>` / `<section end="X"/>` markers select a labelled
+/// region for `{{#lst:}}` to transclude. They have no visible output in the page
+/// body, so Parsoid renders one **void `<link>`** carrying the extension metadata,
+/// which is what the served bytes show — measured, on `2024 Summer Olympics`:
+///
+/// ```html
+/// <link typeof="mw:Extension/section" about="#mwt1096"
+///       data-mw='{"name":"section","attrs":{"begin":"Calendar"}}' id="mwBtI"/>
+/// ```
+///
+/// The `about` id is spent by [`crate::pipeline::parser::Parser::number_extension_token`]
+/// (as for every extension except `<nowiki>`); this handler only places it on the
+/// `<link>`, mirroring `pre_items`. Unlike the indicator's `data-mw`, an attribute
+/// with an **empty** value is kept: `<section begin="Schools" of="" thought=""/>`
+/// serves `{"begin":"Schools","of":"","thought":""}`.
+fn section_items(token: &SelfclosingTagTk) -> Vec<Item> {
+    let mut dp = token.data_parsoid.clone();
+    dp.src = None;
+    dp.src_content = None;
+    dp.ext_tag_offsets = None;
+
+    let mut link = TagTk::new("link", vec![], dp);
+    link.add_attribute_str("typeof", "mw:Extension/section");
+    if let Some(about) = attr_str(token, "about") {
+        link.add_attribute_str("about", about);
+    }
+    link.add_attribute_str("data-mw", &section_data_mw(token));
+
+    // A `<link>` is a void element, so there is no end tag to emit.
+    vec![Item::Tok(ParsoidToken::Tag(link))]
+}
+
+/// The `data-mw` for a `<section>` marker: `name`, then `attrs` in source order,
+/// with empty values kept (`{"begin":"Schools","of":"","thought":""}`).
+fn section_data_mw(token: &SelfclosingTagTk) -> String {
+    let attrs = extension_kv_attrs(token);
+    let mut out = String::from(r#"{"name":"section""#);
+    let pairs: Vec<String> = attrs
+        .iter()
+        .filter_map(|kv| {
+            let key = kv.key.as_str()?;
+            let value = kv.value.as_str()?;
+            (!key.is_empty()).then(|| format!("{}:{}", json_string(key), json_string(value)))
+        })
+        .collect();
+    if !pairs.is_empty() {
+        out.push_str(r#","attrs":{"#);
+        out.push_str(&pairs.join(","));
+        out.push('}');
+    }
+    out.push('}');
+    out
 }
 
 /// Build the token sequence for a `<style>` extension. Faithful port of

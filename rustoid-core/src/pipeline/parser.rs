@@ -4074,11 +4074,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // Only the extensions whose output consumes the id are numbered here.
             // `<ref>`/`<references>` keep it on the `<extension>` element the Cite
             // pass later reads; `<pre>` keeps it on the `<pre>` element (see
-            // `extension_handler::pre_items`). `<nowiki>` is lean markup with no
-            // `about` at all. The remaining extensions are rebuilt from their rich
-            // `data-mw` attribs (`extension_kv_attrs`), which do not carry a token
-            // attribute, so numbering them here would spend an id the output never
-            // shows — a second, different drift. They are left to a follow-up.
+            // `extension_handler::pre_items`), and `<section>` on the void `<link>`
+            // it renders (`extension_handler::section_items`). `<nowiki>` is lean
+            // markup with no `about` at all. The remaining extensions are rebuilt
+            // from their rich `data-mw` attribs (`extension_kv_attrs`), which do
+            // not carry a token attribute, so numbering them here would spend an id
+            // the output never shows — a second, different drift. They are left to
+            // a follow-up.
             //
             // A token that already carries an `about` — one the nested expansion
             // that produced it already numbered — is left alone.
@@ -4127,7 +4129,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let name = extension_name(t);
             if !matches!(
                 name.as_deref(),
-                Some("ref") | Some("references") | Some("pre")
+                Some("ref") | Some("references") | Some("pre") | Some("section")
             ) {
                 return;
             }
