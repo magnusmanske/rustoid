@@ -49,10 +49,34 @@ rustoid/
 ├── PLAN.md                # roadmap (standalone parser phases)
 ├── ONLINE-PARITY.md       # current goal + plan (the active workstream)
 ├── REMAINING-BUCKETS.md   # per-fixture notes for the fixture suite
+├── rustoid-ast/           # shared AST/DOM node and token types
 ├── rustoid-core/          # parser, tokenizer, tree builder, serializers, Lua
+├── rustoid-extensions/    # MediaWiki parser extensions (Cite, …)
 ├── rustoid-cli/           # command-line binary
 └── enwiki-parser-extensions.md
 ```
+
+### Crate graph
+
+`rustoid-ast` is a leaf crate holding the data model — the AST/DOM node types
+and the Parsoid token types — with no dependency on the parser. `rustoid-core`
+and `rustoid-extensions` both depend on it, so an extension can build and
+mutate trees without depending on the parser. `rustoid-core` depends on
+`rustoid-extensions` to invoke the extensions from its finalization passes.
+
+```
+rustoid-ast  ◄──  rustoid-extensions  ◄──┐
+      ▲                                  │
+      └─────────────  rustoid-core  ─────┘
+                            ▲
+              rustoid-cli ──┴── rustoid-compare
+```
+
+This split exists because an extension needs the node types that live in the
+parser's crate: putting extensions *inside* `rustoid-core` would force a
+dependency cycle the moment the parser calls back into them. The shared leaf
+crate breaks that cycle, and keeps extensions a single place to gather the
+per-extension ports.
 
 ## License
 
