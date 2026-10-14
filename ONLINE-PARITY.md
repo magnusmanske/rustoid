@@ -16319,3 +16319,95 @@ corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier
 ```
 
 The link sits after each page's first difference, so the scoreboard does not move.
+
+## The live transform endpoint, and the literal `subst:` it settled
+
+The corpus oracle is one page at a time and needs a page to exist. For a
+*reduction* there is a better instrument, and it is worth reaching for first:
+
+```
+POST https://en.wikipedia.org/w/rest.php/v1/transform/wikitext/to/html/<title>
+     {"wikitext": "…"}   -> the live Parsoid's HTML for that wikitext
+```
+
+It is the same engine that produces the corpus oracle, it answers arbitrary
+wikitext, and a `User-Agent` header is required (a bare request is `403`). The
+standalone Parsoid in `/tmp/parsoid2` is *close* but not the same — it carries
+`MockApiHelper` fixtures, and that is exactly what made the earlier reading of
+`subst:` wrong.
+
+### What it answered
+
+`A {{subst:REVISIONUSER}} B` serves a **transclusion whose body is the literal
+call**:
+
+```
+<span about="#mwt1" typeof="mw:Transclusion" id="mwAw"
+      data-mw='{"parts":[{"template":{"target":{
+        "wt":"subst:REVISIONUSER","href":"./Template:Subst:REVISIONUSER"},
+        "params":{},"i":0}}]}'>{{subst:REVISIONUSER}}</span>
+```
+
+So the mechanism is Parsoid's `elseif ($expandTemplates)` arm, which hands the
+invocation source to the **wiki's preprocessor**: `Parser::braceSubstitution`
+keeps a plain `subst:` literal (`$literal = $substMatch == 'subst'` outside PST)
+via `virtualBracketedImplode( '{{', '|', '}}', … )`, and
+`processTemplateSource` then wraps the result. rustoid's earlier port answered
+the literal *text* alone — which matches in a string context (`Help:Introduction`
+carries one through `{{urlencode:…}}`) but loses the wrapper on a page that
+renders one. `expand_template_token` now builds the wrapper with the
+`mw:Transclusion` encapsulator, and the `data-mw` matches the service byte for
+byte on `{{subst:X}}`, `{{Subst:X}}`, `{{subst:X|arg}}` and
+`{{subst:#time:j F Y}}`.
+
+The last of those also exposed a fragment drop: `resolve_target_string` rebuilt
+the Template-namespace title with `Title::new(ns, text)`, which has no fragment,
+so `make_link` answered `./Template:Subst:` where the service has
+`./Template:Subst:#time:j_F_Y`. The fragment is part of the link and not of the
+page name, so the title now keeps it and `name` asks for
+`get_prefixed_db_key`.
+
+Still open on the same path: a template target whose *name* holds a `#`
+(`{{Foo#bar}}`) bails to `convert_to_string` and loses both the `./` prefix and
+the fragment. Not on a corpus page, and recorded rather than guessed at.
+
+## `render_links`: what a bail can re-expand, and what it cannot
+
+Parsoid's `bailTokens` re-tokenizes the link's **original source**
+(`$tsr->substr($frameSrc)`) and runs `wikitext-to-expanded-tokens` over it, so
+the `{{subst:…}}` inside `[[User:{{subst:REVISIONUSER}}]]` is expanded again —
+into the wrapper above — and what the page shows is
+`[[User:<span …>{{subst:REVISIONUSER}}</span>]]`.
+
+rustoid's bail does not re-run the pipeline, and the earlier session left a
+`<template …>` element where the wrapper belongs. Three things are true at once:
+
+- **The bail reconstructs from the expanded href/content**
+  (`reconstruct_link_src`), not from the original source, so every `{{…}}` in the
+  text it re-tokenizes came *out of* an expansion. The only invocation that
+  survives expansion is a `{{subst:…}}`; anything else that looks like a
+  template is text, and re-creating an invocation resurrects one the expansion
+  pass will never see again.
+- **The expansion cannot simply be re-run there**: `render_links` is
+  synchronous, and the synchronous entry point (`wikitext_to_ast`) has no
+  `Frame`/`DataSource` and dozens of test callers, so the async conversion the
+  faithful bail would need is not a local change.
+- **It does not need to be** for the one construct that reaches it. A
+  `{{subst:…}}` needs no fetch, so its wrapper can be built inline.
+
+What is shipped is the *text* half: a re-tokenized `template` token collapses
+back to its source (`collapse_reparsed_templates`), so the bogus element is gone
+and `[[User:{{subst:REVISIONUSER}}]]` shows the same text the service does. The
+wrapper half — building the `mw:Transclusion` span at the bail, which would
+match the oracle exactly — needs the encapsulator's `about` id, the caller's
+`inTemplate` and the page source, none of which `render_links` is handed today;
+that is the shape of the refactor, and it is why it is a separate pass.
+
+### Effect
+
+```
+subst: wrapper      data-mw byte-identical to the live transform endpoint
+bailed link          no more literal <template …> element
+fixture guard       877/896  (unchanged)
+corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier)
+```
