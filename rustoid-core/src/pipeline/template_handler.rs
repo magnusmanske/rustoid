@@ -425,13 +425,18 @@ fn resolve_target_string(
     // PHP parser"). Mirror that by rejecting here.
     let parsed = TitleParser::try_parse(&target, config)?;
     let title = if let Some(ns) = namespace_id {
-        Title::new(ns, parsed.text)
+        // The Template-namespace default must not drop the fragment: Parsoid's
+        // `makeLink` keeps it — `{{subst:#time:j F Y}}` records
+        // `"./Template:Subst:#time:j_F_Y"` — while the *page name* does not.
+        let mut titled = Title::new(ns, parsed.text);
+        titled.fragment = parsed.fragment;
+        titled
     } else {
         parsed
     };
 
     Some(ResolvedTarget::Template {
-        name: title.get_full_db_key(),
+        name: title.get_prefixed_db_key(),
         title,
     })
 }

@@ -5280,20 +5280,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             })
             .unwrap_or_default();
 
-        // `Parser::braceSubstitution`'s SUBST block. In a normal (non-PST) parse
-        // a plain `subst:` keeps the invocation literal; only `safesubst:`
-        // expands, and the tokenizer has already stripped that prefix.
-        // `Template:Edit` carries a `{{subst:REVISIONUSER}}` through a
-        // `{{urlencode:…}}`, and resolving it as `Template:Subst:REVISIONUSER`
-        // redlinked where the service keeps the literal text.
-        if crate::wikitext::tokenizer_v2::subst_is_literal(&target_str) {
-            let src = stt
-                .data_parsoid
-                .src
-                .clone()
-                .unwrap_or_else(|| format!("{{{{{target_str}}}}}"));
-            return vec![Item::Str(src)];
-        }
+        // `Parser::braceSubstitution`'s SUBST block is handled in the
+        // `ResolvedTarget::Template` arm below, where the target's title is
+        // known: a plain `subst:` keeps the invocation literally *as a
+        // transclusion of it*.
 
         // The target may hold a nested template
         // A comment in the template *target* (`{{f<!---->oo}}`) is
@@ -5330,6 +5320,49 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let mut out = Vec::new();
         let resolved = resolve_template_target(self.config, Some(frame.title()), &target_str);
+
+        // `Parser::braceSubstitution`'s SUBST block. A plain `subst:` is not
+        // performed while a page is *rendered* (only a save substitutes it), so
+        // the invocation is kept as written — and kept as a *transclusion of the
+        // literal call*, which is what the live transform endpoint serves:
+        //
+        //   A {{subst:REVISIONUSER}} B
+        //     → <span typeof="mw:Transclusion" data-mw='…"wt":"subst:REVISIONUSER"…'
+        //         data-parsoid='{"pi":[[]],…}'>{{subst:REVISIONUSER}}</span>
+        //
+        // so the body is the call's own source and `data-mw`/`data-parsoid` name
+        // `Template:Subst:X`. (A `safesubst:` always expands, and the tokenizer
+        // has already stripped that prefix.) This replaced a bare literal: the
+        // text matched, but a page that *renders* one lost the wrapper, and a
+        // link bail that re-tokenized it resurrected a `<template>` element.
+        if let Some(ResolvedTarget::Template { name, title }) = &resolved
+            && crate::wikitext::tokenizer_v2::subst_is_literal(&target_str)
+        {
+            let src = stt
+                .data_parsoid
+                .src
+                .clone()
+                .unwrap_or_else(|| format!("{{{{{target_str}}}}}"));
+            let body = vec![Item::Str(src)];
+            let produced = if !wrap {
+                body
+            } else {
+                let about_id = take_id();
+                let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, tok);
+                let mut info = template_info_from(None, Some(name.as_str()), vec![]);
+                info.target_wt = Some(target_wt.clone());
+                info.href = Some(crate::title::make_link(title, self.config));
+                info.param_infos = crate::pipeline::template_encapsulator::prepare_tpl_param_infos(
+                    &params, src_text,
+                );
+                encap.encap_tokens(body, &info)
+            };
+            for e in &produced {
+                track_table(e, table_depth);
+            }
+            out.extend(produced);
+            return out;
+        }
         // The parser function's name, lower-cased, when this call is one. The
         // `#tag` and general argument-expansion passes below key off it.
         let pf_name = match &resolved {
