@@ -1170,11 +1170,12 @@ impl TemplateHandler {
                 );
                 encap.encap_tokens(result, &info)
             }
-            Some(ResolvedTarget::Template { name, .. }) => {
+            Some(ResolvedTarget::Template { name, title }) => {
                 // Native template fetching is deferred; emit a redlink wikilink.
                 let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-                let mut info = template_info_from(None, Some(&name), vec![]);
+                let mut info = template_info_from(None, None, vec![]);
                 info.target_wt = Some(target_str.clone());
+                info.href = Some(crate::title::make_link(&title, config));
                 info.param_infos = super::template_encapsulator::prepare_tpl_param_infos(
                     params,
                     token
@@ -1787,8 +1788,16 @@ impl TemplateHandler {
         // Fetch the template source; missing templates become a redlink.
         let fetched = source.get_template(title).await.ok().flatten();
         let Some(src) = fetched else {
+            let tok_src = token
+                .data_parsoid()
+                .and_then(|dp| dp.src.as_deref())
+                .unwrap_or("");
             let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-            let info = template_info_from(None, Some(name), vec![]);
+            let mut info = template_info_from(None, None, vec![]);
+            info.target_wt = raw_template_target(tok_src).map(|t| t.trim_start().to_string());
+            info.href = Some(crate::title::make_link(title, config));
+            info.param_infos =
+                super::template_encapsulator::prepare_tpl_param_infos(params, tok_src);
             return encap.encap_tokens(vec![template_to_wikilink(name, config)], &info);
         };
 

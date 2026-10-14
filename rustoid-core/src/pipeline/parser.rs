@@ -5290,6 +5290,38 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         encap.encap_tokens(body, &info)
     }
 
+    /// The `mw:Transclusion` wrapper a *missing* template renders as: a redlink to
+    /// the page it named, with `data-mw` naming that call.
+    ///
+    /// `data-mw.target.wt` is the target **as written** and `href` is its link
+    /// (`./Template:Foo`, fragment and all). Building both from the resolved DB
+    /// key left `"wt":""` — no target at all — and an `href` without the `./`
+    /// prefix, so every redlinked template on a page carried a wrong `data-mw`.
+    #[allow(clippy::too_many_arguments)]
+    fn missing_template_items(
+        &self,
+        name: &str,
+        target_wt: &str,
+        title: &crate::title::Title,
+        params: &crate::pipeline::parser_functions::Params,
+        about_id: String,
+        token: &ParsoidToken,
+        wrap: bool,
+        page_source: &str,
+    ) -> Vec<Item> {
+        let link = crate::pipeline::template_handler::template_to_wikilink(name, self.config);
+        if !wrap {
+            return vec![link];
+        }
+        let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+        let mut info = template_info_from(None, None, vec![]);
+        info.target_wt = Some(target_wt.to_string());
+        info.href = Some(crate::title::make_link(title, self.config));
+        info.param_infos =
+            crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params, page_source);
+        encap.encap_tokens(vec![link], &info)
+    }
+
     /// Expand one `template` token, whose preprocessor node has already been
     /// charged by the caller. The `table_depth` is carried in and out because an
     /// expansion's own tokens change whether the tokens *after* it sit in a table.
@@ -6350,39 +6382,29 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         // Without a data source, a template becomes a redlink.
         let Some(src) = source else {
-            if !wrap {
-                return vec![crate::pipeline::template_handler::template_to_wikilink(
-                    name,
-                    self.config,
-                )];
-            }
-            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-            let info = template_info_from(None, Some(name), vec![]);
-            return encap.encap_tokens(
-                vec![crate::pipeline::template_handler::template_to_wikilink(
-                    name,
-                    self.config,
-                )],
-                &info,
+            return self.missing_template_items(
+                name,
+                target_wt,
+                title,
+                params,
+                about_id,
+                token,
+                wrap,
+                page_source,
             );
         };
 
         let fetched = src.get_template(title).await.ok().flatten();
         let Some(template_src) = fetched else {
-            if !wrap {
-                return vec![crate::pipeline::template_handler::template_to_wikilink(
-                    name,
-                    self.config,
-                )];
-            }
-            let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-            let info = template_info_from(None, Some(name), vec![]);
-            return encap.encap_tokens(
-                vec![crate::pipeline::template_handler::template_to_wikilink(
-                    name,
-                    self.config,
-                )],
-                &info,
+            return self.missing_template_items(
+                name,
+                target_wt,
+                title,
+                params,
+                about_id,
+                token,
+                wrap,
+                page_source,
             );
         };
 
@@ -6412,20 +6434,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // `[[Category:…]]` trailer are bookkeeping, and rendering them as
             // article text invents content Parsoid never emits.
             Redirected::Unresolved => {
-                if !wrap {
-                    return vec![crate::pipeline::template_handler::template_to_wikilink(
-                        name,
-                        self.config,
-                    )];
-                }
-                let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
-                let info = template_info_from(None, Some(name), vec![]);
-                return encap.encap_tokens(
-                    vec![crate::pipeline::template_handler::template_to_wikilink(
-                        name,
-                        self.config,
-                    )],
-                    &info,
+                return self.missing_template_items(
+                    name,
+                    target_wt,
+                    title,
+                    params,
+                    about_id,
+                    token,
+                    wrap,
+                    page_source,
                 );
             }
             Redirected::NotARedirect => (template_src, title.clone()),
