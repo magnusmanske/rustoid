@@ -16256,3 +16256,29 @@ corpus matches       4/48 strict + 1 nondeterministic-only (was 4/48)
 fixture guard       877/896  (unchanged)
 lib tests   core 1037, compare 126, extensions 22, ast 5
 ```
+
+## The `NUMBEROF*` magic variables, and the Lua error they removed
+
+`Module:High-use` — which `{{High-use}}` puts on a template's page — reads
+`mw.getCurrentFrame():callParserFunction('NUMBEROFPAGES', 'R')` and divides by
+the answer. `frame:callParserFunction` renders the call back to wikitext, so it
+lands on `{{NUMBEROFPAGES:R}}`, and MediaWiki registers the `NUMBEROF*` words as
+`SFH_NO_HASH` hooks backed by a magic variable: the two spellings are one
+implementation, `CoreParserFunctions::numberofpages` over `SiteStats`, formatted
+by `formatRaw` — the bare number for the `R` (the `rawsuffix` word) suffix, else
+`Language::formatNum`.
+
+rustoid's `variable_value` had no arm for any of them and answered the empty
+string, which Lua reports as arithmetic on a string. Seven variables
+(`numberofpages`, `numberofarticles`, `numberoffiles`, `numberofedits`,
+`numberofusers`, `numberofactiveusers`, `numberofadmins`) now answer from
+`SiteConfig::site_stats()`, so the module — and every other reader of the same
+words — gets the recorded counts.
+
+### Effect
+
+```
+Template:Infobox    first difference 6533 -> 8434
+fixture guard       877/896  (unchanged)
+corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier)
+```
