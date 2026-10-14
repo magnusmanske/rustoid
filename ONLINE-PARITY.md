@@ -16062,3 +16062,36 @@ corpus matches              4/48  (no regressions; only the phonos pages changed
 fixture guard              877/896  (unchanged)
 lib tests           core 1025, extensions 22, ast 5, compare 126
 ```
+
+## `<templatedata>` renders its parameter-documentation table
+
+TemplateData is a legacy hook whose `<templatedata>` body is a JSON blob; the
+wiki renders it as a documentation table. rustoid leaked the tag. Ported as
+`pipeline/templatedata.rs` (a faithful port of
+`TemplateDataHtmlFormatter::getHtml` plus the parts of
+`TemplateDataBlob`/`TemplateDataNormalizer` the formatter reads).
+
+Two details beyond the table itself:
+
+- **The frame's title, not the page's.** The `mw:edittemplatedata` marker records
+  `$frame->getTitle()` — the template's `/doc` subpage the tag sits in, which is
+  none of the titles threaded through the render. A template body's
+  `<templatedata>` token therefore carries that title, stamped in
+  `expand_one_template` (only for a body that contains the tag).
+- **`deprecated` is a reason string.** The field is usually the reason text, not
+  `true`, so the flag is read with PHP truthiness (a non-empty string is true).
+
+Like `<phonos>`, `<templatedata>` is not a Parsoid module: `is_native_ext` treats
+both as non-native, so Parsoid discards the table's `data-parsoid` inside the
+`/doc` transclusion range and the whole subtree takes no ids.
+
+### Effect
+
+```
+templatedata leaks          3 pages -> 0
+Table:Infobox, Table:Weather box   whole section byte-identical to the oracle,
+                                    bar the id counter
+corpus matches              4/48  (no regressions; only the templatedata pages changed)
+fixture guard              877/896  (unchanged)
+lib tests           core 1030, extensions 22, ast 5, compare 126
+```

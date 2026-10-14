@@ -15,6 +15,7 @@ The corpus numbers referenced here are from an `--offline` run of the built-in
 | `section` (LabeledSectionTransclusion) | 4 | renders a void `<link typeof="mw:Extension/section" …/>` |
 | `imagemap` (ImageMap) | 4 | `pipeline/imagemap.rs` + `Parser::build_imagemap` |
 | `phonos` (Phonos) | 10 | `pipeline/phonos.rs` + the minimal OOUI serializer |
+| `templatedata` (TemplateData) | 2 | `pipeline/templatedata.rs` (parameter-documentation table) |
 
 ### `section`
 
@@ -67,14 +68,18 @@ Every phonos region matches the oracle byte for byte, bar the global id counter;
 `Israel` still renders one `Audio` twice, a pre-existing duplication unrelated to
 the widget.
 
-## `templatedata` (3 pages) — a documentation table
+### `templatedata`
 
-Not the OOUI task the earlier plan assumed: `<templatedata>` renders a
-`<section class="mw-templatedata-doc-wrap">` holding a ~28 KB sortable parameter
-table (`<header>`, `<table class="wikitable mw-templatedata-doc-params">`, a row
-per JSON parameter with `data-sort-value`/type/status). Deterministic, derived
-from the JSON blob, but a renderer of its own (JSON parse + table); the one OOUI
-piece is a settings icon `<span>`.
+2 corpus pages (a third, `Brat (album)`, leaks the tag from a `/doc` page Parsoid
+never transcludes — a separate `noinclude` difference). A legacy hook: the tag's
+JSON body is validated and normalized, then rendered as a parameter
+documentation table. `pipeline/templatedata.rs` is a faithful port of
+`TemplateDataHtmlFormatter::getHtml` plus the parts of
+`TemplateDataBlob`/`TemplateDataNormalizer` the formatter reads (interface texts
+resolved to the content language, per-param defaults). The `mw:edittemplatedata`
+marker names the frame the tag sits in (`$frame->getTitle()` — the template's
+`/doc` subpage), which a template body's token carries. Like `<phonos>`,
+`<templatedata>` is not native content, so its table takes no ids.
 
 ## `mapframe` (4 pages)
 
