@@ -16431,3 +16431,36 @@ bailed link          renders the transclusion the service serves (no <template �
 fixture guard       877/896  (unchanged)
 corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier)
 ```
+
+## The last "lua failure" is not a Lua failure: `Module:Math`'s content model
+
+The corpus's remaining Lua runtime error was
+`[string "Module:Math"]:363: bad argument #1 to 'log10' (number expected, got
+string)` on `Module:Math` — one page, so it read as a small Lua-library gap. It
+is not one. Probed through the transform endpoint, rustoid's Lua agrees with the
+service on exactly the calls `Module:Math` wraps:
+
+| call | service | rustoid |
+| --- | --- | --- |
+| `{{#invoke:Math\|log10\|100}}` | `2` | `2` |
+| `{{#invoke:Math\|log10\|1e3}}` | `3` | `3` |
+| `{{#invoke:Math\|order\|12345}}` | `4` | `4` |
+| `{{#invoke:Math\|log10\|x}}` | `Script error: … bad argument #1 to 'log10' …` | the same |
+
+numeric strings coerce, and a non-numeric one errors on both sides.
+
+The error comes from the **page**, not from a call a reader made. `Module:Math`
+has content model `Scribunto`, and Scribunto's `ScribuntoContentHandler` renders
+such a page as *the doc page's parse, then the syntax-highlighted source* — never
+as wikitext. rustoid parses it as wikitext, so the module's own comments run:
+`-- Usage: {{#invoke:Math | log10 | x }}` is a live invocation with `x`. The
+served HTML is
+`<div class="mw-highlight mw-highlight-lang-lua" …><pre>…Pygments spans…</pre></div>`
+(20 such blocks on the page, the doc's examples included).
+
+So the blocker is the syntax highlighter, and the leading candidate is the
+"large Pygments port" the earlier notes parked. A partial version — rendering the
+source escaped inside the wrapper — would not match (the spans are most of the
+bytes) and would add a second, wrong rendering path for Module pages, so it is
+recorded rather than built. With this, every Lua runtime failure in the corpus
+except the content-model one is resolved.
