@@ -475,10 +475,18 @@ fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool)
 /// claiming a node id it should not. A stylesheet in the `<references>` list keeps
 /// its slot (the list is native `mw:Extension/references`), which is why the note
 /// body's stylesheet *does* take an id. See [`crate::pagebundle::assign_node_ids`].
+///
+/// `<phonos>` is the same case: it is a legacy MediaWiki hook the wiki renders for
+/// Parsoid, not a Parsoid-native module, so Parsoid discards its output's
+/// `data-parsoid` inside a range too. A Phonos button in a transclusion therefore
+/// takes no ids (its whole subtree is discarded), while one spliced in from a note
+/// body — a range of its own — keeps them.
 fn is_native_ext(node: &Node) -> bool {
     node.get_attr("typeof").is_some_and(|ty| {
-        ty.split_whitespace()
-            .any(|t| t.starts_with("mw:Extension/") && t != "mw:Extension/templatestyles")
+        ty.split_whitespace().any(|t| {
+            t.starts_with("mw:Extension/")
+                && !matches!(t, "mw:Extension/templatestyles" | "mw:Extension/phonos")
+        })
     })
 }
 

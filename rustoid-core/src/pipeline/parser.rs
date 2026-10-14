@@ -366,6 +366,26 @@ fn imagemap_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosi
     }
 }
 
+/// If `item` is a `<phonos>` extension token, return the self-closing token.
+fn phonos_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    if stt.name != "extension" {
+        return None;
+    }
+    let name = stt
+        .attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str());
+    if name == Some("phonos") {
+        Some(stt)
+    } else {
+        None
+    }
+}
+
 /// The first element named `name` in `node`'s subtree.
 fn find_element<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
     if matches!(&node.kind, crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(t)) if t == name)
@@ -1264,6 +1284,11 @@ pub struct Parser<'a, C: SiteConfig> {
     /// well-behaved module nests a handful of levels at most. The counter stops
     /// a pathological one from recursing until the stack runs out.
     lua_expansion_depth: std::cell::Cell<usize>,
+    /// OOUI's `ooui-php-N` id counter, one per parse. OOUI keeps a process
+    /// global that resets each request; rustoid parses one page per `Parser`,
+    /// so the counter lives here. Shared by every widget an extension emits on
+    /// the page, in document order.
+    ooui: crate::pipeline::ooui::OouiCounter,
     /// Title of the page being parsed, recorded by `build_ast`.
     ///
     /// A `#invoke` inside a template needs the *root* page title — a module
@@ -1535,6 +1560,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         Self {
             config,
             lua_expansion_depth: std::cell::Cell::new(0),
+            ooui: crate::pipeline::ooui::OouiCounter::new(),
             page_title: std::cell::RefCell::new(String::new()),
             page_source: std::cell::RefCell::new(String::new()),
             pp_node_count: std::cell::Cell::new(0),
@@ -2092,6 +2118,42 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     about_counter,
                     None,
+                    &mut fragments,
+                    next_id,
+                )
+                .await;
+            // The body is a *fresh* pipeline (PHP's `sourceToDom` over the tag
+            // body), so the extension passes that render a tag with output of its
+            // own — a gallery, an imagemap, a Phonos button — must run here too: a
+            // `{{#tag:phonos|…}}` or `<gallery>` inside a note reached only the
+            // template expansion, and its token was built into the fragment
+            // unresolved, leaking a bare `<extension>`.
+            tokens = self
+                .expand_gallery(
+                    tokens,
+                    source,
+                    frame,
+                    about_counter,
+                    &mut fragments,
+                    next_id,
+                )
+                .await;
+            tokens = self
+                .expand_imagemap(
+                    tokens,
+                    source,
+                    frame,
+                    about_counter,
+                    &mut fragments,
+                    next_id,
+                )
+                .await;
+            tokens = self
+                .expand_phonos(
+                    tokens,
+                    source,
+                    frame,
+                    about_counter,
                     &mut fragments,
                     next_id,
                 )
@@ -3081,6 +3143,111 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
+    /// Expand `<phonos>` extension tokens in place, stashing each rendered
+    /// `<span class="ext-phonos">` behind a `mw:dom-fragment-token` placeholder
+    /// (mirrors `expand_gallery`/`expand_imagemap`).
+    async fn expand_phonos(
+        &self,
+        tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = phonos_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            match self.build_phonos(&stt, source, frame, about_counter).await {
+                Some(node) => {
+                    let mut frag = crate::dom::node::Node::document();
+                    frag.push_child(node);
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    fragments.insert(id, frag);
+                    out.push(emit_dom_fragment_placeholder(&stt, id));
+                }
+                None => out.push(item),
+            }
+        }
+        out
+    }
+
+    /// Build the `<span class="ext-phonos">` for one `<phonos>` tag. Port of
+    /// `Phonos::renderPhonos` for the corpus's `<phonos file="…">` form: an
+    /// OOUI `PhonosButton` inside the wrapper, then the attribution `<sup>`.
+    async fn build_phonos(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::pipeline::extension_handler::{extension_data_mw, extension_kv_attrs};
+        let attrs: Vec<(String, String)> = extension_kv_attrs(stt)
+            .into_iter()
+            .filter_map(|kv| Some((kv.key.as_str()?.to_string(), kv.value.as_str()?.to_string())))
+            .collect();
+        let args =
+            crate::pipeline::phonos::PhonosArgs::from_attrs(&attrs, self.config.language_code());
+        if args.file.is_empty() {
+            return None;
+        }
+        // `handleExistingFile` resolves the file (a redirect included) and reads
+        // its mp3 transcode; a missing file throws there, so the tag is left
+        // for the error path.
+        let src = source?;
+        let title = crate::title::Title::new(6, args.file.clone());
+        let info = src.get_file_info(&title, None, None).await.ok().flatten()?;
+
+        // The tag body is the button's visible label, parsed in full
+        // (`renderPhonos`'s `recursiveTagParseFully`) and stripped of an outer
+        // paragraph; it is empty for the plain `<phonos file="…"/>` form.
+        let ext_src = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let body_src = crate::pipeline::extension_handler::extract_ext_body(stt, &ext_src);
+        let label_wt = body_src.trim();
+        let label = if label_wt.is_empty() {
+            None
+        } else {
+            Some(
+                Box::pin(self.process_fragment_body(label_wt, source, frame, about_counter, false))
+                    .await,
+            )
+        };
+
+        let mut node =
+            crate::pipeline::phonos::render(&args, &info, label.as_ref(), self.config, &self.ooui);
+
+        // The extension encapsulation: `typeof`, `about`, `data-mw`.
+        let about = stt
+            .attribs
+            .iter()
+            .find(|kv| {
+                kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            })
+            .and_then(|kv| kv.value.as_str())
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| self.new_about_id(about_counter, "phonos"));
+        node.set_attr("typeof", "mw:Extension/phonos");
+        node.set_attr("about", about);
+        node.set_attr(
+            "data-mw",
+            extension_data_mw("phonos", &extension_kv_attrs(stt), Some(&body_src)),
+        );
+        Some(node)
+    }
+
     /// Resolve one `<templatestyles>` extension token into a placeholder, stashing
     /// the resolved stylesheet for the chunk's extension pass to number.
     ///
@@ -3625,8 +3792,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     crate::pipeline::wiki_link_render::WikiLinkContext::new(self.config);
                 let mut index = 0usize;
                 for item in &mut chunk {
-                    let is_gallery =
-                        gallery_target(item).is_some() || imagemap_target(item).is_some();
+                    let is_gallery = gallery_target(item).is_some()
+                        || imagemap_target(item).is_some()
+                        || phonos_target(item).is_some();
                     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                         continue;
                     };
@@ -3703,6 +3871,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .await;
         let tokens = self
             .expand_imagemap(
+                tokens,
+                source,
+                &frame,
+                about_counter,
+                &mut fragments,
+                next_id,
+            )
+            .await;
+        let tokens = self
+            .expand_phonos(
                 tokens,
                 source,
                 &frame,
