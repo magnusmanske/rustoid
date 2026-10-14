@@ -225,23 +225,28 @@ pub fn tokens_to_string_with_opts(tokens: &[Item], opts: TokensToStringOpts<'_>)
                         out.push_str(src);
                     }
                 }
-                // Reconstruct a `wikilink` token as `[[target]]`.
+                // Reconstruct a `wikilink` token as `[[target|content]]`.
                 //
                 // A wikilink token is normally replaced by a real `<a>` before
-                // this is reached, so the arm exists for the one place a token is
-                // *handed to a module* rather than rendered: a missing template's
-                // answer is the wikitext `[[:Title]]`, and `frame:expandTemplate`
-                // must give the module exactly that source. Without the arm the
-                // token stringified to nothing, and the redlink disappeared.
+                // this is reached, so the arm exists for the places a token is
+                // *handed on as text*: a missing template's answer is the wikitext
+                // `[[:Title]]`, and a wikilink inside a template call's target
+                // (`{{urlencode:[[User:{{…}}]]}}`) is part of the target string.
+                // Both the target and each `mw:maybeContent` part are stringified
+                // recursively — their values may be token arrays once a nested
+                // template has been expanded into them.
                 ParsoidToken::SelfclosingTag(tk) if tk.name == "wikilink" => {
-                    let href = tk
-                        .attribs
-                        .iter()
-                        .find(|kv| kv.key.as_str() == Some("href"))
-                        .and_then(|kv| kv.value.as_str())
-                        .unwrap_or_default();
                     out.push_str("[[");
-                    out.push_str(href);
+                    for kv in &tk.attribs {
+                        match kv.key.as_str() {
+                            Some("href") => out.push_str(&key_value_to_string(&kv.value)),
+                            Some("mw:maybeContent") => {
+                                out.push('|');
+                                out.push_str(&key_value_to_string(&kv.value));
+                            }
+                            _ => {}
+                        }
+                    }
                     out.push_str("]]");
                 }
                 // Resolve a DOM-fragment placeholder to its fragment's text

@@ -551,6 +551,39 @@ fn is_template_item(item: &Item) -> bool {
         if t.name == "template" || t.name == "template3")
 }
 
+/// Whether a token-list holds a template, either directly or nested inside a
+/// token-array attribute of one of its tokens.
+///
+/// A template call's target is tokenized as a token list, and a directive inside
+/// it binds to whatever token surrounds it — `{{urlencode:[[User:{{T}}]]}}` puts
+/// the `{{T}}` in the `wikilink`'s `href` token array. PHP's `Frame::expand`
+/// walks the whole tree and expands it; rustoid's target pass only reaches the
+/// list's own tokens, so this is the guard that says the attribute pass is
+/// needed ([`Parser::expand_target_templates`]).
+fn target_holds_template(items: &[Item]) -> bool {
+    items
+        .iter()
+        .any(|it| is_template_item(it) || item_holds_templated_attribute(it))
+}
+
+/// Whether a token carries a token-array attribute that holds a template (see
+/// [`target_holds_template`]).
+fn item_holds_templated_attribute(item: &Item) -> bool {
+    use crate::wikitext::tokens_v2::KeyValue;
+    let Item::Tok(tok) = item else {
+        return false;
+    };
+    if !matches!(tok, ParsoidToken::Tag(_) | ParsoidToken::SelfclosingTag(_)) {
+        return false;
+    }
+    tok.get_attribs().iter().any(|kv| {
+        [&kv.key, &kv.value].into_iter().any(|field| match field {
+            KeyValue::Tokens(toks) => target_holds_template(toks),
+            _ => false,
+        })
+    })
+}
+
 /// Report whether a `mw:maybeContent` value contains a nested wikilink that must
 /// trigger PHP's `Link-in-link` bail. A `[[` inside a `<nowiki>` body, a
 /// recognized HTML tag's quoted attribute value, a template, or a language
@@ -5209,6 +5242,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             })
             .unwrap_or_default();
 
+        // `Parser::braceSubstitution`'s SUBST block. In a normal (non-PST) parse
+        // a plain `subst:` keeps the invocation literal; only `safesubst:`
+        // expands, and the tokenizer has already stripped that prefix.
+        // `Template:Edit` carries a `{{subst:REVISIONUSER}}` through a
+        // `{{urlencode:…}}`, and resolving it as `Template:Subst:REVISIONUSER`
+        // redlinked where the service keeps the literal text.
+        if crate::wikitext::tokenizer_v2::subst_is_literal(&target_str) {
+            let src = stt
+                .data_parsoid
+                .src
+                .clone()
+                .unwrap_or_else(|| format!("{{{{{target_str}}}}}"));
+            return vec![Item::Str(src)];
+        }
+
         // The target may hold a nested template
         // A comment in the template *target* (`{{f<!---->oo}}`) is
         // stripped by the PHP preprocessor before target resolution,
@@ -5596,7 +5644,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &target.key else {
             return attribs;
         };
-        if !items.iter().any(is_template_item) {
+        // A template may sit directly in the target (`{{ {{T}} }}`) or nested
+        // inside a token-array attribute of one of the target's tokens
+        // (`{{urlencode:[[User:{{T}}]]}}`, whose `wikilink` carries the `{{T}}` in
+        // its `href`). PHP's `Frame::expand` walks the whole tree, so both must be
+        // expanded before the target is resolved and stringified.
+        if !target_holds_template(items) {
             return attribs;
         }
         let items = items.clone();
@@ -5613,6 +5666,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let expanded = Box::pin(self.expand_templates(
             frame,
             items,
+            source,
+            about_counter,
+            in_template,
+            body,
+            src_text,
+        ))
+        .await;
+        // The top-level pass reaches only the target's own tokens; one nested in
+        // a token-array attribute survives it, so the attribute pass runs too.
+        let expanded = Box::pin(self.expand_attrib_templates(
+            frame,
+            expanded,
             source,
             about_counter,
             in_template,
@@ -6994,6 +7059,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             }
+            // Mirrors PHP's `AttributeExpander::processComplexAttributes`: an
+            // `extlink`/`urllink` whose `href` holds a template token is flagged,
+            // and `render_answer` then *rebuilds* it rather than writing back its
+            // stale `src`. rustoid tokenizes a template body before its `{{{…}}}`
+            // are substituted, so that `src` spells `{{{1}}}` where the service's
+            // (preprocessed before tokenizing) spells the expansion.
+            let href_holds_template = matches!(tok.get_name(), "extlink" | "urllink")
+                && attribs.iter().any(|kv| {
+                    kv.key.as_str() == Some("href") && matches!(kv.value, KeyValue::Tokens(_))
+                });
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in attribs {
                 let mut new_kv = kv.clone();
@@ -7063,6 +7138,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             let mut new_tok = tok.clone();
             new_tok.set_attribs(expanded_attrs);
+            if href_holds_template && let Some(dp) = new_tok.data_parsoid_mut() {
+                dp.tmp.link_contains_template = Some(true);
+            }
             out.push(Item::Tok(new_tok));
         }
         out

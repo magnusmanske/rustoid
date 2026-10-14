@@ -791,7 +791,16 @@ pub fn answer_item_text(
             // handed the expansion, not the template. See
             // [`crate::wikitext::token_utils::rewrite_expanded_attrs`].
             // Table-structure tokens have no `src` and are rebuilt instead.
-            if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
+            //
+            // A link whose `href` held a template token has a *stale* `src`, and
+            // `rewrite_expanded_attrs` cannot fix the `[href content]` form: the
+            // `src` spells `{{{1}}}` where the expansion spells the value (the
+            // service preprocesses before tokenizing; rustoid does not). Such a
+            // link is rebuilt from its expanded parts below.
+            let link_stale = tok
+                .data_parsoid()
+                .is_some_and(|dp| dp.tmp.link_contains_template == Some(true));
+            if !link_stale && let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
                 let rewritten =
                     crate::wikitext::token_utils::rewrite_expanded_attrs(src, tok.get_attribs())
                         .unwrap_or_else(|| src.to_string());

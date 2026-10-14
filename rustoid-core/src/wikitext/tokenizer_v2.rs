@@ -3161,7 +3161,13 @@ impl<'a> PegTokenizer<'a> {
         // which no page matches, so its argument list leaks out as body text. On
         // a page transcluding `Template:Country data …` that emitted a hundred
         // lines of raw parameters per call site.
-        let target_raw = strip_subst_prefix(&target_raw).unwrap_or(target_raw);
+        let target_raw = match strip_subst_prefix(&target_raw) {
+            // `safesubst:` — strip the prefix; the rest is the template.
+            Some(SubstPrefix::Safe(name)) => name,
+            // `subst:` (kept literal at expansion) or no prefix: leave the
+            // target as written.
+            Some(SubstPrefix::Literal) | None => target_raw,
+        };
         let target = if target_raw.contains("{{") {
             tokenize_template_arg_value(&target_raw, self.lang_conv_enabled, &self.ext_tags)
         } else {
@@ -3438,11 +3444,19 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(1);
 
-        // Check for URL protocol (from the configured protocol set).
+        // Check for URL protocol (from the configured protocol set). PHP's
+        // `extlink` admits an *empty* `addr` when a `url_directive` follows, and
+        // its guard accepts a token array (templates present) as long as it is
+        // non-empty ("There are templates present, alas"). So
+        // `[{{fullurl:…}} text]` is an extlink whose `href` is the directive,
+        // expanded later — without this the `[` stayed literal and only the
+        // bare URL inside was autolinked.
         let rem = self.remaining();
         let has_protocol = self.protocols.iter().any(|p| rem.starts_with(p.as_str()));
+        let starts_with_directive =
+            rem.starts_with("{{") || (self.lang_conv_enabled && rem.starts_with("-{"));
 
-        if !has_protocol {
+        if !has_protocol && !starts_with_directive {
             self.pos = saved;
             return false;
         }
@@ -4780,7 +4794,7 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
 ///
 /// Here the prefix *does* apply — it starts the target — and the service reports
 /// `"function":"switch"`, so the name is `#switch: {{{1|¬}}}`.
-fn strip_subst_prefix(target: &str) -> Option<String> {
+fn strip_subst_prefix(target: &str) -> Option<SubstPrefix> {
     // Drop any `<noinclude />`/`<includeonly />` markers, then look for the
     // directive. Only those two go: any other tag between the word and the colon
     // means this is not a substitution but a title that happens to begin with
@@ -4810,22 +4824,29 @@ fn strip_subst_prefix(target: &str) -> Option<String> {
     subst_name(&cleaned)
 }
 
+/// The `subst`/`safesubst` prefix on a template target, if any.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SubstPrefix {
+    /// `safesubst:` — strip the prefix; the rest is the template to expand.
+    Safe(String),
+    /// `subst:` — a render keeps the whole invocation literal; only a save
+    /// substitutes it (`Parser::braceSubstitution`: `$literal = $substMatch ==
+    /// 'subst'` outside PST).
+    Literal,
+}
+
+/// Whether `target` begins with a plain `subst:`, which keeps the invocation
+/// literal during a render (rather than transcluding `Template:Subst:X`).
+pub(crate) fn subst_is_literal(target: &str) -> bool {
+    matches!(strip_subst_prefix(target), Some(SubstPrefix::Literal))
+}
+
 /// The name half of [`strip_subst_prefix`], once any tags are gone.
-fn subst_name(text: &str) -> Option<String> {
+fn subst_name(text: &str) -> Option<SubstPrefix> {
     // The word must be followed directly by the colon; any other colon in the
     // target belongs to what follows it, not to a prefix (`Foo:subst:Bar`).
     let colon = text.find(':')?;
     let word = text[..colon].trim();
-    // Only `safesubst:` is stripped. `subst:` is *not* performed while a page is
-    // being rendered (it only substitutes on a save), so MediaWiki treats
-    // `{{subst:X}}` as an ordinary transclusion of a page named `subst:X`,
-    // which does not exist and renders back as the literal `{{subst:X}}`.
-    // Stripping it made `Template:Unreferenced section`'s
-    // `<includeonly>{{subst:substcheck}}</includeonly>` expand to `SUBST` and
-    // tripped `Module:Message box`'s subst check on every normal transclusion.
-    if !word.eq_ignore_ascii_case("safesubst") {
-        return None;
-    }
     // Nothing may precede the word. `{{lc: y}}` reaching here means the prefix
     // belongs to a *nested* argument, not to this title, and stripping it would
     // resolve that argument before its own caller sees it. A `[[wikilink]]`
@@ -4834,10 +4855,16 @@ fn subst_name(text: &str) -> Option<String> {
     if word.contains('{') || word.contains('[') {
         return None;
     }
-    let name = text[colon + 1..].trim();
-    // `{{subst:}}` names nothing. Leaving it alone keeps the literal text, which
-    // is what the parser does with a directive it cannot resolve.
-    (!name.is_empty()).then(|| name.to_string())
+    if word.eq_ignore_ascii_case("safesubst") {
+        let name = text[colon + 1..].trim();
+        // `{{safesubst:}}` names nothing; leaving it alone keeps the literal
+        // text, which is what the parser does with a directive it cannot resolve.
+        return (!name.is_empty()).then(|| SubstPrefix::Safe(name.to_string()));
+    }
+    if word.eq_ignore_ascii_case("subst") {
+        return Some(SubstPrefix::Literal);
+    }
+    None
 }
 
 /// Skip a well-formed `{{{…}}}` argument reference starting at `start`,
@@ -7882,23 +7909,26 @@ mod tests {
 
     #[test]
     fn a_safesubst_prefix_is_stripped() {
-        assert_eq!(strip_subst_prefix("safesubst:Foo"), Some("Foo".to_string()));
+        assert_eq!(
+            strip_subst_prefix("safesubst:Foo"),
+            Some(SubstPrefix::Safe("Foo".to_string()))
+        );
         // Case and spacing both vary in real wikitext.
         assert_eq!(
             strip_subst_prefix("SAFESUBST:  Foo"),
-            Some("Foo".to_string())
+            Some(SubstPrefix::Safe("Foo".to_string()))
         );
     }
 
-    /// `subst:` is *not* a render-time prefix: MediaWiki only substitutes on a
-    /// save, so while rendering it treats `{{subst:Foo}}` as a transclusion of a
-    /// page named `subst:Foo`, which does not exist. Stripping it expanded
-    /// `Template:Unreferenced section`'s `<includeonly>{{subst:substcheck}}</includeonly>`
-    /// to `SUBST` and tripped `Module:Message box`'s subst check.
+    /// `subst:` keeps the invocation literal during a render (MediaWiki only
+    /// substitutes on a save), so it is recognised but *not* stripped.
     #[test]
-    fn a_plain_subst_prefix_is_not_stripped() {
-        assert_eq!(strip_subst_prefix("subst:Foo"), None);
-        assert_eq!(strip_subst_prefix("Subst: Foo"), None);
+    fn a_plain_subst_prefix_is_recognised_but_kept() {
+        assert_eq!(strip_subst_prefix("subst:Foo"), Some(SubstPrefix::Literal));
+        assert_eq!(strip_subst_prefix("Subst: Foo"), Some(SubstPrefix::Literal));
+        assert!(subst_is_literal("subst:Foo"));
+        assert!(!subst_is_literal("safesubst:Foo"));
+        assert!(!subst_is_literal("Foo"));
     }
 
     /// The form `Template:Country data X` is written in, where a `<noinclude />`
@@ -7907,10 +7937,13 @@ mod tests {
     fn a_noinclude_between_word_and_colon_is_removed() {
         assert_eq!(
             strip_subst_prefix("safesubst<noinclude />: Foo"),
-            Some("Foo".to_string())
+            Some(SubstPrefix::Safe("Foo".to_string()))
         );
-        // A `subst:` with the same separator is still not a render-time prefix.
-        assert_eq!(strip_subst_prefix("subst<includeonly/>: Foo"), None);
+        // A `subst:` with the same separator is still a literal `subst:`.
+        assert_eq!(
+            strip_subst_prefix("subst<includeonly/>: Foo"),
+            Some(SubstPrefix::Literal)
+        );
     }
 
     /// A template whose name merely *starts* with the word is not a
@@ -7924,11 +7957,11 @@ mod tests {
         assert_eq!(strip_subst_prefix("subst<nowiki />: Foo"), None);
     }
 
-    /// A directive naming nothing is left as literal text, matching the parser's
-    /// behaviour for a substitution it cannot resolve.
+    /// A directive naming nothing: a `safesubst:` with no name is left alone,
+    /// while a plain `subst:` keeps the invocation literal either way.
     #[test]
     fn an_empty_name_is_not_a_substitution() {
-        assert_eq!(strip_subst_prefix("subst:"), None);
+        assert_eq!(strip_subst_prefix("subst:"), Some(SubstPrefix::Literal));
         assert_eq!(strip_subst_prefix("safesubst:   "), None);
     }
 
@@ -7963,13 +7996,13 @@ mod tests {
     fn a_prefix_before_a_magic_word_is_a_title_prefix() {
         assert_eq!(
             strip_subst_prefix("safesubst:#switch: {{{1|¬}}}"),
-            Some("#switch: {{{1|¬}}}".to_string())
+            Some(SubstPrefix::Safe("#switch: {{{1|¬}}}".to_string()))
         );
         // With the `<includeonly>` pair still in the text, as the tokenizer sees
         // it before directive resolution.
         assert_eq!(
             strip_subst_prefix("<includeonly>safesubst:</includeonly>#switch: x"),
-            Some("#switch: x".to_string())
+            Some(SubstPrefix::Safe("#switch: x".to_string()))
         );
     }
 
