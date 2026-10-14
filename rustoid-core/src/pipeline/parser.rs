@@ -386,6 +386,48 @@ fn phonos_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosing
     }
 }
 
+/// Name of the extension a self-closing `extension` token carries, if it is one.
+fn extension_token_name(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> Option<&str> {
+    if stt.name != "extension" {
+        return None;
+    }
+    stt.attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str())
+}
+
+/// If `item` is a `<templatedata>` extension token, return the self-closing token.
+fn templatedata_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    (extension_token_name(stt) == Some("templatedata")).then_some(stt)
+}
+
+/// The temporary attribute a template body's `<templatedata>` token carries the
+/// frame's title in, so [`Parser::build_templatedata`] can name the frame the tag
+/// sits in (`$frame->getTitle()` — the `/doc` subpage of the documented template).
+const TEMPLATEDATA_FRAME_TITLE_ATTR: &str = "data-mw-frame-title";
+
+/// Stamp [`TEMPLATEDATA_FRAME_TITLE_ATTR`] onto any `<templatedata>` extension
+/// token in a template body. Called only for a body whose source contains the
+/// tag, so the walk costs nothing for ordinary templates.
+fn stamp_templatedata_frame_title(items: Vec<Item>, title: &str) -> Vec<Item> {
+    items
+        .into_iter()
+        .map(|item| {
+            let Item::Tok(ParsoidToken::SelfclosingTag(mut t)) = item else {
+                return item;
+            };
+            if extension_token_name(&t) == Some("templatedata") {
+                t.add_attribute_str(TEMPLATEDATA_FRAME_TITLE_ATTR, title);
+            }
+            Item::Tok(ParsoidToken::SelfclosingTag(t))
+        })
+        .collect()
+}
+
 /// The first element named `name` in `node`'s subtree.
 fn find_element<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
     if matches!(&node.kind, crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(t)) if t == name)
@@ -3248,6 +3290,94 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         Some(node)
     }
 
+    /// Expand `<templatedata>` extension tokens in place, stashing each rendered
+    /// `<section class="mw-templatedata-doc-wrap">` behind a
+    /// `mw:dom-fragment-token` placeholder (mirrors `expand_imagemap`).
+    fn expand_templatedata(
+        &self,
+        tokens: Vec<Item>,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = templatedata_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            match self.build_templatedata(&stt, about_counter) {
+                Some(node) => {
+                    let mut frag = crate::dom::node::Node::document();
+                    frag.push_child(node);
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    fragments.insert(id, frag);
+                    out.push(emit_dom_fragment_placeholder(&stt, id));
+                }
+                None => out.push(item),
+            }
+        }
+        out
+    }
+
+    /// Build the `<section class="mw-templatedata-doc-wrap">` for one
+    /// `<templatedata>` tag. Port of `TemplateData\Hooks::render`'s formatter
+    /// path; the tag's JSON body is validated and normalized inside
+    /// [`crate::pipeline::templatedata::render`].
+    fn build_templatedata(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::pipeline::extension_handler::{extension_data_mw, extension_kv_attrs};
+        let ext_src = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let body_src = crate::pipeline::extension_handler::extract_ext_body(stt, &ext_src);
+
+        // `$frame->getTitle()`: the subpage the tag sits in, stamped by
+        // `stamp_templatedata_frame_title` when the body was expanded. Fall back
+        // to the page title for a tag written directly on the page.
+        let frame_title = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some(TEMPLATEDATA_FRAME_TITLE_ATTR))
+            .and_then(|kv| kv.value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.page_title.borrow().clone());
+
+        let mut node = crate::pipeline::templatedata::render(
+            &body_src,
+            &frame_title,
+            self.config.language_code(),
+        );
+
+        // The extension encapsulation: `typeof`, `about`, `data-mw`.
+        let about = stt
+            .attribs
+            .iter()
+            .find(|kv| {
+                kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            })
+            .and_then(|kv| kv.value.as_str())
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| self.new_about_id(about_counter, "templatedata"));
+        node.set_attr("typeof", "mw:Extension/templatedata");
+        node.set_attr("about", about);
+        node.set_attr(
+            "data-mw",
+            extension_data_mw("templatedata", &extension_kv_attrs(stt), Some(&body_src)),
+        );
+        Some(node)
+    }
+
     /// Resolve one `<templatestyles>` extension token into a placeholder, stashing
     /// the resolved stylesheet for the chunk's extension pass to number.
     ///
@@ -3794,7 +3924,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 for item in &mut chunk {
                     let is_gallery = gallery_target(item).is_some()
                         || imagemap_target(item).is_some()
-                        || phonos_target(item).is_some();
+                        || phonos_target(item).is_some()
+                        || templatedata_target(item).is_some();
                     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                         continue;
                     };
@@ -3889,6 +4020,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 next_id,
             )
             .await;
+        let tokens = self.expand_templatedata(tokens, about_counter, &mut fragments, next_id);
         // `<templatestyles>` is normally resolved during expansion, so its `.about`
         // id is already spent; anything left over here is a tag the inline pass
         // could not resolve (a missing sheet, or one produced after expansion).
@@ -6024,6 +6156,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             &template_src,
         ))
         .await;
+        // A `<templatedata>` in the body records the frame's title for its
+        // `mw:edittemplatedata` marker (`$frame->getTitle()` — the `/doc` subpage
+        // of the documented template). Only walked when the body has the tag.
+        let expanded = if template_src.contains("<templatedata") {
+            stamp_templatedata_frame_title(
+                expanded,
+                &child_frame.title().full_text_with_config(self.config),
+            )
+        } else {
+            expanded
+        };
 
         // A comment in a template body is dropped. MediaWiki's preprocessor
         // strips comments out of a template's expanded source before it is

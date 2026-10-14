@@ -468,24 +468,26 @@ fn discard_node(node: &mut Node, is_first: bool, is_last: bool, in_native: bool)
 /// non-native extension tags, so *any* extension content is treated as native,
 /// which discards less than the reference rather than more.
 ///
-/// The exception is `<templatestyles>`, which has no native Parsoid handler, so
-/// Parsoid's `inNativeContent` (which asks `getExtTagImpl` in the *native* ext
-/// list) is false for it and its `data-parsoid` is discarded inside a
-/// transclusion range — that is what keeps a template-emitted stylesheet from
-/// claiming a node id it should not. A stylesheet in the `<references>` list keeps
-/// its slot (the list is native `mw:Extension/references`), which is why the note
-/// body's stylesheet *does* take an id. See [`crate::pagebundle::assign_node_ids`].
-///
-/// `<phonos>` is the same case: it is a legacy MediaWiki hook the wiki renders for
-/// Parsoid, not a Parsoid-native module, so Parsoid discards its output's
-/// `data-parsoid` inside a range too. A Phonos button in a transclusion therefore
-/// takes no ids (its whole subtree is discarded), while one spliced in from a note
-/// body — a range of its own — keeps them.
+/// The exceptions are the extensions Parsoid leaves opaque (legacy MediaWiki
+/// hooks, not Parsoid modules), so `inNativeContent` — which asks
+/// `getExtTagImpl` in the *native* ext list — is false for them and their
+/// `data-parsoid` is discarded inside a transclusion range: `<templatestyles>`
+/// (what keeps a template-emitted stylesheet from claiming an id),
+/// `<phonos>` (a button in a transclusion takes no ids) and `<templatedata>`
+/// (the documentation table is unkeyed). A stylesheet in the `<references>` list
+/// keeps its slot (the list is native `mw:Extension/references`), which is why
+/// the note body's stylesheet *does* take an id. See
+/// [`crate::pagebundle::assign_node_ids`].
 fn is_native_ext(node: &Node) -> bool {
     node.get_attr("typeof").is_some_and(|ty| {
         ty.split_whitespace().any(|t| {
             t.starts_with("mw:Extension/")
-                && !matches!(t, "mw:Extension/templatestyles" | "mw:Extension/phonos")
+                && !matches!(
+                    t,
+                    "mw:Extension/templatestyles"
+                        | "mw:Extension/phonos"
+                        | "mw:Extension/templatedata"
+                )
         })
     })
 }

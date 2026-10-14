@@ -44,6 +44,7 @@ pub mod section_wrapper;
 pub mod table_fixups;
 pub mod template_encapsulator;
 pub mod template_handler;
+pub mod templatedata;
 pub mod templatestyles;
 pub mod token_handler_pipeline;
 pub mod token_stream_patcher;
