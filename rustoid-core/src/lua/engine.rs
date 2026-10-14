@@ -114,12 +114,25 @@ impl LuaSite {
                 // MediaWiki's main namespace has the *empty* name; a config that
                 // labels it (the mock calls it "Main") must not leak into Lua,
                 // where modules test `nsText == ''` and build titles from it.
+                //
+                // The **localized** name, not the canonical one: Scribunto's
+                // `Title::getNsText()` is the content-language name, so namespace
+                // 4 on enwiki is `Wikipedia`, whose canonical name is `Project`.
+                // Using the canonical name made `prefixedText` (and the title-fact
+                // lookup key) `Project:I`, which matches neither the module's
+                // expectation nor the wiki's own spelling.
                 let name = if *id == 0 {
                     String::new()
                 } else {
-                    ns.canonical.clone()
+                    ns.local.clone().unwrap_or_else(|| ns.canonical.clone())
                 };
-                (*id, name, ns.aliases.clone())
+                // The canonical spelling stays resolvable (`Project:I`,
+                // `mw.title.new`).
+                let mut aliases = ns.aliases.clone();
+                if name != ns.canonical && !aliases.iter().any(|a| a == &ns.canonical) {
+                    aliases.push(ns.canonical.clone());
+                }
+                (*id, name, aliases)
             })
             .filter(|(_, name, _)| !name.is_empty())
             .collect();
@@ -2805,9 +2818,21 @@ fn title_derived_field(
                 is_current || facts.as_ref().is_some_and(|f| f.exists),
             ))
         }
-        "isRedirect" => Ok(Value::Boolean(
-            facts.as_ref().is_some_and(|f| f.is_redirect),
-        )),
+        "isRedirect" => {
+            // A redirect is a fact the host gathers, exactly like `exists` — and
+            // `mw.title.new(x).isRedirect` is the query `Module:Redirect` makes
+            // to decide whether a page redirects. Unlike `exists`/`file`, this
+            // arm never recorded an unknown title, so the retry loop had nothing
+            // to fetch and the answer stayed a false "not a redirect":
+            // `Template:No redirect` then took its plain-link branch, and
+            // `Help:Introduction`'s shortcut list lost its `plainlinks` link.
+            if facts.is_none() && !is_current && !full.is_empty() {
+                note_missing_title(lua, full)?;
+            }
+            Ok(Value::Boolean(
+                facts.as_ref().is_some_and(|f| f.is_redirect),
+            ))
+        }
         // `protectionLevels` is a table keyed by action, each value an *array*
         // whose first item is the level string: `{ edit = { 'sysop' } }`.
         // `Module:Effective protection level` reads

@@ -739,8 +739,28 @@ pub trait SiteConfig: Send + Sync {
     /// Mirrors PHP's `SiteConfig::getExternalLinkAttribs`, which defaults to
     /// `rel = ["nofollow"]` (i.e. `$wgNoFollowLinks = true`). The `class` key
     /// holds the class tokens to *add* (not replace) to any existing `class`.
+    ///
+    /// The `href`/`data-mw-original-href` rewrite is *not* applied here: it is
+    /// a wiki behaviour (the live service's `getExternalUrlInfo`), and the
+    /// standalone Parsoid the fixtures target leaves a protocol-relative URL
+    /// untouched. A source that targets the live wiki applies it with
+    /// [`protocol_relative_href_attrs`](Self::protocol_relative_href_attrs).
     fn external_link_attribs(&self, _href: &str) -> Vec<(String, Vec<String>)> {
         vec![("rel".to_string(), vec!["nofollow".to_string()])]
+    }
+
+    /// `Env::getExternalLinkAttribs`'s `href` rewrite. A protocol-relative URL
+    /// that names the wiki's own server is expanded to the site protocol, with
+    /// the written form kept in `data-mw-original-href`; any other URL yields
+    /// nothing. See [`crate::links::protocol_expand_same_host`].
+    fn protocol_relative_href_attrs(&self, href: &str) -> Vec<(String, Vec<String>)> {
+        match crate::links::protocol_expand_same_host(href, self.server_url()) {
+            Some(expanded) => vec![
+                ("href".to_string(), vec![expanded]),
+                ("data-mw-original-href".to_string(), vec![href.to_string()]),
+            ],
+            None => Vec::new(),
+        }
     }
 
     /// Whether `ParsoidExperimentalParserFunctionOutput` should generate

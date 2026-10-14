@@ -359,12 +359,12 @@ impl SiteConfig for WikiSiteConfig {
     /// `$wgNoFollowNsExceptions` is empty, so the only escape is
     /// [`WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS`], which `siteinfo` does not expose.
     fn external_link_attribs(&self, href: &str) -> Vec<(String, Vec<String>)> {
-        if rustoid_core::links::url_host_matches_domain_list(href, WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS)
+        let mut out = self.protocol_relative_href_attrs(href);
+        if !rustoid_core::links::url_host_matches_domain_list(href, WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS)
         {
-            Vec::new()
-        } else {
-            vec![("rel".to_string(), vec!["nofollow".to_string()])]
+            out.push(("rel".to_string(), vec!["nofollow".to_string()]));
         }
+        out
     }
 }
 

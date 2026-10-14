@@ -1363,6 +1363,17 @@ impl TemplateHandler {
             "expr" => ParserFunctions::pf_expr(params),
             "ifexpr" => ParserFunctions::pf_ifexpr(params),
             "iferror" => ParserFunctions::pf_iferror(params),
+            // `{{PLURAL:count|sing|plur}}` — core `CoreParserFunctions::plural`
+            // + `Language::convertPlural`. Reached as a function because the
+            // resolver finds it in the site's function-hook table; without an
+            // arm it spilled its own `{{PLURAL:…}}` source into the DOM.
+            "plural" => ParserFunctions::pf_plural(params),
+            // `{{fullurl:title|query}}` and the `localurl`/`canonicalurl` family —
+            // core `CoreParserFunctions::urlFunction`. Reached as functions
+            // because the resolver finds them in the site's function-hook table;
+            // without an arm each spilled its own `{{fullurl:…}}` source.
+            "localurl" | "localurle" | "fullurl" | "fullurle" | "canonicalurl"
+            | "canonicalurle" => ParserFunctions::pf_url(config, name, params),
             // `{{#time: format | date | language }}` — MediaWiki formats a date
             // with `Language::sprintfDate`, the same routine Scribunto exposes as
             // `mw.language:formatDate`, so the two share one implementation

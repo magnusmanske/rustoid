@@ -405,6 +405,14 @@ fn templatedata_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfc
     (extension_token_name(stt) == Some("templatedata")).then_some(stt)
 }
 
+/// If `item` is an `<inputbox>` extension token, return the self-closing token.
+fn inputbox_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    (extension_token_name(stt) == Some("inputbox")).then_some(stt)
+}
+
 /// The temporary attribute a template body's `<templatedata>` token carries the
 /// frame's title in, so [`Parser::build_templatedata`] can name the frame the tag
 /// sits in (`$frame->getTitle()` — the `/doc` subpage of the documented template).
@@ -3378,6 +3386,87 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         Some(node)
     }
 
+    /// Expand `<inputbox>` extension tokens in place, stashing each rendered form
+    /// behind a `mw:dom-fragment-token` placeholder (mirrors `expand_templatedata`).
+    fn expand_inputbox(
+        &self,
+        tokens: Vec<Item>,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = inputbox_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            match self.build_inputbox(&stt, about_counter, next_id) {
+                Some(node) => {
+                    let mut frag = crate::dom::node::Node::document();
+                    frag.push_child(node);
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    fragments.insert(id, frag);
+                    out.push(emit_dom_fragment_placeholder(&stt, id));
+                }
+                None => out.push(item),
+            }
+        }
+        out
+    }
+
+    /// Build the `<div class="mw-inputbox-centered">` for one `<inputbox>` tag.
+    /// Port of `InputBox::render`'s search forms; other types fall back to the
+    /// generic `<extension>` (the caller leaves the token).
+    fn build_inputbox(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        about_counter: &std::cell::Cell<usize>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::pipeline::extension_handler::{extension_data_mw, extension_kv_attrs};
+        let ext_src = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let body_src = crate::pipeline::extension_handler::extract_ext_body(stt, &ext_src);
+        let options = crate::pipeline::inputbox::Options::parse(&body_src);
+
+        // `wfRandom()`: `0.` + 12 digits, used for the checkbox ids. The mask in
+        // the comparator ignores the value, so a deterministic one keeps rustoid's
+        // own output reproducible.
+        let seed = next_id.get() as u64;
+        let rand_suffix = format!(
+            "0.{:012}",
+            seed.wrapping_mul(2_654_435_761).wrapping_add(12_345) % 1_000_000_000_000
+        );
+        let mut node = options.render(self.config, &rand_suffix)?;
+
+        // The extension encapsulation: `typeof`, `about`, `data-mw`.
+        let about = stt
+            .attribs
+            .iter()
+            .find(|kv| {
+                kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            })
+            .and_then(|kv| kv.value.as_str())
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| self.new_about_id(about_counter, "inputbox"));
+        node.set_attr("typeof", "mw:Extension/inputbox");
+        node.set_attr("about", about);
+        node.set_attr(
+            "data-mw",
+            extension_data_mw("inputbox", &extension_kv_attrs(stt), Some(&body_src)),
+        );
+        Some(node)
+    }
+
     /// Resolve one `<templatestyles>` extension token into a placeholder, stashing
     /// the resolved stylesheet for the chunk's extension pass to number.
     ///
@@ -3922,10 +4011,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     crate::pipeline::wiki_link_render::WikiLinkContext::new(self.config);
                 let mut index = 0usize;
                 for item in &mut chunk {
+                    if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item
+                        && t.attribs.iter().any(|kv| {
+                            kv.key.as_str()
+                                == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+                        })
+                    {
+                        // Numbered in source order by the expansion pass
+                        // (`stamp_rich_extension_about`); leave it alone.
+                        continue;
+                    }
                     let is_gallery = gallery_target(item).is_some()
                         || imagemap_target(item).is_some()
                         || phonos_target(item).is_some()
-                        || templatedata_target(item).is_some();
+                        || templatedata_target(item).is_some()
+                        || inputbox_target(item).is_some();
                     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                         continue;
                     };
@@ -4021,6 +4121,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             )
             .await;
         let tokens = self.expand_templatedata(tokens, about_counter, &mut fragments, next_id);
+        let tokens = self.expand_inputbox(tokens, about_counter, &mut fragments, next_id);
         // `<templatestyles>` is normally resolved during expansion, so its `.about`
         // id is already spent; anything left over here is a tag the inline pass
         // could not resolve (a missing sheet, or one produced after expansion).
@@ -4768,12 +4869,54 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 if self.number_style_placeholder(item, about_counter) {
                     continue;
                 }
+                if self.stamp_rich_extension_about(item, about_counter) {
+                    continue;
+                }
                 self.number_extension_token(item, source, frame, about_counter)
                     .await;
             }
             result.extend(out);
         }
         result
+    }
+
+    /// Stamp the `about` id a rich-rendered extension (`<gallery>`, `<imagemap>`,
+    /// `<phonos>`, `<templatedata>`, `<inputbox>`) would be given at its chunk
+    /// position, in the same source-order pass that numbers `<templatestyles>`.
+    ///
+    /// The output is built in a later pass, so the id travels on the token
+    /// (`MW_ABOUT_BASE_ATTR`); it has to be *chosen* here, because that later
+    /// pass reads a counter already past the chunk's stylesheets and so cannot
+    /// interleave: `Help:Introduction`'s `<inputbox>` sits between two
+    /// stylesheets and took a later id than the second. Returns whether `item`
+    /// was such a token.
+    fn stamp_rich_extension_about(
+        &self,
+        item: &mut Item,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> bool {
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+            return false;
+        };
+        if !matches!(
+            extension_token_name(t),
+            Some("gallery")
+                | Some("imagemap")
+                | Some("phonos")
+                | Some("templatedata")
+                | Some("inputbox")
+        ) {
+            return false;
+        }
+        if t.attribs.iter().any(|kv| {
+            kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+        }) {
+            return false;
+        }
+        let about = self.new_about_id(about_counter, "extension-id");
+        let id = about.trim_start_matches("#mwt").to_string();
+        t.add_attribute_str(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR, id);
+        true
     }
 
     /// Number one extension token in place, if it is a kind that carries an

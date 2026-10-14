@@ -147,6 +147,285 @@ fn value_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// A [`KeyValue`] read as a bare value (empty key), so `expand_kv` answers the
+/// value alone rather than its `key=value` rejoining.
+fn value_only(value: &KeyValue) -> KV {
+    KV {
+        key: KeyValue::Str(String::new()),
+        value: value.clone(),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    }
+}
+
+/// `preg_match('/\d+=/i', $form)`: a digit immediately followed by `=`, which
+/// marks an explicit `n=form` entry in `{{PLURAL:…}}`.
+fn has_explicit_plural_number(form: &str) -> bool {
+    form.as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_digit() && w[1] == b'=')
+}
+
+/// MediaWiki's `NS_MEDIA` (the `Media:` pseudo-namespace), which
+/// `CoreParserFunctions::urlFunction` converts to `NS_FILE`.
+const MEDIA_NAMESPACE_ID: i32 = -2;
+/// MediaWiki's `NS_FILE` (the `File:` namespace).
+const FILE_NAMESPACE_ID: i32 = -6;
+
+/// `CoreParserFunctions::urlFunction` — a title's URL in the `local`, `full` or
+/// `canonical` flavour chosen by `name`, or `None` for a title the wiki rejects
+/// (a name it cannot build).
+fn url_function(
+    config: &dyn crate::traits::SiteConfig,
+    s: &str,
+    query: Option<&str>,
+    name: &str,
+) -> Option<String> {
+    let mut title = crate::title::TitleParser::try_parse(s, config)?;
+    // `urlFunction` converts NS_MEDIA -> NS_FILE.
+    if title.namespace_id == MEDIA_NAMESPACE_ID {
+        title = crate::title::Title::new(FILE_NAMESPACE_ID, title.text.clone());
+    }
+
+    // `getLocalURL`: an interwiki title reaches the remote wiki's URL; a local
+    // one is the article path or the script with `?title=`.
+    let local = match title
+        .interwiki
+        .as_ref()
+        .and_then(|p| config.interwiki_map().get(p))
+    {
+        Some(iw) => {
+            let page = wf_urlencode(&title.get_dbkey());
+            append_query(&iw.url.replace("$1", &page), query)
+        }
+        None => local_url(config, &title, query),
+    };
+
+    let url = if name.starts_with("localurl") {
+        local
+    } else if name.starts_with("fullurl") {
+        // `getFullURL`: expand to `PROTO_RELATIVE` (protocol-relative) and add
+        // the fragment.
+        format!(
+            "{}{}",
+            expand_protocol(config, &local, Proto::Relative),
+            fragment_for_url(&title)
+        )
+    } else {
+        format!(
+            "{}{}",
+            expand_protocol(config, &local, Proto::Canonical),
+            fragment_for_url(&title)
+        )
+    };
+    Some(url)
+}
+
+/// The protocol expansion `UrlUtils::expand` performs: a relative URL is
+/// qualified with the wiki's server, a protocol-relative one gets the protocol,
+/// and an absolute URL is left as-is.
+enum Proto {
+    Relative,
+    Canonical,
+}
+
+fn expand_protocol(config: &dyn crate::traits::SiteConfig, url: &str, proto: Proto) -> String {
+    if url.starts_with("//") {
+        return match proto {
+            Proto::Relative => url.to_string(),
+            Proto::Canonical => format!("{protocol}:{url}", protocol = site_protocol(config)),
+        };
+    }
+    if !url.starts_with('/') {
+        return url.to_string();
+    }
+    match proto {
+        Proto::Relative => format!("//{}{url}", server_authority(config)),
+        Proto::Canonical => format!(
+            "{protocol}://{authority}{url}",
+            protocol = site_protocol(config),
+            authority = server_authority(config)
+        ),
+    }
+}
+
+/// `Title::getLocalURL`: the article path for a bare title, else the script with
+/// `?title=` and the query (`$wgScript`, the `-` query meaning empty).
+fn local_url(
+    config: &dyn crate::traits::SiteConfig,
+    title: &crate::title::Title,
+    query: Option<&str>,
+) -> String {
+    let dbkey = wf_urlencode(&title.get_prefixed_db_key());
+    match query {
+        None => config.article_path().replace("$1", &dbkey),
+        Some(q) => {
+            let q = if q == "-" { "" } else { q };
+            format!("{}/index.php?title={dbkey}&{q}", config.script_path())
+        }
+    }
+}
+
+/// `getFragmentForURL`: `#` and the fragment, or nothing.
+fn fragment_for_url(title: &crate::title::Title) -> String {
+    title
+        .fragment
+        .as_ref()
+        .map(|f| format!("#{}", wf_urlencode(f)))
+        .unwrap_or_default()
+}
+
+/// `wfAppendQuery` for the interwiki case: `&`-joined when the URL already has
+/// a query, `?`-joined otherwise. A `null` query adds nothing.
+fn append_query(url: &str, query: Option<&str>) -> String {
+    match query {
+        None => url.to_string(),
+        Some(q) => {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}{q}")
+        }
+    }
+}
+
+/// The wiki's own protocol (`https` on enwiki). `server_url` may be
+/// protocol-relative (the wiki's `$wgServer` is `//en.wikipedia.org`), in which
+/// case the request protocol — https on the Wikimedia wikis — is assumed.
+fn site_protocol(config: &dyn crate::traits::SiteConfig) -> &str {
+    config
+        .server_url()
+        .split_once("://")
+        .map(|(protocol, _)| protocol)
+        .unwrap_or("https")
+}
+
+/// The wiki's host, without protocol or path.
+fn server_authority(config: &dyn crate::traits::SiteConfig) -> &str {
+    config
+        .server_url()
+        .split("://")
+        .last()
+        .unwrap_or(config.server_url())
+        .trim_start_matches('/')
+}
+
+/// MediaWiki's `wfUrlencode`: `rawurlencode` (unreserved `A-Za-z0-9-_.~` kept),
+/// then a handful of sub-delims and `; @ : / '` unescaped.
+fn wf_urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b';'
+            | b'@'
+            | b'$'
+            | b','
+            | b'/'
+            | b'!'
+            | b'*'
+            | b'('
+            | b')'
+            | b'\''
+            | b':' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// PHP's `rawurlencode`: keep the RFC 3986 unreserved set, percent-encode the
+/// rest byte-wise.
+fn rawurlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// PHP's `urlencode`: `rawurlencode` with a space as `+`. PHP encodes `~` here
+/// (its `urlencode` predates the unreserved-set change), so `rawurlencode` and
+/// `urlencode` differ on that one character.
+fn php_urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+            out.push(b as char);
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The count `{{PLURAL:count|…}}` is evaluated against: core applies
+/// `parseFormattedNumber` (grouping commas dropped, U+2212 read as `-`) and
+/// then PHP's `settype`, which keeps an all-digit string an integer and makes
+/// everything else a float.
+struct PluralCount {
+    /// Whether the argument was an integer (`settype` → `int`).
+    is_int: bool,
+    value: f64,
+    /// PHP's `(string)$count`, used to match an explicit `n=form` entry.
+    display: String,
+}
+
+impl PluralCount {
+    fn parse(text: &str) -> Self {
+        let cleaned: String = text
+            .chars()
+            .filter(|c| *c != ',')
+            .map(|c| if c == '\u{2212}' { '-' } else { c })
+            .collect();
+        let trimmed = cleaned.trim();
+        let is_int = !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit());
+        let value = trimmed.parse::<f64>().unwrap_or(f64::NAN);
+        let display = if is_int {
+            // `(string)(int)` drops leading zeros.
+            let stripped = trimmed.trim_start_matches('0');
+            if stripped.is_empty() {
+                "0".to_string()
+            } else {
+                stripped.to_string()
+            }
+        } else if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e15 {
+            // PHP renders a float with no fraction as its integer form.
+            format!("{}", value as i64)
+        } else {
+            format!("{value}")
+        };
+        PluralCount {
+            is_int,
+            value,
+            display,
+        }
+    }
+
+    /// English's CLDR rule `i = 1 and v = 0` → form 0 (`one`), else form 1.
+    /// An integer has no fraction (`v = 0`) and `i` is the value; a float is
+    /// `one` only when it is integral and its absolute value is 1.
+    fn plural_index(&self) -> usize {
+        let one = if self.is_int {
+            self.value == 1.0
+        } else {
+            self.value.abs() == 1.0 && self.value.fract() == 0.0
+        };
+        if one { 0 } else { 1 }
+    }
+}
+
 /// PHP's `(int)` cast applied to a string: trim leading whitespace, take an
 /// optional sign and the leading run of ASCII digits, and answer `0` when there
 /// are none. `(int)"2abc"` is `2`, `(int)"abc"` is `0`.
@@ -226,6 +505,65 @@ impl ParserFunctions {
     /// apply. Kept separate so the two rules cannot be collapsed by accident.
     pub fn untrimmed_branch(kv: Option<&KV>) -> Vec<Item> {
         Self::expand_kv(kv, None)
+    }
+
+    /// `{{PLURAL:count|sing|plur|…}}` — core `CoreParserFunctions::plural`
+    /// feeding `Language::convertPlural`. English has the CLDR rule
+    /// `i = 1 and v = 0`, so a count of one answers the first form and any
+    /// other count the last; an explicit `n=form` entry wins when `n` equals
+    /// the count, and is otherwise dropped (`handleExplicitPluralForms`).
+    pub fn pf_plural(params: &Params) -> Vec<Item> {
+        // The count is the colon argument, expanded like any other.
+        let count_kv = params.args.first().map(|kv| value_only(&kv.key));
+        let count = tokens_to_string(&Self::expand_kv(count_kv.as_ref(), None));
+        let count = PluralCount::parse(&count);
+
+        // Each form as MediaWiki hands it to `convertPlural`: `key=value` when
+        // the argument was named (`1=one`), the value alone when positional.
+        let forms: Vec<KV> = params.args.iter().skip(1).cloned().collect();
+        let strings: Vec<String> = forms
+            .iter()
+            .map(|kv| tokens_to_string(&Self::expand_kv(Some(kv), None)))
+            .collect();
+
+        let mut kept: Vec<&KV> = Vec::new();
+        for (kv, form) in forms.iter().zip(&strings) {
+            if has_explicit_plural_number(form) {
+                let pos = form.find('=').unwrap_or(form.len());
+                if form[..pos] == count.display {
+                    return Self::expand_kv(Some(&value_only(&kv.value)), None);
+                }
+                continue;
+            }
+            kept.push(kv);
+        }
+        if kept.is_empty() {
+            return Vec::new();
+        }
+        let index = count.plural_index().min(kept.len() - 1);
+        Self::expand_kv(Some(kept[index]), None)
+    }
+
+    /// `{{fullurl:title|query}}` and its siblings — core
+    /// `CoreParserFunctions::urlFunction` over `Title::getLocalURL`,
+    /// `getFullURL` and `getCanonicalURL`. The names are `localurl`/`localurle`,
+    /// `fullurl`/`fullurle` and `canonicalurl`/`canonicalurle`; the `…e`
+    /// spellings only `htmlspecialchars` the answer in the legacy parser, while
+    /// Parsoid inserts the string as text and the serializer escapes it, so both
+    /// spellings answer the same bytes here.
+    pub fn pf_url(
+        config: &dyn crate::traits::SiteConfig,
+        name: &str,
+        params: &Params,
+    ) -> Vec<Item> {
+        let raw = params.args.first().map(|kv| value_only(&kv.key));
+        let s = tokens_to_string(&Self::expand_kv(raw.as_ref(), None));
+        let query = params
+            .args
+            .get(1)
+            .map(|kv| tokens_to_string(&Self::expand_kv(Some(kv), None)));
+        let url = url_function(config, &s, query.as_deref(), name).unwrap_or_default();
+        vec![Item::Str(url)]
     }
 
     /// `#switch` — a port of core `ParserFunctions::switch`, which is what the
@@ -719,16 +1057,29 @@ impl ParserFunctions {
         vec![Item::Tok(ParsoidToken::SelfclosingTag(stt))]
     }
 
-    /// `#urlencode` — mirrors `pf_urlencode`.
+    /// `#urlencode` — core `CoreParserFunctions::urlencode`, whose mode argument
+    /// picks the encoder: `url_wiki` (`wfUrlencode`, spaces as `_`), `url_path`
+    /// (`rawurlencode`), and `url_query`/absent (PHP's `urlencode`, which is
+    /// `rawurlencode` with `+` for a space). The old blanket `rawurlencode`-ish
+    /// encoding answered `a%20b` where the wiki answers `a+b`, left `?&=/` alone,
+    /// and ignored the mode entirely.
     pub fn pf_urlencode(params: &Params) -> Vec<Item> {
         let target = params
             .args
             .first()
             .map(|kv| key_value_to_string(&kv.key))
             .unwrap_or_default();
-        vec![Item::Str(crate::sanitizer::encode_url_for_ext_link(
-            target.trim(),
-        ))]
+        let mode = params
+            .args
+            .get(1)
+            .map(|kv| tokens_to_string(&Self::expand_kv(Some(kv), None)))
+            .unwrap_or_default();
+        let encoded = match mode.to_ascii_uppercase().as_str() {
+            "WIKI" => wf_urlencode(&target.replace(' ', "_")),
+            "PATH" => rawurlencode(&target),
+            _ => php_urlencode(&target),
+        };
+        vec![Item::Str(encoded)]
     }
 
     /// `#anchorencode` — encode a string so it can be used as a link fragment.
@@ -1831,10 +2182,78 @@ mod tests {
     }
 
     #[test]
+    fn test_pf_plural() {
+        // English: a count of one takes the first form, any other the last.
+        let two = params(vec![("2", ""), ("", "Shortcut"), ("", "Shortcuts")]);
+        assert_eq!(
+            ParserFunctions::pf_plural(&two),
+            vec![Item::Str("Shortcuts".to_string())]
+        );
+        let one = params(vec![("1", ""), ("", "Shortcut"), ("", "Shortcuts")]);
+        assert_eq!(
+            ParserFunctions::pf_plural(&one),
+            vec![Item::Str("Shortcut".to_string())]
+        );
+        // An explicit `n=form` wins when `n` matches, and is dropped otherwise.
+        let explicit_hit = params(vec![("1", ""), ("1", "one"), ("", "many")]);
+        assert_eq!(
+            ParserFunctions::pf_plural(&explicit_hit),
+            vec![Item::Str("one".to_string())]
+        );
+        let explicit_miss = params(vec![("5", ""), ("1", "one"), ("", "many")]);
+        assert_eq!(
+            ParserFunctions::pf_plural(&explicit_miss),
+            vec![Item::Str("many".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_pf_url() {
+        // Mock site: server `https://en.wikipedia.org`, article path `/wiki/$1`,
+        // script path `/w`.
+        let config = crate::mock::MockSiteConfig::new();
+        let title = params(vec![("WP:X", "")]);
+        assert_eq!(
+            ParserFunctions::pf_url(&config, "fullurl", &title),
+            vec![Item::Str("//en.wikipedia.org/wiki/WP:X".to_string())]
+        );
+        let query = params(vec![("WP:X", ""), ("", "action=edit")]);
+        assert_eq!(
+            ParserFunctions::pf_url(&config, "localurl", &query),
+            vec![Item::Str("/w/index.php?title=WP:X&action=edit".to_string())]
+        );
+        let bare = params(vec![("WP:X", "")]);
+        assert_eq!(
+            ParserFunctions::pf_url(&config, "canonicalurl", &bare),
+            vec![Item::Str("https://en.wikipedia.org/wiki/WP:X".to_string())]
+        );
+    }
+
+    #[test]
     fn test_pf_urlencode() {
-        let p = params(vec![("a b|c", "")]);
-        let out = ParserFunctions::pf_urlencode(&p);
-        assert_eq!(out, vec![Item::Str("a%20b%7Cc".to_string())]);
+        // Probed on the live wiki. The default is PHP's `urlencode` (`+` for a
+        // space, everything but `A-Za-z0-9-_.` percent-encoded), `|wiki` is
+        // `wfUrlencode`, `|path` is `rawurlencode`.
+        let default = params(vec![("a b|c", "")]);
+        assert_eq!(
+            ParserFunctions::pf_urlencode(&default),
+            vec![Item::Str("a+b%7Cc".to_string())]
+        );
+        let query = params(vec![("x/y?z=1&w", "")]);
+        assert_eq!(
+            ParserFunctions::pf_urlencode(&query),
+            vec![Item::Str("x%2Fy%3Fz%3D1%26w".to_string())]
+        );
+        let wiki = params(vec![("a b", ""), ("", "wiki")]);
+        assert_eq!(
+            ParserFunctions::pf_urlencode(&wiki),
+            vec![Item::Str("a_b".to_string())]
+        );
+        let path = params(vec![("a b", ""), ("", "path")]);
+        assert_eq!(
+            ParserFunctions::pf_urlencode(&path),
+            vec![Item::Str("a%20b".to_string())]
+        );
     }
 
     #[test]

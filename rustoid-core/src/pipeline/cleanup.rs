@@ -487,6 +487,7 @@ fn is_native_ext(node: &Node) -> bool {
                     "mw:Extension/templatestyles"
                         | "mw:Extension/phonos"
                         | "mw:Extension/templatedata"
+                        | "mw:Extension/inputbox"
                 )
         })
     })
