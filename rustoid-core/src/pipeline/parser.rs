@@ -624,41 +624,6 @@ fn reconstruct_link_src(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, href
     src
 }
 
-/// Collapse the `template` tokens a re-tokenized *rendered* fragment holds back
-/// into their source text.
-///
-/// A wikilink bail path re-tokenizes a source it reconstructed from the
-/// **expanded** `href`/content ([`reconstruct_link_src`]), so any `{{…}}` in
-/// that text is literal — an expansion is what put it there (a `{{subst:…}}`
-/// kept as written, a module's output). Expansion has already run by then, so a
-/// re-created invocation is never expanded again and reaches the tree builder,
-/// which names an element after it (`<template …>`), and spends an `about` id.
-/// The text is what the caller meant, and it is also what
-/// `Parser::expand_template_token` answers for a literal `subst:` (see
-/// `wikitext::tokenizer_v2::subst_is_literal`).
-fn collapse_reparsed_templates(items: Vec<Item>) -> Vec<Item> {
-    items
-        .into_iter()
-        .map(|item| {
-            let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &item else {
-                return item;
-            };
-            if t.name != "template" && t.name != "template3" {
-                return item;
-            }
-            let src = t.data_parsoid.src.clone().unwrap_or_else(|| {
-                let target = t
-                    .attribs
-                    .first()
-                    .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
-                    .unwrap_or_default();
-                format!("{{{{{target}}}}}")
-            });
-            Item::Str(src)
-        })
-        .collect()
-}
-
 /// Whether a token chunk holds an unexpanded `extension` self-closing token.
 ///
 /// Used to tell an `extension` a value already carried (a literal `<nowiki>` in
@@ -1871,6 +1836,85 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         self.style_defer.get() > 0
     }
 
+    /// Rewrite what a bail's re-tokenization produced, so nothing reaches the
+    /// tree builder as an element it is not.
+    ///
+    /// A bail tokenizes a source reconstructed from the **expanded**
+    /// href/content ([`reconstruct_link_src`]), so every `{{…}}` in it came *out
+    /// of* an expansion. The expansion pass has already run, so re-creating an
+    /// invocation resurrects one nothing will expand again: it reached the tree
+    /// builder, which named an element after it (`<template …>`) and spent an
+    /// `about` id. Two kinds of text look like one, and each has its own answer:
+    ///
+    /// - a `{{subst:…}}` is the invocation that *survives* expansion — it renders
+    ///   as its own source inside a transclusion, which
+    ///   [`Self::encapsulate_subst_literal`] rebuilds. That needs no fetch, so it
+    ///   can be done here, and it is the one place the bail can match the service
+    ///   exactly.
+    /// - anything else is text by construction, and collapses back to its source.
+    ///
+    /// The wrapper takes an `about`, so `about_counter` must be present: it is on
+    /// the async render paths and absent from the synchronous, data-source-less
+    /// one, which keeps the text. `source` is the text the re-tokenized
+    /// parameters' source ranges index, for `data-mw`'s `wt`, and `wrap` is the
+    /// caller's `wrapTemplates` (a page-level link wraps, one produced in a
+    /// template body does not).
+    fn reparse_bail_source(
+        &self,
+        items: Vec<Item>,
+        source: &str,
+        about_counter: Option<&std::cell::Cell<usize>>,
+        context_title: Option<&crate::title::Title>,
+        wrap: bool,
+    ) -> Vec<Item> {
+        use crate::wikitext::token_utils::key_value_to_string;
+
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &item else {
+                out.push(item);
+                continue;
+            };
+            if t.name != "template" && t.name != "template3" {
+                out.push(item);
+                continue;
+            }
+            let target = t
+                .attribs
+                .first()
+                .map(|kv| key_value_to_string(&kv.key))
+                .unwrap_or_default();
+            let body_src = t
+                .data_parsoid
+                .src
+                .clone()
+                .unwrap_or_else(|| format!("{{{{{target}}}}}"));
+            if wrap
+                && crate::wikitext::tokenizer_v2::subst_is_literal(&target)
+                && let Some(counter) = about_counter
+                && let Some(ResolvedTarget::Template { name, title }) =
+                    resolve_template_target(self.config, context_title, &target)
+            {
+                let params = crate::pipeline::parser_functions::Params::new(t.attribs.clone());
+                let about_id = self.new_about_id(counter, "template");
+                let produced = self.encapsulate_subst_literal(
+                    &ParsoidToken::SelfclosingTag(t.clone()),
+                    &body_src,
+                    &name,
+                    &title,
+                    &params,
+                    about_id,
+                    wrap,
+                    source,
+                );
+                out.extend(produced);
+                continue;
+            }
+            out.push(Item::Str(body_src));
+        }
+        out
+    }
+
     /// Expand `wikilink` self-closing tokens into `<a>`/`<link>` tag sequences
     /// (mirrors the TT2 `WikiLinkHandler`, whose rendering path lives in
     /// `pipeline::wiki_link_render`).
@@ -1941,6 +1985,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .unwrap_or_default();
             let href_src = href.clone();
 
+            let wrap = !stt.data_parsoid.tmp.synthesized;
+
             // Don't allow internal links to pages containing a PROTO (scheme).
             // `[[http://…]]` is really a (bracketed) external/autonumber link;
             // bail to plain text and let the external-link pass re-render it
@@ -1948,7 +1994,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if !href.is_empty() && self.config.has_valid_protocol(&href) {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
-                let sub = collapse_reparsed_templates(self.tokenize(&src[1..]).unwrap_or_default());
+                let sub = self.reparse_bail_source(
+                    self.tokenize(&src[1..]).unwrap_or_default(),
+                    &src[1..],
+                    about_counter,
+                    context_title,
+                    wrap,
+                );
                 let sub = self.render_links(sub, fragments, next_id, context_title, about_counter);
                 out.extend(sub);
                 continue;
@@ -1962,8 +2014,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // `bailTokens` re-processing the link source).
                     let src = reconstruct_link_src(stt, &href);
                     out.push(Item::Str("[".to_string()));
-                    let sub =
-                        collapse_reparsed_templates(self.tokenize(&src[1..]).unwrap_or_default());
+                    let sub = self.reparse_bail_source(
+                        self.tokenize(&src[1..]).unwrap_or_default(),
+                        &src[1..],
+                        about_counter,
+                        context_title,
+                        wrap,
+                    );
                     let sub =
                         self.render_links(sub, fragments, next_id, context_title, about_counter);
                     out.extend(sub);
@@ -1992,7 +2049,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if !is_file_path && content_has_nested {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
-                let sub = collapse_reparsed_templates(self.tokenize(&src[1..]).unwrap_or_default());
+                let sub = self.reparse_bail_source(
+                    self.tokenize(&src[1..]).unwrap_or_default(),
+                    &src[1..],
+                    about_counter,
+                    context_title,
+                    wrap,
+                );
                 let sub = self.render_links(sub, fragments, next_id, context_title, about_counter);
                 out.extend(sub);
                 continue;
@@ -2093,6 +2156,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             match stt.name.as_str() {
                 "extlink" => {
                     let token = ParsoidToken::SelfclosingTag(stt.clone());
+                    let content_wrap = !stt.data_parsoid.tmp.synthesized;
                     let render_content = |items: Vec<Item>| {
                         // Re-tokenize and render the link content so nested
                         // `[[…]]` (media/links) are expanded, then wrap in a
@@ -2108,8 +2172,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             for it in src_items.drain(..) {
                                 match it {
                                     Item::Str(s) if s.contains("[[") => {
-                                        let sub = collapse_reparsed_templates(
+                                        let sub = self.reparse_bail_source(
                                             self.tokenize_inline(&s).unwrap_or_default(),
+                                            &s,
+                                            about_counter,
+                                            None,
+                                            content_wrap,
                                         );
                                         let sub = self.render_links(
                                             sub,
@@ -5170,6 +5238,58 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .sum::<usize>()
     }
 
+    /// The `mw:Transclusion` wrapper a literal `subst:` invocation renders as.
+    ///
+    /// `Parser::braceSubstitution` keeps a plain `subst:` literal outside PST —
+    /// `virtualBracketedImplode( '{{', '|', '}}', … )` for the title and the
+    /// arguments — and Parsoid serves the result as a transclusion whose *body is
+    /// the call as written*. The live transform endpoint answers
+    /// `A {{subst:X}} B` with
+    ///
+    /// ```text
+    /// <span typeof="mw:Transclusion"
+    ///       data-mw='…"target":{"wt":"subst:X","href":"./Template:Subst:X"}…'
+    ///   >{{subst:X}}</span>
+    /// ```
+    ///
+    /// so the body is the invocation source and the target names
+    /// `Template:Subst:X` even though no such page exists. A `safesubst:` always
+    /// expands, and the tokenizer has already stripped that prefix.
+    ///
+    /// [`Parser::expand_template_token`] calls this when it resolves such a
+    /// target. [`Parser::reparse_bail_source`] calls it too, because a link bail
+    /// re-tokenizes a source reconstructed from *expanded* text and a
+    /// `{{subst:…}}` is the one invocation that survives that — it renders as its
+    /// own source, and rebuilding it needs no fetch, so it is synchronous.
+    #[allow(clippy::too_many_arguments)]
+    fn encapsulate_subst_literal(
+        &self,
+        token: &ParsoidToken,
+        // The invocation's source, which is the wrapper's body.
+        src: &str,
+        name: &str,
+        title: &crate::title::Title,
+        params: &crate::pipeline::parser_functions::Params,
+        about_id: String,
+        wrap: bool,
+        // The text the parameters' source ranges index, for `data-mw`'s `wt`.
+        source: &str,
+    ) -> Vec<Item> {
+        let body = vec![Item::Str(src.to_string())];
+        if !wrap {
+            return body;
+        }
+        let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, token);
+        let mut info = template_info_from(None, Some(name), vec![]);
+        // `data-mw.target.wt` is the target as written (`subst:X`), not the page
+        // it resolves to (`Template:Subst:X`), while `href` is that page.
+        info.target_wt = raw_template_target(src).map(|t| t.trim_start().to_string());
+        info.href = Some(crate::title::make_link(title, self.config));
+        info.param_infos =
+            crate::pipeline::template_encapsulator::prepare_tpl_param_infos(params, source);
+        encap.encap_tokens(body, &info)
+    }
+
     /// Expand one `template` token, whose preprocessor node has already been
     /// charged by the caller. The `table_depth` is carried in and out because an
     /// expansion's own tokens change whether the tokens *after* it sit in a table.
@@ -5343,20 +5463,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .src
                 .clone()
                 .unwrap_or_else(|| format!("{{{{{target_str}}}}}"));
-            let body = vec![Item::Str(src)];
-            let produced = if !wrap {
-                body
-            } else {
-                let about_id = take_id();
-                let encap = TemplateEncapsulator::new("mw:Transclusion", about_id, tok);
-                let mut info = template_info_from(None, Some(name.as_str()), vec![]);
-                info.target_wt = Some(target_wt.clone());
-                info.href = Some(crate::title::make_link(title, self.config));
-                info.param_infos = crate::pipeline::template_encapsulator::prepare_tpl_param_infos(
-                    &params, src_text,
-                );
-                encap.encap_tokens(body, &info)
-            };
+            let produced = self.encapsulate_subst_literal(
+                tok,
+                &src,
+                name,
+                title,
+                &params,
+                take_id(),
+                wrap,
+                src_text,
+            );
             for e in &produced {
                 track_table(e, table_depth);
             }
