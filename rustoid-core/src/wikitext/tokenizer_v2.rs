@@ -6013,7 +6013,14 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
                     // Paired `<nowiki>…</nowiki>`: consume up to (and incl.) the
                     // close tag.
                     if let Some(close_rel) = lower[i..].find("</nowiki") {
-                        let close_end = i + close_rel + "</nowiki>".len();
+                        // `close_rel` points at the `<` of `</nowiki`; skip its
+                        // eight bytes, then the `>` that terminates the close tag
+                        // (allowing `</nowiki >`). Using `"</nowiki>".len()` here
+                        // over-ran the `>`, so the `find('>')` below landed on a
+                        // *later* `>` — swallowing a top-level `|` and merging
+                        // following arguments (e.g. two `{{{c|<nowiki>…</nowiki>}}}`
+                        // cases in `Template:Won`'s `#switch`).
+                        let close_end = i + close_rel + "</nowiki".len();
                         let gt = inner[close_end..].find('>').map(|g| g + 1).unwrap_or(0);
                         current.push_str(&inner[i..close_end + gt]);
                         i = close_end + gt;
@@ -7532,6 +7539,30 @@ mod tests {
                 "An [http://t/?a=|b external] URL"
             ]
         );
+    }
+
+    #[test]
+    fn a_nowiki_close_tag_does_not_swallow_a_following_separator() {
+        // Two `{{{c|<nowiki>…</nowiki>}}}` arguments in one template call. The
+        // close-tag scan used to over-run the `>` of `</nowiki>` (a 9-byte
+        // `"</nowiki>"` length where the tag name is 8) and then search for the
+        // *next* `>`, which landed on the second `<nowiki>` — swallowing the
+        // top-level `|` and merging the arguments. `Template:Won`'s `#switch`
+        // then rendered its remaining cases as literal `<pre>` text.
+        let parts = split_template_args(
+            "#switch: q|q={{{color|{{{c|<nowiki>#</nowiki>x}}}}}}|r={{{color|{{{c|<nowiki>#</nowiki>y}}}}}}",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                "#switch: q",
+                "q={{{color|{{{c|<nowiki>#</nowiki>x}}}}}}",
+                "r={{{color|{{{c|<nowiki>#</nowiki>y}}}}}}",
+            ]
+        );
+        // A `</nowiki >` with trailing space still terminates the close tag.
+        let parts = split_template_args("a|<nowiki>x</nowiki >|b");
+        assert_eq!(parts, vec!["a", "<nowiki>x</nowiki >", "b"]);
     }
 
     #[test]
