@@ -14,6 +14,7 @@ The corpus numbers referenced here are from an `--offline` run of the built-in
 | Cite (`ref`/`references`) | 44 | `rustoid-extensions` |
 | `section` (LabeledSectionTransclusion) | 4 | renders a void `<link typeof="mw:Extension/section" …/>` |
 | `imagemap` (ImageMap) | 4 | `pipeline/imagemap.rs` + `Parser::build_imagemap` |
+| `phonos` (Phonos) | 10 | `pipeline/phonos.rs` + the minimal OOUI serializer |
 
 ### `section`
 
@@ -42,45 +43,43 @@ Porting it surfaced two argument bugs *upstream* of the handler, both now fixed
 (see `ONLINE-PARITY.md`): `#tag` must take its content positionally, and the
 lowering of `frame:extensionTag` must keep the (possibly empty) content slot.
 
-## OOUI foundation — gates `phonos` (10 pages), `templatedata` (3), `mapframe` (4)
+### `phonos`
 
-`phonos` and `templatedata` are **legacy parser hooks**, not Parsoid-native
-extensions, so what the oracle serves is **OOUI's** serialization. Measured:
+10 corpus pages. A legacy MediaWiki hook, so the wiki serves OOUI's HTML: a
+`PhonosButton` (frameless, `volumeUp`, no visible label) inside a
+`<span class="ext-phonos">`, then an attribution `<sup>`. Rendered by
+`pipeline/phonos.rs`, which drives the minimal OOUI serializer in
+`pipeline/ooui.rs` — the `oo-ui-*` class vocabulary and its order, the
+`data-ooui` JSON (a PHP-`json_encode`-compatible encoder, because the key order
+and the `/`-escaping are visible), and the `ooui-php-N` counter (one per page).
 
-```html
-<span class="ext-phonos" typeof="mw:Extension/phonos" about="#mwt70"
-      data-mw='{"name":"phonos","attrs":{"file":"…"},"body":{"extsrc":""}}'>
-  <span data-nosnippet="" id="ooui-php-1" class="noexcerpt ext-phonos-PhonosButton
-        … oo-ui-widget oo-ui-widget-enabled oo-ui-buttonElement …"
-        data-ooui='{"_":"mw.Phonos.PhonosButton","href":"//upload.wikimedia.org/…mp3",
-                    "rel":["nofollow"],"framed":false,"icon":"volumeUp",
-                    "data":{"ipa":"","text":"","lang":"en","wikibase":"","file":"…"},…}'>
-    <a role="button" tabindex="0" href="…" rel="nofollow" aria-label="Play audio"
-       title="Play audio" class="oo-ui-buttonElement-button">
-      <span class="oo-ui-iconElement-icon oo-ui-icon-volumeUp"></span>
-      <span class="oo-ui-labelElement-label"></span>
-      <span class="oo-ui-indicatorElement-indicator oo-ui-indicatorElement-noIndicator"></span>
-    </a>
-  </span>
-  <sup class="ext-phonos-attribution noexcerpt navigation-not-searchable">…</sup>
-</span>
-```
+`data.file` is the *resolved* file title — a redirect and the wiki's first-letter
+capitalization both applied, which the API reports only through the description
+URL — and the button's `href` is TimedMediaHandler's mp3 transcode URL, already
+in the file facts' `videoinfo` derivatives. The attribution link uses the wiki's
+`wfUrlencode`d `/wiki/File:…` URL. The tag body is the visible label, parsed in
+full. Two supporting fixes: a ref/note body now runs the extension passes (so a
+`{{#tag:phonos|…}}` inside a note renders), and `phonos` is no longer treated as
+native content (Parsoid discards its output's `data-parsoid` inside a
+transclusion range, so its button takes no ids).
 
-Matching this byte-for-byte means reproducing OOUI's HTML: the `oo-ui-*` class
-lists, the `data-ooui` JSON (`_`, `href`, `rel`, `framed`, `icon`, `data`,
-`classes`), and the `ooui-php-N` element counter. So it is **not** a per-extension
-task; it is one shared serializer plus two thin config builders
-(`PhonosButton`, and TemplateData's widget). Recommendation: port a *minimal* OOUI
-HTML serializer for exactly the widgets these two use (button element, icon,
-label, indicator, field layouts) rather than attempting OOUI in general, and drive
-it from two builders. That single piece unlocks 13 pages.
+Every phonos region matches the oracle byte for byte, bar the global id counter;
+`Israel` still renders one `Audio` twice, a pre-existing duplication unrelated to
+the widget.
 
-`phonos` additionally needs TimedMediaHandler's mp3 transcode URL
-(`getSources(...).transcodekey == 'mp3'`), which is available from the file facts
-the media pass already fetches.
+## `templatedata` (3 pages) — a documentation table
 
-`mapframe` (Kartographer) needs map tiles/data and is likely **unwinnable
-offline**; treat like the other nondeterministic cases.
+Not the OOUI task the earlier plan assumed: `<templatedata>` renders a
+`<section class="mw-templatedata-doc-wrap">` holding a ~28 KB sortable parameter
+table (`<header>`, `<table class="wikitable mw-templatedata-doc-params">`, a row
+per JSON parameter with `data-sort-value`/type/status). Deterministic, derived
+from the JSON blob, but a renderer of its own (JSON parse + table); the one OOUI
+piece is a settings icon `<span>`.
+
+## `mapframe` (4 pages)
+
+Kartographer needs map tiles/data and is likely **unwinnable offline**; treat
+like the other nondeterministic cases.
 
 ## `math` (5 pages) and `syntaxhighlight` (4 pages, 171 tags)
 

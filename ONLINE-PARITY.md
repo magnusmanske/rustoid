@@ -16021,3 +16021,44 @@ corpus matches               4/48  (no regressions; only the imagemap pages chan
 fixture guard              877/896  (unchanged)
 lib tests           core 1015, extensions 22, ast 5, compare 126
 ```
+
+## `<phonos>` renders, through a minimal OOUI serializer
+
+Phonos is a legacy MediaWiki hook, so the wiki serves OOUI's `ButtonWidget`
+serialization, and rustoid leaked the tag as a bare `<extension>`. Reproducing it
+needed an OOUI serializer (`pipeline/ooui.rs`) covering only what these widgets
+emit, driven by the builder in `pipeline/phonos.rs`.
+
+The bytes forced three details:
+
+- **Class and key order.** OOUI appends classes as each element/mixin initialises
+  (`oo-ui-widget`, `oo-ui-buttonElement[-frameless]`, `oo-ui-iconElement`, … after
+  the caller's own), and `Element::getSerializedConfig` walks the config callbacks
+  in registration order, so the `data-ooui` key order (`_`, `href`, `rel`,
+  `framed`, `icon`, `label`, `data`, `classes`) is observable. The encoder matches
+  PHP `json_encode`'s defaults, including `\/` and `\uXXXX` escaping.
+- **Resolved file titles.** `data.file` is `$file->getTitle()->getText()`: the
+  API reports neither the redirect target nor the first-letter capitalization on
+  `title` (it echoes the request), but the description URL carries both, so it is
+  read from there. The button `href` is TimedMediaHandler's `mp3` transcode URL
+  from the file facts' `videoinfo` derivatives.
+- **No ids on a transcluded button.** `phonos` is not a Parsoid module, so its
+  output's `data-parsoid` is discarded inside a transclusion range and the whole
+  subtree takes no ids — `is_native_ext` had to stop treating it as native.
+  (A button spliced in from a note body is a range of its own and keeps them.)
+
+A `{{#tag:phonos|…}}` inside a `{{efn}}` note also exposed that the fragment-body
+pipeline (`process_fragment_body`) ran no extension passes, so the tag never
+reached the renderer; it now runs them, like a fresh `sourceToDom` pipeline does.
+
+### Effect
+
+```
+phonos leaks                18 across 10 pages -> 0
+phonos regions              every region byte-identical to the oracle, bar the
+                            global id counter (Israel still double-renders one
+                            Audio, a pre-existing duplication)
+corpus matches              4/48  (no regressions; only the phonos pages changed)
+fixture guard              877/896  (unchanged)
+lib tests           core 1025, extensions 22, ast 5, compare 126
+```
