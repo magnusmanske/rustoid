@@ -624,6 +624,41 @@ fn reconstruct_link_src(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk, href
     src
 }
 
+/// Collapse the `template` tokens a re-tokenized *rendered* fragment holds back
+/// into their source text.
+///
+/// A wikilink bail path re-tokenizes a source it reconstructed from the
+/// **expanded** `href`/content ([`reconstruct_link_src`]), so any `{{…}}` in
+/// that text is literal — an expansion is what put it there (a `{{subst:…}}`
+/// kept as written, a module's output). Expansion has already run by then, so a
+/// re-created invocation is never expanded again and reaches the tree builder,
+/// which names an element after it (`<template …>`), and spends an `about` id.
+/// The text is what the caller meant, and it is also what
+/// `Parser::expand_template_token` answers for a literal `subst:` (see
+/// `wikitext::tokenizer_v2::subst_is_literal`).
+fn collapse_reparsed_templates(items: Vec<Item>) -> Vec<Item> {
+    items
+        .into_iter()
+        .map(|item| {
+            let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &item else {
+                return item;
+            };
+            if t.name != "template" && t.name != "template3" {
+                return item;
+            }
+            let src = t.data_parsoid.src.clone().unwrap_or_else(|| {
+                let target = t
+                    .attribs
+                    .first()
+                    .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
+                    .unwrap_or_default();
+                format!("{{{{{target}}}}}")
+            });
+            Item::Str(src)
+        })
+        .collect()
+}
+
 /// Whether a token chunk holds an unexpanded `extension` self-closing token.
 ///
 /// Used to tell an `extension` a value already carried (a literal `<nowiki>` in
@@ -1913,7 +1948,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if !href.is_empty() && self.config.has_valid_protocol(&href) {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
-                let sub = self.tokenize(&src[1..]).unwrap_or_default();
+                let sub = collapse_reparsed_templates(self.tokenize(&src[1..]).unwrap_or_default());
                 let sub = self.render_links(sub, fragments, next_id, context_title, about_counter);
                 out.extend(sub);
                 continue;
@@ -1927,7 +1962,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // `bailTokens` re-processing the link source).
                     let src = reconstruct_link_src(stt, &href);
                     out.push(Item::Str("[".to_string()));
-                    let sub = self.tokenize(&src[1..]).unwrap_or_default();
+                    let sub =
+                        collapse_reparsed_templates(self.tokenize(&src[1..]).unwrap_or_default());
                     let sub =
                         self.render_links(sub, fragments, next_id, context_title, about_counter);
                     out.extend(sub);
@@ -1956,7 +1992,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             if !is_file_path && content_has_nested {
                 let src = reconstruct_link_src(stt, &href);
                 out.push(Item::Str("[".to_string()));
-                let sub = self.tokenize(&src[1..]).unwrap_or_default();
+                let sub = collapse_reparsed_templates(self.tokenize(&src[1..]).unwrap_or_default());
                 let sub = self.render_links(sub, fragments, next_id, context_title, about_counter);
                 out.extend(sub);
                 continue;
@@ -2072,7 +2108,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             for it in src_items.drain(..) {
                                 match it {
                                     Item::Str(s) if s.contains("[[") => {
-                                        let sub = self.tokenize_inline(&s).unwrap_or_default();
+                                        let sub = collapse_reparsed_templates(
+                                            self.tokenize_inline(&s).unwrap_or_default(),
+                                        );
                                         let sub = self.render_links(
                                             sub,
                                             fragments,
