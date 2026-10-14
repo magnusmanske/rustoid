@@ -16395,19 +16395,39 @@ rustoid's bail does not re-run the pipeline, and the earlier session left a
 - **It does not need to be** for the one construct that reaches it. A
   `{{subst:…}}` needs no fetch, so its wrapper can be built inline.
 
-What is shipped is the *text* half: a re-tokenized `template` token collapses
-back to its source (`collapse_reparsed_templates`), so the bogus element is gone
-and `[[User:{{subst:REVISIONUSER}}]]` shows the same text the service does. The
-wrapper half — building the `mw:Transclusion` span at the bail, which would
-match the oracle exactly — needs the encapsulator's `about` id, the caller's
-`inTemplate` and the page source, none of which `render_links` is handed today;
-that is the shape of the refactor, and it is why it is a separate pass.
+What is shipped: a re-tokenized `template` token whose target is a literal
+`subst:` is rebuilt as its transclusion — the wrapper needs no fetch, so
+`reparse_bail_source` can call `encapsulate_subst_literal`, the same helper
+`expand_template_token` uses. `[[User:{{subst:REVISIONUSER}}]]` now renders
+`[[User:<span about=… typeof="mw:Transclusion" data-mw=…>{{subst:REVISIONUSER}}</span>]]`,
+and its `data-mw` matches the live transform endpoint. Anything else that looks
+like a template collapses back to its source, because it is text by
+construction.
+
+The wrapper does need an `about`, and `render_links` only carries an
+`about_counter` on the async paths — the synchronous `wikitext_to_ast` has no
+`Frame`/`DataSource` and dozens of test callers, so it keeps the text. `wrap`
+follows the link token's `synthesized` flag, the signal already used elsewhere
+for "was this produced in a template body?".
+
+What is *not* shipped, and would need the wider refactor: re-running the whole
+expansion for a bail. That is only reachable for a fetchable invocation, and
+rustoid's bail reconstructs from expanded text, so no such invocation survives
+into the source — which is why the synchronous rebuild is enough for the one
+case that does.
+
+One id caveat, measured rather than hidden: the wrapper's `about` is allocated
+when the bail runs, i.e. after the expansion pass, so a page that bails *and*
+has later transclusions would number them differently from the service. The live
+endpoint's own numbering is not comparable here either (`[[User:{{subst:X}}]]`
+answers `#mwt8` for a page with no other transclusion), so the wrapper's id is
+right only in position, not in value.
 
 ### Effect
 
 ```
 subst: wrapper      data-mw byte-identical to the live transform endpoint
-bailed link          no more literal <template …> element
+bailed link          renders the transclusion the service serves (no <template …>)
 fixture guard       877/896  (unchanged)
 corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier)
 ```
