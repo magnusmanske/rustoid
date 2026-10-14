@@ -857,6 +857,19 @@ fn entity_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
             .map_err(lua_err)?,
     )
     .map_err(lua_err)?;
+    // `Language::sprintfDate`, for the Wikibase time formatter
+    // (`MwTimeIsoFormatter` renders a date through it). `#time`'s implementation
+    // already is that routine, so the two share one. `nil` is the
+    // `InvalidArgumentException` the formatter catches and answers with the raw
+    // timestamp.
+    out.set(
+        "formatDate",
+        lua.create_function(|_, (format, stamp): (String, String)| {
+            Ok(format_date(&format, &stamp).ok())
+        })
+        .map_err(lua_err)?,
+    )
+    .map_err(lua_err)?;
     Ok(out)
 }
 
@@ -1214,6 +1227,111 @@ return function(args)
     -- rendering (`time`, `quantity`, `globecoordinate`, `wikibase-item`'s label)
     -- returns its raw value rather than a wrong one; that is a recorded gap, not
     -- an accident, and it does not arise on a cached page yet.
+    -- The `wikibase-time-precision-*` messages (en), which a precision coarser
+    -- than a year renders the folded year through.
+    local function precisionMessage(msg, year, isBCE)
+        if msg == 'Gannum' then return year .. (isBCE and ' billion years BCE' or ' billion years CE') end
+        if msg == 'Mannum' then return year .. (isBCE and ' million years BCE' or ' million years CE') end
+        if msg == 'annum' then
+            local unit = (tonumber(year) == 1) and ' year' or ' years'
+            return year .. unit .. (isBCE and ' BCE' or ' CE')
+        end
+        if msg == 'millennium' then return year .. '. millennium' .. (isBCE and ' BCE' or '') end
+        if msg == 'century' then return year .. '. century' .. (isBCE and ' BCE' or '') end
+        if msg == '10annum' then return year .. 's' .. (isBCE and ' BCE' or '') end
+        return year
+    end
+
+    -- `MwTimeIsoFormatter::getLocalizedYear`: the year, folded into a decade, a
+    -- century or a millennium (or an "annum" count) when the precision is coarser
+    -- than a year, and suffixed with the calendar era when it is BCE or short.
+    local function localizedYear(isoTs, precision)
+        local sign, digits = isoTs:match('^(%D*)(%d*)')
+        if digits == nil or digits == '' then return nil end
+        local isBCE = (sign == '-')
+        local year = digits
+        -- The shift table (`MwTimeIsoFormatter::shiftNumber`).
+        local shift, unshift, func, msg = 1, 1, 'round', nil
+        if precision == 0 then msg, shift = 'Gannum', 1e9
+        elseif precision == 1 then msg, shift, unshift = 'Mannum', 1e8, 1e2
+        elseif precision == 2 then msg, shift, unshift = 'Mannum', 1e7, 1e1
+        elseif precision == 3 then msg, shift = 'Mannum', 1e6
+        elseif precision == 4 then msg, shift, unshift = 'annum', 1e5, 1e5
+        elseif precision == 5 then msg, shift, unshift = 'annum', 1e4, 1e4
+        elseif precision == 6 then msg, shift, func = 'millennium', 1e3, 'ceil'
+        elseif precision == 7 then msg, shift, func = 'century', 1e2, 'ceil'
+        elseif precision == 8 then msg, shift, unshift, func = '10annum', 1e1, 1e1, 'floor'
+        end
+        local shifted
+        if shift == 1 and unshift == 1 then
+            -- `shiftNumber` answers the *string* unchanged when there is no shift.
+            shifted = year
+        else
+            local n = tonumber(year) or 0
+            if func == 'ceil' then n = math.ceil(n / shift)
+            elseif func == 'floor' then n = math.floor(n / shift)
+            else n = math.floor(n / shift + 0.5) end
+            shifted = string.format('%.0f', n * unshift)
+        end
+        if tonumber(shifted) == 0 and (precision < 9 or (isBCE and precision == 9)) then
+            msg = nil
+        else
+            year = shifted
+        end
+        year = year:gsub('^0+', '')
+        if year == '' then year = '0' end
+        if msg == nil then
+            if isBCE then return year .. ' BCE' end
+            if #year <= 2 then return year .. ' CE' end
+            return year
+        end
+        return precisionMessage(msg, year, isBCE)
+    end
+
+    -- `MwTimeIsoFormatter::getLocalizedDate`: a date for a day or month precision,
+    -- the year alone for a year or coarser. `nil` is the `InvalidArgumentException`
+    -- `formatTimeValue` catches (an unsupported precision, or a stamp the language
+    -- routine cannot format).
+    local function localizedDate(isoTs, precision)
+        local year = localizedYear(isoTs, precision)
+        if year == nil then return nil end
+        if precision <= 9 then return year end
+        if precision > 11 then return nil end
+        -- `splitIsoTimestamp`: six numeric fields, and the day/month must be
+        -- present for the precision.
+        local nums = {}
+        for n in isoTs:gmatch('%d+') do nums[#nums + 1] = n end
+        if #nums < 6 then return nil end
+        local stamp = string.format('%04d%02d%02d%02d%02d%02d',
+            tonumber(nums[1]:sub(-4)), math.max(1, tonumber(nums[2])),
+            math.max(1, tonumber(nums[3])), tonumber(nums[4]),
+            tonumber(nums[5]), tonumber(nums[6]))
+        -- Day and month formats for `dmy`, which en supports; the language's date
+        -- format string is `j F Y` for a day, `F Y` for a month.
+        local fmt = (precision == 10) and 'F Y' or 'j F Y'
+        local mwYear = args.formatDate('Y', stamp)
+        local out = args.formatDate(fmt, stamp)
+        if out == nil then return nil end
+        if mwYear ~= nil and mwYear ~= year then
+            -- The localized year is not the four-digit one; swap it in, but only
+            -- if it can be identified unambiguously.
+            local _, count = out:gsub(mwYear, '')
+            if count ~= 1 then return nil end
+            out = out:gsub(mwYear, year)
+        end
+        return out
+    end
+
+    -- `PlaintextTimeFormatter` over `MwTimeIsoFormatter`, with the calendar model
+    -- left off (the `ShowCalendarModelDecider` default is "never show"). An
+    -- unrenderable value answers its raw ISO timestamp.
+    local function formatTimeValue(v)
+        local isoTs = v.time
+        if type(isoTs) ~= 'string' then return '' end
+        local precision = tonumber(v.precision) or 11
+        return localizedDate(isoTs, precision) or isoTs
+    end
+
     local function plainValue(snak)
         if snak == nil or snak.snaktype ~= 'value' then return '' end
         local dv = snak.datavalue
@@ -1221,6 +1339,7 @@ return function(args)
         local v = dv.value
         if type(v) == 'table' then
             if v.text ~= nil then return v.text end
+            if v.time ~= nil then return formatTimeValue(v) end
             return ''
         end
         if v == nil then return '' end
@@ -1258,6 +1377,66 @@ return function(args)
 
     function wb.renderSnaks(snaks) return snakList(snaks, false) end
     function wb.formatValues(snaks) return snakList(snaks, true) end
+
+    -- `StatementList::getByRank( $ranks )` — the statements whose rank is one of
+    -- the given ones (`Entity.claimRanks`, so `0`/`1`/`2`; a JSON rank is the
+    -- string spelling).
+    function Entity:getStatementsByRank(property, ranks)
+        local named = { [0] = 'deprecated', [1] = 'normal', [2] = 'preferred' }
+        local wanted = {}
+        for _, r in ipairs(ranks or {}) do
+            wanted[r] = true
+            if named[r] then wanted[named[r]] = true end
+        end
+        local out = {}
+        for _, st in ipairs(self:getAllStatements(property)) do
+            if wanted[st.rank or 'normal'] then out[#out + 1] = st end
+        end
+        return out
+    end
+
+    -- `StatementTransclusionInteractor::render`: the main snaks of the property's
+    -- statements (the best rank when none is named), each formatted, comma-joined.
+    -- A rich render is `formatStatements`, a plain one `formatPropertyValues`.
+    local function formatByPropertyId(self, propertyLabelOrId, acceptableRanks, rich)
+        if type(propertyLabelOrId) ~= 'string' then return '' end
+        local statements
+        if acceptableRanks == nil then
+            statements = self:getBestStatements(propertyLabelOrId)
+        else
+            statements = self:getStatementsByRank(propertyLabelOrId, acceptableRanks)
+        end
+        local parts = {}
+        for _, st in ipairs(statements) do
+            local formatted = rich and snakRich(st.mainsnak) or snakPlain(st.mainsnak)
+            if formatted ~= '' then parts[#parts + 1] = formatted end
+        end
+        return table.concat(parts, ', ')
+    end
+
+    -- A property id (`Pnnn`), the shape `mw.wikibase.entity.lua` validates before
+    -- it asks for the property's label.
+    local function isValidPropertyId(id)
+        return type(id) == 'string' and id:match('^P[1-9]%d*$') ~= nil
+    end
+
+    -- The `{ value = …, label = … }` table both formatters answer with; the label
+    -- falls back on the property id, mirroring `mw.wikibase.entity.lua`.
+    local function formatValues(self, propertyLabelOrId, acceptableRanks, rich)
+        local value = formatByPropertyId(self, propertyLabelOrId, acceptableRanks, rich)
+        local label
+        if isValidPropertyId(propertyLabelOrId) then label = wb.getLabel(propertyLabelOrId) end
+        if label == nil then label = propertyLabelOrId end
+        return { value = value, label = label }
+    end
+
+    function Entity:formatPropertyValues(propertyLabelOrId, acceptableRanks)
+        return formatValues(self, propertyLabelOrId, acceptableRanks, false)
+    end
+
+    function Entity:formatStatements(propertyLabelOrId, acceptableRanks)
+        return formatValues(self, propertyLabelOrId, acceptableRanks, true)
+    end
 
     return wb
 end
@@ -7438,6 +7617,17 @@ mod tests {
                     "P856": [
                         {"id": "Q42$3", "rank": "preferred", "mainsnak": {"snaktype": "value"}},
                         {"id": "Q42$4", "rank": "normal", "mainsnak": {"snaktype": "value"}}
+                    ],
+                    "P569": [
+                        {"id": "Q42$5", "rank": "normal", "mainsnak": {
+                            "snaktype": "value",
+                            "datatype": "time",
+                            "datavalue": {"type": "time", "value": {
+                                "time": "+1642-12-25T00:00:00Z",
+                                "timezone": 0, "before": 0, "after": 0, "precision": 11,
+                                "calendarmodel": "http://www.wikidata.org/entity/Q1985786"
+                            }}
+                        }}
                     ]
                 }
             }
@@ -7555,6 +7745,35 @@ mod tests {
                 .eval("return #mw.wikibase.getAllStatements('Q42', 'P999')")
                 .unwrap(),
             "0"
+        );
+    }
+
+    /// `Entity:formatPropertyValues` and `formatStatements` render the main snaks
+    /// of a property's best statements; a `time` value goes through
+    /// `MwTimeIsoFormatter`, so it is a formatted date rather than the raw ISO
+    /// timestamp. `Module:Internet Archive` reads P569/P570 this way.
+    #[test]
+    fn test_mw_wikibase_format_property_values() {
+        let engine = make_engine_with_q42();
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntityObject():formatPropertyValues('P569').value")
+                .unwrap(),
+            "25 December 1642"
+        );
+        // The label falls back on the property id when the property is not loaded.
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntityObject():formatPropertyValues('P569').label")
+                .unwrap(),
+            "P569"
+        );
+        // The rich form wraps the list in one outer `<span>`.
+        assert_eq!(
+            engine
+                .eval("return mw.wikibase.getEntityObject():formatStatements('P569').value")
+                .unwrap(),
+            "<span>25 December 1642</span>"
         );
     }
 
