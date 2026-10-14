@@ -16282,3 +16282,40 @@ Template:Infobox    first difference 6533 -> 8434
 fixture guard       877/896  (unchanged)
 corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier)
 ```
+
+## `entity:formatPropertyValues`, and the Wikibase time formatter
+
+`{{Internet Archive author}}` reads a person's birth and death years out of
+Wikidata: `entity:formatPropertyValues('P569')`, then keeps the last word of the
+returned `value` when it starts with a digit. rustoid's `mw.wikibase` entity
+object had no such method, so the template stopped with `attempt to call method
+'formatPropertyValues' (a nil value)` on `Albert Einstein` and `Isaac Newton`.
+
+The method chain is short and was ported whole: `WikibaseEntityLibrary` ->
+`StatementTransclusionInteractor::render` -> `SnaksFinder::findSnaks` (the
+property's **best** statements, or those of the named ranks) -> each main snak
+formatted -> comma-joined, with the property's label beside it. The rich variant
+(`formatStatements`) is the same with the list wrapped in one `<span>`.
+
+Formatting a snak is where the second gap was: only the datatypes whose plain
+value *is* a string were handled, and a `time` answered empty. The plain-text
+time path is `PlaintextTimeFormatter` over `MwTimeIsoFormatter`, and the latter
+is now ported — the precision shift table (decade, century, millennium, the
+"annum" counts) with the `wikibase-time-precision-*` messages, the BCE/CE
+suffixes, and, for a day or month precision, the date itself through
+`Language::sprintfDate`. rustoid already has that routine for `#time`
+(`format_date`), so it is exposed to the library rather than reimplemented.
+`quantity`, `globecoordinate` and `wikibase-item`'s label remain the recorded
+gap they were.
+
+### Effect
+
+```
+Albert Einstein     Internet Archive link byte-identical to the oracle
+Isaac Newton        Internet Archive link byte-identical to the oracle
+lua failures        3 -> 1  (only the Module:Math `log10` one remains)
+fixture guard       877/896  (unchanged)
+corpus              4/48 strict + 1 nondeterministic-only (no page moved earlier)
+```
+
+The link sits after each page's first difference, so the scoreboard does not move.
