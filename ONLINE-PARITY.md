@@ -16464,3 +16464,42 @@ source escaped inside the wrapper — would not match (the spans are most of the
 bytes) and would add a second, wrong rendering path for Module pages, so it is
 recorded rather than built. With this, every Lua runtime failure in the corpus
 except the content-model one is resolved.
+
+## A `</nowiki>` scan over-ran its `>`, merging `#switch` arguments
+
+The `extension` outcome bucket (25 of 44 non-matching pages) turned out to hide a
+real parser bug under an extension-shaped label. `Template:Won` is a `#switch` of
+table-cell styles:
+
+```wikitext
+{{#switch: {{lc:{{{place|{{{p|Won}}}}}}}}
+  |won = {{{color|{{{c|<nowiki>#</nowiki>9EFF9E}}}}}}
+  |1|1st|gold = {{{color|{{{c|<nowiki>#</nowiki>FFD700}}}}}}
+  |#default = {{{color|{{{c|<nowiki>#</nowiki>F8EABA}}}}}}
+}}
+```
+
+rustoid rendered `style="background: #9EFF9E` and then dumped the *remaining
+cases* into a `<pre>` (where the `<nowiki>` leaked as a literal `<extension>`
+tag). The recorded `data-mw` showed why: the whole case list was folded into
+**one** parameter, so the `#switch` never saw its later cases.
+
+`split_template_args_impl_offsets` — the tokenizer's own `|` splitter, shared by
+template arguments and wikilink content — has a `<nowiki>`-is-opaque branch. On
+the paired form it found `</nowiki`, then
+`let close_end = i + close_rel + "</nowiki>".len();` — **nine** bytes for an
+eight-byte tag name — so `close_end` already pointed *past* the `>` of `</nowiki>`.
+The next line (`inner[close_end..].find('>')`) was therefore looking for the tag's
+`>`, but its input started after it, so it skipped to the **next** `>` in the
+document — the `>` of the *second* `<nowiki>`. That swallowed the top-level `|`
+and everything up to it, folding the following case into the first argument.
+
+It only bit when two or more `<nowiki>`s appeared in one call, which is why the
+single-`nowiki` forms (`{{#if:1|<nowiki>#</nowiki>…}}`) were already correct and
+fixtures stayed green. The fix is the off-by-one: `"</nowiki".len()` (8), then
+`find('>')` to cross the tag's `>` (still allowing `</nowiki >`). A regression
+test (`a_nowiki_close_tag_does_not_swallow_a_following_separator`) pins the two
+cases.
+
+Effect: `Hydrogen`'s first difference moved from byte 3733 to 6635 (its
+remaining gap is elsewhere); fixture guard 877/896 unchanged; no page regressed.

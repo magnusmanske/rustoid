@@ -100,24 +100,72 @@ generic `<extension>` fallback until a page needs them. Not native content, so
 Kartographer needs map tiles/data and is likely **unwinnable offline**; treat
 like the other nondeterministic cases.
 
-## `math` (5 pages) and `syntaxhighlight` (4 pages, 171 tags)
+## `math` (5 pages)
 
-Parsoid-native and deterministic, but each needs a large third-party algorithm
-ported faithfully:
+**Not winnable by a faithful port.** The serving path is *Mathoid*, Wikimedia's
+MathJax-based service, not a local renderer. Probed through the transform
+endpoint, one `<math>` becomes
 
-- `math` → KaTeX's HTML output (`<span class="mwe-math-element">…` with
-  `mwe-math-*` spans). The Math extension's Parsoid handler calls a
-  KaTeX-compatible renderer.
-- `syntaxhighlight` → SyntaxHighlight_GeSHi's Pygments tokenization
-  (`<code class="mw-highlight mw-highlight-lang-…">` with `mw-highlight-*` spans).
-  Most corpus occurrences are `<syntaxhighlight lang="wikitext" inline
-  style="display:none">` in template docs.
+```html
+<span class="mwe-math-element mwe-math-element-inline" typeof="mw:Extension/math"
+      about="#mwt1" data-mw='{"name":"math","attrs":{},"body":{"extsrc":"…"}}' id="mwAw">
+  <span class="mwe-math-mathml-a11y" style="display: none;">
+    <math xmlns="http://www.w3.org/1998/Math/MathML" class="mathjax_ignore" alttext="…">
+      <semantics>
+        <mrow class="MJX-TeXAtom-ORD">
+          <mstyle displaystyle="true" scriptlevel="0"> … </mstyle>
+```
 
-These are separate, large efforts (a KaTeX subset / a Pygments subset). Worth
-doing only once a page is otherwise within reach of 100 %, because neither can be
-approximated without failing the byte comparison.
+Two independent blockers:
+
+1. The MathML is **MathJax's** (the `MJX-TeXAtom-ORD` wrapper around every group,
+   `mstyle displaystyle="true" scriptlevel="0"` at the root, the
+   `<annotation encoding="application/x-tex">`). Reproducing it means porting
+   MathJax's TeX→MathML conversion, not the doc's earlier guess of "KaTeX".
+2. The visible output is `<img src="//wikimedia.org/api/rest_v1/media/math/render/
+   svg/<sha1>" … style="vertical-align: -0.838ex; width:22.769ex; height:2.843ex;"/>`,
+   a hashed *Mathoid* URL. The `sha1` is not a hash of the TeX (checked), and the
+   `width`/`height`/`vertical-align` values are MathJax's own layout metrics.
+
+Both fall outside "parse, don't validate": there is no local function from the
+TeX source to those bytes. Treat `math` like `mapframe`, not as a large-but-finite
+port.
+
+## `syntaxhighlight` (4 pages, 171 tags)
+
+Deterministic and local: SyntaxHighlight_GeSHi shells out to **Pygments**, and
+Parsoid serialises its token spans directly (`<div class="mw-highlight
+mw-highlight-lang-…">` with `mw-highlight-*` spans). Unlike `math` there is no
+service and no metrics — only a Pygments subset (`wikitext`, `python`, `python2`,
+`python3`, `text`, `css`, `js`, `lua`) to port. This is the one large-but-winnable
+highlighter; worth doing once a page is otherwise within reach of 100 %.
+
+## The literal-`<extension>` leak bucket
+
+The scoreboard's `extension` outcome (25 of 44 non-matching pages) is *not* a
+homogeneous bucket: `mw:Extension/ref` (Cite) and
+`mw:Extension/templatestyles` are on almost every page, so the classifier — which
+fires on the first `mw:Extension` in the differing region — labels any diff that
+merely sits next to one. Splitting the bucket by the actual cause, the pages
+carrying an *unrendered* `<extension>` tag (rustoid fell through to its generic
+placeholder) are only:
+
+| Leaked tag | Pages | Where |
+| --- | --- | --- |
+| `syntaxhighlight` | 4 | `Template:Infobox` (91), `Python` (62), `Template:Weather box` (15), `Brat` |
+| `math` | 5 | `Sundial` (66), `Tropical cyclone` (7), `Hydrogen` (3), `India` (2), `Earth` (1) |
+| `mapframe`/`maplink` | 4 | `2024 Summer Olympics`, `Titanic`, `Chernobyl disaster`, `Berlin` |
+| `nowiki` | 2 | `Grand Theft Auto V` (15), `Brat` (6) — a *parser* bug, not a missing extension |
+| `timeline` | 1 | `The Beatles` |
+| `categorytree` | 1 | `Isaac Newton` |
+
+The `nowiki` leak was the `#switch`-argument bug fixed below (a `</nowiki>` scan
+over-ran its `>`); the other leaks are the extension ports named here. Everything
+else tagged `extension` first-diverges on Cite numbering or a templatestyles link
+and its true cause is elsewhere (often a Lua/magic-word value).
 
 ## Not winnable by faithful implementation
 
 - Media derivative `utm_campaign`, and `mapframe`: data/map dependent. The media
   campaign is masked by the comparator.
+- `math`: Mathoid/MathJax output and layout metrics (see above).
