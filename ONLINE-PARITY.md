@@ -16095,3 +16095,89 @@ corpus matches              4/48  (no regressions; only the templatedata pages c
 fixture guard              877/896  (unchanged)
 lib tests           core 1030, extensions 22, ast 5, compare 126
 ```
+
+## The inputbox port, and the four gaps behind it on `Help:Introduction`
+
+`<inputbox>` was the page's first blocker: rustoid leaked the tag, its body a
+`key=value` option list (`InputBox::extractOptions`) rendered by
+`InputBox::getSearchForm`. The port (`pipeline/inputbox.rs`) fixed the region —
+but the `about` id it took sat *between two stylesheets* and came out after the
+second, so the served bytes still disagreed. Chasing that, and then the page's
+next differences, surfaced four more gaps, each its own bug.
+
+### A rich extension's `about` id was taken after every stylesheet in the chunk
+
+`<gallery>`, `<imagemap>`, `<phonos>`, `<templatedata>` and `<inputbox>` are
+rendered in a pass that runs once the chunk is built, and that pass read a
+counter already past the chunk's `<templatestyles>` — so every stylesheet in the
+chunk preceded every extension, whatever their source order. Parsoid numbers
+them in one document-order walk. `stamp_rich_extension_about` now takes the id in
+the same source-order pass that numbers the stylesheets, and the post-expansion
+pass only stamps the media it alone owns.
+
+### `{{PLURAL:…}}` spilled its own source
+
+The resolver classifies `PLURAL` as a parser function (it is in the site's
+function-hook table), but `call_parser_function` had no arm for it, so the
+unknown-function fallback emitted the raw `{{PLURAL:…}}` — serialized as a
+`<template>` element inside the shortcut link. Ported as
+`ParserFunctions::pf_plural`: core `CoreParserFunctions::plural` over
+`Language::convertPlural`. English's rule is the CLDR `i = 1 and v = 0` (so a
+count of one takes the first form, anything else the last), with
+`handleExplicitPluralForms`' `n=form` entries winning when `n` matches.
+
+### `mw.title.new(x).isRedirect` never asked the wiki
+
+`Template:No redirect` read `Module:Redirect`'s `isRedirect` as `false` and took
+its plain-link branch. `exists` and `file` *record* a title the host was never
+asked about, so the retry loop fetches the fact and re-runs; `isRedirect` did
+not, so nothing was ever fetched. It now feeds the same missing-title collector.
+The fetch then needed the title's real spelling — the cache keys `Wikipedia:I`,
+and the module's `full` was `Project:I` — because `LuaSite` used the *canonical*
+namespace name where Scribunto uses the localized one; it now uses `ns.local`
+(the canonical spelling stays resolvable as an alias).
+
+### `{{fullurl:…}}`, `{{urlencode:…}}`'s modes, and a same-host extlink
+
+Three gaps the now-live `Template:Edit` hit at once:
+
+- The `{{fullurl}}`/`{{localurl}}`/`{{canonicalurl}}` family (and the `…e`
+  spellings) was unimplemented and spilled its source. Ported as
+  `ParserFunctions::pf_url` — core `CoreParserFunctions::urlFunction` over
+  `Title::getLocalURL`/`getFullURL`/`getCanonicalURL` (the article path for a
+  bare title, else `$wgScript` with `?title=`, and a `PROTO_RELATIVE`/`PROTO_CANONICAL`
+  expansion; interwiki targets reach the remote URL).
+- `{{urlencode:…}}` ignored its mode and barely encoded — the default left
+  `?`, `&`, `=`, `/` and `:` alone. Probed on the live wiki, the modes are: the
+  default PHP's `urlencode` (`+` for a space), `|wiki` `wfUrlencode` (`_` for a
+  space), `|path` `rawurlencode`. All three now match.
+- A protocol-relative external link *to the wiki's own server* is expanded to
+  the site protocol with the written form kept in `data-mw-original-href`
+  (`Env::getExternalLinkAttribs`, where the wiki's `getExternalUrlInfo` rewrites
+  the href). A foreign host is left protocol-relative — probed on the live wiki,
+  `[//example.com/x y]` keeps its form while `[//en.wikipedia.org/wiki/Z w]`
+  becomes `https://en.wikipedia.org/wiki/Z`. The rewrite lives in the
+  live-wiki `SiteConfig`, not the trait default, because the standalone Parsoid
+  the fixtures target leaves a protocol-relative URL untouched.
+
+### What remains
+
+`Template:Edit` wraps the URL in `[{{fullurl:…}} text]`. PHP's `extlink` rule
+admits an *empty* `addr` when a `url_directive` follows, so this is an external
+link whose `href` is the directive, expanded later; rustoid's `try_extlink`
+requires a leading protocol, so the `[` stays literal and only the bare URL is
+autolinked. Widening that check is correct but not sufficient — the token-array
+`href` then expands empty and its `mw:ExpandedAttrs` marking is the pre-existing
+gate — so the change was measured (it moved the page from 95.4 % to 88.2 %),
+reverted, and left for the pass that finishes the expanded-attribute path.
+
+### Effect
+
+```
+Help:Introduction    first difference at byte 17644 (was 16908)
+Nobel Prize                                  18701 (was 12006)
+Isaac Newton                                 41098 (was 37730)
+corpus matches       4/48  (unchanged; no page's first difference moved earlier)
+fixture guard       877/896  (unchanged)
+lib tests   core 1037, compare 126, extensions 22, ast 5
+```

@@ -16,6 +16,7 @@ The corpus numbers referenced here are from an `--offline` run of the built-in
 | `imagemap` (ImageMap) | 4 | `pipeline/imagemap.rs` + `Parser::build_imagemap` |
 | `phonos` (Phonos) | 10 | `pipeline/phonos.rs` + the minimal OOUI serializer |
 | `templatedata` (TemplateData) | 2 | `pipeline/templatedata.rs` (parameter-documentation table) |
+| `inputbox` (InputBox) | 1 | `pipeline/inputbox.rs` (the `search`/`fulltext` forms) |
 
 ### `section`
 
@@ -81,6 +82,19 @@ marker names the frame the tag sits in (`$frame->getTitle()` — the template's
 `/doc` subpage), which a template body's token carries. Like `<phonos>`,
 `<templatedata>` is not native content, so its table takes no ids.
 
+### `inputbox`
+
+The `Help:Introduction` search box. A legacy hook: the tag body is a
+`key=value` option list (`InputBox::extractOptions`) and `InputBox::render`
+builds one of several forms. `pipeline/inputbox.rs` ports the `search` and
+`fulltext` forms (`InputBox::getSearchForm` and its `buildTextBox`/
+`buildCheckboxInput`/`buildSubmitInput` helpers), built as DOM nodes so the usual
+`typeof`/`about`/`data-mw` encapsulation applies. The checkbox `id` is
+`wfRandom()`, which the comparator masks (`0.<8+ digits>`); rustoid emits a
+deterministic one. The edit forms (`create`/`comment`/`move`) are left to the
+generic `<extension>` fallback until a page needs them. Not native content, so
+`is_native_ext` excludes it.
+
 ## `mapframe` (4 pages)
 
 Kartographer needs map tiles/data and is likely **unwinnable offline**; treat
@@ -105,8 +119,5 @@ approximated without failing the byte comparison.
 
 ## Not winnable by faithful implementation
 
-- `<inputbox>` (Help:Introduction): the input's id is `mw-inputbox-ns12-0.<mt_rand()>`.
-  The new comparator masks it, but the page has other real differences, so it is
-  not yet `Equivalent`.
 - Media derivative `utm_campaign`, and `mapframe`: data/map dependent. The media
   campaign is masked by the comparator.
