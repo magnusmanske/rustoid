@@ -1279,6 +1279,39 @@ impl TemplateHandler {
                     arg.to_string()
                 }
             }
+            // `{{NUMBEROFPAGES}}` and its family — core `CoreParserFunctions`'
+            // `numberofpages`/`numberofarticles`/… over `SiteStats`, rendered by
+            // `Language::formatNum` unless the `R` (the `rawsuffix` magic word)
+            // suffix asks for the bare number. They reach here both as bare magic
+            // words and as `frame:callParserFunction('NUMBEROFPAGES', 'R')`,
+            // because MediaWiki registers them as `SFH_NO_HASH` hooks backed by
+            // the variable. Without the arm the answer was empty, and
+            // `Module:High-use` failed its arithmetic on the empty string.
+            "numberofpages"
+            | "numberofarticles"
+            | "numberoffiles"
+            | "numberofedits"
+            | "numberofusers"
+            | "numberofactiveusers"
+            | "numberofadmins" => {
+                let stats = config.site_stats();
+                let count = match name {
+                    "numberofpages" => stats.pages,
+                    "numberofarticles" => stats.articles,
+                    "numberoffiles" => stats.images,
+                    "numberofedits" => stats.edits,
+                    "numberofusers" => stats.users,
+                    "numberofactiveusers" => stats.active_users,
+                    _ => stats.admins,
+                };
+                // `CoreParserFunctions::formatRaw`: the `rawsuffix` word (`R`)
+                // returns `(string)$num`, anything else `formatNum`.
+                if pf_arg.trim().eq_ignore_ascii_case("R") {
+                    count.to_string()
+                } else {
+                    crate::lua::engine::format_number(count as f64)
+                }
+            }
             // Any other variable: empty for now (requires page context).
             _ => String::new(),
         }
