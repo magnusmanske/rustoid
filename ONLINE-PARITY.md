@@ -16171,6 +16171,10 @@ autolinked. Widening that check is correct but not sufficient — the token-arra
 gate — so the change was measured (it moved the page from 95.4 % to 88.2 %),
 reverted, and left for the pass that finishes the expanded-attribute path.
 
+**Resolved** (the last section of this file): the three gaps went in together —
+the directive-URL extlink, literal `subst:`, and a template nested in a call's
+target.
+
 ### Effect
 
 ```
@@ -16178,6 +16182,77 @@ Help:Introduction    first difference at byte 17644 (was 16908)
 Nobel Prize                                  18701 (was 12006)
 Isaac Newton                                 41098 (was 37730)
 corpus matches       4/48  (unchanged; no page's first difference moved earlier)
+fixture guard       877/896  (unchanged)
+lib tests   core 1037, compare 126, extensions 22, ast 5
+```
+
+## The `Template:Edit` link: a directive URL, literal `subst:`, and a target's nested template
+
+The three gaps the previous section left open on `Help:Introduction`, closed
+together. They were the page's last differences, and each is a real port gap
+rather than a page-specific patch.
+
+### `[{{fullurl:…}} text]` is an external link
+
+PHP's `extlink` rule admits an *empty* `addr` when a `url_directive` follows —
+"There are templates present, alas" — so `[{{fullurl:…}} edit]` is an external
+link whose `href` is the directive, expanded later. `try_extlink` required a
+leading protocol, so the `[` stayed literal and only the bare URL inside was
+autolinked. It now also admits a target that begins with `{{` (`-{` under
+language conversion), mirroring the rule's directive branch.
+
+### A plain `subst:` is left literal during a render
+
+`Parser::braceSubstitution` sets `$literal = $substMatch == 'subst'` outside PST
+(only a *save* substitutes; `safesubst:` always expands). rustoid expanded both,
+resolving `{{subst:REVISIONUSER}}` as a transclusion of
+`Template:Subst:REVISIONUSER` — which does not exist — so `Template:Edit`'s
+`preloadtitle` served `([[Template:Subst:]])` where the service keeps
+`({{subst:#time:j F Y}})`. `strip_subst_prefix` now returns a `SubstPrefix`
+(`Safe(name)` for `safesubst:`, `Literal` for `subst:`), the tokenizer keeps a
+`Literal` target as written, and `expand_template_token` returns the invocation's
+source verbatim for one — the render-time analogue of
+`$frame->virtualBracketedImplode( '{{', '|', '}}', … )`.
+
+### A template nested in a call's target, and the `wikilink` stringify arm
+
+`Template:Edit` wraps the value in `{{urlencode:{{{preloadtitle}}}}}`. The
+argument expands to `Feedback from [[User:{{subst:REVISIONUSER}}|…]] (…)`, so the
+`urlencode` *target* is `urlencode:Feedback from [[…]] (…)` — a token list whose
+`wikilink` carries its own `href` token array, with a template inside it. Two
+gaps:
+
+- The target pass expanded only a template sitting **directly** in the target
+  (`{{ {{T}} }}`), so the `{{subst:REVISIONUSER}}` inside the `wikilink` survived
+  — while PHP's `Frame::expand` walks the whole tree. `expand_target_templates`
+  now also runs the attribute pass when the target holds a template anywhere
+  under a token-array attribute (`target_holds_template`).
+- The `wikilink` arm of `tokens_to_string` printed `[[` + `href` + `]]`, reading
+  `href` only when it was a plain string and dropping every `mw:maybeContent`. A
+  link whose target *or* text held a template therefore collapsed to `[[]]`, and
+  a templated caption vanished. The arm now stringifies the target and each
+  content part recursively — `[[User:{{subst:REVISIONUSER}}|{{subst:REVISIONUSER}}]]`,
+  as the service serves it.
+
+### The extlink's expanded `href` survives the Lua `frame:expandTemplate` answer
+
+`AttributeExpander::processComplexAttributes` records
+`TempData::linkContainsTemplate` on an `extlink`/`urllink` whose `href` holds a
+template token, and the answer renderer then *rebuilds* the link from its
+expanded parts instead of writing back its `src`. rustoid tokenizes a template
+body before its `{{{…}}}` are substituted, so that `src` spells `{{{1}}}` where
+the service's (preprocessed before tokenizing) spells the value — `render_answer`
+now skips a stale `src` for such a token and falls through to the rebuilder.
+
+### Effect
+
+The extlink's `href` was the last thing on the page that differed;
+`Help:Introduction` now matches the oracle (nondeterministic only: the
+`<inputbox>` `mt_rand()` id, which the harness masks).
+
+```
+Help:Introduction    matched (was first difference at byte 17644)
+corpus matches       4/48 strict + 1 nondeterministic-only (was 4/48)
 fixture guard       877/896  (unchanged)
 lib tests   core 1037, compare 126, extensions 22, ast 5
 ```
