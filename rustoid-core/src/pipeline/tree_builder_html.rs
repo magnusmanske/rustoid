@@ -2203,12 +2203,23 @@ fn wrap_transclusion_children(
                         // For other targets (extensions, `mw:Nowiki`, parser
                         // functions, …) the transclusion type is *appended*
                         // (`mw:Extension/pre mw:Transclusion`, etc.).
+                        //
+                        // An `mw:Entity` target also takes the prepend: PHP's
+                        // `DOMRangeBuilder::encapsulateTemplates` prepends every
+                        // type of the range's start element when the start element
+                        // is not the encapsulation target (`addTypeOf(…, true)`),
+                        // which is the case for a transclusion whose whole output
+                        // is an entity (`{{snd}}` → a `mw:Entity` span). The
+                        // appended cases are the extension paths that unfold a
+                        // `mw:DOMFragment` (`mw:Extension/templatestyles`, `…/
+                        // syntaxhighlight`), which transfer the type themselves.
                         let is_media = existing
                             .split_whitespace()
                             .any(|t| t == "mw:File" || t.starts_with("mw:File/"));
                         let has_expanded_attrs =
                             existing.split_whitespace().any(|t| t == "mw:ExpandedAttrs");
-                        if is_media || has_expanded_attrs {
+                        let has_entity = existing.split_whitespace().any(|t| t == "mw:Entity");
+                        if is_media || has_expanded_attrs || has_entity {
                             format!("{typeof_} {existing}")
                         } else {
                             format!("{existing} {typeof_}")
