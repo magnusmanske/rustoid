@@ -16689,3 +16689,29 @@ always capitalized).
 ### Effect
 
 `Periodic table` 36305 → 43871; no regressions (48 pages, better=1 worse=0).
+
+## `mw.text.decode` decodes named entities with the flag
+
+`mw.text.decode( s, decodeNamedEntities )` decodes every named entity in HTML's
+table when the flag is set, and the basic set (`&lt; &gt; &amp; &quot; &#039;
+&nbsp;`) plus numeric references either way. rustoid replaced only the five
+ASCII entities — and not `&nbsp;` — so a `&nbsp;` left in a value by
+`Module:Marriage` survived as a bare `&`.
+
+That mattered because `Module:Detect singular` tests `mw.ustring.find(s, '&', 1,
+true)` for its "and" case: every `{{marriage}}` value looked like a list, so
+`Template:Infobox person`'s `Spouse{{Pluralize from text|…}}` label came out
+`Spouse(s)`.
+
+### Effect
+
+`Taylor Swift` 14223 → 14736; no regressions (48 pages, better=1 worse=0).
+
+### Open lead: `{{marriage|…|end=…}}` through `Module:Template wrapper`
+
+`Albert Einstein`'s label still differs — Parsoid `Spouses`, rustoid `Spouse`.
+`{{Infobox person|spouse=<plainlist of two marriages>}}` is right, and
+`{{Infobox scientist|…}}` (which reaches `Infobox person` through
+`Module:Template wrapper`) is right while neither entry passes `end=`; add
+`end=divorced`/`end=died` and the same call reports one bullet. `Albert Einstein`
+is the page it gates.
