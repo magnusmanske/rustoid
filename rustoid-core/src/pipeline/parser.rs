@@ -1552,6 +1552,14 @@ pub struct Parser<'a, C: SiteConfig> {
     /// Cite later reads from the DOM node. The body text is what Cite itself
     /// identifies a note by, so it is the stable key.
     ref_bodies_by_body: std::cell::RefCell<std::collections::HashMap<String, Node>>,
+    /// The `<ref>` bodies that may hold a nested `<ref>`: those whose pipeline ran
+    /// with `inTemplate` (`RefTagHandler::sourceToDom`'s `allowNestedRef =
+    /// $extApi->inTemplate()`). A literal `<ref>` at the page's own level is parsed
+    /// without it, so Parsoid drops a nested one; rustoid's body render keeps it as
+    /// an unrefined `mw:Extension` marker either way, so the state cannot be read
+    /// back off the DOM and is recorded here (by body text) for Cite's nested-ref
+    /// walk. See [`Parser::number_extension_token`] and `cite::collect`.
+    nested_ref_bodies: std::cell::RefCell<std::collections::HashSet<String>>,
     /// Whether the current chunk's template expansions are encapsulated in
     /// `mw:Transclusion` markers. PHP derives that from its pipeline option
     /// `wrapTemplates`, and it is false for a *fresh* extension-body pipeline
@@ -1662,6 +1670,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies_by_body: std::cell::RefCell::new(std::collections::HashMap::new()),
+            nested_ref_bodies: std::cell::RefCell::new(std::collections::HashSet::new()),
             wrap_templates: std::cell::Cell::new(true),
         }
     }
@@ -4416,8 +4425,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             };
             // A `<ref>` nested in a transcluded note (a `#tag:ref` body) is rendered
             // by Cite into the note body, so it needs the body's stashed node by
-            // wikitext — the same lookup `render_body` falls back to below.
+            // wikitext — the same lookup `render_body` falls back to below. Only a
+            // body parsed with `inTemplate` can hold one; Parsoid drops a nested
+            // `<ref>` in any other body, so returning the node for one would let
+            // Cite collect a ref the service never saw.
             let nested_body = |text: &str| -> Option<Node> {
+                if !self.nested_ref_bodies.borrow().contains(text) {
+                    return None;
+                }
                 self.ref_bodies_by_body.borrow().get(text).cloned()
             };
             crate::ext::cite::run(
@@ -5247,6 +5262,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         if let Some(node) = rendered {
             self.ref_bodies.borrow_mut().insert(about, node.clone());
             if !body.is_empty() {
+                // A body parsed with `inTemplate` may hold a nested `<ref>`; see
+                // [`Parser::nested_ref_bodies`].
+                if arg_value {
+                    self.nested_ref_bodies.borrow_mut().insert(body.clone());
+                }
                 self.ref_bodies_by_body
                     .borrow_mut()
                     .insert(body.clone(), node);

@@ -67,7 +67,7 @@ pub enum UseBody {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     /// The `name` attribute, `""` when anonymous. Drives the `id` and the sharing
-    /// key.
+    /// key; an anonymous ref shares with nothing.
     pub name: String,
     /// The group (`<ref group="…">`), `""` when ungrouped.
     pub group: String,
@@ -199,9 +199,13 @@ fn alpha_label(n: usize, group: &str) -> String {
 pub struct CiteState {
     /// Notes in first-use order. Ungrouped refs are group `""`.
     pub references: Vec<Reference>,
-    /// `(group, key) -> index into `references``, so a repeated use finds its note
-    /// in O(1) rather than rescanning. The key is the name when named, else the
-    /// body.
+    /// `(group, name) -> index into `references``, so a repeated use of a **named**
+    /// ref finds its note in O(1) rather than rescanning.
+    ///
+    /// Only named refs are indexed: Cite's `RefGroup::$indexByName` is filled
+    /// under `if ( $ref->name )`, so every anonymous `<ref>` is a note of its own
+    /// even when its content repeats (`<ref>a</ref><ref>a</ref>` renders two
+    /// notes, `cite_note-1` and `cite_note-2`, both reading `a`).
     index: HashMap<(String, String), usize>,
     /// The next footnote number, *per group*: numbering restarts for each group.
     next_number: HashMap<String, usize>,
@@ -262,18 +266,20 @@ impl CiteState {
         self_closing: bool,
         about: Option<&str>,
     ) -> String {
-        // A named ref is identified by its *name*, so `<ref name="x" />` finds the
-        // note that `<ref name="x">…</ref>` defined. An anonymous one is identified
-        // by its content, so the same text twice shares a note — which is what Cite
-        // does, and why `<ref>a</ref><ref>a</ref>` renders one note with two uses.
-        let key = if name.is_empty() {
-            (group.to_string(), body.to_string())
+        // A **named** ref is identified by its name, so `<ref name="x" />` finds
+        // the note that `<ref name="x">…</ref>` defined. An anonymous one is not
+        // identified at all: Cite indexes only named refs (`RefGroup::push` under
+        // `if ( $ref->name )`), so `<ref>a</ref><ref>a</ref>` is two notes and two
+        // global ids, not one note used twice.
+        let idx = if name.is_empty() {
+            None
         } else {
-            (group.to_string(), name.to_string())
+            self.index
+                .get(&(group.to_string(), name.to_string()))
+                .copied()
         };
-
-        let idx = match self.index.get(&key) {
-            Some(&i) => i,
+        let idx = match idx {
+            Some(i) => i,
             None => {
                 let counter = self.next_number.entry(group.to_string()).or_insert(1);
                 let number = *counter;
@@ -293,7 +299,9 @@ impl CiteState {
                     body_about: None,
                 });
                 let i = self.references.len() - 1;
-                self.index.insert(key, i);
+                if !name.is_empty() {
+                    self.index.insert((group.to_string(), name.to_string()), i);
+                }
                 i
             }
         };
@@ -608,13 +616,11 @@ fn collect(
     if let Some((name, group, body, self_closing, attrs)) = read_ref(node) {
         // A ref nested in a transcluded note is processed *before* the note itself
         // (Cite's `References::extractRefFromNode` calls `processNestedRefInRef`
-        // before `addRef`), so the nested refs take the lower numbers. It is only
-        // allowed when the note's pipeline ran `inTemplate` — `{{#tag:ref|…}}`,
-        // which the `mw:Transclusion` type records.
-        if !self_closing
-            && typeof_contains(node, "mw:Transclusion")
-            && let Some(body_node) = nested_body(&body)
-        {
+        // before `addRef`), so the nested refs take the lower numbers. `nested_body`
+        // returns the body only when Parsoid would have kept a nested ref in it —
+        // the note's pipeline ran `inTemplate` (`{{#tag:ref|…}}`); see
+        // [`Parser::nested_ref_bodies`].
+        if !self_closing && let Some(body_node) = nested_body(&body) {
             for child in &body_node.children {
                 collect(child, state, use_ids, nested_body);
             }
@@ -866,9 +872,9 @@ fn walk_render(
         // A note reached through a transclusion may hold a nested `<ref>`. Cite
         // renders it into the body here, before the note's own marker is built,
         // and the body renderer later prefers the converted body. The nested refs
-        // were collected first (`collect`), so they take the next ids.
+        // were collected first (`collect`), so they take the next ids. `nested_body`
+        // is `None` for a body Parsoid would never have kept a nested ref in.
         if !self_closing
-            && typeof_contains(node, "mw:Transclusion")
             && let Some(mut body_node) = nested_body(&body)
             && has_ref(&body_node)
         {
@@ -1255,15 +1261,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numbering_follows_first_use_order() {
+    fn an_anonymous_ref_is_never_shared() {
+        // Cite indexes only named refs, so repeating the same anonymous content
+        // makes a second note rather than a reuse: `<ref>a</ref><ref>a</ref>`
+        // renders `cite_note-1` and `cite_note-2`, both reading `a`.
         let mut st = CiteState::new();
-        st.add("", "", "first", false, None);
-        st.add("", "", "second", false, None);
-        st.add("", "", "first", false, None);
-        assert_eq!(st.references.len(), 2, "the repeat must not add a note");
+        st.add("", "", "a", false, None);
+        st.add("", "", "b", false, None);
+        st.add("", "", "a", false, None);
+        assert_eq!(st.references.len(), 3, "each anonymous ref is its own note");
         assert_eq!(st.references[0].number, 1);
         assert_eq!(st.references[1].number, 2);
-        assert_eq!(st.references[0].uses.len(), 2, "both uses are recorded");
+        assert_eq!(st.references[2].number, 3);
+        assert_eq!(st.references[2].global_id, 3);
+        assert_eq!(st.references[2].note_id(), "cite_note-3");
+        assert_eq!(st.references[2].uses.len(), 1);
     }
 
     /// A named ref used again does not allocate a new number, even when the second
@@ -1325,15 +1337,16 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_ids_skip_the_use_suffix_only_on_first_use() {
-        // Cite cannot know at the first use whether the ref will be reused, so
-        // the marker is `cite_ref-1`; the reuse appends `-1`.
+    fn anonymous_ids_carry_neither_name_nor_use_suffix() {
+        // `AnchorFormatter::getBacklinkIdentifier` drops the `-0` suffix on a
+        // first, unnamed use; `getNoteIdentifier` uses the bare global id.
         let mut st = CiteState::new();
-        let first = st.add("", "", "same", false, None);
-        let second = st.add("", "", "same", true, None);
+        let first = st.add("", "", "a", false, None);
+        let second = st.add("", "", "a", false, None);
         assert_eq!(first, "cite_ref-1");
-        assert_eq!(second, "cite_ref-1-1");
+        assert_eq!(second, "cite_ref-2");
         assert_eq!(st.references[0].note_id(), "cite_note-1");
+        assert_eq!(st.references[1].note_id(), "cite_note-2");
     }
 
     #[test]
@@ -1343,18 +1356,6 @@ mod tests {
         assert_eq!(super::normalize_fragment_identifier("a__b"), "a_b");
         assert_eq!(super::normalize_fragment_identifier("a _b"), "a_b");
         assert_eq!(super::normalize_fragment_identifier("a_"), "a_");
-    }
-
-    #[test]
-    fn an_anonymous_repeat_shares_by_body() {
-        let mut st = CiteState::new();
-        st.add("", "", "same", false, None);
-        st.add("", "", "same", false, None);
-        assert_eq!(
-            st.references.len(),
-            1,
-            "identical anonymous refs share a note, as Cite does"
-        );
     }
 
     #[test]
