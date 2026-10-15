@@ -531,13 +531,73 @@ fn build_request(method: &str, args: mlua::MultiValue) -> mlua::Result<FrameRequ
     }
 }
 
-/// The wikitext a request stands for.
+/// The tokens a deferred request stands for, and the wikitext they were
+/// tokenized from (`""` when the request is not wikitext).
 ///
-/// This is the call as the module would have written it, which is what the
-/// pipeline expands.
-pub fn render_call(request: &FrameRequest) -> String {
+/// Mirrors how MediaWiki serves each request. The `frame:expandTemplate` case is
+/// the one that is *not* a call as written: `LuaEngine::expandTemplate`
+/// converts every value to an opaque node (`Preprocessor::newPartNodeArray`
+/// builds a part whose `value` is the raw string) and expands the target
+/// template's DOM against a frame holding them. A value carrying a top-level
+/// `|` or `=` therefore reaches the template intact, where writing the call back
+/// out and re-parsing it split the value into two arguments — `Albert
+/// Einstein`'s `spouse` argument, which `Module:Template wrapper` builds from an
+/// already-rendered `{{marriage}}` carrying a `display` rule with a `|`, arrived
+/// as a one-item list and the infobox showed `Spouse` instead of `Spouses`.
+pub fn request_tokens(request: &FrameRequest, ext_tags: &[String]) -> (Vec<Item>, String) {
+    if let FrameRequest::ExpandTemplate { title, args } = request {
+        return (vec![template_token(title, args)], String::new());
+    }
+    let text = request_wikitext(request).unwrap_or_default();
+    let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+        &text, /* in_template */ true, ext_tags,
+    );
+    (items, text)
+}
+
+/// The `template` token a `frame:expandTemplate` request stands for.
+///
+/// Each argument value is carried as a *string* attribute rather than being
+/// spliced into `{{title|k=v}}` wikitext and re-tokenized: MediaWiki treats the
+/// values as opaque (see [`request_tokens`]), and the expander substitutes a
+/// string attribute verbatim — the same shape the tokenizer produces for a
+/// `|name=value` whose value holds no markup, so the whole downstream path
+/// (nested `{{{…}}}` references, named-argument trimming, `data-mw`) is
+/// unchanged.
+pub fn template_token(title: &str, args: &[FrameArg]) -> Item {
+    use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue};
+    let kv = |key: String, value: String| KV {
+        key: KeyValue::Str(key),
+        value: KeyValue::Str(value),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    };
+    // `attribs[0]` is the target, mirroring the tokenizer's `template` token; a
+    // positional argument's key is empty.
+    let mut attribs = vec![kv(title.to_string(), String::new())];
+    attribs.extend(
+        args.iter()
+            .map(|arg| kv(arg.name.clone().unwrap_or_default(), arg.value.clone())),
+    );
+    Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(
+        crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+            "template",
+            attribs,
+            DataParsoid::default(),
+        ),
+    ))
+}
+
+/// The wikitext a request stands for, when it is one.
+///
+/// `frame:preprocess` hands its text to the preprocessor and a parser function
+/// call is written back out as `{{#name:…}}`; both are parsed. A
+/// `frame:expandTemplate` is not wikitext — its values are opaque and its token
+/// is built directly — and an `ExpandArgs` slot list is not a call at all.
+fn request_wikitext(request: &FrameRequest) -> Option<String> {
     match request {
-        FrameRequest::ExpandTemplate { title, args } => render_invocation(title, args),
+        FrameRequest::ExpandTemplate { .. } | FrameRequest::ExpandArgs { .. } => None,
         // `{{#name:first|rest}}`: a parser function's first argument is joined
         // by a *colon*, and the pipe separates the rest. Scribunto lets the
         // module pass an empty first argument precisely so the colon can be
@@ -573,12 +633,9 @@ pub fn render_call(request: &FrameRequest) -> String {
                 out.push_str(&arg.value);
             }
             out.push_str("}}");
-            out
+            Some(out)
         }
-        FrameRequest::Preprocess(text) => text.clone(),
-        // Not a call at all: the host serves an `ExpandArgs` request by
-        // expanding the slots directly, not by rendering wikitext.
-        FrameRequest::ExpandArgs { .. } => String::new(),
+        FrameRequest::Preprocess(text) => Some(text.clone()),
     }
 }
 
@@ -671,21 +728,6 @@ fn is_no_hash_function(name: &str) -> bool {
         "pagesinnamespace",
     ];
     NO_HASH_FUNCTIONS.contains(&lower.as_str())
-}
-
-/// The wikitext a template or parser-function call with these arguments is.
-fn render_invocation(target: &str, args: &[FrameArg]) -> String {
-    let mut out = format!("{{{{{target}");
-    for arg in args {
-        out.push('|');
-        if let Some(name) = &arg.name {
-            out.push_str(name);
-            out.push('=');
-        }
-        out.push_str(&arg.value);
-    }
-    out.push_str("}}");
-    out
 }
 
 /// The text a module receives from a frame call.
@@ -1093,22 +1135,49 @@ mod tests {
 
     /// A `frame:callParserFunction` for a function MediaWiki registers without a
     /// hash must be written without one: `{{DISPLAYTITLE:…}}` resolves, while
-    /// `{{#DISPLAYTITLE:…}}` is a broken parser function the service renders
+    /// `{{#DISPLAYTITLE:…}}` is a broken parser function the service renders it
     /// literally. `#tag` and `#if` keep their hash.
     #[test]
-    fn render_call_writes_a_no_hash_function_without_the_hash() {
+    fn request_wikitext_writes_a_no_hash_function_without_the_hash() {
         let call = |name: &str| FrameRequest::CallParserFunction {
             name: name.to_string(),
             args: vec![FrameArg::positional("X")],
         };
-        assert_eq!(render_call(&call("DISPLAYTITLE")), "{{DISPLAYTITLE:X}}");
+        let text = |name: &str| request_wikitext(&call(name));
+        assert_eq!(text("DISPLAYTITLE").as_deref(), Some("{{DISPLAYTITLE:X}}"));
         assert_eq!(
-            render_call(&call("PROTECTIONEXPIRY")),
-            "{{PROTECTIONEXPIRY:X}}"
+            text("PROTECTIONEXPIRY").as_deref(),
+            Some("{{PROTECTIONEXPIRY:X}}")
         );
         // `frame:extensionTag` lowers to `#tag`; the hash must survive.
-        assert_eq!(render_call(&call("#tag")), "{{#tag:X}}");
-        assert_eq!(render_call(&call("if")), "{{#if:X}}");
+        assert_eq!(text("#tag").as_deref(), Some("{{#tag:X}}"));
+        assert_eq!(text("if").as_deref(), Some("{{#if:X}}"));
+    }
+
+    /// A `frame:expandTemplate` argument value is *opaque*: MediaWiki converts it
+    /// to a node holding the raw string, so a top-level `|` (or `=`) inside a
+    /// value must not split it into two arguments. Splicing the value into
+    /// `{{title|k=v}}` wikitext and re-tokenizing that did exactly that, which is
+    /// what made `Albert Einstein`'s infobox label read `Spouse`.
+    #[test]
+    fn template_token_keeps_a_value_carrying_a_pipe() {
+        use crate::wikitext::tokens_v2::ParsoidToken;
+        let args = vec![
+            FrameArg::named("spouse", "a|b"),
+            FrameArg::positional("c=d"),
+        ];
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = template_token("Infobox person", &args)
+        else {
+            panic!("expected a template token");
+        };
+        assert_eq!(stt.name, "template");
+        assert_eq!(stt.attribs.len(), 3);
+        assert_eq!(stt.attribs[0].key.as_str(), Some("Infobox person"));
+        assert_eq!(stt.attribs[1].key.as_str(), Some("spouse"));
+        assert_eq!(stt.attribs[1].value.as_str(), Some("a|b"));
+        // A positional argument keeps an empty key and its value verbatim.
+        assert_eq!(stt.attribs[2].key.as_str(), Some(""));
+        assert_eq!(stt.attribs[2].value.as_str(), Some("c=d"));
     }
 
     /// A `[[File:…]]` a module emits through `frame:expandTemplate` is tokenized

@@ -7394,12 +7394,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             return String::new();
         };
 
-        let text = crate::pipeline::lua_deferred::render_call(&request);
-        let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
-            &text,
-            /* in_template */ true,
-            self.config.extension_tags(),
-        );
+        let (items, text) =
+            crate::pipeline::lua_deferred::request_tokens(&request, self.config.extension_tags());
         // A module reaching a protection magic word is the common case, not an
         // edge one: `Module:Effective protection expiry` and
         // `Module:Effective protection level` are both built entirely from
@@ -7515,7 +7511,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `frame:expandTemplate('stack begin')`, and `Template:Stack` opens with a
         // literal `<templatestyles>` — has a fragment placeholder inside it, and
         // `render_answer` has no textual form for one and drops it. The fragment
-        // was spent (`Stack/styles.css` `#mwt13`) and then lost, and the output
+        // Was the fragment spent (`Stack/styles.css` `#mwt13`) and then lost, and the output
         // re-expanded the template's source, building a second fragment at
         // `#mwt64`. The marker keeps the first.
         self.render_answer_markers(&encapped)
