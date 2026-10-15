@@ -866,7 +866,6 @@ fn emit_wrapper_placeholder(
 fn emit_indicator_placeholder(
     stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
     id: usize,
-    about: Option<&str>,
 ) -> Vec<Item> {
     use crate::wikitext::tokens_v2::{KV, SelfclosingTagTk};
 
@@ -885,11 +884,9 @@ fn emit_indicator_placeholder(
     };
     frag.attribs
         .push(kv("typeof", "mw:Extension/indicator".to_string()));
-    // The extension's `about` id, placed where the served bytes have it (after
-    // `typeof`, before `data-mw`).
-    if let Some(about) = about {
-        frag.attribs.push(kv("about", about.to_string()));
-    }
+    // The extension's `about` id is added by the chunk post-pass (see
+    // `Parser::number_indicator_placeholder`), which the tree builder carries
+    // onto the element it inserts, between `typeof` and `data-mw`.
     frag.attribs
         .push(kv("data-mw", indicator_placeholder_data_mw(stt)));
     frag.attribs.push(kv("data-fragment-id", id.to_string()));
@@ -2649,7 +2646,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             let id = next_id.get();
             next_id.set(id + 1);
             fragments.insert(id, build(body, attrs));
-            out.extend(emit_indicator_placeholder(stt, id, None));
+            out.extend(emit_indicator_placeholder(stt, id));
         }
 
         (out, fragments)
@@ -3762,53 +3759,77 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 
     /// Resolve one `<indicator>` extension token into a placeholder plus a
-    /// stashed `<meta>` fragment, spending an `about` id.
+    /// stashed `<meta>` fragment.
     ///
-    /// Numbered where the token is seen: the id belongs to the expansion's
-    /// position in the document. It matters here because a module emits the
-    /// indicator from *inside* a template; a pass running after expansion would
-    /// number it after everything the template
-    /// expansion produced, and the transclusion that follows the template would
-    /// take the id the indicator should have spent. PHP's `ExtensionHandler::
-    /// onDocumentFragment` allocates an id for every extension except `nowiki`,
-    /// and the `<meta>` ends up sharing the enclosing transclusion's `about` in
-    /// the output — the id is spent and discarded, but the spend is what shifts
-    /// every following transclusion by one.
+    /// The `about` id is **not** taken here. Parsoid's TT2 numbers a chunk's
+    /// extensions only after its templates (`TemplateHandler` runs over the
+    /// whole chunk, then `ExtensionHandler`), and in source order among
+    /// themselves — the rule [`Self::number_style_placeholders`] applies to
+    /// `<templatestyles>`, and it holds for indicators too: on
+    /// `<templatestyles…/><indicator…>` the service numbers the stylesheet
+    /// `#mwt1` and the indicator `#mwt2`, while an inline spend numbered the
+    /// indicator first. The id belongs to the position the placeholder ends up
+    /// in, not the position the token is first *seen*: one spliced in from a
+    /// template argument or a module's output is seen while the argument is
+    /// expanded — before the callee's own stylesheets that precede it in the
+    /// output. `Berlin`'s infobox `coordinates` argument took `#mwt7` there
+    /// where the service numbers the infobox's first stylesheet `#mwt7` and
+    /// the indicator `#mwt16`.
+    ///
+    /// The chunk post-pass ([`Self::number_indicator_placeholder`], alongside
+    /// the stylesheet pass) gives the placeholder its id, and the tree builder
+    /// carries it onto the `<meta>`. A chunk whose extensions are deferred
+    /// (`style_defer`/`arg_expansion`) skips that pass, leaving the placeholder
+    /// unnumbered for the chunk it lands in.
     ///
     /// Returns `None` when `item` is not an indicator token, so the caller can
     /// fall through to the other extension paths.
-    fn expand_one_indicator(
-        &self,
-        item: &Item,
-        about_counter: &std::cell::Cell<usize>,
-    ) -> Option<Vec<Item>> {
+    fn expand_one_indicator(&self, item: &Item) -> Option<Vec<Item>> {
         let stt = indicator_target(item)?;
         let body = extension_body(stt);
         let attrs = crate::pipeline::extension_handler::extension_kv_attrs(stt);
         let node = Node::document_with_child(crate::pipeline::extension_handler::indicator_node(
             &body, &attrs,
         ));
-        // The extension spends the id whether or not it survives into the
-        // output (see the method comment). Allocating it *before* stashing the
-        // fragment also keeps the sequence in expansion order. Inside an
-        // `#invoke` argument the id is not spent — the placeholder is rendered
-        // back to text and the indicator re-created where the module's output
-        // places it (see [`Parser::arg_expansion`]).
-        //
-        // The id is the indicator's `about`: Parsoid's
-        // `ExtensionHandler::onDocumentFragment` sets it on the fragment so the
-        // extension is one about-chain (`<meta typeof="mw:Extension/indicator"
-        // about="#mwt7">`), and the placeholder — which is what reaches the
-        // output — carries it. Discarding it left the meta with no `about`.
-        let about = if self.in_arg_expansion() {
-            None
-        } else {
-            Some(self.new_about_id(about_counter, "indicator"))
-        };
         let id = self.ext_next_id.get();
         self.ext_next_id.set(id + 1);
         self.ext_fragments.borrow_mut().insert(id, node);
-        Some(emit_indicator_placeholder(stt, id, about.as_deref()))
+        Some(emit_indicator_placeholder(stt, id))
+    }
+
+    /// Number one `<indicator>` placeholder in place, spending an `about` id
+    /// from the same source-order pass that numbers the chunk's
+    /// `<templatestyles>` (see [`Self::expand_one_indicator`]).
+    ///
+    /// Parsoid's `ExtensionHandler::onDocumentFragment` sets the id it
+    /// allocates as the `about` of every top-level node of the extension's
+    /// output, so the `<meta>` an indicator renders to carries it. The
+    /// placeholder is what reaches the output, and the tree builder carries its
+    /// attributes (minus the fragment indirection) onto the element it inserts,
+    /// so the id travels there. Returns whether `item` was such a placeholder.
+    fn number_indicator_placeholder(
+        &self,
+        item: &mut Item,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> bool {
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+            return false;
+        };
+        if t.name != "mw:dom-fragment-token" {
+            return false;
+        }
+        let is_indicator = t.attribs.iter().any(|kv| {
+            kv.key.as_str() == Some("typeof") && kv.value.as_str() == Some("mw:Extension/indicator")
+        });
+        if !is_indicator {
+            return false;
+        }
+        if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about")) {
+            return true;
+        }
+        let about = self.new_about_id(about_counter, "indicator");
+        t.add_attribute_str("about", &about);
+        true
     }
 
     /// Inline every `<templatestyles>` stylesheet.
@@ -4966,7 +4987,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // the indicator from *inside* a template, so a pass running after
                 // expansion would number it too late — the transclusion following
                 // the template would take the id the indicator should have spent.
-                if let Some(emitted) = self.expand_one_indicator(&item, about_counter) {
+                if let Some(emitted) = self.expand_one_indicator(&item) {
                     out.extend(emitted);
                     continue;
                 }
@@ -5025,6 +5046,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // see the `begin_style_defer` around the branch expansion.)
             for item in out.iter_mut() {
                 if self.number_style_placeholder(item, about_counter) {
+                    continue;
+                }
+                if self.number_indicator_placeholder(item, about_counter) {
                     continue;
                 }
                 if self.stamp_rich_extension_about(item, about_counter) {
