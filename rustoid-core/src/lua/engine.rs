@@ -3078,6 +3078,17 @@ fn title_derived_field(
                     arr.set(1, value.first().map(String::as_str).unwrap_or(""))?;
                     levels.set(action.as_str(), arr)?;
                 }
+            } else if !full.is_empty() {
+                // The title's facts were never fetched, so the levels are not
+                // known rather than empty. Requesting it makes the next round
+                // answer the real values — without this, `Module:Lua banner`
+                // read `mw.title.new(module).protectionLevels["edit"][1]` as
+                // nil (0) for a module that is protected, found it *less*
+                // protected than the template, and added
+                // `Category:Templates using under-protected Lua modules` on
+                // `Template:Infobox` and `Template:Weather box` where the wiki
+                // adds none.
+                note_missing_title(lua, full)?;
             }
             Ok(Value::Table(levels))
         }
