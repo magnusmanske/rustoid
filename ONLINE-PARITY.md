@@ -16534,3 +16534,39 @@ flips the value by a year. Re-fetching the pinned revision's oracle returns `95`
 and the page matches again. The lesson is a harness one: a cached `page/html`
 response bakes in the fetch time, so a date-dependent page must have its oracle
 re-fetched, not merely its *facts*.
+
+## An `mw:Entity` transclusion target takes the prepended type
+
+A transclusion whose whole output is an entity (`{{snd}}`) encapsulates the
+`mw:Entity` span. Parsoid *prepends* the transclusion type there
+(`mw:Transclusion mw:Entity`); rustoid appended it. The corpus shows the two
+disjoint: 59 `mw:Transclusion mw:Entity` on Parsoid's side, 61
+`mw:Entity mw:Transclusion` on rustoid's, no overlap. This is the general rule —
+PHP's `DOMRangeBuilder::encapsulateTemplates` prepends every type of the range's
+start element (`addTypeOf(…, true)`) when the start element is not the
+encapsulation target — while the *appended* cases are only the extension paths
+that unfold a `mw:DOMFragment` (`mw:Extension/templatestyles mw:Transclusion`,
+the same for `syntaxhighlight`). So `mw:Entity` joins media and `mw:ExpandedAttrs`
+in the prepend set. Effect: `Isaac Newton` 41098 → 41596; fixtures 877/896.
+
+## Open lead: a duplicated protection indicator
+
+The frequent `about="#mwtN"` off-by-one (`Berlin`, `Chernobyl disaster`,
+`COVID-19 pandemic`, `International Space Station`) is one extra id spent before
+the infobox's `Module:Infobox/styles.css` `<style>`. Tracing it (with
+`RUSTOID_TRACE_ABOUT`) lands on an `indicator` allocation, and the dumps confirm
+rustoid emits the `pp-default` protection padlock **twice** where Parsoid emits it
+once. The duplicate sits inside a `Module:Documentation` render, which points at
+`Module:Protected page`'s wrapper resolution — `cfg.wrappers[parent:getTitle()]`
+maps `Template:Move-protected` to `{action = 'move', catonly = 'yes'}`. If that
+lookup misses, the move call falls back to `action = 'edit'` and emits a second
+`pp-default` padlock instead of a suppressed move padlock.
+
+### Also ruled out
+
+`Isaac Newton`, `Python`, `Brat (album)` and `Template:Weather box` all have
+`syntaxhighlight`, but a faithful port is a large Pygments 2.21.0 subset
+(`WikitextLexer` alone is ~500 lines with recursive delegate lexers), and its
+first *corpus* difference is never a highlight block — each is a different bug
+(a comment argument, a hidden table row, an extra category). Porting it gates no
+page on its own.
