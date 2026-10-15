@@ -16816,15 +16816,49 @@ once; `Albert Einstein` 20113 → 20306, `Taylor Swift` 14736 → 17451; fixture
 stay at 877/896; no regressions (48 pages, better=3 worse=0 against the baseline
 before this run).
 
-### Open lead: `{{REVISIONID}}` is empty, so `{{if preview}}` takes the wrong branch
+## `{{REVISIONID}}` in miser mode answers the stub `-`, not the empty string
 
-`Albert Einstein`'s next difference is a `Template:Tooltip` span where Parsoid
-renders the bare year. `Template:Tooltip` is reached through
-`{{if preview|<wrapped>|{{YEAR|…}}}}`, and `Template:If preview` is
-`{{safesubst:<noinclude/>#invoke:If preview|pmain}}`; `pmain` returns its first
-argument when `Module:If preview/configuration` says `preview`, which is
-`frame:preprocess('{{REVISIONID}}') == nil or ''`. rustoid answers
-`{{REVISIONID}}` with the empty string, so the module concludes it is previewing
-and picks the first argument — Parsoid, parsing a saved revision, picks the
-second. The page's revision is available from the data source
-(`get_page_with_revision`); the frame's page-scope magic words need to carry it.
+`Template:If preview` reaches `Module:If preview/configuration`, which decides
+whether it is previewing by `frame:preprocess('{{REVISIONID}}') == nil or ''`.
+rustoid answered the empty string, so every `{{if preview|…}}` took its first
+argument; a saved page takes the second. Core's `CoreParserFunctions::revisionid`
+has a shape the port was missing: the *page's own* id is stubbed to `-` when the
+wiki is in miser mode (the `misermode` siteinfo flag, `$wgMiserMode`), the title
+is in a subject namespace, and a revision exists — empty only when there is no
+revision at all (T137900). The stub is a real answer, not a placeholder: `-` is
+truthy, which is all preview detection needs.
+
+`{{REVISIONID}}` also needed the page's revision, which expansion (being
+synchronous) cannot fetch: the parser now asks its data source for it up front, in
+`build_ast`, next to the page's protection, and carries it through the renamed
+`PageContext` (the old `ProtectionContext` grew a `revision` field, and
+`miser_mode` joins `SiteConfig`). A source that does not track revisions reports
+`None`, which is MediaWiki's "no revision" — a parser test, or a page not yet
+saved — and the magic word answers empty there rather than inventing an id. An
+explicit `{{REVISIONID:title}}` for *another* page would need a fetch this path
+cannot make; the corpus only ever spells the bare form.
+
+### Effect
+
+`{{if preview}}` takes its second argument on a saved page; `Albert Einstein`'s
+`Template:Tooltip` span renders the bare year; `Template:Infobox` 10044 → 11509.
+Fixtures stay at 877/896; no regressions (48 pages, better=1 worse=0).
+
+## `#iferror` with no `else` answers the test, not the empty string
+
+`ParserFunctions::iferror` has three shapes, and the port had only two. When the
+test holds no error *and* no `else` argument was given, core sets
+`$result = $test` and returns `trim( $frame->expand( $result ) )` — the (already
+expanded, trimmed) test itself. rustoid fell through to `args.get(2)`, which is
+`None`, and returned empty. `Template:Marriage` compares
+`{{#ifexpr:{{#iferror:{{YEAR|…}}|{{#time:Y}}}} >= {{YEAR|…}}|…|…}}`, so the empty
+string compared as `0`, the comparison failed, and the template took its
+"posthumous date" branch — pulling in `Template:Tooltip` and two extra
+`Template:Tooltip/styles.css` placeholders, which shifted every later `about` id
+by +2.
+
+### Effect
+
+`{{marriage|[[Mileva Marić]]|1903|1919|end=divorced}}` now matches the wiki
+exactly, ids included; `Albert Einstein` 20306 → 29228. Fixtures stay at 877/896;
+no regressions (48 pages, better=1 worse=0).
