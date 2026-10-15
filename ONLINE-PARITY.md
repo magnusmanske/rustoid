@@ -16907,3 +16907,72 @@ next round's `title_facts_of` answer the real levels, so the comparison
 Fixtures stay at 877/896; no regressions (48 pages, better=2 worse=0). The
 corpus is offline, so the two titles' protection has to be in the cache: this
 was populated by an online render, and the harness caches it as it fetches.
+
+## The reported "first difference" steps over nondeterministic spans
+
+The harness already masked per-render values (`utm_campaign`, `mt_rand()` ids,
+`{{CURRENTTIMESTAMP}}`) to decide whether a page differs *only* by noise, but
+the byte offset it printed came from the raw text. So a page whose first raw
+divergence was such a span was reported as blocked there, hiding the real
+difference behind it — and a corpus page can never be driven to parity while
+the reported blocker is one nobody can fix.
+
+The `utm_campaign` on a media `<source src>` is exactly that: it is baked into
+the wiki's per-file transcode cache rather than into the revision. A fresh REST
+fetch answers `index` for `Zebra`'s `<source>` and `rest` for `Albert
+Einstein`'s, same construct and same request path. Across the pinned oracles it
+is `rest` 50 times and `index` once.
+
+`first_difference` now steps over a span `nondeterministic_span` recognises on
+*both* sides at once, each side by its own span's length, so a span that differs
+in length (a campaign) cannot desynchronise them and the reported offset stays
+the raw one. The strict `Match`/`Equivalent` verdicts are unchanged; only the
+diagnostic moves, and the percentage now measures how far the two renditions
+agree on the markup that matters.
+
+### Effect
+
+`Association football` 113213 → 272823, `Canada` +717, `Bicycle` +548, `Israel`
++237, `Albert Einstein` +231, `France` +225 — each now pointing at its real
+blocker (the media `<track>`s, or the extlink's `http`→`https` upgrade). Compare
+lib tests 129.
+
+## The media `<track>`s: `AddMediaInfo::addTracks`
+
+An audio/video element carries one `<track>` per subtitle language:
+
+```html
+<track kind="subtitles" type="text/vtt" src="https://commons.wikimedia.org/w/api.php?action=timedtext&title=File%3A03_ALBERT_EINSTEIN.ogg&lang=am&trackformat=vtt&origin=%2A" srclang="am" label="አማርኛ ‪(am)‬" data-mwtitle="" data-dir="ltr"/>
+```
+
+Parsoid's `Wt2Html/DOM/Processors/AddMediaInfo::addTracks` builds each from an
+entry of `$info['videoinfo']['timedtext']`, writing `kind`, `type`, `src`,
+`srclang`, `label`, `data-mwtitle`, `data-dir` in that order — *not* the order
+the API returns them in — and `data-mwtitle` is present as the empty string
+when the answer carries no `title` (`$o['title'] ?? ''`). rustoid rendered no
+tracks at all, so every page with a spoken-audio or video file diverged at the
+first one.
+
+The list is a fact about the file, not the wikitext, so it joins `FileInfo` and
+is fetched with the rest: `viprop=timedtext` (the wiki serves it for a file on a
+shared repo as well as for one of its own) and cached as `file:`.
+
+Two details worth keeping:
+
+- **The doubled `origin`.** The local API appends `origin=*` a second time when
+  it proxies a shared repo's answer (`…&origin=%2A&origin=%2A`) where
+  `TextHandler::getFullURL` appends it once for a non-local file. The `src` is
+  collapsed to the single `origin` the served HTML carries; a file local to the
+  asking wiki carries none at all.
+- **The order is the API's.** The track list is emitted in the order
+  `videoinfo.timedtext` answered, which is sorted by language code — including
+  the `ko-kp` before `ko` and `zh-cn` before `zh-hans` that a plain `strcmp`
+  would order the other way.
+
+### Effect
+
+`Albert Einstein` 33809 → 53321, `France` +20225, `Canada` +17826, `Israel`
++15571, `Bicycle` +14407. Fixtures stay at 877/896; no regressions (48 pages,
+better=5 worse=0). The corpus is offline, so the track lists have to be in the
+cache: the audio/video `file:` entries were dropped and backfilled once with
+`RUSTOID_FILL_FILES=1`.
