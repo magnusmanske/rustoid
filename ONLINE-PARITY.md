@@ -17144,3 +17144,44 @@ difference moves past the citation), and every page's total moves 62 651 794 →
 Python's 64 empty notes are filled; 4 remain, whose `<templatestyles>` reaches
 the note through a `frame:expandTemplate` answer. Fixtures stay at 877/896 and
 every lib test passes; the 48-page offline corpus is better=1, worse=0.
+
+## `#tag` content: a placeholder has to survive the wikitext round-trip
+
+`#tag:ref|content|name=A` does not hand the extension its *tokens*. Parsoid
+serializes them back to wikitext and re-parses it
+(`TemplateHandler::expandTemplate` → `preparePFragment` → `processTemplateSource`),
+replacing every piece with no wikitext form by a fragment marker
+(`PipelineUtils::pFragmentToParsoidFragmentMarkers`, `{{#parsoid\0fragment:N}}`).
+rustoid's `tag_extension_token` serialized the content too, but *dropped* such a
+piece: `token_to_source` writes nothing for a token without a `src`.
+
+That is exactly what a template argument resolves before the call. In
+`{{refn|name=A|{{cite web|…}}}}` — `refn` is
+`{{#tag:ref|{{{1}}}|name={{{name}}}|group={{{group}}}}}` — the argument's
+expansion has already resolved `Module:Citation/CS1`'s `<templatestyles>` into a
+`<style typeof="mw:DOMFragment">`+`</style>` placeholder when `pf_tag` runs. The
+serialization dropped the pair, so the note rendered without its stylesheet and
+its `about` id was never spent:
+
+```
+{{refn|name="A"|{{cite web|url=…|title=X}}}}{{reflist}}
+  service: <span id="mw-reference-text-cite_note-A-1" …><style data-mw-deduplicate="TemplateStyles:r1333433106" …>
+  rustoid: <span id="mw-reference-text-cite_note-A-1" …><cite class="citation web cs1">…
+```
+
+### The fix
+
+`tag_extension_token` keeps the content tokens (`TempData::tag_content`), and
+`Parser::tag_body_source` re-serializes them where the marker map is in reach:
+`dom_fragment_placeholder_at` finds a `mw:DOMFragment` element (with its matching
+end tag, or the `mw:dom-fragment-token` it wraps), `record_marker` stands a strip
+marker in for it, and `substitute_strip_markers` splices it back after the body
+is tokenized — the path a module's `frame:extensionTag` answer already takes. The
+body's own post-pass then numbers the placeholder and its `<style>` reaches the
+note. A token with no source that is *not* a placeholder still drops, as before.
+
+### Effect
+
+`Python (programming language)` 25628 → 27043; `{{refn|…}}` and `{{efn|…}}` notes
+keep their `Module:Citation/CS1/styles.css` link. Fixtures stay at 877/896, every
+lib test passes, and the 48-page offline corpus is better=1, worse=0.
