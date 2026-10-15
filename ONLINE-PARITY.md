@@ -16793,15 +16793,38 @@ expressions, which is what made `Albert Einstein`'s spouse cell carry
 13324 → 22711; `Albert Einstein` (with the opaque-argument fix above) → 20113;
 fixtures stay at 877/896; no regressions (48 pages, better=2 worse=0).
 
-### Open lead: a branch emitted twice with its `|` separator
+## A tag name needs its boundary to be a tag
 
-With the arguments no longer truncated, `Albert Einstein` shows the next
-difference: inside `Template:Marriage`'s inline `style`, the `#if` whose
-separators sit on their own lines (`{{#if:{{{end|{{{reason|}}}}}}\n  |THEN\n
-|ELSE\n}}`) emits THEN **and** `\n  |` plus the first element of ELSE. Parsoid
-emits THEN alone. The leaked text is the source's separator line followed by the
-else branch's first `<div>` — the shape `convertToString` produces — so the
-split that decides the arguments is failing at *that* `|`. The same duplication
-is present before the two fixes above (it is what the `Expression error` text
-sat inside); it was invisible on the corpus only because the argument split
-discarded everything after the first top-level `|`.
+`skip_recognized_html_tag` accepted a tag as soon as the name matched the HTML
+tag lists, then scanned for the closing `>`. PHP's `$elementsRegex` carries a
+lookahead — `(?=<ws>|/>|>)` — so `<br|plain=true` is not a tag at all: the name
+is not followed by a boundary, and the `<` stays literal text (its `|` therefore
+separates the argument list). Without that check the scan ran on to the *next*
+`>` anywhere in the input and swallowed everything between, including the `}}`
+of the call that held it.
+
+`Template:In string` is called as
+`…|target=<br|plain=true|nomatch=}}`, and inside `Template:Marriage`'s inline
+`style` the next `>` belongs to a `<div>` much later — so the enclosing `#if`
+recorded one parameter and emitted its else branch, preceded by the source's own
+`|` separator, next to the branch it had actually taken.
+
+### Effect
+
+`{{marriage|[[Mileva Marić]]|1903|1919|end=divorced}}` renders its display rule
+once; `Albert Einstein` 20113 → 20306, `Taylor Swift` 14736 → 17451; fixtures
+stay at 877/896; no regressions (48 pages, better=3 worse=0 against the baseline
+before this run).
+
+### Open lead: `{{REVISIONID}}` is empty, so `{{if preview}}` takes the wrong branch
+
+`Albert Einstein`'s next difference is a `Template:Tooltip` span where Parsoid
+renders the bare year. `Template:Tooltip` is reached through
+`{{if preview|<wrapped>|{{YEAR|…}}}}`, and `Template:If preview` is
+`{{safesubst:<noinclude/>#invoke:If preview|pmain}}`; `pmain` returns its first
+argument when `Module:If preview/configuration` says `preview`, which is
+`frame:preprocess('{{REVISIONID}}') == nil or ''`. rustoid answers
+`{{REVISIONID}}` with the empty string, so the module concludes it is previewing
+and picks the first argument — Parsoid, parsing a saved revision, picks the
+second. The page's revision is available from the data source
+(`get_page_with_revision`); the frame's page-scope magic words need to carry it.
