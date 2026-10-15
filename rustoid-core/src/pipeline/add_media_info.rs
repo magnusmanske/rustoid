@@ -1296,6 +1296,7 @@ fn apply_av_media(
 
     let frag = parse_frag(root, &job.path, info);
     add_sources(&mut elt, info, &frag, !is_audio);
+    add_tracks(&mut elt, info);
 
     // `mw-file-element` (added by `AddMediaInfo::run` after the handler), then
     // the upright class/style, which `AddMediaInfo` applies to any media element.
@@ -1352,6 +1353,31 @@ fn add_sources(elt: &mut Node, info: &FileInfo, frag: &str, has_dimension: bool)
         // an id (mirrors PHP's `createElement('source')`).
         source.empty_dp_slot = true;
         elt.push_child(source);
+    }
+}
+
+/// The `<track>` children of an audio/video element (mirrors `addTracks`).
+///
+/// One per subtitle language, in the order `videoinfo.timedtext` answered (the
+/// wiki sorts by language code, and the served HTML preserves that order). The
+/// attributes are written in Parsoid's order, not the API's: `kind`, `type`,
+/// `src`, `srclang`, `label`, `data-mwtitle`, `data-dir`. `data-mwtitle` is
+/// always present, falling back to the empty string for an answer with no
+/// `title` (`$o['title'] ?? ''`).
+fn add_tracks(elt: &mut Node, info: &FileInfo) {
+    for t in &info.timedtext {
+        let mut track = Node::element(ElementKind::Other("track".to_string()));
+        track.set_attr("kind", &t.kind);
+        track.set_attr("type", &t.mime);
+        track.set_attr("src", &t.src);
+        track.set_attr("srclang", &t.srclang);
+        track.set_attr("label", &t.label);
+        track.set_attr("data-mwtitle", &t.title);
+        track.set_attr("data-dir", &t.dir);
+        // A fresh element, so it carries an empty `data-parsoid` slot and takes
+        // an id (mirrors PHP's `createElement('track')`).
+        track.empty_dp_slot = true;
+        elt.push_child(track);
     }
 }
 
@@ -2127,6 +2153,15 @@ mod tests {
                 height: 0,
                 duration: Some(12.5),
                 file_url: "http://example.com/images/3/3a/Foobar.ogg".to_string(),
+                timedtext: vec![crate::traits::FileTrack {
+                    kind: "subtitles".to_string(),
+                    mime: "text/vtt".to_string(),
+                    src: "https://commons.wikimedia.org/w/api.php?action=timedtext&title=File%3AFoobar.ogg&lang=en&trackformat=vtt&origin=%2A".to_string(),
+                    srclang: "en".to_string(),
+                    label: "English".to_string(),
+                    title: String::new(),
+                    dir: "ltr".to_string(),
+                }],
                 ..FileInfo::default()
             },
         );
@@ -2161,6 +2196,37 @@ mod tests {
         let source = &audio.children[0];
         assert_eq!(source.get_attr("type"), Some("application/ogg"));
         assert!(source.get_attr("src").unwrap_or("").ends_with("Foobar.ogg"));
+        // The subtitle track follows the sources, in Parsoid's attribute order,
+        // with `data-mwtitle` present even though the answer carries no title.
+        let track = &audio.children[1];
+        assert!(
+            matches!(&track.kind, NodeKind::Element(ElementKind::Other(t)) if t == "track"),
+            "the second child is a <track>"
+        );
+        assert_eq!(track.get_attr("kind"), Some("subtitles"));
+        assert_eq!(track.get_attr("type"), Some("text/vtt"));
+        assert!(track.get_attr("src").unwrap_or("").contains("lang=en"));
+        assert_eq!(track.get_attr("srclang"), Some("en"));
+        assert_eq!(track.get_attr("label"), Some("English"));
+        assert_eq!(track.get_attr("data-mwtitle"), Some(""));
+        assert_eq!(track.get_attr("data-dir"), Some("ltr"));
+        assert_eq!(
+            track
+                .attrs
+                .iter()
+                .map(|a| a.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "kind",
+                "type",
+                "src",
+                "srclang",
+                "label",
+                "data-mwtitle",
+                "data-dir"
+            ],
+            "the attributes are in Parsoid's order, not the API's"
+        );
     }
 
     #[test]

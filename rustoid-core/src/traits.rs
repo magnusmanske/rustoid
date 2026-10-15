@@ -292,6 +292,30 @@ pub struct FileDerivative {
     pub transcodekey: Option<String>,
 }
 
+/// One subtitle track of an audio/video file (`videoinfo.timedtext`), the source
+/// of one `<track>` element in `AddMediaInfo::addTracks`.
+///
+/// Parsoid writes the attributes in exactly this order — `kind`, `type`, `src`,
+/// `srclang`, `label`, `data-mwtitle`, `data-dir` — not the order the API
+/// returns them in, so the fields keep their emitted names.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileTrack {
+    pub kind: String,
+    /// `text/vtt`, or `text/x-srt` for a source only the full inventory carries.
+    #[serde(rename = "type")]
+    pub mime: String,
+    pub src: String,
+    pub srclang: String,
+    pub label: String,
+    /// The API's `title`, which Parsoid writes as `data-mwtitle` (empty when the
+    /// answer carries none).
+    #[serde(default)]
+    pub title: String,
+    /// The track language's direction, which Parsoid writes as `data-dir`.
+    #[serde(default)]
+    pub dir: String,
+}
+
 /// Metadata for a file (image, audio, video).
 ///
 /// `Serialize`/`Deserialize` so a data source can cache the answer at a
@@ -316,6 +340,11 @@ pub struct FileInfo {
     /// a source that does not fetch them.
     #[serde(default)]
     pub derivatives: Vec<FileDerivative>,
+    /// The file's subtitle tracks (`videoinfo.timedtext`), the `<track>` list an
+    /// audio/video element is built from. Empty for a still image, for a file
+    /// with no subtitles, and for a source that does not fetch them.
+    #[serde(default)]
+    pub timedtext: Vec<FileTrack>,
     /// File size in bytes.
     pub size: u64,
     /// Image width in pixels.

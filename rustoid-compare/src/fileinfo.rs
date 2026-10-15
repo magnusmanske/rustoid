@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use rustoid_core::traits::{FileDerivative, FileInfo};
+use rustoid_core::traits::{FileDerivative, FileInfo, FileTrack};
 
 use crate::error::{CompareError, Result};
 use crate::wire::WikiClient;
@@ -55,11 +55,14 @@ pub async fn file_info(
     // The derivative list is a `videoinfo` answer; for a still image the prop is
     // absent (or empty), so this stays empty and the caller falls back to one
     // source built from the file itself.
-    let derivatives = page
-        .videoinfo
-        .and_then(|mut v| v.drain(..).next())
-        .map(|v| v.derivatives)
-        .unwrap_or_default()
+    // The derivative list and the subtitle tracks are both `videoinfo` answers;
+    // for a still image the prop is absent (or empty), so both stay empty.
+    let video = page.videoinfo.and_then(|mut v| v.drain(..).next());
+    let (derivative_rows, track_rows) = match video {
+        Some(v) => (v.derivatives, v.timedtext),
+        None => (Vec::new(), Vec::new()),
+    };
+    let derivatives = derivative_rows
         .into_iter()
         .map(|d| FileDerivative {
             src: d.src,
@@ -69,11 +72,26 @@ pub async fn file_info(
             transcodekey: d.transcodekey,
         })
         .collect();
+    // The subtitle tracks, in the API's order. `AddMediaInfo::addTracks` emits
+    // them in that order after the `<source>`s, so the order is load-bearing.
+    let timedtext = track_rows
+        .into_iter()
+        .map(|t| FileTrack {
+            kind: t.kind,
+            mime: t.mime,
+            src: collapse_duplicate_origin(&t.src),
+            srclang: t.srclang,
+            label: t.label,
+            title: t.title.unwrap_or_default(),
+            dir: t.dir,
+        })
+        .collect();
     let mut result = FileInfo {
         title: page.title.unwrap_or_default(),
         mime_type: info.mime.unwrap_or_default(),
         media_type: info.mediatype,
         derivatives,
+        timedtext,
         size: info.size.unwrap_or(0),
         width: info.width.unwrap_or(0) as u32,
         height: info.height.unwrap_or(0) as u32,
@@ -121,6 +139,59 @@ struct ImageInfoPage {
 struct VideoInfo {
     #[serde(default)]
     derivatives: Vec<Derivative>,
+    /// TimedMediaHandler's subtitle list (`viprop=timedtext`); empty for a file
+    /// with no subtitles and for a wiki without the extension.
+    #[serde(default)]
+    timedtext: Vec<TimedText>,
+}
+
+#[derive(serde::Deserialize)]
+struct TimedText {
+    #[serde(default)]
+    kind: String,
+    #[serde(default, rename = "type")]
+    mime: String,
+    #[serde(default)]
+    src: String,
+    #[serde(default)]
+    srclang: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    dir: String,
+}
+
+/// Collapse the duplicate `origin=*` the API appends to a shared-repo file's
+/// track URL.
+///
+/// `TextHandler::getFullURL` appends `origin=*` once for a file that is not local
+/// to the asking wiki, and the served HTML carries it once. The API path appends
+/// it a second time when it proxies the shared repo's answer, so a request to
+/// enwiki for a Commons file answers `…&origin=%2A&origin=%2A` where Parsoid
+/// emits `…&origin=%2A`. Dropping the repeat reproduces the served URL for both a
+/// local file (no `origin` at all) and a shared one.
+fn collapse_duplicate_origin(src: &str) -> String {
+    let Some((base, query)) = src.split_once('?') else {
+        return src.to_string();
+    };
+    let mut origin: Option<&str> = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|part| {
+            if part.starts_with("origin=") {
+                origin = Some(part);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let Some(origin) = origin else {
+        return src.to_string();
+    };
+    format!("{base}?{}&{origin}", kept.join("&"))
 }
 
 #[derive(serde::Deserialize)]
@@ -217,5 +288,41 @@ mod tests {
         assert_eq!(d[0].mime.as_deref(), Some("audio/ogg; codecs=\"vorbis\""));
         assert!(d[0].transcodekey.is_none());
         assert_eq!(d[1].transcodekey.as_deref(), Some("mp3"));
+    }
+
+    /// The subtitle list rides in `videoinfo.timedtext`, and the local API appends
+    /// `origin=*` a second time for a file on a shared repo — the served HTML
+    /// carries it once.
+    #[test]
+    fn timedtext_is_read_and_the_duplicate_origin_collapsed() {
+        let src = "https://commons.wikimedia.org/w/api.php?action=timedtext\
+             &title=File%3AX.ogg&lang=am&trackformat=vtt&origin=%2A&origin=%2A";
+        let json = format!(
+            r#"{{"query":{{"pages":[{{"ns":6,"title":"File:X.ogg",
+            "imageinfo":[{{"mime":"application/ogg","mediatype":"AUDIO"}}],
+            "videoinfo":[{{"derivatives":[],"timedtext":[
+                {{"src":"{src}","kind":"subtitles","type":"text/vtt",
+                 "srclang":"am","dir":"ltr","label":"\u202a(am)\u202c"}}
+            ]}}]}}]}}}}"#
+        );
+        let parsed: ImageInfoResponse = serde_json::from_str(&json).unwrap();
+        let t = &parsed.query.pages[0].videoinfo.as_ref().unwrap()[0].timedtext;
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].kind, "subtitles");
+        assert_eq!(t[0].mime, "text/vtt");
+        assert_eq!(t[0].dir, "ltr");
+        assert_eq!(t[0].srclang, "am");
+        assert!(t[0].title.is_none());
+        // The collapse is applied by `file_info`, not by the deserializer.
+        let collapsed = collapse_duplicate_origin(&t[0].src);
+        assert_eq!(collapsed.matches("origin=").count(), 1);
+        assert!(collapsed.ends_with("&lang=am&trackformat=vtt&origin=%2A"));
+    }
+
+    /// A URL with no `origin` (a file local to the asking wiki) is left alone.
+    #[test]
+    fn a_local_track_url_is_unchanged() {
+        let s = "https://en.wikipedia.org/w/api.php?action=timedtext&title=File%3AY.ogg&lang=en&trackformat=vtt";
+        assert_eq!(collapse_duplicate_origin(s), s);
     }
 }

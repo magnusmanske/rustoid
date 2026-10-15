@@ -464,7 +464,9 @@ impl WikiClient {
     /// `iiurlwidth`/`iiurlheight` make the wiki generate a thumbnail at that
     /// size and return its URL *and* `thumbwidth`/`thumbheight`; that returned
     /// width is what the rendered `<img>` uses, mirroring Parsoid's per-request
-    /// `dims` reaching `DataAccess::getFileInfo`.
+    /// `dims` reaching `DataAccess::getFileInfo`. `timedtext` is
+    /// TimedMediaHandler's subtitle list, which the wiki serves for a file on a
+    /// shared repo as well as for one of its own.
     pub async fn file_info_json(
         &self,
         title: &str,
@@ -472,7 +474,7 @@ impl WikiClient {
         height: Option<u32>,
     ) -> Result<String> {
         let mut url = format!(
-            "{}?action=query&prop=imageinfo%7Cvideoinfo&iiprop=url%7Csize%7Cmime%7Cmediatype&viprop=derivatives&format=json&formatversion=2&titles={}",
+            "{}?action=query&prop=imageinfo%7Cvideoinfo&iiprop=url%7Csize%7Cmime%7Cmediatype&viprop=derivatives%7Ctimedtext&format=json&formatversion=2&titles={}",
             self.wiki.api_url(),
             urlencode(title)
         );
