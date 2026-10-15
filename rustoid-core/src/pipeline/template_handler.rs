@@ -1474,6 +1474,17 @@ impl TemplateHandler {
             // the fallback arm below misses the bare name and the call would
             // otherwise spill its own source text.
             "defaultsort" | "defaultsortkey" | "defaultcategorysort" => Vec::new(),
+            // `{{#coordinates:…}}` — the GeoData extension's parser function. In
+            // Parsoid it renders nothing in the body: the coordinate is stashed
+            // on the page's `geoData`, which the served HTML does not carry.
+            // Left unimplemented it fell through to the unknown-function fallback
+            // and spilled its own `{{#coordinates:…}}` source — which
+            // `Module:Coordinates` reaches through `frame:callParserFunction`, so
+            // the module spliced the source back into its output and it leaked as
+            // a stray `<template #coordinates="">` node (`Sundial`). A genuinely
+            // unknown parser function *does* spill its source in Parsoid, so this
+            // is a real implementation, not a silenced fallback.
+            "coordinates" => Vec::new(),
             "lc" => ParserFunctions::pf_lc(params),
             "uc" => ParserFunctions::pf_uc(params),
             "ucfirst" => ParserFunctions::pf_ucfirst(params),
@@ -2622,6 +2633,44 @@ mod tests {
             );
             assert!(out.is_empty(), "{name} should render nothing, got {out:?}");
         }
+    }
+
+    /// `{{#coordinates:…}}` is the GeoData extension's parser function and renders
+    /// nothing in Parsoid's body output — unlike a *genuinely* unknown parser
+    /// function, which spills its own source. `Module:Coordinates` reaches it
+    /// through `frame:callParserFunction`, so with no arm the module spliced the
+    /// source back into its output and it leaked as a stray
+    /// `<template #coordinates="">` node (`Sundial`).
+    #[test]
+    fn test_coordinates_parser_function_has_no_output() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let config = MockSiteConfig::new();
+        let page_protection = std::cell::RefCell::new(Default::default());
+        let titles_protection = std::cell::RefCell::new(HashMap::new());
+        let protection = ProtectionContext::new(&page_protection, &titles_protection);
+        let ifexist = HashMap::new();
+        let params = Params::new(vec![KV {
+            key: KeyValue::Str("39.9157".to_string()),
+            value: KeyValue::Str(String::new()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }]);
+        let out = TemplateHandler::call_parser_function(
+            &config,
+            "coordinates",
+            &params,
+            None,
+            &protection,
+            &ifexist,
+            None,
+            false,
+        );
+        assert!(
+            out.is_empty(),
+            "coordinates should render nothing, got {out:?}"
+        );
     }
 
     #[test]
