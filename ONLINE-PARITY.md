@@ -16503,3 +16503,34 @@ cases.
 
 Effect: `Hydrogen`'s first difference moved from byte 3733 to 6635 (its
 remaining gap is elsewhere); fixture guard 877/896 unchanged; no page regressed.
+
+## An HTML comment was not opaque to argument splitting
+
+`split_template_args_impl_offsets` — the tokenizer's own `|` splitter, which the
+`data-mw` parameter list is built from — handled `-{…}-`, recognized HTML tags,
+`<nowiki>`, braces, brackets, tables and extlinks, but not `<!-- … -->`. The
+preprocessor parses a comment as a single node, so a `|` inside one never ends an
+argument; rustoid split on it. `Template:Infobox` arguments carry commented-out
+`| name = …` lines, so the recorded parameter list was torn apart:
+
+```
+{{#if:1|a<!-- | x = y -->b|C}}
+  service  {"1":"a<!-- | x = y -->b", "2":"C"}
+  rustoid  {"1":"a<!-- ", "2":"x = y -->b", "3":"C"}
+```
+
+The splitter now consumes `<!-- … -->` (an *unclosed* comment runs to the end of
+the input, per `Preprocessor_Hash`'s "Unclosed comment in input, runs to end").
+Effect: `Python`'s first difference moved 17072 → 25609, `United States`
+6591 → 25014; fixtures 877/896 unchanged.
+
+### A date-boundary artifact, not a regression
+
+After this change `Order of the British Empire` — a match — briefly reported a
+difference at `{{age|1931|10|15}}` (`94` vs `95`). It is not a regression: the
+cached oracle HTML was rendered when that age *was* 94, while rustoid reads the
+wall clock (`Module:Date`'s `os.date('!*t')`), so a run that crosses midnight
+flips the value by a year. Re-fetching the pinned revision's oracle returns `95`
+and the page matches again. The lesson is a harness one: a cached `page/html`
+response bakes in the fetch time, so a date-dependent page must have its oracle
+re-fetched, not merely its *facts*.
