@@ -16722,3 +16722,86 @@ the `spouse` argument and `Template:Infobox person` then saw a one-item list.
 MediaWiki passes `expandTemplate` args as opaque nodes, so they never re-split;
 the faithful fix is to stop re-parsing these values (or to render a literal `|`
 and `=` as `{{!}}`/`{{=}}`). `Albert Einstein` is the page it gates.
+
+## `frame:expandTemplate` argument values are opaque
+
+`render_call` wrote a `frame:expandTemplate` request back out as
+`{{title|k=v|…}}` and re-tokenized it. MediaWiki never does that: `LuaEngine::
+expandTemplate` converts every value to an opaque node
+(`Preprocessor::newPartNodeArray` builds a `part` whose `value` child is the raw
+string) and expands the target template's DOM against a frame that holds them.
+`PPTemplateFrame_Hash::getNamedArgument` then expands that node in the *parent*
+frame, and `PPFrame_Hash::expand` emits a bare string verbatim — so a value
+carrying a top-level `|` or `=` reaches the template intact.
+
+Splicing the value into wikitext split it instead. `Module:Template wrapper`
+collects the arguments of `{{Infobox scientist}}` and hands them to
+`frame:expandTemplate{ title = 'Infobox person', args = … }`; the `spouse` value
+is the rendered `{{plainlist}}` of two `{{marriage}}` calls, and the one with
+`end=divorced` carries a `display` rule with a top-level `|` — so the argument
+split in two, `Template:Infobox person` saw a one-item list, and the label came
+out `Spouse` where Parsoid renders `Spouses`.
+
+The request's token is now built directly: `request_tokens` returns a
+`template` token whose values are single *string* attributes, the same shape a
+literal `|name=value` produces when the value holds no markup
+(`template_token`). `request_wikitext` still renders the other requests —
+`frame:preprocess` hands its text to the preprocessor and a parser function call
+is written back out as `{{#name:…}}`, and both *are* wikitext.
+
+A literal `|` cannot be spelled with `{{!}}` here, which is why this is not an
+escaping fix: a value's text is not preprocessed again, so `{{!}}` in a value
+would reach the template as the four characters `{{!}}`.
+
+### Effect
+
+`Albert Einstein` 19032 → 20113 (the label is right; the difference moves to the
+marriage rendering); `2024 Summer Olympics` 13324 → 22711; no regressions
+(48 pages, better=2 worse=0).
+
+## A five-brace run opens `{{` then `{{{`
+
+`split_template_args_with_offsets` chose the opener of a run of `{` by testing
+`starts_with("{{{")` first, so the five-brace `subst` idiom
+`{{{{{name|safesubst:}}}#ifexpr:…}}` was read as an argument plus a template
+rather than a template whose name begins with an argument. The stack then held
+the two constructs in the wrong order, so a following top-level `|` was seen as
+nested and the arguments merged.
+
+MediaWiki's precedence is `N % 3`: a run of N braces opens a template when
+`N % 3 == 2`, an argument when `N % 3 == 0`, and when `N % 3 == 1` one `{` is
+literal content and the rest of the run is reconsidered. The splitter now uses
+it, matching `find_template_closing_memo` and `PegTokenizer::parse_directive`.
+The `N % 3 == 1` case falls through rather than consuming the brace, so the
+`{|` table rule below it still sees a table opener.
+
+`Template:Str ≥ len` is the case that pins it — its whole body is that idiom
+around an `#ifexpr`, and the merged arguments put the branches *into* the
+expression, so `{{str ≥ len|1=abc|2=5|3=YES|4=NO}}` evaluated
+`3 >= 5 |YES|NO` and answered
+`<strong class="error">Expression error: Unrecognized word "YES".</strong>`.
+`Template:Str ≠ len` and every `{{{{{|safesubst:}}}}}`-prefixed call had the
+same fault. `Template:Marriage` reaches both through its inline `style`
+expressions, which is what made `Albert Einstein`'s spouse cell carry
+`Expression error: Unrecognized word "margin".`.
+
+### Effect
+
+`{{str ≥ len|1=abc|2=5|3=YES|4=NO}}` answers `NO` (and `YES` at six characters);
+`{{marriage|[[Mileva Marić]]|1903|1919|end=divorced}}` renders its real
+`margin-top` style instead of an expression error. `2024 Summer Olympics`
+13324 → 22711; `Albert Einstein` (with the opaque-argument fix above) → 20113;
+fixtures stay at 877/896; no regressions (48 pages, better=2 worse=0).
+
+### Open lead: a branch emitted twice with its `|` separator
+
+With the arguments no longer truncated, `Albert Einstein` shows the next
+difference: inside `Template:Marriage`'s inline `style`, the `#if` whose
+separators sit on their own lines (`{{#if:{{{end|{{{reason|}}}}}}\n  |THEN\n
+|ELSE\n}}`) emits THEN **and** `\n  |` plus the first element of ELSE. Parsoid
+emits THEN alone. The leaked text is the source's separator line followed by the
+else branch's first `<div>` — the shape `convertToString` produces — so the
+split that decides the arguments is failing at *that* `|`. The same duplication
+is present before the two fixes above (it is what the `Expression error` text
+sat inside); it was invisible on the corpus only because the argument split
+discarded everything after the first top-level `|`.
