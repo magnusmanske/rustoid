@@ -16862,3 +16862,27 @@ by +2.
 `{{marriage|[[Mileva Marić]]|1903|1919|end=divorced}}` now matches the wiki
 exactly, ids included; `Albert Einstein` 20306 → 29228. Fixtures stay at 877/896;
 no regressions (48 pages, better=1 worse=0).
+
+## A bare-URL `urllink` flattens to its href
+
+A bare URL in a template-argument value tokenizes into a `urllink` token, and
+its wikitext lives in the `href` attribute — `tokens_to_string` had no arm for
+it, so it flattened to nothing. `{{{thesis_url}}}` therefore reached
+`Template:Infobox scientist`'s
+`{{#if:{{{thesis_url|}}}|''[{{{thesis_url}}} {{{thesis_title}}}]''|'' {{{thesis_title}}} ''}}`
+as the empty string, the test failed, and the infobox's Thesis row dropped its
+external link while `{{{thesis_title}}}` (in the branch, afterwards) resolved
+normally — the giveaway that only the *test* was empty.
+
+Emitting the href mirrors the arm `argument_value_text` already grew for the
+same token. PHP's `tokensToString` never meets a raw `urllink` because its
+preprocessor hands Parsoid *text*, but rustoid tokenizes a template-argument
+value directly, so its stringifier has to compensate — the same reason it
+already handles `wikilink` and `extension` there.
+
+### Effect
+
+`{{Infobox scientist|thesis_title=T1|thesis_url=https://x.org/a.pdf}}` renders
+the thesis as an external link, matching the wiki; `Albert Einstein`
+29228 → 33578. Fixtures stay at 877/896; no regressions (48 pages,
+better=1 worse=0).
