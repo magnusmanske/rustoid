@@ -326,6 +326,16 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let comparison = rt.block_on(rustoid_compare::compare_page(
         &client, &config, &cache, &req,
     ))?;
+    // `WikiCache::put` writes a body through but defers the manifest, and the
+    // corpus path writes it at the end of its run. Without the same here, a
+    // single-page fetch is on disk yet unindexed — invisible to the next run and
+    // to `--offline`, which then reports the page as uncached. This matters most
+    // for an oracle the run re-fetched to test a stale-oracle difference: the
+    // point of keeping it is that the next run reads it.
+    cache
+        .lock()
+        .map_err(|_| "cache mutex poisoned")?
+        .write_index()?;
     report(&comparison, cli.verbose, cli.ignore_nondeterministic)
 }
 

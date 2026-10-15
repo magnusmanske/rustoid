@@ -296,13 +296,20 @@ impl std::fmt::Display for FactDrift {
     }
 }
 
-/// Whole UTC days a cached oracle's fetch stamp lags behind now.
+/// Whole UTC days a cached entry's fetch stamp lags behind now.
 ///
 /// `0` for a stamp from today, for an unparseable stamp, and for a stamp in the
 /// future. Only a *calendar*-day difference counts: a page rendered at 23:59 and
 /// compared at 00:01 is a day apart even though only two minutes passed, and
 /// that is exactly the case a date-dependent value turns over in.
-fn stale_oracle_days(fetched_at: Option<&str>) -> u64 {
+///
+/// Used for both the oracle and the facts it is compared against, because a
+/// `rest_v1/page/html` render and the templates the page leans on are refreshed
+/// on the same rule (see [`CachedDataSource::fetch_with_revision`]) — refreshing
+/// one without the other de-synchronises them, which is a difference that looks
+/// like a bug and is not (`TemplateStyles:r1380355963` in a fresh oracle vs the
+/// cached `r1289143401` stylesheet it was rendered against).
+fn stale_days(fetched_at: Option<&str>) -> u64 {
     const DAY: u64 = 86_400;
     let (Some(fetched), Some(now)) = (fetched_at.and_then(parse_epoch), now_epoch()) else {
         return 0;
@@ -1443,26 +1450,30 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     // The oracle's own fetch time, for the drift check: a fact newer than this is
     // a different day's answer than the revision the oracle rendered.
     //
-    // A cached oracle is reused only while it is from the *current* UTC day. A
+    // A cached oracle is reused even when it is from an earlier day. A
     // `rest_v1/page/html` render bakes in its fetch time, and a page's
     // date-dependent magic words (`{{CURRENTYEAR}}`, `Module:Date`'s
     // `os.date('!*t')`) are the wiki's clock at that moment, not the revision's —
     // so an oracle from yesterday can disagree with a render made today
-    // (`Order of the British Empire`'s `{{age}}` flips from 94 to 95 at
-    // midnight). That is cache staleness, not a parser bug, so refresh it rather
-    // than reuse it; offline there is nothing to refresh it with, so reuse it and
-    // report the lag through `suspect`.
+    // (`Order of the British Empire`'s `{{age}}` flips from 94 to 95 at midnight).
+    // That is *cache* staleness, not a parser bug, and the cure is not to refresh
+    // every stale oracle up front: a fresh oracle and a stale fact are just as
+    // inconsistent as the reverse (`TemplateStyles:r1380355963` against the cached
+    // stylesheet the page was *not* rendered with). Instead the staleness is
+    // *tested* — see the re-fetch after the comparison below — so a page is only
+    // disturbed when the staleness actually mattered. Offline, and when the
+    // re-fetch fails, the lag is reported through `suspect`.
     let rev_matches = cached.as_ref().is_some_and(|c| {
         c.meta.revid == Some(revid)
             || (c.meta.revid.is_none() && parsoid_revision(&c.body) == Some(revid))
     });
     let lag_days = if rev_matches {
-        stale_oracle_days(cached.as_ref().and_then(|c| c.meta.fetched_at.as_deref()))
+        stale_days(cached.as_ref().and_then(|c| c.meta.fetched_at.as_deref()))
     } else {
         0
     };
     let (parsoid_html, oracle_fetched_at, oracle_lag_days) = match cached {
-        Some(c) if rev_matches && (req.offline || (lag_days == 0 && !req.refresh)) => {
+        Some(c) if rev_matches && (req.offline || !req.refresh) => {
             (c.body, c.meta.fetched_at, lag_days)
         }
         _ if req.offline => {
@@ -1474,23 +1485,24 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
             ));
         }
         _ => {
-            let body = client.parsoid_html_at(&title, revid).await?;
-            let fetched_at = now_rfc3339();
-            cache
-                .lock()
-                .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
-                .put(
-                    EntryKind::Rendered,
-                    &title,
-                    &body,
-                    EntryMeta {
-                        kind: EntryKind::Rendered,
-                        title: title.clone(),
-                        revid: Some(revid),
-                        fetched_at: fetched_at.clone(),
-                    },
-                )?;
-            (body, fetched_at, 0)
+            match fetch_oracle(client, cache, &title, revid).await {
+                Ok((body, fetched_at)) => (body, fetched_at, 0),
+                // A re-fetch can fail: the wiki's own renderer times out on a
+                // multi-megabyte article. Keep the comparison by falling back to
+                // the cached oracle — reading it back, since the match above
+                // consumed it — and let `suspect` say it may be stale, rather
+                // than dropping the page from the run entirely.
+                Err(e) => {
+                    let fallback = cache
+                        .lock()
+                        .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+                        .get(EntryKind::Rendered, &title)?;
+                    match fallback {
+                        Some(c) if rev_matches => (c.body, c.meta.fetched_at, lag_days),
+                        _ => return Err(e),
+                    }
+                }
+            }
         }
     };
 
@@ -1515,7 +1527,30 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         });
     };
 
-    let outcome = compare_html(&parsoid_html, &rustoid_html);
+    let mut outcome = compare_html(&parsoid_html, &rustoid_html);
+    let mut parsoid_html = parsoid_html;
+    let mut oracle_fetched_at = oracle_fetched_at;
+    // A difference against an oracle from an earlier day may be an artifact of the
+    // oracle's own fetch time rather than a parser bug (see `stale_days`). Fetch
+    // the oracle afresh and keep it *only* if the stale pairing was the whole
+    // story — the fresh rendering matches. Otherwise the cached oracle stays in
+    // memory *and* on disk, so a page that differs for a real reason keeps the
+    // baseline it was compared against and is not disturbed by an unrelated
+    // stylesheet revision picked up by the refresh.
+    if !req.offline
+        && oracle_lag_days > 0
+        && matches!(outcome, Outcome::Differ { .. })
+        && let Ok(fresh) = client.parsoid_html_at(&title, revid).await
+    {
+        let fresh_outcome = compare_html(&fresh, &rustoid_html);
+        if fresh_outcome.is_match() || fresh_outcome.is_equivalent() {
+            let fresh_at = now_rfc3339();
+            store_oracle(cache, &title, revid, &fresh, fresh_at.clone()).await?;
+            parsoid_html = fresh;
+            oracle_fetched_at = fresh_at;
+            outcome = fresh_outcome;
+        }
+    }
     // Optional side-by-side dump, for reducing a difference: both renderings
     // written verbatim under `$RUSTOID_DUMP_DIR`. One file per side *per page*,
     // so a parallel corpus run can dump every page; the plain `parsoid.html` /
@@ -1994,6 +2029,48 @@ fn parsoid_revision(html: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Store a freshly fetched oracle, so an `--offline` run can serve it.
+async fn store_oracle(
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
+    title: &str,
+    revid: u64,
+    body: &str,
+    fetched_at: Option<String>,
+) -> Result<()> {
+    cache
+        .lock()
+        .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+        .put(
+            EntryKind::Rendered,
+            title,
+            body,
+            EntryMeta {
+                kind: EntryKind::Rendered,
+                title: title.to_string(),
+                revid: Some(revid),
+                fetched_at,
+            },
+        )?;
+    Ok(())
+}
+
+/// Fetch a page's Parsoid HTML at `revid`, store it, and return it with its
+/// fetch stamp.
+///
+/// The store is what makes an `--offline` run reproduce the online one; the stamp
+/// is what [`stale_days`] and [`FactDrift::detect`] read.
+async fn fetch_oracle(
+    client: &WikiClient,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
+    title: &str,
+    revid: u64,
+) -> Result<(String, Option<String>)> {
+    let body = client.parsoid_html_at(title, revid).await?;
+    let fetched_at = now_rfc3339();
+    store_oracle(cache, title, revid, &body, fetched_at.clone()).await?;
+    Ok((body, fetched_at))
+}
+
 /// Reduce both sides to a comparable form.
 fn normalise(html: &str) -> String {
     // Strip a whole-document wrapper if present, so a `rest.php` response
@@ -2303,33 +2380,21 @@ mod tests {
         const DAY: u64 = 86_400;
         let today = now_epoch().expect("a clock") / DAY;
         // Same UTC day, however late: not stale.
+        assert_eq!(stale_days(Some(&format!("epoch:{}", today * DAY))), 0);
         assert_eq!(
-            stale_oracle_days(Some(&format!("epoch:{}", today * DAY))),
-            0
-        );
-        assert_eq!(
-            stale_oracle_days(Some(&format!("epoch:{}", today * DAY + DAY - 1))),
+            stale_days(Some(&format!("epoch:{}", today * DAY + DAY - 1))),
             0
         );
         // One and two days back: stale by that many whole days, even at the last
         // second of the day — the calendar boundary, not elapsed time, is what
         // matters, because that is when a date-dependent value turns over.
-        assert_eq!(
-            stale_oracle_days(Some(&format!("epoch:{}", today * DAY - 1))),
-            1
-        );
-        assert_eq!(
-            stale_oracle_days(Some(&format!("epoch:{}", (today - 2) * DAY))),
-            2
-        );
+        assert_eq!(stale_days(Some(&format!("epoch:{}", today * DAY - 1))), 1);
+        assert_eq!(stale_days(Some(&format!("epoch:{}", (today - 2) * DAY))), 2);
         // A stamp in the future, an unparseable one, and an absent one claim
         // nothing.
-        assert_eq!(
-            stale_oracle_days(Some(&format!("epoch:{}", (today + 3) * DAY))),
-            0
-        );
-        assert_eq!(stale_oracle_days(None), 0);
-        assert_eq!(stale_oracle_days(Some("nonsense")), 0);
+        assert_eq!(stale_days(Some(&format!("epoch:{}", (today + 3) * DAY))), 0);
+        assert_eq!(stale_days(None), 0);
+        assert_eq!(stale_days(Some("nonsense")), 0);
     }
 
     #[test]
