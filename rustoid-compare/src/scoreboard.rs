@@ -352,13 +352,13 @@ impl Scoreboard {
             out.push_str(&format!("  {:20} {}\n", b.name, b.count));
         }
 
-        // Differences that may be wiki drift rather than parser bugs, named so
-        // they are not chased as the latter. Reported separately from the score:
-        // the page still counts as a difference.
+        // Differences that may be cache staleness rather than parser bugs, named
+        // so they are not chased as the latter. Reported separately from the
+        // score: the page still counts as a difference.
         let suspects: Vec<&Row> = self.rows.iter().filter(|r| r.suspect.is_some()).collect();
         if !suspects.is_empty() {
             out.push_str(&format!(
-                "\npossibly stale facts ({} of {} compared — the difference may be wiki drift):\n",
+                "\npossibly stale inputs ({} of {} compared — the difference may be wiki drift):\n",
                 suspects.len(),
                 self.compared()
             ));
@@ -596,24 +596,39 @@ mod tests {
     #[test]
     fn a_suspect_difference_is_named_but_still_counts_as_a_difference() {
         let mut b = board();
-        b.rows[1].suspect = Some(FactDrift {
+        b.rows[1].suspect = Some(FactDrift::Fact {
             kind: crate::cache::EntryKind::PageInfo,
             key: "Electric bicycle".to_string(),
             seconds: 615_000,
         });
         let report = b.render(false);
         assert!(
-            report.contains("possibly stale facts (1 of 3 compared"),
+            report.contains("possibly stale inputs (1 of 3 compared"),
             "{report}"
         );
         assert!(
-            report.contains("facts 7d newer than the oracle"),
+            report.contains("a fact 7d newer than the oracle"),
             "{report}"
         );
         assert!(report.contains("newest: info:Electric bicycle"), "{report}");
         // The score is unchanged: drift is a caveat on a difference, not a pass.
         assert!(report.contains("1/3 compared"), "{report}");
         assert!(report.contains("suspect drift"), "{report}");
+    }
+
+    #[test]
+    fn a_stale_oracle_is_named_in_the_same_report() {
+        let mut b = board();
+        b.rows[0].suspect = Some(FactDrift::Oracle { days: 2 });
+        let report = b.render(false);
+        assert!(
+            report.contains("possibly stale inputs (1 of 3 compared"),
+            "{report}"
+        );
+        assert!(
+            report.contains("the oracle is 2d old (re-run online to refresh it)"),
+            "{report}"
+        );
     }
 
     #[test]

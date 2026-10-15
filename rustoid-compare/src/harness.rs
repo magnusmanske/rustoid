@@ -226,17 +226,30 @@ fn parse_epoch(stamp: &str) -> Option<u64> {
 /// when a fact can have moved on from the revision the oracle rendered.
 const FACT_TOLERANCE_SECS: u64 = 60;
 
-/// A difference that is plausibly wiki drift, not a parser bug.
+/// Why a difference may be an artifact of *when* the cache was taken rather than
+/// a parser bug.
 ///
 /// Reported rather than hidden: the page still counts as a difference, but the
-/// run names the fact that moved and by how much, so the difference is not
-/// chased as a bug when re-pinning the fact would erase it.
+/// run names the cause so the difference is not chased as a bug when a fresh
+/// fetch would erase it.
 #[derive(Debug, Clone)]
-pub struct FactDrift {
-    pub kind: EntryKind,
-    pub key: String,
-    /// How much newer the fact is than the oracle, in seconds.
-    pub seconds: u64,
+pub enum FactDrift {
+    /// A consulted fact was fetched after the oracle, so the two renderings used
+    /// different versions of something the page leans on.
+    Fact {
+        kind: EntryKind,
+        key: String,
+        /// How much newer the fact is than the oracle, in seconds.
+        seconds: u64,
+    },
+    /// The oracle itself predates the run by at least a day.
+    ///
+    /// A `rest_v1/page/html` render is stamped with the time it was *fetched*,
+    /// and the date-dependent magic words it embeds (`{{CURRENTYEAR}}`,
+    /// `Module:Date`'s `os.date('!*t')`) are the wiki's clock at that moment, not
+    /// the revision's. So an oracle cached on an earlier day can disagree with a
+    /// render made today; re-running online refreshes it.
+    Oracle { days: u64 },
 }
 
 impl FactDrift {
@@ -250,24 +263,51 @@ impl FactDrift {
         if seconds <= FACT_TOLERANCE_SECS {
             return None;
         }
-        Some(Self {
+        Some(Self::Fact {
             kind,
             key: key.to_string(),
             seconds,
         })
     }
+
+    /// A stale-oracle report for a cached oracle that lags the run by `days`
+    /// whole UTC days, or `None` when it is from today.
+    fn oracle(days: u64) -> Option<Self> {
+        (days > 0).then_some(Self::Oracle { days })
+    }
 }
 
 impl std::fmt::Display for FactDrift {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "facts {} newer than the oracle (newest: {}:{})",
-            human_age(self.seconds),
-            self.kind.as_str(),
-            self.key
-        )
+        match self {
+            Self::Fact { kind, key, seconds } => write!(
+                f,
+                "a fact {} newer than the oracle (newest: {}:{})",
+                human_age(*seconds),
+                kind.as_str(),
+                key
+            ),
+            Self::Oracle { days } => write!(
+                f,
+                "the oracle is {} old (re-run online to refresh it)",
+                human_age(days * 86_400)
+            ),
+        }
     }
+}
+
+/// Whole UTC days a cached oracle's fetch stamp lags behind now.
+///
+/// `0` for a stamp from today, for an unparseable stamp, and for a stamp in the
+/// future. Only a *calendar*-day difference counts: a page rendered at 23:59 and
+/// compared at 00:01 is a day apart even though only two minutes passed, and
+/// that is exactly the case a date-dependent value turns over in.
+fn stale_oracle_days(fetched_at: Option<&str>) -> u64 {
+    const DAY: u64 = 86_400;
+    let (Some(fetched), Some(now)) = (fetched_at.and_then(parse_epoch), now_epoch()) else {
+        return 0;
+    };
+    (now / DAY).saturating_sub(fetched / DAY)
 }
 
 /// A coarse duration for a drift report: seconds, then minutes, hours, days.
@@ -1402,14 +1442,28 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     };
     // The oracle's own fetch time, for the drift check: a fact newer than this is
     // a different day's answer than the revision the oracle rendered.
-    let (parsoid_html, oracle_fetched_at) = match cached {
-        Some(c) if c.meta.revid == Some(revid) => (c.body, c.meta.fetched_at),
-        // A cache recovered by `reindex` has no recorded revision, but the HTML
-        // states its own — so the body can still be matched against the wikitext
-        // instead of being reported as absent. This is what makes a reindexed
-        // cache usable for an offline run at all.
-        Some(c) if c.meta.revid.is_none() && parsoid_revision(&c.body) == Some(revid) => {
-            (c.body, c.meta.fetched_at)
+    //
+    // A cached oracle is reused only while it is from the *current* UTC day. A
+    // `rest_v1/page/html` render bakes in its fetch time, and a page's
+    // date-dependent magic words (`{{CURRENTYEAR}}`, `Module:Date`'s
+    // `os.date('!*t')`) are the wiki's clock at that moment, not the revision's —
+    // so an oracle from yesterday can disagree with a render made today
+    // (`Order of the British Empire`'s `{{age}}` flips from 94 to 95 at
+    // midnight). That is cache staleness, not a parser bug, so refresh it rather
+    // than reuse it; offline there is nothing to refresh it with, so reuse it and
+    // report the lag through `suspect`.
+    let rev_matches = cached.as_ref().is_some_and(|c| {
+        c.meta.revid == Some(revid)
+            || (c.meta.revid.is_none() && parsoid_revision(&c.body) == Some(revid))
+    });
+    let lag_days = if rev_matches {
+        stale_oracle_days(cached.as_ref().and_then(|c| c.meta.fetched_at.as_deref()))
+    } else {
+        0
+    };
+    let (parsoid_html, oracle_fetched_at, oracle_lag_days) = match cached {
+        Some(c) if rev_matches && (req.offline || (lag_days == 0 && !req.refresh)) => {
+            (c.body, c.meta.fetched_at, lag_days)
         }
         _ if req.offline => {
             return Ok(Comparison::skipped(
@@ -1436,7 +1490,7 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
                         fetched_at: fetched_at.clone(),
                     },
                 )?;
-            (body, fetched_at)
+            (body, fetched_at, 0)
         }
     };
 
@@ -1482,7 +1536,8 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     // facts' age. Naming the drifted fact here keeps a wiki-drift difference from
     // being chased as a parser bug.
     let suspect = match &outcome {
-        Outcome::Differ { .. } => FactDrift::detect(oracle_fetched_at.as_deref(), &fact_ages),
+        Outcome::Differ { .. } => FactDrift::detect(oracle_fetched_at.as_deref(), &fact_ages)
+            .or_else(|| FactDrift::oracle(oracle_lag_days)),
         _ => None,
     };
 
@@ -2059,11 +2114,18 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 
 fn now_rfc3339() -> Option<String> {
     // Avoid a chrono dependency here; the harness only needs a rough stamp.
-    let secs = std::time::SystemTime::now()
+    now_epoch().map(|secs| format!("epoch:{secs}"))
+}
+
+/// The current time as Unix seconds, or `None` if the clock is before the epoch.
+///
+/// The one clock the harness reads, so the cache stamps and the staleness checks
+/// share an instant.
+fn now_epoch() -> Option<u64> {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(format!("epoch:{secs}"))
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// The cache key under which a wiki's `siteinfo` is stored. One entry per wiki,
@@ -2224,12 +2286,58 @@ mod tests {
         let mut facts = FactAges::default();
         facts.observe(&fact(EntryKind::PageInfo, "Electric bicycle", 1_000_000));
         let drift = FactDrift::detect(Some("epoch:999000"), &facts).expect("1000s past the oracle");
-        assert_eq!(drift.kind, EntryKind::PageInfo);
-        assert_eq!(drift.key, "Electric bicycle");
-        assert_eq!(drift.seconds, 1000);
+        let FactDrift::Fact { kind, key, seconds } = drift else {
+            panic!("expected a fact drift, got {drift:?}");
+        };
+        assert_eq!(kind, EntryKind::PageInfo);
+        assert_eq!(key, "Electric bicycle");
+        assert_eq!(seconds, 1000);
         assert_eq!(
-            drift.to_string(),
-            "facts 16m newer than the oracle (newest: info:Electric bicycle)"
+            FactDrift::Fact { kind, key, seconds }.to_string(),
+            "a fact 16m newer than the oracle (newest: info:Electric bicycle)"
+        );
+    }
+
+    #[test]
+    fn an_oracle_from_an_earlier_day_is_stale_but_one_from_earlier_today_is_not() {
+        const DAY: u64 = 86_400;
+        let today = now_epoch().expect("a clock") / DAY;
+        // Same UTC day, however late: not stale.
+        assert_eq!(
+            stale_oracle_days(Some(&format!("epoch:{}", today * DAY))),
+            0
+        );
+        assert_eq!(
+            stale_oracle_days(Some(&format!("epoch:{}", today * DAY + DAY - 1))),
+            0
+        );
+        // One and two days back: stale by that many whole days, even at the last
+        // second of the day — the calendar boundary, not elapsed time, is what
+        // matters, because that is when a date-dependent value turns over.
+        assert_eq!(
+            stale_oracle_days(Some(&format!("epoch:{}", today * DAY - 1))),
+            1
+        );
+        assert_eq!(
+            stale_oracle_days(Some(&format!("epoch:{}", (today - 2) * DAY))),
+            2
+        );
+        // A stamp in the future, an unparseable one, and an absent one claim
+        // nothing.
+        assert_eq!(
+            stale_oracle_days(Some(&format!("epoch:{}", (today + 3) * DAY))),
+            0
+        );
+        assert_eq!(stale_oracle_days(None), 0);
+        assert_eq!(stale_oracle_days(Some("nonsense")), 0);
+    }
+
+    #[test]
+    fn a_fresh_oracle_is_not_reported_as_stale() {
+        assert!(FactDrift::oracle(0).is_none());
+        assert_eq!(
+            FactDrift::oracle(3).expect("three days").to_string(),
+            "the oracle is 3d old (re-run online to refresh it)"
         );
     }
 
