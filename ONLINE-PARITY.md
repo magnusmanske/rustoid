@@ -16668,3 +16668,24 @@ The decode runs *before* the insecure-pattern check, so a `\75 rl(` that spells
 ### Effect
 
 `World War II` 25363 → 26339; no regressions (48 pages, better=1 worse=0).
+
+## `mw.title.new` capitalizes the first letter
+
+`Title::newFromText` upper-cases the first letter when the namespace is
+first-letter capitalized (`$wgCapitalLinks`, true for every content namespace on
+enwiki), and `mw.title.new` reports the title *as stored*. rustoid's Lua
+`mw.title.new` kept the text as written, so
+`Template:Sidebar with collapsible lists`'s `|name = sidebar periodic table` gave
+`title.fullText` as `Template:sidebar periodic table`. The *view* link still
+looked right — the wikilink target normalizes the first letter again — but
+`Special:EditPage/…` is not a capitalized namespace, so the navbar's edit link
+kept the lower-case spelling.
+
+`LuaSite` now carries the capitalized-namespace set (from the siteinfo `case`
+field) and `namespace_is_capitalized` mirrors `NamespaceInfo::isCapitalized`
+(NS_MEDIA → NS_FILE, a talk namespace → its subject, Special/User/MediaWiki
+always capitalized).
+
+### Effect
+
+`Periodic table` 36305 → 43871; no regressions (48 pages, better=1 worse=0).
