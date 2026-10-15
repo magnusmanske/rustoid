@@ -16976,3 +16976,50 @@ Two details worth keeping:
 better=5 worse=0). The corpus is offline, so the track lists have to be in the
 cache: the audio/video `file:` entries were dropped and backfilled once with
 `RUSTOID_FILL_FILES=1`.
+
+## The `<indicator>` `about` id belongs to the chunk pass, not the token's arrival
+
+Parsoid's TT2 runs its token handlers **over the whole chunk, one handler at a
+time**: `OnlyInclude`, then `TemplateHandler`, then `ExtensionHandler`
+(`ParserPipelineFactory::STAGES['TokenTransform2']`). So a chunk's templates are
+all expanded before any of its extensions is numbered, and the extensions are
+then numbered in source order. `ExtensionHandler::onDocumentFragment` calls
+`$env->newAboutId()` for every tag except `nowiki`, so each extension token
+spends exactly one id — a `<templatestyles>` and an `<indicator>` in one chunk
+take consecutive ids in that order:
+
+```
+<templatestyles src="Plainlist/styles.css"/><indicator name="x">abc</indicator>
+  service: style #mwt1, indicator #mwt2        rustoid (before): indicator #mwt1, style #mwt2
+<indicator name="x">abc</indicator>{{Center|b}}
+  service: Center #mwt1, indicator #mwt2        rustoid (before): indicator #mwt1, Center #mwt2
+```
+
+rustoid already numbered `<templatestyles>` in a per-chunk post-pass
+(`number_style_placeholders`) for exactly this reason, but `expand_one_indicator`
+spent its id *inline*, where the walk reached the token. The two orders agree
+only when nothing precedes the indicator in the chunk. When the indicator is
+spliced in from a **template argument** or a module's output it is reached while
+that argument is expanded — before the callee's own stylesheets, which precede it
+in the output. `Berlin`'s infobox `coordinates` argument took `#mwt7` where the
+service numbers the infobox's first stylesheet `#mwt7` and the indicator
+`#mwt16`; the whole rest of the page was shifted by the one spent id.
+
+### The fix
+
+`expand_one_indicator` no longer takes an id: it stashes the `<meta>` fragment
+and emits the placeholder, exactly as the `<templatestyles>` resolver does. A
+new `number_indicator_placeholder` runs in the same per-chunk pass as
+`number_style_placeholder`, in `out` order, and stamps the id onto the
+placeholder (the tree builder carries the placeholder's attributes onto the
+element it inserts, so it lands on the `<meta>` between `typeof` and `data-mw`).
+A chunk whose extensions are deferred (`style_defer`, `arg_expansion`) skips that
+pass, so the placeholder travels unnumbered and is numbered in the chunk it
+lands in — which is where Parsoid numbers it too.
+
+### Effect
+
+`Berlin` 9538 → 27691 (its real blocker is now the missing Kartographer
+`mapframe`), `Chernobyl disaster` 4109 → 6837. Fixtures stay at 877/896, all lib
+tests pass, and the 48-page offline corpus is strictly better with no
+regressions (better=2, worse=0).
