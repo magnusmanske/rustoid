@@ -16886,3 +16886,24 @@ already handles `wikilink` and `extension` there.
 the thesis as an external link, matching the wiki; `Albert Einstein`
 29228 → 33578. Fixtures stay at 877/896; no regressions (48 pages,
 better=1 worse=0).
+
+## `title.protectionLevels` requests an unfetched title
+
+`protectionLevels` answered empty arrays for a title whose facts had never been
+fetched, and an empty array is indistinguishable from "unprotected".
+`Module:Lua banner` reads `mw.title.new(module).protectionLevels["edit"][1]` on a
+module that *is* protected (`Module:Infobox` and `Module:Weather box` are
+`templateeditor`, as their templates are), found it less protected than the
+template, and added `Category:Templates using under-protected Lua modules` where
+the wiki adds none.
+
+Requesting the title — as `categories`, `exists` and `file` already do — lets
+next round's `title_facts_of` answer the real levels, so the comparison
+`moduleProt < currentProt` is made on facts rather than on unknowns.
+
+### Effect
+
+`Template:Infobox` 11509 → 12605, `Template:Weather box` 25963 → 29451.
+Fixtures stay at 877/896; no regressions (48 pages, better=2 worse=0). The
+corpus is offline, so the two titles' protection has to be in the cache: this
+was populated by an online render, and the harness caches it as it fetches.
