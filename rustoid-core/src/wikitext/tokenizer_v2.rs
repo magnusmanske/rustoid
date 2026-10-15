@@ -5076,6 +5076,23 @@ fn skip_recognized_html_tag(lower: &str, input: &str, at: usize) -> Option<usize
     {
         return None;
     }
+    // The name must be followed by whitespace, `/>` or `>`; anything else means
+    // this is not a tag at all. PHP's `$elementsRegex` carries exactly that
+    // lookahead (`(?=\s|\/>|>)`), so `<br|plain=true` is literal text whose `|`
+    // separates the argument list. Without it the scan ran on to the *next* `>`
+    // anywhere in the input and swallowed the intervening `}}` and every `|`:
+    // `Template:In string` is called as `…|target=<br|plain=true|nomatch=}}`,
+    // and `Template:Marriage`'s following `<div …>` supplied that `>` — so the
+    // enclosing `#if` recorded one parameter and emitted its else branch, with
+    // the source's own `|` separator, alongside the taken one.
+    let boundary = match bytes.get(j) {
+        Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'\x0c') | Some(b'>') => true,
+        Some(b'/') => bytes.get(j + 1) == Some(&b'>'),
+        _ => false,
+    };
+    if !boundary {
+        return None;
+    }
 
     // Skip to the tag's `>`, honoring quoted attribute values. A `{{…}}` is an
     // atom: a `"` inside one neither opens nor closes a quoted value, which is
@@ -6546,6 +6563,26 @@ mod tests {
         // Six braces are two arguments, and the split after them still holds.
         let parts = split_template_args("{{{|a|}}}#ifexpr: 1 | YES | NO ");
         assert_eq!(parts, vec!["{{{|a|}}}#ifexpr: 1 ", " YES ", " NO "]);
+    }
+
+    /// A tag name must be followed by whitespace, `/>` or `>`; `<br|plain=true`
+    /// is literal text, so its `|` still separates the argument list. Without
+    /// the boundary the scan ran on to the *next* `>` anywhere in the input and
+    /// swallowed everything between it and here, including the `}}` of the call
+    /// that held it.
+    #[test]
+    fn a_tag_name_without_a_boundary_is_literal() {
+        let parts = split_template_args("1x|target=<br|plain=true|nomatch=|x");
+        assert_eq!(
+            parts,
+            vec!["1x", "target=<br", "plain=true", "nomatch=", "x"]
+        );
+
+        // A well-formed tag is still an atom, so a `|` inside it stays put.
+        let parts = split_template_args("1x|<span class=\"a|b\">x</span>|y");
+        assert_eq!(parts, vec!["1x", "<span class=\"a|b\">x</span>", "y"]);
+        let parts = split_template_args("1x|<br/>|y");
+        assert_eq!(parts, vec!["1x", "<br/>", "y"]);
     }
 
     fn tokenize(input: &str) -> Vec<Either<String, ParsoidToken>> {
