@@ -17071,3 +17071,76 @@ off the DOM.
 `Cristiano Ronaldo` 17095 → 20369, `Grand Theft Auto V` +1225, `Doom (1993 video
 game)` +853, `France` +486, `Israel` +370. Fixtures stay at 877/896 and every lib
 test passes; the 48-page offline corpus is better=5, worse=0.
+
+## List-defined references: the `<references>` body has to be rendered
+
+A `<references>` tag's body holds its **list-defined** refs
+(`{{reflist|refs=<ref name="A">{{cite web|…}}</ref>}}`), which Parsoid parses into
+the element's children (`ReferenceListTagHandler::sourceToDom` → `extTagToDOM`)
+and `References::processRefs` then walks at the element's position. rustoid built
+the `<ref>`/`<references>` DOM in the Cite pass and left the element *childless*,
+so every definition was invisible: a note used before its definition rendered as
+back-links with no text at all.
+
+```
+x<ref name="A"/>y<references><ref name="A">TEXT</ref></references>
+  service: <li …><span class="mw-cite-backlink">…</span> <span id="mw-reference-text-cite_note-A-1" …>TEXT</span></li>
+  rustoid: <li …><span class="mw-cite-backlink">…</span> </li>
+```
+
+The definition's body is where the note's *content* lives — including the
+`<templatestyles>` a `{{cite}}` emits, whose `about` id was never spent. On
+`Python (programming language)` that left 64 of 206 notes empty and every id
+after the reference list shifted.
+
+### The fix
+
+`Parser::number_extension_token` renders a `<references>` body the same way it
+renders a `<ref>` body (a fresh pipeline through `process_fragment_body`, so the
+definitions' own bodies are expanded and stashed), keyed by the body wikitext in
+`Parser::references_bodies`. `cite::collect` reads it at the element's position —
+the same place Parsoid's `processRefs` reaches the children — and walks the
+definitions as **embedded** refs: `ReferencesData::inReferenceList` puts them in
+`embeddedNodes`, so they fill their notes' bodies and spend a `globalId` when
+their name is new, but produce no `cite_ref-…` use and no back-link
+(`CiteState::add_embedded`). A ref nested inside such a body is *not* embedded —
+`processNestedRefInRef` raises the nested depth, which drops
+`referenceListGroup()` — so it keeps its marker.
+
+### What is still missing
+
+The `<references>` element's own `data-mw.body` is `{"extsrc":""}` here. Parsoid
+writes the *body*: `{"html":"…"}` when the body is literal markup, and
+`{"extsrc":"{{#parsoid\u0000fragment:290}}"}` when it came through a template
+argument (`{{reflist|refs=…}}`). The latter embeds Parsoid's own per-render
+fragment counter, and the former is an attribute-order-sensitive inner-HTML
+serialisation, so neither is reproduced yet. The §`data-mw` bucket carries the
+difference; the notes themselves now match.
+
+### The `wikidata-…` note names: a stale entity, not a hash bug
+
+`Module:Wd` names a Wikidata-driven citation's `<ref>` from the chosen
+statement's **reference hash**:
+
+```lua
+ref.refHash = "wikidata-" .. statement.hash .. "-v" .. (tonumber(i18n['version']) + version)
+```
+
+so a differing `wikidata-9fa6c204…`/`wikidata-90bb707a…` pair looked like a hash
+computed wrongly. It was the *entity*: the cached `www.wikidata.org` copy of
+`Q28865` was from 2026-09-19 and knew only `3.15.0rc1` as preferred, while the
+oracle (rendered later) had the `3.15.0` release — so rustoid picked the previous
+stable version, whose reference hashes differ. Refreshing that one cached entity
+(`Special:EntityData/Q28865.json`) made both the version *and* the note names
+match, leaving only the id gap below. **The cache never invalidates an
+`entity:` entry** — it carries no `fetched_at` and `WikiCache::get` serves it
+forever — so any page reading `mw.wikibase` drifts against its oracle.
+
+### Effect
+
+The notes render: `Python (programming language)` 25609 → 25628 (the first
+difference moves past the citation), and every page's total moves 62 651 794 →
+64 093 113 rustoid bytes against parsoid's 64 411 707 (0.97× → 1.00×). 60 of
+Python's 64 empty notes are filled; 4 remain, whose `<templatestyles>` reaches
+the note through a `frame:expandTemplate` answer. Fixtures stay at 877/896 and
+every lib test passes; the 48-page offline corpus is better=1, worse=0.
