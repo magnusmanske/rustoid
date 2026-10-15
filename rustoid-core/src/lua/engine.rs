@@ -2677,8 +2677,11 @@ fn named_or_numeric(ch: char) -> String {
     }
 }
 
-fn luafn_text_decode(_: &Lua, s: Value) -> mlua::Result<String> {
-    Ok(html_unescape(&coerce_string(&s, "decode")?))
+fn luafn_text_decode(_: &Lua, (s, named): (Value, Option<Value>)) -> mlua::Result<String> {
+    let s = coerce_string(&s, "decode")?;
+    // Lua truthiness: absent, nil and `false` all mean "basic entities only".
+    let named = !matches!(named, None | Some(Value::Nil) | Some(Value::Boolean(false)));
+    Ok(decode_text(&s, named))
 }
 
 fn luafn_text_trim(_: &Lua, s: Value) -> mlua::Result<String> {
@@ -6430,12 +6433,100 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn html_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&")
+/// `mw.text.decode( s, decodeNamedEntities )` — decode HTML entities.
+///
+/// Mirrors Scribunto's `mw.text.lua`: with the flag every *named* entity in
+/// HTML's table decodes; without it, and always, the basic set
+/// (`&lt; &gt; &amp; &quot; &#039; &nbsp;`) and numeric references do.
+///
+/// The flag is load-bearing: `Module:Detect singular` tests `mw.ustring.find(s,
+/// '&', 1, true)` for its "and" case, and a `&nbsp;` left undecoded reads as
+/// one — so every `{{marriage}}` value looked plural.
+fn decode_text(s: &str, named: bool) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            match s[i..].chars().next() {
+                Some(c) => {
+                    out.push(c);
+                    i += c.len_utf8();
+                }
+                None => break,
+            }
+            continue;
+        }
+        match parse_entity_ref(&s[i..]) {
+            Some((len, flg, name)) => match decode_entity_ref(&flg, &name, named) {
+                Some(decoded) => {
+                    out.push_str(&decoded);
+                    i += len;
+                }
+                None => {
+                    out.push('&');
+                    i += 1;
+                }
+            },
+            None => {
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Match Scribunto's `(&(#?x?)([a-zA-Z0-9]+);)` at the start of `rest` (which
+/// begins with `&`). Returns the match length, the `#`/`#x` flag and the name.
+fn parse_entity_ref(rest: &str) -> Option<(usize, String, String)> {
+    let after = &rest[1..];
+    let mut k = 0;
+    if after.starts_with('#') {
+        k += 1;
+    }
+    if after[k..].starts_with('x') {
+        k += 1;
+    }
+    let name: String = after[k..]
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    if name.is_empty() || !after[k + name.len()..].starts_with(';') {
+        return None;
+    }
+    Some((1 + k + name.len() + 1, after[..k].to_string(), name))
+}
+
+/// One entity's decoded value, or `None` to leave the reference as written.
+fn decode_entity_ref(flg: &str, name: &str, named: bool) -> Option<String> {
+    // A named entity, only with the flag (numeric refs carry a flag).
+    if named && flg.is_empty() {
+        let key = format!("{name};");
+        if let Some(decoded) = crate::html5::html_data::named_entity_translation(&key) {
+            return Some(decoded.to_string());
+        }
+    }
+    let codepoint = match flg {
+        "#" => name.parse::<u32>().ok(),
+        "#x" => u32::from_str_radix(name, 16).ok(),
+        _ => None,
+    };
+    if let Some(n) = codepoint
+        && let Some(c) = char::from_u32(n)
+    {
+        return Some(c.to_string());
+    }
+    // The basic set, whose keys include the flag and terminator.
+    match format!("&{flg}{name};").as_str() {
+        "&lt;" => Some("<".to_string()),
+        "&gt;" => Some(">".to_string()),
+        "&amp;" => Some("&".to_string()),
+        "&quot;" => Some("\"".to_string()),
+        "&#039;" => Some("'".to_string()),
+        "&nbsp;" => Some("\u{a0}".to_string()),
+        _ => None,
+    }
 }
 
 /// Build `mw.site.namespaces`, indexed by id and by canonical name.
@@ -6843,6 +6934,46 @@ mod tests {
         assert_eq!(
             engine.eval("return mw.text.encode('<>&\"')").unwrap(),
             "&lt;&gt;&amp;&quot;"
+        );
+    }
+
+    /// `mw.text.encode`'s counterpart. Without the flag only the basic entities
+    /// and numeric references decode; with it, every named entity does. The flag
+    /// matters: `Module:Detect singular` reads a leftover `&` as the word "and",
+    /// so an undecoded `&nbsp;` made every `{{marriage}}` value look plural.
+    #[test]
+    fn test_mw_text_decode() {
+        let engine = make_engine();
+        assert_eq!(
+            engine
+                .eval("return mw.text.decode('a&lt;b&amp;c&#039;d')")
+                .unwrap(),
+            "a<b&c'd"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.decode('&#x41;&#66;')").unwrap(),
+            "AB"
+        );
+        // `&nbsp;` is in the basic set, so it decodes either way.
+        assert_eq!(
+            engine.eval("return mw.text.decode('a&nbsp;b')").unwrap(),
+            "a\u{a0}b"
+        );
+        // A named entity outside the basic set needs the flag.
+        assert_eq!(
+            engine.eval("return mw.text.decode('&eacute;')").unwrap(),
+            "&eacute;"
+        );
+        assert_eq!(
+            engine
+                .eval("return mw.text.decode('&eacute;', true)")
+                .unwrap(),
+            "\u{e9}"
+        );
+        // An unknown reference is left as written.
+        assert_eq!(
+            engine.eval("return mw.text.decode('a&nope;b')").unwrap(),
+            "a&nope;b"
         );
     }
 
