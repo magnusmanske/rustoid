@@ -689,6 +689,12 @@ impl ParserFunctions {
     }
 
     /// `#iferror` — mirrors `pf_iferror`.
+    ///
+    /// Core's `#iferror` has a third shape: with no `else` argument it answers
+    /// the *test* itself (already expanded and trimmed), not the empty string.
+    /// That is what makes `{{#ifexpr:{{#iferror:{{YEAR|1919}}|{{#time:Y}}}} >= …}}`
+    /// compare against the year rather than against nothing, which is the branch
+    /// `Template:Marriage` depends on.
     pub fn pf_iferror(params: &Params) -> Vec<Item> {
         let args = &params.args;
         let target = args
@@ -699,8 +705,11 @@ impl ParserFunctions {
             target.contains("class=\"error\"") || target.contains("<strong class=\"error\">");
         if has_error {
             Self::trimmed_branch(args.get(1))
-        } else {
+        } else if args.len() > 2 {
             Self::trimmed_branch(args.get(2))
+        } else {
+            // No `else`: `$result = $test`, then `trim($frame->expand($result))`.
+            vec![Item::Str(target.trim().to_string())]
         }
     }
 
