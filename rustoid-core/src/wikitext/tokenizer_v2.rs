@@ -5989,6 +5989,23 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
             i += 2;
             continue;
         }
+        // An HTML comment is an atom: a `|` (or `=`/newline) inside it is
+        // literal and must not split the option/argument list. The preprocessor
+        // parses `<!-- … -->` as a single `comment` node, so a pipe inside one
+        // never ends an argument; an *unclosed* comment runs to the end of the
+        // input (PHP `Preprocessor_Hash`, "Unclosed comment in input, runs to
+        // end"). Without this, `Template:Infobox` arguments whose value carries a
+        // commented-out `| name = …` were torn apart, so the recorded parameter
+        // list and every `name=value` split after it were wrong.
+        if inner[i..].starts_with("<!--") {
+            let end = match inner[i + 4..].find("-->") {
+                Some(rel) => i + 4 + rel + 3,
+                None => inner.len(),
+            };
+            current.push_str(&inner[i..end]);
+            i = end;
+            continue;
+        }
         // A recognized HTML tag is an atom: a `|` inside a quoted attribute
         // value (`<span class="a|b">`) must not split the list, since PHP's
         // `inline_element`/`html_tag` consume the whole tag (attributes and all).
@@ -7563,6 +7580,21 @@ mod tests {
         // A `</nowiki >` with trailing space still terminates the close tag.
         let parts = split_template_args("a|<nowiki>x</nowiki >|b");
         assert_eq!(parts, vec!["a", "<nowiki>x</nowiki >", "b"]);
+    }
+
+    #[test]
+    fn a_comment_is_opaque_to_argument_splitting() {
+        // A `|` inside an HTML comment is literal: the preprocessor parses
+        // `<!-- … -->` as one node, so it never ends an argument. `Template:Infobox`
+        // arguments carry commented-out `| name = …` lines, and splitting there
+        // tore the parameter list apart (mis-attributing `Python` and
+        // `United States`).
+        let parts = split_template_args("#if:1|a<!-- | x = y -->b|C");
+        assert_eq!(parts, vec!["#if:1", "a<!-- | x = y -->b", "C"]);
+        // An unclosed comment runs to the end of the input, so a later `|` is
+        // still inside it.
+        let parts = split_template_args("a<!-- | b|c");
+        assert_eq!(parts, vec!["a<!-- | b|c"]);
     }
 
     #[test]
