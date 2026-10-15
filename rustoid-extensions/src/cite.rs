@@ -211,6 +211,10 @@ pub struct CiteState {
     next_number: HashMap<String, usize>,
     /// The next global id (`globalId`), one sequence shared by every group.
     next_global: usize,
+    /// Indices into `references` for each group's **current instance**, in
+    /// first-use order. A `<references>` element consumes the instance it finds
+    /// ([`CiteState::cut_group`]), so refs seen after it form a fresh one.
+    group_members: HashMap<String, Vec<usize>>,
 }
 
 impl CiteState {
@@ -332,6 +336,10 @@ impl CiteState {
                     body_about: None,
                 });
                 let i = self.references.len() - 1;
+                self.group_members
+                    .entry(group.to_string())
+                    .or_default()
+                    .push(i);
                 if !name.is_empty() {
                     self.index.insert((group.to_string(), name.to_string()), i);
                 }
@@ -381,7 +389,30 @@ impl CiteState {
         id
     }
 
+    /// Take the notes of `group` collected so far, and start a fresh instance of
+    /// the group.
+    ///
+    /// A `<references>` element renders the notes that exist when it is reached
+    /// and then drops the group (`References::insertReferencesIntoDOM` ends in
+    /// `ReferencesData::removeRefGroup`), so a later `<ref>` of the same group
+    /// becomes a *new* note with a new number and `globalId`, and a second
+    /// `<references>` for that group does not repeat the first one's notes. The
+    /// returned indices are into [`CiteState::references`], in first-use order.
+    pub fn cut_group(&mut self, group: &str) -> Vec<usize> {
+        let members = self.group_members.remove(group).unwrap_or_default();
+        // Drop the named-ref index and the number counter with it, so a reused
+        // name defines a new note and the next ref of this group is numbered from
+        // 1 again — both as a freshly created `RefGroup` would.
+        self.index.retain(|(g, _), _| g != group);
+        self.next_number.remove(group);
+        members
+    }
+
     /// The refs in one group, in first-use order.
+    ///
+    /// This is the *whole* group across every instance of it; a `<references>`
+    /// element normally renders only its own [`CiteState::cut_group`] slice, and
+    /// this is the fallback when the two walks disagree.
     pub fn group(&self, group: &str) -> Vec<&Reference> {
         self.references
             .iter()
@@ -609,7 +640,18 @@ pub fn run(
 ) -> usize {
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
-    collect(root, &mut state, &mut use_ids, nested_body, references_body);
+    // One entry per `<references>` element, in document order: the notes that
+    // element renders. `collect` fills it, `render` consumes it (see
+    // [`CiteState::cut_group`]).
+    let mut cuts = Vec::new();
+    collect(
+        root,
+        &mut state,
+        &mut use_ids,
+        &mut cuts,
+        nested_body,
+        references_body,
+    );
     // Deliberately **not** skipped when `state` is empty: a `<references>` tag with
     // no refs still renders its wrapper and an empty `<ol>`, which is what Parsoid
     // emits (verified against the cached output — the list structure is always
@@ -638,18 +680,17 @@ pub fn run(
         nested_body,
         &converted,
         &mut use_ids,
+        &cuts,
     )
 }
 
-/// Walk once, recording every `<ref>` in document order.
-///
-/// `<references>` is deliberately not collected here: it renders in place, from
-/// state only this walk can build, so it is handled during substitution. Its
-/// *body* is walked, though — that is where its list-defined refs live.
+/// Walk once, recording every `<ref>` in document order, and the notes each
+/// `<references>` element claims.
 fn collect(
     node: &rustoid_ast::dom::node::Node,
     state: &mut CiteState,
     use_ids: &mut Vec<String>,
+    cuts: &mut Vec<Vec<usize>>,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
     references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
 ) {
@@ -657,37 +698,71 @@ fn collect(
         node,
         state,
         use_ids,
+        cuts,
         nested_body,
         references_body,
-        /* embedded */ false,
+        Ctx::default(),
     );
 }
 
-/// [`collect`], carrying whether the node sits inside a `<references>` body.
-///
-/// An **embedded** ref — a list-defined definition — is added to its group but
-/// records no marker (Parsoid's `ReferencesData::inReferenceList` puts it in
-/// `embeddedNodes`), so it must not consume a `use_ids` slot; `walk_render`
-/// consumes those in DOM order and never sees one.
+/// The Cite context a node is collected in.
+#[derive(Clone, Copy, Default)]
+struct Ctx<'a> {
+    /// The node sits inside a `<references>` body, so its refs are list-defined:
+    /// they fill notes and spend `globalId`s but record no marker
+    /// (`ReferencesData::inReferenceList`).
+    embedded: bool,
+    /// The enclosing `<references>` element's group. A ref inside one takes that
+    /// group whatever its own `group` attribute says
+    /// (`Validator::validateRefInReferenceList`), and the list it feeds is the one
+    /// that element renders. `None` outside such an element, and inside a nested
+    /// `<ref>`, where the list context is dropped
+    /// (`ReferencesData::referenceListGroup`).
+    refs_group: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_in(
     node: &rustoid_ast::dom::node::Node,
     state: &mut CiteState,
     use_ids: &mut Vec<String>,
+    cuts: &mut Vec<Vec<usize>>,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
     references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
-    embedded: bool,
+    ctx: Ctx,
 ) {
-    // A `<references>` element's body holds its **list-defined** refs
-    // (`{{reflist|refs=<ref name="A">…</ref>}}`), which Parsoid parses into the
-    // element's children (`ReferenceListTagHandler::sourceToDom`) and `processRefs`
-    // then walks at the element's position. rustoid's element is childless, so the
-    // body is read from the stash.
-    if let Some(body) = read_references_body(node)
-        && let Some(body_node) = references_body(&body)
-    {
-        for child in &body_node.children {
-            collect_in(child, state, use_ids, nested_body, references_body, true);
+    // A `<references>` element renders the notes of its group that exist when it
+    // is reached, then starts a fresh instance of that group
+    // (`References::insertReferencesIntoDOM` renders the current `RefGroup` and
+    // ends in `ReferencesData::removeRefGroup`), which is what keeps a repeated
+    // list from repeating the notes. A *nested* list does neither. Its body holds
+    // its **list-defined** refs (`{{reflist|refs=<ref name="A">…</ref>}}`), which
+    // Parsoid parses into the element's children
+    // (`ReferenceListTagHandler::sourceToDom`) and `processRefs` then walks at the
+    // element's position; rustoid's element is childless, so the body is read from
+    // the stash. Those refs join the list they sit in, before it is cut.
+    if let Some(group) = references_group(node) {
+        if let Some(body) = read_references_body(node)
+            && let Some(body_node) = references_body(&body)
+        {
+            let inner = Ctx {
+                embedded: true,
+                refs_group: Some(&group),
+            };
+            for child in &body_node.children {
+                collect_in(
+                    child,
+                    state,
+                    use_ids,
+                    cuts,
+                    nested_body,
+                    references_body,
+                    inner,
+                );
+            }
+        }
+        if ctx.refs_group.is_none() {
+            cuts.push(state.cut_group(&group));
         }
     }
     if let Some((name, group, body, self_closing, attrs)) = read_ref(node) {
@@ -698,17 +773,31 @@ fn collect_in(
         // the note's pipeline ran `inTemplate` (`{{#tag:ref|…}}`); see
         // [`Parser::nested_ref_bodies`]. `processNestedRefInRef` also raises the
         // nested depth, which drops `referenceListGroup()` — so a nested ref is
-        // never embedded, whatever encloses it.
-        if !self_closing && let Some(body_node) = nested_body(&body) {
+        // never embedded, and never takes the enclosing list's group, whatever
+        // encloses it.
+        if !self_closing
+            && let Some(body_node) = nested_body(&body)
+            && has_ref(&body_node)
+        {
+            let inner = Ctx::default();
             for child in &body_node.children {
-                collect_in(child, state, use_ids, nested_body, references_body, false);
+                collect_in(
+                    child,
+                    state,
+                    use_ids,
+                    cuts,
+                    nested_body,
+                    references_body,
+                    inner,
+                );
             }
         }
         let about = node.get_attr("about");
-        if embedded {
-            state.add_embedded(&name, &group, attrs, &body, self_closing, about);
+        let group = ctx.refs_group.unwrap_or(&group);
+        if ctx.embedded {
+            state.add_embedded(&name, group, attrs, &body, self_closing, about);
         } else {
-            use_ids.push(state.add_with_attrs(&name, &group, attrs, &body, self_closing, about));
+            use_ids.push(state.add_with_attrs(&name, group, attrs, &body, self_closing, about));
         }
     }
     for child in &node.children {
@@ -716,9 +805,10 @@ fn collect_in(
             child,
             state,
             use_ids,
+            cuts,
             nested_body,
             references_body,
-            embedded,
+            ctx,
         );
     }
 }
@@ -859,9 +949,11 @@ fn render(
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
     converted: &std::cell::RefCell<std::collections::HashMap<String, rustoid_ast::dom::node::Node>>,
     use_ids: &mut [String],
+    cuts: &[Vec<usize>],
 ) -> usize {
     let mut rendered = 0usize;
     let mut next_use = 0usize;
+    let mut cut_cursor = 0usize;
     walk_render(
         root,
         state,
@@ -873,11 +965,18 @@ fn render(
         use_ids,
         &mut next_use,
         &mut rendered,
+        cuts,
+        &mut cut_cursor,
+        /* templated */ false,
     );
     rendered
 }
 
 /// Transform one node's children, then the node itself.
+///
+/// Returns whether the node must be dropped from its parent: a reference list
+/// that comes out empty *and* from a template is removed rather than left behind
+/// as an empty `<ol>` (Cite's T364830).
 #[allow(clippy::too_many_arguments)]
 fn walk_render(
     node: &mut rustoid_ast::dom::node::Node,
@@ -890,9 +989,30 @@ fn walk_render(
     use_ids: &mut [String],
     next_use: &mut usize,
     rendered: &mut usize,
-) {
-    for child in &mut node.children {
-        walk_render(
+    cuts: &[Vec<usize>],
+    cut_cursor: &mut usize,
+    templated: bool,
+) -> bool {
+    // `templated` is "this node is templated content", which its own wrapper group
+    // can make true as well as an ancestor; track the group as the children come,
+    // since only the first element of a same-`about` run carries the `typeof`.
+    let mut group_about: Option<String> = None;
+    let mut group_is_tpl = false;
+    node.children.retain_mut(|child| {
+        match child.get_attr("about") {
+            Some(about) => {
+                if group_about.as_deref() != Some(about) {
+                    group_about = Some(about.to_string());
+                    group_is_tpl = typeof_contains(child, "mw:Transclusion");
+                }
+            }
+            None => {
+                group_about = None;
+                group_is_tpl = false;
+            }
+        }
+        let in_tpl = templated || (group_about.is_some() && group_is_tpl);
+        !walk_render(
             child,
             state,
             page_title,
@@ -903,11 +1023,30 @@ fn walk_render(
             use_ids,
             next_use,
             rendered,
-        );
-    }
+            cuts,
+            cut_cursor,
+            in_tpl,
+        )
+    });
 
     if let Some((group, attrs_json, has_body, responsive)) = read_references(node) {
-        let refs = state.group(&group);
+        // The notes this element renders: those of `group` that were collected up
+        // to here, not the whole group — a second `<references>` for the same group
+        // renders only what came after the first (see [`collect`]). Falls back to
+        // the whole group if the two walks ever disagree, so a desync empties no
+        // list outright.
+        let members = cuts.get(*cut_cursor);
+        *cut_cursor += 1;
+        let refs: Vec<&Reference> = match members {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|&i| state.references.get(i))
+                .collect(),
+            None => state.group(&group),
+        };
+        if refs.is_empty() && templated {
+            return true;
+        }
         // The list renderer works in terms of the `Reference`; the body renderer the
         // caller supplied works in terms of wikitext. Bridging here keeps the
         // renderer's signature about what it needs rather than about what happens to
@@ -955,7 +1094,7 @@ fn walk_render(
             list.set_attr("data-mw", data_mw);
             *node = list;
         }
-        return;
+        return false;
     }
 
     if let Some((_, _, body, self_closing, _)) = read_ref(node) {
@@ -979,15 +1118,18 @@ fn walk_render(
                 use_ids,
                 next_use,
                 rendered,
+                cuts,
+                cut_cursor,
+                templated,
             );
             converted.borrow_mut().insert(body, body_node);
         }
         let Some(ref_id) = use_ids.get(*next_use).cloned() else {
-            return;
+            return false;
         };
         *next_use += 1;
         let Some(reference) = state.references.iter().find(|r| r.uses.contains(&ref_id)) else {
-            return;
+            return false;
         };
         let about = node.get_attr("about").map(str::to_string);
         let mut marker = ref_marker_nodes(reference, &ref_id, page_title, ids, about);
@@ -1003,6 +1145,7 @@ fn walk_render(
         *node = marker;
         *rendered += 1;
     }
+    false
 }
 
 /// Whether a node's subtree contains a `<ref>` element (Cite's
@@ -1074,6 +1217,11 @@ fn read_references_body(node: &rustoid_ast::dom::node::Node) -> Option<String> {
     }
     let body = body_between(source)?;
     (!body.is_empty()).then_some(body)
+}
+
+/// The group a `<references>` element renders, or `None` if the node is not one.
+fn references_group(node: &rustoid_ast::dom::node::Node) -> Option<String> {
+    read_references(node).map(|(group, _, _, _)| group)
 }
 
 /// Read a `<references>` element into `(group, attrs_json, has_body)`.
@@ -1626,7 +1774,15 @@ mod tests {
 
         let mut state = CiteState::new();
         let mut ids = Vec::new();
-        collect(&root, &mut state, &mut ids, &nested_body, &references_body);
+        let mut cuts = Vec::new();
+        collect(
+            &root,
+            &mut state,
+            &mut ids,
+            &mut cuts,
+            &nested_body,
+            &references_body,
+        );
 
         assert_eq!(state.references.len(), 2);
         // The anonymous nested ref is numbered first; the named note follows.
@@ -1677,7 +1833,15 @@ mod tests {
 
         let mut state = CiteState::new();
         let mut ids = Vec::new();
-        collect(&root, &mut state, &mut ids, &nested_body, &references_body);
+        let mut cuts = Vec::new();
+        collect(
+            &root,
+            &mut state,
+            &mut ids,
+            &mut cuts,
+            &nested_body,
+            &references_body,
+        );
 
         // The use is the only marker; neither definition records a use.
         assert_eq!(ids, vec!["cite_ref-A_1-0".to_string()]);
