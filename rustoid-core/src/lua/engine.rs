@@ -66,6 +66,11 @@ pub struct LuaSite {
     /// `CoreParserFunctions::anchorencode` strips external links, which needs the
     /// site's protocol list.
     pub protocols: Vec<String>,
+    /// Namespace ids whose first letter is upper-cased (`NamespaceInfo`'s
+    /// `case === 'first-letter'`), for `mw.title.new`. The siteinfo `case` field
+    /// decides for the namespaces the API returns; Special is added on demand
+    /// by [`LuaSite::namespace_is_capitalized`].
+    pub capitalized_namespaces: std::collections::HashSet<i32>,
 }
 
 /// The counters `mw.site.stats` exposes.
@@ -137,6 +142,12 @@ impl LuaSite {
             .filter(|(_, name, _)| !name.is_empty())
             .collect();
         namespaces.sort_by_key(|(id, _, _)| *id);
+        let capitalized_namespaces = config
+            .namespaces()
+            .iter()
+            .filter(|(_, ns)| !ns.case_sensitive)
+            .map(|(id, _)| *id)
+            .collect();
         Self {
             server: config.server_url().to_string(),
             language_code: config.language_code().to_string(),
@@ -154,6 +165,7 @@ impl LuaSite {
             // raising `attempt to index a nil value`.
             stats: config.site_stats(),
             protocols: config.protocols().iter().map(|s| s.to_string()).collect(),
+            capitalized_namespaces,
         }
     }
 
@@ -191,6 +203,21 @@ impl LuaSite {
             .find(|(ns_id, _, _)| *ns_id == id)
             .map(|(_, name, _)| name.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether `NamespaceInfo::isCapitalized` holds for `ns_id`: NS_MEDIA is
+    /// treated as NS_FILE, a talk namespace as its subject, and Special, User and
+    /// MediaWiki are always capitalized; otherwise the namespace's own setting
+    /// decides. `mw.title.new` upper-cases the first letter when this is true.
+    pub fn namespace_is_capitalized(&self, ns_id: i32) -> bool {
+        let mut index = if ns_id == -2 { 6 } else { ns_id };
+        if index > 0 && index % 2 == 1 {
+            index -= 1;
+        }
+        if matches!(index, -1 | 2 | 8) {
+            return true;
+        }
+        self.capitalized_namespaces.contains(&index)
     }
 
     /// Namespace id for a canonical or localized name, or for a numeric string.
@@ -2756,7 +2783,18 @@ fn luafn_title_new(
         })
         .or(prefix)
         .unwrap_or(0);
-    let title_text = rest.trim().to_string();
+    let title_text = if ctx.site.namespace_is_capitalized(ns_id) {
+        // `Title::newFromText` upper-cases the first letter for a first-letter
+        // namespace, and `mw.title.new` reports the title as stored: `Template:
+        // Sidebar with collapsible lists`'s `|name = sidebar periodic table`
+        // yields `title.fullText` `Template:Sidebar periodic table`. Without it
+        // the view link still looked right (the wikilink target normalizes
+        // again) while `Special:EditPage/…` — not a capitalized namespace — did
+        // not, so the edit link's target kept the lower-case spelling.
+        crate::title::ucfirst(rest.trim(), &ctx.site.language_code)
+    } else {
+        rest.trim().to_string()
+    };
     let ns_text = ctx.site.namespace_name(ns_id);
 
     let table = lua.create_table()?;
