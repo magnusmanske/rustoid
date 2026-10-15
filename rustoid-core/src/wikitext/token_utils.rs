@@ -249,6 +249,20 @@ pub fn tokens_to_string_with_opts(tokens: &[Item], opts: TokensToStringOpts<'_>)
                     }
                     out.push_str("]]");
                 }
+                // A bare URL tokenized into a `urllink` carries its wikitext in
+                // `href`; flattening it must emit that URL rather than nothing.
+                // PHP's `tokensToString` never meets a raw `urllink` because its
+                // preprocessor hands *text* to Parsoid, but rustoid tokenizes a
+                // template-argument value directly, so a `{{{url}}}` whose value
+                // is a bare URL arrives here. Dropping it emptied the value, which
+                // made `{{#if:{{{url}}}|…}}` take its else branch — the thesis row
+                // of `Template:Infobox scientist` lost its link.
+                ParsoidToken::SelfclosingTag(tk) if tk.name == "urllink" => {
+                    if let Some(href) = tk.attribs.iter().find(|kv| kv.key.as_str() == Some("href"))
+                    {
+                        out.push_str(&key_value_to_string(&href.value));
+                    }
+                }
                 // Resolve a DOM-fragment placeholder to its fragment's text
                 // content. A `TagTk` is followed by its `EndTagTk`, which is
                 // skipped (mirrors PHP's `$i += 1` + the "tag should be followed
