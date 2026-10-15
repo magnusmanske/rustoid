@@ -16710,8 +16710,15 @@ true)` for its "and" case: every `{{marriage}}` value looked like a list, so
 ### Open lead: `{{marriage|…|end=…}}` through `Module:Template wrapper`
 
 `Albert Einstein`'s label still differs — Parsoid `Spouses`, rustoid `Spouse`.
-`{{Infobox person|spouse=<plainlist of two marriages>}}` is right, and
-`{{Infobox scientist|…}}` (which reaches `Infobox person` through
-`Module:Template wrapper`) is right while neither entry passes `end=`; add
-`end=divorced`/`end=died` and the same call reports one bullet. `Albert Einstein`
-is the page it gates.
+`{{Infobox person|spouse=<plainlist of two marriages>}}` is right; so is
+`{{#invoke:Template wrapper|wrap|_template=Infobox person|…}}` while neither
+entry passes `end=`. Add `end=divorced`/`end=died` and the same call reports one
+bullet. Dumping `Module:Template wrapper`'s collected args shows why: the
+`{{marriage}}` with an `end=` renders a `margins`/`auto`-style `display` rule
+whose value carries a **top-level `|`**, and `Module:Template wrapper` hands its
+args to `frame:expandTemplate{title=…, args=…}`. `render_invocation` splices each
+value straight into the `{{…|k=v|…}}` wikitext it re-tokenizes, so that `|` split
+the `spouse` argument and `Template:Infobox person` then saw a one-item list.
+MediaWiki passes `expandTemplate` args as opaque nodes, so they never re-split;
+the faithful fix is to stop re-parsing these values (or to render a literal `|`
+and `=` as `{{!}}`/`{{=}}`). `Albert Einstein` is the page it gates.
