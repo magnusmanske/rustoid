@@ -219,17 +219,29 @@ fn build_template_title(name: &str, config: &dyn SiteConfig) -> Title {
 
 /// Strip `<noinclude>...</noinclude>` sections and their content.
 /// Content outside `<noinclude>` is kept; content inside is removed.
+///
+/// An **unclosed** `<noinclude>` strips everything after it: MediaWiki reads the
+/// rest of the text as the tag's content, so it is part of the section. That is
+/// not hypothetical — `Template:Time interval` is exactly
+/// `<includeonly>{{{{{|safesubst:}}}}#invoke:age|time_interval}}</includeonly><noinclude>{{documentation}}`
+/// with no closing tag. Dropping only the opening tag kept the remainder, so the
+/// template's own documentation — and the protection padlock rendered inside it —
+/// leaked into every article that used the template, spending an `about` id and
+/// shifting every following one (`COVID-19 pandemic`, `Berlin`, `Chernobyl
+/// disaster`, `International Space Station`).
 pub(crate) fn strip_noinclude_sections(text: &str) -> String {
+    const OPEN: &str = "<noinclude>";
+    const CLOSE: &str = "</noinclude>";
     let mut result = String::new();
     let mut pos = 0;
     while pos < text.len() {
-        if let Some(start) = text[pos..].find("<noinclude>") {
+        if let Some(start) = text[pos..].find(OPEN) {
             result.push_str(&text[pos..pos + start]);
             let abs_start = pos + start;
-            if let Some(end) = text[abs_start..].find("</noinclude>") {
-                pos = abs_start + end + 12; // Skip past </noinclude>
-            } else {
-                pos = abs_start + 11; // Skip just <noinclude>
+            match text[abs_start..].find(CLOSE) {
+                Some(end) => pos = abs_start + end + CLOSE.len(),
+                // Unclosed: the rest of the text is the tag's content, so it goes.
+                None => break,
             }
         } else {
             result.push_str(&text[pos..]);
@@ -385,6 +397,15 @@ mod tests {
     fn test_noinclude_stripping() {
         let text = "before<noinclude>hidden</noinclude>after";
         assert_eq!(strip_noinclude_sections(text), "beforeafter");
+    }
+
+    #[test]
+    fn test_unclosed_noinclude_strips_to_the_end() {
+        // MediaWiki reads the rest of the text as the tag's content, e.g.
+        // `Template:Time interval`, whose documentation must not leak out.
+        let text = "keep<noinclude>doc {{padlock}}";
+        assert_eq!(strip_noinclude_sections(text), "keep");
+        assert_eq!(strip_noinclude_sections("<noinclude>only"), "");
     }
 
     #[test]
