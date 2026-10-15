@@ -1323,11 +1323,16 @@ pub fn sanitize_tag_attrs_with_fragments(
     new_attrs
 }
 
-/// Faithful port of `Sanitizer::checkCss`: rejects control characters and the
-/// insecure CSS patterns (`INSECURE_RE`), returning a marker comment in their
-/// place, and otherwise passes the value through. (CSS normalization — decoding
-/// char refs/escapes and stripping comments — is omitted for now.)
+/// Faithful port of `Sanitizer::checkCss`: normalises the value (decoding
+/// character references and CSS escapes, then stripping comments), rejects
+/// control characters and the insecure CSS patterns (`INSECURE_RE`) with a
+/// marker comment, and otherwise passes the normalised value through.
 fn check_css(value: &str) -> String {
+    // `checkCss` normalises *first*: a value that only becomes insecure once
+    // decoded (`\75 rl(` spelling `url(`) must still be caught.
+    let value = normalize_css(value);
+    let value = value.as_str();
+
     // Reject problematic keywords and control characters.
     if value.chars().any(|c| {
         (c as u32) <= 0x08
@@ -1356,6 +1361,187 @@ fn check_css(value: &str) -> String {
     }
 
     value.to_string()
+}
+
+/// Faithful port of `Sanitizer::normalizeCss`.
+///
+/// Decodes character references and CSS escape sequences, then strips comments.
+/// The escape decoding is what makes Scribunto's `mw.html` output match the
+/// served bytes: `cssEncode` escapes `;` as `\3B ` to keep a value from breaking
+/// out into a new declaration, and Parsoid's sanitizer decodes it straight back
+/// (`World War II`'s `border-right:1px dotted #aaa;`).
+fn normalize_css(value: &str) -> String {
+    let value = crate::html::wts_utils::decode_wt_entities_all(value);
+    let value = decode_css_escapes(&value);
+
+    // A value that is nothing but a single comment is passed through untouched,
+    // so a caller can hand an error comment along (`^\s*/\*[^*/]*\*/\s*$`).
+    if is_single_css_comment(&value) {
+        return value;
+    }
+
+    // Replace every balanced comment with a space, then drop anything from a
+    // remaining (unterminated) `/*`.
+    let value = delimiter_replace(&value, "/*", "*/", " ");
+    match value.find("/*") {
+        Some(pos) => value[..pos].to_string(),
+        None => value,
+    }
+}
+
+/// Decode CSS escape sequences (CSS 2.1 appendix D): a backslash before a
+/// newline is a line continuation, `\` + 1–6 hex digits (+ one optional space)
+/// is that character, `\` before any other character is that character, and a
+/// trailing `\` is a literal backslash. Mirrors `Sanitizer::cssDecodeCallback`.
+fn decode_css_escapes(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(next) = chars.peek().copied() else {
+            // Backslash at end of string: the literal backslash, re-escaped.
+            push_css_decoded(&mut out, '\\');
+            continue;
+        };
+        // 1. Line continuation — `\r\n` counts as one newline.
+        if next == '\n' || next == '\r' || next == '\u{0C}' {
+            chars.next();
+            if next == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            continue;
+        }
+        // 2. Hex escape: up to six hex digits, then one optional whitespace.
+        if next.is_ascii_hexdigit() {
+            let mut hex = String::new();
+            while hex.len() < 6 {
+                match chars.peek() {
+                    Some(h) if h.is_ascii_hexdigit() => {
+                        hex.push(*h);
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(ws) = chars.peek().copied()
+                && is_css_space(ws)
+            {
+                chars.next();
+            }
+            // An out-of-range or surrogate codepoint becomes U+FFFD, as
+            // `codepointToUtf8` does.
+            let cp = u32::from_str_radix(&hex, 16).unwrap_or(0);
+            push_css_decoded(&mut out, char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            continue;
+        }
+        // 3. `\` cancelling a special meaning: the character itself.
+        chars.next();
+        push_css_decoded(&mut out, next);
+    }
+    out
+}
+
+/// Emit a decoded character, re-escaping the four that must stay escaped inside
+/// CSS strings. PHP writes `'\\' . dechex( ord( $char ) ) . ' '` (lower-case hex).
+fn push_css_decoded(out: &mut String, c: char) {
+    if c == '\n' || c == '"' || c == '\'' || c == '\\' {
+        out.push('\\');
+        out.push_str(&format!("{:x} ", c as u32));
+    } else {
+        out.push(c);
+    }
+}
+
+/// PCRE `\s` in `Sanitizer`'s `\s` uses: space, tab, newline, carriage return,
+/// form feed, vertical tab.
+fn is_css_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0B}' | '\u{0C}')
+}
+
+/// `^\s*/\*[^*/]*\*/\s*$` — a value that is nothing but one comment.
+fn is_single_css_comment(value: &str) -> bool {
+    let trimmed = value.trim_matches(is_css_space);
+    let Some(rest) = trimmed.strip_prefix("/*") else {
+        return false;
+    };
+    let Some(inner) = rest.strip_suffix("*/") else {
+        return false;
+    };
+    !inner.contains(['*', '/'])
+}
+
+/// Faithful port of `StringUtils::delimiterReplace` for a literal replacement:
+/// every *outermost* balanced `start…end` run (delimiters included) becomes
+/// `replace`. A start with no following end, and an end with no open start, are
+/// kept as written.
+fn delimiter_replace(subject: &str, start: &str, end: &str, replace: &str) -> String {
+    let mut input_pos = 0;
+    let mut output_pos = 0;
+    let mut found_start = false;
+    let mut out = String::new();
+
+    while input_pos < subject.len() {
+        let Some((token_offset, is_start)) = find_next_delim(subject, input_pos, start, end) else {
+            break;
+        };
+        // A start that is also an end at the same offset, while a start is
+        // already open, closes it (`START START END` matches the outer pair).
+        let (opens, token_len) =
+            if is_start && !(found_start && starts_at(subject, token_offset, end)) {
+                (true, start.len())
+            } else {
+                (false, end.len())
+            };
+
+        if opens {
+            if !found_start {
+                input_pos = token_offset + token_len;
+                out.push_str(&subject[output_pos..token_offset]);
+                output_pos = token_offset;
+                found_start = true;
+            } else {
+                // Move past the *first character* of the inner start, so an end
+                // that overlaps it still closes the outer start.
+                input_pos = token_offset + 1;
+            }
+        } else {
+            if found_start {
+                found_start = false;
+                out.push_str(replace);
+            } else {
+                // A stray end: write it out verbatim (`input_pos == output_pos`
+                // here, so the PHP `substr` bases coincide).
+                out.push_str(&subject[output_pos..token_offset + token_len]);
+            }
+            input_pos = token_offset + token_len;
+            output_pos = input_pos;
+        }
+    }
+    if output_pos < subject.len() {
+        out.push_str(&subject[output_pos..]);
+    }
+    out
+}
+
+/// The earliest offset at or after `from` where `subject` starts with `start` or
+/// `end`, and which of the two it was (a start wins a tie).
+fn find_next_delim(subject: &str, from: usize, start: &str, end: &str) -> Option<(usize, bool)> {
+    let hay = &subject[from..];
+    let s = hay.find(start).map(|i| (from + i, true));
+    let e = hay.find(end).map(|i| (from + i, false));
+    match (s, e) {
+        (Some(s), Some(e)) => Some(if s.0 <= e.0 { s } else { e }),
+        (Some(s), None) => Some(s),
+        (None, Some(e)) => Some(e),
+        (None, None) => None,
+    }
+}
+
+fn starts_at(subject: &str, offset: usize, delim: &str) -> bool {
+    subject[offset..].starts_with(delim)
 }
 
 /// Match the `attr\([^)]+[\s,]+url` portion of `INSECURE_RE`.
@@ -1647,5 +1833,41 @@ mod tests {
         );
         // Control characters are rejected as invalid.
         assert_eq!(check_css("color:\u{7F}blue"), "/* invalid control char */");
+    }
+
+    /// `checkCss` normalises the value first: Scribunto's `mw.html:css` escapes a
+    /// `;` as `\3B `, and Parsoid's sanitizer decodes it straight back
+    /// (`Module:Infobox military conflict`'s `border-right:1px dotted #aaa;`).
+    #[test]
+    fn test_check_css_decodes_escapes() {
+        assert_eq!(
+            check_css("border-right:1px dotted #aaa\\3B "),
+            "border-right:1px dotted #aaa;"
+        );
+        // The decode happens before the insecure check, so an escape that spells
+        // a dangerous keyword is still caught.
+        assert_eq!(check_css("background:\\75 rl(x)"), "/* insecure input */");
+        // Comments are stripped once decoded, and an unterminated `/*` truncates.
+        assert_eq!(check_css("color/*x*/:red"), "color :red");
+        assert_eq!(check_css("color:red/* oops"), "color:red");
+    }
+
+    /// The escape decoder follows CSS 2.1 appendix D: line continuations, hex
+    /// escapes (1–6 digits plus one optional space), `\` before any character,
+    /// and a trailing `\`; the four characters that must stay escaped inside
+    /// strings are re-escaped with lower-case hex.
+    #[test]
+    fn test_decode_css_escapes() {
+        assert_eq!(decode_css_escapes("a\\3B b"), "a;b");
+        // `z` is not a hex digit, so the hex run stops; a following hex digit
+        // would extend it (`\3Bc` is one three-digit escape).
+        assert_eq!(decode_css_escapes("a\\3Bz"), "a;z");
+        // A backslash before a letter is that letter; a backslash before a real
+        // newline is a line continuation.
+        assert_eq!(decode_css_escapes("a\\nb"), "anb");
+        assert_eq!(decode_css_escapes("a\\\nb"), "ab");
+        assert_eq!(decode_css_escapes("a\\\"b"), "a\\22 b");
+        assert_eq!(decode_css_escapes("a\\"), "a\\5c ");
+        assert_eq!(decode_css_escapes("a\\ b"), "a b");
     }
 }
