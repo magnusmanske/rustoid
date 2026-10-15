@@ -782,6 +782,16 @@ pub struct TempData {
     /// ParagraphWrapper and is dropped before tree building, because Parsoid's
     /// equivalent newline never reaches the output.
     pub synthetic_sol_newline: bool,
+    /// The content tokens of a `#tag` call whose target is a registered extension
+    /// tag. `ParserFunctions::pf_tag` has to hand the extension a *wikitext* body
+    /// (`source`), but that serialization drops any token with no wikitext form —
+    /// a `<templatestyles>` resolved before the call, for instance. The tokens are
+    /// kept here so [`Parser::tag_body_source`] can serialize them again with a
+    /// marker standing in for each such token, which
+    /// `substitute_strip_markers` splices back. Mirrors Parsoid's
+    /// `tag_worker` returning real tokens and `preparePFragment` marking the
+    /// pieces with no wikitext form.
+    pub tag_content: Option<Vec<Item>>,
 }
 
 /// The parsed structure of a `-{ … }-` language-variant construct (mirrors PHP's

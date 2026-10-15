@@ -998,30 +998,8 @@ impl ParserFunctions {
         // pipes they produce aren't consumed as argument separators (mirrors the
         // token-level `processSpecialMagicWord`/`!` magic-variable handling).
         let content_src: String = crate::expand::tpl_args::replace_magic_pipe(
-            &crate::pipeline::parser::tag_content_source(content).unwrap_or_else(|| {
-                // A token `tag_content_source` cannot rebuild (an external link,
-                // say) drops to each token's own `src`. The decoded text after an
-                // `mw:Entity` span is skipped: the span's `src` already spells the
-                // entity, and emitting both doubles it (`&nbsp;` + a literal NBSP).
-                let mut s = String::new();
-                let mut i = 0;
-                while i < content.len() {
-                    match &content[i] {
-                        Item::Str(text) => s.push_str(text),
-                        Item::Tok(t) => {
-                            s.push_str(&token_to_source(t));
-                            if crate::wikitext::token_utils::skip_entity_decoded_text(
-                                t,
-                                content.get(i + 1),
-                            ) {
-                                i += 1;
-                            }
-                        }
-                    }
-                    i += 1;
-                }
-                s
-            }),
+            &crate::pipeline::parser::tag_content_source(content)
+                .unwrap_or_else(|| tag_content_fallback_source(content)),
         );
         let attr_src = serialize_tag_attribs(display_target, tag_attribs);
         let open_tag = format!("<{}{attr_src}>", display_target.to_lowercase());
@@ -1046,6 +1024,10 @@ impl ParserFunctions {
         // `Parser::number_extension_token`.
         let mut dp = dp;
         dp.tmp.in_arg_value = true;
+        // Keep the content tokens for [`Parser::tag_body_source`], which
+        // re-serializes them with a marker for every token that has no wikitext
+        // form (`source` above drops those).
+        dp.tmp.tag_content = Some(content.to_vec());
 
         let mut stt = SelfclosingTagTk::new("extension", vec![], dp);
         stt.add_attribute_str("typeof", "mw:Extension");
@@ -1410,6 +1392,34 @@ fn token_to_source(t: &ParsoidToken) -> String {
             .to_string(),
         _ => String::new(),
     }
+}
+
+/// Serialize a `#tag` extension's content back to wikitext, for the token
+/// `tag_content_source` could not rebuild as a whole.
+///
+/// Each token falls back to its own `src`. The decoded text after an `mw:Entity`
+/// span is skipped: the span's `src` already spells the entity, and emitting both
+/// doubles it (`&nbsp;` + a literal NBSP).
+///
+/// A token with **no** source of its own serializes to nothing, which is
+/// deliberately not what [`Parser::tag_body_source`] does: that one markerizes
+/// such tokens so they survive the round-trip.
+pub(crate) fn tag_content_fallback_source(content: &[Item]) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while i < content.len() {
+        match &content[i] {
+            Item::Str(text) => s.push_str(text),
+            Item::Tok(t) => {
+                s.push_str(&token_to_source(t));
+                if crate::wikitext::token_utils::skip_entity_decoded_text(t, content.get(i + 1)) {
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    s
 }
 
 /// Very basic expression evaluator for `#expr` and `#ifexpr`.

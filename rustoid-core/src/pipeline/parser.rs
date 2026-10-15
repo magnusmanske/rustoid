@@ -4650,6 +4650,49 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         marker
     }
 
+    /// The wikitext body for a `#tag` extension's content.
+    ///
+    /// Parsoid never hands an extension the *tokens* `#tag` collected: it
+    /// serializes them back to wikitext and re-parses it (`TemplateHandler::
+    /// expandTemplate`'s `preparePFragment` + `processTemplateSource`), replacing
+    /// every piece with no wikitext form by a fragment marker
+    /// (`PipelineUtils::pFragmentToParsoidFragmentMarkers`). rustoid's serializer
+    /// dropped such a piece instead — `tag_content_source` cannot rebuild the
+    /// whole list, and `tag_content_fallback_source` writes nothing for a token
+    /// without a `src`. That is how a `<templatestyles>` resolved *before* the
+    /// call (the placeholder a template argument's expansion left) vanished from
+    /// `{{refn|name=A|{{cite web|…}}}}`, leaving `cite_note-A-1` with no
+    /// stylesheet and its `about` id unspent.
+    ///
+    /// The marker is rustoid's own strip marker, recorded in
+    /// [`Parser::strip_markers`]; `expand_templates`'s `substitute_strip_markers`
+    /// splices the piece back once the body has been tokenized — the same path a
+    /// module's `frame:extensionTag` answer takes. Only a placeholder (a
+    /// `mw:DOMFragment` tag, or the `mw:dom-fragment-token` it wraps) is marked,
+    /// with its matching end tag when it is a pair: a token that legitimately has
+    /// no source in the body is *meant* to drop.
+    fn tag_body_source(&self, content: &[Item]) -> String {
+        if let Some(src) = tag_content_source(content) {
+            return src;
+        }
+        let mut replaced: Vec<Item> = Vec::with_capacity(content.len());
+        let mut i = 0;
+        while i < content.len() {
+            match dom_fragment_placeholder_at(content, i) {
+                Some((end, tokens)) => {
+                    let marker = self.record_marker("tag", tokens);
+                    replaced.push(Item::Str(marker));
+                    i = end;
+                }
+                None => {
+                    replaced.push(content[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        crate::pipeline::parser_functions::tag_content_fallback_source(&replaced)
+    }
+
     /// Replace an `extension` token nested in an attribute value with a strip
     /// marker, at any depth.
     ///
@@ -5151,7 +5194,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
     ) {
-        let (body, is_ref, is_references, arg_value) = {
+        let (body, is_ref, is_references, arg_value, tag_content) = {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                 return;
             };
@@ -5193,7 +5236,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // bare `mw:Extension/templatestyles`, unlike a literal
             // `<ref>{{mono|EA}}</ref>`). See [`crate::wikitext::tokens_v2::TempData::in_arg_value`].
             let arg_value = t.data_parsoid.tmp.in_arg_value;
-            (body, is_ref, is_references, arg_value)
+            let tag_content = t.data_parsoid.tmp.tag_content.clone();
+            (body, is_ref, is_references, arg_value, tag_content)
         };
         // Pre-rendering a body costs a full expansion. Only a body that can spend
         // an `about` id of its own needs it: a template (which may emit a
@@ -5202,7 +5246,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // inline fallback, and leaves the id sequence untouched, so the expensive
         // path is skipped for the plain-text and bare-URL notes that large pages
         // carry in bulk.
-        let needs_expansion = body.contains("{{") || body.contains('<');
+        // A `#tag` call keeps its content tokens (`TempData::tag_content`); the
+        // `source` it also carries has already dropped anything with no wikitext
+        // form, so the body is serialized again here where a marker can stand in
+        // for such a piece. See [`Parser::tag_body_source`].
+        let render_body = match &tag_content {
+            Some(content) => self.tag_body_source(content),
+            None => body.clone(),
+        };
+        let needs_expansion = render_body.contains("{{") || render_body.contains('<');
         let rendered = if needs_expansion {
             // The note body is a *fresh* pipeline: its templates are numbered
             // whether or not they are wrapped. Whether they are wrapped follows
@@ -5217,7 +5269,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 (is_ref && self.expansion_nesting.get() > 1).then(|| self.expand_unwrapped());
             Some(
                 Box::pin(self.process_fragment_body(
-                    &body,
+                    &render_body,
                     source,
                     frame,
                     about_counter,
@@ -7629,6 +7681,56 @@ fn strip_marker(tag: &str, id: usize) -> String {
     format!("\u{7f}'\"`UNIQ--{tag}-{id:08X}-QINU`\"'\u{7f}")
 }
 
+/// The `mw:DOMFragment` placeholder starting at `items[i]`, with the index just
+/// past it: a self-closing `mw:dom-fragment-token`, a self-closing
+/// `mw:DOMFragment` element, or a `mw:DOMFragment` element with the immediately
+/// following matching end tag.
+///
+/// Used by [`Parser::tag_body_source`] to keep such a placeholder alive through
+/// the `#tag` content's wikitext round-trip. Anything else — including an
+/// `mw:DOMFragment` tag whose pair is not adjacent — is left to the plain
+/// serializer, so the change stays confined to the shapes an expansion emits.
+fn dom_fragment_placeholder_at(items: &[Item], i: usize) -> Option<(usize, Vec<Item>)> {
+    let Item::Tok(tok) = &items[i] else {
+        return None;
+    };
+    let is_placeholder = |t: &crate::wikitext::tokens_v2::ParsoidToken| {
+        let typeof_ = t
+            .get_attribs()
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("typeof"))
+            .and_then(|kv| kv.value.as_str());
+        match t {
+            crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(tk)
+                if tk.name == "mw:dom-fragment-token" =>
+            {
+                true
+            }
+            _ => typeof_.is_some_and(|ty| ty.split_whitespace().any(|v| v == "mw:DOMFragment")),
+        }
+    };
+    if !is_placeholder(tok) {
+        return None;
+    }
+    if matches!(
+        tok,
+        crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(_)
+    ) {
+        return Some((i + 1, vec![items[i].clone()]));
+    }
+    let crate::wikitext::tokens_v2::ParsoidToken::Tag(open) = tok else {
+        return None;
+    };
+    match items.get(i + 1) {
+        Some(Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::EndTag(end)))
+            if end.name == open.name =>
+        {
+            Some((i + 2, items[i..=i + 1].to_vec()))
+        }
+        _ => None,
+    }
+}
+
 /// Whether an attribute key or value holds a token list.
 fn kv_holds_tokens(kv: &crate::wikitext::tokens_v2::KV) -> bool {
     use crate::wikitext::tokens_v2::KeyValue;
@@ -8717,6 +8819,61 @@ mod tests {
             }
             other => panic!("expected the marker resolved to tokens, got {other:?}"),
         }
+    }
+
+    /// A `#tag` body that holds an expanded placeholder keeps it: the wikitext
+    /// round-trip cannot spell a `mw:DOMFragment`, so
+    /// [`Parser::tag_body_source`] replaces it with a strip marker that
+    /// `substitute_strip_markers` splices back. Without it the placeholder — a
+    /// `<templatestyles>` a template argument resolved before the call — was
+    /// dropped from `{{refn|name=A|{{cite web|…}}}}`.
+    #[test]
+    fn tag_body_source_marks_a_dom_fragment_placeholder() {
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, TagTk};
+
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        // The `<style typeof="mw:DOMFragment">` + `</style>` pair a resolved
+        // `<templatestyles>` is reached through, with no `src` of its own.
+        let mut open = TagTk::new("style", vec![], DataParsoid::default());
+        open.add_attribute_str("typeof", "mw:DOMFragment");
+        open.add_attribute_str("data-fragment-id", "0");
+        let content = vec![
+            Item::Tok(ParsoidToken::Tag(open)),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "style",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ];
+
+        let source = parser.tag_body_source(&content);
+        assert!(
+            source.contains('\u{7f}'),
+            "placeholder not marked: {source:?}"
+        );
+        assert!(!source.contains("<style"), "serialized instead: {source:?}");
+
+        // The marker resolves back to the very pair, in place.
+        let out = parser.substitute_strip_markers(vec![Item::Str(source)]);
+        assert_eq!(out.len(), 2, "got {out:?}");
+        let Item::Tok(ParsoidToken::Tag(t)) = &out[0] else {
+            panic!("expected the style tag, got {:?}", out[0]);
+        };
+        assert_eq!(t.name, "style");
+        assert!(
+            t.attribs
+                .iter()
+                .any(|kv| kv.key.as_str() == Some("data-fragment-id")
+                    && kv.value.as_str() == Some("0")),
+            "the placeholder keeps its fragment id: {t:?}"
+        );
+        assert!(
+            matches!(&out[1], Item::Tok(ParsoidToken::EndTag(e)) if e.name == "style"),
+            "expected the matching end tag, got {:?}",
+            out[1]
+        );
     }
 
     #[test]
