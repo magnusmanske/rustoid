@@ -17023,3 +17023,51 @@ lands in — which is where Parsoid numbers it too.
 `mapframe`), `Chernobyl disaster` 4109 → 6837. Fixtures stay at 877/896, all lib
 tests pass, and the 48-page offline corpus is strictly better with no
 regressions (better=2, worse=0).
+
+## Cite: an anonymous `<ref>` is not shared, and a nested one only under `inTemplate`
+
+Two rules in the Cite extension decide the `globalId` in `cite_ref-…`/`cite_note-…`,
+and rustoid had both wrong in the same direction, so every later reference id on
+several pages was one low.
+
+**`RefGroup::push` indexes a ref only `if ( $ref->name )`.** `lookupRefByName`
+therefore never finds an anonymous one, and every anonymous `<ref>` calls
+`addRef` again — a note and a `globalId` of its own, even when the content
+repeats:
+
+```
+<ref>a</ref><ref>a</ref>{{reflist}}
+  service: cite_note-1, cite_note-2   (both reading `a`)
+  rustoid: one note used twice (`cite_note-1`, markers `cite_ref-1`, `cite_ref-1-1`)
+```
+
+rustoid keyed an anonymous ref by its *body*, which is what a `{{sfn}}`-style
+reuse looks like; only a *named* ref may be reused.
+
+**`RefTagHandler::sourceToDom` keeps a nested `<ref>` only when the note's
+pipeline ran `inTemplate`** (`allowNestedRef = $extApi->inTemplate()`), and
+`References::extractRefFromNode` then calls `processNestedRefInRef` *before*
+`addRef`, so a surviving nested ref takes the lower `globalId`. A
+`{{#tag:ref|outer<ref name="B"/>|name=A}}` (which is what `{{efn}}` is built on)
+therefore registers B first and A second, while a literal
+`<ref name="A">outer<ref name="B"/></ref>` drops B entirely:
+
+```
+{{#tag:ref|outer<ref name="B"/>|name=A}}{{reflist}}
+  service: cite_note-B-1 then cite_note-A-2
+  rustoid: only cite_note-A-1 — B never registered, every later id one low
+```
+
+rustoid gated the nested walk on the note carrying `mw:Transclusion`, which the
+`#tag:ref` note does not (its transclusion is on the enclosing `<p>`), so the
+nested note was skipped. The gate is now the `inTemplate` state itself, recorded
+on the stashed body (`Parser::nested_ref_bodies`) when the body is rendered,
+because rustoid's body render leaves the nested ref as an unrefined
+`mw:Extension` marker whether or not it survived — the state cannot be read back
+off the DOM.
+
+### Effect
+
+`Cristiano Ronaldo` 17095 → 20369, `Grand Theft Auto V` +1225, `Doom (1993 video
+game)` +853, `France` +486, `Israel` +370. Fixtures stay at 877/896 and every lib
+test passes; the 48-page offline corpus is better=5, worse=0.
