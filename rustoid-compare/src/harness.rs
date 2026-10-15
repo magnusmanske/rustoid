@@ -1945,6 +1945,30 @@ fn mask_nondeterministic_counted(html: &str) -> (String, usize) {
     (out, masked)
 }
 
+/// The length of the nondeterministic span that starts at the head of `s`, if
+/// one does — the same spans [`mask_nondeterministic`] replaces. Used by
+/// [`first_difference`] to step over such a span on both sides at once, so a
+/// value that differs between two renders (a `utm_campaign`, a per-render id,
+/// `{{CURRENTTIMESTAMP}}`) does not become "the first difference".
+fn nondeterministic_span(s: &str) -> Option<usize> {
+    if let Some(after) = s.strip_prefix("utm_campaign=") {
+        let n = after
+            .find(|c: char| !is_campaign_char(c))
+            .unwrap_or(after.len());
+        return Some("utm_campaign=".len() + n);
+    }
+    if let Some(after) = match_rand_id(s) {
+        return Some(s.len() - after.len());
+    }
+    if s.starts_with(|c: char| c.is_ascii_digit()) {
+        let n = s.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 14 && match_timestamp(s).is_some() {
+            return Some(14);
+        }
+    }
+    None
+}
+
 /// Characters a `utm_campaign` value is built from (`parser`, `rest`, `index`,
 /// or a campaign string like `3701f6dc34-nature-briefing-daily-20260915`).
 fn is_campaign_char(c: char) -> bool {
@@ -2144,25 +2168,45 @@ pub fn script_errors(html: &str, limit: usize) -> Vec<String> {
 /// position rather than cause. Both sides are included, because the *shape* of
 /// the divergence — extra markup on one side, a renamed attribute on the other —
 /// is what identifies the feature area.
+///
+/// The position is the first *real* difference: a span [`nondeterministic_span`]
+/// recognises (a `utm_campaign`, a per-render id, `{{CURRENTTIMESTAMP}}`) is
+/// stepped over on both sides, because such a value differs between two renders
+/// of the same revision and would otherwise be reported as the blocker while
+/// hiding the real one behind it. Each side advances by its own span's length, so
+/// a span that differs in length cannot desynchronise the two.
 fn first_difference(a: &str, b: &str) -> String {
     const CONTEXT: usize = 400;
 
     let ab = a.as_bytes();
     let bb = b.as_bytes();
-    let mut i = 0;
-    while i < ab.len() && i < bb.len() && ab[i] == bb[i] {
-        i += 1;
+    let (mut ia, mut ib) = (0usize, 0usize);
+    while ia < ab.len() && ib < bb.len() {
+        // `get` returns `None` off a char boundary, which is where a multi-byte
+        // character's continuation byte sits; a span never starts there.
+        let span_a = a.get(ia..).and_then(nondeterministic_span);
+        let span_b = b.get(ib..).and_then(nondeterministic_span);
+        if let (Some(na), Some(nb)) = (span_a, span_b) {
+            ia += na;
+            ib += nb;
+            continue;
+        }
+        if ab[ia] != bb[ib] {
+            break;
+        }
+        ia += 1;
+        ib += 1;
     }
 
     // Walk back to a char boundary so the snippet is valid UTF-8.
-    let start = floor_char_boundary(a, i.saturating_sub(CONTEXT));
-    let end = floor_char_boundary(a, (i + CONTEXT).min(a.len()));
-    let bend = floor_char_boundary(b, (i + CONTEXT).min(b.len()));
+    let start = floor_char_boundary(a, ia.saturating_sub(CONTEXT));
+    let end = floor_char_boundary(a, (ia + CONTEXT).min(a.len()));
+    let bstart = floor_char_boundary(b, ib.saturating_sub(CONTEXT));
+    let bend = floor_char_boundary(b, (ib + CONTEXT).min(b.len()));
 
     let expected = &a[start..end];
-    let actual = &b[start.min(b.len())..bend];
-    let diverged_at = a.len() == b.len() && i == a.len();
-    if diverged_at {
+    let actual = &b[bstart..bend];
+    if ia == a.len() && ib == b.len() {
         return format!("length-identical but differing at the end: {expected:?}");
     }
     // The percentage of the parsoid total is what makes the offset readable at a
@@ -2171,10 +2215,10 @@ fn first_difference(a: &str, b: &str) -> String {
     let pct = if a.is_empty() {
         0.0
     } else {
-        100.0 * i as f64 / a.len() as f64
+        100.0 * ia as f64 / a.len() as f64
     };
     format!(
-        "first difference at byte {i} of {} ({pct:.2}% of parsoid) / {} (rustoid):\n  parsoid: {expected:?}\n  rustoid: {actual:?}",
+        "first difference at byte {ia} of {} ({pct:.2}% of parsoid) / {} (rustoid):\n  parsoid: {expected:?}\n  rustoid: {actual:?}",
         a.len(),
         b.len()
     )
