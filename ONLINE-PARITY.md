@@ -16535,6 +16535,37 @@ and the page matches again. The lesson is a harness one: a cached `page/html`
 response bakes in the fetch time, so a date-dependent page must have its oracle
 re-fetched, not merely its *facts*.
 
+### The fix: test the oracle's age instead of trusting or refreshing it
+
+The oracle is now re-fetched only when a *stale-oracle* comparison differs, and the
+fresh rendering is kept **only if it matches**. A page that differs for a real
+reason keeps the baseline it was compared against, so its first difference is not
+disturbed by an unrelated stylesheet revision that a blind refresh picked up.
+Offline — and when the refresh fails, which a multi-megabyte page can (the wiki's
+own renderer returns `504`) — the cached oracle is used and the lag is reported
+through `suspect` (`a fact 2d newer than the oracle` or `the oracle is 3d old`).
+
+The single-page path also writes the cache manifest now, which it did not: a
+re-fetched oracle was on disk but unindexed, so the next run reported the page
+uncached.
+
+#### Two approaches that failed, and why
+
+Both were tried and reverted, so they are recorded rather than retried:
+
+- **Re-fetch every day-stale oracle up front.** This de-synchronises the oracle
+  from the cached facts: the fresh oracle is rendered with the wiki's *current*
+  templates while rustoid uses its cached ones, so `Zebra` went from a match to a
+  difference on `TemplateStyles:r1380355963` vs the cached stylesheet
+  `TemplateStyles:r1289143401`. A fresh oracle against a stale fact is exactly as
+  inconsistent as the reverse.
+- **Refresh the day-stale facts too, so the two stay in step.** Correct in
+  principle, but it re-reads every template in the corpus in one run and bursts
+  the API into `HTTP 429 Too Many Requests`; the harness maps a failed fetch to
+  "does not exist", so `Module:Unicode data` and `Module:Protected page` vanished
+  and the corpus scored **0/47**. The day rule is therefore *not* applied to the
+  facts; a full re-read stays an explicit act (`--flush`, then warm).
+
 ## An `mw:Entity` transclusion target takes the prepended type
 
 A transclusion whose whole output is an entity (`{{snd}}`) encapsulates the
