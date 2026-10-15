@@ -16610,3 +16610,21 @@ a *different* cause — each side emits exactly one indicator — so their extra
 first *corpus* difference is never a highlight block — each is a different bug
 (a comment argument, a hidden table row, an extra category). Porting it gates no
 page on its own.
+
+## An empty `<ref>` tag pair carries an empty `html` body
+
+`References::renderReference` gives the `data-mw.body` a `<ref>` **use** carries
+three shapes. A self-closing `<ref name="x"/>` has no `body` key at all; an empty
+tag pair `<ref name="x"></ref>` gets `"body":{"html":""}`; and a use that carried
+content points at its note with `"body":{"id":"mw-reference-text-…"}`. rustoid
+collapsed the first two — `Reference::use_has_body` was just
+`!self_closing && !body.is_empty()` — so an empty pair emitted no `body`, losing
+`Lionel Messi`'s `<ref name="U23" group="upper-alpha"></ref>`. PHP's test is
+`trim($refDataMw->body->extsrc ?? '') === ''`, so blank whitespace counts as
+empty. `use_has_body: Vec<bool>` became `use_body: Vec<UseBody>`
+(`None`/`Empty`/`Content`), and the shape is chosen per use, not per note.
+
+### Effect
+
+`Lionel Messi` 22049 → 36892, `Tropical cyclone` 46768 → 76868; no regressions
+(48 pages, better=2 worse=0). Fixtures 877/896.
