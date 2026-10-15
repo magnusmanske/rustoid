@@ -16580,20 +16580,29 @@ that unfold a `mw:DOMFragment` (`mw:Extension/templatestyles mw:Transclusion`,
 the same for `syntaxhighlight`). So `mw:Entity` joins media and `mw:ExpandedAttrs`
 in the prepend set. Effect: `Isaac Newton` 41098 → 41596; fixtures 877/896.
 
-## Open lead: a duplicated protection indicator
+## An unclosed `<noinclude>` runs to the end of the text
 
-The frequent `about="#mwtN"` off-by-one (`Berlin`, `Chernobyl disaster`,
-`COVID-19 pandemic`, `International Space Station`) is one extra id spent before
-the infobox's `Module:Infobox/styles.css` `<style>`. Tracing it (with
-`RUSTOID_TRACE_ABOUT`) lands on an `indicator` allocation, and the dumps confirm
-rustoid emits the `pp-default` protection padlock **twice** where Parsoid emits it
-once. The duplicate sits inside a `Module:Documentation` render, which points at
-`Module:Protected page`'s wrapper resolution — `cfg.wrappers[parent:getTitle()]`
-maps `Template:Move-protected` to `{action = 'move', catonly = 'yes'}`. If that
-lookup misses, the move call falls back to `action = 'edit'` and emits a second
-`pp-default` padlock instead of a suppressed move padlock.
+MediaWiki reads an unclosed `<noinclude>` as consuming the rest of the text, so
+`strip_noinclude_sections` must drop *everything* after it, not merely the opening
+tag. `Template:Time interval` is exactly
+`<includeonly>{{{{{|safesubst:}}}}#invoke:age|time_interval}}</includeonly><noinclude>{{documentation}}`
+— 101 bytes, no closing tag. Dropping only the opening tag kept `{{documentation}}`,
+so rustoid rendered the template's own documentation — and the `pp-default`
+protection padlock its `Module:Documentation` render emits — into the middle of
+every article that transcluded it, spending an `about` id and shifting every
+following one.
 
-### Also ruled out
+### Effect
+
+`COVID-19 pandemic` 8292 → 23282, `International Space Station` 10614 →
+15058; no regressions (48 pages, better=2 worse=0). This supersedes the
+"duplicated protection indicator" lead: the duplicate was the leaked
+`{{documentation}}`, not a `Module:Protected page` wrapper miss. `Berlin` and
+`Chernobyl disaster` carry the *same* off-by-one at their first `<style>` but from
+a *different* cause — each side emits exactly one indicator — so their extra id
+(rustoid allocates `#mwt17` where Parsoid jumps to `#mwt20`) stays open.
+
+## Syntaxhighlight is ruled out as a gating bug
 
 `Isaac Newton`, `Python`, `Brat (album)` and `Template:Weather box` all have
 `syntaxhighlight`, but a faithful port is a large Pygments 2.21.0 subset
