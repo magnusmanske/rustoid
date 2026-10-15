@@ -1552,6 +1552,16 @@ pub struct Parser<'a, C: SiteConfig> {
     /// Cite later reads from the DOM node. The body text is what Cite itself
     /// identifies a note by, so it is the stable key.
     ref_bodies_by_body: std::cell::RefCell<std::collections::HashMap<String, Node>>,
+    /// The pre-expanded *bodies* of `<references>` elements, keyed by their
+    /// wikitext. Those bodies hold the **list-defined** references
+    /// (`{{reflist|refs=<ref name="A">…</ref>}}`), which Parsoid parses into the
+    /// element's children (`ReferenceListTagHandler::sourceToDom`) and Cite then
+    /// collects at the element's position — an ordinary `<ref>` there, whose body
+    /// it renders like any other. rustoid keeps the element childless, so the
+    /// definitions are read from here by `cite::collect`; without them a note
+    /// defined this way renders empty (and its body's extension ids are never
+    /// spent).
+    references_bodies: std::cell::RefCell<std::collections::HashMap<String, Node>>,
     /// The `<ref>` bodies that may hold a nested `<ref>`: those whose pipeline ran
     /// with `inTemplate` (`RefTagHandler::sourceToDom`'s `allowNestedRef =
     /// $extApi->inTemplate()`). A literal `<ref>` at the page's own level is parsed
@@ -1670,6 +1680,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
             ref_bodies_by_body: std::cell::RefCell::new(std::collections::HashMap::new()),
+            references_bodies: std::cell::RefCell::new(std::collections::HashMap::new()),
             nested_ref_bodies: std::cell::RefCell::new(std::collections::HashSet::new()),
             wrap_templates: std::cell::Cell::new(true),
         }
@@ -4435,12 +4446,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 }
                 self.ref_bodies_by_body.borrow().get(text).cloned()
             };
+            // A `<references>` element's **list-defined** refs
+            // (`{{reflist|refs=<ref name="A">…</ref>}}`), which Parsoid parses into
+            // the element's children and Cite collects at its position. rustoid
+            // keeps the element childless, so its body comes from the stash
+            // instead (see [`Parser::references_bodies`]).
+            let references_body =
+                |text: &str| -> Option<Node> { self.references_bodies.borrow().get(text).cloned() };
             crate::ext::cite::run(
                 &mut ast,
                 &page_title_prefixed,
                 &mut ids,
                 &render_body,
                 &nested_body,
+                &references_body,
             );
             // Hand the advanced counter back: ids are allocated in document
             // order, so anything numbered after Cite must continue from here.
@@ -5132,7 +5151,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
     ) {
-        let (body, is_ref, arg_value) = {
+        let (body, is_ref, is_references, arg_value) = {
             let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                 return;
             };
@@ -5150,13 +5169,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 return;
             }
             let is_ref = name.as_deref() == Some("ref");
+            let is_references = name.as_deref() == Some("references");
 
             // PHP parses the body in a *fresh* pipeline (`sourceToDom` on the
             // extension body), so `inTemplate` is false and a template inside a
             // note is a top-level transclusion that is wrapped — even when the
             // ref itself sits in a template argument (`{{Infobox|data1=<ref>{{tl|A}}</ref>}}`
             // numbers `{{tl}}`; the body is not the argument's body).
-            let body = if is_ref {
+            //
+            // A `<references>` body is its **list-defined** `ref`s
+            // (`{{reflist|refs=<ref name="A">…</ref>}}`), which
+            // `ReferenceListTagHandler::sourceToDom` parses into the element's
+            // children before Cite collects them — they are ordinary refs there,
+            // so their bodies are rendered and stashed like any other.
+            let body = if is_ref || is_references {
                 extension_body(t)
             } else {
                 String::new()
@@ -5167,7 +5193,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // bare `mw:Extension/templatestyles`, unlike a literal
             // `<ref>{{mono|EA}}</ref>`). See [`crate::wikitext::tokens_v2::TempData::in_arg_value`].
             let arg_value = t.data_parsoid.tmp.in_arg_value;
-            (body, is_ref, arg_value)
+            (body, is_ref, is_references, arg_value)
         };
         // Pre-rendering a body costs a full expansion. Only a body that can spend
         // an `about` id of its own needs it: a template (which may emit a
@@ -5260,6 +5286,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             t.add_attribute_str("about", &about);
         }
         if let Some(node) = rendered {
+            if is_references {
+                // The definitions live in the `<references>` element's children;
+                // Cite's collect walk reads them from here (see
+                // [`Parser::references_bodies`]).
+                self.references_bodies
+                    .borrow_mut()
+                    .insert(body.clone(), node.clone());
+            }
             self.ref_bodies.borrow_mut().insert(about, node.clone());
             if !body.is_empty() {
                 // A body parsed with `inTemplate` may hold a nested `<ref>`; see

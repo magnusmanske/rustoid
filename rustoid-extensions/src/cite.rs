@@ -266,6 +266,39 @@ impl CiteState {
         self_closing: bool,
         about: Option<&str>,
     ) -> String {
+        self.add_full(name, group, attrs, body, self_closing, about, true)
+    }
+
+    /// Record a **list-defined** ref — one defined inside `<references>`.
+    ///
+    /// Parsoid adds it to its group but not to the page's markers: outside a
+    /// reference list a ref is "embedded content"
+    /// (`ReferencesData::inReferenceList`), so it lands in `embeddedNodes`, gets
+    /// no `cite_ref-…` use and no back-link. It still creates a note — and spends
+    /// a `globalId`, if its name is new — and supplies that note's body.
+    pub fn add_embedded(
+        &mut self,
+        name: &str,
+        group: &str,
+        attrs: Vec<(String, String)>,
+        body: &str,
+        self_closing: bool,
+        about: Option<&str>,
+    ) {
+        self.add_full(name, group, attrs, body, self_closing, about, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_full(
+        &mut self,
+        name: &str,
+        group: &str,
+        attrs: Vec<(String, String)>,
+        body: &str,
+        self_closing: bool,
+        about: Option<&str>,
+        record_use: bool,
+    ) -> String {
         // A **named** ref is identified by its name, so `<ref name="x" />` finds
         // the note that `<ref name="x">…</ref>` defined. An anonymous one is not
         // identified at all: Cite indexes only named refs (`RefGroup::push` under
@@ -322,7 +355,11 @@ impl CiteState {
 
         // The id is keyed on the note the ref *resolved to*, not on this call's
         // spelling, so two uses of `<ref name="x" />` produce `-0` and `-1` for the
-        // same note — which is what makes the back-links line up.
+        // same note — which is what makes the back-links line up. An *embedded*
+        // (list-defined) ref produces no use at all.
+        if !record_use {
+            return String::new();
+        }
         let use_index = self.references[idx].uses.len();
         let id = marker_id(
             &self.references[idx].name,
@@ -568,10 +605,11 @@ pub fn run(
     ids: &mut DocIds,
     body_of: &dyn Fn(&Reference) -> rustoid_ast::dom::node::Node,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
 ) -> usize {
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
-    collect(root, &mut state, &mut use_ids, nested_body);
+    collect(root, &mut state, &mut use_ids, nested_body, references_body);
     // Deliberately **not** skipped when `state` is empty: a `<references>` tag with
     // no refs still renders its wrapper and an empty `<ol>`, which is what Parsoid
     // emits (verified against the cached output — the list structure is always
@@ -606,30 +644,82 @@ pub fn run(
 /// Walk once, recording every `<ref>` in document order.
 ///
 /// `<references>` is deliberately not collected here: it renders in place, from
-/// state only this walk can build, so it is handled during substitution.
+/// state only this walk can build, so it is handled during substitution. Its
+/// *body* is walked, though — that is where its list-defined refs live.
 fn collect(
     node: &rustoid_ast::dom::node::Node,
     state: &mut CiteState,
     use_ids: &mut Vec<String>,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
 ) {
+    collect_in(
+        node,
+        state,
+        use_ids,
+        nested_body,
+        references_body,
+        /* embedded */ false,
+    );
+}
+
+/// [`collect`], carrying whether the node sits inside a `<references>` body.
+///
+/// An **embedded** ref — a list-defined definition — is added to its group but
+/// records no marker (Parsoid's `ReferencesData::inReferenceList` puts it in
+/// `embeddedNodes`), so it must not consume a `use_ids` slot; `walk_render`
+/// consumes those in DOM order and never sees one.
+#[allow(clippy::too_many_arguments)]
+fn collect_in(
+    node: &rustoid_ast::dom::node::Node,
+    state: &mut CiteState,
+    use_ids: &mut Vec<String>,
+    nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    embedded: bool,
+) {
+    // A `<references>` element's body holds its **list-defined** refs
+    // (`{{reflist|refs=<ref name="A">…</ref>}}`), which Parsoid parses into the
+    // element's children (`ReferenceListTagHandler::sourceToDom`) and `processRefs`
+    // then walks at the element's position. rustoid's element is childless, so the
+    // body is read from the stash.
+    if let Some(body) = read_references_body(node)
+        && let Some(body_node) = references_body(&body)
+    {
+        for child in &body_node.children {
+            collect_in(child, state, use_ids, nested_body, references_body, true);
+        }
+    }
     if let Some((name, group, body, self_closing, attrs)) = read_ref(node) {
         // A ref nested in a transcluded note is processed *before* the note itself
         // (Cite's `References::extractRefFromNode` calls `processNestedRefInRef`
         // before `addRef`), so the nested refs take the lower numbers. `nested_body`
         // returns the body only when Parsoid would have kept a nested ref in it —
         // the note's pipeline ran `inTemplate` (`{{#tag:ref|…}}`); see
-        // [`Parser::nested_ref_bodies`].
+        // [`Parser::nested_ref_bodies`]. `processNestedRefInRef` also raises the
+        // nested depth, which drops `referenceListGroup()` — so a nested ref is
+        // never embedded, whatever encloses it.
         if !self_closing && let Some(body_node) = nested_body(&body) {
             for child in &body_node.children {
-                collect(child, state, use_ids, nested_body);
+                collect_in(child, state, use_ids, nested_body, references_body, false);
             }
         }
         let about = node.get_attr("about");
-        use_ids.push(state.add_with_attrs(&name, &group, attrs, &body, self_closing, about));
+        if embedded {
+            state.add_embedded(&name, &group, attrs, &body, self_closing, about);
+        } else {
+            use_ids.push(state.add_with_attrs(&name, &group, attrs, &body, self_closing, about));
+        }
     }
     for child in &node.children {
-        collect(child, state, use_ids, nested_body);
+        collect_in(
+            child,
+            state,
+            use_ids,
+            nested_body,
+            references_body,
+            embedded,
+        );
     }
 }
 
@@ -969,6 +1059,21 @@ fn apply_transclusion_encapsulation(
 fn typeof_contains(node: &rustoid_ast::dom::node::Node, value: &str) -> bool {
     node.get_attr("typeof")
         .is_some_and(|t| t.split_whitespace().any(|v| v == value))
+}
+
+/// The raw body of a `<references>` tag pair, which holds its list-defined refs.
+///
+/// `None` for a self-closing `<references/>`, and for a tag pair whose body is
+/// empty (the element is `childless` either way, and the stash is keyed by the
+/// body text). The extraction mirrors [`read_ref`]'s: the body is what sits
+/// between the start tag's `>` and the closing `</references>`.
+fn read_references_body(node: &rustoid_ast::dom::node::Node) -> Option<String> {
+    let source = node.get_attr("source")?;
+    if source.trim_end().ends_with("/>") {
+        return None;
+    }
+    let body = body_between(source)?;
+    (!body.is_empty()).then_some(body)
 }
 
 /// Read a `<references>` element into `(group, attrs_json, has_body)`.
@@ -1492,8 +1597,9 @@ mod tests {
 
     /// A `<ref>` inside a transcluded note's body is collected before the note
     /// itself, so it takes the lower number: Cite's `extractRefFromNode` calls
-    /// `processNestedRefInRef` before `addRef`. The nested ref is only processed
-    /// when the note carries `mw:Transclusion` (the `inTemplate` gate).
+    /// `processNestedRefInRef` before `addRef`. Whether the nested ref survived at
+    /// all is what `nested_body` decides — it returns the body only for a note
+    /// whose pipeline ran `inTemplate`.
     #[test]
     fn a_nested_ref_is_collected_before_its_note() {
         use rustoid_ast::dom::node::{ElementKind, Node};
@@ -1510,6 +1616,7 @@ mod tests {
         body.push_child(Node::text("A"));
         body.push_child(ref_node("mw:Extension", "<ref>B</ref>"));
         let nested_body = move |text: &str| text.contains("A<ref>B</ref>C").then(|| body.clone());
+        let references_body = |_text: &str| None;
 
         let mut root = Node::document();
         root.push_child(ref_node(
@@ -1519,13 +1626,70 @@ mod tests {
 
         let mut state = CiteState::new();
         let mut ids = Vec::new();
-        collect(&root, &mut state, &mut ids, &nested_body);
+        collect(&root, &mut state, &mut ids, &nested_body, &references_body);
 
         assert_eq!(state.references.len(), 2);
         // The anonymous nested ref is numbered first; the named note follows.
         assert_eq!(state.references[0].global_id, 1);
         assert_eq!(state.references[0].body, "B");
         assert_eq!(state.references[1].name, "o");
+        assert_eq!(state.references[1].global_id, 2);
+    }
+
+    /// A `<references>` element's body holds **list-defined** refs, which Parsoid
+    /// parses into the element's children (`ReferenceListTagHandler::sourceToDom`)
+    /// and collects at the element's position. They are *embedded* refs — inside a
+    /// reference list — so they fill their notes' bodies without adding a use: the
+    /// note a use already made gets its text, and a definition nobody used still
+    /// becomes a note (`ReferencesData::inReferenceList` puts it in
+    /// `embeddedNodes`).
+    #[test]
+    fn a_list_defined_ref_fills_a_note_without_a_use() {
+        use rustoid_ast::dom::node::{ElementKind, Node};
+
+        let ref_node = |source: &str| {
+            let mut n = Node::element(ElementKind::Other("extension".to_string()));
+            n.set_attr("typeof", "mw:Extension");
+            n.set_attr("name", "ref");
+            n.set_attr("source", source);
+            n
+        };
+
+        // The definition as the `<references>` body renders it.
+        let mut body = Node::document();
+        body.push_child(ref_node("<ref name=\"A\">TEXT</ref>"));
+        body.push_child(ref_node("<ref name=\"Z\">ZZZ</ref>"));
+        let references_body = move |text: &str| text.contains("name=\"A\"").then(|| body.clone());
+        let nested_body = |_text: &str| None;
+
+        let mut refs = Node::element(ElementKind::Other("div".to_string()));
+        refs.set_attr("typeof", "mw:Extension");
+        refs.set_attr("name", "references");
+        refs.set_attr(
+            "source",
+            "<references><ref name=\"A\">TEXT</ref></references>",
+        );
+
+        let mut root = Node::document();
+        // The use comes first, so the note is created with no body.
+        root.push_child(ref_node("<ref name=\"A\"/>"));
+        root.push_child(refs);
+
+        let mut state = CiteState::new();
+        let mut ids = Vec::new();
+        collect(&root, &mut state, &mut ids, &nested_body, &references_body);
+
+        // The use is the only marker; neither definition records a use.
+        assert_eq!(ids, vec!["cite_ref-A_1-0".to_string()]);
+        assert_eq!(
+            state.references.len(),
+            2,
+            "A gains its body, Z is a new note"
+        );
+        assert_eq!(state.references[0].name, "A");
+        assert_eq!(state.references[0].body, "TEXT");
+        assert_eq!(state.references[0].uses.len(), 1);
+        assert_eq!(state.references[1].name, "Z");
         assert_eq!(state.references[1].global_id, 2);
     }
 
