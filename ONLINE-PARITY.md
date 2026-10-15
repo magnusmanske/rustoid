@@ -16650,3 +16650,21 @@ implementation rather than a silenced fallback.
 `COVID-19 pandemic` 23282 → 23530; `Sundial`'s output lost all five stray
 `<template>` nodes; no regressions (48 pages, better=1 worse=0, plus the node
 removal on `Sundial` below its first difference). Fixtures 877/896.
+
+## `style` values are CSS-normalized
+
+`Sanitizer::checkCss` normalizes a `style` value before its own checks —
+`normalizeCss` decodes character references, decodes CSS escape sequences
+(CSS 2.1 appendix D), and strips comments. rustoid's `checkCss` port skipped the
+normalization ("omitted for now"), so a value Scribunto escaped stayed escaped:
+`mw.html`'s `cssEncode` writes `;` as `\3B ` to keep a value from breaking out
+into a new declaration, and Parsoid decodes it straight back.
+`Module:Infobox military conflict`'s `border-right:1px dotted #aaa;` came out as
+`#aaa\3B `.
+
+The decode runs *before* the insecure-pattern check, so a `\75 rl(` that spells
+`url(` is still rejected — that ordering is the point.
+
+### Effect
+
+`World War II` 25363 → 26339; no regressions (48 pages, better=1 worse=0).
