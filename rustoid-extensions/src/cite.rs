@@ -47,6 +47,22 @@
 
 use std::collections::HashMap;
 
+/// The `data-mw.body` shape a single `<ref>` use carries.
+///
+/// Mirrors `References::renderReference`: a self-closing `<ref name="x"/>` has
+/// no `body` key; an empty *tag pair* `<ref name="x"></ref>` gets
+/// `"body":{"html":""}`; a use that carried content points at the note with
+/// `"body":{"id":"mw-reference-text-…"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseBody {
+    /// Self-closing: no `body` key.
+    None,
+    /// An empty tag pair: `"body":{"html":""}`.
+    Empty,
+    /// A use that carried content: `"body":{"id":"mw-reference-text-…"}`.
+    Content,
+}
+
 /// One collected reference: a note in the list, plus every site that points at it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
@@ -82,17 +98,17 @@ pub struct Reference {
     /// trimmed — `TokenUtils::kvToHash`), which is why a `<ref group="">` keeps
     /// its empty `group` where a `<ref name="x">` has none.
     pub use_attrs: Vec<Vec<(String, String)>>,
-    /// One entry per use site, parallel to `uses`: whether that use carried its
-    /// own non-empty body (`<ref name="x">…</ref>`) rather than being a bare
-    /// `<ref name="x"/>` reuse.
+    /// One entry per use site, parallel to `uses`: the `data-mw.body` shape
+    /// that use carries (see [`UseBody`]).
     ///
-    /// Parsoid points every such use at the note's text, not only the one that
-    /// supplied it: `References::renderReference` sets `$refDataMw->body->id`
-    /// whenever the use's own body is non-empty, and only a bare self-closing
-    /// reuse (empty body) gets none. An `{{sfn}}` footnote, which repeats the
-    /// same content at every occurrence, therefore carries a `data-mw.body` on
-    /// each — a shape that a `body_use`-only rule got wrong.
-    pub use_has_body: Vec<bool>,
+    /// Parsoid points every content-carrying use at the note's text, not only
+    /// the one that supplied it: `References::renderReference` sets
+    /// `$refDataMw->body->id` whenever the use's own body is non-empty, while a
+    /// bare self-closing reuse (empty body) gets none and an empty *tag pair*
+    /// gets an empty `html` body. An `{{sfn}}` footnote, which repeats the same
+    /// content at every occurrence, therefore carries a `data-mw.body` on each —
+    /// a shape that a `body_use`-only rule got wrong.
+    pub use_body: Vec<UseBody>,
     /// The `about` id of the use that supplied this note's body.
     ///
     /// A `<ref>` body is expanded *at the ref site* during template expansion
@@ -273,7 +289,7 @@ impl CiteState {
                     global_id,
                     uses: Vec::new(),
                     use_attrs: Vec::new(),
-                    use_has_body: Vec::new(),
+                    use_body: Vec::new(),
                     body_about: None,
                 });
                 let i = self.references.len() - 1;
@@ -282,10 +298,14 @@ impl CiteState {
             }
         };
 
+        // `References::renderReference` treats a body that is blank after
+        // trimming as empty (`$isEmptyBody`), so `""` and `"   "` behave alike.
+        let empty_body = body.trim().is_empty();
+
         // A use that carries text *defines* the note, wherever it sits. An empty
         // body never overwrites one, and never claims the pointer: a bare
         // `<ref name="x"/>` contributes a back-link and nothing else.
-        let defines = !self_closing && !body.is_empty();
+        let defines = !self_closing && !empty_body;
         if defines {
             self.references[idx].body = body.to_string();
             self.references[idx].self_closing = false;
@@ -303,9 +323,16 @@ impl CiteState {
         );
         self.references[idx].uses.push(id.clone());
         self.references[idx].use_attrs.push(attrs);
-        // Whether *this* use carried its own body drives its `data-mw.body`
-        // pointer, not which use defined the note (see `use_has_body`).
-        self.references[idx].use_has_body.push(defines);
+        // The use's *own* body drives its `data-mw.body` shape, not which use
+        // defined the note (see `use_body`).
+        let shape = if self_closing {
+            UseBody::None
+        } else if empty_body {
+            UseBody::Empty
+        } else {
+            UseBody::Content
+        };
+        self.references[idx].use_body.push(shape);
         id
     }
 
@@ -467,13 +494,17 @@ pub fn ref_data_mw(reference: &Reference, use_index: usize) -> String {
     //
     // `attrs` is emitted even when empty, which is Cite's shape for a bare
     // `<ref>`.
-    if reference.use_has_body.get(use_index) != Some(&true) {
-        return format!("{{\"name\":\"ref\",\"attrs\":{attrs}}}");
+    match reference.use_body.get(use_index) {
+        Some(UseBody::Content) => format!(
+            "{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"id\":{}}}}}",
+            json_string(&format!("mw-reference-text-{}", reference.note_id()))
+        ),
+        Some(UseBody::Empty) => {
+            format!("{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"html\":\"\"}}}}")
+        }
+        // A bare `<ref>` (or a use whose shape was never recorded) has no body.
+        _ => format!("{{\"name\":\"ref\",\"attrs\":{attrs}}}"),
     }
-    format!(
-        "{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"id\":{}}}}}",
-        json_string(&format!("mw-reference-text-{}", reference.note_id()))
-    )
 }
 
 /// The `data-mw` JSON for a `<references>` tag.
@@ -1353,6 +1384,36 @@ mod tests {
         assert_eq!(
             ref_data_mw(&st.references[0], 0),
             r#"{"name":"ref","attrs":{},"body":{"id":"mw-reference-text-cite_note-1"}}"#
+        );
+    }
+
+    /// An empty *tag pair* is not the same as a self-closing ref: Parsoid records
+    /// an empty `html` body for it (`References::renderReference`, the
+    /// `$hasMissingContent` arm that is not `selfClose`). A self-closing ref gets
+    /// no `body` at all, and blank content counts as empty.
+    #[test]
+    fn an_empty_tag_pair_carries_an_empty_html_body() {
+        let mut st = CiteState::new();
+        st.add("U23", "upper-alpha", "", false, None);
+        assert_eq!(
+            ref_data_mw(&st.references[0], 0),
+            r#"{"name":"ref","attrs":{"name":"U23","group":"upper-alpha"},"body":{"html":""}}"#
+        );
+
+        // Whitespace-only content is empty after trimming, as in PHP.
+        let mut st = CiteState::new();
+        st.add("", "", "  \n", false, None);
+        assert_eq!(
+            ref_data_mw(&st.references[0], 0),
+            r#"{"name":"ref","attrs":{},"body":{"html":""}}"#
+        );
+
+        // The self-closing form still carries none.
+        let mut st = CiteState::new();
+        st.add("", "", "", true, None);
+        assert_eq!(
+            ref_data_mw(&st.references[0], 0),
+            r#"{"name":"ref","attrs":{}}"#
         );
     }
 
