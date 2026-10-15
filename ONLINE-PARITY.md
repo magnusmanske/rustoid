@@ -16628,3 +16628,25 @@ empty. `use_has_body: Vec<bool>` became `use_body: Vec<UseBody>`
 
 `Lionel Messi` 22049 → 36892, `Tropical cyclone` 46768 → 76868; no regressions
 (48 pages, better=2 worse=0). Fixtures 877/896.
+
+## `#coordinates` renders nothing in the body
+
+`{{#coordinates:…}}` is the GeoData extension's parser function, reached on the
+corpus by `Module:Coordinates`'s `coord_wrapper` through
+`frame:callParserFunction('#coordinates', in_args)`. In Parsoid it renders
+nothing in the body — the coordinate is stashed on the page's `geoData`, which
+the served HTML does not carry. rustoid had no arm, so it took the
+unknown-parser-function fallback, which spills the call's own source; the module
+then spliced that source back into its answer and it leaked as a stray
+`<template #coordinates="">` node where the marker landed (`Sundial`, five
+times), sharing the enclosing transclusion's `about` id.
+
+A *genuinely* unknown parser function does spill its source in the live service
+(`{{#notafunction123:1|2}}` renders the literal call), so this is an
+implementation rather than a silenced fallback.
+
+### Effect
+
+`COVID-19 pandemic` 23282 → 23530; `Sundial`'s output lost all five stray
+`<template>` nodes; no regressions (48 pages, better=1 worse=0, plus the node
+removal on `Sundial` below its first difference). Fixtures 877/896.
