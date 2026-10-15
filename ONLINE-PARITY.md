@@ -17185,3 +17185,53 @@ note. A token with no source that is *not* a placeholder still drops, as before.
 `Python (programming language)` 25628 → 27043; `{{refn|…}}` and `{{efn|…}}` notes
 keep their `Module:Citation/CS1/styles.css` link. Fixtures stay at 877/896, every
 lib test passes, and the 48-page offline corpus is better=1, worse=0.
+
+## A `<references>` list renders only the notes that came before it
+
+A `<references>` element does not render "its group". In Parsoid it renders the
+notes that exist **when the walk reaches it**, and then drops the group:
+`References::insertReferencesIntoDOM` renders the current `RefGroup` and ends in
+`ReferencesData::removeRefGroup`. A later `<ref>` of the same group therefore
+starts a *fresh* one — new note number, new `globalId` — and a second
+`<references>` for that group renders only that fresh instance.
+
+rustoid collected every ref first and then wrote the *whole* group into every
+matching list, so a page whose list appears before some of its refs printed the
+notes twice. `Israel`, whose infobox carries `| footnotes = {{notelist}}`, drew a
+spurious fourth list holding `cite_note-29`; `Cristiano Ronaldo`'s two
+`lower-alpha` lists each held all 45 notes where the service splits them 17 + 28,
+and the second one re-numbered them from `a`.
+
+An empty list *from a template* is removed outright (Cite's T364830): the service
+asks `WTUtils::fromTemplatedContent`, so a refslist an expansion emitted is
+dropped rather than left as an empty `<ol>`, while a literal, empty
+`<references/>` stays. That is what removes the infobox notelist on `Israel`.
+
+### The fix
+
+`CiteState::cut_group` hands back a group's current member indices and starts a
+fresh instance (clearing the named-ref index and the number counter, as
+`removeRefGroup` + `getOrCreateRefGroup` do). `collect_in` pushes one cut per
+top-level `<references>` element in document order — after that element's
+list-defined body has joined the instance — and `walk_render` consumes them in the
+same order, so each list renders its own slice. A ref inside a `<references>`
+context also takes *that* element's group whatever its own `group` attribute says
+(`Validator::validateRefInReferenceList`).
+
+`walk_render` now carries "is this node templated content", computed the way
+`WTUtils::findFirstEncapsulationWrapperNode` does: an ancestor (or the node) with
+an `about` whose same-`about` sibling run is headed by a `mw:Transclusion` element.
+An empty list in that context is dropped from its parent.
+
+### Effect
+
+The reference lists of `Israel` (765 = 765 notes, three lists), `Cristiano
+Ronaldo` (547 = 547) and `2024 Summer Olympics` (260 = 260) now match the service
+exactly. Across the corpus the total list-length error falls 104 → 13 notes, with
+`Lionel Messi` 613 → 579 against parsoid's 580; the remaining ±1s are the
+pre-existing missing-ref/id-gap cluster, not notes this change drops. The
+first-difference positions do not move (the Cite lists sit well past every page's
+first difference), so the strict score is unchanged. A Cite auto-generated list
+(`CiteDocumentPostProcessor::insertMissingReferencesIntoDOM`) exists but is not
+reached on any of the 48 pages. Fixtures stay at 877/896, every lib test passes,
+and clippy and fmt are clean.
