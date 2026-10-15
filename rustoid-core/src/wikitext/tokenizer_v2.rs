@@ -6051,17 +6051,13 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
             }
         }
         // Track nesting of `{{{`, `{{`, and `[[`.
-        if inner[i..].starts_with("{{{") {
-            braces.push(Brace::Tplarg);
-            current.push_str("{{{");
-            i += 3;
-            continue;
-        }
+        //
         // The `{{!}}` magic word is a *pipe* separator at the top level of
         // wikilink content (mirrors the PEG `pipe = "|" / "{{!}}"`), so
         // `[[Main Page{{!}}Something else]]` splits on it just like `|`. Only in
         // wikilink content (not template args, where `{{!}}` is a nested magic
-        // word).
+        // word). It is tested first because the brace-run rule below would read
+        // its two-brace run as a template.
         if magic_pipe
             && lower[i..].starts_with("{{!}}")
             && braces.is_empty()
@@ -6075,11 +6071,36 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
             i += 5;
             continue;
         }
-        if inner[i..].starts_with("{{") {
-            braces.push(Brace::Template);
-            current.push_str("{{");
-            i += 2;
-            continue;
+        // A run of `{` opens a template when `N % 3 == 2`, an argument when
+        // `N % 3 == 0`, and when `N % 3 == 1` one `{` is literal and the rest of
+        // the run is reconsidered (MediaWiki's "ideal precedence"). Testing
+        // `starts_with("{{{")` first read the five-brace `subst` idiom
+        // (`{{{{{name|safesubst:}}}#invoke:…}}`) as an argument, which
+        // desynchronised the stack: a following top-level `|` was then seen as
+        // nested and the arguments merged, so `Template:Str ≥ len` — whose body
+        // is exactly that idiom around an `#ifexpr` — recorded one parameter and
+        // evaluated the branches as part of the expression. Mirrors
+        // [`find_template_closing_memo`] and [`PegTokenizer::parse_directive`].
+        if let Some(&b'{') = inner.as_bytes().get(i) {
+            let run = inner[i..].bytes().take_while(|&b| b == b'{').count();
+            match run % 3 {
+                0 => {
+                    braces.push(Brace::Tplarg);
+                    current.push_str("{{{");
+                    i += 3;
+                    continue;
+                }
+                2 => {
+                    braces.push(Brace::Template);
+                    current.push_str("{{");
+                    i += 2;
+                    continue;
+                }
+                // `N % 3 == 1`: the first brace is literal content, and the rest
+                // of the run is reconsidered. Fall through rather than consuming
+                // it, so the `{|` table rule below still sees a table opener.
+                _ => {}
+            }
         }
         // A run of closing braces closes as many open constructs as it can, and
         // which closer comes first is decided by the *innermost* open construct.
@@ -6506,6 +6527,25 @@ mod tests {
         // A pipe inside the nested constructs is still not a separator.
         let parts = split_template_args("a|{{b|c|d}}|e");
         assert_eq!(parts, vec!["a", "{{b|c|d}}", "e"]);
+    }
+
+    /// A run of `{` opens a template when `N % 3 == 2` and an argument when
+    /// `N % 3 == 0`. Reading the five-brace `subst` idiom as an argument first
+    /// left the stack out of order, so the `|` between the `#ifexpr`'s condition
+    /// and its branches was taken as nested and the whole body became one
+    /// parameter — `Template:Str ≥ len` evaluated `3 >= 5 |YES|NO` and answered
+    /// `Expression error: Unrecognized word "YES".`.
+    #[test]
+    fn a_five_brace_run_opens_template_then_argument() {
+        let parts = split_template_args("{{{|safesubst:}}}#ifexpr: 3 >= 5 | YES | NO ");
+        assert_eq!(
+            parts,
+            vec!["{{{|safesubst:}}}#ifexpr: 3 >= 5 ", " YES ", " NO "]
+        );
+
+        // Six braces are two arguments, and the split after them still holds.
+        let parts = split_template_args("{{{|a|}}}#ifexpr: 1 | YES | NO ");
+        assert_eq!(parts, vec!["{{{|a|}}}#ifexpr: 1 ", " YES ", " NO "]);
     }
 
     fn tokenize(input: &str) -> Vec<Either<String, ParsoidToken>> {
