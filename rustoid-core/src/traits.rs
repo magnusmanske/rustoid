@@ -495,6 +495,19 @@ pub trait SiteConfig: Send + Sync {
         SiteStats::default()
     }
 
+    /// Whether the wiki is in "miser mode" (`$wgMiserMode`, the `misermode`
+    /// flag of `siteinfo`).
+    ///
+    /// In miser mode `{{REVISIONID}}` on the page itself answers the stub `-`
+    /// rather than the real id, so that a saved page's HTML does not change with
+    /// every edit while `{{if preview}}` can still tell a preview from a saved
+    /// page (`CoreParserFunctions::revisionid`, T137900). Defaults to false,
+    /// which is MediaWiki's own and the honest answer for a config that does not
+    /// report the flag.
+    fn miser_mode(&self) -> bool {
+        false
+    }
+
     /// Whether pages in namespace `ns` support subpages (relative `[[./…]]` /
     /// `[[../…]]` / `[[/…]]` link targets resolve against the context title).
     /// Mirrors PHP's `SiteConfig::namespaceHasSubpages`. Default: false (the

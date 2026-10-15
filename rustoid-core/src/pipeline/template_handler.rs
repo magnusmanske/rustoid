@@ -718,24 +718,30 @@ pub fn process_special_magic_word(magic_word_type: &str, in_template: bool) -> V
     }
 }
 
-/// What `{{PROTECTIONLEVEL:…}}` and `{{PROTECTIONEXPIRY:…}}` can answer.
+/// The page-scoped facts that `{{PROTECTIONLEVEL:…}}`/`{{PROTECTIONEXPIRY:…}}`
+/// and `{{REVISIONID}}` answer from.
 ///
 /// These are core magic words, but unlike `{{SITENAME}}` they need data no site
-/// configuration carries: the protection actually applied to a page. Expansion
-/// is synchronous, so the answers must be in hand before the tokens are walked —
-/// the parser fetches the page's own protection up front and this carries it.
+/// configuration carries: the protection actually applied to a page, and the
+/// revision the page is being parsed at. Expansion is synchronous, so the
+/// answers must be in hand before the tokens are walked — the parser fetches
+/// them up front and this carries them.
 ///
 /// A title the parser did not prefetch reports as unprotected, which is
 /// MediaWiki's answer for a title that does not exist and the conservative one
 /// for a title that was simply not asked about.
-pub struct ProtectionContext<'a> {
-    /// The page being parsed, for the no-title form.
+pub struct PageContext<'a> {
+    /// The protection of the page being parsed, for the no-title form.
     pub page: std::cell::Ref<'a, crate::traits::ProtectionEntry>,
     /// Protection for any other title a call named.
     pub titles: std::cell::Ref<'a, HashMap<String, crate::traits::ProtectionEntry>>,
+    /// The revision id of the page being parsed, when the data source knows it.
+    /// `None` is MediaWiki's "no revision": a parser test, or a page that has
+    /// not been saved yet.
+    pub revision: Option<u64>,
 }
 
-impl<'a> ProtectionContext<'a> {
+impl<'a> PageContext<'a> {
     /// Borrow both maps for as long as the returned context lives.
     ///
     /// Taking the `Ref`s here rather than at the call sites keeps the two
@@ -749,11 +755,18 @@ impl<'a> ProtectionContext<'a> {
         Self {
             page: page.borrow(),
             titles: titles.borrow(),
+            revision: None,
         }
+    }
+
+    /// Attach the page's revision id; see [`PageContext::revision`].
+    pub fn with_revision(mut self, revision: Option<u64>) -> Self {
+        self.revision = revision;
+        self
     }
 }
 
-impl ProtectionContext<'_> {
+impl PageContext<'_> {
     /// Resolve the first argument of a protection magic word.
     ///
     /// With no argument the page being parsed is meant; with a title (or an
@@ -1023,7 +1036,7 @@ impl TemplateHandler {
         params: &Params,
         about_id: String,
         token: &crate::wikitext::tokens_v2::ParsoidToken,
-        protection: &ProtectionContext,
+        page: &PageContext,
         // Whether each `#ifexist` title this call names exists; see
         // [`TemplateHandler::process`].
         ifexist: &std::collections::HashMap<String, bool>,
@@ -1074,7 +1087,7 @@ impl TemplateHandler {
                 let value = match name.as_str() {
                     "protectionlevel" | "protectionexpiry" => {
                         let raw = protection_full_arg(&pf_arg, params);
-                        protection.answer(&raw, |e, action| {
+                        page.answer(&raw, |e, action| {
                             if name == "protectionlevel" {
                                 e.level(action).map(str::to_string)
                             } else {
@@ -1082,7 +1095,7 @@ impl TemplateHandler {
                             }
                         })
                     }
-                    _ => Self::variable_value(config, &name, &pf_arg, page_title),
+                    _ => Self::variable_value(config, &name, &pf_arg, page_title, page),
                 };
                 if !wrap {
                     return vec![Item::Str(value)];
@@ -1115,7 +1128,7 @@ impl TemplateHandler {
                     &name,
                     &pf_params,
                     token_src.as_deref(),
-                    protection,
+                    page,
                     ifexist,
                     page_title,
                     // Whether the call was written with a leading `#`. The
@@ -1245,6 +1258,7 @@ impl TemplateHandler {
         name: &str,
         pf_arg: &str,
         context_title: Option<&crate::title::Title>,
+        page: &PageContext,
     ) -> String {
         if let Some(title) = context_title
             && let Some(value) = page_name_variable(config, name, title)
@@ -1318,6 +1332,30 @@ impl TemplateHandler {
                     crate::lua::engine::format_number(count as f64)
                 }
             }
+            // `{{REVISIONID}}` — core `CoreParserFunctions::revisionid`. In
+            // miser mode the page's *own* id is stubbed to `-` (empty when no
+            // revision exists), so that a saved page's HTML does not change with
+            // every edit while `{{if preview}}` can still tell a preview from a
+            // saved page (T137900). The stub applies only on the page itself, in
+            // a subject namespace; an explicit *other* title would need a fetch
+            // this synchronous path cannot make, so it answers empty (the corpus
+            // only ever spells the bare form).
+            "revisionid" => {
+                let own = pf_arg.trim().is_empty();
+                let subject =
+                    context_title.is_none_or(|t| t.namespace_id >= 0 && t.namespace_id % 2 == 0);
+                if own && config.miser_mode() && subject {
+                    if page.revision.is_some() {
+                        "-".to_string()
+                    } else {
+                        String::new()
+                    }
+                } else if own {
+                    page.revision.map(|r| r.to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            }
             // Any other variable: empty for now (requires page context).
             _ => String::new(),
         }
@@ -1375,18 +1413,18 @@ impl TemplateHandler {
     /// "Parser function implementation … missing" message is a native-only
     /// branch not exercised by the integrated fixtures).
     ///
-    /// `protection` answers the two protection magic words, which reach here in
-    /// their `{{#…}}` spelling. That spelling is not cosmetic: it is what a module
-    /// produces, because `frame:callParserFunction` renders the call as wikitext
-    /// and re-expands it, and a module cannot know the wiki spells the same word
-    /// without a hash on a page.
+    /// `page` answers the two protection magic words and `{{REVISIONID}}`, which
+    /// reach here in their `{{#…}}` spelling. That spelling is not cosmetic: it
+    /// is what a module produces, because `frame:callParserFunction` renders the
+    /// call as wikitext and re-expands it, and a module cannot know the wiki
+    /// spells the same word without a hash on a page.
     #[allow(clippy::too_many_arguments)]
     fn call_parser_function(
         config: &dyn SiteConfig,
         name: &str,
         params: &Params,
         token_src: Option<&str>,
-        protection: &ProtectionContext,
+        page: &PageContext,
         // Whether each `#ifexist` title this call names exists; see
         // [`TemplateHandler::process`].
         ifexist: &std::collections::HashMap<String, bool>,
@@ -1520,6 +1558,7 @@ impl TemplateHandler {
                     name,
                     &arg,
                     context_title,
+                    page,
                 ))]
             }
             // The `#`-spelled protection words, which is how a module reaches them.
@@ -1536,7 +1575,7 @@ impl TemplateHandler {
                     params,
                 );
                 let level = name == "protectionlevel";
-                vec![Item::Str(protection.answer(&raw, |e, action| {
+                vec![Item::Str(page.answer(&raw, |e, action| {
                     if level {
                         e.level(action).map(str::to_string)
                     } else {
@@ -1596,6 +1635,7 @@ impl TemplateHandler {
                         &canonical,
                         &arg,
                         context_title,
+                        page,
                     ))]
                 }
                 None => vec![Item::Str(token_src.unwrap_or("").to_string())],
@@ -1674,7 +1714,7 @@ impl TemplateHandler {
         config: &dyn SiteConfig,
         frame: &super::frame::Frame,
         about_counter: &std::cell::Cell<usize>,
-        protection: &ProtectionContext,
+        page: &PageContext,
         // Whether each `#ifexist` title this chunk names exists, resolved before
         // the (synchronous) call runs. See [`crate::pipeline::parser`]'s
         // `prime_ifexist`.
@@ -1729,7 +1769,7 @@ impl TemplateHandler {
                     &params,
                     about_id,
                     tok,
-                    protection,
+                    page,
                     ifexist,
                     wrap,
                 );
@@ -2534,7 +2574,7 @@ mod tests {
             &params,
             "#mwt1".to_string(),
             &token,
-            &ProtectionContext::new(&page_protection, &titles_protection),
+            &PageContext::new(&page_protection, &titles_protection),
             &std::collections::HashMap::new(),
             true,
         );
@@ -2561,7 +2601,7 @@ mod tests {
         let page = TitleParser::parse("Albert Einstein", &config);
         let page_protection = std::cell::RefCell::new(Default::default());
         let titles_protection = std::cell::RefCell::new(HashMap::new());
-        let protection = ProtectionContext::new(&page_protection, &titles_protection);
+        let ctx = PageContext::new(&page_protection, &titles_protection);
         let ifexist = HashMap::new();
         let call = |name: &str, arg: &str| {
             let params = Params::new(vec![KV {
@@ -2576,7 +2616,7 @@ mod tests {
                 name,
                 &params,
                 None,
-                &protection,
+                &ctx,
                 &ifexist,
                 Some(&page),
                 true,
@@ -2611,7 +2651,7 @@ mod tests {
         let config = MockSiteConfig::new();
         let page_protection = std::cell::RefCell::new(Default::default());
         let titles_protection = std::cell::RefCell::new(HashMap::new());
-        let protection = ProtectionContext::new(&page_protection, &titles_protection);
+        let ctx = PageContext::new(&page_protection, &titles_protection);
         let ifexist = HashMap::new();
         for name in ["defaultsort", "defaultsortkey", "defaultcategorysort"] {
             let params = Params::new(vec![KV {
@@ -2622,14 +2662,7 @@ mod tests {
                 vsrc: None,
             }]);
             let out = TemplateHandler::call_parser_function(
-                &config,
-                name,
-                &params,
-                None,
-                &protection,
-                &ifexist,
-                None,
-                true,
+                &config, name, &params, None, &ctx, &ifexist, None, true,
             );
             assert!(out.is_empty(), "{name} should render nothing, got {out:?}");
         }
@@ -2648,7 +2681,7 @@ mod tests {
         let config = MockSiteConfig::new();
         let page_protection = std::cell::RefCell::new(Default::default());
         let titles_protection = std::cell::RefCell::new(HashMap::new());
-        let protection = ProtectionContext::new(&page_protection, &titles_protection);
+        let ctx = PageContext::new(&page_protection, &titles_protection);
         let ifexist = HashMap::new();
         let params = Params::new(vec![KV {
             key: KeyValue::Str("39.9157".to_string()),
@@ -2662,7 +2695,7 @@ mod tests {
             "coordinates",
             &params,
             None,
-            &protection,
+            &ctx,
             &ifexist,
             None,
             false,
@@ -2911,7 +2944,7 @@ mod tests {
             &config,
             &frame,
             &about,
-            &ProtectionContext::new(&page_protection, &titles_protection),
+            &PageContext::new(&page_protection, &titles_protection),
             &std::collections::HashMap::new(),
             input,
             true,

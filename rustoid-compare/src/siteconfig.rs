@@ -53,6 +53,8 @@ pub struct WikiSiteConfig {
     article_path: String,
     language_code: String,
     stats: SiteStats,
+    /// `$wgMiserMode`; see [`SiteConfig::miser_mode`](rustoid_core::SiteConfig::miser_mode).
+    miser_mode: bool,
     /// PHP's `SiteConfig::widthOption()`: the default thumbnail width for a
     /// `thumb`/`frameless` media option with no explicit size.
     width_option: u32,
@@ -71,6 +73,7 @@ impl Default for WikiSiteConfig {
             article_path: String::new(),
             language_code: String::new(),
             stats: SiteStats::default(),
+            miser_mode: false,
             // MediaWiki's first thumb limit; a config that reports none keeps
             // this, which is the conservative choice (a smaller thumbnail).
             width_option: 180,
@@ -103,6 +106,9 @@ impl WikiSiteConfig {
             }
             if let Some(lang) = g.lang {
                 cfg.language_code = lang;
+            }
+            if let Some(miser) = g.misermode {
+                cfg.miser_mode = miser;
             }
             // PHP's `widthOption()` is `thumblimits[defaultoptions.thumbsize]`,
             // not the first limit: the wiki-wide default thumbnail at 250px is
@@ -354,6 +360,10 @@ impl SiteConfig for WikiSiteConfig {
         self.width_option
     }
 
+    fn miser_mode(&self) -> bool {
+        self.miser_mode
+    }
+
     /// `Parser::getExternalLinkRel` — `rel="nofollow"` unless the link's host is
     /// exempt. `$wgNoFollowLinks` is true on Wikimedia and
     /// `$wgNoFollowNsExceptions` is empty, so the only escape is
@@ -452,6 +462,10 @@ struct General {
     articlepath: Option<String>,
     #[serde(default)]
     lang: Option<String>,
+    /// `$wgMiserMode`. A bool in `formatversion=2`; some callers spell it as a
+    /// string, so both are accepted.
+    #[serde(default, deserialize_with = "opt_bool")]
+    misermode: Option<bool>,
     /// The selectable thumbnail widths, keyed by index as a string.
     #[serde(default)]
     thumblimits: Option<HashMap<String, serde_json::Value>>,
@@ -461,6 +475,23 @@ struct General {
 fn json_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// A JSON boolean that may be spelled as a string (`"true"`/`"false"`).
+///
+/// `formatversion=2` sends real booleans, but a hand-written or `fv1` body
+/// spells them as strings, and a siteinfo that fails to parse takes the whole
+/// config down with it.
+fn opt_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(|v| match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]

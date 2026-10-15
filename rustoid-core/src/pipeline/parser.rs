@@ -11,9 +11,7 @@ use crate::options::ParserOptions;
 use crate::pipeline::frame::Frame;
 use crate::pipeline::lua_deferred::{ArgSlot, ArgSource};
 use crate::pipeline::template_encapsulator::{ParamInfo, TemplateEncapsulator, template_info_from};
-use crate::pipeline::template_handler::{
-    ProtectionContext, TemplateHandler, resolve_template_target,
-};
+use crate::pipeline::template_handler::{PageContext, TemplateHandler, resolve_template_target};
 use crate::pipeline::tree_builder_stage::TreeBuilderStage;
 use crate::title::TitleParser;
 use crate::traits::{DataSource, ProtectionEntry, SiteConfig};
@@ -1446,6 +1444,9 @@ pub struct Parser<'a, C: SiteConfig> {
     /// The protection levels of the page being parsed, as
     /// `{{PROTECTIONLEVEL:action}}` with no title argument reports them.
     page_protection: std::cell::RefCell<ProtectionEntry>,
+    /// The revision id of the page being parsed, when the data source knows one.
+    /// `{{REVISIONID}}` answers from it; see [`PageContext`].
+    page_revision: std::cell::Cell<Option<u64>>,
     /// Sub-fragments built during expansion, waiting for the tree builder.
     ///
     /// A `<templatestyles>` is resolved while expansion is running — the CSS
@@ -1653,6 +1654,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             ifexist: std::cell::RefCell::new(std::collections::HashMap::new()),
             title_facts: std::cell::RefCell::new(std::collections::HashMap::new()),
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
+            page_revision: std::cell::Cell::new(None),
             ext_fragments: std::cell::RefCell::new(std::collections::HashMap::new()),
             ext_next_id: std::cell::Cell::new(0),
             pending_styles: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -1674,8 +1676,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// not hold an expansion that writes the map. Both maps are written exactly
     /// once, in [`Parser::build_ast`] before expansion starts, so a borrow taken
     /// during expansion can never conflict with a write.
-    fn protection_context(&self) -> ProtectionContext<'_> {
-        ProtectionContext::new(&self.page_protection, &self.protection)
+    fn page_context(&self) -> PageContext<'_> {
+        PageContext::new(&self.page_protection, &self.protection)
+            .with_revision(self.page_revision.get())
     }
 
     /// Resolve the existence an `#ifexist` call is about to read, if it is not
@@ -4040,6 +4043,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
         }
         *self.page_protection.borrow_mut() = page_protection.clone();
+        // The revision the page is being parsed at, which `{{REVISIONID}}`
+        // answers from. Asked of the source rather than threaded from the caller,
+        // because the wikitext and its revision come from one fetch; a source
+        // that does not track revisions reports `None`, which is MediaWiki's
+        // "no revision" and makes the magic word answer empty rather than
+        // inventing an id.
+        let page_revision = match source {
+            Some(source) => source
+                .get_page_with_revision(&title)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|(_, revision)| revision),
+            None => None,
+        };
+        self.page_revision.set(page_revision);
         // The page's own protection is a Lua fact as well as a magic-word one:
         // `Module:Protection banner` reads
         // `mw.title.getCurrentTitle().protectionLevels`, which goes through the
@@ -5766,7 +5785,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     self.config,
                     frame,
                     about_counter,
-                    &self.protection_context(),
+                    &self.page_context(),
                     &self.ifexist.borrow(),
                     vec![expanded_item],
                     wrap,
