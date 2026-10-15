@@ -17233,5 +17233,85 @@ pre-existing missing-ref/id-gap cluster, not notes this change drops. The
 first-difference positions do not move (the Cite lists sit well past every page's
 first difference), so the strict score is unchanged. A Cite auto-generated list
 (`CiteDocumentPostProcessor::insertMissingReferencesIntoDOM`) exists but is not
-reached on any of the 48 pages. Fixtures stay at 877/896, every lib test passes,
+reach on any of the 48 pages. Fixtures stay at 877/896, every lib test passes,
 and clippy and fmt are clean.
+
+## Open: the `about`-id sequence is not yet exact
+
+The `#mwtN` ids are allocated by a single document-wide counter, so *any* spend
+that differs shifts every later element. Eight pages currently use their first
+difference on an id (`Cristiano Ronaldo`, `Doom`, `Grand Theft Auto V`,
+`Megadeth`, `Polio vaccine`, `Sundial`, `The Beatles`, `Tropical cyclone`), and
+it is not one bug: the divergences have several distinct causes, and the totals
+drift both ways (from `+1448` on `Periodic table` to `-302` on `Lionel Messi`).
+
+Working tool: `/tmp/tools/idmetric.py <dumpdir>` reports, per page, the delta at
+the first id divergence and at the end, against the cached parsoid dumps — an
+oracle that costs no API call. `/tmp/tools/idalign.py` finds the first *structural*
+(not just numeric) element difference. Baseline over `/tmp/dumpsN45`:
+`|first| = 5468`, `|final| = 3331` (the `first` column is noisy where the element
+sequences misalign, so compare `final` too).
+
+Causes identified so far, with evidence:
+
+**1. An expansion inside a template argument that reaches an `#invoke` spends an
+id that rustoid does not.** Probes against the live endpoint, batched one call:
+
+```
+{{small|{{lang|en|T}}}}                      → both spend 1
+{{small|1={{lang|en|T}}}}                    → both spend 1
+{{#invoke:String|len|{{lang|en|T}}}}         → both spend 1
+{{#invoke:String|len|{{{missing|{{lang|en|T}}}}}}} → both spend 1
+{{cite web|url=…|title={{lang|en|T}}}}       → parsoid +1
+{{cite web|url=…|title=[[T]]}}               → parsoid +1
+{{cite web|url=…|title={{small|T}}}}         → both spend the same
+```
+
+So it is not "a template in a named argument" (the handoff's guess) and not the
+`#invoke` argument *as written*: it needs a *stored* argument value that is
+expanded inside the module's argument pipeline, and both `{{lang|…}}` and `[[…]]`
+trigger it while `{{small|T}}` does not. `{{cite web}}`'s own `title` path is
+`{{#invoke:Citation/CS1|…|Title={{{title}}}}}`.
+
+**2. A transclusion whose whole output is metadata is encapsulated *on* the
+`<style>`.** `Albert Einstein`'s `{{Albert Einstein series}}` (Module:Sidebar)
+serves
+
+```
+<span class="mw-empty-elt" about="#mwt51" typeof="mw:Transclusion" …><style …
+  data-mw-deduplicate="TemplateStyles:r1374427404" typeof="mw:Extension/templatestyles" about="#mwt52" …>
+```
+
+rustoid instead merges onto the stylesheet itself — `typeof="mw:Extension/templatestyles
+mw:Transclusion" about="#mwt51"` — i.e. it took the no-boundary branch of
+`tree_builder_html::wrap_transclusion_children` (the `should_stash` test), where
+Parsoid stashed. `should_stash` matches PHP's
+`DOMRangeBuilder::shouldStashRenderingTransparentNodes` line for line, so the
+divergence is upstream of it (`is_stashable_elt`, the run scan, or `prev`).
+
+**3. The `mw-empty-elt` wrapper count differs on nine pages**, missing 1–2 on
+`Albert Einstein`, `Brat (album)`, `Chernobyl disaster`, `Earth`, `Periodic
+table`, `The Beatles` and *extra* on `Anarchism` (+29), `United States` (+7),
+`Israel` (+1).
+
+**4. Templatestyles scheduling order differs** (`Israel`, `France`): parsoid puts
+a `<style data-mw-deduplicate="TemplateStyles:r1239334494">` where rustoid has a
+`<link rel="mw-deduplicated-inline-style" … r886047488>`.
+
+**5. A `style` attribute keeps whitespace differently** (`Cristiano Ronaldo`,
+`The Beatles`): the `{{quote box}}` built attribute is parity-perfect up to the
+point that parsoid has `\n    \n;` where rustoid has `\n    ;` — an extra line
+break in parsoid. `Sanitizer::check_css` passes such values through in both, so
+the difference is in the attribute-value pipeline, not the sanitizer.
+
+### A rule change that was tried and reverted
+
+For a `<ref>` reached inside a transclusion, `number_extension_token` spends
+`1 + count_body_extensions(rendered)`. Swapping that for `count_note_extensions`
+(which also counts `mw:Extension` placeholders and follows a nested `<ref>`'s own
+note) fixes `Doom`'s `-1`, and moves `Cristiano Ronaldo` `-49 → 0`, `Canada`
+`-28 → -2`, `Grand Theft Auto V` `-37 → -15`, `Israel` `-38 → -10`; `|final|`
+falls 3331 → 2839 overall. But it *worsens* `Periodic table` `+1448 → +1546`,
+`Chess` `+58 → +76`, `Albert Einstein` `+241 → +246`, so it is a better heuristic
+rather than the rule. Do not land it without finding why a body's ref
+placeholders must not always count.
