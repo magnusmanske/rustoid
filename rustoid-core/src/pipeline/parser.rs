@@ -308,22 +308,6 @@ fn is_note_extension(node: &Node) -> bool {
             .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:Extension"))
 }
 
-/// Count the extension wrappers in a rendered `<ref>` body.
-///
-/// Each one carries its own `about` id, and the live Cite extension releases
-/// that id and takes a fresh one when it splices a *transcluded* note's body
-/// back into the page. rustoid renders the body once and keeps the node, so it
-/// has to spend the discarded ids itself (see
-/// [`Parser::number_extension_token`]).
-fn count_body_extensions(node: &Node) -> usize {
-    usize::from(is_extension_wrapper(node))
-        + node
-            .children
-            .iter()
-            .map(count_body_extensions)
-            .sum::<usize>()
-}
-
 /// If `item` is a `<gallery>` extension token, return the self-closing token.
 fn gallery_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
     let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
@@ -5321,15 +5305,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // nothing extra, one reached through any nested expansion spends one.
         if is_ref && self.expansion_nesting.get() > 1 {
             let _ = self.new_about_id(about_counter, "extension-id");
-            // Each extension wrapper in the note's rendered body spends a
-            // further discarded id: the live Cite extension re-numbers the body
-            // when it splices a *transcluded* note back into the page, so a
-            // stylesheet (`{{Cite web}}`, whose module emits a
-            // `<templatestyles>`) or a literal `<pre>` costs two ids where a
-            // standalone Parsoid charges one. See `Parser::count_body_extensions`
-            // for why the count is taken from the rendered body.
+            // Each wrapper in the note's rendered body spends a further discarded
+            // id — see [`Parser::count_note_extensions`] for the count and why it
+            // follows a nested `<ref>`'s own note. This is the same rule the
+            // top-level `#tag` case above applies; the two only differ in the
+            // outer id they spend.
             if let Some(node) = rendered.as_ref() {
-                for _ in 0..count_body_extensions(node) {
+                for _ in 0..self.count_note_extensions(node) {
                     let _ = self.new_about_id(about_counter, "extension-id");
                 }
             }
@@ -5363,12 +5345,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// Extension wrappers in a rendered note body, *plus* those in the notes of
     /// any `<ref>` nested inside it.
     ///
-    /// A `#tag`-produced ref re-numbers the whole note when Cite splices it back
-    /// into the page, and a nested `<ref>`'s own note is spliced in the same pass
-    /// — so its wrappers are re-numbered too. A nested ref appears in the outer
-    /// body's render as an `mw:Extension` placeholder (counted by
-    /// [`count_body_extensions`]); its note body lives in `ref_bodies`, keyed by
-    /// that `about`, and is followed here. See [`Parser::number_extension_token`].
+    /// A ref's note is re-numbered when Cite splices it back into the page, and a
+    /// nested `<ref>`'s own note is spliced in the same pass — so its wrappers are
+    /// re-numbered too. A nested ref appears in the outer body's render as an
+    /// `mw:Extension` placeholder, counted by [`is_note_extension`]; its note body
+    /// lives in `ref_bodies`, keyed by that `about`, and is followed here. See
+    /// [`Parser::number_extension_token`].
     fn count_note_extensions(&self, node: &Node) -> usize {
         let mut count = usize::from(is_note_extension(node));
         // A node whose `about` is a stashed note is a `<ref>`; its note is spliced
@@ -8678,10 +8660,13 @@ mod tests {
 
     /// A rendered `<ref>` body's discarded-id count is the number of extension
     /// wrappers in it, with lean `<nowiki>` excluded. See
-    /// [`count_body_extensions`].
+    /// [`Parser::count_note_extensions`].
     #[test]
-    fn count_body_extensions_counts_wrappers() {
+    fn count_note_extensions_counts_wrappers() {
         use crate::dom::node::{ElementKind, Node};
+
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
         let ext = |typeof_: &str| {
             let mut n = Node::element(ElementKind::Other("style".to_string()));
             n.set_attr("typeof", typeof_);
@@ -8698,12 +8683,14 @@ mod tests {
         body.push_child(pre);
         // `<nowiki>` is lean markup and is not counted.
         body.push_child(ext("mw:Extension/nowiki"));
-        assert_eq!(count_body_extensions(&body), 3);
+        assert_eq!(parser.count_note_extensions(&body), 3);
     }
 
     /// A nested `<ref>`'s own note is spliced in with the enclosing note, so its
     /// wrappers are re-numbered too. [`Parser::count_note_extensions`] must follow
-    /// the placeholder (`about` → stashed body in `ref_bodies`) into that note.
+    /// the placeholder (`about` → stashed body in `ref_bodies`) into that note,
+    /// and must count the placeholder itself (it is still an `mw:Extension`
+    /// marker, and it too is re-numbered). Lean `<nowiki>` is excluded.
     #[test]
     fn count_note_extensions_follows_a_nested_ref_note() {
         use crate::dom::node::{ElementKind, Node};
