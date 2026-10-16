@@ -17311,7 +17311,25 @@ mw:Transclusion" about="#mwt51"` — i.e. it took the no-boundary branch of
 `tree_builder_html::wrap_transclusion_children` (the `should_stash` test), where
 Parsoid stashed. `should_stash` matches PHP's
 `DOMRangeBuilder::shouldStashRenderingTransparentNodes` line for line, so the
-divergence is upstream of it (`is_stashable_elt`, the run scan, or `prev`).
+divergence is upstream of it.
+
+Tracing the decision (`RUSTOID_TRACE_STASH=1`, temporary `eprintln!` in
+`wrap_transclusion_children`) shows why it took that branch:
+
+```
+tgt about=#mwt51 typeof=mw:Transclusion node=<style typeof=mw:DOMFragment frag=1> transparent=true
+  stash? run=2 target=<style> prev=- next=<p about=#mwt51> -> false
+```
+
+`next` is a `<p about="#mwt51">`, and "the next element shares the target's
+`about`" is exactly the test that refuses the stash. But Parsoid's served output
+has no such `<p>` there — it has the `<span class="mw-empty-elt">` then the
+styles then the sidebar `<table>`. So the real divergence is that rustoid's range
+content holds a paragraph wrapper Parsoid does not: PHP's `shouldStash` also sees
+`next` as the *sentinel* past the range end (and nulls it) when the run reaches
+the range's edge. Fixing the spurious `<p>` should make the stash decision fall
+out. The same shape appears on `Earth` (its `{{Infobox planet}}`) and drives the
+over-spend noted below.
 
 **3. The `mw-empty-elt` wrapper count differs on nine pages**, missing 1–2 on
 `Albert Einstein`, `Brat (album)`, `Chernobyl disaster`, `Earth`, `Periodic
