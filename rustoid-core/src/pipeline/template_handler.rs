@@ -2154,6 +2154,30 @@ pub fn tokenize_wikitext_to_items_with_sol(
     )
 }
 
+/// Tokenize a parser-function branch whose text is spliced into the enclosing
+/// source at the call's position.
+///
+/// `sol` is that position's start-of-line state. When it is false the fragment
+/// starts mid-line: a leading `||`/`!!` still continues the current table row
+/// (PHP's `tds`/`ths` apply after a cell's content), while a single `|` is
+/// ordinary text — see [`TokenizerOptions::continue_table_cells`].
+pub fn tokenize_branch_fragment(
+    wikitext: &str,
+    ext_tags: &[String],
+    sol: bool,
+    in_table: bool,
+) -> Vec<Item> {
+    let options = TokenizerOptions {
+        in_template: true,
+        ext_tags: ext_tags.to_vec(),
+        sol,
+        table_data_block: in_table,
+        continue_table_cells: !sol && in_table,
+        ..Default::default()
+    };
+    tokenize_with_options(wikitext, options, /* in_template */ true)
+}
+
 /// [`tokenize_wikitext_to_items_with_sol`] with an explicit table-data-block flag.
 ///
 /// `enforce_table_data_block` is true for re-tokenization of bailed source, where
@@ -2175,6 +2199,15 @@ pub fn tokenize_wikitext_to_items_with_sol_and_table(
         enforce_table_data_block,
         ..Default::default()
     };
+    tokenize_with_options(wikitext, options, in_template)
+}
+
+/// Run the PEG tokenizer with `options` and flatten its output.
+fn tokenize_with_options(
+    wikitext: &str,
+    options: TokenizerOptions,
+    in_template: bool,
+) -> Vec<Item> {
     let mut tokenizer = PegTokenizer::new(wikitext, &options);
     let items = match tokenizer.tokenize() {
         Ok(chunks) => chunks

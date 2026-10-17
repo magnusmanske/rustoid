@@ -80,6 +80,12 @@ pub struct TokenizerOptions {
     /// the surrounding table context is known; left false for the page-level
     /// initial pass (see `PegTokenizer::enforce_table_data_block`).
     pub enforce_table_data_block: bool,
+    /// Whether a mid-line `||`/`!!` at the start of the input continues the
+    /// current table row. Set only for a re-tokenized parser-function branch:
+    /// its text is spliced at the call's position in the source, so a separator
+    /// that starts the fragment is mid-line in the enclosing line even though
+    /// it starts this tokenization unit. A single `|` is ordinary text there.
+    pub continue_table_cells: bool,
 }
 
 impl Default for TokenizerOptions {
@@ -99,6 +105,7 @@ impl Default for TokenizerOptions {
             linkdesc: false,
             table_data_block: false,
             enforce_table_data_block: false,
+            continue_table_cells: false,
         }
     }
 }
@@ -182,6 +189,9 @@ pub struct PegTokenizer<'a> {
     /// template will produce; true wherever a caller supplies the context
     /// explicitly (PHP's `tableDataBlock` parameter proper).
     enforce_table_data_block: bool,
+    /// Whether a mid-line `||`/`!!` at the input starts a table row continuation
+    /// (see [`TokenizerOptions::continue_table_cells`]).
+    continue_table_cells: bool,
     /// Byte offset of `input` within the ambient source.
     ///
     /// Zero for a top-level pass, where `input` *is* the ambient source. A
@@ -220,6 +230,7 @@ impl<'a> PegTokenizer<'a> {
             in_table_cell: false,
             table_data_depth: usize::from(options.table_data_block),
             enforce_table_data_block: options.enforce_table_data_block,
+            continue_table_cells: options.continue_table_cells,
             base_offset: 0,
         }
     }
@@ -379,6 +390,14 @@ impl<'a> PegTokenizer<'a> {
     /// Try to match one toplevel block. Returns true if matched.
     fn try_parse_one_toplevel_block(&mut self) -> bool {
         let start = self.pos;
+
+        // A re-tokenized branch fragment is spliced at the call's position in
+        // the source. When that position is mid-line, a leading `||`/`!!`
+        // continues the current table row (PHP's `tds`/`ths` run after a cell's
+        // inline content); a lone `|` is ordinary text there.
+        if !self.at_sol && self.continue_table_cells && self.try_table_cell_continuation() {
+            return self.pos > start;
+        }
 
         // Try block constructs at SOL.
         if self.at_sol {
@@ -666,6 +685,13 @@ impl<'a> PegTokenizer<'a> {
 
         while self.pos < self.input_len {
             let ch = self.remaining().chars().next().unwrap();
+
+            // A mid-line branch fragment stops at a cell separator so the
+            // enclosing loop can continue the row (see
+            // `continue_table_cells`); ordinary text keeps `||` literal.
+            if self.continue_table_cells && self.at_pipe_pipe() {
+                break;
+            }
 
             // Check for inline breaks.
             if ch == '\n' || ch == '\r' {
@@ -1506,6 +1532,33 @@ impl<'a> PegTokenizer<'a> {
     }
 
     /// Try table content line: heading_tags / row_tag / data_tags / caption_tag.
+    /// Mid-line `||`/`!!` at the start of a re-tokenized branch fragment. The
+    /// branch text was spliced after the current cell's content, which is where
+    /// PHP's `tds`/`ths` rule applies. Returns whether anything was consumed.
+    fn try_table_cell_continuation(&mut self) -> bool {
+        let saved = self.pos;
+        if self.starts_with("!!") {
+            self.parse_ths();
+        } else if self.at_pipe_pipe() {
+            self.parse_tds();
+        } else {
+            return false;
+        }
+        self.at_sol = false;
+        self.pos > saved
+    }
+
+    /// Whether the input begins with a `pipe_pipe` (`||` or its `{{!}}` forms),
+    /// without consuming it.
+    fn at_pipe_pipe(&self) -> bool {
+        const PIPE: [&str; 2] = ["{{!}}", "|"];
+        let rest = &self.input[self.pos..];
+        PIPE.iter().any(|a| {
+            rest.strip_prefix(a)
+                .is_some_and(|after| PIPE.iter().any(|b| after.starts_with(b)))
+        })
+    }
+
     fn try_table_content_line(&mut self) -> bool {
         if self.try_table_heading_tags() {
             return true;
@@ -1543,10 +1596,9 @@ impl<'a> PegTokenizer<'a> {
             dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
         self.apply_build_table_tokens_attrs(&mut dp, &attrs, &sep, "!", start, tag_end);
-        // `buildTableTokens` sets `AT_SRC_START` when the cell's source is at the
-        // start of its line (preceded only by whitespace + the pipe);
-        // `try_table_heading_tags` only runs at SOL.
-        dp.tmp.at_src_start = true;
+        // `buildTableTokens` sets `AT_SRC_START` when the cell begins the
+        // tokenized source; see `is_source_start`.
+        dp.tmp.at_src_start = is_source_start(self.input, start);
 
         // `buildTableTokens` th branch: a `<th>` with no attribute box whose
         // content begins with `!` (the `"!!foo"` SOL form parsed as `<th>!foo</th>`)
@@ -1695,10 +1747,11 @@ impl<'a> PegTokenizer<'a> {
             dp.tmp.table_cell_with_no_attribute_syntax = true;
         }
         self.apply_build_table_tokens_attrs(&mut dp, &attrs, &sep, &pipe, saved, tag_end);
-        // `buildTableTokens` sets `AT_SRC_START` on a cell at the start of its
-        // source line (preceded only by whitespace + the pipe);
-        // `try_table_data_tags` only runs at SOL.
-        dp.tmp.at_src_start = true;
+        // `buildTableTokens` sets `AT_SRC_START` when the cell begins the
+        // tokenized source: the whole prefix before the cell's TSR (which starts
+        // after the leading pipe) matches `/\s*([|!]|\{\{!\}\})$/`. A cell at
+        // a later line start is *not* at the source start.
+        dp.tmp.at_src_start = is_source_start(self.input, saved);
 
         self.emit_token(ParsoidToken::Tag(TagTk::new("td", attrs, dp)));
 
@@ -5298,6 +5351,18 @@ fn strip_html_comments(input: &str) -> String {
 
 /// Find the name/value separator `=` in a template argument, as a byte offset.
 ///
+/// PHP `TokenizerUtils::buildTableTokens`' `AT_SRC_START`: a cell begins the
+/// tokenized source when everything before its leading pipe is only whitespace.
+/// `pipe_start` is the pipe's position; the cell's TSR begins after it, so its
+/// prefix is exactly that one pipe, which is what the PHP regex allows.
+fn is_source_start(input: &str, pipe_start: usize) -> bool {
+    input.get(..pipe_start).is_some_and(|prefix| {
+        prefix
+            .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{000B}')
+            .is_empty()
+    })
+}
+
 /// Returns the byte index of the first `=` that can act as the `name=value`
 /// separator, or `None` if the argument is positional. A `=` at start-of-line
 /// introduces a heading (`===… ===`), which the PEG tokenizer consumes as a

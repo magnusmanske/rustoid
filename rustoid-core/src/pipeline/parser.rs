@@ -1189,6 +1189,43 @@ fn re_tokenize_text_branch(
     items: Vec<Item>,
     ext_tags: &[String],
     syntax: BranchSyntax,
+    table_data_block: bool,
+    // Whether the branch's text starts at a line start in the enclosing source
+    // (see [`branch_starts_line`]).
+    starts_line: bool,
+) -> Vec<Item> {
+    re_tokenize_text_branch_inner(items, ext_tags, syntax, table_data_block, starts_line)
+}
+
+/// Whether a parser-function call sits at the start of a source line.
+///
+/// Core's preprocessor splices the returned branch into the source at the
+/// call's position, so this is the `sol` the branch's first line has. Everything
+/// since the last newline must be whitespace (the tokenizer consumes leading
+/// spaces/comments while staying at SOL).
+fn branch_starts_line(tok: &ParsoidToken, src_text: &str) -> bool {
+    let Some(tsr) = tok.data_parsoid().and_then(|dp| dp.tsr.as_ref()) else {
+        return false;
+    };
+    let Some(start) = tsr.start else {
+        return false;
+    };
+    let source = tsr.source.as_deref().unwrap_or(src_text);
+    let Some(prefix) = source.get(..start) else {
+        return false;
+    };
+    let line = prefix.rsplit_once('\n').map_or(prefix, |(_, rest)| rest);
+    // PCRE `\s` also matches the vertical tab, which Rust's ASCII helper omits.
+    line.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{000B}')
+        .is_empty()
+}
+
+fn re_tokenize_text_branch_inner(
+    items: Vec<Item>,
+    ext_tags: &[String],
+    syntax: BranchSyntax,
+    table_data_block: bool,
+    starts_line: bool,
 ) -> Vec<Item> {
     fn is_wrapper(it: &Item) -> bool {
         matches!(
@@ -1201,9 +1238,12 @@ fn re_tokenize_text_branch(
                     })
         )
     }
-    fn tokenize(text: &str, ext_tags: &[String]) -> Vec<Item> {
-        crate::pipeline::template_handler::tokenize_wikitext_to_items(
-            text, /* in_template */ true, ext_tags,
+    fn tokenize(text: &str, ext_tags: &[String], sol: bool, table_data_block: bool) -> Vec<Item> {
+        crate::pipeline::template_handler::tokenize_branch_fragment(
+            text,
+            ext_tags,
+            sol,
+            table_data_block,
         )
     }
     /// Re-tokenize a text run. `#if`/`#ifeq`/`#iferror` answer a *string* in
@@ -1217,6 +1257,8 @@ fn re_tokenize_text_branch(
         at_line_start: bool,
         syntax: BranchSyntax,
         ext_tags: &[String],
+        force: bool,
+        table_data_block: bool,
     ) {
         if run.is_empty() {
             return;
@@ -1237,23 +1279,22 @@ fn re_tokenize_text_branch(
             lines.next();
         }
         let line_trigger = lines.any(|line| syntax.triggers(line));
-        let retokenize = match syntax {
-            // Core answers the branch as a string and re-parses all of it, so
-            // markup that was assembled across a template boundary (a `<span`
-            // whose `>` lives in another expansion) and entities have to be
-            // tokenized again as well as block syntax.
-            BranchSyntax::Cells => line_trigger || text.contains('<') || text.contains('&'),
-            BranchSyntax::TableOnly => line_trigger,
-        };
+        let retokenize = force
+            || match syntax {
+                // Core answers the branch as a string and re-parses all of it, so
+                // markup that was assembled across a template boundary (a `<span`
+                // whose `>` lives in another expansion) and entities have to be
+                // tokenized again as well as block syntax.
+                BranchSyntax::Cells => line_trigger || text.contains('<') || text.contains('&'),
+                BranchSyntax::TableOnly => line_trigger,
+            };
         if retokenize {
-            out.extend(
-                crate::pipeline::template_handler::tokenize_wikitext_to_items_with_sol(
-                    &text,
-                    /* in_template */ true,
-                    ext_tags,
-                    at_line_start,
-                ),
-            );
+            out.extend(crate::pipeline::template_handler::tokenize_branch_fragment(
+                &text,
+                ext_tags,
+                at_line_start,
+                table_data_block,
+            ));
             run.clear();
         } else {
             out.append(run);
@@ -1294,7 +1335,7 @@ fn re_tokenize_text_branch(
             return items;
         }
         let mut out: Vec<Item> = items[..start].to_vec();
-        out.extend(tokenize(&text, ext_tags));
+        out.extend(tokenize(&text, ext_tags, starts_line, table_data_block));
         out.extend_from_slice(&items[end..]);
         return out;
     }
@@ -1307,7 +1348,12 @@ fn re_tokenize_text_branch(
     // run that carries a table start is re-tokenized on its own.
     let mut out: Vec<Item> = items[..start].to_vec();
     let mut run: Vec<Item> = Vec::new();
-    let mut run_starts_line = true;
+    // The branch is spliced where the parser-function call sits, so its first
+    // text run has that position's start-of-line state.
+    let mut run_starts_line = starts_line;
+    // A `{{!}}` marker was folded into the run as `|`; the run must be
+    // re-tokenized even if no other trigger matches.
+    let mut run_has_bang = false;
     let mut i = start;
     while i < end {
         match &items[i] {
@@ -1325,15 +1371,48 @@ fn re_tokenize_text_branch(
                 run.push(Item::Str("{|".to_string()));
                 i += 1;
             }
+            // In core's textual pipeline a cell opener inside a text-returning
+            // branch is literal text in the branch *string* (`{{!}}` is `|`, and
+            // a template body of `||` is `||`), so it belongs in the text stream.
+            // Keeping it as a `<td>` token made the attribute box before it
+            // unreachable: `|| style="…" | [[Ontario]]` tokenized the cell
+            // boundary but left `style="…"` as cell content. `#switch` keeps its
+            // tokens, so this applies to `Cells` only.
+            Item::Tok(ParsoidToken::Tag(t))
+                if syntax == BranchSyntax::Cells && cell_opener_source(t).is_some() =>
+            {
+                run.push(Item::Str(
+                    cell_opener_source(t).unwrap_or_else(|| "|".to_string()),
+                ));
+                run_has_bang = true;
+                i += 1;
+            }
             _ => {
-                flush(&mut out, &mut run, run_starts_line, syntax, ext_tags);
+                flush(
+                    &mut out,
+                    &mut run,
+                    run_starts_line,
+                    syntax,
+                    ext_tags,
+                    run_has_bang,
+                    table_data_block,
+                );
+                run_has_bang = false;
                 run_starts_line = false;
                 out.push(items[i].clone());
                 i += 1;
             }
         }
     }
-    flush(&mut out, &mut run, run_starts_line, syntax, ext_tags);
+    flush(
+        &mut out,
+        &mut run,
+        run_starts_line,
+        syntax,
+        ext_tags,
+        run_has_bang,
+        table_data_block,
+    );
     out.extend_from_slice(&items[end..]);
     out
 }
@@ -2508,6 +2587,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     in_template,
                     false,
                     body,
+                    0,
                 )
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
@@ -2912,6 +2992,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     in_template,
                     false,
                     body,
+                    0,
                 )
                 .await;
             // TT2 order: ExtensionHandler precedes the AttributeExpander.
@@ -3051,7 +3132,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, false, false, &caption)
+                .expand_templates(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    false,
+                    false,
+                    &caption,
+                    0,
+                )
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -3125,7 +3215,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let next_id = std::cell::Cell::new(0usize);
         if source.is_some() {
             tokens = self
-                .expand_templates(frame, tokens, source, about_counter, false, false, wikitext)
+                .expand_templates(
+                    frame,
+                    tokens,
+                    source,
+                    about_counter,
+                    false,
+                    false,
+                    wikitext,
+                    0,
+                )
                 .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
@@ -4371,6 +4470,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     false,
                     false,
                     page_source,
+                    0,
                 )
                 .await;
             // TT2 order: ExtensionHandler runs after TemplateHandler and before
@@ -5101,6 +5201,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // keys off `atTopLevel` and the fixtures pin it to `|` one level down.
         body: bool,
         src_text: &str,
+        // Table-data-block depth inherited from the caller: a branch or body
+        // expanded while a table is open keeps recognizing cell separators
+        // (PHP's `tableDataBlock`).
+        initial_table_depth: usize,
     ) -> Vec<Item> {
         let _nesting = self.enter_expansion();
         // A marker a module held and moved becomes the fragment placeholder it
@@ -5119,7 +5223,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `table_depth` is deliberately *not* chunk state: a table spans lines,
         // so it is carried across the chunks here.
         let mut result = Vec::with_capacity(tokens.len());
-        let mut table_depth = 0usize;
+        let mut table_depth = initial_table_depth;
         // Extension ids are not spent while an argument whose extensions are
         // numbered where it lands in the output is being expanded. See
         // [`Parser::arg_expansion`] and [`Parser::style_defer`]. The flags are
@@ -5245,6 +5349,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         in_template,
                         body,
                         src_text,
+                        table_depth,
                     ))
                     .await;
                     for e in &expanded {
@@ -6103,6 +6208,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     in_tpl,
                     body,
                     src_text,
+                    *table_depth,
                 ))
                 .await;
                 for e in &expanded {
@@ -6163,6 +6269,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         in_tpl,
                         body,
                         src_text,
+                        *table_depth,
                     ))
                     .await
                 };
@@ -6180,6 +6287,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         expanded,
                         self.config.extension_tags(),
                         BranchSyntax::Cells,
+                        *table_depth > 0,
+                        branch_starts_line(tok, src_text),
                     );
                     mark_in_text_branch(&mut expanded);
                 } else if retokenize_branch_table {
@@ -6187,6 +6296,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         expanded,
                         self.config.extension_tags(),
                         BranchSyntax::TableOnly,
+                        *table_depth > 0,
+                        // T2529 puts an expansion that starts with `{|` on a
+                        // line of its own even when the call is mid-line.
+                        true,
                     );
                 }
                 for e in &expanded {
@@ -6255,6 +6368,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             in_template,
             body,
             src_text,
+            0,
         ))
         .await;
         // The top-level pass reaches only the target's own tokens; one nested in
@@ -6455,6 +6569,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             false,
             /* body */ true,
             src_text,
+            0,
         ))
         .await;
         // A target the expansion left nested — `[[{{PAGENAME}}]]` — is resolved
@@ -6657,6 +6772,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 in_tpl,
                 in_tpl,
                 page_source.unwrap_or(""),
+                0,
             )
             .await;
         // The tokens already in the value keep their page-absolute `tsr`: PHP's
@@ -6931,6 +7047,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             in_template,
             /* body */ true,
             &template_src,
+            0,
         ))
         .await;
         // A `<templatedata>` in the body records the frame's title for its
@@ -7215,6 +7332,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             body,
             false,
             /* src_text */ "",
+            0,
         ))
         .await;
         // A module's output is not the page's own wikitext: `expand_attributes`
@@ -7398,6 +7516,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 in_template,
                 /* body */ true,
                 page_source,
+                0,
             ))
             .await;
             let expanded = Box::pin(self.expand_attrib_templates(
@@ -7491,6 +7610,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 /* in_template */ true,
                 body,
                 src_text,
+                0,
             ))
             .await;
             // A target the expansion left nested — `[[{{PAGENAME}}]]` — is
@@ -7654,6 +7774,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             in_template,
                             body,
                             src_text,
+                            0,
                         )
                         .await;
                     // A token in an attribute value can carry attributes of its
@@ -7829,6 +7950,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             /* in_template */ true,
             /* body */ false,
             &text,
+            0,
         ))
         .await;
         // The body's *attributes* are expanded one pass later on a page
@@ -8479,7 +8601,11 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 }
                 out.push_str("]]");
             }
-            Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
+            Item::Tok(ParsoidToken::Tag(t))
+                if (t.name == "td" || t.name == "th") && cell_opener_source(t).is_some() =>
+            {
+                out.push_str(&cell_opener_source(t).unwrap_or_default());
+            }
             // A `listItem` token: its `bullets` attribute holds the `*`/`#`/`;`
             // marker, and the item content follows as separate items. A module
             // argument that contains a list — `Module:Navbox`'s nested
@@ -8572,15 +8698,57 @@ fn key_value_text(value: &crate::wikitext::tokens_v2::KeyValue) -> Option<String
     }
 }
 
-/// Whether a `td` tag is the `{{!}}` marker rather than a real table cell.
+/// The wikitext a table-cell opener token stands for.
 ///
-/// [`crate::pipeline::template_handler::process_special_magic_word`] builds it
-/// with an empty `attrSrc` and the `AT_SRC_START` flag, which is what
-/// `TableFixups` keys on; nothing else produces that pair.
-fn is_bang_marker(t: &crate::wikitext::tokens_v2::TagTk) -> bool {
-    t.name == "td"
-        && t.data_parsoid.tmp.at_src_start
-        && t.data_parsoid.tmp.attr_src.as_deref() == Some("")
+/// A `td`/`th` token in a text-returning branch is a *cell opener*, not
+/// content: PHP's preprocessed source spells it as literal text (`||`, or
+/// `| class="…" |`). The tokenizer records the opener in its TSR, but a token
+/// that came out of a template expansion loses it (`Template:!!`, whose whole
+/// source is `||`), so the opener is rebuilt from `startTagSrc` + `attrSrc` +
+/// `attrSepSrc` — the same fields PHP's `buildTableTokens` writes. A `{{!}}`
+/// magic marker has none of them set and stands for a single `|`. A literal
+/// HTML `<td>` is not a wikitext cell and returns `None`.
+fn cell_opener_source(t: &crate::wikitext::tokens_v2::TagTk) -> Option<String> {
+    if t.name != "td" && t.name != "th" {
+        return None;
+    }
+    let dp = &t.data_parsoid;
+    if dp.stx.as_deref() == Some("html") {
+        return None;
+    }
+    if let Some((Some(start), Some(source))) =
+        dp.tsr.as_ref().map(|r| (r.start, r.source.as_deref()))
+    {
+        // The cell's TSR spans only the opener and its attribute box, never the
+        // content, so the slice is exactly the wikitext the token stands for.
+        if let Some(src) = source.get(start..dp.tsr.as_ref()?.end) {
+            return Some(src.to_string());
+        }
+    }
+    let row_syntax = dp.stx.as_deref() == Some("row");
+    let default_opener = match (t.name.as_str(), row_syntax) {
+        ("th", true) => "!!",
+        ("th", false) => "!",
+        (_, true) => "||",
+        (_, false) => "|",
+    };
+    let attr_src = dp.tmp.attr_src.as_deref().unwrap_or("");
+    let mut out = dp
+        .start_tag_src
+        .clone()
+        .unwrap_or_else(|| default_opener.to_string());
+    out.push_str(attr_src);
+    if attr_src.is_empty() {
+        // No attribute box: only a separator the tokenizer recorded is part of
+        // the opener (`||` from a template body), not the default one.
+        if let Some(sep) = &dp.attr_sep_src {
+            out.push_str(sep);
+        }
+    } else {
+        // A non-empty box is always followed by its separating pipe.
+        out.push_str(dp.attr_sep_src.as_deref().unwrap_or("|"));
+    }
+    Some(out)
 }
 
 /// Render `#tag` content tokens back to the wikitext the tag records as its
@@ -8654,7 +8822,11 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
                 }
                 out.push_str("]]");
             }
-            Item::Tok(ParsoidToken::Tag(t)) if is_bang_marker(t) => out.push('|'),
+            Item::Tok(ParsoidToken::Tag(t))
+                if (t.name == "td" || t.name == "th") && cell_opener_source(t).is_some() =>
+            {
+                out.push_str(&cell_opener_source(t).unwrap_or_default());
+            }
             _ => return None,
         }
         i += 1;
@@ -10550,7 +10722,7 @@ mod tests {
                 Default::default(),
             ))),
         ];
-        let out = re_tokenize_text_branch(items, &[], BranchSyntax::Cells);
+        let out = re_tokenize_text_branch(items, &[], BranchSyntax::Cells, false, true);
         assert!(
             out.iter()
                 .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "table")),
