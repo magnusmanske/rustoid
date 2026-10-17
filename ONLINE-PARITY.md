@@ -17810,3 +17810,47 @@ Canada's first difference moves from 25.99% to 28.50%. A cached `fileinfo` entry
 written before the field existed has to be refetched once (delete that one entry
 and run online); the rest of the cache is untouched. Lib tests now cover both
 paths; clippy clean.
+
+## Fragment bodies keep their wrappers, links and srcset
+
+Four independent gaps were left on Canada's last few kilobytes.
+
+- **A blank `mw:Nowiki` transclusion wrapper must survive.** `Template:As of`
+  ends in `<nowiki/>`; inside a `<ref>` body the flattener dropped every nowiki
+  span, including the one `tplwrap` had made the range's root. PHP's
+  `finalCleanup` keeps an encapsulated forest root, so the flattener now does
+  too (`flatten_nowiki_spans`, `about^="#mwt"`).
+- **`tag_content_source` must write live elements.** A module's
+  `<span>[[…]]</span>` string reaches a `#tag` body as HTML tokens; the
+  serializer declined on the start tag, and the per-token fallback then dropped
+  the wikilink (it has no `src`), leaving an empty span. It now serializes
+  `Tag`/`EndTag` from their source, and the fallback renders a token from
+  `tag_content_source` when `token_to_source` has nothing — so
+  `Module:IPA`'s pronunciation link survives in note bodies.
+- **`data-file-type` is the API media class, not the MIME subtype.** Already
+  recorded above; PDFs are `office`.
+- **SecureLinkFixer upgrades preloaded hosts.** The live wiki runs the
+  extension as a `LinkerMakeExternalLink` hook, rewriting `http://` (and
+  protocol-relative) links whose host is on Mozilla's HSTS preload list, with
+  the written form kept in `data-mw-original-href`.
+  `rustoid-extensions::secure_link_fixer` carries the generated table (two
+  sorted lists, `162,218` subdomain-capable entries and `8,630` exact-only
+  entries) and the lookup; `rustoid-compare`'s site config applies it alongside
+  the same-host protocol expansion.
+- **`srcset` for a height-constrained thumbnail.** The API omits
+  `responsiveUrls` when `iiurlheight` is supplied, while Parsoid computes the
+  srcset from the transform. The harness asks once more, width-only, at the
+  physical thumb width taken from the thumb URL.
+- **`#tag:indicator` ids are deferred like `#tag:templatestyles`.** Numbering
+  the indicator at the call put it before a stylesheet the module had emitted
+  earlier, shifting every later `about`; both are placeholders, so both are now
+  numbered where they land.
+
+### Effect
+
+Canada's first difference moves from 28.50% to 99.87%; the visible HTML is
+identical and the only remaining diff is the `{{#parsoid fragment:N}}` marker
+Parsoid records for a DOM fragment in the indicator's `extsrc`. Association
+football becomes nondeterministic-only. Fixtures stay at 877/896, lib tests
+1056, clippy clean; the corpus keeps its four strict matches and has no
+regressions.
