@@ -752,10 +752,7 @@ fn apply_media_info(
     // reflect the manual-thumb file, matching PHP's `$info` replacement.
     img.set_attr("data-file-width", media_info.width.to_string());
     img.set_attr("data-file-height", media_info.height.to_string());
-    img.set_attr(
-        "data-file-type",
-        media_type_from_mime(&media_info.mime_type),
-    );
+    img.set_attr("data-file-type", data_file_type(&media_info));
     // Rendered dimensions.
     img.set_attr("height", height.to_string());
     img.set_attr("width", width.to_string());
@@ -1178,6 +1175,18 @@ fn media_type_from_mime(mime: &str) -> String {
             "bitmap".to_string()
         }
         _ => mime.rsplit('/').next().unwrap_or("").to_string(),
+    }
+}
+
+/// `data-file-type`: PHP's
+/// `strtolower( $info['mediatype'] ?? '' )` (`AddMediaInfo.php:439`). The API's
+/// `mediatype` is authoritative — a PDF is `OFFICE`, so its value is `office`,
+/// not the MIME subtype `pdf`. The MIME mapping is only for a source that does
+/// not report the field.
+fn data_file_type(info: &FileInfo) -> String {
+    match &info.media_type {
+        Some(t) => t.to_lowercase(),
+        None => media_type_from_mime(&info.mime_type),
     }
 }
 
@@ -1921,6 +1930,24 @@ mod tests {
     fn test_media_type_from_mime() {
         assert_eq!(media_type_from_mime("image/jpeg"), "bitmap");
         assert_eq!(media_type_from_mime("image/svg+xml"), "drawing");
+    }
+
+    #[test]
+    fn data_file_type_comes_from_mediatype() {
+        // The API reports a PDF as `OFFICE`; PHP lowercases that, so the
+        // attribute is `office`, not the MIME subtype `pdf`.
+        let info = FileInfo {
+            mime_type: "application/pdf".to_string(),
+            media_type: Some("OFFICE".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(data_file_type(&info), "office");
+        // A source without the field falls back to the MIME mapping.
+        let info = FileInfo {
+            mime_type: "image/svg+xml".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(data_file_type(&info), "drawing");
     }
 
     #[test]
