@@ -17595,3 +17595,96 @@ Corpus effect of this increment: none (first-difference positions and `<td>`
 counts unchanged on `Canada`, `France`, `Israel`, `United States`). Fixtures stay
 877/896, all lib tests pass, clippy and fmt are clean. It is kept as the
 branch-level half of the eventual textual pass.
+
+## A named argument's edge trim crosses comments
+
+MediaWiki removes HTML comments during preprocessing, *before* a template
+argument is trimmed (`PPTemplateFrame_Hash::getNamedArgument` runs `trim()` on
+the expanded text). Parsoid's native `TokenUtils::tokenTrim` stops at the first
+non-text token instead, so `| Gini = 29.2 <!--number only-->` came out as
+`29.2 ` — the comment was dropped when rendering, leaving its trailing space
+behind. `Template:Infobox country` splices `{{{Gini}}}{{{Gini_ref|}}}`, so the
+stray blank landed between the value and its `<ref>` (`29.2 <sup>` where the
+wiki serves `29.2<sup>`).
+
+`trim_items` now walks past `Comment` tokens at either edge, exactly as it
+already walked past `Nl`. Comments are not rendered, so nothing else changes.
+
+### Effect
+
+Canada's first difference moved from the Gini row to the `#iferror` work below.
+
+## `#iferror`'s test is tokens, and branch text runs are re-parsed
+
+Two related losses, both from flattening markup to text too early:
+
+- `#iferror` with no `else` answers its test (`$result = $test`), and core
+  re-expands that *string*. rustoid returned `Item::Str(tokens_to_string(…))`:
+  an extension placeholder stringifies to nothing (`<templatestyles>` vanished)
+  and a tag assembled across a template boundary stayed literal (`&lt;span`).
+  rustoid now keeps the parser function's colon argument as tokens
+  (`parser_function_arg0_tokens`, which strips the `#name:` prefix from the
+  leading text) and returns those tokens, trimmed, for the no-else path. The
+  error test looks for the markup in both forms — a literal string, or an
+  element whose `class` contains `error` — because by then the error box may
+  already be a `<strong>` token.
+- A mixed text-returning branch (`#if`/`#ifeq`/`#ifexpr`/`#iferror`) is spliced
+  into the caller as a *string* in core and parsed there. rustoid expands the
+  branch in place, so a text run that carries markup has to be re-tokenized:
+  `Template:Color`'s `<span class="tmp-color"` (whose `>` lives in
+  `Template:Ifsubst`'s body) and its entity references now become real tokens.
+  Only runs containing `<` or `&` (or a line-start table cell) are re-tokenized.
+
+The second half is deliberately **not** applied to all-text branches.
+Re-tokenizing every text branch regressed `Template:Infobox football biography`:
+its header style is `…background-color: {{#ifeq:…|#b0c4de}}`, and core inserts
+the T2529 newline *in the caller's context* (mid-attribute), where the result is
+ordinary text. Tokenizing `#b0c4de` at SOL first made it a `listItem`, which
+suppressed the newline (`Cristiano Ronaldo` 1.21% → 0.46%, `Lionel Messi`
+similarly). The all-text path keeps its original "a line begins block syntax"
+trigger; `t2529_force_line_start` owns the in-context case.
+
+### Effect
+
+Canada 2.74 → 18.91%, France 3.29 → 11.34%, Grand Theft Auto V 1.96 → 20.88%,
+Israel 2.60 → 3.06%, India 1.08 → 2.40%; Zebra stays a byte match, and the
+Ronaldo/Messi first-difference positions return to their baseline. Fixtures stay
+877/896.
+
+## An expanded extlink URL is split at its first whitespace
+
+`Template:As of` writes `[{{#if:…|…|{{fullurl:…}} &#91;update&#93;}}]`. Core
+expands templates *textually*, so the parser sees `[url &#91;update&#93;]` and
+the first space ends the URL. Parsoid's grammar admits a `url_directive` into
+the href (and rustoid mirrors that), so after expansion the href token list held
+`https://…&action=edit`, a space, and the entity tokens for `[update]` — and
+rustoid used the whole thing as the href, rendering an empty autolink whose URL
+was `…action=edit%20%5Bupdate%5D`.
+
+When there is no `mw:content`, `on_ext_link` now splits the expanded href token
+list at the first whitespace: the URL is what precedes it, the rest becomes the
+link text (entity tokens included). This is the post-expansion equivalent of the
+textual parse core performs.
+
+### Effect
+
+Canada's `<sup>[update]</sup>` external link now matches the wiki
+(first difference 16.21% → 18.91%). Fixtures stay 877/896.
+
+## `#formatnum` pass-through keeps entity tokens
+
+`{{formatnum:2.221&nbsp;trillion}}` passes the input through unchanged. Core
+answers the expanded *string* (which still spells the entity) and the parser
+re-parses it, so the NBSP stays an `mw:Entity` span. rustoid stringified the
+argument first (decoding `&nbsp;` to U+00A0) and returned a plain string, so
+`Template:US$`'s GDP row emitted a bare NBSP character where the wiki serves
+`<span typeof="mw:Entity">\u{a0}</span>`.
+
+When the formatted value equals the input text, `pf_formatnum` now returns the
+argument's tokens (comments dropped, edges trimmed) instead of a new string —
+the same value with the markup's identity intact.
+
+### Effect
+
+Canada 18.91% (the GDP row moved past). Fixtures stay 877/896; 4/48 strict,
+Zebra/ISO/Quicksilver/Order of the British Empire match.
