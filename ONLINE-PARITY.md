@@ -17557,3 +17557,41 @@ parsed — which is an architectural change, not a patch.
   wikitext. That needs the content model plus a Lua highlighter.
 
 All three are extension/content-model ports, not bounded fixes.
+
+## Landed: branch text-run re-tokenization; the body-boundary case remains
+
+`re_tokenize_text_branch` now re-tokenizes **each text run** of a mixed branch
+(not only an all-text branch), restores a `{|` table-start token to source text
+(dropping the transclusion marker, so `{{(!}}` is transparent as it is on the
+service), and is also applied to `#switch` — whose branch keeps its tokens — in a
+`TableOnly` mode. Verified on probes: both
+
+```
+{{#if:1|<div>
+{|
+! H
+|-
+| a
+|}
+</div>}}
+```
+
+and the `{{(!}}` equivalent now render a real `<table>` (they were literal
+`{|`/`|`/`!` text), while a top-level `{{(!}}` is byte-for-byte unchanged.
+
+It does **not** fix `Template:Largest cities` on the corpus, and the refined
+finding explains why:
+
+- The template closes its `#switch` at line 14. Only `<div>` and the `{|` (from
+  `{{(!}}`) are *inside* the branch; the `|-`, `!` header and `|` row lines are
+  **template-body** content after the switch.
+- The body is tokenized before expansion, so those lines are plain text — and
+  are split further at the `[[…]]` wikilink tokens inside each cell.
+- Joining the branch's `{|` to body text that lives outside the branch, and
+  rebuilding cells around already-tokenized wikilinks, needs the one thing
+  rustoid does not have: tokenize *after* textual template expansion.
+
+Corpus effect of this increment: none (first-difference positions and `<td>`
+counts unchanged on `Canada`, `France`, `Israel`, `United States`). Fixtures stay
+877/896, all lib tests pass, clippy and fmt are clean. It is kept as the
+branch-level half of the eventual textual pass.

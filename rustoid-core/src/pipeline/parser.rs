@@ -1094,10 +1094,38 @@ pub fn render_inline_fragment(
 /// a plain textual form and a line begins table syntax, re-tokenize so the
 /// construct is recognized. A branch holding any other token (a link, a tag) is
 /// left alone.
-fn re_tokenize_text_branch(items: Vec<Item>, ext_tags: &[String]) -> Vec<Item> {
-    // A parser function's answer is wrapped in `mw:Transclusion` marker metas;
-    // the branch content sits between them. Re-tokenize the content and keep the
-    // markers, so the tree builder still wraps the result.
+/// Which line shapes trigger a branch re-tokenization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchSyntax {
+    /// `{|`, `|`, `!` — a branch returned as *text* (`#if`, `#ifeq`, …), where a
+    /// leading `|`/`!` line can be a cell of an enclosing table.
+    Cells,
+    /// `{|` only — a branch that keeps its tokens (`#switch`): only a real table
+    /// start needs re-tokenizing, so the branch's own nodes stay as they are.
+    TableOnly,
+}
+
+impl BranchSyntax {
+    fn triggers(self, line: &str) -> bool {
+        let t = line.trim_start_matches(' ');
+        t.starts_with("{|") || (self == Self::Cells && (t.starts_with('|') || t.starts_with('!')))
+    }
+}
+
+/// Re-tokenize a parser function's branch so block syntax it carries is parsed.
+///
+/// MediaWiki's preprocessor is *textual*: a branch is spliced into the source and
+/// re-tokenized, so a line-start `{|` starts a table and the `|-`/`!`/`|` lines
+/// after it become cells. rustoid's branch is already tokenized as an argument
+/// value (inline), so this pass puts the text back through the tokenizer.
+///
+/// The branch content sits between the `mw:Transclusion` marker metas that wrap
+/// the parser-function result; those are kept so the tree builder still wraps it.
+fn re_tokenize_text_branch(
+    items: Vec<Item>,
+    ext_tags: &[String],
+    syntax: BranchSyntax,
+) -> Vec<Item> {
     fn is_wrapper(it: &Item) -> bool {
         matches!(
             it,
@@ -1109,6 +1137,47 @@ fn re_tokenize_text_branch(items: Vec<Item>, ext_tags: &[String]) -> Vec<Item> {
                     })
         )
     }
+    fn tokenize(text: &str, ext_tags: &[String]) -> Vec<Item> {
+        crate::pipeline::template_handler::tokenize_wikitext_to_items(
+            text, /* in_template */ true, ext_tags,
+        )
+    }
+    /// Re-tokenize a run of text items when a line in it starts block syntax.
+    /// `at_line_start` says the run's first line begins a source line; otherwise
+    /// that first line cannot start a table and is skipped.
+    fn flush(
+        out: &mut Vec<Item>,
+        run: &mut Vec<Item>,
+        at_line_start: bool,
+        syntax: BranchSyntax,
+        ext_tags: &[String],
+    ) {
+        if run.is_empty() {
+            return;
+        }
+        let mut text = String::new();
+        for it in run.iter() {
+            match it {
+                Item::Str(s) => text.push_str(s),
+                Item::Tok(ParsoidToken::Nl(_)) => text.push('\n'),
+                _ => {
+                    out.append(run);
+                    return;
+                }
+            }
+        }
+        let mut lines = text.lines();
+        if !(at_line_start || text.starts_with('\n')) {
+            lines.next();
+        }
+        if lines.any(|line| syntax.triggers(line)) {
+            out.extend(tokenize(&text, ext_tags));
+            run.clear();
+        } else {
+            out.append(run);
+        }
+    }
+
     let start = items
         .iter()
         .position(|it| !is_wrapper(it))
@@ -1118,26 +1187,65 @@ fn re_tokenize_text_branch(items: Vec<Item>, ext_tags: &[String]) -> Vec<Item> {
         .rposition(|it| !is_wrapper(it))
         .map(|i| i + 1)
         .unwrap_or(start);
-    let mut text = String::new();
-    for it in &items[start..end] {
-        match it {
-            Item::Str(s) => text.push_str(s),
-            Item::Tok(ParsoidToken::Nl(_)) => text.push('\n'),
-            _ => return items,
+    let content = &items[start..end];
+
+    // A branch that is only text is re-tokenized as a whole.
+    let all_text = content
+        .iter()
+        .all(|it| matches!(it, Item::Str(_) | Item::Tok(ParsoidToken::Nl(_))));
+    if all_text {
+        let mut text = String::new();
+        for it in content {
+            match it {
+                Item::Str(s) => text.push_str(s),
+                Item::Tok(ParsoidToken::Nl(_)) => text.push('\n'),
+                _ => unreachable!("checked above"),
+            }
+        }
+        if !text.lines().any(|line| syntax.triggers(line)) {
+            return items;
+        }
+        let mut out: Vec<Item> = items[..start].to_vec();
+        out.extend(tokenize(&text, ext_tags));
+        out.extend_from_slice(&items[end..]);
+        return out;
+    }
+
+    // Mixed content: a branch can return markup tokens *and* raw table lines —
+    // `Template:Largest cities`'s branch is a `<div>` followed by the `{|`/`|-`/
+    // `!` lines that `{{(!}}`/`{{!}}` expand to. The tokens stay where they are;
+    // a table-start token produced from `{|` is put back into the text stream (a
+    // transclusion marker is not source text, so it is dropped), and each text
+    // run that carries a table start is re-tokenized on its own.
+    let mut out: Vec<Item> = items[..start].to_vec();
+    let mut run: Vec<Item> = Vec::new();
+    let mut run_starts_line = true;
+    let mut i = start;
+    while i < end {
+        match &items[i] {
+            Item::Str(_) | Item::Tok(ParsoidToken::Nl(_)) => {
+                run.push(items[i].clone());
+                i += 1;
+            }
+            it if is_wrapper(it) => {
+                i += 1;
+            }
+            Item::Tok(ParsoidToken::Tag(t))
+                if t.data_parsoid.start_tag_src.as_deref() == Some("{|")
+                    && t.attribs.is_empty() =>
+            {
+                run.push(Item::Str("{|".to_string()));
+                i += 1;
+            }
+            _ => {
+                flush(&mut out, &mut run, run_starts_line, syntax, ext_tags);
+                run_starts_line = false;
+                out.push(items[i].clone());
+                i += 1;
+            }
         }
     }
-    if !text.lines().any(|line| {
-        let t = line.trim_start_matches(' ');
-        t.starts_with('|') || t.starts_with('!') || t.starts_with("{|")
-    }) {
-        return items;
-    }
-    let mut out: Vec<Item> = items[..start].to_vec();
-    out.extend(
-        crate::pipeline::template_handler::tokenize_wikitext_to_items(
-            &text, /* in_template */ true, ext_tags,
-        ),
-    );
+    flush(&mut out, &mut run, run_starts_line, syntax, ext_tags);
     out.extend_from_slice(&items[end..]);
     out
 }
@@ -5694,6 +5802,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(ResolvedTarget::ParserFunction { name, .. })
                 if TemplateHandler::expands_branch_to_text(name)
         );
+        // `#switch` keeps its branch's *tokens* (core returns them with
+        // `PPFrame::RECOVER_ORIG`), so the text-branch marking above must not run.
+        // A branch that carries a table start still needs it re-tokenized, though:
+        // the value was tokenized inline as an argument, and
+        // `Template:Largest cities` builds its whole table inside a `#switch`
+        // branch, so without this the `{|`/`|-`/`!` lines stayed literal text.
+        let retokenize_branch_table = matches!(
+            &resolved,
+            Some(ResolvedTarget::ParserFunction { name, .. })
+                if name.eq_ignore_ascii_case("switch")
+        );
         // `#ifexist` needs its answer before the synchronous parser-function call
         // below. The title is known here — the target's `{{{…}}}` have already
         // been substituted into `target_str` — which is exactly why this cannot be
@@ -5952,8 +6071,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // what is left — see
                     // [`TemplateHandler::expands_branch_to_text`] and
                     // [`crate::wikitext::tokens_v2::TempData::in_text_branch`].
-                    expanded = re_tokenize_text_branch(expanded, self.config.extension_tags());
+                    expanded = re_tokenize_text_branch(
+                        expanded,
+                        self.config.extension_tags(),
+                        BranchSyntax::Cells,
+                    );
                     mark_in_text_branch(&mut expanded);
+                } else if retokenize_branch_table {
+                    expanded = re_tokenize_text_branch(
+                        expanded,
+                        self.config.extension_tags(),
+                        BranchSyntax::TableOnly,
+                    );
                 }
                 for e in &expanded {
                     track_table(e, table_depth);
@@ -10289,6 +10418,43 @@ mod tests {
                 SelfclosingTagTk::new("template", vec![], Default::default())
             ))]),
             None
+        );
+    }
+
+    /// A branch whose content is a tag followed by table lines (`<div>` then a
+    /// `{|`/`!`/`|` block) must have each *text run* re-tokenized, not only an
+    /// all-text branch. `Template:Largest cities` builds its table this way.
+    #[test]
+    fn re_tokenize_text_branch_parses_a_table_after_a_tag() {
+        use crate::wikitext::tokens_v2::{EndTagTk, NlTk, TagTk};
+
+        let s = |t: &str| Item::Str(t.to_string());
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(TagTk::new(
+                "div",
+                vec![],
+                Default::default(),
+            ))),
+            Item::Tok(ParsoidToken::Nl(NlTk {
+                data_parsoid: Default::default(),
+            })),
+            s("{|\n! H1\n|-\n| a\n|}\n"),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "div",
+                vec![],
+                Default::default(),
+            ))),
+        ];
+        let out = re_tokenize_text_branch(items, &[], BranchSyntax::Cells);
+        assert!(
+            out.iter()
+                .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "table")),
+            "the table start should be tokenized: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|it| matches!(it, Item::Str(s) if s.contains("{|"))),
+            "the literal table-start text should be gone: {out:?}"
         );
     }
 }
