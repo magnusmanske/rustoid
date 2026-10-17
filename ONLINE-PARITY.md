@@ -17384,3 +17384,48 @@ different, identified cause (the missing `mw-empty-elt` wrapper, below) and move
 by 2–18 within deltas of 23–1550. No page's first-difference position changes, so
 the strict score is still 4/48. Fixtures stay 877/896, every lib test passes,
 clippy and fmt are clean.
+
+## `{{formatnum:…}}` answered empty
+
+`{{formatnum:…}}` was recognised as a magic word but never implemented: the
+unimplemented-function fallback in `call_parser_function` answered the magic
+variable's value, and `formatnum` has none, so the whole call rendered as the
+empty string. Templates that build a number through it dropped their argument —
+`{{US dollar}}`'s `{{formatnum:{{replace|{{{1|}}}|,|}}}}` made `{{US dollar|40}}`
+render `US$` with no amount, and `{{US dollar|1035000}}` render `US$` with no
+amount either. That is the first difference on `Doom (1993 video game)`
+(`US$40`), `Nobel Prize` (`US$1,035,000`) and `Grand Theft Auto V`
+(`$800 million`).
+
+### The reference
+
+The oracle is production Parsoid, which routes the call to MediaWiki core's
+`CoreParserFunctions::formatnum` over `Language::formatNum`. Parsoid's own
+`src/Wt2Html/TT/ParserFunctions.php` `pf_formatnum` sits in its "stub section"
+and returns the argument unchanged — that is *not* what the served page shows, so
+core is the reference. English has neither a digit- nor a separator-transform
+table, so `Language::formatNum` / `formatNumInternal`
+(`includes/Language/Language.php`) reduces to: group the integer part in threes
+with `,`, keep the decimal point and every fraction digit verbatim, turn a
+leading `-` into U+2212, and, for a non-numeric argument, rewrite each
+number-like run piecewise. `parseFormattedNumber` (`R`) strips the separators
+back out and `formatNumNoSeparators` (`NOSEP`) skips the grouping; `NAN` answers
+the `formatnum-nan` message and `INF`/`-INF` answer `∞`/`−∞`.
+
+### The fix
+
+`ParserFunctions::pf_formatnum` implements those behaviours, wired into the
+`formatnum` arm of `TemplateHandler::call_parser_function`. A single batched live
+probe confirmed each against the transform endpoint: `1,035,000`, `40`,
+`1,234,567.89`, `007`, `−1,234`, `1035000` for `|R`, `1234` for `|NOSEP`,
+`abc123def` (unchanged), the empty string, `-0` → `−0`, and `1234.500` →
+`1,234.500`.
+
+### Effect
+
+The first difference moves on five pages with no regression:
+`Doom (1993 video game)` 13.33% → 41.52%, `Nobel Prize` 2.51% → 13.04%,
+`Canada` 2.02% → 2.72%, `Israel` 1.95% → 2.30%; `Grand Theft Auto V` is unchanged
+at 1.96% (it reaches formatnum later than its own first difference). The strict
+score stays 4/48, fixtures stay 877/896, every lib test passes, clippy and fmt
+are clean.
