@@ -17749,3 +17749,48 @@ The row's city/province links render as real `<a>` elements. The first
 difference is unchanged in *position* (19.31%) because the same row still needs
 the template-emitted `||` to split cells, but the diff content moves from
 literal link text to the cell boundary. Fixtures stay 877/896; no page regresses.
+
+## A branch is spliced where its call sits, and cell openers are text
+
+`Template:Largest cities` builds its table rows out of `#if` branches such as
+`{{!!}} style="text-align:left;" {{!}} [[{{{div_1}}}]]`. Core's preprocessor
+expands the branch to text and splices it at the call's position in the source,
+so the tokenizer sees a single line — `... [[Toronto]] || style="text-align:left;" | [[Ontario]] ...` —
+and splits the cells there. rustoid expands the branch on its own, which caused
+two distinct errors:
+
+- **The `sol` flag was guessed from the branch, not from the call.**
+  Re-tokenizing the fragment at `sol=true` made a *leading* `|` a cell. That is
+  wrong for a mid-line branch: inside `#tag:indicator`'s content, an `#ifeq`
+  branch of `{{!}}link=…` became a `<td>` cell token, and `tag_content_source`
+  then could not rebuild the field (it fell back to the raw, unsubstituted
+  source). `re_tokenize_text_branch` now takes the call's line-start state
+  (`branch_starts_line`, from the parser-function token's TSR) and
+  `tokenize_branch_fragment` passes it to the tokenizer.
+- **A mid-line fragment still has to continue the current row.** The tokenizer
+  gained `continue_table_cells`: when the fragment starts mid-line, a leading
+  `||`/`!!` runs PHP's `tds`/`ths` rule and splits cells, while a single `|`
+  stays text. The inline line parser also stops at `||` in that mode, so a
+  separator after cell content (`... [[London]] || style=…`) is found.
+- **A cell opener must go back into the text stream as its source.** A
+  `td`/`th` token in a text-returning branch is an opener, not content;
+  `cell_opener_source` renders it from its TSR when present, otherwise rebuilds
+  it from `startTagSrc`/`attrSrc`/`attrSepSrc`. This is what makes
+  `Template:!!` (whose body is `||`, and whose token loses its TSR during
+  expansion) come back as `||` instead of being mistaken for a `{{!}}` marker
+  and folded to a single `|`.
+- The nested branch inherits the enclosing table depth (`expand_templates`
+  gained `initial_table_depth`), so a branch expanded while a table is open
+  still recognizes its separators. `AT_SRC_START` is now PHP's rule — the cell
+  must begin the *whole* tokenized source, not merely a line
+  (`is_source_start`) — which is what keeps `TableFixups` from merging a
+  correctly formed cell with the one before it.
+
+### Effect
+
+Canada's table rows match: `1 | Toronto | Ontario | 6,202,225 | 11 | London | Ontario | 543,551 …`
+instead of the attribute box staying in the previous cell. The first difference
+moves from byte 359,622 (19.31%) to byte 484,034 (25.99%), where it is now an
+unrelated file-type fact (`office` vs `pdf` for `O-Canada-1908.pdf`). Fixtures
+stay at 877/896, lib tests 1054, clippy clean; no corpus page regresses, and the
+four strict matches plus the nondeterministic-only page are unchanged.
