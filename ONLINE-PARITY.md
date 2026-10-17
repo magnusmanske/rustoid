@@ -17794,3 +17794,19 @@ moves from byte 359,622 (19.31%) to byte 484,034 (25.99%), where it is now an
 unrelated file-type fact (`office` vs `pdf` for `O-Canada-1908.pdf`). Fixtures
 stay at 877/896, lib tests 1054, clippy clean; no corpus page regresses, and the
 four strict matches plus the nondeterministic-only page are unchanged.
+
+## `data-file-type` comes from the API's media class
+
+PHP's `AddMediaInfo` writes `data-file-type` as
+`strtolower( $info['mediatype'] ?? '' )` — the API's media **class**, not the
+MIME subtype. rustoid mapped the MIME (`application/pdf` → `pdf`), so
+`O-Canada-1908.pdf` came out `data-file-type="pdf"` where the service says
+`office`. It now lowercases `FileInfo::media_type` and only falls back to the
+MIME mapping for a source that predates the field.
+
+### Effect
+
+Canada's first difference moves from 25.99% to 28.50%. A cached `fileinfo` entry
+written before the field existed has to be refetched once (delete that one entry
+and run online); the rest of the cache is untouched. Lib tests now cover both
+paths; clippy clean.
