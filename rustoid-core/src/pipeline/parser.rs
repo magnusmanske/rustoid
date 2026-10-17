@@ -1481,7 +1481,15 @@ fn flatten_nowiki_spans(root: &mut Node) {
     let children = std::mem::take(&mut root.children);
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     for mut child in children {
-        if is_nowiki_span(&child) {
+        // A nowiki span that anchors a transclusion range (`about="#mwt…"`) is
+        // the range's wrapper, not a DOM-fragment placeholder: PHP's
+        // `finalCleanup` keeps it even when it is empty (an `<nowiki/>` at the
+        // end of a template, as in `Template:As of`). Only an unencapsulated
+        // wrapper is flattened away.
+        let encapsulated_root = child
+            .get_attr("about")
+            .is_some_and(|a| a.starts_with("#mwt"));
+        if is_nowiki_span(&child) && !encapsulated_root {
             let text = text_content(&child);
             if !text.is_empty() {
                 out.push(Node::text(text));
@@ -7935,12 +7943,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // module left it, in document order — *not* at the call. So a
         // `#tag:templatestyles` answer is deferred like any other; the resolved
         // stylesheet is carried to the module's output by a strip marker and
-        // numbered there, in the chunk's document order. Only that tag is
-        // deferred: its answer is a `mw:DOMFragment` placeholder a marker carries.
+        // numbered there, in the chunk's document order. The `indicator` answer
+        // is a placeholder too (see [`Self::expand_one_indicator`]), so it is
+        // deferred by the same rule: numbering it at the call put it *before* a
+        // stylesheet the module emitted earlier, shifting every later id.
         let defer = !matches!(
             request,
             crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { .. }
-        ) || is_templatestyles_extension_tag(&request);
+        ) || is_deferred_extension_tag(&request);
         let _answer_gate = defer.then(|| self.begin_style_defer());
         let expanded = Box::pin(self.expand_templates(
             &child,
@@ -8104,15 +8114,15 @@ fn value_carries_marker(value: &crate::wikitext::tokens_v2::KeyValue) -> bool {
 /// Only that tag's answer is a `mw:DOMFragment` placeholder the module's output
 /// can carry, so the id it spends waits for the position the module left it in.
 /// See [`Parser::expand_lua_request`].
-fn is_templatestyles_extension_tag(request: &crate::pipeline::lua_deferred::FrameRequest) -> bool {
+fn is_deferred_extension_tag(request: &crate::pipeline::lua_deferred::FrameRequest) -> bool {
     let crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { name, args } = request
     else {
         return false;
     };
     name == "#tag"
-        && args
-            .first()
-            .is_some_and(|a| a.name.is_none() && a.value == "templatestyles")
+        && args.first().is_some_and(|a| {
+            a.name.is_none() && (a.value == "templatestyles" || a.value == "indicator")
+        })
 }
 
 /// Convert a frame's raw parameters into Scribunto `Arg`s.
@@ -8826,6 +8836,17 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
                 if (t.name == "td" || t.name == "th") && cell_opener_source(t).is_some() =>
             {
                 out.push_str(&cell_opener_source(t).unwrap_or_default());
+            }
+            // A live HTML element: the start tag, the content (which follows as
+            // separate items) and the end tag are each written as they were.
+            // Declining on them made the fallback drop any following token that
+            // has no `src` of its own — a module's `<span>[[link]]</span>`
+            // stringifies to an empty span instead of a link.
+            Item::Tok(tok @ ParsoidToken::Tag(_)) => {
+                out.push_str(&token_source_for_module(tok)?);
+            }
+            Item::Tok(tok @ ParsoidToken::EndTag(_)) => {
+                out.push_str(&token_source_for_module(tok)?);
             }
             _ => return None,
         }
@@ -10695,6 +10716,53 @@ mod tests {
                 SelfclosingTagTk::new("template", vec![], Default::default())
             ))]),
             None
+        );
+    }
+
+    /// A live HTML element in a `#tag` body is written from its source, and a
+    /// wikitext link that follows it keeps its content even though the link
+    /// token has no `src` of its own (it came from a module's string).
+    #[test]
+    fn tag_content_source_keeps_a_link_inside_a_live_element() {
+        use crate::wikitext::tokens_v2::{
+            DataParsoid, EndTagTk, KeyValue, ParsoidToken, SelfclosingTagTk, TagTk,
+        };
+
+        let kv = |k: &str, v: &str| crate::wikitext::tokens_v2::KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let mut span = TagTk::new(
+            "span",
+            vec![],
+            DataParsoid {
+                src: Some("<span class=\"IPA nowrap\">".to_string()),
+                ..Default::default()
+            },
+        );
+        span.add_attribute_str("class", "IPA nowrap");
+        let mut link = SelfclosingTagTk::new("wikilink", vec![], Default::default());
+        link.attribs.push(kv("href", "Help:IPA/English"));
+        link.attribs.push(kv("mw:maybeContent", "/x/"));
+        let end = EndTagTk::new(
+            "span",
+            vec![],
+            DataParsoid {
+                src: Some("</span>".to_string()),
+                ..Default::default()
+            },
+        );
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Tok(ParsoidToken::SelfclosingTag(link)),
+            Item::Tok(ParsoidToken::EndTag(end)),
+        ];
+        assert_eq!(
+            tag_content_source(&items),
+            Some("<span class=\"IPA nowrap\">[[Help:IPA/English|/x/]]</span>".to_string())
         );
     }
 

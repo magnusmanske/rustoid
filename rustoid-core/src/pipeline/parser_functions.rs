@@ -1736,7 +1736,20 @@ pub(crate) fn tag_content_fallback_source(content: &[Item]) -> String {
         match &content[i] {
             Item::Str(text) => s.push_str(text),
             Item::Tok(t) => {
-                s.push_str(&token_to_source(t));
+                let source = token_to_source(t);
+                if source.is_empty() {
+                    // A token with no `src` of its own can still have a known
+                    // wikitext form. A module's `<span>[[link]]</span>` reaches
+                    // here as a wikilink token without one, and dropping it left
+                    // an empty span in the note body (`Module:IPA`).
+                    if let Some(rendered) = crate::pipeline::parser::tag_content_source(
+                        std::slice::from_ref(&content[i]),
+                    ) {
+                        s.push_str(&rendered);
+                    }
+                } else {
+                    s.push_str(&source);
+                }
                 if crate::wikitext::token_utils::skip_entity_decoded_text(t, content.get(i + 1)) {
                     i += 1;
                 }
