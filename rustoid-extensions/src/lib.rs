@@ -10,3 +10,4 @@
 //! these entry points from its finalization passes.
 
 pub mod cite;
+pub mod secure_link_fixer;
