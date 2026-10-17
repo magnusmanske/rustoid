@@ -17429,3 +17429,43 @@ The first difference moves on five pages with no regression:
 at 1.96% (it reaches formatnum later than its own first difference). The strict
 score stays 4/48, fixtures stay 877/896, every lib test passes, clippy and fmt
 are clean.
+
+## Open: a `{{{N}}}` reference survives in an attribute when the call arrives as an argument
+
+`{{{N}}}` (no default) referenced inside a template is left unsubstituted when
+the calling template call arrives as *another* template's argument value, and is
+then expanded against the **root** frame — which has no arguments — so it renders
+as the literal `{{{2}}}`.
+
+The clearest instance is `Template:Drugs.com`, whose `monograph` branch is
+`[https://www.drugs.com/monograph/{{#if:1|{{{2}}}}}.html Monograph]`:
+
+```
+{{drugs.com|monograph|ZZZ}}                                    -> …/monograph/ZZZ.html        (correct)
+{{Infobox drug|drug_name=X|tradename={{drugs.com|monograph|ZZZ}}}}  -> …/monograph/{{{2}}}.html (broken)
+```
+
+Any bare `{{{P|}}}` echo cell reproduces (`Drugs.com`, `tradename`,
+`biosimilars`, `gt_target_gene`); wrapping the call in `{{#if:1|…}}`/`{{#ifeq}}`
+or a passthrough such as `{{nowrap|…}}` does **not**, so the trigger is the
+argument-value indirection specifically. Content-level leaks (`{{{` outside
+`data-mw`) are: `Brat (album)` 8, `Commonwealth of Nations` 21, `Earth` 2,
+`International Space Station` 1, `Lionel Messi` 1, `Polio vaccine` 15, `Unix` 4,
+`Wikipedia` 20.
+
+What tracing established (instrumentation since removed):
+
+- The inner call's `Frame` carries every argument: in a direct call all 18
+  `{{{2}}}` occurrences in `Template:Drugs.com` resolve against its own frame.
+- With the indirection the same 18 lookups *also* succeed, yet the served URL is
+  the literal `{{{2}}}`. The single **failing** lookup is `name="2"` against
+  frame `Polio vaccine` — the root frame, empty args.
+- The Drugs.com body items and the child frame's arguments are identical between
+  the two cases, so the divergence is downstream of the body expansion. The
+  prime suspect is the argument-value expansion path
+  ([`Parser::expand_template_arg_values`]) and how a template token spliced out
+  of another template's argument is later expanded: the identifier ends up on
+  the `expand_attributes` pass, which runs against the root frame.
+
+Recorded, not fixed — the fix needs a careful reading of that path rather than a
+guess.
