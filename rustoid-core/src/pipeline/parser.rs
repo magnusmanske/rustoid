@@ -8761,6 +8761,53 @@ fn cell_opener_source(t: &crate::wikitext::tokens_v2::TagTk) -> Option<String> {
     Some(out)
 }
 
+/// `tag_content_source` for the *source* of a `#tag` call.
+///
+/// A resolved DOM-fragment placeholder has no wikitext form. Parsoid records it
+/// as its fragment marker (`PipelineUtils::pFragmentToParsoidFragmentMarkers`),
+/// which is what the service keeps in an `extsrc` — for example the template
+/// stylesheet a module emitted before an indicator's content. `tag_body_source`
+/// deliberately does not use this: a body is re-parsed, so its placeholder must
+/// stay alive under a strip marker.
+pub(crate) fn tag_source_with_fragments(items: &[Item]) -> String {
+    let mut replaced: Vec<Item> = Vec::with_capacity(items.len());
+    let mut i = 0;
+    while i < items.len() {
+        match dom_fragment_placeholder_at(items, i) {
+            Some((end, tokens)) => {
+                let Some(id) = tokens.iter().find_map(fragment_id) else {
+                    // A placeholder without an id cannot be named; keep the
+                    // fallback's behaviour rather than inventing one.
+                    replaced.extend_from_slice(&items[i..end]);
+                    i = end;
+                    continue;
+                };
+                replaced.push(Item::Str(format!("{{{{#parsoid\u{0}fragment:{id}}}}}")));
+                i = end;
+            }
+            None => {
+                replaced.push(items[i].clone());
+                i += 1;
+            }
+        }
+    }
+    tag_content_source(&replaced).unwrap_or_else(|| {
+        crate::pipeline::parser_functions::tag_content_fallback_source(&replaced)
+    })
+}
+
+/// The `data-fragment-id` a DOM-fragment placeholder carries.
+fn fragment_id(item: &Item) -> Option<usize> {
+    let Item::Tok(tok) = item else {
+        return None;
+    };
+    tok.get_attribs()
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+        .and_then(|kv| kv.value.as_str())
+        .and_then(|v| v.parse().ok())
+}
+
 /// Render `#tag` content tokens back to the wikitext the tag records as its
 /// `source`/`extsrc`.
 ///
@@ -10717,6 +10764,47 @@ mod tests {
             ))]),
             None
         );
+    }
+
+    /// A resolved DOM-fragment placeholder in a `#tag` source is written as
+    /// Parsoid's fragment marker, which is what the service keeps in an
+    /// `extsrc`; the body renderer (not this function) keeps it alive instead.
+    #[test]
+    fn tag_source_names_a_fragment_placeholder() {
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, KeyValue, ParsoidToken, TagTk};
+
+        let attr = |k: &str, v: &str| crate::wikitext::tokens_v2::KV {
+            key: KeyValue::Str(k.to_string()),
+            value: KeyValue::Str(v.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let style = TagTk::new(
+            "style",
+            vec![
+                attr("typeof", "mw:DOMFragment"),
+                attr("data-fragment-id", "7"),
+            ],
+            DataParsoid::default(),
+        );
+        let items = vec![
+            Item::Str("a".to_string()),
+            Item::Tok(ParsoidToken::Tag(style)),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "style",
+                vec![],
+                DataParsoid::default(),
+            ))),
+            Item::Str("b".to_string()),
+        ];
+        assert_eq!(
+            tag_source_with_fragments(&items),
+            "a{{#parsoid\u{0}fragment:7}}b"
+        );
+        // Without a placeholder the two serializers agree.
+        let plain = vec![Item::Str("a".to_string()), Item::Str("b".to_string())];
+        assert_eq!(tag_source_with_fragments(&plain), "ab");
     }
 
     /// A live HTML element in a `#tag` body is written from its source, and a

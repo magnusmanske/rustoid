@@ -17854,3 +17854,22 @@ Parsoid records for a DOM fragment in the indicator's `extsrc`. Association
 football becomes nondeterministic-only. Fixtures stay at 877/896, lib tests
 1056, clippy clean; the corpus keeps its four strict matches and has no
 regressions.
+
+## A `#tag` source records a DOM fragment as Parsoid's marker
+
+A resolved DOM-fragment placeholder has no wikitext form. Parsoid serializes it
+into the extension's `extsrc` as `{{#parsoid\0fragment:<id>}}`
+(`PipelineUtils::pFragmentToParsoidFragmentMarkers`), which is how the
+coordinates indicator records the stylesheet and template fragment a module
+emitted before it. Rustoid's `tag_content_source` declined on the placeholder
+and the per-token fallback dropped it, so the indicator's
+`data-mw.body.extsrc` was missing the marker (`tag_source_names_a_fragment_placeholder`).
+
+`tag_source_with_fragments` now resolves placeholders to that marker before
+serializing; `tag_body_source` deliberately does not, because a body is
+re-parsed and its placeholder must stay alive under a strip marker.
+
+**Effect:** Canada's only remaining difference is the marker's *id* — rustoid's
+fragment sequence says `1373`, Parsoid's says `729`. The id is Parsoid's opaque
+strip-state index (`StripState::addParsoidOpaque`), not a fragment counter, and
+needs the opaque-strip bookkeeping to reproduce; that is the next step.
