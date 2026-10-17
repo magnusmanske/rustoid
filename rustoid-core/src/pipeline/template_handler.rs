@@ -1529,6 +1529,11 @@ impl TemplateHandler {
             "lcfirst" => ParserFunctions::pf_lcfirst(params),
             "padleft" => ParserFunctions::pf_padleft(params),
             "padright" => ParserFunctions::pf_padright(params),
+            // `{{formatnum:…}}` — core `CoreParserFunctions::formatnum` over
+            // `Language::formatNum`. The corpus oracle is production Parsoid, which
+            // routes this to MediaWiki core; Parsoid's own `pf_formatnum` is a stub
+            // that would return the argument unchanged, so core is the reference.
+            "formatnum" => ParserFunctions::pf_formatnum(params),
             "titleparts" => ParserFunctions::pf_titleparts(config, params),
             "tag" => ParserFunctions::pf_tag(config, params),
             "urlencode" => ParserFunctions::pf_urlencode(params),

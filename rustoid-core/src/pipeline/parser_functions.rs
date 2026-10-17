@@ -147,6 +147,195 @@ fn value_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// `Language::formatNum` for English — see [`ParserFunctions::pf_formatnum`].
+///
+/// Not numeric-accurate above 2^53: MediaWiki formats through ICU's
+/// `NumberFormatter`, which reads the value as a double, so a longer integer
+/// would round; English number formatting has no such input in practice.
+fn format_num_english(number: &str) -> String {
+    if number.is_empty() {
+        return String::new();
+    }
+    match number {
+        // English defines no `formatnum-nan` message, so the key stands in.
+        "NAN" => return "<formatnum-nan>".to_string(),
+        "INF" => return "\u{221e}".to_string(),
+        "-INF" => return "\u{2212}\u{221e}".to_string(),
+        _ => {}
+    }
+    if !is_numeric(number) {
+        return format_non_numeric(number, format_num_english);
+    }
+    let (sign, body) = match number.strip_prefix('-') {
+        Some(rest) => ('\u{2212}', rest),
+        None => ('\0', number),
+    };
+    let mut out = String::new();
+    if sign != '\0' {
+        out.push(sign);
+    }
+    out.push_str(&group_thousands_preserving_decimals(body));
+    out
+}
+
+/// `Language::formatNumNoSeparators` for English: the same input handling as
+/// [`format_num_english`], but the grouping step is skipped, so only the minus
+/// sign is rewritten.
+fn format_num_no_separators(number: &str) -> String {
+    if number.is_empty() {
+        return String::new();
+    }
+    match number {
+        "NAN" => return "<formatnum-nan>".to_string(),
+        "INF" => return "\u{221e}".to_string(),
+        "-INF" => return "\u{2212}\u{221e}".to_string(),
+        _ => {}
+    }
+    if !is_numeric(number) {
+        return format_non_numeric(number, format_num_no_separators);
+    }
+    number
+        .strip_prefix('-')
+        .map_or_else(|| number.to_string(), |rest| format!("\u{2212}{rest}"))
+}
+
+/// `Language::parseFormattedNumber` for English: undo [`format_num_english`].
+fn parse_formatted_number(number: &str) -> String {
+    match number {
+        "<formatnum-nan>" => return "NAN".to_string(),
+        "\u{221e}" => return "INF".to_string(),
+        _ => {}
+    }
+    let number = number.replace('\u{2212}', "-");
+    if number == "-\u{221e}" {
+        return "-INF".to_string();
+    }
+    number.replace(',', "")
+}
+
+/// Group the integer part in threes, keeping any fraction verbatim.
+fn group_thousands_preserving_decimals(body: &str) -> String {
+    match body.split_once('.') {
+        Some((int_part, frac)) => format!("{}.{frac}", group_thousands(int_part)),
+        None => group_thousands(body),
+    }
+}
+
+/// Insert `,` every three digits, counted from the right, over the whole run
+/// (leading zeros included — ICU's `MIN_INTEGER_DIGITS` keeps them).
+fn group_thousands(digits: &str) -> String {
+    let n = digits.len();
+    if n <= 3 {
+        return digits.to_string();
+    }
+    let mut out = String::with_capacity(n + n / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (n - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Rewrite every number-like run through `f` — `Language::formatNumInternal`'s
+/// legacy pass for non-numeric input.
+fn format_non_numeric(s: &str, f: fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        match match_number_span(s, i) {
+            Some(end) => {
+                out.push_str(&f(&s[i..end]));
+                i = end;
+            }
+            None => {
+                let c = s[i..].chars().next().expect("index is a char boundary");
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// The span length of the number regex
+/// `(-(?=[\d.]))?(\d+|(?=\.\d))(\.\d*)?([Ee][-+]?\d+)?` at `start`, or
+/// `None` if it does not match there. The pattern cannot match empty, so a
+/// caller may advance by the returned length unconditionally.
+fn match_number_span(s: &str, start: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let digit = |i: usize| matches!(b.get(i), Some(c) if c.is_ascii_digit());
+    let mut i = start;
+
+    // `(-(?=[\d.]))?` — a minus sign only when a number follows.
+    if b.get(i) == Some(&b'-') {
+        if digit(i + 1) || b.get(i + 1) == Some(&b'.') {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    // `(\d+|(?=\.\d))` — a digit run, or a zero-width lookahead at `.digit`.
+    let mut j = i;
+    while digit(j) {
+        j += 1;
+    }
+    if j > i {
+        i = j;
+    } else if !(b.get(i) == Some(&b'.') && digit(i + 1)) {
+        return None;
+    }
+    // `(\.\d*)?`
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while digit(i) {
+            i += 1;
+        }
+    }
+    // `([Ee][-+]?\d+)?`
+    if matches!(b.get(i), Some(&c) if c == b'e' || c == b'E') {
+        let mut k = i + 1;
+        if matches!(b.get(k), Some(&c) if c == b'+' || c == b'-') {
+            k += 1;
+        }
+        let digits_start = k;
+        while digit(k) {
+            k += 1;
+        }
+        if k > digits_start {
+            i = k;
+        }
+    }
+    Some(i)
+}
+
+/// PHP `is_numeric` for the shapes `formatnum` sees: optional sign, decimal or
+/// exponent notation, surrounding whitespace.
+fn is_numeric(s: &str) -> bool {
+    let t = s.trim();
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (mantissa, exponent) = match t.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (t, None),
+    };
+    if let Some(e) = exponent {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if e.is_empty() || !e.bytes().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let (int_part, frac) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let int_ok = !int_part.is_empty() && int_part.bytes().all(|c| c.is_ascii_digit());
+    match frac {
+        Some(f) => f.bytes().all(|c| c.is_ascii_digit()) && (int_ok || !f.is_empty()),
+        None => int_ok,
+    }
+}
+
 /// A [`KeyValue`] read as a bare value (empty key), so `expand_kv` answers the
 /// value alone rather than its `key=value` rejoining.
 fn value_only(value: &KeyValue) -> KV {
@@ -832,6 +1021,75 @@ impl ParserFunctions {
             result.push_str(&pad.chars().take(remaining).collect::<String>());
         }
         vec![Item::Str(result)]
+    }
+
+    /// `{{formatnum:…}}` — MediaWiki core's `CoreParserFunctions::formatnum`
+    /// (the production path; Parsoid's own `pf_formatnum` is a stub that returns
+    /// its argument unchanged, so core is the reference for byte parity).
+    ///
+    /// The number is formatted by `Language::formatNum`, which for English — a
+    /// language with neither a digit- nor a separator-transform table — reduces
+    /// to: group the integer part in threes with `,`, keep the decimal point and
+    /// every fraction digit exactly as written (`1234.500` → `1,234.500`), and
+    /// turn a leading `-` into the Unicode minus `−` (U+2212). Non-numeric input
+    /// is rewritten piecewise, one number-like run at a time.
+    ///
+    /// The colon argument is the number; up to two further arguments are
+    /// modifiers matched against the `rawsuffix`/`nocommafysuffix`/`lossless`
+    /// magic words: `R` parses a formatted number back to a bare one, `NOSEP`
+    /// formats without separators, and `LOSSLESS` keeps the formatted value only
+    /// when it round-trips through `R`.
+    pub fn pf_formatnum(params: &Params) -> Vec<Item> {
+        let args = &params.args;
+        let number = args
+            .first()
+            .map(|kv| key_value_to_string(&kv.key))
+            .unwrap_or_default();
+        // A modifier is a positional `|` argument; the tokenizer stores those in
+        // the value side of the `KV`.
+        let modifier = |i: usize| -> String {
+            args.get(i)
+                .map(|kv| {
+                    let value = value_to_string(&kv.value);
+                    if value.is_empty() {
+                        key_value_to_string(&kv.key)
+                    } else {
+                        value
+                    }
+                })
+                .unwrap_or_default()
+        };
+        let (m1, m2) = (modifier(1), modifier(2));
+        // `rawsuffix` (`R`) is case-sensitive; `nocommafysuffix` (`NOSEP`) and
+        // `lossless` are not. `MagicWordArray::matchStartToEnd` requires the
+        // modifier to be the whole argument.
+        let word = |canonical: &str, text: &str| canonical.eq_ignore_ascii_case(text);
+        let raw = m1 == "R" || m2 == "R";
+        let no_separators = word("NOSEP", &m1) || word("NOSEP", &m2);
+        let lossless = word("LOSSLESS", &m1) || word("LOSSLESS", &m2);
+
+        let value = if raw {
+            parse_formatted_number(&number)
+        } else {
+            let format = |s: &str| {
+                if no_separators {
+                    format_num_no_separators(s)
+                } else {
+                    format_num_english(s)
+                }
+            };
+            if lossless {
+                let formatted = format(&number);
+                if parse_formatted_number(&formatted) == number {
+                    formatted
+                } else {
+                    number
+                }
+            } else {
+                format(&number)
+            }
+        };
+        vec![Item::Str(value)]
     }
 
     /// `#titleparts` — a port of the ParserFunctions extension's
@@ -2281,6 +2539,49 @@ mod tests {
         let p = params(vec![("7", ""), ("", "3"), ("", "0")]);
         let out = ParserFunctions::pf_padleft(&p);
         assert_eq!(out, vec![Item::Str("007".to_string())]);
+    }
+
+    #[test]
+    fn test_pf_formatnum_english() {
+        // The `Language::formatNum` behaviours the corpus depends on, each
+        // checked against the live Parsoid oracle: thousands grouping, fraction
+        // digits kept verbatim, leading zeros kept, the Unicode minus, and the
+        // empty input answered with the empty string.
+        let cases = [
+            ("1035000", "1,035,000"),
+            ("40", "40"),
+            ("1234567.89", "1,234,567.89"),
+            ("007", "007"),
+            ("-1234", "\u{2212}1,234"),
+            ("1234.500", "1,234.500"),
+            ("-0", "\u{2212}0"),
+            ("abc123def", "abc123def"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            let p = params(vec![(input, "")]);
+            assert_eq!(
+                ParserFunctions::pf_formatnum(&p),
+                vec![Item::Str(expected.to_string())],
+                "formatnum({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pf_formatnum_modifiers() {
+        // `|R` parses a formatted number back to a bare one; `|NOSEP` formats
+        // without separators. Both spellings reach a page in practice.
+        let raw = params(vec![("1,035,000", ""), ("", "R")]);
+        assert_eq!(
+            ParserFunctions::pf_formatnum(&raw),
+            vec![Item::Str("1035000".to_string())]
+        );
+        let nosep = params(vec![("1035000", ""), ("", "NOSEP")]);
+        assert_eq!(
+            ParserFunctions::pf_formatnum(&nosep),
+            vec![Item::Str("1035000".to_string())]
+        );
     }
 
     #[test]

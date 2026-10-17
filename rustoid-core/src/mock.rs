@@ -676,6 +676,7 @@ impl MockSiteConfig {
         for f in [
             "padleft",
             "padright",
+            "formatnum",
             "protectionlevel",
             "protectionexpiry",
             "ns",
