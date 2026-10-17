@@ -585,6 +585,70 @@ fn key_value_has_nested_wikilink(value: &crate::wikitext::tokens_v2::KeyValue) -
     }
 }
 
+/// Split a `|` that arrived in a wikilink target *after* expansion.
+///
+/// Core's preprocessor substitutes template arguments before the parser
+/// tokenizes, so `[[{{{1}}}]]` with `{{{1}}} = A{{!}}B` is `[[A|B]]`: the pipe
+/// ends the target and starts the caption. rustoid tokenizes the template
+/// argument, so the pipe only appears once the value is spliced into the
+/// `href`. Move everything after the first top-level pipe into the link text.
+fn split_expanded_link_href(stt: &mut crate::wikitext::tokens_v2::SelfclosingTagTk) {
+    use crate::wikitext::tokens_v2::KeyValue;
+
+    let Some(href_kv) = stt
+        .attribs
+        .iter_mut()
+        .find(|kv| kv.key.as_str() == Some("href"))
+    else {
+        return;
+    };
+    let KeyValue::Tokens(items) = &mut href_kv.value else {
+        return;
+    };
+    let Some((i, pipe)) = items.iter().enumerate().find_map(|(i, it)| match it {
+        Item::Str(s) => s.find('|').map(|p| (i, p)),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let mut rest: Vec<Item> = Vec::new();
+    if let Item::Str(s) = &items[i] {
+        if pipe + 1 < s.len() {
+            rest.push(Item::Str(s[pipe + 1..].to_string()));
+        }
+        items[i] = Item::Str(s[..pipe].to_string());
+    }
+    rest.extend(items.drain(i + 1..));
+    if rest.is_empty() {
+        return;
+    }
+
+    // The caption comes before any content the source already had (the pipe we
+    // split is earlier in the source).
+    match stt
+        .attribs
+        .iter_mut()
+        .find(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+    {
+        Some(kv) => {
+            let existing = std::mem::replace(&mut kv.value, KeyValue::Tokens(Vec::new()));
+            rest.extend(match existing {
+                KeyValue::Str(s) => vec![Item::Str(s)],
+                KeyValue::Tokens(t) => t,
+            });
+            kv.value = KeyValue::Tokens(rest);
+        }
+        None => stt.attribs.push(crate::wikitext::tokens_v2::KV {
+            key: KeyValue::Str("mw:maybeContent".to_string()),
+            value: KeyValue::Tokens(rest),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        }),
+    }
+}
+
 /// Reconstruct the full wikilink source (`[[href|content0|content1…]]`) from a
 /// `wikilink` token's `href` and `mw:maybeContent` KVs. Used by the media-in-link
 /// bail to re-tokenize the source without the leading `[` (mirrors PHP's
@@ -2068,6 +2132,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         use crate::wikitext::token_utils::key_value_to_string;
 
+        let mut tokens = tokens;
+        for item in &mut tokens {
+            if let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item
+                && stt.name == "wikilink"
+            {
+                split_expanded_link_href(stt);
+            }
+        }
+
         let mut ctx = WikiLinkContext::new(self.config);
         if let Some(title) = context_title {
             ctx.set_context_title(title);
@@ -2120,6 +2193,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .map(|kv| key_value_to_string(&kv.value))
                 .unwrap_or_default();
             let href_src = href.clone();
+            if std::env::var_os("RUSTOID_TRACE_LINK").is_some()
+                && (href.contains("Toronto") || href.contains("Greater"))
+            {
+                eprintln!(
+                    "WIKILINK href={href:?} src={href_src:?} attribs={:?}",
+                    stt.attribs
+                );
+            }
 
             let wrap = !stt.data_parsoid.tmp.synthesized;
 
