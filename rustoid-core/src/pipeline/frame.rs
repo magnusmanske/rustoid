@@ -303,9 +303,14 @@ fn trim_items(items: &mut Vec<Item>) {
     // the newline behind — which is observable once the value is spliced into
     // a link target or a category name, where the break turns a clean
     // `[[Category:X]]` into literal text.
+    //
+    // Comments at the edge do not stop the trim either: `|1=A <!--c-->` expands
+    // to `A`, not `A ` (verified against the live transform endpoint). They are
+    // dropped from rendered output, so the trailing space is all that remains
+    // visible if trimming stops at them.
     while let Some(first) = items.first() {
         match first {
-            Item::Tok(ParsoidToken::Nl(_)) => {
+            Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => {
                 items.remove(0);
             }
             Item::Str(s) if s.trim().is_empty() => {
@@ -323,7 +328,7 @@ fn trim_items(items: &mut Vec<Item>) {
     }
     while let Some(last) = items.last() {
         match last {
-            Item::Tok(ParsoidToken::Nl(_)) => {
+            Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => {
                 items.pop();
             }
             Item::Str(s) if s.trim().is_empty() => {

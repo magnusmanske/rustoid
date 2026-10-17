@@ -102,6 +102,42 @@ fn has_image_link_generic(href: &str) -> bool {
     has_image_link(href, &[])
 }
 
+/// Split an expanded extlink URL at its first whitespace.
+///
+/// A `{{…}}` inside `[ … ]` is admitted into the URL by the tokenizer (Parsoid's
+/// `extlink_nonipv6url`), but core expands templates textually, so the parser
+/// sees `[url text]` and ends the URL at the whitespace. Returns the split
+/// `(url, content)` when the expansion produced a space, `None` otherwise.
+fn split_extlink_url_tokens(items: &[Item]) -> Option<(Vec<Item>, Vec<Item>)> {
+    let mut url = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let Item::Str(s) = item else {
+            url.push(item.clone());
+            continue;
+        };
+        let Some(pos) = s.find(|c: char| c.is_ascii_whitespace()) else {
+            url.push(item.clone());
+            continue;
+        };
+        if pos > 0 {
+            url.push(Item::Str(s[..pos].to_string()));
+        }
+        // A URL is required for an extlink; a leading whitespace means the
+        // original token was not a URL at all.
+        if url.is_empty() {
+            return None;
+        }
+        let rest = s[pos..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let mut content = Vec::new();
+        if !rest.is_empty() {
+            content.push(Item::Str(rest.to_string()));
+        }
+        content.extend_from_slice(&items[i + 1..]);
+        return Some((url, content));
+    }
+    None
+}
+
 /// Handler for an `extlink` token (a bracketed `[url ...]`). Mirrors
 /// `ExternalLinkHandler::onExtLink` for the non-templated case.
 ///
@@ -120,12 +156,13 @@ pub fn on_ext_link(
     // tokenizer has admitted a `{{…}}` inside the URL (`extlink_nonipv6url`);
     // the attribute expander expands it, and PHP's `tokensToString` flattens it
     // to the string that becomes the `href`.
-    let orig_href = key_value_to_string(token.get_attribute("href")?);
+    let href_kv = token.get_attribute("href")?;
+    let mut orig_href = key_value_to_string(href_kv);
     // `mw:content` may be a plain string, or (after the AttributeExpander has
     // expanded any embedded templates) a token array carrying `mw:Transclusion`
     // markers / `template` tokens. Render it faithfully rather than collapsing
     // it back to a string.
-    let content_items: Vec<Item> = {
+    let mut content_items: Vec<Item> = {
         let kv = token.get_attribute_kv("mw:content");
         match kv.map(|kv| &kv.value) {
             Some(crate::wikitext::tokens_v2::KeyValue::Str(s)) => vec![Item::Str(s.clone())],
@@ -133,6 +170,18 @@ pub fn on_ext_link(
             None => vec![],
         }
     };
+    // Core's preprocessor expands a directive *textually*, so `[… {{#if:…}}]`
+    // reaches the parser as `[url text]` and the whitespace ends the URL. rustoid
+    // admits the directive into the URL token (as Parsoid's grammar does), so
+    // apply that split once the expansion is known: the URL is what precedes the
+    // first whitespace, the rest is link text.
+    if content_items.is_empty()
+        && let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = href_kv
+        && let Some((url, text)) = split_extlink_url_tokens(items)
+    {
+        orig_href = key_value_to_string(&crate::wikitext::tokens_v2::KeyValue::Tokens(url));
+        content_items = text;
+    }
 
     let data_parsoid = token.data_parsoid().cloned().unwrap_or_default();
 

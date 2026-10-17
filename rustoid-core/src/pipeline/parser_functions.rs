@@ -88,6 +88,34 @@ fn args_to_test(kv: &KeyValue) -> String {
     key_value_to_string(kv).trim().to_string()
 }
 
+/// Does this argument carry the error box `#iferror` looks for?
+///
+/// The extension's test is a regex over the expanded string,
+/// `/<(?:strong|span|p|div)\s…class="…error…"/`. rustoid may already have
+/// tokenized that markup (a text-returning branch is re-tokenized), so a literal
+/// string and an element token with an `error` class both count.
+fn key_value_has_error_markup(kv: &KeyValue) -> bool {
+    fn item_has_error(item: &Item) -> bool {
+        match item {
+            Item::Str(s) => s.contains("class=\"error\"") || s.contains("<strong class=\"error\">"),
+            Item::Tok(tok) => {
+                matches!(tok.get_name(), "strong" | "span" | "p" | "div")
+                    && tok.get_attribs().iter().any(|attr| {
+                        attr.key.as_str() == Some("class")
+                            && attr
+                                .value
+                                .as_str()
+                                .is_some_and(|v| v.split_whitespace().any(|w| w == "error"))
+                    })
+            }
+        }
+    }
+    match kv {
+        KeyValue::Str(s) => s.contains("class=\"error\"") || s.contains("<strong class=\"error\">"),
+        KeyValue::Tokens(t) => t.iter().any(item_has_error),
+    }
+}
+
 /// Does this argument carry an explicit `=` — i.e. is it `name=value`?
 ///
 /// The tokenizer records a *positional* argument's key range as ending where its
@@ -886,19 +914,37 @@ impl ParserFunctions {
     /// `Template:Marriage` depends on.
     pub fn pf_iferror(params: &Params) -> Vec<Item> {
         let args = &params.args;
-        let target = args
+        // Core tests the expanded *string* for an error box. rustoid's test may
+        // already be re-tokenized (`<strong class="error">` is a Tag token), so
+        // look for the markup in both forms: a literal string, or an element
+        // whose `class` contains `error`.
+        let has_error = args
             .first()
-            .map(|kv| key_value_to_string(&kv.key))
-            .unwrap_or_default();
-        let has_error =
-            target.contains("class=\"error\"") || target.contains("<strong class=\"error\">");
+            .is_some_and(|kv| key_value_has_error_markup(&kv.key));
         if has_error {
             Self::trimmed_branch(args.get(1))
         } else if args.len() > 2 {
             Self::trimmed_branch(args.get(2))
         } else {
             // No `else`: `$result = $test`, then `trim($frame->expand($result))`.
-            vec![Item::Str(target.trim().to_string())]
+            // The test reaches here already expanded, and core re-expands the
+            // *string* — so extension tokens (`<templatestyles>`) and markup it
+            // carried survive the round trip. Stringifying it instead dropped
+            // the extension (the string form of a placeholder is empty) and made
+            // the surviving markup literal text: `Template:Infobox country`'s
+            // Gini row lost the `Template:Color` stylesheet and rendered
+            // `&lt;span class="tmp-color"`.
+            let mut items = match args.first().map(|kv| &kv.key) {
+                Some(KeyValue::Str(s)) => vec![Item::Str(s.clone())],
+                Some(KeyValue::Tokens(t)) => t
+                    .iter()
+                    .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            trim_item_edges(&mut items);
+            items
         }
     }
 
@@ -1083,12 +1129,33 @@ impl ParserFunctions {
                 if parse_formatted_number(&formatted) == number {
                     formatted
                 } else {
-                    number
+                    number.clone()
                 }
             } else {
                 format(&number)
             }
         };
+        // An input that passes through unchanged keeps its markup. Core answers
+        // the expanded *string* and the parser re-parses it, so an entity span
+        // (`&nbsp;`) survives; rendering the decoded text instead emitted a bare
+        // NBSP character. `Template:US$` formats `2.221&nbsp;trillion`, and
+        // `Canada`'s GDP row lost the `<span typeof="mw:Entity">` around it.
+        if value == number
+            && let Some(kv) = args.first()
+        {
+            let mut items: Vec<Item> = match &kv.key {
+                KeyValue::Str(s) => vec![Item::Str(s.clone())],
+                KeyValue::Tokens(t) => t
+                    .iter()
+                    .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
+                    .cloned()
+                    .collect(),
+            };
+            trim_item_edges(&mut items);
+            if !items.is_empty() {
+                return items;
+            }
+        }
         vec![Item::Str(value)]
     }
 

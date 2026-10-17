@@ -1142,9 +1142,11 @@ fn re_tokenize_text_branch(
             text, /* in_template */ true, ext_tags,
         )
     }
-    /// Re-tokenize a run of text items when a line in it starts block syntax.
-    /// `at_line_start` says the run's first line begins a source line; otherwise
-    /// that first line cannot start a table and is skipped.
+    /// Re-tokenize a text run. `#if`/`#ifeq`/`#iferror` answer a *string* in
+    /// core, so every text run of their branch was parsed as wikitext; a run is
+    /// therefore always re-tokenized (`Cells`). A `#switch` branch keeps its
+    /// tokens, so only a block start needs it (`TableOnly`). `at_line_start`
+    /// tells the tokenizer whether the run's first line begins a source line.
     fn flush(
         out: &mut Vec<Item>,
         run: &mut Vec<Item>,
@@ -1170,8 +1172,24 @@ fn re_tokenize_text_branch(
         if !(at_line_start || text.starts_with('\n')) {
             lines.next();
         }
-        if lines.any(|line| syntax.triggers(line)) {
-            out.extend(tokenize(&text, ext_tags));
+        let line_trigger = lines.any(|line| syntax.triggers(line));
+        let retokenize = match syntax {
+            // Core answers the branch as a string and re-parses all of it, so
+            // markup that was assembled across a template boundary (a `<span`
+            // whose `>` lives in another expansion) and entities have to be
+            // tokenized again as well as block syntax.
+            BranchSyntax::Cells => line_trigger || text.contains('<') || text.contains('&'),
+            BranchSyntax::TableOnly => line_trigger,
+        };
+        if retokenize {
+            out.extend(
+                crate::pipeline::template_handler::tokenize_wikitext_to_items_with_sol(
+                    &text,
+                    /* in_template */ true,
+                    ext_tags,
+                    at_line_start,
+                ),
+            );
             run.clear();
         } else {
             out.append(run);
@@ -1189,7 +1207,13 @@ fn re_tokenize_text_branch(
         .unwrap_or(start);
     let content = &items[start..end];
 
-    // A branch that is only text is re-tokenized as a whole.
+    // A branch that is only text is re-tokenized as a whole when a line begins
+    // block syntax. Re-tokenizing *every* text branch was wrong: core splices
+    // the branch string into the surrounding wikitext and parses it there, so a
+    // branch like `#b0c4de` inside an attribute value is text, and the T2529
+    // newline is inserted in context. Tokenizing it here, at SOL, made a
+    // `listItem` out of it and suppressed that newline (`Template:Infobox
+    // football biography`'s header style lost it).
     let all_text = content
         .iter()
         .all(|it| matches!(it, Item::Str(_) | Item::Tok(ParsoidToken::Nl(_))));

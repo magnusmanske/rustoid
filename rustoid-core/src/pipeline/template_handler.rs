@@ -688,6 +688,63 @@ fn protection_full_arg(pf_arg: &str, params: &Params) -> String {
     }
 }
 
+/// The colon argument of a parser function call, as *tokens*.
+///
+/// `resolve_template_target` works on the stringified target, but the token form
+/// still holds the expansion: a `<span>` assembled across a template boundary and
+/// a `<templatestyles>` extension are tokens, while `tokensToString` flattens the
+/// first to literal text and drops the second. Core answers `#iferror`'s test as
+/// an expanded *string* that the parser re-parses, so keeping the tokens is the
+/// faithful equivalent.
+///
+/// `prefix_len` is the number of plain-text bytes before the argument in the
+/// trimmed target — the `#name:` prefix (possibly behind a `safesubst:` modifier),
+/// which is always text. Returns `None` when the prefix cannot be consumed from
+/// leading text items (a target built by markup), where the caller falls back to
+/// the string form.
+fn parser_function_arg0_tokens(
+    key: &crate::wikitext::tokens_v2::KeyValue,
+    prefix_len: usize,
+) -> Option<crate::wikitext::tokens_v2::KeyValue> {
+    use crate::wikitext::tokens_v2::{Item, KeyValue};
+
+    let KeyValue::Tokens(items) = key else {
+        return None;
+    };
+    let mut to_skip = prefix_len;
+    let mut in_text = false;
+    let mut out = Vec::new();
+    for item in items {
+        if to_skip == 0 {
+            out.push(item.clone());
+            continue;
+        }
+        match item {
+            Item::Str(s) => {
+                let text = if in_text { s.as_str() } else { s.trim_start() };
+                if text.is_empty() {
+                    continue;
+                }
+                in_text = true;
+                if to_skip < text.len() {
+                    if !text.is_char_boundary(to_skip) {
+                        return None;
+                    }
+                    out.push(Item::Str(text[to_skip..].to_string()));
+                    to_skip = 0;
+                } else {
+                    to_skip -= text.len();
+                }
+            }
+            // A wrapper meta contributes no text to the stringified target, so
+            // it can sit before the name without shifting the prefix.
+            _ if !in_text => {}
+            _ => return None,
+        }
+    }
+    (to_skip == 0).then_some(KeyValue::Tokens(out))
+}
+
 /// Process the special `!` magic word. Mirrors PHP's
 /// `TemplateHandler::processSpecialMagicWord`.
 ///
@@ -1114,9 +1171,28 @@ impl TemplateHandler {
             }) => {
                 // Rebuild params: args[0].k is the first argument (from the
                 // colon syntax); remaining params.args[1..] are positional/named.
+                //
+                // Keep the argument's *tokens* when the target carried markup.
+                // Stringifying it (PHP's `tokensToString`) drops extension
+                // tokens and leaves an unclosed tag as literal text, while
+                // `#iferror` without an `else` answers its test and core
+                // re-parses the expanded string. `Template:Color`'s
+                // `<templatestyles>` and `<span>` were lost that way.
                 let mut pf_params = params.clone();
+                let raw_arg0 =
+                    crate::wikitext::token_utils::key_value_to_string(&params.args[0].key);
+                let raw_trimmed = raw_arg0.trim();
+                let arg0_tokens = raw_trimmed
+                    .ends_with(pf_arg.as_str())
+                    .then(|| {
+                        parser_function_arg0_tokens(
+                            &params.args[0].key,
+                            raw_trimmed.len() - pf_arg.len(),
+                        )
+                    })
+                    .flatten();
                 pf_params.args[0] = crate::wikitext::tokens_v2::KV {
-                    key: crate::wikitext::tokens_v2::KeyValue::Str(pf_arg),
+                    key: arg0_tokens.unwrap_or(crate::wikitext::tokens_v2::KeyValue::Str(pf_arg)),
                     value: crate::wikitext::tokens_v2::KeyValue::Str(String::new()),
                     src_offsets: None,
                     ksrc: None,
