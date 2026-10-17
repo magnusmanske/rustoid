@@ -17519,3 +17519,41 @@ lose their last error elements; `Israel` moves 2.30% → 2.60%. The only corpus
 error element left is `Wikipedia`'s 45 `language code: -1 not recognized`, which
 is `mw.ext.data` (an unported extension). Strict score stays 4/48, fixtures
 877/896, clippy and fmt are clean.
+
+## Open: table syntax produced by templates needs the textual preprocessor
+
+MediaWiki's preprocessor expands templates to **text** before the tokenizer runs,
+which is what lets `{{(!}}` / `{{!}}` build a table: `Template:(!` is `{|`, so
+`{{(!}} style="…"` becomes the single line `{| style="…"`, followed by `|-` and
+`!`/`|` lines that the tokenizer reads as cells.
+
+rustoid's pipeline is token-based: `{{(!}}` becomes a template token and then a
+`<table>` token, while the adjacent ` style="…"` and the `!`/`|` lines were
+tokenized earlier as plain text. At a page's top level the tree builder gets
+close (a table forms, but the `style` is detached); inside a `#switch` branch —
+which keeps its tokens by design (`PPFrame::RECOVER_ORIG`) — the whole table
+renders as literal `{|`/`|-`/`!` text. That is the first difference on `Canada`,
+`France`, `Israel` and `United States` (via `Template:Largest cities`), and why
+those pages are short ~20 `<td>`s.
+
+A bounded attempt was made and reverted: returning `{|`/`|-`/`|}` as text for a
+template whose whole body is table syntax fixed the branch cases but *regressed*
+the previously-working top-level case, because nothing re-tokenizes the text
+that follows. A correct fix needs the preprocessor model — expand table-syntax
+templates (and, generally, re-tokenize a branch's cell lines) before the table is
+parsed — which is an architectural change, not a patch.
+
+## Open: `math`, `mapframe`, and the Scribunto content model
+
+- **`math`** (`Sundial`): Parsoid emits Mathoid's MathML plus a
+  `render/svg/<hash>` fallback image. Byte parity needs a LaTeX→MathML
+  implementation (Mathoid), not a wrapper.
+- **`mapframe`** (`Berlin`, `Chernobyl disaster`, `Titanic`): the `<a>` carries
+  `data-overlays='["_<40 hex>"]'`, a hash of geoshape data served by
+  Kartographer's external service, and the `<img>` src is built from it and the
+  revision. Not derivable offline.
+- **`Module:Math`** is not the `math` extension at all: it is a `Module:` page
+  whose Scribunto content model renders the Lua source instead of parsing it as
+  wikitext. That needs the content model plus a Lua highlighter.
+
+All three are extension/content-model ports, not bounded fixes.
