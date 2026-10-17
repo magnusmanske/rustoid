@@ -2994,6 +2994,23 @@ fn transfer_transclusion_to_element(
     range_end: Option<usize>,
     plan: &RangePlan,
 ) {
+    // The encapsulation target may start before the template (a paragraph whose
+    // text precedes a transclusion on the same line). Core records that leading
+    // wikitext as a string `data-mw.parts` entry (DOMRangeBuilder
+    // `encapsulateTemplates`), which is what makes the served paragraph's
+    // `data-mw` a mixed block: `["The majority…\n", {"template":…}]`.
+    // Capture the target's own DSR before the transfer replaces the metadata.
+    let target_dsr_start = target
+        .dp
+        .as_ref()
+        .and_then(|d| d.dsr.as_ref())
+        .and_then(|r| r.start);
+    // rustoid's p-wrapping can give an empty-elt paragraph a DSR that starts at
+    // an earlier marker, which would prepend unrelated template source (Zebra's
+    // top-of-page meta paragraph). Core's range DSR never has that problem, so
+    // validate the gap against the target's own rendered text.
+    let target_text = subtree_text(target);
+
     if let Some(about) = start_meta.get_attr("about") {
         target.set_attr("about", about);
     }
@@ -3004,8 +3021,39 @@ fn transfer_transclusion_to_element(
     let plan_mw = start_meta
         .get_attr("about")
         .and_then(|a| plan.compound_data_mw(a, source, range_end));
-    target.data_mw = plan_mw.or_else(|| build_compound_data_mw(start_meta, source, range_end));
+    let mut data_mw = plan_mw.or_else(|| build_compound_data_mw(start_meta, source, range_end));
+    let template_start = start_meta
+        .dp
+        .as_ref()
+        .and_then(|d| d.dsr.as_ref())
+        .and_then(|r| r.start);
+    if let (Some(mw), Some(target_start), Some(template_start), Some(src)) =
+        (data_mw.as_deref(), target_dsr_start, template_start, source)
+        && target_start < template_start
+        && let Some(leading) = src.get(target_start..template_start)
+        && !leading.is_empty()
+    {
+        let text = target_text.trim_start();
+        let prefix: String = text.chars().take(24).collect();
+        if !prefix.trim().is_empty() && leading.trim_start().starts_with(&prefix) {
+            data_mw = Some(prepend_unwrapped_wt_part(mw, leading));
+        }
+    }
+    target.data_mw = data_mw;
     apply_encap_dp_fields(target, start_meta);
+}
+
+/// Concatenated text of a node's subtree, comments excluded.
+fn subtree_text(node: &Node) -> String {
+    let mut out = String::new();
+    for child in &node.children {
+        match &child.kind {
+            NodeKind::Text(t) => out.push_str(t),
+            NodeKind::Comment(_) => {}
+            _ => out.push_str(&subtree_text(child)),
+        }
+    }
+    out
 }
 
 /// Apply `firstWikitextNode` and `pi` onto an encapsulation target, derived

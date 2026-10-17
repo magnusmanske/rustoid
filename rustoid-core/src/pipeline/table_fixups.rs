@@ -1101,8 +1101,25 @@ fn process_children_in_tpl(
 ) -> Vec<Node> {
     let mut out: Vec<Node> = Vec::with_capacity(children.len());
     let mut i = 0;
+    // Parsoid's `DOMTraverser` keeps `tplInfo` while walking every sibling that
+    // shares the wrapper `about` (`getAboutSiblings`); only the *first* wrapper
+    // node carries `typeof="mw:Transclusion"`. A table inside a later wrapper
+    // sibling (the `<div>` after the `<p>` on `Canada`) is still template
+    // content, which is what lets `pipeStatusInContent` see the `|` separators a
+    // template emitted.
+    let mut range_about: Option<String> = None;
     while i < children.len() {
         let child = children[i].clone();
+        let child_about = child.get_attr("about").map(str::to_string);
+        if has_type_of(&child, "mw:Transclusion") && child_about.is_some() {
+            range_about = child_about.clone();
+        } else if let Some(range) = &range_about
+            && matches!(child.kind, NodeKind::Element(_) | NodeKind::Document)
+            && child_about.as_deref() != Some(range.as_str())
+        {
+            range_about = None;
+        }
+        let current_in_tpl = enclosing_tpl || range_about.is_some();
         // The immediate previous sibling. Use the last *emitted* node in `out`
         // (which reflects merges), mirroring PHP's live-DOM `$cell->previousSibling`:
         // when the previous cell was merged into the cell before it, the previous
@@ -1128,7 +1145,7 @@ fn process_children_in_tpl(
                 // content (mirrors `dtState->tplInfo`), which is what lets
                 // `getReparseType` treat its cells as templated even after a
                 // range merge has left them as plain text.
-                let child_in_tpl = enclosing_tpl || has_type_of(&child, "mw:Transclusion");
+                let child_in_tpl = current_in_tpl || has_type_of(&child, "mw:Transclusion");
                 child.children = process_children_in_tpl(children, config, source, child_in_tpl);
                 out.push(child);
             }
@@ -1139,7 +1156,7 @@ fn process_children_in_tpl(
                 // Mirror PHP's `$cell->previousSibling`: the merge only fires when
                 // the immediate previous sibling is an Element (a text/comment
                 // separator between cells — e.g. across rows — prevents merging).
-                if get_reparse_type(&child, enclosing_tpl, prev_sibling.as_ref())
+                if get_reparse_type(&child, current_in_tpl, prev_sibling.as_ref())
                     == ReparseScenario::MaybeCombineWithPrevCell
                 {
                     // Find and mutate the previous cell in `out`.
@@ -1170,8 +1187,13 @@ fn process_children_in_tpl(
                         }
                         // consumed == 1: `cur` remains a distinct cell; process it
                         // normally (reparse/split).
-                        let mut processed =
-                            process_cell(cur, config, source, enclosing_tpl, prev_sibling.as_ref());
+                        let mut processed = process_cell(
+                            cur,
+                            config,
+                            source,
+                            current_in_tpl,
+                            prev_sibling.as_ref(),
+                        );
                         out.append(&mut processed);
                         i += 1;
                         continue;
@@ -1179,7 +1201,7 @@ fn process_children_in_tpl(
                 }
 
                 let mut processed =
-                    process_cell(child, config, source, enclosing_tpl, prev_sibling.as_ref());
+                    process_cell(child, config, source, current_in_tpl, prev_sibling.as_ref());
                 out.append(&mut processed);
             }
             NodeKind::Element(_) | NodeKind::Document => {
@@ -1188,7 +1210,7 @@ fn process_children_in_tpl(
                 // A transclusion node scopes its whole subtree into template
                 // content (mirrors `dtState->tplInfo`, whose `first` is the
                 // encapsulation target tested by `getReparseType`).
-                let child_in_tpl = enclosing_tpl || has_type_of(&child, "mw:Transclusion");
+                let child_in_tpl = current_in_tpl || has_type_of(&child, "mw:Transclusion");
                 child.children = process_children_in_tpl(children, config, source, child_in_tpl);
                 out.push(child);
             }
@@ -1258,9 +1280,19 @@ fn process_cell(
         }
     }
 
-    if reparse_type == ReparseScenario::MaybeReparseAttrs
-        && cell_tmp_flag(&cell, |t| t.table_cell_with_no_attribute_syntax)
+    if (reparse_type == ReparseScenario::MaybeReparseAttrs
+        && cell_tmp_flag(&cell, |t| t.table_cell_with_no_attribute_syntax))
+        || in_tpl
+        || is_templated
     {
+        // A cell inside templated content can begin with an attribute box that
+        // the in-place expansion left as *text*: `Template:Largest cities`
+        // emits `|| style="…" | [[London]]`, and the tokenizer never saw that
+        // `|` at a cell boundary. Production's preprocessor parses the box
+        // before Parsoid tokenizes, so the equivalent here is to run the same
+        // reparse `Parsoid's own TableFixups` runs. It is a no-op unless a
+        // `k=v|` prefix is actually there (`tokenize_table_cell_attributes`
+        // returns no attributes for prose with a stray pipe).
         let template_wrapper = if is_templated {
             Some(cell.clone())
         } else {
