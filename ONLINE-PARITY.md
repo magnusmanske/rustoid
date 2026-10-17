@@ -17688,3 +17688,42 @@ the same value with the markup's identity intact.
 
 Canada 18.91% (the GDP row moved past). Fixtures stay 877/896; 4/48 strict,
 Zebra/ISO/Quicksilver/Order of the British Empire match.
+
+## The transclusion wrapper's leading wikitext, and table-cell context
+
+Two halves of the same Parsoid range model were missing on `Canada`'s
+`Template:Largest cities` table:
+
+- `DOMRangeBuilder::encapsulateTemplates` prepends the source between the
+  encapsulation target's DSR start and the first template's DSR start as a
+  string `data-mw.parts` entry. A paragraph that ends in a transclusion on the
+  same line is one wrapper around both, so the served `data-mw` is
+  `["The majority…\n", {"template":…}]`. rustoid emitted only the template part.
+  The gap is now prepended, after checking it against the target's own rendered
+  text — p-wrapping can give an empty-elt paragraph a DSR that starts at an
+  earlier marker, and without that check a top-of-page meta paragraph on `Zebra`
+  gained unrelated template source.
+- `DOMTraverser` keeps `tplInfo` while walking every sibling that shares the
+  wrapper `about` (`getAboutSiblings`); only the *first* wrapper node carries
+  `typeof="mw:Transclusion"`. rustoid propagated the flag only into nodes that
+  carried `typeof` themselves, so the `<div>` after the `<p>` lost the context
+  and `TableFixups` treated the table's cells as non-templated. A templated
+  cell's leading `k=v|` attribute box is now also reparsed when the cell's own
+  flag claims it already had attributes: production's preprocessor parsed that
+  box before Parsoid tokenized, while rustoid splices it as text.
+
+### Effect
+
+Canada 18.91% → 19.31% (the diff moves from the wrapper's `data-mw` into the
+table's first row). Every other page keeps its first-difference position;
+Zebra stays a byte match; fixtures stay 877/896.
+
+### What is left in that table
+
+The row still contains literal `[[Greater Toronto Area|Toronto]]`: the template
+body writes `[[{{{city_1}}}]]`, the tokenizer cannot parse a wikilink around a
+template argument, and the argument's `{{!}}` becomes the pipe only after
+expansion. Core's preprocessor substitutes first and parses second. Rustoid
+needs the same treatment for text runs that carry a substituted argument inside
+unparsed wikilink brackets; `reparse_templated_attributes` already handles the
+adjacent `k=v|` prefix.
