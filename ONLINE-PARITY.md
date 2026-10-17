@@ -17727,3 +17727,25 @@ expansion. Core's preprocessor substitutes first and parses second. Rustoid
 needs the same treatment for text runs that carry a substituted argument inside
 unparsed wikilink brackets; `reparse_templated_attributes` already handles the
 adjacent `k=v|` prefix.
+
+## A pipe that arrives in a wikilink target is the caption separator
+
+`Template:Largest cities` writes `[[{{{city_1}}}]]`, and the page value is
+`Greater Toronto Area{{!}}Toronto`. Core substitutes before it tokenizes, so the
+parser sees `[[Greater Toronto Area|Toronto]]`. rustoid tokenizes the template
+argument, so the pipe only appears *inside* the expanded `href`; the title then
+contained a `|`, `get_wiki_link_target_info` rejected it, and the link bailed to
+literal `[[Greater Toronto Area|Toronto]]` text.
+
+`render_links` now splits the first top-level `|` out of an expanded `href` and
+prepends the remainder to the link text (before any `mw:maybeContent` the source
+already had, since the split pipe comes earlier in the source). A media link
+gets the same treatment: `[[File:{{{1}}} pictogram.svg]]` with a piped value
+splits at the pipe just as the page tokenizer would.
+
+### Effect
+
+The row's city/province links render as real `<a>` elements. The first
+difference is unchanged in *position* (19.31%) because the same row still needs
+the template-emitted `||` to split cells, but the diff content moves from
+literal link text to the cell boundary. Fixtures stay 877/896; no page regresses.
