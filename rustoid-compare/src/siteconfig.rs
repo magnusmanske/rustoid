@@ -369,7 +369,22 @@ impl SiteConfig for WikiSiteConfig {
     /// `$wgNoFollowNsExceptions` is empty, so the only escape is
     /// [`WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS`], which `siteinfo` does not expose.
     fn external_link_attribs(&self, href: &str) -> Vec<(String, Vec<String>)> {
-        let mut out = self.protocol_relative_href_attrs(href);
+        // The live wiki runs `SecureLinkFixer` as a `LinkerMakeExternalLink`
+        // hook, and the same-host protocol expansion is the other rewrite.
+        // `Env::getExternalLinkAttribs` compares the final href with the written
+        // one and keeps the latter in `data-mw-original-href`.
+        let upgraded =
+            rustoid_core::ext::secure_link_fixer::rewrite(href).unwrap_or_else(|| href.to_string());
+        let effective =
+            match rustoid_core::links::protocol_expand_same_host(&upgraded, self.server_url()) {
+                Some(expanded) => expanded,
+                None => upgraded,
+            };
+        let mut out = Vec::new();
+        if effective != href {
+            out.push(("href".to_string(), vec![effective]));
+            out.push(("data-mw-original-href".to_string(), vec![href.to_string()]));
+        }
         if !rustoid_core::links::url_host_matches_domain_list(href, WMF_NO_FOLLOW_DOMAIN_EXCEPTIONS)
         {
             out.push(("rel".to_string(), vec!["nofollow".to_string()]));

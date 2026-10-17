@@ -104,10 +104,49 @@ pub async fn file_info(
         responsive_urls,
         bad_file: page.badfile.unwrap_or(false),
     };
+    // The API omits `responsiveUrls` when `iiurlheight` is also given, while
+    // Parsoid computes the srcset from the transform regardless. A width-only
+    // request at the physical thumb width returns them, so ask once more — only
+    // when the first answer had none.
+    if result.responsive_urls.is_empty()
+        && height.is_some()
+        && let Some(px) = physical_thumb_width(result.thumb_url.as_deref())
+        && let Ok(extra) = client.file_info_json(title, Some(px), None).await
+        && let Ok(parsed) = serde_json::from_str::<ImageInfoResponse>(&extra)
+        && let Some(info) = parsed
+            .query
+            .pages
+            .into_iter()
+            .next()
+            .and_then(|page| page.imageinfo)
+            .and_then(|mut infos| infos.drain(..).next())
+    {
+        result.responsive_urls = info
+            .responsive_urls
+            .into_iter()
+            .filter_map(|(density, url)| url.map(|u| (density, u)))
+            .collect();
+    }
     // The API expands URLs and stamps its own UTM campaign; the parser wants
     // the protocol-relative, `parser`-campaign form.
     result.normalize_api_urls();
     Ok(Some(result))
+}
+
+/// The physical thumbnail width from a thumb URL (`…/20px-Name.svg.png`,
+/// `…/page1-250px-Name.pdf.jpg`): the digits just before the last `px-`.
+fn physical_thumb_width(url: Option<&str>) -> Option<u32> {
+    let segment = url?.rsplit('/').next()?;
+    let end = segment.rfind("px-")?;
+    let digits: String = segment[..end]
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    digits.parse().ok()
 }
 
 #[derive(serde::Deserialize)]
@@ -270,6 +309,26 @@ mod tests {
             info.responsive_urls.get("2").and_then(|u| u.as_deref()),
             Some("https://t/500px-X.jpg")
         );
+    }
+
+    /// The physical width in a thumb URL, used to re-ask for the density map
+    /// that an `iiurlheight` request suppresses.
+    #[test]
+    fn a_thumb_url_yields_its_physical_width() {
+        assert_eq!(
+            physical_thumb_width(Some(
+                "//thumb.wikimedia.org/a/aa/X.svg/20px-X.svg.png?utm_source=x"
+            )),
+            Some(20)
+        );
+        assert_eq!(
+            physical_thumb_width(Some(
+                "//thumb.wikimedia.org/a/aa/X.pdf/page1-250px-X.pdf.jpg"
+            )),
+            Some(250)
+        );
+        assert_eq!(physical_thumb_width(Some("//u/X.svg")), None);
+        assert_eq!(physical_thumb_width(None), None);
     }
 
     /// `prop=videoinfo` rides alongside `imageinfo` for an audio/video file; its
