@@ -4959,6 +4959,14 @@ fn parse_date(stamp: &str) -> Option<(i32, usize, u32, u32, u32, u32)> {
         ));
     }
 
+    // `YYYY-MM`: MediaWiki completes a month-only stamp with day 1. `{{Time ago}}`
+    // is called with `1961-05` and previously answered `Error: Invalid time.`
+    if dashed.len() == 2
+        && let (Ok(year), Ok(month)) = (dashed[0].parse::<i32>(), dashed[1].parse::<usize>())
+    {
+        return Some((year, month, 1, hour, minute, second));
+    }
+
     // A bare year: MediaWiki completes it with the current month and day.
     if dashed.len() == 1
         && date_part.len() == 4
@@ -4994,7 +5002,12 @@ fn parse_date(stamp: &str) -> Option<(i32, usize, u32, u32, u32, u32)> {
     }
 
     // `<month name> <year>` and `<year> <month name>`, the two orders that occur.
-    let words: Vec<&str> = date_part.split_whitespace().collect();
+    // A three-word `<day> <month> <year>` (`31 March 1727`) or `<month> <day>
+    // <year>` (`March 31, 1727`) is the shape `{{New Style to Old Style}}`
+    // hands to `#time`; without it that template answered `Error: Invalid time.`
+    // and the error markup then fed `#expr`, which named the `<strong>` tag.
+    let comma_cleaned = date_part.replace(',', " ");
+    let words: Vec<&str> = comma_cleaned.split_whitespace().collect();
     if words.len() == 2 {
         let (name, year_str) = if words[0].parse::<i32>().is_ok() {
             (words[1], words[0])
@@ -5003,6 +5016,18 @@ fn parse_date(stamp: &str) -> Option<(i32, usize, u32, u32, u32, u32)> {
         };
         if let (Some(month), Ok(year)) = (month_number(name), year_str.parse::<i32>()) {
             return Some((year, month, 1, hour, minute, second));
+        }
+    }
+    if words.len() == 3 {
+        let (day, name, year_str) = if let Ok(day) = words[0].parse::<u32>() {
+            (day, words[1], words[2])
+        } else if let Ok(day) = words[1].parse::<u32>() {
+            (day, words[0], words[2])
+        } else {
+            return None;
+        };
+        if let (Some(month), Ok(year)) = (month_number(name), year_str.parse::<i32>()) {
+            return Some((year, month, day, hour, minute, second));
         }
     }
 
@@ -5075,53 +5100,86 @@ fn unix_timestamp(
 /// The result is `YYYY-MM-DD HH:MM:SS` in UTC, which is what the caller's
 /// parser expects.
 fn resolve_relative(stamp: &str) -> Option<String> {
-    const UNITS: [(&str, i64); 6] = [
-        ("second", 1),
-        ("minute", 60),
-        ("hour", 3_600),
-        ("day", 86_400),
-        ("week", 604_800),
-        ("month", 2_592_000),
-    ];
-
     let trimmed = stamp.trim();
-    let (base, rest) = trimmed
+    let lower = trimmed.to_ascii_lowercase();
+    let (base, rest) = lower
         .split_once(char::is_whitespace)
-        .map_or((trimmed, ""), |(a, b)| (a, b.trim()));
+        .map_or((lower.as_str(), ""), |(a, b)| (a, b.trim()));
+
+    // A bare offset (`-1 year`, `+1 month`) is relative to *now*; `strtotime`
+    // and `#time` accept it, and `{{#time:y|+1 year}}` is the shape
+    // `Tropical cyclone`'s season links use.
+    let bare_offset = base
+        .chars()
+        .next()
+        .is_some_and(|c| c == '+' || c == '-' || c.is_ascii_digit());
 
     let mut when = chrono::Utc::now();
-    match base.to_ascii_lowercase().as_str() {
-        "today" | "now" => {}
-        "yesterday" => when -= chrono::Duration::seconds(86_400),
-        "tomorrow" => when += chrono::Duration::seconds(86_400),
-        _ => return None,
-    }
-    // "today" means midnight, so a bare `today + 2 days` is two whole days on.
-    if matches!(
-        base.to_ascii_lowercase().as_str(),
-        "today" | "yesterday" | "tomorrow"
-    ) {
-        when = when.date_naive().and_hms_opt(0, 0, 0)?.and_utc();
-    }
-
-    if !rest.is_empty() {
-        // `+ N days` / `- N days`, with an optional plural `s`.
-        let rest = rest.trim_start_matches(['+', ' ']);
-        let (sign, rest) = match rest.strip_prefix('-') {
-            Some(r) => (-1, r.trim_start()),
-            None => (1, rest.trim_start()),
-        };
-        let mut fields = rest.split_whitespace();
-        let amount: i64 = fields.next()?.parse().ok()?;
-        let unit = fields.next()?.trim_end_matches('s');
-        let seconds = UNITS
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(unit))
-            .map(|(_, secs)| *secs)?;
-        when += chrono::Duration::seconds(sign * amount * seconds);
+    if bare_offset {
+        when = apply_relative_offset(when, trimmed)?;
+    } else {
+        match base {
+            "today" | "now" => {}
+            "yesterday" => when -= chrono::Duration::days(1),
+            "tomorrow" => when += chrono::Duration::days(1),
+            _ => return None,
+        }
+        // "today" means midnight, so a bare `today + 2 days` is two whole days on.
+        if matches!(base, "today" | "yesterday" | "tomorrow") {
+            when = when.date_naive().and_hms_opt(0, 0, 0)?.and_utc();
+        }
+        if !rest.is_empty() {
+            when = apply_relative_offset(when, rest)?;
+        }
     }
 
     Some(when.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+/// Apply one relative offset (`-1 year`, `+ 2 days`, `3 hours`) to `when`.
+///
+/// Years and months are *calendar* arithmetic, not fixed second counts: a
+/// `+1 month` from 31 January is not 30 days later, and `checked_*_months`
+/// clamps the day the way PHP's `strtotime` does.
+fn apply_relative_offset(
+    when: chrono::DateTime<chrono::Utc>,
+    text: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = text.trim();
+    let (sign, rest) = match text.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1i64, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let mut fields = rest.split_whitespace();
+    let amount: i64 = fields.next()?.parse().ok()?;
+    let unit = fields.next()?.trim_end_matches('s').to_ascii_lowercase();
+    let signed = sign * amount;
+    let months = |n: i64| -> Option<chrono::DateTime<chrono::Utc>> {
+        let n = u32::try_from(n.unsigned_abs()).ok()?;
+        if signed >= 0 {
+            when.checked_add_months(chrono::Months::new(n))
+        } else {
+            when.checked_sub_months(chrono::Months::new(n))
+        }
+    };
+    let days = |n: i64| -> Option<chrono::DateTime<chrono::Utc>> {
+        let n = n.unsigned_abs();
+        if signed >= 0 {
+            when.checked_add_days(chrono::Days::new(n))
+        } else {
+            when.checked_sub_days(chrono::Days::new(n))
+        }
+    };
+    match unit.as_str() {
+        "year" => months(signed.checked_mul(12)?),
+        "month" => months(signed),
+        "day" => days(signed),
+        "week" => days(signed.checked_mul(7)?),
+        "hour" => Some(when + chrono::Duration::hours(signed)),
+        "minute" => Some(when + chrono::Duration::minutes(signed)),
+        "second" => Some(when + chrono::Duration::seconds(signed)),
+        _ => None,
+    }
 }
 
 /// `mw.clone(value)` — a deep copy that keeps metatables.
@@ -9456,6 +9514,15 @@ mod tests {
         // A month name in either order; the service gives 2020-01-01 for both.
         assert_eq!(ts("January 2020"), "1577836800");
         assert_eq!(ts("2020 January"), "1577836800");
+        // A day with the month name, in either order and with an optional comma.
+        // `{{New Style to Old Style}}` passes the first form to `#time`; the
+        // service parses all three.
+        assert_eq!(format_date("Y-m-d", "31 March 1727").unwrap(), "1727-03-31");
+        assert_eq!(
+            format_date("Y-m-d", "March 31, 1727").unwrap(),
+            "1727-03-31"
+        );
+        assert_eq!(format_date("Y-m-d", "March 31 1727").unwrap(), "1727-03-31");
         // A bare year keeps the current month and day, so it is pinned to a real
         // instant inside that year rather than to an exact value. The service
         // returned 1600732800 for `{{#time:U|2020}}` on 2026-09-22.
@@ -9471,6 +9538,27 @@ mod tests {
     /// page` builds a protection banner's expiry with exactly this pair
     /// (`formatDate('F j, Y "at" H:i e', '@' .. unix)`); while the `@` form was
     /// unparseable its `pcall` swallowed the error and the banner read "until ,".
+    #[test]
+    fn format_date_reads_bare_relative_offsets() {
+        // `Tropical cyclone`'s season links are `{{#time:Y|-1 year}}` and
+        // `{{#time:y|+1 year}}`; a bare signed offset is relative to *now*.
+        let now_year = chrono::Utc::now()
+            .format("%Y")
+            .to_string()
+            .parse::<i32>()
+            .unwrap();
+        for (offset, delta) in [("+1 year", 1), ("-1 year", -1)] {
+            let year: i32 = format_date("Y", offset).unwrap().parse().unwrap();
+            // The one-year window absorbs a test that straddles New Year.
+            assert!(
+                (year - (now_year + delta)).abs() <= 1,
+                "{offset}: {year} vs {now_year}"
+            );
+        }
+        // The spelled-out base still works.
+        assert!(format_date("Y-m-d", "today + 2 days").is_ok());
+    }
+
     #[test]
     fn format_date_reads_a_unix_timestamp_and_quoted_literals() {
         assert_eq!(

@@ -1793,6 +1793,9 @@ enum ExprToken {
     /// *binary* operator (lower precedence than `+ -`), so a leading `round`
     /// with no left operand is the parser's error, not a dropped word.
     Round,
+    /// A unary math function (`abs`, `floor`, `ln`, …). It applies to the next
+    /// *primary*, so `floor2.5^2` is `(floor 2.5)^2`.
+    Func(&'static str),
     LParen,
     RParen,
 }
@@ -1817,7 +1820,12 @@ fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
         // them, so they are dropped.
         if b.is_ascii_alphabetic() {
             let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            // MediaWiki's expression lexer reads a *word* as letters only, so
+            // `floor4` is the function `floor` applied to `4`, not the unknown
+            // word `floor4`. `Template:Rating` relies on exactly that spelling
+            // (`{{#expr:floor{{{1}}}-1}}`), and a digits-in-words scan turned it
+            // into `Expression error: Unrecognized word "floor4"`.
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
                 i += 1;
             }
             match &lower[start..i] {
@@ -1827,13 +1835,26 @@ fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
                 "div" => tokens.push(ExprToken::Op('D')),
                 "mod" => tokens.push(ExprToken::Op('%')),
                 // `round` is a binary operator, not a value: keep it as a token
-                // so a missing left operand becomes the parser's error. The
-                // remaining functions and constants are recognised (so they do
-                // not read as garbage) but dropped; the evaluator does not
-                // implement them, and erroring on them would be *more* wrong.
+                // so a missing left operand becomes the parser's error.
                 "round" => tokens.push(ExprToken::Round),
-                "abs" | "ceil" | "floor" | "trunc" | "sqrt" | "exp" | "ln" | "log" | "sin"
-                | "cos" | "tan" | "asin" | "acos" | "atan" | "e" | "pi" => {}
+                // Constants are values, not functions.
+                "e" => tokens.push(ExprToken::Num(std::f64::consts::E)),
+                "pi" => tokens.push(ExprToken::Num(std::f64::consts::PI)),
+                // `log` is deliberately absent: the live wiki reports it as an
+                // unrecognized word (verified against the transform endpoint).
+                "abs" => tokens.push(ExprToken::Func("abs")),
+                "ceil" => tokens.push(ExprToken::Func("ceil")),
+                "floor" => tokens.push(ExprToken::Func("floor")),
+                "trunc" => tokens.push(ExprToken::Func("trunc")),
+                "sqrt" => tokens.push(ExprToken::Func("sqrt")),
+                "exp" => tokens.push(ExprToken::Func("exp")),
+                "ln" => tokens.push(ExprToken::Func("ln")),
+                "sin" => tokens.push(ExprToken::Func("sin")),
+                "cos" => tokens.push(ExprToken::Func("cos")),
+                "tan" => tokens.push(ExprToken::Func("tan")),
+                "asin" => tokens.push(ExprToken::Func("asin")),
+                "acos" => tokens.push(ExprToken::Func("acos")),
+                "atan" => tokens.push(ExprToken::Func("atan")),
                 _ => return Err(format!("Unrecognized word \"{}\".", &expr[start..i])),
             }
             continue;
@@ -2067,7 +2088,38 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
         // `round` needs a left operand; where a value is expected it is the
         // parser's error (`{{#expr: round 5}}`).
         ExprToken::Round => Err(RustoidError::Parse("Unexpected round operator".to_string())),
+        ExprToken::Func(name) => {
+            *pos += 1;
+            // The argument is the next primary — a number, a constant, a
+            // parenthesised expression, a signed value, or another function.
+            // That binding is what makes `floor2.5^2` answer `4` (i.e. `(floor
+            // 2.5)^2`), matching the live wiki.
+            let arg = expr_primary(tokens, pos)?;
+            Ok(apply_expr_func(name, arg))
+        }
         _ => Ok(0.0),
+    }
+}
+
+/// Evaluate one `#expr` math function. MediaWiki's `ExprParser` uses PHP's
+/// counterparts; the names the lexer accepts are exactly the ones the wiki
+/// evaluates.
+fn apply_expr_func(name: &str, value: f64) -> f64 {
+    match name {
+        "abs" => value.abs(),
+        "ceil" => value.ceil(),
+        "floor" => value.floor(),
+        "trunc" => value.trunc(),
+        "sqrt" => value.sqrt(),
+        "exp" => value.exp(),
+        "ln" => value.ln(),
+        "sin" => value.sin(),
+        "cos" => value.cos(),
+        "tan" => value.tan(),
+        "asin" => value.asin(),
+        "acos" => value.acos(),
+        "atan" => value.atan(),
+        _ => value,
     }
 }
 
@@ -2190,6 +2242,41 @@ mod tests {
             ParserFunctions::pf_expr(&params(vec![("1+2", "")])),
             vec![Item::Str("3".to_string())]
         );
+    }
+
+    #[test]
+    fn test_pf_expr_math_functions() {
+        // The live wiki lexes a word as letters only, so `floor4` is `floor(4)`,
+        // and evaluates the math functions applied to the next primary (which is
+        // why `floor2.5^2` is `(floor 2.5)^2 = 4`). Each expectation was taken
+        // from the transform endpoint.
+        for (expr, want) in [
+            ("floor4", "4"),
+            ("floor4.7", "4"),
+            ("floor 4.7", "4"),
+            ("ceil4.2", "5"),
+            ("trunc-4.7", "-4"),
+            ("abs-4", "4"),
+            ("sqrt9", "3"),
+            ("exp0", "1"),
+            ("ln(abs-4)", "1.3862943611199"),
+            ("floor2.5^2", "4"),
+            ("floor4-1", "3"),
+            ("sin0", "0"),
+            ("pi", "3.1415926535898"),
+        ] {
+            assert_eq!(
+                ParserFunctions::pf_expr(&params(vec![(expr, "")])),
+                vec![Item::Str(want.to_string())],
+                "{expr}"
+            );
+        }
+        // `log` is not one of the names the wiki evaluates.
+        let out = ParserFunctions::pf_expr(&params(vec![("log100", "")]));
+        let Item::Str(s) = &out[0] else {
+            panic!("expected a string item: {out:?}")
+        };
+        assert!(s.contains("Unrecognized word \"log\""), "{s}");
     }
 
     /// Core's `#ifexpr` catches the expression error and answers the error

@@ -17469,3 +17469,53 @@ What tracing established (instrumentation since removed):
 
 Recorded, not fixed — the fix needs a careful reading of that path rather than a
 guess.
+
+## `#expr` read `floor4` as one word, and `#time` rejected three date shapes
+
+`Template:Rating` writes `{{#expr:floor{{{1}}}-1}}` — after substitution,
+`floor4`. MediaWiki's expression lexer reads a *word* as letters only, so that
+is the function `floor` applied to `4`. rustoid scanned `[A-Za-z0-9_]`, so
+`floor4` became an unknown word and every `{{Rating}}` rendered
+`Expression error: Unrecognized word "floor4".` (`Brat (album)` had 24 of them).
+The same lexer *dropped* every function/constant instead of evaluating it
+(`ln`, `sqrt`, `abs`, `pi`, …), so values were silently wrong wherever it did
+not error.
+
+`#time` was missing three stamp shapes, each of which became
+`Error: Invalid time.`:
+
+- `<day> <month> <year>` (`31 March 1727`, from `{{New Style to Old Style}}`);
+- `YYYY-MM` (`1961-05`, from `{{Time ago}}`);
+- a bare signed offset (`+1 year`, `-1 year`, from `Tropical cyclone`'s season
+  links).
+
+Because `#time` answers its error as `<strong class="error">…</strong>`, that
+markup then broke the surrounding wikilink (leaving a literal `[[2026–`) and, in
+`Isaac Newton`, was fed into `#ifexpr`, which reported
+`Unrecognized word "strong"`.
+
+### The reference
+
+Each case was checked against the live transform endpoint in one batched probe:
+`floor4`→4, `floor4.7`→4, `ln4`→1.3862943611199, `sqrt9`→3, `abs-4`→4,
+`floor2.5^2`→4 (`(floor 2.5)^2`, so a function binds to the next *primary*),
+`log100`→an "Unrecognized word `log`" error, `pi`→3.1415926535898, plus the date
+shapes above.
+
+### The fix
+
+`tokenize_expr` scans letters only and emits `ExprToken::Func` for the functions
+(`log` deliberately errors, matching the wiki); `expr_primary` applies a function
+to the next primary. `parse_date` gains `<day> <month> <year>` (either order,
+optional comma) and `YYYY-MM`; `resolve_relative` gains bare signed offsets and
+applies years/months as *calendar* arithmetic.
+
+### Effect
+
+`Brat (album)`'s 30 error elements are gone (with its 24 `floor4` errors);
+`Isaac Newton`'s first difference moves **2.87% → 14.85%** (its only error was
+the `#time`-fed `#ifexpr`); `Tropical cyclone` (3) and `COVID-19 pandemic` (1)
+lose their last error elements; `Israel` moves 2.30% → 2.60%. The only corpus
+error element left is `Wikipedia`'s 45 `language code: -1 not recognized`, which
+is `mw.ext.data` (an unported extension). Strict score stays 4/48, fixtures
+877/896, clippy and fmt are clean.
