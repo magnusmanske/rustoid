@@ -17910,3 +17910,26 @@ a naive reading:
 3.06% → 4.19%, Nobel Prize 13.04% → 34.85%, Tropical cyclone 5.75% → 6.33%.
 The four strict matches and the two nondeterministic-only pages are unchanged,
 and no page regresses (48-page corpus, lib tests 1058, clippy clean).
+
+## Media options: an all-string token array is a string
+
+`mw:ExpandedAttrs` on a media container follows PHP's
+`$expOpt = is_array($origOptSrc)`. rustoid kept `alt={{{alt|}}}` as a token
+array even after the argument expanded to nothing, so the empty `alt=` marked
+the whole container expanded. Core preprocesses a template body before Parsoid
+tokenizes it — the image in `Template:Image label begin` sits in one — so the
+service sees `alt=` as a plain string. A token array whose items are all
+`Item::Str` is now treated as a string; a page-level `alt={{Foo}}` keeps its
+wrapper tokens and is unaffected.
+
+## Media captions: only the first chunk is at line start
+
+`tokenize_caption_items_sol` re-tokenizes a caption chunk by chunk, and passed
+`sol` to every chunk. In `…[[Afghanistan]]; [[Ivory Coast]]…` the `; ` after
+the link token is its own chunk, so it started a `<dl>` instead of staying
+text (`Template:Legend`'s caption on France). Only the caption's first chunk
+inherits `sol`; a chunk after a newline is at line start again, and any other
+token leaves the position mid-line (`caption_chunks_after_a_link_do_not_start_a_list`).
+
+**Effect:** France's first difference moves from 16.02% to 28.81%, with no
+other page changing on the 48-page corpus.

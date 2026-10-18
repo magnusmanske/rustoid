@@ -780,11 +780,27 @@ fn tokenize_caption_items_sol(
     });
     if !needs_reconstruction {
         let mut out = Vec::with_capacity(items.len());
+        // `sol` describes the caption's *first* position. Re-tokenizing every
+        // text chunk with it made each chunk a fresh line start: in
+        // `…[[Afghanistan]]; [[Ivory Coast]]…` the `; ` after the link token is
+        // its own chunk, so it started a `<dl>` instead of staying text (the
+        // `Legend` caption on France). A chunk after a newline is at line start
+        // again; other tokens (links, templates) leave the position mid-line.
+        let mut at_sol = sol;
         for item in items {
-            if let Item::Str(s) = item {
-                out.extend(tokenize_caption_sol(s, config, sol, linkdesc));
-            } else {
-                out.push(item.clone());
+            match item {
+                Item::Str(s) => {
+                    out.extend(tokenize_caption_sol(s, config, at_sol, linkdesc));
+                    at_sol = sol && s.ends_with('\n');
+                }
+                Item::Tok(ParsoidToken::Nl(_)) => {
+                    out.push(item.clone());
+                    at_sol = sol;
+                }
+                _ => {
+                    out.push(item.clone());
+                    at_sol = false;
+                }
             }
         }
         return out;
@@ -1009,7 +1025,18 @@ fn parse_media_options(ctx: &WikiLinkContext, token: &ParsoidToken) -> MediaOpti
         // Whether this part's raw source is a token array (i.e. it contained a
         // template/entity, not a plain string). Used to detect `mw:ExpandedAttrs`
         // on *options* (not captions), mirroring PHP's `is_array($origOptSrc)`.
-        let is_token_array = matches!(kv.value, crate::wikitext::tokens_v2::KeyValue::Tokens(_));
+        //
+        // A list of plain strings is a string for that purpose. The tokenizer
+        // keeps `alt={{{alt|}}}` as a token list even when the argument expands
+        // to nothing, and core preprocesses a template body (which is where this
+        // image sits) before Parsoid ever tokenizes it, so the service sees
+        // `alt=` — a plain string, not an array, and not `mw:ExpandedAttrs`.
+        // A page-level `alt={{Foo}}` keeps its wrapper tokens and is unaffected.
+        let is_token_array = matches!(
+            kv.value,
+            crate::wikitext::tokens_v2::KeyValue::Tokens(ref items)
+                if items.iter().any(|i| !matches!(i, Item::Str(_)))
+        );
         // The raw source wikitext for round-tripping (`$oContent->vsrc` in PHP).
         let vsrc = kv.vsrc.clone();
         let part = match &kv.value {
@@ -2374,6 +2401,29 @@ mod tests {
     fn test_split_media_options_simple() {
         let parts = split_media_options("right|Caption text");
         assert_eq!(parts, vec!["right", "Caption text"]);
+    }
+
+    /// Re-tokenizing a caption chunk by chunk must not restart line context at
+    /// every chunk: the `; ` after a link token is mid-line in
+    /// `…[[Afghanistan]]; [[Ivory Coast]]…`, so it is text, not a `<dl>` start
+    /// (the `Legend` caption on France).
+    #[test]
+    fn caption_chunks_after_a_link_do_not_start_a_list() {
+        let items = vec![
+            Item::Str("French military interventions: ".to_string()),
+            Item::Tok(wikilink_token("./Afghanistan", Some("Afghanistan"))),
+            Item::Str("; [[Ivory Coast]]; [[Chad]]".to_string()),
+        ];
+        let out = tokenize_caption_items(&items, config_static());
+        assert!(
+            !out.iter().any(|i| matches!(
+                i,
+                Item::Tok(ParsoidToken::Tag(t)) if t.name == "listItem"
+            )),
+            "the `;` must stay text: {out:?}"
+        );
+        let text = crate::wikitext::token_utils::tokens_to_string(&out);
+        assert!(text.contains("; [[Ivory Coast]]"), "got: {text}");
     }
 
     #[test]
