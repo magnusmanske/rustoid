@@ -17973,3 +17973,15 @@ from the content now.
 **Effect:** France's first difference moves from 36.09% to 36.95%. Its next
 difference is the `<references>` `extsrc` PFragment marker, i.e. the same
 fragment-counter blocker as Canada's indicator.
+
+## Named refs are trimmed
+
+Cite's `Validator` trims a ref's name and group, so `<ref name="x " />` is a
+use of the note `x`, not a new one. rustoid keyed the note map on the raw
+attribute, so the second use of `PlayStationAwards 2013` on Grand Theft Auto V
+(written with a trailing space) created a second note with the wrong number
+and marker id (`_196-0` where the service serves `_194-1`). `CiteState::add_full`
+trims both now.
+
+**Effect:** Grand Theft Auto V's first difference moves from 20.88% to 44.81%.
+Its next difference is, again, the `<references>` `extsrc` fragment marker.

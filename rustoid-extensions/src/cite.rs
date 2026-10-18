@@ -303,6 +303,12 @@ impl CiteState {
         about: Option<&str>,
         record_use: bool,
     ) -> String {
+        // Cite trims a ref's name and group (`Validator::validateRef`):
+        // `name="x "` and `name="x"` are the same note. Without the trim a
+        // trailing space made a second note with the wrong number and id
+        // (`Grand Theft Auto V`'s `PlayStationAwards 2013 `).
+        let name = name.trim();
+        let group = group.trim();
         // A **named** ref is identified by its name, so `<ref name="x" />` finds
         // the note that `<ref name="x">…</ref>` defined. An anonymous one is not
         // identified at all: Cite indexes only named refs (`RefGroup::push` under
@@ -2130,5 +2136,18 @@ mod tests {
         // The bare reuse must not blank the note's text.
         assert_eq!(st.references[0].body, "hello");
         assert_eq!(st.references[0].number, 1);
+    }
+
+    /// Cite trims a ref's name, so a trailing space is the same note
+    /// (`Grand Theft Auto V`'s `PlayStationAwards 2013 `) — and the marker id
+    /// uses the trimmed spelling.
+    #[test]
+    fn named_refs_are_trimmed() {
+        let mut st = CiteState::new();
+        let first = st.add("PlayStationAwards 2013 ", "", "body", false, Some("#mwt1"));
+        let second = st.add("PlayStationAwards 2013", "", "", true, None);
+        assert_eq!(st.references.len(), 1);
+        assert_eq!(first, "cite_ref-PlayStationAwards_2013_1-0");
+        assert_eq!(second, "cite_ref-PlayStationAwards_2013_1-1");
     }
 }
