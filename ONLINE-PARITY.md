@@ -17955,3 +17955,21 @@ link's content, not an attribute, and is excluded.
 **Effect:** France's first difference moves from 28.81% to 36.09%, with no
 other page changing on the 48-page corpus (the four strict matches are
 preserved).
+
+## Note bodies get link trails, and `#tag` arguments drop comments
+
+Cite splices a note's body into the reference list *after* `HandleLinkNeighbours`
+has run, so a link in a note never got its trail: `[[glacier]]s` served as
+`<a>glacier</a>s`. Parsoid had already parsed those bodies at extension time.
+The pass is idempotent for links it already handled, so it runs once more right
+after Cite.
+
+`#tag` arguments are preprocessed by core, which strips comments before the
+extension is built. Rustoid's `source` serializer already dropped them, but the
+live token list kept them, so the body renderer served
+`{{efn|…{{IPA|…}}<!-- … -->}}`'s comment. `tag_extension_token` filters them
+from the content now.
+
+**Effect:** France's first difference moves from 36.09% to 36.95%. Its next
+difference is the `<references>` `extsrc` PFragment marker, i.e. the same
+fragment-counter blocker as Canada's indicator.

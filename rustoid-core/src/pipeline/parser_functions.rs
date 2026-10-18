@@ -1316,6 +1316,18 @@ impl ParserFunctions {
             DataMw, DataMwAttrib, DataMwValue, DomSourceRange, SelfclosingTagTk,
         };
 
+        // Core strips comments from a parser function's arguments before
+        // `#tag` builds the extension, so these must go from the live content
+        // too — `tag_content_source` already drops them from `source`, and the
+        // body renderer used to keep them (`France`'s `{{efn|…{{IPA|…}}<!-- …
+        // -->}}` served a comment the service does not).
+        let content: Vec<Item> = content
+            .iter()
+            .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
+            .cloned()
+            .collect();
+        let content = content.as_slice();
+
         // Reconstruct the literal `<name attrs>content</name>` source so that
         // `extract_ext_body` can recover the raw body via the open/close widths.
         // Magic pipe words in the content (`{{!}}` → `|`, `{{{!}}` → `{|`) are

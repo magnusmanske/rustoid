@@ -4777,6 +4777,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // order, so anything numbered after Cite must continue from here.
             about_counter.set(ids.about_counter());
         }
+        // Cite splices the note bodies into the reference list *after* the
+        // link-neighbour pass above, so their links never got their trails
+        // (`[[glacier]]s` served as `<a>glacier</a>s`). Parsoid had already
+        // parsed those bodies at extension time, which is why its pass saw
+        // them. Running the pass again is safe: a link whose trail was already
+        // merged has no adjacent text left.
+        crate::pipeline::handle_link_neighbours::run(&mut ast, self.config);
         // DisplaySpace (`displayspace`): armor French spaces. PHP runs it as a
         // global DOM pass after extension post-processing (`extpp`) and before
         // `gen-anchors`, which is why it is here and not before Cite: a note's
