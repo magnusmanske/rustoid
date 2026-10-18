@@ -17985,3 +17985,30 @@ trims both now.
 
 **Effect:** Grand Theft Auto V's first difference moves from 20.88% to 44.81%.
 Its next difference is, again, the `<references>` `extsrc` fragment marker.
+
+## T2529 is a nested-expansion rule
+
+Core's `Parser::braceSubstitution` prepends `\n` to an expansion that starts with
+a list/table marker when the call did not start a line. Rustoid applied that to
+*every* call — top-level page calls and calls inside attribute values included —
+and represented the newline as an `Nl` token.
+
+Neither is right for production Parsoid. The page's own calls are expanded by
+Parsoid with `sol => true` (`PipelineUtils::processTemplateSource`), so their
+output is already tokenized at start of line and no newline is inserted
+(T382464: the hack is restricted to nested expansions, which is where the PHP
+preprocessor still runs). Inside an attribute value, PHP splices the newline
+into the attribute *text* (`style="…\n;…"`), where block syntax is never parsed;
+an `Nl` token is instead discarded by `tokensToString`, so the newline vanished
+(`Template:Quote box`'s generated `style`).
+
+`t2529_force_line_start` now inserts the newline only for nested expansions
+(`body`), as a `Str("\n")` while an attribute value is being expanded (the new
+`Parser::attr_expansion` guard) and as an `Nl` token in content. The leading
+marker is still re-tokenized at SOL for every call: Parsoid tokenizes an
+expansion's output at SOL either way, and a text branch such as `#ifeq`
+returning `;` is outside the branch re-tokenizer's `{|`/`|`/`!` trigger set.
+
+**Effect:** Isaac Newton's first difference moves from 14.85% to 19.63% (the
+paragraph after the Quote box now starts on its own line). No corpus
+regressions; 4/48 strict.

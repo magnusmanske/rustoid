@@ -1586,6 +1586,16 @@ impl Drop for ArgExpansion<'_> {
     }
 }
 
+/// RAII guard for [`Parser::attr_expansion`]: constructing it increments the
+/// counter, dropping it decrements it.
+struct AttrExpansion<'a>(&'a std::cell::Cell<u32>);
+
+impl Drop for AttrExpansion<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 /// RAII guard for [`Parser::style_defer`]: constructing it increments the
 /// counter, dropping it decrements it.
 struct StyleDefer<'a>(&'a std::cell::Cell<u32>);
@@ -1770,6 +1780,14 @@ pub struct Parser<'a, C: SiteConfig> {
     /// extension and is numbered at the call; see
     /// [`Parser::expand_lua_request`]).
     style_defer: std::cell::Cell<u32>,
+    /// Non-zero while an attribute value is being expanded.
+    ///
+    /// T2529 inserts a newline into the *text* of an expansion, so inside an
+    /// attribute value that newline is ordinary text (`style="…\n;…"`). A
+    /// `Nl` token would be dropped when the value is stringified, since
+    /// Parsoid's `tokensToString` discards newline tokens. See
+    /// [`t2529_force_line_start`].
+    attr_expansion: std::cell::Cell<u32>,
     /// How many [`Parser::expand_templates`] calls are on the stack. The
     /// page-level call is depth 1; anything deeper is being spliced into another
     /// expansion, i.e. the item is inside a transclusion. See
@@ -1849,16 +1867,46 @@ pub struct Parser<'a, C: SiteConfig> {
     wrap_templates: std::cell::Cell<bool>,
 }
 
-/// Core `Parser::braceSubstitution`'s T2529 rule: a template's expansion that
-/// begins with a table or list marker begins a new line, so a `\n` is put in
-/// front of it. The marker came from a substituted argument and was tokenized
-/// where the argument sat (mid-line), so it never became a list: the leading
-/// string is re-tokenized here at SOL. `Parser.php` guards the rule with
-/// `preg_match( '/^(?:{\||:|;|#|\*)/', $text )` on the expanded string.
-fn t2529_force_line_start(expanded: Vec<Item>, at_line_start: bool) -> Vec<Item> {
-    if at_line_start {
-        return expanded;
-    }
+/// Core's `$piece['lineStart']` for a template/parser-function call, as the
+/// preprocessor computes it: `$text[$i - 1] === "\n"` — the character
+/// immediately before the `{{`, with no allowance for indentation. A
+/// preprocessed template body starts with `textStartsInSOLState = false`.
+fn t2529_at_line_start(tok: &ParsoidToken, src_text: &str, body: bool) -> bool {
+    (|| {
+        let tsr = tok.data_parsoid().and_then(|dp| dp.tsr.as_ref())?;
+        let start = tsr.start?;
+        if start == 0 {
+            return Some(!body);
+        }
+        let source = tsr.source.as_deref().unwrap_or(src_text);
+        Some(source.as_bytes().get(start - 1) == Some(&b'\n'))
+    })()
+    .unwrap_or(false)
+}
+
+/// Core `Parser::braceSubstitution`'s T2529 rule: a *nested* template's
+/// expansion that begins with a table or list marker begins a new line, so a
+/// `\n` is put in front of it when the call did not itself start a line.
+///
+/// Production Parsoid expands the page's own calls with `sol => true`
+/// (`PipelineUtils::processTemplateSource`), which already tokenizes a leading
+/// marker as a list; core's hack is consequently restricted to nested
+/// expansions (T382464), i.e. the calls the PHP preprocessor expands inside a
+/// template body. The re-tokenization below still runs for every call whose
+/// expansion begins with a marker: Parsoid tokenizes an expansion's output at
+/// start of line either way, and a parser function's branch (`#ifeq` returning
+/// `;`) is not covered by the branch re-tokenizer.
+///
+/// Inside an attribute value, PHP splices the inserted newline into the
+/// attribute *text* (`style="…\n;…"`), where block syntax is never parsed. A
+/// `Nl` token would be dropped when the value is stringified, so the newline is
+/// a plain string there and no re-tokenization happens.
+fn t2529_force_line_start(
+    expanded: Vec<Item>,
+    at_line_start: bool,
+    body: bool,
+    in_attribute: bool,
+) -> Vec<Item> {
     // The expansion is wrapped in its transclusion marker(s); core checks the
     // expansion *string*, which is the first content token's source here.
     let start = expanded
@@ -1876,12 +1924,22 @@ fn t2529_force_line_start(expanded: Vec<Item>, at_line_start: bool) -> Vec<Item>
     if !(src.starts_with("{|") || src.starts_with([':', ';', '#', '*'])) {
         return expanded;
     }
-    // The newline goes *before* the transclusion's start marker, so it lands
-    // outside the wrapper the encapsulation pass builds (`<div>\n<ul about=…>`).
     let mut out = Vec::with_capacity(expanded.len() + 1);
-    out.push(Item::Tok(ParsoidToken::Nl(
-        crate::wikitext::tokens_v2::NlTk::new(crate::wikitext::tokens_v2::SourceRange::new(0, 0)),
-    )));
+    if body && !at_line_start {
+        if in_attribute {
+            out.push(Item::Str("\n".to_string()));
+        } else {
+            out.push(Item::Tok(ParsoidToken::Nl(
+                crate::wikitext::tokens_v2::NlTk::new(
+                    crate::wikitext::tokens_v2::SourceRange::new(0, 0),
+                ),
+            )));
+        }
+    }
+    if in_attribute {
+        out.extend(expanded);
+        return out;
+    }
     for (i, it) in expanded.into_iter().enumerate() {
         // A leading *string* was tokenized where the argument sat (mid-line),
         // so it is re-tokenized at SOL; a marker that is already a token (a
@@ -1942,6 +2000,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             pending_styles: std::cell::RefCell::new(std::collections::HashMap::new()),
             arg_expansion: std::cell::Cell::new(0),
             style_defer: std::cell::Cell::new(0),
+            attr_expansion: std::cell::Cell::new(0),
             expansion_nesting: std::cell::Cell::new(0),
             module_scope: std::cell::Cell::new(0),
             strip_markers: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -2074,6 +2133,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             arg: &self.arg_expansion,
             style: &self.style_defer,
         }
+    }
+
+    /// Enter one level of attribute-value expansion; the returned guard leaves
+    /// it on drop. See [`Parser::attr_expansion`].
+    fn begin_attr_expansion(&self) -> AttrExpansion<'_> {
+        self.attr_expansion.set(self.attr_expansion.get() + 1);
+        AttrExpansion(&self.attr_expansion)
+    }
+
+    /// Whether an attribute value is currently being expanded. See
+    /// [`Parser::attr_expansion`].
+    fn in_attr_expansion(&self) -> bool {
+        self.attr_expansion.get() > 0
     }
 
     /// Enter one level of *template*-argument expansion; the returned guard leaves
@@ -5309,17 +5381,26 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         )
                         .await;
                     self.leave_pp_node();
-                    // Core `Parser::braceSubstitution`'s T2529: a template or
-                    // parser-function whose expansion (a *string* in PHP) begins
-                    // with a table or list marker is treated as beginning a new
-                    // line — unless the call was already at one. The tokenizer
-                    // never saw the marker at a line start (it came out of a
-                    // substituted argument), so the leading string is
-                    // re-tokenized at SOL with a newline in front.
+                    // Core `Parser::braceSubstitution`'s T2529: a *nested*
+                    // template or parser-function expansion that begins with a
+                    // table or list marker is treated as beginning a new line.
+                    // The page's own calls are expanded by Parsoid with
+                    // `sol => true` and take no such newline (T382464), but
+                    // their output is still tokenized at start of line, so the
+                    // leading marker is re-tokenized either way. Core's
+                    // `$piece['lineStart']` is strict: `$text[$i - 1] === "\n"`,
+                    // so a directive indented with spaces does **not** start a
+                    // line and gets the newline (`Template:Quote box`'s style,
+                    // Isaac Newton).
                     let expanded = t2529_force_line_start(
                         expanded,
-                        out.is_empty()
-                            || matches!(out.last(), Some(Item::Tok(ParsoidToken::Nl(_)))),
+                        t2529_at_line_start(
+                            &ParsoidToken::SelfclosingTag(stt.clone()),
+                            src_text,
+                            body,
+                        ),
+                        body,
+                        self.in_attr_expansion(),
                     );
                     for e in &expanded {
                         track_table(e, &mut table_depth);
@@ -6809,8 +6890,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // expanded here — otherwise the tree builder flattens it to its raw
         // `src` (`<nowiki>A</nowiki>` where the service serves `A`).
         let had_extension = chunk_has_extension_token(&toks);
-        let expanded = self
-            .expand_templates(
+        let expanded = {
+            let _attr = self.begin_attr_expansion();
+            self.expand_templates(
                 frame,
                 toks,
                 source,
@@ -6820,7 +6902,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 page_source.unwrap_or(""),
                 0,
             )
-            .await;
+            .await
+        };
         // The tokens already in the value keep their page-absolute `tsr`: PHP's
         // `Frame::expand` runs the chunk through the expansion pipeline, which
         // only *replaces* template/variable tokens and clears the `tsr` of what
@@ -10686,8 +10769,14 @@ mod tests {
                 crate::wikitext::tokens_v2::DataParsoid::default(),
             ),
         ));
-        // A list marker mid-line: newline first, then the re-tokenized content.
-        let out = t2529_force_line_start(vec![marker.clone(), Item::Str("* a".to_string())], false);
+        // A nested call that did not start a line: newline first, then the
+        // re-tokenized content.
+        let out = t2529_force_line_start(
+            vec![marker.clone(), Item::Str("* a".to_string())],
+            false,
+            true,
+            false,
+        );
         assert!(
             matches!(out[0], Item::Tok(ParsoidToken::Nl(_))),
             "newline first"
@@ -10697,15 +10786,39 @@ mod tests {
             "`* a` re-tokenized into list syntax: {:?}",
             out[1]
         );
-        // At a line start, or for content that is not a marker, unchanged.
-        assert!(matches!(
-            t2529_force_line_start(vec![Item::Str("* a".to_string())], true)[0],
+        // Parsoid expands the page's own calls at `sol => true`, so the marker
+        // is re-tokenized but no newline is inserted (T382464).
+        let out = t2529_force_line_start(
+            vec![marker.clone(), Item::Str("* a".to_string())],
+            false,
+            false,
+            false,
+        );
+        assert!(!matches!(out[0], Item::Tok(ParsoidToken::Nl(_))));
+        assert!(!matches!(out[0], Item::Str(_)), "re-tokenized at SOL");
+        // At a line start the marker is still re-tokenized (Parsoid tokenizes
+        // the expansion at SOL), just without a newline; content that is not a
+        // marker is unchanged.
+        assert!(!matches!(
+            t2529_force_line_start(vec![Item::Str("* a".to_string())], true, true, false)[0],
             Item::Str(_)
         ));
         assert!(matches!(
-            t2529_force_line_start(vec![marker, Item::Str("plain".to_string())], false)[0],
+            t2529_force_line_start(
+                vec![marker.clone(), Item::Str("plain".to_string())],
+                false,
+                true,
+                false
+            )[0],
             Item::Tok(ParsoidToken::SelfclosingTag(_))
         ));
+        // Inside an attribute value the newline is text (PHP splices it into the
+        // value string) and the marker stays text: block syntax is not parsed
+        // there.
+        let out =
+            t2529_force_line_start(vec![marker, Item::Str(";".to_string())], false, true, true);
+        assert!(matches!(&out[0], Item::Str(s) if s == "\n"));
+        assert!(matches!(out.last(), Some(Item::Str(s)) if s == ";"));
     }
 
     /// A module receives an argument's *expanded* text, and that includes a link
