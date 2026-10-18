@@ -1360,6 +1360,10 @@ impl TemplateHandler {
                 .to_string(),
             "contentlanguage" | "contentlang" => config.language_code().to_string(),
             "scriptpath" => config.script_path().to_string(),
+            // `{{=}}` — core's `=` magic word answers a literal `=` (it is what
+            // assembles attributes from `<span style{{=}}"…">`, e.g.
+            // `Template:Normal`).
+            "=" => "=".to_string(),
             "ns" | "nse" => {
                 // `{{ns:index}}` maps a namespace index (or localized name) to its
                 // canonical name. A non-numeric arg is looked up as a namespace
@@ -1510,6 +1514,10 @@ impl TemplateHandler {
         no_hash_spelling: bool,
     ) -> Vec<Item> {
         match name {
+            // `{{=}}` — core `ParserFunctions::equals`, an `SFH_NO_HASH` hook.
+            // It answers a literal `=`, which is what assembles attributes such
+            // as `Template:Normal`'s `<span style{{=}}"…">`.
+            "=" => vec![Item::Str("=".to_string())],
             "if" => ParserFunctions::pf_if(params),
             "ifeq" => ParserFunctions::pf_ifeq(params),
             "switch" => ParserFunctions::pf_switch(params),

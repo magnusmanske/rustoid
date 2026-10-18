@@ -1981,8 +1981,16 @@ impl<'a> PegTokenizer<'a> {
 
         self.consume_spaces();
 
-        if self.starts_with("=") {
-            self.advance(1);
+        // See `parse_one_attribute`: core preprocessed `{{=}}` into `=`.
+        let sep_len = if self.starts_with("=") {
+            1
+        } else if self.starts_with("{{=}}") {
+            5
+        } else {
+            0
+        };
+        if sep_len > 0 {
+            self.advance(sep_len);
             let val = self
                 .parse_table_att_value(cell_arg)
                 .unwrap_or(KeyValue::Str(String::new()));
@@ -1992,7 +2000,7 @@ impl<'a> PegTokenizer<'a> {
                 src_offsets: Some(KVSourceRange {
                     key_start: name_start,
                     key_end: name_end,
-                    value_start: name_end + 1,
+                    value_start: name_end + sep_len,
                     value_end: self.pos,
                     source: None,
                 }),
@@ -2721,8 +2729,19 @@ impl<'a> PegTokenizer<'a> {
 
         self.consume_spaces();
 
-        if self.starts_with("=") {
-            self.advance(1);
+        // Core's preprocessor expands `{{=}}` before Parsoid tokenizes, so
+        // `style{{=}}"…"` arrives as `style="…"`. Recognize the magic word as
+        // the attribute separator here, where the tokenizer still sees the
+        // template body's raw source.
+        let sep_len = if self.starts_with("=") {
+            1
+        } else if self.starts_with("{{=}}") {
+            5
+        } else {
+            0
+        };
+        if sep_len > 0 {
+            self.advance(sep_len);
             self.consume_spaces();
             let (val, val_src) = self.parse_attr_value();
             let val_end = self.pos;
@@ -2741,7 +2760,7 @@ impl<'a> PegTokenizer<'a> {
                 src_offsets: Some(KVSourceRange {
                     key_start: name_start,
                     key_end: name_end,
-                    value_start: name_end + 1,
+                    value_start: name_end + sep_len,
                     value_end: val_end,
                     source: None,
                 }),
@@ -2799,6 +2818,12 @@ impl<'a> PegTokenizer<'a> {
         let mut buf = String::new();
 
         loop {
+            // `{{=}}` is the `=` separator once core has preprocessed the
+            // source; stop the name before it so `parse_one_attribute` can see
+            // it (see the call site).
+            if self.starts_with("{{=}}") {
+                break;
+            }
             // In table attribute-name position a `{{…}}` directive is a valid
             // (token-valued) name — PHP's `table_attribute_name_piece` includes
             // `directive` unconditionally. The *only* `{`-run that `inline_breaks`
@@ -7309,6 +7334,26 @@ mod tests {
                 Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template"
             ));
         }
+    }
+
+    #[test]
+    fn test_html_tag_equals_magic_word_separator() {
+        // Core's preprocessor expands `{{=}}` before Parsoid tokenizes, so
+        // `style{{=}}"…"` is an ordinary `style="…"` attribute. Recognizing
+        // it here (rather than as part of the name) is what keeps the quoted
+        // value intact — `Template:Normal`.
+        let tokens = tokenize("<span style{{=}}\"color:red\">y</span>");
+        let span = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::Tag(tk)) if tk.name == "span" => Some(tk),
+                _ => None,
+            })
+            .expect("expected <span> tag");
+        assert_eq!(span.attribs.len(), 1, "one attribute expected");
+        let kv = &span.attribs[0];
+        assert_eq!(kv.key.as_str(), Some("style"));
+        assert_eq!(kv.value.as_str(), Some("color:red"));
     }
 
     #[test]

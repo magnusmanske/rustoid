@@ -18048,3 +18048,24 @@ namespace. Both now share a `namespace_wins` flag.
 **Effect:** Periodic table's first difference moves from 2.26% to 2.49% (the
 navbar links are correct; the next difference is a Lua-generated cell). No
 corpus regressions; 4/48 strict.
+
+## `{{=}}` is expanded before the tag is tokenized
+
+Core's preprocessor expands `{{=}}` before Parsoid sees the wikitext, so
+`<span style{{=}}"font-weight:normal; font-style:normal">` reaches the tokenizer
+as an ordinary `style="…"` attribute. Rustoid tokenized the template body first,
+so the attribute-name parser consumed `style`, then the `{{=}}` directive, then
+the quoted value up to its first space — the value was truncated at the space
+and the rest became junk attributes.
+
+The `=` magic word also answered the empty string: it is resolved as a variable
+(not a parser function) here, and `variable_value` had no arm for it.
+
+`parse_attr_name_impl` now stops before `{{=}}`, and both `parse_one_attribute`
+and `parse_table_attribute` accept it as the `=` separator; `variable_value`
+answers `=` for the bare magic word. This is the corpus' behaviour (the
+`rest_v1` renderer uses the PHP preprocessor and carries no `mw:ExpandedAttrs`
+marker on the span).
+
+**Effect:** India's first difference moves from 2.40% to 6.19%. No corpus
+regressions; 4/48 strict.
