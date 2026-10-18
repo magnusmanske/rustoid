@@ -1569,8 +1569,13 @@ fn setup_uri_library(lua: &Lua, ctx: &Arc<LuaContext>) -> Result<()> {
             name,
             lua.create_function(move |lua, (page, query): (Value, Value)| {
                 let page = coerce_string(&page, name)?;
-                let title =
-                    luafn_title_new(lua, &ctx, Value::String(lua.create_string(&page)?), None)?;
+                let title = luafn_title_new(
+                    lua,
+                    &ctx,
+                    Value::String(lua.create_string(&page)?),
+                    None,
+                    false,
+                )?;
                 let full_text: String = title.get("fullText").unwrap_or(page);
                 // A title's URL uses its DB key, so spaces become underscores
                 // (Scribunto's `Title::getPrefixedDBkey`).
@@ -2044,7 +2049,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     title.set(
         "new",
         lua.create_function(move |lua, (text, ns): (Value, Option<Value>)| {
-            luafn_title_new(lua, &ctx2, text, ns.as_ref())
+            luafn_title_new(lua, &ctx2, text, ns.as_ref(), false)
         })?,
     )?;
     // `mw.title.equals(a, b)` — whether two titles name the same page. Titles are
@@ -2091,6 +2096,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
                     &ctx_make,
                     Value::String(lua.create_string(text)?),
                     Some(&Value::Integer(ns as i64)),
+                    true,
                 )
             },
         )?,
@@ -2763,29 +2769,46 @@ fn luafn_title_new(
     ctx: &LuaContext,
     text: Value,
     namespace: Option<&Value>,
+    namespace_wins: bool,
 ) -> mlua::Result<Table> {
     let text = coerce_string(&text, "title.new")?;
+    // `Title::newFromText` strips a leading `:` ("no interwiki") before it
+    // parses a namespace prefix. `Module:Navbar` passes exactly that form,
+    // `':' .. getParent():getTitle()`, so treating the colon as the namespace
+    // separator left the real `Template:` prefix in the page text and produced
+    // `Template:Template:Periodic table`.
+    let text = text.trim();
+    let text = text.strip_prefix(':').unwrap_or(text);
     // Split `Ns:Title#frag` against the namespace snapshot. Full `TitleParser`
     // semantics (interwiki, language variants) are not observable here yet.
     let (prefix, rest) = match text.split_once(':') {
         Some((p, r)) => (ctx.site.namespace_id(p), r),
-        None => (None, text.as_str()),
+        None => (None, text),
     };
     let (rest, fragment) = match rest.split_once('#') {
         Some((t, f)) => (t, f.to_string()),
         None => (rest, String::new()),
     };
-    let ns_id = namespace
-        // Scribunto accepts a namespace *name* here as well as an id:
-        // `mw.title.new('Foo', 'Template')` is common in modules.
-        .and_then(|ns| match ns {
-            Value::Integer(i) => Some(*i as i32),
-            Value::Number(n) => Some(*n as i32),
-            Value::String(s) => s.to_str().ok().and_then(|s| ctx.site.namespace_id(&s)),
-            _ => None,
-        })
-        .or(prefix)
-        .unwrap_or(0);
+    let ns_id = {
+        let explicit = namespace
+            // Scribunto accepts a namespace *name* here as well as an id:
+            // `mw.title.new('Foo', 'Template')` is common in modules.
+            .and_then(|ns| match ns {
+                Value::Integer(i) => Some(*i as i32),
+                Value::Number(n) => Some(*n as i32),
+                Value::String(s) => s.to_str().ok().and_then(|s| ctx.site.namespace_id(&s)),
+                _ => None,
+            });
+        // `Title::newFromText` uses the default namespace only when the text
+        // has no recognised prefix; `Title::makeTitleSafe` applies its
+        // namespace unconditionally.
+        if namespace_wins {
+            explicit.or(prefix)
+        } else {
+            prefix.or(explicit)
+        }
+    }
+    .unwrap_or(0);
     let title_text = if ctx.site.namespace_is_capitalized(ns_id) {
         // `Title::newFromText` upper-cases the first letter for a first-letter
         // namespace, and `mw.title.new` reports the title as stored: `Template:
@@ -3797,6 +3820,7 @@ fn luafn_title_current(lua: &Lua, ctx: &LuaContext) -> mlua::Result<Table> {
         ctx,
         Value::String(lua.create_string(&ctx.current_title)?),
         None,
+        false,
     )
 }
 
@@ -7619,6 +7643,22 @@ mod tests {
             .eval("return mw.title.new('Template:Foo').fullText")
             .unwrap();
         assert_eq!(result, "Template:Foo");
+        // A leading `:` is "no interwiki", stripped before the prefix is
+        // parsed. `Module:Navbar` builds its target as `':' .. parentTitle`.
+        assert_eq!(
+            engine
+                .eval("return mw.title.new(':Template:Foo', 'Template').fullText")
+                .unwrap(),
+            "Template:Foo"
+        );
+        // It also makes an explicit namespace argument parse the remaining
+        // prefix instead of repeating it.
+        assert_eq!(
+            engine
+                .eval("return mw.title.new(':Talk:Foo', 'Template').fullText")
+                .unwrap(),
+            "Talk:Foo"
+        );
     }
 
     /// `mw.title.makeTitle` always applies its namespace argument, where `new`

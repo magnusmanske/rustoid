@@ -18030,3 +18030,21 @@ fragment is stashed, falling back to the inline children for `<nowiki>`.
 
 **Effect:** Isaac Newton's first difference moves from 19.63% to 29.60%. No
 corpus regressions; 4/48 strict.
+
+## `mw.title.new` strips a leading colon, and the text's prefix wins
+
+`Module:Navbar` builds its target as `':' .. getParent():getTitle()`. The colon
+means "no interwiki" in `Title::newFromText`; it is stripped *before* the
+namespace prefix is parsed. Rustoid split `:Template:Periodic table` at the
+first colon, took the empty part as the namespace, and then prepended the
+explicit `Template` namespace to what was left — `Template:Template:Periodic
+table`, i.e. red links in every navbar.
+
+`new` also had its precedence backwards: `Title::newFromText` uses its default
+namespace only when the text has no recognised prefix, while
+`Title::makeTitleSafe` (behind `mw.title.makeTitle`) always applies its
+namespace. Both now share a `namespace_wins` flag.
+
+**Effect:** Periodic table's first difference moves from 2.26% to 2.49% (the
+navbar links are correct; the next difference is a Lua-generated cell). No
+corpus regressions; 4/48 strict.
