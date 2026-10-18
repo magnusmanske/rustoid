@@ -18012,3 +18012,21 @@ returning `;` is outside the branch re-tokenizer's `{|`/`|`/`!` trigger set.
 **Effect:** Isaac Newton's first difference moves from 14.85% to 19.63% (the
 paragraph after the Quote box now starts on its own line). No corpus
 regressions; 4/48 strict.
+
+## A DOM fragment's contents decide p-wrap optionality
+
+`PWrap::pWrapOptional` treats a `mw:DOMFragment` wrapper as optional only when
+the *fragment's* children are all optional (`WTUtils::getDOMFragmentContents`
+reads them from `data-parsoid.html`). Rustoid stores those contents in
+`Node::fragment` but the check looked at `Node::children`, which for the
+placeholder is empty — so every DOM fragment counted as optional.
+
+A wikilink is a formatting element, so PWrap splits it into runs of its
+children. With its text fragment silently "optional", the `<a>` itself became
+agnostic and was left *outside* the paragraph: `[[William Stukeley]] wrote …`
+rendered `<a>…</a><p> wrote …</p>` where the service has
+`<p><a>…</a> wrote …</p>`. The check now recurses into `Node::fragment` when a
+fragment is stashed, falling back to the inline children for `<nowiki>`.
+
+**Effect:** Isaac Newton's first difference moves from 19.63% to 29.60%. No
+corpus regressions; 4/48 strict.

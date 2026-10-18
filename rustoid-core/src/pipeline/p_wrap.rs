@@ -135,10 +135,18 @@ fn p_wrap_optional(node: &Node) -> bool {
     match &node.kind {
         NodeKind::Comment(_) => true,
         NodeKind::Text(s) => s.trim().is_empty(),
-        NodeKind::Element(kind) if is_nowiki_or_dom_fragment(node) => {
-            node.children.iter().all(p_wrap_optional)
+        NodeKind::Element(_) if is_nowiki_or_dom_fragment(node) => {
+            // A `mw:DOMFragment` wrapper keeps its contents in the stashed
+            // `fragment` (PHP's `data-parsoid.html`), not in `children`.
+            // `PWrap::pWrapOptional` tests the fragment's children, so a
+            // wikilink holding a text fragment is wrappable.
+            let children = node
+                .fragment
+                .as_deref()
+                .map_or(node.children.as_slice(), |f| f.children.as_slice());
+            children.iter().all(p_wrap_optional)
         }
-        NodeKind::Element(kind) if is_wrapper(node) => node.children.iter().all(p_wrap_optional),
+        NodeKind::Element(_) if is_wrapper(node) => node.children.iter().all(p_wrap_optional),
         NodeKind::Element(kind) => {
             let tag = element_tag(kind);
             METADATA_TAGS.contains(&tag.as_str())
