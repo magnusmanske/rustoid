@@ -2593,7 +2593,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     about_counter,
                     in_template,
-                    false,
+                    // A body reached through an argument value (`#tag:ref`) was
+                    // already expanded by the preprocessor, so a `{{…}}` left
+                    // in it is text, not a token Parsoid numbers. `body` is
+                    // what suppresses that id without changing how magic words
+                    // expand (`in_template` stays).
+                    in_template,
                     body,
                     0,
                 )
@@ -2998,7 +3003,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     source,
                     about_counter,
                     in_template,
-                    false,
+                    // See [`Self::process_fragment_body`]: an argument-value
+                    // body has already been preprocessed.
+                    in_template,
                     body,
                     0,
                 )
@@ -5834,8 +5841,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         //
         // A variable or parser function takes its own id inside
         // `TemplateHandler::process`, which is a separate path.
+        //
+        // The suppression is `arg_value || body`, not `in_tpl || body`: PHP
+        // constructs a `TemplateEncapsulator` (which allocates the id in its
+        // constructor) for every `template` token Parsoid processes, whatever
+        // `wrapTemplates` says, while core *pre-expanded* content is never seen
+        // by Parsoid at all. A module's output is the former: it is re-parsed at
+        // the caller's level, so a `{{…}}` that survives there spends an id even
+        // though nothing is wrapped. `arg_value` is the former too — the value
+        // is flattened to text for a module or a parser function and never
+        // reaches Parsoid as tokens.
         let take_id = || {
-            if in_tpl || body {
+            if arg_value || body {
                 String::new()
             } else {
                 self.new_about_id(about_counter, "template")
@@ -6204,6 +6221,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // `{{ {{T}} }}` → `Main Page|Something else`, whose `|`
                 // makes it an illegal title). Bail back to literal
                 // `{{` … `}}` around the re-tokenized source.
+                //
+                // Parsoid's `TemplateEncapsulator` allocates its `about` id in
+                // the constructor, *before* the target is resolved, so an
+                // un-resolvable target still spends one; the id is never
+                // attached to an element and shows only as a gap in the
+                // sequence. `Module:Citation/CS1` writes its maintenance
+                // message as `{{[[Template:Cite web|cite web]]}}`, which is
+                // exactly this case (see `t5` in the reduction notes): without
+                // the spend, every id after such a citation is one too low.
+                let _ = take_id();
                 let bailed = TemplateHandler::convert_to_string(tok, in_tpl, *table_depth > 0);
                 // PHP's `convertToString` runs the bailed chunk through
                 // `wikitext-to-expanded-tokens`, so a nested template in
@@ -7332,13 +7359,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `frame:extensionTag` — and that stylesheet's `about` id belongs to the
         // page's sequence. A fresh counter started it at 1, so the `<style>`
         // reused the id the enclosing `#invoke` wrapper had just been given.
+        //
+        // The output is *expanded output*, not a template body: the core
+        // preprocessor expands the template (and its `#invoke`) before Parsoid
+        // ever sees it, and Parsoid then tokenizes the resulting wikitext. A
+        // `{{…}}` that survives in it — `Module:Citation/CS1` writes its
+        // maintenance message as `{{[[Template:Cite web|cite web]]}}` — is
+        // therefore a token Parsoid processes, so it spends an `about` id even
+        // when the target does not resolve (`take_id` keys off `body`, not the
+        // wrapping flag). Nothing in the chunk is *wrapped*, though: Parsoid
+        // runs the expansion with `expandTemplates => false` / `inTemplate =>
+        // true`, and a `{{{…}}}` it contains is pre-processed text, not a new
+        // `mw:Param` range. Wrapping them put bogus `templatearg` parts into the
+        // enclosing transclusion's compound `data-mw` (`Template:Infobox`'s
+        // documentation).
         let mut expanded = Box::pin(self.expand_templates(
             &child,
             items,
             source,
             about_counter,
-            body,
-            false,
+            /* in_template */ true,
+            /* body */ false,
             /* src_text */ "",
             0,
         ))
@@ -7592,11 +7633,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // `{{Further|…}}`'s body is returned verbatim by `Module:Unsubst`,
             // and its inner `#invoke:labelled list hatnote` reads the enclosing
             // template's arguments to learn which pages to name.
-            let substituted = if has_arg_ref {
+            let mut substituted = if has_arg_ref {
                 frame.expand(items)
             } else {
                 items.clone()
             };
+            // The value is flattened to the string the module receives, so the
+            // templates in it are expanded by the preprocessor and never reach
+            // Parsoid as tokens; mark them so `expand_template_token` does not
+            // spend `about` ids for them.
+            mark_arg_value_tokens(&mut substituted);
             // The text this argument keeps to when the expansion below cannot be
             // rendered exactly (see [`argument_value_or_source`]). It has to be
             // taken from the tokens *now*, before they are expanded: the recorded
@@ -7952,13 +7998,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { .. }
         ) || is_deferred_extension_tag(&request);
         let _answer_gate = defer.then(|| self.begin_style_defer());
+        // The answer is the preprocessor's expansion (a string the module
+        // returns), so any `{{…}}` left in it was already expanded by core or
+        // did not resolve. `body` marks it as content Parsoid does not see as
+        // tokens, which suppresses the `about` id a template token would
+        // otherwise spend here: the two `{{…}}`s `Module:Infobox` feeds through
+        // `frame:expandTemplate` were two ids ahead of the service (`France`'s
+        // first infobox stylesheet), and the attribute pass below spent five
+        // more on `Zebra`.
         let expanded = Box::pin(self.expand_templates(
             &child,
             items,
             Some(source),
             about_counter,
             /* in_template */ true,
-            /* body */ false,
+            /* body */ true,
             &text,
             0,
         ))
@@ -7977,7 +8031,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(source),
             about_counter,
             /* in_template */ true,
-            /* body */ false,
+            /* body */ true,
             &text,
         ))
         .await;
@@ -10723,6 +10777,35 @@ mod tests {
             html.contains(r##"<pre typeof="mw:Extension/pre" about="#mwt2""##),
             "the pre must carry the id TT2 spent: {html}"
         );
+    }
+
+    /// An unresolvable template target still spends an `about` id.
+    ///
+    /// PHP's `TemplateHandler::onTemplate` constructs the `TemplateEncapsulator`
+    /// (whose constructor calls `Env::newAboutId`) *before* the target is
+    /// resolved, so `{{[[Foo|bar]]}}` — which only renders back as literal text —
+    /// leaves a gap in the sequence. `Module:Citation/CS1` writes its maintenance
+    /// message in exactly that shape, so missing the spend put every later
+    /// transclusion one id low (`France`'s Buchenwald note).
+    #[tokio::test]
+    async fn an_unresolvable_template_target_still_spends_an_about_id() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template("Template:Real", "real");
+        let config = crate::mock::MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "a{{[[Foo|bar]]}}b{{Real}}c",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        // The target renders back as literal `{{` + link + `}}` …
+        assert!(html.contains("{{"), "got: {html}");
+        // … but the spent id moves the following transclusion to #mwt2.
+        assert!(html.contains(r##"about="#mwt2""##), "got: {html}");
+        assert!(!html.contains(r##"about="#mwt1""##), "got: {html}");
     }
 
     /// `tag_content_source` must rebuild a link from its expanded fields (the

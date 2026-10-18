@@ -17870,6 +17870,43 @@ serializing; `tag_body_source` deliberately does not, because a body is
 re-parsed and its placeholder must stay alive under a strip marker.
 
 **Effect:** Canada's only remaining difference is the marker's *id* — rustoid's
-fragment sequence says `1373`, Parsoid's says `729`. The id is Parsoid's opaque
-strip-state index (`StripState::addParsoidOpaque`), not a fragment counter, and
-needs the opaque-strip bookkeeping to reproduce; that is the next step.
+fragment sequence says `1373`, Parsoid's says `729`. The id comes from the
+static counter in `PipelineUtils::pFragmentToParsoidFragmentMarkers`, which is
+incremented once per non-string piece of every `PFragment` fed through
+`preparePFragment` during the parse. It is therefore not a fragment-id counter
+and cannot be derived from rustoid's `ext_next_id`; reproducing it needs the
+core preprocessor's PFragment bookkeeping (which expansions produce mixed
+pieces, and how many), not just the fragment map. That is the next step.
+
+## Template ids: an unresolvable target still spends one
+
+PHP constructs `TemplateEncapsulator` in `TemplateHandler::onTemplate` *before*
+`resolveTemplateTarget`, and the constructor allocates the `about` id. An
+unresolvable target — `{{[[Foo|bar]]}}`, which renders back as literal
+`{{link}}` — therefore leaves a gap in the sequence. `Module:Citation/CS1`
+writes its maintenance message in exactly that shape, so France's Buchenwald
+note was one id behind from ref 82 on. The `None` arm of
+`Parser::expand_template_token` now spends the id too
+(`an_unresolvable_template_target_still_spends_an_about_id`).
+
+## Module output: tokens spend ids, but nothing is wrapped
+
+Parsoid tokenizes a module's returned wikitext at the caller's pipeline with
+`expandTemplates => false` / `inTemplate => true`. Two consequences diverge from
+a naive reading:
+
+- A `{{…}}` that survives there is still a token `TemplateHandler` sees, so it
+  spends an `about` id even though nothing is wrapped. `take_id` now keys off
+  `body` / argument-value context, not the wrapping flag.
+- A `{{{…}}}` in that output is pre-processed text, not a new `mw:Param` range,
+  and text that reaches rustoid through `frame:preprocess`/`frame:expandTemplate`
+  or a `#tag` body was already expanded by the preprocessor. Those paths are
+  now marked as pre-expanded (`body`), so they neither wrap nor spend ids.
+  Without that, `Template:Infobox`'s documentation put forty bogus
+  `templatearg` parts into the enclosing transclusion's compound `data-mw`, and
+  `Megadeth`/`Zebra` spent five extra ids inside note bodies.
+
+**Effect:** France's first difference moves from 11.34% to 16.02%, Israel
+3.06% → 4.19%, Nobel Prize 13.04% → 34.85%, Tropical cyclone 5.75% → 6.33%.
+The four strict matches and the two nondeterministic-only pages are unchanged,
+and no page regresses (48-page corpus, lib tests 1058, clippy clean).
