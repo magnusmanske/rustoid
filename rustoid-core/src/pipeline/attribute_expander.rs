@@ -742,7 +742,13 @@ pub fn build_expanded_attrs(
         && (!branch_text || saw_dom_fragment)
         && (!synthesized || saw_dom_fragment)
     {
-        let about_id = new_about_id(about_counter, "expanded-attrs");
+        // An id reserved by the expansion's own pipeline (see
+        // `Parser::expand_one_template`) is spent there, in the right position;
+        // the wrapper overwrites it here. Otherwise take one now.
+        let about_id = token
+            .data_parsoid_mut()
+            .and_then(|dp| dp.tmp.pending_expanded_attrs.take())
+            .unwrap_or_else(|| new_about_id(about_counter, "expanded-attrs"));
         token.set_attribute("about", &about_id);
         token.add_space_separated_attribute("typeof", "mw:ExpandedAttrs");
 

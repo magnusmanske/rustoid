@@ -782,6 +782,13 @@ pub struct TempData {
     /// ParagraphWrapper and is dropped before tree building, because Parsoid's
     /// equivalent newline never reaches the output.
     pub synthetic_sol_newline: bool,
+    /// The `about` id Parsoid's `AttributeExpander` spent for this token while
+    /// expanding an attribute inside a template's own pipeline. The transclusion
+    /// wrapper overwrites the attribute, but the id stays spent and belongs in
+    /// the sequence where the expansion happened, not where rustoid's late
+    /// page-level attribute pass runs. Set by `Parser::expand_one_template`, read
+    /// by [`crate::pipeline::attribute_expander::build_expanded_attrs`].
+    pub pending_expanded_attrs: Option<String>,
     /// The content tokens of a `#tag` call whose target is a registered extension
     /// tag. `ParserFunctions::pf_tag` has to hand the extension a *wikitext* body
     /// (`source`), but that serialization drops any token with no wikitext form —

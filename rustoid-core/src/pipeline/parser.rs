@@ -6183,6 +6183,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         about_counter,
                         in_tpl,
                         wrap,
+                        // The expansion's own pipeline only exists when Parsoid
+                        // (not core) processes this token; a body's nesting is
+                        // already part of the caller's expansion.
+                        body,
                         target_has_comment,
                         src_text,
                         *table_depth > 0,
@@ -6870,6 +6874,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // tokens are spliced into the caller's expansion and the caller carries
         // the wrapper.
         wrap: bool,
+        // Whether this call sits in a *template body* expanded by core. Such a
+        // body has no pipeline of its own on the Parsoid side.
+        body: bool,
         target_has_comment: bool,
         page_source: &str,
         // Whether the *call site* was inside an open table (PHP's
@@ -7137,6 +7144,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // A body's tags are not the page's: `expand_attributes` must not mark
         // their attributes `mw:ExpandedAttrs`. See [`mark_synthesized`].
         mark_synthesized(&mut expanded);
+
+        // Parsoid runs the attribute expander inside the expansion's *own*
+        // pipeline (`processTemplateSource`) and then overwrites the `about` it
+        // set with the transclusion wrapper's. The id it spent stays in the
+        // sequence, though, *before* the outer chunk's next expansion
+        // (`France`'s Art paragraph: `Template:Abbreviation`'s
+        // `title="{{#tag:nowiki|…}}"`, ref 319). rustoid's page-level pass runs
+        // after the whole chunk, so reserve the ids here and let that pass
+        // consume them. Only an expansion Parsoid actually processes has such a
+        // pipeline: a nested template was expanded by core, and its output is
+        // part of this expansion.
+        if !body {
+            for item in expanded.iter_mut() {
+                let Item::Tok(tok) = item else { continue };
+                if tok.get_attribute_v("about").is_some()
+                    || !has_expandable_dom_fragment(tok, self.config)
+                {
+                    continue;
+                }
+                let id = self.new_about_id(about_counter, "expanded-attrs");
+                if let Some(dp) = tok.data_parsoid_mut() {
+                    dp.tmp.pending_expanded_attrs = Some(id);
+                }
+            }
+        }
 
         if !wrap || target_has_comment {
             // Nested/extension-content context, or a comment in the template
@@ -8357,6 +8389,67 @@ fn strip_link_content_comments(items: &mut [Item]) {
 /// only — Parsoid's `AttributeExpander` runs per chunk and a body's `inTemplate`
 /// suppresses it — so the fact is carried on the token. See
 /// [`crate::wikitext::tokens_v2::TempData::synthesized`].
+/// Whether one of the token's attribute values carries a piece Parsoid's
+/// `AttributeExpander` expands in the expansion's own pipeline — a
+/// `mw:DOMFragment` placeholder or an extension token (`#tag:nowiki`).
+///
+/// Those are the attributes rustoid's page-level pass marks even on a
+/// synthesized (template-output) token, so they are also the ones whose `about`
+/// id Parsoid spends before the wrapper exists.
+fn has_expandable_dom_fragment(tok: &ParsoidToken, config: &dyn SiteConfig) -> bool {
+    tok.get_attribs().iter().any(|kv| {
+        // `mw:maybeContent` is a wikilink/media link's *content*, not an HTML
+        // attribute; the DOM fragment inside it is the link text, not an
+        // expanded attribute (`ISO 3166-1 alpha-2`'s `{{mono}}` in a link).
+        if kv
+            .key
+            .as_str()
+            .is_some_and(|k| k.starts_with("mw:") || k == "data-mw" || k == "data-parsoid")
+        {
+            return false;
+        }
+        let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value else {
+            return false;
+        };
+        items.iter().any(|item| match item {
+            Item::Tok(t) => {
+                t.get_name() == "extension"
+                    || t.get_attribute_v("typeof")
+                        .is_some_and(|ty| ty.starts_with("mw:DOMFragment"))
+                    || is_extension_tag_call(t, config)
+            }
+            Item::Str(_) => false,
+        })
+    })
+}
+
+/// Whether a template token in an attribute value is a `{{#tag:<extension>|…}}`
+/// call.
+///
+/// Such a call is nowiki-protected (or otherwise tunnelled through a strip
+/// marker) by the core preprocessor, so it survives into Parsoid's token stream
+/// and `AttributeExpander` expands it into a DOM fragment. A plain
+/// `title={{Foo}}` is expanded to text by core and does *not* leave a token, so
+/// it must not spend an id here.
+fn is_extension_tag_call(tok: &ParsoidToken, config: &dyn SiteConfig) -> bool {
+    if tok.get_name() != "template" {
+        return false;
+    }
+    let src = tok
+        .data_parsoid()
+        .and_then(|d| d.src.as_deref())
+        .unwrap_or("")
+        .trim_start();
+    let Some(rest) = src.strip_prefix("{{#tag:") else {
+        return false;
+    };
+    let target = rest.split(['|', '}']).next().unwrap_or("").trim();
+    config
+        .extension_tags()
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(target))
+}
+
 fn mark_synthesized(items: &mut [Item]) {
     for item in items.iter_mut() {
         if let Item::Tok(tok) = item
@@ -10806,6 +10899,35 @@ mod tests {
         // … but the spent id moves the following transclusion to #mwt2.
         assert!(html.contains(r##"about="#mwt2""##), "got: {html}");
         assert!(!html.contains(r##"about="#mwt1""##), "got: {html}");
+    }
+
+    /// An attribute that Parsoid's `AttributeExpander` expands inside a
+    /// template's own pipeline spends its `about` id there, before the outer
+    /// chunk continues — even though the transclusion wrapper overwrites it.
+    /// rustoid reserves that id in `expand_one_template` so the page-level
+    /// attribute pass keeps the position (`France`, ref 319).
+    #[tokio::test]
+    async fn an_attribute_expanded_in_a_template_body_spends_its_id_early() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template(
+            "Template:Abbr",
+            r#"<abbr title="{{#tag:nowiki|x}}">y</abbr>"#,
+        );
+        source.add_template("Template:After", "z");
+        let config = crate::mock::MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{Abbr}} {{After}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        // `Abbr` is #mwt1; its expanded `title` spends #mwt2 (and is then
+        // overwritten by the wrapper), so `After` is #mwt3.
+        assert!(html.contains(r##"about="#mwt1""##), "got: {html}");
+        assert!(html.contains(r##"about="#mwt3""##), "got: {html}");
     }
 
     /// `tag_content_source` must rebuild a link from its expanded fields (the

@@ -17933,3 +17933,25 @@ token leaves the position mid-line (`caption_chunks_after_a_link_do_not_start_a_
 
 **Effect:** France's first difference moves from 16.02% to 28.81%, with no
 other page changing on the 48-page corpus.
+
+## An attribute expanded in a template spends its id in that pipeline
+
+Parsoid's `processTemplateSource` runs the chunk's `TemplateHandler` and then
+its `AttributeExpander` *inside the expansion's own pipeline*, before the
+transclusion wrapper is applied. An attribute it expands —
+`Template:Abbreviation`'s `title="{{#tag:nowiki|…}}"`, reached through
+`{{lit}}` — gets an `about` id that the wrapper then overwrites, but the id is
+still spent and belongs *before* the outer chunk's next expansion. rustoid's
+page-level attribute pass runs after the whole chunk, so the id landed at the
+wrong end (France's Art paragraph, ref 319: the note's templates were one id
+low).
+
+`Parser::expand_one_template` now reserves such ids for the page pass to
+consume (`TempData::pending_expanded_attrs`), for expansions Parsoid actually
+processes (`!body`) and for real HTML attributes carrying a DOM fragment, an
+extension token, or a `{{#tag:<extension>|…}}` call. `mw:maybeContent` is a
+link's content, not an attribute, and is excluded.
+
+**Effect:** France's first difference moves from 28.81% to 36.09%, with no
+other page changing on the 48-page corpus (the four strict matches are
+preserved).
