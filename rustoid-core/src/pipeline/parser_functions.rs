@@ -1102,9 +1102,12 @@ impl ParserFunctions {
     /// when it round-trips through `R`.
     pub fn pf_formatnum(params: &Params) -> Vec<Item> {
         let args = &params.args;
+        // `Parser::callParserFunction` trims every plain-text argument; without
+        // it `{{formatnum: 190 }}` grouped the leading space as if it were a
+        // digit (` ,190`).
         let number = args
             .first()
-            .map(|kv| key_value_to_string(&kv.key))
+            .map(|kv| key_value_to_string(&kv.key).trim().to_string())
             .unwrap_or_default();
         // A modifier is a positional `|` argument; the tokenizer stores those in
         // the value side of the `KV`.
@@ -1113,9 +1116,9 @@ impl ParserFunctions {
                 .map(|kv| {
                     let value = value_to_string(&kv.value);
                     if value.is_empty() {
-                        key_value_to_string(&kv.key)
+                        key_value_to_string(&kv.key).trim().to_string()
                     } else {
-                        value
+                        value.trim().to_string()
                     }
                 })
                 .unwrap_or_default()
@@ -2790,6 +2793,8 @@ mod tests {
             ("1234.500", "1,234.500"),
             ("-0", "\u{2212}0"),
             ("abc123def", "abc123def"),
+            // Parser-function arguments are trimmed before the handler runs.
+            ("  190  ", "190"),
             ("", ""),
         ];
         for (input, expected) in cases {

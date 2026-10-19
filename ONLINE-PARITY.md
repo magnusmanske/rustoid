@@ -18270,3 +18270,13 @@ substitutes it before the lookup.
 **Effect:** after filling the newly-requested file metadata, World War II's
 first difference moves from 1.47% to 5.15% and Titanic's from 1.16% to 1.48%.
 No corpus regressions; 4/48 strict.
+
+## Parser-function arguments are trimmed
+
+`Parser::callParserFunction` trims every plain-text argument before the hook
+runs. Rustoid handed `formatnum` its raw argument, so
+`{{formatnum: 190 }}` grouped the leading space as if it were a digit and
+rendered ` ,190`. `{{Inflation|…|fmt=c}}` reaches this shape through a nested
+`{{formatnum: <result> |}}`, producing `£ ,   ,190` on Titanic's infobox where
+the service serves `£190`. `pf_formatnum` now trims the number and its
+modifiers, with a regression case in the English formatting table.
