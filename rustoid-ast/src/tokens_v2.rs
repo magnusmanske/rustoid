@@ -262,10 +262,13 @@ pub struct DataParsoid {
     pub fostered: bool,
     /// Rendered attributes (shadow info): normalized attribute values keyed by
     /// name (mirrors PHP's `DataParsoid->a`).
-    pub a: Option<std::collections::HashMap<String, String>>,
+    /// Insertion order is significant: Parsoid serializes these maps in the
+    /// order the attributes were added, and nested `domToHtml` output (the
+    /// Kartographer group hash) exposes that order.
+    pub a: Option<serde_json::Map<String, serde_json::Value>>,
     /// Source attributes (shadow info): original wikitext attribute values keyed
     /// by name (mirrors PHP's `DataParsoid->sa`).
-    pub sa: Option<std::collections::HashMap<String, String>>,
+    pub sa: Option<serde_json::Map<String, serde_json::Value>>,
     /// DOM source range computed by `ComputeDSR` (mirrors PHP's
     /// `DataParsoid->dsr`). Carries nullable offsets and tag widths.
     pub dsr: Option<DomSourceRange>,
@@ -332,16 +335,18 @@ impl DataParsoid {
 
     /// Set a rendered (normalized) attribute in the `a` shadow map.
     pub fn set_a(&mut self, key: &str, value: &str) {
-        self.a
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(key.to_string(), value.to_string());
+        self.a.get_or_insert_with(serde_json::Map::new).insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 
     /// Set a source attribute in the `sa` shadow map.
     pub fn set_sa(&mut self, key: &str, value: &str) {
-        self.sa
-            .get_or_insert_with(std::collections::HashMap::new)
-            .insert(key.to_string(), value.to_string());
+        self.sa.get_or_insert_with(serde_json::Map::new).insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 
     /// Parse a `data-parsoid` JSON object back into a `DataParsoid`.
@@ -363,8 +368,11 @@ impl DataParsoid {
         let shadow = |k: &str| {
             obj.get(k).and_then(|v| v.as_object()).map(|m| {
                 m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect::<std::collections::HashMap<String, String>>()
+                    .filter_map(|(k, v)| {
+                        v.as_str()
+                            .map(|s| (k.clone(), serde_json::Value::String(s.to_string())))
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
             })
         };
         dp.a = shadow("a");
@@ -443,6 +451,20 @@ impl DataParsoid {
         }
         if let Some(stx) = &self.stx {
             obj.insert("stx".to_string(), serde_json::Value::String(stx.clone()));
+        }
+        if let Some(name) = &self.src_tag_name {
+            obj.insert(
+                "srcTagName".to_string(),
+                serde_json::Value::String(name.clone()),
+            );
+        }
+        // Set by `buildXMLTag` for `<tag />`; `noClose` for an unselfclosed
+        // void element such as `<br>`.
+        if self.self_close == Some(true) {
+            obj.insert("selfClose".to_string(), serde_json::Value::Bool(true));
+        }
+        if self.no_close {
+            obj.insert("noClose".to_string(), serde_json::Value::Bool(true));
         }
         if let Some(colon) = &self.colon {
             obj.insert(

@@ -6455,7 +6455,10 @@ fn args_from_table(t: &Table) -> mlua::Result<Vec<Arg>> {
             Value::String(s) => s.to_str()?.to_string(),
             Value::Integer(i) => i.to_string(),
             Value::Number(n) => n.to_string(),
-            Value::Boolean(b) => b.to_string(),
+            // Scribunto hands the value to PHP, where `(string)true` is `"1"`
+            // and `(string)false` is `""`. `frame:extensionTag` relies on it:
+            // `frameless = true` must become the attribute `frameless="1"`.
+            Value::Boolean(b) => if b { "1" } else { "" }.to_string(),
             Value::Nil => continue,
             other => other.type_name().to_string(),
         };
@@ -10081,5 +10084,19 @@ mod tests {
         assert_eq!(engine.execute(src, "nil_value", &[]).unwrap(), "");
         assert_eq!(engine.execute(src, "nothing", &[]).unwrap(), "");
         assert_eq!(engine.execute(src, "mixed", &[]).unwrap(), "a");
+    }
+
+    /// A Lua boolean handed to the host becomes a PHP value; PHP string
+    /// conversion turns `true` into `"1"` and `false` into `""`. Modules rely
+    /// on this when they lower `frame:extensionTag{ frameless = true }`.
+    #[test]
+    fn lua_booleans_become_php_strings_in_frame_args() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("yes", true).unwrap();
+        table.set("no", false).unwrap();
+        let args = args_from_table(&table).unwrap();
+        assert!(args.contains(&Arg::Named("yes".into(), "1".into())));
+        assert!(args.contains(&Arg::Named("no".into(), String::new())));
     }
 }

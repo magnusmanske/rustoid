@@ -779,7 +779,7 @@ fn serialize_attributes(
         keys.sort();
         for key in keys {
             if node.get_attr(key).is_none() {
-                if let Some(sv) = sa.get(key)
+                if let Some(sv) = sa.get(key).and_then(|v| v.as_str())
                     && !sv.is_empty()
                 {
                     out.push(format!("{key}=\"{}\"", sv.replace('"', "&quot;")));
@@ -1051,10 +1051,16 @@ mod tests {
         // `dataParsoid->a`/`sa` is restored from its source value.
         let mut div = Node::element(ElementKind::Div);
         div.set_attr("style", "color:red");
-        let mut a = std::collections::HashMap::new();
-        a.insert("align".to_string(), "left".to_string());
-        let mut sa = std::collections::HashMap::new();
-        sa.insert("align".to_string(), "left".to_string());
+        let mut a = serde_json::Map::new();
+        a.insert(
+            "align".to_string(),
+            serde_json::Value::String("left".to_string()),
+        );
+        let mut sa = serde_json::Map::new();
+        sa.insert(
+            "align".to_string(),
+            serde_json::Value::String("left".to_string()),
+        );
         div.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
             a: Some(a),
             sa: Some(sa),

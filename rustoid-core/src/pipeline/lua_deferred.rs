@@ -250,7 +250,10 @@ fn stringify(value: &Value) -> mlua::Result<String> {
         Value::String(s) => Ok(s.to_str()?.to_string()),
         Value::Integer(i) => Ok(i.to_string()),
         Value::Number(n) => Ok(crate::lua::engine::format_number(*n)),
-        Value::Boolean(b) => Ok(b.to_string()),
+        // Scribunto hands the table to PHP, where `(string)true` is `"1"` and
+        // `(string)false` is `""`. `frame:extensionTag` relies on this: a
+        // boolean attribute such as `frameless` becomes `frameless="1"`.
+        Value::Boolean(b) => Ok(if *b { "1" } else { "" }.to_string()),
         other => Ok(other.to_string()?),
     }
 }
@@ -1152,6 +1155,20 @@ mod tests {
         // `frame:extensionTag` lowers to `#tag`; the hash must survive.
         assert_eq!(text("#tag").as_deref(), Some("{{#tag:X}}"));
         assert_eq!(text("if").as_deref(), Some("{{#if:X}}"));
+    }
+
+    /// Scribunto passes Lua values to PHP, where `(string)true` is `"1"` and
+    /// `(string)false` is `""`. `Module:Mapframe` relies on this for boolean
+    /// tag attributes such as `frameless`.
+    #[test]
+    fn boolean_argument_values_use_php_string_conversion() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("yes", true).unwrap();
+        table.set("no", false).unwrap();
+        let args = args_from_table(&table).unwrap();
+        assert!(args.contains(&FrameArg::named("yes", "1")));
+        assert!(args.contains(&FrameArg::named("no", "")));
     }
 
     /// A `frame:expandTemplate` argument value is *opaque*: MediaWiki converts it

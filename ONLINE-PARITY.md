@@ -18280,3 +18280,60 @@ rendered ` ,190`. `{{Inflation|…|fmt=c}}` reaches this shape through a nested
 `{{formatnum: <result> |}}`, producing `£ ,   ,190` on Titanic's infobox where
 the service serves `£190`. `pf_formatnum` now trims the number and its
 modifiers, with a regression case in the English formatting table.
+
+## Kartographer `<maplink>`
+
+`ParsoidMapLink::sourceToDom` was unported, so `Module:OSM Location map`'s
+`<maplink>` escaped as a bare `<extension>` after the mapframe. The rendered
+`<a>` is easy; its **group id** is not: `"_" + sha1(FormatJson::encode(
+$geometries))` is taken over the GeoJSON *after* `SimpleStyleParser` has parsed
+`properties.title`/`description` as inline wikitext and after
+`updateMarkerSymbolCounters` has rewritten `-number…` markers. The hash input
+therefore contains Parsoid `domToHtml` output, including `data-parsoid`, and a
+single byte difference in that HTML changes the id.
+
+Rustoid now ports `ParsoidMapLink`, `MapLinkAttributeGenerator`,
+`CoordFormatter` and the counter pass, and parses each property string with the
+same inline sub-pipeline (`wikitextToDOM`: inline context, `clearDSROffsets`).
+Matching the nested serialization required four generic fixes, all verified
+against the live `wgKartographerLiveData` value:
+
+- `data-parsoid` uses `smartQuote` like every other attribute: the empty `{}`
+  slot is double-quoted, non-empty JSON single-quoted.
+- A canonical literal tag carries no `src` in `data-parsoid`; it is `srcTagName`
+  only when the spelling's case differs, and void elements get `noClose`.
+- `Env::prepareDoc` sets `serializeNewEmptyDp`, so every element created during
+  parsing gets `data-parsoid="{}"` even when it has no data (the media
+  description anchor).
+- A media container keeps the link token's `tsr`; an `<img>`'s shadow map is
+  ordered `resource`, `height`, `width`; `a`/`sa` are recorded only when the
+  normalized value differs from the source (`setShadowInfoIfModified`).
+
+**Effect:** 2024 Summer Olympics's first difference moves from 8.80% to 51.08%
+(the group id and every later byte up to the medal-standings table now match).
+No corpus regressions; 4/48 strict.
+
+## `#tag` attribute values keep HTML markup
+
+Scribunto lowers `frame:extensionTag` to `#tag`, and `Module:OSM Location map`
+passes `text=<div title="…">&nbsp;…</div>`. Parsoid keeps the value's tokens and
+stringifies them from their source, so the extension receives the markup.
+Rustoid used `tokens_to_string`, which drops plain HTML tags, and the `<maplink>`
+lost its label (`text=""`). Attribute values are now rendered with
+`tag_source_with_fragments`.
+
+Relatedly, a Lua boolean handed to a frame method becomes a PHP value, and
+`(string)true` is `"1"` / `(string)false` is `""`; both argument paths now use
+that conversion.
+
+## Rich attributes are ordered like Parsoid
+
+Parsoid's `dumpRichAttribs` lists the DOM's normal attributes first and appends
+the rich attributes in attachment order. `data-mw` therefore precedes a later
+`data-mw-i18n` (a red link inside a transclusion), while
+`data-mw-deduplicate` stays a normal attribute. The serializer now defers only
+`data-mw-i18n`/`data-mw-variant` until after `data-parsoid`/`data-mw`.
+`data-parsoid` itself is smart-quoted instead of forced single-quoted.
+
+**Effect:** removes the next difference after the maplink on 2024 Summer
+Olympics; no corpus regressions.

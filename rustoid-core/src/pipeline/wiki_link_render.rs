@@ -518,12 +518,16 @@ fn render_wiki_link_with_fragment(
         let prefixed = title.get_prefixed_text();
         a_tag.add_attribute_str("href", &href);
         a_tag.add_attribute_str("title", &prefixed);
-        a_tag.data_parsoid.set_sa("href", &target.href_src);
-        a_tag.data_parsoid.set_a("href", &href);
+        if href != target.href_src {
+            a_tag.data_parsoid.set_sa("href", &target.href_src);
+            a_tag.data_parsoid.set_a("href", &href);
+        }
     } else {
         a_tag.add_attribute_str("href", &target.href);
-        a_tag.data_parsoid.set_sa("href", &target.href_src);
-        a_tag.data_parsoid.set_a("href", &target.href);
+        if target.href != target.href_src {
+            a_tag.data_parsoid.set_sa("href", &target.href_src);
+            a_tag.data_parsoid.set_a("href", &target.href);
+        }
     }
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
@@ -575,8 +579,10 @@ pub fn render_interwiki_link(
             .unwrap_or(abs_href);
     }
     new_tk.add_attribute_str("href", &abs_href);
-    new_tk.data_parsoid.set_sa("href", &target.href_src);
-    new_tk.data_parsoid.set_a("href", &abs_href);
+    if abs_href != target.href_src {
+        new_tk.data_parsoid.set_sa("href", &target.href_src);
+        new_tk.data_parsoid.set_a("href", &abs_href);
+    }
 
     // Replace the rel attribute value with mw:WikiLink/Interwiki.
     if let Some(kv) = new_tk
@@ -634,8 +640,10 @@ pub fn render_language_link(
             .unwrap_or(abs_href);
     }
     new_tk.add_attribute_str("href", &abs_href);
-    new_tk.data_parsoid.set_sa("href", &target.href_src);
-    new_tk.data_parsoid.set_a("href", &abs_href);
+    if abs_href != target.href_src {
+        new_tk.data_parsoid.set_sa("href", &target.href_src);
+        new_tk.data_parsoid.set_a("href", &abs_href);
+    }
 
     // Change rel to mw:PageProp/Language.
     if let Some(kv) = new_tk
@@ -1482,7 +1490,14 @@ pub fn render_file(
     // `$dataParsoid` — the optList — to the container token). Insert the caption
     // entry at its recorded position (preceding captions become `bogus`).
     {
-        let mut dp = DataParsoid::default();
+        // The container inherits the link token's source range; Parsoid moves
+        // the token's `dataParsoid` onto it (`renderFile`), which keeps `tsr`
+        // while the `dsr` is filled in later. The nested `domToHtml` that
+        // Kartographer hashes titles over exposes it.
+        let mut dp = DataParsoid {
+            tsr: token.data_parsoid().and_then(|d| d.tsr.clone()),
+            ..DataParsoid::default()
+        };
         if caption.is_some() {
             if caption_pos > opt_list.len() {
                 caption_pos = opt_list.len();

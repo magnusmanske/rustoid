@@ -337,7 +337,14 @@ fn title_from_container(container: &Node, config: &dyn SiteConfig) -> Title {
 /// `Image:Foobar.jpg`), recovered from the span's `data-parsoid.sa.resource`.
 fn href_src_from_container(container: &Node) -> Option<String> {
     let span = node_at_path(container, &anchor_path(container)).and_then(first_element_child);
-    span.and_then(|s| s.dp.as_ref()?.sa.as_ref()?.get("resource").cloned())
+    span.and_then(|s| {
+        s.dp.as_ref()?
+            .sa
+            .as_ref()?
+            .get("resource")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    })
 }
 
 /// The `data-width` attribute on a container's broken span, if present.
@@ -717,9 +724,11 @@ fn apply_media_info(
     // `addNormalizedAttribute` calls on the `<img>` resource/width/height.
     {
         let dp = img.dp.get_or_insert_with(Default::default);
+        // PHP order: `copyOverAttribute(resource)` first, then
+        // `addNormalizedAttribute(height)`, then `width`.
         dp.set_a("resource", &canonical_resource);
-        dp.set_a("width", &width.to_string());
         dp.set_a("height", &height.to_string());
+        dp.set_a("width", &width.to_string());
         if let Some(href_src) = &job.href_src {
             dp.set_sa("resource", href_src);
         }

@@ -7,8 +7,9 @@
 //! SHA-1 of the normalized GeoJSON body. Nothing here needs the map tile
 //! service; only the URL is emitted.
 //!
-//! This module implements `<mapframe>`; `<maplink>` differs in its text/counter
-//! handling and is left for a page that needs it.
+//! Both tags are implemented. `<maplink>` shares the argument validator but
+//! renders a lone `<a>` (no figure/img), parses its `text` as inline wikitext,
+//! and gets its counter-substituted group id from the parser.
 
 use rustoid_ast::dom::node::{ElementKind, Node};
 use serde_json::Value;
@@ -46,6 +47,27 @@ pub struct MapFrameRequest<'a> {
 pub struct Rendered {
     pub node: Node,
     pub group_id: Option<String>,
+}
+
+/// Everything `<maplink>` needs. The parser has already normalized the body
+/// (ExternalData, parsed `title`/`description` wikitext, marker counters), since
+/// both the group hash and the fallback label depend on that result.
+pub struct MapLinkRequest<'a> {
+    /// Tag arguments in source order (the `data-mw.attrs` echo).
+    pub attrs: &'a [(String, String)],
+    /// Raw GeoJSON body, for `data-mw.body.extsrc`.
+    pub body: &'a str,
+    /// Normalized geometries, or `None` when the body is empty/invalid.
+    pub geometries: Option<&'a Value>,
+    /// Rendered wikitext content, already parsed by the caller.
+    pub text: Option<&'a Node>,
+    /// The label `getTextWithFallback` would return when `text` is absent (the
+    /// first marker symbol). Only affects the `error` class.
+    pub fallback_text: Option<&'a str>,
+    /// Page language code (`en`).
+    pub page_lang: &'a str,
+    /// The extension's encapsulation id (`#mwt12`).
+    pub about: &'a str,
 }
 
 /// Render one `<mapframe>` tag. Returns `None` when the arguments are invalid
@@ -95,6 +117,162 @@ pub fn render(req: &MapFrameRequest<'_>) -> Option<Rendered> {
     node.data_mw = Some(data_mw(req.attrs, req.body));
 
     Some(Rendered { node, group_id })
+}
+
+/// Render one `<maplink>` tag (port of `ParsoidMapLink::sourceToDom` plus
+/// `MapLinkAttributeGenerator`). Returns `None` when the arguments are invalid.
+pub fn render_maplink(req: &MapLinkRequest<'_>) -> Option<Rendered> {
+    let args = MapLinkArgs::parse(req.attrs)?;
+    let group_id = req
+        .geometries
+        .filter(|g| g.as_array().is_some_and(|a| !a.is_empty()))
+        .map(|g| format!("_{}", sha1_hex(compact_json(g).as_bytes())));
+
+    let mut class = vec!["mw-kartographer-maplink".to_string()];
+    if !args.css_class.is_empty() {
+        class.push(args.css_class.clone());
+    }
+    if !args.has_coordinates() && args.text.is_none() && req.fallback_text.is_none() {
+        class.push("error".to_string());
+    }
+
+    let mut a = Node::element(ElementKind::Other("a".to_string()));
+    a.set_attr("class", class.join(" "));
+    a.set_attr("data-mw-kartographer", "maplink");
+    a.set_attr("data-style", &args.map_style);
+    if let (Some(lat), Some(lon)) = (args.lat, args.lon) {
+        a.set_attr(
+            "href",
+            special_map_link(lat, lon, args.zoom, &args.language(req.page_lang)),
+        );
+    }
+    if let Some(zoom) = args.zoom {
+        a.set_attr("data-zoom", zoom.to_string());
+    }
+    if let (Some(lat), Some(lon)) = (args.lat, args.lon) {
+        a.set_attr("data-lat", format_float(lat));
+        a.set_attr("data-lon", format_float(lon));
+    }
+    if let Some(lang) = &args.specified_lang {
+        a.set_attr("data-lang", lang);
+    }
+    if let Some(group) = &group_id {
+        a.set_attr(
+            "data-overlays",
+            compact_json(&Value::Array(vec![Value::String(group.clone())])),
+        );
+    }
+    if let Some(text) = req.text {
+        for child in text.children.clone() {
+            a.push_child(child);
+        }
+    }
+    a.set_attr("typeof", "mw:Extension/maplink");
+    a.set_attr("about", req.about);
+    a.data_mw = Some(data_mw_named("maplink", req.attrs, req.body));
+
+    Some(Rendered { node: a, group_id })
+}
+
+/// `<maplink>`'s validated arguments (the shared subset of
+/// `MapTagArgumentValidator`).
+struct MapLinkArgs {
+    lat: Option<f64>,
+    lon: Option<f64>,
+    zoom: Option<i32>,
+    map_style: String,
+    text: Option<String>,
+    specified_lang: Option<String>,
+    css_class: String,
+}
+
+impl MapLinkArgs {
+    fn parse(pairs: &[(String, String)]) -> Option<Self> {
+        let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.trim());
+        // `getFloat`: the regexp admits an optional leading `-`, digits and one
+        // dot, and the value must stay within ±max (90 for latitude, 360 for
+        // longitude). An invalid value behaves as absent.
+        let float = |key: &str, max: f64| {
+            get(key)
+                .filter(|v| is_float_source(v))
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|f| f.is_finite() && f.abs() <= max)
+        };
+        let mut lat = float("latitude", 90.0);
+        let mut lon = float("longitude", 360.0);
+        if lat.is_some() != lon.is_some() {
+            lat = None;
+            lon = None;
+        }
+        let zoom = get("zoom")
+            .filter(|v| is_int_source(v))
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|z| z.abs() <= 100);
+        let map_style = match get("mapstyle") {
+            Some(s) if matches!(s, "osm-intl" | "osm") => s.to_string(),
+            _ => DEFAULT_MAP_STYLE.to_string(),
+        };
+        let specified_lang = get("lang")
+            .filter(|l| is_known_language_code(l))
+            .map(str::to_string);
+        Some(Self {
+            lat,
+            lon,
+            zoom,
+            map_style,
+            text: get("text").map(str::to_string),
+            specified_lang,
+            css_class: get("class")
+                .filter(|c| is_css_class(c))
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    fn has_coordinates(&self) -> bool {
+        self.lat.is_some() && self.lon.is_some()
+    }
+
+    fn language(&self, page_lang: &str) -> String {
+        self.specified_lang
+            .clone()
+            .unwrap_or_else(|| page_lang.to_string())
+    }
+}
+
+/// `Tag::getFloat`'s `^-?[0-9]*\.?[0-9]+$`.
+fn is_float_source(value: &str) -> bool {
+    let rest = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = match rest.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (rest, None),
+    };
+    if !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match fraction {
+        Some(f) => !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()),
+        None => !whole.is_empty(),
+    }
+}
+
+/// `Tag::getInt`'s `^-?[0-9]+$`.
+fn is_int_source(value: &str) -> bool {
+    let rest = value.strip_prefix('-').unwrap_or(value);
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `MapTagArgumentValidator`'s `class` pattern `/^([a-z][\w-]*)?$/i`.
+fn is_css_class(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// The tag's validated arguments (mirrors `MapTagArgumentValidator`).
@@ -357,10 +535,130 @@ fn build_image(req: &MapFrameRequest<'_>, args: &Args, group_id: Option<&str>, l
     img
 }
 
+/// The first `marker-symbol` that names a counter (`-number…`/`-letter…`),
+/// before any counter is applied. `SimpleStyleParser::findFirstMarkerSymbol`.
+pub fn find_first_marker_symbol(values: &Value) -> Option<String> {
+    let items = values.as_array()?;
+    for item in items {
+        let marker = item
+            .get("properties")
+            .and_then(|p| p.get("marker-symbol"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if marker.starts_with("-number") || marker.starts_with("-letter") {
+            return Some(marker.to_string());
+        }
+        for key in ["features", "geometries"] {
+            if let Some(found) = item.get(key).and_then(find_first_marker_symbol) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Apply `SimpleStyleParser::updateMarkerSymbolCounters` in place, returning the
+/// counter assigned to the *first* marker (what the DOM processor writes over a
+/// `<maplink>`'s label when the tag has no `text` attribute).
+pub fn update_marker_counters(values: &mut Value) -> Option<String> {
+    let mut counters: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut first = None;
+    walk_marker_counters(values, &mut counters, &mut first);
+    first
+}
+
+fn walk_marker_counters(
+    values: &mut Value,
+    counters: &mut std::collections::HashMap<String, u32>,
+    first: &mut Option<String>,
+) {
+    let Some(items) = values.as_array_mut() else {
+        return;
+    };
+    for item in items {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        let marker = object
+            .get("properties")
+            .and_then(|p| p.get("marker-symbol"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let is_number = marker.starts_with("-number");
+        let is_letter = marker.starts_with("-letter");
+        if is_number || is_letter {
+            let max = if is_number { 99 } else { 26 };
+            let count = counters.entry(marker.clone()).or_insert(0);
+            if *count < max {
+                *count += 1;
+            }
+            let value = if is_number {
+                count.to_string()
+            } else {
+                char::from(b'a' + (*count as u8 - 1)).to_string()
+            };
+            if first.is_none() {
+                *first = Some(value.clone());
+            }
+            if let Some(Value::Object(properties)) = object.get_mut("properties") {
+                properties.insert("marker-symbol".to_string(), Value::String(value));
+            }
+        }
+        for key in ["features", "geometries"] {
+            if let Some(child) = object.get_mut(key) {
+                walk_marker_counters(child, counters, first);
+            }
+        }
+    }
+}
+
+/// The coordinate label a `<maplink>` without `text` gets when it has no
+/// marker fallback. `CoordFormatter::formatParsoidSpan` through the tag's args.
+pub fn coordinate_span(attrs: &[(String, String)]) -> Option<Node> {
+    let args = MapLinkArgs::parse(attrs)?;
+    Some(coord_i18n_span(args.lat?, args.lon?))
+}
+
+/// `CoordFormatter::formatParsoidSpan`: an empty `mw:I18n` span whose message
+/// key names the two signs and whose params are degrees/minutes/seconds.
+pub fn coord_i18n_span(lat: f64, lon: f64) -> Node {
+    let (lat_sign, lat_parts) = split_coord(lat);
+    let (lon_sign, lon_parts) = split_coord(lon);
+    let params = lat_parts
+        .iter()
+        .chain(lon_parts.iter())
+        .map(|n| format!("{{\"num\":{n}}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key = format!("kartographer-coord-lat-{lat_sign}-lon-{lon_sign}");
+    let mut span = Node::element(ElementKind::Other("span".to_string()));
+    span.set_attr("typeof", "mw:I18n");
+    span.data_parsoid = Some("{}".to_string());
+    span.set_attr(
+        "data-mw-i18n",
+        format!(
+            "{{\"/\":{{\"lang\":\"x-page\",\"key\":{},\"params\":[{params}]}}}}",
+            json_string(&key)
+        ),
+    );
+    span
+}
+
+fn split_coord(coord: f64) -> (&'static str, [i64; 3]) {
+    let value = (coord * 3600.0).round();
+    let sign = if value < 0.0 { "neg" } else { "pos" };
+    let value = value.abs();
+    let degrees = (value / 3600.0).floor();
+    let minutes = ((value - degrees * 3600.0) / 60.0).floor();
+    let seconds = value - degrees * 3600.0 - minutes * 60.0;
+    (sign, [degrees as i64, minutes as i64, seconds as i64])
+}
+
 /// Parse and normalize the GeoJSON body the way `SimpleStyleParser` does for
 /// the hash: a non-list value becomes a one-element list, and `ExternalData`
 /// services are canonicalized into a `url`.
-fn parse_geometries(body: &str) -> Option<Value> {
+pub fn parse_geometries(body: &str) -> Option<Value> {
     if body.trim().is_empty() {
         return None;
     }
@@ -439,13 +737,18 @@ fn compact_json(value: &Value) -> String {
 }
 
 fn data_mw(attrs: &[(String, String)], body: &str) -> String {
+    data_mw_named("mapframe", attrs, body)
+}
+
+fn data_mw_named(name: &str, attrs: &[(String, String)], body: &str) -> String {
     let pairs = attrs
         .iter()
         .map(|(key, value)| format!("{}:{}", json_string(key), json_string(value)))
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"name\":\"mapframe\",\"attrs\":{{{pairs}}},\"body\":{{\"extsrc\":{}}}}}",
+        "{{\"name\":{},\"attrs\":{{{pairs}}},\"body\":{{\"extsrc\":{}}}}}",
+        json_string(name),
         json_string(body)
     )
 }

@@ -471,7 +471,7 @@ pub fn get_shadow_info(node: &Node, name: &str, cur_val: Option<&str>) -> Shadow
     }
 
     // `a[name] !== curVal` → the attribute changed.
-    let a_val = dp.map(|d| d.a.as_ref().unwrap().get(name).unwrap().as_str());
+    let a_val = dp.and_then(|d| d.a.as_ref().unwrap().get(name).and_then(|v| v.as_str()));
     if a_val != Some(cur_val) {
         return ShadowInfo {
             value: cur_val.to_string(),
@@ -495,7 +495,9 @@ pub fn get_shadow_info(node: &Node, name: &str, cur_val: Option<&str>) -> Shadow
     // Full shadow: use the source value.
     ShadowInfo {
         value: dp
-            .map(|d| d.sa.as_ref().unwrap().get(name).unwrap().clone())
+            .and_then(|d| d.sa.as_ref().unwrap().get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
             .unwrap_or_default(),
         modified: false,
         fromsrc: true,

@@ -307,7 +307,7 @@ impl TreeHandler for NodeTreeHandler {
         preposition: Preposition,
         reference: Option<usize>,
         element: &mut Element,
-        _void: bool,
+        void: bool,
         _source_start: usize,
         _source_length: usize,
     ) {
@@ -339,7 +339,14 @@ impl TreeHandler for NodeTreeHandler {
             self.children.push(Vec::new());
             self.parents.push(None);
             element.user_data = Some(idx);
-            self.uids.insert(element.uid, idx);
+            // Void elements are never pushed on the open-element stack, so
+            // Parsoid's `TreeMutationRelay::endTag` never sees them and never
+            // marks them `autoInsertedEnd`. Tracking them here made `<br>`
+            // carry `autoInsertedEnd` in data-parsoid, which a nested
+            // `domToHtml` (the Kartographer group hash) exposes.
+            if !void {
+                self.uids.insert(element.uid, idx);
+            }
             idx
         };
         self.place(preposition, reference, Child::Node(idx));

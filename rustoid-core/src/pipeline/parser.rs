@@ -348,8 +348,9 @@ fn imagemap_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosi
     }
 }
 
-/// If `item` is a `<mapframe>` extension token, return the self-closing token.
-fn mapframe_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+/// If `item` is a Kartographer extension token (`<mapframe>` or `<maplink>`),
+/// return the self-closing token.
+fn kartographer_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
     let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
         return None;
     };
@@ -361,11 +362,272 @@ fn mapframe_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosi
         .iter()
         .find(|a| a.key.as_str() == Some("name"))
         .and_then(|a| a.value.as_str());
-    if name == Some("mapframe") {
+    if matches!(name, Some("mapframe") | Some("maplink")) {
         Some(stt)
     } else {
         None
     }
+}
+
+/// The extension's tag name from a token that [`kartographer_target`] accepted.
+fn kartographer_tag(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> &str {
+    stt.attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str())
+        .unwrap_or_default()
+}
+
+/// A path into a GeoJSON value, for the two-pass `title`/`description` parse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GeojsonPath {
+    Key(String),
+    Index(usize),
+}
+
+/// Collect every non-empty `properties.title`/`properties.description` string,
+/// mirroring the traversal of `recursivelySanitizeAndParseWikitext` (keys
+/// starting with `_` are dropped and never visited).
+fn collect_geojson_properties(
+    value: &serde_json::Value,
+    path: &mut Vec<GeojsonPath>,
+    out: &mut Vec<(Vec<GeojsonPath>, String)>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(GeojsonPath::Index(index));
+                collect_geojson_properties(item, path, out);
+                path.pop();
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                if key.starts_with('_') {
+                    continue;
+                }
+                path.push(GeojsonPath::Key(key.clone()));
+                collect_geojson_properties(child, path, out);
+                path.pop();
+            }
+            let Some(serde_json::Value::Object(properties)) = object.get("properties") else {
+                return;
+            };
+            for prop in ["title", "description"] {
+                match properties.get(prop) {
+                    Some(serde_json::Value::String(text)) if !text.is_empty() => {
+                        path.push(GeojsonPath::Key("properties".to_string()));
+                        path.push(GeojsonPath::Key(prop.to_string()));
+                        out.push((path.clone(), text.clone()));
+                        path.pop();
+                        path.pop();
+                    }
+                    Some(serde_json::Value::Object(langs)) => {
+                        for (lang, text) in langs {
+                            let Some(text) = text.as_str() else { continue };
+                            if text.is_empty() {
+                                continue;
+                            }
+                            path.push(GeojsonPath::Key("properties".to_string()));
+                            path.push(GeojsonPath::Key(prop.to_string()));
+                            path.push(GeojsonPath::Key(lang.clone()));
+                            out.push((path.clone(), text.to_string()));
+                            path.pop();
+                            path.pop();
+                            path.pop();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply the parsed `title`/`description` HTML, dropping empty and non-string
+/// values (and `_`-prefixed keys) exactly as `parseWikitextProperties` does.
+fn apply_geojson_properties(
+    value: &mut serde_json::Value,
+    path: &mut Vec<GeojsonPath>,
+    rendered: &std::collections::HashMap<Vec<GeojsonPath>, String>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                path.push(GeojsonPath::Index(index));
+                apply_geojson_properties(item, path, rendered);
+                path.pop();
+            }
+        }
+        serde_json::Value::Object(object) => {
+            object.retain(|key, _| !key.starts_with('_'));
+            let keys: Vec<String> = object.keys().cloned().collect();
+            for key in keys {
+                path.push(GeojsonPath::Key(key.clone()));
+                if let Some(child) = object.get_mut(&key) {
+                    apply_geojson_properties(child, path, rendered);
+                }
+                path.pop();
+            }
+            let Some(serde_json::Value::Object(properties)) = object.get_mut("properties") else {
+                return;
+            };
+            for prop in ["title", "description"] {
+                path.push(GeojsonPath::Key("properties".to_string()));
+                path.push(GeojsonPath::Key(prop.to_string()));
+                match properties.get(prop).cloned() {
+                    Some(serde_json::Value::String(text)) => {
+                        if text.is_empty() {
+                            properties.remove(prop);
+                        } else if let Some(html) = rendered.get(path) {
+                            properties
+                                .insert(prop.to_string(), serde_json::Value::String(html.clone()));
+                        }
+                    }
+                    Some(serde_json::Value::Object(langs)) => {
+                        let mut kept = serde_json::Map::new();
+                        for (lang, text) in langs {
+                            path.push(GeojsonPath::Key(lang.clone()));
+                            if let Some(text) = text.as_str()
+                                && !text.is_empty()
+                            {
+                                let html = rendered
+                                    .get(path)
+                                    .cloned()
+                                    .unwrap_or_else(|| text.to_string());
+                                kept.insert(lang, serde_json::Value::String(html));
+                            }
+                            path.pop();
+                        }
+                        if kept.is_empty() {
+                            properties.remove(prop);
+                        } else {
+                            properties.insert(prop.to_string(), serde_json::Value::Object(kept));
+                        }
+                    }
+                    Some(_) => {
+                        properties.remove(prop);
+                    }
+                    None => {}
+                }
+                path.pop();
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parsoid does not store `data-parsoid.src` for a literal HTML tag: its
+/// source is rebuilt from the tag name and the attribute shadow data. Rustoid
+/// keeps the whole start-tag source (module stringification needs it), so the
+/// nested serialization used for the Kartographer group hash must drop it, and
+/// record only a non-lowercase spelling as `srcTagName` (as `buildXMLTag`
+/// does). Entity spans keep their `&…;` source.
+fn strip_literal_tag_src(node: &mut Node) {
+    if let Some(dp) = node.dp.as_mut()
+        && dp.stx.as_deref() == Some("html")
+        && let Some(src) = dp.src.take()
+    {
+        if let Some(rest) = src.strip_prefix('<') {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+                .unwrap_or(rest.len());
+            let written = &rest[..end];
+            let lower = written.to_ascii_lowercase();
+            if !written.is_empty() && written != lower {
+                dp.src_tag_name = Some(written.to_string());
+            }
+        } else {
+            dp.src = Some(src);
+        }
+        node.data_parsoid = dp.to_data_parsoid_json();
+    }
+    // `Env::prepareDoc` sets `serializeNewEmptyDp`, so Parsoid writes an empty
+    // `data-parsoid` for every element created during parsing (e.g. the `<a>`
+    // of a media description link). The nested serialization has to match.
+    if matches!(node.kind, crate::dom::node::NodeKind::Element(_)) {
+        if node.data_parsoid.is_none()
+            && let Some(dp) = node.dp.as_ref()
+        {
+            node.data_parsoid = dp.to_data_parsoid_json();
+        }
+        if node.data_parsoid.is_none() {
+            node.data_parsoid = Some("{}".to_string());
+        }
+    }
+    for child in &mut node.children {
+        strip_literal_tag_src(child);
+    }
+}
+
+/// `ctype_alnum` for the ASCII strings the corpus uses.
+fn is_ascii_alnum(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Whether `wfEscapeWikiText` would change `input`, i.e. whether
+/// `WikitextParser::needsParsing` runs the parser. Any replacement match means
+/// the escaped text differs from the input, so this is an exact test rather
+/// than an approximation.
+fn wf_escape_wiki_text_changes(input: &str, config: &dyn crate::traits::SiteConfig) -> bool {
+    if input.len() >= 65536 {
+        return true;
+    }
+    // `wfEscapeWikiText` prepends a newline before applying `strtr`, so a
+    // line-start token at offset 0 matches as well.
+    let probe = format!("\n{input}");
+    const REPLACEMENTS: [&str; 35] = [
+        "\"", "&", "'", "<", "=", ">", "[", "]", "{", "|", "}", ";", "!!", "\n!", "\r!", "\n#",
+        "\r#", "\n*", "\r*", "\n:", "\r:", "\n ", "\r ", "\n\n", "\r\n", "\n\r", "\r\r", "\n\t",
+        "\r\t", "\n----", "\r----", "__", "://", "＿", "~~~",
+    ];
+    if REPLACEMENTS.iter().any(|needle| probe.contains(needle)) {
+        return true;
+    }
+    for (which, word) in [("RFC", "RFC"), ("PMID", "PMID"), ("ISBN", "ISBN")] {
+        if config.magic_link_enabled(which)
+            && [" ", "\t", "\r", "\n", "\u{c}"]
+                .iter()
+                .any(|ws| probe.contains(&format!("{word}{ws}")))
+        {
+            return true;
+        }
+    }
+    let bytes = input.as_bytes();
+    if let Some(first) = bytes.first()
+        && matches!(first, b'+' | b'-' | b'_' | b'~')
+    {
+        return true;
+    }
+    if let Some(last) = bytes.last()
+        && matches!(last, b'_' | b'~' | b'\n' | b'\r' | b'\t')
+    {
+        return true;
+    }
+    // Protocols without `://` (`mailto:`, `tel:`, `urn:`, …) are escaped by a
+    // `\b(proto):` regexp.
+    const COLON_PROTOCOLS: [&str; 12] = [
+        "bitcoin", "geo", "magnet", "mailto", "matrix", "news", "sip", "sips", "sms", "tel", "urn",
+        "xmpp",
+    ];
+    let lower = input.to_ascii_lowercase();
+    for proto in COLON_PROTOCOLS {
+        let needle = format!("{proto}:");
+        let mut from = 0usize;
+        while let Some(found) = lower[from..].find(&needle) {
+            let at = from + found;
+            let boundary = at == 0
+                || !lower.as_bytes()[at - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[at - 1] != b'_';
+            if boundary {
+                return true;
+            }
+            from = at + 1;
+        }
+    }
+    false
 }
 
 /// If `item` is a `<phonos>` extension token, return the self-closing token.
@@ -2759,7 +3021,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     next_id,
                 )
                 .await;
-            tokens = self.expand_mapframe(tokens, about_counter, &mut fragments, next_id);
+            tokens = self
+                .expand_mapframe(
+                    tokens,
+                    source,
+                    frame,
+                    about_counter,
+                    &mut fragments,
+                    next_id,
+                )
+                .await;
         }
         // A `<templatestyles>` the body expanded stashes its `<style>` in
         // `ext_fragments` (drained into the page's map only at the end of
@@ -3879,21 +4150,28 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// Expand `<mapframe>` extension tokens in place, stashing each rendered
     /// Kartographer map behind a `mw:dom-fragment-token` placeholder (mirrors
     /// `expand_phonos`).
-    fn expand_mapframe(
+    #[allow(clippy::too_many_arguments)]
+    async fn expand_mapframe(
         &self,
         tokens: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &std::cell::Cell<usize>,
     ) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         for item in tokens {
-            let Some(stt) = mapframe_target(&item) else {
+            let Some(stt) = kartographer_target(&item) else {
                 out.push(item);
                 continue;
             };
             let stt = stt.clone();
-            match self.build_mapframe(&stt, about_counter) {
+            let node = match kartographer_tag(&stt) {
+                "maplink" => self.build_maplink(&stt, source, frame, about_counter).await,
+                _ => self.build_mapframe(&stt, about_counter),
+            };
+            match node {
                 Some(node) => {
                     let mut frag = crate::dom::node::Node::document();
                     frag.push_child(node);
@@ -3956,6 +4234,189 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             about: &about,
         };
         rustoid_extensions::kartographer::render(&request).map(|rendered| rendered.node)
+    }
+
+    /// Build the `<a>` for one `<maplink>` tag (port of
+    /// `ParsoidMapLink::sourceToDom`). The body's `title`/`description`
+    /// properties are inline wikitext that Kartographer parses *before* hashing
+    /// the group id, and marker counters are applied after that.
+    async fn build_maplink(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::pipeline::extension_handler::{extension_kv_attrs, extract_ext_body};
+        let attrs: Vec<(String, String)> = extension_kv_attrs(stt)
+            .into_iter()
+            .filter_map(|kv| Some((kv.key.as_str()?.to_string(), kv.value.as_str()?.to_string())))
+            .collect();
+        let source_text = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default();
+        let body = extract_ext_body(stt, source_text);
+        let about = stt
+            .attribs
+            .iter()
+            .find(|kv| {
+                kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            })
+            .and_then(|kv| kv.value.as_str())
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| self.new_about_id(about_counter, "extension-id"));
+
+        let mut geometries = rustoid_extensions::kartographer::parse_geometries(&body);
+        let mut fallback_text: Option<String> = None;
+        if let Some(geometries) = geometries.as_mut() {
+            self.parse_geojson_wikitext(geometries, source, frame, about_counter)
+                .await;
+            let fallback = rustoid_extensions::kartographer::find_first_marker_symbol(geometries);
+            // The DOM processor writes the counter over the label when the tag
+            // has no `text` attribute; without a marker it uses the raw symbol.
+            let counter = rustoid_extensions::kartographer::update_marker_counters(geometries);
+            fallback_text = counter.or(fallback);
+        }
+
+        let text_attr = attrs.iter().find(|(k, _)| k == "text").map(|(_, v)| v);
+        let text_node = match text_attr.map(|v| v.trim()) {
+            Some("") => None,
+            Some(text) if is_ascii_alnum(text) => {
+                let mut doc = Node::document();
+                doc.push_child(Node::text(text.to_string()));
+                Some(doc)
+            }
+            Some(text) => Some(
+                self.parse_inline_nodes(text, source, frame, about_counter)
+                    .await,
+            ),
+            None => {
+                if let Some(label) = &fallback_text {
+                    let mut doc = Node::document();
+                    doc.push_child(Node::text(label.clone()));
+                    Some(doc)
+                } else {
+                    rustoid_extensions::kartographer::coordinate_span(&attrs).map(|span| {
+                        let mut doc = Node::document();
+                        doc.push_child(span);
+                        doc
+                    })
+                }
+            }
+        };
+
+        let request = rustoid_extensions::kartographer::MapLinkRequest {
+            attrs: &attrs,
+            body: &body,
+            geometries: geometries.as_ref(),
+            text: text_node.as_ref(),
+            fallback_text: fallback_text.as_deref(),
+            page_lang: self.config.language_code(),
+            about: &about,
+        };
+        rustoid_extensions::kartographer::render_maplink(&request).map(|r| r.node)
+    }
+
+    /// Parse the GeoJSON `properties.title`/`description` wikitext the way
+    /// `SimpleStyleParser::recursivelySanitizeAndParseWikitext` does, before the
+    /// group id is hashed over the result.
+    async fn parse_geojson_wikitext(
+        &self,
+        geometries: &mut serde_json::Value,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) {
+        let mut strings: Vec<(Vec<GeojsonPath>, String)> = Vec::new();
+        collect_geojson_properties(geometries, &mut Vec::new(), &mut strings);
+        let mut rendered: std::collections::HashMap<Vec<GeojsonPath>, String> =
+            std::collections::HashMap::new();
+        for (path, text) in strings {
+            let html = if wf_escape_wiki_text_changes(&text, self.config) {
+                self.parse_inline_html(&text, source, frame, about_counter)
+                    .await
+            } else {
+                text
+            };
+            rendered.insert(path, html);
+        }
+        apply_geojson_properties(geometries, &mut Vec::new(), &rendered);
+    }
+
+    /// Build an inline fragment from raw wikitext (mirrors `wikitextToDOM` with
+    /// `context: inline`, `processInNewFrame`, `clearDSROffsets`).
+    async fn parse_inline_nodes(
+        &self,
+        text: &str,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Node {
+        let mut tokens = match self.tokenize_inline(text) {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                let mut doc = Node::document();
+                doc.push_child(Node::text(text.to_string()));
+                return doc;
+            }
+        };
+        let mut fragments: std::collections::HashMap<usize, Node> =
+            std::collections::HashMap::new();
+        let next_id = std::cell::Cell::new(0usize);
+        tokens = self
+            .expand_templates(frame, tokens, source, about_counter, false, false, text, 0)
+            .await;
+        tokens = crate::pipeline::extension_handler::expand_in_attributes(
+            tokens,
+            self.config,
+            &mut fragments,
+            &next_id,
+        );
+        tokens = self
+            .expand_attributes(
+                frame,
+                tokens,
+                source,
+                about_counter,
+                None,
+                &mut fragments,
+                &next_id,
+            )
+            .await;
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &next_id);
+        if let Some(src) = source {
+            crate::pipeline::add_media_info::run(&mut frag, src, self.config).await;
+        }
+        frag
+    }
+
+    /// Serialize [`Self::parse_inline_nodes`] the way `ParsoidExtensionAPI::
+    /// domToHtml` does — `data-parsoid` intact, because Kartographer hashes the
+    /// HTML string.
+    async fn parse_inline_html(
+        &self,
+        text: &str,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> String {
+        let mut frag = self
+            .parse_inline_nodes(text, source, frame, about_counter)
+            .await;
+        strip_literal_tag_src(&mut frag);
+        let serializer =
+            crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions {
+                body_only: true,
+                strip_data_parsoid: false,
+                ..crate::options::ParserOptions::for_page("")
+            });
+        serializer
+            .serialize(&frag)
+            .unwrap_or_else(|_| text.to_string())
     }
 
     /// Expand `<templatedata>` extension tokens in place, stashing each rendered
@@ -4727,7 +5188,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         || phonos_target(item).is_some()
                         || templatedata_target(item).is_some()
                         || inputbox_target(item).is_some()
-                        || mapframe_target(item).is_some();
+                        || kartographer_target(item).is_some();
                     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                         continue;
                     };
@@ -4822,7 +5283,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 next_id,
             )
             .await;
-        let tokens = self.expand_mapframe(tokens, about_counter, &mut fragments, next_id);
+        let tokens = self
+            .expand_mapframe(
+                tokens,
+                source,
+                &frame,
+                about_counter,
+                &mut fragments,
+                next_id,
+            )
+            .await;
         let tokens = self.expand_templatedata(tokens, about_counter, &mut fragments, next_id);
         let tokens = self.expand_inputbox(tokens, about_counter, &mut fragments, next_id);
         // `<templatestyles>` is normally resolved during expansion, so its `.about`
@@ -5690,6 +6160,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 | Some("templatedata")
                 | Some("inputbox")
                 | Some("mapframe")
+                | Some("maplink")
         ) {
             return false;
         }

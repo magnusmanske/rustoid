@@ -1292,7 +1292,19 @@ impl ParserFunctions {
                 continue;
             }
             let name = key_value_to_string(&kv.key).trim().to_string();
-            let value = strip_attr_value_quotes(key_value_to_string(&kv.value).trim());
+            // An attribute value can carry HTML markup. Parsoid keeps it as a
+            // token array and stringifies it with the *source* of each token, so
+            // `text=<div title="…">&nbsp;</div>` reaches the extension as that
+            // markup (`Module:OSM Location map` passes exactly that to
+            // `frame:extensionTag`). `tokens_to_string` drops plain HTML tags,
+            // which emptied the value.
+            let value = match &kv.value {
+                KeyValue::Str(s) => s.clone(),
+                KeyValue::Tokens(items) => {
+                    crate::pipeline::parser::tag_source_with_fragments(items)
+                }
+            };
+            let value = strip_attr_value_quotes(value.trim());
             let mut kv = kv.clone();
             kv.key = KeyValue::Str(name);
             kv.value = KeyValue::Str(value);
@@ -2877,6 +2889,41 @@ mod tests {
             }
             other => panic!("expected extension token, got {other:?}"),
         }
+    }
+
+    /// A `#tag` attribute value that carries HTML markup must keep it.
+    /// `Module:OSM Location map` passes `text=<div title="…">&nbsp;…</div>`
+    /// through `frame:extensionTag`; dropping the tags emptied the attribute
+    /// and the `<maplink>` lost its label.
+    #[test]
+    fn test_pf_tag_attribute_value_keeps_html_markup() {
+        let config = crate::mock::MockSiteConfig::new();
+        let value = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+            "<div title=\"x\">A&nbsp;B</div>",
+            true,
+            &[],
+        );
+        let p = Params::new(vec![
+            kv("maplink", ""),
+            kv("", ""),
+            KV {
+                key: KeyValue::Str("text".to_string()),
+                value: KeyValue::Tokens(value),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+        let out = ParserFunctions::pf_tag(&config, &p);
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] else {
+            panic!("expected an extension token, got {out:?}");
+        };
+        let text = t
+            .data_mw
+            .as_ref()
+            .and_then(|mw| mw.attribs.iter().find(|a| a.key.as_str() == Some("text")))
+            .and_then(|a| a.value.as_str());
+        assert_eq!(text, Some("<div title=\"x\">A&nbsp;B</div>"));
     }
 
     #[test]

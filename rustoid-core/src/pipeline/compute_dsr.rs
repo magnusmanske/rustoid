@@ -105,7 +105,8 @@ fn compute_a_tag_width(node: &Node, dp: &DataParsoid) -> Option<(Option<usize>, 
                 .sa
                 .as_ref()
                 .and_then(|sa| sa.get("href"))
-                .cloned()
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
                 .unwrap_or_default();
             Some((Some(2 + href.len() + pipe_len), Some(2)))
         } else {

@@ -260,8 +260,12 @@ pub fn on_ext_link(
     // Record source/normalized href shadow attrs for round-tripping. The `<a>`
     // *width* for `ComputeDSR` is derived from `tmp.extLinkContentOffsets` (set
     // by the tokenizer), not from these.
-    a_tag.data_parsoid.set_sa("href", &orig_href);
-    a_tag.data_parsoid.set_a("href", &href);
+    // `addNormalizedAttribute` only records shadow info when the normalized
+    // value differs from the source (`setShadowInfoIfModified`).
+    if href != orig_href {
+        a_tag.data_parsoid.set_sa("href", &orig_href);
+        a_tag.data_parsoid.set_a("href", &href);
+    }
 
     let mut out = vec![Item::Tok(ParsoidToken::Tag(a_tag))];
     out.extend(rendered_content);

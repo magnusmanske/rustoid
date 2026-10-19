@@ -367,19 +367,31 @@ impl HtmlSerializer {
             }
             _ => (None, &attrs[..]),
         };
+        // Parsoid's `dumpRichAttribs` lists the DOM's normal attributes first
+        // and then the rich attributes (`data-parsoid`, `data-mw`, and later
+        // additions such as `data-mw-i18n`/`data-mw-variant`) in the order they
+        // were attached. rustoid keeps `data-mw` outside the attribute list, so
+        // emit the `data-mw-*` family after it to keep that order.
         for attr in head {
-            serialize_attr(attr, buf);
+            if !is_late_rich_attr(&attr.key) {
+                serialize_attr(attr, buf);
+            }
         }
-        // Add data-parsoid and data-mw if present
+        // Add data-parsoid and data-mw if present. Both go through
+        // `smartQuote`: a value containing `"` (the usual non-empty
+        // data-parsoid) is single-quoted, an empty one (`{}`) is double-quoted.
         if let Some(ref dp) = node.data_parsoid
             && !self.options.strip_data_parsoid
         {
-            // Single-quoted attribute: only escape & and '
-            let escaped = dp.replace('&', "&amp;").replace('\'', "&#39;");
-            buf.push_str(&format!(" data-parsoid='{escaped}'"));
+            serialize_attr_kv("data-parsoid", dp, buf);
         }
         if let Some(ref dm) = node.data_mw {
             serialize_attr_kv("data-mw", dm, buf);
+        }
+        for attr in head {
+            if is_late_rich_attr(&attr.key) {
+                serialize_attr(attr, buf);
+            }
         }
         if let Some(id) = generated_id {
             serialize_attr(id, buf);
@@ -499,10 +511,16 @@ fn is_void_element(tag: &str) -> bool {
     )
 }
 
-/// Serialize a single attribute. JSON data attributes set via `DOMDataUtils`
-/// (`data-mw-i18n`, and the `data-parsoid` field handled separately) are emitted
-/// single-quoted with raw inner quotes, matching PHP's `XHtmlSerializer`. All
-/// other attributes — `data-mw` included — follow PHP's `smartQuote` rule:
+/// A rich attribute Parsoid attaches after `data-parsoid`/`data-mw` rather than
+/// among the DOM's normal attributes. `data-mw-deduplicate` is a *normal*
+/// attribute (TemplateStyles adds it to the DOM), so it is not one of these.
+fn is_late_rich_attr(key: &str) -> bool {
+    key == "data-mw-i18n" || key == "data-mw-variant"
+}
+
+/// Serialize a single attribute. `data-mw-i18n` is emitted single-quoted with
+/// raw inner quotes, matching PHP's `DOMDataUtils`. Every other attribute —
+/// `data-parsoid` and `data-mw` included — follows PHP's `smartQuote` rule:
 /// single quotes when the value contains `"` and (no `'` or more `"` than `'`),
 /// else double quotes, with the value escaped for the chosen quote.
 fn serialize_attr(attr: &crate::dom::node::Attribute, buf: &mut String) {
