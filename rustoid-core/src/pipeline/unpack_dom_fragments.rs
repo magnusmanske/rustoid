@@ -17,7 +17,7 @@
 //! directly on the DOM (see [`fix_nested_anchors`]), preserving the node data a
 //! serialize/reparse round-trip would otherwise lose.
 
-use crate::dom::node::{Node, NodeKind};
+use crate::dom::node::{ElementKind, Node, NodeKind};
 
 /// Whether a node's `typeof` contains the `mw:DOMFragment` token.
 fn has_dom_fragment_type(node: &Node) -> bool {
@@ -195,9 +195,14 @@ fn split_paragraphs_on_block(node: &mut Node) {
 /// Bottom-up splice of fragment content. Bad nesting is repaired afterward by
 /// [`fix_nested_anchors`], which needs the full (post-splice) tree.
 fn run_inner(node: &mut Node) {
+    run_inner_at(node, false);
+}
+
+fn run_inner_at(node: &mut Node, in_cell: bool) {
+    let in_cell = in_cell || is_table_cell(node);
     let mut new_children: Vec<Node> = Vec::with_capacity(node.children.len());
     for mut child in std::mem::take(&mut node.children) {
-        run_inner(&mut child);
+        run_inner_at(&mut child, in_cell);
         if has_dom_fragment_type(&child) {
             let mut fragment = child
                 .fragment
@@ -207,10 +212,10 @@ fn run_inner(node: &mut Node) {
             let mut kids = std::mem::take(&mut fragment.children);
             if kids.is_empty() {
                 // A leaf fragment (e.g. a bare text node) is itself the content.
-                transfer_metadata(&child, std::slice::from_mut(&mut fragment));
+                transfer_metadata(&child, std::slice::from_mut(&mut fragment), in_cell);
                 new_children.push(fragment);
             } else {
-                transfer_metadata(&child, &mut kids);
+                transfer_metadata(&child, &mut kids, in_cell);
                 new_children.extend(kids);
             }
         } else {
@@ -220,10 +225,17 @@ fn run_inner(node: &mut Node) {
     node.children = new_children;
 }
 
+fn is_table_cell(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::Element(ElementKind::TableCell | ElementKind::TableHeader)
+    )
+}
+
 /// Transfer `typeof`/`data-mw`/`about`/`data-parsoid` metadata from a
 /// `mw:DOMFragment` placeholder onto its (span-wrapped) first fragment child.
 /// Mirrors the transclusion/fostered transfer in PHP's `UnpackDOMFragments::handler`.
-fn transfer_metadata(placeholder: &Node, kids: &mut [Node]) {
+fn transfer_metadata(placeholder: &Node, kids: &mut [Node], in_cell: bool) {
     let is_transclusion = has_transclusion_type(placeholder);
     let about = placeholder.get_attr("about").map(str::to_string);
     let dmw = placeholder.data_mw.clone();
@@ -255,16 +267,22 @@ fn transfer_metadata(placeholder: &Node, kids: &mut [Node]) {
             }
         }
         // The placeholder's `about` is the *enclosing* range's id, stamped during
-        // encapsulation. A fragment child may already carry an id of its own — a
-        // `<templatestyles>` was numbered when its fragment was built and the
-        // `DEFERRED_ABOUT` marker was resolved at splice time — and that id must
-        // win: it is the extension's, not the transclusion's. Overwriting it made
-        // `{{no result|{{mono|AB}}}}` serve `<style about="">` (`TableFixups`
-        // then strips the wrongly-transferred cell `about` because it matches).
-        if let Some(ab) = &about
-            && child.get_attr("about").is_none()
-        {
-            child.set_attr("about", ab.clone());
+        // encapsulation, and Parsoid overwrites the fragment child's own id with
+        // it (`UnpackDOMFragments::handler` sets it unconditionally). That is
+        // what gives a deduplicated `<templatestyles>` link the range's id, and
+        // keeps the range's `about` chain contiguous.
+        //
+        // Rustoid unpacks fragments *before* `TableFixups`, where Parsoid runs
+        // the fixups first. Inside a cell the placeholder may carry the cell's
+        // absorbed id, and overwriting the child's own here would let
+        // `TableFixups::strip_inner_encapsulation` strip it
+        // (`{{no result|{{mono|AB}}}}`). The child's own id wins in that case.
+        if let Some(ab) = &about {
+            if in_cell && child.get_attr("about").is_some() {
+                // Keep the fragment's own extension id.
+            } else {
+                child.set_attr("about", ab.clone());
+            }
         }
     }
 }
@@ -441,14 +459,41 @@ mod tests {
         assert_eq!(child.data_mw.as_deref(), Some("{\"name\":\"pre\"}"));
     }
 
-    /// A fragment child that already carries its own `about` keeps it. The
-    /// placeholder's `about` is the enclosing transclusion range's id, stamped
-    /// during encapsulation; a `<templatestyles>` child was numbered separately,
-    /// so the two differ and the child's own id must win (else `TableFixups`
-    /// strips it as the cell's, and `{{no result|{{mono|AB}}}}` serves
-    /// `<style about="">`).
+    /// A fragment child that already carries its own `about` keeps it inside a
+    /// table cell. Rustoid unpacks fragments before `TableFixups` (Parsoid runs
+    /// the fixups first), so the placeholder may carry the cell's absorbed id;
+    /// overwriting the child's own id would let `TableFixups` strip it and
+    /// `{{no result|{{mono|AB}}}}` would serve `<style about="">`.
     #[test]
-    fn test_keeps_the_fragment_childs_own_about() {
+    fn test_keeps_the_fragment_childs_own_about_inside_a_cell() {
+        let mut frag = Node::document();
+        let mut style = Node::element(ElementKind::Other("style".into()));
+        style.set_attr("about", "#mwt2");
+        frag.push_child(style);
+
+        let mut ph = fragment_placeholder(ElementKind::Other("style".into()));
+        ph.set_attr("about", "#mwt1");
+        ph.fragment = Some(Box::new(frag));
+
+        let mut cell = Node::element(ElementKind::TableCell);
+        cell.push_child(ph);
+        let mut doc = Node::document();
+        doc.push_child(cell);
+        run(&mut doc);
+
+        assert_eq!(
+            doc.children[0].children[0].get_attr("about"),
+            Some("#mwt2"),
+            "the fragment child's own about is kept, not overwritten"
+        );
+    }
+
+    /// Outside a table cell, the placeholder's `about` (the enclosing
+    /// transclusion range's id) wins, as in `UnpackDOMFragments::handler`. A
+    /// deduplicated `<templatestyles>` link must carry the range id so the
+    /// `about` chain stays contiguous.
+    #[test]
+    fn test_overwrites_the_fragment_childs_own_about_outside_a_cell() {
         let mut frag = Node::document();
         let mut style = Node::element(ElementKind::Other("style".into()));
         style.set_attr("about", "#mwt2");
@@ -462,11 +507,7 @@ mod tests {
         doc.push_child(ph);
         run(&mut doc);
 
-        assert_eq!(
-            doc.children[0].get_attr("about"),
-            Some("#mwt2"),
-            "the fragment child's own about is kept, not overwritten"
-        );
+        assert_eq!(doc.children[0].get_attr("about"), Some("#mwt1"));
     }
 
     #[test]

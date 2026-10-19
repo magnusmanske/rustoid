@@ -18337,3 +18337,21 @@ the rich attributes in attachment order. `data-mw` therefore precedes a later
 
 **Effect:** removes the next difference after the maplink on 2024 Summer
 Olympics; no corpus regressions.
+
+## Unpacking a fragment overwrites the child's `about` outside cells
+
+Parsoid's `UnpackDOMFragments::handler` sets the placeholder's `about` on every
+top-level fragment child unconditionally. Rustoid kept a child's own id instead,
+which was needed because it unpacks fragments *before* `TableFixups` (Parsoid
+runs the fixups first): inside a cell the placeholder can carry the cell's
+absorbed id, and overwriting a `<templatestyles>`' own id made TableFixups strip
+it (`{{no result|{{mono|AB}}}}`).
+
+The transfer now overwrites outside a table cell and keeps the child's own id
+inside one. A deduplicated `<templatestyles>` link therefore takes the enclosing
+transclusion's id, as the service serves it, and the range's `about` chain stays
+contiguous.
+
+**Effect:** 2024 Summer Olympics 51.08% → 56.15% (the stale dedup id had also
+made a following `<p about>` look like a new range, so it kept a `data-parsoid`
+and took a generated id). No corpus regressions; 4/48 strict.
