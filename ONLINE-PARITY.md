@@ -18253,3 +18253,20 @@ corrected.
 **Effect:** Chernobyl disaster 0.67% → 1.15%, Titanic 0.93% → 1.17%, Berlin
 1.90% → 1.92%, 2024 Summer Olympics 3.54% → 3.57% (its later `<maplink>` is
 still unported). No corpus regressions; 4/48 strict.
+
+## Template argument *names* keep nested references
+
+`{{{flag alias-{{{variant}}}}}}` is the standard idiom a country-data template
+uses to select a per-variant flag (`Template:Flag/core`). The tokenizer stored
+the argument name as a plain string, so the outer lookup used the literal key
+`flag alias-{{{variant}}}` and never matched; the fallback flag won. Both
+Titanic (`United Kingdom|government`) and World War II (`Soviet Union|1936`)
+stopped at the wrong image.
+
+The name is now tokenized like the value (`tokenize_template_arg_value`), so the
+nested `{{{variant}}}` stays a live `templatearg` token and `Frame::expand`
+substitutes it before the lookup.
+
+**Effect:** after filling the newly-requested file metadata, World War II's
+first difference moves from 1.47% to 5.15% and Titanic's from 1.16% to 1.48%.
+No corpus regressions; 4/48 strict.

@@ -3150,10 +3150,16 @@ impl<'a> PegTokenizer<'a> {
         //
         // Comments in the argument name are stripped (as in template targets).
         let parts = split_template_args_with_offsets(&inner);
-        let name = parts
+        let name_src = parts
             .first()
             .map(|(_, s)| strip_html_comments(s).trim().to_string())
             .unwrap_or_default();
+        // The name is tokenized like a value, so a nested argument reference
+        // stays live: `{{{flag alias-{{{variant}}}}}}` must expand `variant`
+        // before the outer parameter is looked up (`Template:Flag/core`'s
+        // per-variant flag selection depends on it). Keeping the name a plain
+        // string left the literal `{{{variant}}}` in the key, which never
+        // matched a parameter.
 
         // Mirrors `tplarg`: attribs[0] is KV(name, '') and each following
         // attribute is KV('', default). The name may be empty — the `subst`
@@ -3163,7 +3169,13 @@ impl<'a> PegTokenizer<'a> {
         // that `Frame::expand` cannot substitute, so it survived to the token
         // stream and was wrapped in an `mw:Param` marker, spending an `about` id
         // the service does not.
-        stt.attribs.push(kv_str(&name, ""));
+        stt.attribs.push(KV {
+            key: tokenize_template_arg_value(&name_src, self.lang_conv_enabled, &self.ext_tags),
+            value: KeyValue::Str(String::new()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
         for (_, default) in parts.iter().skip(1) {
             let value =
                 tokenize_template_arg_value(default, self.lang_conv_enabled, &self.ext_tags);
@@ -5580,17 +5592,6 @@ fn html_tag_len(part: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Build a string-valued KV (key/value as string tokens).
-fn kv_str(key: &str, value: &str) -> KV {
-    KV {
-        key: KeyValue::Str(key.to_string()),
-        value: KeyValue::Str(value.to_string()),
-        src_offsets: None,
-        ksrc: None,
-        vsrc: None,
-    }
-}
-
 /// Tokenize a template *argument value* into a `KeyValue`, faithful to PHP's
 /// `template_param_value` → `template_param_text` (which runs
 /// `nested_block<table=false, extlink=false, templateArg=true, tableCellArg=false>`).
@@ -6653,6 +6654,36 @@ mod tests {
         // Six braces are two arguments, and the split after them still holds.
         let parts = split_template_args("{{{|a|}}}#ifexpr: 1 | YES | NO ");
         assert_eq!(parts, vec!["{{{|a|}}}#ifexpr: 1 ", " YES ", " NO "]);
+    }
+
+    /// A template argument's *name* is tokenized like its value, so a nested
+    /// reference survives: `{{{flag alias-{{{variant}}}}}}` must expand
+    /// `variant` before the outer parameter lookup.
+    #[test]
+    fn a_templatearg_name_keeps_a_nested_reference() {
+        let toks = tokenize("{{{flag alias-{{{variant}}}|Base.svg}}}");
+        let stt = toks
+            .iter()
+            .find_map(|item| match item {
+                Either::Right(ParsoidToken::SelfclosingTag(t)) if t.name == "templatearg" => {
+                    Some(t)
+                }
+                _ => None,
+            })
+            .expect("a templatearg token");
+        let KeyValue::Tokens(items) = &stt.attribs[0].key else {
+            panic!(
+                "expected the name to be tokenized, got {:?}",
+                stt.attribs[0].key
+            );
+        };
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "templatearg"
+            )),
+            "the nested reference is a live token: {items:?}"
+        );
     }
 
     /// A tag name must be followed by whitespace, `/>` or `>`; `<br|plain=true`
