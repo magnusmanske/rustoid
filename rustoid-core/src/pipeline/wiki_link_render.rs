@@ -1507,15 +1507,19 @@ pub fn render_file(
                 serde_json::Value::Array(mw_attribs_json),
             );
         }
-        // Inline-media captions are stored in `data-mw.caption` (mirrors PHP's
-        // `$dataMw->caption`, a serialized DOM fragment of the re-parsed caption).
+        // Inline-media captions are stored in `data-mw.caption` as the HTML of
+        // the caption parsed in an inline context (mirrors PHP's
+        // `$dataMw->caption = $captionDOM`). The fragment is tunneled through a
+        // marked placeholder so the id pass numbers its nodes and a post-pass
+        // fills the HTML in (`attr_mw_fragments`); serializing the wikitext here
+        // instead lost the rendered markup (`Flag of <b>…</b>` became plain
+        // text).
         if is_inline && let Some(cap) = &caption {
-            // Stringify the caption tokens (inline media has no rendered block
-            // structure). The raw tokens preserve transclusion markers for
-            // round-tripping when present.
+            let frag = build_fragment(cap.clone(), fragments, next_id);
+            mw_attr_frag_tokens.push(attr_mw_fragment_token("caption", frag, fragments, next_id));
             obj.insert(
                 "caption".to_string(),
-                serde_json::Value::String(crate::wikitext::token_utils::tokens_to_string(cap)),
+                serde_json::Value::String(String::new()),
             );
         }
         container.add_attribute_str("data-mw", serde_json::Value::Object(obj).to_string());

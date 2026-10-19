@@ -907,8 +907,25 @@ fn caption_text(root: &Node, path: &[usize]) -> Option<String> {
             Some(trimmed.to_string())
         };
     }
-    // Inline case: extract the text from `data-mw.caption` by stripping
-    // wikilink/quote/entity markup.
+    // Inline case: the caption's parsed DOM fragment is the faithful source
+    // (`data-mw.caption` is only serialized from it after this pass, and at this
+    // point still holds the empty placeholder). Its text content is what
+    // `textContentFromCaption` reads in PHP.
+    if let Some((_, fragment)) = container
+        .attr_mw_fragments
+        .iter()
+        .find(|(key, _)| key == "caption")
+    {
+        let text = text_content(fragment);
+        let trimmed = text.trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    // Fallback: a caption that never reached the fragment path. Strip
+    // wikilink/quote/entity/tag markup from the stored spellings.
     let caption = json_string_field(container, "caption")?;
     let text = caption_text_from_source(&caption);
     let trimmed = text.trim();

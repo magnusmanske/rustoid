@@ -59,7 +59,15 @@ pub fn serialize_into_data_mw(root: &mut Node, strip_data_parsoid: bool) {
     }
     for (ck, fragment) in std::mem::take(&mut root.attr_mw_fragments) {
         let html = serialize_fragment(&fragment, strip_data_parsoid);
-        set_attrib_html(&mut json, &ck, &html);
+        if ck == "caption" {
+            // An inline media caption is a bare HTML string on `data-mw`, not an
+            // `attribs` entry (mirrors PHP `$dataMw->caption`).
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert("caption".to_string(), serde_json::Value::String(html));
+            }
+        } else {
+            set_attrib_html(&mut json, &ck, &html);
+        }
     }
     root.data_mw = Some(json.to_string());
 }

@@ -18208,3 +18208,21 @@ and is now performed (`transfer_tpl_metadata`), in Parsoid's property order.
 **Effect:** Bitcoin's first difference moves from 0.60% to 1.07% (and its
 infobox wrapper now carries the metadata on the wrapper, as served). No corpus
 regressions; 4/48 strict.
+
+## Inline media captions carry rendered HTML in `data-mw`
+
+An inline (`<span typeof="mw:File">`) image does not render its caption, but
+Parsoid still stores it in `data-mw.caption` as the **HTML** of the caption
+parsed in an inline context. `render_file` was storing the raw wikitext, so
+`Flag of '''Commonwealth of Nations'''` became `"Flag of Commonwealth of
+Nations"` instead of `"Flag of <b id=\"mwCw\">Commonwealth of Nations</b>"`.
+
+The caption token array is now built into a fragment (the same
+`expanded-tokens-to-fragment` path block captions use) and tunneled through a
+marked `mw:dom-fragment-token`; `attr_mw_fragments` numbers its nodes and fills
+the HTML into `data-mw.caption` after the id pass. `AddMediaInfo` reads its
+text content from that fragment for the image's `alt`/`title`, since the
+serialized `data-mw.caption` is still the empty placeholder while it runs.
+
+**Effect:** Commonwealth of Nations' first difference moves from 1.15% to
+4.24%. No corpus regressions; 4/48 strict.
