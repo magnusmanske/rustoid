@@ -18445,3 +18445,16 @@ precipitation cell read `2534.7` where the service serves `2,534.7`.
 
 **Effect:** `Template:Weather box` 68,633 → 73,891 (the next difference is the
 unported `syntaxhighlight` extension). No corpus regressions; 5/48 strict.
+
+## Open: `#property` is unimplemented, and a literal call is truthy
+
+`Template:Infobox OS` falls back to `{{#property:P1324}}` for its Repository row.
+Rustoid leaves that call literal, so `{{#if:{{#property:P1324}}|…}}` sees the
+braces as a non-empty string and takes the then branch: `Unix` renders a
+Repository row whose only content is the empty-list stylesheet, where the service
+has no row at all. This is the first difference at 11,710 and is pre-existing.
+
+Wikibase's `#property` is not implemented (`mw.wikibase` is). Doing it properly
+needs the entity fetch `mw.wikibase` already performs plus Wikibase's value
+formatting; a stub that always answers empty would fix this page by accident and
+break every page whose property is set.
