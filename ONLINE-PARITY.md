@@ -18355,3 +18355,33 @@ contiguous.
 **Effect:** 2024 Summer Olympics 51.08% → 56.15% (the stale dedup id had also
 made a following `<p about>` look like a new range, so it kept a `data-parsoid`
 and took a generated id). No corpus regressions; 4/48 strict.
+
+## A note body is trimmed like the final document
+
+A `<ref>` body is built as an inline fragment while Cite renders the reference
+list, i.e. after the page-level `CleanUp` pass. Parsoid's global cleanup still
+sees the finished list, so the list item's leading space (`* {{cite…}}`) is
+trimmed there; rustoid's fragment kept it (`<li> <style>`). The note body now
+runs the whitespace half of `CleanUp` (`trim_whitespace_in_subtree`). The rest
+of the pass must wait for the real splice: an anchor whose content is still an
+unpacked DOM-fragment placeholder would look empty and be removed.
+
+## Re-serializing a `#tag` body keeps external links
+
+`{{Refn|{{cite…}}}}` passes the citation through a template argument into a
+`#tag:ref` body. Re-serializing that body (`tag_content_source`/`argument_value_text`)
+had no arm for an `extlink` token, so it declined and the fallback dropped the
+link — the citation rendered without its title link. Both renderers now rebuild
+`[href content]` from the token's `href`/`mw:content`, as `render_answer`
+already did for module answers.
+
+## Cite reports a named ref without text
+
+A named `<ref name="x"/>` that never carries content makes Cite attach
+`cite_error_references_no_text` to every use and render the error in the note
+list. Rustoid silently rendered an empty note. `ref_marker_nodes` now appends
+`mw:Error` + `data-mw.errors` to each use, and the note list appends the
+interface `mw:I18n` error span after the empty note text.
+
+**Effect:** 2024 Summer Olympics 56.15% → 94.27%. No corpus regressions;
+4/48 strict.

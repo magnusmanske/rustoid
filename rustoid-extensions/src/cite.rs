@@ -1377,8 +1377,27 @@ pub fn ref_marker_nodes(
     sup.set_attr("class", "mw-ref reference");
     sup.set_attr("id", ref_id);
     sup.set_attr("rel", "dc:references");
-    sup.set_attr("typeof", "mw:Extension/ref");
-    sup.set_attr("data-mw", ref_data_mw(reference, use_index));
+    // A named ref with no text carries the error on every use
+    // (`ErrorUtils::addErrorsToNode`), both as an extra `typeof` and in
+    // `data-mw.errors`.
+    let no_text = !reference.name.is_empty() && reference.body.trim().is_empty();
+    sup.set_attr(
+        "typeof",
+        if no_text {
+            "mw:Extension/ref mw:Error"
+        } else {
+            "mw:Extension/ref"
+        },
+    );
+    let mut dmw = ref_data_mw(reference, use_index);
+    if no_text {
+        dmw.pop();
+        dmw.push_str(&format!(
+            ",\"errors\":[{{\"key\":\"cite_error_references_no_text\",\"params\":[{}]}}]}}",
+            json_string(&reference.name)
+        ));
+    }
+    sup.set_attr("data-mw", dmw);
 
     let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
     let mut a = Node::element(ElementKind::Other("a".to_string()));
@@ -1471,6 +1490,14 @@ pub fn references_list_nodes(
             text.push_child(body_of(r));
             li.push_child(text);
         }
+        // A named ref that never carried content has no text to show. Parsoid
+        // attaches `cite_error_references_no_text` to every use and the list
+        // renders it after the (empty) note text (`RefGroup::
+        // renderReferenceListElement`).
+        if !r.name.is_empty() && r.body.trim().is_empty() {
+            li.push_child(Node::text(" "));
+            li.push_child(cite_error_span("cite_error_references_no_text", &[&r.name]));
+        }
         ol.push_child(li);
         // Backward-compatibility: a newline follows every note (T372889, PHP
         // `RefGroup::renderReferenceListElement`). It is a real text node child
@@ -1478,6 +1505,29 @@ pub fn references_list_nodes(
         ol.push_child(Node::text("\n"));
     }
     ol
+}
+
+/// `ErrorUtils::renderParsoidError`: an interface-language `mw:I18n` span
+/// wrapping `cite_error` around the specific error.
+fn cite_error_span(key: &str, params: &[&str]) -> rustoid_ast::dom::node::Node {
+    use rustoid_ast::dom::node::{ElementKind, Node};
+
+    let params = params
+        .iter()
+        .map(|p| json_string(p))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut span = Node::element(ElementKind::Other("span".to_string()));
+    span.set_attr("typeof", "mw:I18n");
+    span.set_attr("class", "error mw-ext-cite-error");
+    span.set_attr(
+        "data-mw-i18n",
+        format!(
+            "{{\"/\":{{\"lang\":\"x-user\",\"key\":\"cite_error\",\"params\":[{{\"text\":{{\"key\":\"{key}\",\"params\":[{params}]}}}}]}}}}"
+        ),
+    );
+    mark_for_id(&mut span);
+    span
 }
 
 /// One back-link. `label` is the use number when a note has several, and `None`

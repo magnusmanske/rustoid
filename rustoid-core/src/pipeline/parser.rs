@@ -2940,6 +2940,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Ok(t) => t,
             Err(_) => return crate::dom::node::Node::document(),
         };
+
         // Expand nested templates/parser functions when a data source is
         // available (the synchronous `wikitext_to_ast` path has none).
         let mut fragments: std::collections::HashMap<usize, Node> =
@@ -3048,6 +3049,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
+
         let mut frag = self.build_inline_fragment(tokens, &mut fragments, next_id);
         flatten_nowiki_spans(&mut frag);
         frag
@@ -6264,25 +6266,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // an Infobox argument does not). See [`Parser::wrap_templates`].
             let _unwrapped =
                 (is_ref && self.expansion_nesting.get() > 1).then(|| self.expand_unwrapped());
-            Some(
-                Box::pin(self.process_fragment_body(
-                    &render_body,
-                    source,
-                    frame,
-                    about_counter,
-                    // A `#tag` body is the call's argument value, expanded with
-                    // `inTemplate`: its templates take no `about` of their own and
-                    // are not wrapped. `arg_value` carries that (the ref token is
-                    // marked by `tag_extension_token`). A `<ref>` nested in such a
-                    // body keeps its own body's transclusion ids, though: Parsoid
-                    // allocates them (they show as gaps) even where it emits no
-                    // wrapper, which the `nest > 1` `expand_unwrapped` path above
-                    // reproduces by suppressing only `wrap_templates`.
-                    /* in_template */
-                    arg_value,
-                ))
-                .await,
-            )
+            let mut body = Box::pin(self.process_fragment_body(
+                &render_body,
+                source,
+                frame,
+                about_counter,
+                // A `#tag` body is the call's argument value, expanded with
+                // `inTemplate`: its templates take no `about` of their own and
+                // are not wrapped. `arg_value` carries that (the ref token is
+                // marked by `tag_extension_token`). A `<ref>` nested in such a
+                // body keeps its own body's transclusion ids, though: Parsoid
+                // allocates them (they show as gaps) even where it emits no
+                // wrapper, which the `nest > 1` `expand_unwrapped` path above
+                // reproduces by suppressing only `wrap_templates`.
+                /* in_template */
+                arg_value,
+            ))
+            .await;
+            // The note body reaches the final document when Cite builds the
+            // reference list, i.e. *after* the page-level CleanUp pass. Parsoid's
+            // global cleanup therefore sees it; trim its whitespace here so
+            // `* {{cite…}}` loses the list marker's space. The rest of the pass
+            // must wait for the real splice: an anchor whose content is still an
+            // unpacked DOM-fragment placeholder would look empty.
+            crate::pipeline::cleanup::trim_whitespace_in_subtree(&mut body);
+            Some(body)
         } else {
             None
         };
@@ -9477,6 +9485,27 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
                 }
                 out.push_str("]]");
             }
+            // A bracketed external link: `[href content]`. A module's output
+            // produces this token without a `src`, and declining on it dropped
+            // the whole link from a re-serialized argument (`{{Refn|{{cite…}}}}`
+            // lost the citation title).
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extlink" => {
+                let href = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))?;
+                out.push('[');
+                out.push_str(&key_value_text(&href.value)?);
+                if let Some(content) = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("mw:content"))
+                {
+                    out.push(' ');
+                    out.push_str(&key_value_text(&content.value)?);
+                }
+                out.push(']');
+            }
             Item::Tok(ParsoidToken::Tag(t))
                 if (t.name == "td" || t.name == "th") && cell_opener_source(t).is_some() =>
             {
@@ -9744,6 +9773,27 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
                     out.push_str(&key_value_text(&part.value)?);
                 }
                 out.push_str("]]");
+            }
+            // A bracketed external link: `[href content]`. A module's output
+            // produces this token without a `src`, and declining on it dropped
+            // the whole link from a re-serialized `#tag` body (`{{Refn|{{cite…}}}}`
+            // lost the citation title).
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extlink" => {
+                let href = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))?;
+                out.push('[');
+                out.push_str(&key_value_text(&href.value)?);
+                if let Some(content) = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("mw:content"))
+                {
+                    out.push(' ');
+                    out.push_str(&key_value_text(&content.value)?);
+                }
+                out.push(']');
             }
             Item::Tok(ParsoidToken::Tag(t))
                 if (t.name == "td" || t.name == "th") && cell_opener_source(t).is_some() =>

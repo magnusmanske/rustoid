@@ -229,6 +229,19 @@ fn is_nowiki_span(node: &Node) -> bool {
         .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:Nowiki"))
 }
 
+/// Trim the whitespace Parsoid's `finalCleanup` trims (`trimWhiteSpace`) in a
+/// subtree, without the rest of the cleanup pass. Used for a node that is built
+/// as a fragment and spliced into the final document after the page-level
+/// cleanup: the trim itself does not depend on the surrounding document, while
+/// `handleEmptyElements` does (it would remove an anchor whose content is still
+/// an unpacked DOM-fragment placeholder).
+pub fn trim_whitespace_in_subtree(root: &mut Node) {
+    trim_whitespace(root);
+    for child in &mut root.children {
+        trim_whitespace_in_subtree(child);
+    }
+}
+
 /// Run the `CleanUp` pass over the document.
 ///
 /// Both handlers of Parsoid's `cleanup` pipeline run in one traversal, which
