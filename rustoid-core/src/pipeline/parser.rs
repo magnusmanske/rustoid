@@ -5627,6 +5627,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// Record `tokens` under a freshly numbered strip marker and return its text.
     fn record_marker(&self, tag: &str, tokens: Vec<Item>) -> String {
         let marker = strip_marker(tag, self.strip_markers.borrow().len());
+
         self.strip_markers
             .borrow_mut()
             .insert(marker.clone(), tokens);
@@ -5720,12 +5721,26 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let KeyValue::Tokens(items) = kv else {
             return kv.clone();
         };
-        KeyValue::Tokens(
-            items
-                .iter()
-                .map(|it| self.markerize_extension(it))
-                .collect(),
-        )
+        // A templatestyles placeholder can sit *inside* a value — a wikilink
+        // label (`[[X|{{color|…}}]]`) carries it as a `<style typeof="mw:
+        // DOMFragment">` tag pair. Carrying it as one strip marker keeps the
+        // argument's measured length right (`Module:Navbox` sums them) and
+        // lets `substitute_strip_markers` splice the stylesheet back.
+        let mut out = Vec::with_capacity(items.len());
+        let mut i = 0;
+        while i < items.len() {
+            match answer_marker_span(items, i) {
+                Some((end, tokens, tag)) => {
+                    out.push(Item::Str(self.record_marker(&tag, tokens)));
+                    i = end;
+                }
+                None => {
+                    out.push(self.markerize_extension(&items[i]));
+                    i += 1;
+                }
+            }
+        }
+        KeyValue::Tokens(out)
     }
 
     /// Replace an `extension` token with a strip marker, or recurse into a
@@ -5788,6 +5803,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     return;
                 };
                 let marker = &rest[start..start + end + 2];
+
                 match self.strip_markers.borrow().get(marker) {
                     Some(items) => out.extend(items.iter().cloned()),
                     None => out.push(Item::Str(marker.to_string())),
@@ -5856,6 +5872,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 KeyValue::Tokens(self.substitute_strip_markers(vec![Item::Str(s.clone())]))
             }
             KeyValue::Tokens(items) => {
+                // A marker inside an HTML attribute is written with its `\"`
+                // armoring entity-encoded (`&quot;`), so the tokenizer gives
+                // the value a `mw:Entity` span in the middle of the marker and
+                // `substitute_strip_markers` cannot see it whole. Flatten the
+                // decoded text first when that text holds a marker.
+                if let Some(flat) = flatten_attribute_markers(items)
+                    && flat.contains('\u{7f}')
+                {
+                    return KeyValue::Tokens(self.substitute_strip_markers(vec![Item::Str(flat)]));
+                }
                 KeyValue::Tokens(self.substitute_strip_markers(items.clone()))
             }
             _ => value.clone(),
@@ -8028,6 +8054,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             /* in_template */ true,
             self.config.extension_tags(),
         );
+
         // A module whose output begins with a table (`{|`) is spliced into the
         // caller right after the transclusion's marker span, which is not the
         // start of a line — so the table is not at SOL. Parsoid inserts a newline
@@ -8906,6 +8933,37 @@ fn value_carries_marker(value: &crate::wikitext::tokens_v2::KeyValue) -> bool {
         KeyValue::Str(s) => s.contains('\u{7f}'),
         KeyValue::Tokens(items) => items_carry_marker(items),
     }
+}
+
+/// Flatten an attribute value's `Str` and `mw:Entity` spans to the text HTML
+/// decoding would produce, or `None` if it holds any other token.
+///
+/// `mw.html` entity-encodes the quotes inside a strip marker, so the tokenizer
+/// sees `&quot;` in the middle of the marker and emits an entity span. The
+/// decoded text is what `substitute_strip_markers` must search for the marker.
+fn flatten_attribute_markers(items: &[Item]) -> Option<String> {
+    use crate::wikitext::token_utils::{is_entity_span_token, skip_entity_decoded_text};
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
+            Item::Str(s) => out.push_str(s),
+            Item::Tok(tok) if is_entity_span_token(tok) => {
+                out.push_str(tok.data_parsoid()?.src_content.as_deref()?);
+                if skip_entity_decoded_text(tok, items.get(i + 1)) {
+                    i += 1;
+                }
+                if matches!(items.get(i + 1), Some(Item::Tok(ParsoidToken::EndTag(e))) if e.name == "span")
+                {
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(out)
 }
 
 /// Whether a deferred request is a `frame:extensionTag('templatestyles', …)` —

@@ -18385,3 +18385,27 @@ interface `mw:I18n` error span after the empty note text.
 
 **Effect:** 2024 Summer Olympics 56.15% → 94.27%. No corpus regressions;
 4/48 strict.
+
+## Strip markers survive `mw.html` attribute encoding
+
+`Module:Navbox` builds a title cell with `:cssText('background: {{…}}')`; the
+template expands to `<nowiki>#</nowiki>`, which the argument renderer carries as
+a strip marker. Scribunto's `mw.html` entity-encodes the marker's `"` armoring
+(`&quot;`), and the tokenizer turned that entity into an `mw:Entity` span *in
+the middle of the marker*, so the marker was never spliced back and the CSS
+sanitizer saw a raw DEL (`/* invalid control char */`). Attribute values are now
+flattened (entities decoded) before the marker lookup when the flattened text
+holds one.
+
+Two related gaps in the same area:
+
+- A marker nested inside an attribute value (a wikilink label carrying a
+  templatestyles placeholder) is now collapsed to one marker too. Navbox sums
+  its arguments' lengths into the title id (`argHash`), so a missing 42-byte
+  marker shifted the id (`Olympic_Games3493` vs `…3703`).
+- A `<references>` tag pair outside a template wrapper gets
+  `"body":{"html":""}`, not `"extsrc":""`; inside one (`Template:Reflist`) it
+  keeps the `extsrc`, as `References::insertReferencesIntoDOM` leaves it.
+
+**Effect:** 2024 Summer Olympics 94.27% → **match** (5/48 strict). No corpus
+regressions.
