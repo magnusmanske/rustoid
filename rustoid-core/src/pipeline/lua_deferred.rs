@@ -862,6 +862,21 @@ pub fn answer_item_text(
                 };
                 return Some((text, next));
             }
+            if let Some(src) = heading_token_wikitext(tok) {
+                // A heading's tokens carry only the `tsr` of its equals run, not
+                // a `src`, so the answer renderer wrote nothing for the markup
+                // and left the heading text as an ordinary line: a transcluded
+                // document (Module:Documentation feeds it through
+                // `frame:expandTemplate`) lost every `== Section ==`.
+                return Some((src, i + 1));
+            }
+            if let Some(src) = behavior_switch_wikitext(tok) {
+                // A behavior switch becomes a `mw:PageProp` meta whose source is
+                // not recorded. Without this a template's `__EXPECTUNUSEDTEMPLATE__`
+                // vanished from a `frame:expandTemplate` answer (Template:Weather
+                // box's documentation).
+                return Some((src, i + 1));
+            }
             if let Some(src) = wikilink_token_wikitext(tok) {
                 // A `[[…]]` the tokenizer did not stamp with `src` — a link a
                 // module returned, tokenized from the module's output — is
@@ -915,6 +930,52 @@ pub fn answer_item_text(
             None
         }
     }
+}
+
+/// A heading is `==…==`; its tag name is the level, and the markup itself is not
+/// recorded on either the opening or the closing token.
+fn heading_token_wikitext(tok: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    let name = match tok {
+        ParsoidToken::Tag(t) => &t.name,
+        ParsoidToken::EndTag(t) => &t.name,
+        _ => return None,
+    };
+    let level = name.strip_prefix('h')?.parse::<usize>().ok()?;
+    (1..=6).contains(&level).then(|| "=".repeat(level))
+}
+
+/// A behavior switch is written as its source magic word, but its token is
+/// either the raw `behavior-switch` or the `meta` it becomes, and neither records
+/// a `src`.
+fn behavior_switch_wikitext(tok: &crate::wikitext::tokens_v2::ParsoidToken) -> Option<String> {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    let ParsoidToken::SelfclosingTag(t) = tok else {
+        return None;
+    };
+    let word = if t.name == "behavior-switch" {
+        t.attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("word"))?
+            .value
+            .as_str()?
+    } else if t.name == "meta" {
+        let property = t
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("property"))?
+            .value
+            .as_str()?;
+        // A category or language link is a `<link>`, so a `meta` here is a switch.
+        property.strip_prefix("mw:PageProp/")?
+    } else {
+        return None;
+    };
+    // The tokenizer lowercases the word, while the canonical source spelling is
+    // upper case.
+    word.chars()
+        .all(|c| c.is_ascii_alphabetic())
+        .then(|| format!("__{}__", word.to_ascii_uppercase()))
 }
 
 /// Rebuild an element from its *expanded* attributes when a construct survives the
@@ -1275,6 +1336,47 @@ mod tests {
         });
         let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(link))];
         assert_eq!(render_answer(&items), "[[Equus (genus)|''Equus'']]");
+    }
+
+    /// A heading's markup is not recorded as a `src`, so `render_answer` must
+    /// spell it back from the tag name. Without it a document transcluded through
+    /// `frame:expandTemplate` (Module:Documentation) lost every section heading and
+    /// its title rendered as ordinary paragraph text.
+    #[test]
+    fn render_answer_spells_out_a_heading() {
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, Item, ParsoidToken, TagTk};
+        let items = vec![
+            Item::Tok(ParsoidToken::Tag(TagTk::new(
+                "h2",
+                vec![],
+                DataParsoid::default(),
+            ))),
+            Item::Str("Examples".into()),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "h2",
+                vec![],
+                DataParsoid::default(),
+            ))),
+        ];
+        assert_eq!(render_answer(&items), "==Examples==");
+    }
+
+    /// A behavior switch is a `meta` token with no `src`, so a
+    /// `frame:expandTemplate` answer dropped it. `Template:Always substitute`
+    /// carries `__EXPECTUNUSEDTEMPLATE__` inside `<includeonly>`.
+    #[test]
+    fn render_answer_spells_out_a_behavior_switch() {
+        use crate::wikitext::tokens_v2::{DataParsoid, Item, ParsoidToken, SelfclosingTagTk};
+        let mut meta = SelfclosingTagTk::new("meta", vec![], DataParsoid::default());
+        meta.add_attribute_str("property", "mw:PageProp/expectunusedtemplate");
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(meta))];
+        assert_eq!(render_answer(&items), "__EXPECTUNUSEDTEMPLATE__");
+
+        // Before the behavior-switch pass the token is still the raw switch.
+        let mut raw = SelfclosingTagTk::new("behavior-switch", vec![], DataParsoid::default());
+        raw.add_attribute_str("word", "expectunusedtemplate");
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(raw))];
+        assert_eq!(render_answer(&items), "__EXPECTUNUSEDTEMPLATE__");
     }
 
     fn request(title: &str, args: &[(&str, &str)]) -> FrameRequest {

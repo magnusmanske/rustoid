@@ -18409,3 +18409,25 @@ Two related gaps in the same area:
 
 **Effect:** 2024 Summer Olympics 94.27% → **match** (5/48 strict). No corpus
 regressions.
+
+## A `frame` answer keeps its headings and behavior switches
+
+`Module:Documentation` transcludes a template's `/doc` page through
+`frame:expandTemplate` and embeds the answer in an `mw.html` tree. The answer is
+a *string*, so `lua_deferred::render_answer` rebuilds it from the expansion's
+tokens — and two token shapes record only a `tsr`, never a `src`:
+
+- a heading (`== Examples ==`) is an `h2`/`</h2>` pair;
+- `__EXPECTUNUSEDTEMPLATE__` is a `behavior-switch` token, or the
+  `mw:PageProp/…` meta it becomes.
+
+Both were dropped. Every section heading in a transcluded document therefore
+rendered as ordinary paragraph text (`Template:Weather box`'s `== Examples ==`
+and its eight later headings), and the transcluded `Template:Always substitute`
+lost the `__EXPECTUNUSEDTEMPLATE__` it carries inside `<includeonly>`, so the
+page lost `mw:PageProp/expectunusedtemplate`. The renderer now writes the equals
+run back from the tag name and the magic word from the token's `word`/`property`;
+both re-tokenize to the construct the expansion produced.
+
+**Effect:** `Template:Weather box`'s first difference moves from the lost heading
+at 29,451 to 68,633. No corpus regressions; 5/48 strict.
