@@ -18069,3 +18069,24 @@ marker on the span).
 
 **Effect:** India's first difference moves from 2.40% to 6.19%. No corpus
 regressions; 4/48 strict.
+
+## Template argument names are expanded too
+
+Core's preprocessor expands both halves of a template call in the caller's
+frame, including the argument *name*. Templates use computed names to switch
+between parameters: `Template:Multi-sport event sidebar` writes
+`| {{#ifeq: … |yes|list1title|title}} = …` so a non-collapsible sidebar fills
+`title`, not `list1title`.
+
+Rustoid expanded argument values only, so those names stayed literal token
+arrays and the callee saw neither `title` nor `content1`. The sidebar lost its
+title and body entirely (only its pretitle and navbar rendered).
+
+`expand_template_arg_values` now runs the same expansion pipeline over a
+token-valued key (and folds a single-string result back to a `KeyValue::Str`),
+then over the value. The expansion is inside the existing `style_defer` guard,
+so the core-side templates spend no Parsoid ids.
+
+**Effect:** 2024 Summer Olympics' first difference moves from 1.23% to 1.40%;
+its sidebar now has the same structure as the service's. No corpus
+regressions; 4/48 strict.

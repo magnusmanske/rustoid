@@ -7658,50 +7658,92 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // output, not here — see the note above and [`Parser::style_defer`].
         let _guard = self.begin_style_defer();
         for kv in args.iter_mut() {
-            let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &mut kv.value else {
-                continue;
-            };
-            // MediaWiki's preprocessor resolves the include directives in an
-            // argument value before the callee's body is tokenized: the value
-            // `A<noinclude>B</noinclude>C` reaches the body as `ABC`, the
-            // `includeonly` form as `AC`, and the `onlyinclude` form as `ABC`.
-            // (`Preprocessor_Hash` includes or skips a directive's content and
-            // drops the marker; the page's own top-level markers stay, which is
-            // why this belongs to argument values and not to the page.)
-            strip_include_directive_metas(items);
-            let found = expandable_content(items);
-            if !found.template && !found.arg {
-                continue;
+            // Both halves of a call are expanded in the caller's frame. Core's
+            // preprocessor expands an argument *name* too, which templates use
+            // for computed names: `Template:Multi-sport event sidebar` writes
+            // `| {{#ifeq:…|yes|list1title|title}} = …`.
+            if let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.key {
+                let expanded = self
+                    .expand_template_arg_tokens(
+                        frame,
+                        items.clone(),
+                        source,
+                        about_counter,
+                        in_template,
+                        page_source,
+                    )
+                    .await;
+                kv.key = crate::pipeline::attribute_transform_manager::items_to_key_value(expanded);
             }
-            let substituted = if found.arg {
-                frame.expand(items)
-            } else {
-                items.clone()
+            let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &kv.value else {
+                continue;
             };
-            let child = frame.new_child(frame.root_title().clone(), frame.args().args.clone());
-            let expanded = Box::pin(self.expand_templates(
-                &child,
-                substituted,
-                source,
-                about_counter,
-                in_template,
-                /* body */ true,
-                page_source,
-                0,
-            ))
-            .await;
-            let expanded = Box::pin(self.expand_attrib_templates(
-                &child,
-                expanded,
-                source,
-                about_counter,
-                in_template,
-                true,
-                page_source,
-            ))
-            .await;
+            let expanded = self
+                .expand_template_arg_tokens(
+                    frame,
+                    items.clone(),
+                    source,
+                    about_counter,
+                    in_template,
+                    page_source,
+                )
+                .await;
             kv.value = crate::wikitext::tokens_v2::KeyValue::Tokens(expanded);
         }
+    }
+
+    /// Expand one template call argument (key or value) in the caller's frame.
+    ///
+    /// MediaWiki's preprocessor resolves the include directives, `{{{…}}}`
+    /// references and nested templates before the callee's body is tokenized.
+    async fn expand_template_arg_tokens(
+        &self,
+        frame: &Frame,
+        mut items: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+        page_source: &str,
+    ) -> Vec<Item> {
+        // MediaWiki's preprocessor resolves the include directives in an
+        // argument value before the callee's body is tokenized: the value
+        // `A<noinclude>B</noinclude>C` reaches the body as `ABC`, the
+        // `includeonly` form as `AC`, and the `onlyinclude` form as `ABC`.
+        // (`Preprocessor_Hash` includes or skips a directive's content and
+        // drops the marker; the page's own top-level markers stay, which is
+        // why this belongs to argument values and not to the page.)
+        strip_include_directive_metas(&mut items);
+        let found = expandable_content(&items);
+        if !found.template && !found.arg {
+            return items;
+        }
+        let substituted = if found.arg {
+            frame.expand(&items)
+        } else {
+            items
+        };
+        let child = frame.new_child(frame.root_title().clone(), frame.args().args.clone());
+        let expanded = Box::pin(self.expand_templates(
+            &child,
+            substituted,
+            source,
+            about_counter,
+            in_template,
+            /* body */ true,
+            page_source,
+            0,
+        ))
+        .await;
+        Box::pin(self.expand_attrib_templates(
+            &child,
+            expanded,
+            source,
+            about_counter,
+            in_template,
+            true,
+            page_source,
+        ))
+        .await
     }
 
     async fn expand_invoke_args(
@@ -10543,6 +10585,32 @@ mod tests {
         // unexpanded `<template …>` token.
         assert!(html.contains("mw:Transclusion"), "got: {html}");
         assert!(!html.contains("<template "), "got: {html}");
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_template_argument_names_are_expanded() {
+        use crate::mock::MockDataSource;
+
+        // MediaWiki's preprocessor expands an argument *name* in the caller's
+        // frame. `Template:Multi-sport event sidebar` relies on it:
+        // `| {{#ifeq:…|yes|list1title|title}} = …`.
+        let source = MockDataSource::new();
+        source.add_template("Template:Dyn", "{{{title|missing}}}/{{{content1|empty}}}");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{Dyn|{{#ifeq:no|yes|list1title|title}}=Shown|{{#ifeq:no|yes|list1|content1}}=Body}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(html.contains("Shown"), "got: {html}");
+        assert!(html.contains("Body"), "got: {html}");
+        assert!(!html.contains("missing"), "got: {html}");
+        assert!(!html.contains("empty"), "got: {html}");
     }
 
     #[tokio::test]
