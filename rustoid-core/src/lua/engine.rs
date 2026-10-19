@@ -6803,19 +6803,35 @@ fn luafn_site_interwiki_map(lua: &Lua, site: &LuaSite, filter: Option<&Value>) -
 }
 
 pub fn format_number(n: f64) -> String {
-    if n == n.trunc() && n.abs() < 1e15 {
-        let s = (n as i64).to_string();
-        let mut result = String::new();
-        for (i, ch) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                result.push(',');
-            }
-            result.push(ch);
-        }
-        result.chars().rev().collect()
+    // MediaWiki's `Language::formatNum` groups the *integer part*, decimals
+    // included: a precipitation total of `2534.7` is served as `2,534.7`.
+    let s = if n == n.trunc() && n.abs() < 1e15 {
+        (n as i64).to_string()
     } else {
         n.to_string()
+    };
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", s.as_str()),
+    };
+    let (integer, fraction) = match rest.split_once('.') {
+        Some((integer, fraction)) => (integer, Some(fraction)),
+        None => (rest, None),
+    };
+    let mut grouped = String::new();
+    for (i, ch) in integer.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
     }
+    let mut result = String::from(sign);
+    result.extend(grouped.chars().rev());
+    if let Some(fraction) = fraction {
+        result.push('.');
+        result.push_str(fraction);
+    }
+    result
 }
 
 fn url_encode(s: &str) -> String {
@@ -8346,6 +8362,13 @@ mod tests {
                 .eval("return mw.language.new('de'):formatNum(1234)")
                 .unwrap(),
             "1,234"
+        );
+        // The integer part is grouped even when a fraction follows.
+        assert_eq!(
+            engine
+                .eval("return mw.getContentLanguage():formatNum(2534.7)")
+                .unwrap(),
+            "2,534.7"
         );
     }
 

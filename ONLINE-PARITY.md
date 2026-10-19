@@ -18431,3 +18431,17 @@ both re-tokenize to the construct the expansion produced.
 
 **Effect:** `Template:Weather box`'s first difference moves from the lost heading
 at 29,451 to 68,633. No corpus regressions; 5/48 strict.
+
+## `lang:formatNum` groups the integer part of a decimal
+
+MediaWiki's `Language::formatNum` commafies `2534.7` as `2,534.7`; rustoid
+grouped only whole integers, because `format_number` inserted separators in the
+integer branch and returned `to_string()` for everything else. The helper now
+groups the integer part and appends the fraction unchanged.
+
+`Module:Weather box/row` builds the annual total with
+`mw.getContentLanguage():formatNum(math.abs(total))`, so the "Year"
+precipitation cell read `2534.7` where the service serves `2,534.7`.
+
+**Effect:** `Template:Weather box` 68,633 → 73,891 (the next difference is the
+unported `syntaxhighlight` extension). No corpus regressions; 5/48 strict.
