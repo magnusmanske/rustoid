@@ -328,6 +328,27 @@ fn namespace_id(config: &dyn SiteConfig, name: &str) -> Option<i32> {
     None
 }
 
+/// [`get_wiki_link_target_info`] for a token produced by a module (`#invoke`).
+///
+/// Core renders a module's output as HTML through MediaWiki's parser, so every
+/// title in it went through `Title::newFromText` and is NFC-composed. A link
+/// written on the page — or in a template body, which core hands to Parsoid as
+/// wikitext — keeps its source decomposition. `Module:Wikt-lang` emits NFD link
+/// targets and relies on that composition.
+pub fn get_wiki_link_target_info_for_token(
+    ctx: &WikiLinkContext,
+    token: &ParsoidToken,
+    href: &str,
+    href_src: &str,
+) -> Result<WikiLinkTargetInfo, String> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut target = get_wiki_link_target_info(ctx, href, href_src)?;
+    if token.data_parsoid().is_some_and(|dp| dp.tmp.from_module) {
+        target.href = target.href.nfc().collect();
+    }
+    Ok(target)
+}
+
 /// Extract link text and build attributes for a wikilink, returning the new
 /// `<a>` tag attributes and the content tokens. Faithful port of
 /// `WikiLinkHandler::addLinkAttributesAndGetContent` for the simple/simple-piped
@@ -750,6 +771,140 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
     tokenize_caption_items_sol(items, config, true, false)
 }
 
+/// Whether a caption's token list contains a wikilink split across a token:
+/// `"[[Earth|"`, an italics `<i>` token, `"earth"`, `</i>`, `"]]"`. The
+/// media-option and link-content tokenizers do not parse links, so only a
+/// rebuild-and-retokenize recognizes it.
+///
+/// A *closed* link whose display is already tokenized — the normal piped-
+/// wikilink path — has no open `[[` at the token and is left alone.
+pub(crate) fn caption_items_split_by_token(items: &[Item]) -> bool {
+    let mut open_brackets = 0i32;
+    for item in items {
+        match item {
+            Item::Str(s) => open_brackets = scan_brackets(s, open_brackets),
+            Item::Tok(tok) if open_brackets > 0 => {
+                // Transclusion/param marker metas are not source text and are
+                // preserved by the per-chunk path; every other token interrupts
+                // the link and needs it rebuilt.
+                let is_marker = tok.get_attribute_v("typeof").is_some_and(|t| {
+                    t.split_whitespace().any(|ty| {
+                        ty == "mw:Transclusion"
+                            || ty == "mw:Param"
+                            || ty.starts_with("mw:Transclusion/")
+                    })
+                });
+                if !is_marker {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Net unmatched `[[` after scanning `s`, starting from `depth`.
+fn scan_brackets(s: &str, mut depth: i32) -> i32 {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if &bytes[i..i + 2] == b"[[" {
+            depth += 1;
+            i += 2;
+        } else if &bytes[i..i + 2] == b"]]" {
+            depth = (depth - 1).max(0);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    depth
+}
+
+/// Rebuild every wikilink that the caption/link-content tokenizer split across
+/// tokens, and leave all other items untouched.
+///
+/// Re-tokenizing the *whole* caption would also re-create an already-expanded
+/// `<ref>` (from its raw source) and drop the `about` id the expansion spent on
+/// it, so Cite would renumber it from the document-end counter — a whole-page id
+/// shift. Only the span from the `[[`-opening string through the `]]`-closing
+/// one is rebuilt.
+fn rebuild_split_links(
+    items: &[Item],
+    config: &dyn SiteConfig,
+    sol: bool,
+    linkdesc: bool,
+) -> Vec<Item> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut at_sol = sol;
+    let mut i = 0;
+    while i < items.len() {
+        let opens_link = matches!(&items[i], Item::Str(s) if scan_brackets(s, 0) > 0);
+        if opens_link {
+            let mut depth = 0;
+            if let Item::Str(s) = &items[i] {
+                depth = scan_brackets(s, depth);
+            }
+            let mut j = i + 1;
+            let mut end = None;
+            while j < items.len() {
+                if let Item::Str(s) = &items[j] {
+                    depth = scan_brackets(s, depth);
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if let Some(j) = end {
+                let mut src = String::new();
+                for item in &items[i..=j] {
+                    match item {
+                        Item::Str(s) => src.push_str(s),
+                        Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
+                            if let Some(v) = t
+                                .attribs
+                                .iter()
+                                .find(|kv| kv.key.as_str() == Some("value"))
+                                .and_then(|kv| kv.value.as_str())
+                            {
+                                src.push_str(v);
+                            }
+                        }
+                        Item::Tok(tok) => {
+                            if let Some(s) = tok.data_parsoid().and_then(|d| d.src.clone()) {
+                                src.push_str(&s);
+                            }
+                        }
+                    }
+                }
+                out.extend(tokenize_caption_sol(&src, config, at_sol, linkdesc));
+                at_sol = false;
+                i = j + 1;
+                continue;
+            }
+        }
+        match &items[i] {
+            Item::Str(s) => {
+                out.extend(tokenize_caption_sol(s, config, at_sol, linkdesc));
+                at_sol = sol && s.ends_with('\n');
+            }
+            Item::Tok(ParsoidToken::Nl(_)) => {
+                out.push(items[i].clone());
+                at_sol = sol;
+            }
+            _ => {
+                out.push(items[i].clone());
+                at_sol = false;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn tokenize_caption_items_sol(
     items: &[Item],
     config: &dyn SiteConfig,
@@ -767,7 +922,8 @@ fn tokenize_caption_items_sol(
     // `<ref>` from its `data-parsoid.src`, discarding the expansion (and the
     // `about` id the extension handler spent on it), so Cite then renumbered the
     // ref from its own counter, too late (`[[File:…|thumb|caption<ref>…]]`).
-    let needs_reconstruction = items.iter().any(|item| match item {
+    let split_by_token = caption_items_split_by_token(items);
+    let has_directive = items.iter().any(|item| match item {
         Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant" => true,
         Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extension" => {
             tk.attribs
@@ -778,6 +934,12 @@ fn tokenize_caption_items_sol(
         }
         _ => false,
     });
+    // Repair just the split link, leaving every other token (notably an
+    // already-expanded `<ref>` with its `about` id) untouched.
+    if split_by_token && !has_directive {
+        return rebuild_split_links(items, config, sol, linkdesc);
+    }
+    let needs_reconstruction = split_by_token || has_directive;
     if !needs_reconstruction {
         let mut out = Vec::with_capacity(items.len());
         // `sol` describes the caption's *first* position. Re-tokenizing every
@@ -813,6 +975,19 @@ fn tokenize_caption_items_sol(
     for item in items {
         match item {
             Item::Str(s) => src.push_str(s),
+            // A quote token carries its apostrophe run in `value`; it has no
+            // `data-parsoid.src`, so spelling it from the token data is the only
+            // way the rebuilt caption keeps its italics/bold.
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
+                if let Some(v) = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("value"))
+                    .and_then(|kv| kv.value.as_str())
+                {
+                    src.push_str(v);
+                }
+            }
             Item::Tok(tok) => {
                 let dp_src = tok.data_parsoid().and_then(|d| d.src.clone());
                 if let Some(s) = dp_src {

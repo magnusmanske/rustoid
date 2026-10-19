@@ -18090,3 +18090,88 @@ so the core-side templates spend no Parsoid ids.
 **Effect:** 2024 Summer Olympics' first difference moves from 1.23% to 1.40%;
 its sidebar now has the same structure as the service's. No corpus
 regressions; 4/48 strict.
+
+## A comment in the template target does not suppress wrapping
+
+`{{Infobox planet\n<!--…-->\n| …}}` records the comment in `data-mw.target.wt`
+(the target is the source substring up to the first `|`), but the preprocessor
+strips comments before resolving it. Live Parsoid therefore wraps the
+expansion as usual. Rustoid suppressed segmentation for any target containing
+`<!--`, so Earth's whole infobox transclusion had no `about`/`typeof`/`data-mw`
+and the table lost its `#mwt` chain.
+
+The suppression is removed; the recorded `wt` still keeps the comment, which is
+what the service serves.
+
+**Effect:** Earth's first difference moves from 0.28% to 3.24%.
+
+## Parser functions use PHP `trim()`, not Rust's Unicode trim
+
+Core's `#if`/`#ifeq` answer `trim($frame->expand(...))`, and `TokenUtils::tokenTrim`
+uses the same default character list (`" \t\n\r\0\x0B"`). Rust's `str::trim`
+is Unicode-aware and also strips U+00A0 — so Earth's
+`| temp_name1 = &nbsp;` made the condition read as empty, and the whole
+surface-temperature table vanished from `Template:Infobox planet`.
+
+`pf_if`, `pf_ifeq`, `pf_dir` and `trim_item_edges` now trim with the PHP
+character list (`php_trim`).
+
+**Effect:** Earth's first difference moves from 3.24% to 4.46%.
+
+## `{{#language:code|inLanguage}}`
+
+Core's `CoreParserFunctions::language` answers
+`Language::fetchLanguageName`: an omitted in-language gives the autonym
+(`ang` → `Ænglisc`), `en` gives the English name (`ang` → `Old English`), and an
+unknown code answers itself. Rustoid had no arm, so `Template:Linktext`'s
+`{{#language:{{{lang}}}|en}}` spilled its source into the wiktionary link.
+
+The function now uses the existing English name table plus a generated autonym
+table (from `meta=languageinfo&liprop=autonym`). A non-English in-language
+would need MediaWiki's translated tables, which rustoid does not carry; it falls
+back to the English name, as core does for an unknown in-language.
+
+**Effect:** Earth's first difference moves from 4.46% to 4.60%.
+
+## Module output's link targets are NFC-composed
+
+A module's `#invoke` output is rendered as HTML by MediaWiki's own parser, so
+every link target in it went through `Title::newFromText` and is NFC. A link
+written on the page — or in a template body, which core hands to Parsoid as
+wikitext — keeps its source decomposition. `Module:Wikt-lang` deliberately
+emits NFD targets (`mw.ustring.toNFD`) and relies on the composition: Earth's
+`γῆ` was linked as `γη` + U+0342 instead of the NFC spelling.
+
+`TempData::from_module` marks tokens produced by `expand_invoke`;
+`get_wiki_link_target_info_for_token` NFC-composes a module token's target.
+
+**Effect:** Earth's first difference moves past the wiktionary links (4.60%).
+
+## `<i>`/`<b>` serialize their `data-parsoid`/`data-mw`
+
+The serializer special-cased bold/italic elements to plain attributes, but
+Parsoid attaches `data-parsoid` to quote-generated `<i>`/`<b>` and can make an
+`<i>` a transclusion's encapsulation target (carrying `about`/`typeof`/`data-mw`).
+Suppressing the metadata left Earth's `<i lang="grc" about="#mwt112">` without
+its `data-mw`, and (more visibly) every quoted `<i>`/`<b>` without its `dsr`.
+
+Both now use the normal attribute serializer.
+
+**Effect:** Earth's first difference moves from 4.60% to 27.32%, and Megadeth's
+from 18.85% to 25.14%. No corpus regressions; 4/48 strict.
+
+## A link split across a media caption's tokens is rebuilt
+
+The media-option tokenizer does not parse links inside a caption, so
+`[[axis mundi|''axis mundi'']]` arrives as `"[[axis mundi|"`, the quote tokens,
+`"axis mundi"`, more quotes, `"]]"`. Rustoid tokenized each string chunk on its
+own and the link stayed literal.
+
+`caption_items_split_by_token` detects an open `[[` interrupted by a non-marker
+token, and `rebuild_split_links` re-tokenizes only that span (spelling
+`mw-quote` from its `value`, since it has no `src`). Re-tokenizing the whole
+caption would re-create an already-expanded `<ref>` and drop the `about` id its
+expansion spent, shifting every later id on the page.
+
+**Effect:** Earth's first difference moves from 27.32% to 28.40%. No corpus
+regressions; 4/48 strict.

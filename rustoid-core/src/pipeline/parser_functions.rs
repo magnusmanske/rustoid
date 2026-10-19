@@ -662,6 +662,21 @@ fn php_int_cast(s: &str) -> i64 {
     }
 }
 
+/// PHP's default `trim()` character list — `" \t\n\r\0\x0B"`.
+///
+/// Rust's `str::trim` is Unicode-aware and also strips e.g. U+00A0 (NBSP), which
+/// PHP does *not*. That difference is observable: `{{#if:&nbsp;|then|else}}`
+/// takes the *then* branch on the service (the condition is non-empty) but was
+/// read as an empty condition here — Earth's `|temp_name1 = &nbsp;` lost the
+/// whole surface-temperature table from its infobox.
+fn php_trim_char(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\0' | '\u{0B}')
+}
+
+fn php_trim(s: &str) -> &str {
+    s.trim_matches(php_trim_char)
+}
+
 /// The ParserFunctions handler.
 pub struct ParserFunctions;
 
@@ -679,7 +694,7 @@ impl ParserFunctions {
             .first()
             .map(|kv| key_value_to_string(&kv.key))
             .unwrap_or_default();
-        if condition.trim() != "" {
+        if !php_trim(&condition).is_empty() {
             Self::trimmed_branch(args.get(1))
         } else {
             Self::trimmed_branch(args.get(2))
@@ -700,7 +715,7 @@ impl ParserFunctions {
             .get(1)
             .map(|kv| key_value_to_string(&kv.value))
             .unwrap_or_default();
-        if a.trim() == b.trim() {
+        if php_trim(&a) == php_trim(&b) {
             Self::trimmed_branch(args.get(2))
         } else {
             Self::trimmed_branch(args.get(3))
@@ -1483,9 +1498,8 @@ impl ParserFunctions {
             .args
             .first()
             .map(|kv| key_value_to_string(&kv.key))
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase();
+            .unwrap_or_default();
+        let code = php_trim(&code).to_lowercase();
 
         let dir = if code.is_empty() {
             "auto"
@@ -1495,6 +1509,48 @@ impl ParserFunctions {
             "ltr"
         };
         vec![Item::Str(dir.to_string())]
+    }
+
+    /// `{{#language:code|inLanguage}}` — core `CoreParserFunctions::language`
+    /// over `Language::fetchLanguageName`.
+    ///
+    /// An omitted `inLanguage` answers the language's *autonym* (`ang` →
+    /// `Ænglisc`); `en` answers the English name (`ang` → `Old English`). An
+    /// unknown code answers itself, and an empty code falls back to the content
+    /// language. A non-English `inLanguage` would need MediaWiki's translated
+    /// name tables, which rustoid does not carry; it answers the English name,
+    /// which is also what core falls back to for an unknown in-language.
+    pub fn pf_language(config: &dyn crate::traits::SiteConfig, params: &Params) -> Vec<Item> {
+        let code = params
+            .args
+            .first()
+            .map(|kv| key_value_to_string(&kv.key))
+            .unwrap_or_default();
+        let in_language = params
+            .args
+            .get(1)
+            .map(|kv| key_value_to_string(&kv.value))
+            .unwrap_or_default();
+        let code = php_trim(&code);
+        let in_language = php_trim(&in_language);
+        let code = if code.is_empty() {
+            config.language_code()
+        } else {
+            code
+        };
+
+        let lookup = |table: &[(&str, &str)]| {
+            table
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(code))
+                .map(|(_, name)| name.to_string())
+        };
+        let name = if in_language.is_empty() {
+            lookup(crate::lua::LANGUAGE_AUTONYMS)
+        } else {
+            lookup(crate::lua::LANGUAGE_NAMES)
+        };
+        vec![Item::Str(name.unwrap_or_else(|| code.to_string()))]
     }
 
     /// Expand a KV into items (mirrors `expandKV`).
@@ -1589,7 +1645,7 @@ fn trim_item_edges(items: &mut Vec<Item>) {
     while start < items.len() {
         match &mut items[start] {
             Item::Str(s) => {
-                let trimmed = s.trim_start();
+                let trimmed = s.trim_start_matches(php_trim_char);
                 if trimmed.len() != s.len() {
                     *s = trimmed.to_string();
                 }
@@ -1607,7 +1663,7 @@ fn trim_item_edges(items: &mut Vec<Item>) {
     while let Some(last) = items.last_mut() {
         match last {
             Item::Str(s) => {
-                let trimmed = s.trim_end();
+                let trimmed = s.trim_end_matches(php_trim_char);
                 if trimmed.len() != s.len() {
                     *s = trimmed.to_string();
                 }

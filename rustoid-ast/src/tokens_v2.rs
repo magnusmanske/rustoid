@@ -742,6 +742,15 @@ pub struct TempData {
     /// transclusion into one token stream and runs `expand_attributes` once at
     /// the page level, so it has lost the chunk — this flag carries the fact.
     pub synthesized: bool,
+    /// Set on a token that came out of a module's (`#invoke`) output.
+    ///
+    /// The live service renders that output as HTML through MediaWiki's own
+    /// parser, so every link target in it went through `Title::newFromText` and
+    /// is NFC-composed — while a link written on the page (or in a template
+    /// body, which core hands to Parsoid as wikitext) keeps whatever
+    /// decomposition the source used. `Module:Wikt-lang` deliberately emits
+    /// NFD link targets (`mw.ustring.toNFD`) and relies on that composition.
+    pub from_module: bool,
     /// Set by `MarkFosteredContent` on the transclusion start meta of a fostered
     /// transclusion (mirrors `TempData::FROM_FOSTER`).
     pub from_foster: bool,

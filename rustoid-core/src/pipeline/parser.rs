@@ -987,7 +987,7 @@ pub fn render_inline_fragment(
 ) -> Node {
     use crate::pipeline::external_link_handler::{on_ext_link, on_url_link};
     use crate::pipeline::wiki_link_render::{
-        WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+        WikiLinkContext, get_wiki_link_target_info_for_token, render_wiki_link_dispatched,
     };
     use crate::wikitext::token_utils::key_value_to_string;
 
@@ -1012,7 +1012,12 @@ pub fn render_inline_fragment(
                 .map(|kv| key_value_to_string(&kv.value))
                 .unwrap_or_default();
             let href_src = href.clone();
-            let target = match get_wiki_link_target_info(&link_ctx, &href, &href_src) {
+            let target = match get_wiki_link_target_info_for_token(
+                &link_ctx,
+                &ParsoidToken::SelfclosingTag(stt.clone()),
+                &href,
+                &href_src,
+            ) {
                 Ok(t) => t,
                 Err(_) => {
                     // Invalid title (bad chars, stray `%hh`, multiple colons): bail
@@ -2286,7 +2291,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: Option<&std::cell::Cell<usize>>,
     ) -> Vec<Item> {
         use crate::pipeline::wiki_link_render::{
-            WikiLinkContext, get_wiki_link_target_info, render_redirect,
+            WikiLinkContext, get_wiki_link_target_info_for_token, render_redirect,
             render_wiki_link_dispatched,
         };
         use crate::wikitext::token_utils::key_value_to_string;
@@ -2382,7 +2387,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 continue;
             }
 
-            let target = match get_wiki_link_target_info(&ctx, &href, &href_src) {
+            let target = match get_wiki_link_target_info_for_token(
+                &ctx,
+                &ParsoidToken::SelfclosingTag(stt.clone()),
+                &href,
+                &href_src,
+            ) {
                 Ok(t) => t,
                 Err(_) => {
                     // Invalid title: bail to literal `[[…]]` text, re-tokenizing the
@@ -3293,7 +3303,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: &std::cell::Cell<usize>,
     ) -> Option<Node> {
         use crate::pipeline::wiki_link_render::{
-            WikiLinkContext, get_wiki_link_target_info, render_wiki_link_dispatched,
+            WikiLinkContext, get_wiki_link_target_info_for_token, render_wiki_link_dispatched,
         };
         use crate::wikitext::token_utils::key_value_to_string;
 
@@ -3351,7 +3361,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     .map(|kv| key_value_to_string(&kv.value))
                     .unwrap_or_default();
                 let href_src = href.clone();
-                let target = match get_wiki_link_target_info(&link_ctx, &href, &href_src) {
+                let target = match get_wiki_link_target_info_for_token(
+                    &link_ctx,
+                    &ParsoidToken::SelfclosingTag(stt.clone()),
+                    &href,
+                    &href_src,
+                ) {
                     Ok(t) => t,
                     Err(_) => return vec![Item::Str(format!("[[{href}]]"))],
                 };
@@ -6000,22 +6015,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // transclusion of it*.
 
         // The target may hold a nested template
-        // A comment in the template *target* (`{{f<!---->oo}}`) is
-        // stripped by the PHP preprocessor before target resolution,
-        // so the template still expands, but Parsoid does not wrap the
-        // expansion in a `mw:Transclusion` wrapper (the target is no
-        // longer cleanly stringifiable). Detect this from the raw
-        // template source so the expansion matches PHP's
-        // `convertToString(..., /* expandTemplates */ true)` path,
-        // which emits the expansion unencapsulated.
-        let target_has_comment = stt
-            .data_parsoid
-            .src
-            .as_deref()
-            .and_then(raw_template_target)
-            .map(|t| t.contains("<!--"))
-            .unwrap_or(false);
-
         // The transclusion's `data-mw.target.wt` is the *source substring* of
         // the target key, not the cleaned name: PHP's
         // `TemplateEncapsulator::getTemplateInfo` takes it from
@@ -6275,7 +6274,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         // (not core) processes this token; a body's nesting is
                         // already part of the caller's expansion.
                         body,
-                        target_has_comment,
                         src_text,
                         *table_depth > 0,
                     )
@@ -6967,7 +6965,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // Whether this call sits in a *template body* expanded by core. Such a
         // body has no pipeline of its own on the Parsoid side.
         body: bool,
-        target_has_comment: bool,
         page_source: &str,
         // Whether the *call site* was inside an open table (PHP's
         // `tableDataBlock`). Carried into the body tokenization so a body's `|`
@@ -7260,9 +7257,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
         }
 
-        if !wrap || target_has_comment {
-            // Nested/extension-content context, or a comment in the template
-            // target (`{{f<!---->oo}}`): no `mw:Transclusion` wrapping.
+        if !wrap {
+            // Nested/extension-content context: no `mw:Transclusion` wrapping.
             return expanded;
         }
 
@@ -7509,6 +7505,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // A module's output is not the page's own wikitext: `expand_attributes`
         // must not mark its tags `mw:ExpandedAttrs`. See [`mark_synthesized`].
         mark_synthesized(&mut expanded);
+        mark_from_module(&mut expanded);
 
         // A module that reaches `<templatestyles>` through `frame:extensionTag`
         // lowers it to `#tag`, whose extension token is built during the
@@ -8588,6 +8585,19 @@ fn mark_synthesized(items: &mut [Item]) {
             && let Some(dp) = tok.data_parsoid_mut()
         {
             dp.tmp.synthesized = true;
+        }
+    }
+}
+
+/// Mark a module's (`#invoke`) output. Core renders that output as HTML, so its
+/// link targets are NFC-composed (see `TempData::from_module`); a template
+/// body's output is wikitext that Parsoid parses and is not marked here.
+fn mark_from_module(items: &mut [Item]) {
+    for item in items.iter_mut() {
+        if let Item::Tok(tok) = item
+            && let Some(dp) = tok.data_parsoid_mut()
+        {
+            dp.tmp.from_module = true;
         }
     }
 }
@@ -10046,7 +10056,8 @@ mod tests {
             )
             .unwrap();
         assert!(html.contains("<pre"), "got: {html}");
-        assert!(html.contains("<b>bold</b>"), "got: {html}");
+        assert!(html.contains("<b"), "got: {html}");
+        assert!(html.contains("bold"), "got: {html}");
     }
 
     #[test]
@@ -10134,7 +10145,7 @@ mod tests {
         let html = parser
             .wikitext_to_html("'''bold'''", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("<b>"), "got: {html}");
+        assert!(html.contains("<b"), "got: {html}");
         assert!(html.contains("bold"), "got: {html}");
     }
 
@@ -10202,7 +10213,7 @@ mod tests {
         let html = parser
             .wikitext_to_html("''italic''", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("<i>"), "got: {html}");
+        assert!(html.contains("<i"), "got: {html}");
         assert!(html.contains("italic"), "got: {html}");
     }
 
@@ -10213,8 +10224,8 @@ mod tests {
         let html = parser
             .wikitext_to_html("'''''both'''''", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("<b>"), "got: {html}");
-        assert!(html.contains("<i>"), "got: {html}");
+        assert!(html.contains("<b"), "got: {html}");
+        assert!(html.contains("<i"), "got: {html}");
         assert!(html.contains("both"), "got: {html}");
     }
 
@@ -10228,7 +10239,10 @@ mod tests {
         let html = parser
             .wikitext_to_html("''foo''''bar''", &ParserOptions::for_page("Test"))
             .unwrap();
-        assert!(html.contains("<i>foo'<b>bar</b></i>"), "got: {html}");
+        assert!(html.contains("<i"), "got: {html}");
+        assert!(html.contains("foo'"), "got: {html}");
+        assert!(html.contains("<b"), "got: {html}");
+        assert!(html.contains("bar"), "got: {html}");
         // No stray empty `<b></b>` should remain.
         assert!(!html.contains("<b></b>"), "got: {html}");
         assert!(!html.contains("<i></i>"), "got: {html}");

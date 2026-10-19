@@ -12,4 +12,4 @@ pub mod language;
 pub mod ustring;
 pub mod wikibase;
 
-pub(crate) use language_names::LANGUAGE_NAMES;
+pub(crate) use language_names::{LANGUAGE_AUTONYMS, LANGUAGE_NAMES};

@@ -1625,6 +1625,8 @@ impl TemplateHandler {
             // `{{#dir:code}}` — the directionality (`ltr`/`rtl`) of a language.
             // Core `$noHashFunctions` member (invoked with a leading `#`).
             "dir" => ParserFunctions::pf_dir(params),
+            // `{{#language:code|inLanguage}}` — core `CoreParserFunctions::language`.
+            "language" => ParserFunctions::pf_language(config, params),
             // `{{ns:…}}`/`{{nse:…}}` reached as *functions* (`{{safesubst:ns:0}}`,
             // `{{#ns:0}}`) rather than as bare magic words. Both spellings mean the
             // same thing, so both answer from the same place: the logic already
