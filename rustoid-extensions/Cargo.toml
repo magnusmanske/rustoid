@@ -9,3 +9,4 @@ authors.workspace = true
 
 [dependencies]
 rustoid-ast = { path = "../rustoid-ast" }
+serde_json = { workspace = true }

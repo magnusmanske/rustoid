@@ -17,6 +17,7 @@ The corpus numbers referenced here are from an `--offline` run of the built-in
 | `phonos` (Phonos) | 10 | `pipeline/phonos.rs` + the minimal OOUI serializer |
 | `templatedata` (TemplateData) | 2 | `pipeline/templatedata.rs` (parameter-documentation table) |
 | `inputbox` (InputBox) | 1 | `pipeline/inputbox.rs` (the `search`/`fulltext` forms) |
+| `mapframe` (Kartographer) | 4 | `rustoid-extensions/src/kartographer.rs` (`<maplink>` still falls through) |
 
 ### `section`
 
@@ -95,10 +96,25 @@ deterministic one. The edit forms (`create`/`comment`/`move`) are left to the
 generic `<extension>` fallback until a page needs them. Not native content, so
 `is_native_ext` excludes it.
 
-## `mapframe` (4 pages)
+### `mapframe`
 
-Kartographer needs map tiles/data and is likely **unwinnable offline**; treat
-like the other nondeterministic cases.
+Kartographer is *not* service-dependent for the bytes Parsoid serves: the
+`data-overlays` group id is `"_" + sha1(FormatJson::encode($geometries))` where
+`$geometries` is the normalized GeoJSON body, so it is derivable offline. The
+only service interaction is the static-map `<img>` URL, which rustoid builds
+rather than fetches. Ported in `rustoid-extensions/src/kartographer.rs`
+(`ParsoidMapFrame::sourceToDom` + `ParsoidDomProcessor`'s group pass), wired
+through `Parser::expand_mapframe`.
+
+Normalization matters for the hash: `SimpleStyleParser` turns a non-list body
+into a one-element list and rewrites each `ExternalData` service into
+`{type, service, url, properties}` before encoding. `<maplink>` differs in its
+text and marker-counter handling and is still unported.
+
+Porting it surfaced a Scribunto bug: `mw.text.jsonEncode` treated only 1-based
+sequences as JSON arrays. PHP also emits a JSON array for any array whose keys
+are exactly `0..n-1` (Module:Mapframe's coordinate pair is `{[0]=lon,[1]=lat}`),
+so the encoder now accepts that shape as well.
 
 ## `math` (5 pages)
 

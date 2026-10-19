@@ -5702,8 +5702,10 @@ fn luafn_text_json_decode(lua: &Lua, (s, flags): (Value, Option<i64>)) -> mlua::
 /// serialiser:
 ///
 /// - A Lua table is a JSON **array** when its keys are exactly `1..n` in order
-///   (or `0..n-1` under `JSON_PRESERVE_KEYS`, which suppresses the reindex).
-///   Otherwise it is an **object**. So `{}` is `[]`, `{1,2}` is `[1,2]`, and
+///   (`reindexArrays` turns that into the PHP list `0..n-1`), or when they are
+///   already exactly `0..n-1` (a PHP list is a JSON array whatever the flag).
+///   Otherwise it is an **object**. So `{}` is `[]`, `{1,2}` is `[1,2]`,
+///   `{[0]=a,[1]=b}` (Module:Mapframe's coordinate pair) is `[a,b]`, and
 ///   `{a=1}` is `{"a":1}`.
 /// - Numeric-string keys count as array keys when encoding (`{['1']=x}` is
 ///   `[x]`), which the PHP `ctype_digit` arm of `reindexArrays` does and which
@@ -5886,18 +5888,37 @@ fn json_from_lua_table(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let first_index = if preserve_keys { 0 } else { 1 };
-    let is_sequence = ordered.iter().zip(first_index..).all(|(key, next)| {
-        match key {
-            JsonKey::Int(n) => *n == next,
+    // `reindexArrays` rewrites a 1-based Lua sequence to a 0-based PHP list;
+    // `json_encode` then emits a JSON array for any PHP array whose keys are
+    // exactly `0..n-1`. A table that is already 0-based (Module:Mapframe's
+    // `{[0]=lon,[1]=lat}` coordinate pair) is therefore *binary-safe* as a list
+    // even though `reindexArrays` rejects it as a sequence, so both spellings
+    // must be tested. Under `JSON_PRESERVE_KEYS` only the 0-based one applies.
+    let is_index_run = |keys: &[&JsonKey], start: usize| {
+        keys.iter().zip(start..).all(|(key, next)| match key {
+            JsonKey::Int(n) => *n as usize == next,
             // Only when *encoding* does a digit-string key count as an index.
-            JsonKey::Digits(n) => *n == next,
+            JsonKey::Digits(n) => *n as usize == next,
             JsonKey::String(_) => false,
-        }
-    });
+        })
+    };
+    // With `JSON_PRESERVE_KEYS` PHP keeps the Lua iteration order, so the 0-based
+    // list test must use it too; without the flag `reindexArrays` has sorted.
+    let zero_based_order: Vec<&JsonKey> = if preserve_keys {
+        entries.iter().map(|(k, _)| k).collect()
+    } else {
+        ordered.clone()
+    };
+    let is_sequence =
+        is_index_run(&zero_based_order, 0) || (!preserve_keys && is_index_run(&ordered, 1));
+    let item_order = if is_index_run(&zero_based_order, 0) {
+        zero_based_order
+    } else {
+        ordered
+    };
 
     if is_sequence {
-        let items = ordered
+        let items = item_order
             .into_iter()
             .map(|key| {
                 let idx = entries
@@ -7409,20 +7430,16 @@ mod tests {
                 .unwrap(),
             "{\"1\":1,\"2\":2}"
         );
-        // A zero-based sequence is an array only under the flag, which is the
-        // mirror of what `jsonDecode` does with it.
-        assert_eq!(
-            engine
-                .eval("return mw.text.jsonEncode({[0]='a',[1]='b'}, mw.text.JSON_PRESERVE_KEYS)")
-                .unwrap(),
-            "[\"a\",\"b\"]"
-        );
-        assert_eq!(
-            engine
-                .eval("return mw.text.jsonEncode({[0]='a',[1]='b'})")
-                .unwrap(),
-            "{\"0\":\"a\",\"1\":\"b\"}"
-        );
+        // A zero-based sequence is a PHP list either way: `json_encode` emits
+        // any array whose keys are exactly `0..n-1` as a JSON array, whether or
+        // not `reindexArrays` ran. (Module:Mapframe's `{[0]=lon,[1]=lat}`
+        // coordinate pair relies on this.)
+        for expr in [
+            "return mw.text.jsonEncode({[0]='a',[1]='b'}, mw.text.JSON_PRESERVE_KEYS)",
+            "return mw.text.jsonEncode({[0]='a',[1]='b'})",
+        ] {
+            assert_eq!(engine.eval(expr).unwrap(), "[\"a\",\"b\"]", "for {expr}");
+        }
     }
 
     /// `FormatJson::encode( …, ALL_OK )` leaves non-ASCII and `/` alone, which

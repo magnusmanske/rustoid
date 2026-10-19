@@ -348,6 +348,26 @@ fn imagemap_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfclosi
     }
 }
 
+/// If `item` is a `<mapframe>` extension token, return the self-closing token.
+fn mapframe_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    if stt.name != "extension" {
+        return None;
+    }
+    let name = stt
+        .attribs
+        .iter()
+        .find(|a| a.key.as_str() == Some("name"))
+        .and_then(|a| a.value.as_str());
+    if name == Some("mapframe") {
+        Some(stt)
+    } else {
+        None
+    }
+}
+
 /// If `item` is a `<phonos>` extension token, return the self-closing token.
 fn phonos_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
     let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
@@ -2739,6 +2759,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     next_id,
                 )
                 .await;
+            tokens = self.expand_mapframe(tokens, about_counter, &mut fragments, next_id);
         }
         // A `<templatestyles>` the body expanded stashes its `<style>` in
         // `ext_fragments` (drained into the page's map only at the end of
@@ -3855,6 +3876,88 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         Some(node)
     }
 
+    /// Expand `<mapframe>` extension tokens in place, stashing each rendered
+    /// Kartographer map behind a `mw:dom-fragment-token` placeholder (mirrors
+    /// `expand_phonos`).
+    fn expand_mapframe(
+        &self,
+        tokens: Vec<Item>,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = mapframe_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            match self.build_mapframe(&stt, about_counter) {
+                Some(node) => {
+                    let mut frag = crate::dom::node::Node::document();
+                    frag.push_child(node);
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    fragments.insert(id, frag);
+                    out.push(emit_dom_fragment_placeholder(&stt, id));
+                }
+                None => out.push(item),
+            }
+        }
+        out
+    }
+
+    /// Build the `<a>`/`<figure>` for one `<mapframe>` tag. Port of
+    /// Kartographer's `ParsoidMapFrame::sourceToDom` plus the DOM processor's
+    /// group-hash pass.
+    fn build_mapframe(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        about_counter: &std::cell::Cell<usize>,
+    ) -> Option<Node> {
+        use crate::pipeline::extension_handler::{extension_kv_attrs, extract_ext_body};
+        let attrs: Vec<(String, String)> = extension_kv_attrs(stt)
+            .into_iter()
+            .filter_map(|kv| Some((kv.key.as_str()?.to_string(), kv.value.as_str()?.to_string())))
+            .collect();
+        let source = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str())
+            .unwrap_or_default();
+        let body = extract_ext_body(stt, source);
+        let about = stt
+            .attribs
+            .iter()
+            .find(|kv| {
+                kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+            })
+            .and_then(|kv| kv.value.as_str())
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| self.new_about_id(about_counter, "extension-id"));
+        let page_title = self.page_title.borrow().replace(' ', "_");
+        let server = self.config.server_url();
+        // The server URL is protocol-relative on the live wiki (`//en.wikipedia.org`).
+        let domain = server
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("//")
+            .trim_end_matches('/');
+        let request = rustoid_extensions::kartographer::MapFrameRequest {
+            attrs: &attrs,
+            body: &body,
+            page_title: &page_title,
+            revision_id: self.page_revision.get(),
+            page_lang: self.config.language_code(),
+            domain,
+            about: &about,
+        };
+        rustoid_extensions::kartographer::render(&request).map(|rendered| rendered.node)
+    }
+
     /// Expand `<templatedata>` extension tokens in place, stashing each rendered
     /// `<section class="mw-templatedata-doc-wrap">` behind a
     /// `mw:dom-fragment-token` placeholder (mirrors `expand_imagemap`).
@@ -4623,7 +4726,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         || imagemap_target(item).is_some()
                         || phonos_target(item).is_some()
                         || templatedata_target(item).is_some()
-                        || inputbox_target(item).is_some();
+                        || inputbox_target(item).is_some()
+                        || mapframe_target(item).is_some();
                     let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
                         continue;
                     };
@@ -4718,6 +4822,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 next_id,
             )
             .await;
+        let tokens = self.expand_mapframe(tokens, about_counter, &mut fragments, next_id);
         let tokens = self.expand_templatedata(tokens, about_counter, &mut fragments, next_id);
         let tokens = self.expand_inputbox(tokens, about_counter, &mut fragments, next_id);
         // `<templatestyles>` is normally resolved during expansion, so its `.about`
@@ -5584,6 +5689,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 | Some("phonos")
                 | Some("templatedata")
                 | Some("inputbox")
+                | Some("mapframe")
         ) {
             return false;
         }

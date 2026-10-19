@@ -18226,3 +18226,30 @@ serialized `data-mw.caption` is still the empty placeholder while it runs.
 
 **Effect:** Commonwealth of Nations' first difference moves from 1.15% to
 4.24%. No corpus regressions; 4/48 strict.
+
+## Kartographer `mapframe`
+
+Kartographer's served bytes are derivable offline. The map link carries the
+tag arguments, an `<img>` whose URL is built from them, and a private group id
+that is `"_" + sha1(FormatJson::encode($geometries))` over the normalized
+GeoJSON body (`SimpleStyleParser`: a non-list becomes a one-element list, each
+`ExternalData` service is rewritten to `{type, service, url, properties}`).
+Rustoid emitted a raw `<extension>`.
+
+`rustoid-extensions/src/kartographer.rs` now ports
+`ParsoidMapFrame::sourceToDom`, `MapFrameAttributeGenerator`, and the group-hash
+half of `ParsoidDomProcessor`; `Parser::expand_mapframe` stashes the result like
+the other native extensions. The static-map URL uses the page revision, the
+page title as a DB key, the page language, and the group id; it is constructed,
+not fetched.
+
+The module that builds the body (`Module:Mapframe`) exposed a Scribunto bug:
+`mw.text.jsonEncode` emitted a 0-based Lua table as a JSON object. PHP's
+`json_encode` emits a JSON array for any array whose keys are exactly
+`0..n-1`, so `{[0]=lon,[1]=lat}` must be `[lon,lat]`. The encoder now accepts
+that shape, and the `JSON_PRESERVE_KEYS` test that pinned the old behaviour was
+corrected.
+
+**Effect:** Chernobyl disaster 0.67% → 1.15%, Titanic 0.93% → 1.17%, Berlin
+1.90% → 1.92%, 2024 Summer Olympics 3.54% → 3.57% (its later `<maplink>` is
+still unported). No corpus regressions; 4/48 strict.

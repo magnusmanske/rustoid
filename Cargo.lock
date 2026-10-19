@@ -1537,6 +1537,7 @@ name = "rustoid-extensions"
 version = "0.1.0"
 dependencies = [
  "rustoid-ast",
+ "serde_json",
 ]
 
 [[package]]
