@@ -18175,3 +18175,36 @@ expansion spent, shifting every later id on the page.
 
 **Effect:** Earth's first difference moves from 27.32% to 28.40%. No corpus
 regressions; 4/48 strict.
+
+## A transclusion's leading newline stays inside its range
+
+Bitcoin's infobox follows a paragraph on its own line, and its template body
+begins with a newline (the `{{#if:…}}` line is empty and the literal newline
+after it survives expansion). Parsoid emits `</p>\n<span class="mw-empty-elt"…>`
+where rustoid emitted `</p>\n\n<span…>`.
+
+Two ordering mistakes kept the template's newline out of the transclusion range,
+where `DOMRangeBuilder` can drop it:
+
+- `MigrateTemplateMarkerMetas` moves a start marker up past a `<p>` whose last
+  non-separator child it is. PHP moves the node's *last child first*, then
+  repeats until the sentinel (the marker) has moved, inserting each before the
+  same sibling. The net effect preserves document order: marker first, trailing
+  whitespace after it. The port drained the whole suffix and inserted the nodes
+  one by one at a fixed index, which reversed them and put the newline *before*
+  the marker. It now splices the drained suffix in place.
+- `findEncapTarget` runs after `ensureElementsInRangeAndAddAboutIds`, so when a
+  range's first content is whitespace it is the freshly created newline span —
+  not a later element — that receives the transclusion metadata. The port skipped
+  whitespace spans when choosing the target, leaving the metadata on the first
+  real element and the newline outside the range.
+
+With the marker adjacent to its content again, the newline span is the range
+start. `handleFirstRenderingTransparentNode` then moves the transclusion type,
+`data-mw.parts`, and `data-parsoid`'s `pi`/`dsr` onto the `mw-empty-elt` wrapper
+before dropping the span; that transfer was missing from `stash_stashable_runs`
+and is now performed (`transfer_tpl_metadata`), in Parsoid's property order.
+
+**Effect:** Bitcoin's first difference moves from 0.60% to 1.07% (and its
+infobox wrapper now carries the metadata on the wrapper, as served). No corpus
+regressions; 4/48 strict.

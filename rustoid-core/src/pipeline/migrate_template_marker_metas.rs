@@ -157,12 +157,16 @@ fn process_children(children: &mut Vec<Node>, depths: &HashMap<String, (usize, u
             && migrate_last_child(&children[idx].children[last], depths)
             && can_migrate_across_end(&children[idx])
         {
+            // PHP moves the node's *last* child first and repeats until the
+            // sentinel (the last non-separator child) has moved, inserting each
+            // before the same next sibling. The net result keeps the drained
+            // suffix in document order: marker first, trailing separators after
+            // it. Inserting them one by one at a fixed index would reverse that
+            // and put a template's leading newline *before* its start marker,
+            // where encapsulation can no longer drop it.
             let moved: Vec<Node> = children[idx].children.drain(last..).collect();
             let moved = mark_fostered(moved, fostered);
-            let insert_at = idx + 1;
-            for m in moved.into_iter() {
-                children.insert(insert_at, m);
-            }
+            children.splice(idx + 1..idx + 1, moved);
         }
 
         i += 1;
@@ -306,5 +310,39 @@ mod tests {
         ));
         assert_eq!(body.children[1].children.len(), 1, "{doc:?}");
         assert!(is_tpl_end_marker_meta(&body.children[2]));
+    }
+
+    #[test]
+    fn test_trailing_separator_stays_after_migrated_start_marker() {
+        // `<p>text\n{{infobox}}\n` — the start marker is the last non-separator
+        // child and a newline follows it. PHP moves the last child first, so the
+        // marker ends up directly after the paragraph and the newline after the
+        // marker. Reversing those two would leave the newline outside the
+        // transclusion range, where it cannot be dropped during encapsulation.
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.dp.get_or_insert_with(Default::default).auto_inserted_end = true;
+        p.push_child(Node::text("text\n"));
+        p.push_child(meta("mw:Transclusion", "#mwt1"));
+        p.push_child(Node::text("\n"));
+
+        let mut body = Node::element(ElementKind::Other("body".to_string()));
+        body.push_child(p);
+
+        let mut doc = Node::document();
+        doc.push_child(body);
+
+        let mut depths = HashMap::new();
+        depths.insert("#mwt1".to_string(), (3, 2));
+
+        run(&mut doc, &depths);
+
+        let body = &doc.children[0];
+        assert_eq!(body.children.len(), 3, "{doc:?}");
+        assert!(matches!(
+            &body.children[0].kind,
+            NodeKind::Element(ElementKind::Paragraph)
+        ));
+        assert!(is_tpl_start_marker_meta(&body.children[1]), "{doc:?}");
+        assert!(matches!(&body.children[2].kind, NodeKind::Text(t) if t == "\n"));
     }
 }

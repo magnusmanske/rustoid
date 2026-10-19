@@ -2057,6 +2057,16 @@ fn wrap_transclusion_children(
                         }
                         span.push_child(Node::text(s.clone()));
                         span.data_parsoid = Some("{\"tmp\":{\"wrapper\":true}}".to_string());
+                        // `findEncapTarget` runs after the range is made
+                        // element-only, so a leading newline span *is* the
+                        // encapsulation target. That matters: PHP then moves the
+                        // transclusion metadata onto the `mw-empty-elt` wrapper
+                        // when the run is stashed, and drops the newline with the
+                        // span. Choosing a later element here instead leaves the
+                        // newline outside the wrapper (an extra blank line).
+                        if encap_target.is_none() {
+                            encap_target = Some(new_content.len());
+                        }
                         new_content.push(span);
                         continue;
                     }
@@ -2421,10 +2431,14 @@ fn stash_stashable_runs(content: &mut Vec<Node>, fostered: bool) {
         }
 
         let about = content[start].get_attr("about").map(str::to_string);
+        let tpl_type = match_tpl_type(&content[start]);
         let mut span = Node::element(ElementKind::Span);
         span.set_attr("class", "mw-empty-elt");
         if let Some(about) = about {
             span.set_attr("about", about);
+        }
+        if let Some(tpl_type) = &tpl_type {
+            transfer_tpl_metadata(&mut content[start], &mut span, tpl_type);
         }
         // `migrateElements`: non-elements and newline spans are dropped, and the
         // rest keep their content but lose their `about` (the span has it now).
@@ -2440,6 +2454,89 @@ fn stash_stashable_runs(content: &mut Vec<Node>, fostered: bool) {
         span.children = moved;
         content.insert(start, span);
         i = start + 1;
+    }
+}
+
+/// `WTUtils::matchTplType` — the first `mw:Transclusion`/`mw:Param` value in a
+/// node's `typeof` (start- or end-marker form).
+fn match_tpl_type(node: &Node) -> Option<String> {
+    node.get_attr("typeof").and_then(|ty| {
+        ty.split_whitespace()
+            .find(|t| {
+                matches!(
+                    *t,
+                    "mw:Transclusion" | "mw:Param" | "mw:Transclusion/End" | "mw:Param/End"
+                )
+            })
+            .map(str::to_string)
+    })
+}
+
+/// `DOMRangeBuilder::handleFirstRenderingTransparentNode`'s metadata transfer: a
+/// stashable run that starts at the transclusion's encapsulation target moves
+/// the transclusion type, `data-mw.parts`, and the `data-parsoid` `pi`/`dsr`
+/// onto the `mw-empty-elt` wrapper, leaving the inner node with only its own
+/// metadata.
+fn transfer_tpl_metadata(inner: &mut Node, span: &mut Node, tpl_type: &str) {
+    let remaining: Vec<String> = inner
+        .get_attr("typeof")
+        .unwrap_or("")
+        .split_whitespace()
+        .filter(|t| *t != tpl_type)
+        .map(str::to_string)
+        .collect();
+    if remaining.is_empty() {
+        inner.attrs.retain(|a| a.key != "typeof");
+    } else {
+        inner.set_attr("typeof", remaining.join(" "));
+    }
+    span.set_attr("typeof", tpl_type);
+
+    if let Some(dmw) = inner.data_mw.clone()
+        && let Some((s, e)) = data_mw_key_span(&dmw, "parts")
+    {
+        let stripped = strip_data_mw_key(&dmw, "parts");
+        span.data_mw = Some(format!("{{\"parts\":{}}}", &dmw[s..e]));
+        inner.data_mw = if stripped.trim() == "{}" {
+            None
+        } else {
+            Some(stripped)
+        };
+    }
+
+    // A fresh wrapper `DataParsoid` gains the flags first and then `pi`/`dsr`,
+    // which is the order Parsoid serializes them in.
+    let dp_json = inner
+        .data_parsoid
+        .clone()
+        .unwrap_or_else(|| "{}".to_string());
+    let mut stripped = dp_json.clone();
+    let mut fields = vec![
+        "\"autoInsertedStart\":true".to_string(),
+        "\"autoInsertedEnd\":true".to_string(),
+    ];
+    for key in ["pi", "dsr"] {
+        if let Some((s, e)) = data_mw_key_span(&stripped, key) {
+            fields.push(format!("\"{key}\":{}", &stripped[s..e]));
+            stripped = strip_data_mw_key(&stripped, key);
+        }
+    }
+    span.data_parsoid = Some(format!("{{{}}}", fields.join(",")));
+    span.dp = Some(TDataParsoid {
+        auto_inserted_start: true,
+        auto_inserted_end: true,
+        ..Default::default()
+    });
+    if inner.data_parsoid.is_some() {
+        inner.data_parsoid = if stripped.trim() == "{}" {
+            None
+        } else {
+            Some(stripped)
+        };
+    }
+    if let Some(dp) = inner.dp.as_mut() {
+        dp.pi = None;
+        dp.dsr = None;
     }
 }
 
