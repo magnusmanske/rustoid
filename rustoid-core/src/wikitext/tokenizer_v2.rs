@@ -4782,6 +4782,20 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
     let mut i = 0;
     let bytes = input.as_bytes();
     while i < bytes.len() {
+        // `<!-- … -->` is one opaque piece. MediaWiki's preprocessor matches a
+        // comment before it looks for braces, so a `{{`/`}}` inside one neither
+        // opens nor closes anything. `Template:Cite IETF` comments out a whole
+        // alternative invocation; scanning its braces ended the outer `#invoke`
+        // early and left the template's source as literal text. An unclosed
+        // `<!--` is ordinary text, as the preprocessor's comment rule needs its
+        // `-->`.
+        if bytes[i] == b'<'
+            && input[i..].starts_with("<!--")
+            && let Some(offset) = input[i + 4..].find("-->")
+        {
+            i += 4 + offset + 3;
+            continue;
+        }
         match (stack.last(), bytes[i]) {
             // A `}}` while a wikilink is still open cannot close this template;
             // the rule fails here and the `{{` degrades to literal text.
@@ -7625,6 +7639,26 @@ mod tests {
         // A five-brace run nested in an argument of another one.
         let nested = "{{{|safesubst:}}}#if:1|plain={{{{{|safesubst:}}}#if:1|x|y}}}}";
         assert_eq!(find_template_closing(nested), Some(nested.len() - 2));
+    }
+
+    /// A comment is one opaque piece, so braces inside it neither open nor
+    /// close a construct. `Template:Cite IETF` comments out a complete
+    /// alternative `{{#invoke:…}}`; counting that comment's braces ended the
+    /// outer invocation early and leaked the template's source as text.
+    #[test]
+    fn a_comment_does_not_close_a_template() {
+        let input = "#invoke:x|{{#if:a|b|c}}<!-- {{y|z}} -->|arg}}";
+        assert_eq!(find_template_closing(input), Some(input.len() - 2));
+
+        // A comment nested in a tplarg is skipped there too.
+        let mut memo = ScanMemo::default();
+        let tplarg = "{{{p|<!-- {{q}} -->x}}}";
+        assert_eq!(skip_tplarg_memo(tplarg, 0, &mut memo), Some(tplarg.len()));
+
+        // An unclosed `<!--` is ordinary text, as the preprocessor's comment
+        // rule needs its `-->`; the `}}` after it still closes.
+        let unclosed = "a<!-- b}}";
+        assert_eq!(find_template_closing(unclosed), Some(unclosed.len() - 2));
     }
 
     /// The two scanners must share one memo, and a failed `{{{` must be
