@@ -2934,17 +2934,27 @@ fn luafn_title_new(
 
     // `getContent()` — the page's wikitext. Only available for pages that were
     // fetched (or the page being parsed, whose source rustoid already has);
-    // Scribunto returns nil for a page it has not loaded.
+    // Scribunto returns nil for a page it has not loaded. An *unfetched* page is
+    // unknown rather than empty, so the retry loop is asked to fetch it.
+    // `Module:GetShortDescription` reads a linked page's wikitext to look for a
+    // `{{short description}}`, and without this it concluded the page did not
+    // exist and dropped every [[Abel Prize]]-style annotation.
+    let full_for_content = full.clone();
     table.set(
         "getContent",
         lua.create_function(move |lua, _this: Value| {
             if is_current {
                 return Ok(Value::String(lua.create_string(&current_source)?));
             }
-            Ok(match facts.as_ref().and_then(|f| f.content.as_ref()) {
-                Some(c) => Value::String(lua.create_string(c)?),
-                None => Value::Nil,
-            })
+            match facts.as_ref().and_then(|f| f.content.as_ref()) {
+                Some(c) => Ok(Value::String(lua.create_string(c)?)),
+                None => {
+                    if facts.is_none() && !full_for_content.is_empty() {
+                        note_missing_title(lua, &full_for_content)?;
+                    }
+                    Ok(Value::Nil)
+                }
+            }
         })?,
     )?;
 
@@ -9933,6 +9943,48 @@ mod tests {
             engine.take_missing_titles(),
             vec!["Module:Unknown".to_string()]
         );
+    }
+
+    /// `getContent` on an unfetched page is *unknown*, not empty, and must ask
+    /// for the page. `Module:GetShortDescription` reads a linked page's wikitext
+    /// to find its `{{short description}}`; returning nil without recording the
+    /// title made every `{{annotated link|Abel Prize}}` lose its description.
+    #[test]
+    fn get_content_on_an_unknown_page_requests_it() {
+        let engine = make_engine();
+        let src = r#"
+            local p = {}
+            function p.main()
+                local content = mw.title.new('Module:Unknown').getContent()
+                return type(content)
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(src, "main", &[]).unwrap(), "nil");
+        assert_eq!(
+            engine.take_missing_titles(),
+            vec!["Module:Unknown".to_string()]
+        );
+
+        // A page whose facts were fetched but has no body answers nil without a
+        // second request (it genuinely does not exist / is empty).
+        let mut ctx = LuaContext::new(LuaSite::from_config(&MockSiteConfig::new()), "Test");
+        ctx.titles.insert(
+            "Module:Gone".to_string(),
+            TitleFacts {
+                exists: false,
+                content: None,
+                ..Default::default()
+            },
+        );
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+        assert_eq!(
+            engine
+                .eval("return type(mw.title.new('Module:Gone').getContent())")
+                .unwrap(),
+            "nil"
+        );
+        assert!(engine.take_missing_titles().is_empty());
     }
 
     /// A derived title in another namespace must read *its own* facts, not its
