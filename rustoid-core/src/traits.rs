@@ -391,7 +391,7 @@ impl FileInfo {
     /// differing only in the caller). Applied by the API-backed data sources; a
     /// mock keeps its own URLs, so the media processor never has to know which
     /// source supplied the answer.
-    pub fn normalize_api_urls(&mut self) {
+    pub fn normalize_api_urls(&mut self, local_host: Option<&str>) {
         fn strip_proto(url: &str) -> String {
             url.strip_prefix("https://")
                 .or_else(|| url.strip_prefix("http://"))
@@ -418,6 +418,55 @@ impl FileInfo {
         for d in &mut self.derivatives {
             d.src = strip_proto(&d.src).replace("utm_campaign=api", "utm_campaign=index");
         }
+        // A subtitle track on the *local* wiki is served by its own
+        // `/w/api.php`: root-relative and without the `origin` the API appends.
+        // A track on a shared repo (Commons) keeps the absolute repository URL
+        // and one `origin`, which is what the pinned HTML carries.
+        for t in &mut self.timedtext {
+            let is_local = local_host
+                .is_some_and(|host| url_host(&t.src).is_some_and(|h| h.eq_ignore_ascii_case(host)));
+            if is_local {
+                t.src = without_origin(&root_relative(&t.src));
+            }
+        }
+    }
+}
+
+/// The host of an absolute URL (`https://host/path`), without the port.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url.strip_prefix("//")?,
+    };
+    let host = rest.split(['/', '?', '#']).next()?;
+    Some(host.split(':').next().unwrap_or(host))
+}
+
+/// An absolute URL's path and query (`/w/api.php?…`).
+fn root_relative(url: &str) -> String {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url.strip_prefix("//").unwrap_or(url),
+    };
+    match rest.find('/') {
+        Some(slash) => rest[slash..].to_string(),
+        None => rest.to_string(),
+    }
+}
+
+/// Drop every `origin=` query parameter.
+fn without_origin(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|part| !part.starts_with("origin="))
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
     }
 }
 
@@ -1091,6 +1140,36 @@ mod tests {
         assert!(c.is_extension_tag("ref"));
         assert!(c.is_extension_tag("REF")); // lower-cased before matching
         assert!(!c.is_extension_tag("div"));
+    }
+
+    /// A subtitle track on the local wiki is root-relative and origin-free; a
+    /// shared repo's track keeps the absolute URL and one `origin`.
+    #[test]
+    fn test_local_subtitle_track_urls_are_root_relative() {
+        let track = |src: &str| crate::traits::FileTrack {
+            src: src.to_string(),
+            ..Default::default()
+        };
+        let mut info = FileInfo {
+            timedtext: vec![
+                track(
+                    "https://en.wikipedia.org/w/api.php?action=timedtext&title=File%3AA.ogg&lang=en&trackformat=vtt&origin=%2A",
+                ),
+                track(
+                    "https://commons.wikimedia.org/w/api.php?action=timedtext&title=File%3AB.ogg&lang=en&trackformat=vtt&origin=%2A",
+                ),
+            ],
+            ..Default::default()
+        };
+        info.normalize_api_urls(Some("en.wikipedia.org"));
+        assert_eq!(
+            info.timedtext[0].src,
+            "/w/api.php?action=timedtext&title=File%3AA.ogg&lang=en&trackformat=vtt"
+        );
+        assert_eq!(
+            info.timedtext[1].src,
+            "https://commons.wikimedia.org/w/api.php?action=timedtext&title=File%3AB.ogg&lang=en&trackformat=vtt&origin=%2A"
+        );
     }
 
     #[test]

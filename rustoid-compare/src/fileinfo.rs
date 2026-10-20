@@ -129,7 +129,7 @@ pub async fn file_info(
     }
     // The API expands URLs and stamps its own UTM campaign; the parser wants
     // the protocol-relative, `parser`-campaign form.
-    result.normalize_api_urls();
+    result.normalize_api_urls(Some(&client.wiki().host));
     Ok(Some(result))
 }
 

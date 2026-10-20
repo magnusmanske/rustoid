@@ -305,7 +305,11 @@ impl MediaWikiApiDataSource {
                     };
                     // The API expands URLs and stamps its own UTM campaign; the
                     // parser wants the protocol-relative, `parser`-campaign form.
-                    result.normalize_api_urls();
+                    result.normalize_api_urls(
+                        self.api_url
+                            .split_once("://")
+                            .map(|(_, rest)| rest.split('/').next().unwrap_or(rest)),
+                    );
                     return Ok(Some(result));
                 }
             }

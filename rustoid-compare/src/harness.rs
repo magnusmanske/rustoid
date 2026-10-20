@@ -1173,14 +1173,24 @@ impl CachedDataSource {
     /// what the cache exists to avoid. A parse failure is a miss, as in
     /// [`Self::cached_page_info`].
     fn cached_file_info(&self, key: &str) -> Option<Option<rustoid_core::traits::FileInfo>> {
-        let cached = self
-            .cache
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get(EntryKind::FileInfo, key).ok().flatten());
+        let (cached, host) = {
+            let guard = self.cache.lock().ok()?;
+            (
+                guard.get(EntryKind::FileInfo, key).ok().flatten(),
+                guard.host().to_string(),
+            )
+        };
         let hit = cached?;
         self.observe(&hit.meta);
-        serde_json::from_str(&hit.body).ok()
+        let mut info: Option<rustoid_core::traits::FileInfo> =
+            serde_json::from_str(&hit.body).ok()?;
+        // Normalize on read as well as on fetch: a body written by an older
+        // build carries the API's own URL forms (an absolute local subtitle
+        // track with `origin`), and the cache outlives the code that wrote it.
+        if let Some(info) = info.as_mut() {
+            info.normalize_api_urls(Some(&host));
+        }
+        Some(info)
     }
 
     /// Write a file's media info (or its absence) to the cache.
