@@ -6098,6 +6098,10 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
     let mut table: i32 = 0;
     let mut dash_brace: i32 = 0;
     let lower = inner.to_ascii_lowercase();
+    // Shared by the `{{{` checks below: an argument reference is only opened
+    // when it really closes with `}}}`, and remembering the failures keeps the
+    // scan linear on an input full of unterminated braces.
+    let mut memo = ScanMemo::default();
     let mut i = 0;
     while i < inner.len() {
         // A `-{ … }-` language-variant construct is balanced: its internal `|`
@@ -6219,10 +6223,25 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
             let run = inner[i..].bytes().take_while(|&b| b == b'{').count();
             match run % 3 {
                 0 => {
-                    braces.push(Brace::Tplarg);
-                    current.push_str("{{{");
-                    i += 3;
-                    continue;
+                    // `{{{` opens an argument only when it really is one. The
+                    // `{{{!}}` magic pipe is `{` + `{{!}}`: PHP's `preproc_piece`
+                    // tries the argument and falls back to a literal `{` when the
+                    // first `}}` is not a `}}}` closer. Opening an argument here
+                    // left `braces` out of step with the closing scan, so the
+                    // template's own `}}` and every following top-level `|` were
+                    // read as nested — `Template:Infobox football biography`'s
+                    // `data196` (a `{{{!}}` table) swallowed the parameters after
+                    // it (`| belowstyle = …`).
+                    if skip_tplarg_memo(inner, i, &mut memo).is_none() {
+                        // Fall through: the first `{` is literal content and the
+                        // rest of the run is reconsidered. (Do not `continue` —
+                        // that would retest the same run forever.)
+                    } else {
+                        braces.push(Brace::Tplarg);
+                        current.push_str("{{{");
+                        i += 3;
+                        continue;
+                    }
                 }
                 2 => {
                     braces.push(Brace::Template);
@@ -7803,6 +7822,22 @@ mod tests {
             Some("{{{a|{{{b|C}}}}}}".len())
         );
         assert_eq!(find_arg_separator_eq("{{t|a}}=b", false), Some(7));
+    }
+
+    #[test]
+    fn test_split_template_args_handles_the_magic_pipe() {
+        // `{{{!}}` is `{` + `{{!}}`, not an argument reference: PHP tries the
+        // argument, the first `}}` is not a `}}}` closer, so the `{` stays
+        // literal. Opening an argument instead left the stack unbalanced, and
+        // every following top-level `|` was read as nested — `Template:Infobox
+        // football biography`'s `data196` swallowed the parameters after it.
+        let parts = split_template_args("m|{{#if:x|{{{!}} a\n{{!}}-\n{{!}}} }}|below=1");
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[2], "below=1");
+
+        // A real `{{{…}}}` argument reference still nests.
+        let parts = split_template_args("m|{{{a|b|c}}}|d=1");
+        assert_eq!(parts, vec!["m", "{{{a|b|c}}}", "d=1"]);
     }
 
     #[test]
