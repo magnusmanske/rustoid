@@ -18493,17 +18493,37 @@ for an `inline` tag and a `<div><pre>` for a block, with
 `style`/`class`, and the extension encapsulation. A self-closing tag carries no
 `body` in `data-mw`, a pair carries `body.extsrc`, and the wrapper's `about` is
 stamped in the same chunk pass as the other rich extensions, so the id order is
-the service's.
+the service's. Copied attributes keep their source order: a source `class` keeps
+its position (the generated classes merge into it), an empty `style=""` is still
+serialized, and a source `class` the tag omits gets the generated one appended
+after `style`.
 
 The body is escaped text. That is exactly what Pygments' `TextLexer` (and so
 `lang=text`, or a language the extension does not know) produces, and it is the
 right structure for the rest — but Pygments' token spans are not reproduced.
 
-**Effect:** `Template:Weather box` 73,891 → 74,154. Every empty inline
-`{{para}}` tag and its `lang=text` body now matches; the first difference is the
-generated HTML `id` of the first wrapper (`mwCQ` where the service has `mwCg`),
-which is an id-sequence gap, not the tag. `Python (programming language)` keeps
-its first difference at 27,043. No corpus regressions; 5/48 strict.
+**Effect:** `Template:Weather box` 73,891 → 134,985. Every wrapper, the block
+`<pre>`, and the generated ids now match; the first difference is Pygments'
+token span inside the first block (`<span class="p">{{</span>` where rustoid
+has the text `{{`). `Python (programming language)` keeps its first difference
+at 27,043. No corpus regressions; 5/48 strict.
+
+## Sections are wrapped after cleanup, so they take ids
+
+The first syntaxhighlight wrapper was still one id low after the wrapper port:
+`mwCQ` where the service has `mwCg`. The missing id was a `<section>` wrapper.
+Rustoid ran `mark_discardable_data_parsoid` after `wrap_sections`, so the
+section wrappers created inside a transclusion range were marked discardable
+and took no page-bundle id; only the lead section, outside every range, had one.
+PHP's `CleanUp` (which records `DISCARDABLE_DP`) runs *before* `WrapSections`,
+so the wrappers are never marked. The two passes are now in that order. Every
+earlier pass keeps its `dp` — `wrap_sections` only reads a heading's `stx`, and
+`discard_node` deliberately keeps that on headings.
+
+**Effect:** the ids on `Template:Weather box` (sections, wrappers and `<pre>`)
+now match the service one for one; the first difference moved from 74,154 to
+134,985. Nine spot-checked pages kept their first-difference offsets, `Unix`
+stayed at 63,753, and the corpus stayed at 5/48 strict.
 
 **Open:** Pygments' lexers. The token markup inside a block (`<span class="p">`,
 `<span class="nn">`, …) needs a Pygments port for `wikitext`, `python` and the

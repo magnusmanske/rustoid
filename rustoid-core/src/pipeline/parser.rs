@@ -5679,15 +5679,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `<templatestyles>` is emitted full at its first occurrence and as a
         // `mw-deduplicated-inline-style` link afterwards.
         crate::pipeline::dedupe_styles::run(&mut ast);
+        // PHP's `CleanUp` (which records `DISCARDABLE_DP`) runs *before*
+        // `WrapSections`, so the section wrappers the next pass creates are not
+        // marked discardable — and so take page-bundle ids even inside a
+        // transclusion range. Running the marking after wrapping marked them,
+        // and every id after the first section shifted down (`Template:Weather
+        // box`: `mwCQ` where the service has `mwCg`).
+        //
+        // Every earlier pass keeps its `dp`: `wrap_sections` only reads a
+        // heading's `stx`, and a heading is one of the nodes `discard_node`
+        // deliberately keeps.
+        crate::pipeline::cleanup::mark_discardable_data_parsoid(&mut ast);
         wrap_sections_in_ast(&mut ast, options.wrap_sections);
         // Core appends the table-of-contents placeholder to section 0 of a
         // main-namespace page that has enough headings and no `__TOC__`/
         // `__NOTOC__`. It needs the sections to already exist, so it runs here.
         crate::pipeline::auto_toc::insert(&mut ast, title.namespace_id == 0);
-        // PHP marks the `data-parsoid` a transclusion's interior nodes may not
-        // keep as its cleanup traverser stores them, i.e. just before the ids are
-        // handed out. Doing it here leaves every earlier pass its `dp`.
-        crate::pipeline::cleanup::mark_discardable_data_parsoid(&mut ast);
         // Page-bundle node ids are allocated last, after every pass that can create
         // or destroy an element. The ids are positional — one element inserted
         // earlier shifts every id after it — so the assignment cannot run before

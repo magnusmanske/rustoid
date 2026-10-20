@@ -41,23 +41,45 @@ pub fn render(request: &Request) -> Option<Node> {
     } else {
         "div".to_string()
     }));
-    if let Some(style) = attribute(request.attrs, "style")
-        && !style.is_empty()
-    {
-        node.set_attr("style", style);
-    }
+
+    // `sourceToDom` copies the tag attributes it does not consume, in source
+    // order. `class` and `style` are the observable ones: `class` keeps its
+    // source position when written (and receives the generated classes), and an
+    // empty `style=""` is still serialized. A `class` the source omitted is
+    // added after the copied attributes.
     let mut classes = vec![
         "mw-highlight".to_string(),
         format!("mw-highlight-lang-{lang}"),
         "mw-content-ltr".to_string(),
     ];
-    if let Some(class) = attribute(request.attrs, "class")
-        && !class.is_empty()
-    {
-        classes.push(class.to_string());
+    let mut has_class = false;
+    let mut has_dir = false;
+    for (key, value) in request.attrs {
+        match key.to_ascii_lowercase().as_str() {
+            "lang" | "language" | "inline" | "line" | "start" | "highlight" | "linenos"
+            | "linenostart" | "enclose" | "title" | "page" | "filename" | "debug" => {}
+            "class" => {
+                has_class = true;
+                let user = value.trim();
+                if !user.is_empty() {
+                    classes.push(user.to_string());
+                }
+                node.set_attr("class", classes.join(" "));
+            }
+            "style" => node.set_attr("style", value.clone()),
+            "dir" => {
+                has_dir = true;
+                node.set_attr("dir", value.clone());
+            }
+            _ => node.set_attr(key.clone(), value.clone()),
+        }
     }
-    node.set_attr("class", classes.join(" "));
-    node.set_attr("dir", if is_rtl(lang) { "rtl" } else { "ltr" });
+    if !has_class {
+        node.set_attr("class", classes.join(" "));
+    }
+    if !has_dir {
+        node.set_attr("dir", if is_rtl(lang) { "rtl" } else { "ltr" });
+    }
     node.set_attr("typeof", "mw:Extension/syntaxhighlight");
     node.set_attr("about", request.about.clone());
     node.set_attr("data-mw", request.data_mw.clone());
@@ -164,6 +186,39 @@ mod tests {
         );
         assert!(
             matches!(pre.children.as_slice(), [child] if matches!(&child.kind, NodeKind::Text(t) if t == "| name = value\n"))
+        );
+    }
+
+    #[test]
+    fn an_empty_style_is_kept_and_a_source_class_keeps_its_position() {
+        // Source order `lang, class, style, inline`: the copied attributes come
+        // out as class, style, dir; the generated class merges into the source
+        // one and the empty style is still serialized.
+        let attrs = vec![
+            ("lang".to_string(), "text".to_string()),
+            ("class".to_string(), String::new()),
+            ("style".to_string(), String::new()),
+            ("inline".to_string(), "1".to_string()),
+        ];
+        let node = render(&request(&attrs, Some("trace"))).expect("a language is named");
+        let keys: Vec<&str> = node.attrs.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["class", "style", "dir", "typeof", "about", "data-mw"]
+        );
+        assert_eq!(node.get_attr("style"), Some(""));
+
+        // With no source `class`, the generated one follows `style`.
+        let attrs = vec![
+            ("lang".to_string(), "wikitext".to_string()),
+            ("inline".to_string(), String::new()),
+            ("style".to_string(), "display: none;".to_string()),
+        ];
+        let node = render(&request(&attrs, None)).expect("a language is named");
+        let keys: Vec<&str> = node.attrs.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["style", "class", "dir", "typeof", "about", "data-mw"]
         );
     }
 
