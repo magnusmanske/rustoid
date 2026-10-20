@@ -18446,15 +18446,66 @@ precipitation cell read `2534.7` where the service serves `2,534.7`.
 **Effect:** `Template:Weather box` 68,633 → 73,891 (the next difference is the
 unported `syntaxhighlight` extension). No corpus regressions; 5/48 strict.
 
-## Open: `#property` is unimplemented, and a literal call is truthy
+## `#property` is implemented by property id
 
 `Template:Infobox OS` falls back to `{{#property:P1324}}` for its Repository row.
-Rustoid leaves that call literal, so `{{#if:{{#property:P1324}}|…}}` sees the
-braces as a non-empty string and takes the then branch: `Unix` renders a
-Repository row whose only content is the empty-list stylesheet, where the service
-has no row at all. This is the first difference at 11,710 and is pre-existing.
+Rustoid left that call literal, so `{{#if:{{#property:P1324}}|…}}` saw the
+braces as a non-empty string and took the then branch: `Unix` rendered a
+Repository row whose only content was the empty-list stylesheet, where the
+service has no row at all.
 
-Wikibase's `#property` is not implemented (`mw.wikibase` is). Doing it properly
-needs the entity fetch `mw.wikibase` already performs plus Wikibase's value
-formatting; a stub that always answers empty would fix this page by accident and
-break every page whose property is set.
+`rustoid-extensions/src/wikibase.rs` now renders a property's **best statements**
+the way `StatementTransclusionInteractor` does: preferred statements when there
+are any, otherwise non-deprecated ones; each main snak formatted as
+`TYPE_ESCAPED_PLAINTEXT`, joined with `", "`.
+
+- `string`/`external-id`/`commonsMedia` are their text, `wfEscapeWikiText`-escaped;
+- a `url` is returned unescaped, so the parser autolinks it;
+- a `wikibase-item` is its label, falling back to the entity id;
+- a `time` is `MwTimeIsoFormatter`'s plain rendering (year, month, or day by
+  precision, including the coarse-precision fold and the era suffix);
+- a `quantity` is its localized amount plus its unit's label;
+- a `globecoordinate` is `LatLongFormatter` with the options Wikibase sets
+  (DMS, which falls back to decimal minutes or degrees by precision, cardinal
+  directions, and spacing only between latitude and longitude).
+
+The parser resolves the entity asynchronously just before the synchronous call
+(`Parser::prime_property`), once per render for the page's own item, and fetches
+the labels the values name. `#property` is also marked as a text-returning
+branch, so a bare URL is re-tokenized into a link.
+
+**Effect:** `Unix` 11,710 → 63,753 (the spurious Repository row is gone).
+`Titanic` 18,422 → 18,451 offline, and 24,339 once one online run cached the
+labels its builder links name. No corpus regressions; 5/48 strict.
+
+**Not implemented:** a property *label* (`{{#property:occupation}}`) needs
+Wikidata's label→id index, which rustoid does not hold; the call answers empty.
+An id that names no property gets no error `<p>` (the wiki emits `Failed to
+render property P99999: P99999 property not found.`), and a quantity's
+`upperBound`/`lowerBound` are ignored.
+
+## SyntaxHighlight: the wrapper is a port, Pygments is not
+
+`<syntaxhighlight>` was left as a bare `<extension>`. `rustoid-extensions` now
+emits the tag's wrapper the way `SyntaxHighlight::sourceToDom` does: a `<code>`
+for an `inline` tag and a `<div><pre>` for a block, with
+`mw-highlight mw-highlight-lang-{lang} mw-content-ltr`, `dir`, the user's
+`style`/`class`, and the extension encapsulation. A self-closing tag carries no
+`body` in `data-mw`, a pair carries `body.extsrc`, and the wrapper's `about` is
+stamped in the same chunk pass as the other rich extensions, so the id order is
+the service's.
+
+The body is escaped text. That is exactly what Pygments' `TextLexer` (and so
+`lang=text`, or a language the extension does not know) produces, and it is the
+right structure for the rest — but Pygments' token spans are not reproduced.
+
+**Effect:** `Template:Weather box` 73,891 → 74,154. Every empty inline
+`{{para}}` tag and its `lang=text` body now matches; the first difference is the
+generated HTML `id` of the first wrapper (`mwCQ` where the service has `mwCg`),
+which is an id-sequence gap, not the tag. `Python (programming language)` keeps
+its first difference at 27,043. No corpus regressions; 5/48 strict.
+
+**Open:** Pygments' lexers. The token markup inside a block (`<span class="p">`,
+`<span class="nn">`, …) needs a Pygments port for `wikitext`, `python` and the
+other languages the corpus uses; the pure-Rust crates on crates.io mirror only
+the text kernels, not the lexer tables.

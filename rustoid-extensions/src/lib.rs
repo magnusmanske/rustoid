@@ -12,3 +12,5 @@
 pub mod cite;
 pub mod kartographer;
 pub mod secure_link_fixer;
+pub mod syntaxhighlight;
+pub mod wikibase;

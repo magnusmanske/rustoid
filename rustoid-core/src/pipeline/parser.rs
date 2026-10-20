@@ -661,6 +661,14 @@ fn extension_token_name(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> O
         .and_then(|a| a.value.as_str())
 }
 
+/// If `item` is a `<syntaxhighlight>` extension token, return the self-closing token.
+fn syntaxhighlight_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    (extension_token_name(stt) == Some("syntaxhighlight")).then_some(stt)
+}
+
 /// If `item` is a `<templatedata>` extension token, return the self-closing token.
 fn templatedata_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
     let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
@@ -1480,8 +1488,19 @@ fn re_tokenize_text_branch(
     // Whether the branch's text starts at a line start in the enclosing source
     // (see [`branch_starts_line`]).
     starts_line: bool,
+    // Re-tokenize even when no block-syntax trigger matches. `#property` returns
+    // escaped plain text, which can be a bare URL; the tokenizer is what turns
+    // that into an external link.
+    force: bool,
 ) -> Vec<Item> {
-    re_tokenize_text_branch_inner(items, ext_tags, syntax, table_data_block, starts_line)
+    re_tokenize_text_branch_inner(
+        items,
+        ext_tags,
+        syntax,
+        table_data_block,
+        starts_line,
+        force,
+    )
 }
 
 /// Whether a parser-function call sits at the start of a source line.
@@ -1513,6 +1532,7 @@ fn re_tokenize_text_branch_inner(
     syntax: BranchSyntax,
     table_data_block: bool,
     starts_line: bool,
+    force: bool,
 ) -> Vec<Item> {
     fn is_wrapper(it: &Item) -> bool {
         matches!(
@@ -1618,7 +1638,7 @@ fn re_tokenize_text_branch_inner(
                 _ => unreachable!("checked above"),
             }
         }
-        if !text.lines().any(|line| syntax.triggers(line)) {
+        if !force && !text.lines().any(|line| syntax.triggers(line)) {
             return items;
         }
         let mut out: Vec<Item> = items[..start].to_vec();
@@ -1681,7 +1701,7 @@ fn re_tokenize_text_branch_inner(
                     run_starts_line,
                     syntax,
                     ext_tags,
-                    run_has_bang,
+                    run_has_bang || force,
                     table_data_block,
                 );
                 run_has_bang = false;
@@ -1697,7 +1717,7 @@ fn re_tokenize_text_branch_inner(
         run_starts_line,
         syntax,
         ext_tags,
-        run_has_bang,
+        run_has_bang || force,
         table_data_block,
     );
     out.extend_from_slice(&items[end..]);
@@ -1991,6 +2011,15 @@ pub struct Parser<'a, C: SiteConfig> {
     /// substituted. [`Parser::prime_ifexist`] therefore resolves it at the point
     /// the call is reached, which is where the substitution has already happened.
     ifexist: std::cell::RefCell<std::collections::HashMap<String, bool>>,
+    /// Answers for `#property`, keyed by `(property argument, from)`.
+    ///
+    /// `#property` reads Wikidata, which is a fetch, while the parser-function
+    /// call is synchronous: [`Parser::prime_property`] resolves the answer just
+    /// before the call and [`TemplateHandler`] reads it back here.
+    property_values: std::cell::RefCell<std::collections::HashMap<(String, String), String>>,
+    /// The page's Wikidata item id. Resolved at most once per render, because
+    /// every `#property` call without `from` needs the same answer.
+    page_entity: std::cell::RefCell<Option<Option<String>>>,
     /// Title facts already fetched this render, keyed by the title as written.
     ///
     /// `preload_titles` runs once per `#invoke`, and the titles it wants — a
@@ -2279,6 +2308,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             strip_data_parsoid: std::cell::Cell::new(false),
             protection: std::cell::RefCell::new(std::collections::HashMap::new()),
             ifexist: std::cell::RefCell::new(std::collections::HashMap::new()),
+            property_values: std::cell::RefCell::new(std::collections::HashMap::new()),
+            page_entity: std::cell::RefCell::new(None),
             title_facts: std::cell::RefCell::new(std::collections::HashMap::new()),
             page_protection: std::cell::RefCell::new(ProtectionEntry::default()),
             page_revision: std::cell::Cell::new(None),
@@ -2309,6 +2340,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     fn page_context(&self) -> PageContext<'_> {
         PageContext::new(&self.page_protection, &self.protection)
             .with_revision(self.page_revision.get())
+            .with_property_values(&self.property_values)
     }
 
     /// Resolve the existence an `#ifexist` call is about to read, if it is not
@@ -2357,6 +2389,99 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .and_then(|m| m.get(&title).map(|i| !i.missing))
             .unwrap_or(false);
         self.ifexist.borrow_mut().insert(title, exists);
+    }
+
+    /// Resolve the answer a `#property` call is about to read.
+    ///
+    /// Like `#ifexist`, the value is a fetch and the parser-function call itself
+    /// is synchronous, so the answer has to be in hand first. The property is
+    /// expanded text by this point, so both the id and the optional `from`
+    /// entity are known.
+    async fn prime_property(
+        &self,
+        property_arg: &str,
+        params: &crate::pipeline::parser_functions::Params,
+        source: Option<&dyn DataSource>,
+    ) {
+        // `property_arg` is the resolver's text after the colon; `params` still
+        // holds the raw target, so only its named `from` is read here.
+        let property = property_arg.trim().to_string();
+        let (_, from) =
+            crate::pipeline::template_handler::TemplateHandler::property_call_key(params);
+        if property.is_empty() {
+            return;
+        }
+        let key = (property.clone(), from.clone());
+        if self.property_values.borrow().contains_key(&key) {
+            return;
+        }
+        let Some(source) = source else {
+            return;
+        };
+        let value = self.resolve_property(&property, &from, source).await;
+        self.property_values.borrow_mut().insert(key, value);
+    }
+
+    /// Read one property of one entity and render it as the plain wikitext
+    /// `#property` returns. An unknown value, entity or property is empty, which
+    /// is what the wiki serves; the parser function's error `<p>` for a property
+    /// that does not exist is not reproduced (see ONLINE-PARITY.md).
+    async fn resolve_property(
+        &self,
+        property_arg: &str,
+        from: &str,
+        source: &dyn DataSource,
+    ) -> String {
+        // A label such as `occupation` needs Wikidata's label→id index, which
+        // rustoid does not hold; only an id can be resolved. Answering empty is
+        // what an item without the value does, so a caller's `#if` still sees a
+        // missing value rather than the unevaluated `{{#property:…}}` source.
+        if !rustoid_extensions::wikibase::is_property_id(property_arg) {
+            return String::new();
+        }
+        let property = property_arg.to_ascii_uppercase();
+        let entity_id = if from.is_empty() {
+            self.current_entity_id(source).await
+        } else if crate::lua::wikibase::is_entity_id(from) {
+            Some(from.to_ascii_uppercase())
+        } else {
+            None
+        };
+        let Some(entity_id) = entity_id else {
+            return String::new();
+        };
+        let Some(entity_json) = source.get_entity(&entity_id).await.ok().flatten() else {
+            return String::new();
+        };
+        let mut labels = std::collections::HashMap::new();
+        for id in rustoid_extensions::wikibase::referenced_entity_ids(&entity_json, &property) {
+            if labels.len() >= MAX_PROPERTY_LABELS {
+                break;
+            }
+            if labels.contains_key(&id) {
+                continue;
+            }
+            let Some(json) = source.get_entity(&id).await.ok().flatten() else {
+                continue;
+            };
+            if let Some(label) =
+                rustoid_extensions::wikibase::label(&json, self.config.language_code())
+            {
+                labels.insert(id, label);
+            }
+        }
+        rustoid_extensions::wikibase::render_property(&entity_json, &property, &labels)
+    }
+
+    /// The page's Wikidata item id, fetched once per render.
+    async fn current_entity_id(&self, source: &dyn DataSource) -> Option<String> {
+        if let Some(cached) = self.page_entity.borrow().as_ref() {
+            return cached.clone();
+        }
+        let title = self.page_title.borrow().clone();
+        let id = source.get_entity_id_for_page(&title).await.ok().flatten();
+        *self.page_entity.borrow_mut() = Some(id.clone());
+        id
     }
 
     /// Tokenize raw wikitext into the V2 `Item` stream.
@@ -3022,6 +3147,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     next_id,
                 )
                 .await;
+            tokens = self.expand_syntaxhighlight(tokens, about_counter, &mut fragments, next_id);
             tokens = self
                 .expand_mapframe(
                     tokens,
@@ -4044,6 +4170,83 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         out
     }
 
+    /// Expand `<syntaxhighlight>` extension tokens in place, stashing each
+    /// wrapper behind a `mw:dom-fragment-token` placeholder (mirrors
+    /// `expand_phonos`). The body is escaped text rather than Pygments output;
+    /// see [`rustoid_extensions::syntaxhighlight`].
+    fn expand_syntaxhighlight(
+        &self,
+        tokens: Vec<Item>,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        use crate::pipeline::extension_handler::{extension_data_mw, extension_kv_attrs};
+
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = syntaxhighlight_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            let about = stt
+                .attribs
+                .iter()
+                .find(|kv| {
+                    kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+                })
+                .and_then(|kv| kv.value.as_str())
+                .filter(|b| !b.is_empty())
+                .map(|b| format!("#mwt{b}"))
+                .unwrap_or_else(|| self.new_about_id(about_counter, "syntaxhighlight"));
+            let attrs = extension_kv_attrs(&stt);
+            let pairs: Vec<(String, String)> = attrs
+                .iter()
+                .filter_map(|kv| {
+                    Some((kv.key.as_str()?.to_string(), kv.value.as_str()?.to_string()))
+                })
+                .collect();
+            let ext_src = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("source"))
+                .and_then(|kv| kv.value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // A self-closing tag has no body, and the service's `data-mw` omits
+            // the key entirely; a tag pair keeps it even when empty.
+            let has_body = stt
+                .data_parsoid
+                .ext_tag_offsets
+                .as_ref()
+                .and_then(|offsets| offsets.close_width)
+                .unwrap_or(0)
+                > 0;
+            let body = has_body
+                .then(|| crate::pipeline::extension_handler::extract_ext_body(&stt, &ext_src));
+            let data_mw = extension_data_mw("syntaxhighlight", &attrs, body.as_deref());
+            let request = rustoid_extensions::syntaxhighlight::Request {
+                attrs: &pairs,
+                body: body.as_deref(),
+                about,
+                data_mw,
+            };
+            match rustoid_extensions::syntaxhighlight::render(&request) {
+                Some(node) => {
+                    let mut frag = crate::dom::node::Node::document();
+                    frag.push_child(node);
+                    let id = next_id.get();
+                    next_id.set(id + 1);
+                    fragments.insert(id, frag);
+                    out.push(emit_dom_fragment_placeholder(&stt, id));
+                }
+                None => out.push(item),
+            }
+        }
+        out
+    }
+
     /// Expand `<phonos>` extension tokens in place, stashing each rendered
     /// `<span class="ext-phonos">` behind a `mw:dom-fragment-token` placeholder
     /// (mirrors `expand_gallery`/`expand_imagemap`).
@@ -4921,12 +5124,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments.extend(wrapper_fragments);
         let (tokens, indicator_fragments) = self.expand_indicator_sync(tokens, &next_id);
         fragments.extend(indicator_fragments);
-        let tokens = self.expand_gallery_sync(
-            tokens,
-            &std::cell::Cell::new(0usize),
-            &mut fragments,
-            &next_id,
-        );
+        let about_counter = std::cell::Cell::new(0usize);
+        let tokens = self.expand_gallery_sync(tokens, &about_counter, &mut fragments, &next_id);
+        let tokens = self.expand_syntaxhighlight(tokens, &about_counter, &mut fragments, &next_id);
         let stage = TreeBuilderStage::new(false);
         let mut ast =
             stage.to_ast_with_fragments(tokens, Some(wikitext), self.config, fragments, None);
@@ -5285,6 +5485,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 next_id,
             )
             .await;
+        let tokens = self.expand_syntaxhighlight(tokens, about_counter, &mut fragments, next_id);
         let tokens = self
             .expand_mapframe(
                 tokens,
@@ -6189,6 +6390,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 | Some("inputbox")
                 | Some("mapframe")
                 | Some("maplink")
+                | Some("syntaxhighlight")
         ) {
             return false;
         }
@@ -6735,6 +6937,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Some(ResolvedTarget::ParserFunction { name, .. })
                 if TemplateHandler::expands_branch_to_text(name)
         );
+        // A `#property` answer is plain text that may be a bare URL, which only
+        // the tokenizer turns into a link; there is no block-syntax trigger to
+        // key on, so the branch always re-tokenizes.
+        let force_branch_retokenize = matches!(
+            &resolved,
+            Some(ResolvedTarget::ParserFunction { name, .. })
+                if name.eq_ignore_ascii_case("property")
+        );
         // `#switch` keeps its branch's *tokens* (core returns them with
         // `PPFrame::RECOVER_ORIG`), so the text-branch marking above must not run.
         // A branch that carries a table start still needs it re-tokenized, though:
@@ -6754,6 +6964,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             && name.eq_ignore_ascii_case("ifexist")
         {
             self.prime_ifexist(pf_arg, source).await;
+        }
+        // `#property` reads Wikidata, so its answer is also a fetch. Its `from`
+        // argument has been expanded by now, which is what makes the entity id
+        // known here.
+        if let Some(ResolvedTarget::ParserFunction { name, pf_arg, .. }) = &resolved
+            && name.eq_ignore_ascii_case("property")
+        {
+            let params = crate::pipeline::parser_functions::Params::new(attribs.clone());
+            self.prime_property(pf_arg, &params, source).await;
         }
         match resolved {
             // `#invoke` is Scribunto, not a parser function: MediaWiki
@@ -7025,6 +7244,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         BranchSyntax::Cells,
                         *table_depth > 0,
                         branch_starts_line(tok, src_text),
+                        force_branch_retokenize,
                     );
                     mark_in_text_branch(&mut expanded);
                 } else if retokenize_branch_table {
@@ -7036,6 +7256,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         // T2529 puts an expansion that starts with `{|` on a
                         // line of its own even when the call is mid-line.
                         true,
+                        false,
                     );
                 }
                 for e in &expanded {
@@ -9252,6 +9473,12 @@ fn mark_from_module(items: &mut [Item]) {
 /// each title once and reuses the answer, which is a stricter budget than
 /// MediaWiki's per-call count and therefore never exceeds it.
 const MAX_IFEXIST_TITLES: usize = 500;
+
+/// How many property values one `#property` call may fetch labels for.
+///
+/// A statement list is short in practice; the bound keeps a hostile entity from
+/// turning one call into an unbounded crawl of Wikidata.
+const MAX_PROPERTY_LABELS: usize = 32;
 
 /// How many redirect hops may be followed before giving up.
 ///
@@ -11970,7 +12197,7 @@ mod tests {
                 Default::default(),
             ))),
         ];
-        let out = re_tokenize_text_branch(items, &[], BranchSyntax::Cells, false, true);
+        let out = re_tokenize_text_branch(items, &[], BranchSyntax::Cells, false, true, false);
         assert!(
             out.iter()
                 .any(|it| matches!(it, Item::Tok(ParsoidToken::Tag(t)) if t.name == "table")),

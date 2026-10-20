@@ -796,6 +796,10 @@ pub struct PageContext<'a> {
     /// `None` is MediaWiki's "no revision": a parser test, or a page that has
     /// not been saved yet.
     pub revision: Option<u64>,
+    /// Answers for `#property`, keyed by `(property argument, from)`.
+    /// Resolved asynchronously before the synchronous call; absent in tests and
+    /// on a wiki without Wikibase, where every call answers empty.
+    pub property_values: Option<std::cell::Ref<'a, HashMap<(String, String), String>>>,
 }
 
 impl<'a> PageContext<'a> {
@@ -813,7 +817,17 @@ impl<'a> PageContext<'a> {
             page: page.borrow(),
             titles: titles.borrow(),
             revision: None,
+            property_values: None,
         }
+    }
+
+    /// Attach the `#property` answers resolved for this render.
+    pub fn with_property_values(
+        mut self,
+        values: &'a std::cell::RefCell<HashMap<(String, String), String>>,
+    ) -> Self {
+        self.property_values = Some(values.borrow());
+        self
     }
 
     /// Attach the page's revision id; see [`PageContext::revision`].
@@ -1459,7 +1473,7 @@ impl TemplateHandler {
     pub fn expands_branch_to_text(name: &str) -> bool {
         matches!(
             name.to_ascii_lowercase().as_str(),
-            "if" | "ifeq" | "ifexpr" | "iferror"
+            "if" | "ifeq" | "ifexpr" | "iferror" | "property"
         )
     }
 
@@ -1498,6 +1512,32 @@ impl TemplateHandler {
     /// is what a module produces, because `frame:callParserFunction` renders the
     /// call as wikitext and re-expands it, and a module cannot know the wiki
     /// spells the same word without a hash on a page.
+    /// The `(property, from)` key of a `#property` call.
+    ///
+    /// The async priming pass and the synchronous call have to agree on this, so
+    /// both read the expanded arguments through it. `from` is a named argument;
+    /// the property itself is the positional first argument (the text after the
+    /// colon).
+    pub(crate) fn property_call_key(params: &Params) -> (String, String) {
+        let property = params
+            .args
+            .first()
+            .map(|kv| key_value_to_string(&kv.key))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let from = params
+            .args
+            .iter()
+            .skip(1)
+            .find(|kv| kv.key.as_str() == Some("from"))
+            .map(|kv| key_value_to_string(&kv.value))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        (property, from)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn call_parser_function(
         config: &dyn SiteConfig,
@@ -1596,6 +1636,20 @@ impl TemplateHandler {
             // the fallback arm below misses the bare name and the call would
             // otherwise spill its own source text.
             "defaultsort" | "defaultsortkey" | "defaultcategorysort" => Vec::new(),
+            // The Wikibase client's `{{#property:…}}`. Reading Wikidata is a fetch
+            // and this call is synchronous, so the host resolved the answer before
+            // the call (see [`crate::pipeline::parser`]'s `prime_property`). An
+            // unanswered call is empty, which is what the wiki serves for an item
+            // with no such value.
+            "property" => {
+                let (property, from) = Self::property_call_key(params);
+                let value = page
+                    .property_values
+                    .as_ref()
+                    .and_then(|values| values.get(&(property, from)).cloned())
+                    .unwrap_or_default();
+                vec![Item::Str(value)]
+            }
             // `{{#coordinates:…}}` — the GeoData extension's parser function. In
             // Parsoid it renders nothing in the body: the coordinate is stashed
             // on the page's `geoData`, which the served HTML does not carry.
@@ -2646,6 +2700,30 @@ mod tests {
 
         // Unsupported magic-word types yield an empty chunk (no panic).
         assert!(process_special_magic_word("something-else", false).is_empty());
+    }
+
+    #[test]
+    fn property_call_key_reads_the_property_and_from() {
+        use crate::wikitext::tokens_v2::{KV, KeyValue};
+
+        let kv = |key: &str, value: &str| KV {
+            key: KeyValue::Str(key.to_string()),
+            value: KeyValue::Str(value.to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        // The resolver rebuilds args[0] as the text after the colon.
+        let params = Params::new(vec![kv(" P856 ", ""), kv("from", " Q42 ")]);
+        assert_eq!(
+            TemplateHandler::property_call_key(&params),
+            ("P856".to_string(), "Q42".to_string())
+        );
+        let params = Params::new(vec![kv("P31", "")]);
+        assert_eq!(
+            TemplateHandler::property_call_key(&params),
+            ("P31".to_string(), String::new())
+        );
     }
 
     #[test]
