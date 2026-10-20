@@ -43,7 +43,7 @@ Titanic @ 1375768600 | transclusion, parser-function, cite, table, media
 Periodic table @ 1375981470 | table, transclusion, cite, media, math
 List of sovereign states @ 1375759429 | table, transclusion, cite, media
 Commonwealth of Nations @ 1375522280 | table, transclusion, cite, media
-ISO 3166-1 alpha-2 @ 1374091039 | table, parser-function, transclusion, cite
+ISO 3166-1 alpha-2 @ 1379731488 | table, parser-function, transclusion, cite
 
 # --- Extensions other than Lua ---
 Zebra | gallery, transclusion, table, cite, media
