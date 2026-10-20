@@ -3136,8 +3136,50 @@ fn transfer_transclusion_to_element(
             data_mw = Some(prepend_unwrapped_wt_part(mw, leading));
         }
     }
-    target.data_mw = data_mw;
+    attach_range_data_mw(target, data_mw);
     apply_encap_dp_fields(target, start_meta);
+}
+
+/// Give a transclusion target the range's `data-mw`.
+///
+/// A range can start at an extension node — the Audio template expanding to a
+/// bare `<phonos>` is the corpus case. That node already carries the
+/// extension's `data-mw` (`name`/`attrs`/`body`), and PHP's encapsulator
+/// mutates that same `DataMw` object to add the range's `parts`, so the served
+/// element has one merged attribute and not two. rustoid keeps the extension
+/// blob as a plain attribute, so fold it into the field here.
+pub(crate) fn attach_range_data_mw(target: &mut Node, range_mw: Option<String>) {
+    let Some(range_mw) = range_mw else { return };
+    let extension = target
+        .get_attr("data-mw")
+        .map(str::to_string)
+        .or_else(|| target.data_mw.take());
+    let Some(extension) = extension else {
+        target.data_mw = Some(range_mw);
+        return;
+    };
+    target.attrs.retain(|a| a.key != "data-mw");
+    target.data_mw = Some(merge_range_data_mw(&extension, &range_mw));
+}
+
+/// Append the range object's keys to the extension's `data-mw`. Falls back to
+/// the range object when either side is not a JSON object.
+fn merge_range_data_mw(extension: &str, range_mw: &str) -> String {
+    let (Ok(extension), Ok(range)) = (
+        serde_json::from_str::<serde_json::Value>(extension),
+        serde_json::from_str::<serde_json::Value>(range_mw),
+    ) else {
+        return range_mw.to_string();
+    };
+    let (serde_json::Value::Object(mut extension), serde_json::Value::Object(range)) =
+        (extension, range)
+    else {
+        return range_mw.to_string();
+    };
+    for (key, value) in range {
+        extension.insert(key, value);
+    }
+    serde_json::Value::Object(extension).to_string()
 }
 
 /// Concatenated text of a node's subtree, comments excluded.
@@ -4476,6 +4518,51 @@ mod tests {
         // No data-mw at all → None.
         let empty = Node::element(ElementKind::Other("meta".to_string()));
         assert_eq!(parser_function_name(&empty), None);
+    }
+
+    #[test]
+    fn a_range_data_mw_merges_into_an_extension_node() {
+        // The Audio template expands to a bare `<phonos>`, so the element is
+        // both the extension and the transclusion target. PHP mutates the one
+        // `DataMw` object; rustoid keeps the extension blob as an attribute.
+        let mut span = Node::element(ElementKind::Other("span".to_string()));
+        span.set_attr("typeof", "mw:Extension/phonos");
+        span.set_attr("about", "#mwt2");
+        span.set_attr(
+            "data-mw",
+            "{\"name\":\"phonos\",\"attrs\":{\"file\":\"A.ogg\"}}",
+        );
+
+        attach_range_data_mw(
+            &mut span,
+            Some("{\"parts\":[{\"template\":{\"target\":{\"wt\":\"Audio\"}}}]}".to_string()),
+        );
+
+        let keys: Vec<&str> = span.attrs.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["typeof", "about"],
+            "the attribute folds into the field"
+        );
+        assert_eq!(
+            span.data_mw.as_deref(),
+            Some(
+                "{\"name\":\"phonos\",\"attrs\":{\"file\":\"A.ogg\"},\"parts\":[{\"template\":{\"target\":{\"wt\":\"Audio\"}}}]}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_range_data_mw_replaces_none_and_keeps_a_non_json_blob() {
+        let mut plain = Node::element(ElementKind::Other("span".to_string()));
+        attach_range_data_mw(&mut plain, Some("{\"parts\":[]}".to_string()));
+        assert_eq!(plain.data_mw.as_deref(), Some("{\"parts\":[]}"));
+
+        let mut odd = Node::element(ElementKind::Other("span".to_string()));
+        odd.set_attr("data-mw", "not json");
+        attach_range_data_mw(&mut odd, Some("{\"parts\":[]}".to_string()));
+        assert_eq!(odd.data_mw.as_deref(), Some("{\"parts\":[]}"));
+        assert_eq!(odd.get_attr("data-mw"), None);
     }
 
     fn find_placeholder(node: &Node) -> Option<&Node> {

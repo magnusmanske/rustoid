@@ -4329,8 +4329,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             )
         };
 
-        let mut node =
-            crate::pipeline::phonos::render(&args, &info, label.as_ref(), self.config, &self.ooui);
+        let mut node = crate::pipeline::phonos::render(
+            &args,
+            &info,
+            label.as_ref(),
+            self.config,
+            &self.ooui,
+            self.strip_data_parsoid.get(),
+        );
 
         // The extension encapsulation: `typeof`, `about`, `data-mw`.
         let about = stt

@@ -174,7 +174,7 @@ impl ButtonWidget {
     ///
     /// The caller is responsible for the `PhonosButton`-specific config
     /// (frameless, `volumeUp`, infusable, `data-nosnippet`) via the fields above.
-    pub fn into_node(self, counter: &OouiCounter) -> Node {
+    pub fn into_node(self, counter: &OouiCounter, strip_data_parsoid: bool) -> Node {
         let mut widget = self;
         if widget.phonos_button {
             // `PhonosButton::__construct`: `ext-phonos-PhonosButton` is pushed
@@ -287,7 +287,7 @@ impl ButtonWidget {
         let id = counter.generate_id();
         root.set_attr("id", id);
         root.set_attr("class", root_classes.join(" "));
-        root.set_attr("data-ooui", data_ooui(&widget));
+        root.set_attr("data-ooui", data_ooui(&widget, strip_data_parsoid));
         root.push_child(a);
         root
     }
@@ -295,7 +295,7 @@ impl ButtonWidget {
 
 /// `Element::getSerializedConfig` for a `ButtonWidget`/`PhonosButton`, in the
 /// exact key order the config callbacks produce.
-fn data_ooui(widget: &ButtonWidget) -> String {
+fn data_ooui(widget: &ButtonWidget, strip_data_parsoid: bool) -> String {
     let mut config: Vec<(String, Json)> = Vec::new();
     // A placeholder for `_`, first as in `getSerializedConfig`.
     config.push(("_".to_string(), Json::Str(String::new())));
@@ -325,7 +325,10 @@ fn data_ooui(widget: &ButtonWidget) -> String {
     if let Some(label) = &widget.label {
         config.push((
             "label".to_string(),
-            Json::Object(vec![("html".to_string(), Json::Str(label_html(label)))]),
+            Json::Object(vec![(
+                "html".to_string(),
+                Json::Str(label_html(label, strip_data_parsoid)),
+            )]),
         ));
     }
     // TitledElement: the title is carried by Phonos as the aria-label, not as a
@@ -354,8 +357,12 @@ fn data_ooui(widget: &ButtonWidget) -> String {
 }
 
 /// The inner HTML of a label node, as `HtmlSnippet` carries it into `data-ooui`.
-fn label_html(node: &Node) -> String {
-    crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions::for_page(""))
+fn label_html(node: &Node, strip_data_parsoid: bool) -> String {
+    let options = crate::options::ParserOptions {
+        strip_data_parsoid,
+        ..crate::options::ParserOptions::for_page("")
+    };
+    crate::html::serialize::HtmlSerializer::new(options)
         .serialize_children_to_string(node)
         .unwrap_or_default()
 }

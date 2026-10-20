@@ -137,6 +137,7 @@ pub fn render(
     label: Option<&Node>,
     config: &dyn SiteConfig,
     counter: &OouiCounter,
+    strip_data_parsoid: bool,
 ) -> Node {
     // `handleExistingFile` rewrites `data.file` to the resolved target's text.
     let resolved = resolved_file_text(info);
@@ -164,7 +165,7 @@ pub fn render(
         phonos_button: true,
         error: false,
     }
-    .into_node(counter);
+    .into_node(counter, strip_data_parsoid);
 
     let sup = attribution_sup(&resolved, config);
 

@@ -250,7 +250,7 @@ fn transfer_metadata(placeholder: &Node, kids: &mut [Node], in_cell: bool) {
                 add_typeof(child, "mw:Transclusion");
             }
             if let Some(d) = &dmw {
-                child.data_mw = Some(d.clone());
+                crate::pipeline::tree_builder_html::attach_range_data_mw(child, Some(d.clone()));
             }
             if let Some(d) = &dp {
                 // Merge the placeholder's DSR (the computed range over the
