@@ -2027,13 +2027,18 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     text.set("tag", lua.create_function(luafn_text_tag)?)?;
     text.set("nowiki", lua.create_function(luafn_text_nowiki)?)?;
     text.set("listToText", lua.create_function(luafn_text_list_to_text)?)?;
-    // The strip-marker functions operate on MediaWiki's "UNIQ…QINU" markers,
-    // which rustoid has no equivalent of: a `nowiki`/`ref`/`gallery` tag is
-    // parsed into the tree rather than carried through Lua as a marker. There is
-    // therefore nothing to unstrip, and returning the input unchanged is the
-    // correct answer rather than a stub — the text a module sees never held a
-    // marker to begin with.
-    for name in ["unstripNoWiki", "unstrip", "killMarkers"] {
+    // The strip-marker functions operate on MediaWiki's "UNIQ…QINU" markers.
+    // rustoid's expanded argument values *do* carry them (a `<ref>` argument is a
+    // marker string, not the tag's source), so `killMarkers` is a real strip.
+    // `unstrip`/`unstripNoWiki` would return the marker's rendered content, which
+    // the Lua host does not hold, so they stay identity functions.
+    text.set(
+        "killMarkers",
+        lua.create_function(|_, s: Value| {
+            Ok(kill_strip_markers(&coerce_string(&s, "killMarkers")?))
+        })?,
+    )?;
+    for name in ["unstripNoWiki", "unstrip"] {
         text.set(
             name,
             lua.create_function(|_, s: Value| coerce_string(&s, "unstrip"))?,
@@ -2692,6 +2697,31 @@ fn luafn_text_decode(_: &Lua, (s, named): (Value, Option<Value>)) -> mlua::Resul
 
 fn luafn_text_trim(_: &Lua, s: Value) -> mlua::Result<String> {
     Ok(coerce_string(&s, "trim")?.trim().to_string())
+}
+
+/// `Parser::killMarkers`: remove every strip marker from `text`.
+///
+/// A marker is `\x7f'"`UNIQ--<tag>-<hex>-QINU`"'\x7f` (see
+/// `pipeline::parser`'s `strip_marker`); everything from a prefix to the next
+/// suffix is removed. An unterminated prefix is ordinary text.
+fn kill_strip_markers(text: &str) -> String {
+    const PREFIX: &str = "\u{7f}'\"`UNIQ--";
+    const SUFFIX: &str = "-QINU`\"'\u{7f}";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(PREFIX) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + PREFIX.len()..];
+        match after.find(SUFFIX) {
+            Some(end) => rest = &after[end + SUFFIX.len()..],
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `mw.text.listToText` — joins all but the last item with `sep`, then appends the
@@ -7391,14 +7421,13 @@ mod tests {
         );
     }
 
-    /// rustoid has no strip markers to remove, so these return their input —
-    /// which is the right answer, not a stub: the text a module sees never
-    /// carried a marker. They must exist so a module that calls them does not
-    /// stop.
+    /// `unstrip`/`unstripNoWiki` return their input (the Lua host does not hold
+    /// the marker's rendered content); `killMarkers` really strips markers,
+    /// because expanded argument values do carry them.
     #[test]
-    fn test_mw_text_strip_markers_are_identity() {
+    fn test_mw_text_strip_markers() {
         let engine = make_engine();
-        for call in ["unstripNoWiki", "unstrip", "killMarkers"] {
+        for call in ["unstripNoWiki", "unstrip"] {
             assert_eq!(
                 engine
                     .eval(&format!("return mw.text.{call}('plain')"))
@@ -7407,6 +7436,17 @@ mod tests {
                 "mw.text.{call}"
             );
         }
+
+        // A marker-shaped argument is killed; text around it survives.
+        let marker = "\u{7f}'\"`UNIQ--ref-0000000A-QINU`\"'\u{7f}";
+        assert_eq!(kill_strip_markers(marker), "");
+        assert_eq!(kill_strip_markers(&format!("a{marker}b{marker}c")), "abc");
+        assert_eq!(kill_strip_markers("plain"), "plain");
+        // An unterminated prefix is ordinary text.
+        assert_eq!(
+            kill_strip_markers("a\u{7f}'\"`UNIQ--ref"),
+            "a\u{7f}'\"`UNIQ--ref"
+        );
     }
 
     /// `mw.text.jsonEncode` follows Scribunto's array/object rule, not a

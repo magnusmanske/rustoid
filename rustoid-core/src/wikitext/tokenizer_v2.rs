@@ -5442,6 +5442,18 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
     let mut i = 0usize;
     while i < bytes.len() {
         let b = bytes[i];
+        // An HTML comment is one atom, as in `split_template_args`: a `=` inside
+        // it is prose, not a name/value separator. `Template:Chem molar mass/format`
+        // keeps a note holding `(=smart number …)` and `"|2"` in a comment;
+        // splitting there turned the rest of the comment into the argument value.
+        if b == b'<' && part[i..].starts_with("<!--") {
+            i = match part[i + 4..].find("-->") {
+                Some(rel) => i + 4 + rel + 3,
+                None => part.len(),
+            };
+            at_sol = false;
+            continue;
+        }
         // An HTML tag is a single atom: `<div class="x">` holds a `=`, but that
         // separates an attribute, not a template argument name from its value.
         // Without this, `{{#if:1|<div class="x">hi</div>|no}}` split at
@@ -7791,6 +7803,18 @@ mod tests {
             Some("{{{a|{{{b|C}}}}}}".len())
         );
         assert_eq!(find_arg_separator_eq("{{t|a}}=b", false), Some(7));
+    }
+
+    #[test]
+    fn test_arg_separator_ignores_eq_inside_a_comment() {
+        // A comment is one atom, so its `=` is prose. `Template:Chem molar
+        // mass/format` keeps a note with `(=smart number …)` in one.
+        let part = "x<!-- note (=smart number of decimals) -->y";
+        assert_eq!(find_arg_separator_eq(part, false), None);
+
+        // A real separator after the comment is still found.
+        let part = "<!-- a=b -->name=value";
+        assert_eq!(find_arg_separator_eq(part, false), Some(part.len() - 6));
     }
 
     #[test]
