@@ -18529,3 +18529,105 @@ stayed at 63,753, and the corpus stayed at 5/48 strict.
 `<span class="nn">`, …) needs a Pygments port for `wikitext`, `python` and the
 other languages the corpus uses; the pure-Rust crates on crates.io mirror only
 the text kernels, not the lexer tables.
+
+## An extension node that is also a transclusion target keeps one data-mw
+
+`{{Audio|…}}` expands to a bare `<phonos>` tag, so the element is both the
+extension node and the transclusion target. PHP's encapsulator mutates the
+node's one `DataMw` object, adding the range's `parts` beside the extension's
+`name`/`attrs`/`body`. Rustoid kept the extension blob as a `data-mw`
+attribute and the encapsulator appended a second attribute to the field, so the
+served span had `data-mw` twice. `attach_range_data_mw` now folds the attribute
+into the field and merges the two JSON objects (the range's keys win, as
+`DataMw` mutation does).
+
+The phonos label's `data-ooui` HTML is serialized separately, so it kept
+`data-parsoid` even when the page was served stripped. It now honours
+`strip_data_parsoid`.
+
+**Effect:** `Israel` 113,547 → 176,190 (the next difference is a `&thinsp;`
+assembled across a parser-function boundary inside a template). No corpus
+regressions; 5/48 strict.
+
+## Special-page aliases, and no magic links
+
+MediaWiki resolves a special-page alias when it parses the title, so
+`[[Special:Edit/Unix]]` is the title `Special:EditPage/Unix`. The siteinfo
+query now asks for `specialpagealiases`, and the title parser canonicalizes the
+first path segment (`Edit` → `EditPage`, `PermaLink` → `PermanentLink`,
+`Prefixindex` → `PrefixIndex`) case-insensitively, keeping a subpage. The
+canonical spelling is the alias list's *first* entry, not the registered
+`realname`: the wiki links `Special:Random`, not `Special:Randompage`, and
+`Special:MyPage`, not `Special:Mypage`. An unknown name stays as written and
+stays a red link.
+
+The same siteinfo refresh showed that this Parsoid deployment serves no magic
+links at all: `mw-magiclink` appears nowhere in the pinned corpus, and the live
+transform endpoint leaves `RFC 681`, `PMID 12345678` and
+`ISBN 978-3-16-148410-0` as text. `WikiSiteConfig::magic_link_enabled` reports
+them disabled.
+
+**Effect:** `Unix` 63,753 → 111,779, then → 112,084. No corpus regressions.
+
+## A comment is opaque to brace and `=` scanning
+
+MediaWiki's preprocessor matches `<!-- … -->` as one piece before it looks for
+braces, so a `{{`/`}}` inside a comment neither opens nor closes a construct,
+and a `=` inside one is prose rather than a template-argument separator.
+
+Two scanners disagreed with that. `find_template_closing` counted braces
+inside comments: `Template:Cite IETF` comments out a whole alternative
+`{{#invoke:…}}`, and scanning its braces ended the outer invocation early, so
+the template's source leaked as literal text instead of expanding.
+`find_arg_separator_eq` split on a comment's `=`: `Template:Chem molar
+mass/format` keeps a note with `(=smart number …)`, which turned the rest of
+the comment into an infobox value.
+
+The argument splitter had a third mismatch: it opened `{{{` as an argument
+reference unconditionally, while PHP tries the argument and falls back to a
+literal `{` when the first `}}` is not a `}}}`. `{{{!}}` is the magic pipe
+(`{` + `{{!}}`); opening an argument left the brace stack out of step with the
+closing scan, so every following top-level `|` read as nested.
+`Template:Infobox football biography`'s `data196` (a `{{{!}}` table) swallowed
+`| belowstyle` and `| below`, which leaked into articles as paragraph text.
+
+**Effect:** `Unix` 112,084 (the Cite IETF reference now expands), `Lionel
+Messi` 36,892 → 42,278, `Cristiano Ronaldo` 38,810 → 409,233, `Polio vaccine`
+16,124 → 20,904. No corpus regressions; 5/48 strict.
+
+## `mw.text.killMarkers` really strips markers
+
+Expanded argument values do carry `UNIQ…QINU` markers — a `<ref>` argument
+reaches a module as a marker string — so returning the input unchanged was
+wrong, not a safe stub. `Template:KillMarkers` then returned the marker's
+leftover text, and `Template:Infobox drug/non-ref-space` saw a text value where
+the service sees an empty one, inserting a space before a ref-only comment.
+
+**Effect:** `Polio vaccine` 16,124 → 20,904 (its first difference was the
+space); `Hydrogen` 6,635 → 8,872.
+
+## `getContent` on an unfetched page asks for the page
+
+Scribunto reads a page's wikitext from the database, so an unknown title is not
+an empty page. `title:getContent()` returned `nil` for any title whose facts
+were not preloaded, without recording the title, so the Lua retry loop had
+nothing to fetch. `Module:GetShortDescription` reads a linked page's wikitext to
+find its `{{short description}}`; getting `nil` made it treat the page as
+nonexistent and fall back to Wikidata — which it then also skipped — so every
+`{{annotated link|Abel Prize}}` lost its description.
+
+**Effect:** `Nobel Prize` 259,554 → 665,491. No corpus regressions.
+
+## A local subtitle track is root-relative
+
+The wiki serves a subtitle track on its *own* wiki as
+`/w/api.php?action=timedtext&…`, without the `origin` the API appends, while a
+track on a shared repo keeps the absolute repository URL and one `origin`. The
+URL is normalized both when fetched and when read back from a cache written by
+an older build.
+
+**Effect:** `The Beatles` 108,969 → 511,996. No corpus regressions; 5/48 strict.
+
+**Open:** the derivative (`<source>`) campaign parameter still differs when the
+oracle happens to carry `rest` rather than `index`; see
+`FileInfo::normalize_api_urls`'s comment.
