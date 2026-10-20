@@ -58,6 +58,9 @@ pub struct WikiSiteConfig {
     /// PHP's `SiteConfig::widthOption()`: the default thumbnail width for a
     /// `thumb`/`frameless` media option with no explicit size.
     width_option: u32,
+    /// Special-page aliases, keyed by the lowercased alias, mapping to the
+    /// canonical name (`"edit"` → `"EditPage"`).
+    special_pages: HashMap<String, String>,
 }
 
 impl Default for WikiSiteConfig {
@@ -77,6 +80,7 @@ impl Default for WikiSiteConfig {
             // MediaWiki's first thumb limit; a config that reports none keeps
             // this, which is the conservative choice (a smaller thumbnail).
             width_option: 180,
+            special_pages: HashMap::new(),
         }
     }
 }
@@ -208,6 +212,22 @@ impl WikiSiteConfig {
             cfg.magic_word_variables = vars.into_iter().map(|v| v.to_lowercase()).collect();
         }
 
+        // `specialpagealiases` is keyed by canonical name; the alias list holds
+        // the spellings a link may use (`Edit` and `EditPage` for `EditPage`).
+        // `specialpagealiases` is an array of `{realname, aliases}`. The first
+        // alias is the spelling the wiki links with (`Random`, not the
+        // registered `Randompage`), which is what a parsed title carries. The
+        // lookup is case-insensitive, as `SpecialPageFactory::resolveAlias` is.
+        if let Some(pages) = q.specialpagealiases {
+            for page in pages {
+                let canonical = page.aliases.first().cloned().unwrap_or(page.realname);
+                for alias in page.aliases {
+                    cfg.special_pages
+                        .insert(alias.trim().to_lowercase(), canonical.clone());
+                }
+            }
+        }
+
         if let Some(hooks) = q.functionhooks {
             cfg.function_hooks = hooks.into_iter().map(|h| h.to_lowercase()).collect();
             cfg.function_hooks.sort();
@@ -322,6 +342,18 @@ impl SiteConfig for WikiSiteConfig {
 
     fn function_hooks(&self) -> &[String] {
         &self.function_hooks
+    }
+
+    /// The served HTML carries no magic links at all (`mw-magiclink-rfc`,
+    /// `…-pmid`, `…-isbn` appear nowhere in it), so this Parsoid deployment's
+    /// magic-link map is empty. Probe of the live transform endpoint agrees:
+    /// `RFC 681`, `PMID 12345678` and `ISBN 978-3-16-148410-0` all stay text.
+    fn magic_link_enabled(&self, _which: &str) -> bool {
+        false
+    }
+
+    fn canonical_special_page(&self, name: &str) -> Option<String> {
+        self.special_pages.get(&name.trim().to_lowercase()).cloned()
     }
 
     fn extension_tags(&self) -> &[String] {
@@ -439,6 +471,9 @@ struct SiteInfoQuery {
     variables: Option<Vec<String>>,
     #[serde(default)]
     functionhooks: Option<Vec<String>>,
+    /// Canonical special-page names, each with its aliases.
+    #[serde(default)]
+    specialpagealiases: Option<Vec<SpecialPageAliases>>,
     #[serde(default)]
     extensiontags: Option<Vec<String>>,
     #[serde(default)]
@@ -448,6 +483,14 @@ struct SiteInfoQuery {
     /// `defaultoptions` carries the `thumbsize` index into `general.thumblimits`.
     #[serde(default)]
     defaultoptions: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// A special page's canonical name and the aliases that resolve to it.
+#[derive(Debug, Deserialize, Default)]
+struct SpecialPageAliases {
+    realname: String,
+    #[serde(default)]
+    aliases: Vec<String>,
 }
 
 /// The `statistics` section of `siteinfo`, which is `mw.site.stats`.
@@ -717,6 +760,39 @@ mod tests {
         );
         // Namespace 0 has an empty localized name; that must not become an alias.
         assert!(c.namespaces().get(&0).unwrap().aliases.is_empty());
+    }
+
+    /// `specialpagealiases` maps every alias to the *first* alias for the page,
+    /// not to the registered real name: the wiki links `Special:Random`, not
+    /// `Special:Randompage`, and the lookup is case-insensitive.
+    #[test]
+    fn special_page_aliases_resolve_case_insensitively() {
+        let c = WikiSiteConfig::from_siteinfo_json(
+            r#"{"query":{"specialpagealiases":[
+              {"realname":"EditPage","aliases":["EditPage","Edit"]},
+              {"realname":"Randompage","aliases":["Random","RandomPage"]},
+              {"realname":"Prefixindex","aliases":["PrefixIndex"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.canonical_special_page("Edit").as_deref(),
+            Some("EditPage")
+        );
+        assert_eq!(
+            c.canonical_special_page("eDiT").as_deref(),
+            Some("EditPage")
+        );
+        assert_eq!(
+            c.canonical_special_page("Randompage").as_deref(),
+            Some("Random")
+        );
+        assert_eq!(
+            c.canonical_special_page("Prefixindex").as_deref(),
+            Some("PrefixIndex")
+        );
+        // An unknown special page stays unknown, so its link stays a red link.
+        assert_eq!(c.canonical_special_page("FooBar"), None);
     }
 
     #[test]

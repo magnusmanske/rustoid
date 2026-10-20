@@ -397,6 +397,33 @@ pub fn ucfirst(s: &str, language_code: &str) -> String {
     format!("{upper}{}", &s[rest_start..])
 }
 
+/// Canonicalize the special-page name of a `Special:` title (`Edit` →
+/// `EditPage`) while keeping a subpage (`Edit/Foo` → `EditPage/Foo`).
+///
+/// MediaWiki resolves the name through `SpecialPageFactory` when the title is
+/// parsed, so the link's href and title carry the canonical spelling even when
+/// the wikitext used an alias.
+fn canonical_special_page_if_needed(
+    title_part: &str,
+    namespace_id: i32,
+    config: &dyn SiteConfig,
+) -> String {
+    if namespace_id != -1 {
+        return title_part.to_string();
+    }
+    let (name, rest) = match title_part.split_once('/') {
+        Some((name, rest)) => (name, Some(rest)),
+        None => (title_part, None),
+    };
+    let Some(canonical) = config.canonical_special_page(name) else {
+        return title_part.to_string();
+    };
+    match rest {
+        Some(rest) => format!("{canonical}/{rest}"),
+        None => canonical,
+    }
+}
+
 /// Parser for constructing `Title` from a string, using `SiteConfig` for
 /// namespace alias resolution and interwiki prefix matching.
 pub struct TitleParser;
@@ -478,8 +505,9 @@ impl TitleParser {
                     }
                 };
                 if let Some(title_part) = match_prefix(&ns_info.canonical) {
+                    let title_part = canonical_special_page_if_needed(title_part, ns_id, config);
                     return Some(Self::with_case(
-                        title_part,
+                        &title_part,
                         ns_id,
                         ns_info.case_sensitive,
                         fragment,
@@ -488,8 +516,10 @@ impl TitleParser {
                 }
                 for alias in &ns_info.aliases {
                     if let Some(title_part) = match_prefix(alias) {
+                        let title_part =
+                            canonical_special_page_if_needed(title_part, ns_id, config);
                         return Some(Self::with_case(
-                            title_part,
+                            &title_part,
                             ns_id,
                             ns_info.case_sensitive,
                             fragment,

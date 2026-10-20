@@ -587,6 +587,18 @@ pub trait SiteConfig: Send + Sync {
             .map(|info| info.local.clone().unwrap_or_else(|| info.canonical.clone()))
     }
 
+    /// The canonical name of a special page, given any of its aliases:
+    /// `"Edit"` → `"EditPage"`, `"PermaLink"` → `"PermanentLink"`. Mirrors
+    /// `SpecialPageFactory::resolveAlias`, which matches the name
+    /// case-insensitively.
+    ///
+    /// `None` when the site did not report its special-page aliases (a partial
+    /// `siteinfo`) or the name is not a known special page — an unknown
+    /// `Special:Foo` stays as written and is a red link, as the wiki renders it.
+    fn canonical_special_page(&self, _name: &str) -> Option<String> {
+        None
+    }
+
     /// `SiteConfig::interwikiMapNoNamespaces` — the interwiki map with entries
     /// that conflict with a namespace name removed (namespace wins).
     fn interwiki_map_no_namespaces(&self) -> Vec<(String, InterwikiInfo)> {
