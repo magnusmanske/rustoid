@@ -239,6 +239,7 @@ fn build_template_title(name: &str, config: &dyn SiteConfig) -> Title {
 /// shifting every following one (`COVID-19 pandemic`, `Berlin`, `Chernobyl
 /// disaster`, `International Space Station`).
 pub(crate) fn strip_noinclude_sections(text: &str) -> String {
+    let text = strip_self_closing_tag(text, "noinclude");
     const OPEN: &str = "<noinclude>";
     const CLOSE: &str = "</noinclude>";
     let mut result = String::new();
@@ -264,15 +265,45 @@ pub(crate) fn strip_noinclude_sections(text: &str) -> String {
 /// When transcluding, we keep this content; when viewing the template page,
 /// it would be hidden. For our purposes, we simply remove the tags.
 pub(crate) fn extract_includeonly_sections(text: &str) -> String {
-    text.replace("<includeonly>", "")
+    strip_self_closing_tag(text, "includeonly")
+        .replace("<includeonly>", "")
         .replace("</includeonly>", "")
+}
+
+/// Remove the self-closing form of an inclusion-control tag (`<noinclude/>`).
+///
+/// The paired form drops its content; the self-closing one has none, so only the
+/// tag itself goes. Templates use it as a marker between documentation sections,
+/// and MediaWiki's preprocessor removes it — leaving it in leaked a literal
+/// `&lt;noinclude/>` into the rendered page.
+fn strip_self_closing_tag(text: &str, name: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let open = format!("<{name}");
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find(&open) {
+        let start = pos + rel;
+        let after = start + open.len();
+        let tail = &lower[after..];
+        let trimmed = tail.trim_start_matches([' ', '\t', '\n', '\r']);
+        if trimmed.starts_with("/>") {
+            out.push_str(&text[pos..start]);
+            pos = after + (tail.len() - trimmed.len()) + 2;
+        } else {
+            out.push_str(&text[pos..after]);
+            pos = after;
+        }
+    }
+    out.push_str(&text[pos..]);
+    out
 }
 
 /// Handle `<onlyinclude>...</onlyinclude>` sections.
 /// When transcluding, ONLY content inside these tags is kept.
 pub(crate) fn extract_onlyinclude_sections(text: &str) -> String {
+    let text = strip_self_closing_tag(text, "onlyinclude");
     if !text.contains("<onlyinclude>") {
-        return text.to_string();
+        return text;
     }
     let mut result = String::new();
     let mut pos = 0;
@@ -415,6 +446,16 @@ mod tests {
         let text = "keep<noinclude>doc {{padlock}}";
         assert_eq!(strip_noinclude_sections(text), "keep");
         assert_eq!(strip_noinclude_sections("<noinclude>only"), "");
+    }
+
+    #[test]
+    fn test_self_closing_inclusion_tags_are_removed() {
+        // `Template:Update span` separates its sections with `<noinclude/>`.
+        assert_eq!(strip_noinclude_sections("a<noinclude/>b"), "ab");
+        assert_eq!(strip_noinclude_sections("a<noinclude />b"), "ab");
+        assert_eq!(strip_noinclude_sections("a<NoInclude\n/>b"), "ab");
+        assert_eq!(extract_includeonly_sections("a<includeonly/>b"), "ab");
+        assert_eq!(extract_onlyinclude_sections("a<onlyinclude/>b"), "ab");
     }
 
     #[test]

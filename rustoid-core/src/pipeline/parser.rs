@@ -106,12 +106,34 @@ fn has_token_attributes(items: &[Item]) -> bool {
 /// targets templated; the flag is what tells the marking to behave as the service
 /// does.
 fn mark_in_text_branch(items: &mut [Item]) {
-    for item in items.iter_mut() {
-        let Item::Tok(tok) = item else { continue };
+    for_each_token_mut(items, &mut |tok| {
         if let Some(dp) = tok.data_parsoid_mut() {
             dp.tmp.in_text_branch = Some(true);
         }
         strip_token_source_range(tok);
+    });
+}
+
+/// Visit every token in `items`, including tokens nested in an attribute's key
+/// or value.
+///
+/// A wikilink keeps its text in an attribute, so a tag written inside a link's
+/// text (`[[T|<span title="{{…}}">…</span>]]`) is *not* a top-level item of the
+/// chunk that produced it. Marking only the top level left such a tag unmarked.
+fn for_each_token_mut(items: &mut [Item], f: &mut impl FnMut(&mut ParsoidToken)) {
+    for item in items.iter_mut() {
+        let Item::Tok(tok) = item else { continue };
+        f(tok);
+        let Some(attribs) = tok.attribs_mut() else {
+            continue;
+        };
+        for kv in attribs.iter_mut() {
+            for field in [&mut kv.key, &mut kv.value] {
+                if let crate::wikitext::tokens_v2::KeyValue::Tokens(nested) = field {
+                    for_each_token_mut(nested, f);
+                }
+            }
+        }
     }
 }
 
@@ -9468,13 +9490,11 @@ fn is_extension_tag_call(tok: &ParsoidToken, config: &dyn SiteConfig) -> bool {
 }
 
 fn mark_synthesized(items: &mut [Item]) {
-    for item in items.iter_mut() {
-        if let Item::Tok(tok) = item
-            && let Some(dp) = tok.data_parsoid_mut()
-        {
+    for_each_token_mut(items, &mut |tok| {
+        if let Some(dp) = tok.data_parsoid_mut() {
             dp.tmp.synthesized = true;
         }
-    }
+    });
 }
 
 /// Mark a module's (`#invoke`) output. Core renders that output as HTML, so its
