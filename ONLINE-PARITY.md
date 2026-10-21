@@ -18631,3 +18631,28 @@ an older build.
 **Open:** the derivative (`<source>`) campaign parameter still differs when the
 oracle happens to carry `rest` rather than `index`; see
 `FileInfo::normalize_api_urls`'s comment.
+
+## A token nested in an attribute is still part of the chunk
+
+`mark_synthesized` and `mark_in_text_branch` walked only the top level of an
+expansion's token list, but a wikilink keeps its text in an attribute. A tag
+written inside a link's text — `Template:Glossary link`'s
+`[[{{{glossary}}}#…|<span title="See entry {{#if:…}} …">…</span>]]` — is
+therefore not a top-level item of the body that produced it. It stayed unmarked,
+so the attribute expander took the body's attribute for page content: it wrapped
+the `#if` in a `mw:Transclusion` span, spent an id for it, and stamped
+`mw:ExpandedAttrs` on the span. The service serves a bare span with plain text.
+
+Both markers now recurse into an attribute's key and value (a small shared
+walker), so every token that came out of a body is flagged wherever it is
+stored. `TempData::synthesized` already suppresses the marking and makes the
+attribute expansion run with `inTemplate`; the flag was simply missing.
+
+Templates also mark section boundaries with a self-closing `<noinclude/>`
+(`Template:Update span`, `Template:Col-break`). It carries no content, so only
+the tag itself goes; rustoid stripped the paired form alone and leaked a literal
+`&lt;noinclude/>` into the rendered page. `<includeonly/>` and `<onlyinclude/>`
+are handled the same way.
+
+**Effect:** `Chess` 16,785 → 63,307 (its glossary link and the noinclude
+leak were the first two differences). No corpus regressions; 5/48 strict.
