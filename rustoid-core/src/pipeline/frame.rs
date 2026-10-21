@@ -61,6 +61,17 @@ impl Frame {
         &self.args
     }
 
+    /// The frame that called this one, if any.
+    ///
+    /// A template's argument values were written at the call site and were
+    /// expanded there when the frame was built; `frame:getParent().args` must
+    /// therefore resolve `{{{…}}}` against the caller, not against the
+    /// template's own argument table (a value that names its own parameter
+    /// would otherwise expand into itself).
+    pub fn parent(&self) -> Option<&Frame> {
+        self.parent_frame.as_deref()
+    }
+
     pub fn depth(&self) -> usize {
         self.depth
     }

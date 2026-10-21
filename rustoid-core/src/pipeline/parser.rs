@@ -8240,11 +8240,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                     ArgSource::Call => raw_call_args,
                                     ArgSource::Parent => raw_parent_args,
                                 };
+                                // A parent argument's `{{{…}}}` was expanded in the
+                                // frame that called the template, so that is where it
+                                // is resolved here. Using the template's own frame made
+                                // a value that names its own parameter expand into
+                                // itself: `{{Parameter names example|subheader2={{{subheader2}}}<br/>…}}`
+                                // grew a copy of the value on every pass.
+                                let expand_frame = match slot.source {
+                                    ArgSource::Call => frame,
+                                    ArgSource::Parent => frame.parent().unwrap_or(frame),
+                                };
                                 let text = match kvs.get(slot.index) {
                                     Some(kv) => {
                                         self.expand_invoke_arg_text(
                                             kv,
-                                            frame,
+                                            expand_frame,
                                             source,
                                             about_counter,
                                             body,
@@ -8254,6 +8264,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                                     }
                                     None => String::new(),
                                 };
+
                                 out.push((slot.key(), text));
                             }
                             out

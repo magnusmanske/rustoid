@@ -131,9 +131,18 @@ pub fn substitute_args(wikitext: &str, args: &TemplateArgs, max_depth: u32) -> R
                 let close_start = last_brace.saturating_sub(open_len - 1);
                 let inner: String = chars[i + open_len..close_start].iter().collect();
                 let arg_ref = tpl_args::parse_arg_reference(&inner);
+                // MediaWiki inserts a provided value verbatim: argument
+                // references inside it are *not* expanded again. Only a
+                // default is source text of this template and may itself
+                // contain `{{{…}}}`. Recursing into the value made a value
+                // that names its own parameter expand into itself
+                // (`{{Parameter names example|subheader2={{{subheader2}}}<br/>…}}`
+                // grew a copy per pass).
+                let provided = args.get(&arg_ref.name);
+                let from_default = provided.is_none();
                 let resolved = tpl_args::resolve_arg(&arg_ref, args);
 
-                let expanded = if resolved.contains("{{{") {
+                let expanded = if from_default && resolved.contains("{{{") {
                     substitute_args(&resolved, args, max_depth - 1)?
                 } else {
                     resolved
