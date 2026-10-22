@@ -668,6 +668,9 @@ pub fn render_category(
     ctx: &mut WikiLinkContext,
     token: &ParsoidToken,
     target: &WikiLinkTargetInfo,
+    fragments: &mut std::collections::HashMap<usize, crate::dom::node::Node>,
+    next_id: &std::cell::Cell<usize>,
+    build_fragment: CaptionFragmentBuilder,
 ) -> Vec<Item> {
     use crate::sanitizer::sanitize_title_uri;
 
@@ -703,7 +706,60 @@ pub fn render_category(
         ctx.metadata_mut().add_category(title, &category_sort);
     }
 
-    vec![Item::Tok(ParsoidToken::SelfclosingTag(new_tk))]
+    // A sort key that is not a single piece came from generated content — a
+    // transclusion, or markup such as `<br/>`. Parsoid stores such a key in
+    // `data-mw.attribs` and marks the link so it can be round-tripped
+    // (`renderCategory`: `count($content) !== 1`). The fragment is tunneled so
+    // the id pass numbers its nodes before the link itself, exactly as it does
+    // for a media option.
+    let generated = content_piece_count(&content) != 1;
+    let mut out = Vec::with_capacity(2);
+    if generated {
+        new_tk.add_attribute_str("about", ctx.new_about_id());
+        new_tk.add_attribute_str("typeof", "mw:ExpandedAttrs");
+        new_tk.add_attribute_str(
+            "data-mw",
+            serde_json::json!({ "attribs": [[{ "txt": "mw:sortKey" }, { "html": "" }]] })
+                .to_string(),
+        );
+    }
+    out.push(Item::Tok(ParsoidToken::SelfclosingTag(new_tk)));
+    if generated {
+        let frag = build_fragment(content, fragments, next_id);
+        out.push(attr_mw_fragment_token(
+            "mw:sortKey",
+            frag,
+            fragments,
+            next_id,
+        ));
+    }
+    out
+}
+
+/// The number of pieces in a category sort key after joining adjacent text.
+///
+/// MediaWiki's preprocessor expands a template's body to *text* before Parsoid
+/// tokenizes it, so `|T{{PAGENAME}}` arrives as the single string `TIsrael`.
+/// rustoid expands the body in place, which leaves `["T", "Israel"]`; counting
+/// the runs of text recovers the shape the service sees. A real token (markup,
+/// a transclusion) still counts on its own.
+fn content_piece_count(items: &[Item]) -> usize {
+    let mut count = 0;
+    let mut in_text = false;
+    for item in items {
+        match item {
+            Item::Str(_) if in_text => {}
+            Item::Str(_) => {
+                count += 1;
+                in_text = true;
+            }
+            Item::Tok(_) => {
+                count += 1;
+                in_text = false;
+            }
+        }
+    }
+    count
 }
 
 /// Convert content items to a single string for sort-key computation.
@@ -2067,7 +2123,7 @@ pub fn render_wiki_link_dispatched(
                 return render_file(ctx, token, target, fragments, next_id, build_fragment);
             }
             if Some(title.namespace_id) == category_ns {
-                return render_category(ctx, token, target);
+                return render_category(ctx, token, target, fragments, next_id, build_fragment);
             }
         }
         // A plain wikilink tunnels its link text through a DOM fragment
@@ -2379,7 +2435,16 @@ mod tests {
 
         assert_eq!(target.title.as_ref().unwrap().namespace_id, 14);
 
-        let out = render_category(&mut ctx, &token, &target);
+        let mut fragments = std::collections::HashMap::new();
+        let next_id = std::cell::Cell::new(0usize);
+        let out = render_category(
+            &mut ctx,
+            &token,
+            &target,
+            &mut fragments,
+            &next_id,
+            &mut |_, _, _| crate::dom::node::Node::document(),
+        );
 
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "link"));
         if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] {
@@ -2402,11 +2467,77 @@ mod tests {
     }
 
     #[test]
+    fn test_render_category_with_generated_sort_key_is_marked() {
+        // A sort key that is not a single piece came from generated content (a
+        // transclusion or markup); Parsoid records it in `data-mw.attribs` and
+        // marks the link (`renderCategory`: `count($content) !== 1`).
+        let mut ctx = WikiLinkContext::new(config_static());
+        let mut token = wikilink_token("Category:People", None);
+        // A sort key that is a *token array* — an argument value with markup, or
+        // a transclusion — is what `count($content) !== 1` sees.
+        if let ParsoidToken::SelfclosingTag(tk) = &mut token {
+            tk.attribs.push(KV {
+                key: KeyValue::Str("mw:maybeContent".to_string()),
+                value: KeyValue::Tokens(vec![
+                    Item::Str("a".to_string()),
+                    Item::Tok(ParsoidToken::Tag(TagTk::new(
+                        "br",
+                        vec![],
+                        DataParsoid::default(),
+                    ))),
+                    Item::Str("b".to_string()),
+                ]),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
+        }
+        let target = get_wiki_link_target_info(&ctx, "Category:People", "Category:People").unwrap();
+        let mut fragments = std::collections::HashMap::new();
+        let next_id = std::cell::Cell::new(0usize);
+        let out = render_category(
+            &mut ctx,
+            &token,
+            &target,
+            &mut fragments,
+            &next_id,
+            &mut |_, _, _| crate::dom::node::Node::document(),
+        );
+
+        assert_eq!(out.len(), 2, "the link and its attribute placeholder");
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] else {
+            panic!("expected a self-closing link token");
+        };
+        let attr = |name: &str| {
+            t.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some(name))
+                .and_then(|kv| kv.value.as_str())
+        };
+        assert_eq!(attr("typeof"), Some("mw:ExpandedAttrs"));
+        assert!(attr("about").is_some());
+        assert!(attr("data-mw").unwrap().contains("mw:sortKey"));
+        assert!(matches!(
+            &out[1],
+            Item::Tok(ParsoidToken::SelfclosingTag(p)) if p.name == "mw:dom-fragment-token"
+        ));
+    }
+
+    #[test]
     fn test_render_category_with_sort_key() {
         let mut ctx = WikiLinkContext::new(config_static());
         let token = wikilink_token("Category:People", Some("A sort key"));
         let target = get_wiki_link_target_info(&ctx, "Category:People", "Category:People").unwrap();
-        let out = render_category(&mut ctx, &token, &target);
+        let mut fragments = std::collections::HashMap::new();
+        let next_id = std::cell::Cell::new(0usize);
+        let out = render_category(
+            &mut ctx,
+            &token,
+            &target,
+            &mut fragments,
+            &next_id,
+            &mut |_, _, _| crate::dom::node::Node::document(),
+        );
 
         if let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] {
             let href = t

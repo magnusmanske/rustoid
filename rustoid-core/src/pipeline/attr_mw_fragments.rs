@@ -27,7 +27,14 @@ pub fn collect(root: &mut Node) {
     for mut child in std::mem::take(&mut root.children) {
         if let Some(ck) = child.get_attr(MW_ATTR_KEY_ATTR).map(str::to_string) {
             if let Some(fragment) = child.fragment.take() {
-                root.attr_mw_fragments.push((ck, fragment));
+                // A void element (`<link rel="mw:PageProp/Category">`) cannot hold
+                // its placeholder as a child, so the tree builder emits it right
+                // *after* the element. Attach it to that element when its
+                // `data-mw` names the key.
+                match attr_owner(root.children.last_mut(), &ck) {
+                    Some(owner) => owner.attr_mw_fragments.push((ck, fragment)),
+                    None => root.attr_mw_fragments.push((ck, fragment)),
+                }
             }
             // The placeholder never renders: its fragment lives in `data-mw`.
             continue;
@@ -35,6 +42,24 @@ pub fn collect(root: &mut Node) {
         collect(&mut child);
         root.children.push(child);
     }
+}
+
+/// The preceding sibling, when it is an element whose `data-mw.attribs` names
+/// `ck` — the owner of a placeholder that could not be its child.
+fn attr_owner<'a>(prev: Option<&'a mut Node>, ck: &str) -> Option<&'a mut Node> {
+    let prev = prev?;
+    let json: serde_json::Value = serde_json::from_str(prev.data_mw.as_deref()?).ok()?;
+    let attribs = json.get("attribs")?.as_array()?;
+    let names_key = attribs.iter().any(|pair| {
+        pair.as_array()
+            .and_then(|arr| arr.first())
+            .is_some_and(|key| match key {
+                serde_json::Value::String(s) => s == ck,
+                serde_json::Value::Object(o) => o.get("txt").and_then(|t| t.as_str()) == Some(ck),
+                _ => false,
+            })
+    });
+    names_key.then_some(prev)
 }
 
 /// Serialize each node's option fragments into its `data-mw.attribs`.
@@ -138,6 +163,40 @@ mod tests {
         assert_eq!(figure.attr_mw_fragments.len(), 1);
         assert_eq!(figure.attr_mw_fragments[0].0, "alt");
         assert_eq!(figure.children.len(), 1, "the placeholder is removed");
+    }
+
+    #[test]
+    fn collect_attaches_to_a_void_preceding_sibling() {
+        // A void element (`<link rel="mw:PageProp/Category">`) cannot hold its
+        // placeholder as a child, so the builder emits it right after the element.
+        let mut link = Node::element(ElementKind::Other("link".to_string()));
+        link.data_mw = Some(r#"{"attribs":[[{"txt":"mw:sortKey"},{"html":""}]]}"#.to_string());
+        let mut root = Node::document();
+        root.push_child(link);
+        root.push_child(placeholder("mw:sortKey", "bar<br/>baz"));
+
+        collect(&mut root);
+
+        assert_eq!(root.children.len(), 1, "the placeholder is removed");
+        assert_eq!(root.attr_mw_fragments.len(), 0);
+        assert_eq!(root.children[0].attr_mw_fragments.len(), 1);
+        assert_eq!(root.children[0].attr_mw_fragments[0].0, "mw:sortKey");
+    }
+
+    #[test]
+    fn collect_keeps_a_placeholder_with_no_owner_on_its_parent() {
+        // The preceding sibling does not name the key, so the fragment must not be
+        // moved onto it.
+        let mut span = Node::element(ElementKind::Other("span".to_string()));
+        span.data_mw = Some(r#"{"attribs":[[{"txt":"title"},{"html":""}]]}"#.to_string());
+        let mut root = Node::document();
+        root.push_child(span);
+        root.push_child(placeholder("mw:sortKey", "x"));
+
+        collect(&mut root);
+
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.attr_mw_fragments.len(), 1);
     }
 
     #[test]
