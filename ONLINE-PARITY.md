@@ -18706,3 +18706,34 @@ in-source comment before the construct (`<div … " <!--\n-->style=…>`) that t
 preprocessor strips. Patching the source instead re-kept it, which moved
 `Module:Navbox`'s `argHash` by 8 per `Template:Div col` and broke the
 `aria-labelledby` ids on `2024 Summer Olympics`.
+
+## An explicit namespace wins, and a redirect is checked for loops
+
+Two halves of one target-resolution bug. `resolve_target_string` always rebuilt
+the title as `Title::new(Template, parsed.text)`, dropping an explicit prefix, so
+`{{MediaWiki:Toc}}` became `Template:Toc` and `{{Category:Foo}}` became
+`Template:Category:Foo`. MediaWiki's `Title::newFromText( $text, NS_TEMPLATE )`
+only applies the default when the text has no namespace prefix, so the parsed
+title is kept when it has one.
+
+That mattered because the loop check ran only with the *called* title, and a
+redirect is followed before the child frame exists. `Template:Toc` redirects to
+`Template:Compact TOC`, whose body transcludes `{{MediaWiki:Toc}}`; the second
+round resolved it back to `Template:Toc`, whose target frame was never compared
+against the ancestors, so `{{Compact ToC}}` expanded forever (the offline probe
+stalled). The target is now checked after the redirect too.
+
+The root frame is exempt: it is the page being parsed, not a transclusion.
+Viewing `Template:Infobox`, which demonstrates itself with `{{Infobox}}`, is not
+a loop — MediaWiki expands it once. (The old comparison also missed it, because
+`Title::new` left `namespace_name` unset; with the prefix kept it would have
+matched, hence the explicit `depth > 0` guard.)
+
+`build_expanded_attrs` gated the attribute-key expansion on the *expanded* key
+being a token list. `{{#if:{{{allowtoc|}}}||id="toc"}}` collapses to the single
+string `id="toc"`, so the key was never reparsed into an attribute and the
+`<div>` came out without `id`/`aria-labelledby`. PHP gates on the *original* key
+being an array (`is_array( $oldA->k )`) and the expanded one being non-empty.
+
+**Effect:** `List of sovereign states` 8,893 → 25,192. No corpus regressions;
+5/48 strict, 3 nondeterministic-only (16.7%).
