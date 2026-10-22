@@ -991,7 +991,7 @@ fn behavior_switch_wikitext(tok: &crate::wikitext::tokens_v2::ParsoidToken) -> O
 /// handed the raw call. Rebuilding the tag from the attributes resolves it. A
 /// rewritten source that no longer spells a `{{…}}` is left alone, so the ordinary
 /// case (a substituted attribute value) is unchanged.
-fn stale_tag_html(
+pub(crate) fn stale_tag_html(
     tok: &crate::wikitext::tokens_v2::ParsoidToken,
     rewritten: &str,
     mode: MissingSrc,

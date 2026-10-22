@@ -9868,7 +9868,26 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
             }
             // A live HTML element: the start tag, the content (which follows as
             // separate items) and the end tag are each written as they were.
-            Item::Tok(tok @ ParsoidToken::Tag(_)) => out.push_str(&token_source_for_module(tok)?),
+            //
+            // A start tag whose source still spells an attribute *construct*
+            // (`<div {{#switch:…}}>`) is rebuilt from its expanded attributes
+            // instead. The construct generated the attribute and the source cannot
+            // be patched — its offsets are chunk-relative and the reparsed
+            // attribute loses them — so left as written it reaches the module
+            // unexpanded, and the module's output re-expands it in the *root*
+            // frame, where a `{{{…}}}` it names no longer resolves
+            // (`Template:Wikisource`'s `lang`).
+            Item::Tok(tok @ ParsoidToken::Tag(_)) => {
+                let src = token_source_for_module(tok)?;
+                out.push_str(
+                    &crate::pipeline::lua_deferred::stale_tag_html(
+                        tok,
+                        &src,
+                        crate::pipeline::lua_deferred::MissingSrc::Html,
+                    )
+                    .unwrap_or(src),
+                );
+            }
             Item::Tok(tok @ ParsoidToken::EndTag(_)) => {
                 out.push_str(&token_source_for_module(tok)?)
             }
@@ -11857,6 +11876,44 @@ mod tests {
             t2529_force_line_start(vec![marker, Item::Str(";".to_string())], false, true, true);
         assert!(matches!(&out[0], Item::Str(s) if s == "\n"));
         assert!(matches!(out.last(), Some(Item::Str(s)) if s == ";"));
+    }
+
+    /// A construct that generates a whole attribute (`<div {{#switch:…}}>`) has
+    /// no attribute-level source to rewrite, so a tag whose source still spells
+    /// one is rebuilt from its expanded attributes before a module sees it. Left
+    /// stale, the construct reaches the module unexpanded and is then re-expanded
+    /// in the *root* frame, where the `{{{…}}}` it names no longer resolves.
+    #[tokio::test]
+    async fn a_generated_attribute_reaches_a_module_expanded() {
+        use crate::mock::MockDataSource;
+
+        let config = MockSiteConfig::new();
+        let source = MockDataSource::new();
+        source.add_module(
+            "Module:Echo",
+            "return { main = function(frame) return frame.args[1] end }",
+        );
+        source.add_template(
+            "Template:Inner",
+            "<div {{#switch:{{{lang}}}|en=|#default=lang=\"{{{lang}}}\"}} style=\"x\">y</div>",
+        );
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{#invoke:Echo|main|{{Inner|lang=fr}}}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            html.contains("lang=\"fr\""),
+            "the generated attribute reaches the module expanded: {html}"
+        );
+        assert!(
+            !html.contains("{{{lang}}}"),
+            "the unexpanded reference must not survive: {html}"
+        );
     }
 
     /// A module receives an argument's *expanded* text, and that includes a link
