@@ -953,9 +953,105 @@ impl DataSource for CachedDataSource {
         Ok(None)
     }
 
-    async fn get_message(&self, _lang: &str, _key: &str) -> rustoid_core::Result<Option<String>> {
-        Ok(None)
+    /// An interface message's text, cached per language and name.
+    ///
+    /// Unlike a page, a message is not in the page table at all — `MediaWiki:Toc`
+    /// has no page and still answers "Contents" — so the cache entry is what
+    /// makes an offline run reproduce this. `None` means the wiki has no such
+    /// message, which is what keeps `{{MediaWiki:SomeNonMessage}}` a redlink.
+    async fn get_message(&self, lang: &str, key: &str) -> rustoid_core::Result<Option<String>> {
+        let mut map = self
+            .get_messages(lang, std::slice::from_ref(&key.to_string()))
+            .await?;
+        Ok(map.remove(key))
     }
+
+    /// Messages in one request per 50, which is the API's `ammessages` cap.
+    ///
+    /// A module names every `mw.message.new` key its source spells, so a page can
+    /// want hundreds; one round trip each turned a page's render into minutes of
+    /// fetching (and tripped the stall detector). Cached keys are answered from
+    /// disk, and every answer — including "this is not a message" — is stored, so
+    /// an offline run replays the same decisions.
+    async fn get_messages(
+        &self,
+        lang: &str,
+        keys: &[String],
+    ) -> rustoid_core::Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        let mut wanted: Vec<String> = Vec::new();
+        for key in keys {
+            let cache_key = format!("{lang}:{key}");
+            // Guard scoped to its own statement: an `if let` scrutinee would keep
+            // the `std::sync::Mutex` alive across the awaits below.
+            let cached = {
+                let Ok(guard) = self.cache.lock() else {
+                    return Ok(out);
+                };
+                guard.get(EntryKind::Message, &cache_key).ok().flatten()
+            };
+            match cached {
+                Some(hit) => {
+                    self.observe(&hit.meta);
+                    if let Some(text) = message_text(&hit.body, key) {
+                        out.insert(key.clone(), text);
+                    }
+                }
+                None => wanted.push(key.clone()),
+            }
+        }
+        let Some(client) = self.client.as_ref().filter(|_| !self.offline) else {
+            return Ok(out);
+        };
+        for chunk in wanted.chunks(50) {
+            let Ok(body) = client.messages_json(lang, chunk).await else {
+                continue;
+            };
+            for key in chunk {
+                let text = message_text(&body, key);
+                let meta = EntryMeta {
+                    kind: EntryKind::Message,
+                    title: format!("{lang}:{key}"),
+                    revid: None,
+                    fetched_at: now_rfc3339(),
+                };
+                if let Ok(mut guard) = self.cache.lock() {
+                    let _ = guard.put(EntryKind::Message, &meta.title.clone(), &body, meta);
+                }
+                if let Some(text) = text {
+                    out.insert(key.clone(), text);
+                }
+            }
+            let _ = self.note_written();
+        }
+        Ok(out)
+    }
+}
+
+/// An `allmessages` response's text for `key`, or `None` when the wiki has no
+/// such message.
+///
+/// `missing` marks a name the wiki has no message for; `content` is the
+/// effective text, and `""` is a legitimate blank message rather than a miss.
+fn message_text(json: &str, key: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let entries = value.get("query")?.get("allmessages")?.as_array()?;
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(key) {
+            continue;
+        }
+        if entry.get("missing").is_some() {
+            return None;
+        }
+        return entry
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+    }
+    None
 }
 
 /// The shared body of [`CachedDataSource::get_page_info`] and

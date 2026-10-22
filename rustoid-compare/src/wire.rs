@@ -487,6 +487,28 @@ impl WikiClient {
         self.get_text(&url).await
     }
 
+    /// Interface messages by name, in one language.
+    ///
+    /// `meta=allmessages` is the API's `MessageCache`: it answers with the
+    /// *effective* text, including an on-wiki `MediaWiki:…` override, and marks a
+    /// name that is not a message at all as `missing`. That is exactly the pair of
+    /// facts a `{{MediaWiki:…}}` transclusion needs — text when the message
+    /// exists, a redlink when it does not.
+    pub async fn messages_json(&self, lang: &str, keys: &[String]) -> Result<String> {
+        let joined = keys
+            .iter()
+            .map(|k| urlencode(k))
+            .collect::<Vec<_>>()
+            .join("%7C");
+        let url = format!(
+            "{}?action=query&meta=allmessages&amlang={}&ammessages={}&format=json&formatversion=2",
+            self.wiki.api_url(),
+            urlencode(lang),
+            joined
+        );
+        self.get_text(&url).await
+    }
+
     /// Fetch raw `siteinfo` JSON (namespaces, magic words, function hooks,
     /// extension tags, interwiki map, general, default options).
     pub async fn siteinfo(&self) -> Result<String> {

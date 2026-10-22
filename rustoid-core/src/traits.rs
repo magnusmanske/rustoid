@@ -100,6 +100,27 @@ pub trait DataSource: Send + Sync {
     /// Returns `None` if the message does not exist.
     async fn get_message(&self, lang: &str, key: &str) -> Result<Option<String>>;
 
+    /// Fetch several messages at once.
+    ///
+    /// A module that names messages through `mw.message.new` pulls every key its
+    /// source spells, so a page can want hundreds. A source that can answer them
+    /// in one request (the wiki's `allmessages` API takes 50 at a time) should
+    /// override this; the default asks one by one, which is right for an in-memory
+    /// source.
+    async fn get_messages(
+        &self,
+        lang: &str,
+        keys: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        for key in keys {
+            if let Some(text) = self.get_message(lang, key).await? {
+                out.insert(key.clone(), text);
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch a page's content *together with* the revision it came from.
     ///
     /// `<templatestyles>` needs both: the text is inlined, and the revision

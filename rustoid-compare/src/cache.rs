@@ -89,6 +89,14 @@ pub enum EntryKind {
     /// configuration lives in a DB table the body cannot supply, and without it
     /// every article reads "not pending-changes protected".
     Stability,
+    /// An interface message's text, for `{{MediaWiki:…}}` transclusions and
+    /// `mw.message`.
+    ///
+    /// A message is not a page: `MediaWiki:Toc` answers "Contents" although no
+    /// page with that title exists, so the body cannot supply it either. The key
+    /// carries the language (`en:toc`), because the same message name answers
+    /// differently per wiki language.
+    Message,
 }
 
 impl EntryKind {
@@ -115,6 +123,7 @@ impl EntryKind {
             Self::FileInfo => "file",
             Self::Categories => "cat",
             Self::Stability => "flag",
+            Self::Message => "msg",
         }
     }
 
@@ -132,6 +141,7 @@ impl EntryKind {
             "file" => Some(Self::FileInfo),
             "cat" => Some(Self::Categories),
             "flag" => Some(Self::Stability),
+            "msg" => Some(Self::Message),
             _ => None,
         }
     }

@@ -18908,3 +18908,29 @@ than guessing.
 **Effect:** `Polio vaccine` matches (its only remaining difference is a
 per-render random id the harness masks). 5/48 strict, 4 more
 nondeterministic-only (18.8%). No corpus regressions.
+
+## `{{MediaWiki:Toc}}` transcludes a message, not a page
+
+`Template:Compact TOC` reaches the table of contents through
+`{{MediaWiki:Toc}}`. A MediaWiki-namespace target is resolved by `MessageCache`,
+not by the page table: `MediaWiki:Toc` has no page (`prop=info` reports it
+`missing` but `known`) and still renders "Contents". rustoid asked for the page
+body, found nothing, and served the redlink the service never shows.
+
+The lookup is now the message's: `get_message(lang, key)` (the trait hook that
+already fed `mw.message`), with the key being the title lower-cased in its first
+character only. A name that is not a message at all — `MediaWiki:Sitename`, an
+`allmessages` miss on enwiki — answers `None`, which leaves the page fetch to
+fail and the transclusion to render as a redlink, exactly as the service does.
+
+`CachedDataSource` implements the hook over `action=query&meta=allmessages`, and
+stores the answer per language and key under a new `msg:` cache kind. A miss is
+stored too: "this is not a message" is a fact about the wiki, and an offline run
+cannot re-ask for it. `DataSource::get_messages` (new, with a one-by-one default)
+lets the harness batch 50 names per request: a page's modules name every
+`mw.message.new` literal in their source, and one request each made an online
+render spend minutes in the fetcher.
+
+**Effect:** no corpus page changes (none of the 48 uses `Template:Compact TOC`),
+and the two message probes now match the transform endpoint. 5/48 strict, 4
+nondeterministic-only (18.8%).

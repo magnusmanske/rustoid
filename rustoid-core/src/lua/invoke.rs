@@ -1138,7 +1138,6 @@ async fn preload_messages<S: DataSource + ?Sized>(
     registry: &Registry,
     language: &str,
 ) -> HashMap<String, String> {
-    let mut out = HashMap::new();
     let mut wanted: BTreeSet<String> = BTreeSet::new();
 
     for body in registry.values() {
@@ -1147,15 +1146,15 @@ async fn preload_messages<S: DataSource + ?Sized>(
         }
     }
 
-    for key in wanted.into_iter().take(MAX_MESSAGES) {
-        // A message that does not exist is simply absent, so `exists()` and
-        // `isBlank()` report the truth to the module.
-        if let Ok(Some(text)) = source.get_message(language, &key).await {
-            out.insert(key, text);
-        }
-    }
-
-    out
+    let keys: Vec<String> = wanted.into_iter().take(MAX_MESSAGES).collect();
+    // One request for the whole list where the source can batch them: a page's
+    // modules name hundreds of keys, and one round trip each is minutes of fetch
+    // time (and a per-page stall). A message that does not exist is simply
+    // absent, so `exists()` and `isBlank()` report the truth to the module.
+    source
+        .get_messages(language, &keys)
+        .await
+        .unwrap_or_default()
 }
 
 /// Interface message names named by `mw.message.new('…')` string literals.

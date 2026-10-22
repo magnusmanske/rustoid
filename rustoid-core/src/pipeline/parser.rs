@@ -7874,6 +7874,35 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         }
     }
 
+    /// The interface message a `{{MediaWiki:…}}` transclusion names.
+    ///
+    /// MediaWiki resolves a MediaWiki-namespace target through `MessageCache`,
+    /// not through the page table: `MediaWiki:Toc` has no page and still answers
+    /// "Contents". A name that is not a message at all (`MediaWiki:Sitename`)
+    /// answers `None`, which lets the caller's page fetch fail and the
+    /// transclusion render as a redlink — the service's own answer.
+    ///
+    /// Message keys are case-insensitive in their first character only, and use
+    /// underscores for spaces (`Title::getDBkey`).
+    async fn mediawiki_message(
+        &self,
+        title: &crate::title::Title,
+        source: &dyn DataSource,
+    ) -> Option<String> {
+        let namespace = self.config.canonical_namespace_id("MediaWiki")?;
+        if title.namespace_id != namespace {
+            return None;
+        }
+        let mut chars = title.text.chars();
+        let first = chars.next()?;
+        let key = format!("{}{}", first.to_ascii_lowercase(), chars.as_str()).replace(' ', "_");
+        source
+            .get_message(self.config.language_code(), &key)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Fetch, expand, and recursively re-process a single template. Mirrors the
     /// native template expansion path (`fetchTemplateAndTitle` +
     /// `processTemplateSource`), then recursively runs the fetched+substituted
@@ -7940,7 +7969,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             );
         };
 
-        let fetched = src.get_template(title).await.ok().flatten();
+        // A `{{MediaWiki:…}}` transclusion reads an *interface message*, not a
+        // page body. `MediaWiki:Toc` exists only as a system message, yet
+        // `{{MediaWiki:Toc}}` renders "Contents"; a name that is not a message
+        // (`MediaWiki:Sitename`) stays a redlink, and no `get_message` answer
+        // produces one. `MessageCache` is the authority — it already reflects an
+        // on-wiki override — so a message miss falls back to the page table.
+        let message_src = self.mediawiki_message(title, src).await;
+        let fetched = match message_src {
+            Some(text) => Some(text),
+            None => src.get_template(title).await.ok().flatten(),
+        };
         let Some(template_src) = fetched else {
             return self.missing_template_items(
                 name,
