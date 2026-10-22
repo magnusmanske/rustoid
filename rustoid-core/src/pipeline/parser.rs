@@ -2215,17 +2215,36 @@ pub struct Parser<'a, C: SiteConfig> {
 /// preprocessor computes it: `$text[$i - 1] === "\n"` — the character
 /// immediately before the `{{`, with no allowance for indentation. A
 /// preprocessed template body starts with `textStartsInSOLState = false`.
-fn t2529_at_line_start(tok: &ParsoidToken, src_text: &str, body: bool) -> bool {
+///
+/// `None` when the call's position cannot be established: the token was
+/// synthesised (no `tsr`) or re-tokenized from a *fragment* whose offsets do not
+/// index `src_text`. The caller then decides from the expansion's own shape.
+fn t2529_at_line_start(tok: &ParsoidToken, src_text: &str, body: bool) -> Option<bool> {
     (|| {
         let tsr = tok.data_parsoid().and_then(|dp| dp.tsr.as_ref())?;
         let start = tsr.start?;
+        let source = tsr.source.as_deref().unwrap_or(src_text);
+        if source.is_empty() {
+            // A module's output is re-tokenized against no page source, so no
+            // offset of its own names a line position.
+            return None;
+        }
+        // A token re-tokenized from a *fragment* (a parser-function branch, an
+        // argument value) carries offsets into that fragment, not into
+        // `src_text`. Reading them anyway put the `{{(!}}` of
+        // `Template:Largest cities` at some unrelated offset and invented a
+        // newline before the table it expands to.
+        if let Some(expected) = tok.data_parsoid().and_then(|dp| dp.src.as_deref())
+            && !source.get(start..).is_some_and(|s| s.starts_with(expected))
+        {
+            // Offsets into another chunk say nothing about this one.
+            return None;
+        }
         if start == 0 {
             return Some(!body);
         }
-        let source = tsr.source.as_deref().unwrap_or(src_text);
-        Some(source.as_bytes().get(start - 1) == Some(&b'\n'))
+        source.as_bytes().get(start - 1).map(|b| *b == b'\n')
     })()
-    .unwrap_or(false)
 }
 
 /// Core `Parser::braceSubstitution`'s T2529 rule: a *nested* template's
@@ -2247,8 +2266,8 @@ fn t2529_at_line_start(tok: &ParsoidToken, src_text: &str, body: bool) -> bool {
 /// a plain string there and no re-tokenization happens.
 fn t2529_force_line_start(
     expanded: Vec<Item>,
-    at_line_start: bool,
-    body: bool,
+    at_line_start: Option<bool>,
+    nested: bool,
     in_attribute: bool,
 ) -> Vec<Item> {
     // The expansion is wrapped in its transclusion marker(s); core checks the
@@ -2261,7 +2280,17 @@ fn t2529_force_line_start(
         Some(Item::Str(s)) => s.clone(),
         Some(Item::Tok(t)) => t
             .data_parsoid()
-            .and_then(|dp| dp.src.clone())
+            .map(|dp| {
+                dp.src.clone().unwrap_or_else(|| {
+                    // A `{|` table start is a token with no `src`; its
+                    // `start_tag_src` holds the two-character marker.
+                    dp.start_tag_src
+                        .as_deref()
+                        .filter(|s| s.starts_with('{'))
+                        .unwrap_or_default()
+                        .to_string()
+                })
+            })
             .unwrap_or_default(),
         _ => return expanded,
     };
@@ -2269,7 +2298,22 @@ fn t2529_force_line_start(
         return expanded;
     }
     let mut out = Vec::with_capacity(expanded.len() + 1);
-    if body && !at_line_start {
+    if nested
+        && match at_line_start {
+            Some(at_line_start) => !at_line_start,
+            // Unknown position: a generated *string* marker needs the newline
+            // (Parsoid's `TokenStreamPatcher` hack), and so does any marker
+            // token the tokenizer built from wikitext. A table start seen only
+            // through `start_tag_src` is the one exception: that fallback exists
+            // for an expansion whose own source is not available (a module's
+            // output), where core's preprocessor never ran and so never inserted
+            // a newline (`Zebra`'s infobox table).
+            None => !matches!(
+                expanded.get(start),
+                Some(Item::Tok(t)) if starts_with_table_marker(t)
+            ),
+        }
+    {
         if in_attribute {
             out.push(Item::Str("\n".to_string()));
         } else {
@@ -2304,6 +2348,19 @@ fn t2529_force_line_start(
         out.push(it);
     }
     out
+}
+
+/// Whether `token` is a `{|` table start with no source of its own, i.e. one
+/// detectable only through `start_tag_src`.
+fn starts_with_table_marker(token: &ParsoidToken) -> bool {
+    let Some(dp) = token.data_parsoid() else {
+        return false;
+    };
+    dp.src.is_none()
+        && dp
+            .start_tag_src
+            .as_deref()
+            .is_some_and(|s| s.starts_with('{'))
 }
 
 /// Whether `item` is a transclusion wrapper marker (`mw:Transclusion` start or
@@ -6253,15 +6310,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // so a directive indented with spaces does **not** start a
                     // line and gets the newline (`Template:Quote box`'s style,
                     // Isaac Newton).
+                    let arg_value = self.in_arg_expansion();
+                    let nested = body || arg_value;
                     let expanded = t2529_force_line_start(
                         expanded,
                         t2529_at_line_start(
                             &ParsoidToken::SelfclosingTag(stt.clone()),
                             src_text,
-                            body,
+                            nested,
                         ),
-                        body,
-                        self.in_attr_expansion(),
+                        nested,
+                        // A module argument is handed over as *text*, so the
+                        // newline belongs in that text (like an attribute
+                        // value) and the marker is not re-tokenized here.
+                        self.in_attr_expansion() || arg_value,
                     );
                     for e in &expanded {
                         track_table(e, &mut table_depth);
@@ -11858,7 +11920,7 @@ mod tests {
         // re-tokenized content.
         let out = t2529_force_line_start(
             vec![marker.clone(), Item::Str("* a".to_string())],
-            false,
+            Some(false),
             true,
             false,
         );
@@ -11875,7 +11937,7 @@ mod tests {
         // is re-tokenized but no newline is inserted (T382464).
         let out = t2529_force_line_start(
             vec![marker.clone(), Item::Str("* a".to_string())],
-            false,
+            Some(false),
             false,
             false,
         );
@@ -11885,13 +11947,13 @@ mod tests {
         // the expansion at SOL), just without a newline; content that is not a
         // marker is unchanged.
         assert!(!matches!(
-            t2529_force_line_start(vec![Item::Str("* a".to_string())], true, true, false)[0],
+            t2529_force_line_start(vec![Item::Str("* a".to_string())], Some(true), true, false)[0],
             Item::Str(_)
         ));
         assert!(matches!(
             t2529_force_line_start(
                 vec![marker.clone(), Item::Str("plain".to_string())],
-                false,
+                Some(false),
                 true,
                 false
             )[0],
@@ -11901,9 +11963,40 @@ mod tests {
         // value string) and the marker stays text: block syntax is not parsed
         // there.
         let out =
-            t2529_force_line_start(vec![marker, Item::Str(";".to_string())], false, true, true);
+            t2529_force_line_start(vec![marker, Item::Str(";".to_string())], Some(false), true, true);
         assert!(matches!(&out[0], Item::Str(s) if s == "\n"));
         assert!(matches!(out.last(), Some(Item::Str(s)) if s == ";"));
+    }
+
+    /// A table start (`{|`) is a token with no `src`, so the marker is read from
+    /// `start_tag_src`; and a token with no source range at all (synthesised,
+    /// e.g. from a module's output) is assumed to start its line rather than
+    /// given an invented newline. Getting the second wrong added a stray `\n`
+    /// before `Zebra`'s infobox table while fixing the one in `Hydrogen`.
+    #[test]
+    fn test_t2529_reads_a_table_marker_and_ignores_synthesised_tokens() {
+        let dp = crate::wikitext::tokens_v2::DataParsoid {
+            start_tag_src: Some("{|".to_string()),
+            ..Default::default()
+        };
+        let table = Item::Tok(ParsoidToken::Tag(crate::wikitext::tokens_v2::TagTk::new(
+            "table",
+            vec![],
+            dp,
+        )));
+        let out = t2529_force_line_start(vec![table.clone()], Some(false), true, false);
+        assert!(
+            matches!(out[0], Item::Tok(ParsoidToken::Nl(_))),
+            "a table start not at SOL gets a newline"
+        );
+
+        let synthesized =
+            ParsoidToken::SelfclosingTag(crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+                "template",
+                vec![],
+                crate::wikitext::tokens_v2::DataParsoid::default(),
+            ));
+        assert_eq!(t2529_at_line_start(&synthesized, "", true), None);
     }
 
     /// A construct that generates a whole attribute (`<div {{#switch:…}}>`) has
