@@ -359,6 +359,12 @@ pub struct CachedDataSource {
     /// modules then take their no-data branch, exactly as they do on a wiki with
     /// no Wikidata access.
     entities: Option<SiblingWiki>,
+    /// The wiki that holds tabular data (`Data:…`), reached for `mw.ext.data`.
+    ///
+    /// Data pages live on the commons, a third wiki with its own cache. Absent
+    /// when the run has no commons handle, which makes every data lookup miss and
+    /// `mw.ext.data.get` answer its hollow table.
+    data: Option<SiblingWiki>,
     /// When set, a cache miss returns `None` instead of fetching. Template
     /// expansion can trigger many fetches, so this is what keeps an offline run
     /// genuinely offline.
@@ -405,6 +411,7 @@ impl CachedDataSource {
             client,
             cache,
             entities: None,
+            data: None,
             offline,
             fill_files: std::env::var_os("RUSTOID_FILL_FILES").is_some(),
             fill_page_info: std::env::var_os("RUSTOID_FILL_PAGE_INFO").is_some(),
@@ -429,6 +436,13 @@ impl CachedDataSource {
     #[must_use]
     pub fn with_entities(mut self, entities: Option<SiblingWiki>) -> Self {
         self.entities = entities;
+        self
+    }
+
+    /// Same, with a wiki to read `mw.ext.data` tabular pages from.
+    #[must_use]
+    pub fn with_data(mut self, data: Option<SiblingWiki>) -> Self {
+        self.data = data;
         self
     }
 
@@ -951,6 +965,22 @@ impl DataSource for CachedDataSource {
         _title: &rustoid_core::Title,
     ) -> rustoid_core::Result<Option<rustoid_core::Title>> {
         Ok(None)
+    }
+
+    /// A tabular-data page's JSON, from the commons.
+    ///
+    /// `name` is the module's key (`Wikipedia statistics/meta.tab`); the page is
+    /// `Data:` plus that name. A run with no commons handle — or a page that is
+    /// not there — answers `None`, which leaves `mw.ext.data.get` returning its
+    /// hollow table rather than aborting the module.
+    async fn get_data_page(&self, name: &str) -> rustoid_core::Result<Option<String>> {
+        let Some(data) = &self.data else {
+            return Ok(None);
+        };
+        Ok(self
+            .fetch_from(data, EntryKind::Data, &format!("Data:{name}"))
+            .await
+            .unwrap_or(None))
     }
 
     /// An interface message's text, cached per language and name.
@@ -1717,6 +1747,7 @@ impl OwnedRenderInput {
             self.offline,
         );
         let source = with_entity_wiki(source, &self.client, &self.cache)?;
+        let source = with_data_wiki(source, &self.client, &self.cache)?;
         // `node_ids` is on because the target is what a *wiki serves*: MediaWiki's
         // REST layer page-bundles Parsoid output and assigns each metadata-bearing
         // element an `id="mw…"`. Parsoid's standalone mode emits none, and the
@@ -1921,16 +1952,53 @@ fn with_entity_wiki(
         .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
         .root()
         .to_path_buf();
-    let entities_cache = Arc::new(std::sync::Mutex::new(WikiCache::open(&root, ENTITY_WIKI)?));
-    let entities_client = Arc::new(WikiClient::new(crate::wire::Wiki::new(ENTITY_WIKI))?);
-    Ok(source.with_entities(Some(SiblingWiki {
-        client: entities_client,
-        cache: entities_cache,
-    })))
+    Ok(source.with_entities(Some(sibling_wiki(&root, ENTITY_WIKI)?)))
+}
+
+/// Attach the commons, so `mw.ext.data` has something to read.
+///
+/// Tabular-data pages (`Data:…`) live on the commons, a third wiki with its own
+/// cache directory — the same arrangement as Wikidata for `mw.wikibase`. A page
+/// fetched once is replayed offline from disk.
+fn with_data_wiki(
+    source: CachedDataSource,
+    client: &WikiClient,
+    cache: &Arc<std::sync::Mutex<WikiCache>>,
+) -> Result<CachedDataSource> {
+    let host = &client.wiki().host;
+    if !host.ends_with("wikipedia.org") && !host.ends_with("wikimedia.org") {
+        return Ok(source);
+    }
+    let root = cache
+        .lock()
+        .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+        .root()
+        .to_path_buf();
+    Ok(source.with_data(Some(sibling_wiki(&root, DATA_WIKI)?)))
+}
+
+/// Open a sibling wiki's client and cache under `root`.
+///
+/// A cache that exists on disk but has no manifest (an interrupted or older
+/// population) is reindexed rather than treated as empty, so a filled cache is
+/// never re-fetched wholesale.
+pub fn sibling_wiki(root: &std::path::Path, host: &str) -> Result<SiblingWiki> {
+    let mut cache = WikiCache::open(root, host)?;
+    if cache.is_empty() {
+        let _ = cache.reindex();
+    }
+    let client = WikiClient::new(crate::wire::Wiki::new(host))?;
+    Ok(SiblingWiki {
+        client: Arc::new(client),
+        cache: Arc::new(std::sync::Mutex::new(cache)),
+    })
 }
 
 /// The wiki entities are stored on.
 const ENTITY_WIKI: &str = "www.wikidata.org";
+
+/// The wiki tabular-data pages are stored on.
+const DATA_WIKI: &str = "commons.wikimedia.org";
 
 /// Compare two HTML strings, returning the first difference.
 ///

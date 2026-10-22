@@ -18934,3 +18934,31 @@ render spend minutes in the fetcher.
 **Effect:** no corpus page changes (none of the 48 uses `Template:Compact TOC`),
 and the two message probes now match the transform endpoint. 5/48 strict, 4
 nondeterministic-only (18.8%).
+
+## `mw.ext.data` reads the wiki's tabular data
+
+`{{NUMBEROF|USERS|totalactive.wikipedia}}` renders `Wikipedia`'s user count
+through `Module:NUMBEROF`, which counts rows of
+`Data:Wikipedia statistics/data.tab`. rustoid answered `mw.ext.data.get` with a
+*hollow* table (the extension was not implemented), so the count came out `-1`
+and the infobox read "-1 languages".
+
+Tabular data now comes from the wiki's data repository. That is a third wiki —
+`Data:` pages live on the commons, not the article wiki — so the harness opens a
+commons sibling the same way it opens Wikidata for `mw.wikibase`, with its own
+`data:` cache kind. `mw.ext.data.get(name)` parses the page's `.tab` JSON (the
+`schema.fields`/`data` shape the modules index) into a Lua table; a name whose
+suffix is missing gets `.tab`, as the extension does.
+
+A page the host did not preload is recorded out of band — the module does not
+fail, it gets the hollow table, so the record is the only signal — and the
+`#invoke` retry loop fetches it and re-runs, exactly as for a missing module or
+entity. Names written as `mw.ext.data.get('…')` literals are preloaded up front,
+so the common case costs one round. A name that cannot be fetched is remembered
+as unfetchable and answered with the hollow table, which keeps a module that
+guards on the result from looping.
+
+**Effect:** `Wikipedia` 12,160 → 15,118: the language count is now `348`, matching
+the service's four-digit value, and the next difference is `{{Date|2=MDY}}` — the
+day the cached Parsoid HTML was rendered versus today, which no implementation
+can match. No corpus regressions; 5/48 strict, 4 nondeterministic-only (18.8%).

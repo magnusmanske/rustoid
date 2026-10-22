@@ -74,6 +74,9 @@ pub struct MockDataSource {
     files: RwLock<HashMap<String, FileInfo>>,
     redirects: RwLock<HashMap<String, String>>,
     messages: RwLock<HashMap<(String, String), String>>,
+    /// Tabular-data pages, keyed by the name a module passes to
+    /// `mw.ext.data.get` (`Wikipedia statistics/meta.tab`).
+    data_pages: RwLock<HashMap<String, String>>,
     /// Explicit page-info overrides (special pages, redirects, disambiguation
     /// pages, known-but-contentless files), keyed by prefixed title. Faithful
     /// to PHP `MockApiHelper::getPageInfo`'s per-title `missing`/`known`/
@@ -97,6 +100,7 @@ impl MockDataSource {
             files: RwLock::new(HashMap::new()),
             redirects: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
+            data_pages: RwLock::new(HashMap::new()),
             page_info: RwLock::new(HashMap::new()),
             revisions: RwLock::new(HashMap::new()),
         }
@@ -156,6 +160,15 @@ impl MockDataSource {
             .write()
             .unwrap()
             .insert((lang.to_string(), key.to_string()), value.to_string());
+    }
+
+    /// Add a tabular-data page (`Data:`), keyed by the name `mw.ext.data.get`
+    /// takes — no `Data:` prefix, and the `.tab` suffix the caller used.
+    pub fn add_data_page(&self, name: &str, body: &str) {
+        self.data_pages
+            .write()
+            .unwrap()
+            .insert(name.to_string(), body.to_string());
     }
 
     /// Register an explicit page-info override for a prefixed title, mirroring
@@ -429,6 +442,10 @@ impl DataSource for MockDataSource {
             .unwrap()
             .get(&(lang.to_string(), key.to_string()))
             .cloned())
+    }
+
+    async fn get_data_page(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.data_pages.read().unwrap().get(name).cloned())
     }
 
     async fn get_page_info(&self, titles: &[String]) -> Result<HashMap<String, PageInfo>> {

@@ -100,6 +100,19 @@ pub trait DataSource: Send + Sync {
     /// Returns `None` if the message does not exist.
     async fn get_message(&self, lang: &str, key: &str) -> Result<Option<String>>;
 
+    /// A tabular-data page's source (`Data:…`), for `mw.ext.data`.
+    ///
+    /// `name` is the name a module passed to `mw.ext.data.get` with the `.tab`
+    /// suffix normalized (`Wikipedia statistics/meta.tab`); the page title is
+    /// `Data:` plus that name, and it lives on the wiki's data repository (the
+    /// commons) rather than the article wiki.
+    ///
+    /// The default answers `None` — a source with no data repository — which
+    /// leaves `mw.ext.data.get` returning its hollow table.
+    async fn get_data_page(&self, _name: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Fetch several messages at once.
     ///
     /// A module that names messages through `mw.message.new` pulls every key its

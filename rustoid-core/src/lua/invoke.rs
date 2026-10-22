@@ -329,6 +329,11 @@ pub enum Outcome {
     /// the module re-run: an id built at runtime (`'P'..property`) is invisible
     /// to the literal preload scan.
     MissingEntities(Vec<String>),
+    /// Tabular-data pages the run asked `mw.ext.data` for and the host had never
+    /// fetched. The module did not fail — it got the hollow table — so this is
+    /// the only signal that a count or lookup is missing, and the loop fetches
+    /// the pages and re-runs it.
+    MissingData(Vec<String>),
 }
 
 /// How many times one `#invoke` may be re-run for deferred frame calls.
@@ -417,6 +422,10 @@ pub fn run_once(
             let missing_entities = engine.take_missing_entities();
             if !missing_entities.is_empty() {
                 return Ok(Outcome::MissingEntities(missing_entities));
+            }
+            let missing_data = engine.take_missing_data();
+            if !missing_data.is_empty() {
+                return Ok(Outcome::MissingData(missing_data));
             }
             // A `pcall` around a frame method swallows the deferred-call marker,
             // so a run can finish "successfully" while still having asked the host
@@ -529,10 +538,16 @@ where
         .extend(frame.titles.iter().map(|(k, v)| (k.clone(), v.clone())));
     // Interface messages are fetched here rather than in the parser for the same
     // reason modules are: fetching is asynchronous and Lua is not.
-    let site = {
+    let mut site = {
         let language = site.language_code.clone();
         site.with_messages(preload_messages(source, &registry, &language).await)
     };
+    // Tabular-data pages live on the wiki's data repository, so they are fetched
+    // here too. A name the scan cannot see (built at runtime) is reported by
+    // `mw.ext.data.get` and fetched on the next round.
+    let mut data = preload_data(source, &registry).await;
+    let mut unfetchable_data: std::collections::HashSet<String> = std::collections::HashSet::new();
+    site = site.with_data(data.clone(), unfetchable_data.clone());
     let mut answers = crate::pipeline::lua_deferred::DeferredAnswers::new();
     let mut asked: Vec<String> = Vec::new();
     // Per-call ordinals, matching the engine's [frame method
@@ -681,6 +696,27 @@ where
                         }
                     }
                 }
+                continue;
+            }
+            // Tabular-data pages `mw.ext.data` read and the host did not have.
+            // Fetched into the site's data map; a name that yields nothing is
+            // recorded as unfetchable, so the next round's `get` answers the
+            // hollow table without asking again and the module finishes.
+            Outcome::MissingData(names) => {
+                for name in names {
+                    if data.contains_key(&name) || unfetchable_data.contains(&name) {
+                        continue;
+                    }
+                    match source.get_data_page(&name).await {
+                        Ok(Some(text)) => {
+                            data.insert(name, text);
+                        }
+                        _ => {
+                            unfetchable_data.insert(name);
+                        }
+                    }
+                }
+                site = site.with_data(data.clone(), unfetchable_data.clone());
                 continue;
             }
             Outcome::Deferred(request) => {
@@ -1172,6 +1208,52 @@ fn message_keys(source: &str) -> Vec<String> {
         }
         if let Some(literal) = first_string_literal(tail.trim_start()) {
             out.push(literal.to_string());
+        }
+    }
+    out
+}
+
+/// How many tabular-data pages one scan may preload.
+///
+/// Far above what any real module names (the statistics modules name one or
+/// two), and bounded because each name costs a page fetch.
+const MAX_DATA_PAGES: usize = 8;
+
+/// Tabular-data page names named by `mw.ext.data.get('…')` literals.
+///
+/// The names are normalized the way the extension does — a name without a
+/// suffix means `.tab` — so the preload and an on-demand request for the other
+/// spelling land on one key.
+async fn preload_data<S: DataSource + ?Sized>(
+    source: &S,
+    registry: &Registry,
+) -> HashMap<String, String> {
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    for body in registry.values() {
+        for name in data_page_names(body) {
+            wanted.insert(name);
+        }
+    }
+    let mut out = HashMap::new();
+    for name in wanted.into_iter().take(MAX_DATA_PAGES) {
+        // A page that is not there is simply absent: `mw.ext.data.get` then
+        // answers the hollow table and the module takes its own fallback.
+        if let Ok(Some(text)) = source.get_data_page(&name).await {
+            out.insert(name, text);
+        }
+    }
+    out
+}
+
+/// Data page names named by `mw.ext.data.get('…')` string literals.
+fn data_page_names(source: &str) -> Vec<String> {
+    const CALL: &str = "mw.ext.data.get";
+    let mut out = Vec::new();
+    for (idx, _) in source.match_indices(CALL) {
+        let tail = &source[idx + CALL.len()..];
+        let tail = tail.strip_prefix('(').unwrap_or(tail);
+        if let Some(literal) = first_string_literal(tail.trim_start()) {
+            out.push(crate::lua::engine::data_page_key(literal));
         }
     }
     out

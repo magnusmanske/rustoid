@@ -89,6 +89,13 @@ pub enum EntryKind {
     /// configuration lives in a DB table the body cannot supply, and without it
     /// every article reads "not pending-changes protected".
     Stability,
+    /// A tabular-data page's JSON (`Data:…`), for `mw.ext.data`.
+    ///
+    /// The page lives on the wiki's data repository (the commons), not the article
+    /// wiki, which is why this needs its own kind and its own sibling cache. Like
+    /// [`Protection`](Self::Protection) the body cannot supply it: the statistics
+    /// a page renders come from a page it never transcludes.
+    Data,
     /// An interface message's text, for `{{MediaWiki:…}}` transclusions and
     /// `mw.message`.
     ///
@@ -124,6 +131,7 @@ impl EntryKind {
             Self::Categories => "cat",
             Self::Stability => "flag",
             Self::Message => "msg",
+            Self::Data => "data",
         }
     }
 
@@ -142,6 +150,7 @@ impl EntryKind {
             "cat" => Some(Self::Categories),
             "flag" => Some(Self::Stability),
             "msg" => Some(Self::Message),
+            "data" => Some(Self::Data),
             _ => None,
         }
     }

@@ -47,6 +47,63 @@ fn text_only(html: &str) -> String {
     out
 }
 
+/// `mw.ext.data` reads a tabular-data page.
+///
+/// This is what `Module:NUMBEROF` counts: rows of
+/// `Data:Wikipedia statistics/meta.tab`. rustoid answered with a hollow table, so
+/// every statistic came out `-1` (`Wikipedia`'s "-1 languages"). A name written
+/// as a literal is preloaded from the module source; one built at runtime is
+/// fetched when `mw.ext.data.get` reports it and the module re-runs.
+#[tokio::test]
+async fn invoke_reads_a_tabular_data_page() {
+    const TABLE: &str = r#"{
+        "schema": {"fields": [
+            {"name": "project", "type": "string"},
+            {"name": "status", "type": "string"}
+        ]},
+        "data": [["wikipedia", "active"], ["wiktionary", "closed"]]
+    }"#;
+    let literal = r#"
+        local p = {}
+        function p.main()
+            local d = mw.ext.data.get('Wikipedia statistics/meta.tab')
+            local active = 0
+            for _, row in ipairs(d.data) do
+                if row[2] == 'active' then active = active + 1 end
+            end
+            return 'active=' .. active
+        end
+        return p
+    "#;
+    // The name is built at runtime, so the preload scan cannot see it.
+    let dynamic = r#"
+        local p = {}
+        function p.main()
+            local name = 'Wikipedia statistics/' .. 'meta.tab'
+            local d = mw.ext.data.get(name)
+            return 'rows=' .. #d.data
+        end
+        return p
+    "#;
+    let config = MockSiteConfig::new();
+    let source = MockDataSource::new();
+    source.add_module("Module:Literal", literal);
+    source.add_module("Module:Dynamic", dynamic);
+    source.add_data_page("Wikipedia statistics/meta.tab", TABLE);
+    let parser = Parser::new(&config);
+    let html = parser
+        .wikitext_to_html_expanded(
+            "{{#invoke:Literal|main}} {{#invoke:Dynamic|main}}",
+            &source,
+            &ParserOptions::for_page("Test"),
+        )
+        .await
+        .unwrap();
+    let text = text_only(&html);
+    assert!(text.contains("active=1"), "got: {text}");
+    assert!(text.contains("rows=2"), "got: {text}");
+}
+
 #[tokio::test]
 async fn invoke_calls_a_module_function() {
     let html = expand(&[("Module:Greet", GREET)], "{{#invoke:Greet|main|world}}").await;

@@ -71,6 +71,20 @@ pub struct LuaSite {
     /// decides for the namespaces the API returns; Special is added on demand
     /// by [`LuaSite::namespace_is_capitalized`].
     pub capitalized_namespaces: std::collections::HashSet<i32>,
+    /// Tabular-data pages (`Data:…`) by the name a module asked for, for
+    /// `mw.ext.data`.
+    ///
+    /// Keyed by the requested name (`Wikipedia statistics/meta.tab`) rather than
+    /// by the page title, because that is what a module writes and what the
+    /// extension's own lookup is keyed on. The pages live on the wiki's data
+    /// repository (the commons), so the host fetches them before the engine runs:
+    /// a module cannot, since Lua has no async access.
+    pub data: std::collections::HashMap<String, String>,
+    /// Data names the host tried and could not fetch. `mw.ext.data.get` answers
+    /// the hollow table for them and does not ask again — the same shape as
+    /// [`messages`](Self::messages), so a module that guards on the result takes
+    /// its own fallback instead of aborting the render.
+    pub unfetchable_data: std::collections::HashSet<String>,
 }
 
 /// The counters `mw.site.stats` exposes.
@@ -166,7 +180,21 @@ impl LuaSite {
             stats: config.site_stats(),
             protocols: config.protocols().iter().map(|s| s.to_string()).collect(),
             capitalized_namespaces,
+            data: std::collections::HashMap::new(),
+            unfetchable_data: std::collections::HashSet::new(),
         }
+    }
+
+    /// Attach preloaded tabular-data pages, for `mw.ext.data`.
+    #[must_use]
+    pub fn with_data(
+        mut self,
+        data: std::collections::HashMap<String, String>,
+        unfetchable: std::collections::HashSet<String>,
+    ) -> Self {
+        self.data = data;
+        self.unfetchable_data = unfetchable;
+        self
     }
 
     /// Attach preloaded interface messages, for `mw.message`.
@@ -652,6 +680,16 @@ impl LuaEngine {
         self.take_registry_titles(MISSING_ENTITIES)
     }
 
+    /// Tabular-data pages a run asked `mw.ext.data` for and the host had never
+    /// fetched, taken and cleared.
+    ///
+    /// The counterpart of [`take_missing_entities`](Self::take_missing_entities).
+    /// The module is *not* failing when this is recorded — it got the hollow
+    /// table — so without this the data would simply be missing from the render.
+    pub fn take_missing_data(&self) -> Vec<String> {
+        self.take_registry_titles(MISSING_DATA)
+    }
+
     /// Drain a named registry list of titles, de-duplicated.
     fn take_registry_titles(&self, slot: &str) -> Vec<String> {
         let Ok(t) = self.lua.named_registry_value::<mlua::Table>(slot) else {
@@ -741,6 +779,11 @@ impl LuaEngine {
         // missing entity is a state `mw.wikibase` handles.
         self.lua
             .set_named_registry_value(MISSING_ENTITIES, self.lua.create_table()?)
+            .map_err(|e| RustoidError::Lua(e.to_string()))?;
+        // And one for tabular-data pages `mw.ext.data` read. The module does not
+        // fail on a miss, so the collector is the only signal it happened.
+        self.lua
+            .set_named_registry_value(MISSING_DATA, self.lua.create_table()?)
             .map_err(|e| RustoidError::Lua(e.to_string()))?;
 
         let module = self.load_module_value(module_source, Some(title))?;
@@ -949,6 +992,45 @@ where
     Ok(table)
 }
 
+/// The key a tabular-data page is stored under: the requested name, with the
+/// `.tab` suffix the extension appends when the name carries none.
+///
+/// `mw.ext.data.get('Foo')` and `…get('Foo.tab')` name the same page, so both
+/// spellings must land on one key — the preload scan sees whichever the module
+/// wrote, and the on-demand fetch the other.
+pub(crate) fn data_page_key(name: &str) -> String {
+    let name = name.trim();
+    let has_suffix = name
+        .rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains('.'));
+    if has_suffix {
+        name.to_string()
+    } else {
+        format!("{name}.tab")
+    }
+}
+
+/// The page title a data name stands for, for error messages.
+fn data_page_title(key: &str) -> String {
+    format!("Data:{key}")
+}
+
+/// The shape a real `.tab` page yields, hollowed out.
+///
+/// A module walking it finds empty tables all the way down rather than a nil
+/// that turns into an error: `Module:NUMBEROF/data` does
+/// `ipairs(statistics.schema.fields)`, so a missing `fields` was "bad argument #1
+/// to 'ipairs' (table expected, got nil)".
+fn hollow_data_table(lua: &Lua) -> mlua::Result<Value> {
+    let empty = lua.create_table()?;
+    let schema = lua.create_table()?;
+    schema.set("fields", lua.create_table()?)?;
+    empty.set("schema", schema)?;
+    empty.set("data", lua.create_table()?)?;
+    Ok(Value::Table(empty))
+}
+
 /// Convert a JSON value to its Lua equivalent.
 ///
 /// Arrays become 1-based tables so `ipairs` works, which is how modules index
@@ -1028,6 +1110,12 @@ const MISSING_TITLES: &str = "rustoid_missing_titles";
 /// such an id is invisible to the literal preload scan, so it has to be
 /// reported the way a runtime-built module name is.
 const MISSING_ENTITIES: &str = "rustoid_missing_entities";
+/// Data pages `mw.ext.data.get` asked for and the host had never fetched.
+///
+/// Separate from the module list because the remedy differs — a data page comes
+/// from the wiki's data repository, not the module namespace — and because the
+/// request is not an error: the module continues with the hollow table.
+const MISSING_DATA: &str = "rustoid_missing_data";
 
 /// Record that the current run needed a title the host was not asked about.
 ///
@@ -2383,39 +2471,58 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
 
     mw.set("ustring", ustring)?;
 
-    // `mw.ext.*` are extension-provided helpers; the one that matters in
-    // practice is `mw.ext.data.get`, which loads a Wikidata tabular-data page.
-    // rustoid does not implement the extension, so it returns an empty table:
-    // a module reading statistics then renders nothing rather than aborting the
-    // whole page. Making it *nil* is what fails, with an unattributed "attempt to
-    // index a nil value (field 'ext')".
+    // `mw.ext.data.get(name)` — a tabular-data page's JSON (`Data:…`, usually on
+    // the wiki's data repository), parsed to a table.
+    //
+    // The extension is how statistics templates read their numbers:
+    // `Module:NUMBEROF/data` counts `Data:Wikipedia statistics/data.tab`'s rows,
+    // so returning an empty table made every count `-1`.
+    //
+    // A page the host did not preload is recorded out of band (like a missing
+    // module) and answered with the *hollow* table, not an error: the module's
+    // loop over `schema.fields` then finds nothing and it renders its own
+    // fallback, instead of the whole `#invoke` aborting on data rustoid may not
+    // have. The retry loop fetches the name and runs the module again.
     let ext = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
     let ext_data = lua
         .create_table()
         .map_err(|e| RustoidError::Lua(e.to_string()))?;
+    let data_ctx = ctx.clone();
     ext_data
         .set(
             "get",
-            lua.create_function(|lua, _name: Value| {
-                // The shape a real `.tab` page yields, hollowed out. A module
-                // walking it should find empty tables all the way down rather
-                // than a nil that turns into an error: `Module:NUMBEROF/data`
-                // does `ipairs(statistics.schema.fields)`, so a missing `fields`
-                // was "bad argument #1 to 'ipairs' (table expected, got nil)"
-                // and took out two pages.
-                //
-                // An empty `fields` is also what the module's own loop expects:
-                // it builds a name-to-index map, so no fields means no map and
-                // no statistics, which is the honest result for an extension
-                // rustoid does not have.
-                let empty = lua.create_table()?;
-                let schema = lua.create_table()?;
-                schema.set("fields", lua.create_table()?)?;
-                empty.set("schema", schema)?;
-                empty.set("data", lua.create_table()?)?;
-                Ok(empty)
+            lua.create_function(move |lua, name: Value| {
+                let requested = match &name {
+                    Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "mw.ext.data.get expects a page name string, got a {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let key = data_page_key(&requested);
+                if let Some(source) = data_ctx.site.data.get(&key) {
+                    // A `.tab` page is JSON in a `Tabular.JsonConfig` content
+                    // model, with the `schema`/`data` shape the modules read.
+                    let parsed: serde_json::Value = serde_json::from_str(source).map_err(|e| {
+                        mlua::Error::runtime(format!(
+                            "mw.ext.data.get: {} is not valid JSON: {e}",
+                            data_page_title(&key)
+                        ))
+                    })?;
+                    return json_to_lua(lua, &parsed)
+                        .map_err(|e| mlua::Error::runtime(e.to_string()));
+                }
+                if !data_ctx.site.unfetchable_data.contains(&key)
+                    && let Ok(missing) = lua.named_registry_value::<Table>(MISSING_DATA)
+                {
+                    let len = missing.raw_len();
+                    missing.raw_set(len + 1, key.clone())?;
+                }
+                hollow_data_table(lua)
             })
             .map_err(|e| RustoidError::Lua(e.to_string()))?,
         )
@@ -7491,6 +7598,61 @@ mod tests {
             "a"
         );
         assert_eq!(engine.eval("return mw.text.listToText({})").unwrap(), "");
+    }
+
+    /// `mw.ext.data.get` reads a tabular-data page's JSON: the `schema.fields`
+    /// and `data` shape `Module:NUMBEROF` counts. A name the host did not preload
+    /// is answered with the hollow table *and* recorded, so the parser can fetch
+    /// it and run the module again.
+    #[test]
+    fn test_mw_ext_data_get() {
+        const TABLE: &str = r#"{
+            "license": "CC0-1.0",
+            "schema": {"fields": [
+                {"name": "project", "type": "string"},
+                {"name": "status", "type": "string"}
+            ]},
+            "data": [["wikipedia", "active"], ["wiktionary", "closed"]]
+        }"#;
+        let mut site = LuaSite::from_config(&MockSiteConfig::new());
+        site.data.insert(
+            "Wikipedia statistics/meta.tab".to_string(),
+            TABLE.to_string(),
+        );
+        let ctx = LuaContext::new(site, "Test Page");
+        let engine = LuaEngine::new(LuaEngineConfig::default(), ctx).unwrap();
+
+        // `Module:NUMBEROF/meta`'s own shape: field names and row values.
+        let module = r#"
+            local p = {}
+            function p.main()
+                local d = mw.ext.data.get('Wikipedia statistics/meta.tab')
+                local names = {}
+                for i, f in ipairs(d.schema.fields) do names[i] = f.name end
+                return table.concat(names, ',') .. '|' .. d.data[2][2]
+            end
+            return p
+        "#;
+        assert_eq!(
+            engine.execute(module, "main", &[]).unwrap(),
+            "project,status|closed"
+        );
+
+        // A name the host does not have: the hollow table, and the name is
+        // reported so the invoke retry loop fetches it.
+        let missing = r#"
+            local p = {}
+            function p.main()
+                local d = mw.ext.data.get('Other data')
+                return #d.schema.fields .. '|' .. #d.data
+            end
+            return p
+        "#;
+        assert_eq!(engine.execute(missing, "main", &[]).unwrap(), "0|0");
+        assert_eq!(
+            engine.take_missing_data(),
+            vec!["Other data.tab".to_string()]
+        );
     }
 
     /// `mw.text.nowiki` escapes what would otherwise be read as wikitext.
