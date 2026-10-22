@@ -630,15 +630,14 @@ pub fn rewrite_expanded_attrs(
         if matches!(kv.key, KeyValue::Tokens(_))
             && kv.ksrc.is_none()
             && let Some(so) = &kv.src_offsets
-            && let Some(old_src) = src.get(so.key_start..so.key_end)
-            && old_src.starts_with("{{")
+            && let Some(old_src) = construct_source_in(src, so)
         {
             let new_src = key_value_source_text(&kv.key);
             if new_src != old_src {
-                let Some(pos) = out.find(old_src) else {
+                let Some(pos) = out.find(&old_src) else {
                     continue;
                 };
-                if out[pos + old_src.len()..].contains(old_src) {
+                if out[pos + old_src.len()..].contains(&old_src) {
                     return None;
                 }
                 out.replace_range(pos..pos + old_src.len(), &new_src);
@@ -647,6 +646,52 @@ pub fn rewrite_expanded_attrs(
         }
     }
     patched.then_some(out)
+}
+
+/// The source text of an attribute-position construct.
+///
+/// `src_offsets` are relative to the chunk the token was tokenized from — a
+/// template body's source — while `src` is only the tag's own slice of it, so a
+/// tag that a template body produced records offsets past the end of `src`:
+/// `Template:Flat list`'s `<div class="hlist {{{class|}}}" {{#if:…}}>` does.
+/// The construct's *length* still identifies it, because no other `{{…}}` span in
+/// one tag has that length; a tag where two do declines.
+fn construct_source_in(
+    src: &str,
+    so: &crate::wikitext::tokens_v2::KVSourceRange,
+) -> Option<String> {
+    if let Some(old) = src
+        .get(so.key_start..so.key_end)
+        .filter(|s| s.starts_with("{{"))
+    {
+        return Some(old.to_string());
+    }
+    let len = so.key_end.checked_sub(so.key_start)?;
+    let mut found = None;
+    for (idx, _) in src.match_indices("{{") {
+        let end = idx.checked_add(len)?;
+        if end > src.len() || !src.is_char_boundary(end) {
+            continue;
+        }
+        let candidate = &src[idx..end];
+        // A `{{{…}}}` argument reference is not a construct in attribute
+        // position, and a span that runs into another brace is part of a longer
+        // one; either would make the length alone ambiguous.
+        let is_construct = candidate.starts_with("{{")
+            && !candidate[2..].starts_with('{')
+            && candidate.ends_with("}}")
+            && !candidate[..candidate.len() - 2].ends_with('}')
+            && !src[..idx].ends_with('{')
+            && !src[end..].starts_with('}');
+        if !is_construct {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(candidate.to_string());
+    }
+    found
 }
 
 /// The source text an attribute key or value now stands for.
@@ -816,6 +861,47 @@ mod tests {
         assert_eq!(
             rewrite_expanded_attrs(src, &attribs).as_deref(),
             Some(r#"<div class="xBAR">"#)
+        );
+    }
+
+    /// A construct whose `src_offsets` miss the tag still gets rewritten: the
+    /// offsets are relative to the chunk the token was tokenized from, and `src`
+    /// is only the tag's slice of it. `Template:Flat list` writes
+    /// `<div class="hlist {{{class|}}}" {{#if:…}}>`, whose construct offsets are
+    /// past the end of the tag's own source; the construct's length identifies
+    /// it, and the spaces the preprocessor keeps survive.
+    #[test]
+    fn rewrite_expanded_attrs_finds_a_construct_whose_offsets_miss_the_tag() {
+        let construct_src = r#"{{#if:{{{style|}}}|style="x"}}"#;
+        let src = ["<div class=\"hlist {{{class|}}}\" ", construct_src, ">"].concat();
+        let attribs = vec![
+            KV {
+                key: KeyValue::Str("class".to_string()),
+                value: KeyValue::Tokens(vec![
+                    Item::Str("hlist ".to_string()),
+                    Item::Str(String::new()),
+                ]),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: Some("hlist {{{class|}}}".to_string()),
+            },
+            KV {
+                key: KeyValue::Tokens(vec![]),
+                value: KeyValue::Str(String::new()),
+                src_offsets: Some(crate::wikitext::tokens_v2::KVSourceRange {
+                    key_start: 500,
+                    key_end: 500 + construct_src.len(),
+                    value_start: 500 + construct_src.len(),
+                    value_end: 500 + construct_src.len(),
+                    source: None,
+                }),
+                ksrc: None,
+                vsrc: None,
+            },
+        ];
+        assert_eq!(
+            rewrite_expanded_attrs(&src, &attribs).as_deref(),
+            Some(r#"<div class="hlist " >"#)
         );
     }
 

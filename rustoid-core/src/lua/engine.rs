@@ -6217,6 +6217,23 @@ fn build_args_table(
 ) -> Result<Table> {
     let err = |e: mlua::Error| RustoidError::Lua(e.to_string());
     let args_table = lua.create_table().map_err(err)?;
+    if std::env::var_os("RUSTOID_TRACE_LUA_ARGS").is_some() {
+        for arg in args {
+            match arg {
+                Arg::Positional(v) => eprintln!("arg pos len={} {v:?}", v.len()),
+                Arg::Named(k, v) => eprintln!("arg {k} len={} {v:?}", v.len()),
+                Arg::Lazy(slot) => {
+                    if let Some(text) = answers.get(&slot.key()) {
+                        eprintln!(
+                            "arg lazy {} len={} {text:?}",
+                            slot.name.as_deref().unwrap_or("?"),
+                            text.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut next_positional = 0usize;
     // The slots still waiting to be expanded, with the table key each answers
     // to. Positional slots come first, as `getArguments` merges `numberedArgs`

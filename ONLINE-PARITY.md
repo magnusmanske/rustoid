@@ -18882,3 +18882,29 @@ first/last-character rules (the `$` set is `_`, `~` and whitespace only — not
 
 **Effect:** `Polio vaccine` 344,959 → 644,148 (95.0% of the document). No
 corpus regressions; 5/48 strict, 3 nondeterministic-only (16.7%).
+
+## A construct that expands to nothing keeps the spaces around it
+
+`Template:Flat list` writes `<div class="hlist {{{class|}}}" {{#if:…}}>`; with no
+`style`/`indent` the parser function expands to the empty string, and the
+preprocessor's text keeps the spaces around it — `<div class="hlist " >`. That
+text is what a module receives as `frame.args`, and `Module:Navbox` adds the
+length of every string argument into `argHash`, the suffix of its navbox ids
+(`…Inoculation_(J07)8311`). rustoid rebuilt such a tag from its expanded
+attributes instead (`<div class="hlist ">`), one byte short, so every later
+navbox id was off by one: `Polio vaccine`'s last difference was
+`aria-labelledby=…8310` against the service's `…8311`.
+
+`rewrite_expanded_attrs` already substitutes an attribute-position construct's
+source with its expansion, but it read the construct's range from
+`src_offsets` — offsets relative to the chunk the token was tokenized from (a
+template body's source), not to the tag's own `src`, which is only that tag's
+slice. For a tag produced inside a template body they therefore fall outside
+`src` and the rewrite was skipped. The construct is now found by its *length*
+when the offsets miss: it is the one `{{…}}` span of that size in the tag that
+is not part of a longer brace run, and a tag where two qualify declines rather
+than guessing.
+
+**Effect:** `Polio vaccine` matches (its only remaining difference is a
+per-render random id the harness masks). 5/48 strict, 4 more
+nondeterministic-only (18.8%). No corpus regressions.
