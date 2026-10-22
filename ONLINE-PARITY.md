@@ -18737,3 +18737,64 @@ being an array (`is_array( $oldA->k )`) and the expanded one being non-empty.
 
 **Effect:** `List of sovereign states` 8,893 → 25,192. No corpus regressions;
 5/48 strict, 3 nondeterministic-only (16.7%).
+
+## A bracketed link is expanded textually, and bails when it is not a URL
+
+Core expands templates before it tokenizes, so a `{{…}}` inside `[…]` is plain
+text by the time the parser sees it: `{{#if:[{{PAGENAME}}]|Y|N}}` is
+`{{#if:[Test]|…}}` and takes the *then* branch. rustoid tokenizes the bracket as
+an `extlink` whose `href` is a token array, and stringifying that token used to
+drop it — the condition came out empty, so `Template:Infobox element`'s
+standard-atomic-weight row took its `#if` else branch and the infobox rendered a
+`<tr style="display:none">` where the service has the value list. `Hydrogen`
+stopped at byte 8,872 for this.
+
+`tokens_to_string` now rebuilds an `extlink` as `[href content]`, next to the
+existing `wikilink` reconstruction. Two related fixes rode along:
+
+- **The tokenizer keeps an entity inside the URL.** Parsoid's
+  `extlink_nonipv6url` matches `&htmlentity` as a unit, so
+  `[http://x?a=1&amp;b=2 Label]` has that whole URL; rustoid ended the URL at
+  `&` and turned the rest into link text, truncating the `href`. The entity is
+  now tokenized (an `mw:Entity` span) as part of the `href`, which also keeps
+  its source spelling for a bail.
+- **A bracketed link whose expanded `href` is not a URL bails to text.** PHP's
+  `onExtLink` tests an expanded href with `urlParser->tokenizeURL` and falls
+  back to `bailTokens` when it fails, so `[{{PAGENAME}}]` renders as `[Test]`
+  rather than as a link with `href="Test"`. `on_ext_link` mirrors that
+  (`mw:ExpandedAttrs` plus a protocol check), re-emitting the constructor's own
+  pieces so the separating whitespace survives.
+
+**Effect:** `Hydrogen` 8,872 → 47,125.
+
+## A `{|` argument starts its own line
+
+The next `Hydrogen` difference was the vapor-pressure table: the module's
+argument contained `[[Vapor pressure|…]]` immediately followed by the
+`Template:Infobox element/vapor pressure table` expansion, which begins with
+`{|`. Core's `braceSubstitution` inserts a newline in front of an expansion that
+begins with a table or list marker when the call did not start a line (T2529),
+so the module receives `…
+{| class=…` and its output re-parses as a table.
+rustoid's check read the expansion's *first token's* `src`, and a `{|` table
+start is a token without one (`start_tag_src` holds the marker), so the check
+never fired for a table and the module got `{|` mid-line.
+
+The marker is now read from `start_tag_src`, and an argument value — which a
+module receives as *text* — takes its newline as text, the same shape as an
+attribute value, and is not re-tokenized there.
+
+The position test itself had to get stricter. A token re-tokenized from a
+*fragment* (a parser-function branch, an argument value) carries offsets into
+that fragment, not into the chunk being expanded: reading them put
+`Template:Largest cities`'s `{{(!}}` at an unrelated offset and invented a
+newline before the table it expands to, and the same mismatch made
+`Zebra`'s infobox table gain one. `t2529_at_line_start` now reports `None` when
+the offsets do not index the source, and such a call gets the newline only when
+its expansion starts with a generated *string*; a table start seen solely
+through `start_tag_src` is exempt, because that fallback exists for expansions
+whose own source is unavailable (a module's output), which core's preprocessor
+never saw.
+
+**Effect:** `Hydrogen` 8,872 → 47,125, `Commonwealth of Nations` 74,500 →
+75,090. No corpus regressions; 5/48 strict, 3 nondeterministic-only (16.7%).
