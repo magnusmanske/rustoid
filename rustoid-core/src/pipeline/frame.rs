@@ -107,7 +107,11 @@ impl Frame {
 
         let mut frame = Some(self);
         while let Some(f) = frame {
-            if title == &f.title {
+            // The root frame is the page being parsed, not a transclusion. Viewing
+            // `Template:Infobox`, which transcludes `{{Infobox}}` to demonstrate
+            // itself, is not a loop — MediaWiki expands it once. Only a *template*
+            // frame (depth ≥ 1) can be re-entered.
+            if f.depth > 0 && title == &f.title {
                 return Some("Template loop detected: ".to_string());
             }
             frame = f.parent_frame.as_deref();
@@ -390,15 +394,20 @@ mod tests {
         let root_title = TitleParser::parse("Template:Foo", &config);
         let frame = Frame::new(root_title.clone(), vec![]);
 
-        // Same title => loop.
-        assert!(frame.loop_and_depth_check(&root_title, 40, false).is_some());
+        // The root frame is the page being parsed, not a transclusion: viewing
+        // `Template:Foo` and its own `{{Foo}}` demonstration is not a loop.
+        assert!(frame.loop_and_depth_check(&root_title, 40, false).is_none());
+
+        // Re-entering a *template* frame is a loop.
+        let child = frame.new_child(root_title.clone(), vec![]);
+        assert!(child.loop_and_depth_check(&root_title, 40, false).is_some());
 
         // Different title => no loop.
         let other = TitleParser::parse("Template:Bar", &config);
-        assert!(frame.loop_and_depth_check(&other, 40, false).is_none());
+        assert!(child.loop_and_depth_check(&other, 40, false).is_none());
 
         // ignore_loop bypasses loop detection.
-        assert!(frame.loop_and_depth_check(&root_title, 40, true).is_none());
+        assert!(child.loop_and_depth_check(&root_title, 40, true).is_none());
     }
 
     /// Page-scope magic words resolve against the *page*, so `root_title` must

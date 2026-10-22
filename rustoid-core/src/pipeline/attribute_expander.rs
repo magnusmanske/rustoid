@@ -559,8 +559,13 @@ pub fn build_expanded_attrs(
         let mut key_dom_fragment = false;
         let mut val_dom_fragment = false;
 
-        // Expand a templated attribute key.
-        if matches!(expanded_k, KeyValue::Tokens(_)) {
+        // Expand a templated attribute key. PHP gates the block on the *original*
+        // key being an array (`is_array( $oldA->k )`) and the expanded key being
+        // non-empty; the expansion may itself be a plain string, as
+        // `{{#if:…|id="toc"}}` collapses to `id="toc"`.
+        if matches!(old_a.key, KeyValue::Tokens(_))
+            && !crate::wikitext::token_utils::key_value_source_text(&expanded_k).is_empty()
+        {
             let mut expanded_k_items = key_value_to_items(&expanded_k);
             let nl_tk_pos = nl_tk_index(&expanded_k_items, nl_tk_okay);
             if nl_tk_pos != -1 {

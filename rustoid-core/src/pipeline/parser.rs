@@ -7925,6 +7925,22 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             Redirected::NotARedirect => (template_src, title.clone()),
         };
 
+        // A redirect is followed *before* the child frame is created, and the loop
+        // check above ran with the *called* title. The target must be checked too:
+        // `Template:Toc` redirects to `Template:Compact TOC`, whose body
+        // transcludes `{{MediaWiki:Toc}}`, so without this check a template could
+        // re-enter itself through its own redirect and expand forever.
+        if let Some(err) = crate::pipeline::template_handler::enforce_template_constraints(
+            self.config,
+            frame,
+            &title.get_prefixed_text(),
+            &title,
+            MAX_TEMPLATE_DEPTH,
+            self.module_scope.get() > 0,
+        ) {
+            return err;
+        }
+
         // Build a child frame carrying the template's arguments (params[1..]).
         //
         // PHP expands the template token's *attributes* — i.e. the argument keys
@@ -8854,6 +8870,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 });
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in attribs {
+                // Whether the key was written as a construct rather than a plain
+                // name. PHP gates the reparse on the *original* key being an array
+                // (`is_array( $oldA->k )`); checking the expanded one instead
+                // missed `{{#if:…|id="toc"}}`, which collapses to the single
+                // string `id="toc"` and has to be reparsed into an attribute.
+                let key_was_tokens = matches!(kv.key, KeyValue::Tokens(_));
                 let mut new_kv = kv.clone();
                 for field in [&mut new_kv.key, &mut new_kv.value] {
                     let KeyValue::Tokens(toks) = field else {
@@ -8903,18 +8925,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // `build_expanded_attrs`' reparse-KV step. This pass has to do the
                 // same, or the generated attribute stays a key that merely spells
                 // it (and the module is handed a tag without it).
-                let reparsed = (new_kv.value.is_empty()
-                    && matches!(new_kv.key, KeyValue::Tokens(_)))
-                .then(|| {
-                    crate::pipeline::attribute_expander::reparse_attr_key_string(
-                        &crate::wikitext::token_utils::tokens_to_string(
-                            &crate::pipeline::attribute_transform_manager::key_value_to_items(
-                                &new_kv.key,
+                let reparsed = (new_kv.value.is_empty() && key_was_tokens)
+                    .then(|| {
+                        crate::pipeline::attribute_expander::reparse_attr_key_string(
+                            &crate::wikitext::token_utils::tokens_to_string(
+                                &crate::pipeline::attribute_transform_manager::key_value_to_items(
+                                    &new_kv.key,
+                                ),
                             ),
-                        ),
-                    )
-                })
-                .flatten();
+                        )
+                    })
+                    .flatten();
                 match reparsed {
                     Some(clean) => expanded_attrs.extend(clean),
                     None => expanded_attrs.push(new_kv),

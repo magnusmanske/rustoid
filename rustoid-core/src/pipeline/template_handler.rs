@@ -424,15 +424,20 @@ fn resolve_target_string(
     // template to literal text ("Entities in transclusions aren't decoded in the
     // PHP parser"). Mirror that by rejecting here.
     let parsed = TitleParser::try_parse(&target, config)?;
-    let title = if let Some(ns) = namespace_id {
-        // The Template-namespace default must not drop the fragment: Parsoid's
-        // `makeLink` keeps it — `{{subst:#time:j F Y}}` records
-        // `"./Template:Subst:#time:j_F_Y"` — while the *page name* does not.
-        let mut titled = Title::new(ns, parsed.text);
-        titled.fragment = parsed.fragment;
-        titled
-    } else {
-        parsed
+    let title = match namespace_id {
+        // An explicit namespace prefix wins over the Template default, exactly as
+        // `Title::newFromText( $text, NS_TEMPLATE )` behaves: `{{MediaWiki:Toc}}`
+        // transcludes the MediaWiki-namespace page, and `{{Category:Foo}}` the
+        // category, instead of `Template:MediaWiki:Toc` and `Template:Category:Foo`.
+        Some(ns) if parsed.namespace_id == 0 => {
+            // The Template-namespace default must not drop the fragment: Parsoid's
+            // `makeLink` keeps it — `{{subst:#time:j F Y}}` records
+            // `"./Template:Subst:#time:j_F_Y"` — while the *page name* does not.
+            let mut titled = Title::new(ns, parsed.text);
+            titled.fragment = parsed.fragment;
+            titled
+        }
+        _ => parsed,
     };
 
     Some(ResolvedTarget::Template {
@@ -3167,8 +3172,15 @@ mod tests {
         let title = TitleParser::parse("Template:Foo", &config);
         let frame = crate::pipeline::frame::Frame::new(title.clone(), vec![]);
 
-        // Same title => loop => error tokens.
-        let err = enforce_template_constraints(&config, &frame, "Template:Foo", &title, 40, false);
+        // The root frame is the page itself, so its own title is not a loop.
+        assert!(
+            enforce_template_constraints(&config, &frame, "Template:Foo", &title, 40, false)
+                .is_none()
+        );
+
+        // Re-entering a template frame is a loop => error tokens.
+        let child = frame.new_child(title.clone(), vec![]);
+        let err = enforce_template_constraints(&config, &child, "Template:Foo", &title, 40, false);
         assert!(err.is_some());
         let tokens = err.unwrap();
         assert!(matches!(&tokens[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "span"));
