@@ -18962,3 +18962,17 @@ guards on the result from looping.
 the service's four-digit value, and the next difference is `{{Date|2=MDY}}` — the
 day the cached Parsoid HTML was rendered versus today, which no implementation
 can match. No corpus regressions; 5/48 strict, 4 nondeterministic-only (18.8%).
+
+## A data page's cache manifest is written with the rest
+
+The commons has its own cache handle, and `flush` wrote only the article wiki's
+and Wikidata's manifests. A `Data:` page fetched during a render was therefore
+on disk but unindexed, so the next offline run missed it and `mw.ext.data`
+answered its hollow table again — `Bitcoin`'s `{{unichar|20BF|…}}` rendered
+`<reserved-20BF>` offline although the same probe online resolved `BITCOIN SIGN`
+through `Module:Unicode data/names/002`'s `mw.ext.data.get`. The commons manifest
+is now flushed alongside the others.
+
+**Effect:** `Bitcoin` 11,465 → 11,484. The next difference is a trailing space
+`Template:Unichar` leaves inside the transclusion (`</span> )` against
+`</span>)`), which is the whitespace-wrapping frontier rather than data.

@@ -534,6 +534,15 @@ impl CachedDataSource {
                 .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
                 .write_index()?;
         }
+        // The commons has its own cache handle too: a data page fetched during
+        // this render is on disk but unindexed without this, so the next offline
+        // run misses it and `mw.ext.data` answers its hollow table again.
+        if let Some(wiki) = &self.data {
+            wiki.cache
+                .lock()
+                .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+                .write_index()?;
+        }
         Ok(())
     }
 
