@@ -18798,3 +18798,39 @@ never saw.
 
 **Effect:** `Hydrogen` 8,872 → 47,125, `Commonwealth of Nations` 74,500 →
 75,090. No corpus regressions; 5/48 strict, 3 nondeterministic-only (16.7%).
+
+## A four-brace run is a template whose name is a call
+
+MediaWiki's "ideal precedence" makes one `{` literal when a brace run's length
+is `N % 3 == 1` and reconsiders the rest as a `{{{…}}}` argument. When that
+argument cannot close, Parsoid's `tplarg_or_template` backtracks and reads a
+*template* at the same offset, so `{{{{#ifeq:1|1|sans-serif|mono}}|X}}` is
+`{{` + the inner call as the name + `|X` + `}}`. The service expands it to
+`Template:Sans-serif` and wraps the result in a `<span
+style="font-family:sans-serif;">`; rustoid emitted a literal `{` and left the
+rest as text.
+
+Three scans decide a brace run — the tokenizer's `parse_directive`, the closing
+scan `find_template_closing_memo`, and the argument splitter
+`split_template_args_impl_offsets` — and all three treated one `{` as literal
+unconditionally. They now share `run1_reads_as_template`: for `run % 3 == 1`
+with `run > 1`, a failed `skip_tplarg_memo` at `i + 1` means the run is a
+template at `i` (consume two braces, push `Template`), otherwise the brace is
+literal. A lone `{` stays literal — it opens neither construct, and the guard
+also keeps `skip_tplarg_memo` from slicing three bytes past a character
+boundary (a lone `{` followed by `μ` panicked `Hydrogen`).
+
+Two consequences in `pipeline/parser.rs` follow from the same construct:
+
+- `raw_template_target` delegated to a `|` split of the token source, which cut
+  `{{#ifeq:…}}` at its own `|` and recorded `data-mw.target.wt` as the
+  fragment. It now delegates to the nesting-aware splitter in `tokenizer_v2`.
+- `expand_target_templates` expanded the target with the enclosing chunk's
+  `body` flag. PHP's `expandFirstAttribute` runs the target through the
+  attribute-transform manager, and the service emits no `mw:Transclusion` span
+  for the inner call there: the outer transclusion takes `#mwt1`, not `#mwt2`.
+  The expansion is now always unbodied.
+
+**Effect:** `Bitcoin` 8,089 → 11,465, `Berlin` 27,968 → 36,919 (the next
+difference is a fragment marker, not braces). No corpus regressions; 5/48
+strict, 3 nondeterministic-only (16.7%).

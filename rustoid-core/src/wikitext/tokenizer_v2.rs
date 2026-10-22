@@ -3081,10 +3081,33 @@ impl<'a> PegTokenizer<'a> {
         // as an argument and leaked it into the output as literal text.
         let run = self.remaining().bytes().take_while(|&b| b == b'{').count();
         if run % 3 == 2 {
-            self.parse_template_token()
-        } else {
-            self.parse_templatearg_token()
+            return self.parse_template_token();
         }
+        if run % 3 == 1 {
+            // One `{` is literal and the remaining run is reconsidered — but
+            // only when the rest can actually close as an argument. Parsoid's
+            // grammar tries `tplarg` first and, when the input has no `}}}` to
+            // close it, reads the whole thing as a *template* whose name is the
+            // inner call: `{{{{#ifeq:…}}|x}}` is `{{` + `{{#ifeq:…}}` + `|x` +
+            // `}}`, which the service expands to the target the `#ifeq`
+            // answers (`{{{{#ifeq:1|1|sans-serif|mono}}|X}}` →
+            // `Template:Sans-serif`). Returning `None` here lets the caller emit
+            // the literal `{` and re-enter at the shorter run.
+            //
+            // A lone `{` cannot open either construct, so it is literal.
+            if run == 1 {
+                return None;
+            }
+            let saved = self.pos;
+            self.advance(1);
+            let closes_as_argument = self.parse_templatearg_token().is_some();
+            self.pos = saved;
+            if closes_as_argument {
+                return None;
+            }
+            return self.parse_template_token();
+        }
+        self.parse_templatearg_token()
     }
 
     /// Parse a `-{ ... }-` language-variant construct *without* emitting it,
@@ -4783,6 +4806,21 @@ struct ScanMemo {
     tplarg_failed: std::collections::HashSet<usize>,
 }
 
+/// Decide the reading of a `{` run whose length is `% 3 == 1`.
+///
+/// MediaWiki's ideal precedence makes the first `{` literal and reconsiders the
+/// rest as a `{{{` argument. When that argument cannot close, Parsoid's
+/// `tplarg_or_template` falls back to a *template* at the same offset, so
+/// `{{{{#ifeq:…}}|x}}` is `{{` + the inner call as the name + `|x` + `}}`.
+/// Returns `true` in that fallback case.
+///
+/// A lone `{` opens neither, so it is always literal. That guard also keeps
+/// [`skip_tplarg_memo`] honest: it assumes `i + 1` begins `{{{` and slices three
+/// bytes forward, which would split a multi-byte character otherwise.
+fn run1_reads_as_template(input: &str, i: usize, run: usize, memo: &mut ScanMemo) -> bool {
+    run > 1 && skip_tplarg_memo(input, i + 1, memo).is_none()
+}
+
 fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize> {
     /// Closer pushed by a nested `{{…}}` (and by the template being scanned).
     const TPL: &str = "}}";
@@ -4854,8 +4892,21 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
                     // emitted as literal text with only its arguments parsed.
                     stack.push(TPL);
                     i += 2;
-                } else {
+                } else if !run1_reads_as_template(input, i, run, memo) {
+                    // `run % 3 == 1`: one `{` is literal and the rest of the run
+                    // is reconsidered.
                     i += 1;
+                } else {
+                    // …unless the remaining run cannot close as an argument.
+                    // `{{{{#ifeq:…}}|x}}` has no `}}}` for `{{{#ifeq:…`, so
+                    // Parsoid reads the run as `{{` + the nested call (see
+                    // [`PegTokenizer::parse_directive`]). Consuming only one
+                    // brace left the scan one closer short, so the nested
+                    // call's `}}` closed the *outer* construct
+                    // (`{{nowrap|{{{{#ifeq:…}}|…}}}}` ended at the wrong
+                    // brace).
+                    stack.push(TPL);
+                    i += 2;
                 }
             }
             // Only a `[[` seen while looking for `}}` becomes the pending closer;
@@ -6265,7 +6316,24 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
                 // `N % 3 == 1`: the first brace is literal content, and the rest
                 // of the run is reconsidered. Fall through rather than consuming
                 // it, so the `{|` table rule below still sees a table opener.
-                _ => {}
+                //
+                // Unless the remaining run cannot close as an argument at all:
+                // `{{{{#ifeq:…}}|x}}` has no `}}}` to end `{{{#ifeq:…`, so
+                // Parsoid reads the run as `{{` + the nested call. Treating the
+                // brace as literal left the stack one construct short, and the
+                // nested call's `|` then split the enclosing argument list in
+                // two (`{{nowrap|{{{{#ifeq:…}}|…}}}}` became two parameters and
+                // `Template:Unichar` lost its glyph).
+                _ => {
+                    if !run1_reads_as_template(inner, i, run, &mut memo) {
+                        // Literal brace: fall through to the generic content arm.
+                    } else {
+                        braces.push(Brace::Template);
+                        current.push_str("{{");
+                        i += 2;
+                        continue;
+                    }
+                }
             }
         }
         // A run of closing braces closes as many open constructs as it can, and

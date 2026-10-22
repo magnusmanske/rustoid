@@ -21,14 +21,14 @@ use crate::wikitext::tokens_v2::{Either, Item, ParsoidToken};
 type ResolvedTarget = crate::pipeline::template_handler::ResolvedTarget;
 
 /// Extract the raw template target (the text between `{{` and the first
-/// top-level `|` or the closing `}}`) from a template token's source string.
+/// *top-level* `|` or the closing `}}`) from a template token's source string.
 ///
 /// This is the *unprocessed* target as written in the wikitext, before the
-/// PHP preprocessor strips comments. Used to detect a comment in the target
-/// (`{{f<!---->oo}}`), which suppresses `mw:Transclusion` encapsulation.
-fn raw_template_target(src: &str) -> Option<&str> {
-    let inner = src.strip_prefix("{{")?.strip_suffix("}}")?;
-    Some(inner.split_once('|').map_or(inner, |(t, _)| t))
+/// PHP preprocessor strips comments. Splitting at a bare `|` cut a target that
+/// is itself a call — `{{{{#ifeq:…|…}}|x}}` recorded `data-mw.target.wt` as
+/// `{{#ifeq:…` — so this delegates to the nesting-aware splitter.
+fn raw_template_target(src: &str) -> Option<String> {
+    crate::wikitext::tokenizer_v2::raw_template_target(src)
 }
 
 /// Track PHP's `tableDataBlock` context over a token: true while the walk sits
@@ -6897,7 +6897,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 source,
                 about_counter,
                 in_tpl,
-                body,
                 src_text,
             )
             .await;
@@ -6973,15 +6972,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .src
                 .clone()
                 .unwrap_or_else(|| format!("{{{{{target_str}}}}}"));
+            let subst_id = take_id();
             let produced = self.encapsulate_subst_literal(
-                tok,
-                &src,
-                name,
-                title,
-                &params,
-                take_id(),
-                wrap,
-                src_text,
+                tok, &src, name, title, &params, subst_id, wrap, src_text,
             );
             for e in &produced {
                 track_table(e, table_depth);
@@ -7393,7 +7386,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         about_counter: &std::cell::Cell<usize>,
         in_template: bool,
-        body: bool,
         src_text: &str,
     ) -> Vec<crate::wikitext::tokens_v2::KV> {
         let Some(target) = attribs.first_mut() else {
@@ -7421,13 +7413,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // target references was numbered where the service has the infobox
         // stylesheet.
         let items = frame.expand(&items);
+        // The target is flattened to a *string* that becomes the template's
+        // name, so nothing in it is wrapped: PHP's `expandFirstAttribute` runs
+        // the chunk through `AttributeTransformManager`, and the service emits
+        // no `mw:Transclusion` span for an inner call there.
+        // `{{{{#ifeq:…}}|x}}` is the case that pins it — the inner `#ifeq`
+        // answers the target, and wrapping it spent an `about` id the service
+        // does not (the outer transclusion took `#mwt2` instead of `#mwt1`)
+        // and put a span inside the name.
         let expanded = Box::pin(self.expand_templates(
             frame,
             items,
             source,
             about_counter,
             in_template,
-            body,
+            /* body */ true,
             src_text,
             0,
         ))
@@ -7440,7 +7440,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             source,
             about_counter,
             in_template,
-            body,
+            /* body */ true,
             src_text,
         ))
         .await;
@@ -11962,8 +11962,12 @@ mod tests {
         // Inside an attribute value the newline is text (PHP splices it into the
         // value string) and the marker stays text: block syntax is not parsed
         // there.
-        let out =
-            t2529_force_line_start(vec![marker, Item::Str(";".to_string())], Some(false), true, true);
+        let out = t2529_force_line_start(
+            vec![marker, Item::Str(";".to_string())],
+            Some(false),
+            true,
+            true,
+        );
         assert!(matches!(&out[0], Item::Str(s) if s == "\n"));
         assert!(matches!(out.last(), Some(Item::Str(s)) if s == ";"));
     }
