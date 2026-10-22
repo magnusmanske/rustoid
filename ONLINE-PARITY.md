@@ -18656,3 +18656,29 @@ are handled the same way.
 
 **Effect:** `Chess` 16,785 → 63,307 (its glossary link and the noinclude
 leak were the first two differences). No corpus regressions; 5/48 strict.
+
+## A generated category sort key is an expanded attribute
+
+`[[Category:X|{{{type|}}}?]]` whose key carries markup — `Infobox drug`'s
+`vaccine_type` is a `<br/>`-separated list — makes Parsoid record the key in
+`data-mw.attribs` and mark the link `mw:ExpandedAttrs`. That is
+`renderCategory`'s `count($content) !== 1` rule, and it is independent of
+templates: a literal `<br/>` in the key is enough. rustoid emitted a bare
+`<link>`, so `Polio vaccine`'s first difference was this element.
+
+The key's DOM fragment is tunneled like a media option's, so the id pass numbers
+its nodes (`<br id="mwHw"/>`) before the link itself. A void element cannot hold
+that placeholder as a child, so `attr_mw_fragments::collect` attaches it to the
+preceding self-closing element when that element's `data-mw` names the key.
+
+Adjacent text counts as one piece: MediaWiki's preprocessor joins `'T'` and the
+expansion of `{{PAGENAME}}` into the single string `TIsrael`, while rustoid's
+in-place expansion leaves two items. Counting runs of text keeps
+`Template:Infobox country`'s categories unmarked, as the service serves them.
+
+**Effect:** `Polio vaccine` 20,904 → 21,429. No corpus regressions; 5/48 strict.
+
+**Open:** the page is then one `about` id low at its first citation. The
+allocation happens before that point but leaves no element behind — the
+`TemplateEncapsulator` spend that rustoid does not reproduce somewhere in the
+infobox.
