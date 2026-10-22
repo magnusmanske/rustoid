@@ -18682,3 +18682,27 @@ in-place expansion leaves two items. Counting runs of text keeps
 allocation happens before that point but leaves no element behind — the
 `TemplateEncapsulator` spend that rustoid does not reproduce somewhere in the
 infobox.
+
+## A tag whose source still spells an attribute construct is rebuilt
+
+`Template:Wikisource/inner core` writes `<div {{#switch:{{{lang}}}|…}}>`. The
+construct generates the whole attribute, so there is no attribute-level source
+for `rewrite_expanded_attrs` to patch: the offsets are chunk-relative and the
+reparsed attribute loses them. The stale source reached `Module:Side box`
+unexpanded, and the module's output then re-expanded the construct in the *root*
+frame, where `{{{lang}}}` no longer resolves — the side box came out as
+`<div lang="{{{lang}}}">`.
+
+The argument renderer now rebuilds a start tag whose rewritten source still
+spells a `{{…}}` from its expanded attributes — exactly what
+`answer_item_text` already did through `stale_tag_html`. The ordinary case (a
+substituted attribute value, no construct left) is untouched.
+
+**Effect:** `Megadeth` 332,200 → equivalent except nondeterministic media
+output. No corpus regressions; 5/48 strict, 3 nondeterministic-only (16.7%).
+
+**Note:** the rebuild is also what the service does here, and it drops the
+in-source comment before the construct (`<div … " <!--\n-->style=…>`) that the
+preprocessor strips. Patching the source instead re-kept it, which moved
+`Module:Navbox`'s `argHash` by 8 per `Template:Div col` and broke the
+`aria-labelledby` ids on `2024 Summer Olympics`.
