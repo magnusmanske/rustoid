@@ -18834,3 +18834,30 @@ Two consequences in `pipeline/parser.rs` follow from the same construct:
 **Effect:** `Bitcoin` 8,089 → 11,465, `Berlin` 27,968 → 36,919 (the next
 difference is a fragment marker, not braces). No corpus regressions; 5/48
 strict, 3 nondeterministic-only (16.7%).
+
+## A generated category sort key is numbered where its template is expanded
+
+`WikiLinkHandler::renderCategory` allocates an `about` id when the sort key is
+more than one content piece (`count($content) !== 1`) — markup such as `<br/>`,
+an entity, or a transclusion. The id is spent in the pipeline that handles the
+link, so a link a *template* produced is numbered when that template's output is
+rendered, before the caller's next token. A page-level link is different: the
+service numbers it in the late links pass (its `about` lands after a following
+`<ref>`), which is what rustoid's single late pass already reproduces.
+
+`Template:Infobox drug`'s trailing category is
+`[[Category:Drugs that are a vaccine|{{{vaccine_type}}}?]]`, and a `vaccine_type`
+holding any markup makes its sort key generated. rustoid took that id in the
+page-level link pass, i.e. after the article's first `<ref>`, so every id from
+there on was one low: `Polio vaccine`'s first citation was `#mwt39` where the
+service has `#mwt40`.
+
+`stamp_generated_category_ids` now allocates the id at the end of the outermost
+expansion that produced the link, after that expansion's attribute-expander
+reservations (the block that reserves the caption's `mw:ExpandedAttrs` id, which
+the service allocates in the same pipeline). `render_category` uses the stamped
+id instead of taking a new one. An expansion core pre-processed (`body`) stamps
+nothing: Parsoid owns no pipeline for it.
+
+**Effect:** `Polio vaccine` 21,429 → 344,959. No corpus regressions.
+

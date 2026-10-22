@@ -8207,6 +8207,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     dp.tmp.pending_expanded_attrs = Some(id);
                 }
             }
+            // `WikiLinkHandler::renderCategory` numbers a category link whose
+            // sort key is generated (`count($content) !== 1`), in the same
+            // pipeline — so the id lands after the attribute expander's, and
+            // before the caller's next token. The page-level link pass runs
+            // after the whole chunk, which would put it after everything the
+            // caller does. An expansion core pre-processed (`body`) has no such
+            // pipeline and spends nothing here.
+            crate::pipeline::wiki_link_render::stamp_generated_category_ids(
+                &mut crate::pipeline::wiki_link_render::WikiLinkContext::new(self.config),
+                &mut expanded,
+                about_counter,
+            );
         }
 
         if !wrap {

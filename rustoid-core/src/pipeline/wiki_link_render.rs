@@ -662,6 +662,68 @@ pub fn render_language_link(
     vec![Item::Tok(ParsoidToken::SelfclosingTag(new_tk))]
 }
 
+/// Allocate the `about` id a *generated* category sort key spends, and stamp it
+/// on the wikilink token for [`render_category`] to pick up.
+///
+/// `WikiLinkHandler::renderCategory` numbers the link when its sort key is more
+/// than one content piece (`count($content) !== 1`) — markup such as `<br/>`, an
+/// entity, or a transclusion. That happens in the pipeline that handles the
+/// link, so a link a *template* produced is numbered when that template's output
+/// is rendered, i.e. before the caller's next token. rustoid renders links in one
+/// late pass, which puts the id after everything the caller does; stamping it at
+/// the end of the template's expansion restores the service's position.
+///
+/// A page-level link keeps the late numbering (the service does the same: its
+/// `about` lands after a following `<ref>`), so the caller only applies this to
+/// the token stream an expansion produced.
+pub(crate) fn stamp_generated_category_ids(
+    ctx: &mut WikiLinkContext,
+    items: &mut [Item],
+    about_counter: &std::cell::Cell<usize>,
+) {
+    for item in items.iter_mut() {
+        let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+            continue;
+        };
+        if stt.name != "wikilink"
+            || stt
+                .attribs
+                .iter()
+                .any(|kv| kv.key.as_str() == Some(MW_ABOUT_BASE_ATTR))
+        {
+            continue;
+        }
+        let href = stt
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("href"))
+            .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.value))
+            .unwrap_or_default();
+        let token = ParsoidToken::SelfclosingTag(stt.clone());
+        let Ok(target) = get_wiki_link_target_info_for_token(ctx, &token, &href, &href) else {
+            continue;
+        };
+        let Some(title) = &target.title else {
+            continue;
+        };
+        if target.from_colon_escaped_text
+            || target.href.starts_with('#')
+            || Some(title.namespace_id) != ctx.config.canonical_namespace_id("Category")
+        {
+            continue;
+        }
+        let (_, content, _) = add_link_attributes_and_get_content(ctx, &token, &target);
+        if content_piece_count(&content) == 1 {
+            continue;
+        }
+        // The id is spent even where the link ends up without it: a run of
+        // rendering-transparent elements keeps only its first element's `about`.
+        let id =
+            crate::pipeline::attribute_expander::new_about_id(about_counter, "category-sortkey");
+        stt.add_attribute_str(MW_ABOUT_BASE_ATTR, id.trim_start_matches("#mwt"));
+    }
+}
+
 /// Render a category membership into `<link rel="mw:PageProp/Category">`.
 /// Mirrors `WikiLinkHandler::renderCategory` for the simple sort-key case.
 pub fn render_category(
@@ -715,7 +777,14 @@ pub fn render_category(
     let generated = content_piece_count(&content) != 1;
     let mut out = Vec::with_capacity(2);
     if generated {
-        new_tk.add_attribute_str("about", ctx.new_about_id());
+        // A link stamped by [`stamp_generated_category_ids`] already spent its id
+        // at the position the service spends it.
+        let about = token
+            .get_attribute_v(MW_ABOUT_BASE_ATTR)
+            .filter(|b| !b.is_empty())
+            .map(|b| format!("#mwt{b}"))
+            .unwrap_or_else(|| ctx.new_about_id());
+        new_tk.add_attribute_str("about", &about);
         new_tk.add_attribute_str("typeof", "mw:ExpandedAttrs");
         new_tk.add_attribute_str(
             "data-mw",
@@ -743,7 +812,7 @@ pub fn render_category(
 /// rustoid expands the body in place, which leaves `["T", "Israel"]`; counting
 /// the runs of text recovers the shape the service sees. A real token (markup,
 /// a transclusion) still counts on its own.
-fn content_piece_count(items: &[Item]) -> usize {
+pub(crate) fn content_piece_count(items: &[Item]) -> usize {
     let mut count = 0;
     let mut in_text = false;
     for item in items {
