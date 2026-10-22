@@ -1400,7 +1400,13 @@ pub fn render_inline_fragment(
                         frag, &token, fragments, next_id,
                     )
                 };
-                match on_ext_link(&token, clean, config.relative_link_prefix(), render_content) {
+                match on_ext_link(
+                    &token,
+                    clean,
+                    |proto| config.has_valid_protocol(proto),
+                    config.relative_link_prefix(),
+                    render_content,
+                ) {
                     Some(rendered) => out.extend(rendered),
                     None => out.push(item),
                 }
@@ -3018,6 +3024,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     let Some(rendered) = on_ext_link(
                         &token,
                         clean,
+                        |proto| self.config.has_valid_protocol(proto),
                         self.config.relative_link_prefix(),
                         render_content,
                     ) else {

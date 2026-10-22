@@ -3663,6 +3663,15 @@ impl<'a> PegTokenizer<'a> {
         let mut buf = String::new();
         loop {
             let rem = self.remaining();
+            if rem.starts_with("&")
+                && let Some(entity_items) = self.parse_html_entity()
+            {
+                if !buf.is_empty() {
+                    items.push(Item::Str(std::mem::take(&mut buf)));
+                }
+                items.extend(entity_items);
+                continue;
+            }
             if rem.starts_with("{{")
                 && let Some(tok) = self.parse_directive()
             {
@@ -4408,10 +4417,12 @@ fn strip_marker_len_at(input: &str) -> Option<usize> {
 ///
 /// The fast path accepts everything outside `[^<[{\n\r|!\]}\-\t&="' …]`; the
 /// fallback `[&|{\-!}=]` then permits those characters when they do not start a
-/// `url_directive` or an entity. The net effect: a `|`, `&`, `=`, `{`, `}`(opening),
-/// `-`, or `!` continues the URL, while `[`, `<`, `]`, whitespace, and quotes stop
-/// it. A `{`/`}` that opens a `{{…}}`/`{|` directive stops the URL, and an `&`
-/// that opens an entity stops it (the entity becomes part of the link content).
+/// `url_directive`. The net effect: a `|`, `&`, `=`, `{`, `}`(opening), `-`, or
+/// `!` continues the URL, while `[`, `<`, `]`, whitespace, and quotes stop it. A
+/// `{`/`}` that opens a `{{…}}`/`{|` directive stops the URL. An `&` that opens
+/// an entity is part of the URL too, so `?a=1&amp;b=2` survives; the caller
+/// tokenizes it (`scan_extlink_url`), because the grammar matches the entity as
+/// a unit.
 fn scan_extlink_url_len(input: &str) -> usize {
     let mut i = 0usize;
     while i < input.len() {
@@ -4435,7 +4446,9 @@ fn scan_extlink_url_len(input: &str) -> usize {
         {
             break;
         }
-        // An `&` that starts an entity is content, not URL.
+        // An entity is part of the URL, but the grammar matches it as a unit:
+        // stop here so `scan_extlink_url` can tokenize it (`&nbsp;` must not be
+        // split and must keep its source spelling for a bail).
         if ch == '&' && is_entity_at(input, i) {
             break;
         }
@@ -7972,9 +7985,10 @@ mod tests {
         assert_eq!(scan_extlink_url_len("http://x]"), 8);
         assert_eq!(scan_extlink_url_len("http://example.com|[[X]]]"), 19);
 
-        // A page URL with query/fragment characters stays intact.
+        // A page URL with query/fragment characters stays intact. An entity is
+        // part of the URL too, but stopped at here so that `scan_extlink_url`
+        // can tokenize it as a unit (PHP's `&htmlentity` alternative).
         assert_eq!(scan_extlink_url_len("//x/y?a=b&c=d]"), 13);
-        // An entity is link content, not URL.
         assert_eq!(scan_extlink_url_len("http://x&amp;]"), 8);
     }
 

@@ -107,7 +107,8 @@ fn has_image_link_generic(href: &str) -> bool {
 /// A `{{…}}` inside `[ … ]` is admitted into the URL by the tokenizer (Parsoid's
 /// `extlink_nonipv6url`), but core expands templates textually, so the parser
 /// sees `[url text]` and ends the URL at the whitespace. Returns the split
-/// `(url, content)` when the expansion produced a space, `None` otherwise.
+/// `(url, rest)` when the expansion produced a space, `None` otherwise. `rest`
+/// keeps the separating spaces, because a bail has to emit the source verbatim.
 fn split_extlink_url_tokens(items: &[Item]) -> Option<(Vec<Item>, Vec<Item>)> {
     let mut url = Vec::new();
     for (i, item) in items.iter().enumerate() {
@@ -127,15 +128,62 @@ fn split_extlink_url_tokens(items: &[Item]) -> Option<(Vec<Item>, Vec<Item>)> {
         if url.is_empty() {
             return None;
         }
-        let rest = s[pos..].trim_start_matches(|c: char| c.is_ascii_whitespace());
-        let mut content = Vec::new();
-        if !rest.is_empty() {
-            content.push(Item::Str(rest.to_string()));
-        }
-        content.extend_from_slice(&items[i + 1..]);
-        return Some((url, content));
+        let mut rest = Vec::new();
+        rest.push(Item::Str(s[pos..].to_string()));
+        rest.extend_from_slice(&items[i + 1..]);
+        return Some((url, rest));
     }
     None
+}
+
+/// Drop the leading whitespace an extlink's content carries from its source.
+/// PHP's `extlink` rule keeps `(space)*` between the URL and the link text, and
+/// `ExtLinkContentOffsets` skips it when rendering, so the text starts after it.
+fn trim_leading_whitespace(items: &[Item]) -> Vec<Item> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut trimming = true;
+    for item in items {
+        match item {
+            Item::Str(s) if trimming => {
+                let trimmed = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                if !trimmed.is_empty() {
+                    out.push(Item::Str(trimmed.to_string()));
+                    trimming = false;
+                }
+            }
+            _ => {
+                out.push(item.clone());
+                trimming = false;
+            }
+        }
+    }
+    out
+}
+
+/// Does `href` begin with a URL protocol the wiki accepts?
+///
+/// Mirrors the PEG `url_protocol` rule plus the `url` rule's "at least one
+/// character after the protocol" guard: `//` is protocol-relative and always
+/// accepted, a `scheme:` must be a well-formed scheme in the wiki's protocol
+/// list. `ExternalLinkHandler::onExtLink` uses this to decide whether an
+/// *expanded* href still names a link.
+pub fn begins_with_url_protocol(href: &str, has_valid_protocol: impl Fn(&str) -> bool) -> bool {
+    if let Some(rest) = href.strip_prefix("//") {
+        return !rest.is_empty();
+    }
+    let Some(colon) = href.find(':') else {
+        return false;
+    };
+    let scheme = &href[..colon];
+    let mut chars = scheme.chars();
+    let well_formed = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | '.'));
+    if !well_formed {
+        return false;
+    }
+    let after = &href[colon + 1..];
+    let after = after.strip_prefix("//").unwrap_or(after);
+    !after.is_empty() && has_valid_protocol(&href[..colon + 1])
 }
 
 /// Handler for an `extlink` token (a bracketed `[url ...]`). Mirrors
@@ -149,6 +197,7 @@ fn split_extlink_url_tokens(items: &[Item]) -> Option<(Vec<Item>, Vec<Item>)> {
 pub fn on_ext_link(
     token: &ParsoidToken,
     clean: impl Fn(&str) -> Option<String>,
+    has_valid_protocol: impl Fn(&str) -> bool,
     relative_link_prefix: &str,
     mut render_content: impl FnMut(Vec<Item>) -> Item,
 ) -> Option<Vec<Item>> {
@@ -174,13 +223,16 @@ pub fn on_ext_link(
     // reaches the parser as `[url text]` and the whitespace ends the URL. rustoid
     // admits the directive into the URL token (as Parsoid's grammar does), so
     // apply that split once the expansion is known: the URL is what precedes the
-    // first whitespace, the rest is link text.
+    // first whitespace, the rest is link text. The unsplit pieces are kept for
+    // the bail below, which emits the construct verbatim as text.
+    let mut bail_parts: Option<(Vec<Item>, Vec<Item>)> = None;
     if content_items.is_empty()
         && let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = href_kv
-        && let Some((url, text)) = split_extlink_url_tokens(items)
+        && let Some((url, rest)) = split_extlink_url_tokens(items)
     {
-        orig_href = key_value_to_string(&crate::wikitext::tokens_v2::KeyValue::Tokens(url));
-        content_items = text;
+        orig_href = crate::wikitext::token_utils::tokens_to_string(&url);
+        content_items = trim_leading_whitespace(&rest);
+        bail_parts = Some((url, rest));
     }
 
     let data_parsoid = token.data_parsoid().cloned().unwrap_or_default();
@@ -218,6 +270,33 @@ pub fn on_ext_link(
             vec![],
             DataParsoid::default(),
         ))));
+        return Some(out);
+    }
+
+    // An extlink whose href was expanded from a construct (`{{…}}`) is a link
+    // only while the expansion still spells a URL. Core expands textually, so
+    // `[{{PAGENAME}}]` reaches the parser as `[Test]` — plain text. PHP tests
+    // exactly this (`hasExpandedAttrs` plus `urlParser->tokenizeURL`) and bails
+    // the construct back to text when it fails; without the test, `[Test]`
+    // rendered as a link with a bogus `href`.
+    let expanded_attrs = token
+        .get_attribute_v("typeof")
+        .is_some_and(|ty| ty.split_whitespace().any(|t| t == "mw:ExpandedAttrs"));
+    if expanded_attrs && !begins_with_url_protocol(&orig_href, &has_valid_protocol) {
+        let (href_items, rest) = bail_parts.unwrap_or_else(|| {
+            let href_items =
+                crate::pipeline::attribute_transform_manager::key_value_to_items(href_kv);
+            let mut rest = Vec::new();
+            if !content_items.is_empty() {
+                rest.push(Item::Str(" ".to_string()));
+                rest.extend(content_items.clone());
+            }
+            (href_items, rest)
+        });
+        let mut out = vec![Item::Str("[".to_string())];
+        out.extend(href_items);
+        out.extend(rest);
+        out.push(Item::Str("]".to_string()));
         return Some(out);
     }
 
@@ -324,9 +403,13 @@ mod tests {
     #[test]
     fn test_extlink_renders_a_tag() {
         let token = extlink_token("http://example.com", "link");
-        let out = on_ext_link(&token, id_clean, "./", |_items| {
-            Item::Str("link".to_string())
-        })
+        let out = on_ext_link(
+            &token,
+            id_clean,
+            |p| p.starts_with("http:") || p.starts_with("https:"),
+            "./",
+            |_items| Item::Str("link".to_string()),
+        )
         .unwrap();
 
         assert!(matches!(&out[0], Item::Tok(ParsoidToken::Tag(t)) if t.name == "a"));
@@ -346,6 +429,60 @@ mod tests {
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "link"))
         );
+    }
+
+    /// An extlink whose href was expanded from a construct is a link only while
+    /// the expansion still names a URL; otherwise core's preprocessor would
+    /// have handed the parser the plain text `[Test]`.
+    #[test]
+    fn test_an_expanded_href_that_is_not_a_url_bails_to_text() {
+        let mut token = extlink_token("Test", "");
+        if let ParsoidToken::SelfclosingTag(tk) = &mut token {
+            tk.attribs
+                .retain(|kv| kv.key.as_str() != Some("mw:content"));
+            tk.attribs.push(crate::wikitext::tokens_v2::KV {
+                key: KeyValue::Str("typeof".to_string()),
+                value: KeyValue::Str("mw:ExpandedAttrs".to_string()),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            });
+        }
+        let out = on_ext_link(
+            &token,
+            id_clean,
+            |p| p.starts_with("http:") || p.starts_with("https:"),
+            "./",
+            |_items| Item::Str("link".to_string()),
+        )
+        .unwrap();
+
+        assert!(
+            out.iter().all(|it| matches!(it, Item::Str(_))),
+            "no element remains: {out:?}"
+        );
+        let text: String = out
+            .iter()
+            .map(|it| match it {
+                Item::Str(s) => s.clone(),
+                Item::Tok(t) => t.to_string(),
+            })
+            .collect();
+        assert_eq!(text, "[Test]");
+    }
+
+    #[test]
+    fn test_begins_with_url_protocol() {
+        let valid = |p: &str| p == "http:" || p == "https:" || p == "ftp:";
+        assert!(begins_with_url_protocol("http://x", valid));
+        assert!(begins_with_url_protocol("//x/y", valid));
+        assert!(begins_with_url_protocol("ftp://x", valid));
+        // No scheme, an unknown scheme, or nothing after the protocol.
+        assert!(!begins_with_url_protocol("Test", valid));
+        assert!(!begins_with_url_protocol("mailto:x", valid));
+        assert!(!begins_with_url_protocol("http:", valid));
+        assert!(!begins_with_url_protocol("//", valid));
+        assert!(!begins_with_url_protocol("1a:x", valid));
     }
 
     #[test]

@@ -249,6 +249,30 @@ pub fn tokens_to_string_with_opts(tokens: &[Item], opts: TokensToStringOpts<'_>)
                     }
                     out.push_str("]]");
                 }
+                // Reconstruct a bracketed external link as `[href content]`.
+                //
+                // Core's preprocessor expands a directive inside a `[…]`
+                // *textually*, so `{{#if:[{{PAGENAME}}]|…}}` reaches the parser
+                // as `[Test]` and the condition is non-empty. rustoid tokenizes
+                // the bracket as an `extlink` whose `href` is a token array, so
+                // flattening it must rebuild the source text rather than drop
+                // the link: dropping it emptied the condition and took the else
+                // branch (the standard atomic weight row of `Hydrogen`'s
+                // infobox lost its list).
+                ParsoidToken::SelfclosingTag(tk) if tk.name == "extlink" => {
+                    out.push('[');
+                    for kv in &tk.attribs {
+                        match kv.key.as_str() {
+                            Some("href") => out.push_str(&key_value_to_string(&kv.value)),
+                            Some("mw:content") => {
+                                out.push(' ');
+                                out.push_str(&key_value_to_string(&kv.value));
+                            }
+                            _ => {}
+                        }
+                    }
+                    out.push(']');
+                }
                 // A bare URL tokenized into a `urllink` carries its wikitext in
                 // `href`; flattening it must emit that URL rather than nothing.
                 // PHP's `tokensToString` never meets a raw `urllink` because its
@@ -707,6 +731,37 @@ mod tests {
             ))),
         ];
         assert_eq!(tokens_to_source(&tokens), "&#59;");
+    }
+
+    /// A bracketed link flattens to its source form, not to nothing: a directive
+    /// inside a `[…]` is expanded textually by core, so `{{#if:[{{PAGENAME}}]}}`
+    /// sees the non-empty string `[Test]`.
+    #[test]
+    fn tokens_to_string_spells_a_bracketed_link() {
+        let mut tk = crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+            "extlink",
+            vec![],
+            DataParsoid::default(),
+        );
+        tk.attribs.push(KV {
+            key: KeyValue::Str("href".to_string()),
+            value: KeyValue::Str("Test".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+        let bare = vec![Item::Tok(ParsoidToken::SelfclosingTag(tk.clone()))];
+        assert_eq!(tokens_to_string(&bare), "[Test]");
+
+        tk.attribs.push(KV {
+            key: KeyValue::Str("mw:content".to_string()),
+            value: KeyValue::Str("Label".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        });
+        let with_content = vec![Item::Tok(ParsoidToken::SelfclosingTag(tk))];
+        assert_eq!(tokens_to_string(&with_content), "[Test Label]");
     }
 
     fn mw_quote(run: &str) -> Item {
