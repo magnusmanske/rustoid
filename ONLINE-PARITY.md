@@ -18861,3 +18861,24 @@ nothing: Parsoid owns no pipeline for it.
 
 **Effect:** `Polio vaccine` 21,429 → 344,959. No corpus regressions.
 
+
+## `mw.text.nowiki` is Scribunto's, pass for pass
+
+`Module:Citation/CS1` escapes every identifier with `mw.text.nowiki`, so its
+output is what CS1's labels contain. rustoid's version approximated the manual
+and treated `;` as a line-start character, while Scribunto escapes it
+*everywhere* (it could close an entity reference). A DOI such as
+`10.1002/(SICI)1097-4644(20000201)76:2<189::AID-JCB3>3.0.CO;2-J` therefore
+rendered its `;` as plain text where the service emits an `mw:Entity` span.
+
+The function is now Scribunto's `mw.text.lua` pass for pass: numeric entity
+spellings (`&#38;`, not `&amp;`), `;` in the always-escaped set, the
+newline-prefixed line-start rules (`!`, `#`, `*`, `:`, space, tab, blank lines),
+the `----` rule, `!!`, `__`, `://`, `~~~`, the fullwidth underscore, the
+first/last-character rules (the `$` set is `_`, `~` and whitespace only — not
+`-`/`+`), the magic-link prefixes, and the configured protocols' colons
+(`mailto:` → `mailto&#58;`), which `TextLibrary` passes in as
+`nowiki_protocols`.
+
+**Effect:** `Polio vaccine` 344,959 → 644,148 (95.0% of the document). No
+corpus regressions; 5/48 strict, 3 nondeterministic-only (16.7%).

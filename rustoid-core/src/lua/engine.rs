@@ -2025,7 +2025,19 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     // `mw.ustring.find` and the pattern dialect belongs in one place.
     text.set("__splitPlain", lua.create_function(luafn_text_split_plain)?)?;
     text.set("tag", lua.create_function(luafn_text_tag)?)?;
-    text.set("nowiki", lua.create_function(luafn_text_nowiki)?)?;
+    // `mw.text.nowiki` escapes the colon of every configured protocol, so the
+    // protocol list is captured here (mirrors `TextLibrary`'s
+    // `nowiki_protocols` option).
+    let nowiki_protocols = std::sync::Arc::new(ctx.site.protocols.clone());
+    text.set(
+        "nowiki",
+        lua.create_function(move |_, s: Value| {
+            Ok(escape_nowiki(
+                &coerce_string(&s, "nowiki")?,
+                &nowiki_protocols,
+            ))
+        })?,
+    )?;
     text.set("listToText", lua.create_function(luafn_text_list_to_text)?)?;
     // The strip-marker functions operate on MediaWiki's "UNIQ…QINU" markers.
     // rustoid's expanded argument values *do* carry them (a `<ref>` argument is a
@@ -2585,107 +2597,198 @@ fn luafn_text_encode(_: &Lua, s: Value) -> mlua::Result<String> {
 /// `mw.text.nowiki( s )` — escape the characters that would otherwise be read as
 /// wikitext, so the text renders literally.
 ///
-/// The manual lists the cases; they are position-dependent, which is why this is
-/// not a simple character map:
+/// This is Scribunto's `mw.text.lua` pass for pass; the order matters, because
+/// the line-start rules see a string with a newline prepended and the later
+/// multi-character rules run over the already-escaped text.
 ///
-/// - a fixed set of characters is always escaped (`"`, `&`, `'`, `<`, `=`, `>`,
-///   `[`, `]`, `{`, `|`, `}`);
-/// - line-leading characters (`#`, `*`, `:`, `;`, space, tab) are escaped only at
-///   the start of a line;
-/// - a blank line has one of its newline characters escaped, and `----` has its
-///   first `-` escaped;
-/// - `__` loses one underscore, `://` loses its colon, and whitespace after
-///   `ISBN`, `RFC` or `PMID` is escaped (those prefixes would otherwise become
-///   magic links).
-///
-/// `Module:Citation/CS1` escapes an identifier with this so that a value such as
-/// `ISBN 123` cannot turn into a link.
-fn luafn_text_nowiki(_: &Lua, s: Value) -> mlua::Result<String> {
-    let text = coerce_string(&s, "nowiki")?;
-    let mut out = String::with_capacity(text.len());
-    // Whether the next character starts a line, which the position-dependent
-    // rules key off. The string starts at a line start, as MediaWiki treats it.
-    let mut at_line_start = true;
-
-    for (idx, ch) in text.char_indices() {
-        // `ISBN`, `RFC`, `PMID` followed by whitespace become magic links.
-        if ch.is_whitespace() && ends_with_magic_link_prefix(&text[..idx]) {
-            out.push_str("&#");
-            out.push_str(&(ch as u32).to_string());
-            out.push(';');
-            at_line_start = false;
-            continue;
-        }
-
+/// `Module:Citation/CS1` escapes every identifier with it. A DOI such as
+/// `10.1234/a;b` therefore reaches the page as `10.1234/a&#59;b`, and the `;`
+/// becomes an `mw:Entity` span. rustoid previously escaped `;` only at the start
+/// of a line, so the label rendered it as plain text.
+fn escape_nowiki(text: &str, protocols: &[String]) -> String {
+    // `s = string.gsub( s, '["&\'<=>%[%]{|};]', nowikiRepl1 )`
+    let mut out = String::with_capacity(text.len() + 16);
+    for ch in text.chars() {
         let escaped = match ch {
-            '"' | '&' | '\'' | '<' | '=' | '>' | '[' | ']' | '{' | '|' | '}' => {
-                Some(named_or_numeric(ch))
+            '"' => "&#34;",
+            '&' => "&#38;",
+            '\'' => "&#39;",
+            '<' => "&#60;",
+            '=' => "&#61;",
+            '>' => "&#62;",
+            '[' => "&#91;",
+            ']' => "&#93;",
+            '{' => "&#123;",
+            '|' => "&#124;",
+            '}' => "&#125;",
+            ';' => "&#59;",
+            other => {
+                out.push(other);
+                continue;
             }
-            '#' | '*' | ':' | ';' | ' ' | '\t' if at_line_start => Some(named_or_numeric(ch)),
-            _ => None,
         };
-        if let Some(replacement) = escaped {
-            out.push_str(&replacement);
-            at_line_start = false;
+        out.push_str(escaped);
+    }
+
+    // The library prepends a newline so the line-start rules also cover the
+    // string's own first character, and strips it again afterwards.
+    out.insert(0, '\n');
+    out = escape_after_newline(&out);
+    out = escape_hr(&out);
+    out.remove(0);
+
+    out = out.replace("!!", "&#33;!");
+    out = out.replace("__", "_&#95;");
+    out = out.replace("://", "&#58;//");
+    out = out.replace("~~~", "~~&#126;");
+    out = out.replace('＿', "&#xFF3F;");
+    // `s:gsub( '^[%-+_~]', nowikiRepl3 )` / `s:gsub( '[_~\r\n\t]$', nowikiRepl4 )`
+    if let Some(ch) = out.chars().next()
+        && let Some(escaped) = edge_escape(ch)
+    {
+        out.replace_range(0..ch.len_utf8(), escaped);
+    }
+    if let Some(ch) = out.chars().next_back()
+        && let Some(escaped) = last_char_escape(ch)
+    {
+        out.replace_range(out.len() - ch.len_utf8().., escaped);
+    }
+    out = escape_magic_link_prefixes(&out);
+    escape_protocols(&out, protocols)
+}
+
+/// `s:gsub( '[\r\n][!#*: \n\r\t]', nowikiRepl2 )` — escape a character that
+/// starts a line, and a blank line's newline.
+fn escape_after_newline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        if matches!(first, '\r' | '\n')
+            && let Some(second) = rest[first.len_utf8()..].chars().next()
+            && let Some(escaped) = match second {
+                '!' => Some("&#33;"),
+                '#' => Some("&#35;"),
+                '*' => Some("&#42;"),
+                ':' => Some("&#58;"),
+                ' ' => Some("&#32;"),
+                '\n' => Some("&#10;"),
+                '\r' => Some("&#13;"),
+                '\t' => Some("&#9;"),
+                _ => None,
+            }
+        {
+            out.push(first);
+            out.push_str(escaped);
+            rest = &rest[first.len_utf8() + second.len_utf8()..];
             continue;
         }
+        out.push(first);
+        rest = &rest[first.len_utf8()..];
+    }
+    out
+}
 
-        match ch {
-            // A blank line: escape its newline so the blank line is preserved.
-            '\n' => {
-                if at_line_start {
-                    out.push_str("&#10;");
-                } else {
-                    out.push('\n');
-                }
-                at_line_start = true;
-                continue;
-            }
-            // `----` at a line start would be a horizontal rule.
-            '-' if at_line_start && text[idx..].starts_with("----") => {
-                out.push_str("&#45;");
-                at_line_start = false;
-                continue;
-            }
-            // `__` is a behavior-switch delimiter.
-            '_' if text[idx..].starts_with("__") => {
-                out.push_str("&#95;");
-                at_line_start = false;
-                continue;
-            }
-            // `://` would make the preceding text a protocol.
-            ':' if text[idx..].starts_with("://") => {
-                out.push_str("&#58;");
-                at_line_start = false;
-                continue;
-            }
-            _ => {}
+/// `s:gsub( '([\r\n])%-%-%-%-', '%1&#45;---' )` — a line-leading horizontal rule.
+fn escape_hr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        if matches!(first, '\r' | '\n') && rest[first.len_utf8()..].starts_with("----") {
+            out.push(first);
+            out.push_str("&#45;---");
+            rest = &rest[first.len_utf8() + 4..];
+            continue;
         }
-        out.push(ch);
-        at_line_start = false;
+        out.push(first);
+        rest = &rest[first.len_utf8()..];
     }
-    Ok(out)
+    out
 }
 
-/// Whether `before` ends with one of the prefixes that form a magic link.
-fn ends_with_magic_link_prefix(before: &str) -> bool {
-    const PREFIXES: [&str; 3] = ["ISBN", "RFC", "PMID"];
-    PREFIXES.iter().any(|p| before.ends_with(p))
-}
-
-/// The named entity for the characters the manual names, else a numeric one.
-///
-/// Only the five names the manual lists have short forms; the rest are emitted
-/// numerically, as MediaWiki does.
-fn named_or_numeric(ch: char) -> String {
+/// The characters the `[_~\r\n\t]$` rule escapes — `-` and `+` are not among
+/// them, even though the replacement table has entries for both.
+fn last_char_escape(ch: char) -> Option<&'static str> {
     match ch {
-        '<' => "&lt;".to_string(),
-        '>' => "&gt;".to_string(),
-        '&' => "&amp;".to_string(),
-        '"' => "&quot;".to_string(),
-        '\'' => "&#39;".to_string(),
-        other => format!("&#{};", other as u32),
+        '_' | '~' | '\r' | '\n' | '\t' => edge_escape(ch),
+        _ => None,
     }
+}
+
+/// The replacement table for the `^[%-+_~]` and `[_~\r\n\t]$` rules.
+fn edge_escape(ch: char) -> Option<&'static str> {
+    match ch {
+        '-' => Some("&#45;"),
+        '+' => Some("&#43;"),
+        '_' => Some("&#95;"),
+        '~' => Some("&#126;"),
+        '\r' => Some("&#13;"),
+        '\n' => Some("&#10;"),
+        '\t' => Some("&#9;"),
+        _ => None,
+    }
+}
+
+/// `ISBN%s`, `RFC%s`, `PMID%s` — a whitespace after one of these prefixes would
+/// turn it into a magic link.
+fn escape_magic_link_prefixes(text: &str) -> String {
+    const PREFIXES: [&str; 3] = ["ISBN", "RFC", "PMID"];
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        if let Some(prefix) = PREFIXES.iter().find(|p| rest.starts_with(**p))
+            && let Some(ws) = rest[prefix.len()..].chars().next()
+            && let Some(escaped) = match ws {
+                ' ' => Some("&#32;"),
+                '\t' => Some("&#9;"),
+                '\n' => Some("&#10;"),
+                '\r' => Some("&#13;"),
+                '\x0c' => Some("&#12;"),
+                '\x0b' => Some("&#11;"),
+                _ => None,
+            }
+        {
+            out.push_str(prefix);
+            out.push_str(escaped);
+            rest = &rest[prefix.len() + ws.len_utf8()..];
+            continue;
+        }
+        out.push(first);
+        rest = &rest[first.len_utf8()..];
+    }
+    out
+}
+
+/// `nowiki_protocols`: escape the colon of a configured URL protocol, so
+/// `mailto:…` cannot become a link. Case-insensitive, like the Lua patterns
+/// `TextLibrary` builds from the protocol list.
+fn escape_protocols(text: &str, protocols: &[String]) -> String {
+    let protocols: Vec<&str> = protocols
+        .iter()
+        .filter_map(|p| p.strip_suffix(':'))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if protocols.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    'outer: while let Some(first) = rest.chars().next() {
+        for protocol in &protocols {
+            if rest.len() > protocol.len()
+                && rest.is_char_boundary(protocol.len())
+                && rest[..protocol.len()].eq_ignore_ascii_case(protocol)
+                && rest[protocol.len()..].starts_with(':')
+            {
+                out.push_str(&rest[..protocol.len()]);
+                out.push_str("&#58;");
+                rest = &rest[protocol.len() + 1..];
+                continue 'outer;
+            }
+        }
+        out.push(first);
+        rest = &rest[first.len_utf8()..];
+    }
+    out
 }
 
 fn luafn_text_decode(_: &Lua, (s, named): (Value, Option<Value>)) -> mlua::Result<String> {
@@ -7376,12 +7479,15 @@ mod tests {
     /// `mw.text.nowiki` escapes what would otherwise be read as wikitext.
     /// `Module:Citation/CS1` escapes an identifier with it so that a value such
     /// as `ISBN 123` cannot become a magic link.
+    ///
+    /// The expectations are Scribunto's `mw.text.lua` output, entity spellings
+    /// included: it emits numeric entities (`&#38;`), not named ones.
     #[test]
     fn test_mw_text_nowiki() {
         let engine = make_engine();
         assert_eq!(
             engine.eval("return mw.text.nowiki('a&b')").unwrap(),
-            "a&amp;b"
+            "a&#38;b"
         );
         assert_eq!(
             engine.eval("return mw.text.nowiki('[[x]]')").unwrap(),
@@ -7390,6 +7496,12 @@ mod tests {
         assert_eq!(
             engine.eval("return mw.text.nowiki(\"it's\")").unwrap(),
             "it&#39;s"
+        );
+        // `;` is always escaped: it could close an entity reference. CS1 relies
+        // on this for a DOI such as `10.1234/a;b`.
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('10.1234/a;b')").unwrap(),
+            "10.1234/a&#59;b"
         );
         // A line-leading marker is escaped; the same character mid-line is not.
         assert_eq!(
@@ -7415,14 +7527,27 @@ mod tests {
             engine.eval("return mw.text.nowiki('----')").unwrap(),
             "&#45;---"
         );
-        // `__` is a behavior-switch delimiter, and `://` a protocol.
+        // `__` is a behavior-switch delimiter: the second underscore of each
+        // pair is escaped, and the leading-character rule escapes the first.
         assert_eq!(
             engine.eval("return mw.text.nowiki('__NOTOC__')").unwrap(),
-            "&#95;_NOTOC&#95;_"
+            "&#95;&#95;NOTOC_&#95;"
         );
+        // `://` is a protocol separator; a protocol without it loses its colon.
         assert_eq!(
             engine.eval("return mw.text.nowiki('http://x')").unwrap(),
             "http&#58;//x"
+        );
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('mailto:a@b')").unwrap(),
+            "mailto&#58;a@b"
+        );
+        // The final character follows the same rules as the first — but only
+        // `_`, `~` and whitespace are in the `$` set, not `-` or `+`.
+        assert_eq!(engine.eval("return mw.text.nowiki('x-')").unwrap(), "x-");
+        assert_eq!(
+            engine.eval("return mw.text.nowiki('x_')").unwrap(),
+            "x&#95;"
         );
         // Text with nothing to escape is returned unchanged.
         assert_eq!(
