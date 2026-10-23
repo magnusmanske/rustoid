@@ -1003,6 +1003,28 @@ fn is_file_link_target(href: &str) -> bool {
         || ns.eq_ignore_ascii_case("media")
 }
 
+/// The name a bare `mw:dom-fragment-token`'s strip marker carries.
+///
+/// The preprocessor hands a module a marker named after the *extension tag* it
+/// stands for, and modules match on it: `Module:Coordinates.coordinsert` looks
+/// for `UNIQ--indicator-…-QINU` to replace the indicator a coord call emitted.
+/// An indicator's placeholder records that name in its `typeof`
+/// (`mw:Extension/indicator`), because the fragment *is* the extension's output.
+/// A tunnelled fragment with no type of its own is a gallery, which is the name
+/// its marker has always carried.
+fn fragment_marker_name(t: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String {
+    t.attribs
+        .iter()
+        .find(|kv| kv.key.as_str() == Some("typeof"))
+        .and_then(|kv| kv.value.as_str())
+        .and_then(|ty| {
+            ty.split_whitespace()
+                .find_map(|part| part.strip_prefix("mw:Extension/"))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "gallery".to_string())
+}
+
 /// The `mw:DOMFragment` placeholder starting at `items[i]`, if there is one:
 /// the exclusive end index, the placeholder's tokens, and the name its strip
 /// marker carries.
@@ -1025,7 +1047,7 @@ fn placeholder_span(items: &[Item], i: usize) -> Option<(usize, Vec<Item>, Strin
     };
     match &items[i] {
         Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw:dom-fragment-token" => {
-            Some((i + 1, vec![items[i].clone()], "gallery".to_string()))
+            Some((i + 1, vec![items[i].clone()], fragment_marker_name(t)))
         }
         Item::Tok(ParsoidToken::Tag(t)) if is_fragment(attrs_typeof(t)) => {
             let name = t.name.clone();
@@ -12401,6 +12423,41 @@ mod tests {
         // Without a placeholder the two serializers agree.
         let plain = vec![Item::Str("a".to_string()), Item::Str("b".to_string())];
         assert_eq!(tag_source_with_fragments(&plain), "ab");
+    }
+
+    /// A bare `mw:dom-fragment-token`'s strip marker is named after the extension
+    /// it stands for, as the preprocessor names it. `Module:Coordinates.coordinsert`
+    /// matches `UNIQ--indicator-…-QINU` to replace the indicator a coord call
+    /// emitted; naming every bare placeholder `gallery` left the original
+    /// indicator in place, its `extsrc` unmodified (`Berlin`).
+    #[test]
+    fn a_bare_fragment_placeholder_is_named_for_its_extension() {
+        use crate::wikitext::tokens_v2::{DataParsoid, KeyValue, SelfclosingTagTk};
+
+        let placeholder = |attrs: &[(&str, &str)]| {
+            let mut tok =
+                SelfclosingTagTk::new("mw:dom-fragment-token", vec![], DataParsoid::default());
+            for (k, v) in attrs {
+                tok.attribs.push(crate::wikitext::tokens_v2::KV {
+                    key: KeyValue::Str(k.to_string()),
+                    value: KeyValue::Str(v.to_string()),
+                    src_offsets: None,
+                    ksrc: None,
+                    vsrc: None,
+                });
+            }
+            tok
+        };
+        let name = |attrs: &[(&str, &str)]| {
+            let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(placeholder(attrs)))];
+            placeholder_span(&items, 0)
+                .expect("a placeholder spans one item")
+                .2
+        };
+
+        assert_eq!(name(&[("typeof", "mw:Extension/indicator")]), "indicator");
+        // A tunnelled fragment with no type of its own is a gallery.
+        assert_eq!(name(&[("data-fragment-id", "7")]), "gallery");
     }
 
     /// A live HTML element in a `#tag` body is written from its source, and a

@@ -18995,3 +18995,29 @@ leave the digit count to differ) and counts it as nondeterministic.
 **Effect:** `Canada` (1 region, 1822 KB) is no longer reported as a markup
 difference: its only remaining divergence was this number. 5/48 strict, 5
 nondeterministic-only (20.8%, was 18.8%).
+
+## A bare fragment placeholder's marker is named for its extension
+
+`Module:Coordinates.coordinsert` rewrites a rendered `{{coord}}` call, and it
+finds the indicator to replace by matching the strip marker's name:
+`\127…UNIQ--indicator-%x+…QINU…\127`. rustoid handed every bare
+`mw:dom-fragment-token` a marker named `gallery`, so the pattern never matched.
+The indicator the `{{coord}}` call had emitted therefore stayed in the output,
+keeping its *unmodified* content: its `extsrc` still spelled
+`params=…_18_E_ ` where the service has `params=…_18_E_type:city(3596999)_region:DE`,
+and the `_coord` copy that coordinsert builds (with the inserted arguments) was
+never emitted.
+
+The marker name now comes from the placeholder's own type
+(`typeof="mw:Extension/indicator"` → `indicator`); a tunnelled fragment with no
+type of its own stays a `gallery`. The same rule covers any extension whose whole
+output is the fragment (gallery, imagemap, syntaxhighlight likewise ride on such
+a placeholder).
+
+**Effect:** `Berlin`'s indicator `extsrc` now matches the service byte-for-byte,
+including the arguments coordinsert inserts. Its remaining first difference is an
+`about` id gap: Parsoid spends ids for the original indicator and its content
+that the rewrite drops, and for the replacement's content, while rustoid only
+counts what reaches the document (`#mwt16` against `#mwt15`, then offsets of
+three). No corpus bucket changes; `India` and `Israel` still differ where they
+did.
