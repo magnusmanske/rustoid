@@ -1194,10 +1194,16 @@ fn srcset(info: &FileInfo) -> Option<String> {
 
 /// Map a MIME type to the lowercase `data-file-type` value PHP emits
 /// (`BITMAP` → `bitmap`, `SVG` → `drawing`, etc.).
+///
+/// This is a *media type*, not a MIME subtype: MediaWiki classifies every
+/// raster image format — TIFF and XCF included — as `BITMAP`, so the subtype
+/// (`tiff`) is not the answer. Only the formats with a class of their own are
+/// named, and everything else falls back to the subtype.
 fn media_type_from_mime(mime: &str) -> String {
     match mime {
         "image/svg+xml" => "drawing".to_string(),
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/x-ms-bmp" => {
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/x-ms-bmp"
+        | "image/tiff" | "image/x-xcf" | "image/vnd.microsoft.icon" | "image/x-icon" => {
             "bitmap".to_string()
         }
         _ => mime.rsplit('/').next().unwrap_or("").to_string(),

@@ -19065,3 +19065,35 @@ itself uses, so an unregistered name or an unclosed tag stays ordinary text.
 **Effect:** `Earth` 37,933 → 428,402 (a whole list of notes no longer collapses
 into errors). No other corpus page changes; 5/48 strict, 5 nondeterministic-only
 (20.8%).
+
+## A repeated templatestyles placeholder is a new occurrence
+
+A template that uses one parameter value at two places splices the same token
+stream twice, so the same `mw:dom-fragment-token` fragment id reaches the tree
+builder twice. `number_style_placeholder` had already spent that id's pending
+stylesheet on the first copy and skipped the second, leaving the placeholder
+with no fragment; the tree builder then found nothing for it and dropped it.
+`Hydrogen`'s second `{{chem2|H}}` lost its `Module:Chem2/styles.css` link (and
+every id after it was one behind).
+
+The numbering pass now remembers the ids it numbered *in its own chunk*: the
+first copy takes the pending stylesheet, a later copy of the same id is another
+occurrence and gets its own stashed copy of the stylesheet and its own `about`,
+which `DedupeStyles` turns into the `<link>` the service serves.
+
+**Effect:** `Anarchism` 13,419 → 17,092, `Albert Einstein` 62,316 → 183,629,
+`Hydrogen` 47,125 → 47,556. No corpus regressions; 5/48 strict, 5
+nondeterministic-only (20.8%).
+
+## TIFF is a bitmap, not a "tiff"
+
+`data-file-type` is `strtolower( $info['mediatype'] )`, and MediaWiki classifies
+every raster format as `BITMAP` — a `.tif` is a bitmap image just as a `.jpg`
+is. rustoid fell back to the MIME *subtype* for anything not in a short list, so
+a TIFF served `data-file-type="tiff"` where the service serves `bitmap`
+(`Albert Einstein`'s ETH Zurich photograph). The fallback now names the raster
+formats the service treats as bitmaps; the API's `mediatype` still wins whenever
+the cache carries it.
+
+**Effect:** `Albert Einstein` 172,645 → 183,629 (the first difference is now a
+ref name whose attribute value holds an escaped quote).
