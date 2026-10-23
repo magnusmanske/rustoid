@@ -1350,24 +1350,18 @@ impl ParserFunctions {
             DataMw, DataMwAttrib, DataMwValue, DomSourceRange, SelfclosingTagTk,
         };
 
-        // Core strips comments from a parser function's arguments before
-        // `#tag` builds the extension, so these must go from the live content
-        // too — `tag_content_source` already drops them from `source`, and the
-        // body renderer used to keep them (`France`'s `{{efn|…{{IPA|…}}<!-- …
-        // -->}}` served a comment the service does not).
-        let content: Vec<Item> = content
-            .iter()
-            .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
-            .cloned()
-            .collect();
-        let content = content.as_slice();
-
         // Reconstruct the literal `<name attrs>content</name>` source so that
         // `extract_ext_body` can recover the raw body via the open/close widths.
         // Magic pipe words in the content (`{{!}}` → `|`, `{{{!}}` → `{|`) are
         // expanded here, *after* the `#tag` arguments have been split, so the
         // pipes they produce aren't consumed as argument separators (mirrors the
         // token-level `processSpecialMagicWord`/`!` magic-variable handling).
+        //
+        // Core strips comments from a parser function's arguments before `#tag`
+        // builds the extension. That happens in the source builders
+        // (`tag_content_source` and the fallback), which also apply the
+        // preprocessor's whole-line rule, so the tokens are passed through
+        // unmodified here.
         let content_src: String = crate::expand::tpl_args::replace_magic_pipe(
             &crate::pipeline::parser::tag_source_with_fragments(content),
         );
@@ -1821,6 +1815,10 @@ pub(crate) fn tag_content_fallback_source(content: &[Item]) -> String {
     while i < content.len() {
         match &content[i] {
             Item::Str(text) => s.push_str(text),
+            // A comment is removed with its whole line when it has one of its
+            // own; [`crate::pipeline::parser::strip_html_comments`] applies the
+            // rule to the assembled string.
+            Item::Tok(ParsoidToken::Comment(_)) => s.push_str("<!--c-->"),
             Item::Tok(t) => {
                 let source = token_to_source(t);
                 if source.is_empty() {
@@ -1843,7 +1841,7 @@ pub(crate) fn tag_content_fallback_source(content: &[Item]) -> String {
         }
         i += 1;
     }
-    s
+    crate::pipeline::parser::strip_html_comments(&s)
 }
 
 /// Very basic expression evaluator for `#expr` and `#ifexpr`.

@@ -19148,3 +19148,34 @@ inside an empty-elt span with no space.
 
 **Effect:** `Nobel Prize` 665,491 → 696,813. No corpus regressions; 5/48
 strict, 5 nondeterministic-only (20.8%).
+
+## A `<references>` body is its refs' provenance
+
+`{{reflist|refs=…}}` builds its list through `{{#tag:references|{{{refs}}}}}`, so
+the tag's body is an *argument*: each list-defined `<ref>` is already a stashed
+fragment when the service records the extension's `data-mw`. The served
+`extsrc` is therefore the body with every ref replaced by
+`{{#parsoid\u0000fragment:N}}` — one marker per ref, the original blank lines
+between them, and comments removed. rustoid wrote `"extsrc":""`.
+
+Two rules had to land together:
+
+- **A nested `<ref>` in a references body is a marker.** The body is expanded
+text, not markup, so the markers are built from the body source (the refs are
+the only children; anything else stays verbatim).
+- **An HTML comment on a line of its own is removed with that line.** The
+  preprocessor drops `\n[ \t]*<!--…-->[ \t]*\n` as `\n`; an inline comment is
+  dropped alone. rustoid removed the comment text but kept every newline, which
+  left `{{reflist|refs=…}}`'s `extsrc` one newline long between refs separated
+  by a commented-out section header. The rule applies everywhere a comment is
+  stripped from expanded wikitext (a `#tag` body, a module argument).
+
+`references_data_mw` now takes the body, and the comment stripper writes a
+comment token as its own markup before applying that rule — the naive
+character scan could not tell an inline comment from one on a line by itself.
+
+**Effect:** `Isaac Newton` 428,403 → 1,222,095, `Grand Theft Auto V` 486,125 →
+994,503, `France` 632,216 → 832,621, `Doom (1993 video game)` 301,624 →
+334,330, `Albert Einstein` 621,072 → 629,126 (to the next, unrelated
+difference). No corpus regressions; 5/48 strict, 5 nondeterministic-only
+(20.8%).

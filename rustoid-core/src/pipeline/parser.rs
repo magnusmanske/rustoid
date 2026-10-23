@@ -9969,7 +9969,10 @@ fn argument_value_text(items: &[Item]) -> Option<String> {
             // one (`<li>a* b</li>`), so every navbox `above`/`below`/list lost
             // its list structure.
             Item::Tok(ParsoidToken::Nl(_)) => out.push('\n'),
-            Item::Tok(ParsoidToken::Comment(_)) => {}
+            // A comment is rendered as its own markup so the whole-line rule in
+            // [`strip_html_comments`] can see where it sat; its content is never
+            // part of the value.
+            Item::Tok(ParsoidToken::Comment(_)) => out.push_str("<!--c-->"),
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
                 let value = t.attribs.iter().find(|kv| kv.key.as_str() == Some("value"));
                 out.push_str(
@@ -10279,7 +10282,7 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
         match &items[i] {
             Item::Str(s) => out.push_str(s),
             // A comment is stripped by the preprocessor; a newline is content.
-            Item::Tok(ParsoidToken::Comment(_)) => {}
+            Item::Tok(ParsoidToken::Comment(_)) => out.push_str("<!--c-->"),
             Item::Tok(ParsoidToken::Nl(_)) => out.push('\n'),
             Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
                 let value = t.attribs.iter().find(|kv| kv.key.as_str() == Some("value"));
@@ -10380,7 +10383,15 @@ pub(crate) fn tag_content_source(items: &[Item]) -> Option<String> {
 /// service returns the content with the comments gone and the surrounding
 /// whitespace kept. An unclosed `<!--` swallows the rest, which is what the
 /// preprocessor does with one.
-fn strip_html_comments(s: &str) -> String {
+///
+/// A comment that sits on a line of its own — preceded by a newline and
+/// followed by one, with only spaces or tabs around it — takes that whole line
+/// with it: `\n  <!--c-->  \n` becomes `\n`. MediaWiki's preprocessor does the
+/// same, which is why `{{Reflist|refs=…}}`'s `extsrc` keeps one newline fewer
+/// than the source between two refs separated by a commented-out section
+/// header. A comment at the very start of the content has no preceding newline
+/// and is removed alone.
+pub(crate) fn strip_html_comments(s: &str) -> String {
     if !s.contains("<!--") {
         return s.to_string();
     }
@@ -10388,9 +10399,36 @@ fn strip_html_comments(s: &str) -> String {
     let mut rest = s;
     while let Some(start) = rest.find("<!--") {
         out.push_str(&rest[..start]);
-        match rest[start + 4..].find("-->") {
-            Some(end) => rest = &rest[start + 4 + end + 3..],
-            None => rest = "",
+        // The text between the last newline and the comment: a line of its own
+        // only when it is blank.
+        let line_start = out.rfind('\n').map(|n| n + 1);
+        let blank_before =
+            line_start.is_some_and(|from| out[from..].chars().all(|c| c == ' ' || c == '\t'));
+        let mut skip_newline = false;
+        let after = match rest[start + 4..].find("-->") {
+            Some(end) => {
+                let after = &rest[start + 4 + end + 3..];
+                // A following line break, reached over spaces/tabs only.
+                let trimmed = after.trim_start_matches([' ', '\t']);
+                skip_newline = trimmed.starts_with('\n');
+                after
+            }
+            // An unclosed comment swallows the rest.
+            None => "",
+        };
+        // A comment on a line of its own takes that line's break with it; any
+        // other comment leaves the break alone.
+        if blank_before && skip_newline {
+            // Drop the horizontal whitespace the comment's line began with.
+            if let Some(from) = line_start {
+                out.truncate(from);
+            }
+            rest = after
+                .trim_start_matches([' ', '\t'])
+                .strip_prefix('\n')
+                .unwrap_or(after);
+        } else {
+            rest = after;
         }
     }
     out.push_str(rest);
