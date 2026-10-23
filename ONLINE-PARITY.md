@@ -19043,3 +19043,25 @@ unaffected).
 correctly; the page's first difference moves from byte 12,605 to 21,702, where
 the next gap is the missing Pygments highlighting inside `<syntaxhighlight>`.
 No other corpus page changes; 5/48 strict, 5 nondeterministic-only (20.8%).
+
+## An extension tag is opaque to the brace scan
+
+MediaWiki's tokenizer turns every registered extension tag — `<ref>`, `<math>`,
+`<gallery>` — into a single token *before* the preprocessor looks for braces, so
+a `}}` in its body is content. rustoid's template scan did not: it walked the
+body character by character, so `Template:Reflist`'s `refs=` argument ended at
+the `}}` of a `<math>x^{\frac{1}{3}}</math>` formula inside one ref. The ref's
+own `source` was cut to its start tag (its body vanished), and every
+list-defined ref after it fell outside the `<references>` body — read as a
+top-level *use*. That is why `Earth`'s `surfacecover` note, defined in the
+`{{reflist|group="n"|refs=…}}` list and used earlier as a bare
+`<ref group="n" name="surfacecover" />`, was reported as a Cite error
+("no text provided") on the live service's own article.
+
+Both brace scanners — the template closer and the `{{{…}}}` skiper — now skip a
+closed extension tag whole, using the same registry (`extTags`) the tokenizer
+itself uses, so an unregistered name or an unclosed tag stays ordinary text.
+
+**Effect:** `Earth` 37,933 → 428,402 (a whole list of notes no longer collapses
+into errors). No other corpus page changes; 5/48 strict, 5 nondeterministic-only
+(20.8%).

@@ -3154,7 +3154,7 @@ impl<'a> PegTokenizer<'a> {
         // `}}}`, which left the closer one brace short: `{{{p|{{T|d}}}}}` failed
         // to parse and spilled into the output as literal text with the inner
         // `{{T|d}}` re-read as a bogus transclusion.
-        let end = skip_tplarg_memo(self.input, saved, &mut ScanMemo::default())?;
+        let end = skip_tplarg_memo(self.input, saved, &self.ext_tags, &mut ScanMemo::default())?;
 
         // `end` is the byte offset just past the closing `}}}`.
         let inner = self.input[saved + 3..end - 3].to_string();
@@ -3228,7 +3228,7 @@ impl<'a> PegTokenizer<'a> {
         let saved = self.pos;
         self.advance(2);
 
-        let Some(end) = find_template_closing(self.remaining()) else {
+        let Some(end) = find_template_closing_with(self.remaining(), &self.ext_tags) else {
             self.pos = saved;
             return None;
         };
@@ -4783,9 +4783,73 @@ fn find_wikilink_close_at(input: &str) -> Option<usize> {
 ///   `{` + `{{!}}` (rendering `{|`, the table-opening escape) and has no `}}}`.
 ///   Treating it as an argument reference swallowed everything up to the next
 ///   `}}}`, which changed how `<pre>` bodies tokenize.
+#[cfg(test)]
 fn find_template_closing(input: &str) -> Option<usize> {
+    find_template_closing_with(input, &[])
+}
+
+/// [`find_template_closing`] with the site's extension tags, whose regions are
+/// opaque to the scan.
+///
+/// MediaWiki's tokenizer turns `<ref>…</ref>` (and every other registered
+/// extension tag) into one token *before* the preprocessor looks for braces, so
+/// a `}}` in the body — `<math>x^{\frac{1}{3}}</math>` — is content, not the end
+/// of the enclosing call. Reading it as the end cut `Template:Reflist`'s `refs=`
+/// argument at that brace: the ref's own body was lost (its `source` was just
+/// the start tag) and every list-defined ref after it was read as a top-level
+/// use, so `Earth`'s `surfacecover` note came out as a Cite error.
+fn find_template_closing_with(input: &str, ext_tags: &[String]) -> Option<usize> {
     let mut memo = ScanMemo::default();
-    find_template_closing_memo(input, &mut memo)
+    find_template_closing_memo(input, ext_tags, &mut memo)
+}
+
+/// The end (exclusive) of an extension tag starting at `input[i]`, if one does.
+///
+/// Mirrors the tokenizer's `maybe_extension_tag`, which is the rule MediaWiki
+/// applies before its preprocessor looks for braces: a registered tag consumes
+/// everything up to its matching close tag, so the content is opaque. `None` for
+/// anything that is not a *closed* extension tag — an unregistered name, a `</`
+/// close tag, or an unclosed one, which the tokenizer treats as text.
+fn skip_extension_tag_at(input: &str, i: usize, ext_tags: &[String]) -> Option<usize> {
+    let rest = input[i..].strip_prefix('<')?;
+    let name_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = rest[..name_len].to_ascii_lowercase();
+    if !ext_tags.contains(&name) {
+        return None;
+    }
+    // The start tag's `>`; a `>` inside a quoted attribute value is content.
+    let mut quote: Option<u8> = None;
+    let mut end = i + 1 + name_len;
+    while end < input.len() {
+        let b = input.as_bytes()[end];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => break,
+            None => {}
+        }
+        end += 1;
+    }
+    if end >= input.len() {
+        return None;
+    }
+    if input[i..end].trim_end().ends_with('/') {
+        return Some(end + 1);
+    }
+    // The matching close tag. Only the lower-case spelling is recognised, which
+    // is what the tokenizer's own extension rule does.
+    let close = format!("</{name}");
+    let rel = input[end + 1..].find(&close)?;
+    let close_start = end + 1 + rel;
+    let gt = input[close_start..].find('>')?;
+    Some(close_start + gt + 1)
 }
 
 /// Memo for one scan, shared by the template and tplarg scanners.
@@ -4817,11 +4881,21 @@ struct ScanMemo {
 /// A lone `{` opens neither, so it is always literal. That guard also keeps
 /// [`skip_tplarg_memo`] honest: it assumes `i + 1` begins `{{{` and slices three
 /// bytes forward, which would split a multi-byte character otherwise.
-fn run1_reads_as_template(input: &str, i: usize, run: usize, memo: &mut ScanMemo) -> bool {
-    run > 1 && skip_tplarg_memo(input, i + 1, memo).is_none()
+fn run1_reads_as_template(
+    input: &str,
+    i: usize,
+    run: usize,
+    ext_tags: &[String],
+    memo: &mut ScanMemo,
+) -> bool {
+    run > 1 && skip_tplarg_memo(input, i + 1, ext_tags, memo).is_none()
 }
 
-fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize> {
+fn find_template_closing_memo(
+    input: &str,
+    ext_tags: &[String],
+    memo: &mut ScanMemo,
+) -> Option<usize> {
     /// Closer pushed by a nested `{{…}}` (and by the template being scanned).
     const TPL: &str = "}}";
     /// Closer pushed by a `[[…]]` wikilink.
@@ -4845,6 +4919,14 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
             && let Some(offset) = input[i + 4..].find("-->")
         {
             i += 4 + offset + 3;
+            continue;
+        }
+        // An extension tag is one opaque piece too (see
+        // [`find_template_closing_with`]).
+        if bytes[i] == b'<'
+            && let Some(end) = skip_extension_tag_at(input, i, ext_tags)
+        {
+            i = end;
             continue;
         }
         match (stack.last(), bytes[i]) {
@@ -4875,7 +4957,7 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
             _ if bytes[i] == b'{' => {
                 let run = input[i..].bytes().take_while(|&b| b == b'{').count();
                 if run % 3 == 0 && stack.last() == Some(&TPL) {
-                    match skip_tplarg_memo(input, i, memo) {
+                    match skip_tplarg_memo(input, i, ext_tags, memo) {
                         Some(end) => i = end,
                         None => i += 1,
                     }
@@ -4892,7 +4974,7 @@ fn find_template_closing_memo(input: &str, memo: &mut ScanMemo) -> Option<usize>
                     // emitted as literal text with only its arguments parsed.
                     stack.push(TPL);
                     i += 2;
-                } else if !run1_reads_as_template(input, i, run, memo) {
+                } else if !run1_reads_as_template(input, i, run, ext_tags, memo) {
                     // `run % 3 == 1`: one `{` is literal and the rest of the run
                     // is reconsidered.
                     i += 1;
@@ -5046,7 +5128,12 @@ fn subst_name(text: &str) -> Option<SubstPrefix> {
 /// The memo must be shared with the enclosing `find_template_closing_memo`: the
 /// two re-enter each other, so a memo local to one call is discarded exactly when
 /// it is needed.
-fn skip_tplarg_memo(input: &str, start: usize, memo: &mut ScanMemo) -> Option<usize> {
+fn skip_tplarg_memo(
+    input: &str,
+    start: usize,
+    ext_tags: &[String],
+    memo: &mut ScanMemo,
+) -> Option<usize> {
     if memo.tplarg_failed.contains(&start) {
         return None;
     }
@@ -5065,7 +5152,7 @@ fn skip_tplarg_memo(input: &str, start: usize, memo: &mut ScanMemo) -> Option<us
         // Nested pieces are skipped as units, so their own `}}`/`]]` cannot be
         // mistaken for this tplarg's boundary.
         if input[i..].starts_with("{{{") {
-            match skip_tplarg_memo(input, i, memo) {
+            match skip_tplarg_memo(input, i, ext_tags, memo) {
                 Some(end) => i = end,
                 None => {
                     memo.tplarg_failed.insert(start);
@@ -5075,7 +5162,7 @@ fn skip_tplarg_memo(input: &str, start: usize, memo: &mut ScanMemo) -> Option<us
             continue;
         }
         if input[i..].starts_with("{{") {
-            match find_template_closing_memo(&input[i + 2..], memo) {
+            match find_template_closing_memo(&input[i + 2..], ext_tags, memo) {
                 Some(end) => i += 2 + end + 2,
                 None => {
                     memo.tplarg_failed.insert(start);
@@ -5106,6 +5193,12 @@ fn skip_tplarg_memo(input: &str, start: usize, memo: &mut ScanMemo) -> Option<us
                     return None;
                 }
             }
+            continue;
+        }
+        if input[i..].starts_with('<')
+            && let Some(end) = skip_extension_tag_at(input, i, ext_tags)
+        {
+            i = end;
             continue;
         }
         i += input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
@@ -6296,7 +6389,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
                     // read as nested — `Template:Infobox football biography`'s
                     // `data196` (a `{{{!}}` table) swallowed the parameters after
                     // it (`| belowstyle = …`).
-                    if skip_tplarg_memo(inner, i, &mut memo).is_none() {
+                    if skip_tplarg_memo(inner, i, &[], &mut memo).is_none() {
                         // Fall through: the first `{` is literal content and the
                         // rest of the run is reconsidered. (Do not `continue` —
                         // that would retest the same run forever.)
@@ -6325,7 +6418,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
                 // two (`{{nowrap|{{{{#ifeq:…}}|…}}}}` became two parameters and
                 // `Template:Unichar` lost its glyph).
                 _ => {
-                    if !run1_reads_as_template(inner, i, run, &mut memo) {
+                    if !run1_reads_as_template(inner, i, run, &[], &mut memo) {
                         // Literal brace: fall through to the generic content arm.
                     } else {
                         braces.push(Brace::Template);
@@ -7738,6 +7831,31 @@ mod tests {
         assert_eq!(find_template_closing("1x|foo"), None);
     }
 
+    /// A registered extension tag is opaque to the brace scan, exactly as the
+    /// tokenizer makes it before the preprocessor runs: `{{reflist|refs=<ref
+    /// name="x"><math>x^{\frac{1}{3}}</math></ref>}}` must close at the final
+    /// `}}`, not at the one inside the formula.
+    #[test]
+    fn test_find_template_closing_skips_extension_tags() {
+        let tags = vec!["math".to_string(), "ref".to_string()];
+        let input = "reflist|refs=<ref name=\"x\"><math>x^{\\frac{1}{3}}</math></ref>}}";
+        assert_eq!(
+            find_template_closing_with(input, &tags),
+            Some(input.len() - 2)
+        );
+        // Without the registry the tag is ordinary text, so the formula's braces
+        // end the call — the behaviour this scan had before.
+        assert_eq!(
+            find_template_closing(input),
+            Some(input.find("}}").unwrap())
+        );
+        // A self-closing tag is one opaque piece too.
+        assert_eq!(
+            find_template_closing_with("t|a=<ref name=\"x\"/>}}", &tags),
+            Some(19)
+        );
+    }
+
     /// Five braces are `{{` + `{{{` (MediaWiki picks the first construct of a run
     /// by `braces % 3`), the `subst` idiom `{{{{{name|safesubst:}}}#invoke:…}}`.
     /// Scanning the argument first swallowed one `}` of the closer and left a
@@ -7765,7 +7883,10 @@ mod tests {
         // A comment nested in a tplarg is skipped there too.
         let mut memo = ScanMemo::default();
         let tplarg = "{{{p|<!-- {{q}} -->x}}}";
-        assert_eq!(skip_tplarg_memo(tplarg, 0, &mut memo), Some(tplarg.len()));
+        assert_eq!(
+            skip_tplarg_memo(tplarg, 0, &[], &mut memo),
+            Some(tplarg.len())
+        );
 
         // An unclosed `<!--` is ordinary text, as the preprocessor's comment
         // rule needs its `-->`; the `}}` after it still closes.
@@ -7791,14 +7912,14 @@ mod tests {
     fn a_failed_tplarg_scan_is_remembered() {
         let source = "{{{partners</td><td>{{if empty</td>";
         let mut memo = ScanMemo::default();
-        assert_eq!(skip_tplarg_memo(source, 0, &mut memo), None);
+        assert_eq!(skip_tplarg_memo(source, 0, &[], &mut memo), None);
         assert!(
             memo.tplarg_failed.contains(&0),
             "a failed offset must be recorded, or the second scan redoes it"
         );
         // The second call short-circuits: same answer, and the memo is not grown.
         let before = memo.tplarg_failed.len();
-        assert_eq!(skip_tplarg_memo(source, 0, &mut memo), None);
+        assert_eq!(skip_tplarg_memo(source, 0, &[], &mut memo), None);
         assert_eq!(memo.tplarg_failed.len(), before);
     }
 
@@ -7807,7 +7928,7 @@ mod tests {
     #[test]
     fn a_successful_tplarg_still_closes() {
         let mut memo = ScanMemo::default();
-        assert_eq!(skip_tplarg_memo("{{{a}}}", 0, &mut memo), Some(7));
+        assert_eq!(skip_tplarg_memo("{{{a}}}", 0, &[], &mut memo), Some(7));
         assert!(memo.tplarg_failed.is_empty());
     }
 
