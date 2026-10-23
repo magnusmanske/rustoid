@@ -19097,3 +19097,21 @@ the cache carries it.
 
 **Effect:** `Albert Einstein` 172,645 → 183,629 (the first difference is now a
 ref name whose attribute value holds an escaped quote).
+
+## Whitespace after a table-start line is content
+
+`{| class="x"  ` — the spaces after the attribute box are the table's first
+text node, and the service serves them: `<table …>  \n<tbody>`. The tokenizer
+consumed them as layout, so every table written that way lost its leading
+whitespace (`List of sovereign states`, `Chess`, and any `{{col-begin}}` block
+— the template's `role="presentation"` line ends in a space because an `#if`
+that expands to nothing sits after it).
+
+Only whitespace that *separates* the attributes from a cell pipe is syntax
+(`{| class="x" |` is a valueless cell). When no pipe follows, the position is
+rewound to the end of the attribute box so the spaces flow into the text
+stream after the table tag.
+
+**Effect:** no corpus first difference moves (the pages that show it differ
+earlier), but the construct now matches the transform endpoint byte-for-byte in
+isolation.

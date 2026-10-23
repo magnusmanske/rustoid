@@ -1436,12 +1436,22 @@ impl<'a> PegTokenizer<'a> {
         let ts_end = self.pos;
 
         self.consume_spaces();
+        let followed_by_pipe = self.starts_with("|");
         // A bare trailing `|` on the start-tag line (e.g. `{| class="123" |`) is
         // a valueless first cell; the tree builder drops empty cells, so absorb
         // it here (mirrors `table_data_tags` matching an empty `<td>` that is
         // later discarded).
         self.consume_empty_cell_pipe();
 
+        // Spaces after the attribute box that are *not* followed by a cell pipe
+        // are content: the service serves `{| class="x"  ` with the two spaces
+        // as the table's first text node (`<table …>  \n<tbody>`). Only spaces
+        // that separate the attributes from a `|` are separator, not text. The
+        // rewound position is picked up as text after the table tag below,
+        // because `emit_token` flushes only what is already buffered.
+        if !followed_by_pipe {
+            self.pos = ts_end;
+        }
         let mut dp = self.make_dp(start, ts_end);
         // `start_tag_src` = `{` + pipe (`{|` or `{{{!}}`).
         let mut start_tag_src = String::from("{");
@@ -7613,6 +7623,32 @@ mod tests {
             .iter()
             .any(|t| matches!(t, Either::Right(ParsoidToken::Tag(tk)) if tk.name == "table"));
         assert!(has_table, "Expected table, got: {:?}", tokens);
+    }
+
+    /// Whitespace after a table-start line's attributes is *content*: the
+    /// service serves `{| class="x"  ` with the two spaces as the table's first
+    /// text node. Only whitespace that separates the attributes from a cell
+    /// pipe is syntax.
+    #[test]
+    fn test_table_start_keeps_trailing_whitespace() {
+        let text_after_table = |input: &str| -> String {
+            let tokens = tokenize(input);
+            let mut seen_table = false;
+            let mut out = String::new();
+            for t in tokens {
+                match t {
+                    Either::Right(ParsoidToken::Tag(tk)) if tk.name == "table" => seen_table = true,
+                    Either::Left(s) if seen_table => out.push_str(&s),
+                    Either::Right(ParsoidToken::Nl(_)) if seen_table => out.push('\n'),
+                    _ => {}
+                }
+            }
+            out
+        };
+        assert_eq!(text_after_table("{| class=\"x\"  \n|}"), "  \n");
+        // A pipe after the spaces is a valueless cell: the spaces separate it.
+        assert_eq!(text_after_table("{| class=\"x\"  |\n|}"), "\n");
+        assert_eq!(text_after_table("{|   \n|}"), "   \n");
     }
 
     #[test]
