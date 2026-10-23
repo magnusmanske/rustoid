@@ -19115,3 +19115,23 @@ stream after the table tag.
 **Effect:** no corpus first difference moves (the pages that show it differ
 earlier), but the construct now matches the transform endpoint byte-for-byte in
 isolation.
+
+## A ref's attribute values are HTML-decoded
+
+Cite records a note's `name`/`group` from the `<ref>` start tag, and MediaWiki
+decodes character references in an attribute value. rustoid kept the source
+spelling, so `<ref name="A &amp; B">` served `"name":"A &amp;amp; B"` where the
+service serves `"name":"A & B"`.
+
+The same tag can also be *synthesized*: `frame:extensionTag`/`#tag:ref` writes
+`<ref name="…">` back out, and a name holding a quote — `{{sfn}}` builds
+`FOOTNOTECalapriceLipscombe2005[https…pgPR19 "Timeline", p. xix]` — ended the
+attribute at the first `"`. The synthesized source now escapes `"` as `&quot;`,
+and Cite decodes the references every attribute value is parsed for (`&quot;`,
+`&apos;`, `&amp;`, `&lt;`, `&gt;`, and the numeric forms). A named entity such
+as `&nbsp;` would need the full HTML table, which lives in the core crate Cite
+cannot depend on; it stays as written, which is the previous behaviour.
+
+**Effect:** `Albert Einstein` 183,629 → 621,072: the `{{sfn}}` note names are
+no longer split into four bogus parameters. No corpus regressions; 5/48 strict,
+5 nondeterministic-only (20.8%).

@@ -868,7 +868,10 @@ fn tag_attrs(attrs: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut rest = attrs;
     while let Some((key, value, consumed)) = next_attr(rest) {
-        out.push((key.to_lowercase(), value.trim().to_string()));
+        out.push((
+            key.to_lowercase(),
+            decode_attr_entities(value).trim().to_string(),
+        ));
         rest = &rest[consumed..];
     }
     out
@@ -895,6 +898,60 @@ fn body_between(source: &str) -> Option<String> {
     let open = source.find('>')?;
     let close = source.rfind("</")?;
     (close > open).then(|| source[open + 1..close].to_string())
+}
+
+/// Decode the character references an HTML attribute value is parsed for.
+///
+/// A ref's start tag reaches Cite as a *source string*: either the page's own
+/// text or the `<ref …>` that `#tag:ref` synthesizes. HTML decoding applies to
+/// both, and the service records the decoded value in `data-mw.attrs` — a note
+/// named `A &amp; B` serves `"name":"A & B"`. Only the references the
+/// synthesizer itself writes (plus the numeric forms) are handled here; a
+/// named entity such as `&nbsp;` needs the full HTML table, which lives in the
+/// core crate this one cannot depend on.
+fn decode_attr_entities(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        let Some(semi) = after.find(';') else {
+            out.push_str(after);
+            return out;
+        };
+        let entity = &after[..=semi];
+        match entity {
+            "&quot;" => out.push('"'),
+            "&apos;" => out.push('\''),
+            "&amp;" => out.push('&'),
+            "&lt;" => out.push('<'),
+            "&gt;" => out.push('>'),
+            _ => match numeric_char_ref(entity) {
+                Some(c) => out.push(c),
+                None => out.push_str(entity),
+            },
+        }
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `&#39;` / `&#x27;` → the character, when the code point is valid.
+fn numeric_char_ref(entity: &str) -> Option<char> {
+    let digits = entity.strip_prefix("&#")?.strip_suffix(';')?;
+    let (radix, digits) = match digits.strip_prefix(['x', 'X']) {
+        Some(hex) => (16, hex),
+        None => (10, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let cp = u32::from_str_radix(digits, radix).ok()?;
+    char::from_u32(cp)
 }
 
 /// A double-quoted, single-quoted or bare attribute value.
@@ -949,7 +1006,7 @@ fn attr_value(attrs: &str, key: &str) -> Option<String> {
             attrs[start..i].to_string()
         };
         if name == key {
-            return Some(value);
+            return Some(decode_attr_entities(&value));
         }
     }
     None

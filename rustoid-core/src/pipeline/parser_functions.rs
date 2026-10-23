@@ -145,7 +145,11 @@ fn serialize_tag_attribs(_display_target: &str, tag_attribs: &[KV]) -> String {
         out.push(' ');
         out.push_str(&name);
         out.push_str("=\"");
-        out.push_str(&value);
+        // The source is re-parsed (Cite reads a ref's start tag from it), so a
+        // value holding a quote must be escaped or it ends the attribute:
+        // `{{#tag:ref|body|name=a "b", p. xix}}` otherwise served four bogus
+        // attributes and a note named `a`.
+        out.push_str(&value.replace('"', "&quot;"));
         out.push('"');
     }
     out
