@@ -2076,6 +2076,13 @@ pub fn compare_html(parsoid: &str, rustoid: &str) -> Outcome {
 /// - **A 14-digit MediaWiki timestamp** (`YYYYMMDDHHMMSS`), as `{{CURRENTTIMESTAMP}}`
 ///   and friends emit. A render's `{{CURRENTYEAR}}`-style drift is a different,
 ///   date-scale change and is left to the harness's `suspect drift` report.
+/// - **A `{{#parsoid\u0000fragment:N}}` marker.** It stands where a stashed
+///   fragment sat in an extension's `extsrc`; the fragment's *content* is in the
+///   document and compared there, while `N` is a process-wide counter in
+///   `PipelineUtils::pFragmentToParsoidFragmentMarkers` that also counts
+///   conversions whose markers never reach the output (`Berlin` emits `N=20`
+///   with exactly one marker on the page). Nothing can recover it without
+///   re-running Parsoid's re-parses, and it is provenance rather than markup.
 ///
 /// The masking is textual and one pass; it never invents structure, only replaces
 /// a span with a fixed placeholder, so the masked forms of the two sides are
@@ -2101,6 +2108,12 @@ fn mask_nondeterministic_counted(html: &str) -> (String, usize) {
         }
         if let Some(after) = match_rand_id(rest) {
             out.push_str("0.@ND@");
+            rest = after;
+            masked += 1;
+            continue;
+        }
+        if let Some(after) = match_fragment_marker(rest) {
+            out.push_str("{{#parsoid@ND@}}");
             rest = after;
             masked += 1;
             continue;
@@ -2143,6 +2156,9 @@ fn nondeterministic_span(s: &str) -> Option<usize> {
     if let Some(after) = match_rand_id(s) {
         return Some(s.len() - after.len());
     }
+    if let Some(after) = match_fragment_marker(s) {
+        return Some(s.len() - after.len());
+    }
     if s.starts_with(|c: char| c.is_ascii_digit()) {
         let n = s.bytes().take_while(u8::is_ascii_digit).count();
         if n == 14 && match_timestamp(s).is_some() {
@@ -2164,6 +2180,25 @@ fn match_rand_id(s: &str) -> Option<&str> {
     let digits = s.strip_prefix("0.")?;
     let n = digits.bytes().take_while(u8::is_ascii_digit).count();
     (n >= 8).then(|| &s[2 + n..])
+}
+
+/// The prefix of Parsoid's fragment marker. The NUL is written as the JSON
+/// escape `\u0000` because the marker lives inside a `data-mw` attribute.
+const FRAGMENT_MARKER: &str = "{{#parsoid\\u0000fragment:";
+
+/// Match a `{{#parsoid\u0000fragment:N}}` marker at the head of `s`, returning
+/// the remainder.
+///
+/// The whole span is consumed, `}}` included, because the two sides' numbers
+/// have different digit counts (`2` against `20`); stepping past the common
+/// prefix alone would leave the digits to differ.
+fn match_fragment_marker(s: &str) -> Option<&str> {
+    let after = s.strip_prefix(FRAGMENT_MARKER)?;
+    let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    after[digits..].strip_prefix("}}")
 }
 
 /// Match a 14-digit `YYYYMMDDHHMMSS` MediaWiki timestamp at the head of `s`,
@@ -2523,6 +2558,23 @@ mod tests {
     fn a_random_inputbox_id_is_masked() {
         let masked = mask_nondeterministic(r#"id="mw-inputbox-ns12-0.465146790607""#);
         assert_eq!(masked, r#"id="mw-inputbox-ns12-0.@ND@""#);
+    }
+
+    /// The fragment marker's number is a process-wide counter that also counts
+    /// conversions whose markers never reach the output, so two renders of the
+    /// same wikitext can number the same marker differently.
+    #[test]
+    fn a_parsoid_fragment_marker_is_masked() {
+        let html = r#"<meta body="{{#parsoid\u0000fragment:20}}"/>"#;
+        assert_eq!(
+            mask_nondeterministic(html),
+            r#"<meta body="{{#parsoid@ND@}}"/>"#
+        );
+        // A marker with no number is not a marker, and must survive.
+        assert_eq!(
+            mask_nondeterministic(r#"{{#parsoid\u0000fragment:}}"#),
+            r#"{{#parsoid\u0000fragment:}}"#
+        );
     }
 
     #[test]

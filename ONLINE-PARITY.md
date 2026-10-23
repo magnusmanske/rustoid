@@ -18976,3 +18976,22 @@ is now flushed alongside the others.
 **Effect:** `Bitcoin` 11,465 → 11,484. The next difference is a trailing space
 `Template:Unichar` leaves inside the transclusion (`</span> )` against
 `</span>)`), which is the whitespace-wrapping frontier rather than data.
+
+## A Parsoid fragment marker is not markup
+
+A `frame:extensionTag` call — a module emitting a templatestyles, an indicator —
+stashes its output as a Parsoid fragment, and the extension's `extsrc` records
+where that fragment sat as `{{#parsoid\u0000fragment:N}}`. `N` comes from
+`PipelineUtils::pFragmentToParsoidFragmentMarkers`'s process-wide counter, which
+also advances on conversions whose markers never reach the output: `Berlin`
+serves `N=20` for a page that contains exactly one marker. Reproducing it would
+mean re-running Parsoid's own re-parses, and the number is provenance rather than
+markup — the fragment's content is in the document and compared there.
+
+The harness now masks the whole marker, digits and `}}` included (the two sides
+number the same marker `2` and `20`, so consuming only the common prefix would
+leave the digit count to differ) and counts it as nondeterministic.
+
+**Effect:** `Canada` (1 region, 1822 KB) is no longer reported as a markup
+difference: its only remaining divergence was this number. 5/48 strict, 5
+nondeterministic-only (20.8%, was 18.8%).
