@@ -19135,3 +19135,16 @@ cannot depend on; it stays as written, which is the previous behaviour.
 **Effect:** `Albert Einstein` 183,629 → 621,072: the `{{sfn}}` note names are
 no longer split into four bogus parameters. No corpus regressions; 5/48 strict,
 5 nondeterministic-only (20.8%).
+
+## A space between two category links is content
+
+Two sol-transparent links separated by a **newline** lose it (T407798), but a
+*space* between them is rendering content: the service serves
+`<link …/><span about="#mwt1"> </span><link …/>`, and because the range then
+holds something visible it is encapsulated on the first link rather than in a
+`mw-empty-elt` wrapper. rustoid deleted any whitespace here, so it also wrapped
+the range — `Nobel Prize`'s two `Category:` links from `{{citation}}` came out
+inside an empty-elt span with no space.
+
+**Effect:** `Nobel Prize` 665,491 → 696,813. No corpus regressions; 5/48
+strict, 5 nondeterministic-only (20.8%).

@@ -2656,6 +2656,12 @@ fn is_deletable_in_range(content: &[Node], idx: usize, parent: Option<&Node>) ->
         && let Some(next) = next
         && crate::html::wts_utils::is_sol_transparent_link(prev)
         && crate::html::wts_utils::is_sol_transparent_link(next)
+        // T407798 deletes a *newline* here. A space between two category links
+        // is rendering content: the service keeps it in its own `about` span
+        // (`<link …/><span about="#mwt1"> </span><link …/>`), and keeping it
+        // also means the range is not "rendering-transparent only", so it is
+        // encapsulated on the first link rather than in an `mw-empty-elt` span.
+        && matches!(&content[idx].kind, NodeKind::Text(t) if t.chars().all(|c| c == '\n'))
     {
         return true;
     }
@@ -4482,12 +4488,19 @@ mod tests {
             None
         ));
 
-        // A newline between two sol-transparent links is deletable (T407798).
+        // A newline between two sol-transparent links is deletable (T407798)…
         let mut l1 = Node::element(ElementKind::Other("link".to_string()));
         l1.set_attr("rel", "mw:PageProp/Category");
         let mut l2 = Node::element(ElementKind::Other("link".to_string()));
         l2.set_attr("rel", "mw:PageProp/Category");
-        assert!(is_deletable_in_range(&[l1, Node::text("\n"), l2], 1, None));
+        assert!(is_deletable_in_range(&[l1.clone(), Node::text("\n"), l2.clone()], 1, None));
+        // …but a space is rendering content, which the service keeps in its own
+        // `about` span (`<link …/><span about="#mwt1"> </span><link …/>`).
+        assert!(!is_deletable_in_range(
+            &[l1, Node::text(" "), l2],
+            1,
+            None
+        ));
 
         // Anything in a fosterable position is deletable outright — the tree
         // builder would already have fostered out any rendering-relevant
