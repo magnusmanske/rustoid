@@ -5005,8 +5005,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// pending entry whose placeholder never reached a token stream is never
     /// drained and spends nothing.
     fn number_style_placeholders(&self, out: &mut [Item], about_counter: &std::cell::Cell<usize>) {
+        // The ids numbered in *this* pass. A template that splices one parameter
+        // value twice puts the same placeholder in the chunk twice; the second
+        // copy is a new occurrence and must be numbered like one.
+        let mut numbered = std::collections::HashSet::new();
         for item in out.iter_mut() {
-            self.number_style_placeholder(item, about_counter);
+            self.number_style_placeholder(item, about_counter, &mut numbered);
         }
     }
 
@@ -5019,6 +5023,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         &self,
         item: &mut Item,
         about_counter: &std::cell::Cell<usize>,
+        numbered_here: &mut std::collections::HashSet<usize>,
     ) -> bool {
         let Item::Tok(ParsoidToken::Tag(t)) = item else {
             return false;
@@ -5041,7 +5046,35 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         else {
             return false;
         };
-        let Some(pending) = self.pending_styles.borrow_mut().remove(&id) else {
+        let pending = self.pending_styles.borrow_mut().remove(&id);
+        let repeated_here = !numbered_here.insert(id);
+        let Some(pending) = pending else {
+            if !repeated_here {
+                return true;
+            }
+            // The same placeholder, twice in one chunk: a template body that
+            // uses one parameter value at two places. The first copy was
+            // numbered above; this one is another occurrence, so it gets its
+            // own copy of the stylesheet and its own `about`. `DedupeStyles`
+            // then serves it as the `<link>` the service emits for a repeated
+            // stylesheet (`Hydrogen`'s second `{{chem2|H}}` lost it, and every
+            // id after it was one behind).
+            let Some(existing) = self.ext_fragments.borrow().get(&id).cloned() else {
+                return true;
+            };
+            let new_id = self.ext_next_id.get();
+            self.ext_next_id.set(new_id + 1);
+            let about = self.new_about_id(about_counter, "templatestyles");
+            let mut node = existing;
+            if let Some(style) = node.children.first_mut() {
+                style.set_attr("about", about);
+            }
+            self.ext_fragments.borrow_mut().insert(new_id, node);
+            for kv in t.attribs.iter_mut() {
+                if kv.key.as_str() == Some("data-fragment-id") {
+                    kv.value = crate::wikitext::tokens_v2::KeyValue::Str(new_id.to_string());
+                }
+            }
             return true;
         };
         let about = self.new_about_id(about_counter, "templatestyles");
@@ -6471,8 +6504,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // lower id. (The `<references>` reaches this pass only because the
             // parser-function branch that produces it deferred its numbering —
             // see the `begin_style_defer` around the branch expansion.)
+            let mut numbered_styles = std::collections::HashSet::new();
             for item in out.iter_mut() {
-                if self.number_style_placeholder(item, about_counter) {
+                if self.number_style_placeholder(item, about_counter, &mut numbered_styles) {
                     continue;
                 }
                 if self.number_indicator_placeholder(item, about_counter) {
