@@ -8496,13 +8496,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             items.insert(0, Item::Tok(ParsoidToken::Nl(nl)));
         }
 
-        // The module's output is expanded in a child of the calling frame. It
-        // carries the calling frame's arguments so that a nested `#invoke` in
-        // the output sees them through `frame:getParent()`: `Module:Unsubst`
-        // returns a template body verbatim, and the `#invoke` inside it needs
-        // the enclosing template's arguments. The title is the calling frame's
-        // too, so a genuine self-invocation still trips the loop guard.
-        let child = frame.new_child(frame.title().clone(), frame.args().args.clone());
+        // The module's output is expanded in a child of the calling frame. This
+        // frame carries *no* arguments: a `{{{…}}}` in the output is literal
+        // wikitext to the service — the preprocessor has already run, and its
+        // re-parse is a parser pass, not a preprocessor one — so expanding it
+        // against the `#invoke` call's arguments resolved a value that named its
+        // own parameter into itself. `Template:Infobox`'s documentation hands
+        // `subheader2={{{subheader2}}}<br/>......` to `{{Parameter names
+        // example}}`, which passes it to `frame.expandTemplate`; the service
+        // serves the one literal `{{{subheader2}}}`, while rustoid re-expanded it
+        // three deep (`…<br/>......<br/>......<br/>......`).
+        //
+        // `frame:getParent()` is a separate path: `expand_invoke` reads the
+        // calling frame's raw arguments for it (see `raw_parent_args`), so a
+        // nested `#invoke` in the output still sees them.
+        let child = frame.new_child(frame.title().clone(), Vec::new());
         // A module's output is wikitext in the calling frame's context, and a
         // template it echoes (`Module:Clade` emits nested `{{clade}}` calls) is
         // expanded with the title-chain loop check stood down: production

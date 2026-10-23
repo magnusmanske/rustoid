@@ -19021,3 +19021,25 @@ that the rewrite drops, and for the replacement's content, while rustoid only
 counts what reaches the document (`#mwt16` against `#mwt15`, then offsets of
 three). No corpus bucket changes; `India` and `Israel` still differ where they
 did.
+
+## A module's output carries no template arguments
+
+A module's returned text is *parsed* output, not template source: the
+preprocessor has already run, and its re-parse has no frame arguments. rustoid
+expanded it in a child of the `#invoke` frame that *carried the call's
+arguments*, so a `{{{…}}}` in the output resolved against them — and a value
+that names its own parameter expanded into itself. `Template:Infobox`'s
+documentation passes `subheader2={{{subheader2}}}<br/>......` through
+`{{Parameter names example}}` into `frame.expandTemplate`; the service serves
+the one literal reference, rustoid three copies of the value
+(`…<br/>......<br/>......<br/>......`).
+
+The output-expansion frame now carries no arguments (its parent is still the
+calling frame, and `expand_invoke` reads that frame's raw arguments for
+`frame:getParent()` separately, so a nested `#invoke` in the output is
+unaffected).
+
+**Effect:** `Template:Infobox`'s documentation renders its sample infobox
+correctly; the page's first difference moves from byte 12,605 to 21,702, where
+the next gap is the missing Pygments highlighting inside `<syntaxhighlight>`.
+No other corpus page changes; 5/48 strict, 5 nondeterministic-only (20.8%).

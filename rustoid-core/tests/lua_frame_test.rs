@@ -493,3 +493,35 @@ async fn a_numeric_return_is_stringified() {
     let html = expand(&[("Module:T", module)], &[], "{{#invoke:T|main}}").await;
     assert!(html.contains("42"), "got: {html}");
 }
+
+/// A `{{{…}}}` in a module's output is literal wikitext, not a reference the
+/// preprocessor expands: the service parses module output in a pass that has no
+/// frame arguments. The output-expansion frame therefore carries none, or a
+/// value that names its own parameter expands into itself —
+/// `Template:Infobox`'s documentation passes
+/// `subheader2={{{subheader2}}}<br/>......` through `frame.expandTemplate`, and
+/// the service serves the one literal reference while rustoid repeated the
+/// value three deep.
+#[tokio::test]
+async fn a_template_argument_reference_in_module_output_is_literal() {
+    let module = r#"
+        local p = {}
+        function p.main(frame)
+            return frame.args.subheader2
+        end
+        return p
+    "#;
+    let html = expand(
+        &[("Module:T", module)],
+        &[],
+        "{{#invoke:T|main|subheader2={{{subheader2}}}}}",
+    )
+    .await;
+    assert!(html.contains("{{{subheader2}}}"), "got: {html}");
+    // Once as text: the call's own `data-parsoid`/`data-mw` spell it too, so the
+    // assertion is on the text the transclusion wrapper carries.
+    assert!(
+        html.contains(">{{{subheader2}}}</span>"),
+        "the reference must not expand into a copy of itself: {html}"
+    );
+}
