@@ -19311,3 +19311,20 @@ calls `{{reflist|colwidth=…}}` without a column count.
 **Effect:** the `reflist-columns-3` class is gone; on the corpus this is
 currently masked by later differences on the same pages (`Nigeria`), and was
 verified with a transform-endpoint probe of `#ifexpr`/`#iferror`.
+
+## A template argument closes around a five-brace run
+
+`skip_tplarg_memo` read a run of `{` greedily — `{{{` first, then `{{` — while
+`find_template_closing_memo` applies MediaWiki's precedence rule (`run % 3`:
+two braces a template, zero an argument, one a literal `{`). In
+`{{{2|{{{{{|safesubst:}}}PAGENAME}}}}}` the five-brace `subst` idiom was read as
+`{{{` + `{{`, so the argument never appeared to close. It degraded to literal
+braces around a bogus `{{2|…}}` transclusion, which rendered
+`Template:2`'s "Unexpected use of template" error where the page shows the
+page name (`Template:OSM relation`'s external-link text on `Nigeria`).
+
+The skip scan now dispatches on the run length with the same rule, including the
+`run % 3 == 1` fallback to a template when the remainder cannot be an argument.
+
+**Effect:** `Nigeria` 1,506,716 → 1,513,421 (93.1%), `France` 832,621 →
+1,023,091. No corpus regressions; 5/48 strict, 7 nondeterministic-only (25.0%).

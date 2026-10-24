@@ -5160,24 +5160,45 @@ fn skip_tplarg_memo(
             return None;
         }
         // Nested pieces are skipped as units, so their own `}}`/`]]` cannot be
-        // mistaken for this tplarg's boundary.
-        if input[i..].starts_with("{{{") {
-            match skip_tplarg_memo(input, i, ext_tags, memo) {
-                Some(end) => i = end,
-                None => {
-                    memo.tplarg_failed.insert(start);
-                    return None;
+        // mistaken for this tplarg's boundary. A run of `{` is read by the same
+        // precedence rule `find_template_closing_memo` applies (`run % 3`: two
+        // braces a template, zero an argument, one a literal `{`). Checking
+        // `{{{` before `{{` mis-read the five-brace `subst` idiom: in
+        // `{{{2|{{{{{|safesubst:}}}PAGENAME}}}}}` it took `{{{{{` as `{{{` plus
+        // `{{`, so the argument never appeared to close and the whole construct
+        // degraded to literal braces around a bogus `{{2|…}}` transclusion
+        // (Template:OSM relation's `safesubst` gymnastics).
+        if input[i..].starts_with('{') {
+            let run = input[i..].bytes().take_while(|&b| b == b'{').count();
+            if run % 3 == 0 {
+                match skip_tplarg_memo(input, i, ext_tags, memo) {
+                    Some(end) => i = end,
+                    None => {
+                        memo.tplarg_failed.insert(start);
+                        return None;
+                    }
                 }
-            }
-            continue;
-        }
-        if input[i..].starts_with("{{") {
-            match find_template_closing_memo(&input[i + 2..], ext_tags, memo) {
-                Some(end) => i += 2 + end + 2,
-                None => {
-                    memo.tplarg_failed.insert(start);
-                    return None;
+            } else if run % 3 == 2 {
+                match find_template_closing_memo(&input[i + 2..], ext_tags, memo) {
+                    Some(end) => i += 2 + end + 2,
+                    None => {
+                        memo.tplarg_failed.insert(start);
+                        return None;
+                    }
                 }
+            } else if run > 1 && skip_tplarg_memo(input, i + 1, ext_tags, memo).is_none() {
+                // `run % 3 == 1`: one `{` is literal and the rest is reconsidered.
+                // When that remainder cannot close as an argument, the run is
+                // `{{` + a nested call (`run1_reads_as_template`).
+                match find_template_closing_memo(&input[i + 3..], ext_tags, memo) {
+                    Some(end) => i += 3 + end + 2,
+                    None => {
+                        memo.tplarg_failed.insert(start);
+                        return None;
+                    }
+                }
+            } else {
+                i += 1;
             }
             continue;
         }
@@ -6883,6 +6904,45 @@ mod tests {
         // Six braces are two arguments, and the split after them still holds.
         let parts = split_template_args("{{{|a|}}}#ifexpr: 1 | YES | NO ");
         assert_eq!(parts, vec!["{{{|a|}}}#ifexpr: 1 ", " YES ", " NO "]);
+    }
+
+    /// A five-brace `subst` idiom inside a template argument's *default* closes
+    /// correctly. The skip scan read a run of `{` greedily (`{{{` then `{{`)
+    /// instead of by MediaWiki's `run % 3` precedence, so
+    /// `{{{2|{{{{{|safesubst:}}}PAGENAME}}}}}` looked unterminated: the outer
+    /// argument degraded to literal braces around a bogus `{{2|…}}`
+    /// transclusion (`Template:OSM relation` on `Nigeria`).
+    #[test]
+    fn a_tplarg_default_closes_around_a_five_brace_run() {
+        let toks = tokenize("{{{2|{{{{{|safesubst:}}}PAGENAME}}}}}");
+        let stt = toks
+            .iter()
+            .find_map(|item| match item {
+                Either::Right(ParsoidToken::SelfclosingTag(t)) if t.name == "templatearg" => {
+                    Some(t)
+                }
+                _ => None,
+            })
+            .expect("a templatearg token, not a template");
+        assert_eq!(stt.attribs.len(), 2, "name and one default: {stt:?}");
+        let KeyValue::Tokens(default) = &stt.attribs[1].value else {
+            panic!(
+                "expected the default to be tokenized, got {:?}",
+                stt.attribs[1]
+            );
+        };
+        assert!(
+            default.iter().any(|item| matches!(
+                item,
+                Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "template"
+            )),
+            "the default's nested call stays a token: {default:?}"
+        );
+        // No template token at top level: the whole thing is one argument.
+        assert!(!toks.iter().any(|item| matches!(
+            item,
+            Either::Right(ParsoidToken::SelfclosingTag(t)) if t.name == "template"
+        )));
     }
 
     /// A template argument's *name* is tokenized like its value, so a nested
