@@ -784,6 +784,28 @@ pub fn build_expanded_attrs(
         dp.tmp.cell_attr_terminator_seen = Some(true);
     }
 
+    // A table start line whose last attribute was a template that expanded to
+    // nothing. Core preprocesses a template body to plain text before Parsoid
+    // tokenizes it, so the space before the call becomes trailing content of the
+    // `{|` line and the tokenizer's `s2:space*` emits it after `<table>`. rustoid
+    // expanded the template after tokenizing, when that space had already been
+    // consumed as an attribute separator; put it back. Only a template *body*
+    // goes through core's preprocessor — a page-level table keeps PHP's
+    // separator behaviour, where the space is lost.
+    let lost_separator = if token_name == "table"
+        && token.data_parsoid().is_some_and(|dp| dp.tmp.synthesized)
+        && old_attrs
+            .last()
+            .is_some_and(|kv| matches!(kv.key, KeyValue::Tokens(_)))
+        && token.get_attribs().last().is_some_and(|kv| {
+            crate::wikitext::token_utils::key_value_to_string(&kv.key).is_empty()
+                && crate::wikitext::token_utils::key_value_to_string(&kv.value).is_empty()
+        }) {
+        table_lost_separator(&token, old_attrs)
+    } else {
+        None
+    };
+
     let mut out = meta_tokens;
     out.push(Item::Tok(token));
     // The attribute-fragment placeholders are children of the token, so the tree
@@ -791,7 +813,29 @@ pub fn build_expanded_attrs(
     // element before it could be unpacked into view.
     out.extend(attr_fragments);
     out.extend(post_nl_toks);
+    if let Some(ws) = lost_separator {
+        out.push(Item::Str(ws));
+    }
     out
+}
+
+/// The whitespace a table start line lost when its last (template) attribute
+/// expanded to nothing.
+fn table_lost_separator(token: &ParsoidToken, old_attrs: &[KV]) -> Option<String> {
+    let dp = token.data_parsoid()?;
+    let tsr = dp.tsr.as_ref()?;
+    let start = tsr.start?;
+    let attr_src = dp.tmp.attr_src.as_deref()?;
+    let start_tag_len = dp.start_tag_src.as_deref().map(str::len).unwrap_or(2);
+    let key_start = old_attrs.last()?.src_offsets.as_ref()?.key_start;
+    let rel = key_start.checked_sub(start + start_tag_len)?;
+    let prefix = attr_src.get(..rel)?;
+    let ws: Vec<char> = prefix
+        .chars()
+        .rev()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect();
+    (!ws.is_empty()).then(|| ws.into_iter().rev().collect())
 }
 
 #[cfg(test)]
@@ -1022,6 +1066,34 @@ mod tests {
             .and_then(|kv| kv.value.as_str())
             .expect("expected data-mw attribute");
         assert!(data_mw.contains("\"attribs\""), "got: {data_mw}");
+    }
+
+    #[test]
+    fn test_table_lost_separator_recovers_the_space_before_an_empty_attribute() {
+        use crate::wikitext::tokens_v2::{DataParsoid, KVSourceRange, SourceRange};
+        let mut dp = DataParsoid::default();
+        dp.tsr = Some(SourceRange::new(0, 34));
+        dp.start_tag_src = Some("{|".to_string());
+        dp.tmp.attr_src = Some(" class=\"x\" {{#if:0|a=1|}} ".to_string());
+        dp.tmp.synthesized = true;
+        let table = SelfclosingTagTk::new("table", vec![], dp);
+        let old = vec![KV {
+            key: KeyValue::Tokens(vec![]),
+            value: KeyValue::Str(String::new()),
+            src_offsets: Some(KVSourceRange {
+                key_start: 13,
+                key_end: 33,
+                value_start: 33,
+                value_end: 33,
+                source: None,
+            }),
+            ksrc: None,
+            vsrc: None,
+        }];
+        assert_eq!(
+            table_lost_separator(&ParsoidToken::SelfclosingTag(table), &old).as_deref(),
+            Some(" ")
+        );
     }
 
     #[test]

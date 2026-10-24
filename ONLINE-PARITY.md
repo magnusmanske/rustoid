@@ -19489,3 +19489,22 @@ The migration is now part of the transclusion wrapping pass.
 
 **Effect:** `Chess` 63,307 → 179,037 and `List of sovereign states` 25,192 →
 41,760; no corpus regressions, 5/48 strict, 7 nondeterministic-only (25.0%).
+
+## A table line keeps the space before an emptied attribute
+
+Core preprocesses a template body to plain text before Parsoid tokenizes it.
+`Template:Col-begin`'s `{| … role="presentation" {{#if:…}}` therefore reaches
+the tokenizer *without* the `#if`: the space before it is now trailing content
+of the `{|` line, and `table_start_tag`'s `s2:space*` emits it after `<table>`
+(`<table …> \n<tbody>`). rustoid tokenized the body first and expanded the
+`#if` afterwards, by which point the space had been consumed as an attribute
+separator.
+
+When a table-start line's last attribute was a template that expanded to an
+empty key and value, the separator whitespace before it is now emitted as text
+after the `<table>` token. This is limited to a token from a template *body*
+(`synthesized`), which is the content core preprocesses; a page-level table
+keeps PHP's separator behaviour.
+
+**Effect:** `Taylor Swift` 487,996 → 2,113,356; no other corpus change, 5/48
+strict, 7 nondeterministic-only (25.0%).
