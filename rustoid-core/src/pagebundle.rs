@@ -326,6 +326,13 @@ fn assign_walk(
                     stored.insert(existing);
                 }
                 None => {
+                    // An empty `id=""` (Parsoid "forcibly resets the ID if it
+                    // is invalid") is dropped before the generated one is
+                    // appended. Replacing it in place left the fresh id *before*
+                    // `about`/`typeof`/`data-mw`, where the service emits it
+                    // last: a `<dfn>` a template wraps has `id=""` from the
+                    // tree builder.
+                    node.attrs.retain(|a| a.key != "id");
                     let fresh = alloc.next_id();
                     node.set_attr("id", fresh.clone());
                     stored.insert(fresh);
@@ -463,6 +470,28 @@ mod tests {
         );
         assert_eq!(root.children[0].get_attr("id"), Some("mwAQ"));
         assert_eq!(root.children[1].get_attr("id"), None);
+    }
+
+    /// An empty `id=""` is replaced by a generated one *last*: the tree
+    /// builder leaves the empty attribute on a template-wrapped element, and
+    /// the service's fresh id follows `about`/`typeof`/`data-mw`.
+    #[test]
+    fn an_empty_id_is_replaced_after_the_other_attributes() {
+        use crate::dom::node::{ElementKind, Node};
+        let mut dfn = Node::element(ElementKind::Other("dfn".into()));
+        dfn.data_mw = Some("{}".into());
+        dfn.set_attr("id", "");
+        dfn.set_attr("about", "#mwt1");
+        dfn.set_attr("typeof", "mw:Transclusion");
+        let mut root = Node::document();
+        root.push_child(dfn);
+        assign_node_ids(&mut root);
+        let keys: Vec<&str> = root.children[0]
+            .attrs
+            .iter()
+            .map(|a| a.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["about", "typeof", "id"]);
     }
 
     /// Two metadata-bearing elements that ask for the same id: the first keeps

@@ -19508,3 +19508,17 @@ keeps PHP's separator behaviour.
 
 **Effect:** `Taylor Swift` 487,996 → 2,113,356; no other corpus change, 5/48
 strict, 7 nondeterministic-only (25.0%).
+
+## An empty id is replaced after the other attributes
+
+Parsoid "forcibly resets the ID if it is invalid", and the generated id is
+appended. A `<dfn>` that a template wraps arrives from the tree builder with an
+empty `id=""`; rustoid kept that attribute in place and replaced its value, so
+the fresh id came *before* `about`/`typeof`/`data-mw` where the service emits
+it last (`<dfn about="#mwt101" typeof="mw:Transclusion" data-mw='…'
+id="mw9w">`).
+
+An empty id is now dropped before the generated one is set.
+
+**Effect:** `Chess` 179,037 → 240,075; no other corpus change, 5/48 strict,
+7 nondeterministic-only (25.0%).
