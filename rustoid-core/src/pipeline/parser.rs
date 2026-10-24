@@ -3209,7 +3209,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 next_id,
             );
             tokens = self
-                .expand_attributes(
+                .expand_attributes_at(
                     frame,
                     tokens,
                     source,
@@ -3217,6 +3217,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     None,
                     &mut fragments,
                     next_id,
+                    0,
+                    in_template,
                 )
                 .await;
             // The body is a *fresh* pipeline (PHP's `sourceToDom` over the tag
@@ -3233,6 +3235,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     about_counter,
                     &mut fragments,
                     next_id,
+                    in_template,
                 )
                 .await;
             tokens = self
@@ -3604,7 +3607,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let next_id = std::cell::Cell::new(0usize);
+        // The document-wide fragment space: a `<templatestyles>` or a gallery
+        // expanded in the body below allocates from it, so a separate counter
+        // here would collide with those ids.
+        let next_id = &self.ext_next_id;
         if source.is_some() {
             tokens = self
                 .expand_templates(
@@ -3625,25 +3631,35 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 tokens,
                 self.config,
                 &mut fragments,
-                &next_id,
+                next_id,
             );
             tokens = self
-                .expand_attributes(
+                .expand_attributes_at(
                     frame,
                     tokens,
                     source,
                     about_counter,
                     None,
                     &mut fragments,
-                    &next_id,
+                    next_id,
+                    0,
+                    in_template,
                 )
                 .await;
         }
+        // Fold in the sub-fragments the expansion stashed in `ext_fragments`
+        // (a gallery is rendered there, in source order).
+        fragments.extend(
+            self.ext_fragments
+                .borrow()
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
         let mut ast = if inline {
-            self.build_inline_fragment(tokens, &mut fragments, &next_id)
+            self.build_inline_fragment(tokens, &mut fragments, next_id)
         } else {
             let stage = TreeBuilderStage::new(false);
             let mut ast =
@@ -3733,6 +3749,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Vec<Node> {
         // Whitespace-normalize the caption in inline context (mirrors PHP's
         // `extArgToDOM`, which does `preg_replace('/[\t\r\n ]/', ' ', $vsrc)` so
@@ -3754,39 +3771,51 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let next_id = std::cell::Cell::new(0usize);
+        // See `process_block_fragment_body`: share the document-wide fragment
+        // space with the nested expansions.
+        let next_id = &self.ext_next_id;
         if source.is_some() {
-            tokens = self
-                .expand_templates(
-                    frame,
-                    tokens,
-                    source,
-                    about_counter,
-                    false,
-                    false,
-                    &caption,
-                    0,
-                )
-                .await;
+            tokens = Box::pin(self.expand_templates(
+                frame,
+                tokens,
+                source,
+                about_counter,
+                in_template,
+                false,
+                &caption,
+                0,
+            ))
+            .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
                 self.config,
                 &mut fragments,
-                &next_id,
+                next_id,
             );
             tokens = self
-                .expand_attributes(
+                .expand_attributes_at(
                     frame,
                     tokens,
                     source,
                     about_counter,
                     None,
                     &mut fragments,
-                    &next_id,
+                    next_id,
+                    0,
+                    in_template,
                 )
                 .await;
         }
-        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &next_id);
+        // A gallery carried in the caption stashes its fragment in
+        // `ext_fragments` (it was rendered during the expansion above); fold a
+        // copy in, as `process_fragment_body` does, so the placeholder resolves.
+        fragments.extend(
+            self.ext_fragments
+                .borrow()
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, next_id);
         std::mem::take(&mut frag.children)
     }
 
@@ -3806,15 +3835,71 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Option<Node> {
         // The trailing `|none` forces the block figure, per `renderMedia`'s
         // `$pieces[] = '|none'`.
         let wikitext = format!("[[{title_str}|{opts_str}|none]]");
-        self.render_inline_wikitext_node(&wikitext, source, frame, about_counter)
+        self.render_inline_wikitext_node(&wikitext, source, frame, about_counter, in_template)
             .await
     }
 
-    /// Render `wikitext` through the inline sub-pipeline and return its single
+    /// Number one chunk's extensions in source order, in TT2's order:
+    /// `<templatestyles>` placeholders, then indicators, then the rich
+    /// extensions, then refs and the rest.
+    ///
+    /// A `<gallery>` is *rendered* here, where it sits, rather than by the
+    /// page-level `expand_gallery` pass: Parsoid's `ExtensionHandler` runs
+    /// `sourceToDom` before it allocates the wrapper's `about`, so a template in
+    /// a gallery caption spends its (discarded) id first and the gallery's own id
+    /// comes after it.
+    async fn number_chunk_extensions(
+        &self,
+        out: Vec<Item>,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
+    ) -> Vec<Item> {
+        let mut numbered_styles = std::collections::HashSet::new();
+        let mut numbered: Vec<Item> = Vec::with_capacity(out.len());
+        for mut item in out {
+            if source.is_some()
+                && let Some(stt) = gallery_target(&item)
+            {
+                let (id, frag) = Box::pin(self.build_gallery_fragment(
+                    stt,
+                    source,
+                    frame,
+                    about_counter,
+                    &self.ext_next_id,
+                    in_template,
+                ))
+                .await;
+                self.ext_fragments.borrow_mut().insert(id, frag);
+                numbered.push(emit_dom_fragment_placeholder(stt, id));
+                continue;
+            }
+            if self.number_style_placeholder(&mut item, about_counter, &mut numbered_styles) {
+                numbered.push(item);
+                continue;
+            }
+            if self.number_indicator_placeholder(&mut item, about_counter) {
+                numbered.push(item);
+                continue;
+            }
+            if self.stamp_rich_extension_about(&mut item, about_counter) {
+                numbered.push(item);
+                continue;
+            }
+            self.number_extension_token(&mut item, source, frame, about_counter)
+                .await;
+            numbered.push(item);
+        }
+        numbered
+    }
+
+    /// Expand `wikitext` through the inline sub-pipeline and return its single
     /// root node.
     ///
     /// Media formats are suppressed, so a media line comes back as the plain
@@ -3829,6 +3914,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         source: Option<&dyn DataSource>,
         frame: &Frame,
         about_counter: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Option<Node> {
         use crate::pipeline::wiki_link_render::{
             WikiLinkContext, get_wiki_link_target_info_for_token, render_wiki_link_dispatched,
@@ -3837,35 +3923,38 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
 
         let mut tokens = self.tokenize(wikitext).ok()?;
         let mut fragments = std::collections::HashMap::new();
-        let next_id = std::cell::Cell::new(0usize);
+        // See `process_block_fragment_body`: share the document-wide fragment
+        // space with the nested expansions.
+        let next_id = &self.ext_next_id;
         if source.is_some() {
-            tokens = self
-                .expand_templates(
-                    frame,
-                    tokens,
-                    source,
-                    about_counter,
-                    false,
-                    false,
-                    wikitext,
-                    0,
-                )
-                .await;
+            tokens = Box::pin(self.expand_templates(
+                frame,
+                tokens,
+                source,
+                about_counter,
+                in_template,
+                false,
+                wikitext,
+                0,
+            ))
+            .await;
             tokens = crate::pipeline::extension_handler::expand_in_attributes(
                 tokens,
                 self.config,
                 &mut fragments,
-                &next_id,
+                next_id,
             );
             tokens = self
-                .expand_attributes(
+                .expand_attributes_at(
                     frame,
                     tokens,
                     source,
                     about_counter,
                     None,
                     &mut fragments,
-                    &next_id,
+                    next_id,
+                    0,
+                    in_template,
                 )
                 .await;
         }
@@ -3904,7 +3993,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     &target,
                     false,
                     &mut fragments,
-                    &next_id,
+                    next_id,
                     &mut |items, f, id| {
                         render_inline_fragment(
                             self.config,
@@ -3920,13 +4009,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 )
             })
             .collect();
-        let tokens = self.render_external_links(tokens, &mut fragments, &next_id, None);
+        let tokens = self.render_external_links(tokens, &mut fragments, next_id, None);
         let mut tokens = self.render_behavior_switches(tokens);
         tokens.push(Item::Tok(ParsoidToken::Eof(
             crate::wikitext::tokens_v2::EOFTk,
         )));
         // Build the inline tree, splicing the caption `mw:dom-fragment-token`
         // placeholders via the fragments map populated by `renderFile`.
+        fragments.extend(
+            self.ext_fragments
+                .borrow()
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
         let stage = TreeBuilderStage::new(true);
         let frag = stage.to_ast_with_fragments(tokens, None, self.config, fragments, None);
         let mut frag = extract_fragment_children(&frag);
@@ -3952,6 +4047,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// through an `mw:dom-fragment-token` placeholder. Uses the shared `next_id`
     /// counter so gallery fragments never collide with `render_links`'s caption
     /// fragments (mirrors PHP's `Gallery::sourceToDom` + extension encapsulation).
+    ///
+    /// This is the *fallback* pass for a gallery produced after expansion. A
+    /// gallery seen while expanding its own chunk is rendered by
+    /// [`Parser::expand_templates`] instead, which is where Parsoid takes its
+    /// `about` id: after the captions, in source order.
+    #[allow(clippy::too_many_arguments)]
     async fn expand_gallery(
         &self,
         tokens: Vec<Item>,
@@ -3960,6 +4061,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         about_counter: &std::cell::Cell<usize>,
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &std::cell::Cell<usize>,
+        in_template: bool,
     ) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
 
@@ -3968,56 +4070,92 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 out.push(item);
                 continue;
             };
-            let mut ul = crate::pipeline::gallery::build_with(
-                stt,
-                self.config,
-                |caption: &str| {
-                    let caption = caption.to_string();
-                    async move {
-                        self.render_caption_expanded(&caption, source, frame, about_counter)
-                            .await
-                    }
-                },
-                |title: &str, opts: &str| {
-                    let title = title.to_string();
-                    let opts = opts.to_string();
-                    async move {
-                        self.render_gallery_media(&title, &opts, source, frame, about_counter)
-                            .await
-                    }
-                },
-            )
-            .await;
-            // The gallery `<ul>` is an extension encapsulation wrapper; it must
-            // carry an `about` id (mirrors PHP's `ExtensionHandler` adding
-            // `about` to extension top-level nodes) so the html2wt serializer
-            // recognizes it as `mw:Extension/gallery` rather than a plain list.
-            // The per-chunk expansion loop stamped the id the gallery would have
-            // been given at its position in the document (see `MW_ABOUT_BASE_ATTR`);
-            // a gallery rendered outside that loop still allocates fresh.
-            if let crate::dom::node::NodeKind::Element(_) = ul.kind {
-                let about = stt
-                    .attribs
-                    .iter()
-                    .find(|kv| {
-                        kv.key.as_str()
-                            == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
-                    })
-                    .and_then(|kv| kv.value.as_str())
-                    .filter(|b| !b.is_empty())
-                    .map(|b| format!("#mwt{b}"))
-                    .unwrap_or_else(|| self.new_about_id(about_counter, "gallery"));
-                ul.set_attr("about", about);
-            }
-            let mut frag = crate::dom::node::Node::document();
-            frag.push_child(ul);
-            let id = next_id.get();
-            next_id.set(id + 1);
+            let (id, frag) = self
+                .build_gallery_fragment(stt, source, frame, about_counter, next_id, in_template)
+                .await;
             fragments.insert(id, frag);
             out.push(emit_dom_fragment_placeholder(stt, id));
         }
 
         out
+    }
+
+    /// Build the `<ul>` fragment for one `<gallery>` token and return it with the
+    /// fragment id it was given.
+    ///
+    /// `in_template` is the enclosing pipeline's `inTemplate`, which Parsoid's
+    /// `renderMedia` inherits when it parses a caption: a `{{…}}` inside a
+    /// caption is unwrapped exactly when the gallery itself sits in a template.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_gallery_fragment(
+        &self,
+        stt: &crate::wikitext::tokens_v2::SelfclosingTagTk,
+        source: Option<&dyn DataSource>,
+        frame: &Frame,
+        about_counter: &std::cell::Cell<usize>,
+        next_id: &std::cell::Cell<usize>,
+        in_template: bool,
+    ) -> (usize, Node) {
+        let mut ul = crate::pipeline::gallery::build_with(
+            stt,
+            self.config,
+            |caption: &str| {
+                let caption = caption.to_string();
+                async move {
+                    self.render_caption_expanded(
+                        &caption,
+                        source,
+                        frame,
+                        about_counter,
+                        in_template,
+                    )
+                    .await
+                }
+            },
+            |title: &str, opts: &str| {
+                let title = title.to_string();
+                let opts = opts.to_string();
+                async move {
+                    self.render_gallery_media(
+                        &title,
+                        &opts,
+                        source,
+                        frame,
+                        about_counter,
+                        in_template,
+                    )
+                    .await
+                }
+            },
+        )
+        .await;
+        // The gallery `<ul>` is an extension encapsulation wrapper; it must
+        // carry an `about` id (mirrors PHP's `ExtensionHandler` adding `about`
+        // to extension top-level nodes) so the html2wt serializer recognizes it
+        // as `mw:Extension/gallery` rather than a plain list.
+        //
+        // The id is taken *after* the captions are rendered, which is Parsoid's
+        // order: `ExtensionHandler` runs `sourceToDom` first and allocates the
+        // wrapper's id in `onDocumentFragment`, so a template in a caption spends
+        // its (discarded) id before the gallery's own.
+        if let crate::dom::node::NodeKind::Element(_) = ul.kind {
+            let about = stt
+                .attribs
+                .iter()
+                .find(|kv| {
+                    kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+                })
+                .and_then(|kv| kv.value.as_str())
+                .filter(|b| !b.is_empty())
+                .map(|b| format!("#mwt{b}"))
+                .unwrap_or_else(|| self.new_about_id(about_counter, "gallery"));
+            ul.set_attr("about", about);
+        }
+        let mut frag = crate::dom::node::Node::document();
+        frag.push_child(ul);
+        let id = next_id.get();
+        next_id.set(id + 1);
+        (id, frag)
     }
 
     /// Build the `<figure>` for one `<imagemap>` tag. Port of
@@ -4047,7 +4185,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // The image as a block figure (`|none`) with formats suppressed.
         let img_wt = format!("[[{}|{}|none]]", parsed.image, parsed.options);
         let mut figure = self
-            .render_inline_wikitext_node(&img_wt, source, frame, about_counter)
+            .render_inline_wikitext_node(&img_wt, source, frame, about_counter, false)
             .await?;
         if !matches!(figure.kind, NodeKind::Element(_)) {
             return None;
@@ -4103,7 +4241,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         let mut default_link: Option<Node> = None;
         for line in &parsed.areas {
             let link_dom = self
-                .render_inline_wikitext_node(&line.link, source, frame, about_counter)
+                .render_inline_wikitext_node(&line.link, source, frame, about_counter, false)
                 .await?;
             let a = find_anchor(&link_dom)?;
             let href = a.get_attr("href")?.to_string();
@@ -4685,7 +4823,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         let mut fragments: std::collections::HashMap<usize, Node> =
             std::collections::HashMap::new();
-        let next_id = std::cell::Cell::new(0usize);
+        // The document-wide fragment space, as in `process_block_fragment_body`:
+        // the expansion can render a gallery into `ext_fragments`.
+        let next_id = &self.ext_next_id;
         tokens = self
             .expand_templates(frame, tokens, source, about_counter, false, false, text, 0)
             .await;
@@ -4693,7 +4833,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             tokens,
             self.config,
             &mut fragments,
-            &next_id,
+            next_id,
         );
         tokens = self
             .expand_attributes(
@@ -4703,10 +4843,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 about_counter,
                 None,
                 &mut fragments,
-                &next_id,
+                next_id,
             )
             .await;
-        let mut frag = self.build_inline_fragment(tokens, &mut fragments, &next_id);
+        fragments.extend(
+            self.ext_fragments
+                .borrow()
+                .iter()
+                .map(|(k, v)| (*k, v.clone())),
+        );
+        let mut frag = self.build_inline_fragment(tokens, &mut fragments, next_id);
         if let Some(src) = source {
             crate::pipeline::add_media_info::run(&mut frag, src, self.config).await;
         }
@@ -5610,6 +5756,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 about_counter,
                 &mut fragments,
                 next_id,
+                false,
             )
             .await;
         let tokens = self
@@ -5788,6 +5935,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // Hand the advanced counter back: ids are allocated in document
             // order, so anything numbered after Cite must continue from here.
             about_counter.set(ids.about_counter());
+        }
+        // A note body is only spliced into the reference list above, so media it
+        // carries was not in the tree for the `AddMediaInfo` pass. Parsoid runs
+        // `media` in *every* nested pipeline (`NESTED_PIPELINE_DOM_TRANSFORMS`),
+        // and Cite in production parses the note through one, so a citation's
+        // licence icon is resolved before the list is assembled. A second pass
+        // is cheap (an already-resolved container no longer has a broken span)
+        // and restores that: without it `Nigeria`'s OGL logo rendered as
+        // `mw-broken-media`.
+        if let Some(source) = source {
+            crate::pipeline::add_media_info::run(&mut ast, source, self.config).await;
         }
         // Cite splices the note bodies into the reference list *after* the
         // link-neighbour pass above, so their links never got their trails
@@ -6504,20 +6662,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // lower id. (The `<references>` reaches this pass only because the
             // parser-function branch that produces it deferred its numbering —
             // see the `begin_style_defer` around the branch expansion.)
-            let mut numbered_styles = std::collections::HashSet::new();
-            for item in out.iter_mut() {
-                if self.number_style_placeholder(item, about_counter, &mut numbered_styles) {
-                    continue;
-                }
-                if self.number_indicator_placeholder(item, about_counter) {
-                    continue;
-                }
-                if self.stamp_rich_extension_about(item, about_counter) {
-                    continue;
-                }
-                self.number_extension_token(item, source, frame, about_counter)
-                    .await;
-            }
+            let out = Box::pin(self.number_chunk_extensions(
+                out,
+                source,
+                frame,
+                about_counter,
+                in_template,
+            ))
+            .await;
             result.extend(out);
         }
         result
@@ -6543,8 +6695,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         };
         if !matches!(
             extension_token_name(t),
-            Some("gallery")
-                | Some("imagemap")
+            Some("imagemap")
                 | Some("phonos")
                 | Some("templatedata")
                 | Some("inputbox")
@@ -7729,6 +7880,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             fragments,
             next_id,
             0,
+            false,
         )
         .await
     }
@@ -7741,6 +7893,10 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// `AttributeTransformManager` expands a value with `attrExpansion` and
     /// `buildExpandedAttrs` runs it through a pipeline that includes the
     /// `AttributeExpander`. `depth` bounds the recursion.
+    ///
+    /// `in_template` is that pipeline's `inTemplate` (a caption of a media inside
+    /// a template inherits it): a template in the value is then unwrapped, but
+    /// still spends its id, as Parsoid's `renderMedia` does.
     #[allow(clippy::too_many_arguments)]
     async fn expand_attributes_at(
         &self,
@@ -7752,6 +7908,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &std::cell::Cell<usize>,
         depth: u8,
+        in_template: bool,
     ) -> Vec<Item> {
         use crate::wikitext::tokens_v2::{KV, KeyValue};
 
@@ -7790,7 +7947,16 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // category link whose target is `{{{pagetype|{{pagetype}}}…}}`
             // otherwise burned one id per page — see `Template:Short
             // description`).
-            let in_tpl = tok.data_parsoid().is_some_and(|dp| dp.tmp.synthesized);
+            //
+            // An `in_template` pipeline (a caption reached from a template)
+            // unwraps the same way but *does* spend the id, which is what
+            // Parsoid's `renderMedia` does when it re-parses the caption.
+            let synthesized = tok.data_parsoid().is_some_and(|dp| dp.tmp.synthesized);
+            let (value_in_template, value_body) = if synthesized {
+                (true, true)
+            } else {
+                (in_template, false)
+            };
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
@@ -7803,7 +7969,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             page_source,
                             fragments,
                             next_id,
-                            in_tpl,
+                            value_in_template,
+                            value_body,
                             depth,
                         )
                         .await;
@@ -7821,7 +7988,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                             page_source,
                             fragments,
                             next_id,
-                            in_tpl,
+                            value_in_template,
+                            value_body,
                             depth,
                         )
                         .await;
@@ -7867,7 +8035,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         page_source: Option<&str>,
         fragments: &mut std::collections::HashMap<usize, Node>,
         next_id: &std::cell::Cell<usize>,
-        in_tpl: bool,
+        in_template: bool,
+        body: bool,
         depth: u8,
     ) -> Vec<Item> {
         // An `extension` token the value already carries keeps rustoid's existing
@@ -7887,8 +8056,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 toks,
                 source,
                 about_counter,
-                in_tpl,
-                in_tpl,
+                in_template,
+                body,
                 page_source.unwrap_or(""),
                 0,
             )
@@ -7923,6 +8092,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 fragments,
                 next_id,
                 depth + 1,
+                in_template,
             ))
             .await
         } else {

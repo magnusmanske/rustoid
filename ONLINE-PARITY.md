@@ -19272,3 +19272,26 @@ space) rather than query encoding.
 
 **Effect:** `Bicycle` 50,557 → 72,978, `Nigeria` 233,636 → 563,010. No corpus
 regressions; 5/48 strict, 6 nondeterministic-only (22.9%).
+
+## A gallery is rendered where it sits, before its captions' ids
+
+Parsoid's `ExtensionHandler` runs an extension's `sourceToDom` first and only
+then allocates the wrapper's `about` id. For a `<gallery>` whose caption holds a
+template (`{{circa|1915}}` in `Bicycle`'s excerpt), the caption template
+therefore spends its (discarded) id *before* the gallery's own — and the caption
+is parsed in a pipeline that inherits the gallery's `inTemplate`, so a template
+there is unwrapped when the gallery itself is inside a template.
+
+rustoid stamped the gallery's id at its chunk position and rendered the gallery
+in a page-level pass, so the caption template was numbered *after* every page id
+(`#mwt804` on `Bicycle`) and wrapped. Galleries are now built in
+`expand_templates`'s per-chunk numbering pass (`number_chunk_extensions`), in
+source order, with the enclosing `in_template` threaded into the caption parse
+(`expand_attributes_at` gained that flag; a caption's media options expand with
+`inTemplate` semantics, spending ids but emitting no wrapper). The fragment
+goes to `ext_fragments`, which every nested tree builder now folds in, and the
+fragment-id counter in those builders is the document-wide one rather than a
+local `Cell` that could collide with it.
+
+**Effect:** `Bicycle` 72,978 → *nondeterministic only* (it now matches the served
+bytes). No corpus regressions; 5/48 strict, 7 nondeterministic-only (25.0%).
