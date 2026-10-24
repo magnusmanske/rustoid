@@ -8407,6 +8407,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         } else {
             expanded
         };
+        // The preprocessor expands a transclusion to text before it is tokenized,
+        // so an entity may be assembled across an expansion boundary.
+        let expanded = crate::pipeline::template_handler::retokenize_entities_across_items(
+            expanded,
+            self.config.extension_tags(),
+        );
 
         // A comment in a template body is dropped. MediaWiki's preprocessor
         // strips comments out of a template's expanded source before it is

@@ -19345,3 +19345,22 @@ for now (the trim would have to run again once the branch is fully expanded).
 
 **Effect:** no corpus change (verified: `Bitcoin` is still at 11,484); the
 transform probe of `{{unichar|…}})` now matches the service exactly.
+
+## An entity assembled across an expansion is recognized
+
+Production Parsoid expands templates through MediaWiki's preprocessor, which
+turns a transclusion into plain *text*, and the tokenizer parses that text
+afterwards. An entity can therefore be assembled on either side of an
+expansion: `Template:Reign` writes `&{{#switch:…|#default=thinsp}};`, and the
+service renders one `<span typeof="mw:Entity">` thin space. rustoid expands the
+parser function token-wise, leaving `&`, `thinsp` and `;` as separate text
+items that never form an entity.
+
+A template body's text runs are now joined and re-tokenized once the body is
+expanded. Only runs of plain text are touched (no `{`, `[`, `<` or `'`): their
+atoms were already tokenized, and a second pass could resurrect constructs the
+expansion had escaped.
+
+**Effect:** `Israel` 176,190 → 242,655 (the first difference moved past the
+`{{Reign}}` template); no corpus regressions, 5/48 strict, 7
+nondeterministic-only (25.0%).

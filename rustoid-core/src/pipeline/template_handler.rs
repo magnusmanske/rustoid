@@ -2224,6 +2224,52 @@ pub fn tokenize_wikitext_to_items_with_sol(
     )
 }
 
+/// Re-tokenize text runs that an expansion split apart, so an entity assembled
+/// across the boundary is recognized.
+///
+/// MediaWiki's preprocessor expands a transclusion to plain *text* and Parsoid
+/// tokenizes that text afterwards, so `&{{#switch:…|#default=thinsp}};` in a
+/// template source (as in `Template:Reign`) is one `&thinsp;` by the time the
+/// tokenizer sees it. rustoid expands the parser function token-wise and leaves
+/// `&`, `thinsp` and `;` in separate text items, which never form an entity.
+/// Only *plain* text runs are re-tokenized: a run holding leftover markup
+/// characters had its atoms tokenized already, and a second pass could
+/// resurrect constructs the expansion had escaped.
+pub fn retokenize_entities_across_items(items: Vec<Item>, ext_tags: &[String]) -> Vec<Item> {
+    fn flush(run: &mut Vec<Item>, out: &mut Vec<Item>, ext_tags: &[String]) {
+        if run.len() < 2 {
+            out.append(run);
+            return;
+        }
+        let text: String = run
+            .iter()
+            .filter_map(|item| match item {
+                Item::Str(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        if text.contains('&') && !text.contains(['{', '[', '<', '\'']) {
+            out.extend(tokenize_branch_fragment(&text, ext_tags, false, false));
+        } else {
+            out.append(run);
+        }
+        run.clear();
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    let mut run = Vec::new();
+    for item in items {
+        if matches!(item, Item::Str(_)) {
+            run.push(item);
+            continue;
+        }
+        flush(&mut run, &mut out, ext_tags);
+        out.push(item);
+    }
+    flush(&mut run, &mut out, ext_tags);
+    out
+}
+
 /// Tokenize a parser-function branch whose text is spliced into the enclosing
 /// source at the call's position.
 ///
@@ -3247,6 +3293,45 @@ mod tests {
         assert!(
             out.iter()
                 .any(|it| matches!(it, Item::Str(s) if s == "world"))
+        );
+    }
+
+    #[test]
+    fn an_entity_assembled_across_items_is_recognized() {
+        // `Template:Reign` writes `&{{#switch:…|#default=thinsp}};`; the
+        // preprocessor answers the text `&thinsp;`, which the tokenizer sees as
+        // one entity. Token-wise expansion leaves the pieces apart.
+        let items = vec![
+            Item::Str("r.".to_string()),
+            Item::Str("&".to_string()),
+            Item::Str("thinsp".to_string()),
+            Item::Str(";".to_string()),
+            Item::Str("634".to_string()),
+        ];
+        let out = retokenize_entities_across_items(items, &[]);
+        assert!(
+            out.iter().any(|it| matches!(
+                it,
+                Item::Tok(ParsoidToken::Tag(t))
+                    if t.name == "span"
+                        && t.attribs.iter().any(|kv| kv.key.as_str() == Some("typeof")
+                            && kv.value.as_str() == Some("mw:Entity"))
+            )),
+            "the entity should be recognized: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_holding_markup_is_left_alone() {
+        let items = vec![
+            Item::Str("&".to_string()),
+            Item::Str("thinsp;[[Foo]]".to_string()),
+        ];
+        let out = retokenize_entities_across_items(items, &[]);
+        assert!(
+            out.iter()
+                .all(|it| !matches!(it, Item::Tok(ParsoidToken::Tag(_)))),
+            "a run with markup must not be re-tokenized: {out:?}"
         );
     }
 }
