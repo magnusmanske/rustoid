@@ -19436,3 +19436,23 @@ expanded parts.
 
 **Effect:** `Bitcoin` 197,352 → 240,631; no other corpus change, 5/48 strict,
 7 nondeterministic-only (25.0%).
+
+## A table assembled mid-line starts on its own line
+
+A parser-function branch is spliced into the enclosing source at the call's
+position, so a run of its text that starts mid-line normally has no block
+syntax on its first line. A `{|` is the exception: core's T2529 puts a nested
+expansion that begins with a table marker on a line of its own.
+`Template:Infobox country/formernext` builds its flag row that way inside an
+infobox cell, and the marker was assembled from two items (`{{{!}}` becomes
+`{` + `|`), so it only appeared after the text run was joined — the branch
+re-tokenizer checked each item, not the run.
+
+The run is now inspected after joining: a first line that begins with `{|`
+re-tokenizes at start of line and gets the T2529 newline the service's output
+carries (`<td …>\n<table …>`).
+
+**Effect:** `Commonwealth of Nations` 75,090 → 76,137 (the nested table is
+parsed; the next difference is one extra newline in the empty branches above
+the inner table's end). No corpus regressions; 5/48 strict, 7
+nondeterministic-only (25.0%).

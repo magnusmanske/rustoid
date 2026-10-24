@@ -1632,10 +1632,19 @@ fn re_tokenize_text_branch_inner(
             }
         }
         let mut lines = text.lines();
-        if !(at_line_start || text.starts_with('\n')) {
-            lines.next();
-        }
-        let line_trigger = lines.any(|line| syntax.triggers(line));
+        let mid_line = !(at_line_start || text.starts_with('\n'));
+        // A run that starts mid-line usually has no block syntax on its first
+        // line — a leading `|`/`!` there is content. A `{|` is different: core's
+        // T2529 puts a nested expansion that begins with a table marker on a
+        // line of its own, so the table starts even when the call sat mid-line
+        // (`Template:Infobox country/formernext` builds its flag row inside a
+        // cell). The marker may be assembled from several items — `{{{!}}`
+        // becomes `{` + `|` — so it only appears after the run is joined.
+        let first_line_table = mid_line
+            && lines
+                .next()
+                .is_some_and(|line| line.trim_start_matches(' ').starts_with("{|"));
+        let line_trigger = first_line_table || lines.any(|line| syntax.triggers(line));
         let retokenize = force
             || match syntax {
                 // Core answers the branch as a string and re-parses all of it, so
@@ -1646,10 +1655,19 @@ fn re_tokenize_text_branch_inner(
                 BranchSyntax::TableOnly => line_trigger,
             };
         if retokenize {
+            if first_line_table {
+                // T2529's newline, which the service's output carries before the
+                // table (`<td …>\n<table …>`).
+                out.push(Item::Tok(ParsoidToken::Nl(
+                    crate::wikitext::tokens_v2::NlTk::new(
+                        crate::wikitext::tokens_v2::SourceRange::new(0, 0),
+                    ),
+                )));
+            }
             out.extend(crate::pipeline::template_handler::tokenize_branch_fragment(
                 &text,
                 ext_tags,
-                at_line_start,
+                at_line_start || first_line_table,
                 table_data_block,
             ));
             run.clear();
