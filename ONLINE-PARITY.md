@@ -19456,3 +19456,19 @@ carries (`<td …>\n<table …>`).
 parsed; the next difference is one extra newline in the empty branches above
 the inner table's end). No corpus regressions; 5/48 strict, 7
 nondeterministic-only (25.0%).
+
+## A bare ampersand is not wikitext markup
+
+A media option's `mw:ExpandedAttrs` marking mirrors PHP's
+`$expOpt = is_array($origOptSrc)`: the option was written as tokens, not a plain
+string. rustoid also marked an `alt=` whose *text* contained a character that
+could start markup — including `&`. `Module:Multiple image` builds its gallery
+lines from strings, so `alt=Smokey Robinson & the Miracles` is plain text and
+the service leaves the container unmarked; rustoid marked it, adding a
+`mw:ExpandedAttrs` to every gallery image.
+
+Only a character reference (`&name;` / `&#n;`) counts now, matching the entity
+token PHP's test sees.
+
+**Effect:** `The Beatles` 511,996 → 610,403; no other corpus change, 5/48
+strict, 7 nondeterministic-only (25.0%).

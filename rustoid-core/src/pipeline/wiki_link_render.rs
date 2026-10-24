@@ -1333,13 +1333,6 @@ fn parse_media_options(ctx: &WikiLinkContext, token: &ParsoidToken) -> MediaOpti
         // Whether this part's raw source is a token array (i.e. it contained a
         // template/entity, not a plain string). Used to detect `mw:ExpandedAttrs`
         // on *options* (not captions), mirroring PHP's `is_array($origOptSrc)`.
-        //
-        // A list of plain strings is a string for that purpose. The tokenizer
-        // keeps `alt={{{alt|}}}` as a token list even when the argument expands
-        // to nothing, and core preprocesses a template body (which is where this
-        // image sits) before Parsoid ever tokenizes it, so the service sees
-        // `alt=` — a plain string, not an array, and not `mw:ExpandedAttrs`.
-        // A page-level `alt={{Foo}}` keeps its wrapper tokens and is unaffected.
         let is_token_array = matches!(
             kv.value,
             crate::wikitext::tokens_v2::KeyValue::Tokens(ref items)

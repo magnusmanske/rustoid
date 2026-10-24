@@ -187,9 +187,13 @@ pub fn strip_quote_markers(value: &str) -> String {
 /// `data-mw.attribs`). Mirrors PHP `renderFile`'s `$expOpt = is_array($origOptSrc)`
 /// for non-`link` options: any entity, quote, link, template, or extension-tag
 /// token qualifies.
+///
+/// A bare `&` is not an entity token — `Smokey Robinson & the Miracles` is plain
+/// text, so the service does not mark the container (`Module:Multiple image`
+/// builds its gallery line from strings). Only `&…;` counts.
 pub fn has_wikitext_markup(value: &str) -> bool {
     value.contains("''")
-        || value.contains("&")
+        || holds_entity(value)
         || value.contains("[[")
         || value.contains("{{")
         || value.contains("<!--")
@@ -198,6 +202,23 @@ pub fn has_wikitext_markup(value: &str) -> bool {
         || value.contains("<NOWIKI")
         || value.contains("<ref")
         || value.contains("<REF")
+}
+
+/// Whether `value` holds an HTML character reference (`&name;` / `&#n;`).
+fn holds_entity(value: &str) -> bool {
+    let mut rest = value;
+    while let Some(i) = rest.find('&') {
+        let after = &rest[i + 1..];
+        let Some(semi) = after.find(';') else {
+            return false;
+        };
+        let body = &after[..semi];
+        if !body.is_empty() && body.chars().all(|c| c.is_ascii_alphanumeric() || c == '#') {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// Classify a media option string. Mirrors PHP's `getOptionInfo` for the
@@ -457,6 +478,7 @@ mod tests {
     fn test_has_wikitext_markup() {
         assert!(has_wikitext_markup("''x''"));
         assert!(has_wikitext_markup("&amp;amp;"));
+        assert!(!has_wikitext_markup("Smokey Robinson & the Miracles"));
         assert!(has_wikitext_markup("<nowiki>''x''</nowiki>"));
         assert!(!has_wikitext_markup("plain"));
     }
