@@ -19328,3 +19328,20 @@ The skip scan now dispatches on the run length with the same rule, including the
 
 **Effect:** `Nigeria` 1,506,716 → 1,513,421 (93.1%), `France` 832,621 →
 1,023,091. No corpus regressions; 5/48 strict, 7 nondeterministic-only (25.0%).
+
+## A conditional's branch trims through a comment
+
+`#if`/`#ifexpr`/`#iferror`/`#ifexist` answer `trim($frame->expand(…))`, and the
+trim runs on the expanded *string*, where a comment has already vanished. A
+branch ending `text <!--c-->` is therefore `text`, not `text `.
+`Template:Unichar/main`'s else branch ends exactly like that, with the space
+before a comment that follows an empty `{{Unichar/notes}}` call, so
+`{{unichar|20BF|BITCOIN SIGN|html=}})` kept a space before its bracket.
+
+`trim_item_edges` now skips comment tokens at the edges, as `Frame::trim_items`
+already does. This matters at top level; in an argument value the nested calls
+are still expanded after the trim, so `Bitcoin`'s infobox cell keeps the space
+for now (the trim would have to run again once the branch is fully expanded).
+
+**Effect:** no corpus change (verified: `Bitcoin` is still at 11,484); the
+transform probe of `{{unichar|…}})` now matches the service exactly.

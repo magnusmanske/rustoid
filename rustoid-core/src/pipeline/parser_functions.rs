@@ -1662,7 +1662,13 @@ fn trim_item_edges(items: &mut Vec<Item>) {
                 }
                 start += 1;
             }
-            Item::Tok(ParsoidToken::Nl(_)) => start += 1,
+            // A comment never reaches the output, so it cannot stop the trim.
+            // Core trims the *expanded string*, where `<!--…-->` is already
+            // gone: a branch ending `text <!--c-->` is `text`, not `text `.
+            // `Template:Unichar/main`'s else branch ends in exactly that, after
+            // an empty `{{Unichar/notes}}`, and the surviving space gave
+            // `{{unichar|…}})` a space before the bracket on `Bitcoin`.
+            Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => start += 1,
             _ => break,
         }
     }
@@ -1680,7 +1686,7 @@ fn trim_item_edges(items: &mut Vec<Item>) {
                 }
                 items.pop();
             }
-            Item::Tok(ParsoidToken::Nl(_)) => {
+            Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => {
                 items.pop();
             }
             _ => break,
@@ -2469,6 +2475,33 @@ mod tests {
     /// Core's `#ifexpr` catches the expression error and answers the error
     /// markup itself rather than a branch, which is what makes
     /// `{{#iferror:{{#ifexpr: 30em>1}}|ERR|OK}}` answer `ERR`.
+    /// A branch's edges are trimmed through comments, which never reach the
+    /// output: `text <!--c-->` is `text`, as core trims the expanded *string*.
+    #[test]
+    fn a_branch_trims_through_a_trailing_comment() {
+        use crate::wikitext::tokens_v2::{CommentTk, DataParsoid, ParsoidToken};
+
+        let mut items = vec![
+            Item::Str(" x ".to_string()),
+            Item::Tok(ParsoidToken::Comment(CommentTk::new(
+                "c",
+                DataParsoid::default(),
+            ))),
+        ];
+        trim_item_edges(&mut items);
+        assert_eq!(items, vec![Item::Str("x".to_string())]);
+
+        let mut items = vec![
+            Item::Tok(ParsoidToken::Comment(CommentTk::new(
+                "c",
+                DataParsoid::default(),
+            ))),
+            Item::Str(" y".to_string()),
+        ];
+        trim_item_edges(&mut items);
+        assert_eq!(items, vec![Item::Str("y".to_string())]);
+    }
+
     #[test]
     fn test_pf_ifexpr_propagates_an_expression_error() {
         let out =
