@@ -19381,3 +19381,22 @@ follows (and reports the value offsets from after the `=`).
 `List of sovereign states` and `Taylor Swift` is the newline placement around
 the implicit `<tbody>`); the transform probe for
 `{| class="x" {{#if:0||}} ` now matches the service exactly.
+
+## A trimmed branch is trimmed again after expansion
+
+`#if`/`#ifeq`/`#ifexpr`/`#iferror` answer `trim($frame->expand(…))`, and the
+trim runs on the *expanded* string. rustoid trims the branch before expanding
+it, so whitespace that only reaches an edge once a nested call answers nothing
+survived: `Template:Unichar/main`'s `#ifexpr` branch ends with
+` {{Unichar/notes}}`, the notes call is empty, and the trailing space stayed —
+`{{unichar|…}})` rendered a space before the bracket on `Bitcoin`.
+
+The branch's expanded result is now trimmed at its trailing edge, skipping
+comments (which have already vanished when core trims). A newline token is
+deliberately *not* trimmed there: rustoid expands a branch in more than one
+stage, so a newline at that stage's edge may still be followed by content in
+the finished branch — trimming it removed the line break before `{{Compact
+ToC}}`'s list on `List of sovereign states`.
+
+**Effect:** `Bitcoin` 11,484 → 147,568; no other corpus change, 5/48 strict,
+7 nondeterministic-only (25.0%).

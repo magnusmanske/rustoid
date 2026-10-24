@@ -1648,7 +1648,7 @@ impl ParserFunctions {
 /// `{{#switch:other|other|#default=\n}}` used to answer a newline where the
 /// service answers nothing — and inside `Template:Main other` that newline is
 /// what left a stray `<span about="#mwtN"> </span>` on `Help:Introduction`.
-fn trim_item_edges(items: &mut Vec<Item>) {
+pub(crate) fn trim_item_edges(items: &mut Vec<Item>) {
     let mut start = 0;
     while start < items.len() {
         match &mut items[start] {
@@ -1687,6 +1687,40 @@ fn trim_item_edges(items: &mut Vec<Item>) {
                 items.pop();
             }
             Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => {
+                items.pop();
+            }
+            _ => break,
+        }
+    }
+}
+
+/// The trailing half of [`trim_item_edges`] for a branch that has already been
+/// expanded.
+///
+/// Core trims the expanded string, so whitespace that only reaches the edge
+/// because a nested call answered nothing is trimmed too: `Template:Unichar/main`
+/// ends its `#ifexpr` branch with ` {{Unichar/notes}}`, and the space before the
+/// empty notes call must not survive.
+///
+/// Unlike the pre-expansion trim this leaves a newline token alone. rustoid
+/// expands a branch in more than one stage (an argument value's own templates
+/// are expanded later), so a newline at *this* stage's edge may still be
+/// followed by content in the finished branch; dropping it removed the line
+/// break the list handler needs (`List of sovereign states`' `{{Compact ToC}}`).
+pub(crate) fn trim_item_edges_str(items: &mut Vec<Item>) {
+    while let Some(last) = items.last_mut() {
+        match last {
+            Item::Str(s) => {
+                let trimmed = s.trim_end_matches(php_trim_char);
+                if trimmed.len() != s.len() {
+                    *s = trimmed.to_string();
+                }
+                if !s.is_empty() {
+                    break;
+                }
+                items.pop();
+            }
+            Item::Tok(ParsoidToken::Comment(_)) => {
                 items.pop();
             }
             _ => break,

@@ -7534,6 +7534,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 };
                 let mut expanded = expanded;
                 if branch_is_text {
+                    // Core trims the *expanded* branch (`trim($frame->expand(…))`),
+                    // so whitespace that only becomes an edge after a nested
+                    // template answers nothing goes too: `Template:Unichar/main`
+                    // ends its `#ifexpr` branch with ` {{Unichar/notes}}`, and the
+                    // space before the (empty) notes call must not survive.
+                    crate::pipeline::parser_functions::trim_item_edges_str(&mut expanded);
                     // The branch answers a *string* in core, which the parser
                     // re-tokenizes: table/list syntax it produces must be
                     // recognized, and its wikitext targets were resolved before
