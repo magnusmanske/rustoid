@@ -19472,3 +19472,20 @@ token PHP's test sees.
 
 **Effect:** `The Beatles` 511,996 → 610,403; no other corpus change, 5/48
 strict, 7 nondeterministic-only (25.0%).
+
+## A table range's leading newline moves into `<tbody>`
+
+A transclusion that starts inside a table tokenizes to
+`<table> "\n" meta meta "\n" <tbody>`. PHP's `DOMRangeBuilder::getDOMRange`
+treats a range that starts in a fosterable position specially: the non-element
+nodes between the start marker and the next element migrate into that element
+when it is a `<tbody>`/`<tr>` (or when there is no whitespace at all). That is
+where the service's `<tbody>\n<tr>` line break comes from — the newline after
+the start marker ends up as the tbody's first child. rustoid left it before
+the tbody, so every `{{Col-begin}}`/`{{Col-break}}` table had
+`<table …>\n\n\n<tbody><tr>` where the service has `<table …>\n\n<tbody>\n<tr>`.
+
+The migration is now part of the transclusion wrapping pass.
+
+**Effect:** `Chess` 63,307 → 179,037 and `List of sovereign states` 25,192 →
+41,760; no corpus regressions, 5/48 strict, 7 nondeterministic-only (25.0%).

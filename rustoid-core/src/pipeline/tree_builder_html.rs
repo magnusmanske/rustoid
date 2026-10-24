@@ -1953,6 +1953,42 @@ fn wrap_transclusion_children(
             continue;
         }
 
+        // PHP's `getDOMRange`: a range that starts in a fosterable position (a
+        // child of a table/tbody/tr) has only whitespace and comments between
+        // its start marker and the next element. When that element is a
+        // `<tbody>`/`<tr>` (or there is no whitespace at all), PHP migrates the
+        // nodes into it. That is what puts the line break *inside* `<tbody>`:
+        // `{{Col-begin}}{{Col-break}}` tokenizes to
+        // `<table> "\n" meta meta "\n" <tbody>`, and the second newline ends
+        // up as the tbody's first child (`<tbody>\n<tr>`).
+        if parent.is_some_and(|p| {
+            matches!(p.kind, NodeKind::Element(_))
+                && crate::wikitext::consts::fosterable_position()
+                    .contains(&crate::html::wts_utils::node_name(p))
+        }) && children
+            .get(i + 1)
+            .is_some_and(|n| !matches!(n.kind, NodeKind::Element(_)))
+        {
+            let mut j = i + 1;
+            let mut no_ws = true;
+            while j < children.len() && !matches!(children[j].kind, NodeKind::Element(_)) {
+                if matches!(children[j].kind, NodeKind::Text(_)) {
+                    no_ws = false;
+                }
+                j += 1;
+            }
+            if j < children.len() {
+                let new_start = crate::html::wts_utils::node_name(&children[j]);
+                if no_ws || new_start == "tbody" || new_start == "tr" {
+                    let moved: Vec<Node> = children.drain(i + 1..j).collect();
+                    let target = &mut children[i + 1];
+                    for (k, n) in moved.into_iter().enumerate() {
+                        target.children.insert(k, n);
+                    }
+                }
+            }
+        }
+
         // A range the plan marked absorbed (nested in, or overlap-merged into,
         // another range) is not encapsulated on its own: PHP removes both marker
         // metas in `findTopLevelNonOverlappingRanges` and leaves the content
@@ -4465,6 +4501,42 @@ mod tests {
     }
 
     #[test]
+    fn test_a_table_range_start_migrates_whitespace_into_tbody() {
+        // `{{Col-begin}}{{Col-break}}` tokenizes to
+        // `<table> "\n" meta(End) meta(Start) "\n" <tbody>`. PHP's
+        // `DOMRangeBuilder::getDOMRange` moves the non-element nodes after the
+        // start marker into the following `<tbody>`/`<tr>`, which is where the
+        // service's `<tbody>\n<tr>` line break comes from.
+        let mut start = Node::element(ElementKind::Other("meta".to_string()));
+        start.set_attr("typeof", "mw:Transclusion");
+        start.set_attr("about", "#mwt3");
+
+        let mut tbody = Node::element(ElementKind::Other("tbody".to_string()));
+        let mut tr = Node::element(ElementKind::Other("tr".to_string()));
+        tr.push_child(Node::element(ElementKind::Other("td".to_string())));
+        tbody.push_child(tr);
+
+        let mut table = Node::element(ElementKind::Table);
+        table.push_child(Node::text("\n"));
+        table.push_child(start);
+        table.push_child(Node::text("\n"));
+        table.push_child(tbody);
+
+        let out = wrap_transclusion_children(
+            table.children.clone(),
+            None,
+            Some(&table),
+            &RangePlan::default(),
+        );
+        assert_eq!(out.len(), 3, "{out:?}");
+        let tbody = &out[2];
+        assert_eq!(crate::html::wts_utils::node_name(tbody), "tbody");
+        assert_eq!(tbody.children.len(), 2, "{tbody:?}");
+        assert!(matches!(tbody.children[0].kind, NodeKind::Text(ref s) if s == "\n"));
+        assert_eq!(crate::html::wts_utils::node_name(&tbody.children[1]), "tr");
+    }
+
+    #[test]
     fn test_is_deletable_in_range() {
         // A newline between a div and a table is deletable (T370751).
         assert!(is_deletable_in_range(
@@ -4493,14 +4565,14 @@ mod tests {
         l1.set_attr("rel", "mw:PageProp/Category");
         let mut l2 = Node::element(ElementKind::Other("link".to_string()));
         l2.set_attr("rel", "mw:PageProp/Category");
-        assert!(is_deletable_in_range(&[l1.clone(), Node::text("\n"), l2.clone()], 1, None));
-        // …but a space is rendering content, which the service keeps in its own
-        // `about` span (`<link …/><span about="#mwt1"> </span><link …/>`).
-        assert!(!is_deletable_in_range(
-            &[l1, Node::text(" "), l2],
+        assert!(is_deletable_in_range(
+            &[l1.clone(), Node::text("\n"), l2.clone()],
             1,
             None
         ));
+        // …but a space is rendering content, which the service keeps in its own
+        // `about` span (`<link …/><span about="#mwt1"> </span><link …/>`).
+        assert!(!is_deletable_in_range(&[l1, Node::text(" "), l2], 1, None));
 
         // Anything in a fosterable position is deletable outright — the tree
         // builder would already have fostered out any rendering-relevant
