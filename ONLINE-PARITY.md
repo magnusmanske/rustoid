@@ -19364,3 +19364,20 @@ expansion had escaped.
 **Effect:** `Israel` 176,190 → 242,655 (the first difference moved past the
 `{{Reign}}` template); no corpus regressions, 5/48 strict, 7
 nondeterministic-only (25.0%).
+
+## A valueless table attribute keeps its trailing spaces
+
+`parse_table_attribute` consumed the whitespace after an attribute name whether
+or not a `=` followed. PHP's `vd:(optional_spaces "=" …)?` backtracks both, so
+`{| class="x" {{#if:…}} ` keeps the space after the (empty) template attribute
+as the table's first text node; the service serves `<table …> \n`. rustoid
+dropped it, which was the first difference on every `col-begin` table
+(`<table …>\n\n<tbody>` where the service has `<table …> \n<tbody>`).
+
+The attribute parser now rewinds to the end of the name when no separator
+follows (and reports the value offsets from after the `=`).
+
+**Effect:** no corpus change on its own (the next difference on `Chess`,
+`List of sovereign states` and `Taylor Swift` is the newline placement around
+the implicit `<tbody>`); the transform probe for
+`{| class="x" {{#if:0||}} ` now matches the service exactly.

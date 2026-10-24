@@ -1989,6 +1989,11 @@ impl<'a> PegTokenizer<'a> {
         let name = self.parse_table_attribute_name(cell_arg)?;
         let name_end = self.pos;
 
+        // PHP's `vd:(optional_spaces "=" …)?` backtracks both the spaces and
+        // the `=` when there is no value. Consuming the spaces unconditionally
+        // swallowed the text after a valueless attribute: `{| … {{#if:…}} `
+        // lost its trailing space, which the service keeps as the table's
+        // first text node.
         self.consume_spaces();
 
         // See `parse_one_attribute`: core preprocessed `{{=}}` into `=`.
@@ -1999,8 +2004,12 @@ impl<'a> PegTokenizer<'a> {
         } else {
             0
         };
+        if sep_len == 0 {
+            self.pos = name_end;
+        }
         if sep_len > 0 {
             self.advance(sep_len);
+            let value_start = self.pos;
             let val = self
                 .parse_table_att_value(cell_arg)
                 .unwrap_or(KeyValue::Str(String::new()));
@@ -2010,7 +2019,7 @@ impl<'a> PegTokenizer<'a> {
                 src_offsets: Some(KVSourceRange {
                     key_start: name_start,
                     key_end: name_end,
-                    value_start: name_end + sep_len,
+                    value_start,
                     value_end: self.pos,
                     source: None,
                 }),
@@ -7709,6 +7718,9 @@ mod tests {
         // A pipe after the spaces is a valueless cell: the spaces separate it.
         assert_eq!(text_after_table("{| class=\"x\"  |\n|}"), "\n");
         assert_eq!(text_after_table("{|   \n|}"), "   \n");
+        // A space after a valueless (templated) attribute is content, not a
+        // separator: PHP's `(optional_spaces "=" …)?` backtracks it.
+        assert_eq!(text_after_table("{| class=\"x\" {{#if:0||}} \n|}"), " \n");
     }
 
     #[test]
