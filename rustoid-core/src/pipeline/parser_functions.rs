@@ -2247,6 +2247,20 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
         // `round` needs a left operand; where a value is expected it is the
         // parser's error (`{{#expr: round 5}}`).
         ExprToken::Round => Err(RustoidError::Parse("Unexpected round operator".to_string())),
+        // MediaWiki's parser tracks whether it expects a value or an operator and
+        // rejects a *binary* operator where a value belongs: `{{#ifexpr: > 1}}` is
+        // "Expression error: Unexpected > operator", not false. Quietly answering
+        // zero made `{{#iferror:{{#ifexpr: > 1}}|ERR|OK}}` answer `OK`, which
+        // `Template:Reflist` observes: its class falls to the `reflist-columns-3`
+        // default instead of `mw-references-columns`.
+        ExprToken::Cmp(name) => Err(RustoidError::Parse(format!("Unexpected {name} operator"))),
+        ExprToken::Op(op) => Err(RustoidError::Parse(format!(
+            "Unexpected {} operator",
+            expr_operator_name(op)
+        ))),
+        ExprToken::Caret => Err(RustoidError::Parse("Unexpected ^ operator".to_string())),
+        ExprToken::And => Err(RustoidError::Parse("Unexpected and operator".to_string())),
+        ExprToken::Or => Err(RustoidError::Parse("Unexpected or operator".to_string())),
         ExprToken::Func(name) => {
             *pos += 1;
             // The argument is the next primary — a number, a constant, a
@@ -2256,7 +2270,21 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
             let arg = expr_primary(tokens, pos)?;
             Ok(apply_expr_func(name, arg))
         }
-        _ => Ok(0.0),
+        ExprToken::RParen => Ok(0.0),
+    }
+}
+
+/// The name MediaWiki's expression parser uses for an operator in its error
+/// messages (`unexpected_operator` / `missing_operand`).
+fn expr_operator_name(op: char) -> &'static str {
+    match op {
+        'D' => "div",
+        '%' => "mod",
+        '+' => "+",
+        '-' => "-",
+        '*' => "*",
+        '/' => "/",
+        _ => "?",
     }
 }
 
@@ -2455,6 +2483,15 @@ mod tests {
             ParserFunctions::pf_ifexpr(&params(vec![("1", ""), ("", "yes"), ("", "no")])),
             vec![Item::Str("yes".to_string())]
         );
+
+        // A binary operator with no left operand is an error, not `false`:
+        // `Template:Reflist` tests exactly `{{#ifexpr: {{{1|}}} > 1 }}` with an
+        // empty `1` and relies on the `#iferror` branch that follows from it.
+        let out = ParserFunctions::pf_ifexpr(&params(vec![(" > 1", ""), ("", "yes"), ("", "no")]));
+        let Item::Str(s) = &out[0] else {
+            panic!("expected a string item: {out:?}")
+        };
+        assert!(s.contains("Unexpected > operator"), "{s}");
     }
 
     #[test]

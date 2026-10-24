@@ -19295,3 +19295,19 @@ local `Cell` that could collide with it.
 
 **Effect:** `Bicycle` 72,978 → *nondeterministic only* (it now matches the served
 bytes). No corpus regressions; 5/48 strict, 7 nondeterministic-only (25.0%).
+
+## A binary operator with no left operand is an expression error
+
+MediaWiki's `ExprParser` tracks whether it expects a value or an operator, and
+`{{#ifexpr: > 1}}` answers `Expression error: Unexpected > operator` rather than
+false. rustoid's evaluator quietly returned `0` for any token it did not expect
+in value position, so `{{#iferror:{{#ifexpr: > 1}}|ERR|OK}}` answered `OK`.
+
+`Template:Reflist` tests exactly that with an empty positional parameter:
+`{{#iferror:{{#ifexpr: {{{1|}}} > 1 }}|mw-references-columns|…}}`. The wrong
+branch appended `reflist-columns-3` to the references wrapper on every page that
+calls `{{reflist|colwidth=…}}` without a column count.
+
+**Effect:** the `reflist-columns-3` class is gone; on the corpus this is
+currently masked by later differences on the same pages (`Nigeria`), and was
+verified with a transform-endpoint probe of `#ifexpr`/`#iferror`.
