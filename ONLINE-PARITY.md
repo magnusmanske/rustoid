@@ -19400,3 +19400,20 @@ ToC}}`'s list on `List of sovereign states`.
 
 **Effect:** `Bitcoin` 11,484 → 147,568; no other corpus change, 5/48 strict,
 7 nondeterministic-only (25.0%).
+
+## `E` is an operator between two operands
+
+MediaWiki's `ExprParser` treats the word `e` as Euler's number where a value
+belongs and as the scientific-notation operator `lhs * 10^rhs` where an operator
+belongs. rustoid always read it as the constant, so `1E(-14)` (as
+`Template:Order of magnitude` writes it) became `1 · e` and the rest of the
+expression was dropped: `{{Order of magnitude|0.54}}` answered `0` where the
+service has `-1`, which then made `{{sigfig|0.54|1}}` answer `1` instead of
+`0.5`.
+
+The token now follows MediaWiki's positional rule: a value where a value
+belongs (`e` alone is 2.718…) and `lhs * 10^rhs`, binding like `^`, between two
+operands.
+
+**Effect:** `Bitcoin` 147,568 → 197,352; no other corpus change, 5/48 strict,
+7 nondeterministic-only (25.0%).

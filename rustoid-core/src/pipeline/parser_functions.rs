@@ -1992,6 +1992,11 @@ enum ExprToken {
     /// *binary* operator (lower precedence than `+ -`), so a leading `round`
     /// with no left operand is the parser's error, not a dropped word.
     Round,
+    /// `e` — Euler's number where a value belongs, and the scientific-notation
+    /// operator `lhs * 10^rhs` where an operator belongs. MediaWiki's parser
+    /// decides by position, which is why `1E(-14)` is `1e-14` while `e` alone
+    /// is 2.718….
+    Exp,
     /// A unary math function (`abs`, `floor`, `ln`, …). It applies to the next
     /// *primary*, so `floor2.5^2` is `(floor 2.5)^2`.
     Func(&'static str),
@@ -2037,7 +2042,7 @@ fn tokenize_expr(expr: &str) -> std::result::Result<Vec<ExprToken>, String> {
                 // so a missing left operand becomes the parser's error.
                 "round" => tokens.push(ExprToken::Round),
                 // Constants are values, not functions.
-                "e" => tokens.push(ExprToken::Num(std::f64::consts::E)),
+                "e" => tokens.push(ExprToken::Exp),
                 "pi" => tokens.push(ExprToken::Num(std::f64::consts::PI)),
                 // `log` is deliberately absent: the live wiki reports it as an
                 // unrecognized word (verified against the transform endpoint).
@@ -2211,6 +2216,9 @@ fn expr_parse(
                     lhs.powf(rhs)
                 }
             }
+            // `e` between two operands is scientific notation: `1E(-14)`, as
+            // templates such as `Template:Order of magnitude` write it.
+            ExprToken::Exp => lhs * 10f64.powf(rhs),
             ExprToken::And => bool_num(truthy(lhs) && truthy(rhs)),
             ExprToken::Or => bool_num(truthy(lhs) || truthy(rhs)),
             ExprToken::Cmp(cmp) => compare(cmp, lhs, rhs),
@@ -2261,6 +2269,10 @@ fn expr_primary(tokens: &[ExprToken], pos: &mut usize) -> std::result::Result<f6
         ExprToken::Num(n) => {
             *pos += 1;
             Ok(n)
+        }
+        ExprToken::Exp => {
+            *pos += 1;
+            Ok(std::f64::consts::E)
         }
         ExprToken::Op('-') => {
             *pos += 1;
@@ -2364,6 +2376,8 @@ fn precedence(t: &ExprToken) -> u8 {
         ExprToken::Op('+' | '-') => 5,
         ExprToken::Op('*' | '/' | '%' | 'D') => 6,
         ExprToken::Caret => 7,
+        // `1E-14` binds like `^`: tighter than `*`.
+        ExprToken::Exp => 7,
         _ => 0,
     }
 }
@@ -2665,6 +2679,12 @@ mod tests {
             ("1e13", "10000000000000"),
             ("1e14", "1.0E+14"),
             ("1e-5", "1.0E-5"),
+            // `E` between two operands is the scientific-notation operator, so a
+            // parenthesised exponent works as well: `Template:Order of magnitude`
+            // writes `1E((…)-14)`.
+            ("1E(-14)", "1.0E-14"),
+            ("2E(2)", "200"),
+            ("e", "2.718281828459"),
             ("0.0001", "0.0001"),
             ("1.0", "1"),
             ("0.1+0.2", "0.3"),
