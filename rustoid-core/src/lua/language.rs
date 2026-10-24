@@ -37,7 +37,7 @@ const RTL_CODES: &[&str] = &[
 /// Real MediaWiki reads this from its language data files; the common cases are
 /// reproduced here, and every language falls back to English, which is what
 /// `FALLBACK_MESSAGES` (the default mode) guarantees.
-fn fallbacks_for(code: &str) -> Vec<String> {
+pub(crate) fn fallbacks_for(code: &str) -> Vec<String> {
     // The base language is always the first fallback: `en-gb` → `en`.
     let base = code.split('-').next().unwrap_or(code).to_string();
     let mut out: Vec<String> = Vec::new();

@@ -19250,3 +19250,25 @@ default) now run the same whole-line rule the comment stripper uses elsewhere:
 
 **Effect:** `Taylor Swift` 17,451 → 487,996. No corpus regressions; 5/48
 strict, 5 nondeterministic-only (20.8%).
+
+## A tabular data page's localized fields resolve to one language
+
+`Module:TNT` keeps translated templates identical across wikis: it reads a
+Commons `Data:…tab` page and formats one of its messages. rustoid fetched the
+page, but handed Lua the raw JSON, so a `localized` field arrived as the whole
+`{de=…, en=…}` map. `mw.message.newRawMessage` then failed, `pcall` turned that
+into a fallback to the raw message key, and `Module:Excerpt`'s hatnote read
+`section excerpt History of the bicycle` instead of `This section is an excerpt
+from …`.
+
+`mw.ext.data.get` now applies JsonConfig's `JCTabularContent::localizeData` and
+`JCUtils::pickLocalizedString`: the page description, each field's `title` and
+every cell of a `localized` field resolve through the requested language (or the
+target language when none is given, or stay a map for `'_'`), then its fallback
+chain, then English, then any value. `mw.title:fullUrl` also takes a query now,
+the way `canonicalUrl` already did — `Module:Excerpt` builds its section edit
+link from `fullUrl('action=edit')` — and title URLs use the DB key (`_` for a
+space) rather than query encoding.
+
+**Effect:** `Bicycle` 50,557 → 72,978, `Nigeria` 233,636 → 563,010. No corpus
+regressions; 5/48 strict, 6 nondeterministic-only (22.9%).

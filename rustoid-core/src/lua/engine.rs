@@ -1074,6 +1074,86 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value> {
     }
 }
 
+/// Resolve a `Data:` page's localized strings for one language, the way
+/// JsonConfig's `JCTabularContent::localizeData` does before the extension hands
+/// the page to Lua: a `localized` schema field's cell, the page description and
+/// each field's title become one string.
+///
+/// Without this, `Module:TNT` — the shim that keeps translated modules and
+/// templates identical across wikis — receives the whole `{de=…, en=…}` map, and
+/// its `mw.message.newRawMessage` call fails, so every translated string falls
+/// back to its raw key.
+fn localize_data_page(data: &mut serde_json::Value, lang: &str) {
+    if let Some(description) = data.get_mut("description")
+        && let Some(text) = pick_localized_string(description, lang).map(str::to_owned)
+    {
+        *description = serde_json::Value::String(text);
+    }
+
+    let Some(fields) = data
+        .get_mut("schema")
+        .and_then(|schema| schema.get_mut("fields"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut localized_columns = Vec::new();
+    for (index, field) in fields.iter_mut().enumerate() {
+        let Some(field) = field.as_object_mut() else {
+            continue;
+        };
+        let name = field.get("name").cloned().unwrap_or_default();
+        let kind = field.get("type").cloned().unwrap_or_default();
+        if kind.as_str() == Some("localized") {
+            localized_columns.push(index);
+        }
+        let title = field
+            .get("title")
+            .and_then(|title| pick_localized_string(title, lang))
+            .map(str::to_owned)
+            .unwrap_or_else(|| name.as_str().unwrap_or_default().to_string());
+        // JsonConfig normalizes a field to exactly these three keys.
+        let mut normalized = serde_json::Map::new();
+        normalized.insert("name".to_string(), name);
+        normalized.insert("type".to_string(), kind);
+        normalized.insert("title".to_string(), serde_json::Value::String(title));
+        *field = normalized;
+    }
+
+    for row in data
+        .get_mut("data")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(row) = row.as_array_mut() else {
+            continue;
+        };
+        for &index in &localized_columns {
+            let Some(cell) = row.get_mut(index) else {
+                continue;
+            };
+            if let Some(text) = pick_localized_string(cell, lang).map(str::to_owned) {
+                *cell = serde_json::Value::String(text);
+            }
+        }
+    }
+}
+
+/// `JCUtils::pickLocalizedString`: the requested language, its fallbacks, then
+/// English, then any value the map has.
+fn pick_localized_string<'a>(value: &'a serde_json::Value, lang: &str) -> Option<&'a str> {
+    let Some(map) = value.as_object() else {
+        return value.as_str();
+    };
+    let fallbacks = crate::lua::language::fallbacks_for(lang);
+    std::iter::once(lang)
+        .chain(fallbacks.iter().map(String::as_str))
+        .chain(["en"])
+        .find_map(|code| map.get(code).and_then(serde_json::Value::as_str))
+        .or_else(|| map.values().find_map(serde_json::Value::as_str))
+}
+
 /// `mw.wikibase` — the entity API, over entity JSON parsed by the host.
 ///
 /// `args` is `{ byId = { [id] = entity }, byTitle = { [title] = id }, current =
@@ -2493,7 +2573,7 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
     ext_data
         .set(
             "get",
-            lua.create_function(move |lua, name: Value| {
+            lua.create_function(move |lua, (name, lang): (Value, Value)| {
                 let requested = match &name {
                     Value::String(s) => s.to_str().map_err(mlua::Error::external)?.to_string(),
                     other => {
@@ -2503,16 +2583,36 @@ fn setup_mw_table(lua: &Lua, ctx: Arc<LuaContext>) -> Result<Table> {
                         )));
                     }
                 };
+                // The extension's optional language: `nil` means the parser's
+                // target language, `_` means every language (`Module:TNT` uses
+                // it for its documentation).
+                let lang = match &lang {
+                    Value::Nil => Some(data_ctx.site.language_code.clone()),
+                    Value::String(s) => {
+                        let s = s.to_str().map_err(mlua::Error::external)?.to_string();
+                        (s != "_").then_some(s)
+                    }
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "mw.ext.data.get expects a language code string, got a {}",
+                            other.type_name()
+                        )));
+                    }
+                };
                 let key = data_page_key(&requested);
                 if let Some(source) = data_ctx.site.data.get(&key) {
                     // A `.tab` page is JSON in a `Tabular.JsonConfig` content
                     // model, with the `schema`/`data` shape the modules read.
-                    let parsed: serde_json::Value = serde_json::from_str(source).map_err(|e| {
-                        mlua::Error::runtime(format!(
-                            "mw.ext.data.get: {} is not valid JSON: {e}",
-                            data_page_title(&key)
-                        ))
-                    })?;
+                    let mut parsed: serde_json::Value =
+                        serde_json::from_str(source).map_err(|e| {
+                            mlua::Error::runtime(format!(
+                                "mw.ext.data.get: {} is not valid JSON: {e}",
+                                data_page_title(&key)
+                            ))
+                        })?;
+                    if let Some(code) = &lang {
+                        localize_data_page(&mut parsed, code);
+                    }
                     return json_to_lua(lua, &parsed)
                         .map_err(|e| mlua::Error::runtime(e.to_string()));
                 }
@@ -3512,32 +3612,8 @@ fn title_derived_without_facts(lua: &Lua, t: &Table, key: &str) -> mlua::Result<
                 move |lua, (_this, opts): (Value, Value)| {
                     // Scribunto also accepts a query-string form
                     // (`canonicalUrl('action=edit')`), appended verbatim.
-                    let mut query = format!("title={}", url_encode(&full));
-                    match &opts {
-                        Value::Table(t) => {
-                            for pair in t.clone().pairs::<Value, Value>() {
-                                let (k, v) = pair.map_err(mlua::Error::external)?;
-                                let (Ok(k), Ok(v)) = (
-                                    coerce_string(&k, "canonicalUrl"),
-                                    coerce_string(&v, "canonicalUrl"),
-                                ) else {
-                                    continue;
-                                };
-                                query.push('&');
-                                query.push_str(&url_encode(&k));
-                                query.push('=');
-                                query.push_str(&url_encode(&v));
-                            }
-                        }
-                        Value::String(s) => {
-                            let extra = s.to_str().map_err(mlua::Error::external)?;
-                            if !extra.is_empty() {
-                                query.push('&');
-                                query.push_str(&extra);
-                            }
-                        }
-                        _ => {}
-                    }
+                    let query = title_query(&full, &opts, "canonicalUrl")?
+                        .unwrap_or_else(|| format!("title={}", title_url_encode(&full)));
                     let url = format!("//{server}/w/index.php?{query}");
                     Ok(Value::String(lua.create_string(&url)?))
                 },
@@ -3553,13 +3629,55 @@ fn title_derived_without_facts(lua: &Lua, t: &Table, key: &str) -> mlua::Result<
 ///
 /// Modules call `title:fullUrl()`, so this returns a function. Returning the URL
 /// string made the call fail with "attempt to call a string value".
+///
+/// With a query (`fullUrl('action=edit')`, or a table of parameters) MediaWiki
+/// switches from the article path to `index.php` with the title first, exactly as
+/// `canonicalUrl` does; `Module:Excerpt` builds its section edit link this way.
 fn full_url_closure(lua: &Lua, full: &str) -> mlua::Result<Value> {
     let site = site_for_titles(lua)?;
-    let path = site.article_path.replace("$1", &url_encode(full));
-    let url = format!("{}{path}", site.server);
-    Ok(Value::Function(
-        lua.create_function(move |_, _this: Value| Ok(url.clone()))?,
-    ))
+    let path = site.article_path.replace("$1", &title_url_encode(full));
+    let article_url = format!("{}{path}", site.server);
+    let server = site.server.clone();
+    let full = full.to_string();
+    Ok(Value::Function(lua.create_function(
+        move |lua, (_this, opts): (Value, Value)| {
+            let Some(query) = title_query(&full, &opts, "fullUrl")? else {
+                return Ok(Value::String(lua.create_string(&article_url)?));
+            };
+            let url = format!("{server}/w/index.php?{query}");
+            Ok(Value::String(lua.create_string(&url)?))
+        },
+    )?))
+}
+
+/// The `title=…`-first query that `canonicalUrl` and `fullUrl` build from their
+/// argument: a table of parameters in the order it gave them, or a query string
+/// appended verbatim. `None` when the argument supplied nothing.
+fn title_query(full: &str, opts: &Value, method: &str) -> mlua::Result<Option<String>> {
+    let mut extra = String::new();
+    match opts {
+        Value::Table(t) => {
+            for pair in t.clone().pairs::<Value, Value>() {
+                let (k, v) = pair.map_err(mlua::Error::external)?;
+                let (Ok(k), Ok(v)) = (coerce_string(&k, method), coerce_string(&v, method)) else {
+                    continue;
+                };
+                extra.push('&');
+                extra.push_str(&url_encode(&k));
+                extra.push('=');
+                extra.push_str(&url_encode(&v));
+            }
+        }
+        Value::String(s) => {
+            let s = s.to_str().map_err(mlua::Error::external)?;
+            if !s.is_empty() {
+                extra.push('&');
+                extra.push_str(&s);
+            }
+        }
+        _ => {}
+    }
+    Ok((!extra.is_empty()).then(|| format!("title={}{extra}", title_url_encode(full))))
 }
 
 /// The site snapshot the shared metatable's `__index` needs.
@@ -7102,13 +7220,24 @@ pub fn format_number(n: f64) -> String {
 }
 
 fn url_encode(s: &str) -> String {
+    encode_url(s, '+')
+}
+
+/// `wfUrlencode`'s title form: the title's DB key uses underscores for spaces,
+/// and the rest is percent-encoded. Article paths and `title=` parameters use
+/// this rather than form encoding, so `Foo bar` becomes `Foo_bar`, not `Foo+bar`.
+fn title_url_encode(s: &str) -> String {
+    encode_url(s, '_')
+}
+
+fn encode_url(s: &str, space: char) -> String {
     let mut result = String::new();
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 result.push(byte as char);
             }
-            b' ' => result.push('+'),
+            b' ' => result.push(space),
             _ => result.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -10538,5 +10667,64 @@ mod tests {
         let args = args_from_table(&table).unwrap();
         assert!(args.contains(&Arg::Named("yes".into(), "1".into())));
         assert!(args.contains(&Arg::Named("no".into(), String::new())));
+    }
+
+    /// `mw.ext.data.get` resolves a `localized` schema field the way JsonConfig
+    /// does, so `Module:TNT` receives a string rather than the language map (a
+    /// map made `getHat` fail to concatenate the translated message).
+    #[test]
+    fn a_tabular_data_page_localizes_its_fields() {
+        let mut page = serde_json::json!({
+            "description": {"de": "Beschreibung", "en": "Description"},
+            "schema": {"fields": [
+                {"name": "id", "type": "string"},
+                {"name": "message", "type": "localized"}
+            ]},
+            "data": [
+                ["section", {"de": "Dieser Abschnitt ist", "en": "This section is"}],
+                ["untranslated", {"de": "Nur Deutsch"}]
+            ]
+        });
+        localize_data_page(&mut page, "en");
+        assert_eq!(page["description"], "Description");
+        // JsonConfig normalizes a field's title to its name when none is given.
+        assert_eq!(page["schema"]["fields"][1]["title"], "message");
+        assert_eq!(page["data"][0][1], "This section is");
+        // A map without the language falls back to its first value.
+        assert_eq!(page["data"][1][1], "Nur Deutsch");
+        // A plain field is left alone.
+        assert_eq!(page["data"][0][0], "section");
+
+        // An explicit language picks its own value, and a language without one
+        // goes through its fallback chain.
+        let mut page = serde_json::json!({
+            "schema": {"fields": [{"name": "message", "type": "localized"}]},
+            "data": [
+                [{"de": "Dieser", "en": "This"}],
+                [{"en": "Only English"}]
+            ]
+        });
+        localize_data_page(&mut page, "de");
+        assert_eq!(page["data"][0][0], "Dieser");
+        assert_eq!(page["data"][1][0], "Only English");
+
+        let mut page = serde_json::json!({
+            "schema": {"fields": [{"name": "message", "type": "localized"}]},
+            "data": [[{"de": "Dieser", "en": "This"}]]
+        });
+        localize_data_page(&mut page, "fr");
+        assert_eq!(page["data"][0][0], "This");
+    }
+
+    /// A title's URL uses the DB key, so a space is `_` rather than `+`.
+    #[test]
+    fn a_title_is_url_encoded_with_underscores() {
+        assert_eq!(
+            title_url_encode("History of the bicycle"),
+            "History_of_the_bicycle"
+        );
+        assert_eq!(title_url_encode("Module talk:Math"), "Module_talk%3AMath");
+        // Query parameters keep the form encoding.
+        assert_eq!(url_encode("a b"), "a+b");
     }
 }
