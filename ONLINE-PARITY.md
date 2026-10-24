@@ -19417,3 +19417,22 @@ operands.
 
 **Effect:** `Bitcoin` 147,568 → 197,352; no other corpus change, 5/48 strict,
 7 nondeterministic-only (25.0%).
+
+## A link whose source spells a reference is rebuilt from its parts
+
+A module receives its arguments as *expanded text*, and a link is part of that
+text. rustoid renders a token from its `data-parsoid.src`, which is the source
+*as written* — and a template body is tokenized before its `{{{…}}}` are
+substituted. A link written `[[{{{link|Wikipedia:Cleanup}}}|{{{text|}}}]]`
+therefore reached `Module:Unsubst` still spelling both references; the module
+returned that text, and the re-parse resolved the references in the *root*
+frame, where they have no values. `Template:Update inline`'s "needs update"
+link rendered as `Wikipedia:Cleanup` with an empty label on `Bitcoin`.
+
+The answer renderer already rebuilds an `extlink`/`urllink` whose `href` holds
+tokens; a `wikilink` whose target or display text was written as a template or
+argument reference is now flagged the same way, so the link is rebuilt from its
+expanded parts.
+
+**Effect:** `Bitcoin` 197,352 → 240,631; no other corpus change, 5/48 strict,
+7 nondeterministic-only (25.0%).

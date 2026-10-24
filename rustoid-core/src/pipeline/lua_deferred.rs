@@ -1275,6 +1275,30 @@ mod tests {
         );
     }
 
+    /// A link whose target or label was written as a template argument keeps a
+    /// `src` that spells the reference. When the expansion has substituted it,
+    /// the answer must come from the token's parts, not the stale source:
+    /// otherwise a module receives `[[{{{link|Wikipedia:Cleanup}}}|…]]` and its
+    /// output resolves the *defaults* in the root frame (`Template:Update
+    /// inline`'s "needs update" link on `Bitcoin`).
+    #[test]
+    fn render_answer_rebuilds_a_link_whose_source_spells_a_reference() {
+        use crate::wikitext::tokens_v2::{DataParsoid, Item, ParsoidToken, SelfclosingTagTk};
+        let mut dp = DataParsoid {
+            src: Some("[[{{{link|Wikipedia:Cleanup}}}|{{{text|}}}]]".to_string()),
+            ..DataParsoid::default()
+        };
+        dp.tmp.link_contains_template = Some(true);
+        let mut link = SelfclosingTagTk::new("wikilink", vec![], dp);
+        link.add_attribute_str("href", "Wikipedia:Manual of Style/Dates and numbers");
+        link.add_attribute_str("mw:maybeContent", "needs update");
+        let items = vec![Item::Tok(ParsoidToken::SelfclosingTag(link))];
+        assert_eq!(
+            render_answer(&items),
+            "[[Wikipedia:Manual of Style/Dates and numbers|needs update]]"
+        );
+    }
+
     /// A `[url text]` a module emits through `frame:expandTemplate` is likewise
     /// tokenized without `data_parsoid.src`, so `render_answer` must rebuild it
     /// from `href` and `mw:content` instead of dropping it (`Template:Tooltip`'s

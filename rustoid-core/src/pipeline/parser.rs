@@ -9234,6 +9234,25 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 && attribs.iter().any(|kv| {
                     kv.key.as_str() == Some("href") && matches!(kv.value, KeyValue::Tokens(_))
                 });
+            // A wikilink whose target or display text was written as a template
+            // or an argument reference has the same stale `src`: it still spells
+            // the reference while the token holds the expansion. The answer
+            // renderer has to rebuild such a link from its parts (see
+            // `answer_item_text`), or a module receives `[[{{{link}}}|…]]` and
+            // its output renders the *defaults* in the root frame.
+            let link_holds_template = tok.get_name() == "wikilink"
+                && attribs.iter().any(|kv| {
+                    if !matches!(kv.key.as_str(), Some("href") | Some("mw:maybeContent")) {
+                        return false;
+                    }
+                    match &kv.value {
+                        KeyValue::Tokens(items) => {
+                            let found = expandable_content(items);
+                            found.template || found.arg
+                        }
+                        KeyValue::Str(_) => false,
+                    }
+                });
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in attribs {
                 // Whether the key was written as a construct rather than a plain
@@ -9309,7 +9328,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             let mut new_tok = tok.clone();
             new_tok.set_attribs(expanded_attrs);
-            if href_holds_template && let Some(dp) = new_tok.data_parsoid_mut() {
+            if (href_holds_template || link_holds_template)
+                && let Some(dp) = new_tok.data_parsoid_mut()
+            {
                 dp.tmp.link_contains_template = Some(true);
             }
             out.push(Item::Tok(new_tok));
