@@ -418,10 +418,29 @@ fn language_object(lua: &Lua, code: &str) -> mlua::Result<Table> {
 
     // `getDurationIntervals` — deconstruct a duration into named units. The
     // values must be *integers*: `Module:Listen` feeds them to `%02d`.
+    //
+    // Mirrors `Language::getDurationIntervals`: a unit is reported only when its
+    // value is **non-zero**, except that the smallest requested unit is always
+    // present (as 0) when no larger unit matched. That is what makes
+    // `Module:Spoken Wikipedia` print "36 minutes" rather than "0 hours and 36
+    // minutes". The unit lengths and the iteration order come from the PHP
+    // constant, not from the caller's list: the average year is 365.2425 days.
     obj.set(
         "getDurationIntervals",
         lua.create_function(
             |lua, (_self, seconds, intervals): (Option<Value>, Value, Option<Table>)| {
+                // `Language::DURATION_INTERVALS`, in its declared order.
+                const INTERVALS: [(&str, i64); 9] = [
+                    ("millennia", 31_556_952_000),
+                    ("centuries", 3_155_695_200),
+                    ("decades", 315_569_520),
+                    ("years", 31_556_952),
+                    ("months", 2_629_746),
+                    ("days", 86_400),
+                    ("hours", 3_600),
+                    ("minutes", 60),
+                    ("seconds", 1),
+                ];
                 let seconds = match seconds {
                     Value::Integer(i) => i as f64,
                     Value::Number(f) => f,
@@ -435,34 +454,34 @@ fn language_object(lua: &Lua, code: &str) -> mlua::Result<Table> {
                         .sequence_values::<String>()
                         .filter_map(std::result::Result::ok)
                         .collect(),
-                    // The documented default set.
+                    // The documented default set (no months, no weeks).
                     None => vec![
+                        "millennia".to_string(),
+                        "centuries".to_string(),
+                        "decades".to_string(),
                         "years".to_string(),
-                        "weeks".to_string(),
                         "days".to_string(),
                         "hours".to_string(),
                         "minutes".to_string(),
                         "seconds".to_string(),
                     ],
                 };
+                let chosen: Vec<(&str, i64)> = INTERVALS
+                    .into_iter()
+                    .filter(|(unit, _)| wanted.iter().any(|w| w == unit))
+                    .collect();
+                // `array_key_last`: the smallest unit in the constant's order.
+                let smallest = chosen.last().map(|(unit, _)| *unit);
                 let table = lua.create_table()?;
-                let mut left = seconds.trunc() as i64;
-                for unit in &wanted {
-                    let size = match unit.as_str() {
-                        "millennia" => 31_557_600_000,
-                        "centuries" => 3_155_760_000,
-                        "decades" => 315_576_000,
-                        "years" => 31_557_600,
-                        "weeks" => 604_800,
-                        "days" => 86_400,
-                        "hours" => 3_600,
-                        "minutes" => 60,
-                        "seconds" => 1,
-                        _ => continue,
-                    };
-                    let value = left / size;
-                    left -= value * size;
-                    table.set(unit.clone(), value)?;
+                let mut left = seconds;
+                let mut any = false;
+                for (unit, size) in chosen {
+                    let value = (left / size as f64) as i64;
+                    if value > 0 || (Some(unit) == smallest && !any) {
+                        left -= (value * size) as f64;
+                        table.set(unit, value)?;
+                        any = true;
+                    }
                 }
                 Ok(table)
             },

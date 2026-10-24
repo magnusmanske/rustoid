@@ -8785,6 +8785,27 @@ mod tests {
                 .unwrap(),
             "1|2|5"
         );
+        // A zero-valued unit is omitted, so `Module:Spoken Wikipedia` says
+        // "36 minutes", not "0 hours and 36 minutes".
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = mw.getContentLanguage():getDurationIntervals(2206, {'hours','minutes'}) \
+                     return tostring(t.hours) .. '|' .. tostring(t.minutes)"
+                )
+                .unwrap(),
+            "nil|36"
+        );
+        // With nothing to report, the smallest requested unit is present as 0.
+        assert_eq!(
+            engine
+                .eval(
+                    "local t = mw.getContentLanguage():getDurationIntervals(0, {'hours','minutes'}) \
+                     return tostring(t.hours) .. '|' .. tostring(t.minutes)"
+                )
+                .unwrap(),
+            "nil|0"
+        );
     }
 
     /// `fetchLanguageNames` must return a table whose keys and values are all

@@ -19179,3 +19179,19 @@ character scan could not tell an inline comment from one on a line by itself.
 334,330, `Albert Einstein` 621,072 → 629,126 (to the next, unrelated
 difference). No corpus regressions; 5/48 strict, 5 nondeterministic-only
 (20.8%).
+
+## A zero duration unit is omitted
+
+`mw.language:getDurationIntervals` is `Language::getDurationIntervals`: a unit
+with a **zero** count is not reported, except that the smallest requested unit
+is present as `0` when no larger one matched. rustoid reported every requested
+unit, so `Module:Spoken Wikipedia` printed "0 hours and 36 minutes" where the
+service says "36 minutes".
+
+The unit lengths and their iteration order also had to come from the PHP
+constant (`Language::DURATION_INTERVALS`): the average year is 365.2425 days
+(31,556,952 s), `months` exist but are not in the default set, and `weeks` are
+not an interval at all.
+
+**Effect:** `Isaac Newton` 1,222,095 → 1,236,120, `Nobel Prize` 696,813 →
+732,423. No corpus regressions; 5/48 strict, 5 nondeterministic-only (20.8%).
