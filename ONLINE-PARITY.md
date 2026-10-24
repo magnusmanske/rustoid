@@ -19195,3 +19195,20 @@ not an interval at all.
 
 **Effect:** `Isaac Newton` 1,222,095 → 1,236,120, `Nobel Prize` 696,813 →
 732,423. No corpus regressions; 5/48 strict, 5 nondeterministic-only (20.8%).
+
+## A module argument carries no HTML comment
+
+MediaWiki's preprocessor strips comments from template arguments before it
+splits them, so Scribunto never sees one. `argument_value_text` already did
+that, but the fallback for a value it declines — a token list holding an
+extension placeholder, rendered by `render_argument_markers` — spells a tag's
+own `src`, and that still holds the comments the tag was written with.
+
+`Template:Div col` builds `<div class="div-col…" <!--\n-->>`, so the eight
+bytes of that comment reached `Module:Navbox`, whose `argHash` is the sum of
+its arguments' lengths — one navbox id was `Sir_Isaac_Newton4447` instead of
+`…4439`. Both the key and the value are now passed through the same comment
+stripper.
+
+**Effect:** `Isaac Newton` 1,236,120 → 1,255,136. No corpus regressions; 5/48
+strict, 5 nondeterministic-only (20.8%).

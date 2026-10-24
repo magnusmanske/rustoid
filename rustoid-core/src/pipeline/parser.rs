@@ -9499,8 +9499,16 @@ fn kv_value_source(kv: &crate::wikitext::tokens_v2::KV) -> String {
 /// The name is the tokenizer's, not re-derived from the value: only the tokenizer
 /// can tell a `=` that names an argument from one inside a value.
 fn expanded_arg_pair(kv: &crate::wikitext::tokens_v2::KV) -> (Option<String>, String) {
-    let key = crate::wikitext::token_utils::key_value_to_string(&kv.key);
-    let value = argument_value_or_source(kv);
+    // MediaWiki's preprocessor removes HTML comments from template arguments
+    // before splitting them, so a module never sees one. Most values go through
+    // [`argument_value_text`], which strips them; the fallbacks (a declared
+    // token list, or the rendered marker text) spell a tag's own `src`, which
+    // still holds the comments the tag was written with — `Template:Div col`
+    // builds `<div class="div-col…" <!--\n-->>`, and the eight bytes of that
+    // comment reached `Module:Navbox`, whose `argHash` is the sum of its
+    // arguments' lengths.
+    let key = strip_html_comments(&crate::wikitext::token_utils::key_value_to_string(&kv.key));
+    let value = strip_html_comments(&argument_value_or_source(kv));
     let name = key.trim();
     if name.is_empty() {
         (None, value)
