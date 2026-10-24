@@ -1071,9 +1071,11 @@ mod tests {
     #[test]
     fn test_table_lost_separator_recovers_the_space_before_an_empty_attribute() {
         use crate::wikitext::tokens_v2::{DataParsoid, KVSourceRange, SourceRange};
-        let mut dp = DataParsoid::default();
-        dp.tsr = Some(SourceRange::new(0, 34));
-        dp.start_tag_src = Some("{|".to_string());
+        let mut dp = DataParsoid {
+            tsr: Some(SourceRange::new(0, 34)),
+            start_tag_src: Some("{|".to_string()),
+            ..DataParsoid::default()
+        };
         dp.tmp.attr_src = Some(" class=\"x\" {{#if:0|a=1|}} ".to_string());
         dp.tmp.synthesized = true;
         let table = SelfclosingTagTk::new("table", vec![], dp);
