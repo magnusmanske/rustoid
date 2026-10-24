@@ -19227,3 +19227,26 @@ trimming is on the expanded *items*, so markup at a branch's edge survives.
 **Effect:** `Nobel Prize` 732,423 → 739,912 (99.35% of the page matches
 before the next difference). No corpus regressions; 5/48 strict, 5
 nondeterministic-only (20.8%).
+
+## A template argument loses a comment's whole line
+
+MediaWiki's preprocessor removes HTML comments from a template's arguments
+before it splits them. rustoid removed the comment token but kept its newline,
+so an argument ending
+
+```
+* b
+<!-- c -->
+```
+
+kept one blank line more than the service's. `Template:Flat list`'s body is
+`{{#if:{{{1|}}}|\n{{{1}}}\n</div>}}`, and the extra blank line after the list
+made the paragraph wrapper emit a stray `<p>\n<br/></p>` inside the list's
+`<div>`.
+
+Substituted argument values (named and positional, and a `{{{name|default}}}`
+default) now run the same whole-line rule the comment stripper uses elsewhere:
+`\n[ \t]*<!--…-->[ \t]*\n` becomes `\n`, an inline comment is removed alone.
+
+**Effect:** `Taylor Swift` 17,451 → 487,996. No corpus regressions; 5/48
+strict, 5 nondeterministic-only (20.8%).
