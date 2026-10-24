@@ -19212,3 +19212,18 @@ stripper.
 
 **Effect:** `Isaac Newton` 1,236,120 → 1,255,136. No corpus regressions; 5/48
 strict, 5 nondeterministic-only (20.8%).
+
+## `#ifexist` trims its branch
+
+The ParserFunctions extension answers `trim( $frame->expand( $result ) )`, so a
+branch written as `[[ 2020 Nobel Prizes |2020]]` loses the two blanks around
+the target. rustoid kept them (`untrimmed_branch`), and the extra bytes reached
+`Module:Navbox`'s `argHash` — the sum of its arguments' lengths — so a navbox
+id named `2025_Nobel_Prize_laureates1316` came out as `…1328`.
+
+`#ifexist` now shares `trimmed_branch` with `#if`/`#ifeq`/`#iferror`; the
+trimming is on the expanded *items*, so markup at a branch's edge survives.
+
+**Effect:** `Nobel Prize` 732,423 → 739,912 (99.35% of the page matches
+before the next difference). No corpus regressions; 5/48 strict, 5
+nondeterministic-only (20.8%).

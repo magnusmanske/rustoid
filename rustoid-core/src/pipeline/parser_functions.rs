@@ -729,18 +729,13 @@ impl ParserFunctions {
     /// One of a conditional's branches, trimmed. Core's `if`, `ifeq`, `ifexpr`
     /// and `iferror` all answer `trim($frame->expand(…))`, and the trim happens
     /// *after* expansion — so a branch that is a bare newline, or whose blanks
-    /// come from the source, loses them.
-    fn trimmed_branch(kv: Option<&KV>) -> Vec<Item> {
+    /// come from the source, loses them. The ParserFunctions extension's
+    /// `#ifexist` does the same (`trim( $frame->expand( $result ) )`), so it
+    /// shares this path.
+    pub fn trimmed_branch(kv: Option<&KV>) -> Vec<Item> {
         let mut items = Self::expand_kv(kv, None);
         trim_item_edges(&mut items);
         items
-    }
-
-    /// A conditional's branch with **no** trimming — `#ifexist` answers
-    /// `$then`/`$else` verbatim, without the `trim` that `if`/`ifeq`/`iferror`
-    /// apply. Kept separate so the two rules cannot be collapsed by accident.
-    pub fn untrimmed_branch(kv: Option<&KV>) -> Vec<Item> {
-        Self::expand_kv(kv, None)
     }
 
     /// `{{PLURAL:count|sing|plur|…}}` — core `CoreParserFunctions::plural`

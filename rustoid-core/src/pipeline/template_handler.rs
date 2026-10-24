@@ -1605,9 +1605,10 @@ impl TemplateHandler {
                     }
                 }
             }
-            // `{{#ifexist:TITLE|then|else}}` — core `ParserFunctions::ifexist`,
-            // which answers `then` when the title exists and `else` otherwise,
-            // and does **not** trim its branch (unlike `#if`). The existence
+            // `{{#ifexist:TITLE|then|else}}` — the ParserFunctions extension's
+            // `ifexist`, which answers `trim($frame->expand($result))`: the
+            // branch loses its surrounding blanks, so `[[ 2020 Nobel Prizes |2020]]`
+            // reaches a module as `[[2020 Nobel Prizes|2020]]`. The existence
             // answer is a fetch and therefore could not be computed here; the
             // host resolved it before this synchronous call ran (see
             // [`crate::pipeline::parser`]'s `prime_ifexist`). A title the host
@@ -1630,7 +1631,7 @@ impl TemplateHandler {
                 } else {
                     params.args.get(2)
                 };
-                ParserFunctions::untrimmed_branch(branch)
+                ParserFunctions::trimmed_branch(branch)
             }
             // `{{DEFAULTSORT:key}}` — a behavior switch that sets the page's
             // sort key and has no visible output. Parsoid's `pf_defaultsort`
