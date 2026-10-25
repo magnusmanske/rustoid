@@ -19522,3 +19522,23 @@ An empty id is now dropped before the generated one is set.
 
 **Effect:** `Chess` 179,037 → 240,075; no other corpus change, 5/48 strict,
 7 nondeterministic-only (25.0%).
+
+## Media with no display size is transformed at the file's own width
+
+Parsoid asks for a thumbnail only for the media options that carry a display
+size; `framed`/`manualthumb` (and a bare `[[File:…]]`) reach
+`DataAccess::getFileInfo` with a null width. The wiki still transforms the file
+there: core's `makeTransformOptions` fills in `$hp['width'] = $file->getWidth()`
+before `$file->transform()`, so even an unscaled media element renders from a
+transformed URL — a rasterized `…/250px-…svg.png` for a vector or animated file,
+and the `thumbnail_unscaled` form for a plain bitmap.
+
+rustoid modelled only Parsoid's side of that contract, so a `[[File:X.svg|frame]]`
+printed the original `…?utm_content=original` URL where the wiki serves the
+rasterization. The media processor now asks again at the file's own width once
+the first answer has told it what that width is (mirroring core's ordering); a
+missing second answer keeps the first, which is what a source that never
+transforms returns.
+
+**Effect:** `Chess` 240,075 → 393,604; no other corpus change, 5/48 strict,
+7 nondeterministic-only (25.0%).

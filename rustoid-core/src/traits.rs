@@ -83,8 +83,10 @@ pub trait DataSource: Send + Sync {
     /// per request (`$request[1]['width'|'height']`): they size the thumbnail the
     /// wiki generates, and the answer's [`thumb_url`](FileInfo::thumb_url) and
     /// [`thumb_width`](FileInfo::thumb_width)/[`thumb_height`](FileInfo::thumb_height)
-    /// describe the returned thumbnail. `None` means the file is displayed
-    /// unscaled (`framed`), so no thumbnail is requested.
+    /// describe the returned thumbnail. `None` means the media asked for no
+    /// display size (`framed`, or a bare `[[File:…]]`); the wiki still
+    /// transforms the file at its own width there, so the answer carries the URL
+    /// a browser must load (see [`add_media_info`](crate::pipeline::add_media_info)).
     async fn get_file_info(
         &self,
         title: &Title,

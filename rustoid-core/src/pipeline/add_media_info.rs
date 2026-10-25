@@ -82,11 +82,7 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
         let (req_w, req_h) = requested_dims(job);
         let key = info_key(&job.title, job);
         if let Entry::Vacant(entry) = infos.entry(key) {
-            let info = source
-                .get_file_info(&fetch_title, req_w, req_h)
-                .await
-                .unwrap_or(None);
-            entry.insert(info);
+            entry.insert(fetch_info(source, &fetch_title, req_w, req_h).await);
         }
 
         // `manualthumb=Thumb.png` uses the manual-thumb file's media info for
@@ -98,11 +94,7 @@ pub async fn run(root: &mut Node, source: &dyn DataSource, config: &dyn SiteConf
             let mt_title = Title::new(6, mt.clone());
             let mt_key = info_key(&mt_title, job);
             if let Entry::Vacant(entry) = infos.entry(mt_key) {
-                let mt_info = source
-                    .get_file_info(&mt_title, req_w, req_h)
-                    .await
-                    .unwrap_or(None);
-                entry.insert(mt_info);
+                entry.insert(fetch_info(source, &mt_title, req_w, req_h).await);
             }
         }
     }
@@ -142,6 +134,36 @@ fn requested_dims(job: &ContainerJob) -> (Option<u32>, Option<u32>) {
             .filter(|n| *n > 0)
     };
     (parse(&job.data_width), parse(&job.data_height))
+}
+
+/// Fetch a file's media info for a container.
+///
+/// PHP's core `DataAccess::getFileInfo` always performs a transform: when
+/// Parsoid requested no width, `makeTransformOptions` fills in the file's own
+/// width (`$hp['width'] = $file->getWidth()`), so the answer carries the URL a
+/// browser must load — a rasterization for an SVG or animated GIF, the
+/// `thumbnail_unscaled` form otherwise. The file's width is only known after
+/// the first answer, so ask again at that width, as core does before
+/// transforming. A failed or missing second answer keeps the first, which is
+/// what an older wiki (one that does not transform) would have returned.
+async fn fetch_info(
+    source: &dyn DataSource,
+    title: &Title,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Option<FileInfo> {
+    let info = source
+        .get_file_info(title, width, height)
+        .await
+        .unwrap_or(None)?;
+    if width.is_some() || info.width == 0 {
+        return Some(info);
+    }
+    source
+        .get_file_info(title, Some(info.width), height)
+        .await
+        .unwrap_or(None)
+        .or(Some(info))
 }
 
 /// PHP's `$infoKey`: the file DB key together with the requested size. Two
@@ -1202,10 +1224,15 @@ fn srcset(info: &FileInfo) -> Option<String> {
 fn media_type_from_mime(mime: &str) -> String {
     match mime {
         "image/svg+xml" => "drawing".to_string(),
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "image/x-ms-bmp"
-        | "image/tiff" | "image/x-xcf" | "image/vnd.microsoft.icon" | "image/x-icon" => {
-            "bitmap".to_string()
-        }
+        "image/jpeg"
+        | "image/png"
+        | "image/gif"
+        | "image/webp"
+        | "image/x-ms-bmp"
+        | "image/tiff"
+        | "image/x-xcf"
+        | "image/vnd.microsoft.icon"
+        | "image/x-icon" => "bitmap".to_string(),
         _ => mime.rsplit('/').next().unwrap_or("").to_string(),
     }
 }
@@ -1894,6 +1921,24 @@ mod tests {
                 ..FileInfo::default()
             },
         );
+    }
+
+    /// PHP's core `DataAccess::getFileInfo` always performs a transform, filling
+    /// in the file's own width when Parsoid requested none. The answer a
+    /// browser needs (a rasterization for an SVG or animated GIF, the
+    /// `thumbnail_unscaled` form otherwise) only appears in that second
+    /// request. The mock reports a thumbnail only when a width is given, so the
+    /// returned dimensions show the request was made.
+    #[tokio::test]
+    async fn test_a_container_without_a_display_size_is_fetched_at_the_file_width() {
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let title = Title::new(6, "Foobar.jpg".to_string());
+        let info = fetch_info(&ds, &title, None, None)
+            .await
+            .expect("file info");
+        assert_eq!(info.thumb_width, Some(1941));
+        assert_eq!(info.thumb_height, Some(220));
     }
 
     #[tokio::test]
