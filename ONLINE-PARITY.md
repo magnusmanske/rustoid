@@ -19577,3 +19577,24 @@ its `dsr`.
 **Effect:** `France` 1,517,590 → match (nondeterministic only),
 `List of sovereign states` 41,760 → 178,600, `Cristiano Ronaldo` 409,233 →
 471,357; no other corpus change, 5/48 strict, 8 nondeterministic-only (27.1%).
+
+## A narrow template call records where it sat on its line
+
+Core's T2529 rule reads `$piece['lineStart']` — whether the character before a
+nested `{{…}}` is a newline — and prepends one when the expansion begins with a
+table or block marker. rustoid derived that from the call's `tsr` into the chunk
+being expanded, but a template body is tokenized once and then expanded with its
+arguments substituted, so a call inside it has offsets into the *body*, not the
+substituted text. The source check (which exists to reject offsets from another
+chunk) then answered "unknown", and the unknown-case heuristic refuses to put a
+newline before a table token.
+
+`{{Infobox element/vapor pressure table}}` sits after `<!--…-->` mid-line in
+`Template:Infobox element`, expands to a `{|` table token, and so arrived
+mid-line, where `TokenStreamPatcher` turned the table back into its literal
+`{|`/`|-` source. The tokenizer now records the call's line-start state on the
+token (`TempData::line_start`) and the T2529 check falls back to it when the
+offsets do not index the chunk.
+
+**Effect:** `Hydrogen` 47,556 → 69,769 (its table is built); `Nigeria` now
+matches; no regressions, 5/48 strict, 9 nondeterministic-only (29.2%).

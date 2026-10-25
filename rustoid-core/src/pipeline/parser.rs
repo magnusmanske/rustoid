@@ -2285,6 +2285,17 @@ fn t2529_at_line_start(tok: &ParsoidToken, src_text: &str, body: bool) -> Option
         }
         source.as_bytes().get(start - 1).map(|b| *b == b'\n')
     })()
+    .or_else(|| {
+        // The offsets index a fragment (a template body tokenized before its
+        // arguments were substituted), so the source check above could not place
+        // the call. The tokenizer recorded the call's own line-start state, which
+        // is exactly what core's preprocessor reads off the body text.
+        let dp = tok.data_parsoid()?;
+        let start = dp.tsr.as_ref()?.start?;
+        // At the very start of a body the call follows the body's opening pipe in
+        // the invocation, so the caller's `start == 0` rule wins.
+        (start != 0).then_some(dp.tmp.line_start).flatten()
+    })
 }
 
 /// Core `Parser::braceSubstitution`'s T2529 rule: a *nested* template's
@@ -12383,6 +12394,39 @@ mod tests {
                 crate::wikitext::tokens_v2::DataParsoid::default(),
             ));
         assert_eq!(t2529_at_line_start(&synthesized, "", true), None);
+    }
+
+    /// A call inside a template body carries offsets into the body, which are
+    /// meaningless against the substituted chunk being expanded. The tokenizer
+    /// records the call's own line-start state, and that is what core's
+    /// preprocessor reads off the body text: `{{Infobox element/vapor pressure
+    /// table}}` sits after `-->` on its line, so its table must begin a new one.
+    #[test]
+    fn test_t2529_falls_back_to_the_recorded_line_start() {
+        let mut dp = crate::wikitext::tokens_v2::DataParsoid::with_tsr(297, 569);
+        dp.src = Some("{{T}}".to_string());
+        dp.tmp.line_start = Some(false);
+        let tok = ParsoidToken::SelfclosingTag(crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+            "template",
+            vec![],
+            dp.clone(),
+        ));
+        // The offsets do not index this chunk, so the source check cannot place it.
+        assert_eq!(
+            t2529_at_line_start(&tok, "different text", true),
+            Some(false)
+        );
+
+        dp.tmp.line_start = Some(true);
+        let tok = ParsoidToken::SelfclosingTag(crate::wikitext::tokens_v2::SelfclosingTagTk::new(
+            "template",
+            vec![],
+            dp,
+        ));
+        assert_eq!(
+            t2529_at_line_start(&tok, "different text", true),
+            Some(true)
+        );
     }
 
     /// A construct that generates a whole attribute (`<div {{#switch:…}}>`) has

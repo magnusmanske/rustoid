@@ -742,6 +742,12 @@ pub struct TempData {
     /// The first wikitext node of a multi-template-content-block (html→wt
     /// serialization).
     pub first_wikitext_node: Option<String>,
+    /// Whether a `{{…}}` call sat at the start of a source line when it was
+    /// tokenized (core's `$piece['lineStart']`: the preceding character is a
+    /// newline). Read by the T2529 rule in [`crate::pipeline::parser`] when the
+    /// call's offsets index text other than the chunk being expanded — a template
+    /// body tokenized before its arguments were substituted.
+    pub line_start: Option<bool>,
     /// Set on tokens that came out of a parser function whose branch core
     /// expands to *text* — `#if`, `#ifeq`, `#ifexpr`, `#iferror`, i.e.
     /// `TemplateHandler::expands_branch_to_text`.

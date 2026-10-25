@@ -3267,6 +3267,10 @@ impl<'a> PegTokenizer<'a> {
 
         let mut dp = self.make_dp(saved, self.pos);
         dp.src = Some(self.input[saved..self.pos].to_string());
+        // Core's `$piece['lineStart']`: the character immediately before the call
+        // is a newline. Kept on the token because a later expansion may only have
+        // the substituted text, where these offsets no longer apply.
+        dp.tmp.line_start = Some(saved == 0 || self.input.as_bytes()[saved - 1] == b'\n');
         let mut stt = SelfclosingTagTk::new("template", vec![], dp);
 
         // attribs[0] = KV(target, '') — target is the part before the first '|'.
