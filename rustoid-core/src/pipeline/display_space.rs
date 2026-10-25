@@ -49,9 +49,35 @@ fn visit(node: &mut Node) {
                 NodeKind::Text(t) => t.clone(),
                 _ => unreachable!(),
             };
-            if let Some(offset) = find_left_match(&text).or_else(|| find_right_match(&text)) {
+            // PHP's `textHandler` runs the left handler and then the right
+            // handler on the *same* node. The left one rewrites the node to the
+            // prefix before its space, so the right handler only sees that
+            // prefix; both splits land in one child run, in insertion order
+            // (`prefix2`, right span, `suffix2`, left span, `suffix1`).
+            let left = find_left_match(&text);
+            let left_prefix = match left {
+                Some(o) => &text[..o],
+                None => text.as_str(),
+            };
+            let right = find_right_match(left_prefix);
+            if left.is_some() || right.is_some() {
                 let dsr_start = dsr_start_of_child(node, i);
-                i = splice_display_space(node, i, &text, offset, dsr_start);
+                let mut new_nodes: Vec<Node> = Vec::new();
+                if let Some(o) = right {
+                    push_text(&mut new_nodes, &left_prefix[..o]);
+                    new_nodes.push(display_space_span(dsr_start, o));
+                    push_text(&mut new_nodes, &left_prefix[o + 1..]);
+                } else if left.is_some() {
+                    push_text(&mut new_nodes, left_prefix);
+                }
+                if let Some(o) = left {
+                    new_nodes.push(display_space_span(dsr_start, o));
+                    push_text(&mut new_nodes, &text[o + 1..]);
+                }
+                node.children.splice(i..=i, new_nodes);
+                // The node left at `i` already had both handlers run; resume
+                // at the node after it.
+                i += 1;
                 continue;
             }
         }
@@ -59,30 +85,26 @@ fn visit(node: &mut Node) {
     }
 }
 
-/// Replace `parent.children[index]` (a text node) with
-/// `[prefix?, span, suffix?]`, and return the index of the suffix when there is
-/// one (else the node that followed the original), so the caller resumes there.
-fn splice_display_space(
-    parent: &mut Node,
-    index: usize,
-    text: &str,
-    offset: usize,
-    dsr_start: Option<usize>,
-) -> usize {
-    let prefix = &text[..offset];
-    // `substr( $str, $offset + 1 )` — the armored space is one byte.
-    let suffix = &text[offset + 1..];
+/// Append `text` unless it is empty (PHP never creates empty text nodes).
+fn push_text(nodes: &mut Vec<Node>, text: &str) {
+    if !text.is_empty() {
+        nodes.push(Node::text(text.to_string()));
+    }
+}
 
+/// The `mw:DisplaySpace` span that replaces the space at `offset`.
+///
+/// Its `data-parsoid` is the one-character source range of the space
+/// (`new DomSourceRange( $start, $start + 1, 0, 0 )`), or all-null when the
+/// text node's own start could not be recovered. Either way the metadata is
+/// present, which is what makes the node take a generated id.
+fn display_space_span(dsr_start: Option<usize>, offset: usize) -> Node {
     let mut span = Node::element(ElementKind::Other("span".to_string()));
     span.push_child(Node::text("\u{00A0}"));
     span.set_attr("typeof", "mw:DisplaySpace");
-    // The span's `data-parsoid` is the one-character source range of the space
-    // (`new DomSourceRange( $start, $start + 1, 0, 0 )`), or all-null when the
-    // text node's own start could not be recovered. Either way the metadata is
-    // present, which is what makes the node take a generated id.
     let dsr = match dsr_start {
         Some(s) => {
-            let start = s + prefix.len();
+            let start = s + offset;
             DomSourceRange {
                 start: Some(start),
                 end: Some(start + 1),
@@ -107,18 +129,7 @@ fn splice_display_space(
     };
     span.data_parsoid = dp.to_data_parsoid_json();
     span.dp = Some(dp);
-
-    let mut new_nodes = Vec::with_capacity(3);
-    if !prefix.is_empty() {
-        new_nodes.push(Node::text(prefix.to_string()));
-    }
-    let span_index = index + new_nodes.len();
-    new_nodes.push(span);
-    if !suffix.is_empty() {
-        new_nodes.push(Node::text(suffix.to_string()));
-    }
-    parent.children.splice(index..=index, new_nodes);
-    span_index + 1
+    span
 }
 
 /// The byte offset where `parent.children[index]` starts in the source, mirroring
@@ -306,6 +317,35 @@ mod tests {
         assert!(crate::html::dom_utils::has_type_of(span, "mw:DisplaySpace"));
         let json = span.data_parsoid.as_deref().expect("data-parsoid");
         assert!(json.contains("\"dsr\""), "got {json}");
+    }
+
+    /// A right-hand match survives a left-hand one in the same text node.
+    ///
+    /// PHP runs `leftHandler` and then `rightHandler` on the *same* text node;
+    /// the left split rewrites the node to the text before its space, and the
+    /// right handler then arms the opening guillemet in that prefix. Taking
+    /// only the first match of either kind (and re-visiting the suffix) lost
+    /// the guillemet in `Les « scandales » de 1878`.
+    #[test]
+    fn armors_both_guillemets_of_one_phrase() {
+        let mut p = Node::element(ElementKind::Paragraph);
+        p.push_child(Node::text("Les « scandales » de 1878"));
+        run(&mut p);
+        let html: Vec<String> = p
+            .children
+            .iter()
+            .map(|c| match &c.kind {
+                NodeKind::Text(t) => t.clone(),
+                _ if crate::html::dom_utils::has_type_of(c, "mw:DisplaySpace") => {
+                    "<DS>".to_string()
+                }
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            html,
+            vec!["Les «", "<DS>", "scandales", "<DS>", "» de 1878"]
+        );
     }
 
     /// A second French space in one text node is armored too: the walk resumes at

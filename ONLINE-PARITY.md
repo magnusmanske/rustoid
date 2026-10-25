@@ -19542,3 +19542,18 @@ transforms returns.
 
 **Effect:** `Chess` 240,075 → 393,604; no other corpus change, 5/48 strict,
 7 nondeterministic-only (25.0%).
+
+## Both French spaces of one phrase are armored
+
+PHP's `DisplaySpace` text handler runs `leftHandler` (space before `? : ; ! % »
+›`) and then `rightHandler` (space after `« ‹`) on the *same* text node. The
+left split truncates the node to the text before its space, so the right
+handler sees only that prefix — which is how `Les « scandales » de 1878` gets
+two `mw:DisplaySpace` spans.
+
+rustoid took only the first match of *either* kind, so a text node holding both
+a left and a right candidate lost the guillemet: `"Les « scandales<span …>» …`
+was served where the wiki has `"Les «<span …>scandales<span …>» …`.
+
+**Effect:** `France` 1,023,091 → 1,517,590; no other corpus change, 5/48 strict,
+7 nondeterministic-only (25.0%).
