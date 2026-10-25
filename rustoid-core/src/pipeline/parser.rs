@@ -1457,7 +1457,11 @@ pub fn render_inline_fragment(
     let mut tokens = out;
 
     // Step 3: behavior switches → `mw:PageProp` metas.
-    tokens = crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens);
+    {
+        let aliases = crate::pipeline::behavior_switch_handler::behavior_switch_aliases(config);
+        tokens = crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler
+            .run(tokens, aliases.as_ref());
+    }
 
     // Step 3b: `language-variant` → `mw:LanguageVariant` elements (mirrors the
     // TT2 `LanguageVariantHandler`, which runs in the token pipeline before tree
@@ -3167,9 +3171,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     }
 
     /// Expand `behavior-switch` tokens into `mw:PageProp` metas (mirrors the
-    /// TT2 `BehaviorSwitchHandler`).
+    /// TT2 `BehaviorSwitchHandler`). A `__…__` the site does not register as a
+    /// behavior switch stays literal text, which is what Parsoid's
+    /// `getMagicWordForBehaviorSwitch` check does.
     fn render_behavior_switches(&self, tokens: Vec<Item>) -> Vec<Item> {
-        crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler.run(tokens)
+        let aliases =
+            crate::pipeline::behavior_switch_handler::behavior_switch_aliases(self.config);
+        crate::pipeline::behavior_switch_handler::BehaviorSwitchHandler
+            .run(tokens, aliases.as_ref())
     }
 
     /// Expand `language-variant` tokens into `mw:LanguageVariant` elements

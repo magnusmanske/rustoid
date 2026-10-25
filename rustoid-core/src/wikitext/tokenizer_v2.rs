@@ -3832,6 +3832,9 @@ impl<'a> PegTokenizer<'a> {
 
             let dp = self.make_dp(start, self.pos);
             let mut stt = SelfclosingTagTk::new("behavior-switch", vec![], dp);
+            // The original `__…__` text: a word the site does not register is
+            // ordinary text, and its case must survive.
+            stt.data_parsoid.src = Some(self.input[start..self.pos].to_string());
             stt.add_attribute_str("word", &word);
 
             self.emit_token(ParsoidToken::SelfclosingTag(stt));

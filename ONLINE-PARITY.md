@@ -19598,3 +19598,21 @@ offsets do not index the chunk.
 
 **Effect:** `Hydrogen` 47,556 → 69,769 (its table is built); `Nigeria` now
 matches; no regressions, 5/48 strict, 9 nondeterministic-only (29.2%).
+
+## Only the site's behavior switches become `mw:PageProp` metas
+
+Parsoid's tokenizer makes a `behavior-switch` token only when
+`getMagicWordForBehaviorSwitch` recognizes the whole `__…__` text; every other
+double-underscore word is ordinary text. rustoid accepted any `__…__`, so
+`Module:Infobox ship`'s sentinel label `__1B0X_5H1P__` — which the module
+deletes by matching the rendered `__1B0X_5H1P__` row — became
+`<meta property="mw:PageProp/1b0x_5h1p"/>` and its row survived
+(`Titanic`'s stray empty-label `career` row).
+
+The site config now carries `siteinfo`'s `doubleunderscores` ids, the handler
+resolves an `__…__` against the magic-word aliases (which keep their
+underscores, as PHP matches them), and an unrecognized word is emitted back as
+text in its original case.
+
+**Effect:** `Titanic` 24,339 → 43,977; no other corpus change, 5/48 strict,
+9 nondeterministic-only (29.2%).

@@ -47,6 +47,9 @@ pub struct WikiSiteConfig {
     /// must fall through to a template call: `timef-both` (alias `both`) is a
     /// parser function, so `{{both|…}}` is `Template:Both`.
     magic_word_variables: HashSet<String>,
+    /// Canonical names that are behavior switches (siteinfo's
+    /// `doubleunderscores`). Empty when the site did not report them.
+    behavior_switch_ids: HashSet<String>,
     function_hooks: Vec<String>,
     extension_tags: Vec<String>,
     server_url: String,
@@ -70,6 +73,7 @@ impl Default for WikiSiteConfig {
             interwiki_map: HashMap::new(),
             magic_words: MagicWordMap::default(),
             magic_word_variables: HashSet::new(),
+            behavior_switch_ids: HashSet::new(),
             function_hooks: Vec::new(),
             extension_tags: Vec::new(),
             server_url: String::new(),
@@ -228,6 +232,10 @@ impl WikiSiteConfig {
             }
         }
 
+        if let Some(ids) = q.doubleunderscores {
+            cfg.behavior_switch_ids = ids.into_iter().collect();
+        }
+
         if let Some(hooks) = q.functionhooks {
             cfg.function_hooks = hooks.into_iter().map(|h| h.to_lowercase()).collect();
             cfg.function_hooks.sort();
@@ -338,6 +346,12 @@ impl SiteConfig for WikiSiteConfig {
         // `None` means "the site did not tell us", which keeps the older
         // alias-table heuristic; an empty set would mean "no variables at all".
         (!self.magic_word_variables.is_empty()).then_some(&self.magic_word_variables)
+    }
+
+    fn behavior_switch_ids(&self) -> Option<&HashSet<String>> {
+        // `None` means "the site did not report them" (a `siteinfo` fetched
+        // before MW 1.45), which keeps accepting any `__…__` as a switch.
+        (!self.behavior_switch_ids.is_empty()).then_some(&self.behavior_switch_ids)
     }
 
     fn function_hooks(&self) -> &[String] {
@@ -469,6 +483,10 @@ struct SiteInfoQuery {
     /// Canonical names of the magic *variables* (`MagicWordFactory::$mVariableIDs`).
     #[serde(default)]
     variables: Option<Vec<String>>,
+    /// Canonical names of the magic **behavior switches** (`siteinfo`'s
+    /// `doubleunderscores`, MW 1.45+): the `__TOC__` / `__NOTOC__` family.
+    #[serde(default)]
+    doubleunderscores: Option<Vec<String>>,
     #[serde(default)]
     functionhooks: Option<Vec<String>>,
     /// Canonical special-page names, each with its aliases.

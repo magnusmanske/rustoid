@@ -540,6 +540,17 @@ pub trait SiteConfig: Send + Sync {
         None
     }
 
+    /// Canonical magic-word names that are **behavior switches** (`siteinfo`'s
+    /// `doubleunderscores`): the `__TOC__`/`__NOTOC__` family.
+    ///
+    /// Parsoid's tokenizer only makes a behavior-switch token when
+    /// `getMagicWordForBehaviorSwitch` recognizes the `__…__` text; anything
+    /// else stays literal. `None` means the site did not report the set (a mock,
+    /// or a `siteinfo` fetched before MW 1.45), and every `__…__` is accepted.
+    fn behavior_switch_ids(&self) -> Option<&std::collections::HashSet<String>> {
+        None
+    }
+
     /// Names of the wiki's parser functions (`functionhooks`). Mirrors PHP's
     /// `SiteConfig::$apiFunctionHooks`, which `updateFunctionSynonym` uses to
     /// decide whether a synonym is stored with a leading `#`. Core registers
