@@ -19557,3 +19557,23 @@ was served where the wiki has `"Les «<span …>scandales<span …>» …`.
 
 **Effect:** `France` 1,023,091 → 1,517,590; no other corpus change, 5/48 strict,
 7 nondeterministic-only (25.0%).
+
+## A range that ends in an element takes that element's source range
+
+When a template's expansion opens a container and page text continues it, the
+transclusion's range ends at that *element* rather than at the end-marker meta:
+`{{INSEE}}` expands to a list item and the next line is another `* item`, so
+the range end is the `<ul>`, whose `dsr` reaches the second item. PHP's
+`getRangeEndDSR` reads exactly that node's `dsr`, and
+`encapsulateTemplates` turns the gap between the last part's `dsr.end` and the
+range's into a trailing wikitext `data-mw.parts` entry.
+
+rustoid preferred the node's `tsr` for every holder, and a list element's `tsr`
+is the degenerate `0..0` of its first token, so the range stopped at the end of
+the template and the trailing part was never recorded. Marker metas keep the
+`tsr` preference (their `dsr.end` is the output length); any other node now uses
+its `dsr`.
+
+**Effect:** `France` 1,517,590 → match (nondeterministic only),
+`List of sovereign states` 41,760 → 178,600, `Cristiano Ronaldo` 409,233 →
+471,357; no other corpus change, 5/48 strict, 8 nondeterministic-only (27.1%).

@@ -2904,14 +2904,7 @@ fn wrap_flipped_children(
         // following sibling, as an earlier version did, also swept unrelated
         // later sections into the trailing wikitext part — on Israel the
         // Etymology paragraph's wrapper absorbed the rest of the page to EOF.
-        let source_end = |c: &Node| -> Option<usize> {
-            c.dp.as_ref().and_then(|d| {
-                d.tsr
-                    .as_ref()
-                    .map(|r| r.end)
-                    .or_else(|| d.dsr.as_ref().and_then(|r| r.end))
-            })
-        };
+        let source_end = range_source_end;
         let mut range_end = tpl_end;
         if let Some(end) = source_end(&children[t]) {
             range_end = Some(range_end.map_or(end, |cur| cur.max(end)));
@@ -2980,6 +2973,30 @@ fn wrap_flipped_children(
         stash_range(&mut children, rlo, rhi);
     }
     children
+}
+
+/// The source offset a transclusion range ends at, given the node that holds
+/// its end marker (PHP `getRangeEndDSR` reads that node's `dsr`).
+///
+/// For a template-marker `<meta>`, rustoid's `dsr.end` holds the *output*
+/// length while its `tsr` is the source range, so `tsr` wins there. Any other
+/// node is described by its own `dsr`: an element can be the range's end
+/// because the template opened it and following page content continued it (a
+/// list whose next item is plain wikitext), and its `tsr` is then only the
+/// degenerate position of its first token.
+fn range_source_end(node: &Node) -> Option<usize> {
+    let dp = node.dp.as_ref()?;
+    let tsr_end = dp.tsr.as_ref().map(|r| r.end).filter(|e| *e > 0);
+    let dsr_end = dp.dsr.as_ref().and_then(|r| r.end);
+    let is_marker_meta = crate::html::wts_utils::node_name(node) == "meta"
+        && node
+            .get_attr("typeof")
+            .is_some_and(|t| t.contains("mw:Transclusion"));
+    if is_marker_meta {
+        tsr_end.or(dsr_end)
+    } else {
+        dsr_end.or(tsr_end)
+    }
 }
 
 /// Stash the rendering-transparent runs inside one already-encapsulated range.
@@ -4534,6 +4551,48 @@ mod tests {
         assert_eq!(tbody.children.len(), 2, "{tbody:?}");
         assert!(matches!(tbody.children[0].kind, NodeKind::Text(ref s) if s == "\n"));
         assert_eq!(crate::html::wts_utils::node_name(&tbody.children[1]), "tr");
+    }
+
+    #[test]
+    fn test_a_range_ending_in_an_element_uses_its_own_source_range() {
+        // `{{INSEE}}` expands to a list item, and the page's next line continues
+        // the same `<ul>`. PHP's range end is then the `<ul>` itself, so the
+        // range's `dsr.end` reaches the second item and its source becomes the
+        // trailing `data-mw.parts` entry. Preferring the element's (degenerate)
+        // `tsr` stopped the range at the end of the template.
+        let mut ul = Node::element(ElementKind::Other("ul".to_string()));
+        ul.dp = Some(DataParsoid {
+            tsr: Some(crate::wikitext::tokens_v2::SourceRange {
+                start: Some(0),
+                end: 0,
+                source: None,
+            }),
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(0),
+                end: Some(281_768),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(range_source_end(&ul), Some(281_768));
+
+        // An end-marker meta keeps its `tsr`: its `dsr.end` is the output length.
+        let mut end = Node::element(ElementKind::Other("meta".to_string()));
+        end.set_attr("typeof", "mw:Transclusion/End");
+        end.dp = Some(DataParsoid {
+            tsr: Some(crate::wikitext::tokens_v2::SourceRange {
+                start: Some(100),
+                end: 122,
+                source: None,
+            }),
+            dsr: Some(crate::wikitext::tokens_v2::DomSourceRange {
+                start: Some(100),
+                end: Some(131),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(range_source_end(&end), Some(122));
     }
 
     #[test]
