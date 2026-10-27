@@ -23,11 +23,12 @@ pub struct Frame {
     title: Title,
     args: Params,
     depth: usize,
-    /// This frame exists only to expand a call's argument *values*. It is titled
-    /// with the page (so an argument that calls the caller's own template cannot
-    /// look like a loop), and Scribunto's `frame:getParent()` must read through
-    /// it to the frame that made the call — see [`Frame::arg_value_scope`].
-    arg_value_scope: bool,
+    /// This frame is *derived*: it exists to expand a call's argument values
+    /// (titled with the page, so an argument that calls the caller's own
+    /// template cannot look like a loop) or a module's output (no arguments, so
+    /// a `{{{…}}}` in it stays literal). Scribunto's `frame:getParent()` must
+    /// read through it to the frame the call was written in.
+    derived_scope: bool,
 }
 
 impl Frame {
@@ -38,7 +39,7 @@ impl Frame {
             title,
             args: Params::new(args),
             depth: 0,
-            arg_value_scope: false,
+            derived_scope: false,
         }
     }
 
@@ -89,31 +90,48 @@ impl Frame {
             title,
             args: Params::new(args),
             depth: self.depth + 1,
-            arg_value_scope: false,
+            derived_scope: false,
         }
     }
 
-    /// Create the frame a call's argument values are expanded in.
+    /// Create a derived frame: one that exists only to expand a call's argument
+    /// values or a module's output, not a template of its own.
     ///
-    /// PHP's preprocessor uses a frame with a null title here, which rustoid
-    /// approximates with the page title (see
-    /// `Parser::expand_template_arg_tokens`). The frame still has a parent — the
-    /// one the call was written in — and Scribunto's `frame:getParent()` for a
-    /// `#invoke` inside such a value has to read through it: `Module:Arguments`
-    /// compares the parent *title* against its `wrappers` list.
-    pub fn new_arg_value_child(&self, title: Title, args: Vec<KV>) -> Frame {
+    /// PHP's preprocessor uses a frame with a null title for argument values,
+    /// which rustoid approximates with the page title (see
+    /// `Parser::expand_template_arg_tokens`); a module's output is expanded in a
+    /// frame with no arguments of its own. In both, `frame:getParent()` has to
+    /// read through to the frame the call was written in — `Module:Arguments`
+    /// compares the parent *title* against its `wrappers` list, and
+    /// `Module:Singles` only finds its `single1=` arguments that way.
+    pub fn new_derived_child(&self, title: Title, args: Vec<KV>) -> Frame {
         Frame {
             parent_frame: Some(Box::new(self.clone())),
             title,
             args: Params::new(args),
             depth: self.depth + 1,
-            arg_value_scope: true,
+            derived_scope: true,
         }
     }
 
-    /// Whether this frame only exists to expand a call's argument values.
-    pub fn arg_value_scope(&self) -> bool {
-        self.arg_value_scope
+    /// Whether this frame is derived rather than a template's own.
+    pub fn is_derived_scope(&self) -> bool {
+        self.derived_scope
+    }
+
+    /// The frame Scribunto reports as `frame:getParent()` for a `#invoke`
+    /// written here.
+    ///
+    /// A derived frame is transparent for that purpose: the call was written in
+    /// its parent, so both the parent's arguments and its title are the
+    /// parent's.
+    pub fn scribunto_parent(&self) -> &Frame {
+        let mut frame = self;
+        while frame.derived_scope {
+            let Some(parent) = frame.parent() else { break };
+            frame = parent;
+        }
+        frame
     }
 
     /// Check if expanding a template would lead to a loop, or would exceed

@@ -7614,8 +7614,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // so they are passed raw as well; the parent's list has no
                 // `#invoke:` target, so every entry is an argument — including the
                 // first, which `{{see Wiktionary|…}}` hands to `Module:Hatnote`.
+                //
+                // A derived frame (a call's argument values, a module's output)
+                // has no arguments of its own to report; the call was written in
+                // its parent. See [`Frame::scribunto_parent`].
                 let raw_parent_args: Vec<crate::wikitext::tokens_v2::KV> =
-                    frame.args().args.clone();
+                    frame.scribunto_parent().args().args.clone();
                 let Some(call) =
                     crate::lua::invoke::Invoke::from_parts(pf_arg, &function, raw_pairs)
                 else {
@@ -8873,19 +8877,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // The parent frame's args and title are the calling template's, which
         // modules read through `frame:getParent()`.
         let lazy_parent = lazy_args(&raw_parent_args, ArgSource::Parent);
-        let parent_title = {
-            // An argument value expands in a frame titled with the page
-            // (`expand_template_arg_tokens`), but Scribunto's parent frame is
-            // the one the call was written in; `Module:Arguments` matches its
-            // title against a `wrappers` list (`Template:Singles` calls
-            // `Module:Singles|main` from an argument, and only the template's
-            // own title makes the wrapper match).
-            let mut parent_frame = frame;
-            while parent_frame.arg_value_scope() {
-                parent_frame = parent_frame.parent().unwrap_or(parent_frame);
-            }
-            parent_frame.title().full_text()
-        };
+        let parent_title = frame.scribunto_parent().title().full_text();
         let lazy_call = lazy_args(&raw_call_args, ArgSource::Call);
         // `frame:getParent()` is never nil here, whatever the namespace. The
         // manual is explicit: it "returns the frame for the page that called
@@ -9025,21 +9017,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             items.insert(0, Item::Tok(ParsoidToken::Nl(nl)));
         }
 
-        // The module's output is expanded in a child frame that inherits the
-        // caller's arguments, as every non-top-level pipeline does in Parsoid
-        // (`ParserPipeline::parse` creates the child with `$frame->getArgs()`).
-        // That inheritance is observable: a `#invoke` nested in the output reads
-        // its parent frame's arguments, so `Template:Singles`'s
-        // `data2={{#invoke:Singles|main}}` must see the `single1=` arguments of
-        // the `{{Singles|…}}` call it is expanding inside. An empty argument list
-        // made `Module:Arguments` answer no arguments and the track list vanish.
-        //
-        // Passing the *call's* arguments instead was wrong for a different
-        // reason: a `{{{…}}}` in the output that names one of them expanded the
-        // value into itself (`Template:Infobox`'s documentation hands
+        // The module's output is expanded in a *derived* frame: it inherits the
+        // caller's title and parent, but no arguments of its own. Parsoid builds
+        // it that way (`processTemplateSource` passes `attribs => []` for a
+        // PFragment handler), which is what keeps a `{{{…}}}` written in the
+        // output literal — `Template:Infobox`'s documentation hands
         // `subheader2={{{subheader2}}}<br/>…` to `{{Parameter names example}}`,
-        // which rustoid then re-expanded three deep).
-        let child = frame.new_child(frame.title().clone(), frame.args().args.clone());
+        // and the service serves one literal reference. Arguments still reach a
+        // `#invoke` nested in the output through `frame:getParent()`
+        // (`Template:Singles`'s `data2={{#invoke:Singles|main}}`), because the
+        // derived frame's parent is the caller — see [`Frame::scribunto_parent`].
+        let child = frame.new_derived_child(frame.title().clone(), Vec::new());
         // A module's output is wikitext in the calling frame's context, and a
         // template it echoes (`Module:Clade` emits nested `{{clade}}` calls) is
         // expanded with the title-chain loop check stood down: production
@@ -9293,8 +9281,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         } else {
             items
         };
-        let child =
-            frame.new_arg_value_child(frame.root_title().clone(), frame.args().args.clone());
+        let child = frame.new_derived_child(frame.root_title().clone(), frame.args().args.clone());
         let expanded = Box::pin(self.expand_templates(
             &child,
             substituted,
