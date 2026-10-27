@@ -938,6 +938,12 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
         .as_deref()
         .is_some_and(|c| c.trim_start().to_uppercase().starts_with("#REDIRECT"))
         || info.as_ref().is_some_and(|i| i.redirect);
+    // `title.redirectTarget` needs the redirect's *target*, which only the body
+    // carries. A title whose body was not fetched answers nil and records the
+    // request, like `exists`.
+    let redirect_target = content
+        .as_deref()
+        .and_then(crate::pipeline::template_handler::redirect_target_of);
     // Protection is asked for in one batch rather than per title, and after the
     // content loop so a data source that can only answer one of the two cheaply
     // still gets asked once.
@@ -992,6 +998,7 @@ pub(crate) async fn title_facts_of<S: DataSource + ?Sized>(
     TitleFacts {
         exists,
         is_redirect,
+        redirect_target,
         content,
         protection,
         categories,

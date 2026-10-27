@@ -382,6 +382,9 @@ pub struct TitleFacts {
     pub exists: bool,
     /// The page is a redirect.
     pub is_redirect: bool,
+    /// The title the page redirects to, when it is a redirect and its body was
+    /// fetched: `mw.title.new(x).redirectTarget`.
+    pub redirect_target: Option<String>,
     /// Wikitext, when it was fetched. `None` means "not fetched", which is
     /// distinct from "empty": `getContent()` on an unfetched page returns nil,
     /// while a fetched empty page returns `""`.
@@ -3228,6 +3231,7 @@ fn luafn_title_new(
     // as a lookup closure, under a key the metatable knows.
     let facts_for_lookup = facts.clone();
     let full_for_lookup = full.clone();
+    let site_for_lookup = ctx.site.clone();
     table.raw_set(
         TITLE_FACTS_KEY,
         lua.create_function(move |lua, (_this, key): (Value, String)| {
@@ -3238,6 +3242,7 @@ fn luafn_title_new(
                 is_current,
                 &full_for_lookup,
                 ns_id,
+                &site_for_lookup,
             )
         })?,
     )?;
@@ -3364,6 +3369,7 @@ fn title_derived_field(
     is_current: bool,
     full: &str,
     ns_id: i32,
+    site: &LuaSite,
 ) -> mlua::Result<Value> {
     match key {
         "exists" if ns_id == MEDIA_NAMESPACE_ID => {
@@ -3425,6 +3431,28 @@ fn title_derived_field(
             Ok(Value::Boolean(
                 facts.as_ref().is_some_and(|f| f.is_redirect),
             ))
+        }
+        // `title.redirectTarget` — the title a redirect points at, as a title
+        // object (`nil` for a page that is not a redirect). Scribunto reads it
+        // from the page's content, which is why an unfetched title asks the host
+        // for a retry before answering. `Template:United States Ship` uses it to
+        // link `USS Arizona (BB-39)` at its target rather than through the
+        // redirect, and a nil answer left the redirect target in the link.
+        "redirectTarget" => {
+            // The page being parsed is never its own redirect.
+            if is_current {
+                return Ok(Value::Nil);
+            }
+            let Some(facts) = facts else {
+                if !full.is_empty() {
+                    note_missing_title(lua, full)?;
+                }
+                return Ok(Value::Nil);
+            };
+            match &facts.redirect_target {
+                Some(target) => title_from_full_text(lua, site, target),
+                None => Ok(Value::Nil),
+            }
         }
         // `protectionLevels` is a table keyed by action, each value an *array*
         // whose first item is the level string: `{ edit = { 'sysop' } }`.
@@ -3787,10 +3815,19 @@ fn title_object(
         .as_ref()
         .is_some_and(|db| is_current_title(&db.current_title, full, title_text, ns_id));
     let full_for_lookup = full.to_string();
+    let site_for_lookup = site.clone();
     table.raw_set(
         TITLE_FACTS_KEY,
         lua.create_function(move |lua, (_this, key): (Value, String)| {
-            title_derived_field(lua, &key, &facts, is_current, &full_for_lookup, ns_id)
+            title_derived_field(
+                lua,
+                &key,
+                &facts,
+                is_current,
+                &full_for_lookup,
+                ns_id,
+                &site_for_lookup,
+            )
         })?,
     )?;
     let mt = title_metatable(lua, site)?;
