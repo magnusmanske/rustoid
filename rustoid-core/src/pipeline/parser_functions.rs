@@ -3019,6 +3019,73 @@ mod tests {
         }
     }
 
+    /// A `#tag:<extension>` call spends the parse's pFragment numbers in order:
+    /// one for its own atomic result, then one per piece of its body. Parsoid
+    /// prepares the call before expanding the body, so the body's first piece is
+    /// numbered after the call's own. The marker in `source` is what the served
+    /// `extsrc` carries.
+    #[test]
+    fn test_pf_tag_numbers_its_fragment_before_the_body_pieces() {
+        use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, TagTk};
+
+        crate::pipeline::pfragment::reset();
+        let placeholder = |name: &str, ty: &str| {
+            let mut tag = TagTk::new(name, vec![], DataParsoid::default());
+            tag.add_attribute_str("typeof", ty);
+            tag.add_attribute_str("data-fragment-id", "7");
+            Item::Tok(ParsoidToken::Tag(tag))
+        };
+        let content = vec![
+            Item::Str("a".to_string()),
+            placeholder("style", "mw:DOMFragment"),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "style",
+                vec![],
+                DataParsoid::default(),
+            ))),
+            Item::Str("b".to_string()),
+        ];
+        let p = Params::new(vec![
+            kv("pre", ""),
+            KV {
+                key: KeyValue::Str(String::new()),
+                value: KeyValue::Tokens(content),
+                src_offsets: None,
+                ksrc: None,
+                vsrc: None,
+            },
+        ]);
+        let out = ParserFunctions::pf_tag(&crate::mock::MockSiteConfig::new(), &p);
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &out[0] else {
+            panic!("expected an extension token, got {out:?}");
+        };
+        let source = t
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("source"))
+            .and_then(|kv| kv.value.as_str());
+        assert_eq!(source, Some("<pre>a{{#parsoid\u{0}fragment:1}}b</pre>"));
+        // The call's own number and the body's piece are spent.
+        assert_eq!(crate::pipeline::pfragment::allocate(), 2);
+    }
+
+    /// A `#tag:<extension>` reached from another such call's content argument is
+    /// expanded lazily as a piece of that argument, so it spends no number of
+    /// its own — the outer body's serialization numbers the whole piece.
+    #[test]
+    fn test_a_lazy_tag_call_spends_no_number_for_itself() {
+        crate::pipeline::pfragment::reset();
+        let previous = crate::pipeline::pfragment::set_lazy(true);
+        let p = params(vec![("pre", ""), ("", "123")]);
+        let out = ParserFunctions::pf_tag(&crate::mock::MockSiteConfig::new(), &p);
+        crate::pipeline::pfragment::restore_lazy(previous);
+        assert!(matches!(
+            &out[0],
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension"
+        ));
+        assert_eq!(crate::pipeline::pfragment::allocate(), 0);
+    }
+
     /// A `#tag` attribute value that carries HTML markup must keep it.
     /// `Module:OSM Location map` passes `text=<div title="…">&nbsp;…</div>`
     /// through `frame:extensionTag`; dropping the tags emptied the attribute
