@@ -548,14 +548,21 @@ fn build_request(method: &str, args: mlua::MultiValue) -> mlua::Result<FrameRequ
 /// already-rendered `{{marriage}}` carrying a `display` rule with a `|`, arrived
 /// as a one-item list and the infobox showed `Spouse` instead of `Spouses`.
 pub fn request_tokens(request: &FrameRequest, ext_tags: &[String]) -> (Vec<Item>, String) {
-    if let FrameRequest::ExpandTemplate { title, args } = request {
-        return (vec![template_token(title, args)], String::new());
+    match request {
+        FrameRequest::ExpandTemplate { title, args } => {
+            (vec![template_token(title, args)], String::new())
+        }
+        FrameRequest::CallParserFunction { name, args } => {
+            (vec![call_parser_function_token(name, args)], String::new())
+        }
+        _ => {
+            let text = request_wikitext(request).unwrap_or_default();
+            let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
+                &text, /* in_template */ true, ext_tags,
+            );
+            (items, text)
+        }
     }
-    let text = request_wikitext(request).unwrap_or_default();
-    let items = crate::pipeline::template_handler::tokenize_wikitext_to_items(
-        &text, /* in_template */ true, ext_tags,
-    );
-    (items, text)
 }
 
 /// The `template` token a `frame:expandTemplate` request stands for.
@@ -568,76 +575,76 @@ pub fn request_tokens(request: &FrameRequest, ext_tags: &[String]) -> (Vec<Item>
 /// (nested `{{{…}}}` references, named-argument trimming, `data-mw`) is
 /// unchanged.
 pub fn template_token(title: &str, args: &[FrameArg]) -> Item {
-    use crate::wikitext::tokens_v2::{DataParsoid, KV, KeyValue};
-    let kv = |key: String, value: String| KV {
-        key: KeyValue::Str(key),
-        value: KeyValue::Str(value),
-        src_offsets: None,
-        ksrc: None,
-        vsrc: None,
-    };
-    // `attribs[0]` is the target, mirroring the tokenizer's `template` token; a
-    // positional argument's key is empty.
-    let mut attribs = vec![kv(title.to_string(), String::new())];
+    let mut attribs = vec![kv(title, "")];
     attribs.extend(
         args.iter()
-            .map(|arg| kv(arg.name.clone().unwrap_or_default(), arg.value.clone())),
+            .map(|arg| kv(arg.name.as_deref().unwrap_or(""), &arg.value)),
     );
+    template_tag(attribs)
+}
+
+/// The `template` token a `frame:callParserFunction` request stands for.
+///
+/// Scribunto passes a parser function its arguments as *values*, so a `|` or `=`
+/// inside one is literal. Writing the call back out as `{{#name:…}}` and
+/// re-tokenizing it split those values: `Module:Gallery` hands `#tag:gallery` one
+/// content argument holding a `|`-separated line per image, and the split put the
+/// gallery's `alt=` text into the tag's attributes instead of its body (Earth's
+/// gallery).
+///
+/// The token has the shape the tokenizer produces: `attribs[0]` is the
+/// colon-joined `name:first-argument` target, the rest are the remaining
+/// arguments with an empty key for a positional one.
+fn call_parser_function_token(name: &str, args: &[FrameArg]) -> Item {
+    // The `#` is *syntax*, not part of the name: Scribunto names the function
+    // `tag`, and `#tag` arrives with its own hash from `frame:extensionTag`.
+    // MediaWiki registers some functions without one (`{{DISPLAYTITLE:…}}`), so
+    // the hash is only written for the others.
+    let bare = name.strip_prefix('#').unwrap_or(name);
+    let hash = if is_no_hash_function(bare) { "" } else { "#" };
+    let mut args = args.iter();
+    let mut target = format!("{hash}{bare}");
+    if let Some(first) = args.next() {
+        target.push(':');
+        target.push_str(&first.value);
+    }
+    let mut attribs = vec![kv(&target, "")];
+    attribs.extend(args.map(|arg| kv(arg.name.as_deref().unwrap_or(""), &arg.value)));
+    template_tag(attribs)
+}
+
+/// A `template` self-closing tag over an argument list (`attribs[0]` is the
+/// target).
+fn template_tag(attribs: Vec<crate::wikitext::tokens_v2::KV>) -> Item {
     Item::Tok(crate::wikitext::tokens_v2::ParsoidToken::SelfclosingTag(
         crate::wikitext::tokens_v2::SelfclosingTagTk::new(
             "template",
             attribs,
-            DataParsoid::default(),
+            crate::wikitext::tokens_v2::DataParsoid::default(),
         ),
     ))
 }
 
+fn kv(key: &str, value: &str) -> crate::wikitext::tokens_v2::KV {
+    crate::wikitext::tokens_v2::KV {
+        key: crate::wikitext::tokens_v2::KeyValue::Str(key.to_string()),
+        value: crate::wikitext::tokens_v2::KeyValue::Str(value.to_string()),
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    }
+}
+
 /// The wikitext a request stands for, when it is one.
 ///
-/// `frame:preprocess` hands its text to the preprocessor and a parser function
-/// call is written back out as `{{#name:…}}`; both are parsed. A
-/// `frame:expandTemplate` is not wikitext — its values are opaque and its token
-/// is built directly — and an `ExpandArgs` slot list is not a call at all.
+/// Only `frame:preprocess` is wikitext: everything else is opaque values, which
+/// [`request_tokens`] turns into tokens directly. `ExpandArgs` is not a call at
+/// all.
 fn request_wikitext(request: &FrameRequest) -> Option<String> {
     match request {
-        FrameRequest::ExpandTemplate { .. } | FrameRequest::ExpandArgs { .. } => None,
-        // `{{#name:first|rest}}`: a parser function's first argument is joined
-        // by a *colon*, and the pipe separates the rest. Scribunto lets the
-        // module pass an empty first argument precisely so the colon can be
-        // written even when the function ignores it.
-        FrameRequest::CallParserFunction { name, args } => {
-            let mut args = args.iter();
-            // The `#` is *syntax*, not part of the name: Scribunto names the
-            // function `tag`, and `{{#tag:…}}` writes the hash once. A name that
-            // arrives with its own leading `#` — which is how
-            // `frame:extensionTag` is lowered, to `"#tag"` — would otherwise
-            // render as `{{##tag:…}}`, which is not a call at all and silently
-            // failed to expand.
-            //
-            // Whether the hash belongs there at all follows MediaWiki's
-            // registration: a function in Parsoid's `noHashFunctions` set is
-            // written bare (`{{DISPLAYTITLE:…}}`), every other one carries a
-            // hash (`{{#if:…}}`). Rendering `{{#DISPLAYTITLE:…}}` would be a
-            // *broken* parser function — the service renders it literally — so a
-            // `frame:callParserFunction('DISPLAYTITLE', …)` has to come out bare.
-            let bare = name.strip_prefix('#').unwrap_or(name);
-            let hash = if is_no_hash_function(bare) { "" } else { "#" };
-            let mut out = format!("{{{{{hash}{bare}");
-            if let Some(first) = args.next() {
-                out.push(':');
-                out.push_str(&first.value);
-            }
-            for arg in args {
-                out.push('|');
-                if let Some(name) = &arg.name {
-                    out.push_str(name);
-                    out.push('=');
-                }
-                out.push_str(&arg.value);
-            }
-            out.push_str("}}");
-            Some(out)
-        }
+        FrameRequest::ExpandTemplate { .. }
+        | FrameRequest::ExpandArgs { .. }
+        | FrameRequest::CallParserFunction { .. } => None,
         FrameRequest::Preprocess(text) => Some(text.clone()),
     }
 }
@@ -1196,26 +1203,57 @@ fn urllink_token_wikitext(token: &crate::wikitext::tokens_v2::ParsoidToken) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wikitext::tokens_v2::{Item, ParsoidToken};
 
     /// A `frame:callParserFunction` for a function MediaWiki registers without a
     /// hash must be written without one: `{{DISPLAYTITLE:…}}` resolves, while
     /// `{{#DISPLAYTITLE:…}}` is a broken parser function the service renders it
     /// literally. `#tag` and `#if` keep their hash.
     #[test]
-    fn request_wikitext_writes_a_no_hash_function_without_the_hash() {
-        let call = |name: &str| FrameRequest::CallParserFunction {
-            name: name.to_string(),
-            args: vec![FrameArg::positional("X")],
+    fn call_parser_function_keeps_the_registration_s_hash() {
+        let target = |name: &str| {
+            let item = call_parser_function_token(name, &[FrameArg::positional("X")]);
+            let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+                panic!("expected a template token");
+            };
+            t.attribs[0].key.as_str().unwrap_or_default().to_string()
         };
-        let text = |name: &str| request_wikitext(&call(name));
-        assert_eq!(text("DISPLAYTITLE").as_deref(), Some("{{DISPLAYTITLE:X}}"));
-        assert_eq!(
-            text("PROTECTIONEXPIRY").as_deref(),
-            Some("{{PROTECTIONEXPIRY:X}}")
-        );
+        assert_eq!(target("DISPLAYTITLE"), "DISPLAYTITLE:X");
+        assert_eq!(target("PROTECTIONEXPIRY"), "PROTECTIONEXPIRY:X");
         // `frame:extensionTag` lowers to `#tag`; the hash must survive.
-        assert_eq!(text("#tag").as_deref(), Some("{{#tag:X}}"));
-        assert_eq!(text("if").as_deref(), Some("{{#if:X}}"));
+        assert_eq!(target("#tag"), "#tag:X");
+        assert_eq!(target("if"), "#if:X");
+    }
+
+    /// A parser function's argument is a *value*, so a pipe in it is literal.
+    /// Writing the call back to wikitext split `Module:Gallery`'s gallery body
+    /// into one argument per cell, which put the `alt=` text on the tag.
+    #[test]
+    fn call_parser_function_keeps_a_value_carrying_a_pipe() {
+        let item = call_parser_function_token(
+            "#tag",
+            &[
+                FrameArg::positional("gallery"),
+                FrameArg::positional("File:a|alt=b|caption"),
+            ],
+        );
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+            panic!("expected a template token");
+        };
+        let args: Vec<_> = t
+            .attribs
+            .iter()
+            .map(|kv| {
+                (
+                    kv.key.as_str().unwrap_or(""),
+                    kv.value.as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            args,
+            vec![("#tag:gallery", ""), ("", "File:a|alt=b|caption")]
+        );
     }
 
     /// Scribunto passes Lua values to PHP, where `(string)true` is `"1"` and

@@ -9758,21 +9758,21 @@ fn flatten_attribute_markers(items: &[Item]) -> Option<String> {
     Some(out)
 }
 
-/// Whether a deferred request is a `frame:extensionTag('templatestyles', …)` —
-/// lowered to `#tag` with `templatestyles` as its first argument.
+/// Whether a deferred request is a `#tag` call — `frame:extensionTag` lowers to
+/// one.
 ///
-/// Only that tag's answer is a `mw:DOMFragment` placeholder the module's output
-/// can carry, so the id it spends waits for the position the module left it in.
+/// Its answer is a *string* the module can hold, move, or concatenate, so Parsoid
+/// numbers everything in it where the module's output lands, not at the call:
+/// `Module:Gallery` calls `extensionTag` for the gallery before it calls it for
+/// the stylesheet, but the stylesheet is emitted first and takes the lower id.
+/// Deferring the numbering is what reproduces that document order.
 /// See [`Parser::expand_lua_request`].
 fn is_deferred_extension_tag(request: &crate::pipeline::lua_deferred::FrameRequest) -> bool {
-    let crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { name, args } = request
+    let crate::pipeline::lua_deferred::FrameRequest::CallParserFunction { name, .. } = request
     else {
         return false;
     };
     name == "#tag"
-        && args.first().is_some_and(|a| {
-            a.name.is_none() && (a.value == "templatestyles" || a.value == "indicator")
-        })
 }
 
 /// Convert a frame's raw parameters into Scribunto `Arg`s.
