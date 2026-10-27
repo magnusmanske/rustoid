@@ -29,6 +29,12 @@ pub struct ParagraphWrapper {
 
     /// Whether p-warpping is disabled (inline context).
     disabled: bool,
+
+    /// Ids of the tunnelled extension fragments (`mw:dom-fragment-token`) whose
+    /// DOM `getWrapperTokens` would represent with a *block* element. Those
+    /// tokens stand in for a block tag, so they close a paragraph instead of
+    /// behaving like an SOL-transparent marker.
+    block_fragments: std::collections::HashSet<usize>,
 }
 
 impl ParagraphWrapper {
@@ -39,6 +45,15 @@ impl ParagraphWrapper {
     /// Create a ParagraphWrapper with the given inline-context flag.
     /// In PHP, `disabled = !empty(options['inlineContext'])`.
     pub fn with_options(inline_context: bool) -> Self {
+        Self::with_options_and_fragments(inline_context, std::collections::HashSet::new())
+    }
+
+    /// Create a ParagraphWrapper that knows which tunnelled fragments are block
+    /// content; see [`ParagraphWrapper::block_fragments`].
+    pub fn with_options_and_fragments(
+        inline_context: bool,
+        block_fragments: std::collections::HashSet<usize>,
+    ) -> Self {
         Self {
             has_open_p_tag: false,
             in_block_elem: false,
@@ -51,6 +66,7 @@ impl ParagraphWrapper {
             curr_line_block_tag_seen: false,
             curr_line_block_tag_open: false,
             disabled: inline_context,
+            block_fragments,
         }
     }
 
@@ -95,7 +111,6 @@ impl ParagraphWrapper {
                 output.extend(res);
             }
         }
-
         output
     }
 
@@ -238,6 +253,18 @@ impl ParagraphWrapper {
             _ => String::new(),
         };
 
+        // A tunnelled extension fragment whose DOM is a block element is a block
+        // tag in disguise (see [`ParagraphWrapper::block_fragments`]): Parsoid's
+        // wrapper tokens are named after that DOM, so p-wrapping must see the
+        // block here. The fragment is a complete element, so the block scope is
+        // not left open (`figure`/`div` are never-block elements).
+        if self.is_block_fragment(&token) {
+            self.curr_line_block_tag_seen = true;
+            self.curr_line_block_tag_open = false;
+            self.curr_line_has_wrappable_tokens = true;
+            return self.process_buffers(token, false);
+        }
+
         // 1. SOL-transparent: whitespace-only strings, EmptyLineTk, CommentTk,
         //    behavior switches.
         //    (For simplicity, we treat whitespace strings and comments as
@@ -322,6 +349,22 @@ impl ParagraphWrapper {
 
         self.curr_line_has_wrappable_tokens = true;
         self.process_buffers(token, false)
+    }
+
+    /// Is this token a `mw:dom-fragment-token` for block content?
+    fn is_block_fragment(&self, token: &Item) -> bool {
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = token else {
+            return false;
+        };
+        if t.name != "mw:dom-fragment-token" {
+            return false;
+        }
+        t.attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
+            .and_then(|kv| kv.value.as_str())
+            .and_then(|id| id.parse::<usize>().ok())
+            .is_some_and(|id| self.block_fragments.contains(&id))
     }
 
     /// Check if a token is SOL-transparent (basic cases).

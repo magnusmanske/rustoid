@@ -173,6 +173,14 @@ fn has_block_tag(node: &Node) -> bool {
             return true;
         }
     }
+    // A `mw:DOMFragment` placeholder keeps its content in the stashed fragment
+    // (PHP's `data-parsoid.html`) rather than in `children`; `pWrapOptional`
+    // reads it there, and so must this — otherwise a block extension's
+    // placeholder looked wrappable and p-wrapping put a `<p>` around it, which
+    // then swallowed the transclusion markers (`{{USA image map}}`'s figure).
+    if node.fragment.as_deref().is_some_and(has_block_tag) {
+        return true;
+    }
     node.children.iter().any(has_block_tag)
 }
 

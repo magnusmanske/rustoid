@@ -66,7 +66,14 @@ impl TreeBuilderStage {
         out = list_handler.run(out);
 
         // 4. ParagraphWrapper (wrap content in <p>).
-        let mut pw = ParagraphWrapper::with_options(self.inline_context);
+        let mut pw = ParagraphWrapper::with_options_and_fragments(
+            self.inline_context,
+            fragments
+                .iter()
+                .filter(|(_, node)| crate::pipeline::extension_handler::fragment_is_block(node))
+                .map(|(id, _)| *id)
+                .collect(),
+        );
         out = pw.wrap(out);
         // Drop the synthetic newline that forced a module's table onto its own
         // line (see [`Parser::expand_invoke`]). It has done its work in the

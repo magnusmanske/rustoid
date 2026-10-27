@@ -792,6 +792,27 @@ fn content_wrapper_tag(extension: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Would `PipelineUtils::getWrapperTokens` represent this fragment with a
+/// *block* element?
+///
+/// The wrapper is named after the fragment's first node, or `div` when any node
+/// is block content but the first is not — either way a block name. That name
+/// is what `ParagraphWrapper` reads to decide whether a paragraph ends before the
+/// extension, so an extension whose DOM is a `<figure>`/`<div>`/`<table>` must
+/// close the paragraph like the tag would. Without it the placeholder looked
+/// SOL-transparent and kept the preceding newline inside the `<p>`
+/// (`{{USA image map}}`'s imagemap).
+pub fn fragment_is_block(fragment: &crate::dom::node::Node) -> bool {
+    fn has_block_descendant(node: &crate::dom::node::Node) -> bool {
+        node.children.iter().any(|child| {
+            crate::html::dom_utils::is_wikitext_block_node(child) || has_block_descendant(child)
+        })
+    }
+    fragment.children.iter().any(|child| {
+        crate::html::dom_utils::is_wikitext_block_node(child) || has_block_descendant(child)
+    })
+}
 /// Expand extension tokens in a token stream. Runs before tree building,
 /// replacing `extension` self-closing tokens with their DOM token sequences.
 /// Faithful to the TT3 extension-handler stage in PHP Parsoid.
