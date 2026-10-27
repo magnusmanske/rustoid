@@ -992,27 +992,7 @@ fn rebuild_split_links(
                 j += 1;
             }
             if let Some(j) = end {
-                let mut src = String::new();
-                for item in &items[i..=j] {
-                    match item {
-                        Item::Str(s) => src.push_str(s),
-                        Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
-                            if let Some(v) = t
-                                .attribs
-                                .iter()
-                                .find(|kv| kv.key.as_str() == Some("value"))
-                                .and_then(|kv| kv.value.as_str())
-                            {
-                                src.push_str(v);
-                            }
-                        }
-                        Item::Tok(tok) => {
-                            if let Some(s) = tok.data_parsoid().and_then(|d| d.src.clone()) {
-                                src.push_str(&s);
-                            }
-                        }
-                    }
-                }
+                let src = items_source(&items[i..=j]);
                 out.extend(tokenize_caption_sol(&src, config, at_sol, linkdesc));
                 at_sol = false;
                 i = j + 1;
@@ -1031,6 +1011,49 @@ fn rebuild_split_links(
             _ => {
                 out.push(items[i].clone());
                 at_sol = false;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Reconstruct the source wikitext of a token run for re-tokenization.
+///
+/// Entity spans are spelled by their source and their decoded text and end tag
+/// are skipped, exactly as `TokenUtils::tokensToString(..., ['includeEntities'
+/// => true])` does. Without the skip, `100&nbsp;km` would rebuild as
+/// `100&nbsp; km`: the entity's source *plus* the decoded character as text, so
+/// re-tokenizing duplicated the character (Earth's Kármán-line caption).
+fn items_source(items: &[Item]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
+            Item::Str(s) => out.push_str(s),
+            // A quote token carries its apostrophe run in `value`; it has no
+            // `data-parsoid.src`, so spelling it from the token data is the only
+            // way the rebuilt caption keeps its italics/bold.
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
+                if let Some(v) = t
+                    .attribs
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("value"))
+                    .and_then(|kv| kv.value.as_str())
+                {
+                    out.push_str(v);
+                }
+            }
+            Item::Tok(tok) if crate::wikitext::token_utils::is_entity_span_token(tok) => {
+                if let Some(src) = tok.data_parsoid().and_then(|d| d.src.as_deref()) {
+                    out.push_str(src);
+                }
+                i += 2;
+            }
+            Item::Tok(tok) => {
+                if let Some(s) = tok.data_parsoid().and_then(|d| d.src.as_deref()) {
+                    out.push_str(s);
+                }
             }
         }
         i += 1;
@@ -1104,31 +1127,7 @@ fn tokenize_caption_items_sol(
     // Reconstruct the full caption source, then tokenize it whole. `extension`/
     // `language-variant`/`template`/meta tokens carry their exact wikitext in `src`;
     // text chunks are already literal.
-    let mut src = String::new();
-    for item in items {
-        match item {
-            Item::Str(s) => src.push_str(s),
-            // A quote token carries its apostrophe run in `value`; it has no
-            // `data-parsoid.src`, so spelling it from the token data is the only
-            // way the rebuilt caption keeps its italics/bold.
-            Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "mw-quote" => {
-                if let Some(v) = t
-                    .attribs
-                    .iter()
-                    .find(|kv| kv.key.as_str() == Some("value"))
-                    .and_then(|kv| kv.value.as_str())
-                {
-                    src.push_str(v);
-                }
-            }
-            Item::Tok(tok) => {
-                let dp_src = tok.data_parsoid().and_then(|d| d.src.clone());
-                if let Some(s) = dp_src {
-                    src.push_str(&s);
-                }
-            }
-        }
-    }
+    let src = items_source(items);
     tokenize_caption_sol(&src, config, sol, linkdesc)
 }
 
@@ -2581,6 +2580,32 @@ mod tests {
         assert_eq!(ctx.config.canonical_namespace_id("Media"), Some(-2));
         assert_eq!(ctx.config.canonical_namespace_id("File"), Some(6));
         assert_eq!(ctx.config.canonical_namespace_id("Category"), Some(14));
+    }
+
+    #[test]
+    fn test_items_source_skips_an_entity_s_decoded_text() {
+        // As the tokenizer emits it: start tag, decoded text, end tag.
+        let mut span = TagTk::new(
+            "span",
+            vec![],
+            DataParsoid {
+                src: Some("&nbsp;".to_string()),
+                ..DataParsoid::default()
+            },
+        );
+        span.add_attribute_str("typeof", "mw:Entity");
+        let items = vec![
+            Item::Str("100".to_string()),
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str("\u{a0}".to_string()),
+            Item::Tok(ParsoidToken::EndTag(
+                crate::wikitext::tokens_v2::EndTagTk::new("span", vec![], DataParsoid::default()),
+            )),
+            Item::Str("km".to_string()),
+        ];
+        // The source keeps the reference and does not also spell the decoded
+        // character, so re-tokenizing it yields one entity, not two.
+        assert_eq!(items_source(&items), "100&nbsp;km");
     }
 
     #[test]
