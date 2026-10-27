@@ -23,6 +23,11 @@ pub struct Frame {
     title: Title,
     args: Params,
     depth: usize,
+    /// This frame exists only to expand a call's argument *values*. It is titled
+    /// with the page (so an argument that calls the caller's own template cannot
+    /// look like a loop), and Scribunto's `frame:getParent()` must read through
+    /// it to the frame that made the call — see [`Frame::arg_value_scope`].
+    arg_value_scope: bool,
 }
 
 impl Frame {
@@ -33,6 +38,7 @@ impl Frame {
             title,
             args: Params::new(args),
             depth: 0,
+            arg_value_scope: false,
         }
     }
 
@@ -83,7 +89,31 @@ impl Frame {
             title,
             args: Params::new(args),
             depth: self.depth + 1,
+            arg_value_scope: false,
         }
+    }
+
+    /// Create the frame a call's argument values are expanded in.
+    ///
+    /// PHP's preprocessor uses a frame with a null title here, which rustoid
+    /// approximates with the page title (see
+    /// `Parser::expand_template_arg_tokens`). The frame still has a parent — the
+    /// one the call was written in — and Scribunto's `frame:getParent()` for a
+    /// `#invoke` inside such a value has to read through it: `Module:Arguments`
+    /// compares the parent *title* against its `wrappers` list.
+    pub fn new_arg_value_child(&self, title: Title, args: Vec<KV>) -> Frame {
+        Frame {
+            parent_frame: Some(Box::new(self.clone())),
+            title,
+            args: Params::new(args),
+            depth: self.depth + 1,
+            arg_value_scope: true,
+        }
+    }
+
+    /// Whether this frame only exists to expand a call's argument values.
+    pub fn arg_value_scope(&self) -> bool {
+        self.arg_value_scope
     }
 
     /// Check if expanding a template would lead to a loop, or would exceed

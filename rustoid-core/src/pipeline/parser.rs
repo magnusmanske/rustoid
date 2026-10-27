@@ -1580,6 +1580,178 @@ fn branch_starts_line(tok: &ParsoidToken, src_text: &str) -> bool {
         .is_empty()
 }
 
+/// Splice a wikilink that template expansions opened and closed back into one
+/// token.
+///
+/// MediaWiki's preprocessor is textual: `{{!((}}target{{!}}text{{))!}}` inside a
+/// branch reaches core's parser as `[[target|text]]`, so the link is recognized.
+/// rustoid's branch is tokenized before those templates expand, so the `[[`, the
+/// `|` (a `{{!}}` cell token) and the `]]` end up in different items, with the
+/// already-expanded content in between; the per-run tokenizer below can never
+/// see the whole link. Join that span into a `wikilink` token, which the
+/// page-level link pass renders like any other (a tokenized link holds exactly
+/// such content).
+///
+/// Only an *unclosed* `[[` in a plain text run is treated as assembled: a real
+/// wikilink is a `wikilink` token, never text.
+fn splice_assembled_wikilinks(items: Vec<Item>) -> Vec<Item> {
+    // The tokenizer emits an unterminated `[[` as two separate `[` items, so
+    // join adjacent text runs before looking for one.
+    let mut joined: Vec<Item> = Vec::with_capacity(items.len());
+    for item in items {
+        if let (Item::Str(next), Some(Item::Str(prev))) = (&item, joined.last_mut()) {
+            prev.push_str(next);
+            continue;
+        }
+        joined.push(item);
+    }
+    let items = joined;
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    let mut i = 0;
+    while i < items.len() {
+        let spliced = match &items[i] {
+            Item::Str(s) => s.rfind("[[").map(|pos| (s, pos)),
+            _ => None,
+        }
+        .and_then(|(s, pos)| splice_one_wikilink(&items, i, s, pos));
+        let Some((link, next)) = spliced else {
+            out.push(items[i].clone());
+            i += 1;
+            continue;
+        };
+        out.extend(link);
+        i = next;
+    }
+    out
+}
+
+/// Splice the link that opens at `(at, pos)` (an unclosed `[[` in a text run).
+/// Returns the replacement items and the index to continue scanning at.
+fn splice_one_wikilink(
+    items: &[Item],
+    at: usize,
+    source: &str,
+    pos: usize,
+) -> Option<(Vec<Item>, usize)> {
+    // The target runs to the first `|` — a literal one in the text or a cell
+    // opener that `{{!}}` produced.
+    let mut target = String::new();
+    let mut rest = &source[pos + 2..];
+    let mut i = at;
+    let inline_content: Option<String>;
+    loop {
+        if rest.contains("]]") {
+            // A contentless link (`[[target]]`) that was assembled is rare and
+            // has no cell/tag shape to worry about; leave it to the tokenizer.
+            return None;
+        }
+        if let Some(bar) = rest.find('|') {
+            target.push_str(&rest[..bar]);
+            inline_content = Some(rest[bar + 1..].to_string());
+            i += 1;
+            break;
+        }
+        target.push_str(rest);
+        i += 1;
+        match items.get(i)? {
+            Item::Str(s) => rest = s,
+            Item::Tok(ParsoidToken::Tag(t)) => {
+                target.push_str(&cell_opener_source(t)?);
+                inline_content = Some(String::new());
+                i += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if target.contains('[') || target.contains(']') {
+        return None;
+    }
+
+    let mut content: Vec<Item> = Vec::new();
+    let mut inline_content = inline_content?;
+    while i < items.len() {
+        match &items[i] {
+            Item::Str(s) => {
+                if let Some(close) = s.find("]]") {
+                    inline_content.push_str(&s[..close]);
+                    if !inline_content.is_empty() {
+                        content.push(Item::Str(inline_content));
+                    }
+                    let mut out = Vec::with_capacity(3);
+                    if pos > 0 {
+                        out.push(Item::Str(source[..pos].to_string()));
+                    }
+                    out.push(Item::Tok(ParsoidToken::SelfclosingTag(
+                        assembled_wikilink_token(&target, content),
+                    )));
+                    let after = &s[close + 2..];
+                    if !after.is_empty() {
+                        out.push(Item::Str(after.to_string()));
+                    }
+                    return Some((out, i + 1));
+                }
+                if s.contains("[[") {
+                    return None;
+                }
+                if !inline_content.is_empty() {
+                    content.push(Item::Str(std::mem::take(&mut inline_content)));
+                }
+                content.push(items[i].clone());
+            }
+            _ => {
+                if is_transclusion_wrapper(&items[i]) {
+                    return None;
+                }
+                if !inline_content.is_empty() {
+                    content.push(Item::Str(std::mem::take(&mut inline_content)));
+                }
+                content.push(items[i].clone());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A `mw:Transclusion` start/end meta. A spliced link must not cross one: the
+/// marker is not source text, and a link assembled across it is not what the
+/// preprocessor would have produced.
+pub(crate) fn is_transclusion_wrapper(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Tok(ParsoidToken::SelfclosingTag(t))
+            if t.name == "meta"
+                && t.attribs.iter().any(|kv| {
+                    kv.key.as_str() == Some("typeof")
+                        && kv.value.as_str().is_some_and(|v| v.starts_with("mw:Transclusion"))
+                })
+    )
+}
+
+fn assembled_wikilink_token(
+    target: &str,
+    content: Vec<Item>,
+) -> crate::wikitext::tokens_v2::SelfclosingTagTk {
+    use crate::wikitext::tokens_v2::{KV, KeyValue, SelfclosingTagTk};
+
+    let kv = |key: &str, value: KeyValue| KV {
+        key: KeyValue::Str(key.to_string()),
+        value,
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    };
+    let mut link = SelfclosingTagTk::new("wikilink", vec![], Default::default());
+    link.attribs
+        .push(kv("href", KeyValue::Str(target.to_string())));
+    if !content.is_empty() {
+        link.attribs
+            .push(kv("mw:maybeContent", KeyValue::Tokens(content)));
+    }
+    link
+}
+
 fn re_tokenize_text_branch_inner(
     items: Vec<Item>,
     ext_tags: &[String],
@@ -1589,15 +1761,7 @@ fn re_tokenize_text_branch_inner(
     force: bool,
 ) -> Vec<Item> {
     fn is_wrapper(it: &Item) -> bool {
-        matches!(
-            it,
-            Item::Tok(ParsoidToken::SelfclosingTag(t))
-                if t.name == "meta"
-                    && t.attribs.iter().any(|kv| {
-                        kv.key.as_str() == Some("typeof")
-                            && kv.value.as_str().is_some_and(|v| v.starts_with("mw:Transclusion"))
-                    })
-        )
+        is_transclusion_wrapper(it)
     }
     fn tokenize(text: &str, ext_tags: &[String], sol: bool, table_data_block: bool) -> Vec<Item> {
         crate::pipeline::template_handler::tokenize_branch_fragment(
@@ -1689,7 +1853,11 @@ fn re_tokenize_text_branch_inner(
         .rposition(|it| !is_wrapper(it))
         .map(|i| i + 1)
         .unwrap_or(start);
-    let content = &items[start..end];
+    // Splice a wikilink that template expansions opened and closed around
+    // already-expanded tokens back into one `wikilink` token (see
+    // [`splice_assembled_wikilinks`]).
+    let spliced_content = splice_assembled_wikilinks(items[start..end].to_vec());
+    let content = spliced_content.as_slice();
 
     // A branch that is only text is re-tokenized as a whole when a line begins
     // block syntax. Re-tokenizing *every* text branch was wrong: core splices
@@ -1710,7 +1878,7 @@ fn re_tokenize_text_branch_inner(
                 _ => unreachable!("checked above"),
             }
         }
-        if !force && !text.lines().any(|line| syntax.triggers(line)) {
+        if !force && !text.lines().any(|line| syntax.triggers(line)) && !text.contains("[[") {
             return items;
         }
         let mut out: Vec<Item> = items[..start].to_vec();
@@ -1733,11 +1901,11 @@ fn re_tokenize_text_branch_inner(
     // A `{{!}}` marker was folded into the run as `|`; the run must be
     // re-tokenized even if no other trigger matches.
     let mut run_has_bang = false;
-    let mut i = start;
-    while i < end {
-        match &items[i] {
+    let mut i = 0;
+    while i < content.len() {
+        match &content[i] {
             Item::Str(_) | Item::Tok(ParsoidToken::Nl(_)) => {
-                run.push(items[i].clone());
+                run.push(content[i].clone());
                 i += 1;
             }
             it if is_wrapper(it) => {
@@ -1778,7 +1946,7 @@ fn re_tokenize_text_branch_inner(
                 );
                 run_has_bang = false;
                 run_starts_line = false;
-                out.push(items[i].clone());
+                out.push(content[i].clone());
                 i += 1;
             }
         }
@@ -7888,6 +8056,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             }
             let positional = matches!(&kv.key, KeyValue::Str(s) if s.is_empty());
             if TemplateHandler::arg_is_branch(name, i, positional) {
+                // The *value* is the branch the function hands back, and the
+                // caller expands it in its own pass. The *name* is not: `#switch`
+                // compares it as a case label, and core reads it after the
+                // preprocessor has expanded it — `{{#switch:1|{{#expr:…}}=x}}`
+                // matches the first case. Leaving it unexpanded made every case
+                // label the empty string (`Template:Metacritic album prose`'s
+                // score buckets all fell through).
+                self.expand_field_tokens(frame, &mut kv.key, source, about_counter, src_text)
+                    .await;
                 continue;
             }
             // Expand both halves: a named argument's name is its case for
@@ -8574,6 +8751,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         }
         let mut expanded = out;
         strip_link_content_comments(&mut expanded);
+        // A link whose `[[`/`]]` were written with `{{!((}}`/`{{))!}}` in the
+        // template's own source reaches core's parser as flat wikitext, so its
+        // brackets can sit on either side of a parser-function call (the
+        // periodic table's `element cell-named` opens the link in the outer
+        // `#if` and closes it in a nested one). Join it here, at the body level,
+        // where all of those pieces have been spliced into one stream.
+        let mut expanded = splice_assembled_wikilinks(expanded);
         // A body's tags are not the page's: `expand_attributes` must not mark
         // their attributes `mw:ExpandedAttrs`. See [`mark_synthesized`].
         mark_synthesized(&mut expanded);
@@ -8689,7 +8873,19 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // The parent frame's args and title are the calling template's, which
         // modules read through `frame:getParent()`.
         let lazy_parent = lazy_args(&raw_parent_args, ArgSource::Parent);
-        let parent_title = frame.title().full_text();
+        let parent_title = {
+            // An argument value expands in a frame titled with the page
+            // (`expand_template_arg_tokens`), but Scribunto's parent frame is
+            // the one the call was written in; `Module:Arguments` matches its
+            // title against a `wrappers` list (`Template:Singles` calls
+            // `Module:Singles|main` from an argument, and only the template's
+            // own title makes the wrapper match).
+            let mut parent_frame = frame;
+            while parent_frame.arg_value_scope() {
+                parent_frame = parent_frame.parent().unwrap_or(parent_frame);
+            }
+            parent_frame.title().full_text()
+        };
         let lazy_call = lazy_args(&raw_call_args, ArgSource::Call);
         // `frame:getParent()` is never nil here, whatever the namespace. The
         // manual is explicit: it "returns the frame for the page that called
@@ -8829,21 +9025,21 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             items.insert(0, Item::Tok(ParsoidToken::Nl(nl)));
         }
 
-        // The module's output is expanded in a child of the calling frame. This
-        // frame carries *no* arguments: a `{{{…}}}` in the output is literal
-        // wikitext to the service — the preprocessor has already run, and its
-        // re-parse is a parser pass, not a preprocessor one — so expanding it
-        // against the `#invoke` call's arguments resolved a value that named its
-        // own parameter into itself. `Template:Infobox`'s documentation hands
-        // `subheader2={{{subheader2}}}<br/>......` to `{{Parameter names
-        // example}}`, which passes it to `frame.expandTemplate`; the service
-        // serves the one literal `{{{subheader2}}}`, while rustoid re-expanded it
-        // three deep (`…<br/>......<br/>......<br/>......`).
+        // The module's output is expanded in a child frame that inherits the
+        // caller's arguments, as every non-top-level pipeline does in Parsoid
+        // (`ParserPipeline::parse` creates the child with `$frame->getArgs()`).
+        // That inheritance is observable: a `#invoke` nested in the output reads
+        // its parent frame's arguments, so `Template:Singles`'s
+        // `data2={{#invoke:Singles|main}}` must see the `single1=` arguments of
+        // the `{{Singles|…}}` call it is expanding inside. An empty argument list
+        // made `Module:Arguments` answer no arguments and the track list vanish.
         //
-        // `frame:getParent()` is a separate path: `expand_invoke` reads the
-        // calling frame's raw arguments for it (see `raw_parent_args`), so a
-        // nested `#invoke` in the output still sees them.
-        let child = frame.new_child(frame.title().clone(), Vec::new());
+        // Passing the *call's* arguments instead was wrong for a different
+        // reason: a `{{{…}}}` in the output that names one of them expanded the
+        // value into itself (`Template:Infobox`'s documentation hands
+        // `subheader2={{{subheader2}}}<br/>…` to `{{Parameter names example}}`,
+        // which rustoid then re-expanded three deep).
+        let child = frame.new_child(frame.title().clone(), frame.args().args.clone());
         // A module's output is wikitext in the calling frame's context, and a
         // template it echoes (`Module:Clade` emits nested `{{clade}}` calls) is
         // expanded with the title-chain loop check stood down: production
@@ -9097,7 +9293,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         } else {
             items
         };
-        let child = frame.new_child(frame.root_title().clone(), frame.args().args.clone());
+        let child =
+            frame.new_arg_value_child(frame.root_title().clone(), frame.args().args.clone());
         let expanded = Box::pin(self.expand_templates(
             &child,
             substituted,
