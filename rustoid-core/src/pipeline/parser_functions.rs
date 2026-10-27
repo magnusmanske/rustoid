@@ -684,6 +684,24 @@ fn php_trim(s: &str) -> &str {
 /// The ParserFunctions handler.
 pub struct ParserFunctions;
 
+/// Whether a KV side has a faithful *text* spelling — i.e. stringifying it and
+/// tokenizing the result reproduces the same tokens.
+///
+/// `Str` always does; a `urllink` does (its `href`), and so does a comment
+/// (dropped either way). A `template`/marker/extension token does not: its
+/// `about`, `data-mw` and fragment id are not in its text.
+fn has_text_spelling(value: &KeyValue) -> bool {
+    match value {
+        KeyValue::Str(_) => true,
+        KeyValue::Tokens(items) => items.iter().all(|item| match item {
+            Item::Str(_) => true,
+            Item::Tok(ParsoidToken::Comment(_)) => true,
+            Item::Tok(ParsoidToken::SelfclosingTag(t)) => t.name == "urllink",
+            _ => false,
+        }),
+    }
+}
+
 impl ParserFunctions {
     /// `#if` — a port of core `ParserFunctions::if`, which answers
     /// `trim($frame->expand($args[n]))`.
@@ -1617,6 +1635,33 @@ impl ParserFunctions {
                 vec![Item::Str(format!("{k}={v}"))]
             };
         }
+        // A *name* that had to be tokenized (it holds a URL, so the
+        // name/value split took the `=` out of it) must not keep its tokens:
+        // Parsoid stringifies the whole KV and expands it again
+        // (`TemplateHandlerArguments::getOrderedArgs`), which reads the
+        // reassembled `name=value` as one wikitext run. Keeping the name's
+        // tokens, its autolink ended at the `=` and the value fell outside it —
+        // `{{#if:1|http://x/?a=b}}` rendered `http://x/?a` plus `=b`
+        // (World War II's `GBurl` reference).
+        //
+        // Only a KV that has a full *text* spelling is re-read this way: a
+        // token value may carry transclusion markers or extension placeholders,
+        // and plain text would lose them. A `urllink` is text (its `href`).
+        if matches!(kv.key, KeyValue::Tokens(_))
+            && has_text_spelling(&kv.key)
+            && has_text_spelling(&kv.value)
+        {
+            let value = key_value_to_string(&kv.value);
+            let text = match key_value_to_string(&kv.key) {
+                k if k.is_empty() => value,
+                k => format!("{k}={value}"),
+            };
+            return crate::pipeline::template_handler::tokenize_wikitext_to_items(
+                &text,
+                /* in_template */ false,
+                &[],
+            );
+        }
         // Otherwise `rejoinKV`: key + `=` + value, all as tokens.
         let mut items = match &kv.key {
             KeyValue::Str(k) if k.is_empty() => Vec::new(),
@@ -2412,6 +2457,37 @@ mod tests {
     /// inside a `#if` branch sits in the **key** half of a `k=v` split, so
     /// stringifying dropped it and `Template:Taxobox/core`'s image row lost its
     /// cell.
+    /// A *name* tokenized as a URL (`{{#if:1|http://x/?a=b}}`): the `=` split the
+    /// KV, so the name's autolink stops at the `=` and the value would fall
+    /// outside it. Parsoid stringifies the KV and expands it again, reading the
+    /// reassembled `name=value` as one wikitext run, so the URL is one link.
+    #[test]
+    fn test_expand_kv_re_reads_a_url_name_with_its_value() {
+        use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk};
+        let mut url = SelfclosingTagTk::new("urllink", vec![], DataParsoid::default());
+        url.add_attribute_str("href", "http://x/?a");
+        let kv = KV {
+            key: KeyValue::Tokens(vec![Item::Tok(ParsoidToken::SelfclosingTag(url))]),
+            value: KeyValue::Str("b".to_string()),
+            src_offsets: None,
+            ksrc: None,
+            vsrc: None,
+        };
+        let items = ParserFunctions::expand_kv(Some(&kv), None);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let Item::Tok(ParsoidToken::SelfclosingTag(t)) = &items[0] else {
+            panic!("expected a urllink, got {items:?}");
+        };
+        assert_eq!(t.name, "urllink");
+        assert_eq!(
+            t.attribs
+                .iter()
+                .find(|a| a.key.as_str() == Some("href"))
+                .and_then(|a| a.value.as_str()),
+            Some("http://x/?a=b")
+        );
+    }
+
     #[test]
     fn test_expand_kv_rejoins_a_tokenized_named_argument() {
         use crate::wikitext::tokens_v2::{DataParsoid, SelfclosingTagTk};
