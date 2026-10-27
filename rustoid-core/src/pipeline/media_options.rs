@@ -242,6 +242,10 @@ pub fn get_option_info(config: &dyn SiteConfig, opt_str: &str) -> Option<OptionI
     // Prefix option: match a parameterized alias (`link=$1`, `$1px`, …) where
     // the option text has a `key=value` form, or (`width`) a trailing `px`.
     if let Some((group, val)) = prefix_option_info(config.magic_words(), o_text) {
+        // `getOptionInfo` decodes entities in the captured value *after* the
+        // option split, so an entity-encoded pipe stays inside the value and the
+        // served `txt`/`alt` carries the decoded character.
+        let val = crate::html::wts_utils::decode_wt_entities_all(&val);
         // `width` is matched against a bare numeric string (`200px`).
         if group == "width" {
             return Some(OptionInfo {
@@ -494,6 +498,20 @@ mod tests {
             parse_media_dimension("200x300px"),
             Some("200x300".to_string())
         );
+    }
+
+    #[test]
+    fn test_prefix_option_value_decodes_entities() {
+        // PHP decodes entities in the *captured value* only, after splitting, so
+        // an encoded pipe stays inside the value instead of starting a new option
+        // (`getOptionInfo`'s `Utils::decodeWtEntities( $bits['v'] )`).
+        let config = MockSiteConfig::new();
+        let info = get_option_info(&config, "alt=&nbsp;").unwrap();
+        assert_eq!(info.ck, "alt");
+        assert_eq!(info.v, "\u{a0}");
+
+        let info = get_option_info(&config, "alt=a&#124;b").unwrap();
+        assert_eq!(info.v, "a|b");
     }
 
     #[test]

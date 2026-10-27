@@ -1563,9 +1563,12 @@ pub fn render_file(
     //
     // A value that was a token array is rendered to a DOM fragment
     // (`expandAttrValueToDOM`), tunneled by a marked `mw:dom-fragment-token` so
-    // its nodes can be numbered and serialized into `html` after the id pass. A
-    // value carrying a transclusion marker keeps the direct serializer, which
-    // knows the `mw:Transclusion` shape the sub-pipeline would build.
+    // its nodes can be numbered and serialized into `html` after the id pass.
+    // This includes a value carrying a transclusion: the sub-pipeline builds the
+    // `mw:Transclusion` wrapper from the marker metas exactly as it does in the
+    // body, and a lean serializer cannot (it drops every tag/entity node the
+    // template produced, and the served `html` keeps them: `alt={{nbsp}}` is a
+    // `nowrap` span around an `mw:Entity` span, not bare text).
     let mut mw_attr_frag_tokens: Vec<Item> = Vec::new();
     // The value object is built by hand rather than via
     // `serialize_data_mw_attribs`, because Parsoid's `renderFile` sets `html`
@@ -1582,7 +1585,6 @@ pub fn render_file(
             continue;
         };
         let html = match opts.expanded_src.get(key) {
-            Some(items) if contains_transclusion(items) => Some(tokens_to_attribute_html(items)),
             Some(items) => {
                 let frag = build_fragment(items.clone(), fragments, next_id);
                 mw_attr_frag_tokens.push(attr_mw_fragment_token(key, frag, fragments, next_id));
@@ -1769,67 +1771,6 @@ fn contains_transclusion(items: &[Item]) -> bool {
     })
 }
 
-/// Serialize an expanded option's token array to the HTML attribute fragment
-/// PHP's `expandAttrValueToDOM` produces (the `data-mw.attribs[i].value.html`).
-/// The `mw:Transclusion` marker metas become `<span typeof="mw:Transclusion"
-/// data-mw='…'>…</span>` (the `about` id is dropped, as PHP does in attribute
-/// expansion), text is HTML-text-escaped, and other tokens fall back to their
-/// stored source.
-fn tokens_to_attribute_html(items: &[Item]) -> String {
-    fn attr_html(tok: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> Option<String> {
-        let type_of = tok
-            .attribs
-            .iter()
-            .find(|kv| kv.key.as_str() == Some("typeof"))
-            .and_then(|kv| kv.value.as_str())?;
-        (type_of == "mw:Transclusion" || type_of == "mw:Param").then(|| {
-            let data_mw = tok
-                .attribs
-                .iter()
-                .find(|kv| kv.key.as_str() == Some("data-mw"))
-                .and_then(|kv| kv.value.as_str())
-                .unwrap_or("{}");
-            // Single-quote the `data-mw` value (it carries JSON double quotes).
-            let escaped = data_mw.replace('&', "&amp;");
-            format!("<span typeof=\"{type_of}\" data-mw='{escaped}'>")
-        })
-    }
-
-    let mut out = String::new();
-    for item in items {
-        match item {
-            Item::Str(s) => {
-                out.push_str(&s.replace('&', "&amp;").replace('<', "&lt;"));
-            }
-            Item::Tok(ParsoidToken::SelfclosingTag(tk)) => {
-                let type_of = tk
-                    .attribs
-                    .iter()
-                    .find(|kv| kv.key.as_str() == Some("typeof"))
-                    .and_then(|kv| kv.value.as_str());
-                match type_of {
-                    Some("mw:Transclusion/End") | Some("mw:Param/End") => {
-                        out.push_str("</span>");
-                    }
-                    Some("mw:Transclusion") | Some("mw:Param") => {
-                        if let Some(html) = attr_html(tk) {
-                            out.push_str(&html);
-                        }
-                    }
-                    _ => {
-                        // Fall back to the stored source wikitext.
-                        if let Some(src) = tk.data_parsoid.src.clone() {
-                            out.push_str(&src.replace('&', "&amp;").replace('<', "&lt;"));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 /// The attribute marking a `mw:dom-fragment-token` as a *data-mw* attribute
 /// fragment rather than a rendered one.
 ///
@@ -1897,9 +1838,20 @@ pub(crate) fn attr_mw_fragment_token(
 fn stringify_option_tokens(ctx: &WikiLinkContext, items: &[Item], prefix: &str) -> Option<String> {
     let mut opt_info: Option<super::media_options::OptionInfo> = None;
     let mut result = String::new();
+    // PHP's `skipToEndOf`: after an entity span's start tag, everything up to the
+    // matching `</span>` (the decoded character) is already accounted for.
+    let mut skip_to_end_of: Option<&str> = None;
+    let mut i = 0;
 
-    for item in items {
-        match item {
+    while i < items.len() {
+        if let Some(name) = skip_to_end_of {
+            if matches!(&items[i], Item::Tok(ParsoidToken::EndTag(t)) if t.name == name) {
+                skip_to_end_of = None;
+            }
+            i += 1;
+            continue;
+        }
+        match &items[i] {
             Item::Str(s) => result.push_str(s),
             Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "mw-quote" => {
                 // `link` and `alt` are allowed to contain arbitrary wikitext.
@@ -1915,6 +1867,7 @@ fn stringify_option_tokens(ctx: &WikiLinkContext, items: &[Item], prefix: &str) 
                 if is_wikitext_opt {
                     // Just recurse inside.
                     opt_info = None; // might change the nature of opt
+                    i += 1;
                     continue;
                 }
                 return None;
@@ -1924,12 +1877,22 @@ fn stringify_option_tokens(ctx: &WikiLinkContext, items: &[Item], prefix: &str) 
                 // drops it, so `alt=  <!--x-->  ` stringifies to `alt=` — not to a
                 // value holding the comment (which `$optInfo['v']` must not).
             }
+            // `TokenUtils::isEntitySpanToken`: PHP appends the span's source (so
+            // `&#124;` stays source text and its pipe is not mistaken for an
+            // option separator), then skips to the matching end tag.
+            Item::Tok(tok) if crate::wikitext::token_utils::is_entity_span_token(tok) => {
+                if let Some(src) = tok.data_parsoid().and_then(|dp| dp.src.as_deref()) {
+                    result.push_str(src);
+                }
+                skip_to_end_of = Some("span");
+            }
             Item::Tok(_) => {
                 // Any other token contributes its stringification.
-                let single = std::slice::from_ref(item);
+                let single = std::slice::from_ref(&items[i]);
                 result.push_str(&crate::wikitext::token_utils::tokens_to_string(single));
             }
         }
+        i += 1;
     }
 
     Some(result)

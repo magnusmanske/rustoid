@@ -3677,7 +3677,7 @@ impl<'a> PegTokenizer<'a> {
                 ));
             stt.attribs.push(KV {
                 key: KeyValue::Str("mw:content".to_string()),
-                value: tokenize_extlink_content(
+                value: tokenize_link_content(
                     text,
                     self.lang_conv_enabled,
                     &self.ext_tags,
@@ -5943,34 +5943,15 @@ fn tokenize_link_target(
     tokenize_directives(target, lang_conv_enabled, ext_tags, base_offset)
 }
 
-/// Tokenize inline link *content* (e.g. wikilink text) into a `KeyValue`: plain
-/// text when no directives are present, or a `Tokens` array when the content
-/// contains `{{...}}`/`{{{...}}}`/`<nowiki>`/`-{…}-`/quote runs. Mirrors the PHP
-/// tokenizer's `link_text` for wikilink text.
+/// Tokenize the content of a wikilink (its `mw:maybeContent` parts, which is
+/// also where a media link's options and caption live).
+///
+/// Entities are tokenized here: Parsoid's `link_text` includes `urltext`, whose
+/// last alternative is `&htmlentity`, so `[[File:x|alt=&nbsp;]]` reaches
+/// `renderFile` with an `mw:Entity` span. Keeping the reference as text made the
+/// media option's `html` a literal `&amp;nbsp;` where the service serves the
+/// entity span (and the option's `txt` the decoded character).
 fn tokenize_link_content(
-    content: &str,
-    lang_conv_enabled: bool,
-    ext_tags: &[String],
-    base_offset: usize,
-) -> KeyValue {
-    tokenize_directives_and_quotes(
-        content,
-        lang_conv_enabled,
-        ext_tags,
-        true,
-        false,
-        base_offset,
-    )
-}
-
-/// Tokenize bracketed external-link *content* (`[url text]`). Like
-/// [`tokenize_link_content`], but the text also decodes HTML entities into
-/// `mw:Entity` spans: Parsoid runs extlink content through the inline pipeline
-/// (`getDOMFragmentToken(..., inlineContext)`), where `link_text` alone —
-/// `tokenize_link_content` — leaves them. Wikilink/media content keeps its own
-/// entity handling (the caption re-tokenization in `wiki_link_render`), so a
-/// `&#124;` there must stay a source-level separator, not become a `|` token.
-fn tokenize_extlink_content(
     content: &str,
     lang_conv_enabled: bool,
     ext_tags: &[String],
@@ -6014,8 +5995,7 @@ fn tokenize_directives(
 /// `quotes` enables the `quote` rule (only valid where PHP's grammar uses
 /// `inlineline`/`link_text`, i.e. link *content* — link *targets* run
 /// `wikilink_preprocessor_text`, which has no quote production). `entities`
-/// additionally decodes HTML entities into `mw:Entity` spans, which only
-/// extlink content needs (see [`tokenize_extlink_content`]).
+/// additionally decodes HTML entities into `mw:Entity` spans.
 fn tokenize_directives_and_quotes(
     input: &str,
     lang_conv_enabled: bool,
@@ -8298,9 +8278,9 @@ mod tests {
 
     /// An entity in *extlink* content becomes an `mw:Entity` span, because
     /// Parsoid runs the content through the inline pipeline
-    /// (`getDOMFragmentToken(..., inlineContext)`). A wikilink target/content
-    /// keeps its own entity handling, so `mw:content` here is the one place the
-    /// tokenizer decodes.
+    /// (`getDOMFragmentToken(..., inlineContext)`), whose `link_text` includes
+    /// `urltext`/`&htmlentity`. Wikilink content uses the same `link_text`, so it
+    /// decodes too (see [`test_wikilink_content_decodes_entities`]).
     #[test]
     fn test_extlink_content_decodes_entities() {
         let toks = tokenize("[http://x A&#124;B]");
@@ -8320,6 +8300,40 @@ mod tests {
             .expect("extlink should carry mw:content");
         let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &content.value else {
             panic!("expected tokenized content, got {:?}", content.value);
+        };
+        assert!(
+            items.iter().any(|it| matches!(it,
+                Item::Tok(ParsoidToken::Tag(t))
+                    if t.attribs.iter().any(|kv| kv.key.as_str() == Some("typeof")
+                        && kv.value.as_str() == Some("mw:Entity")))),
+            "the entity must become an mw:Entity span: {items:?}"
+        );
+    }
+
+    /// A wikilink's `mw:maybeContent` (the caption/option segments) is `link_text`
+    /// too, so an entity there becomes an `mw:Entity` span. `renderFile` relies on
+    /// this: `alt=&nbsp;` must reach it as a span (the served `html` is a `nowrap`
+    /// span around the entity, and `txt` is the decoded character).
+    #[test]
+    fn test_wikilink_content_decodes_entities() {
+        let tokens = tokenize("[[File:x|alt=&nbsp;|A]]");
+        let link = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "wikilink" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("wikilink token");
+        let parts: Vec<_> = link
+            .attribs
+            .iter()
+            .filter(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+            .collect();
+        assert_eq!(parts.len(), 2, "the entity's pipe must not split options");
+        let crate::wikitext::tokens_v2::KeyValue::Tokens(items) = &parts[0].value else {
+            panic!("expected tokenized content, got {:?}", parts[0].value);
         };
         assert!(
             items.iter().any(|it| matches!(it,
