@@ -5172,6 +5172,34 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         emit_style_placeholder(stt, id)
     }
 
+    /// Resolve any `<templatestyles>` in an expansion's output.
+    ///
+    /// An expansion's tokens are re-processed by Parsoid's TT2, so a
+    /// `<templatestyles>` it produced is resolved there — before anything later
+    /// in the pipeline serializes a body that contains it. rustoid expands a
+    /// token and appends its output, so the per-item check in the walk above
+    /// never sees it; without this pass a `{{#tag:templatestyles|…}}` nested in a
+    /// `#tag` body stayed raw extension source instead of becoming the marker
+    /// the served `extsrc` carries.
+    async fn resolve_output_styles(
+        &self,
+        items: Vec<Item>,
+        source: Option<&dyn DataSource>,
+    ) -> Vec<Item> {
+        if source.is_none() || !items.iter().any(|it| templatestyles_target(it).is_some()) {
+            return items;
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if templatestyles_target(&item).is_some() {
+                out.extend(self.expand_one_templatestyles(&item, source).await);
+            } else {
+                out.push(item);
+            }
+        }
+        out
+    }
+
     /// Assign `about` ids to the templatestyles placeholders in a chunk, in
     /// document order, and build the stashed `<style>` fragments.
     ///
@@ -5632,6 +5660,9 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // A parse starts with the preprocessor counters clear, mirroring the part
         // of `Parser::clearState` that zeroes `mPPNodeCount`.
         self.reset_expansion();
+        // The same for the pFragment counter: `data-mw`'s
+        // `{{#parsoid\0fragment:N}}` markers are numbered per parse.
+        crate::pipeline::pfragment::reset();
         let frame = Frame::new(title.clone(), vec![]);
 
         // TT2 is per chunk: PHP's `TokenHandlerPipeline` runs `TemplateHandler`,
@@ -6576,6 +6607,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                         // value) and the marker is not re-tokenized here.
                         self.in_attr_expansion() || arg_value,
                     );
+                    // A `#tag`-produced (or template-produced) `<templatestyles>`
+                    // is an extension token in the expansion's *output*, so the
+                    // per-item check above never saw it. Parsoid processes the
+                    // output through TT2 again, where `ExtensionHandler` resolves
+                    // it, so do the same here: the stylesheet must be a fragment
+                    // before any enclosing `#tag` body is serialized.
+                    let expanded = self.resolve_output_styles(expanded, source).await;
                     for e in &expanded {
                         track_table(e, &mut table_depth);
                     }
@@ -7247,8 +7285,27 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `{{{image|…}}}` (the first difference on Grand Theft Auto V and, once
         // its other breaks were cleared, on COVID-19 pandemic).
         let attribs = if pf_name.as_deref() == Some("tag") {
-            self.expand_tag_args(frame, attribs, source, about_counter, src_text)
-                .await
+            // `#tag` arguments are expanded eagerly, but how they are evaluated
+            // depends on the target: a registered extension tag receives its
+            // content as a fragment, so a parser function reached inside it is a
+            // lazy piece that spends no pFragment number of its own; a plain HTML
+            // tag's content is ordinary wikitext and expands normally.
+            // The target argument is spelled `#tag:<name>`; the tag's own name
+            // is what follows the colon.
+            let lazy = attribs.first().is_some_and(|kv| {
+                let target = crate::wikitext::token_utils::key_value_to_string(&kv.key);
+                let name = target.rsplit(':').next().unwrap_or("").trim();
+                self.config
+                    .extension_tags()
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(name))
+            });
+            let previous = crate::pipeline::pfragment::set_lazy(lazy);
+            let expanded = self
+                .expand_tag_args(frame, attribs, source, about_counter, src_text)
+                .await;
+            crate::pipeline::pfragment::restore_lazy(previous);
+            expanded
         } else {
             attribs
         };
@@ -7534,6 +7591,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     // [`Parser::wrap_templates`].
                     !in_tpl && !body,
                 );
+                // A parser function's answer is a fragment too, and Parsoid
+                // prepares it before the caller sees it: every atomic piece it
+                // holds spends a pFragment number. `{{#if:1|a<nowiki/>b}}` does,
+                // while the same tag in a branch that is not returned does not.
+                // A `{{#tag:…}}` result is prepared at the call, and a module's
+                // output when the module finishes, so both are excluded (see
+                // `preprocessed_piece_count`).
+                let produced_pieces = preprocessed_piece_count(&produced);
+                crate::pipeline::pfragment::allocate_many(produced_pieces);
                 // A parser function hands back a *branch*, and a branch is
                 // wikitext: PHP's handlers return its tokens unexpanded and the
                 // token stream processes them again, so `{{#ifeq:1|1|{{Large|…}}|z}}`
@@ -7544,7 +7610,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 // family of `Help:Introduction`'s first difference, which is a
                 // `{{SHORTDESC:…}}` inside `Template:Short description`'s
                 // `#ifeq` branch. Expansion happens *after* the wrapper is built,
-                // Expansion happens *after* the wrapper is built,
                 // so the wrapper's own id still precedes its children's, as on
                 // the service.
                 //
@@ -7858,7 +7923,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             return;
         };
         let found = expandable_content(items);
-        if !found.template && !found.arg {
+        if !found.template && !found.arg && !found.styles {
             return;
         }
         let substituted = if found.arg {
@@ -8375,6 +8440,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             self.config.extension_tags(),
             in_table,
         );
+        // Parsoid prepares this template's preprocessed source before its tokens
+        // are handled, and spends one pFragment number per atomic piece in it.
+        // Every extension tag written in the body is such a piece, so it is
+        // counted here — before the body expands and any marker inside it is
+        // numbered. Argument values (and the pieces they carry) are counted when
+        // they are spliced in, below.
+        crate::pipeline::pfragment::allocate_many(preprocessed_piece_count(&items));
 
         // Argument substitution replaces each `{{{…}}}` with its value's
         // tokens. A plain-string value (the default `{{{attr|}}}`, or a string
@@ -8392,7 +8464,14 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // this for free: its `{{1x|!!foo}}` puts `!!foo` at the very start of the
         // body. Detect it by checking that every item before the text run is
         // itself a `templatearg` reference at the body start.
+        let body_pieces = preprocessed_piece_count(&items);
         let spliced = child_frame.expand(&items);
+        // The preprocessed source carries the argument values the body uses, and
+        // each extension tag one of them holds is a piece of its own — once per
+        // use, since the preprocessor substitutes its strip marker at every
+        // `{{{…}}}`.
+        let arg_pieces = preprocessed_piece_count(&spliced).saturating_sub(body_pieces);
+        crate::pipeline::pfragment::allocate_many(arg_pieces);
         // The substituted text is at start of line only when the body began with a
         // run of argument references and nothing else preceded the trailing text.
         let body_was_arg_refs = items.iter().all(|it| {
@@ -9772,6 +9851,11 @@ struct ExpandableContent {
     template: bool,
     /// A `{{{…}}}` argument reference.
     arg: bool,
+    /// A `<templatestyles>` that has to be resolved to a fragment. A `#tag`
+    /// body keeps its atomic pieces as markers (see
+    /// `tag_source_with_fragments`), so the stylesheet must be resolved before
+    /// the body is serialized, not after.
+    styles: bool,
 }
 
 /// Scan a chunk for what expansion has to resolve, looking inside tokens.
@@ -9793,12 +9877,16 @@ fn expandable_content(items: &[Item]) -> ExpandableContent {
                 _ => {}
             }
         }
+        if templatestyles_target(item).is_some() {
+            found.styles = true;
+        }
         for kv in tok.get_attribs() {
             for field in [&kv.key, &kv.value] {
                 if let KeyValue::Tokens(toks) = field {
                     let nested = expandable_content(toks);
                     found.template |= nested.template;
                     found.arg |= nested.arg;
+                    found.styles |= nested.styles;
                 }
             }
         }
@@ -9962,6 +10050,42 @@ fn mark_from_module(items: &mut [Item]) {
             dp.tmp.from_module = true;
         }
     }
+}
+
+/// How many atomic pieces one template expansion adds to the pFragment
+/// counter.
+///
+/// With the PHP preprocessor, every extension tag in the *preprocessed* source
+/// of a template becomes a strip marker, and Parsoid's `preparePFragment` spends
+/// one pFragment number per marker. Those tags surface in rustoid's expansion
+/// output as `extension` tokens.
+///
+/// Only the fragment's **top level** counts. A tag nested in a template or
+/// parser-function argument is prepared as part of that call, not of this
+/// source: `Template:Short description`'s `<nowiki/>` sits in an `#ifeq`
+/// argument and spends nothing, while `Template:Dated maintenance category`'s
+/// sits at the top of its source and spends one. A nested template's pieces are
+/// likewise its own; they are not re-marked by an enclosing expansion.
+///
+/// Two kinds must not be counted:
+///
+/// - a `{{#tag:…}}` result, which is prepared (and numbered) at the call;
+/// - a module's output, which is prepared when the module finishes.
+///
+/// Both are marked on the token (see `TempData::tag_content` and
+/// `TempData::from_module`).
+fn preprocessed_piece_count(items: &[Item]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            let Item::Tok(ParsoidToken::SelfclosingTag(t)) = item else {
+                return false;
+            };
+            t.name == "extension"
+                && t.data_parsoid.tmp.tag_content.is_none()
+                && !t.data_parsoid.tmp.from_module
+        })
+        .count()
 }
 
 /// How many `#ifexist` titles one render may resolve.
@@ -10464,24 +10588,22 @@ fn cell_opener_source(t: &crate::wikitext::tokens_v2::TagTk) -> Option<String> {
 /// `tag_content_source` for the *source* of a `#tag` call.
 ///
 /// A resolved DOM-fragment placeholder has no wikitext form. Parsoid records it
-/// as its fragment marker (`PipelineUtils::pFragmentToParsoidFragmentMarkers`),
-/// which is what the service keeps in an `extsrc` — for example the template
-/// stylesheet a module emitted before an indicator's content. `tag_body_source`
-/// deliberately does not use this: a body is re-parsed, so its placeholder must
-/// stay alive under a strip marker.
+/// as `PipelineUtils::pFragmentToParsoidFragmentMarkers` does —
+/// `{{#parsoid\0fragment:N}}`, where `N` comes from the parse's pFragment
+/// counter — which is what the service keeps in an `extsrc`, for example the
+/// template stylesheet a module emitted before an indicator's content. The
+/// placeholder's `data-fragment-id` is a different sequence and does not belong
+/// here. `tag_body_source` deliberately does not use this: a body is re-parsed,
+/// so its placeholder must stay alive under a strip marker.
 pub(crate) fn tag_source_with_fragments(items: &[Item]) -> String {
     let mut replaced: Vec<Item> = Vec::with_capacity(items.len());
     let mut i = 0;
     while i < items.len() {
         match dom_fragment_placeholder_at(items, i) {
-            Some((end, tokens)) => {
-                let Some(id) = tokens.iter().find_map(fragment_id) else {
-                    // A placeholder without an id cannot be named; keep the
-                    // fallback's behaviour rather than inventing one.
-                    replaced.extend_from_slice(&items[i..end]);
-                    i = end;
-                    continue;
-                };
+            Some((end, _tokens)) => {
+                // Each occurrence is its own atomic piece, even when a template
+                // spliced the same placeholder twice.
+                let id = crate::pipeline::pfragment::allocate();
                 replaced.push(Item::Str(format!("{{{{#parsoid\u{0}fragment:{id}}}}}")));
                 i = end;
             }
@@ -10494,18 +10616,6 @@ pub(crate) fn tag_source_with_fragments(items: &[Item]) -> String {
     tag_content_source(&replaced).unwrap_or_else(|| {
         crate::pipeline::parser_functions::tag_content_fallback_source(&replaced)
     })
-}
-
-/// The `data-fragment-id` a DOM-fragment placeholder carries.
-fn fragment_id(item: &Item) -> Option<usize> {
-    let Item::Tok(tok) = item else {
-        return None;
-    };
-    tok.get_attribs()
-        .iter()
-        .find(|kv| kv.key.as_str() == Some("data-fragment-id"))
-        .and_then(|kv| kv.value.as_str())
-        .and_then(|v| v.parse().ok())
 }
 
 /// Render `#tag` content tokens back to the wikitext the tag records as its
@@ -12753,6 +12863,7 @@ mod tests {
     fn tag_source_names_a_fragment_placeholder() {
         use crate::wikitext::tokens_v2::{DataParsoid, EndTagTk, KeyValue, ParsoidToken, TagTk};
 
+        crate::pipeline::pfragment::reset();
         let attr = |k: &str, v: &str| crate::wikitext::tokens_v2::KV {
             key: KeyValue::Str(k.to_string()),
             value: KeyValue::Str(v.to_string()),
@@ -12780,7 +12891,7 @@ mod tests {
         ];
         assert_eq!(
             tag_source_with_fragments(&items),
-            "a{{#parsoid\u{0}fragment:7}}b"
+            "a{{#parsoid\u{0}fragment:0}}b"
         );
         // Without a placeholder the two serializers agree.
         let plain = vec![Item::Str("a".to_string()), Item::Str("b".to_string())];

@@ -19616,3 +19616,45 @@ text in its original case.
 
 **Effect:** `Titanic` 24,339 → 43,977; no other corpus change, 5/48 strict,
 9 nondeterministic-only (29.2%).
+
+## A fragment marker is numbered by the parse's pFragment counter
+
+A `data-mw` body that holds a piece with no wikitext form records it as
+`{{#parsoid\0fragment:N}}` (`PipelineUtils::pFragmentToParsoidFragmentMarkers`).
+`N` is not a DOM fragment id: Parsoid stamps it from a counter it bumps once per
+atomic piece of every fragment it *prepares* during the parse — a template
+expansion's preprocessed source, a `#tag:<extension>` call's own result and its
+body, a parser function's answer. rustoid spelled the placeholder's
+`data-fragment-id` instead, which is a different and much smaller sequence; the
+two agree only by accident, and Chernobyl's coordinates indicator was
+`fragment:1` where the service has `fragment:11`.
+
+The counter is now thread-local (`pipeline::pfragment`), reset when a parse
+starts, and is fed at the points Parsoid feeds it:
+
+- an extension tag written in a template's source: one number, spent when the
+  expansion starts; an extension tag in a *substituted argument value* is one
+  more, once per `{{{…}}}` use;
+- a `{{#tag:<extension>}}` call: one for the call's own atomic result, then one
+  per atomic piece in its body (`tag_source_with_fragments` now allocates the
+  number rather than reusing the fragment id);
+- a parser function's answer: one per atomic piece it returns;
+- only the top level of each of those counts, exactly as the preprocessor nests
+  its strip state.
+
+A `#tag` reached from *inside another* `#tag`'s content argument is expanded
+lazily as a piece of that argument and spends nothing of its own, which the
+`pfragment` module tracks while `#tag`'s fields expand.
+
+Verified against the live transform endpoint: `{{#tag:indicator|…}}` with one,
+two, and a nested stylesheet (previously `0`/`1`/`1`, now `1`/`3`/`6`), two
+indicators (`8`, `10`), a `#tag:templatestyles` before one, `{{#if:…}}` results
+that do and do not return the piece, `{{#invoke:…}}` output, and the
+`{{Use dmy dates}}`/`{{Use short footnotes}}` family all agree.
+
+**Effect:** no corpus change (those pages differ earlier), still 5/48 strict,
+9 nondeterministic-only (29.2%). Chernobyl's marker moves `1 → 7` toward the
+service's `11` and Berlin's `2 → 13` toward `20`; the rest of both sequences
+comes from module and parser-function evaluation paths not modelled yet (a
+module argument evaluated lazily inside Lua, and `safesubst`-styly wrappers,
+each apparently spending a number rustoid does not know about).

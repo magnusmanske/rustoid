@@ -1276,6 +1276,19 @@ impl ParserFunctions {
         // line breaks (`{{#tag:imagemap|…}}`).
         let mut content: Vec<Item> = Vec::new();
         let mut tag_attribs: Vec<KV> = Vec::new();
+        let lc_target = target.to_lowercase();
+        let is_ext = config
+            .extension_tags()
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(&lc_target));
+        // A `{{#tag:<extension>}}` call is a fragment handler: Parsoid prepares
+        // its result as one atomic fragment before expanding it, so the call
+        // spends the first pFragment number ahead of its body's pieces. A call
+        // reached from another such call's argument is expanded lazily and has
+        // no preparation of its own (see `pfragment::set_lazy`).
+        if is_ext {
+            crate::pipeline::pfragment::allocate_tag();
+        }
         if let Some(kv) = args.get(1) {
             if key_value_to_string(&kv.key).is_empty() {
                 content.extend(key_value_to_items(&kv.value));
@@ -1309,12 +1322,6 @@ impl ParserFunctions {
             kv.value = KeyValue::Str(value);
             tag_attribs.push(kv);
         }
-
-        let lc_target = target.to_lowercase();
-        let is_ext = config
-            .extension_tags()
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(&lc_target));
 
         if is_ext {
             return Self::tag_extension_token(&lc_target, &target, &tag_attribs, &content);

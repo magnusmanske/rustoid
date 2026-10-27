@@ -74,7 +74,9 @@ impl BehaviorSwitchAliases {
 }
 
 /// The site's switch table, or `None` when the site does not report one.
-pub fn behavior_switch_aliases(config: &dyn crate::traits::SiteConfig) -> Option<BehaviorSwitchAliases> {
+pub fn behavior_switch_aliases(
+    config: &dyn crate::traits::SiteConfig,
+) -> Option<BehaviorSwitchAliases> {
     config
         .behavior_switch_ids()
         .map(|ids| BehaviorSwitchAliases::new(ids, config.magic_words()))

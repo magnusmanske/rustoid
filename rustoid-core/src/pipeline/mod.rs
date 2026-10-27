@@ -37,6 +37,7 @@ pub mod p_wrap;
 pub mod paragraph_wrapper_v2;
 pub mod parser;
 pub mod parser_functions;
+pub mod pfragment;
 pub mod phonos;
 pub mod pre_handler;
 pub mod quote_transformer_v2;
