@@ -1558,6 +1558,28 @@ impl TemplateHandler {
         // Only these may fall back to a magic word when unimplemented.
         no_hash_spelling: bool,
     ) -> Vec<Item> {
+        // Core trims the arguments of every parser function registered without
+        // `SFH_OBJECT_ARGS` (`Parser::braceSubstitution`): `{{lc:hydrogen  }}`
+        // answers `hydrogen`. The branch-taking functions get `PPNode`s and do
+        // their own trimming, so they are listed here.
+        let trimmed;
+        let params = if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "if" | "ifeq"
+                | "iferror"
+                | "ifexpr"
+                | "ifexist"
+                | "switch"
+                | "expr"
+                | "titleparts"
+                | "tag"
+                | "invoke"
+        ) {
+            params
+        } else {
+            trimmed = params.trimmed();
+            &trimmed
+        };
         match name {
             // `{{=}}` — core `ParserFunctions::equals`, an `SFH_NO_HASH` hook.
             // It answers a literal `=`, which is what assembles attributes such

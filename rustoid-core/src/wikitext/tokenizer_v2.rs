@@ -5690,33 +5690,21 @@ fn find_arg_separator_eq(part: &str, starts_line: bool) -> Option<usize> {
             i += 2;
             continue;
         }
-        // Nested `{{` / `}}` (and `{{{` / `}}}`) atoms.
-        if b == b'{' && bytes.get(i + 1) == Some(&b'{') {
-            let tplarg = bytes.get(i + 2) == Some(&b'{');
-            braces.push(if tplarg {
-                Brace::Tplarg
-            } else {
-                Brace::Template
-            });
-            i += if tplarg { 3 } else { 2 };
+        // Nested `{{` / `}}` (and `{{{` / `}}}`) atoms. The run precedence is
+        // shared with [`split_template_args_impl_offsets`]: a five-brace `subst`
+        // idiom opens a template around an argument, and reading it in the other
+        // order left the scan holding an argument that no closing run could
+        // close, so every later `=` looked nested.
+        if b == b'{'
+            && let Some((brace, take)) = open_brace_run(part, i)
+        {
+            braces.push(brace);
+            i += take;
             at_sol = false;
             continue;
         }
-        if b == b'}' && bytes.get(i + 1) == Some(&b'}') && !braces.is_empty() {
-            let run = bytes[i..].iter().take_while(|&&c| c == b'}').count();
-            let mut consumed = 0usize;
-            while consumed < run {
-                let remaining = run - consumed;
-                let close = match braces.last() {
-                    Some(Brace::Tplarg) if remaining >= 3 => 3,
-                    Some(Brace::Template) if remaining >= 2 => 2,
-                    _ => break,
-                };
-                braces.pop();
-                consumed += close;
-            }
-            // Always advance, or a run of unmatched `}` would not progress.
-            i += consumed.max(1);
+        if b == b'}' && !braces.is_empty() {
+            i += close_brace_run(part, i, &mut braces);
             continue;
         }
         // Single-bracket `[…]` extlink atom.
@@ -6267,6 +6255,58 @@ enum Brace {
     Tplarg,
 }
 
+/// The construct a run of `{` at `i` opens, and how many braces it consumes.
+///
+/// MediaWiki's "ideal precedence": a run of `N` braces opens an argument when
+/// `N % 3 == 0`, a template when `N % 3 == 2`, and when `N % 3 == 1` the first
+/// brace is literal and the rest of the run is reconsidered.
+///
+/// The argument splitter and the `name=value` separator must read a run the
+/// same way, or their nesting depths drift apart. The five-brace `subst` idiom
+/// (`{{{{{name|safesubst:}}}}#switch:…}}`) opens a *template* around an
+/// *argument*; reading it the other way round left the `=` scan holding an
+/// argument that the closing run could not close, so every later `=` looked
+/// nested and the switch's cases were recorded as positional values
+/// (`Template:Metacritic album prose`'s score buckets).
+fn open_brace_run(part: &str, i: usize) -> Option<(Brace, usize)> {
+    if part.as_bytes().get(i) != Some(&b'{') {
+        return None;
+    }
+    let run = part[i..].bytes().take_while(|&b| b == b'{').count();
+    let mut memo = ScanMemo::default();
+    match run % 3 {
+        // `{{{` opens an argument only when it really is one.
+        0 => skip_tplarg_memo(part, i, &[], &mut memo)
+            .is_some()
+            .then_some((Brace::Tplarg, 3)),
+        2 => Some((Brace::Template, 2)),
+        // `N % 3 == 1`: the run reads as a template when the remaining braces
+        // can close as one (`{{{{#ifeq:…}}|x}}`), else the first brace is text.
+        _ => run1_reads_as_template(part, i, run, &[], &mut memo).then_some((Brace::Template, 2)),
+    }
+}
+
+/// Consume a run of `}` at `i` against `braces`.
+///
+/// Returns how many characters the run accounts for; unmatched braces are
+/// literal text, and at least one character is always consumed so the caller's
+/// loop advances.
+fn close_brace_run(part: &str, i: usize, braces: &mut Vec<Brace>) -> usize {
+    let run = part[i..].bytes().take_while(|&b| b == b'}').count();
+    let mut consumed = 0usize;
+    while consumed < run {
+        let remaining = run - consumed;
+        let close = match braces.last() {
+            Some(Brace::Tplarg) if remaining >= 3 => 3,
+            Some(Brace::Template) if remaining >= 2 => 2,
+            _ => break,
+        };
+        braces.pop();
+        consumed += close;
+    }
+    consumed.max(1)
+}
+
 fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize, String)> {
     let mut parts: Vec<(usize, String)> = Vec::new();
     let mut current = String::new();
@@ -6282,10 +6322,6 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
     let mut table: i32 = 0;
     let mut dash_brace: i32 = 0;
     let lower = inner.to_ascii_lowercase();
-    // Shared by the `{{{` checks below: an argument reference is only opened
-    // when it really closes with `}}}`, and remembering the failures keeps the
-    // scan linear on an input full of unterminated braces.
-    let mut memo = ScanMemo::default();
     let mut i = 0;
     while i < inner.len() {
         // A `-{ … }-` language-variant construct is balanced: its internal `|`
@@ -6393,68 +6429,13 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
             i += 5;
             continue;
         }
-        // A run of `{` opens a template when `N % 3 == 2`, an argument when
-        // `N % 3 == 0`, and when `N % 3 == 1` one `{` is literal and the rest of
-        // the run is reconsidered (MediaWiki's "ideal precedence"). Testing
-        // `starts_with("{{{")` first read the five-brace `subst` idiom
-        // (`{{{{{name|safesubst:}}}#invoke:…}}`) as an argument, which
-        // desynchronised the stack: a following top-level `|` was then seen as
-        // nested and the arguments merged, so `Template:Str ≥ len` — whose body
-        // is exactly that idiom around an `#ifexpr` — recorded one parameter and
-        // evaluated the branches as part of the expression. Mirrors
-        // [`find_template_closing_memo`] and [`PegTokenizer::parse_directive`].
-        if let Some(&b'{') = inner.as_bytes().get(i) {
-            let run = inner[i..].bytes().take_while(|&b| b == b'{').count();
-            match run % 3 {
-                0 => {
-                    // `{{{` opens an argument only when it really is one. The
-                    // `{{{!}}` magic pipe is `{` + `{{!}}`: PHP's `preproc_piece`
-                    // tries the argument and falls back to a literal `{` when the
-                    // first `}}` is not a `}}}` closer. Opening an argument here
-                    // left `braces` out of step with the closing scan, so the
-                    // template's own `}}` and every following top-level `|` were
-                    // read as nested — `Template:Infobox football biography`'s
-                    // `data196` (a `{{{!}}` table) swallowed the parameters after
-                    // it (`| belowstyle = …`).
-                    if skip_tplarg_memo(inner, i, &[], &mut memo).is_none() {
-                        // Fall through: the first `{` is literal content and the
-                        // rest of the run is reconsidered. (Do not `continue` —
-                        // that would retest the same run forever.)
-                    } else {
-                        braces.push(Brace::Tplarg);
-                        current.push_str("{{{");
-                        i += 3;
-                        continue;
-                    }
-                }
-                2 => {
-                    braces.push(Brace::Template);
-                    current.push_str("{{");
-                    i += 2;
-                    continue;
-                }
-                // `N % 3 == 1`: the first brace is literal content, and the rest
-                // of the run is reconsidered. Fall through rather than consuming
-                // it, so the `{|` table rule below still sees a table opener.
-                //
-                // Unless the remaining run cannot close as an argument at all:
-                // `{{{{#ifeq:…}}|x}}` has no `}}}` to end `{{{#ifeq:…`, so
-                // Parsoid reads the run as `{{` + the nested call. Treating the
-                // brace as literal left the stack one construct short, and the
-                // nested call's `|` then split the enclosing argument list in
-                // two (`{{nowrap|{{{{#ifeq:…}}|…}}}}` became two parameters and
-                // `Template:Unichar` lost its glyph).
-                _ => {
-                    if !run1_reads_as_template(inner, i, run, &[], &mut memo) {
-                        // Literal brace: fall through to the generic content arm.
-                    } else {
-                        braces.push(Brace::Template);
-                        current.push_str("{{");
-                        i += 2;
-                        continue;
-                    }
-                }
-            }
+        // A run of `{` opens a template or an argument; see [`open_brace_run`]
+        // for the precedence rule.
+        if let Some((brace, take)) = open_brace_run(inner, i) {
+            braces.push(brace);
+            current.push_str(&inner[i..i + take]);
+            i += take;
+            continue;
         }
         // A run of closing braces closes as many open constructs as it can, and
         // which closer comes first is decided by the *innermost* open construct.
@@ -6468,21 +6449,7 @@ fn split_template_args_impl_offsets(inner: &str, magic_pipe: bool) -> Vec<(usize
         // article using `{{Short description}}` hit it, through
         // `Template:Short description/lowercasecheck`.
         if inner[i..].starts_with('}') {
-            let run = inner[i..].bytes().take_while(|&b| b == b'}').count();
-            let mut consumed = 0usize;
-            while consumed < run {
-                let remaining = run - consumed;
-                let close = match braces.last() {
-                    Some(Brace::Tplarg) if remaining >= 3 => 3,
-                    Some(Brace::Template) if remaining >= 2 => 2,
-                    _ => break,
-                };
-                braces.pop();
-                consumed += close;
-            }
-            // Braces this run did not close are literal, and there is always at
-            // least one of them to consume or the loop would not advance.
-            let taken = consumed.max(1);
+            let taken = close_brace_run(inner, i, &mut braces);
             current.push_str(&inner[i..i + taken]);
             i += taken;
             continue;

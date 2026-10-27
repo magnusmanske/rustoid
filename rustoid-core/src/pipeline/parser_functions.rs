@@ -25,6 +25,22 @@ impl Params {
         Self { args }
     }
 
+    /// A copy with every argument's name and value trimmed at the edges.
+    ///
+    /// Core's `Parser::braceSubstitution` trims the arguments of a parser
+    /// function that is not registered with `SFH_OBJECT_ARGS`:
+    /// `{{lc:hydrogen  }}` answers `hydrogen`, and the branch-taking functions
+    /// (which receive `PPNode`s and trim themselves) are the exception. The
+    /// trim is on the *expanded* text, so a leading newline token goes too.
+    pub fn trimmed(&self) -> Params {
+        let mut args = self.args.clone();
+        for kv in &mut args {
+            trim_key_value_edges(&mut kv.key);
+            trim_key_value_edges(&mut kv.value);
+        }
+        Self { args }
+    }
+
     /// Convert args to a key→value dict (mirrors `Params::dict`).
     pub fn dict(&self) -> std::collections::HashMap<String, KeyValue> {
         let mut res = std::collections::HashMap::new();
@@ -1678,6 +1694,20 @@ impl ParserFunctions {
         }
         items.extend(value_items(&kv.value));
         items
+    }
+}
+
+/// Trim one half of a `Params` argument: a plain string loses its blanks, and a
+/// token list is trimmed by [`trim_item_edges`].
+fn trim_key_value_edges(value: &mut KeyValue) {
+    match value {
+        KeyValue::Str(s) => {
+            let trimmed = php_trim(s);
+            if trimmed.len() != s.len() {
+                *s = trimmed.to_string();
+            }
+        }
+        KeyValue::Tokens(items) => trim_item_edges(items),
     }
 }
 
