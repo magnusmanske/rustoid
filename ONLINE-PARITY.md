@@ -19728,3 +19728,40 @@ links in the caption are parsed normally.
 next difference moves from byte 170,135 to 389,248. That one is an extra blank
 line after a `<tr>` in the NFPA 704 table. Fixtures stay 867/896 and all 1,116
 lib tests pass.
+
+## A parser-function branch's edge trim runs on the expanded tokens
+
+`#if`/`#ifeq` answer `trim($frame->expand(…))`, and a nested template can
+*contribute* the edge: `Template:Chembox Hazards`' NFPA `#if` returns
+`{{Chembox NFPA}}`, whose body starts with a newline. rustoid trimmed the
+branch's tokens before expanding it, so the newline that arrived with the
+expansion survived — the isotope table's NFPA row got two extra newlines after
+its `<tr>` on `Hydrogen`.
+
+The post-expansion trim now walks the leading edge too, stepping over the
+`mw:Transclusion` start markers without removing them (they render nothing but
+carry the wrapper's `about`) and dropping the newlines and blanks behind them.
+The trailing edge still leaves a newline alone, for the reason recorded in *A
+trimmed branch is trimmed again after expansion*.
+
+Two related fixes were needed to keep the isotope table's own rows in step:
+
+- `expand_kv` now strips comments with the preprocessor's line rule instead of
+  a bare filter, so `<!--\n NFPA box -->` between the GHS and NFPA calls takes
+  its line's break with it.
+- That rule only applies when the newline before the comment is *source* text.
+  rustoid expands argument values before stripping their comments, so
+  `{{trim|1={{iso-na-hl}}<!--…-->\n{{#if:…}}}}` saw the preceding call's trailing
+  newline as if it were a line break and ate the break after the comment,
+  joining the half-life and decay cells. A synthesized `NlTk` no longer counts
+  as the start of a line.
+
+The isotope row also exposed a stale cache entry: `Template:Isotopes/main/isotope/iso-na-hl`
+had been fetched two weeks before the pinned Hydrogen revision, and the
+template gained a `<noinclude>` block (and with it a trailing newline) in
+between. Refreshing that entry restored the row.
+
+**Effect:** with `math`, node ids and the duplicate-ref shape masked, Hydrogen's
+next difference moves from byte 389,248 to 171,197, which is the Cite
+`CONFLICT_INVISIBLE` shape described above. Fixtures stay 867/896 and all 1,119
+lib tests pass.

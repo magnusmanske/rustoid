@@ -1627,11 +1627,9 @@ impl ParserFunctions {
         // `<span about="#mwtN"> </span>` that `Template:Redirect-several`
         // leaves on `Polio vaccine` (its `#switch` default is
         // `<!-- … -->\n     {{#switch:…}}`).
-        let no_comments = |items: Vec<Item>| -> Vec<Item> {
+        let no_comments = |mut items: Vec<Item>| -> Vec<Item> {
+            crate::pipeline::frame::strip_comment_lines(&mut items);
             items
-                .into_iter()
-                .filter(|it| !matches!(it, Item::Tok(ParsoidToken::Comment(_))))
-                .collect()
         };
         let value_items = |value: &KeyValue| -> Vec<Item> {
             no_comments(match value {
@@ -1744,12 +1742,8 @@ pub(crate) fn trim_item_edges(items: &mut Vec<Item>) {
                 }
                 start += 1;
             }
-            // A comment never reaches the output, so it cannot stop the trim.
-            // Core trims the *expanded string*, where `<!--…-->` is already
-            // gone: a branch ending `text <!--c-->` is `text`, not `text `.
-            // `Template:Unichar/main`'s else branch ends in exactly that, after
-            // an empty `{{Unichar/notes}}`, and the surviving space gave
-            // `{{unichar|…}})` a space before the bracket on `Bitcoin`.
+            // A comment never reaches the output, so it cannot stop the trim
+            // (see [`trim_branch_leading_edges`]).
             Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => start += 1,
             _ => break,
         }
@@ -1776,20 +1770,85 @@ pub(crate) fn trim_item_edges(items: &mut Vec<Item>) {
     }
 }
 
-/// The trailing half of [`trim_item_edges`] for a branch that has already been
-/// expanded.
+/// The leading half of the *post-expansion* branch trim.
+///
+/// A string loses its leading blanks, and a newline or comment token is dropped
+/// and the walk continues. A transclusion start marker is stepped over without
+/// being removed: it is not part of the string core trims, so the blanks behind
+/// it are still at the edge, but the marker carries the wrapper's `about` and
+/// must survive. `{{#if:1|{{Chembox NFPA|…}}}}` expands to two metas and then
+/// the template's leading newline.
+fn trim_branch_leading_edges(items: &mut Vec<Item>) {
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    let mut trimming = true;
+    for mut item in std::mem::take(items) {
+        if trimming {
+            if is_transclusion_start_marker(&item) {
+                out.push(item);
+                continue;
+            }
+            match &mut item {
+                Item::Str(s) => {
+                    let trimmed = s.trim_start_matches(php_trim_char);
+                    if trimmed.len() != s.len() {
+                        *s = trimmed.to_string();
+                    }
+                    if s.is_empty() {
+                        continue;
+                    }
+                    trimming = false;
+                }
+                // A comment never reaches the output, so it cannot stop the
+                // trim. Core trims the *expanded string*, where `<!--…-->` is
+                // already gone: a branch ending `text <!--c-->` is `text`, not
+                // `text `. `Template:Unichar/main`'s else branch ends in exactly
+                // that, after an empty `{{Unichar/notes}}`, and the surviving
+                // space gave `{{unichar|…}})` a space before the bracket on
+                // `Bitcoin`.
+                Item::Tok(ParsoidToken::Nl(_) | ParsoidToken::Comment(_)) => continue,
+                _ => trimming = false,
+            }
+        }
+        out.push(item);
+    }
+    *items = out;
+}
+
+/// A `<meta typeof="mw:Transclusion">` (or `mw:Param`) start marker, which
+/// renders nothing and therefore cannot be the edge of a trimmed string.
+fn is_transclusion_start_marker(item: &Item) -> bool {
+    let Item::Tok(tok) = item else {
+        return false;
+    };
+    if !matches!(tok, ParsoidToken::SelfclosingTag(t) if t.name == "meta") {
+        return false;
+    }
+    tok.get_attribute_v("typeof").is_some_and(|v| {
+        v.split_whitespace()
+            .any(|ty| ty == "mw:Transclusion" || ty == "mw:Param")
+    })
+}
+
+/// The post-expansion half of [`trim_item_edges`] for a branch that has already
+/// been expanded.
 ///
 /// Core trims the expanded string, so whitespace that only reaches the edge
 /// because a nested call answered nothing is trimmed too: `Template:Unichar/main`
 /// ends its `#ifexpr` branch with ` {{Unichar/notes}}`, and the space before the
-/// empty notes call must not survive.
+/// empty notes call must not survive. The same applies at the start, where a
+/// nested template may *contribute* the edge: `Template:Chembox Hazards`'
+/// `#if` answers `{{Chembox NFPA}}`, whose body starts with a newline, and the
+/// service removes it — on `Hydrogen` the isotope table's NFPA row otherwise
+/// gets two extra newlines after its `<tr>`.
 ///
-/// Unlike the pre-expansion trim this leaves a newline token alone. rustoid
-/// expands a branch in more than one stage (an argument value's own templates
-/// are expanded later), so a newline at *this* stage's edge may still be
-/// followed by content in the finished branch; dropping it removed the line
-/// break the list handler needs (`List of sovereign states`' `{{Compact ToC}}`).
+/// The trailing edge leaves a newline token alone. rustoid expands a branch in
+/// more than one stage (an argument value's own templates are expanded later), so
+/// a newline there may still be followed by content in the finished branch;
+/// dropping it removed the line break the list handler needs (`List of sovereign
+/// states`' `{{Compact ToC}}`).
 pub(crate) fn trim_item_edges_str(items: &mut Vec<Item>) {
+    trim_branch_leading_edges(items);
+
     while let Some(last) = items.last_mut() {
         match last {
             Item::Str(s) => {
@@ -3302,5 +3361,35 @@ mod tests {
         let p = params(vec![("Café", "")]);
         let out = ParserFunctions::pf_anchorencode(&p);
         assert_eq!(tokens_to_string(&out), "Café");
+    }
+
+    /// Core trims the *expanded* branch, and a nested template can supply the
+    /// leading newline: `{{#if:1|{{Chembox NFPA|…}}}}`. The transclusion marker
+    /// that lands in front of it renders nothing, so the trim must step over it
+    /// — but keep it, because it carries the wrapper's `about`.
+    #[test]
+    fn a_branch_trim_steps_over_markers_and_drops_the_newline_behind_them() {
+        use crate::wikitext::tokens_v2::{DataParsoid, NlTk, SelfclosingTagTk, SourceRange};
+
+        let mut marker = SelfclosingTagTk::new("meta", vec![], DataParsoid::default());
+        marker.add_attribute_str("typeof", "mw:Transclusion");
+        let nl = Item::Tok(ParsoidToken::Nl(NlTk::new(SourceRange {
+            start: None,
+            end: 1,
+            source: Some("\n".into()),
+        })));
+        let mut items = vec![
+            Item::Tok(ParsoidToken::SelfclosingTag(marker)),
+            nl,
+            Item::Str("X".to_string()),
+        ];
+
+        trim_item_edges_str(&mut items);
+
+        assert_eq!(tokens_to_string(&items), "X");
+        assert!(
+            matches!(items.first(), Some(Item::Tok(ParsoidToken::SelfclosingTag(t))) if t.name == "meta"),
+            "the marker survives the trim: {items:?}"
+        );
     }
 }

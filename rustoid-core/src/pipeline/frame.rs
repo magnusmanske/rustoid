@@ -197,12 +197,12 @@ impl Frame {
             if self.args.named().named_args.contains_key(&name) {
                 trim_items(&mut items);
             }
-            Self::strip_comment_lines(&mut items);
+            strip_comment_lines(&mut items);
             return items;
         }
         if stt.attribs.len() > 1 {
             let mut items = self.expand(&key_value_to_items(&stt.attribs[1].value));
-            Self::strip_comment_lines(&mut items);
+            strip_comment_lines(&mut items);
             return items;
         }
         vec![
@@ -230,7 +230,7 @@ impl Frame {
             if named.named_args.contains_key(arg_name) {
                 trim_items(&mut items);
             }
-            Self::strip_comment_lines(&mut items);
+            strip_comment_lines(&mut items);
             return items;
         }
 
@@ -240,60 +240,6 @@ impl Frame {
             Item::Str(name.to_string()),
             Item::Str("}}}".to_string()),
         ]
-    }
-
-    /// Remove HTML comments from a substituted argument value, the way MediaWiki's
-    /// preprocessor does before it splits a template's arguments.
-    ///
-    /// A comment on a line of its own takes that line's break with it
-    /// (`\n[ \t]*<!--…-->[ \t]*\n` becomes `\n`); an inline comment is removed
-    /// alone. Keeping the newline left `Template:Flat list` with one blank line
-    /// too many after its list, which the paragraph wrapper turned into a stray
-    /// `<p><br/></p>` (`Taylor Swift`).
-    fn strip_comment_lines(items: &mut Vec<Item>) {
-        use crate::wikitext::tokens_v2::ParsoidToken;
-        let mut out: Vec<Item> = Vec::with_capacity(items.len());
-        let mut i = 0;
-        while i < items.len() {
-            if !matches!(&items[i], Item::Tok(ParsoidToken::Comment(_))) {
-                out.push(items[i].clone());
-                i += 1;
-                continue;
-            }
-            // Is the comment the only thing on its line?
-            let at_line_start = match out.last_mut() {
-                Some(Item::Str(s)) => match s.rfind('\n') {
-                    Some(n) if s[n + 1..].chars().all(|c| c == ' ' || c == '\t') => {
-                        // The blanks before the comment go with its line.
-                        s.truncate(n + 1);
-                        true
-                    }
-                    _ => false,
-                },
-                Some(Item::Tok(ParsoidToken::Nl(_))) => true,
-                _ => false,
-            };
-            // Does a line break follow, reached over blanks only?
-            let ends_line = match items.get(i + 1) {
-                Some(Item::Tok(ParsoidToken::Nl(_))) => true,
-                Some(Item::Str(s)) => s.trim_start_matches([' ', '\t']).starts_with('\n'),
-                _ => false,
-            };
-            if at_line_start && ends_line {
-                match &mut items[i + 1] {
-                    Item::Tok(ParsoidToken::Nl(_)) => {
-                        items.remove(i + 1);
-                    }
-                    Item::Str(s) => {
-                        let after = s.trim_start_matches([' ', '\t']);
-                        *s = after[1..].to_string();
-                    }
-                    _ => {}
-                }
-            }
-            i += 1;
-        }
-        *items = out;
     }
 
     /// Expand / convert a thunk (a chunk of tokens not yet fully expanded).
@@ -404,6 +350,68 @@ impl Frame {
         new_token.set_attribs(expanded);
         Item::Tok(new_token)
     }
+}
+
+/// Remove HTML comments from a substituted argument value or a parser-function
+/// branch, the way MediaWiki's preprocessor does before it splits a template's
+/// arguments.
+///
+/// A comment on a line of its own takes that line's break with it
+/// (`\n[ \t]*<!--…-->[ \t]*\n` becomes `\n`); an inline comment is removed
+/// alone. Keeping the newline left `Template:Flat list` with one blank line too
+/// many after its list, which the paragraph wrapper turned into a stray
+/// `<p><br/></p>` (`Taylor Swift`), and put a second blank line in `Hydrogen`'s
+/// isotope table between the GHS and NFPA rows (`Template:Chembox Hazards` has
+/// `<!--\n NFPA box -->` between two parser functions).
+pub(crate) fn strip_comment_lines(items: &mut Vec<Item>) {
+    use crate::wikitext::tokens_v2::ParsoidToken;
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    let mut i = 0;
+    while i < items.len() {
+        if !matches!(&items[i], Item::Tok(ParsoidToken::Comment(_))) {
+            out.push(items[i].clone());
+            i += 1;
+            continue;
+        }
+        // Is the comment the only thing on its line? A newline that only exists
+        // because a nested call was expanded does not make the comment the first
+        // thing on its source line: `{{trim|1={{T}}<!--c-->\nY}}` has the comment
+        // inline in the source, and eating the newline after it collapsed the
+        // break between `Hydrogen`'s half-life and decay cells.
+        let at_line_start = match out.last_mut() {
+            Some(Item::Str(s)) => match s.rfind('\n') {
+                Some(n) if s[n + 1..].chars().all(|c| c == ' ' || c == '\t') => {
+                    // The blanks before the comment go with its line.
+                    s.truncate(n + 1);
+                    true
+                }
+                _ => false,
+            },
+            Some(Item::Tok(ParsoidToken::Nl(nl))) => !nl.data_parsoid.tmp.synthesized,
+            _ => false,
+        };
+        // Does a line break follow, reached over blanks only?
+        let ends_line = match items.get(i + 1) {
+            Some(Item::Tok(ParsoidToken::Nl(_))) => true,
+            Some(Item::Str(s)) => s.trim_start_matches([' ', '\t']).starts_with('\n'),
+            _ => false,
+        };
+
+        if at_line_start && ends_line {
+            match &mut items[i + 1] {
+                Item::Tok(ParsoidToken::Nl(_)) => {
+                    items.remove(i + 1);
+                }
+                Item::Str(s) => {
+                    let after = s.trim_start_matches([' ', '\t']);
+                    *s = after[1..].to_string();
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    *items = out;
 }
 
 /// Convert a resolved `KeyValue` into a flat token chunk.
@@ -602,6 +610,60 @@ mod tests {
                 .iter()
                 .any(|it| matches!(it, Item::Tok(ParsoidToken::Nl(_)))),
             "a named argument's edge newline tokens must be trimmed: {items:?}"
+        );
+    }
+
+    fn nl_item(synthesized: bool) -> Item {
+        use crate::wikitext::tokens_v2::{NlTk, SourceRange};
+        let mut nl = NlTk::new(SourceRange {
+            start: None,
+            end: 0,
+            source: None,
+        });
+        nl.data_parsoid.tmp.synthesized = synthesized;
+        Item::Tok(ParsoidToken::Nl(nl))
+    }
+
+    fn comment_item() -> Item {
+        use crate::wikitext::tokens_v2::{CommentTk, DataParsoid};
+        Item::Tok(ParsoidToken::Comment(CommentTk::new(
+            "c",
+            DataParsoid::default(),
+        )))
+    }
+
+    #[test]
+    fn a_comment_on_its_own_line_takes_the_break_with_it() {
+        let mut items = vec![
+            Item::Str("A".to_string()),
+            nl_item(false),
+            comment_item(),
+            nl_item(false),
+            Item::Str("B".to_string()),
+        ];
+        strip_comment_lines(&mut items);
+        assert_eq!(
+            crate::wikitext::token_utils::tokens_to_string_with_nls(&items),
+            "A\nB"
+        );
+    }
+
+    /// The newline before an inline comment may come from the preceding call's
+    /// expansion, not from the source (`{{trim|1={{T}}<!--…-->\nY}}`). It must
+    /// not make the comment look like the first thing on its line.
+    #[test]
+    fn a_synthesized_break_does_not_make_a_comment_a_whole_line() {
+        let mut items = vec![
+            Item::Str("X".to_string()),
+            nl_item(true),
+            comment_item(),
+            nl_item(false),
+            Item::Str("B".to_string()),
+        ];
+        strip_comment_lines(&mut items);
+        assert_eq!(
+            crate::wikitext::token_utils::tokens_to_string_with_nls(&items),
+            "X\n\nB"
         );
     }
 }
