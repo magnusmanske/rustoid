@@ -282,9 +282,7 @@ mod tests {
     }
 
     /// The built-in corpus pins a revision for every entry, because that is what
-    /// makes two runs' scoreboards comparable. `Zebra` is the one exception: it
-    /// was added before the pin was recorded anywhere and its body predates the
-    /// manifest entry, so it is called out here rather than silently tolerated.
+    /// makes two runs' scoreboards comparable.
     #[test]
     fn the_builtin_corpus_pins_revisions() {
         let c = Corpus::builtin();
@@ -294,6 +292,6 @@ mod tests {
             .filter(|e| e.revid.is_none())
             .map(|e| e.title.as_str())
             .collect();
-        assert_eq!(unpinned, vec!["Zebra"]);
+        assert_eq!(unpinned, Vec::<&str>::new());
     }
 }

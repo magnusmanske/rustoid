@@ -19897,3 +19897,37 @@ shape masked, `Hydrogen`'s two renderings are now **equal at 1,004,639 bytes**
 — the masked comparison reports no difference at all. The lib suite is at
 1,125, fixtures stay 867/896, `rustoid-extensions` at 50, the Cite tests at
 14 + 2, and `rustoid-compare` at 135.
+
+## The corpus baseline is re-pinned, and a refresh re-reads stale inputs
+
+The built-in corpus still pinned revisions from two weeks earlier while the
+template cache had been advanced to the revision the refreshed Hydrogen oracle
+used, so 35 of 47 comparisons were flagged "suspect drift" and the scoreboard no
+longer meant anything. Every entry is now pinned to the wiki's current revision
+(`Zebra` gains the pin it never had), and a fresh run compares all 48.
+
+Two harness fixes were needed before that run was worth reading:
+
+- `--refresh` re-read only the page. A template, module or stylesheet cached on
+  an earlier day was reused, so a fresh oracle was compared against an input from
+  another day: the smallest page, `Help:Introduction`, "failed" only because its
+  `Template:Intro to single/styles.css` was at the older revision. A refresh now
+  re-reads an input whose cache stamp is from an earlier day, keeps the stale
+  body when the wiki refuses that re-read (a rate limit is the usual answer), and
+  reuses anything fetched today.
+- `wikitext_at` read `rest.php/v1/revision/{revid}`, which answers `429` after a
+  few dozen requests. A refresh touches hundreds of inputs per page and lost 19
+  of 48 pages to it; the Action API
+  (`action=query&prop=revisions&revids=…&rvslots=main`) is used instead, like
+  every other read.
+
+**Effect:** the corpus compares all 48 pages: strict **7/48 (14.6%)**, **12/48
+(25.0%)** when nondeterministic-only differences are credited. `Help:Introduction`
+is now nondeterministic rather than a failure, which confirms the stylesheet was
+the whole difference. The largest remaining class is `extension` (19 pages,
+mostly the unrendered `<math>`), then `table` (4), `wikilink` (4) and `data-mw`
+(3). The two smallest failures name the next features: `Template:Infobox` serves
+a plain `<pre>` where the service has `syntaxhighlight`'s highlighted spans, and
+`Sundial` stops at its first `<math>`. The lib suite is at 1,125, fixtures
+867/896, `rustoid-extensions` 50, the Cite tests 14 + 2, and `rustoid-compare`
+136.
