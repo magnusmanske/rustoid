@@ -8607,6 +8607,13 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // `<onlyinclude>`) in the template source before substituting arguments,
         // mirroring `expandTemplate`'s pre-processing (a transcluded template's
         // `<noinclude>` self-documentation is *not* part of the expansion).
+        //
+        // The self-closing forms are first replaced by an empty comment rather
+        // than deleted: the preprocessor removes the tag only after its brace and
+        // bracket scan, so `[<noinclude />[` must stay two brackets for the
+        // scanner even though it renders as `[[` (see the helper's comment).
+        let template_src =
+            crate::expand::transclusion::barrier_self_closing_include_tags(&template_src);
         let template_src = crate::expand::transclusion::strip_noinclude_sections(&template_src);
         let template_src = crate::expand::transclusion::extract_includeonly_sections(&template_src);
         let template_src = crate::expand::transclusion::extract_onlyinclude_sections(&template_src);
@@ -12767,6 +12774,59 @@ mod tests {
         assert!(
             !html.contains("{{{lang}}}"),
             "the unexpanded reference must not survive: {html}"
+        );
+    }
+
+    /// A self-closing `<noinclude />` is removed by the preprocessor, but only
+    /// after it has parsed the surrounding braces and brackets. Deleting it
+    /// before tokenizing joined `[<noinclude />[` into `[[`, and the template
+    /// scanner then refused to close the enclosing `#if` (its `}}`-under-`[[`
+    /// rule), leaving the call as literal text. `Template:Physics particle`
+    /// splits a link across two `#if` branches exactly this way.
+    #[tokio::test]
+    async fn a_self_closing_noinclude_barrier_keeps_an_if_expandable() {
+        use crate::mock::MockDataSource;
+
+        let config = MockSiteConfig::new();
+        let source = MockDataSource::new();
+        source.add_template(
+            "Template:Probe",
+            "<span>{{#if:{{{link|}}}|[<noinclude />[{{{link}}}{{!}}}}<b>{{{1}}}</b>{{#if:{{{link|}}}|]<noinclude />]}}</span>",
+        );
+        let parser = Parser::new(&config);
+
+        let empty = parser
+            .wikitext_to_html_expanded(
+                "{{Probe|link=|1=H}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            empty.contains("<b>H</b>") && !empty.contains("#if"),
+            "the empty branch leaves only the content: {empty}"
+        );
+
+        let linked = parser
+            .wikitext_to_html_expanded(
+                "{{Probe|link=Foo|1=H}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            linked.contains("mw:WikiLink") && linked.contains("<b>H</b>"),
+            "the two branches assemble one link: {linked}"
+        );
+        assert!(
+            !linked.contains("[[Foo"),
+            "no literal link survives: {linked}"
+        );
+        assert!(
+            !linked.contains("#if"),
+            "no literal call survives: {linked}"
         );
     }
 

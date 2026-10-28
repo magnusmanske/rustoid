@@ -75,6 +75,10 @@ pub struct Reference {
     /// that is where Cite renders it — a `<ref>`'s content appears in the footnote,
     /// not at the call site.
     pub body: String,
+    /// Whether a non-empty body has already been recorded. Parsoid keeps the
+    /// **first** definition of a named note; a later duplicate definition does
+    /// not replace it (it is compared for conflict instead).
+    pub defined: bool,
     /// A self-closing ref (`<ref name="x" />`) contributes a back-link and no
     /// content of its own.
     pub self_closing: bool,
@@ -333,6 +337,7 @@ impl CiteState {
                     name: name.to_string(),
                     group: group.to_string(),
                     body: String::new(),
+                    defined: false,
                     self_closing,
                     number,
                     global_id,
@@ -361,8 +366,9 @@ impl CiteState {
         // body never overwrites one, and never claims the pointer: a bare
         // `<ref name="x"/>` contributes a back-link and nothing else.
         let defines = !self_closing && !empty_body;
-        if defines {
+        if defines && !self.references[idx].defined {
             self.references[idx].body = body.to_string();
+            self.references[idx].defined = true;
             self.references[idx].self_closing = false;
             self.references[idx].body_about = about.map(str::to_string);
         }
@@ -1897,6 +1903,16 @@ mod tests {
 
     /// The marker's `data-mw` is exactly the shape in the cached output, including
     /// the omission of `group` when unset.
+    #[test]
+    fn a_later_definition_does_not_replace_the_first_body() {
+        let mut st = CiteState::new();
+        st.add_with_attrs("x", "", Vec::new(), "ONE", false, Some("#mwt1"));
+        st.add_with_attrs("x", "", Vec::new(), "TWO", false, Some("#mwt2"));
+        assert_eq!(st.references[0].body, "ONE");
+        assert_eq!(st.references[0].body_about.as_deref(), Some("#mwt1"));
+        assert_eq!(st.references[0].uses.len(), 2);
+    }
+
     #[test]
     fn ref_data_mw_matches_the_cached_shape() {
         let mut st = CiteState::new();

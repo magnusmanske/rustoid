@@ -19658,3 +19658,51 @@ service's `11` and Berlin's `2 → 13` toward `20`; the rest of both sequences
 comes from module and parser-function evaluation paths not modelled yet (a
 module argument evaluated lazily inside Lua, and `safesubst`-styly wrappers,
 each apparently spending a number rustoid does not know about).
+
+## A self-closing `<noinclude />` is a barrier, not nothing
+
+The refreshed Hydrogen render first diverged at `Template:Physics particle`,
+whose body splits a wikilink across two parser-function branches:
+
+```
+{{#if:{{{link|}}}|[<noinclude />[{{{link}}}{{!}}}}…
+…{{#if:{{{link|}}}|]<noinclude />]}}
+```
+
+MediaWiki's preprocessor removes the self-closing tag from the text, but only
+after it has parsed the surrounding braces and brackets. To the scanner
+`[<noinclude />[` is therefore two `[` characters, not an opening `[[`; the
+enclosing `#if` closes normally and its two branches assemble into a link after
+expansion. rustoid deleted the tag *before* tokenizing, so the scanner saw an
+unclosed `[[` and took its "`}}` under an open `[[`" failure arm: the call
+stayed literal (`{{#if:…}}` plus an unexpanded `{{{link}}}`) and the article
+showed its source.
+
+The template path now replaces each self-closing inclusion tag with an empty
+comment before tokenizing (`barrier_self_closing_include_tags`). A comment is
+opaque to the brace/bracket scan and is dropped with the body's other comments
+after expansion, so the barrier disappears without joining the brackets early.
+
+**Effect:** the leak is gone; with `math` masked, Hydrogen's next difference
+moves from byte 117,824 to 170,135. Fixtures stay 867/896 and all 1,115 lib
+tests pass.
+
+## The refreshed Hydrogen oracle, and the next difference
+
+The cached `html:Hydrogen` baseline had one newline where the live service now
+has two before `Template:Isotopes/main/isotope/decay`'s first cell. That was a
+stale oracle, not a parser bug: the live render at the same pinned revision
+agrees with rustoid, and Parsoid's own transform endpoint has the same `\n\n`.
+After refreshing the baseline, the first difference is the unrendered `<math>`
+extension (recorded as needing Mathoid above); masking it and the random node
+ids puts the next difference at 170,135.
+
+That one is a duplicate named-ref definition. `Template:Infobox hydrogen` and
+the article both define `<ref name="Nostrand">` with the same visible citation,
+so Parsoid detects `CONFLICT_INVISIBLE`: the second use's `data-mw.body` becomes
+`{"html":…}` (its own expanded HTML) instead of `{"id":…}`, without an error.
+rustoid keeps `{"id":…}`; it now also keeps the *first* definition's body
+(Parsoid's rule) rather than the last, but the use's `body.html` needs Cite's
+`checkForConflictingContent`/`normalizeRef` port, including the
+invisible-vs-visible distinction and the inner-HTML serialization the
+`<references>` bucket already records as missing.

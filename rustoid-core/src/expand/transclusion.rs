@@ -277,6 +277,25 @@ pub(crate) fn extract_includeonly_sections(text: &str) -> String {
 /// and MediaWiki's preprocessor removes it — leaving it in leaked a literal
 /// `&lt;noinclude/>` into the rendered page.
 fn strip_self_closing_tag(text: &str, name: &str) -> String {
+    replace_self_closing_tag(text, name, "")
+}
+
+/// Replace each self-closing inclusion-control tag with `replacement`.
+///
+/// `replacement` is empty for the plain string expander, and an empty comment
+/// where the source is about to be *tokenized*. The preprocessor removes these
+/// tags from the text but only after it has parsed the surrounding braces and
+/// brackets, so the tag still separates markup: `[<noinclude />[` is two `[`
+/// characters to the preprocessor, not an opening `[[`. Dropping the tag before
+/// tokenizing joined the brackets, which made the template scanner reject an
+/// enclosing `#if` whose branch held an unclosed link (the scanner's
+/// `}}`-under-`[[` rule). `Template:Physics particle` splits `[[`/`]]` across two
+/// `#if` branches exactly this way.
+///
+/// An empty comment is the right stand-in for the tokenizer: comments are opaque
+/// to the brace/bracket scan and are dropped from an expanded template body
+/// before its text runs are spliced back together.
+fn replace_self_closing_tag(text: &str, name: &str, replacement: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let open = format!("<{name}");
     let mut out = String::with_capacity(text.len());
@@ -288,6 +307,7 @@ fn strip_self_closing_tag(text: &str, name: &str) -> String {
         let trimmed = tail.trim_start_matches([' ', '\t', '\n', '\r']);
         if trimmed.starts_with("/>") {
             out.push_str(&text[pos..start]);
+            out.push_str(replacement);
             pos = after + (tail.len() - trimmed.len()) + 2;
         } else {
             out.push_str(&text[pos..after]);
@@ -296,6 +316,17 @@ fn strip_self_closing_tag(text: &str, name: &str) -> String {
     }
     out.push_str(&text[pos..]);
     out
+}
+
+/// Put a barrier in place of every self-closing inclusion-control tag.
+///
+/// Used before tokenizing a template body, where the tag must not be dropped
+/// outright (see [`replace_self_closing_tag`]). The comment is removed with the
+/// body's other comments after expansion.
+pub(crate) fn barrier_self_closing_include_tags(text: &str) -> String {
+    let text = replace_self_closing_tag(text, "noinclude", "<!-- -->");
+    let text = replace_self_closing_tag(&text, "includeonly", "<!-- -->");
+    replace_self_closing_tag(&text, "onlyinclude", "<!-- -->")
 }
 
 /// Handle `<onlyinclude>...</onlyinclude>` sections.
