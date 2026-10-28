@@ -3355,15 +3355,25 @@ impl<'a> PegTokenizer<'a> {
                     // `template_param_text`), so a `{{!}}` in the *key* half is a
                     // template token, not literal text: `{{!}} colspan=2` splits
                     // on the `=` and `expandKV` rejoins the tokenized key.
-                    let k = part[..eq].trim();
-                    let key =
-                        tokenize_template_arg_value(k, self.lang_conv_enabled, &self.ext_tags);
+                    //
+                    // The key keeps its surrounding whitespace, exactly as the
+                    // preprocessor's `splitArg` does: PHP trims a name only when
+                    // it is *read* as one (`PPTemplateFrame_Hash::newChild`),
+                    // and `#tag`'s inner argument is the whole part, untrimmed.
+                    // Trimming here lost a value's leading newline whenever the
+                    // part also carried a `=` — `Template:NFPA 704 diamond`'s
+                    // `{{#tag:imagemap|\nFile:…|80px{{!}}alt=…}}` reached the
+                    // extension as `File:…` and `extsrc` lost the `\n`.
+                    let key = tokenize_template_arg_value(
+                        &part[..eq],
+                        self.lang_conv_enabled,
+                        &self.ext_tags,
+                    );
                     let v = part[eq + 1..].to_string();
                     let v = tokenize_template_arg_value(&v, self.lang_conv_enabled, &self.ext_tags);
-                    // `key` spans the part up to `=` (trailing spaces are
-                    // recorded separately by PHP as `spc`), `value` the rest.
-                    let key_start = part_start + part[..eq].trim_end().len()
-                        - part[..eq].trim_end().trim_start().len();
+                    // `key` spans the part up to `=`, `value` the rest; both
+                    // include their own whitespace.
+                    let key_start = part_start;
                     let key_end = part_start + eq;
                     let value_start = part_start + eq + 1;
                     stt.attribs.push(KV {
@@ -7344,7 +7354,42 @@ mod tests {
                 _ => None,
             })
             .expect("expected template token");
-        assert_eq!(template.attribs[1].key.as_str(), Some("key"));
+        // The key keeps the whitespace around it — PHP's `splitArg` records the
+        // name as written and trims it only where a field reads it as a name —
+        // so assert the name rather than the token shape.
+        assert_eq!(
+            crate::wikitext::token_utils::key_value_to_string(&template.attribs[1].key).trim(),
+            "key"
+        );
+        assert_eq!(template.attribs[1].value.as_str(), Some(" value"));
+    }
+
+    #[test]
+    fn a_named_argument_keeps_the_whitespace_around_its_name() {
+        // PHP's `splitArg` records the name half exactly as written and
+        // `PPTemplateFrame_Hash::newChild` trims it only when it is *read* as a
+        // name. Trimming it in the tokenizer instead loses information no later
+        // stage can recover: `#tag` rebuilds its inner argument from the two
+        // halves, so `Template:NFPA 704 diamond`'s
+        // `{{#tag:imagemap|\nFile:…{{!}}80px{{!}}alt=…}}` reached the extension
+        // without its leading newline and `extsrc` differed by its first byte.
+        let tokens = tokenize("{{T|\nkey\n= value}}");
+        let template = tokens
+            .iter()
+            .find_map(|t| match t {
+                Either::Right(ParsoidToken::SelfclosingTag(tk)) if tk.name == "template" => {
+                    Some(tk)
+                }
+                _ => None,
+            })
+            .expect("expected template token");
+        match &template.attribs[1].key {
+            KeyValue::Tokens(items) => assert!(
+                matches!(items.first(), Some(Item::Tok(ParsoidToken::Nl(_)))),
+                "the key kept its leading newline: {items:?}"
+            ),
+            other => panic!("expected a tokenized key, got {other:?}"),
+        }
         assert_eq!(template.attribs[1].value.as_str(), Some(" value"));
     }
 

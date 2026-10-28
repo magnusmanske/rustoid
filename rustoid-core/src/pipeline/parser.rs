@@ -8016,6 +8016,17 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
     /// that nothing re-expands later — leaving it alone recorded
     /// `Template:Top icon`'s indicator body as the literal
     /// `[[File:{{{image|{{{imagename|…}}}}}}|…]]` instead of the resolved file.
+    ///
+    /// A `#tag:ref`'s content is no exception: it is the note body, which Cite
+    /// renders later from the body *source*. That source is the content tokens'
+    /// recorded wikitext, and a token's `src` is stale once an argument reference
+    /// was substituted, so leaving the content unexpanded fed the body render
+    /// `{{cite web|url=…{{{name}}}…}}`, whose `{{{name}}}` no later frame can
+    /// resolve: `Template:Infobox element/standard atomic weight format`'s
+    /// `{{ubl|1=…{{#tag:ref|{{cite web|url=https://www.ciaaw.org/{{{name}}}.htm…}}
+    /// …}}…}}` served `https://www.ciaaw.org/{{{name}}}.htm` in the note.
+    /// Expanding here costs nothing extra — the body render then has no
+    /// templates left to expand.
     #[allow(clippy::too_many_arguments)]
     async fn expand_tag_args(
         &self,
@@ -8028,22 +8039,6 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         use crate::wikitext::tokens_v2::KeyValue;
 
         let mut out = attribs;
-        // The tag's name (`ref` in `#tag:ref`). A `#tag:ref`'s content is the
-        // reference *body*, which the Cite extension renders from the recorded
-        // source; expanding it here is redundant, and on `India` it made the
-        // render take minutes — the body's templates were expanded a second
-        // time. The served `<ref>` records only `body.id`, no `extsrc`, so
-        // nothing observable changes.
-        let tag_name = out
-            .first()
-            .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.key))
-            .unwrap_or_default();
-        let expand_content = !tag_name
-            .rsplit(':')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .eq_ignore_ascii_case("ref");
 
         for (i, kv) in out.iter_mut().enumerate() {
             if i == 0 {
@@ -8054,10 +8049,8 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // attribute (`name=value`).
             let key_empty = matches!(&kv.key, KeyValue::Str(s) if s.is_empty());
             if key_empty {
-                if expand_content {
-                    self.expand_tag_field(frame, &mut kv.value, source, about_counter, src_text)
-                        .await;
-                }
+                self.expand_tag_field(frame, &mut kv.value, source, about_counter, src_text)
+                    .await;
                 continue;
             }
             self.expand_tag_field(frame, &mut kv.key, source, about_counter, src_text)
@@ -13307,6 +13300,85 @@ mod tests {
                 SelfclosingTagTk::new("template", vec![], Default::default())
             ))]),
             None
+        );
+    }
+
+    /// `#tag`'s inner argument is the whole *raw* part, so an `=` inside it (an
+    /// imagemap's `alt=…` option) must not cost the content the whitespace that
+    /// precedes the `=`. `Template:NFPA 704 diamond` writes
+    /// `{{#tag:imagemap|\nFile:…{{!}}80px{{!}}alt=…}}`, and the trimmed name half
+    /// made the served `extsrc` start at `File:` instead of at the newline.
+    #[tokio::test]
+    async fn tag_content_keeps_the_newline_before_an_equals_sign() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template(
+            "Template:Imap",
+            "{{#tag:imagemap|\nFile:Example.svg{{!}}50px{{!}}alt=x\ndesc none\n}}",
+        );
+        source.add_file(
+            "File:Example.svg",
+            crate::traits::FileInfo {
+                title: "Example.svg".to_string(),
+                mime_type: "image/svg+xml".to_string(),
+                size: 1024,
+                width: 512,
+                height: 512,
+                description_url: "https://en.wikipedia.org/wiki/File:Example.svg".to_string(),
+                file_url: "//upload.wikimedia.org/example.svg".to_string(),
+                ..Default::default()
+            },
+        );
+        let mut config = MockSiteConfig::new();
+        config.add_extension_tag("imagemap");
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded("{{Imap}}", &source, &ParserOptions::for_page("Test"))
+            .await
+            .unwrap();
+        assert!(
+            html.contains(r#""extsrc":"\nFile:Example.svg|50px|alt=x"#),
+            "the content kept its leading newline: {html}"
+        );
+    }
+
+    /// A `#tag:ref` body is expanded like every other tag's content, so an
+    /// argument reference inside a *nested* template's arguments is substituted
+    /// by this frame. The body render reads the content's recorded source, which
+    /// is stale after the substitution, and the note is rendered in whatever
+    /// frame the ref surfaces in — here the module's output, where the
+    /// `{{{name}}}` no longer resolves. `Template:Infobox element/standard
+    /// atomic weight format` reached the same path through `{{ubl}}` and served
+    /// `https://www.ciaaw.org/{{{name}}}.htm`.
+    #[tokio::test]
+    async fn tag_ref_body_expands_its_argument_references() {
+        let source = crate::mock::MockDataSource::new();
+        // `{{ubl|1=…}}` is `#invoke:list`, so the ref reaches the page through a
+        // module's output — the frame that renders its body is not the one that
+        // wrote it.
+        source.add_module(
+            "Module:Passthru",
+            "return { main = function(frame) return frame:getParent().args[1] end }",
+        );
+        source.add_template("Template:UBL", "{{#invoke:Passthru|main}}");
+        source.add_template("Template:CiteX", "url={{{1}}}");
+        source.add_template(
+            "Template:Format",
+            "{{UBL|1={{#tag:ref|{{CiteX|{{{name}}}}} tail|name=n}}}}",
+        );
+        source.add_template("Template:Reflist", "<references/>");
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "A{{Format|name=Q}}B\n\n{{Reflist}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            html.contains(">url=Q tail<"),
+            "the note body expanded its argument reference: {html}"
         );
     }
 

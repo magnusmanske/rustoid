@@ -19796,3 +19796,39 @@ this path; the comparison masks ids.
 next difference moves from byte 171,197 to 374,878. That one is an imagemap
 `extsrc` that starts with a newline in the service and not in rustoid. Fixtures
 stay 867/896, all 1,119 lib tests pass, and `rustoid-extensions` is at 50.
+
+## A named argument keeps the whitespace around its name
+
+`#tag`'s inner argument is the whole *raw* part, including whitespace the
+preprocessor later trims only when a field is read as a *name*. The tokenizer
+trimmed the name half of every `key=value` part, which is invisible for a
+template argument (`PPTemplateFrame_Hash::newChild` trims the name again) but
+destructive for `#tag`: `pf_tag` rebuilds the inner argument from the two
+halves, and the whitespace it had lost is content. `Template:NFPA 704 diamond`'s
+`{{#tag:imagemap|\nFile:NFPA 704.svg{{!}}80px{{!}}alt=…}}` splits at the `alt=`,
+so the newline was part of the *name* half; the extension received `File:…` and
+the served `extsrc` differed by its first byte.
+
+The key half is now tokenized as written (its `src_offsets` range starts at the
+part, not at the first non-blank), exactly as PHP's `splitArg` records it. Every
+reader of a *name* trims it (`Params::dict`/`named`, `trim_key_value_edges`,
+`TemplateHandler`'s replacement map, `prepare_*_param_infos`), so nothing else
+moves.
+
+A `#tag:ref` body must also be expanded like every other tag's content:
+`tag_body_source` reads the content tokens' recorded source, which is stale once
+an argument reference was substituted, so an unexpanded body fed the later note
+render `{{cite web|url=…{{{name}}}…}}` with no frame left that could resolve it.
+`Template:Infobox element/standard atomic weight format` reaches that path
+through `{{ubl}}` (a module), and the CIAAW note served
+`https://www.ciaaw.org/{{{name}}}.htm`. Expanding the body up front costs
+nothing extra — the body render then has no templates left to expand.
+
+**Effect:** with `math`, node ids and the duplicate-ref shape masked, Hydrogen's
+next difference moves from byte 374,878 (37.31%) to 393,989, which is the
+unexpanded `{{{name}}}` above; expanding the ref body carries it to byte 805,468
+(80.17%). That one is a media `link=` target that is an interwiki title:
+Parsoid serves `<a href="./creativecommons:by/3.0/" title="…">` (the target
+treated as a local page), while rustoid resolves the interwiki URL and marks the
+anchor external — the next difference to take. Fixtures stay 867/896, the lib
+suite is at 1,122, `rustoid-extensions` at 50, and the Cite tests at 14 + 2.
