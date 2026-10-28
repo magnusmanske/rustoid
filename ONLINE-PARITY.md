@@ -19684,7 +19684,7 @@ opaque to the brace/bracket scan and is dropped with the body's other comments
 after expansion, so the barrier disappears without joining the brackets early.
 
 **Effect:** the leak is gone; with `math` masked, Hydrogen's next difference
-moves from byte 117,824 to 170,135. Fixtures stay 867/896 and all 1,115 lib
+moves from byte 117,824 to 170,135. Fixtures stay 867/896 and all 1,116 lib
 tests pass.
 
 ## The refreshed Hydrogen oracle, and the next difference
@@ -19706,3 +19706,25 @@ rustoid keeps `{"id":…}`; it now also keeps the *first* definition's body
 `checkForConflictingContent`/`normalizeRef` port, including the
 invisible-vs-visible distinction and the inner-HTML serialization the
 `<references>` bucket already records as missing.
+
+## A media caption's split link keeps its expansion
+
+A caption link whose display is a template — here
+`[[Hindenburg-class airship|{{lang|de|Hindenburg|cat=no}}]]` — is split by the
+caption tokenizer into `"…[[Hindenburg-class airship|"`, the transclusion
+marker metas, the already-expanded `lang` span, and `"]]"`. The rebuild step
+reconstructed the link from `data-parsoid.src`, so it spelled the marker's
+source (`{{lang|…}}`) *and* the expanded span, producing a raw `<template>`
+element next to the span, and it left any text after the link un-tokenized
+(`[[New York City]]` stayed literal).
+
+The rebuild now assembles the link directly from the tokens — target from the
+text before the first `|`, content as the existing marker/span tokens — and
+tokenizes only the plain text before and after it. The marker survives, so
+tplwrap gives the span its `about`/`typeof`/`data-mw` wrapper, and the later
+links in the caption are parsed normally.
+
+**Effect:** with `math`, node ids and the duplicate-ref shape masked, Hydrogen's
+next difference moves from byte 170,135 to 389,248. That one is an extra blank
+line after a `<tr>` in the NFPA 704 table. Fixtures stay 867/896 and all 1,116
+lib tests pass.

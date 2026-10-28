@@ -904,6 +904,18 @@ fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> 
     tokenize_caption_items_sol(items, config, true, false)
 }
 
+/// Whether a token is a transclusion/param marker meta — preprocessor bookkeeping,
+/// not source text. Re-tokenizing a caption must preserve these tokens and must
+/// not spell their `src` again: the expansion they introduced is already in the
+/// token run, so including the marker's source duplicated it.
+fn is_preproc_marker(tok: &ParsoidToken) -> bool {
+    tok.get_attribute_v("typeof").is_some_and(|t| {
+        t.split_whitespace().any(|ty| {
+            ty == "mw:Transclusion" || ty == "mw:Param" || ty.starts_with("mw:Transclusion/")
+        })
+    })
+}
+
 /// Whether a caption's token list contains a wikilink split across a token:
 /// `"[[Earth|"`, an italics `<i>` token, `"earth"`, `</i>`, `"]]"`. The
 /// media-option and link-content tokenizers do not parse links, so only a
@@ -916,21 +928,7 @@ pub(crate) fn caption_items_split_by_token(items: &[Item]) -> bool {
     for item in items {
         match item {
             Item::Str(s) => open_brackets = scan_brackets(s, open_brackets),
-            Item::Tok(tok) if open_brackets > 0 => {
-                // Transclusion/param marker metas are not source text and are
-                // preserved by the per-chunk path; every other token interrupts
-                // the link and needs it rebuilt.
-                let is_marker = tok.get_attribute_v("typeof").is_some_and(|t| {
-                    t.split_whitespace().any(|ty| {
-                        ty == "mw:Transclusion"
-                            || ty == "mw:Param"
-                            || ty.starts_with("mw:Transclusion/")
-                    })
-                });
-                if !is_marker {
-                    return true;
-                }
-            }
+            Item::Tok(tok) if open_brackets > 0 && !is_preproc_marker(tok) => return true,
             _ => {}
         }
     }
@@ -953,6 +951,97 @@ fn scan_brackets(s: &str, mut depth: i32) -> i32 {
         }
     }
     depth
+}
+
+/// Assemble a wikilink that the caption tokenizer split across expanded tokens.
+///
+/// The link's target is the plain text before the first `|`; everything between
+/// that pipe and the closing `]]` is kept as content **as tokens**, including
+/// transclusion markers and already-expanded elements. Re-tokenizing the
+/// reconstructed source instead would spell a marker's `src` again (duplicating
+/// the expansion) and drop the wrapper metadata the markers carry.
+fn assemble_split_link(items: &[Item]) -> Option<Vec<Item>> {
+    let first = match items.first()? {
+        Item::Str(s) => s.as_str(),
+        _ => return None,
+    };
+    let open = first.rfind("[[")?;
+    let last = match items.last()? {
+        Item::Str(s) => s.as_str(),
+        _ => return None,
+    };
+    let close = last.find("]]")?;
+
+    let mut content: Vec<Item> = Vec::new();
+    let target = if items.len() == 1 {
+        if close < open + 2 {
+            return None;
+        }
+        let inner = &first[open + 2..close];
+        match inner.find('|') {
+            Some(pipe) => {
+                let rest = &inner[pipe + 1..];
+                if !rest.is_empty() {
+                    content.push(Item::Str(rest.to_string()));
+                }
+                inner[..pipe].to_string()
+            }
+            None => inner.to_string(),
+        }
+    } else {
+        let after_open = &first[open + 2..];
+        let pipe = after_open.find('|')?;
+        let rest = &after_open[pipe + 1..];
+        if !rest.is_empty() {
+            content.push(Item::Str(rest.to_string()));
+        }
+        for item in &items[1..items.len() - 1] {
+            if let Item::Str(s) = item
+                && s.contains("[[")
+            {
+                return None;
+            }
+            content.push(item.clone());
+        }
+        let before_close = &last[..close];
+        if !before_close.is_empty() {
+            content.push(Item::Str(before_close.to_string()));
+        }
+        after_open[..pipe].to_string()
+    };
+    if target.contains('[') || target.contains(']') {
+        return None;
+    }
+
+    let kv = |key: &str, value: crate::wikitext::tokens_v2::KeyValue| KV {
+        key: crate::wikitext::tokens_v2::KeyValue::Str(key.to_string()),
+        value,
+        src_offsets: None,
+        ksrc: None,
+        vsrc: None,
+    };
+    let mut link = SelfclosingTagTk::new("wikilink", vec![], DataParsoid::default());
+    link.attribs.push(kv(
+        "href",
+        crate::wikitext::tokens_v2::KeyValue::Str(target),
+    ));
+    if !content.is_empty() {
+        link.attribs.push(kv(
+            "mw:maybeContent",
+            crate::wikitext::tokens_v2::KeyValue::Tokens(content),
+        ));
+    }
+
+    let mut out = Vec::new();
+    if open > 0 {
+        out.push(Item::Str(first[..open].to_string()));
+    }
+    out.push(Item::Tok(ParsoidToken::SelfclosingTag(link)));
+    let after_close = &last[close + 2..];
+    if !after_close.is_empty() {
+        out.push(Item::Str(after_close.to_string()));
+    }
+    Some(out)
 }
 
 /// Rebuild every wikilink that the caption/link-content tokenizer split across
@@ -992,8 +1081,25 @@ fn rebuild_split_links(
                 j += 1;
             }
             if let Some(j) = end {
-                let src = items_source(&items[i..=j]);
-                out.extend(tokenize_caption_sol(&src, config, at_sol, linkdesc));
+                let run = &items[i..=j];
+                if let Some(assembled) = assemble_split_link(run) {
+                    // The link's leading/trailing text is still source text; only
+                    // the tokens *inside* the link were already expanded.
+                    for (index, item) in assembled.into_iter().enumerate() {
+                        match item {
+                            Item::Str(s) => out.extend(tokenize_caption_sol(
+                                &s,
+                                config,
+                                if index == 0 { at_sol } else { false },
+                                linkdesc,
+                            )),
+                            other => out.push(other),
+                        }
+                    }
+                } else {
+                    let src = items_source(run);
+                    out.extend(tokenize_caption_sol(&src, config, at_sol, linkdesc));
+                }
                 at_sol = false;
                 i = j + 1;
                 continue;
@@ -1050,6 +1156,7 @@ fn items_source(items: &[Item]) -> String {
                 }
                 i += 2;
             }
+            Item::Tok(tok) if is_preproc_marker(tok) => {}
             Item::Tok(tok) => {
                 if let Some(s) = tok.data_parsoid().and_then(|d| d.src.as_deref()) {
                     out.push_str(s);
@@ -2727,6 +2834,79 @@ mod tests {
                 |it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "extension")
             ),
             "expanded extension must survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_split_link_keeps_its_expanded_transclusion() {
+        // A caption link split by a template's expansion must be assembled from
+        // the expanded tokens, not re-tokenized from the markers' `src`: the
+        // source would duplicate the template call and lose the wrapper info.
+        let mut start = SelfclosingTagTk::new("meta", vec![], DataParsoid::default());
+        start.add_attribute_str("typeof", "mw:Transclusion");
+        start.add_attribute_str("about", "#mwt1");
+        start.data_parsoid.src = Some("{{lang|de|Hindenburg}}".to_string());
+        let mut span = TagTk::new("span", vec![], DataParsoid::default());
+        span.add_attribute_str("title", "German-language text");
+        let mut end = SelfclosingTagTk::new("meta", vec![], DataParsoid::default());
+        end.add_attribute_str("typeof", "mw:Transclusion/End");
+        end.add_attribute_str("about", "#mwt1");
+        let items = vec![
+            Item::Str("The [[Target|".to_string()),
+            Item::Tok(ParsoidToken::SelfclosingTag(start)),
+            Item::Tok(ParsoidToken::Tag(span)),
+            Item::Str("Hindenburg".to_string()),
+            Item::Tok(ParsoidToken::EndTag(EndTagTk::new(
+                "span",
+                vec![],
+                DataParsoid::default(),
+            ))),
+            Item::Tok(ParsoidToken::SelfclosingTag(end)),
+            Item::Str("]] over [[Other]]".to_string()),
+        ];
+
+        let out = tokenize_caption_items(&items, config_static());
+        let links: Vec<&SelfclosingTagTk> = out
+            .iter()
+            .filter_map(|it| match it {
+                Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "wikilink" => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links.len(), 2, "both links are assembled: {out:?}");
+        let link = links[0];
+        assert_eq!(
+            link.attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("Target")
+        );
+        let content = link
+            .attribs
+            .iter()
+            .find(|kv| kv.key.as_str() == Some("mw:maybeContent"))
+            .map(|kv| &kv.value)
+            .expect("link content");
+        let crate::wikitext::tokens_v2::KeyValue::Tokens(content) = content else {
+            panic!("link content is a token list");
+        };
+        assert!(
+            content.iter().any(|it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.attribs.iter().any(|kv| kv.key.as_str() == Some("about") && kv.value.as_str() == Some("#mwt1")))),
+            "the transclusion marker survives in the content: {content:?}"
+        );
+        assert!(
+            !out.iter().any(|it| matches!(it, Item::Tok(ParsoidToken::SelfclosingTag(t)) if t.name == "template")),
+            "no raw template token is re-created: {out:?}"
+        );
+        assert_eq!(
+            links[1]
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("href"))
+                .and_then(|kv| kv.value.as_str()),
+            Some("Other"),
+            "the trailing text is still tokenized: {out:?}"
         );
     }
 
