@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use rustoid_core::traits::DataSource;
 
-use crate::cache::{EntryKind, EntryMeta, WikiCache};
+use crate::cache::{CachedBody, EntryKind, EntryMeta, WikiCache};
 use crate::error::{CompareError, Result};
 use crate::siteconfig::WikiSiteConfig;
 use crate::wire::WikiClient;
@@ -369,6 +369,11 @@ pub struct CachedDataSource {
     /// expansion can trigger many fetches, so this is what keeps an offline run
     /// genuinely offline.
     offline: bool,
+    /// When set, an input cached on an earlier day is re-read rather than reused:
+    /// the oracle is rendered by the wiki today, so a stale stylesheet or template
+    /// is a difference no parser change explains. See
+    /// [`refresh_stale_input`].
+    refresh: bool,
     /// Fetch file info even when `offline`, and cache it.
     ///
     /// File metadata is a revision-stable fact (a thumbnail does not change), so
@@ -413,6 +418,7 @@ impl CachedDataSource {
             entities: None,
             data: None,
             offline,
+            refresh: false,
             fill_files: std::env::var_os("RUSTOID_FILL_FILES").is_some(),
             fill_page_info: std::env::var_os("RUSTOID_FILL_PAGE_INFO").is_some(),
             pending: std::sync::atomic::AtomicUsize::new(0),
@@ -430,6 +436,13 @@ impl CachedDataSource {
     /// The facts consulted so far, for [`FactDrift::detect`].
     pub fn fact_ages(&self) -> FactAges {
         self.facts.lock().map(|f| f.clone()).unwrap_or_default()
+    }
+
+    /// Same, re-reading inputs cached on an earlier day.
+    #[must_use]
+    pub fn with_refresh(mut self, refresh: bool) -> Self {
+        self.refresh = refresh;
+        self
     }
 
     /// Same, with a wiki to read `mw.wikibase` entities from.
@@ -600,41 +613,84 @@ impl CachedDataSource {
                 .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
             guard.get(kind, key)?
         };
-        if let Some(hit) = cached {
-            self.observe(&hit.meta);
-            return Ok(Some((hit.body, hit.meta.revid)));
-        }
+        // A `--refresh` run re-reads everything the page leans on, not only the
+        // page: the oracle is rendered by the wiki today, so an input cached on an
+        // earlier day can disagree with it for no reason a parser change explains
+        // (`Help:Introduction` compared a fresh oracle against a stylesheet from
+        // an older revision). An input fetched today is reused, so a run pays for
+        // each stale input once.
+        let re_read = refresh_stale_input(
+            cached.as_ref(),
+            self.refresh && !self.offline && self.client.is_some(),
+        );
+        let cached = match cached {
+            Some(hit) if !re_read => {
+                self.observe(&hit.meta);
+                return Ok(Some((hit.body, hit.meta.revid)));
+            }
+            // A stale input is kept for the fallback below: a refresh must not
+            // lose a page to a rate limit.
+            other => other,
+        };
 
         let Some(client) = &self.client else {
             // Offline: a miss stays a miss rather than becoming an error, so a
             // partially populated cache still produces a usable run.
-            return Ok(None);
+            return Ok(cached_body(cached));
         };
         if self.offline {
-            return Ok(None);
+            return Ok(cached_body(cached));
         }
 
         let title = key.to_string();
-        let Some(revid) = client.latest_revid(&title).await? else {
-            return Ok(None);
-        };
-        let body = client.wikitext_at(revid).await?;
-        if trace_enabled() {
-            eprintln!("fetch {kind:?} {title} -> {} bytes", body.len());
+        let fetched = async {
+            let Some(revid) = client.latest_revid(&title).await? else {
+                return Ok(None);
+            };
+            let body = client.wikitext_at(revid).await?;
+            Ok::<_, CompareError>(Some((body, revid)))
         }
-        let meta = EntryMeta {
-            kind,
-            title: title.clone(),
-            revid: Some(revid),
-            fetched_at: now_rfc3339(),
-        };
-        self.cache
-            .lock()
-            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
-            .put(kind, &title, &body, meta)?;
-        self.note_written()?;
-        Ok(Some((body, Some(revid))))
+        .await;
+        match fetched {
+            Ok(Some((body, revid))) => {
+                if trace_enabled() {
+                    eprintln!("fetch {kind:?} {title} -> {} bytes", body.len());
+                }
+                let meta = EntryMeta {
+                    kind,
+                    title: title.clone(),
+                    revid: Some(revid),
+                    fetched_at: now_rfc3339(),
+                };
+                self.cache
+                    .lock()
+                    .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+                    .put(kind, &title, &body, meta)?;
+                self.note_written()?;
+                Ok(Some((body, Some(revid))))
+            }
+            Ok(None) => Ok(None),
+            // The stale input is better than nothing when the wiki refuses the
+            // re-read (a rate limit is the usual answer mid-run).
+            Err(e) => match cached {
+                Some(hit) => {
+                    self.observe(&hit.meta);
+                    Ok(Some((hit.body, hit.meta.revid)))
+                }
+                None => Err(e),
+            },
+        }
     }
+}
+
+/// Whether a cached input must be re-read, given whether this run is refreshing.
+fn refresh_stale_input(hit: Option<&CachedBody>, re_read: bool) -> bool {
+    re_read && hit.is_some_and(|hit| stale_days(hit.meta.fetched_at.as_deref()) > 0)
+}
+
+/// The cached body as a fetch result.
+fn cached_body(hit: Option<CachedBody>) -> Option<(String, Option<u64>)> {
+    hit.map(|hit| (hit.body, hit.meta.revid))
 }
 
 #[async_trait::async_trait]
@@ -1652,8 +1708,16 @@ pub async fn compare_page<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     };
 
     // --- rustoid's rendering ---
-    let rustoid_html =
-        render_rustoid(client, config, cache, &title, &wikitext, req.offline).await?;
+    let rustoid_html = render_rustoid(
+        client,
+        config,
+        cache,
+        &title,
+        &wikitext,
+        req.offline,
+        req.refresh,
+    )
+    .await?;
     let Some((rustoid_html, fact_ages)) = rustoid_html else {
         // The render hit the per-page cap. No HTML was produced, so there is
         // nothing to compare and no unexpanded count to take.
@@ -1742,6 +1806,7 @@ struct OwnedRenderInput {
     title: String,
     wikitext: String,
     offline: bool,
+    refresh: bool,
 }
 
 impl OwnedRenderInput {
@@ -1754,7 +1819,8 @@ impl OwnedRenderInput {
             Some(Arc::new(self.client.clone())),
             Arc::clone(&self.cache),
             self.offline,
-        );
+        )
+        .with_refresh(self.refresh);
         let source = with_entity_wiki(source, &self.client, &self.cache)?;
         let source = with_data_wiki(source, &self.client, &self.cache)?;
         // `node_ids` is on because the target is what a *wiki serves*: MediaWiki's
@@ -1812,7 +1878,7 @@ pub async fn render_wikitext<C: rustoid_core::SiteConfig + Clone + Send + 'stati
     offline: bool,
 ) -> Result<Option<String>> {
     Ok(
-        render_rustoid(client, config, cache, title, wikitext, offline)
+        render_rustoid(client, config, cache, title, wikitext, offline, false)
             .await?
             .map(|(html, _)| html),
     )
@@ -1832,6 +1898,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
     title: &str,
     wikitext: &str,
     offline: bool,
+    refresh: bool,
 ) -> Result<Option<(String, FactAges)>> {
     let cap = std::time::Duration::from_secs_f64(page_stall_seconds());
     let input = OwnedRenderInput {
@@ -1840,6 +1907,7 @@ async fn render_rustoid<C: rustoid_core::SiteConfig + Clone + Send + 'static>(
         title: title.to_string(),
         wikitext: wikitext.to_string(),
         offline,
+        refresh,
     };
     // The render runs on a blocking worker so the timer below can win.
     // `Cristiano Ronaldo` is why it does not simply run inline:
@@ -2552,6 +2620,26 @@ mod tests {
             revid: None,
             fetched_at: Some(format!("epoch:{epoch}")),
         }
+    }
+
+    #[test]
+    fn a_refresh_re_reads_an_input_from_an_earlier_day() {
+        let stale = CachedBody {
+            body: "old".to_string(),
+            meta: fact(EntryKind::Template, "Template:A", 0),
+        };
+        assert!(refresh_stale_input(Some(&stale), true));
+        assert!(!refresh_stale_input(Some(&stale), false));
+
+        let fresh = CachedBody {
+            body: "new".to_string(),
+            meta: EntryMeta {
+                fetched_at: now_rfc3339(),
+                ..fact(EntryKind::Template, "Template:A", 0)
+            },
+        };
+        assert!(!refresh_stale_input(Some(&fresh), true));
+        assert!(!refresh_stale_input(None, true));
     }
 
     #[test]

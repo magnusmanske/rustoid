@@ -86,7 +86,8 @@ struct Cli {
     #[arg(long)]
     ignore_nondeterministic: bool,
 
-    /// Re-fetch this page, ignoring cached entries.
+    /// Re-fetch this page and any input (template, module, page) cached on an
+    /// earlier day, ignoring cached entries.
     #[arg(long)]
     refresh: bool,
 
