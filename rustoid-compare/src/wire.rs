@@ -12,7 +12,7 @@
 //! | Purpose | Request |
 //! |---|---|
 //! | latest revid | `api.php?action=query&prop=revisions&titles=…&rvprop=ids` |
-//! | wikitext at a revision | `rest.php/v1/revision/{revid}` → `.source` |
+//! | wikitext at a revision | `api.php?action=query&prop=revisions&revids=…&rvslots=main` |
 //! | Parsoid HTML, latest | `rest.php/v1/page/{title}/html` |
 //! | Parsoid HTML, pinned | `api/rest_v1/page/html/{title}/{revision}` |
 //! | site config | `api.php?action=query&meta=siteinfo&siprop=…` |
@@ -210,15 +210,32 @@ impl WikiClient {
     }
 
     /// Fetch the wikitext of `revid`.
+    ///
+    /// Through the Action API rather than `rest.php/v1/revision`: that endpoint
+    /// starts answering `429` after a few dozen requests, and a refresh run reads
+    /// every input it touches (a corpus page leans on hundreds of templates).
     pub async fn wikitext_at(&self, revid: u64) -> Result<String> {
-        let url = format!("{}/revision/{}", self.wiki.rest_url(), revid);
+        let url = format!(
+            "{}?action=query&prop=revisions&revids={revid}&rvprop=content&rvslots=main&format=json&formatversion=2",
+            self.wiki.api_url()
+        );
         let body = self.get_text(&url).await?;
-        let parsed: RevisionResponse =
+        let parsed: QueryRevisions =
             serde_json::from_str(&body).map_err(|e| CompareError::Response {
                 url: url.clone(),
                 message: format!("revision parse: {e}"),
             })?;
-        let Some(source) = parsed.source else {
+        let source = parsed
+            .query
+            .pages
+            .into_iter()
+            .next()
+            .and_then(|page| page.revisions)
+            .and_then(|revisions| revisions.into_iter().next())
+            .and_then(|revision| revision.slots)
+            .and_then(|slots| slots.main)
+            .and_then(|main| main.content);
+        let Some(source) = source else {
             return Err(CompareError::Response {
                 url,
                 message: "revision response had no `source`".to_string(),
@@ -573,13 +590,22 @@ struct PageEntry {
 
 #[derive(Debug, Deserialize)]
 struct RevisionEntry {
+    #[serde(default)]
     revid: u64,
+    #[serde(default)]
+    slots: Option<Slots>,
 }
 
 #[derive(Debug, Deserialize)]
-struct RevisionResponse {
+struct Slots {
     #[serde(default)]
-    source: Option<String>,
+    main: Option<SlotContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlotContent {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[cfg(test)]
@@ -681,9 +707,19 @@ mod tests {
     }
 
     #[test]
-    fn revision_response_parses_source() {
-        let body = r#"{"id":1300000000,"source":"{{Short description|x}}"}"#;
-        let parsed: RevisionResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.source.unwrap(), "{{Short description|x}}");
+    fn revision_content_parses_from_the_query_shape() {
+        // Shape captured from the live API (formatversion=2, `rvslots=main`).
+        let body = r#"{"batchcomplete":true,"query":{"pages":[{"pageid":1,"ns":10,"title":"Template:Foo","revisions":[{"revid":1300000000,"slots":{"main":{"contentmodel":"wikitext","contentformat":"text/x-wiki","content":"{{bar}}"}}}]}]}}"#;
+        let parsed: QueryRevisions = serde_json::from_str(body).unwrap();
+        let content = parsed.query.pages[0].revisions.as_ref().unwrap()[0]
+            .slots
+            .as_ref()
+            .unwrap()
+            .main
+            .as_ref()
+            .unwrap()
+            .content
+            .as_deref();
+        assert_eq!(content, Some("{{bar}}"));
     }
 }
