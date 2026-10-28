@@ -19840,3 +19840,35 @@ page (`link=wikt:Foo` → `./wikt:Foo`, `link=de:Foo` → `./de:Foo`), while a
 *link-valued* one (`link=[[wikipedia:Foo]]`, already pinned by `media.txt`) keeps
 that link's href. Fixtures stay 867/896, the lib suite is at 1,122,
 `rustoid-extensions` at 50, and the Cite tests at 14 + 2.
+
+## A plain-text `link=` target is a local page
+
+`AddMediaInfo`'s `link=` handling has two shapes. A value that is a *link* keeps
+the href that link's handler produced: `link=[[wikipedia:Foo]]` serves
+`http://en.wikipedia.org/wiki/Foo` with `rel="nofollow"`. A plain-text page name
+is always spelled as a local page, even when its prefix names an interwiki:
+`link=wikt:Foo` serves `href="./wikt:Foo" title="wikt:Foo"`, and `link=de:Foo`
+and `link=creativecommons:by/3.0/` the same way (all three verified against the
+live transform endpoint). rustoid resolved every `link=` title through the
+interwiki map, so `Hydrogen`'s Creative Commons attribution anchor pointed at
+`//creativecommons.org/licenses/by/3.0/` with `rel="nofollow"` where the service
+serves `./creativecommons:by/3.0/`.
+
+The distinction survives in the container's `data-parsoid.optList`: an option's
+`ak` is the option *as written*, so a link value still has its brackets while a
+plain target does not. The rendered value is only the link's text by then.
+
+**Effect:** with `math`, node ids and the duplicate-ref shape masked, Hydrogen's
+next difference moves from byte 805,468 (80.17%) to 934,724 (93.04%), and the
+two renderings are now the same length (1,004,639 bytes each). Getting there also
+needed one stale cache entry refreshed: `Module:Sister project links/bar/styles.css`
+was cached at revision 1364559274 while the pinned `Hydrogen` revision embeds
+`r1381122418` (the newer revision's parent), so a `<style>` differed in both its
+`data-mw-deduplicate` key and its CSS. Fixtures stay 867/896, the lib suite is at
+1,124, `rustoid-extensions` at 50, and the Cite tests at 14 + 2.
+
+The next difference is the Periodic-table navbox's `aria-labelledby`:
+`Periodic_table25046` in the service against `Periodic_table25006`. The number is
+`Module:Navbox`'s `argHash`, the sum of the lengths of its string arguments, so
+some argument of that navbox expands 40 characters short — the next thing to
+reduce.

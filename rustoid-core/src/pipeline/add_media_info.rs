@@ -805,6 +805,7 @@ fn apply_media_info(
         &AnchorOpts {
             caption_text: caption_text.as_deref(),
             link_target: link_target.as_deref(),
+            link_is_link: link_option_source(root, &job.path).is_some_and(|ak| ak.contains("[[")),
             is_manual_thumb: job.manualthumb.is_some(),
             page: page.as_deref(),
             lang: lang.as_deref(),
@@ -833,6 +834,24 @@ fn apply_media_info(
 fn data_mw_attrib(root: &Node, path: &[usize], key: &str) -> Option<String> {
     let container = node_at_read(root, path)?;
     data_mw_txt(container, key)
+}
+
+/// The `link=` option exactly as written (`link=[[wikipedia:Foo]]`), from the
+/// container's `data-parsoid.optList`.
+///
+/// `replaceAnchor` can tell a *link-valued* target from a plain-text one, and the
+/// two are served differently: a link keeps the href its handler produced
+/// (`link=[[wikipedia:Foo]]` serves the interwiki URL), while a plain page name is
+/// always spelled as a local page (`link=wikt:Foo` serves `./wikt:Foo`). By the
+/// time the media is rendered the option's value is only the link's *text*, so
+/// the distinction survives only in the option's source text.
+fn link_option_source(root: &Node, path: &[usize]) -> Option<String> {
+    let dp = node_at_read(root, path)?.dp.as_ref()?;
+    dp.opt_list
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.ck.as_deref() == Some("link"))
+        .and_then(|entry| entry.ak.clone())
 }
 
 /// The key of one `data-mw.attribs` entry: `["alt", …]` or
@@ -1667,6 +1686,9 @@ fn mark_bad_file(
 struct AnchorOpts<'a> {
     caption_text: Option<&'a str>,
     link_target: Option<&'a str>,
+    /// The `link=` option's value was a link, so its href is that link's; a
+    /// plain-text target is a local page (see [`link_option_source`]).
+    link_is_link: bool,
     is_manual_thumb: bool,
     page: Option<&'a str>,
     lang: Option<&'a str>,
@@ -1760,6 +1782,34 @@ fn rewrite_structure(
                     // An invalid title falls back to the description link but
                     // keeps `link` for round-tripping (mirrors `replaceAnchor`).
                     discard_link = false;
+                } else if let Some(iw) = &link_title.interwiki
+                    && !opts.link_is_link
+                {
+                    // A *plain-text* `link=` target is spelled as a local page
+                    // even when its prefix names an interwiki: the live service
+                    // serves `link=wikt:Foo` as `href="./wikt:Foo"`
+                    // `title="wikt:Foo"` (`link=de:Foo` and `link=creativecommons:
+                    // by/3.0/` alike). The interwiki URL appears only for a
+                    // *link-valued* option, whose href is the rendered link's —
+                    // the branch below reproduces that from the title. The prefix
+                    // is part of the target text here, which
+                    // [`Title::get_prefixed_text`] leaves out.
+                    let mut text = format!("{iw}:");
+                    text.push_str(&link_title.get_prefixed_text());
+                    // `make_link`'s `getFullDBKey()` equivalent: underscore the
+                    // spaces and append the fragment, then `./`-relative.
+                    let mut dbkey = text.replace(' ', "_");
+                    if let Some(fragment) = &link_title.fragment {
+                        dbkey.push('#');
+                        dbkey.push_str(fragment);
+                    }
+                    let href = format!(
+                        "{}{}",
+                        crate::title::relative_link_prefix(config),
+                        crate::sanitizer::sanitize_title_uri(&dbkey, false)
+                    );
+                    anchor.set_attr("href", href);
+                    anchor.set_attr("title", text);
                 } else if let Some(iw) = &link_title.interwiki
                     && let Some(info) = config.interwiki_map().get(iw)
                 {
@@ -2179,6 +2229,68 @@ mod tests {
         let a = &c.children[0];
         assert!(matches!(a.kind, NodeKind::Element(ElementKind::Span)));
         assert_eq!(a.get_attr("href"), None);
+    }
+
+    /// A `<span typeof="mw:File">` container whose `data-parsoid.optList`
+    /// records the `link=` option *as written* (the shape `renderFile` emits).
+    fn container_with_link_option(ak: &str, txt: &str) -> Node {
+        let mut c = container(None);
+        c.data_mw = Some(format!(
+            "{{\"attribs\":[[\"link\",{{\"txt\":\"{txt}\"}}]]}}"
+        ));
+        let dp = crate::wikitext::tokens_v2::DataParsoid {
+            opt_list: Some(vec![crate::wikitext::tokens_v2::OptListEntry {
+                ck: Some("link".to_string()),
+                ak: Some(ak.to_string()),
+                v: None,
+            }]),
+            ..Default::default()
+        };
+        c.dp = Some(dp);
+        c
+    }
+
+    /// A plain-text `link=` target is spelled as a local page even when its
+    /// prefix names an interwiki — `link=wikt:Foo` serves `./wikt:Foo` with a
+    /// `title` (verified against the live transform endpoint).
+    #[tokio::test]
+    async fn test_plain_text_link_target_is_a_local_page() {
+        let mut doc = Node::document();
+        doc.push_child(container_with_link_option(
+            "link=wikipedia:Foo",
+            "wikipedia:Foo",
+        ));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        let a = &c.children[0];
+        assert_eq!(a.get_attr("href"), Some("./wikipedia:Foo"));
+        assert_eq!(a.get_attr("title"), Some("wikipedia:Foo"));
+        assert_eq!(a.get_attr("rel"), None);
+    }
+
+    /// A *link-valued* `link=` keeps the href that link's handler produced, so
+    /// an interwiki target stays an interwiki URL (`media.txt` pins the same
+    /// shape for `link=[[wikipedia:Foo]]`).
+    #[tokio::test]
+    async fn test_link_valued_link_target_keeps_the_interwiki_url() {
+        let mut doc = Node::document();
+        doc.push_child(container_with_link_option(
+            "link=[[wikipedia:Foo]]",
+            "wikipedia:Foo",
+        ));
+        let ds = MockDataSource::new();
+        seed_file(&ds);
+        let cfg = MockSiteConfig::new();
+        run(&mut doc, &ds, &cfg).await;
+
+        let c = &doc.children[0];
+        let a = &c.children[0];
+        assert_eq!(a.get_attr("href"), Some("http://en.wikipedia.org/wiki/Foo"));
+        assert_eq!(a.get_attr("rel"), Some("nofollow"));
     }
 
     #[tokio::test]
