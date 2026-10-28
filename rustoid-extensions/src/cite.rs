@@ -63,8 +63,26 @@ pub enum UseBody {
     Content,
 }
 
+/// A duplicate named definition whose body differs from the note's first one.
+///
+/// Mirrors Cite's `CONFLICT_INVISIBLE`/`CONFLICT_VISIBLE`: Parsoid stores the
+/// duplicate's own HTML in `data-mw.body.html` so that round-tripping keeps it.
+/// A *visible* conflict also raises `cite_error_references_duplicate_key`; an
+/// invisible one differs only in metadata (`data-mw`/`typeof`), so the reader
+/// cannot tell the two bodies apart and no error is shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseConflict {
+    /// The use's own expanded body as HTML, for `data-mw.body.html`.
+    pub html: String,
+    /// The expanded body itself, kept so the final stylesheet dedupe can run on
+    /// it before the HTML is written into `data-mw`.
+    pub body: rustoid_ast::dom::node::Node,
+    /// Whether the conflict is visible to the reader.
+    pub visible: bool,
+}
+
 /// One collected reference: a note in the list, plus every site that points at it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Reference {
     /// The `name` attribute, `""` when anonymous. Drives the `id` and the sharing
     /// key; an anonymous ref shares with nothing.
@@ -113,6 +131,10 @@ pub struct Reference {
     /// content at every occurrence, therefore carries a `data-mw.body` on each —
     /// a shape that a `body_use`-only rule got wrong.
     pub use_body: Vec<UseBody>,
+    /// One entry per use site, parallel to `uses`: set when this use repeats a
+    /// name with a body that differs from the note's first definition (see
+    /// [`UseConflict`]).
+    pub use_conflict: Vec<Option<UseConflict>>,
     /// The `about` id of the use that supplied this note's body.
     ///
     /// A `<ref>` body is expanded *at the ref site* during template expansion
@@ -274,7 +296,42 @@ impl CiteState {
         self_closing: bool,
         about: Option<&str>,
     ) -> String {
-        self.add_full(name, group, attrs, body, self_closing, about, true)
+        self.add_with_attrs_and_conflict(name, group, attrs, body, self_closing, about, None)
+    }
+
+    /// Like [`CiteState::add_with_attrs`], but records how this use's body
+    /// compares with the note's first definition (see [`UseConflict`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_with_attrs_and_conflict(
+        &mut self,
+        name: &str,
+        group: &str,
+        attrs: Vec<(String, String)>,
+        body: &str,
+        self_closing: bool,
+        about: Option<&str>,
+        conflict: Option<UseConflict>,
+    ) -> String {
+        self.add_full(
+            name,
+            group,
+            attrs,
+            body,
+            self_closing,
+            about,
+            true,
+            conflict,
+        )
+    }
+
+    /// The note `(group, name)` currently resolves to, if any.
+    pub fn lookup(&self, group: &str, name: &str) -> Option<&Reference> {
+        if name.is_empty() {
+            return None;
+        }
+        self.index
+            .get(&(group.to_string(), name.to_string()))
+            .map(|&i| &self.references[i])
     }
 
     /// Record a **list-defined** ref — one defined inside `<references>`.
@@ -293,7 +350,7 @@ impl CiteState {
         self_closing: bool,
         about: Option<&str>,
     ) {
-        self.add_full(name, group, attrs, body, self_closing, about, false);
+        self.add_full(name, group, attrs, body, self_closing, about, false, None);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -306,6 +363,7 @@ impl CiteState {
         self_closing: bool,
         about: Option<&str>,
         record_use: bool,
+        conflict: Option<UseConflict>,
     ) -> String {
         // Cite trims a ref's name and group (`Validator::validateRef`):
         // `name="x "` and `name="x"` are the same note. Without the trim a
@@ -344,6 +402,7 @@ impl CiteState {
                     uses: Vec::new(),
                     use_attrs: Vec::new(),
                     use_body: Vec::new(),
+                    use_conflict: Vec::new(),
                     body_about: None,
                 });
                 let i = self.references.len() - 1;
@@ -398,6 +457,7 @@ impl CiteState {
             UseBody::Content
         };
         self.references[idx].use_body.push(shape);
+        self.references[idx].use_conflict.push(conflict);
         id
     }
 
@@ -582,6 +642,18 @@ pub fn ref_data_mw(reference: &Reference, use_index: usize) -> String {
     //
     // `attrs` is emitted even when empty, which is Cite's shape for a bare
     // `<ref>`.
+    // A conflicting duplicate definition keeps its own body inline, so that the
+    // note list's first body does not lose it (`References::checkForConflictingContent`).
+    if let Some(conflict) = reference
+        .use_conflict
+        .get(use_index)
+        .and_then(Option::as_ref)
+    {
+        return format!(
+            "{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"html\":{}}}}}",
+            json_string(&conflict.html)
+        );
+    }
     match reference.use_body.get(use_index) {
         Some(UseBody::Content) => format!(
             "{{\"name\":\"ref\",\"attrs\":{attrs},\"body\":{{\"id\":{}}}}}",
@@ -789,6 +861,7 @@ fn matching_ref_close(s: &str, from: usize) -> Option<usize> {
 /// pipeline. Passing it in keeps this module independent of the parser.
 ///
 /// Returns the number of `<ref>` markers rendered.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     root: &mut rustoid_ast::dom::node::Node,
     page_title: &str,
@@ -796,6 +869,7 @@ pub fn run(
     body_of: &dyn Fn(&Reference) -> rustoid_ast::dom::node::Node,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
     references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    conflict_of: &ConflictOf<'_>,
 ) -> usize {
     let mut state = CiteState::new();
     let mut use_ids = Vec::new();
@@ -810,6 +884,7 @@ pub fn run(
         &mut cuts,
         nested_body,
         references_body,
+        conflict_of,
     );
     // Deliberately **not** skipped when `state` is empty: a `<references>` tag with
     // no refs still renders its wrapper and an empty `<ol>`, which is what Parsoid
@@ -845,6 +920,15 @@ pub fn run(
 
 /// Walk once, recording every `<ref>` in document order, and the notes each
 /// `<references>` element claims.
+/// Compare a duplicate definition's expanded body with the note's first one.
+///
+/// The arguments are the new use's node and body text, then the existing
+/// definition's body text and the `about` id its expanded body was stashed
+/// under. `None` means the caller could not compare (the body was never
+/// stashed), which is treated as no conflict.
+pub type ConflictOf<'a> =
+    dyn Fn(&rustoid_ast::dom::node::Node, &str, &str, Option<&str>) -> Option<UseConflict> + 'a;
+
 fn collect(
     node: &rustoid_ast::dom::node::Node,
     state: &mut CiteState,
@@ -852,6 +936,7 @@ fn collect(
     cuts: &mut Vec<Vec<usize>>,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
     references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    conflict_of: &ConflictOf<'_>,
 ) {
     collect_in(
         node,
@@ -860,6 +945,7 @@ fn collect(
         cuts,
         nested_body,
         references_body,
+        conflict_of,
         Ctx::default(),
     );
 }
@@ -888,6 +974,7 @@ fn collect_in(
     cuts: &mut Vec<Vec<usize>>,
     nested_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
     references_body: &dyn Fn(&str) -> Option<rustoid_ast::dom::node::Node>,
+    conflict_of: &ConflictOf<'_>,
     ctx: Ctx,
 ) {
     // A `<references>` element renders the notes of its group that exist when it
@@ -916,6 +1003,7 @@ fn collect_in(
                     cuts,
                     nested_body,
                     references_body,
+                    conflict_of,
                     inner,
                 );
             }
@@ -947,6 +1035,7 @@ fn collect_in(
                     cuts,
                     nested_body,
                     references_body,
+                    conflict_of,
                     inner,
                 );
             }
@@ -956,7 +1045,27 @@ fn collect_in(
         if ctx.embedded {
             state.add_embedded(&name, group, attrs, &body, self_closing, about);
         } else {
-            use_ids.push(state.add_with_attrs(&name, group, attrs, &body, self_closing, about));
+            // A named, non-empty use that repeats an already-defined note is
+            // compared with that definition (`References::checkForConflictingContent`).
+            let previous = if self_closing || body.trim().is_empty() || name.trim().is_empty() {
+                None
+            } else {
+                state
+                    .lookup(group.trim(), name.trim())
+                    .filter(|r| r.defined)
+                    .map(|r| (r.body.clone(), r.body_about.clone()))
+            };
+            let conflict = previous
+                .and_then(|(old, old_about)| conflict_of(node, &body, &old, old_about.as_deref()));
+            use_ids.push(state.add_with_attrs_and_conflict(
+                &name,
+                group,
+                attrs,
+                &body,
+                self_closing,
+                about,
+                conflict,
+            ));
         }
     }
     for child in &node.children {
@@ -967,6 +1076,7 @@ fn collect_in(
             cuts,
             nested_body,
             references_body,
+            conflict_of,
             ctx,
         );
     }
@@ -1557,7 +1667,7 @@ fn next_attr(rest: &str) -> Option<(&str, &str, usize)> {
 /// Serde is not used because the surrounding object is assembled by hand to keep
 /// attribute order exact, and mixing the two would make the escaping rules
 /// inconsistent between fields.
-fn json_string(s: &str) -> String {
+pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -1605,25 +1715,55 @@ pub fn ref_marker_nodes(
     sup.set_attr("rel", "dc:references");
     // A named ref with no text carries the error on every use
     // (`ErrorUtils::addErrorsToNode`), both as an extra `typeof` and in
-    // `data-mw.errors`.
+    // `data-mw.errors`. A *visible* duplicate-definition conflict adds the same
+    // shape with `cite_error_references_duplicate_key`; the invisible kind differs
+    // only in metadata and shows no error.
     let no_text = !reference.name.is_empty() && reference.body.trim().is_empty();
-    sup.set_attr(
-        "typeof",
-        if no_text {
-            "mw:Extension/ref mw:Error"
-        } else {
-            "mw:Extension/ref"
-        },
-    );
-    let mut dmw = ref_data_mw(reference, use_index);
+    let visible_conflict = reference
+        .use_conflict
+        .get(use_index)
+        .and_then(Option::as_ref)
+        .is_some_and(|c| c.visible);
+    let mut errors = Vec::new();
     if no_text {
-        dmw.pop();
-        dmw.push_str(&format!(
-            ",\"errors\":[{{\"key\":\"cite_error_references_no_text\",\"params\":[{}]}}]}}",
+        errors.push(format!(
+            "{{\"key\":\"cite_error_references_no_text\",\"params\":[{}]}}",
             json_string(&reference.name)
         ));
     }
+    if visible_conflict {
+        errors.push(format!(
+            "{{\"key\":\"cite_error_references_duplicate_key\",\"params\":[{}]}}",
+            json_string(&reference.name)
+        ));
+    }
+    sup.set_attr(
+        "typeof",
+        if errors.is_empty() {
+            "mw:Extension/ref"
+        } else {
+            "mw:Extension/ref mw:Error"
+        },
+    );
+    let mut dmw = ref_data_mw(reference, use_index);
+    if !errors.is_empty() {
+        dmw.pop();
+        dmw.push_str(",\"errors\":[");
+        dmw.push_str(&errors.join(","));
+        dmw.push_str("]}");
+    }
     sup.set_attr("data-mw", dmw);
+    // A conflicting duplicate's stored HTML has to reflect the final stylesheet
+    // dedupe, which runs after Cite. Keep the body on the marker for that pass to
+    // re-serialize (see `rewrite_conflict_bodies`); the `data-mw` already holds a
+    // pre-dedupe fallback.
+    if let Some(conflict) = reference
+        .use_conflict
+        .get(use_index)
+        .and_then(Option::as_ref)
+    {
+        sup.fragment = Some(Box::new(conflict.body.clone()));
+    }
 
     let href = format!("./{}#{}", page_title.replace(' ', "_"), reference.anchor());
     let mut a = Node::element(ElementKind::Other("a".to_string()));
@@ -2067,6 +2207,8 @@ mod tests {
         let mut state = CiteState::new();
         let mut ids = Vec::new();
         let mut cuts = Vec::new();
+        let conflict_of =
+            |_: &rustoid_ast::dom::node::Node, _: &str, _: &str, _: Option<&str>| None;
         collect(
             &root,
             &mut state,
@@ -2074,6 +2216,7 @@ mod tests {
             &mut cuts,
             &nested_body,
             &references_body,
+            &conflict_of,
         );
 
         assert_eq!(state.references.len(), 2);
@@ -2126,6 +2269,8 @@ mod tests {
         let mut state = CiteState::new();
         let mut ids = Vec::new();
         let mut cuts = Vec::new();
+        let conflict_of =
+            |_: &rustoid_ast::dom::node::Node, _: &str, _: &str, _: Option<&str>| None;
         collect(
             &root,
             &mut state,
@@ -2133,6 +2278,7 @@ mod tests {
             &mut cuts,
             &nested_body,
             &references_body,
+            &conflict_of,
         );
 
         // The use is the only marker; neither definition records a use.
@@ -2437,6 +2583,78 @@ mod tests {
         // The bare reuse must not blank the note's text.
         assert_eq!(st.references[0].body, "hello");
         assert_eq!(st.references[0].number, 1);
+    }
+
+    /// A duplicate definition with a different body keeps its own HTML in
+    /// `data-mw`; a *visible* conflict also raises the duplicate-key error
+    /// (`References::checkForConflictingContent`), while the invisible kind only
+    /// differs in metadata and shows nothing.
+    #[test]
+    fn a_conflicting_duplicate_records_its_own_html() {
+        use rustoid_ast::dom::node::Node;
+
+        let conflict = |html: &str, visible: bool| UseConflict {
+            html: html.to_string(),
+            body: Node::text(html),
+            visible,
+        };
+        let mut st = CiteState::new();
+        st.add("x", "", "ONE", false, Some("#mwt1"));
+        st.add_with_attrs_and_conflict(
+            "x",
+            "",
+            vec![("name".to_string(), "x".to_string())],
+            "ONE2",
+            false,
+            Some("#mwt2"),
+            Some(conflict("ONE2", false)),
+        );
+        assert_eq!(
+            ref_data_mw(&st.references[0], 1),
+            r#"{"name":"ref","attrs":{"name":"x"},"body":{"html":"ONE2"}}"#
+        );
+        // Invisible: no error, plain `typeof`.
+        let mut ids = DocIds::new();
+        let marker = ref_marker_nodes(
+            &st.references[0],
+            &st.references[0].uses[1],
+            "Sandbox",
+            &mut ids,
+            Some("#mwt2".to_string()),
+        );
+        assert_eq!(marker.get_attr("typeof"), Some("mw:Extension/ref"));
+        assert!(!marker.get_attr("data-mw").unwrap().contains("errors"));
+
+        // Visible: the duplicate-key error and `mw:Error`.
+        let mut st = CiteState::new();
+        st.add("x", "", "ONE", false, Some("#mwt1"));
+        st.add_with_attrs_and_conflict(
+            "x",
+            "",
+            vec![("name".to_string(), "x".to_string())],
+            "TWO",
+            false,
+            Some("#mwt2"),
+            Some(conflict("TWO", true)),
+        );
+        let mut ids = DocIds::new();
+        let marker = ref_marker_nodes(
+            &st.references[0],
+            &st.references[0].uses[1],
+            "Sandbox",
+            &mut ids,
+            Some("#mwt2".to_string()),
+        );
+        assert_eq!(marker.get_attr("typeof"), Some("mw:Extension/ref mw:Error"));
+        let dmw = marker.get_attr("data-mw").unwrap();
+        assert!(
+            dmw.contains(r#""body":{"html":"TWO"}"#),
+            "its own body is recorded: {dmw}"
+        );
+        assert!(
+            dmw.contains(r#""key":"cite_error_references_duplicate_key","params":["x"]"#),
+            "the conflict raises Cite's duplicate-key error: {dmw}"
+        );
     }
 
     /// Cite trims a ref's name, so a trailing space is the same note

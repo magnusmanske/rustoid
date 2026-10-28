@@ -19765,3 +19765,34 @@ between. Refreshing that entry restored the row.
 next difference moves from byte 389,248 to 171,197, which is the Cite
 `CONFLICT_INVISIBLE` shape described above. Fixtures stay 867/896 and all 1,119
 lib tests pass.
+
+## A duplicate named ref compares its body with the first definition
+
+`References::checkForConflictingContent` compares a repeated named ref's body
+with the note's first one and stores the duplicate's own HTML in
+`data-mw.body.html`. Two bodies that differ only in round-tripping metadata are
+`CONFLICT_INVISIBLE` (no error); a visible difference also adds
+`cite_error_references_duplicate_key` and `mw:Error` to the marker. rustoid kept
+the note pointer on every body-carrying use, so `Hydrogen`'s second
+`<ref name="Nostrand">` served `{"id":…}` where the service has `{"html":…}`.
+
+Cite now takes a `ConflictOf` closure from the parser. The parser looks up both
+uses' expanded bodies (from the ref-body stash, or by rendering a plain body),
+serializes them, and compares them twice: once with only `data-parsoid`/`about`
+removed, and once with `data-mw`/`typeof` removed as well, mirroring
+`References::normalizeRef` (foreign `<math>`/`<svg>` content is left alone).
+`UseConflict` is recorded per use and drives `ref_data_mw` and the marker's
+`typeof`/`errors`.
+
+The stored HTML is what Parsoid serializes *after* the DOM passes, so the
+stashed body is finished in a later pass: `AddRedLinks` resolves its links (the
+citation's ISBN link carries `class="mw-redirect"`), `DedupeStyles` turns its
+repeated `<templatestyles>` into a `mw-deduplicated-inline-style` link, and the
+DSR bookkeeping (`data-parsoid`) is dropped because Cite captures the body
+before `ComputeDSR`. Generated ids inside that stored HTML are not allocated on
+this path; the comparison masks ids.
+
+**Effect:** with `math`, node ids and the duplicate-ref shape masked, Hydrogen's
+next difference moves from byte 171,197 to 374,878. That one is an imagemap
+`extsrc` that starts with a newline in the service and not in rustoid. Fixtures
+stay 867/896, all 1,119 lib tests pass, and `rustoid-extensions` is at 50.

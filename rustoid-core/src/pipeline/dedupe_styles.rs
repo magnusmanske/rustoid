@@ -22,9 +22,18 @@ use std::collections::HashSet;
 ///
 /// `seen` is the document-scoped set of keys already emitted (PHP's
 /// `$env->styleTagKeys`).
-pub fn run(root: &mut Node) {
+pub fn run(root: &mut Node) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     visit(root, &mut seen);
+    seen
+}
+
+/// Run the pass over one fragment with a set that already records the document's
+/// stylesheets. Cite needs it for a duplicate definition's stored HTML: Parsoid
+/// serializes that body *after* the stylesheet dedupe, so a repeated
+/// `<templatestyles>` is a `<link>` there too.
+pub fn run_on(root: &mut Node, seen: &mut HashSet<String>) {
+    visit(root, seen);
 }
 
 /// Pre-order walk, mirroring `DOMTraverser`'s dispatch for the `style` handler.

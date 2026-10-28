@@ -6161,6 +6161,61 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             // instead (see [`Parser::references_bodies`]).
             let references_body =
                 |text: &str| -> Option<Node> { self.references_bodies.borrow().get(text).cloned() };
+            // Cite compares a duplicate named definition with the note's first
+            // body (`References::checkForConflictingContent`). The comparison is
+            // on the *expanded* bodies' HTML with the round-tripping metadata
+            // stripped: `data-parsoid`/`about` first, then `data-mw`/`typeof` for
+            // the "invisible" case where only metadata differs.
+            // A plain-text body is not stashed (nothing in it spends an id), so
+            // it is rendered here. Only a body carrying a template or an extension
+            // was pre-rendered into `ref_bodies`.
+            let render_text = |text: &str| -> Node {
+                let mut fragments = note_fragments.borrow_mut();
+                render_inline_fragment(
+                    self.config,
+                    self.tokenize(text).unwrap_or_default(),
+                    &mut fragments,
+                    &next_note_id,
+                    Some(&crate::title::TitleParser::parse(
+                        &self.page_title.borrow(),
+                        self.config,
+                    )),
+                )
+            };
+            let stored_body = |about: Option<&str>, body: &str| -> Option<Node> {
+                about
+                    .and_then(|a| self.ref_bodies.borrow().get(a).cloned())
+                    .or_else(|| self.ref_bodies_by_body.borrow().get(body).cloned())
+                    .or_else(|| Some(render_text(body)))
+            };
+            let serializer = crate::html::serialize::HtmlSerializer::new(
+                crate::options::ParserOptions::for_page(""),
+            );
+            let serialize = |n: &Node| -> String {
+                serializer
+                    .serialize_children_to_string(n)
+                    .unwrap_or_default()
+            };
+            let conflict_of = |node: &Node,
+                               new_body: &str,
+                               old_body: &str,
+                               old_about: Option<&str>|
+             -> Option<crate::ext::cite::UseConflict> {
+                let new = stored_body(node.get_attr("about"), new_body)?;
+                let old = stored_body(old_about, old_body)?;
+                let normalized_new = serialize(&strip_ref_metadata(&new, false));
+                let normalized_old = serialize(&strip_ref_metadata(&old, false));
+                if normalized_new == normalized_old {
+                    return None;
+                }
+                let hidden_new = serialize(&strip_ref_metadata(&new, true));
+                let hidden_old = serialize(&strip_ref_metadata(&old, true));
+                Some(crate::ext::cite::UseConflict {
+                    html: serialize(&new),
+                    body: new,
+                    visible: hidden_new != hidden_old,
+                })
+            };
             crate::ext::cite::run(
                 &mut ast,
                 &page_title_prefixed,
@@ -6168,6 +6223,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 &render_body,
                 &nested_body,
                 &references_body,
+                &conflict_of,
             );
             // Hand the advanced counter back: ids are allocated in document
             // order, so anything numbered after Cite must continue from here.
@@ -6210,17 +6266,31 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
         // batch-checked with everything else.
         let mut titles = Vec::new();
         crate::pipeline::add_red_links::collect_wikilink_titles(&ast, &mut titles);
+        // A duplicate ref definition's stored body is not in the tree, but Parsoid's
+        // served HTML has it resolved too (`class="mw-redirect"` on a citation
+        // link). Collect and resolve its titles with everything else.
+        for_each_conflict_body(&ast, &mut |body| {
+            crate::pipeline::add_red_links::collect_wikilink_titles(body, &mut titles)
+        });
         if !titles.is_empty() {
             let page_info = match source {
                 Some(source) => source.get_page_info(&titles).await.unwrap_or_default(),
                 None => std::collections::HashMap::new(),
             };
             crate::pipeline::add_red_links::run(&mut ast, &page_info, &page_title_prefixed);
+            for_each_conflict_body_mut(&mut ast, &mut |body| {
+                crate::pipeline::add_red_links::run(body, &page_info, &page_title_prefixed)
+            });
         }
         // DedupeStyles runs over the tree just made final by Cite: a note's
         // `<templatestyles>` is emitted full at its first occurrence and as a
         // `mw-deduplicated-inline-style` link afterwards.
-        crate::pipeline::dedupe_styles::run(&mut ast);
+        let seen_styles = crate::pipeline::dedupe_styles::run(&mut ast);
+        // A duplicate ref definition's own body is stored inline in `data-mw`,
+        // and Parsoid serializes it after the same dedupe. Its `<style>`s are not
+        // in the tree, so apply the pass to the stashed body and rewrite the
+        // attribute.
+        rewrite_conflict_bodies(&mut ast, &seen_styles);
         // PHP's `CleanUp` (which records `DISCARDABLE_DP`) runs *before*
         // `WrapSections`, so the section wrappers the next pass creates are not
         // marked discardable — and so take page-bundle ids even inside a
@@ -10106,6 +10176,146 @@ fn ends_with_newline(last: Option<&Item>) -> bool {
         Some(Item::Str(s)) => s.ends_with('\n'),
         _ => false,
     }
+}
+
+/// Visit the stashed body of every conflicting ref marker.
+fn for_each_conflict_body(node: &Node, f: &mut dyn FnMut(&Node)) {
+    if node
+        .get_attr("id")
+        .is_some_and(|id| id.starts_with("cite_ref-"))
+        && let Some(body) = &node.fragment
+    {
+        f(body);
+    }
+    for child in &node.children {
+        for_each_conflict_body(child, f);
+    }
+}
+
+/// Mutable form of [`for_each_conflict_body`].
+fn for_each_conflict_body_mut(node: &mut Node, f: &mut dyn FnMut(&mut Node)) {
+    let is_marker = node
+        .get_attr("id")
+        .is_some_and(|id| id.starts_with("cite_ref-"));
+    if is_marker && let Some(body) = node.fragment.as_mut() {
+        f(body);
+    }
+    for child in &mut node.children {
+        for_each_conflict_body_mut(child, f);
+    }
+}
+
+/// Rewrite the inline HTML of duplicate ref definitions after `DedupeStyles`.
+///
+/// Cite stores a conflicting use's own body in `data-mw.body.html`, and Parsoid
+/// serializes it after the stylesheet dedupe, so a repeated `<templatestyles>`
+/// is a `mw-deduplicated-inline-style` link there. The body is not in the tree,
+/// so the pass is run on the stashed copy with the document's seen keys first.
+fn rewrite_conflict_bodies(root: &mut Node, seen: &std::collections::HashSet<String>) {
+    let serializer =
+        crate::html::serialize::HtmlSerializer::new(crate::options::ParserOptions::for_page(""));
+    fn walk(
+        node: &mut Node,
+        seen: &std::collections::HashSet<String>,
+        serializer: &crate::html::serialize::HtmlSerializer,
+    ) {
+        let is_marker = node
+            .get_attr("id")
+            .is_some_and(|id| id.starts_with("cite_ref-"));
+        if is_marker && let Some(body) = node.fragment.as_mut() {
+            // Cite captures the ref body before the DSR pass, so the stored HTML
+            // carries no `data-parsoid`; the body is outside the tree, where the
+            // cleanup passes strip it, so do that here.
+            strip_data_parsoid(body);
+            let mut local = seen.clone();
+            crate::pipeline::dedupe_styles::run_on(body, &mut local);
+            if let Ok(html) = serializer.serialize_children_to_string(body)
+                && let Some(dmw) = node.get_attr("data-mw")
+                && let Some(new) = replace_json_body_html(dmw, &html)
+            {
+                node.set_attr("data-mw", new);
+            }
+            // The stashed body has done its work; do not carry it to serialization.
+            node.fragment = None;
+        }
+        for child in &mut node.children {
+            walk(child, seen, serializer);
+        }
+    }
+    walk(root, seen, &serializer);
+}
+
+/// Replace the JSON string after `"body":{"html":` in a `data-mw` value.
+fn replace_json_body_html(data_mw: &str, html: &str) -> Option<String> {
+    let marker = "\"body\":{\"html\":";
+    let start = data_mw.find(marker)? + marker.len();
+    let rest = &data_mw[start..];
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                return Some(format!(
+                    "{}{}{}",
+                    &data_mw[..start],
+                    crate::ext::cite::json_string(html),
+                    &rest[i + 1..]
+                ));
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Remove the DSR bookkeeping from a body that Cite stores inline. Parsoid
+/// captures that HTML before `ComputeDSR`, so no element in it carries
+/// `data-parsoid`.
+fn strip_data_parsoid(node: &mut Node) {
+    node.data_parsoid = None;
+    node.dp = None;
+    node.attrs.retain(|a| a.key != "data-parsoid");
+    for child in &mut node.children {
+        strip_data_parsoid(child);
+    }
+}
+
+/// Clone a ref body with the attributes Cite ignores when it compares two
+/// definitions (`References::normalizeRef`).
+///
+/// `data-parsoid` and `about` always go; with `remove_metadata` the
+/// round-tripping metadata (`data-mw`, `typeof`) goes too, which is what makes a
+/// templating-only difference an *invisible* conflict. Foreign content (`<math>`,
+/// `<svg>`) is left untouched, following Remex's inability to remove foreign
+/// attributes there.
+fn strip_ref_metadata(node: &Node, remove_metadata: bool) -> Node {
+    fn walk(node: &mut Node, remove_metadata: bool) {
+        if let crate::dom::node::NodeKind::Element(crate::dom::node::ElementKind::Other(tag)) =
+            &node.kind
+            && (tag == "math" || tag == "svg")
+        {
+            return;
+        }
+        node.attrs.retain(|a| {
+            !matches!(a.key.as_str(), "data-parsoid" | "about")
+                && !(remove_metadata && matches!(a.key.as_str(), "data-mw" | "typeof"))
+        });
+        node.data_parsoid = None;
+        node.dp = None;
+        if remove_metadata {
+            node.data_mw = None;
+        }
+        for child in &mut node.children {
+            walk(child, remove_metadata);
+        }
+    }
+    let mut out = node.clone();
+    walk(&mut out, remove_metadata);
+    out
 }
 
 /// Strip comments nested in a link's content.
