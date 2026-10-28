@@ -19872,3 +19872,28 @@ The next difference is the Periodic-table navbox's `aria-labelledby`:
 `Module:Navbox`'s `argHash`, the sum of the lengths of its string arguments, so
 some argument of that navbox expands 40 characters short — the next thing to
 reduce.
+
+## A cell opener keeps the spaces before its pipe
+
+The 40-byte shortfall behind the navbox's `aria-labelledby` was not in the
+navbox at all. A temporary copy of `Module:Navbox` printed its arguments'
+lengths, and a `{{navbox|…}}` probe on `Sandbox` narrowed the difference to
+`list2`, `{{periodic table legend|theme1=Block|unknown1=no|style= margin:0;}}`:
+the service hands the module 710 bytes, rustoid 670.
+
+`Template:Periodic table legend/Block` writes each cell as
+`| style="…"          | [[s-block]]`, with ten spaces between the box and the
+separating pipe. `row_syntax_table_args` matches `optional_spaces pipe`, so
+those spaces belong to the cell's recorded `attr_src` — and PHP appends that box
+verbatim (`TokenStreamPatcher::convertNonHTMLTokenToString`). rustoid rebuilds
+the box from the *expanded* attributes (the source may still spell templates),
+which dropped the trailing run: ten spaces on each of the four cells is exactly
+the forty bytes `Module:Navbox` summed into its `argHash`. The rebuild now
+appends the source's trailing whitespace before the separator.
+
+**Effect:** the probe's two `argHash` values agree (`Periodic_table772` on both
+sides), and with `math`, node ids, `#mwt`, `utm_campaign` and the duplicate-ref
+shape masked, `Hydrogen`'s two renderings are now **equal at 1,004,639 bytes**
+— the masked comparison reports no difference at all. The lib suite is at
+1,125, fixtures stay 867/896, `rustoid-extensions` at 50, the Cite tests at
+14 + 2, and `rustoid-compare` at 135.

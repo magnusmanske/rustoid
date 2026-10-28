@@ -559,6 +559,19 @@ pub fn table_token_wikitext(tok: &ParsoidToken) -> Option<String> {
             out.push_str(&key_value_source_text(&kv.value));
             out.push('"');
         }
+        // `row_syntax_table_args` consumes `optional_spaces pipe`, so a cell's
+        // `attr_src` keeps the whitespace *after* its last attribute. PHP hands
+        // the box over verbatim, and a module can measure it: `Module:Navbox`
+        // sums its arguments into the navbox `id`, and
+        // `Template:Periodic table legend/Block` writes ten spaces before each
+        // cell's `|` — forty bytes over its four cells.
+        out.push_str(
+            dp.tmp
+                .attr_src
+                .as_deref()
+                .map(trailing_whitespace)
+                .unwrap_or(""),
+        );
         if matches!(name, "caption" | "td" | "th") {
             out.push_str(dp.attr_sep_src.as_deref().unwrap_or("|"));
         }
@@ -569,6 +582,11 @@ pub fn table_token_wikitext(tok: &ParsoidToken) -> Option<String> {
 /// The leading whitespace of `s` (the prefix before its first non-space).
 fn leading_whitespace(s: &str) -> &str {
     &s[..s.len() - s.trim_start().len()]
+}
+
+/// The trailing whitespace of `s` (the suffix after its last non-space).
+fn trailing_whitespace(s: &str) -> &str {
+    &s[s.trim_end().len()..]
 }
 
 /// A token's own source with substituted attributes written back.
@@ -973,6 +991,23 @@ mod tests {
         assert_eq!(
             table_token_wikitext(&unspaced).as_deref(),
             Some("{|class=\"clade\"")
+        );
+    }
+
+    #[test]
+    fn table_token_wikitext_keeps_the_sources_trailing_spaces() {
+        // PHP appends the source attribute box verbatim, and a cell's box keeps
+        // the spaces before its separating `|` (`row_syntax_table_args` matches
+        // `optional_spaces pipe`). `Template:Periodic table legend/Block` writes
+        // ten of them in front of each cell, and `Module:Navbox` measures its
+        // arguments into the navbox `id`'s `argHash`.
+        let mut dp = DataParsoid::default();
+        dp.tmp.attr_src = Some("| style=\"text-align:center\"          ".to_string());
+        let mut td = TagTk::new("td", vec![], dp);
+        td.add_attribute_str("style", "text-align:center");
+        assert_eq!(
+            table_token_wikitext(&ParsoidToken::Tag(td)).as_deref(),
+            Some("| style=\"text-align:center\"          |")
         );
     }
 
