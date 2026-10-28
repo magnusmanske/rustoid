@@ -293,7 +293,7 @@ impl WikiSiteConfig {
                         localinterwiki: None,
                         language: entry.language,
                         extralanglink: None,
-                        protorel: None,
+                        protorel: entry.protorel,
                         prefix: Some(prefix),
                     },
                 );
@@ -642,6 +642,8 @@ struct InterwikiEntry {
     local: bool,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    protorel: Option<bool>,
 }
 
 #[cfg(test)]
@@ -675,7 +677,8 @@ mod tests {
         "extensiontags": ["<pre>", "<nowiki>", "<ref>", "</ref>", "<references>", "<gallery>"],
         "interwikimap": [
           { "prefix": "wikipedia", "url": "https://en.wikipedia.org/wiki/$1", "local": true },
-          { "prefix": "commons", "url": "https://commons.wikimedia.org/wiki/$1" }
+          { "prefix": "commons", "url": "https://commons.wikimedia.org/wiki/$1" },
+          { "prefix": "creativecommons", "url": "https://creativecommons.org/licenses/$1", "protorel": true }
         ]
       }
     }"#;
@@ -841,8 +844,19 @@ mod tests {
     #[test]
     fn interwiki_map_is_populated() {
         let c = cfg();
-        assert_eq!(c.interwiki_map().len(), 2);
+        assert_eq!(c.interwiki_map().len(), 3);
         assert!(c.interwiki_map().contains_key("commons"));
+    }
+
+    #[test]
+    fn an_interwiki_entry_keeps_its_protorel_flag() {
+        // `protorel` decides whether a link's href drops its scheme
+        // (`//creativecommons.org/…`). The siteinfo response carries it, and
+        // dropping it made every such link serve `https://` instead.
+        let c = cfg();
+        let cc = c.interwiki_map().get("creativecommons").unwrap();
+        assert_eq!(cc.protorel, Some(true));
+        assert_eq!(c.interwiki_map().get("commons").unwrap().protorel, None);
     }
 
     #[test]

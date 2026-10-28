@@ -19824,11 +19824,19 @@ through `{{ubl}}` (a module), and the CIAAW note served
 `https://www.ciaaw.org/{{{name}}}.htm`. Expanding the body up front costs
 nothing extra — the body render then has no templates left to expand.
 
+The comparison harness also dropped the siteinfo's `protorel` flag when it built
+the interwiki map, so every protocol-relative interwiki link served `https://`
+where Parsoid serves `//` (`[[creativecommons:by/3.0/|CC BY 3.0]]` on `Hydrogen`).
+
 **Effect:** with `math`, node ids and the duplicate-ref shape masked, Hydrogen's
 next difference moves from byte 374,878 (37.31%) to 393,989, which is the
 unexpanded `{{{name}}}` above; expanding the ref body carries it to byte 805,468
 (80.17%). That one is a media `link=` target that is an interwiki title:
 Parsoid serves `<a href="./creativecommons:by/3.0/" title="…">` (the target
 treated as a local page), while rustoid resolves the interwiki URL and marks the
-anchor external — the next difference to take. Fixtures stay 867/896, the lib
-suite is at 1,122, `rustoid-extensions` at 50, and the Cite tests at 14 + 2.
+anchor external — the next difference to take. A probe of the live transform
+endpoint pins the rule: a *plain-text* `link=` value is always spelled as a local
+page (`link=wikt:Foo` → `./wikt:Foo`, `link=de:Foo` → `./de:Foo`), while a
+*link-valued* one (`link=[[wikipedia:Foo]]`, already pinned by `media.txt`) keeps
+that link's href. Fixtures stay 867/896, the lib suite is at 1,122,
+`rustoid-extensions` at 50, and the Cite tests at 14 + 2.
