@@ -96,6 +96,12 @@ pub enum EntryKind {
     /// [`Protection`](Self::Protection) the body cannot supply it: the statistics
     /// a page renders come from a page it never transcludes.
     Data,
+    /// A rendered `<math>` body, keyed by its source and display mode.
+    ///
+    /// **Not native code**: the body is MathJax/Mathoid output, which the
+    /// renderer does not produce; the harness fetches the wiki's rendering and
+    /// caches it so a corpus run (and an offline replay) can compare math pages.
+    Math,
     /// An interface message's text, for `{{MediaWiki:…}}` transclusions and
     /// `mw.message`.
     ///
@@ -132,6 +138,7 @@ impl EntryKind {
             Self::Stability => "flag",
             Self::Message => "msg",
             Self::Data => "data",
+            Self::Math => "math",
         }
     }
 
@@ -151,6 +158,7 @@ impl EntryKind {
             "flag" => Some(Self::Stability),
             "msg" => Some(Self::Message),
             "data" => Some(Self::Data),
+            "math" => Some(Self::Math),
             _ => None,
         }
     }

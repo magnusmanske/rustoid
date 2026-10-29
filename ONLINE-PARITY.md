@@ -19992,3 +19992,36 @@ service byte for byte, including the attribute box's classes. `Template:Infobox`
 is unchanged: its remaining difference is the `<nowiki>` inside a
 template-expanded extension body recorded above. Lib 1,125, fixtures 867/896,
 `rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 136.
+
+## Math is rendered by the host, not natively
+
+`<math>` has been the largest single class of corpus failures — 19 pages stop at
+their first expression. What the service serves there is MathJax/Mathoid output:
+a MathML tree, an `alttext` transcription and a hashed fallback image.
+**This is not native code.** rustoid does not generate it, and porting MathJax is
+not on the table. Instead the parser asks the host for the body through
+`DataSource::render_math(tex, display)` (default: `None`) and only builds the
+wrapper around what it gets — `mwe-math-element mwe-math-element-{inline|block}`,
+`typeof="mw:Extension/math"`, this parse's `about` and `data-mw` — splicing the
+body unchanged. The ids the renderer used are dropped and the fragment is marked
+`discardable_dp`, so the id pass leaves it unnumbered as the service does — and
+the fallback `<img>` is kept out of the figure migration, which would otherwise
+turn it into `<figure><figure-inline>`.
+
+Rendering is routed through a real `span typeof="mw:DOMFragment"` placeholder
+rather than the opaque `mw:dom-fragment-token` meta: that is what keeps the
+paragraph wrapper treating the math as inline, so `A <math>x</math> B` stays in
+one `<p>`.
+
+The compare harness implements the method by asking the wiki's own Parsoid
+transform for the same `<math>` source and caching the answer under a new `Math`
+cache kind, keyed by display mode and a stable FNV-1a hash of the source. A
+corpus run therefore compares math pages, and an offline run replays them; a
+host with no renderer, or an offline run without the cache, gets the old
+placeholder unchanged.
+
+**Effect:** a probe with inline and display math matches the service byte for
+byte, MathML and fallback image included. `Hydrogen` is now identical with only
+node ids, `#mwt` and `utm_campaign` masked — **1,007,311 bytes on both sides,
+with the `<math>` spans no longer masked**. Lib 1,127, fixtures 867/896,
+`rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 137.

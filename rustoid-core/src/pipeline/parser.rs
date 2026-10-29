@@ -699,6 +699,40 @@ fn templatedata_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::Selfc
     (extension_token_name(stt) == Some("templatedata")).then_some(stt)
 }
 
+/// If `item` is a `<math>` extension token, return the self-closing token.
+fn math_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
+    let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
+        return None;
+    };
+    (extension_token_name(stt) == Some("math")).then_some(stt)
+}
+
+/// Drop the ids a rendered extension fragment came with.
+///
+/// The ids belong to the render that produced the fragment (the wiki's
+/// node-id sequence), not to this parse; `assign_node_ids` numbers the fragment's
+/// elements here, and only the ones that carry metadata of their own — which is
+/// exactly what the service leaves unnumbered.
+fn strip_extension_ids(node: &mut Node) {
+    node.attrs
+        .retain(|attr| attr.key != "id" && attr.key != "data-parsoid");
+    // Extension content is Parsoid's `DISCARDABLE_DP` case: it draws no node id,
+    // however the fragment was parsed.
+    node.discardable_dp = true;
+    // A rendered extension's `<img>` is content, not wikitext media: leaving it
+    // an `Image` lets the paragraph wrapper turn a lone one into
+    // `<figure><figure-inline>`, which the service does not do for the math
+    // fallback image (it has no media metadata to migrate).
+    if let crate::dom::node::NodeKind::Element(kind) = &mut node.kind
+        && matches!(kind, crate::dom::node::ElementKind::Image)
+    {
+        *kind = crate::dom::node::ElementKind::Other("img".to_string());
+    }
+    for child in &mut node.children {
+        strip_extension_ids(child);
+    }
+}
+
 /// If `item` is an `<inputbox>` extension token, return the self-closing token.
 fn inputbox_target(item: &Item) -> Option<&crate::wikitext::tokens_v2::SelfclosingTagTk> {
     let Item::Tok(ParsoidToken::SelfclosingTag(stt)) = item else {
@@ -3465,6 +3499,11 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 )
                 .await;
             tokens = self.expand_syntaxhighlight(tokens, about_counter, &mut fragments, next_id);
+            if let Some(source) = source {
+                tokens = self
+                    .expand_maths(tokens, source, about_counter, &mut fragments, next_id)
+                    .await;
+            }
             tokens = self
                 .expand_mapframe(
                     tokens,
@@ -4695,6 +4734,129 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 }
                 None => out.push(item),
             }
+        }
+        out
+    }
+
+    /// Expand `<math>` extension tokens the host can render.
+    ///
+    /// **Not native code.** The served content is MathJax/Mathoid output, so the
+    /// parser asks the data source to render the body and only wraps what it gets
+    /// back: the `<span class="mwe-math-element mwe-math-element-{inline|block}">`
+    /// with this parse's `about` and `data-mw`. A source that answers `None` (the
+    /// trait's default) leaves the token untouched, so the tag stays the
+    /// unresolved placeholder it has always been.
+    ///
+    /// Ids inside the returned fragment are dropped: Parsoid assigns none to
+    /// extension content that has no metadata of its own, and this parse's own
+    /// id pass numbers the mathml span and fallback image in place.
+    async fn expand_maths(
+        &self,
+        tokens: Vec<Item>,
+        source: &dyn DataSource,
+        about_counter: &std::cell::Cell<usize>,
+        fragments: &mut std::collections::HashMap<usize, Node>,
+        next_id: &std::cell::Cell<usize>,
+    ) -> Vec<Item> {
+        use crate::pipeline::extension_handler::{extension_data_mw, extension_kv_attrs};
+
+        let mut out: Vec<Item> = Vec::new();
+        for item in tokens {
+            let Some(stt) = math_target(&item) else {
+                out.push(item);
+                continue;
+            };
+            let stt = stt.clone();
+            let about = stt
+                .attribs
+                .iter()
+                .find(|kv| {
+                    kv.key.as_str() == Some(crate::pipeline::wiki_link_render::MW_ABOUT_BASE_ATTR)
+                })
+                .and_then(|kv| kv.value.as_str())
+                .filter(|b| !b.is_empty())
+                .map(|b| format!("#mwt{b}"))
+                .unwrap_or_else(|| self.new_about_id(about_counter, "math"));
+            let attrs = extension_kv_attrs(&stt);
+            let pairs: Vec<(String, String)> = attrs
+                .iter()
+                .filter_map(|kv| {
+                    Some((kv.key.as_str()?.to_string(), kv.value.as_str()?.to_string()))
+                })
+                .collect();
+            let ext_src = stt
+                .attribs
+                .iter()
+                .find(|kv| kv.key.as_str() == Some("source"))
+                .and_then(|kv| kv.value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let has_body = stt
+                .data_parsoid
+                .ext_tag_offsets
+                .as_ref()
+                .and_then(|offsets| offsets.close_width)
+                .unwrap_or(0)
+                > 0;
+            if !has_body {
+                // A self-closing `<math/>` has nothing to render.
+                out.push(item);
+                continue;
+            }
+            let tex = crate::pipeline::extension_handler::extract_ext_body(&stt, &ext_src);
+            let display = pairs.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("display") && value.trim().eq_ignore_ascii_case("block")
+            });
+            let Some(inner) = source.render_math(&tex, display).await.ok().flatten() else {
+                out.push(item);
+                continue;
+            };
+            let Ok(fragment) = crate::html::parse::parse_fragment_in_context(&inner, "div") else {
+                out.push(item);
+                continue;
+            };
+            let data_mw = extension_data_mw("math", &attrs, Some(&tex));
+            let mut node = Node::element(crate::dom::node::ElementKind::Other("span".to_string()));
+            node.set_attr(
+                "class",
+                if display {
+                    "mwe-math-element mwe-math-element-block"
+                } else {
+                    "mwe-math-element mwe-math-element-inline"
+                },
+            );
+            node.set_attr("typeof", "mw:Extension/math");
+            node.set_attr("about", about);
+            node.set_attr("data-mw", data_mw);
+            for mut child in fragment.children {
+                strip_extension_ids(&mut child);
+                node.push_child(child);
+            }
+            let mut frag = Node::document();
+            frag.push_child(node);
+            let id = next_id.get();
+            next_id.set(id + 1);
+            fragments.insert(id, frag);
+            // A real `span typeof="mw:DOMFragment"` (rather than the opaque
+            // `mw:dom-fragment-token` meta) keeps the paragraph wrapper treating
+            // the math as inline content, which is what the service serves:
+            // `Inline <span class="mwe-math-element">…</span> here.` stays in one
+            // `<p>`. `ext_tag_offsets` is kept so `ComputeDSR` stamps the
+            // wrapper's `dsr` with the tag's open/close widths.
+            let mut dp = stt.data_parsoid.clone();
+            dp.src = None;
+            dp.src_content = None;
+            let mut open = crate::wikitext::tokens_v2::TagTk::new("span", vec![], dp);
+            open.add_attribute_str("typeof", "mw:DOMFragment");
+            open.add_attribute_str("data-fragment-id", id.to_string());
+            out.push(Item::Tok(ParsoidToken::Tag(open)));
+            out.push(Item::Tok(ParsoidToken::EndTag(
+                crate::wikitext::tokens_v2::EndTagTk::new(
+                    "span",
+                    vec![],
+                    crate::wikitext::tokens_v2::DataParsoid::default(),
+                ),
+            )));
         }
         out
     }
@@ -6017,6 +6179,12 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             )
             .await;
         let tokens = self.expand_syntaxhighlight(tokens, about_counter, &mut fragments, next_id);
+        let tokens = if let Some(source) = source {
+            self.expand_maths(tokens, source, about_counter, &mut fragments, next_id)
+                .await
+        } else {
+            tokens
+        };
         let tokens = self
             .expand_mapframe(
                 tokens,
@@ -13339,6 +13507,53 @@ mod tests {
             html.contains(r#""extsrc":"\nFile:Example.svg|50px|alt=x"#),
             "the content kept its leading newline: {html}"
         );
+    }
+
+    /// A host-rendered `<math>` body is wrapped the way the service wraps it:
+    /// the extension span carries this parse's `about`/`data-mw`, its class names
+    /// the display mode, and the body is spliced unchanged (no ids, no figure
+    /// migration). Without a renderer the tag stays the placeholder.
+    #[tokio::test]
+    async fn a_host_rendered_math_is_wrapped_like_the_service() {
+        let source = crate::mock::MockDataSource::new()
+            .with_math(r#"<span class="mwe-math-mathml-a11y">x</span><img src="u"/>"#);
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "A <math>n=1</math> B",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            html.contains("A <span class=\"mwe-math-element mwe-math-element-inline\""),
+            "inline math stays in its paragraph: {html}"
+        );
+        assert!(html.contains("about=\"#mwt1\""), "{html}");
+        assert!(
+            html.contains(r#""extsrc":"n=1""#),
+            "the data-mw carries the source: {html}"
+        );
+        assert!(html.contains("<img src=\"u\"/>"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn math_without_a_renderer_stays_a_placeholder() {
+        let source = crate::mock::MockDataSource::new();
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "A <math>n=1</math> B",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(html.contains("name=\"math\""), "{html}");
+        assert!(!html.contains("mwe-math-element"), "{html}");
     }
 
     /// A `#tag:ref` body is expanded like every other tag's content, so an

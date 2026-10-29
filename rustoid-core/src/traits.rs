@@ -102,6 +102,18 @@ pub trait DataSource: Send + Sync {
     /// Returns `None` if the message does not exist.
     async fn get_message(&self, lang: &str, key: &str) -> Result<Option<String>>;
 
+    /// Render a `<math>` tag's body, returning the HTML inside the extension's
+    /// wrapper (the MathML accessibility span and the fallback image).
+    ///
+    /// **Not native code.** The served content is MathJax/Mathoid output — a
+    /// MathML tree, an `alttext` transcription and a hashed fallback image — and
+    /// rustoid does not generate it. A host that wants math rendered delegates to
+    /// the wiki's own renderer; the default answers `None`, which leaves the tag
+    /// the unresolved placeholder it has always been. See `ONLINE-PARITY.md`.
+    async fn render_math(&self, _tex: &str, _display: bool) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// A tabular-data page's source (`Data:…`), for `mw.ext.data`.
     ///
     /// `name` is the name a module passed to `mw.ext.data.get` with the `.tab`

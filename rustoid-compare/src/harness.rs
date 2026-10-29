@@ -681,6 +681,108 @@ impl CachedDataSource {
             },
         }
     }
+
+    /// The wiki's rendering of a `<math>` body, cached by source and mode.
+    ///
+    /// **Not native code.** The body is MathJax/Mathoid output (MathML, an
+    /// `alttext` and a hashed fallback image). rustoid does not generate it, so
+    /// the harness asks the wiki for the same rendering the oracle has. A failed
+    /// fetch (or an offline run with no cache) answers `None`, which leaves the
+    /// tag the unresolved placeholder the parser produces natively.
+    async fn math_rendering(&self, tex: &str, display: bool) -> Result<Option<String>> {
+        let key = format!(
+            "{}:{}",
+            if display { "block" } else { "inline" },
+            fnv_hex(tex)
+        );
+        let cached = {
+            let guard = self
+                .cache
+                .lock()
+                .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?;
+            guard.get(EntryKind::Math, &key)?
+        };
+        if let Some(hit) = cached {
+            return Ok(Some(hit.body));
+        }
+        let Some(client) = &self.client else {
+            return Ok(None);
+        };
+        if self.offline {
+            return Ok(None);
+        }
+        let wikitext = if display {
+            format!("<math display=\"block\">{tex}</math>")
+        } else {
+            format!("<math>{tex}</math>")
+        };
+        let html = match client.parsoid_html_for_wikitext("Sandbox", &wikitext).await {
+            Ok(html) => html,
+            Err(_) => return Ok(None),
+        };
+        let Some(inner) = extract_math_inner(&html) else {
+            return Ok(None);
+        };
+        let meta = EntryMeta {
+            kind: EntryKind::Math,
+            title: key.clone(),
+            revid: None,
+            fetched_at: now_rfc3339(),
+        };
+        self.cache
+            .lock()
+            .map_err(|_| CompareError::cache("<cache>", "mutex poisoned"))?
+            .put(EntryKind::Math, &key, &inner, meta)?;
+        self.note_written()?;
+        Ok(Some(inner))
+    }
+}
+
+/// A stable, short key for a math source (`DefaultHasher` is not guaranteed
+/// stable across Rust releases, and the cache outlives a release).
+fn fnv_hex(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The inside of the `mwe-math-element` wrapper in a rendered `<math>` probe.
+fn extract_math_inner(html: &str) -> Option<String> {
+    let mut doc = rustoid_core::html::parse::parse_html(html).ok()?;
+    // The math fallback `<img>` is content, not wikitext media: as an `Image`
+    // node the serializer rewrites it to `<figure-inline>` and drops everything
+    // but `src`, which is not what the service served.
+    demote_images(&mut doc);
+    let span = find_math_span(&doc)?;
+    let serializer = rustoid_core::html::serialize::HtmlSerializer::new(
+        rustoid_core::options::ParserOptions::for_page("Sandbox"),
+    );
+    serializer.serialize_children_to_string(span).ok()
+}
+
+fn demote_images(node: &mut rustoid_core::dom::node::Node) {
+    if let rustoid_core::dom::node::NodeKind::Element(kind) = &mut node.kind
+        && matches!(kind, rustoid_core::dom::node::ElementKind::Image)
+    {
+        *kind = rustoid_core::dom::node::ElementKind::Other("img".to_string());
+    }
+    for child in &mut node.children {
+        demote_images(child);
+    }
+}
+
+fn find_math_span(node: &rustoid_core::dom::node::Node) -> Option<&rustoid_core::dom::node::Node> {
+    if let Some(class) = node.get_attr("class")
+        && class
+            .split_whitespace()
+            .any(|part| part == "mwe-math-element")
+    {
+        return Some(node);
+    }
+    node.children.iter().find_map(find_math_span)
 }
 
 /// Whether a cached input must be re-read, given whether this run is refreshing.
@@ -1059,6 +1161,15 @@ impl DataSource for CachedDataSource {
             .get_messages(lang, std::slice::from_ref(&key.to_string()))
             .await?;
         Ok(map.remove(key))
+    }
+
+    /// The wiki's rendering of a `<math>` body, or `None` when this run cannot
+    /// get it (offline and uncached, or the fetch failed).
+    ///
+    /// See [`CachedDataSource::math_rendering`]: the body is MathJax output, not
+    /// something rustoid can produce.
+    async fn render_math(&self, tex: &str, display: bool) -> rustoid_core::Result<Option<String>> {
+        Ok(self.math_rendering(tex, display).await.unwrap_or(None))
     }
 
     /// Messages in one request per 50, which is the API's `ammessages` cap.
@@ -2640,6 +2751,20 @@ mod tests {
         };
         assert!(!refresh_stale_input(Some(&fresh), true));
         assert!(!refresh_stale_input(None, true));
+    }
+
+    #[test]
+    fn a_math_rendering_yields_its_inner_html() {
+        // The wrapper is the wiki's; only its children travel, with the image's
+        // attributes intact (an `Image` node would serialise as a figure).
+        let html = r#"<body><p><span class="mwe-math-element mwe-math-element-inline" id="mwA"><span class="mwe-math-mathml-a11y">m</span><img src="u" class="k"/></span></p></body>"#;
+        let inner = extract_math_inner(html).expect("a math span");
+        assert!(
+            inner.starts_with("<span class=\"mwe-math-mathml-a11y\">m</span>"),
+            "{inner}"
+        );
+        assert!(inner.contains("<img src=\"u\" class=\"k\"/>"), "{inner}");
+        assert_eq!(fnv_hex(""), "cbf29ce484222325");
     }
 
     #[test]

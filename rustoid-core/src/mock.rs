@@ -88,6 +88,9 @@ pub struct MockDataSource {
     /// history: a caller that needs a revision sees none rather than a made-up
     /// number. `<templatestyles>` is the caller that cares.
     revisions: RwLock<HashMap<String, u64>>,
+    /// The HTML `DataSource::render_math` answers with, when a test wants a
+    /// host-rendered `<math>` body.
+    math: RwLock<Option<String>>,
 }
 
 impl MockDataSource {
@@ -103,6 +106,7 @@ impl MockDataSource {
             data_pages: RwLock::new(HashMap::new()),
             page_info: RwLock::new(HashMap::new()),
             revisions: RwLock::new(HashMap::new()),
+            math: RwLock::new(None),
         }
     }
 
@@ -118,6 +122,16 @@ impl MockDataSource {
     }
 
     /// Add a page with the given title and wikitext content.
+    /// Answer `DataSource::render_math` with `html` from now on.
+    ///
+    /// Math is not native code (see [`DataSource::render_math`]); this is the
+    /// test hook for a host that hands the parser a rendered body.
+    #[must_use]
+    pub fn with_math(self, html: &str) -> Self {
+        *self.math.write().unwrap() = Some(html.to_string());
+        self
+    }
+
     pub fn add_page(&self, title: &str, content: &str) {
         self.pages
             .write()
@@ -314,6 +328,10 @@ fn transform_helper(width: u32, height: u32, tw: &mut Option<u32>, th: &mut Opti
 
 #[async_trait]
 impl DataSource for MockDataSource {
+    async fn render_math(&self, _tex: &str, _display: bool) -> Result<Option<String>> {
+        Ok(self.math.read().unwrap().clone())
+    }
+
     async fn get_page_content(&self, title: &Title) -> Result<Option<String>> {
         let key = title.full_text();
         // Check pages first, then templates (since templates are also pages).
