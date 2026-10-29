@@ -73,6 +73,20 @@ pub enum Matcher {
     /// lazy name has to stop *before* its terminator, which a guard at the
     /// (fixed) end of a regex match cannot express.
     Parameter,
+    /// `^(:*)(\s*?)(\{\|)([^\n]*)$` — a table start line.
+    TableStart,
+    /// `^([ \t\n\r\0\x0B]*?)(\|\})` — a table end line.
+    TableEnd,
+    /// `^([ \t\n\r\0\x0B]*?)(\|-+)(.*)$` — a table row line.
+    TableRow,
+    /// `^([ \t\n\r\0\x0B]*?)(\|\+)…` — a table caption.
+    TableCaption,
+    /// `( ^(?:[ \t\n\r\0\x0B]*?)\| | \|\| )…` — a table data cell.
+    TableCell,
+    /// `( ^(?:[ \t\n\r\0\x0B]*?)! )…` — a table header cell.
+    TableHeader,
+    /// `(!!|\|\|)…` inside `table-header`.
+    TableHeaderSep,
 }
 
 pub struct Rule {
@@ -284,7 +298,214 @@ fn matched_at<'a>(text: &'a str, pos: usize, rule: &Compiled) -> Option<Match<'a
         Matcher::Heading => heading(text, pos),
         Matcher::Label => label(text, pos),
         Matcher::Parameter => parameter(text, pos),
+        Matcher::TableStart => table_start(text, pos),
+        Matcher::TableEnd => table_end(text, pos),
+        Matcher::TableRow => table_row(text, pos),
+        Matcher::TableCaption => table_caption(text, pos),
+        Matcher::TableCell => table_cell(text, pos),
+        Matcher::TableHeader => table_header(text, pos),
+        Matcher::TableHeaderSep => table_header_sep(text, pos),
     }
+}
+
+/// The class Pygments writes as `[ \t\n\r\0\x0B]` (PHP's `trim()` set).
+fn table_ws(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\0' | '\u{0B}')
+}
+
+fn at_line_start(text: &str, pos: usize) -> bool {
+    pos == 0 || text[..pos].ends_with('\n')
+}
+
+/// The end of the current line (the newline itself excluded).
+fn line_end(text: &str, pos: usize) -> usize {
+    text[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(text.len())
+}
+
+/// `^(?:[ws]*?)target`: the index of the first `target` reachable over
+/// whitespace only, from a line start. `target` may be a two-character marker.
+fn skip_ws_to(text: &str, pos: usize, target: &str) -> Option<usize> {
+    if !at_line_start(text, pos) {
+        return None;
+    }
+    let mut i = pos;
+    loop {
+        if text[i..].starts_with(target) {
+            return Some(i);
+        }
+        let ch = text[i..].chars().next()?;
+        if !table_ws(ch) {
+            return None;
+        }
+        i += ch.len_utf8();
+    }
+}
+
+/// `((?:(?!\[\[|\{\{)[^|\n<])*?)` followed by `sep`, optionally not
+/// followed by `forbidden`. Returns the index of `sep`.
+///
+/// A run that meets `[[`, `{{`, `<`, a newline or a pipe fails, which makes the
+/// enclosing optional group fail — the caller then ends the match earlier.
+fn scan_attr_run(text: &str, from: usize, sep: char, forbidden: Option<char>) -> Option<usize> {
+    let mut i = from;
+    loop {
+        if text[i..].starts_with(sep) {
+            let after = i + sep.len_utf8();
+            if forbidden.is_some_and(|c| text[after..].starts_with(c)) {
+                return None;
+            }
+            return Some(i);
+        }
+        if text[i..].starts_with("[[") || text[i..].starts_with("{{") {
+            return None;
+        }
+        let ch = text[i..].chars().next()?;
+        if matches!(ch, '|' | '\n' | '<') {
+            return None;
+        }
+        i += ch.len_utf8();
+    }
+}
+
+/// A table start line, `^(:*)(\s*?)(\{\|)([^\n]*)$`.
+fn table_start(text: &str, pos: usize) -> Option<Match<'_>> {
+    if !at_line_start(text, pos) {
+        return None;
+    }
+    let cols_end = text[pos..].bytes().take_while(|&b| b == b':').count() + pos;
+    let pipe = skip_ws_to(text, cols_end, "{|")?;
+    let end = line_end(text, pipe + 2);
+    Some(Match {
+        start: pos,
+        end,
+        groups: vec![
+            (pos, end),
+            (pos, cols_end),
+            (cols_end, pipe),
+            (pipe, pipe + 2),
+            (pipe + 2, end),
+        ],
+        _text: &text[pos..end],
+    })
+}
+
+/// A table end line, `^([ws]*?)(\|\})`.
+fn table_end(text: &str, pos: usize) -> Option<Match<'_>> {
+    let pipe = skip_ws_to(text, pos, "|}")?;
+    Some(Match {
+        start: pos,
+        end: pipe + 2,
+        groups: vec![(pos, pipe + 2), (pos, pipe), (pipe, pipe + 2)],
+        _text: &text[pos..pipe + 2],
+    })
+}
+
+/// A row line, `^([ws]*?)(\|-+)(.*)$`.
+fn table_row(text: &str, pos: usize) -> Option<Match<'_>> {
+    let pipe = skip_ws_to(text, pos, "|")?;
+    let mut i = pipe + 1;
+    while text[i..].starts_with('-') {
+        i += 1;
+    }
+    if i == pipe + 1 {
+        return None;
+    }
+    let end = line_end(text, i);
+    Some(Match {
+        start: pos,
+        end,
+        groups: vec![(pos, end), (pos, pipe), (pipe, i), (i, end)],
+        _text: &text[pos..end],
+    })
+}
+
+/// A caption line, `^([ws]*?)(\|+)` with an optional attribute box.
+fn table_caption(text: &str, pos: usize) -> Option<Match<'_>> {
+    let pipe = skip_ws_to(text, pos, "|")?;
+    let plus_end = pipe + 1 + text[pipe + 1..].bytes().take_while(|&b| b == b'+').count();
+    if plus_end == pipe + 1 {
+        return None;
+    }
+    let end = line_end(text, plus_end);
+    let mut groups = vec![
+        (pos, end),
+        (pos, pipe),
+        (pipe, plus_end),
+        (plus_end, plus_end),
+        (plus_end, plus_end),
+        (plus_end, end),
+    ];
+    if let Some(sep) = scan_attr_run(text, plus_end, '|', None) {
+        groups[3] = (plus_end, sep);
+        groups[4] = (sep, sep + 1);
+        groups[5] = (sep + 1, end);
+    }
+    Some(Match {
+        start: pos,
+        end,
+        groups,
+        _text: &text[pos..end],
+    })
+}
+
+/// A data cell's opener: a line-leading `|` (over whitespace) or a `||`.
+fn table_cell(text: &str, pos: usize) -> Option<Match<'_>> {
+    let (opener_end, _) = if at_line_start(text, pos)
+        && let Some(pipe) = skip_ws_to(text, pos, "|")
+    {
+        (pipe + 1, false)
+    } else if text[pos..].starts_with("||") {
+        (pos + 2, true)
+    } else {
+        return None;
+    };
+    cell_match(text, pos, opener_end)
+}
+
+/// A header cell's opener, `( ^(?:[ws]*?)! )`.
+fn table_header(text: &str, pos: usize) -> Option<Match<'_>> {
+    let bang = skip_ws_to(text, pos, "!")?;
+    cell_match(text, pos, bang + 1)
+}
+
+/// The optional `(attr)(\|)(?!\|)` after a cell opener.
+fn cell_match(text: &str, pos: usize, opener_end: usize) -> Option<Match<'_>> {
+    let mut end = opener_end;
+    // Group 0 is the whole match; the three captures are opener, attribute run
+    // and separator.
+    let mut groups = vec![
+        (pos, opener_end),
+        (pos, opener_end),
+        (opener_end, opener_end),
+        (opener_end, opener_end),
+    ];
+    if let Some(sep) = scan_attr_run(text, opener_end, '|', Some('|')) {
+        groups[2] = (opener_end, sep);
+        groups[3] = (sep, sep + 1);
+        end = sep + 1;
+    }
+    groups[0] = (pos, end);
+    Some(Match {
+        start: pos,
+        end,
+        groups,
+        _text: &text[pos..end],
+    })
+}
+
+/// `(!!|\|\|)` with the same optional attribute box, inside `table-header`.
+fn table_header_sep(text: &str, pos: usize) -> Option<Match<'_>> {
+    let opener = if text[pos..].starts_with("!!") {
+        "!!"
+    } else if text[pos..].starts_with("||") {
+        "||"
+    } else {
+        return None;
+    };
+    cell_match(text, pos, pos + opener.len())
 }
 
 /// `(\{\{\{)([^|]*?)(?=\}\}\}|\|)`: a parameter's name, up to its terminator.

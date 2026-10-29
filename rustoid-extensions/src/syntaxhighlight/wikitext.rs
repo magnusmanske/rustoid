@@ -365,6 +365,9 @@ const PARSER_TAGS: &[&str] = &[
     "references",
 ];
 
+/// The relex stack `using(this, state=['root', 'attr'])` names.
+const ATTR: &[&str] = &["root", "attr"];
+
 /// The states this port implements.
 pub(super) const STATE_NAMES: &[&str] = &[
     "root",
@@ -390,6 +393,8 @@ pub(super) const STATE_NAMES: &[&str] = &[
     "text-bold-italic",
     "entity",
     "dt",
+    "table",
+    "table-header",
     "attr",
     "attr-val-0",
     "attr-val-1",
@@ -615,6 +620,17 @@ pub(super) fn rules(state: &str) -> Vec<Rule> {
                 ],
                 Next::Push("extlink-inner"),
             ));
+            v.push(Rule {
+                matcher: Matcher::TableStart,
+                guard: Guard::None,
+                action: Action::Groups(&[
+                    GroupAction::Tok("k", 1),
+                    GroupAction::Tok("w", 2),
+                    GroupAction::Tok("p", 3),
+                    GroupAction::Relex(4, ATTR),
+                ]),
+                next: Next::Push("table"),
+            });
             v.push(Rule::groups(
                 pat(&HTML_OPEN, || format!("(?i)(<)({})\\b", joined(HTML_TAGS))),
                 &[GroupAction::Tok("p", 1), GroupAction::Tok("nt", 2)],
@@ -906,6 +922,79 @@ pub(super) fn rules(state: &str) -> Vec<Rule> {
             include(&mut v, "text");
             v
         }
+        "table" => {
+            let mut v = vec![
+                Rule {
+                    matcher: Matcher::TableEnd,
+                    guard: Guard::None,
+                    action: Action::Groups(&[GroupAction::Tok("w", 1), GroupAction::Tok("p", 2)]),
+                    next: Next::Pop,
+                },
+                Rule {
+                    matcher: Matcher::TableRow,
+                    guard: Guard::None,
+                    action: Action::Groups(&[
+                        GroupAction::Tok("w", 1),
+                        GroupAction::Tok("p", 2),
+                        GroupAction::Relex(3, ATTR),
+                    ]),
+                    next: Next::Stay,
+                },
+                Rule {
+                    matcher: Matcher::TableCaption,
+                    guard: Guard::None,
+                    action: Action::Groups(&[
+                        GroupAction::Tok("w", 1),
+                        GroupAction::Tok("p", 2),
+                        GroupAction::Relex(3, ATTR),
+                        GroupAction::Tok("p", 4),
+                        GroupAction::Tok("gh", 5),
+                    ]),
+                    next: Next::Stay,
+                },
+                Rule {
+                    matcher: Matcher::TableCell,
+                    guard: Guard::None,
+                    action: Action::Groups(&[
+                        GroupAction::Tok("p", 1),
+                        GroupAction::Relex(2, ATTR),
+                        GroupAction::Tok("p", 3),
+                    ]),
+                    next: Next::Stay,
+                },
+                Rule {
+                    matcher: Matcher::TableHeader,
+                    guard: Guard::None,
+                    action: Action::Groups(&[
+                        GroupAction::Tok("p", 1),
+                        GroupAction::Relex(2, ATTR),
+                        GroupAction::Tok("p", 3),
+                    ]),
+                    next: Next::Push("table-header"),
+                },
+            ];
+            include(&mut v, "list");
+            include(&mut v, "inline");
+            include(&mut v, "text");
+            v
+        }
+        "table-header" => {
+            let mut v = vec![
+                Rule::rx_next(r"\n", "", Next::Pop),
+                Rule {
+                    matcher: Matcher::TableHeaderSep,
+                    guard: Guard::None,
+                    action: Action::Groups(&[
+                        GroupAction::Tok("p", 1),
+                        GroupAction::Relex(2, ATTR),
+                        GroupAction::Tok("p", 3),
+                    ]),
+                    next: Next::Stay,
+                },
+            ];
+            v.extend(text_rules("gu"));
+            v
+        }
         "attr" => {
             let mut v = Vec::new();
             include(&mut v, "replaceable");
@@ -1149,6 +1238,34 @@ mod tests {
                 ("p", ":"),
                 ("p", "|"),
                 ("p", "}}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_lexes_its_cells_and_options() {
+        // Verified against the service; a table outside the `table` state is
+        // ordinary text, exactly as Pygments leaves it.
+        assert!(classes("! a !! b\n").is_empty());
+        assert_eq!(
+            classes("{| class=\"wikitable\"\n|-\n! a !! b\n|}\n"),
+            vec![
+                ("p", "{|"),
+                ("w", " "),
+                ("na", "class"),
+                ("o", "="),
+                ("s2", "\""),
+                ("s2", "wikitable"),
+                ("s2", "\""),
+                ("p", "|-"),
+                ("p", "!"),
+                ("gu", " "),
+                ("gu", "a"),
+                ("gu", " "),
+                ("p", "!!"),
+                ("gu", " "),
+                ("gu", "b"),
+                ("p", "|}"),
             ]
         );
     }

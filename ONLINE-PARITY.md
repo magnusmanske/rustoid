@@ -19961,8 +19961,7 @@ The extension's own quirks are matched too: `lang=text` is a Pygments lexer
 (anchor span, trailing newline), while an unknown or absent language is plain
 `<pre>` text with no language class and no added newline.
 
-**Gaps, deliberately:** table lines (their attribute scan uses a per-character
-negative lookahead), language-converter markup, and the nested lexers — a
+**Gaps, deliberately:** language-converter markup, and the nested lexers — a
 `<syntaxhighlight>` inside the body, and the TeX/JSON delegation of
 `<math>`/`<chem>`/`<ce>`/`<templatedata>`. Those constructs stay plain text.
 
@@ -19975,3 +19974,21 @@ extension with its `<nowiki>` tags still spelled, where the service's `extsrc`
 has them resolved. The corpus scoreboard is unchanged (one page, `Bitcoin`,
 moved only because its oracle had aged a day). Lib 1,125, fixtures 867/896,
 `rustoid-extensions` 61, cite 14 + 2, `rustoid-compare` 136.
+
+## A table line highlights its cells
+
+Pygments' `table` state finishes the wikitext lexer: `{|`, `|-`, `|+`, data
+cells, header cells, and the optional attribute box between an opener and its
+separating `|`. That scan is
+`((?:(?!\[\[|\{\{)[^|\n<])*?)(\|)(?!\|)` — a lazy run with a
+per-character negative lookahead, which `regex` cannot express — so the start,
+row, caption, cell and header-cell rules are matched by hand in `lexer.rs`
+(`TableStart`, `TableRow`, `TableCaption`, `TableCell`, `TableHeader`,
+`TableHeaderSep`) and return the capture layout the rule table expects.
+
+**Effect:** a probe with a header row, a data row and attribute syntax —
+`{| class="wikitable"`, `|-`, `! a !! b`, `| c || d`, `|}` — now matches the
+service byte for byte, including the attribute box's classes. `Template:Infobox`
+is unchanged: its remaining difference is the `<nowiki>` inside a
+template-expanded extension body recorded above. Lib 1,125, fixtures 867/896,
+`rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 136.
