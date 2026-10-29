@@ -20088,3 +20088,8 @@ both sides**; the first raw difference is still byte 175,677, the serialized
 `data-mw` of a reference body (masked/nondeterministic). `Sundial` stays a
 match. Lib 1,128 (one new regression test), fixtures 867/896,
 `rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 137.
+
+The corpus is re-pinned to the current revisions. The online run still scores
+**strict 8/48 (16.7%)**, 11/48 with the nondeterministic credit; 19 pages stop
+in `extension`, which is where the uncached math and the remaining extension
+rendering sit.

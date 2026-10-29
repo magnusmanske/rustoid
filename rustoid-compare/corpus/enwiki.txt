@@ -22,10 +22,10 @@
 # --- Lua / Scribunto: the largest single lever ---
 # `invoke=164` and `invoke=101`: these two are the densest Lua consumers in the
 # corpus and the best single measure of `#invoke` progress.
-Cristiano Ronaldo @ 1382316132 | lua, transclusion, table, cite, media
-Lionel Messi @ 1382364926 | lua, transclusion, table, cite, media
-Taylor Swift @ 1381989949 | lua, transclusion, cite, media
-Israel @ 1382031310 | lua, transclusion, table, cite, media
+Cristiano Ronaldo @ 1382576067 | lua, transclusion, table, cite, media
+Lionel Messi @ 1382505449 | lua, transclusion, table, cite, media
+Taylor Swift @ 1382476495 | lua, transclusion, cite, media
+Israel @ 1382526325 | lua, transclusion, table, cite, media
 Python (programming language) @ 1382352332 | lua, parser-function, table, cite, media, syntaxhighlight
 COVID-19 pandemic @ 1381602615 | lua, transclusion, table, cite, media
 Template:Weather box @ 1189173952 | lua, parser-function, template-only
@@ -33,9 +33,9 @@ Template:Weather box @ 1189173952 | lua, parser-function, template-only
 # --- Transclusion and parser functions, minimal Lua ---
 Albert Einstein @ 1381744591 | transclusion, cite, table, media, sub-sup
 World War II @ 1381604228 | transclusion, cite, parser-function, media
-United States @ 1382388261 | transclusion, cite, media, template-bang
+United States @ 1382544225 | transclusion, cite, media, template-bang
 Wikipedia @ 1382377569 | transclusion, parser-function, cite, media, gallery
-France @ 1381205309 | transclusion, cite, media, template-bang
+France @ 1382533870 | transclusion, cite, media, template-bang
 The Beatles @ 1382335930 | transclusion, parser-function, cite, media, template-bang
 Titanic @ 1382315077 | transclusion, parser-function, cite, table, media
 
@@ -49,7 +49,7 @@ ISO 3166-1 alpha-2 @ 1382340398 | table, parser-function, transclusion, cite
 Zebra @ 1375105737 | gallery, transclusion, table, cite, media
 Chess @ 1382042221 | gallery, transclusion, table, cite, media, sub-sup
 Order of the British Empire @ 1381681877 | gallery, transclusion, table, cite, media
-Berlin @ 1382238954 | gallery, transclusion, table, cite, media
+Berlin @ 1382592902 | gallery, transclusion, table, cite, media
 Bicycle @ 1375091239 | gallery, transclusion, cite, media, template-bang
 International Space Station @ 1379562415 | gallery, transclusion, table, cite, media
 Hydrogen @ 1381309830 | math, transclusion, table, cite, media, sub-sup
@@ -63,17 +63,17 @@ Isaac Newton @ 1381964021 | transclusion, cite, media
 Unix @ 1377139403 | transclusion, cite, media
 Nobel Prize @ 1380674954 | transclusion, cite, media
 Megadeth @ 1381730501 | transclusion, cite, media
-Nigeria @ 1381615055 | transclusion, cite, media
+Nigeria @ 1382538424 | transclusion, cite, media
 Bitcoin @ 1382376340 | transclusion, cite, media, sub-sup
 Association football @ 1381327185 | transclusion, cite, media, parser-function
 Anarchism @ 1382023044 | transclusion, cite, table, media, template-bang
-Doom (1993 video game) @ 1382344077 | transclusion, cite, media
+Doom (1993 video game) @ 1382495078 | transclusion, cite, media
 Grand Theft Auto V @ 1381845748 | transclusion, cite, table, media
 Brat (album) @ 1382110683 | transclusion, cite, table, media
 Polio vaccine @ 1381506019 | transclusion, cite, table, media, template-bang
 Chernobyl disaster @ 1380805589 | transclusion, cite, media
 2024 Summer Olympics @ 1381136614 | transclusion, cite, table, media
-India @ 1382137125 | transclusion, cite, table, media, math, gallery
+India @ 1382594487 | transclusion, cite, table, media, math, gallery
 Quicksilver (film) @ 1375761840 | transclusion, cite, media, short
 
 # --- Edge cases and non-article namespaces ---
