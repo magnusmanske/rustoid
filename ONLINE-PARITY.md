@@ -19931,3 +19931,47 @@ a plain `<pre>` where the service has `syntaxhighlight`'s highlighted spans, and
 `Sundial` stops at its first `<math>`. The lib suite is at 1,125, fixtures
 867/896, `rustoid-extensions` 50, the Cite tests 14 + 2, and `rustoid-compare`
 136.
+
+## `syntaxhighlight` highlights its body
+
+`<syntaxhighlight>` was rendered as a wrapper plus escaped text: the highlighting
+itself is Pygments in the PHP extension, and that was a recorded gap. Pygments'
+`WikitextLexer` is declarative, so it is now ported rule for rule, together with
+the `HtmlFormatter` behaviour that is observable in the served HTML:
+
+- `rustoid-extensions/src/syntaxhighlight/lexer.rs` is a small `RegexLexer`
+  engine: ordered rules per state, a state stack, `bygroups`,
+  `using(this, …)`/`Relex`, and Pygments' fallback (an unmatched newline is
+  `Whitespace` and resets the stack, any other unmatched byte is `Error`).
+  Rust's `regex` has no lookaround, so the lexer's assertions are guards checked
+  around the match, and the three rules that need more — a heading's
+  backreference, a template argument's label, and a parameter's name — are
+  matched by hand.
+- `wikitext.rs` transcribes the lexer's states and word lists (magic words,
+  parser functions, tags, protocols) in Pygments' order.
+- `highlight.rs` ports `HtmlFormatter::_format_lines`: same-class tokens share a
+  span on a line, a token containing a newline closes its span at the break, and
+  `_wrap_pre` adds the empty anchor `<span></span>`.
+- `mod.rs` follows `SyntaxHighlight`'s wrapper: the body is
+  `rtrim(trim($text, "\n"))` (and `trim` again inline), an empty body gets no
+  `<pre>`, a known language gets `mw-highlight-lang-{lang}`, and only
+  `class`/`style`/`id` are copied from the tag.
+
+The extension's own quirks are matched too: `lang=text` is a Pygments lexer
+(anchor span, trailing newline), while an unknown or absent language is plain
+`<pre>` text with no language class and no added newline.
+
+**Gaps, deliberately:** table lines (their attribute scan uses a per-character
+negative lookahead), language-converter markup, and the nested lexers — a
+`<syntaxhighlight>` inside the body, and the TeX/JSON delegation of
+`<math>`/`<chem>`/`<ce>`/`<templatedata>`. Those constructs stay plain text.
+
+**Effect:** the probe corpus matches the service byte for byte (template calls,
+parameters, parser functions, media links, comments, quotes, magic variables,
+headings, external links); `Template:Infobox`'s first difference moves from byte
+21,702 (11.0%) to 34,739 (17.7%) of 196,501, and what remains there is not the
+highlighter: the doc's `{{code|lang=wikitext|<nowiki>…</nowiki>}}` reaches the
+extension with its `<nowiki>` tags still spelled, where the service's `extsrc`
+has them resolved. The corpus scoreboard is unchanged (one page, `Bitcoin`,
+moved only because its oracle had aged a day). Lib 1,125, fixtures 867/896,
+`rustoid-extensions` 61, cite 14 + 2, `rustoid-compare` 136.
