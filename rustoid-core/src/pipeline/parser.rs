@@ -1529,6 +1529,12 @@ pub fn render_inline_fragment(
     // media/gallery captions, which would otherwise only get the bare `rel`
     // set by the token handler.
     crate::pipeline::add_link_attributes::run(&mut frag, config);
+    // Parsoid's `finalCleanup` trims whitespace at the edges of a list item
+    // (`: Item` → `<dd>Item</dd>`). A fragment is spliced into the page *after*
+    // that pass, so it has to be trimmed here; without it a definition list in a
+    // reference body kept the marker's space while the same list on the page did
+    // not.
+    crate::pipeline::cleanup::trim_whitespace_in_subtree(&mut frag);
     frag
 }
 
@@ -7184,6 +7190,7 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 | Some("mapframe")
                 | Some("maplink")
                 | Some("syntaxhighlight")
+                | Some("math")
         ) {
             return false;
         }

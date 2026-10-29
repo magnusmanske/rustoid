@@ -20025,3 +20025,29 @@ byte, MathML and fallback image included. `Hydrogen` is now identical with only
 node ids, `#mwt` and `utm_campaign` masked — **1,007,311 bytes on both sides,
 with the `<math>` spans no longer masked**. Lib 1,127, fixtures 867/896,
 `rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 137.
+
+## A rendered fragment trims its list-item edges
+
+A definition list inside a reference body kept the marker's space: `<ref>text
+\n: Item two</ref>` served `<dd> Item two</dd>` where the same list on the page
+served `<dd>Item two</dd>`. The trimming is Parsoid's `CleanUp::trimWhiteSpace`
+in `finalCleanup`, which the page passes through but a fragment — rendered while
+the page is being built and spliced in afterwards — did not. The inline
+fragment build now runs `trim_whitespace_in_subtree` on its result, which is
+where the fragment pipeline's `post_pwrap_transforms` ends.
+
+**Effect:** `Sundial` matches the service completely (444,426 bytes both sides,
+masked). Lib 1,127, fixtures 867/896.
+
+## Math takes its `about` in source order
+
+The math wrapper was allocated a fresh about id when it was expanded, long after
+the page's source-order numbering, so every math page differed in
+`about="#mwt…"` even when the body was right (`Hydrogen`: 1213 against 137).
+`stamp_rich_extension_about` already numbers the extensions that are rendered in
+a later pass; `math` now belongs to that list, so the id is chosen where the tag
+sits and `expand_maths` reuses it.
+
+**Effect:** `Hydrogen`'s first difference moves from byte 90,137 (the math
+about) to 175,677, which is a reference body's serialized `data-mw` — the next
+difference. `Sundial` stays a match. Lib 1,127, fixtures 867/896.
