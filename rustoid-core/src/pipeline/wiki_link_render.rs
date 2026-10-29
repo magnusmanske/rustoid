@@ -900,7 +900,7 @@ fn tokenize_caption(caption: &str, config: &dyn SiteConfig) -> Vec<Item> {
 /// re-assemble such a wikilink, we reconstruct the full caption source (using
 /// each directive's `data-parsoid.src`) and re-tokenize it as one span, rather
 /// than tokenizing each text chunk in isolation.
-fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> {
+pub(crate) fn tokenize_caption_items(items: &[Item], config: &dyn SiteConfig) -> Vec<Item> {
     tokenize_caption_items_sol(items, config, true, false)
 }
 
@@ -1174,68 +1174,61 @@ fn tokenize_caption_items_sol(
     sol: bool,
     linkdesc: bool,
 ) -> Vec<Item> {
-    // Only reconstruct when a directive token is present that may have split a
-    // surrounding wikilink across several items (`tokenize_link_content` only
-    // recognizes `{{…}}`/`-{…}-`/`<nowiki>` directives, so `[[A|…directive…]]` is
-    // fragmented); otherwise keep the per-chunk path to preserve transclusion
-    // markers.
+    // Only a caption whose link was split across tokens needs rebuilding: a
+    // directive token (`{{…}}`, `-{…}-`, `<nowiki>`) inside a link fragments it,
+    // because `tokenize_link_content` does not parse links. Repairing only the
+    // split span keeps an already-expanded `<ref>`'s `about` id and leaves a link
+    // that is already a token (the normal path now that captions are re-parsed
+    // before expansion) intact. When the split run also holds a directive,
+    // `rebuild_split_links` cannot rebuild it (the directive may be part of a
+    // link option), so fall back to reconstructing the caption source.
     //
-    // Only a `<nowiki>` extension can do that. Reconstructing for *any*
-    // `extension` would re-tokenize a caption that holds an already-expanded
-    // `<ref>` from its `data-parsoid.src`, discarding the expansion (and the
-    // `about` id the extension handler spent on it), so Cite then renumbered the
-    // ref from its own counter, too late (`[[File:…|thumb|caption<ref>…]]`).
-    let split_by_token = caption_items_split_by_token(items);
-    let has_directive = items.iter().any(|item| match item {
-        Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant" => true,
-        Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extension" => {
-            tk.attribs
-                .iter()
-                .find(|a| a.key.as_str() == Some("name"))
-                .and_then(|a| a.value.as_str())
-                == Some("nowiki")
+    // A directive *outside* any link needs no rebuild at all: the per-chunk path
+    // below re-tokenizes the text around it, which turns a complete `[[…]]` into
+    // a link token.
+    if caption_items_split_by_token(items) {
+        let has_directive = items.iter().any(|item| match item {
+            Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "language-variant" => true,
+            Item::Tok(ParsoidToken::SelfclosingTag(tk)) if tk.name == "extension" => {
+                tk.attribs
+                    .iter()
+                    .find(|a| a.key.as_str() == Some("name"))
+                    .and_then(|a| a.value.as_str())
+                    == Some("nowiki")
+            }
+            _ => false,
+        });
+        if has_directive {
+            let src = items_source(items);
+            return tokenize_caption_sol(&src, config, sol, linkdesc);
         }
-        _ => false,
-    });
-    // Repair just the split link, leaving every other token (notably an
-    // already-expanded `<ref>` with its `about` id) untouched.
-    if split_by_token && !has_directive {
         return rebuild_split_links(items, config, sol, linkdesc);
     }
-    let needs_reconstruction = split_by_token || has_directive;
-    if !needs_reconstruction {
-        let mut out = Vec::with_capacity(items.len());
-        // `sol` describes the caption's *first* position. Re-tokenizing every
-        // text chunk with it made each chunk a fresh line start: in
-        // `…[[Afghanistan]]; [[Ivory Coast]]…` the `; ` after the link token is
-        // its own chunk, so it started a `<dl>` instead of staying text (the
-        // `Legend` caption on France). A chunk after a newline is at line start
-        // again; other tokens (links, templates) leave the position mid-line.
-        let mut at_sol = sol;
-        for item in items {
-            match item {
-                Item::Str(s) => {
-                    out.extend(tokenize_caption_sol(s, config, at_sol, linkdesc));
-                    at_sol = sol && s.ends_with('\n');
-                }
-                Item::Tok(ParsoidToken::Nl(_)) => {
-                    out.push(item.clone());
-                    at_sol = sol;
-                }
-                _ => {
-                    out.push(item.clone());
-                    at_sol = false;
-                }
+    let mut out = Vec::with_capacity(items.len());
+    // `sol` describes the caption's *first* position. Re-tokenizing every
+    // text chunk with it made each chunk a fresh line start: in
+    // `…[[Afghanistan]]; [[Ivory Coast]]…` the `; ` after the link token is
+    // its own chunk, so it started a `<dl>` instead of staying text (the
+    // `Legend` caption on France). A chunk after a newline is at line start
+    // again; other tokens (links, templates) leave the position mid-line.
+    let mut at_sol = sol;
+    for item in items {
+        match item {
+            Item::Str(s) => {
+                out.extend(tokenize_caption_sol(s, config, at_sol, linkdesc));
+                at_sol = sol && s.ends_with('\n');
+            }
+            Item::Tok(ParsoidToken::Nl(_)) => {
+                out.push(item.clone());
+                at_sol = sol;
+            }
+            _ => {
+                out.push(item.clone());
+                at_sol = false;
             }
         }
-        return out;
     }
-
-    // Reconstruct the full caption source, then tokenize it whole. `extension`/
-    // `language-variant`/`template`/meta tokens carry their exact wikitext in `src`;
-    // text chunks are already literal.
-    let src = items_source(items);
-    tokenize_caption_sol(&src, config, sol, linkdesc)
+    out
 }
 
 /// Split a media option string on *top-level* pipes, respecting nested

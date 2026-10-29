@@ -20051,3 +20051,40 @@ sits and `expand_maths` reuses it.
 **Effect:** `Hydrogen`'s first difference moves from byte 90,137 (the math
 about) to 175,677, which is a reference body's serialized `data-mw` — the next
 difference. `Sundial` stays a match. Lib 1,127, fixtures 867/896.
+
+## A media caption is re-parsed before its templates expand
+
+A caption that holds a link whose text is a template took its `about` ids in
+document order, while the service numbers the caption's own templates first:
+
+```
+[[File:Hindenburg …|thumb|The [[Hindenburg-class airship|{{lang|de|Hindenburg|cat=no}}]] over in{{nbsp}}1937]]
+```
+
+The service gives `{{nbsp}}` the lower id (`#mwt437`) and the nested
+`{{lang}}` the higher one (`#mwt438`); rustoid had them the other way round, so
+every later id on `Hydrogen` was shifted.
+
+The tokenizer's `wikilink_content` pass — which splits the media options — only
+recognizes directives (`{{…}}`, `-{…}-`, `<nowiki>`), so a nested `[[…]]` in a
+caption is still literal text at expansion time. Parsoid re-parses the caption
+as full wikitext in `renderMedia` *before* expanding it, which makes the nested
+link a token; the AttributeExpander then expands its content after the
+caption's own templates (it is an attribute sub-pipeline). rustoid now does the
+same: `expand_attributes_at` re-tokenizes a File link's `mw:maybeContent`
+values with the caption tokenizer (`tokenize_caption_items`) before handing them
+to `expand_attr_tokens`.
+
+The follow-up re-tokenization inside `render_file` then had to stop rebuilding
+a caption whose links are already tokens: it reconstructed the whole source
+whenever a `<nowiki>`/`-{…}-` token was present, and a rebuilt link token has no
+`src`, so the link vanished (fixture `T374445: Non extlink in media caption`).
+It now rebuilds only when a link was actually split across tokens
+(`caption_items_split_by_token`), and falls back to the source reconstruction
+only for a split run that also holds a directive.
+
+**Effect:** `Hydrogen`'s masked comparison is identical at **1,004,639 bytes on
+both sides**; the first raw difference is still byte 175,677, the serialized
+`data-mw` of a reference body (masked/nondeterministic). `Sundial` stays a
+match. Lib 1,128 (one new regression test), fixtures 867/896,
+`rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 137.

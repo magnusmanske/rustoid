@@ -8485,6 +8485,23 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             } else {
                 (in_template, false)
             };
+            // Parsoid re-parses a media caption as full wikitext (`renderMedia`
+            // → `processContentInPipeline`) before its templates expand. The
+            // tokenizer's `wikilink_content` pass that produced
+            // `mw:maybeContent` only recognizes directives, so a nested `[[…]]`
+            // is still literal text there. Re-tokenize the option before
+            // expanding it, so a nested link becomes a token and its templates
+            // are expanded by the attribute pass — after the caption's own
+            // templates, which is the order the service numbers them:
+            // `[[File:x|thumb|A [[L|{{lang}}]] in{{nbsp}}1937]]` gives the nbsp
+            // the lower `about` id, not the lang.
+            let caption_reparse = tok.get_name() == "wikilink"
+                && tok
+                    .get_attribs()
+                    .iter()
+                    .find(|kv| kv.key.as_str() == Some("href"))
+                    .map(|kv| crate::wikitext::token_utils::key_value_to_string(&kv.value))
+                    .is_some_and(|href| is_file_link_target(&href));
             let mut expanded_attrs: Vec<KV> = Vec::with_capacity(attribs.len());
             for kv in &attribs {
                 let new_key = if let KeyValue::Tokens(toks) = &kv.key {
@@ -8507,10 +8524,15 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                     kv.key.clone()
                 };
                 let new_value = if let KeyValue::Tokens(toks) = &kv.value {
+                    let toks = if caption_reparse && kv.key.as_str() == Some("mw:maybeContent") {
+                        crate::pipeline::wiki_link_render::tokenize_caption_items(toks, self.config)
+                    } else {
+                        toks.clone()
+                    };
                     let expanded = self
                         .expand_attr_tokens(
                             frame,
-                            toks.clone(),
+                            toks,
                             source,
                             about_counter,
                             page_source,
@@ -13435,6 +13457,46 @@ mod tests {
         // overwritten by the wrapper), so `After` is #mwt3.
         assert!(html.contains(r##"about="#mwt1""##), "got: {html}");
         assert!(html.contains(r##"about="#mwt3""##), "got: {html}");
+    }
+
+    /// A media caption is re-parsed as full wikitext before its templates
+    /// expand, so a template nested inside a caption link is numbered by the
+    /// attribute pass — *after* the caption's own templates. The service numbers
+    /// `[[File:…|thumb|a [[L|{{lang|de|X}}]] in{{nbsp}}1937]]` that way; getting
+    /// it backwards shifted every later `about` on the page (Hydrogen's
+    /// Hindenburg caption).
+    #[tokio::test]
+    async fn a_template_inside_a_nested_caption_link_is_numbered_after_the_caption() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template("Template:Lang", "L");
+        source.add_template("Template:Nbsp", "N");
+        let config = crate::mock::MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "[[File:Example.jpg|thumb|a [[Target|{{Lang}}]] in{{Nbsp}}1937]]",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        let id_for = |name: &str| -> usize {
+            let needle = format!(r#""wt":"{name}""#);
+            let at = html
+                .find(&needle)
+                .unwrap_or_else(|| panic!("no {name} template: {html}"));
+            let about = html[..at]
+                .rfind("about=\"#mwt")
+                .unwrap_or_else(|| panic!("no about before {name}: {html}"));
+            html[about + "about=\"#mwt".len()..]
+                .split('"')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(id_for("Nbsp"), 1, "caption template: {html}");
+        assert_eq!(id_for("Lang"), 2, "nested-link template: {html}");
     }
 
     /// `tag_content_source` must rebuild a link from its expanded fields (the
