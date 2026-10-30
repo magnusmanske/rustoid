@@ -7214,6 +7214,20 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
             .await;
             result.extend(out);
         }
+        // A heading in a nested pipeline — a template body, an extension body, a
+        // module's output — is transcluded content: it cannot be edited on this
+        // page, which is why the service gives its section
+        // `data-mw-section-id="-1"` (Parsoid's `WrapSectionsState` tests
+        // `tplInfo !== null`). The tree builder carries `tmp` onto the element.
+        if self.expansion_nesting.get() > 1 || body {
+            for item in &mut result {
+                if let Item::Tok(ParsoidToken::Tag(t)) = item
+                    && matches!(t.name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+                {
+                    t.data_parsoid.tmp.in_transclusion = true;
+                }
+            }
+        }
         result
     }
 

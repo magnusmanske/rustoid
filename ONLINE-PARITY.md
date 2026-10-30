@@ -20113,3 +20113,22 @@ written literally inside a tag body is untouched).
 sample (byte 34,739) to the transcluded-section id at byte 20,976 (masked).
 Lib 1,129 (one new test), fixtures 867/896, `rustoid-extensions` 62, cite
 14 + 2, `rustoid-compare` 137.
+
+## A transcluded heading's section is not editable
+
+`Template:Infobox` renders its documentation through `{{documentation}}`, so
+every `<h2>` on the page comes from `Template:Infobox/doc`. Parsoid marks such
+a section `data-mw-section-id="-1"` — its `WrapSectionsState` tests
+`tplInfo !== null` for a heading inside templated output — and does not advance
+the page's own section numbers. rustoid numbered every heading sequentially, so
+each section id on the page was wrong (and the whole rest of the document
+shifted by the attribute's length).
+
+A heading token produced in a nested pipeline now carries
+`TempData::in_transclusion`, which the tree builder keeps on the element;
+`wrap_sections` gives such a section `-1` and leaves the counter alone.
+
+**Effect:** `Template:Infobox`'s first masked difference moves from byte 20,976
+(the first section id) to byte 130,446 — a category link that rustoid leaves
+unstashed. `Hydrogen` and `Sundial` are unchanged. Lib 1,130 (one new test),
+fixtures 867/896, `rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 137.

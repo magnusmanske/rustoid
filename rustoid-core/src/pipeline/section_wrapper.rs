@@ -75,7 +75,18 @@ fn wrap_level(children: &[Node], counter: &mut SectionNumber, at_top: bool) -> V
             // `==References==` section nested `===Sources===`, and the following
             // `==External links==` popped it back off the stack.
             close_above(&mut stack, &mut out, level);
-            let mut section = new_section(&counter.next().to_string());
+            // A heading in a nested pipeline — a template body, an extension
+            // body, a module's output — is transcluded content: it cannot be
+            // edited on this page, so its section is `-1` (Parsoid's
+            // `WrapSectionsState` tests `tplInfo !== null`) and it does not
+            // advance the page's own section numbers.
+            let transcluded = child.dp.as_ref().is_some_and(|dp| dp.tmp.in_transclusion);
+            let id = if transcluded {
+                "-1".to_string()
+            } else {
+                counter.next().to_string()
+            };
+            let mut section = new_section(&id);
             section.push_child(child.clone());
             stack.push(OpenSection {
                 level,
@@ -212,6 +223,27 @@ mod tests {
         wrap_sections(&mut body);
         // Lead (0), h2 (1), h2 (2) as siblings.
         assert_eq!(section_ids(&body), vec!["0", "1", "2"]);
+    }
+
+    #[test]
+    fn test_a_transcluded_heading_is_a_non_editable_section() {
+        // A heading from a template body cannot be edited on this page, so its
+        // section is `-1` and it does not advance the page's own numbering
+        // (Parsoid's `WrapSectionsState` tests `tplInfo !== null`).
+        let mut body = Node::element(ElementKind::Other("body".to_string()));
+        body.push_child(heading(2));
+        let mut tpl = heading(2);
+        tpl.dp = Some(crate::wikitext::tokens_v2::DataParsoid {
+            tmp: crate::wikitext::tokens_v2::TempData {
+                in_transclusion: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        body.push_child(tpl);
+        body.push_child(heading(2));
+        wrap_sections(&mut body);
+        assert_eq!(section_ids(&body), vec!["0", "1", "-1", "2"]);
     }
 
     #[test]
