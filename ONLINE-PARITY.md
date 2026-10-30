@@ -20132,3 +20132,32 @@ A heading token produced in a nested pipeline now carries
 (the first section id) to byte 130,446 — a category link that rustoid leaves
 unstashed. `Hydrogen` and `Sundial` are unchanged. Lib 1,130 (one new test),
 fixtures 867/896, `rustoid-extensions` 62, cite 14 + 2, `rustoid-compare` 137.
+
+## Why the largest pages stall (measurement, not a fix)
+
+`Cristiano Ronaldo`, `Lionel Messi` and `Israel` exceeded a 300 s page budget
+on the `--refresh` corpus run while every other page finished. That is a runtime
+cost, not a hang: offline, the same pages render in **65 s, 69 s and 90 s**.
+
+Phase timings for `Cristiano Ronaldo` (64 s total): **55.7 s in the chunk loop**
+(`expand_templates`, with attribute expansion at 0.3 s), 6.6 s in `render_links`,
+1.9 s in everything after. Inside the chunk loop:
+
+- **12,477 template expansions**, of which tokenizing the bodies is only 0.35 s —
+  the cost is the recursion itself;
+- **13,200 Lua runs** totalling **42.6 s** (~3 ms each) for 2,331 successful
+  `#invoke` calls: the retry loop re-runs a module ~5.7 times, and a fresh
+  `LuaEngine` re-executes the module (and everything it `require`s) on every
+  attempt. That is the single biggest item.
+- `preload_entities` is called once per `#invoke` and re-parses the page's
+  Wikidata JSON each time (`Entities::insert` → `serde_json`), which sampled at
+  ~7% of the render.
+
+The `--refresh` run multiplies this by the paced network: a page that re-fetches
+a few hundred inputs at `--delay-ms 800` spends minutes waiting before the
+render even finishes. A plain (cached) online run does not stall these pages.
+
+Next optimization, in order of expected gain: keep one Lua state (and its
+`package.loaded`) across the retry attempts of one `#invoke`, Scribunto-style,
+instead of rebuilding it per attempt; then memoize the parsed entity JSON per
+render.
