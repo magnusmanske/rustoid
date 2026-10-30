@@ -309,6 +309,50 @@ fn extension_body(stt: &crate::wikitext::tokens_v2::SelfclosingTagTk) -> String 
     crate::pipeline::extension_handler::extract_ext_body(stt, ext_src)
 }
 
+/// Remove every `<nowiki>` wrapper from a body, keeping its text.
+///
+/// `PPFrame::expand` renders a `<nowiki>` node as its text, so `#tag` content
+/// that holds one hands the extension `[[x]]`, not `<nowiki>[[x]]</nowiki>`.
+/// The content is spelled from the token's `source`, so the wrappers have to be
+/// taken off again. An unclosed nowiki keeps the rest as text.
+fn strip_nowiki_wrappers(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    if !lower.contains("<nowiki") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find("<nowiki") {
+        let start = i + rel;
+        out.push_str(&s[i..start]);
+        let Some((open_end, self_closing)) =
+            crate::wikitext::tokenizer_v2::nowiki_start_tag_end(s, start)
+        else {
+            // Not a tag after all; keep the rest literally.
+            out.push_str(&s[start..]);
+            return out;
+        };
+        if self_closing {
+            i = open_end;
+            continue;
+        }
+        match lower[open_end..].find("</nowiki") {
+            Some(close_rel) => {
+                let close_start = open_end + close_rel;
+                out.push_str(&s[open_end..close_start]);
+                let after = close_start + "</nowiki".len();
+                i = s[after..].find('>').map_or(s.len(), |gt| after + gt + 1);
+            }
+            None => {
+                out.push_str(&s[open_end..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(&s[i..]);
+    out
+}
+
 /// Whether this node is an `mw:Extension/*` wrapper that carries its own
 /// `about` id. `<nowiki>` is lean markup with no wrapper and no id.
 fn is_extension_wrapper(node: &Node) -> bool {
@@ -4720,8 +4764,18 @@ impl<'a, C: SiteConfig> Parser<'a, C> {
                 .and_then(|offsets| offsets.close_width)
                 .unwrap_or(0)
                 > 0;
-            let body = has_body
+            let mut body = has_body
                 .then(|| crate::pipeline::extension_handler::extract_ext_body(&stt, &ext_src));
+            // `<nowiki>` wrappers in `#tag` content are preprocessor nodes whose
+            // expansion is their text: `{{code|lang=wikitext|<nowiki>[[File:x]]
+            // </nowiki>}}` serves `"extsrc":"[[File:x]]"`, so the wrapper never
+            // reaches the lexer. A literal `<nowiki>` written inside the tag body
+            // is source text and stays.
+            if stt.data_parsoid.tmp.tag_content.is_some()
+                && let Some(text) = body.as_mut()
+            {
+                *text = strip_nowiki_wrappers(text);
+            }
             let data_mw = extension_data_mw("syntaxhighlight", &attrs, body.as_deref());
             let request = rustoid_extensions::syntaxhighlight::Request {
                 attrs: &pairs,
@@ -13575,6 +13629,34 @@ mod tests {
         assert!(
             html.contains(r#""extsrc":"\nFile:Example.svg|50px|alt=x"#),
             "the content kept its leading newline: {html}"
+        );
+    }
+
+    /// A `<nowiki>` handed to `#tag` as content is a preprocessor node whose
+    /// expansion is its text, so the wrapper never reaches a raw extension's
+    /// body: `{{code|lang=wikitext|<nowiki>[[File:x]]</nowiki>}}` serves
+    /// `"extsrc":"[[File:x]]"`. A literal `<nowiki>` inside the tag body is
+    /// source text and stays.
+    #[tokio::test]
+    async fn a_nowiki_in_tag_content_contributes_its_text() {
+        let source = crate::mock::MockDataSource::new();
+        source.add_template(
+            "Template:Code",
+            "{{#tag:syntaxhighlight|{{{1}}}|lang=wikitext|inline=1}}",
+        );
+        let config = MockSiteConfig::new();
+        let parser = Parser::new(&config);
+        let html = parser
+            .wikitext_to_html_expanded(
+                "{{Code|<nowiki>[[File:x.png|frameless]]</nowiki>}}",
+                &source,
+                &ParserOptions::for_page("Test"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            html.contains(r#""extsrc":"[[File:x.png|frameless]]""#),
+            "the nowiki contributed its text: {html}"
         );
     }
 

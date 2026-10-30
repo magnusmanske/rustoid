@@ -20093,3 +20093,23 @@ The corpus is re-pinned to the current revisions. The online run still scores
 **strict 8/48 (16.7%)**, 11/48 with the nondeterministic credit; 19 pages stop
 in `extension`, which is where the uncached math and the remaining extension
 rendering sit.
+
+## `#tag` content renders a `<nowiki>` as its text
+
+`Template:Infobox/doc` writes its code samples as
+`{{code|lang=wikitext|<nowiki>[[File:example.png|frameless]]</nowiki>}}`, and
+`Template:Code` is `{{#tag:syntaxhighlight|{{{1}}}|…}}`. The service's
+`extsrc` for that block is `[[File:example.png|frameless]]`: `#tag`'s content is
+`$frame->expand`ed, and a `<nowiki>` node there expands to its text, so neither
+the wrapper nor its tags reach the lexer. rustoid spelled the argument's tokens
+back to source, keeping `<nowiki>…</nowiki>`, so the sample was highlighted as
+a nowiki tag and the `extsrc` carried the tags.
+
+The raw-extension renderer now strips the wrappers from a `#tag` body
+(`expand_syntaxhighlight`, gated on `TempData::tag_content` so a `<nowiki>`
+written literally inside a tag body is untouched).
+
+**Effect:** `Template:Infobox`'s first difference moves from its first code
+sample (byte 34,739) to the transcluded-section id at byte 20,976 (masked).
+Lib 1,129 (one new test), fixtures 867/896, `rustoid-extensions` 62, cite
+14 + 2, `rustoid-compare` 137.
